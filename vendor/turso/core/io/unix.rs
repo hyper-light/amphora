@@ -458,7 +458,7 @@ impl File for UnixFile {
             {
                 match sync_type {
                     FileSyncType::Fsync => libc::fsync(self.file.as_raw_fd()),
-                    FileSyncType::FullFsync => {
+                    FileSyncType::FullFsync | FileSyncType::DataSync => {
                         libc::fcntl(self.file.as_raw_fd(), libc::F_FULLFSYNC)
                     }
                 }
@@ -466,8 +466,12 @@ impl File for UnixFile {
             #[cfg(not(target_vendor = "apple"))]
             {
                 // FullFsync has no effect on non-Apple platforms
-                let _ = sync_type;
-                libc::fsync(self.file.as_raw_fd())
+                match sync_type {
+                    FileSyncType::DataSync => libc::fdatasync(self.file.as_raw_fd()),
+                    FileSyncType::Fsync | FileSyncType::FullFsync => {
+                        libc::fsync(self.file.as_raw_fd())
+                    }
+                }
             }
         };
 
@@ -477,11 +481,14 @@ impl File for UnixFile {
         } else {
             #[cfg(target_vendor = "apple")]
             match sync_type {
-                FileSyncType::FullFsync => trace!("fcntl(F_FULLFSYNC)"),
+                FileSyncType::FullFsync | FileSyncType::DataSync => trace!("fcntl(F_FULLFSYNC)"),
                 FileSyncType::Fsync => trace!("fsync"),
             }
             #[cfg(not(target_vendor = "apple"))]
-            trace!("fsync");
+            match sync_type {
+                FileSyncType::DataSync => trace!("fdatasync"),
+                FileSyncType::Fsync | FileSyncType::FullFsync => trace!("fsync"),
+            }
 
             c.complete(0);
             Ok(c)

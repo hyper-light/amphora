@@ -176,7 +176,9 @@ impl Db {
     }
 
     /// Flushes the log, through the database's own IO: what was committed before the flush began
-    /// is durable once it ends (on macOS by `F_FULLFSYNC`: its `fsync` leaves the disk's cache).
+    /// is durable once it ends. Its data only (`fdatasync`; on macOS `F_FULLFSYNC`, its `fsync`
+    /// leaving the disk's cache): the log keeps its length across restarts, so once it has been
+    /// as long as it gets, a flush writes no metadata.
     pub fn flusher(&self) -> Flush {
         let wal = format!("{}-wal", self.path.display());
         let io = self.io.clone();
@@ -193,7 +195,7 @@ impl Db {
                 Err(e) => return Err(std::io::Error::other(e.to_string())),
             };
             let flushed = file
-                .sync(Completion::new_sync(|_| {}), FileSyncType::FullFsync)
+                .sync(Completion::new_sync(|_| {}), FileSyncType::DataSync)
                 .and_then(|c| io.wait_for_completion(c));
             flushed.map_err(|e| std::io::Error::other(e.to_string()))
         })

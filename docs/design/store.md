@@ -12,7 +12,8 @@ into `bench/`.
 
 **Decision.** One writer thread owns the engine and commits as soon as nothing more waits in its
 queue (or a commit reaches its row bound); what came while it committed shares the next commit.
-Nothing waits for a timer.
+Nothing waits for a timer. (The flusher may wait, bounded by a flush's own time, before it begins a
+flush: decision 14.)
 
 **Sources.** Group commit in DeWitt et al., "Implementation Techniques for Main Memory Database
 Systems" (SIGMOD 1984); Helland et al., "Group Commit Timers and High Volume Transaction Systems"
@@ -297,3 +298,69 @@ from when the log is attached (Turso, `Pager::defer_checksum`), when what it rea
 **Falsified by.** A page corrupted on disk read as data (`tests/files.rs`), a database that a power
 cut leaves unopenable (`tests/crash.rs`), or, on btrfs, the flag making writes slower or their tails
 longer than copy-on-write.
+
+## 13. The log flushed by its data, and kept at its length
+
+**Decision.** The flusher flushes the log's data (`FileSyncType::DataSync`, added to Turso:
+`fdatasync` on Linux and the BSDs, `F_FULLFSYNC` on Apple's systems, whose `fsync` leaves the disk's
+cache, `FlushFileBuffers` on Windows). And the log keeps its length when it starts again: the frames
+from before the restart stay, to be overwritten in place, as SQLite's are. Turso cut the file back
+to its header whenever it wrote a new one, so a log grew by appending after every restart; it now
+does that only under its multi-process authority, which checks its snapshot against the file's
+length and which Amphora doesn't use. What makes the frames left behind safe is unchanged: the new
+header changes the salts and is synced before any frame follows it (`prepare_wal_finish`), and a
+recovery stops at the first frame whose salts or checksum don't hold.
+
+**Sources.** fdatasync(2): metadata not needed to read the data back (times) is not flushed.
+SQLite's `os_unix.c` (`unixSync` uses `fdatasync` where the system has it) and `wal.c` (a restart's
+header is synced before frames follow, ticket ff5be73dee; the log is cut only to
+`journal_size_limit`). PostgreSQL's `wal_sync_method` (`fdatasync` by default on Linux), with
+segments written once and recycled (`wal_init_zero`, `wal_recycle`), so a commit's flush finds no
+new extents or length.
+
+**Evidence.** On fedora's disk (Samsung 9100 PRO, btrfs with zstd) the change is neutral: a
+durable write costs the disk's flush however it is made (`bench/disk.py`, decision 2; again
+2026-10-20 with 16 KiB writes, load 3: p50 2.74–3.56 ms appended or overwritten, written first
+or only allocated, `fsync` or `fdatasync`, with copy-on-write or without). It is the case file
+systems that journal metadata reward (ext4, XFS: an `fsync` after an append commits the journal, an
+`fdatasync` after an overwrite doesn't), to be measured on such a disk. Crash injection
+(`tests/crash.rs`, 2026-10-20): 10,000 power cuts with the frames kept, none losing an acknowledged
+batch; with the new header not synced (a mutant), 3 of 10,000 lost acknowledged batches, so the
+test reaches frames left from before a restart.
+
+**Falsified by.** An acknowledged batch lost to a power cut (`tests/crash.rs`); on ext4 or XFS, the
+log's `fdatasync` no faster than its `fsync`.
+
+## 14. Gathering before a flush at low load
+
+**Decision.** When the writer ran out of work during a flush, the flusher doesn't begin the next
+flush at the first commit after it. It waits until the writer has been idle for a 32nd of a flush,
+or half a flush has gone by, whichever comes first (a flush's time smoothed: the first, then an
+eighth of each new one), and then flushes everything committed. When the writer never ran out of
+work, flushes follow one another as before.
+
+**Why.** Writers that each wait for their write to be durable send their next write when told. A
+flush begun at the first commit after the last flush covers the first few of those writes and
+leaves the rest to the flush after; the writers settle into two halves, each committing during the
+other's flush, and each write waits two flushes. At 32 writers on a 2.8 ms flush: 5.6 ms a write
+and 5,700 writes a second, predicted; 5.1–5.8 ms and 5,134–5,608 a second, measured.
+
+**Sources.** Helland et al. (HPTS 1987; decision 1) on group commit timers: a fixed delay adds
+latency once commits arrive faster than they complete, which is why this one is taken only when the
+writer ran out of work, and is bounded by the flush's own time. PostgreSQL's `commit_delay` and
+`commit_siblings`: a delay before the flush when other transactions are active.
+
+**Evidence.** fedora, 2026-10-20, 32 writers, one group, three runs each alternating with
+PostgreSQL 17 in the same windows, at load 4–12 with other work on the machine
+(`bench/records/2026-10-20-fedora-32-writers-flush-at-first-commit.jsonl`,
+`...-gathering.jsonl`). Flushing at the first commit: 5,134–5,608 writes a second, p50 5.12–5.76 ms,
+p99 9.3–9.7 ms, p99.9 14.6–20.7 ms, max 26–54 ms. Gathering: 7,390–7,605 writes a second, p50
+4.06–4.16 ms, p99 7.2–8.1 ms, p99.9 11.3–17.2 ms, max 21–38 ms, with about 5,000 flushes a run
+against 7,000. PostgreSQL: 5,803–6,164 writes a second, p50 5.06–5.44 ms, p99 7.4–8.1 ms, p99.9
+9.5–20.2 ms, max 10–29 ms. Crash injection: 10,000 power cuts, none lost. The two fractions are
+chosen, not yet tuned: a 16th and a 64th of a flush are to be measured against the 32nd on a quiet
+machine, and gathering at 1,000 writers and more against flushing at once.
+
+**Falsified by.** A workload where gathering lengthens a write's p50 or tails against flushing at
+the first commit (an open-loop trickle pays up to a 32nd of a flush a write), or more writers where
+flushes stop following one another.

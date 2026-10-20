@@ -583,6 +583,12 @@ trait WalCoordination: Debug + Send + Sync {
     /// Mark the WAL uninitialized before truncation and return the WAL file handle.
     fn prepare_truncate(&self) -> Result<Arc<dyn File>>;
 
+    /// Amphora: whether a new header cuts the log's file back to it, its frames from before the
+    /// restart dropped. A shared authority does (its snapshot is checked against the file's
+    /// length); in one process the file keeps its length and its frames are overwritten in place,
+    /// as SQLite's are.
+    fn truncates_orphans(&self) -> bool;
+
     /// Return the current WAL header snapshot.
     fn wal_header(&self) -> WalHeader;
 
@@ -1260,6 +1266,10 @@ impl WalCoordination for InProcessWalCoordination {
             }
             Err(err) => Err(err),
         }
+    }
+
+    fn truncates_orphans(&self) -> bool {
+        false
     }
 
     fn prepare_truncate(&self) -> Result<Arc<dyn File>> {
@@ -2346,6 +2356,10 @@ impl WalCoordination for ShmWalCoordination {
 
     fn prepare_truncate(&self) -> Result<Arc<dyn File>> {
         self.fallback.prepare_truncate()
+    }
+
+    fn truncates_orphans(&self) -> bool {
+        true
     }
 
     fn wal_header(&self) -> WalHeader {
@@ -4447,13 +4461,18 @@ impl Wal for WalFile {
         // them so that classify_authority_snapshot_against_wal does not see a
         // length mismatch and unnecessarily fall back to a full disk scan
         // (which can race with concurrent writers and corrupt the authority).
-        let should_skip_truncate = match file.size() {
-            Ok(size) => size <= WAL_HEADER_SIZE as u64,
-            Err(_) => {
-                tracing::warn!("Failed to get WAL file size");
-                true
-            }
-        };
+        // Amphora: only for that authority. In one process they stay, to be overwritten in place
+        // (a flush then writes no metadata): a recovery stops at the first frame whose salts or
+        // checksum don't hold, and this header, synced before any frame is written after it
+        // (prepare_wal_finish), changed the salts.
+        let should_skip_truncate = !self.coordination.truncates_orphans()
+            || match file.size() {
+                Ok(size) => size <= WAL_HEADER_SIZE as u64,
+                Err(_) => {
+                    tracing::warn!("Failed to get WAL file size");
+                    true
+                }
+            };
         if !should_skip_truncate {
             let c = Completion::new_trunc(|res| {
                 if let Err(err) = res {

@@ -133,6 +133,10 @@ pub enum FileSyncType {
     /// Full fsync - on macOS uses F_FULLFSYNC to flush disk write cache.
     /// On other platforms, behaves the same as Fsync.
     FullFsync,
+    /// Amphora: the file's data and what it takes to read it back, not its times: fdatasync on Unix
+    /// systems but Apple's, F_FULLFSYNC on Apple's (its fsync leaves the disk's cache), as Fsync
+    /// elsewhere. For a log written in place, whose flush then writes no metadata.
+    DataSync,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
