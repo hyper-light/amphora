@@ -1032,6 +1032,26 @@ impl<E: Engine> Store<E> {
         }
     }
 
+    /// Run `f` on a reader, on this thread, on what is committed now, waiting for no write: what a
+    /// reader that isn't the writer of what it reads sees in any database. Or `on_writer` on the
+    /// writer when the store has no reader now (which runs once what was sent before is committed).
+    /// Blocking, until `until` at most.
+    pub fn read_committed<T: Send + 'static>(
+        &self,
+        until: Instant,
+        f: impl FnOnce(&mut E::Reader) -> anyhow::Result<T>,
+        on_writer: impl FnOnce(&mut E) -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<T> {
+        let asked = Instant::now();
+        match self.readers.with(until, f) {
+            Some(answer) => {
+                self.meter.waited(asked.elapsed());
+                answer
+            }
+            None => self.run(until, on_writer),
+        }
+    }
+
     /// Run `f` on the engine once what was sent before is committed. Blocking, until `until` at
     /// most.
     pub fn run<T: Send + 'static>(

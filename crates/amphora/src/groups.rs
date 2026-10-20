@@ -147,18 +147,37 @@ impl<E: Engine> Groups<E> {
             .read(Some(key), until, f, on_writer)
     }
 
+    /// [`Store::read_committed`] in `key`'s group: what is committed there now.
+    pub fn read_committed<T: Send + 'static>(
+        &self,
+        key: &str,
+        until: Instant,
+        f: impl FnOnce(&mut E::Reader) -> anyhow::Result<T>,
+        on_writer: impl FnOnce(&mut E) -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<T> {
+        self.at(self.group(key))?
+            .read_committed(until, f, on_writer)
+    }
+
     /// `f` on a reader of every group (or `on_writer` on a group's writer while it has none), once
-    /// each group's writes handed over before are committed: one answer a group, in group order.
+    /// each group's writes handed over before are committed (`committed`: on what each has
+    /// committed now, waiting for none): one answer a group, in group order.
     pub fn read_each<T: Send + 'static>(
         &self,
         until: Instant,
+        committed: bool,
         f: impl Fn(&mut E::Reader) -> anyhow::Result<T>,
         on_writer: impl Fn(&mut E) -> anyhow::Result<T> + Clone + Send + 'static,
     ) -> anyhow::Result<Vec<T>> {
         let mut answers = Vec::with_capacity(self.stores.len());
         for store in &self.stores {
             let w = on_writer.clone();
-            answers.push(store.read(None, until, &f, move |e| w(e))?);
+            let answer = if committed {
+                store.read_committed(until, &f, move |e| w(e))?
+            } else {
+                store.read(None, until, &f, move |e| w(e))?
+            };
+            answers.push(answer);
         }
         Ok(answers)
     }

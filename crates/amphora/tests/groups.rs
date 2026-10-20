@@ -141,6 +141,7 @@ fn rows_go_to_their_keys_group_and_read_back_from_it() {
     let held = groups
         .read_each(
             soon(),
+            false,
             |db| {
                 let mut keys = Vec::new();
                 db.query(KEYS, [], |r| {

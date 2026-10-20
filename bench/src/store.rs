@@ -203,12 +203,14 @@ impl Driver for Amphora {
 
     fn history(&self, session: &str, limit: usize) -> anyhow::Result<usize> {
         let (s, w) = (session.to_owned(), session.to_owned());
-        self.groups.read(session, Instant::now() + WAIT, move |db| page(db, &s, limit), move |e| page(&mut e.db, &w, limit))
+        // What is committed now: the bench's readers aren't the writers of what they read, and read
+        // as any database's readers do, waiting for no one's writes.
+        self.groups.read_committed(session, Instant::now() + WAIT, move |db| page(db, &s, limit), move |e| page(&mut e.db, &w, limit))
     }
 
     fn search(&self, word: &str, limit: usize) -> anyhow::Result<usize> {
         let (s, w) = (word.to_owned(), word.to_owned());
-        let each = self.groups.read_each(Instant::now() + WAIT, move |db| search_on(db, &s, limit), move |e| search_on(&mut e.db, &w, limit))?;
+        let each = self.groups.read_each(Instant::now() + WAIT, true, move |db| search_on(db, &s, limit), move |e| search_on(&mut e.db, &w, limit))?;
         Ok(each.into_iter().sum::<usize>().min(limit))
     }
 

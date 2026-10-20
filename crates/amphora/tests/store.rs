@@ -188,6 +188,37 @@ fn a_read_is_not_held_by_a_busy_writer() {
     job.join().unwrap().unwrap();
 }
 
+/// A read of what is committed doesn't wait for writes handed over and not yet committed: it
+/// answers while the writer is held, with what was committed before.
+#[test]
+fn a_read_of_what_is_committed_waits_for_no_write() {
+    let lab = lab(Config::default(), None);
+    lab.store.put(vec![row("a", 1)]).unwrap();
+    assert_eq!(count(&lab.store, "a"), 1);
+    let busy = lab.store.clone();
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let job = std::thread::spawn(move || {
+        busy.run(soon(), move |_| {
+            held_tx.send(()).unwrap();
+            go_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            Ok(())
+        })
+    });
+    held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    // Handed over, not committed: the writer is held.
+    lab.store.put(vec![row("a", 2)]).unwrap();
+    let committed = lab
+        .store
+        .read_committed(soon(), |r| count_on(r, "a"), |e| count_on(&mut e.db, "a"))
+        .unwrap();
+    assert_eq!(committed, 1);
+    assert!(!job.is_finished(), "the read waited for the writer");
+    go_tx.send(()).unwrap();
+    job.join().unwrap().unwrap();
+    assert_eq!(count(&lab.store, "a"), 2);
+}
+
 /// A sync waits for a flush begun after its commit; a read of what was committed doesn't.
 #[test]
 fn a_sync_waits_for_a_flush_begun_after_its_commit_and_a_read_does_not() {
