@@ -17,14 +17,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use amphora::store::{Config, Engine, Flush, ForReaders, Opener, Refused, Store, Upkept};
+use amphora::store::{
+    Checkpointed, Config, Engine, Flush, ForReaders, Opener, Refused, Store, Upkept,
+};
 use amphora::turso::Db;
 use turso_core::Value;
 
 struct Events {
     db: Db,
-    /// The log's bound for the checkpointer (small, so a test turns it over quickly).
-    frames: u64,
     /// The upkeep to answer next, for a test of what readers do around it.
     next: Arc<std::sync::Mutex<Vec<ForReaders>>>,
 }
@@ -40,22 +40,22 @@ const COUNT: &str = "SELECT count(*) FROM events WHERE key = ?1";
 
 impl Engine for Events {
     type Row = Row;
-    type Reader = (Db, u64);
+    type Reader = Db;
 
     fn key(row: &Row) -> &str {
         &row.key
     }
 
-    fn apply(&mut self, rows: Vec<Row>) -> anyhow::Result<usize> {
+    fn apply(&mut self, rows: &[Row]) -> anyhow::Result<usize> {
         let n = rows.len();
         self.db.transaction(|db| {
-            for r in &rows {
+            for r in rows {
                 let params = [
                     Value::from_text(r.key.clone()),
                     Value::from_i64(r.seq),
                     Value::from_text(r.text.clone()),
                 ];
-                db.query(INSERT, &params, |_| Ok(true))?;
+                db.query(INSERT, params, |_| Ok(true))?;
             }
             Ok(())
         })?;
@@ -66,14 +66,12 @@ impl Engine for Events {
         Some(self.db.flusher())
     }
 
-    fn opener(&self) -> Option<Opener<(Db, u64)>> {
-        let (open, frames) = (self.db.opener(), self.frames);
-        Some(Arc::new(move || Ok((open()?, frames))))
+    fn opener(&self) -> Option<Opener<Db>> {
+        Some(self.db.opener())
     }
 
-    fn checkpoint(reader: &mut (Db, u64)) -> anyhow::Result<bool> {
-        let frames = reader.1;
-        reader.0.checkpoint_past(frames)
+    fn checkpoint(reader: &mut Db) -> anyhow::Result<Checkpointed> {
+        reader.checkpoint()
     }
 
     fn restart_log(&mut self) -> anyhow::Result<bool> {
@@ -91,7 +89,7 @@ impl Engine for Events {
 
 fn count_on(db: &mut Db, key: &str) -> anyhow::Result<i64> {
     let mut n = 0;
-    db.query(COUNT, &[Value::from_text(key.to_owned())], |r| {
+    db.query(COUNT, [Value::from_text(key.to_owned())], |r| {
         n = r.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(true)
     })?;
@@ -105,16 +103,16 @@ struct Lab {
     next: Arc<std::sync::Mutex<Vec<ForReaders>>>,
 }
 
-fn lab(config: Config, frames: u64, flush: Option<Flush>) -> Lab {
+fn lab(config: Config, flush: Option<Flush>) -> Lab {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.db");
     let db = Db::open(&path).unwrap();
-    db.exec("CREATE TABLE events (key TEXT, seq INTEGER, text TEXT); CREATE INDEX by_key ON events (key, seq)")
+    // A row of negative seq can't be written: a batch that holds one fails.
+    db.exec("CREATE TABLE events (key TEXT, seq INTEGER CHECK (seq >= 0), text TEXT); CREATE INDEX by_key ON events (key, seq)")
         .unwrap();
     let next = Arc::new(std::sync::Mutex::new(Vec::new()));
     let engine = Events {
         db,
-        frames,
         next: next.clone(),
     };
     let store = Store::start_with(engine, config, flush).unwrap();
@@ -144,7 +142,7 @@ fn count(store: &Store<Events>, key: &str) -> i64 {
         .read(
             Some(key),
             soon(),
-            move |r| count_on(&mut r.0, &k),
+            move |r| count_on(r, &k),
             move |e| count_on(&mut e.db, &w),
         )
         .unwrap()
@@ -154,7 +152,7 @@ fn count(store: &Store<Events>, key: &str) -> i64 {
 /// before it, and no longer.
 #[test]
 fn what_is_put_is_read_back_by_its_key_at_once() {
-    let lab = lab(Config::default(), amphora::turso::LOG_FRAMES, None);
+    let lab = lab(Config::default(), None);
     for seq in 0..50 {
         lab.store.put(vec![row("a", seq)]).unwrap();
         assert_eq!(count(&lab.store, "a"), seq + 1);
@@ -166,7 +164,7 @@ fn what_is_put_is_read_back_by_its_key_at_once() {
 /// is answered while the writer is still held by a job of its own.
 #[test]
 fn a_read_is_not_held_by_a_busy_writer() {
-    let lab = lab(Config::default(), amphora::turso::LOG_FRAMES, None);
+    let lab = lab(Config::default(), None);
     lab.store.put(vec![row("a", 1)]).unwrap();
     lab.store.sync(soon()).unwrap();
     let busy = lab.store.clone();
@@ -203,7 +201,7 @@ fn a_sync_waits_for_a_flush_begun_after_its_commit_and_a_read_does_not() {
         counted.fetch_add(1, Ordering::Relaxed);
         Ok(())
     });
-    let lab = lab(Config::default(), amphora::turso::LOG_FRAMES, Some(slow));
+    let lab = lab(Config::default(), Some(slow));
     let began = Instant::now();
     lab.store.put(vec![row("a", 1)]).unwrap();
     assert_eq!(count(&lab.store, "a"), 1);
@@ -221,6 +219,97 @@ fn a_sync_waits_for_a_flush_begun_after_its_commit_and_a_read_does_not() {
     assert!(flushes.load(Ordering::Relaxed) >= 1);
 }
 
+/// A batch's ticket is durable once a flush begun after its batch's commit ends, not before.
+#[test]
+fn a_ticket_is_durable_once_a_flush_begun_after_its_commit_ends() {
+    let began = Instant::now();
+    let slow: Flush = Box::new(move || {
+        let until = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < until {
+            std::thread::park_timeout(until - Instant::now());
+        }
+        Ok(())
+    });
+    let lab = lab(Config::default(), Some(slow));
+    let ticket = lab.store.put(vec![row("a", 1)]).unwrap();
+    lab.store.durable(&ticket, soon()).unwrap();
+    assert!(
+        began.elapsed() >= Duration::from_millis(250),
+        "the ticket was durable before a flush ended: {:?}",
+        began.elapsed()
+    );
+}
+
+/// A batch whose commit fails is refused to its sender, nothing of it written; the batches
+/// committed with it are kept and made durable (AC-T1.1.1: no update is dropped unsaid).
+#[test]
+fn a_batch_that_fails_is_refused_to_its_sender_and_the_rest_of_its_commit_is_kept() {
+    let lab = lab(Config::default(), None);
+    // The writer held by a job while three batches queue behind it: they share one commit.
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let busy = lab.store.clone();
+    let job = std::thread::spawn(move || {
+        busy.run(soon(), move |_| {
+            held_tx.send(()).unwrap();
+            go_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            Ok(())
+        })
+    });
+    held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let first = lab.store.put(vec![row("a", 1), row("a", 2)]).unwrap();
+    let bad = lab.store.put(vec![row("a", 3), row("a", -1)]).unwrap();
+    let last = lab.store.put(vec![row("b", 1)]).unwrap();
+    go_tx.send(()).unwrap();
+    job.join().unwrap().unwrap();
+    assert_eq!(lab.store.durable(&first, soon()), Ok(()));
+    assert_eq!(lab.store.durable(&bad, soon()), Err(Refused::Failed));
+    assert_eq!(lab.store.durable(&last, soon()), Ok(()));
+    // Not even the failed batch's good row is there.
+    assert_eq!(count(&lab.store, "a"), 2);
+    assert_eq!(count(&lab.store, "b"), 1);
+    assert_eq!(lab.store.counters().failed, 1);
+}
+
+/// The writer keeps no statement journal, so a statement that fails after writing can't be undone
+/// alone: its transaction is never committed. One that returns the failure is rolled back; one
+/// that ignores it and asks to commit is refused, rolled back whole; and the connection takes
+/// the next transaction (docs/design/store.md, decision 7).
+#[test]
+fn a_transaction_holding_a_failed_statement_is_never_committed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Db::open(&dir.path().join("t.db")).unwrap();
+    db.exec("CREATE TABLE t (n INTEGER CHECK (n >= 0))")
+        .unwrap();
+    const ONE: &str = "INSERT INTO t (n) VALUES (?1)";
+    // Writes its first row, then fails on its second.
+    const TWO: &str = "INSERT INTO t (n) VALUES (?1), (?2)";
+    let two = |db: &mut Db| db.query(TWO, [Value::from_i64(2), Value::from_i64(-1)], |_| Ok(true));
+    let ignored = db.transaction(|db| {
+        db.query(ONE, [Value::from_i64(1)], |_| Ok(true))?;
+        assert!(two(db).is_err());
+        Ok(())
+    });
+    assert!(
+        ignored.is_err(),
+        "a transaction with a failed statement committed"
+    );
+    let returned = db.transaction(|db| {
+        db.query(ONE, [Value::from_i64(1)], |_| Ok(true))?;
+        two(db)
+    });
+    assert!(returned.is_err());
+    db.transaction(|db| db.query(ONE, [Value::from_i64(3)], |_| Ok(true)))
+        .unwrap();
+    let mut rows = Vec::new();
+    db.query("SELECT n FROM t", [], |r| {
+        rows.push(r.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?);
+        Ok(true)
+    })
+    .unwrap();
+    assert_eq!(rows, vec![3]);
+}
+
 /// A full queue refuses what it can't take, typed and counted; a sender that waits for room is
 /// taken once the writer frees some.
 #[test]
@@ -229,7 +318,7 @@ fn a_full_queue_refuses_typed_and_counted_and_a_wait_for_room_is_taken() {
         queue: 1,
         ..Config::default()
     };
-    let lab = lab(config, amphora::turso::LOG_FRAMES, None);
+    let lab = lab(config, None);
     // The writer held by a job, the queue filled behind it.
     let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
@@ -243,7 +332,7 @@ fn a_full_queue_refuses_typed_and_counted_and_a_wait_for_room_is_taken() {
     });
     held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     lab.store.put(vec![row("a", 1)]).unwrap();
-    assert_eq!(lab.store.put(vec![row("a", 2)]), Err(Refused::Full));
+    assert_eq!(lab.store.put(vec![row("a", 2)]).err(), Some(Refused::Full));
     assert_eq!(lab.store.counters().dropped, 1);
     // A wait for room is taken once the writer goes on.
     let waiting = lab.store.clone();
@@ -260,7 +349,13 @@ fn a_full_queue_refuses_typed_and_counted_and_a_wait_for_room_is_taken() {
 /// the writer starts it again between commits, holding the readers back for the moment it takes.
 #[test]
 fn the_log_stays_bounded_under_writes_and_reads_that_never_pause() {
-    let lab = lab(Config::default(), 256, None);
+    let lab = lab(
+        Config {
+            log_frames: 256,
+            ..Config::default()
+        },
+        None,
+    );
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let readers: Vec<_> = (0..4)
         .map(|_| {
@@ -298,7 +393,7 @@ fn the_log_stays_bounded_under_writes_and_reads_that_never_pause() {
 /// open on the new one.
 #[test]
 fn reads_go_on_while_the_engine_replaces_its_file() {
-    let lab = lab(Config::default(), amphora::turso::LOG_FRAMES, None);
+    let lab = lab(Config::default(), None);
     lab.store.put(vec![row("a", 1)]).unwrap();
     assert_eq!(count(&lab.store, "a"), 1);
     lab.next

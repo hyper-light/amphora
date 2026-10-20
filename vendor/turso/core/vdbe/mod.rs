@@ -1009,6 +1009,9 @@ pub struct ProgramState {
     /// the statement subtransactionwill roll back.
     fk_immediate_violations_during_stmt: AtomicIsize,
     uses_subjournal: bool,
+    /// Amphora: this write statement in an explicit transaction kept no statement journal (its
+    /// connection's are off): undoing it alone means rolling back the whole transaction.
+    skipped_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
@@ -1100,6 +1103,7 @@ impl ProgramState {
             hash_tables: HashMap::default(),
             ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
+            skipped_subjournal: false,
             is_active_write: false,
             has_stmt_transaction: false,
             attached_savepoint_pagers: Vec::new(),
@@ -1266,6 +1270,7 @@ impl ProgramState {
             self.ephemeral_temp_files.clear();
         }
         self.uses_subjournal = false;
+        self.skipped_subjournal = false;
         self.is_active_write = false;
         self.has_stmt_transaction = false;
         self.distinct_key_values.clear();
@@ -1542,6 +1547,10 @@ impl ProgramState {
                 if let Some(tx_id) = connection.get_mv_tx_id() {
                     mv_store.begin_savepoint(tx_id);
                 }
+            } else if !connection.statement_journals() {
+                // Amphora: no journal; end_statement poisons the transaction if this statement
+                // has to be undone.
+                self.skipped_subjournal = true;
             } else {
                 // Non-MVCC mode: use pager savepoints
                 let db_size = return_if_io!(pager.with_header(|header| header.database_size.get()));
@@ -1627,6 +1636,11 @@ impl ProgramState {
                 }
             }
             EndStatement::RollbackSavepoint => {
+                // Amphora: a statement kept no journal to undo it by: only rolling back the whole
+                // transaction undoes it, so COMMIT must not go through.
+                if self.skipped_subjournal {
+                    connection.mark_tx_poisoned();
+                }
                 // Rollback pager/MVCC savepoint if one was opened.
                 let pager_err = if let Some(mv_store) = connection.mv_store().as_ref() {
                     let mut err = None;
@@ -1697,6 +1711,7 @@ impl ProgramState {
             pager.stop_use_subjournal();
             self.uses_subjournal = false;
         }
+        self.skipped_subjournal = false;
         for p in &attached_pagers {
             p.stop_use_subjournal();
         }

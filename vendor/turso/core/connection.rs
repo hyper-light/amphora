@@ -408,6 +408,9 @@ pub struct Connection {
     /// was reset or dropped and there was no statement savepoint to undo only
     /// that statement. COMMIT must roll back the whole transaction.
     pub(crate) poisoned_tx: AtomicBool,
+    /// Amphora: whether a write statement in an explicit transaction keeps a statement journal
+    /// (see [`Connection::set_statement_journals`]).
+    pub(crate) statement_journals: AtomicBool,
     pub(super) last_insert_rowid: AtomicI64,
     pub(crate) changes: AtomicI64,
     pub(crate) total_changes: AtomicI64,
@@ -2841,6 +2844,20 @@ impl Connection {
     /// Return whether the active explicit transaction must roll back at COMMIT.
     pub(crate) fn tx_is_poisoned(&self) -> bool {
         self.poisoned_tx.load(Ordering::SeqCst)
+    }
+
+    /// Amphora: whether a write statement in an explicit transaction keeps a statement journal
+    /// (true, the default), so that one which fails is undone alone and the transaction goes on.
+    /// Off, none is kept: a write statement that fails, or is abandoned unfinished, marks the
+    /// transaction poisoned and COMMIT rolls it back whole. For a caller that rolls back on any
+    /// failure anyway, which then never copies a page into a journal.
+    pub fn set_statement_journals(&self, on: bool) {
+        self.statement_journals.store(on, Ordering::SeqCst);
+    }
+
+    /// Amphora: see [`Connection::set_statement_journals`].
+    pub(crate) fn statement_journals(&self) -> bool {
+        self.statement_journals.load(Ordering::SeqCst)
     }
 
     /// Clear the poison marker after BEGIN, COMMIT, or ROLLBACK.

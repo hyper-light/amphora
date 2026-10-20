@@ -1,6 +1,6 @@
 # The store's commit pipeline and readers (CP-T1.1)
 
-`crates/amphora/src/store.rs`, `crates/amphora/src/turso.rs`. Four decisions, each with its sources,
+`crates/amphora/src/store.rs`, `crates/amphora/src/turso.rs`. Its decisions, each with its sources,
 its evidence and what would falsify it (CLAUDE.md §5). The evidence is kiln's K0 workload (1,000
 sessions of 100 events, then 30 s of 32 writers appending one event per durable write and 4 readers
 reading a session's latest 50 events), run on fedora (32 cores, Samsung SSD 9100 PRO 8 TB under
@@ -44,7 +44,11 @@ path (`vendor/turso/core/storage/pager.rs`, `CommitState::WaitSync`): it flushes
 
 **Evidence.** On fedora's disk a durable 4 KiB write takes 2.6–3.3 ms (`dd oflag=dsync`; no
 copy-on-write and direct I/O with `O_DSYNC` measured no faster), the floor of any durable write
-there. With the flusher, the writer is busy about a third of the time and a write's p50 is
+there. `bench/disk.py` (2026-10-20, btrfs with zstd on the Samsung 9100 PRO): one thread, 2.72 ms a
+write, appended or in place, flushed or written through; two to sixteen threads, on one file or a
+file each, 4.9–5.0 ms a write at 200 writes a second a thread. btrfs commits its log one commit at a
+time, so a flush that arrives during another's waits for it and then for its own: under
+concurrency a durable write there costs about two of the disk's flushes, whoever asks. With the flusher, the writer is busy about a third of the time and a write's p50 is
 5.4–6.1 ms, under two of that disk's flushes. Turso's `OFF` mode was measured and refused: a
 checkpoint under `OFF` never records what it copied as safe, so the log never starts again and every
 checkpoint copies all of it again (130 writes/s).
@@ -77,11 +81,14 @@ tests), or a read that waits for another key's write.
 ## 4. No checkpoint in a commit's way
 
 **Decision.** The writer never checkpoints (`wal_autocheckpoint = 0`). A checkpointer with a
-connection of its own copies the log into the file every 25 ms without waiting for anyone
-(passive). A log only starts again once nothing reads from it, which readers that never pause
-prevent: so once the log holds `LOG_FRAMES` (64 MiB of 4 KiB pages), the writer starts it again
-between commits, holding the readers and the checkpointer back for the moment it takes (what little
-the checkpointer left, and a flush of the file).
+connection of its own copies the log into the file every `Config::checkpoint_every` (25 ms) without
+waiting for anyone (passive). A log only starts again once nothing reads from it, which readers that
+never pause prevent: so once the log holds more than `Config::log_frames` (16,384 frames, 64 MiB of
+4 KiB pages), the checkpointer copies without pausing until less than a 64th of the bound is left,
+and the writer then starts the log again between commits, holding the readers and the
+checkpointer back for the moment it takes (what little is left, and a flush of the file). The
+checkpointer starts no pass while a restart is pending. At twice its bound the log is started
+again however much is left.
 
 **Sources.** Checkpoint starvation under continuous readers: sqlite.org/wal.html §"Avoiding
 Excessively Large WAL Files". Turso's checkpoint modes and the writer's restart
@@ -93,8 +100,24 @@ restarts asked of a reader-busy log. With the writer starting it again and the r
 the log under ~90 MB, write p99 18 ms; with the checkpointer every 25 ms instead of 250, write p99
 11–12 ms and p99.9 25–26 ms (the restart has little left to copy).
 
-**Falsified by.** A log that grows past its bound under writes and reads that never pause (the
-store's tests), or a write p99.9 a restart's pause explains.
+Copying until little is left before a restart (2026-10-20, fedora, 512 writers): the longest restart
+went from 69–150 ms to 30–34 ms. The checkpointer starting no pass while a restart waits: the
+writer's longest wait for the gate went from 57–61 ms to under 0.5 ms.
+
+What checkpoints still cost (2026-10-20, fedora, 4,000 sessions, 20 s, load 3–7, one run each):
+with no checkpoints at all (the log left to grow) 512 writers write 38,178 a second at p99 21 ms,
+against 25,500–25,900 at p99 86–89 ms with them; 32 writers write 5,600 at p99 7.9 ms against
+4,900–5,100 at 10.7–12.7. Checkpointing every second with a 262,144-frame log takes back most of
+that (512 writers: 33,200–36,400 a second, p99 41–47 ms) but raises the longest write at 32 writers
+from about 40–90 ms to 97–127 ms, and keeps 10 MB more of log index in memory. The cause, measured
+by sampling where the writer and the flusher wait in the kernel (`bench/wchan.py`): a checkpoint's
+flush of the file, and of the log before it, are btrfs log commits; the flusher's flush of the log
+waits behind them (`wait_log_commit`, once 118 ms), and the writer's next append to the log waits for
+the flusher's hold on the log's inode (`btrfs_inode_lock`), so a commit stalls (Turso's COMMIT, up to
+97 ms). Starting the file's writeback while the checkpoint copies (`sync_file_range`, as
+PostgreSQL's `checkpoint_flush_after` does) didn't shorten the stalls: the copy comes in one burst.
+The defaults stay at 25 ms and 16,384 frames until checkpoints stop competing with the flusher for
+the disk's log (STATUS.md: one thread making everything durable).
 
 ## 5. Page budgets by what a connection does
 
@@ -122,3 +145,45 @@ fedora's disk the flushes serialize anyway: at 300 writes/s the write p50 stayed
 one, two and four (2026-10-20), and four once held a write 1.1 s.
 
 **Falsified by.** A disk whose flushes overlap (a write's latency then falls toward one flush).
+
+## 7. The writer keeps no statement journal; a commit that fails is retried batch by batch
+
+**Decision.** The writer's connection keeps no statement journal (Turso's
+`Connection::set_statement_journals(false)`, Amphora's change to `vendor/turso`): a write statement in
+a transaction that fails, or is abandoned unfinished, poisons the transaction, and COMMIT then rolls
+it back whole and says so. `Db::transaction` rolls back on any failure, and after a COMMIT that
+fails, so nothing a failed statement half-wrote is ever committed, and the next transaction can
+begin. A commit that fails is tried again batch by batch, each batch its own transaction: the
+batches that commit alone are kept, and one that can't is refused to its sender
+(`Refused::Failed`), nothing of it written.
+
+**Sources.** SQLite's statement journal and when it is skipped (`usesStmtJournal = isMultiWrite &&
+mayAbort`, `vdbe.c`, `sqlite3VdbeHalt`), which Turso mirrors
+(`vendor/turso/core/translate/stmt_journal.rs`): an UPSERT whose DO UPDATE can fail is both, so every
+event and session written keeps one, a 4 KiB copy of each page it first touches.
+
+**Evidence.** Amphora's bench (2026-10-20, fedora, 128 writers): the statement journal was 13.6% of
+the writer's time applying rows; without it, the writer's µs per row went from 30.6 to 25.4 and
+writes per second from 13,580 to 14,405. The store's tests: a batch with a row that fails a CHECK is
+refused and writes nothing, the batches committed with it are kept and made durable; a transaction
+holding a failed statement is never committed, whether its failure was returned or ignored.
+
+**Falsified by.** A row of a failed batch found after its sender was refused, a row of a kept batch
+missing, or a statement's half-write committed (the store's tests; T-T1.1.1's crash injection).
+
+## 8. Durable by ticket
+
+**Decision.** `Store::put` and `Store::put_wait` return a `Ticket`; `Store::durable(ticket)` waits
+until that batch's commit is followed by a flush that began after it, and refuses it if its commit
+failed or the writer stopped before committing it. `Store::sync` still waits for everything handed
+over so far, without saying which batches failed.
+
+**Sources.** Group commit with per-transaction acknowledgement (DeWitt et al., 1984; Helland et
+al., 1987): each committer learns its own outcome, not the group's.
+
+**Evidence.** Before tickets, a batch whose commit failed was let go and `Store::sync` reported it
+durable: a silent drop, against AC-T1.1.1. The store's tests cover a ticket made durable only after
+a flush that began after its commit, and a failed batch's ticket refused.
+
+**Falsified by.** A ticket reported durable whose batch isn't in the database after a crash
+(T-T1.1.1), or a failed batch's ticket reported durable.

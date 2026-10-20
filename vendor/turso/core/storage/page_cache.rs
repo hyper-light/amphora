@@ -458,7 +458,7 @@ impl PageCache {
     /// Returns true if the cache is at or above the spill threshold and spilling is enabled.
     /// This indicates that dirty pages should be flushed to make room for new pages.
     #[inline]
-    pub fn needs_spill(&self) -> bool {
+    pub fn needs_spill(&mut self) -> bool {
         let len = self.len();
 
         if len < self.spill_threshold || !self.spill_enabled {
@@ -479,7 +479,13 @@ impl PageCache {
 
         // Slow path: do the full count since our estimate suggests we might need to spill.
         // The actual count may be lower than evictable_count due to locked/pinned pages.
-        self.count_evictable_pages() < needed_evictable
+        // Amphora: the count is kept. A commit cleans its pages in the WAL
+        // (`finalize_committed_pages`), which doesn't tell the cache, so the tracked count only
+        // falls between counts: without this, once enough commits had gone by, every page
+        // brought in counted the whole cache again (5% of Amphora's writer's time).
+        let evictable = self.count_evictable_pages();
+        self.evictable_count = evictable;
+        evictable < needed_evictable
     }
 
     #[inline]
@@ -600,7 +606,7 @@ impl PageCache {
 
     /// Check if the cache needs spilling and return appropriate result.
     /// This is the main entry point for the spilling check during insertion.
-    pub fn check_spill(&self, max_pages: usize) -> SpillResult {
+    pub fn check_spill(&mut self, max_pages: usize) -> SpillResult {
         if !self.needs_spill() {
             return SpillResult::NotNeeded;
         }

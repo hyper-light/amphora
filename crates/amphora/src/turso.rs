@@ -14,7 +14,7 @@ use turso_core::{
     PlatformIO, Row, SqliteDialect, Statement, StepResult, Value,
 };
 
-use crate::store::{Flush, Opener};
+use crate::store::{Checkpointed, Flush, Opener};
 
 /// How long opening waits for another process's hold on the file to go.
 const LOCK_WAIT: Duration = Duration::from_secs(15);
@@ -28,10 +28,6 @@ const BUSY_TRIES: u32 = 10_000;
 /// what one read touches, the checkpointer next to nothing.
 pub const WRITER_PAGES: i64 = 1024;
 pub const READER_PAGES: i64 = 128;
-
-/// The log's frames past which the checkpointer asks the writer to start it again: 64 MiB of
-/// 4 KiB pages (measured on fedora, 2026-10-20: under ~90 MB of log at 5,000 writes a second).
-pub const LOG_FRAMES: u64 = 16_384;
 
 fn fail(e: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("{e}")
@@ -62,7 +58,9 @@ impl Db {
     /// The database at `path`, made as needed, for a store's writer: a commit writes the log and
     /// doesn't flush it (the store's flusher does, [`Db::flusher`]), and no checkpoint runs in a
     /// commit (the store's checkpointer copies the log, [`Db::checkpoint`]). A checkpoint still
-    /// flushes the log before it copies it and the file after.
+    /// flushes the log before it copies it and the file after. Its statements keep no statement
+    /// journal: a transaction ([`Db::transaction`]) is committed whole or rolled back whole, so one
+    /// that fails is never undone alone (docs/design/store.md, decision 7).
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -87,6 +85,7 @@ impl Db {
             }
         };
         let conn = db.connect(ConnectOpts::new()).map_err(fail)?;
+        conn.set_statement_journals(false);
         let d = Self {
             io,
             db,
@@ -153,19 +152,20 @@ impl Db {
         })
     }
 
-    /// Copies what the log holds into the file without waiting for anyone: whether the log holds
-    /// more than [`LOG_FRAMES`], for the writer to start it again ([`Db::restart_log`]).
-    pub fn checkpoint(&mut self) -> anyhow::Result<bool> {
-        self.checkpoint_past(LOG_FRAMES)
-    }
-
-    /// [`Db::checkpoint`], the log's bound `frames`.
-    pub fn checkpoint_past(&mut self, frames: u64) -> anyhow::Result<bool> {
+    /// Copies what the log holds into the file without waiting for anyone: what the log holds
+    /// after, for the store to start it again once it is past its bound ([`Db::restart_log`]). A
+    /// checkpoint already under way (busy) copies nothing and reports nothing.
+    pub fn checkpoint(&mut self) -> anyhow::Result<Checkpointed> {
         match self.conn.checkpoint(CheckpointMode::Passive {
             upper_bound_inclusive: None,
         }) {
-            Ok(copied) => Ok(copied.wal_max_frame > frames),
-            Err(LimboError::Busy) => Ok(false),
+            Ok(copied) => Ok(Checkpointed {
+                log: copied.wal_max_frame,
+                left: copied
+                    .wal_max_frame
+                    .saturating_sub(copied.wal_total_backfilled),
+            }),
+            Err(LimboError::Busy) => Ok(Checkpointed::default()),
             Err(e) => Err(fail(e)),
         }
     }
@@ -201,7 +201,7 @@ impl Db {
     pub fn query(
         &mut self,
         sql: &'static str,
-        params: &[Value],
+        params: impl IntoIterator<Item = Value>,
         each: impl FnMut(&Row) -> anyhow::Result<bool>,
     ) -> anyhow::Result<()> {
         let stmt = match self.statements.entry(sql) {
@@ -213,22 +213,21 @@ impl Db {
         step(self.io.as_ref(), stmt, params, each)
     }
 
-    /// `f` in one transaction: committed if it returns Ok, rolled back if not.
+    /// `f` in one transaction: committed if it returns Ok and the commit goes through, rolled back
+    /// whole if not (a commit that fails can leave the transaction open; the next would then
+    /// refuse to begin).
     pub fn transaction<T>(
         &mut self,
         f: impl FnOnce(&mut Self) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        self.exec("BEGIN")?;
-        match f(self) {
-            Ok(v) => {
-                self.exec("COMMIT")?;
-                Ok(v)
-            }
-            Err(e) => {
-                let _ = self.exec("ROLLBACK");
-                Err(e)
-            }
+        self.query("BEGIN", [], |_| Ok(true))?;
+        let done = f(self).and_then(|v| self.query("COMMIT", [], |_| Ok(true)).map(|()| v));
+        if done.is_err() && !self.conn.get_auto_commit() {
+            // What the failure already says is what the caller hears; a rollback that fails too
+            // leaves the connection to refuse the next transaction, which says so.
+            let _ = self.query("ROLLBACK", [], |_| Ok(true));
         }
+        done
     }
 }
 
@@ -236,13 +235,13 @@ impl Db {
 pub fn step(
     io: &dyn IO,
     stmt: &mut Statement,
-    params: &[Value],
+    params: impl IntoIterator<Item = Value>,
     mut each: impl FnMut(&Row) -> anyhow::Result<bool>,
 ) -> anyhow::Result<()> {
     stmt.reset().map_err(fail)?;
-    for (i, p) in params.iter().enumerate() {
+    for (i, p) in params.into_iter().enumerate() {
         let at = NonZero::new(i.saturating_add(1)).ok_or_else(|| anyhow::anyhow!("parameter 0"))?;
-        stmt.bind_at(at, p.clone()).map_err(fail)?;
+        stmt.bind_at(at, p).map_err(fail)?;
     }
     let mut busy = 0u32;
     loop {

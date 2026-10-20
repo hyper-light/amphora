@@ -154,37 +154,64 @@ fn event(rng: &mut Rng, session: usize, seq: u64, text_bytes: usize) -> Event {
     Event { session: format!("s-{session:06}"), id: format!("e-{seq}"), seq, at: now_ms(), kind, text, body }
 }
 
-/// The heap's bytes now and at most, counted at every allocation: what each database holds,
-/// apart from code, stacks and the allocator's own keeping (which the resident set counts too).
+/// The heap's bytes now and at most: what each database holds, apart from code, stacks and the
+/// allocator's own keeping (which the resident set counts too). Each thread counts its own and adds
+/// it to the shared count once it passes SLACK either way: a shared count touched at every
+/// allocation was a cache line every thread fought over, half of every thread's time at 128
+/// writers (fedora, 2026-10-20). The shared count is off by at most SLACK a thread.
 struct Counting;
 
-static HEAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static HEAP_PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const SLACK: isize = 16 << 10;
+static HEAP: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static HEAP_PEAK: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+thread_local! {
+    static OWN: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+fn count(delta: isize) {
+    let passed = OWN
+        .try_with(|own| {
+            let mine = own.get() + delta;
+            if mine.abs() < SLACK {
+                own.set(mine);
+                0
+            } else {
+                own.set(0);
+                mine
+            }
+        })
+        .unwrap_or(delta);
+    if passed != 0 {
+        let now = HEAP.fetch_add(passed, Ordering::Relaxed) + passed;
+        if passed > 0 {
+            HEAP_PEAK.fetch_max(now, Ordering::Relaxed);
+        }
+    }
+}
+
+fn size(n: usize) -> isize {
+    isize::try_from(n).unwrap_or(isize::MAX)
+}
 
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         let p = unsafe { std::alloc::System.alloc(layout) };
         if !p.is_null() {
-            let now = HEAP.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-            HEAP_PEAK.fetch_max(now, Ordering::Relaxed);
+            count(size(layout.size()));
         }
         p
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
         unsafe { std::alloc::System.dealloc(ptr, layout) };
-        HEAP.fetch_sub(layout.size(), Ordering::Relaxed);
+        count(-size(layout.size()));
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new: usize) -> *mut u8 {
         let p = unsafe { std::alloc::System.realloc(ptr, layout, new) };
         if !p.is_null() {
-            if new >= layout.size() {
-                let now = HEAP.fetch_add(new - layout.size(), Ordering::Relaxed) + (new - layout.size());
-                HEAP_PEAK.fetch_max(now, Ordering::Relaxed);
-            } else {
-                HEAP.fetch_sub(layout.size() - new, Ordering::Relaxed);
-            }
+            count(size(new) - size(layout.size()));
         }
         p
     }
@@ -195,6 +222,10 @@ static ALLOC: Counting = Counting;
 
 fn mb(bytes: usize) -> f64 {
     (bytes as f64 / (1 << 20) as f64 * 10.0).round() / 10.0
+}
+
+fn heap_mb(count: &std::sync::atomic::AtomicIsize) -> f64 {
+    mb(usize::try_from(count.load(Ordering::Relaxed)).unwrap_or(0))
 }
 
 /// A database that does nothing: what the harness holds of itself.
@@ -334,15 +365,27 @@ fn main() -> anyhow::Result<()> {
     })?;
     let preload_s = began.elapsed().as_secs_f64();
     let stats_after_preload = driver.stats();
-    let heap_after_preload = mb(HEAP.load(Ordering::Relaxed));
+    let heap_after_preload = heap_mb(&HEAP);
+
+    // AMPHORA_PROFILE=<prefix>: the mixed phase sampled 997 times a second, written as
+    // <prefix>.svg (a flamegraph) and <prefix>.txt (the frames most samples were in).
+    let profile = std::env::var("AMPHORA_PROFILE").ok();
+    let profiler = match &profile {
+        Some(_) => Some(pprof::ProfilerGuardBuilder::default().frequency(997).blocklist(&["libc", "libgcc", "pthread", "vdso"]).build()?),
+        None => None,
+    };
 
     // Mixed: writers append, readers read, for a while.
     let stop = Arc::new(AtomicBool::new(false));
     let until = Duration::from_secs(o.seconds);
+    // Each second's writes finished, and the longest of them (µs), by the second it finished in.
+    let slots = usize::try_from(o.seconds).unwrap_or(0) + 2;
+    let per_second: Arc<Vec<(AtomicU64, AtomicU64)>> = Arc::new((0..slots).map(|_| (AtomicU64::new(0), AtomicU64::new(0))).collect());
+    let mixed = Instant::now();
     let (writes, reads) = std::thread::scope(|s| -> anyhow::Result<(Hist, Hist)> {
         let mut ws = Vec::new();
         for w in 0..o.writers {
-            let (driver, seqs, stop, o) = (driver.clone(), seqs.clone(), stop.clone(), &o);
+            let (driver, seqs, stop, o, per_second) = (driver.clone(), seqs.clone(), stop.clone(), &o, per_second.clone());
             ws.push(s.spawn(move || -> anyhow::Result<Hist> {
                 let mut rng = Rng(0xd1b5_4a32_d192_ed03 ^ (w as u64 + 1));
                 let mut lat = Hist::new();
@@ -360,7 +403,12 @@ fn main() -> anyhow::Result<()> {
                     let batch: Vec<Event> = (0..o.batch.max(1)).map(|_| event(&mut rng, session, seqs[session].fetch_add(1, Ordering::Relaxed), o.text_bytes)).collect();
                     let t = Instant::now();
                     driver.write(&batch)?;
-                    lat.record(u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX));
+                    let us = u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX);
+                    lat.record(us);
+                    if let Some((n, most)) = per_second.get(usize::try_from(mixed.elapsed().as_secs()).unwrap_or(usize::MAX)) {
+                        n.fetch_add(1, Ordering::Relaxed);
+                        most.fetch_max(us, Ordering::Relaxed);
+                    }
                 }
                 Ok(lat)
             }));
@@ -393,6 +441,61 @@ fn main() -> anyhow::Result<()> {
         Ok((writes, reads))
     })?;
     let stats_after_mixed = driver.stats();
+    if let (Some(prefix), Some(guard)) = (&profile, profiler) {
+        let report = guard.report().build()?;
+        report.flamegraph(std::fs::File::create(format!("{prefix}.svg"))?)?;
+        // The frames most samples were in, by leaf and by any frame on the stack: every thread's,
+        // then the writer's alone.
+        type Counts = std::collections::HashMap<String, usize>;
+        let mut threads: Counts = Counts::new();
+        let tally = |only: Option<&str>| {
+            let (mut leaf, mut any, mut total) = (Counts::new(), Counts::new(), 0usize);
+            for (frames, count) in &report.data {
+                if only.is_some_and(|t| frames.thread_name != t) {
+                    continue;
+                }
+                let count = usize::try_from(*count).unwrap_or(0);
+                total += count;
+                let names: Vec<String> = frames.frames.iter().map(|f| f.iter().map(|s| s.name()).next().unwrap_or_default()).collect();
+                if let Some(first) = names.first() {
+                    *leaf.entry(first.clone()).or_default() += count;
+                }
+                let mut seen = std::collections::HashSet::new();
+                for n in names {
+                    if seen.insert(n.clone()) {
+                        *any.entry(n).or_default() += count;
+                    }
+                }
+            }
+            (leaf, any, total)
+        };
+        for (frames, count) in &report.data {
+            *threads.entry(frames.thread_name.clone()).or_default() += usize::try_from(*count).unwrap_or(0);
+        }
+        let top = |m: Counts, total: usize, n: usize| {
+            let mut v: Vec<(String, usize)> = m.into_iter().collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            v.into_iter().take(n).map(|(k, c)| format!("{:6.2}% {k}", c as f64 * 100.0 / total.max(1) as f64)).collect::<Vec<_>>().join("\n")
+        };
+        let mut out = String::new();
+        let all: usize = threads.values().sum();
+        out.push_str(&format!("== threads ==\n{}\n\n", top(threads, all, 40)));
+        for (title, only) in [("writer", Some("amphora-writer")), ("all", None)] {
+            let (leaf, any, total) = tally(only);
+            out.push_str(&format!("== {title}: samples {total}, by leaf ==\n{}\n\n== {title}: inclusive ==\n{}\n\n", top(leaf, total, 60), top(any, total, 150)));
+        }
+        std::fs::write(format!("{prefix}.txt"), out)?;
+        // Every stack, root first, inlined frames each their own, for any tally after the run.
+        let mut folded = String::new();
+        for (frames, count) in &report.data {
+            let mut names: Vec<String> = Vec::new();
+            for f in frames.frames.iter().rev() {
+                names.extend(f.iter().rev().map(|s| s.name()));
+            }
+            folded.push_str(&format!("{};{} {count}\n", frames.thread_name, names.join(";")));
+        }
+        std::fs::write(format!("{prefix}.folded"), folded)?;
+    }
 
     // Search: a common word, the rare one, and one none says.
     let mut searches = Hist::new();
@@ -427,9 +530,11 @@ fn main() -> anyhow::Result<()> {
         "write_rate": o.write_rate,
         "disjoint": o.disjoint,
         "rss_max_mb": rss_max_mb(),
-        "heap_peak_mb": mb(HEAP_PEAK.load(Ordering::Relaxed)),
-        "heap_end_mb": mb(HEAP.load(Ordering::Relaxed)),
+        "heap_peak_mb": heap_mb(&HEAP_PEAK),
+        "heap_end_mb": heap_mb(&HEAP),
         "heap_after_preload_mb": heap_after_preload,
+        "writes_each_second": per_second.iter().map(|(n, _)| n.load(Ordering::Relaxed)).collect::<Vec<_>>(),
+        "longest_write_ms_each_second": per_second.iter().map(|(_, m)| m.load(Ordering::Relaxed) / 1000).collect::<Vec<_>>(),
         "stats_after_preload": stats_after_preload,
         "stats_after_mixed": stats_after_mixed,
     });

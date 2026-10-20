@@ -4211,7 +4211,7 @@ impl Pager {
                 SpillState::Idle => {
                     // Check if spilling is needed
                     let spill_result = {
-                        let cache = self.page_cache.read();
+                        let mut cache = self.page_cache.write();
                         cache.check_spill(IOV_MAX)
                     };
                     match spill_result {
@@ -4454,7 +4454,7 @@ impl Pager {
     /// This should be called before inserting new pages into the cache.
     fn ensure_cache_space(&self) -> IOResultOr<()> {
         let needs_spill = {
-            let cache = self.page_cache.read();
+            let mut cache = self.page_cache.write();
             cache.needs_spill()
         };
 

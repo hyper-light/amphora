@@ -17,6 +17,9 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 mysql = { version = "26", default-features = false, features = ["minimal"] }
 anyhow = "1"
 serde_json = "1"
+# AMPHORA_PROFILE: a sampling profile of the mixed phase (a timer signal and backtraces: no root, no
+# perf), written as a flamegraph and the hottest frames.
+pprof = { version = "0.14", default-features = false, features = ["flamegraph"] }
 
 [profile.release]
 debug = "line-tables-only"

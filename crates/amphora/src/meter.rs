@@ -42,6 +42,39 @@ pub fn wait_quantile(buckets: &[u64], q: f64) -> Option<u64> {
     Some(top(buckets.len().saturating_sub(1)))
 }
 
+/// What the store keeps the longest of ([`Counters::longest_us`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Longest {
+    Commit,
+    Flush,
+    Checkpoint,
+    RestartWait,
+    Restart,
+}
+
+const LONGEST: usize = 5;
+
+impl Longest {
+    /// Their order in [`Counters::longest_us`].
+    pub const ALL: [Self; LONGEST] = [
+        Self::Commit,
+        Self::Flush,
+        Self::Checkpoint,
+        Self::RestartWait,
+        Self::Restart,
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Commit => 0,
+            Self::Flush => 1,
+            Self::Checkpoint => 2,
+            Self::RestartWait => 3,
+            Self::Restart => 4,
+        }
+    }
+}
+
 /// A store's counters, bumped by its writer, its flusher and its readers as they go.
 #[derive(Default)]
 pub struct Meter {
@@ -58,6 +91,18 @@ pub struct Meter {
     flush_us: AtomicU64,
     /// Batches refused because the writer's queue was full.
     dropped: AtomicU64,
+    /// Batches whose commit failed, each refused to its sender.
+    failed: AtomicU64,
+    /// Passive checkpoints, and how long they took, in µs.
+    checkpoints: AtomicU64,
+    checkpoint_us: AtomicU64,
+    /// The log started again by the writer, how long it waited for the readers and the
+    /// checkpointer to let go, and how long the restart took once they had, in µs.
+    restarts: AtomicU64,
+    restart_wait_us: AtomicU64,
+    restart_us: AtomicU64,
+    /// The longest of each, in µs: a stall shows here first.
+    longest: [AtomicU64; LONGEST],
     /// Reads that got no answer in time.
     timeouts: AtomicU64,
     waits: [AtomicU64; WAIT_BUCKETS],
@@ -74,6 +119,15 @@ pub struct Counters {
     pub flushes: u64,
     pub flush_ms: u64,
     pub dropped: u64,
+    pub failed: u64,
+    pub checkpoints: u64,
+    pub checkpoint_ms: u64,
+    pub restarts: u64,
+    pub restart_wait_ms: u64,
+    pub restart_ms: u64,
+    /// The longest commit, flush, checkpoint, wait to restart and restart, in µs, in the order of
+    /// [`Longest::ALL`].
+    pub longest_us: Vec<u64>,
     pub timeouts: u64,
     /// Reads' waits ([`WAIT_BUCKETS`]).
     pub waits: Vec<u64>,
@@ -89,6 +143,30 @@ impl Meter {
         self.rows
             .fetch_add(u64::try_from(rows).unwrap_or(u64::MAX), Ordering::Relaxed);
         self.apply_us.fetch_add(micros(took), Ordering::Relaxed);
+        self.longest(Longest::Commit, took);
+    }
+
+    fn longest(&self, of: Longest, took: Duration) {
+        if let Some(l) = self.longest.get(of.index()) {
+            l.fetch_max(micros(took), Ordering::Relaxed);
+        }
+    }
+
+    pub fn checkpointed(&self, took: Duration) {
+        self.checkpoints.fetch_add(1, Ordering::Relaxed);
+        self.checkpoint_us
+            .fetch_add(micros(took), Ordering::Relaxed);
+        self.longest(Longest::Checkpoint, took);
+    }
+
+    /// The log started again: `waited` for the readers and the checkpointer, then `took`.
+    pub fn restarted(&self, waited: Duration, took: Duration) {
+        self.restarts.fetch_add(1, Ordering::Relaxed);
+        self.restart_wait_us
+            .fetch_add(micros(waited), Ordering::Relaxed);
+        self.restart_us.fetch_add(micros(took), Ordering::Relaxed);
+        self.longest(Longest::RestartWait, waited);
+        self.longest(Longest::Restart, took);
     }
 
     pub fn ran(&self) {
@@ -102,11 +180,19 @@ impl Meter {
     pub fn flushed(&self, d: Duration) {
         self.flushes.fetch_add(1, Ordering::Relaxed);
         self.flush_us.fetch_add(micros(d), Ordering::Relaxed);
+        self.longest(Longest::Flush, d);
     }
 
     /// A batch dropped: how many have been, this one too.
     pub fn dropped(&self) -> u64 {
         self.dropped
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    /// A batch whose commit failed: how many have, this one too.
+    pub fn failed(&self) -> u64 {
+        self.failed
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1)
     }
@@ -132,6 +218,17 @@ impl Meter {
             flushes: self.flushes.load(Ordering::Relaxed),
             flush_ms: self.flush_us.load(Ordering::Relaxed) / 1000,
             dropped: self.dropped.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            checkpoints: self.checkpoints.load(Ordering::Relaxed),
+            checkpoint_ms: self.checkpoint_us.load(Ordering::Relaxed) / 1000,
+            restarts: self.restarts.load(Ordering::Relaxed),
+            restart_wait_ms: self.restart_wait_us.load(Ordering::Relaxed) / 1000,
+            restart_ms: self.restart_us.load(Ordering::Relaxed) / 1000,
+            longest_us: self
+                .longest
+                .iter()
+                .map(|l| l.load(Ordering::Relaxed))
+                .collect(),
             timeouts: self.timeouts.load(Ordering::Relaxed),
             waits: self
                 .waits

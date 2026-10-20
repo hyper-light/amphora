@@ -3,10 +3,11 @@
 //! for until it is durable; a read takes the session's latest page whole.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use amphora::store::{Config, Engine, Flush, Opener, Store};
+use amphora::store::{Checkpointed, Config, Engine, Flush, Opener, Store};
 use amphora::turso::Db;
 use turso_core::Value;
 
@@ -25,6 +26,9 @@ pub struct Convo {
     reader_pages: Option<i64>,
 }
 
+/// The slowest row, COMMIT and commit, in µs (an experiment: where a slow commit waits).
+static SLOWEST: (AtomicU64, AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+
 fn t(s: &str) -> Value {
     Value::from_text(s.to_owned())
 }
@@ -40,16 +44,19 @@ impl Engine for Convo {
         }
     }
 
-    fn apply(&mut self, rows: Vec<Row>) -> anyhow::Result<usize> {
+    fn apply(&mut self, rows: &[Row]) -> anyhow::Result<usize> {
         let n = rows.len();
         let mut rev = self.rev;
-        self.db.transaction(|db| {
-            for row in &rows {
+        let began = Instant::now();
+        let mut slowest_row = Duration::ZERO;
+        let applied = self.db.transaction(|db| {
+            for row in rows {
+                let one = Instant::now();
                 rev += 1;
                 match row {
                     Row::Session(id) => {
                         let params = [t(id), t("{}"), Value::Null, Value::Null, Value::Null, Value::from_i64(0), Value::from_i64(0), Value::from_i64(rev)];
-                        db.query(schema::SESSION_UPSERT, &params, |_| Ok(true))?;
+                        db.query(schema::SESSION_UPSERT, params, |_| Ok(true))?;
                     }
                     Row::Event(e) => {
                         let params = [
@@ -67,14 +74,20 @@ impl Engine for Convo {
                             t(&e.body),
                             Value::from_i64(rev),
                         ];
-                        db.query(schema::EVENT_UPSERT, &params, |_| Ok(true))?;
+                        db.query(schema::EVENT_UPSERT, params, |_| Ok(true))?;
                     }
                 }
+                slowest_row = slowest_row.max(one.elapsed());
             }
             // The store's number, kept with its rows (kiln's store keeps its own so).
-            db.query(schema::META_SET, &[t("rev"), Value::from_text(rev.to_string())], |_| Ok(true))?;
-            Ok(())
-        })?;
+            db.query(schema::META_SET, [t("rev"), Value::from_text(rev.to_string())], |_| Ok(true))?;
+            Ok(Instant::now())
+        });
+        let rows_done = applied?;
+        // Where a slow commit spent its time: its slowest row, and its COMMIT.
+        SLOWEST.0.fetch_max(u64::try_from(slowest_row.as_micros()).unwrap_or(u64::MAX), Ordering::Relaxed);
+        SLOWEST.1.fetch_max(u64::try_from(rows_done.elapsed().as_micros()).unwrap_or(u64::MAX), Ordering::Relaxed);
+        SLOWEST.2.fetch_max(u64::try_from(began.elapsed().as_micros()).unwrap_or(u64::MAX), Ordering::Relaxed);
         self.rev = rev;
         Ok(n)
     }
@@ -94,7 +107,7 @@ impl Engine for Convo {
         }))
     }
 
-    fn checkpoint(reader: &mut Db) -> anyhow::Result<bool> {
+    fn checkpoint(reader: &mut Db) -> anyhow::Result<Checkpointed> {
         reader.checkpoint()
     }
 
@@ -107,7 +120,7 @@ impl Engine for Convo {
 fn page(db: &mut Db, session: &str, limit: usize) -> anyhow::Result<usize> {
     let mut n = 0;
     let params = [t(session), Value::from_i64(i64::try_from(limit).unwrap_or(i64::MAX))];
-    db.query(schema::EVENTS_LAST, &params, |r| {
+    db.query(schema::EVENTS_LAST, params, |r| {
         let row: Vec<Value> = (0..schema::EVENT_COLUMNS).map(|i| r.get_value(i).clone()).collect();
         std::hint::black_box(row);
         n += 1;
@@ -119,7 +132,7 @@ fn page(db: &mut Db, session: &str, limit: usize) -> anyhow::Result<usize> {
 fn search_on(db: &mut Db, word: &str, limit: usize) -> anyhow::Result<usize> {
     let mut n = 0;
     let params = [Value::from_text(format!("%{word}%")), Value::from_i64(i64::try_from(limit).unwrap_or(i64::MAX))];
-    db.query(schema::SEARCH, &params, |_| {
+    db.query(schema::SEARCH, params, |_| {
         n += 1;
         Ok(true)
     })?;
@@ -149,7 +162,11 @@ impl Amphora {
         if let Some(p) = env("AMPHORA_WRITER_PAGES") {
             db.keep_pages(p)?;
         }
-        let store = Store::start(Convo { db, rev: 0, reader_pages: env("AMPHORA_READER_PAGES") }, Config { flushers, ..Config::default() })?;
+        // AMPHORA_CHECKPOINT_MS: how often the checkpointer copies the log (the store's default when unset).
+        let checkpoint_every = env("AMPHORA_CHECKPOINT_MS").and_then(|ms| u64::try_from(ms).ok()).map_or(Config::default().checkpoint_every, Duration::from_millis);
+        // AMPHORA_LOG_FRAMES: the log's bound in frames (the store's default when unset).
+        let log_frames = env("AMPHORA_LOG_FRAMES").and_then(|f| u64::try_from(f).ok()).unwrap_or(Config::default().log_frames);
+        let store = Store::start(Convo { db, rev: 0, reader_pages: env("AMPHORA_READER_PAGES") }, Config { flushers, checkpoint_every, log_frames, ..Config::default() })?;
         Ok(Self { store, seen: Mutex::new(HashSet::new()) })
     }
 }
@@ -166,9 +183,9 @@ impl Driver for Amphora {
             }
         }
         rows.extend(events.iter().cloned().map(Row::Event));
-        self.store.put_wait(rows, Instant::now() + WAIT)?;
-        // Durable: flushed after its commit.
-        self.store.sync(Instant::now() + WAIT)?;
+        let ticket = self.store.put_wait(rows, Instant::now() + WAIT)?;
+        // Durable: committed, then flushed by a flush begun after its commit.
+        self.store.durable(&ticket, Instant::now() + WAIT)?;
         Ok(())
     }
 
@@ -186,7 +203,11 @@ impl Driver for Amphora {
         let c = self.store.counters();
         serde_json::json!({
             "commits": c.commits, "rows": c.rows, "busy_ms": c.busy_ms, "apply_ms": c.apply_ms,
-            "flushes": c.flushes, "flush_ms": c.flush_ms, "dropped": c.dropped, "timeouts": c.timeouts,
+            "flushes": c.flushes, "flush_ms": c.flush_ms, "dropped": c.dropped, "failed": c.failed, "timeouts": c.timeouts,
+            "checkpoints": c.checkpoints, "checkpoint_ms": c.checkpoint_ms, "restarts": c.restarts, "restart_wait_ms": c.restart_wait_ms,
+            "restart_ms": c.restart_ms, "longest_us": c.longest_us,
+            "slowest_row_us": SLOWEST.0.load(Ordering::Relaxed), "slowest_commit_stmt_us": SLOWEST.1.load(Ordering::Relaxed),
+            "slowest_apply_us": SLOWEST.2.load(Ordering::Relaxed),
         })
     }
 }
