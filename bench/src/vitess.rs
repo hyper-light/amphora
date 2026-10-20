@@ -4,7 +4,8 @@
 use mysql::prelude::Queryable;
 use mysql::{Opts, Pool, PoolConstraints, PoolOpts};
 
-use crate::{Driver, Event};
+use crate::Event;
+use crate::pool::Blocking;
 
 pub struct Vitess {
     pool: Pool,
@@ -25,7 +26,7 @@ impl Vitess {
     }
 }
 
-impl Driver for Vitess {
+impl Blocking for Vitess {
     fn write(&self, events: &[Event]) -> anyhow::Result<()> {
         if events.is_empty() {
             return Ok(());

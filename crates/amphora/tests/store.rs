@@ -240,6 +240,43 @@ fn a_ticket_is_durable_once_a_flush_begun_after_its_commit_ends() {
     );
 }
 
+/// A sender of `put_then` is told once its batch is durable, after a flush begun after its commit,
+/// and the sender of a batch that fails is told it failed (AC-T1.1.1).
+#[test]
+fn a_sender_is_told_once_its_batch_is_durable_or_that_it_failed() {
+    let began = Instant::now();
+    let slow: Flush = Box::new(move || {
+        let until = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < until {
+            std::thread::park_timeout(until - Instant::now());
+        }
+        Ok(())
+    });
+    let lab = lab(Config::default(), Some(slow));
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (n, seq) in [(1, 1), (2, -1)] {
+        let tell = tx.clone();
+        lab.store
+            .put_then(vec![row("a", seq)], soon(), move |answer| {
+                tell.send((n, answer, began.elapsed())).unwrap();
+            })
+            .unwrap();
+    }
+    let mut told = std::collections::HashMap::new();
+    for _ in 0..2 {
+        let (n, answer, at) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        told.insert(n, (answer, at));
+    }
+    assert_eq!(told[&1].0, Ok(()));
+    assert!(
+        told[&1].1 >= Duration::from_millis(100),
+        "told durable before a flush ended: {:?}",
+        told[&1].1
+    );
+    assert_eq!(told[&2].0, Err(Refused::Failed));
+    assert_eq!(count(&lab.store, "a"), 1);
+}
+
 /// A batch whose commit fails is refused to its sender, nothing of it written; the batches
 /// committed with it are kept and made durable (AC-T1.1.1: no update is dropped unsaid).
 #[test]

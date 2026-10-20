@@ -26,7 +26,7 @@ def prealloc(p):
     os.fsync(fd)
     os.close(fd)
 
-def worker(p, mode, out, stop, flags=0):
+def worker(p, mode, out, stop, flags=0, sync=os.fdatasync):
     fd = os.open(p, os.O_RDWR | os.O_CREAT | flags, 0o644)
     off, lat = 0, []
     while not stop.is_set():
@@ -37,12 +37,12 @@ def worker(p, mode, out, stop, flags=0):
             os.pwrite(fd, BLOCK, off)
             off = (off + 4096) % SIZE
         if not flags:
-            os.fdatasync(fd)
+            sync(fd)
         lat.append(time.perf_counter() - t)
     os.close(fd)
     out.extend(lat)
 
-def run(name, files, threads, mode, nocow=False, flags=0):
+def run(name, files, threads, mode, nocow=False, flags=0, sync=os.fdatasync):
     ps = [path(f"{name}-{i}", nocow) for i in range(files)]
     if mode == "overwrite":
         for p in ps:
@@ -51,7 +51,7 @@ def run(name, files, threads, mode, nocow=False, flags=0):
     for i in range(threads):
         o = []
         outs.append(o)
-        ts.append(threading.Thread(target=worker, args=(ps[i % files], mode, o, stop, flags)))
+        ts.append(threading.Thread(target=worker, args=(ps[i % files], mode, o, stop, flags, sync)))
     for t in ts: t.start()
     time.sleep(secs)
     stop.set()
@@ -64,12 +64,15 @@ def run(name, files, threads, mode, nocow=False, flags=0):
         os.unlink(p)
 
 run("append+fdatasync", 1, 1, "append")
+run("append+fsync", 1, 1, "append", sync=os.fsync)
+run("overwrite+fsync", 1, 1, "overwrite", sync=os.fsync)
 run("overwrite+fdatasync", 1, 1, "overwrite")
 run("nocow overwrite+fdatasync", 1, 1, "overwrite", nocow=True)
 run("nocow overwrite O_DSYNC", 1, 1, "overwrite", nocow=True, flags=os.O_DSYNC)
 run("append+fdatasync", 2, 2, "append")
 run("append+fdatasync", 4, 4, "append")
 run("append+fdatasync same file", 1, 4, "append")
+run("append+fsync", 4, 4, "append", sync=os.fsync)
 run("nocow overwrite+fdatasync", 4, 4, "overwrite", nocow=True)
 run("nocow overwrite O_DSYNC", 4, 4, "overwrite", nocow=True, flags=os.O_DSYNC)
 run("nocow overwrite O_DSYNC", 16, 16, "overwrite", nocow=True, flags=os.O_DSYNC)

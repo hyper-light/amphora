@@ -20,7 +20,7 @@
 //!
 //! What it counts is in [`Meter`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
@@ -134,7 +134,9 @@ impl Default for Config {
             // A channel of this bound takes its slots at once: a full queue refuses (`put`) or
             // waits for room (`put_wait`), so it needn't be deep.
             queue: 4096,
-            commit_rows: 2048,
+            // A commit's pages fit its writer's cache: at 10,000 writers a commit of 512 rows wrote
+            // 35,000-41,000 rows a second, of 2,048 rows 22,000-24,000 (fedora, 2026-10-20).
+            commit_rows: 512,
             readers: 4,
             checkpoint_every: Duration::from_millis(25),
             log_frames: 16_384,
@@ -159,6 +161,8 @@ pub enum Refused {
     /// on what its disk holds. After a failed flush the system may have dropped what it couldn't
     /// write, so a flush that succeeds after it proves nothing.
     Disk,
+    /// The batch's rows are in more than one group ([`crate::groups`]): a batch is one group's.
+    Groups,
 }
 
 impl std::fmt::Display for Refused {
@@ -171,6 +175,7 @@ impl std::fmt::Display for Refused {
             Self::Disk => {
                 "a flush of the store's disk failed; nothing more is made durable until it is started again"
             }
+            Self::Groups => "the batch's rows are in more than one group; a batch is one group's",
         })
     }
 }
@@ -181,7 +186,7 @@ type Job<E> = Box<dyn FnOnce(&mut E) + Send>;
 
 enum Msg<E: Engine> {
     /// Rows, the keys they are of, and what becomes of them.
-    Rows(Vec<E::Row>, Vec<String>, Arc<AtomicU64>),
+    Rows(Vec<E::Row>, Vec<String>, Arc<Fate>),
     /// Run on the engine, between commits (what was sent before it is committed first).
     Run(Job<E>),
 }
@@ -191,13 +196,43 @@ pub type Watcher = Box<dyn Fn() -> bool + Send + Sync>;
 
 /// A batch handed to a store's writer: [`Store::durable`] says what became of it.
 #[derive(Debug, Clone)]
-pub struct Ticket(Option<Arc<AtomicU64>>);
+pub struct Ticket(Option<Arc<Fate>>);
 
-/// A ticket's batch not yet committed, nor failed.
+/// Told once its batch is durable, or why it won't be; on the store's notifier thread, so quickly.
+pub type Then = Box<dyn FnOnce(Result<(), Refused>) + Send>;
+
+/// What becomes of a batch: its state, and who is told once it is durable.
+struct Fate {
+    /// [`UNSETTLED`], [`FAILED`], or the number of the commit its batch is in (numbered from 1).
+    state: AtomicU64,
+    then: Mutex<Option<Then>>,
+}
+
+impl std::fmt::Debug for Fate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fate")
+            .field("state", &self.state.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+/// A batch not yet committed, nor failed.
 const UNSETTLED: u64 = 0;
-/// A ticket's batch whose commit failed. Otherwise a ticket holds the number of the commit its batch
-/// is in (numbered from 1).
+/// A batch whose commit failed.
 const FAILED: u64 = u64::MAX;
+
+/// The batches whose senders are told once they are durable ([`Store::put_then`]), for the
+/// notifier.
+#[derive(Default)]
+struct Notices {
+    /// Committed, in commit order: told once a flush covers their commit.
+    awaiting: VecDeque<(u64, Arc<Fate>)>,
+    /// Refused: told at once.
+    refused: Vec<(Arc<Fate>, Refused)>,
+    /// Commits durable.
+    durable: u64,
+    disk_failed: bool,
+}
 
 /// Batches settled (committed, failed or let go) and commits made, counted together.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -238,6 +273,8 @@ struct Sends {
     /// The most batches any flusher has begun a flush for: an idle flusher begins one once more are
     /// committed.
     claimed: Mutex<u64>,
+    notices: Mutex<Notices>,
+    noticed: Condvar,
 }
 
 /// A key's batches handed and committed, under its entry's number.
@@ -270,6 +307,8 @@ impl Default for Sends {
             disk_failed: AtomicBool::new(false),
             room: (Mutex::new(()), Condvar::new()),
             claimed: Mutex::new(0),
+            notices: Mutex::default(),
+            noticed: Condvar::new(),
         }
     }
 }
@@ -374,12 +413,30 @@ impl Sends {
     }
 
     fn made_durable(&self, through: Progress) {
-        let mut durable = locked(&self.durable);
-        if through.batches > durable.batches || through.commits > durable.commits {
+        {
+            let mut durable = locked(&self.durable);
+            if through.batches <= durable.batches && through.commits <= durable.commits {
+                return;
+            }
             durable.batches = durable.batches.max(through.batches);
             durable.commits = durable.commits.max(through.commits);
             self.flushed.notify_all();
         }
+        let mut notices = locked(&self.notices);
+        notices.durable = notices.durable.max(through.commits);
+        self.noticed.notify_all();
+    }
+
+    /// The batches of a commit (numbered `commit`, or none: it failed) that have a sender to tell.
+    fn to_tell(&self, fates: impl Iterator<Item = (Arc<Fate>, Option<u64>)>) {
+        let mut notices = locked(&self.notices);
+        for (fate, commit) in fates {
+            match commit {
+                Some(c) => notices.awaiting.push_back((c, fate)),
+                None => notices.refused.push((fate, Refused::Failed)),
+            }
+        }
+        self.noticed.notify_all();
     }
 
     /// Waits until as many batches are durable as had been handed over when it was asked, up to
@@ -406,11 +463,11 @@ impl Sends {
 
     /// Waits until the batch whose fate is `fate` is committed and then flushed, up to `until`; see
     /// [`Store::durable`].
-    fn wait_ticket(&self, fate: &AtomicU64, until: Instant) -> Result<(), Refused> {
+    fn wait_ticket(&self, fate: &Fate, until: Instant) -> Result<(), Refused> {
         let commit = {
             let mut committed = locked(&self.committed);
             loop {
-                match fate.load(Ordering::Acquire) {
+                match fate.state.load(Ordering::Acquire) {
                     FAILED => return Err(Refused::Failed),
                     UNSETTLED if self.disk_failed.load(Ordering::SeqCst) => {
                         return Err(Refused::Disk);
@@ -463,8 +520,71 @@ impl Sends {
             let _committed = locked(&self.committed);
             self.done.notify_all();
         }
-        let _durable = locked(&self.durable);
-        self.flushed.notify_all();
+        {
+            let _durable = locked(&self.durable);
+            self.flushed.notify_all();
+        }
+        let mut notices = locked(&self.notices);
+        notices.disk_failed = true;
+        self.noticed.notify_all();
+    }
+}
+
+/// The notifier: tells each sender of [`Store::put_then`] once its batch is durable, or why it won't
+/// be, on a thread of its own so no flush waits for a sender's code. It stops once the writer has
+/// stopped and no one is left to tell.
+fn notifier(sends: &Sends) {
+    loop {
+        let (ready, refused) = {
+            let mut notices = locked(&sends.notices);
+            loop {
+                let durable = notices.durable;
+                let due = notices.awaiting.front().is_some_and(|(c, _)| *c <= durable);
+                if due
+                    || !notices.refused.is_empty()
+                    || (notices.disk_failed && !notices.awaiting.is_empty())
+                {
+                    break;
+                }
+                if notices.awaiting.is_empty() && sends.stopping.load(Ordering::Relaxed) {
+                    return;
+                }
+                notices = sends
+                    .noticed
+                    .wait_timeout(notices, Duration::from_secs(1))
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+            let durable = notices.durable;
+            let mut ready = Vec::new();
+            while notices.awaiting.front().is_some_and(|(c, _)| *c <= durable) {
+                if let Some((_, fate)) = notices.awaiting.pop_front() {
+                    ready.push(fate);
+                }
+            }
+            let mut refused = std::mem::take(&mut notices.refused);
+            // Committed but never to be durable: a flush failed.
+            if notices.disk_failed {
+                refused.extend(
+                    notices
+                        .awaiting
+                        .drain(..)
+                        .map(|(_, fate)| (fate, Refused::Disk)),
+                );
+            }
+            (ready, refused)
+        };
+        let tell = |fate: &Fate, answer: Result<(), Refused>| {
+            if let Some(then) = locked(&fate.then).take() {
+                then(answer);
+            }
+        };
+        for fate in &ready {
+            tell(fate, Ok(()));
+        }
+        for (fate, why) in &refused {
+            tell(fate, Err(*why));
+        }
     }
 }
 
@@ -779,6 +899,10 @@ impl<E: Engine> Store<E> {
             }
             None => sends.durable_as_committed.store(true, Ordering::Relaxed),
         }
+        let told = sends.clone();
+        std::thread::Builder::new()
+            .name("amphora-notify".into())
+            .spawn(move || notifier(&told))?;
         let (m, w, s, r) = (
             meter.clone(),
             watchers.clone(),
@@ -805,19 +929,39 @@ impl<E: Engine> Store<E> {
 
     /// Rows to be committed with the next batch. Never blocks: a full queue refuses them, counted.
     pub fn put(&self, rows: Vec<E::Row>) -> Result<Ticket, Refused> {
-        self.hand(rows, None)
+        self.hand(rows, None, None)
     }
 
     /// Rows to be committed with the next batch, waiting for room until `until`.
     pub fn put_wait(&self, rows: Vec<E::Row>, until: Instant) -> Result<Ticket, Refused> {
-        self.hand(rows, Some(until))
+        self.hand(rows, Some(until), None)
     }
 
-    fn hand(&self, rows: Vec<E::Row>, until: Option<Instant>) -> Result<Ticket, Refused> {
+    /// [`Store::put_wait`], and `then` is told once the batch is durable, or why it won't be
+    /// ([`Store::durable`]'s answer), on the store's notifier thread. Refused here, `then` is
+    /// dropped untold: the refusal is the answer.
+    pub fn put_then(
+        &self,
+        rows: Vec<E::Row>,
+        until: Instant,
+        then: impl FnOnce(Result<(), Refused>) + Send + 'static,
+    ) -> Result<Ticket, Refused> {
+        self.hand(rows, Some(until), Some(Box::new(then)))
+    }
+
+    fn hand(
+        &self,
+        rows: Vec<E::Row>,
+        until: Option<Instant>,
+        then: Option<Then>,
+    ) -> Result<Ticket, Refused> {
         if self.sends.disk_failed.load(Ordering::SeqCst) {
             return Err(Refused::Disk);
         }
         if rows.is_empty() {
+            if let Some(then) = then {
+                then(Ok(()));
+            }
             return Ok(Ticket(None));
         }
         let mut keys: Vec<String> = Vec::new();
@@ -829,7 +973,10 @@ impl<E: Engine> Store<E> {
         }
         // Counted before it is queued: a read that begins once it is queued waits for it.
         self.sends.handing(&keys);
-        let fate = Arc::new(AtomicU64::new(UNSETTLED));
+        let fate = Arc::new(Fate {
+            state: AtomicU64::new(UNSETTLED),
+            then: Mutex::new(then),
+        });
         let mut m = Msg::Rows(rows, keys, fate.clone());
         loop {
             match self.tx.try_send(m) {
@@ -966,7 +1113,7 @@ fn notify(watchers: &Mutex<Vec<Watcher>>) {
 struct Batch {
     end: usize,
     keys: Vec<String>,
-    fate: Arc<AtomicU64>,
+    fate: Arc<Fate>,
 }
 
 /// The writer: rows are committed as soon as nothing else waits in the queue (or at the commit's
@@ -1006,7 +1153,7 @@ fn writer<E: Engine>(
         match apply(pending, commits) {
             Ok(commit) => {
                 for b in batches.iter() {
-                    b.fate.store(commit, Ordering::Release);
+                    b.fate.state.store(commit, Ordering::Release);
                 }
             }
             Err(e) => {
@@ -1017,9 +1164,9 @@ fn writer<E: Engine>(
                     let rows = pending.get(start..b.end).unwrap_or_default();
                     start = b.end;
                     match apply(rows, commits) {
-                        Ok(commit) => b.fate.store(commit, Ordering::Release),
+                        Ok(commit) => b.fate.state.store(commit, Ordering::Release),
                         Err(e) => {
-                            b.fate.store(FAILED, Ordering::Release);
+                            b.fate.state.store(FAILED, Ordering::Release);
                             let failed = meter.failed();
                             if failed.is_power_of_two() {
                                 tracing::warn!(target: "amphora.store", event = "batch_failed", error = %format!("{e:#}"), failed, "a batch couldn't be committed; its sender is told");
@@ -1030,6 +1177,21 @@ fn writer<E: Engine>(
             }
         }
         pending.clear();
+        // Senders to tell once their batches are durable, or that they failed.
+        let telling: Vec<(Arc<Fate>, Option<u64>)> = batches
+            .iter()
+            .filter(|b| locked(&b.fate.then).is_some())
+            .map(|b| {
+                let state = b.fate.state.load(Ordering::Acquire);
+                (
+                    b.fate.clone(),
+                    if state == FAILED { None } else { Some(state) },
+                )
+            })
+            .collect();
+        if !telling.is_empty() {
+            sends.to_tell(telling.into_iter());
+        }
         // Committed or failed: either way no read waits on it any longer.
         let n = u64::try_from(batches.len()).unwrap_or(u64::MAX);
         for b in batches.drain(..) {

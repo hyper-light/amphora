@@ -7,12 +7,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use amphora::store::{Checkpointed, Config, Engine, Flush, Opener, Store};
+use amphora::groups::Groups;
+use amphora::store::{Checkpointed, Config, Engine, Flush, Opener};
 use amphora::turso::Db;
 use turso_core::Value;
 
 use crate::schema;
-use crate::{Driver, Event};
+use crate::{Done, Driver, Event};
 
 pub enum Row {
     Session(String),
@@ -142,7 +143,9 @@ fn search_on(db: &mut Db, word: &str, limit: usize) -> anyhow::Result<usize> {
 const WAIT: Duration = Duration::from_secs(60);
 
 pub struct Amphora {
-    store: Store<Convo>,
+    /// AMPHORA_GROUPS: the groups sessions are spread over (1 when unset), each a database file, a
+    /// writer and a flusher of its own.
+    groups: Groups<Convo>,
     seen: Mutex<HashSet<String>>,
 }
 
@@ -151,61 +154,93 @@ impl Amphora {
         let dir = std::path::Path::new(dir);
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir)?;
-        let db = Db::open(&dir.join("bench.db"))?;
-        for s in schema::SCHEMA {
-            db.exec(s)?;
-        }
-        // AMPHORA_FLUSHERS: flusher threads (the store's default when unset).
-        let flushers = std::env::var("AMPHORA_FLUSHERS").ok().and_then(|v| v.parse().ok()).unwrap_or(Config::default().flushers);
         let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<i64>().ok());
-        // AMPHORA_WRITER_PAGES: pages the writer keeps (Amphora's default when unset).
-        if let Some(p) = env("AMPHORA_WRITER_PAGES") {
-            db.keep_pages(p)?;
-        }
-        // AMPHORA_CHECKPOINT_MS: how often the checkpointer copies the log (the store's default when unset).
-        let checkpoint_every = env("AMPHORA_CHECKPOINT_MS").and_then(|ms| u64::try_from(ms).ok()).map_or(Config::default().checkpoint_every, Duration::from_millis);
-        // AMPHORA_LOG_FRAMES: the log's bound in frames (the store's default when unset).
-        let log_frames = env("AMPHORA_LOG_FRAMES").and_then(|f| u64::try_from(f).ok()).unwrap_or(Config::default().log_frames);
-        let store = Store::start(Convo { db, rev: 0, reader_pages: env("AMPHORA_READER_PAGES") }, Config { flushers, checkpoint_every, log_frames, ..Config::default() })?;
-        Ok(Self { store, seen: Mutex::new(HashSet::new()) })
+        let groups = env("AMPHORA_GROUPS").and_then(|g| usize::try_from(g).ok()).unwrap_or(1);
+        let defaults = Config::default();
+        let config = Config {
+            // AMPHORA_FLUSHERS: flusher threads a group.
+            flushers: env("AMPHORA_FLUSHERS").and_then(|f| usize::try_from(f).ok()).unwrap_or(defaults.flushers),
+            // AMPHORA_CHECKPOINT_MS: how often a checkpointer copies its log.
+            checkpoint_every: env("AMPHORA_CHECKPOINT_MS").and_then(|ms| u64::try_from(ms).ok()).map_or(defaults.checkpoint_every, Duration::from_millis),
+            // AMPHORA_LOG_FRAMES: a log's bound in frames.
+            log_frames: env("AMPHORA_LOG_FRAMES").and_then(|f| u64::try_from(f).ok()).unwrap_or(defaults.log_frames),
+            // AMPHORA_COMMIT_ROWS: rows that make a commit at once.
+            commit_rows: env("AMPHORA_COMMIT_ROWS").and_then(|r| usize::try_from(r).ok()).unwrap_or(defaults.commit_rows),
+            ..defaults
+        };
+        let groups = Groups::start(groups, config, |g| {
+            let db = Db::open(&dir.join(format!("bench-{g}.db")))?;
+            for s in schema::SCHEMA {
+                db.exec(s)?;
+            }
+            // AMPHORA_WRITER_PAGES: pages a writer keeps (Amphora's default when unset).
+            if let Some(p) = env("AMPHORA_WRITER_PAGES") {
+                db.keep_pages(p)?;
+            }
+            Ok(Convo { db, rev: 0, reader_pages: env("AMPHORA_READER_PAGES") })
+        })?;
+        Ok(Self { groups, seen: Mutex::new(HashSet::new()) })
     }
 }
 
 impl Driver for Amphora {
-    fn write(&self, events: &[Event]) -> anyhow::Result<()> {
+    fn write(&self, events: Vec<Event>, done: Done) -> anyhow::Result<()> {
         let mut rows = Vec::with_capacity(events.len() + 1);
         {
             let mut seen = self.seen.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
-            for e in events {
+            for e in &events {
                 if seen.insert(e.session.clone()) {
                     rows.push(Row::Session(e.session.clone()));
                 }
             }
         }
-        rows.extend(events.iter().cloned().map(Row::Event));
-        let ticket = self.store.put_wait(rows, Instant::now() + WAIT)?;
-        // Durable: committed, then flushed by a flush begun after its commit.
-        self.store.durable(&ticket, Instant::now() + WAIT)?;
+        rows.extend(events.into_iter().map(Row::Event));
+        // Told once durable: committed, then flushed by a flush begun after its commit.
+        // A write is one session's events: one group's batch.
+        self.groups.put_then(rows, Instant::now() + WAIT, move |answer| done(answer.map_err(anyhow::Error::from)))?;
         Ok(())
     }
 
     fn history(&self, session: &str, limit: usize) -> anyhow::Result<usize> {
         let (s, w) = (session.to_owned(), session.to_owned());
-        self.store.read(Some(session), Instant::now() + WAIT, move |db| page(db, &s, limit), move |e| page(&mut e.db, &w, limit))
+        self.groups.read(session, Instant::now() + WAIT, move |db| page(db, &s, limit), move |e| page(&mut e.db, &w, limit))
     }
 
     fn search(&self, word: &str, limit: usize) -> anyhow::Result<usize> {
         let (s, w) = (word.to_owned(), word.to_owned());
-        self.store.read(None, Instant::now() + WAIT, move |db| search_on(db, &s, limit), move |e| search_on(&mut e.db, &w, limit))
+        let each = self.groups.read_each(Instant::now() + WAIT, move |db| search_on(db, &s, limit), move |e| search_on(&mut e.db, &w, limit))?;
+        Ok(each.into_iter().sum::<usize>().min(limit))
     }
 
     fn stats(&self) -> serde_json::Value {
-        let c = self.store.counters();
+        let mut all = amphora::meter::Counters::default();
+        let mut longest = vec![0u64; 5];
+        for c in self.groups.counters() {
+            all.commits += c.commits;
+            all.rows += c.rows;
+            all.busy_ms = all.busy_ms.max(c.busy_ms);
+            all.apply_ms += c.apply_ms;
+            all.flushes += c.flushes;
+            all.flush_ms += c.flush_ms;
+            all.dropped += c.dropped;
+            all.failed += c.failed;
+            all.timeouts += c.timeouts;
+            all.checkpoints += c.checkpoints;
+            all.checkpoint_ms += c.checkpoint_ms;
+            all.restarts += c.restarts;
+            all.restart_wait_ms += c.restart_wait_ms;
+            all.restart_ms += c.restart_ms;
+            for (l, x) in longest.iter_mut().zip(&c.longest_us) {
+                *l = (*l).max(*x);
+            }
+        }
+        let c = all;
         serde_json::json!({
+            "groups": self.groups.len(),
             "commits": c.commits, "rows": c.rows, "busy_ms": c.busy_ms, "apply_ms": c.apply_ms,
             "flushes": c.flushes, "flush_ms": c.flush_ms, "dropped": c.dropped, "failed": c.failed, "timeouts": c.timeouts,
             "checkpoints": c.checkpoints, "checkpoint_ms": c.checkpoint_ms, "restarts": c.restarts, "restart_wait_ms": c.restart_wait_ms,
-            "restart_ms": c.restart_ms, "longest_us": c.longest_us,
+            "restart_ms": c.restart_ms, "longest_us": longest,
             "slowest_row_us": SLOWEST.0.load(Ordering::Relaxed), "slowest_commit_stmt_us": SLOWEST.1.load(Ordering::Relaxed),
             "slowest_apply_us": SLOWEST.2.load(Ordering::Relaxed),
         })

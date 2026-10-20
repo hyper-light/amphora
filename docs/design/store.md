@@ -224,3 +224,45 @@ there whole or not at all, and Turso's integrity check passes. Each run checks i
 power goes out midway in most seeds, acknowledged and refused batches are checked, and checkpoints
 and restarts happened. Every gate runs 200 seeds; the full 10,000 run with
 `cargo test --release --test crash -- --ignored` (32.7 s on fedora).
+
+## 10. Groups: writes on as many cores
+
+**Decision.** A store can run in groups (`crates/amphora/src/groups.rs`): stores on one node, each
+a database file with a writer, a log, a flusher, a checkpointer and readers of its own, keys spread
+over them by FNV-1a, so writes go on in parallel. A batch is one group's: a batch with rows in more
+than one group is refused (`Refused::Groups`); keeping operations across groups atomic is
+CP-T1.10's. A read of a key goes to its group; a read of every key to each group. A database's
+number of groups is its own for good. The commit's row bound comes down to 512 (`Config::commit_rows`).
+
+**Sources.** Partitioned single-writer engines: H-Store (Kallman et al., "H-Store: a
+High-Performance, Distributed Main Memory Transaction Processing System", VLDB 2008) and VoltDB, one
+thread a partition, no latches between them.
+
+**Evidence.** One writer was the ceiling: at 1,000 to 1,000,000 writers it wrote 21,000-23,000 rows a
+second, its thread busy throughout (fedora, 2026-10-20). With commits of 512 rows instead of 2,048 (a
+commit's pages then fit its writer's cache): 35,000-41,000. In groups, the files without copy-on-write
+or compression (`chattr +C`; on btrfs with both, a checkpoint's flush held every log's for 2-4 s),
+10,000 writers, one run each: 1 group 34,918 a second (p99 401 ms), 4 groups 105,377 (223 ms), 8
+groups 161,789 (207 ms), 12 groups 254,430 (110 ms). At 1,000,000 writers 12 groups wrote 221,417 a
+second and 16 groups 320,451 (p50 3.08 s, max 3.82 s: a million writers ÷ the rate), none failed and
+none unanswered, the machine's 32 cores busy (load 48). Groups cost at low concurrency on btrfs: at
+32 writers 8 groups wrote 3,640 a second at p50 8.7 ms where one group wrote 5,249 at 5.7 ms, eight
+logs flushed at once costing two of btrfs's log commits each.
+
+**Falsified by.** A key whose rows are found in another group than its own, a batch spanning groups
+written (`crates/amphora/tests/groups.rs`), or a node where groups write no faster than one writer.
+
+## 11. Told when durable
+
+**Decision.** `Store::put_then` hands a batch over with what to tell once it is durable (or why it
+won't be). The writer files each committed batch with a sender to tell by its commit, and a notifier
+thread tells them once a flush covers their commit; refusals come the same way. No sender's code runs
+on the flusher, and a client needs no thread waiting per write: the bench drives a million writers
+from 16 threads.
+
+**Evidence.** The store's test: a sender told only after a flush begun after its commit, and a
+failing batch's sender told it failed. The bench at 1,000,000 writers on 16 submitter threads, every
+write answered.
+
+**Falsified by.** A sender told durable before a flush covering its commit ended, or told twice, or
+never.

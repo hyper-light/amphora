@@ -15,7 +15,8 @@ use std::sync::{Arc, Mutex};
 use crate::schema as sql;
 use turso_core::{Connection, ConnectOpts, Database, DatabaseOpts, IO, OpenOptions, PlatformIO, SqliteDialect, StepResult, Value};
 
-use crate::{Driver, Event};
+use crate::Event;
+use crate::pool::Blocking;
 
 fn fresh(dir: &str) -> anyhow::Result<PathBuf> {
     let dir = Path::new(dir);
@@ -125,7 +126,7 @@ impl Turso {
     }
 }
 
-impl Driver for Turso {
+impl Blocking for Turso {
     fn write(&self, events: &[Event]) -> anyhow::Result<()> {
         let new: Vec<String> = {
             let mut seen = self.seen.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
@@ -217,7 +218,7 @@ impl Sqlite {
     }
 }
 
-impl Driver for Sqlite {
+impl Blocking for Sqlite {
     fn write(&self, events: &[Event]) -> anyhow::Result<()> {
         let new: Vec<String> = {
             let mut seen = self.seen.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;

@@ -15,11 +15,14 @@
 //! - [`store`]: a database's commit pipeline and its readers (CP-T1.1): one writer with a group
 //!   commit and no timer, durable beside it by a flusher, readers on connections of their own, and
 //!   no checkpoint in a commit's way.
+//! - [`groups`]: a store in groups on one node, keys spread over them by hash, so writes go on in
+//!   parallel.
 //! - [`turso`]: stores on Turso, vendored (`vendor/turso`).
 //! - [`meter`]: what a store counts.
 //!
 //! The `amphora` binary says what it is ([`reply`]).
 
+pub mod groups;
 pub mod meter;
 pub mod store;
 pub mod turso;
