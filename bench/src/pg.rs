@@ -33,6 +33,7 @@ pub enum Engine {
 /// `crate::schema::SCHEMA` in Postgres's dialect: SQLite's INTEGER (64 bits) as BIGINT, `by`
 /// quoted (a keyword in Postgres), and text compared by bytes (`COLLATE "C"`, as SQLite's, Turso's
 /// and Amphora's BINARY does, where each image's default compares by its locale's rules, slower).
+/// CedarDB refuses the clause: its tables take its own default.
 const TABLES: [&str; 3] = [
     "CREATE TABLE meta (key TEXT COLLATE \"C\" PRIMARY KEY, value TEXT NOT NULL)",
     "CREATE TABLE sessions (id TEXT COLLATE \"C\" PRIMARY KEY, info TEXT, meta TEXT, state TEXT, changes TEXT, updated_at BIGINT NOT NULL DEFAULT 0, closed_at BIGINT, epoch BIGINT NOT NULL DEFAULT 0, rev BIGINT NOT NULL DEFAULT 0, machine TEXT)",
@@ -95,6 +96,7 @@ impl Pg {
         }
         let using = if engine == Engine::Orioledb { " USING orioledb" } else { "" };
         for table in TABLES {
+            let table = if engine == Engine::Cedardb { table.replace(" COLLATE \"C\"", "") } else { table.to_owned() };
             client.batch_execute(&format!("{table}{using}")).map_err(|e| anyhow::anyhow!("{e} (in: {table}{using})"))?;
         }
         for index in INDEXES {

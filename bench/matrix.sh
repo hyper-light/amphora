@@ -33,7 +33,10 @@ for w in "${writers[@]}"; do
   connections=$(( w < 256 ? w : 256 ))
   for t in ${targets//,/ }; do
     echo "== $t writers=$w seconds=$seconds warmup=$warmup connections=$connections load=$(cut -d' ' -f1 /proc/loadavg)" >&2
-    if line=$(./run.sh "$t" --sessions 4000 --preload 25 --writers "$w" --readers 4 --seconds "$seconds" --warmup "$warmup" \
+    # A run gets its window and a quarter of an hour more (a slow engine drains a million writers'
+    # writes slowly), then it is stopped and recorded as failed: a server that dies mid-run (MySQL's
+    # exited at a million writers, 2026-10-20) leaves its client waiting on it otherwise.
+    if line=$(timeout --kill-after=30 $((seconds + warmup + 900)) ./run.sh "$t" --sessions 4000 --preload 25 --writers "$w" --readers 4 --seconds "$seconds" --warmup "$warmup" \
       --submitters 16 --connections "$connections" --searches 3 2>"$err"); then
       echo "$line" >> "$out"
     else
