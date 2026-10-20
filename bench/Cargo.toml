@@ -15,6 +15,10 @@ amphora = { path = "../crates/amphora" }
 turso_core = { path = "../vendor/turso/core", default-features = false, features = ["fs", "json", "pure-rust-crypto"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 mysql = { version = "26", default-features = false, features = ["minimal"] }
+# PostgreSQL, OrioleDB and CedarDB (Postgres's protocol): the synchronous client, here only.
+postgres = "0.19"
+# ClickHouse's HTTP interface: a small blocking client, no async runtime, no TLS.
+ureq = { version = "3", default-features = false }
 anyhow = "1"
 serde_json = "1"
 # AMPHORA_PROFILE: a sampling profile of the mixed phase (a timer signal and backtraces: no root, no

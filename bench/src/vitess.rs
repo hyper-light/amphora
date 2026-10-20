@@ -1,5 +1,6 @@
 //! Clustered MySQL: Vitess, through vtgate's MySQL protocol. The keyspace is sharded by session
-//! (`vitess/schema/convo/vschema.json`); a write is one autocommitted multi-row insert.
+//! (`vitess/schema/convo/vschema.json`); a write is one autocommitted multi-row insert into its
+//! narrower table. Plain MySQL runs kiln's whole schema (`mysql.rs`).
 
 use mysql::prelude::Queryable;
 use mysql::{Opts, Pool, PoolConstraints, PoolOpts};

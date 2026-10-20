@@ -12,6 +12,9 @@
 //!
 //! Each run prints one JSON line: throughput and latency percentiles of each part.
 
+mod clickhouse;
+mod mysql;
+mod pg;
 mod pool;
 mod schema;
 mod store;
@@ -273,6 +276,15 @@ impl Driver for Null {
     }
 }
 
+/// This process's resident memory that no file backs (its heap, stacks and anonymous maps: what it
+/// allocated, apart from code and files it maps), in MiB; none where the system doesn't say (Linux's
+/// `RssAnon`).
+fn rss_anon_mb() -> Option<f64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kb: f64 = status.lines().find_map(|l| l.strip_prefix("RssAnon:"))?.trim().trim_end_matches("kB").trim().parse().ok()?;
+    Some((kb / 1024.0 * 10.0).round() / 10.0)
+}
+
 /// The most memory this process held at once (its resident set's high-water mark), in MiB; none
 /// where the system doesn't say (it's Linux's `VmHWM`).
 fn rss_max_mb() -> Option<f64> {
@@ -434,13 +446,21 @@ fn summary(h: Hist) -> serde_json::Value {
 fn main() -> anyhow::Result<()> {
     let o = opts()?;
     let (k, q) = (o.connections, o.queue);
+    // A server's own port on this machine (bench/servers/<engine>.sh) unless --dsn names another.
+    let dsn = |local: &str| if std::env::args().any(|a| a == "--dsn") { o.dsn.clone() } else { local.to_owned() };
     let driver: Arc<dyn Driver> = match o.target.as_str() {
         "amphora" => Arc::new(store::Amphora::open(&o.dir)?),
         "turso" => Arc::new(pool::Pooled::new(vanilla::Turso::open(&o.dir)?, k, q)?),
         "sqlite" => Arc::new(pool::Pooled::new(vanilla::Sqlite::open(&o.dir)?, k, q)?),
         "null" => Arc::new(Null),
-        "vitess" | "mysql" => Arc::new(pool::Pooled::new(vitess::Vitess::connect(&o.dsn, k + o.readers + 2)?, k, q)?),
-        t => anyhow::bail!("unknown target {t} (amphora, turso, sqlite, vitess, mysql, null)"),
+        "vitess" => Arc::new(pool::Pooled::new(vitess::Vitess::connect(&o.dsn, k + o.readers + 2)?, k, q)?),
+        "mysql" => Arc::new(pool::Pooled::new(mysql::MySql::connect(&dsn("mysql://root@127.0.0.1:33306/convo"), k + o.readers + 2)?, k, q)?),
+        "postgres" => Arc::new(pool::Pooled::new(pg::Pg::connect(&dsn("postgres://postgres@127.0.0.1:55432/postgres"), pg::Engine::Postgres)?, k, q)?),
+        "orioledb" => Arc::new(pool::Pooled::new(pg::Pg::connect(&dsn("postgres://postgres@127.0.0.1:55433/postgres"), pg::Engine::Orioledb)?, k, q)?),
+        "cedardb" => Arc::new(pool::Pooled::new(pg::Pg::connect(&dsn("postgres://postgres:amphorabenchlocalonly2026@127.0.0.1:55434/postgres"), pg::Engine::Cedardb)?, k, q)?),
+        "clickhouse" => Arc::new(pool::Pooled::new(clickhouse::ClickHouse::connect(&dsn("http://127.0.0.1:58123"), false, k + o.readers + 2)?, k, q)?),
+        "clickhouse-durable" => Arc::new(pool::Pooled::new(clickhouse::ClickHouse::connect(&dsn("http://127.0.0.1:58123"), true, k + o.readers + 2)?, k, q)?),
+        t => anyhow::bail!("unknown target {t} (amphora, turso, sqlite, vitess, mysql, postgres, orioledb, cedardb, clickhouse, clickhouse-durable, null)"),
     };
 
     // Preload: every session's history, a hundred events a write, writers side by side.
@@ -491,6 +511,19 @@ fn main() -> anyhow::Result<()> {
     let per_second: Arc<Vec<(AtomicU64, AtomicU64)>> = Arc::new((0..slots).map(|_| (AtomicU64::new(0), AtomicU64::new(0))).collect());
     let mixed = Instant::now();
     let count_from = mixed + Duration::from_secs(o.warmup);
+    // The most anonymous memory held during the mixed phase, looked at every 100 ms.
+    let anon_peak = Arc::new(AtomicU64::new(0));
+    let sampler = {
+        let (stop, anon_peak) = (stop.clone(), anon_peak.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if let Some(mb) = rss_anon_mb() {
+                    anon_peak.fetch_max((mb * 10.0) as u64, Ordering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        })
+    };
     let written = Arc::new(Shared::new());
     let ready = Arc::new(Ready { heap: Mutex::new((0..o.writers).map(|w| Reverse((mixed, w))).collect()), wake: Condvar::new() });
     let inflight = Arc::new(AtomicU64::new(0));
@@ -570,6 +603,7 @@ fn main() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(10));
     }
     let unanswered = inflight.load(Ordering::Relaxed);
+    let _ = sampler.join();
     let writes = written.hist();
     let stats_after_mixed = driver.stats();
     if let (Some(prefix), Some(guard)) = (&profile, profiler) {
@@ -670,6 +704,7 @@ fn main() -> anyhow::Result<()> {
         "write_rate": o.write_rate,
         "disjoint": o.disjoint,
         "rss_max_mb": rss_max_mb(),
+        "rss_anon_max_mb": anon_peak.load(Ordering::Relaxed) as f64 / 10.0,
         "heap_peak_mb": heap_mb(&HEAP_PEAK),
         "heap_end_mb": heap_mb(&HEAP),
         "heap_after_preload_mb": heap_after_preload,
