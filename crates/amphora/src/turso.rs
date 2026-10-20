@@ -9,9 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use turso_core::io::FileSyncType;
 use turso_core::{
-    CheckpointMode, ConnectOpts, Connection, Database, DatabaseOpts, IO, LimboError, OpenOptions,
-    PlatformIO, Row, SqliteDialect, Statement, StepResult, Value,
+    CheckpointMode, Completion, CompletionError, ConnectOpts, Connection, Database, DatabaseOpts,
+    IO, LimboError, OpenFlags, OpenOptions, PlatformIO, Row, SqliteDialect, Statement, StepResult,
+    Value,
 };
 
 use crate::store::{Checkpointed, Flush, Opener};
@@ -65,10 +67,14 @@ impl Db {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        Self::open_with(path, Arc::new(PlatformIO::new().map_err(fail)?))
+    }
+
+    /// [`Db::open`] on `io`: the system's files, or a simulator's disk.
+    pub fn open_with(path: &Path, io: Arc<dyn IO>) -> anyhow::Result<Self> {
         let name = path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("the path isn't UTF-8: {}", path.display()))?;
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(fail)?);
         let until = Instant::now()
             .checked_add(LOCK_WAIT)
             .unwrap_or_else(Instant::now);
@@ -135,20 +141,27 @@ impl Db {
         })
     }
 
-    /// Flushes the log: what was committed before the flush began is durable once it ends.
+    /// Flushes the log, through the database's own IO: what was committed before the flush began
+    /// is durable once it ends (on macOS by `F_FULLFSYNC`: its `fsync` leaves the disk's cache).
     pub fn flusher(&self) -> Flush {
-        let mut wal = self.path.clone().into_os_string();
-        wal.push("-wal");
-        let wal = PathBuf::from(wal);
+        let wal = format!("{}-wal", self.path.display());
+        let io = self.io.clone();
         Box::new(move || {
             // Opened each time: a flush is a disk's round trip, an open a few microseconds, and the
             // log may have been made again. No log: everything is in the file, which the checkpoint
             // that emptied the log flushed.
-            match std::fs::OpenOptions::new().write(true).open(&wal) {
-                Ok(f) => f.sync_data(),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e),
-            }
+            let file = match io.open_file(&wal, OpenFlags::NoLock, false) {
+                Ok(file) => file,
+                Err(LimboError::CompletionError(CompletionError::IOError(
+                    std::io::ErrorKind::NotFound,
+                    _,
+                ))) => return Ok(()),
+                Err(e) => return Err(std::io::Error::other(e.to_string())),
+            };
+            let flushed = file
+                .sync(Completion::new_sync(|_| {}), FileSyncType::FullFsync)
+                .and_then(|c| io.wait_for_completion(c));
+            flushed.map_err(|e| std::io::Error::other(e.to_string()))
         })
     }
 

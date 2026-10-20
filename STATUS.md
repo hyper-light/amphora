@@ -18,7 +18,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   typed and counted, and `put_wait` waits for room. A commit that fails is retried batch by batch:
   a batch that can't be committed is refused to its sender (`Refused::Failed`), the rest kept. The
   writer keeps no statement journal. Its meter keeps the longest commit, flush, checkpoint, wait to
-  restart and restart. Tested in `crates/amphora/tests/store.rs`.
+  restart and restart. A flush that fails is the last: the store refuses what waits and what comes
+  (`Refused::Disk`) until it is started again. Tested in `crates/amphora/tests/store.rs`.
+- **Crash injection** (T-T1.1.1, `crates/amphora/tests/crash.rs`, docs/design/store.md): the store on
+  a simulated disk that loses its power at any change, unflushed writes surviving whole, torn or not
+  at all. 10,000 seeds: no acknowledged batch lost, no refused batch kept, no batch torn, the
+  integrity check passing (2026-10-20). Every gate runs 200.
 - **Stores on Turso** (`crates/amphora/src/turso.rs`): a database opened for the pipeline, its
   readers, its flusher, its checkpoints and its log's restart.
 - **Turso, vendored** (`vendor/turso`, `UPSTREAM.md`): tursodatabase/turso at 3e09a82, the four
@@ -36,9 +41,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   up to 97 ms, writes at 512 writers lost a third of their rate). Closing it: the checkpoint copies
   only frames the flusher has made durable (no flush of the log of its own), and the file's flush
   goes to the flusher's thread, between its flushes of the log, before the log starts again. It
-  changes when Turso's checkpoint makes what it copied durable, so it lands with T-T1.1.1's crash
-  injection, which proves it.
-- **CP-T1.1**: kiln vendors Amphora and its conversation store runs on `amphora::store` in place of its one writer thread; kiln vendors Amphora and its conversation store runs on `amphora::store` in place of its one writer thread; the soak bench for drops (AC-T1.1.5), crash injection (T-T1.1.1) and the stalled-disk test (T-T1.1.2); the bar measured on a quiet machine, best of 3 (AC-T1.1.2–4), with vanilla Turso, SQLite and Vitess beside Amphora (`bench/`).
+  changes when Turso's checkpoint makes what it copied durable; T-T1.1.1's crash injection proves
+  it.
+- **CP-T1.1**: kiln vendors Amphora and its conversation store runs on `amphora::store` in place of its one writer thread; kiln vendors Amphora and its conversation store runs on `amphora::store` in place of its one writer thread; the soak bench for drops (AC-T1.1.5) and the stalled-disk test (T-T1.1.2); the bar measured on a quiet machine, best of 3 (AC-T1.1.2–4), with vanilla Turso, SQLite and Vitess beside Amphora (`bench/`).
 - **CP-T1.2**: Baselines on a quiet machine against SQLite, Postgres 17, Vitess, CockroachDB and TiDB; the research; the client protocol; `docs/design/` written to it.
 - **CP-T1.3**: Turso's MVCC with `BEGIN CONCURRENT` made serializable and production-grade, and the engine multi-writer on it.
 

@@ -53,8 +53,13 @@ concurrency a durable write there costs about two of the disk's flushes, whoever
 checkpoint under `OFF` never records what it copied as safe, so the log never starts again and every
 checkpoint copies all of it again (130 writes/s).
 
+The flusher flushes through the database's own IO (`Db::flusher`), so a simulator's disk sees every
+flush the store counts on.
+
 **Falsified by.** An acknowledged write missing after a crash or power cut (T-T1.1.1: crash
-injection at every write, 10,000 seeds; CP-T1.4's power-cut harness).
+injection at every write, 10,000 seeds, `crates/amphora/tests/crash.rs`; CP-T1.4's power-cut
+harness). 2026-10-20: 10,000 seeds, none lost; with the flusher made to acknowledge without
+flushing, 157 of 200 seeds lost acknowledged batches, so the test sees a loss when there is one.
 
 ## 3. Readers of their own, on the caller's thread, waiting only for their key's writes
 
@@ -187,3 +192,35 @@ a flush that began after its commit, and a failed batch's ticket refused.
 
 **Falsified by.** A ticket reported durable whose batch isn't in the database after a crash
 (T-T1.1.1), or a failed batch's ticket reported durable.
+
+## 9. A failed flush is the last
+
+**Decision.** When a flush fails, the store makes nothing more durable: the flusher stops, every
+sender waiting for a batch to be durable is refused (`Refused::Disk`), and new batches are refused,
+until the store is started again on what its disk holds.
+
+**Sources.** Rebello et al., "Can Applications Recover from fsync Failures?" (USENIX ATC 2020):
+after a failed `fsync`, Linux file systems may mark the pages they couldn't write clean, so a later
+`fsync` succeeds without them. PostgreSQL stops on a failed `fsync` since 2018 for this
+(`data_sync_retry`, off by default).
+
+**Evidence.** The store retried a failed flush every 10 ms: a retry that then succeeded would have
+acknowledged writes the disk never took. The crash test cuts a disk's power mid-flush: the senders
+waiting are refused at once, where before they waited out their deadline.
+
+**Falsified by.** A file system that keeps failed pages dirty and reports a later flush truthfully,
+on every platform Amphora runs on (then a bounded retry could be safe).
+
+## Crash injection (T-T1.1.1)
+
+`crates/amphora/tests/crash.rs` runs the store on a simulated disk whose power goes at a change
+drawn from each seed's workload (writes, flushes and truncations to the database file and the log).
+What a flush made durable survives; each change made since survives whole, torn at a 512-byte
+boundary, or not at all, in any combination. The workload hands over 150 batches of 1 to 4 rows, a
+tenth of them holding a row the engine refuses, a few at a time so they share commits, with the log
+checkpointed every millisecond and restarted past 16 frames. After the restart on what survived:
+every batch acknowledged durable is there, every batch the engine refused isn't, every other batch is
+there whole or not at all, and Turso's integrity check passes. Each run checks it isn't vacuous: the
+power goes out midway in most seeds, acknowledged and refused batches are checked, and checkpoints
+and restarts happened. Every gate runs 200 seeds; the full 10,000 run with
+`cargo test --release --test crash -- --ignored` (32.7 s on fedora).

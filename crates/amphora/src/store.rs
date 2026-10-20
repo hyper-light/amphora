@@ -155,6 +155,10 @@ pub enum Refused {
     Timeout,
     /// The batch's commit failed: nothing of it was written.
     Failed,
+    /// A flush of its disk failed: nothing more is made durable until the store is started again
+    /// on what its disk holds. After a failed flush the system may have dropped what it couldn't
+    /// write, so a flush that succeeds after it proves nothing.
+    Disk,
 }
 
 impl std::fmt::Display for Refused {
@@ -164,6 +168,9 @@ impl std::fmt::Display for Refused {
             Self::Stopped => "the store's writer has stopped",
             Self::Timeout => "the store didn't answer in time",
             Self::Failed => "the batch couldn't be committed; nothing of it was written",
+            Self::Disk => {
+                "a flush of the store's disk failed; nothing more is made durable until it is started again"
+            }
         })
     }
 }
@@ -224,6 +231,8 @@ struct Sends {
     durable_as_committed: AtomicBool,
     /// The writer has stopped: the flusher flushes what is left, then stops.
     stopping: AtomicBool,
+    /// A flush failed: the store takes nothing more, and acknowledges nothing more durable.
+    disk_failed: AtomicBool,
     /// The writer took batches off its queue: a sender waiting for room looks again.
     room: (Mutex<()>, Condvar),
     /// The most batches any flusher has begun a flush for: an idle flusher begins one once more are
@@ -258,6 +267,7 @@ impl Default for Sends {
             flushed: Condvar::new(),
             durable_as_committed: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
+            disk_failed: AtomicBool::new(false),
             room: (Mutex::new(()), Condvar::new()),
             claimed: Mutex::new(0),
         }
@@ -373,14 +383,17 @@ impl Sends {
     }
 
     /// Waits until as many batches are durable as had been handed over when it was asked, up to
-    /// `until`: whether they are.
-    fn wait_durable(&self, until: Instant) -> bool {
+    /// `until`.
+    fn wait_durable(&self, until: Instant) -> Result<(), Refused> {
         let target = self.handed.load(Ordering::Relaxed);
         let mut durable = locked(&self.durable);
         while durable.batches < target {
+            if self.disk_failed.load(Ordering::SeqCst) {
+                return Err(Refused::Disk);
+            }
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return false;
+                return Err(Refused::Timeout);
             }
             durable = self
                 .flushed
@@ -388,7 +401,7 @@ impl Sends {
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
-        true
+        Ok(())
     }
 
     /// Waits until the batch whose fate is `fate` is committed and then flushed, up to `until`; see
@@ -399,6 +412,9 @@ impl Sends {
             loop {
                 match fate.load(Ordering::Acquire) {
                     FAILED => return Err(Refused::Failed),
+                    UNSETTLED if self.disk_failed.load(Ordering::SeqCst) => {
+                        return Err(Refused::Disk);
+                    }
                     UNSETTLED if self.stopping.load(Ordering::Relaxed) => {
                         return Err(Refused::Stopped);
                     }
@@ -418,6 +434,9 @@ impl Sends {
         };
         let mut durable = locked(&self.durable);
         while durable.commits < commit {
+            if self.disk_failed.load(Ordering::SeqCst) {
+                return Err(Refused::Disk);
+            }
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Err(Refused::Timeout);
@@ -436,14 +455,24 @@ impl Sends {
         let _committed = locked(&self.committed);
         self.done.notify_all();
     }
+
+    /// A flush failed: whoever waits for a commit or a flush is told.
+    fn disk_failed(&self) {
+        self.disk_failed.store(true, Ordering::SeqCst);
+        {
+            let _committed = locked(&self.committed);
+            self.done.notify_all();
+        }
+        let _durable = locked(&self.durable);
+        self.flushed.notify_all();
+    }
 }
 
 /// A flusher: flushes what was committed as soon as there is some no flusher has begun a flush
 /// for, again and again; each flush makes durable what was committed before it began. With one
 /// flusher a commit waits for the flush under way and the next; with more, an idle one begins the
-/// next at once.
+/// next at once. A flush that fails is the last.
 fn flusher(sends: &Sends, flush: &Flush, meter: &Meter) {
-    let mut failures = 0u64;
     loop {
         let target = {
             let mut committed = locked(&sends.committed);
@@ -455,7 +484,9 @@ fn flusher(sends: &Sends, flush: &Flush, meter: &Meter) {
                         break *committed;
                     }
                 }
-                if sends.stopping.load(Ordering::Relaxed) {
+                if sends.stopping.load(Ordering::Relaxed)
+                    || sends.disk_failed.load(Ordering::SeqCst)
+                {
                     return;
                 }
                 committed = sends
@@ -472,22 +503,12 @@ fn flusher(sends: &Sends, flush: &Flush, meter: &Meter) {
                 sends.made_durable(target);
             }
             Err(e) => {
-                // What it claimed is claimed again by the next flush to begin.
-                {
-                    let mut claimed = locked(&sends.claimed);
-                    if *claimed == target.batches {
-                        *claimed = target.batches.saturating_sub(1);
-                    }
-                }
-                failures = failures.saturating_add(1);
-                if failures.is_power_of_two() {
-                    tracing::error!(target: "amphora.store", event = "flush_failed", error = %e, failures, "the log couldn't be flushed; writes wait to be durable");
-                }
-                // Tried again after a pause; a commit or a stop meanwhile ends the pause.
-                let committed = locked(&sends.committed);
-                let _paused = sends
-                    .done
-                    .wait_timeout(committed, Duration::from_millis(10));
+                // The last: after a failed flush the system may have dropped what it couldn't
+                // write (Linux marks those pages clean), so a later flush that succeeds proves
+                // nothing (docs/design/store.md, decision 9).
+                tracing::error!(target: "amphora.store", event = "flush_failed", error = %e, "the log couldn't be flushed; the store makes nothing more durable until it is started again");
+                sends.disk_failed();
+                return;
             }
         }
     }
@@ -793,6 +814,9 @@ impl<E: Engine> Store<E> {
     }
 
     fn hand(&self, rows: Vec<E::Row>, until: Option<Instant>) -> Result<Ticket, Refused> {
+        if self.sends.disk_failed.load(Ordering::SeqCst) {
+            return Err(Refused::Disk);
+        }
         if rows.is_empty() {
             return Ok(Ticket(None));
         }
@@ -902,8 +926,10 @@ impl<E: Engine> Store<E> {
 
     /// Waits until the batch of `ticket` is durable: committed with whatever else the writer took
     /// meanwhile (it asks for no commit of its own), then flushed by a flush that began after its
-    /// commit. Refused if its commit failed ([`Refused::Failed`]: nothing of it was written), or if
-    /// the writer stopped before committing it. Blocking, until `until` at most.
+    /// commit. Refused if its commit failed ([`Refused::Failed`]: nothing of it was written), if a
+    /// flush failed first ([`Refused::Disk`]), or if the writer stopped before committing it. A
+    /// batch never acknowledged durable may be found after a crash, whole, or not at all.
+    /// Blocking, until `until` at most.
     pub fn durable(&self, ticket: &Ticket, until: Instant) -> Result<(), Refused> {
         let Some(fate) = &ticket.0 else {
             return Ok(());
@@ -918,12 +944,11 @@ impl<E: Engine> Store<E> {
     /// Waits until everything handed over so far is settled and durable: committed (or failed:
     /// [`Store::durable`] tells a batch which), then flushed. Blocking, until `until` at most.
     pub fn sync(&self, until: Instant) -> Result<(), Refused> {
-        if self.sends.wait_durable(until) {
-            Ok(())
-        } else {
+        let answer = self.sends.wait_durable(until);
+        if answer == Err(Refused::Timeout) {
             self.meter.timed_out();
-            Err(Refused::Timeout)
         }
+        answer
     }
 
     /// `w` is told after every commit, until it says it doesn't want to be.
