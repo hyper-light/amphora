@@ -12,5 +12,15 @@ publish.workspace = true
 name = "amphora"
 path = "src/main.rs"
 
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+# The engine a store runs on: Turso, vendored (vendor/turso/UPSTREAM.md), pure Rust (no simd, no C
+# crypto, no fts: nothing compiled from C).
+turso_core = { path = "../../vendor/turso/core", default-features = false, features = ["fs", "json", "pure-rust-crypto"] }
+
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true
