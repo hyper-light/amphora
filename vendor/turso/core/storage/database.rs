@@ -86,6 +86,15 @@ impl IOContext {
             self.page_transform = PageTransform::None;
         }
     }
+
+    /// Amphora: checks page checksums again after [`IOContext::reset_checksum`] (see
+    /// `Pager::resume_checksum`).
+    pub fn restore_checksum(&mut self) {
+        #[cfg(feature = "checksum")]
+        if matches!(self.page_transform, PageTransform::None) {
+            self.page_transform = PageTransform::Checksum(ChecksumContext::default());
+        }
+    }
 }
 
 impl Default for IOContext {

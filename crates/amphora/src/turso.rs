@@ -119,10 +119,12 @@ impl Db {
                 Err(LimboError::LockingError(_)) if Instant::now() < until => {
                     pause(Duration::from_millis(100));
                 }
-                opened => break opened.map_err(fail)?,
+                opened => break opened.map_err(|e| anyhow::anyhow!("opening {name}: {e}"))?,
             }
         };
-        let conn = db.connect(ConnectOpts::new()).map_err(fail)?;
+        let conn = db
+            .connect(ConnectOpts::new())
+            .map_err(|e| anyhow::anyhow!("connecting to {name}: {e}"))?;
         conn.set_statement_journals(false);
         let d = Self {
             io,

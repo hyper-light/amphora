@@ -92,6 +92,9 @@ struct Disk {
     /// What survived the cut, file by file.
     image: Mutex<Option<HashMap<String, Vec<u8>>>>,
     rng: Mutex<Rng>,
+    /// What the cut did with each change since a flush that touched the database's first page or
+    /// the log's header (for a failing seed's account).
+    told: Mutex<Vec<String>>,
 }
 
 fn power_out() -> LimboError {
@@ -127,6 +130,7 @@ impl Disk {
                 crash_at: AtomicU64::new(u64::MAX),
                 image: Mutex::new(None),
                 rng: Mutex::new(Rng(seed | 1)),
+                told: Mutex::new(Vec::new()),
             }
         })
     }
@@ -166,20 +170,41 @@ impl Disk {
         let files = self.files.lock().unwrap();
         let mut rng = self.rng.lock().unwrap();
         let mut survived = HashMap::new();
+        let mut told = self.told.lock().unwrap();
         for (path, file) in files.iter() {
             let held = file.held.lock().unwrap();
             let mut bytes = held.durable.clone();
+            told.push(format!(
+                "{path}: {} bytes durable, {} bytes seen, {} changes since its last flush",
+                held.durable.len(),
+                held.seen.len(),
+                held.since.len()
+            ));
             for change in &held.since {
-                match (rng.below(4), change) {
-                    (0 | 1, change) => apply(&mut bytes, change),
-                    (2, _) => {}
+                let fate = match (rng.below(4), change) {
+                    (0 | 1, change) => {
+                        apply(&mut bytes, change);
+                        "kept".to_owned()
+                    }
+                    (2, _) => "lost".to_owned(),
                     (_, Change::Write(pos, data)) => {
                         let kept =
                             usize::try_from(rng.below(data.len() as u64 / 512 + 1) * 512).unwrap();
                         let torn = Change::Write(*pos, data[..kept.min(data.len())].to_vec());
                         apply(&mut bytes, &torn);
+                        format!("torn after {kept} bytes")
                     }
-                    (_, change) => apply(&mut bytes, change),
+                    (_, change) => {
+                        apply(&mut bytes, change);
+                        "kept".to_owned()
+                    }
+                };
+                let (pos, len) = match change {
+                    Change::Write(pos, data) => (*pos, data.len() as u64),
+                    Change::Truncate(len) => (*len, 0),
+                };
+                if pos < 4096 {
+                    told.push(format!("  {path}: change at {pos}, {len} bytes: {fate}"));
                 }
             }
             survived.insert(path.clone(), bytes);
@@ -384,6 +409,75 @@ impl Engine for Events {
     }
 }
 
+/// The WAL's checksum (SQLite's format: words little-endian under magic 0x377f0682).
+fn wal_checksum(data: &[u8], (mut s0, mut s1): (u32, u32), little: bool) -> (u32, u32) {
+    for w in data.as_chunks::<8>().0 {
+        let word = |b: &[u8]| {
+            let a: [u8; 4] = b.try_into().unwrap();
+            if little {
+                u32::from_le_bytes(a)
+            } else {
+                u32::from_be_bytes(a)
+            }
+        };
+        s0 = s0.wrapping_add(word(&w[0..4]).wrapping_add(s1));
+        s1 = s1.wrapping_add(word(&w[4..8]).wrapping_add(s0));
+    }
+    (s0, s1)
+}
+
+/// What a recovery would find in a log image: its header, and each frame's page, whether it ends
+/// a commit, and whether it holds (salts and the checksum chain), up to the first that doesn't.
+fn wal_account(wal: &[u8]) -> String {
+    if wal.len() < 32 {
+        return format!("log: {} bytes, no header", wal.len());
+    }
+    let be = |at: usize| u32::from_be_bytes(wal[at..at + 4].try_into().unwrap());
+    let (magic, page_size, seq, salt) = (be(0), be(8) as usize, be(12), (be(16), be(20)));
+    let little = magic == 0x377f_0682;
+    let mut sum = wal_checksum(&wal[0..24], (0, 0), little);
+    let header_holds = sum == (be(24), be(28));
+    let mut out = format!(
+        "log: {} bytes, magic {magic:#x}, page size {page_size}, checkpoint {seq}, salts {salt:?}, header {}\n",
+        wal.len(),
+        if header_holds { "holds" } else { "BROKEN" }
+    );
+    let mut at = 32;
+    let (mut frame, mut last_commit) = (0, 0);
+    while page_size > 0 && at + 24 + page_size <= wal.len() {
+        frame += 1;
+        let (page, commit) = (be(at), be(at + 4));
+        let holds_salt = (be(at + 8), be(at + 12)) == salt;
+        sum = wal_checksum(&wal[at..at + 8], sum, little);
+        sum = wal_checksum(&wal[at + 24..at + 24 + page_size], sum, little);
+        let holds = holds_salt && sum == (be(at + 16), be(at + 20));
+        out.push_str(&format!(
+            "  frame {frame}: page {page}{}{}\n",
+            if commit > 0 {
+                format!(", commit (db {commit} pages)")
+            } else {
+                String::new()
+            },
+            if holds {
+                ""
+            } else if holds_salt {
+                ", checksum BREAKS"
+            } else {
+                ", other salts"
+            }
+        ));
+        if !holds {
+            break;
+        }
+        if commit > 0 {
+            last_commit = frame;
+        }
+        at += 24 + page_size;
+    }
+    out.push_str(&format!("  recovery keeps frames 1..={last_commit}"));
+    out
+}
+
 /// What became of a batch: how many rows it had, whether the engine was bound to refuse it, and
 /// what its sender was told.
 struct Sent {
@@ -474,8 +568,17 @@ fn one_seed(seed: u64) -> Result<Seen, String> {
     };
 
     // The restart, on what survived.
-    let disk = Disk::new(seed, disk.image());
-    let mut db = Db::open_with(path, disk).map_err(|e| format!("reopen: {e:#}"))?;
+    let image = disk.image();
+    let account = || {
+        let told = disk.told.lock().unwrap().join("\n");
+        let db_file = image.get(PATH).map_or(0, Vec::len);
+        let wal = image
+            .get(&format!("{PATH}-wal"))
+            .map_or_else(String::new, |w| wal_account(w));
+        format!("\n{told}\ndatabase file: {db_file} bytes\n{wal}")
+    };
+    let mut db = Db::open_with(path, Disk::new(seed, image.clone()))
+        .map_err(|e| format!("reopen: {e:#}{}", account()))?;
     let mut check = String::new();
     db.query("PRAGMA integrity_check", [], |r| {
         check = r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -549,6 +652,9 @@ fn seeds(n: u64, from: u64) {
             Err(e) => failed.push((seed, e)),
         }
     }
+    for (seed, e) in failed.iter().take(20) {
+        eprintln!("seed {seed}: {e}");
+    }
     assert!(
         failed.is_empty(),
         "{} of {n} seeds failed; the first: seed {} ({})",
@@ -579,6 +685,26 @@ fn seeds(n: u64, from: u64) {
 #[test]
 fn a_power_cut_at_any_change_loses_nothing_acknowledged_and_tears_no_batch() {
     seeds(200, 1);
+}
+
+/// The seeds AMPHORA_CRASH_SEEDS names (comma-separated), each told whatever it found: to look into
+/// one (`cargo test --release --test crash -- --ignored listed`).
+#[test]
+#[ignore = "the seeds AMPHORA_CRASH_SEEDS names"]
+fn listed() {
+    let seeds = std::env::var("AMPHORA_CRASH_SEEDS").unwrap_or_default();
+    for seed in seeds
+        .split(',')
+        .filter_map(|s| s.trim().parse::<u64>().ok())
+    {
+        match one_seed(seed) {
+            Ok(seen) => eprintln!(
+                "seed {seed}: ok (cut midway: {}, acknowledged {}, refused {})",
+                seen.cut_midway, seen.acknowledged, seen.refused
+            ),
+            Err(e) => eprintln!("seed {seed}: {e}"),
+        }
+    }
 }
 
 /// T-T1.1.1 in full: 10,000 seeds (`cargo test --release --test crash -- --ignored`; from another

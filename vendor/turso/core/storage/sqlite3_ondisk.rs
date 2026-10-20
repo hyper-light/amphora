@@ -2304,6 +2304,77 @@ pub fn checksum_wal(
     native_endian: bool, // Sqlite interprets big endian as "native"
 ) -> (u32, u32) {
     turso_assert_eq!(buf.len() % 8, 0, "buffer must be a multiple of 8");
+    // Amphora: a page's worth in four lanes summed side by side (the same sums: see
+    // `checksum_wal_lanes`); what is shorter, or left over, one step after another.
+    let steps = buf.len() / 8;
+    let lane = steps / 4;
+    if lane >= LANE_STEPS_AT_LEAST {
+        if let Some((head, rest)) = lane
+            .checked_mul(32)
+            .and_then(|bytes| buf.split_at_checked(bytes))
+        {
+            if let Some(state) = checksum_wal_lanes(head, lane, input, native_endian) {
+                return checksum_wal_steps(rest, state, native_endian);
+            }
+        }
+    }
+    checksum_wal_steps(buf, input, native_endian)
+}
+
+/// Amphora: below this many steps a lane, the lanes' setup costs more than they save.
+const LANE_STEPS_AT_LEAST: usize = 16;
+
+/// Amphora: one step of the WAL's checksum is linear: with `(a, b)` the step's two words,
+/// `s0' = s0 + s1 + a` and `s1' = s0 + 2 s1 + a + b`, all modulo 2^32, so the state after many steps
+/// is `M^n` times the state before plus what the steps add, `M = [[1, 1], [1, 2]]`. Four lanes of
+/// `lane` steps each are summed from zero side by side (four chains the processor runs at once,
+/// where one step waits on the last), then joined: `M^4L s + M^3L l0 + M^2L l1 + M^L l2 + l3`.
+fn checksum_wal_lanes(
+    buf: &[u8],
+    lane: usize,
+    input: (u32, u32),
+    native_endian: bool,
+) -> Option<(u32, u32)> {
+    let word = |b: &[u8]| -> u32 {
+        let w = u32::from_ne_bytes(b.try_into().unwrap_or([0; 4]));
+        if native_endian {
+            w
+        } else {
+            w.swap_bytes()
+        }
+    };
+    let step = |(s0, s1): (u32, u32), w: &[u8]| -> (u32, u32) {
+        let (a, b) = w.split_at(4);
+        let s0 = s0.wrapping_add(word(a).wrapping_add(s1));
+        (s0, s1.wrapping_add(word(b).wrapping_add(s0)))
+    };
+    let mut lanes = buf.chunks_exact(lane.checked_mul(8)?);
+    let (l0, l1, l2, l3) = (lanes.next()?, lanes.next()?, lanes.next()?, lanes.next()?);
+    let (mut s0, mut s1, mut s2, mut s3) = ((0, 0), (0, 0), (0, 0), (0, 0));
+    for (((w0, w1), w2), w3) in l0
+        .chunks_exact(8)
+        .zip(l1.chunks_exact(8))
+        .zip(l2.chunks_exact(8))
+        .zip(l3.chunks_exact(8))
+    {
+        s0 = step(s0, w0);
+        s1 = step(s1, w1);
+        s2 = step(s2, w2);
+        s3 = step(s3, w3);
+    }
+    let m1 = mat_pow(lane);
+    let m2 = mat_mul(m1, m1);
+    let m3 = mat_mul(m2, m1);
+    let m4 = mat_mul(m2, m2);
+    let add = |x: (u32, u32), y: (u32, u32)| (x.0.wrapping_add(y.0), x.1.wrapping_add(y.1));
+    let joined = add(mat_vec(m4, input), mat_vec(m3, s0));
+    let joined = add(joined, mat_vec(m2, s1));
+    let joined = add(joined, mat_vec(m1, s2));
+    Some(add(joined, s3))
+}
+
+/// Amphora: the WAL's checksum, one step after another.
+fn checksum_wal_steps(buf: &[u8], input: (u32, u32), native_endian: bool) -> (u32, u32) {
     let mut s0: u32 = input.0;
     let mut s1: u32 = input.1;
     if native_endian {
@@ -2324,6 +2395,40 @@ pub fn checksum_wal(
     (s0, s1)
 }
 
+/// Amphora: a 2x2 matrix modulo 2^32, by rows: `(a, b, c, d)` is `[[a, b], [c, d]]`.
+type Mat = (u32, u32, u32, u32);
+
+fn mat_mul(x: Mat, y: Mat) -> Mat {
+    let dot = |p: u32, q: u32, r: u32, s: u32| p.wrapping_mul(q).wrapping_add(r.wrapping_mul(s));
+    (
+        dot(x.0, y.0, x.1, y.2),
+        dot(x.0, y.1, x.1, y.3),
+        dot(x.2, y.0, x.3, y.2),
+        dot(x.2, y.1, x.3, y.3),
+    )
+}
+
+fn mat_vec(m: Mat, v: (u32, u32)) -> (u32, u32) {
+    (
+        m.0.wrapping_mul(v.0).wrapping_add(m.1.wrapping_mul(v.1)),
+        m.2.wrapping_mul(v.0).wrapping_add(m.3.wrapping_mul(v.1)),
+    )
+}
+
+/// `[[1, 1], [1, 2]]` to the `n`th power, modulo 2^32 (by squaring: `n` is a lane's steps).
+fn mat_pow(mut n: usize) -> Mat {
+    let mut result: Mat = (1, 0, 0, 1);
+    let mut base: Mat = (1, 1, 1, 2);
+    while n > 0 {
+        if n & 1 == 1 {
+            result = mat_mul(result, base);
+        }
+        base = mat_mul(base, base);
+        n >>= 1;
+    }
+    result
+}
+
 impl WalHeader {
     pub fn as_bytes(&self) -> &[u8] {
         unsafe { std::mem::transmute::<&WalHeader, &[u8; size_of::<WalHeader>()]>(self) }
@@ -2338,6 +2443,32 @@ pub fn read_u32(buf: &[u8], pos: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use crate::Value;
+
+    /// Amphora: the checksum in lanes gives the sums one step after another gives, for every
+    /// length from one step to a frame and a page, both byte orders, any starting sums.
+    #[test]
+    fn checksum_wal_in_lanes_is_the_checksum_step_by_step() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let buf: Vec<u8> = (0..4104 + 64).map(|_| next() as u8).collect();
+        let header = super::WalHeader::default();
+        for len in (8..=4104 + 64).step_by(8) {
+            for native in [false, true] {
+                let input = (next() as u32, next() as u32);
+                let lanes = super::checksum_wal(&buf[..len], &header, input, native);
+                let steps = super::checksum_wal_steps(&buf[..len], input, native);
+                assert_eq!(
+                    lanes, steps,
+                    "length {len}, native {native}, from {input:?}"
+                );
+            }
+        }
+    }
 
     use super::*;
     use asserting::prelude::*;

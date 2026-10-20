@@ -287,5 +287,13 @@ store's tests: a new database's file and log carry the flag where the file syste
 flipped in a page of the file is refused with a checksum error when read. The checksums' own cost
 is to be measured on a quiet machine.
 
-**Falsified by.** A page corrupted on disk read as data (`tests/files.rs`), or, on btrfs, the flag
-making writes slower or their tails longer than copy-on-write.
+Crash injection found what checksums cost recovery: Turso reads page 1 from the file to open a
+database before attaching its log, and after a power cut during a checkpoint that page can be torn
+in the file while the log holds it whole: with checksums 3-12 of 10,000 seeds couldn't reopen
+(without them the torn page was read, its header's bytes whole). Opening now checks page checksums
+from when the log is attached (Turso, `Pager::defer_checksum`), when what it read before is dropped:
+10,000 seeds twice, none failing (2026-10-20).
+
+**Falsified by.** A page corrupted on disk read as data (`tests/files.rs`), a database that a power
+cut leaves unopenable (`tests/crash.rs`), or, on btrfs, the flag making writes slower or their tails
+longer than copy-on-write.

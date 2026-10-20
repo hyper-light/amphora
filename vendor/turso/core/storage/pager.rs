@@ -1665,6 +1665,9 @@ pub struct Pager {
     #[cfg(feature = "autovacuum")]
     vacuum_state: RwLock<VacuumState>,
     pub(crate) io_ctx: RwLock<IOContext>,
+    /// Amphora: page 1 was read from the file before the log was attached without checking its
+    /// checksum (`defer_checksum`); checked again once the log is (`set_wal`).
+    checksum_deferred: AtomicBool,
     /// encryption is an opt-in feature. we will enable it only if the flag is passed
     enable_encryption: AtomicBool,
     shared: Arc<SharedPagerState>,
@@ -1972,6 +1975,7 @@ impl Pager {
                 btree_create_vacuum_full_state: BtreeCreateVacuumFullState::Start,
             }),
             io_ctx: RwLock::new(IOContext::default()),
+            checksum_deferred: AtomicBool::new(false),
             enable_encryption: AtomicBool::new(false),
             shared,
             #[cfg(target_vendor = "apple")]
@@ -2675,8 +2679,44 @@ impl Pager {
     }
 
     pub fn set_wal(&mut self, wal: Arc<dyn Wal>) {
+        // Amphora: the log writes and checks pages with the context it is given: checked again
+        // first if page 1 was read unchecked while opening.
+        self.resume_checksum();
         wal.set_io_context(self.io_ctx.read().clone());
         self.wal = Some(wal);
+    }
+
+    /// Amphora: stops checking page checksums until the log is attached ([`Pager::set_wal`]), for
+    /// page 1 read from the file while opening: after a crash during a checkpoint the file's page 1
+    /// may be torn while the log, not attached yet, holds it whole (every page read once the log
+    /// is attached is checked, and what opening read is dropped then). Whether it did (checksums
+    /// were being checked, and no log is attached).
+    pub(crate) fn defer_checksum(&self) -> bool {
+        if self.wal.is_some() {
+            return false;
+        }
+        {
+            let mut io_ctx = self.io_ctx.write();
+            if !matches!(
+                io_ctx.page_transform(),
+                crate::storage::page_transform::PageTransform::Checksum(_)
+            ) {
+                return false;
+            }
+            io_ctx.reset_checksum();
+        }
+        self.checksum_deferred.store(true, Ordering::SeqCst);
+        self.clear_page_cache(false);
+        true
+    }
+
+    /// Amphora: checks page checksums again after [`Pager::defer_checksum`], dropping what was
+    /// read unchecked.
+    pub(crate) fn resume_checksum(&self) {
+        if self.checksum_deferred.swap(false, Ordering::SeqCst) {
+            self.io_ctx.write().restore_checksum();
+            self.clear_page_cache(false);
+        }
     }
 
     pub fn get_auto_vacuum_mode(&self) -> AutoVacuumMode {

@@ -2133,6 +2133,11 @@ impl Database {
                         )).into());
                     }
 
+                    // Amphora: a header rewritten here goes straight to the file, so it is written
+                    // with its checksum (checked again first if opening deferred it).
+                    if header_modified {
+                        pager.resume_checksum();
+                    }
                     let page = header.page().clone();
                     // `header` (a cheap Arc<Page> wrapper, no lock) is dropped
                     // here; the page ref carries the (possibly modified) header
@@ -3261,6 +3266,13 @@ impl Database {
         }
         if disable_checksums {
             pager.reset_checksum_context();
+        }
+        // Amphora: opening an initialized database reads its page 1 from the file before the log
+        // is attached (header validation), and after a crash during a checkpoint that page may be
+        // torn there while the log holds it whole: its checksum is checked once the log is
+        // attached (`Pager::set_wal`), when what opening read is dropped.
+        if pager.wal.is_none() && self.initialized() {
+            pager.defer_checksum();
         }
 
         Ok(IOResult::Done(pager))
