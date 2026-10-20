@@ -1,0 +1,22 @@
+[package]
+name = "amphora-bench"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Amphora against vanilla Turso, SQLite and clustered MySQL (Vitess) on kiln's conversation workload (K0)"
+
+# A workspace of its own, outside Amphora's gates: its MySQL client and SQLite (compiled from C)
+# never enter Amphora's build, its lock file or its macOS and Windows checks.
+[workspace]
+
+[dependencies]
+amphora = { path = "../crates/amphora" }
+turso_core = { path = "../vendor/turso/core", default-features = false, features = ["fs", "json", "pure-rust-crypto"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+mysql = { version = "26", default-features = false, features = ["minimal"] }
+anyhow = "1"
+serde_json = "1"
+
+[profile.release]
+debug = "line-tables-only"

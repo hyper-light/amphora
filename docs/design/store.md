@@ -95,3 +95,30 @@ the log under ~90 MB, write p99 18 ms; with the checkpointer every 25 ms instead
 
 **Falsified by.** A log that grows past its bound under writes and reads that never pause (the
 store's tests), or a write p99.9 a restart's pause explains.
+
+## 5. Page budgets by what a connection does
+
+**Decision.** The writer keeps 1,024 pages of the database in memory, each reader 128 (Turso keeps
+2,000, 8 MiB, on every connection). A reader's miss is a read of the file through the system's page
+cache; the writer keeps its indexes' inner pages.
+
+**Sources.** Turso's page cache (`vendor/turso/core/storage/page_cache.rs`): one per connection, 2,000
+pages by default, kept consistent with the log by the connection itself.
+
+**Evidence.** Amphora's bench (`bench/`), fedora, 2026-10-20, K0's load: at Turso's 2,000 pages a
+connection, 78–86 MB resident and reads p99 0.74 ms; at 1,024/128, 47–49 MB and reads p99 0.27 ms
+(p50 0.085 ms against 0.101); writes the same. Smaller caches read faster under writes: the pages
+writes change are fewer to bring up to date.
+
+**Falsified by.** A workload whose reads slow down past a bigger budget's (a working set of hot
+sessions larger than what readers keep, read faster from memory than from the system's cache).
+
+## 6. One flusher
+
+**Decision.** One flusher thread (`Config::flushers`), though the store can run more.
+
+**Evidence.** With two or four flushers a commit landing during a flush starts one of its own; on
+fedora's disk the flushes serialize anyway: at 300 writes/s the write p50 stayed at 6.6–6.7 ms with
+one, two and four (2026-10-20), and four once held a write 1.1 s.
+
+**Falsified by.** A disk whose flushes overlap (a write's latency then falls toward one flush).

@@ -22,6 +22,13 @@ const LOCK_WAIT: Duration = Duration::from_secs(15);
 /// after this, this many times.
 const BUSY_WAIT: Duration = Duration::from_millis(1);
 const BUSY_TRIES: u32 = 10_000;
+/// Pages each connection keeps in memory, by what it does (Turso keeps 2,000, 8 MiB, on every
+/// connection; a store has a writer, readers and a checkpointer, and a reader's miss is a read of the
+/// file through the system's page cache): the writer keeps the inner pages of its indexes, a reader
+/// what one read touches, the checkpointer next to nothing.
+pub const WRITER_PAGES: i64 = 1024;
+pub const READER_PAGES: i64 = 128;
+
 /// The log's frames past which the checkpointer asks the writer to start it again: 64 MiB of
 /// 4 KiB pages (measured on fedora, 2026-10-20: under ~90 MB of log at 5,000 writes a second).
 pub const LOG_FRAMES: u64 = 16_384;
@@ -89,19 +96,27 @@ impl Db {
         };
         d.exec("PRAGMA synchronous = NORMAL")?;
         d.exec("PRAGMA wal_autocheckpoint = 0")?;
+        d.exec(&format!("PRAGMA cache_size = {WRITER_PAGES}"))?;
         Ok(d)
+    }
+
+    /// Keeps `pages` of the database in this connection's memory.
+    pub fn keep_pages(&self, pages: i64) -> anyhow::Result<()> {
+        self.exec(&format!("PRAGMA cache_size = {pages}"))
     }
 
     /// Another connection on the same database, for reading or checkpointing: each read sees what
     /// was committed before it; its checkpoints flush.
     pub fn reader(&self) -> anyhow::Result<Self> {
-        Ok(Self {
+        let r = Self {
             io: self.io.clone(),
             db: self.db.clone(),
             conn: self.db.connect(ConnectOpts::new()).map_err(fail)?,
             path: self.path.clone(),
             statements: HashMap::new(),
-        })
+        };
+        r.keep_pages(READER_PAGES)?;
+        Ok(r)
     }
 
     /// Opens readers on this database from any thread.
@@ -109,13 +124,15 @@ impl Db {
     pub fn opener(&self) -> Opener<Self> {
         let (io, db, path) = (self.io.clone(), self.db.clone(), self.path.clone());
         Arc::new(move || {
-            Ok(Self {
+            let r = Self {
                 io: io.clone(),
                 db: db.clone(),
                 conn: db.connect(ConnectOpts::new()).map_err(fail)?,
                 path: path.clone(),
                 statements: HashMap::new(),
-            })
+            };
+            r.keep_pages(READER_PAGES)?;
+            Ok(r)
         })
     }
 

@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use crate::meter::{Counters, Meter};
 
 /// Flushes what an engine has committed to its disk, from the store's flusher thread.
-pub type Flush = Box<dyn Fn() -> std::io::Result<()> + Send>;
+pub type Flush = Box<dyn Fn() -> std::io::Result<()> + Send + Sync>;
 
 /// Opens a connection for reading on an engine's database, from any thread.
 pub type Opener<R> = Arc<dyn Fn() -> anyhow::Result<R> + Send + Sync>;
@@ -106,16 +106,22 @@ pub struct Config {
     pub checkpoint_every: Duration,
     /// How often the writer asks its engine's upkeep while nothing comes, unless it asks sooner.
     pub idle_every: Duration,
+    /// Flusher threads: with more than one, a commit that lands while a flush is under way starts
+    /// a flush of its own on an idle flusher instead of waiting for that one to end.
+    pub flushers: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            queue: 65_536,
+            // A channel of this bound takes its slots at once: a full queue refuses (`put`) or
+            // waits for room (`put_wait`), so it needn't be deep.
+            queue: 4096,
             commit_rows: 2048,
             readers: 4,
             checkpoint_every: Duration::from_millis(25),
             idle_every: Duration::from_secs(1),
+            flushers: 1,
         }
     }
 }
@@ -182,6 +188,9 @@ struct Sends {
     stopping: AtomicBool,
     /// The writer took batches off its queue: a sender waiting for room looks again.
     room: (Mutex<()>, Condvar),
+    /// The most batches any flusher has begun a flush for: an idle flusher begins one once more are
+    /// committed.
+    claimed: Mutex<u64>,
 }
 
 /// A key's batches handed and committed, under its entry's number.
@@ -212,6 +221,7 @@ impl Default for Sends {
             durable_as_committed: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             room: (Mutex::new(()), Condvar::new()),
+            claimed: Mutex::new(0),
         }
     }
 }
@@ -347,16 +357,23 @@ impl Sends {
     }
 }
 
-/// The flusher: flushes what was committed as soon as there is any, again and again, so a commit
-/// waits at most for the flush under way and the next; each flush makes durable what was committed
-/// before it began.
+/// A flusher: flushes what was committed as soon as there is some no flusher has begun a flush
+/// for, again and again; each flush makes durable what was committed before it began. With one
+/// flusher a commit waits for the flush under way and the next; with more, an idle one begins the
+/// next at once.
 fn flusher(sends: &Sends, flush: &Flush, meter: &Meter) {
-    let mut through = 0u64;
     let mut failures = 0u64;
     loop {
         let target = {
             let mut committed = locked(&sends.committed);
-            while *committed <= through {
+            loop {
+                {
+                    let mut claimed = locked(&sends.claimed);
+                    if *committed > *claimed {
+                        *claimed = *committed;
+                        break *committed;
+                    }
+                }
                 if sends.stopping.load(Ordering::Relaxed) {
                     return;
                 }
@@ -366,16 +383,21 @@ fn flusher(sends: &Sends, flush: &Flush, meter: &Meter) {
                     .unwrap_or_else(PoisonError::into_inner)
                     .0;
             }
-            *committed
         };
         let began = Instant::now();
         match flush() {
             Ok(()) => {
                 meter.flushed(began.elapsed());
-                through = target;
                 sends.made_durable(target);
             }
             Err(e) => {
+                // What it claimed is claimed again by the next flush to begin.
+                {
+                    let mut claimed = locked(&sends.claimed);
+                    if *claimed == target {
+                        *claimed = target.saturating_sub(1);
+                    }
+                }
                 failures = failures.saturating_add(1);
                 if failures.is_power_of_two() {
                     tracing::error!(target: "amphora.store", event = "flush_failed", error = %e, failures, "the log couldn't be flushed; writes wait to be durable");
@@ -605,10 +627,13 @@ impl<E: Engine> Store<E> {
         }
         match flush.or_else(|| engine.flusher()) {
             Some(flush) => {
-                let (s, m) = (sends.clone(), meter.clone());
-                std::thread::Builder::new()
-                    .name("amphora-flush".into())
-                    .spawn(move || flusher(&s, &flush, &m))?;
+                let flush = Arc::new(flush);
+                for _ in 0..config.flushers.max(1) {
+                    let (s, m, f) = (sends.clone(), meter.clone(), flush.clone());
+                    std::thread::Builder::new()
+                        .name("amphora-flush".into())
+                        .spawn(move || flusher(&s, &f, &m))?;
+                }
             }
             None => sends.durable_as_committed.store(true, Ordering::Relaxed),
         }
