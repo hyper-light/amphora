@@ -3,9 +3,9 @@
 Amphora is the database kiln keeps every record in: KilnDB made a product (github.com/hyper-light/amphora; track T1 of kiln's critical path, kiln plan
 `01a157fdefba746a94a5fcd920a80d5a`). It keeps records, never bytes: kiln's sessions, conversations, goals, plans, deploys, CI, runners, places,
 repos, sync, settings, users, grants and audit, and the records of Hex, Veil, Reliquary and Quiver's
-catalog. One binary runs from a laptop to a fleet to global multi-region: Turso, vendored and made
-multi-writer, is each group's state machine, on a write-ahead log that is never optional. Bytes go to
-Mantle.
+catalog. One binary runs from a laptop to a fleet to global multi-region: its engine (`crates/engine`,
+Turso's as of 3e09a82 and Amphora's own since), made multi-writer, is each group's state machine, on
+a write-ahead log that is never optional. Bytes go to Mantle.
 
 These rules are absolute. They are kiln's critical-path bar (its master plan §3, kiln plan
 `01a157fddb8276a2996246ea931c4808`), the bar Mantle, Focal, Slates and Shards hold. Production code is everything compiled
@@ -21,6 +21,12 @@ return. The workspace lints (`Cargo.toml`, `clippy.toml`) encode this, and `scri
 is its gate: it forbids them, so an `#[allow]` or `#[expect]` for one in production code fails it. Test code opts out at its crate root
 with `#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::disallowed_macros))]`.
 Vendored code Amphora changes follows the same rule.
+
+The engine (`crates/engine*`, its `ORIGIN.md`) came from Turso with code that predates these rules.
+Every line Amphora writes or changes there follows them; its crates keep the lints they came with,
+and `scripts/check-production.sh` counts what is left of the inherited code that breaks the rule,
+lint by lint, against `scripts/engine-ratchet.toml`. A count may only fall, and the file is lowered
+with each fall.
 
 ## 2. Every resource has a bound
 
@@ -139,6 +145,8 @@ The person's standing rules (kiln's master plan §8):
 
 ## Where things are
 
+- `crates/engine*`: Amphora's engine (Turso's four crates as of 3e09a82, Amphora's own since; its
+  `ORIGIN.md` says what changed).
 - `docs/design/`: the design and its decision records.
 - `docs/research/`: the source notes decisions cite.
 - `docs/requirements.toml`: the requirement registry.

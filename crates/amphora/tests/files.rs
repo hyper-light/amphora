@@ -17,8 +17,8 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use amphora::turso::Db;
-use turso_core::Value;
+use amphora::db::Db;
+use amphora_engine::Value;
 
 /// A directory on the build's own file system (not a tmpfs `/tmp`, which takes no such flag).
 fn lab() -> tempfile::TempDir {

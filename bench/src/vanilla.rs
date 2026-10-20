@@ -1,6 +1,7 @@
 //! The engines as they ship, on kiln's conversation schema and statements (`crate::schema`), each
 //! as durable as it goes by default:
-//! - **Turso** (`turso_core`, the same revision the store vendors): its defaults (every commit
+//! - **Turso** (`turso_core` upstream, at 3e09a82, the revision Amphora's engine was taken from,
+//!   with none of Amphora's changes): its defaults (every commit
 //!   flushed, its own checkpoints), a connection for each thread, a write one transaction, tried
 //!   again while another writer holds the lock;
 //! - **SQLite** (rusqlite's bundled SQLite): its log (WAL) with every commit flushed

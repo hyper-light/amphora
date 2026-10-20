@@ -22,10 +22,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
+use amphora::db::Db;
 use amphora::store::{Checkpointed, Config, Engine, Flush, Opener, Refused, Store};
-use amphora::turso::Db;
-use turso_core::io::{FileId, FileSyncType};
-use turso_core::{
+use amphora_engine::io::{FileId, FileSyncType};
+use amphora_engine::{
     Buffer, Clock, Completion, CompletionError, File, IO, LimboError, MonotonicInstant, OpenFlags,
     Value, WallClockInstant,
 };
@@ -202,7 +202,7 @@ impl Disk {
     }
 
     /// `f` made to `held`, unless the power is out; the change that reaches the crash point cuts it.
-    fn change(&self, held: &Mutex<Held>, f: impl FnOnce(&mut Held)) -> turso_core::Result<()> {
+    fn change(&self, held: &Mutex<Held>, f: impl FnOnce(&mut Held)) -> amphora_engine::Result<()> {
         {
             let _ordered = self.order.read().unwrap();
             let n = self.changes.fetch_add(1, Ordering::SeqCst) + 1;
@@ -281,12 +281,12 @@ struct SimFile {
 }
 
 impl SimFile {
-    fn change(&self, f: impl FnOnce(&mut Held)) -> turso_core::Result<()> {
+    fn change(&self, f: impl FnOnce(&mut Held)) -> amphora_engine::Result<()> {
         let disk = self.disk.upgrade().ok_or_else(power_out)?;
         disk.change(&self.held, f)
     }
 
-    fn write(&self, pos: u64, data: Vec<u8>, c: Completion) -> turso_core::Result<Completion> {
+    fn write(&self, pos: u64, data: Vec<u8>, c: Completion) -> amphora_engine::Result<Completion> {
         let n = i32::try_from(data.len()).unwrap();
         self.change(|held| {
             let change = Change::Write(pos, data);
@@ -299,15 +299,15 @@ impl SimFile {
 }
 
 impl File for SimFile {
-    fn lock_file(&self, _exclusive: bool) -> turso_core::Result<()> {
+    fn lock_file(&self, _exclusive: bool) -> amphora_engine::Result<()> {
         Ok(())
     }
 
-    fn unlock_file(&self) -> turso_core::Result<()> {
+    fn unlock_file(&self) -> amphora_engine::Result<()> {
         Ok(())
     }
 
-    fn pread(&self, pos: u64, c: Completion) -> turso_core::Result<Completion> {
+    fn pread(&self, pos: u64, c: Completion) -> amphora_engine::Result<Completion> {
         let n = {
             let held = self.held.lock().unwrap();
             let dst = c.as_read().buf().as_mut_slice();
@@ -326,7 +326,7 @@ impl File for SimFile {
         pos: u64,
         buffer: Arc<Buffer>,
         c: Completion,
-    ) -> turso_core::Result<Completion> {
+    ) -> amphora_engine::Result<Completion> {
         self.write(pos, buffer.as_slice().to_vec(), c)
     }
 
@@ -335,7 +335,7 @@ impl File for SimFile {
         pos: u64,
         buffers: Vec<Arc<Buffer>>,
         c: Completion,
-    ) -> turso_core::Result<Completion> {
+    ) -> amphora_engine::Result<Completion> {
         let data = buffers
             .iter()
             .flat_map(|b| b.as_slice().iter().copied())
@@ -343,7 +343,7 @@ impl File for SimFile {
         self.write(pos, data, c)
     }
 
-    fn sync(&self, c: Completion, _sync_type: FileSyncType) -> turso_core::Result<Completion> {
+    fn sync(&self, c: Completion, _sync_type: FileSyncType) -> amphora_engine::Result<Completion> {
         // What was written before the flush began is what it makes durable (a flush begun later
         // may already have made it durable).
         let target = {
@@ -367,7 +367,7 @@ impl File for SimFile {
         Ok(c)
     }
 
-    fn truncate(&self, len: u64, c: Completion) -> turso_core::Result<Completion> {
+    fn truncate(&self, len: u64, c: Completion) -> amphora_engine::Result<Completion> {
         self.change(|held| {
             let change = Change::Truncate(len);
             apply(&mut held.seen, &change);
@@ -377,7 +377,7 @@ impl File for SimFile {
         Ok(c)
     }
 
-    fn size(&self) -> turso_core::Result<u64> {
+    fn size(&self) -> amphora_engine::Result<u64> {
         Ok(self.held.lock().unwrap().seen.len() as u64)
     }
 }
@@ -398,7 +398,7 @@ impl IO for Disk {
         path: &str,
         flags: OpenFlags,
         _direct: bool,
-    ) -> turso_core::Result<Arc<dyn File>> {
+    ) -> amphora_engine::Result<Arc<dyn File>> {
         let mut files = self.files.lock().unwrap();
         if let Some(file) = files.get(path) {
             return Ok(file.clone());
@@ -417,12 +417,12 @@ impl IO for Disk {
         Ok(file)
     }
 
-    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+    fn remove_file(&self, path: &str) -> amphora_engine::Result<()> {
         self.files.lock().unwrap().remove(path);
         Ok(())
     }
 
-    fn file_id(&self, path: &str) -> turso_core::Result<FileId> {
+    fn file_id(&self, path: &str) -> amphora_engine::Result<FileId> {
         Ok(FileId::from_path_hash(&format!("{}:{path}", self.id)))
     }
 }

@@ -36,9 +36,10 @@ Kiln vendors it at `vendor/amphora` and reaches it only through kiln-seams' `Rec
 - **Placement and sharding after Vitess and PlanetScale:** keyspaces with a VSchema, primary and
   lookup vindexes, automatic split and merge with fenced transfers, VReplication-style moves,
   cells to contain failures, and leaders that follow locality.
-- **Turso, with carte blanche.** Amphora owns its copy (`vendor/turso`): each change has its row in
-  `UPSTREAM.md`, keeps Turso's own suites passing, meets this repository's rules, and is offered
-  upstream.
+- **Turso, made Amphora's own.** The engine (`crates/engine*`) is Turso's four crates as of 3e09a82
+  and Amphora's own code since (its `ORIGIN.md`): each change keeps its suites passing and meets
+  this repository's rules, and what is left of the inherited code that breaks them is counted down
+  (CLAUDE.md §1). A change worth Turso's having can still be offered upstream.
 
 ## Decisions
 
@@ -52,3 +53,4 @@ Kiln vendors it at `vendor/amphora` and reaches it only through kiln-seams' `Rec
 | Placement and sharding: the directory, split and merge thresholds, cells | CP-T1.9 | open |
 | Transactions across groups and follower reads | CP-T1.10 | open |
 | Regions: region-local groups, the global root, the multi-region class | CP-T1.11 | open |
+| The engine: Turso's four crates made Amphora's own (`crates/engine*`, its `ORIGIN.md`), not vendored; CLAUDE.md §1 on every line Amphora writes, the rest counted down (`scripts/engine-ratchet.toml`) | Ada, 2026-10-20 | made |

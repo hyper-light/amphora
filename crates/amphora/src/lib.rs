@@ -17,15 +17,15 @@
 //!   no checkpoint in a commit's way.
 //! - [`groups`]: a store in groups on one node, keys spread over them by hash, so writes go on in
 //!   parallel.
-//! - [`turso`]: stores on Turso, vendored (`vendor/turso`).
+//! - [`db`]: stores on Amphora's engine (`crates/engine`).
 //! - [`meter`]: what a store counts.
 //!
 //! The `amphora` binary says what it is ([`reply`]).
 
+pub mod db;
 pub mod groups;
 pub mod meter;
 pub mod store;
-pub mod turso;
 
 /// What `amphora` prints for its arguments, where, and the exit status.
 #[derive(Debug, PartialEq, Eq)]

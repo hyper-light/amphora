@@ -1,6 +1,6 @@
 # The store's commit pipeline and readers (CP-T1.1)
 
-`crates/amphora/src/store.rs`, `crates/amphora/src/turso.rs`. Its decisions, each with its sources,
+`crates/amphora/src/store.rs`, `crates/amphora/src/db.rs`. Its decisions, each with its sources,
 its evidence and what would falsify it (CLAUDE.md §5). The evidence is kiln's K0 workload (1,000
 sessions of 100 events, then 30 s of 32 writers appending one event per durable write and 4 readers
 reading a session's latest 50 events), run on fedora (32 cores, Samsung SSD 9100 PRO 8 TB under
@@ -41,7 +41,7 @@ durable is the same; the flush leaves the commit, so commits no longer wait for 
 Logging" (VLDB 2010): commits acknowledge once the log is durable, without holding the log's
 writer through the flush. `fdatasync(2)` and `fsync(2)` (Linux man-pages): a flush makes durable
 what was written to the file before it began, through any descriptor of the file. Turso's commit
-path (`vendor/turso/core/storage/pager.rs`, `CommitState::WaitSync`): it flushes only in `FULL`.
+path (`crates/engine/storage/pager.rs`, `CommitState::WaitSync`): it flushes only in `FULL`.
 
 **Evidence.** On fedora's disk a durable 4 KiB write takes 2.6–3.3 ms (`dd oflag=dsync`; no
 copy-on-write and direct I/O with `O_DSYNC` measured no faster), the floor of any durable write
@@ -71,7 +71,7 @@ counts, each entry numbered so a reader can tell when its entry was settled and 
 longer: not for other keys' writes, and not behind the writer.
 
 **Sources.** Snapshot reads on a write-ahead log: SQLite's WAL (sqlite.org/wal.html) and Turso's
-(`vendor/turso/core/storage/wal.rs`, `begin_read_tx`): a reader sees what was committed when its
+(`crates/engine/storage/wal.rs`, `begin_read_tx`): a reader sees what was committed when its
 read began, and never blocks the writer.
 
 **Evidence.** kiln's store ran every read on its writer thread: reads p50 159 ms under K0's writes
@@ -98,7 +98,7 @@ again however much is left.
 
 **Sources.** Checkpoint starvation under continuous readers: sqlite.org/wal.html §"Avoiding
 Excessively Large WAL Files". Turso's checkpoint modes and the writer's restart
-(`vendor/turso/core/storage/wal.rs`, `CheckpointMode`, `try_restart_log_before_write`).
+(`crates/engine/storage/wal.rs`, `CheckpointMode`, `try_restart_log_before_write`).
 
 **Evidence.** Checkpoints inline on the writer: write p99 23 ms, p99.9 28 ms. Off the writer with
 passive checkpoints alone: write p99 18 ms, but the log grew past 2 GB in 30 s, and past 700 MB with
@@ -141,7 +141,7 @@ against the 16,384-frame runs before.
 2,000, 8 MiB, on every connection). A reader's miss is a read of the file through the system's page
 cache; the writer keeps its indexes' inner pages.
 
-**Sources.** Turso's page cache (`vendor/turso/core/storage/page_cache.rs`): one per connection, 2,000
+**Sources.** Turso's page cache (`crates/engine/storage/page_cache.rs`): one per connection, 2,000
 pages by default, kept consistent with the log by the connection itself.
 
 **Evidence.** Amphora's bench (`bench/`), fedora, 2026-10-20, K0's load: at Turso's 2,000 pages a
@@ -165,7 +165,7 @@ one, two and four (2026-10-20), and four once held a write 1.1 s.
 ## 7. The writer keeps no statement journal; a commit that fails is retried batch by batch
 
 **Decision.** The writer's connection keeps no statement journal (Turso's
-`Connection::set_statement_journals(false)`, Amphora's change to `vendor/turso`): a write statement in
+`Connection::set_statement_journals(false)`, Amphora's change to its engine): a write statement in
 a transaction that fails, or is abandoned unfinished, poisons the transaction, and COMMIT then rolls
 it back whole and says so. `Db::transaction` rolls back on any failure, and after a COMMIT that
 fails, so nothing a failed statement half-wrote is ever committed, and the next transaction can
@@ -175,7 +175,7 @@ batches that commit alone are kept, and one that can't is refused to its sender
 
 **Sources.** SQLite's statement journal and when it is skipped (`usesStmtJournal = isMultiWrite &&
 mayAbort`, `vdbe.c`, `sqlite3VdbeHalt`), which Turso mirrors
-(`vendor/turso/core/translate/stmt_journal.rs`): an UPSERT whose DO UPDATE can fail is both, so every
+(`crates/engine/translate/stmt_journal.rs`): an UPSERT whose DO UPDATE can fail is both, so every
 event and session written keeps one, a 4 KiB copy of each page it first touches.
 
 **Evidence.** Amphora's bench (2026-10-20, fedora, 128 writers): the statement journal was 13.6% of
@@ -285,7 +285,7 @@ never.
 ## 12. Written in place, every page checksummed
 
 **Decision.** On Linux, a new database's file and log are made with btrfs's no-copy-on-write flag
-before anything is written to them (`turso.rs`, `in_place`; best effort: a file that exists keeps its
+before anything is written to them (`db.rs`, `in_place`; best effort: a file that exists keeps its
 way, a file system without the flag declines it). The flag turns off btrfs's own data checksums for
 those files, and its compression; Turso's page checksums (its `checksum` feature: an XXH3-64 of each
 4 KiB page in the page's last 8 bytes, written with the page and checked whenever the page is read

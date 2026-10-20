@@ -35,14 +35,28 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   flight so commits land during flushes. 10,000 seeds: no acknowledged batch lost, no refused batch
   kept, no batch torn, the integrity check passing (2026-10-20). Every gate runs 200. A test holds a
   flush and commits during it: no checkpoint copies that commit before a later flush (decision 15).
-- **Stores on Turso** (`crates/amphora/src/turso.rs`): a database opened for the pipeline, its
+- **Stores on the engine** (`crates/amphora/src/db.rs`): a database opened for the pipeline, its
   readers, its flusher, its checkpoints and its log's restart.
-- **Turso, vendored** (`vendor/turso`, `UPSTREAM.md`): tursodatabase/turso at 3e09a82, the four
-  crates Amphora builds (core, sqlite/parser, macros, extensions/core) and a cut-down root manifest,
-  with the changes its `UPSTREAM.md` lists. It has no entry in `vendor/MANIFEST.toml` yet:
-  `scripts/vendor.py` takes a project's whole tree, and Turso's four crates are a part of it. The
-  entry, with `include = ["core", "sqlite/parser", "macros", "extensions/core"]`, comes once
-  `vendor.py` takes an include list (kiln's CP-M1).
+- **Amphora's engine** (`crates/engine*`, its `ORIGIN.md`): Turso's four crates (core, sqlite/parser,
+  macros, extensions/core) as of 3e09a82, Amphora's own code since 2026-10-20 as `amphora-engine`,
+  `-parser`, `-macros` and `-ext`, members of the workspace, nothing compiled from C. Its suites run
+  in every gate; what is left of the inherited code that breaks CLAUDE.md §1 is counted, lint by lint,
+  against `scripts/engine-ratchet.toml`, and may only fall. The bench's vanilla Turso is upstream at
+  3e09a82, none of Amphora's changes.
+
+## Measured
+
+- **Against every competitor, 32 to 1,000,000 writers** (`bench/records/2026-10-20-fedora-matrix.jsonl`,
+  `python3 bench/table.py`; fedora, one run each, load 1.4–66 with other work on the machine, so not
+  yet the quiet best of 3 CP-T1.2 asks). Amphora's best (one group at 32 writers, 12 above) against
+  PostgreSQL 17: 1.2× the writes at 32 writers, 3.6× at 1,000, 5.8× at 10,000, 3.9× at 100,000,
+  7.4× at 1,000,000; p99 1.1×, 2.5×, 1.9×, 1.6×, 7.6×; memory 8.9× at 32 writers, 1.3–2.6× with
+  12 groups. Against OrioleDB much the same; against MySQL, Vitess, ClickHouse, vanilla Turso and
+  SQLite 3.4–44× the writes at 32 writers and 18–1,128× from 1,000 up. What bounds it: at low
+  concurrency the disk's flush (2.8 ms on fedora's btrfs, however the log is written); at high, the
+  log's volume (whole pages, about 7 KiB a 200-byte event at 10,000 writers, 1.7 GB/s, as much
+  again copied into the file). CedarDB refused the schema's `COLLATE "C"` (the bench now leaves it
+  out for CedarDB); MySQL's server exited at 1,000,000 writers and the bench waited on it.
 
 ## Next
 
