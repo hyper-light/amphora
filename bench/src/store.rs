@@ -27,8 +27,42 @@ pub struct Convo {
     reader_pages: Option<i64>,
 }
 
-/// The slowest row, COMMIT and commit, in µs (an experiment: where a slow commit waits).
+/// The slowest COMMIT and commit, in µs (where a slow commit waits); the first is unused.
 static SLOWEST: (AtomicU64, AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+
+fn one_row() -> bool {
+    static ONE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ONE.get_or_init(|| std::env::var_os("AMPHORA_ONE_ROW").is_some())
+}
+
+/// How many events one statement takes, largest first.
+const CHUNKS: [usize; 4] = [64, 16, 4, 1];
+
+/// The upsert of `rows` events in one statement (one of [`CHUNKS`]).
+fn event_upsert(rows: usize) -> &'static str {
+    static SQL: std::sync::OnceLock<Vec<(usize, String)>> = std::sync::OnceLock::new();
+    let all = SQL.get_or_init(|| CHUNKS.iter().map(|&n| (n, schema::event_upsert_rows(n))).collect());
+    all.iter().find(|(n, _)| *n == rows).map_or(schema::EVENT_UPSERT, |(_, sql)| sql.as_str())
+}
+
+/// An event's thirteen columns, in the upsert's order.
+fn event_params(e: &Event, rev: i64) -> [Value; 13] {
+    [
+        t(&e.session),
+        t(&e.id),
+        Value::from_i64(i64::try_from(e.seq).unwrap_or(i64::MAX)),
+        Value::from_i64(e.at),
+        Value::Null,
+        Value::Null,
+        t(e.kind),
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        t(&e.text),
+        t(&e.body),
+        Value::from_i64(rev),
+    ]
+}
 
 fn t(s: &str) -> Value {
     Value::from_text(s.to_owned())
@@ -47,46 +81,37 @@ impl Engine for Convo {
 
     fn apply(&mut self, rows: &[Row]) -> anyhow::Result<usize> {
         let n = rows.len();
-        let mut rev = self.rev;
         let began = Instant::now();
-        let mut slowest_row = Duration::ZERO;
+        // Each row its number, in order, as one statement a row would give it.
+        let first = self.rev;
+        let mut events: Vec<(&Event, i64)> = Vec::with_capacity(n);
         let applied = self.db.transaction(|db| {
+            let mut rev = first;
             for row in rows {
-                let one = Instant::now();
                 rev += 1;
                 match row {
                     Row::Session(id) => {
                         let params = [t(id), t("{}"), Value::Null, Value::Null, Value::Null, Value::from_i64(0), Value::from_i64(0), Value::from_i64(rev)];
                         db.query(schema::SESSION_UPSERT, params, |_| Ok(true))?;
                     }
-                    Row::Event(e) => {
-                        let params = [
-                            t(&e.session),
-                            t(&e.id),
-                            Value::from_i64(i64::try_from(e.seq).unwrap_or(i64::MAX)),
-                            Value::from_i64(e.at),
-                            Value::Null,
-                            Value::Null,
-                            t(e.kind),
-                            Value::Null,
-                            Value::Null,
-                            Value::Null,
-                            t(&e.text),
-                            t(&e.body),
-                            Value::from_i64(rev),
-                        ];
-                        db.query(schema::EVENT_UPSERT, params, |_| Ok(true))?;
-                    }
+                    Row::Event(e) => events.push((e, rev)),
                 }
-                slowest_row = slowest_row.max(one.elapsed());
+            }
+            // The events many to a statement: 64, 16, 4 or 1 at a time.
+            let mut at = 0;
+            while at < events.len() {
+                // AMPHORA_ONE_ROW: a statement a row (to compare).
+                let take = if one_row() { 1 } else { CHUNKS.iter().copied().find(|&c| c <= events.len() - at).unwrap_or(1) };
+                let params: Vec<Value> = events[at..at + take].iter().flat_map(|(e, rev)| event_params(e, *rev)).collect();
+                db.query(event_upsert(take), params, |_| Ok(true))?;
+                at += take;
             }
             // The store's number, kept with its rows (kiln's store keeps its own so).
             db.query(schema::META_SET, [t("rev"), Value::from_text(rev.to_string())], |_| Ok(true))?;
-            Ok(Instant::now())
+            Ok((Instant::now(), rev))
         });
-        let rows_done = applied?;
-        // Where a slow commit spent its time: its slowest row, and its COMMIT.
-        SLOWEST.0.fetch_max(u64::try_from(slowest_row.as_micros()).unwrap_or(u64::MAX), Ordering::Relaxed);
+        let (rows_done, rev) = applied?;
+        // Where a slow commit spent its time: its COMMIT, and all of it.
         SLOWEST.1.fetch_max(u64::try_from(rows_done.elapsed().as_micros()).unwrap_or(u64::MAX), Ordering::Relaxed);
         SLOWEST.2.fetch_max(u64::try_from(began.elapsed().as_micros()).unwrap_or(u64::MAX), Ordering::Relaxed);
         self.rev = rev;
@@ -166,6 +191,8 @@ impl Amphora {
             log_frames: env("AMPHORA_LOG_FRAMES").and_then(|f| u64::try_from(f).ok()).unwrap_or(defaults.log_frames),
             // AMPHORA_COMMIT_ROWS: rows that make a commit at once.
             commit_rows: env("AMPHORA_COMMIT_ROWS").and_then(|r| usize::try_from(r).ok()).unwrap_or(defaults.commit_rows),
+            // AMPHORA_QUEUE: batches a group's writer queues at most.
+            queue: env("AMPHORA_QUEUE").and_then(|q| usize::try_from(q).ok()).unwrap_or(defaults.queue),
             ..defaults
         };
         let groups = Groups::start(groups, config, |g| {
@@ -243,7 +270,7 @@ impl Driver for Amphora {
             "flushes": c.flushes, "flush_ms": c.flush_ms, "dropped": c.dropped, "failed": c.failed, "timeouts": c.timeouts,
             "checkpoints": c.checkpoints, "checkpoint_ms": c.checkpoint_ms, "restarts": c.restarts, "restart_wait_ms": c.restart_wait_ms,
             "restart_ms": c.restart_ms, "longest_us": longest,
-            "slowest_row_us": SLOWEST.0.load(Ordering::Relaxed), "slowest_commit_stmt_us": SLOWEST.1.load(Ordering::Relaxed),
+            "slowest_commit_stmt_us": SLOWEST.1.load(Ordering::Relaxed),
             "slowest_apply_us": SLOWEST.2.load(Ordering::Relaxed),
         })
     }

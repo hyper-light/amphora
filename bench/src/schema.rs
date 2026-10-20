@@ -30,6 +30,20 @@ pub const EVENT_UPSERT: &str = "INSERT INTO events (session, id, seq, at, parent
         level = excluded.level, tool = excluded.tool, status = excluded.status, text = excluded.text, body = excluded.body,
         rev = excluded.rev";
 
+/// [`EVENT_UPSERT`] for `rows` events in one statement (row `r`'s columns are `?13r+1` to `?13r+13`):
+/// a store applying a commit's rows runs one statement for many, its cursors opened once.
+pub fn event_upsert_rows(rows: usize) -> String {
+    let values: Vec<String> = (0..rows).map(|r| format!("({})", (1..=13).map(|c| format!("?{}", r * 13 + c)).collect::<Vec<_>>().join(", "))).collect();
+    format!(
+        "INSERT INTO events (session, id, seq, at, parent, by, kind, level, tool, status, text, body, rev) VALUES {}
+    ON CONFLICT (session, id) DO UPDATE SET
+        seq = excluded.seq, at = excluded.at, parent = excluded.parent, by = excluded.by, kind = excluded.kind,
+        level = excluded.level, tool = excluded.tool, status = excluded.status, text = excluded.text, body = excluded.body,
+        rev = excluded.rev",
+        values.join(", ")
+    )
+}
+
 /// A session's last `?2` events, newest first.
 pub const EVENTS_LAST: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body FROM events WHERE session = ?1 ORDER BY seq DESC LIMIT ?2";
 
