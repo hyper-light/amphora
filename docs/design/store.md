@@ -266,3 +266,26 @@ write answered.
 
 **Falsified by.** A sender told durable before a flush covering its commit ended, or told twice, or
 never.
+
+## 12. Written in place, every page checksummed
+
+**Decision.** On Linux, a new database's file and log are made with btrfs's no-copy-on-write flag
+before anything is written to them (`turso.rs`, `in_place`; best effort: a file that exists keeps its
+way, a file system without the flag declines it). The flag turns off btrfs's own data checksums for
+those files, and its compression; Turso's page checksums (its `checksum` feature: an XXH3-64 of each
+4 KiB page in the page's last 8 bytes, written with the page and checked whenever the page is read
+from the file) take their place, so a page corrupted on disk is refused, never read as data.
+
+**Sources.** btrfs(5), `nodatacow` and the `C` attribute: no copy-on-write, no compression, no data
+checksums, for files written in place such as databases and disk images (as systemd-journald does
+for its journals on btrfs). Turso's `storage/checksum.rs`.
+
+**Evidence.** Amphora's bench (2026-10-20, fedora, btrfs with zstd, 10,000 writers, commits of 512
+rows), the same runs in a copy-on-write directory and one with the flag: 1 group 25,051 against
+28,774 rows a second, longest write 1.16 s against 0.57 s; 12 groups 97,150 against 194,941. The
+store's tests: a new database's file and log carry the flag where the file system takes it; a byte
+flipped in a page of the file is refused with a checksum error when read. The checksums' own cost
+is to be measured on a quiet machine.
+
+**Falsified by.** A page corrupted on disk read as data (`tests/files.rs`), or, on btrfs, the flag
+making writes slower or their tails longer than copy-on-write.

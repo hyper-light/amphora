@@ -47,6 +47,36 @@ fn pause(d: Duration) {
     }
 }
 
+/// The log beside the database at `path`.
+fn wal_path(path: &Path) -> PathBuf {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    PathBuf::from(wal)
+}
+
+/// Makes `path`, if it doesn't exist yet, an empty file that a copy-on-write file system writes in
+/// place (btrfs's no-copy-on-write flag, which takes only while a file is empty; docs/design/store.md,
+/// decision 12). Turso checksums each page, so btrfs's own data checksums, which the flag turns off,
+/// aren't missed. Best effort: a file that exists keeps its way, and a file system without the flag
+/// declines it.
+#[cfg(target_os = "linux")]
+fn in_place(path: &Path) {
+    use rustix::fs::{IFlags, ioctl_getflags, ioctl_setflags};
+    let Ok(file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    else {
+        return;
+    };
+    if let Ok(flags) = ioctl_getflags(&file) {
+        let _ = ioctl_setflags(&file, flags | IFlags::NOCOW);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn in_place(_path: &Path) {}
+
 /// A connection on a Turso database, with the statements it prepared kept.
 pub struct Db {
     io: Arc<dyn IO>,
@@ -67,6 +97,8 @@ impl Db {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        in_place(path);
+        in_place(&wal_path(path));
         Self::open_with(path, Arc::new(PlatformIO::new().map_err(fail)?))
     }
 
