@@ -1,0 +1,16 @@
+[package]
+name = "amphora"
+description = "Amphora: the database kiln keeps every record in: KilnDB made a product"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "amphora"
+path = "src/main.rs"
+
+[lints]
+workspace = true
