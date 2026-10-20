@@ -181,8 +181,11 @@ impl Db {
     /// as long as it gets, a flush writes no metadata.
     pub fn flusher(&self) -> Flush {
         let wal = format!("{}-wal", self.path.display());
-        let io = self.io.clone();
+        let (io, db) = (self.io.clone(), self.db.clone());
         Box::new(move || {
+            // Where the log ends before the flush begins: every frame up to it is durable once
+            // the flush ends, and the checkpointer copies those without a flush of its own.
+            let (generation, frame) = db.wal_end();
             // Opened each time: a flush is a disk's round trip, an open a few microseconds, and the
             // log may have been made again. No log: everything is in the file, which the checkpoint
             // that emptied the log flushed.
@@ -194,19 +197,22 @@ impl Db {
                 ))) => return Ok(()),
                 Err(e) => return Err(std::io::Error::other(e.to_string())),
             };
-            let flushed = file
-                .sync(Completion::new_sync(|_| {}), FileSyncType::DataSync)
-                .and_then(|c| io.wait_for_completion(c));
-            flushed.map_err(|e| std::io::Error::other(e.to_string()))
+            file.sync(Completion::new_sync(|_| {}), FileSyncType::DataSync)
+                .and_then(|c| io.wait_for_completion(c))
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            db.wal_durable(generation, frame);
+            Ok(())
         })
     }
 
     /// Copies what the log holds into the file without waiting for anyone: what the log holds
     /// after, for the store to start it again once it is past its bound ([`Db::restart_log`]). A
-    /// checkpoint already under way (busy) copies nothing and reports nothing.
+    /// checkpoint already under way (busy) copies nothing and reports nothing. Once a flush has
+    /// made some of the log durable ([`Db::flusher`]), only that is copied, and the log isn't
+    /// flushed again for it.
     pub fn checkpoint(&mut self) -> anyhow::Result<Checkpointed> {
         match self.conn.checkpoint(CheckpointMode::Passive {
-            upper_bound_inclusive: None,
+            upper_bound_inclusive: self.db.wal_durable_frame(),
         }) {
             Ok(copied) => Ok(Checkpointed {
                 log: copied.wal_max_frame,

@@ -31,9 +31,9 @@ committing on an empty queue.
 
 **Decision.** A commit writes the log and doesn't flush it (Turso's `NORMAL`); a flusher thread
 flushes the log (`fdatasync`) over and over, and a write is durable, and acknowledged by
-`Store::sync`, once a flush that began after its commit ends. A checkpoint still flushes the log
-before it copies it and the file after (Turso's checkpoint in `NORMAL`), so nothing the flusher
-made durable is lost to a checkpoint. This replaces `SyncMode::Full` (a flush inside every
+`Store::sync`, once a flush that began after its commit ends. A checkpoint copies only what a flush
+has made durable (decision 15) and flushes the file after (Turso's checkpoint in `NORMAL`), so
+nothing the flusher made durable is lost to a checkpoint. This replaces `SyncMode::Full` (a flush inside every
 commit), which the design's README names until CP-T1.8: the guarantee to whoever is told a write is
 durable is the same; the flush leaves the commit, so commits no longer wait for the disk one by one.
 
@@ -89,8 +89,8 @@ tests), or a read that waits for another key's write.
 **Decision.** The writer never checkpoints (`wal_autocheckpoint = 0`). A checkpointer with a
 connection of its own copies the log into the file every `Config::checkpoint_every` (25 ms) without
 waiting for anyone (passive). A log only starts again once nothing reads from it, which readers that
-never pause prevent: so once the log holds more than `Config::log_frames` (16,384 frames, 64 MiB of
-4 KiB pages), the checkpointer copies without pausing until less than a 64th of the bound is left,
+never pause prevent: so once the log holds more than `Config::log_frames` (131,072 frames, 512 MiB
+of 4 KiB pages), the checkpointer copies without pausing until less than a 64th of the bound is left,
 and the writer then starts the log again between commits, holding the readers and the
 checkpointer back for the moment it takes (what little is left, and a flush of the file). The
 checkpointer starts no pass while a restart is pending. At twice its bound the log is started
@@ -122,8 +122,18 @@ waits behind them (`wait_log_commit`, once 118 ms), and the writer's next append
 the flusher's hold on the log's inode (`btrfs_inode_lock`), so a commit stalls (Turso's COMMIT, up to
 97 ms). Starting the file's writeback while the checkpoint copies (`sync_file_range`, as
 PostgreSQL's `checkpoint_flush_after` does) didn't shorten the stalls: the copy comes in one burst.
-The defaults stay at 25 ms and 16,384 frames until checkpoints stop competing with the flusher for
-the disk's log (STATUS.md: one thread making everything durable).
+The checkpoints stay at 25 ms until they stop competing with the flusher for the disk's log
+(STATUS.md: one thread making everything durable).
+
+The bound, alone (2026-10-20, fedora, 32 writers, one group, checkpoints every 25 ms, three runs
+each, load 4–9.5; `bench/records/2026-10-20-fedora-32-writers-log-bound-*.jsonl`): each restart
+holds the writer 10–14 ms, and a commit at 32 writers writes about 73 frames, so a 16,384-frame log
+restarted 27 times in 20 s: p99.9 12.0–15.6 ms, max 27–37 ms. At 131,072 frames it restarted 3–4
+times: p99.9 9.1–10.6 ms, max 20–29 ms, 1–2 MB more memory. With no checkpoint at all: p99.9
+8.8–11.8 ms, max 12–45 ms (the longest is the disk's: no checkpoint ran). So the default is now
+131,072. A log keeps up to twice that many frames of disk (decision 13 keeps its length), and a
+restart copies up to a 64th of it: at 1,000 writers and more, the matrix's restarts are to be read
+against the 16,384-frame runs before.
 
 ## 5. Page budgets by what a connection does
 
@@ -216,15 +226,19 @@ on every platform Amphora runs on (then a bounded retry could be safe).
 
 `crates/amphora/tests/crash.rs` runs the store on a simulated disk whose power goes at a change
 drawn from each seed's workload (writes, flushes and truncations to the database file and the log).
-What a flush made durable survives; each change made since survives whole, torn at a 512-byte
-boundary, or not at all, in any combination. The workload hands over 150 batches of 1 to 4 rows, a
-tenth of them holding a row the engine refuses, a few at a time so they share commits, with the log
-checkpointed every millisecond and restarted past 16 frames. After the restart on what survived:
+A flush takes time (0.2 ms) and makes durable what was written before it began; each change not
+made durable survives whole, torn at a 512-byte boundary, or not at all, in any combination. The
+workload hands over 150 batches of 1 to 4 rows, a tenth of them holding a row the engine refuses, a
+few at a time so they share commits, with up to three left in flight so commits land while flushes
+run, the log checkpointed every millisecond and restarted past 16 frames. After the restart on what survived:
 every batch acknowledged durable is there, every batch the engine refused isn't, every other batch is
 there whole or not at all, and Turso's integrity check passes. Each run checks it isn't vacuous: the
 power goes out midway in most seeds, acknowledged and refused batches are checked, and checkpoints
-and restarts happened. Every gate runs 200 seeds; the full 10,000 run with
-`cargo test --release --test crash -- --ignored` (32.7 s on fedora).
+and restarts happened. Seeds run side by side, each on a disk of its own; one that panics fails
+alone. Every gate runs 200 seeds; the full 10,000 run with
+`cargo test --release --test crash -- --ignored` (4.7 s on fedora's 32 cores). Before flushes took
+time, a flush followed each commit at once, so no checkpoint ever met an unflushed commit, and a
+flusher claiming the whole log durable passed 10,000 seeds; it now fails them (decision 15).
 
 ## 10. Groups: writes on as many cores
 
@@ -364,3 +378,34 @@ machine, and gathering at 1,000 writers and more against flushing at once.
 **Falsified by.** A workload where gathering lengthens a write's p50 or tails against flushing at
 the first commit (an open-loop trickle pays up to a 32nd of a flush a write), or more writers where
 flushes stop following one another.
+
+## 15. The checkpoint copies what the flusher made durable
+
+**Decision.** The flusher notes where the log ends before each flush begins, as the log's
+generation (its header's `checkpoint_seq`, which a restart changes in the same step that starts
+the frames again) and its last committed frame, and once the flush ends tells Turso every frame up
+to it is durable (`Database::wal_end`, `Database::wal_durable`, added to Turso). The checkpointer
+copies only up to that frame (`Database::wal_durable_frame`, a passive checkpoint's upper bound),
+and Turso's checkpoint flushes no log of its own for frames the mark covers in the log's current
+generation (`WalCoordination::durable_through`; never under the multi-process authority, whose
+log other processes write). With no mark yet (no flush through `Db::flusher`), a checkpoint copies
+everything and flushes the log first, as before.
+
+**Sources.** Turso's checkpoint (`CheckpointState::SyncWal`): a frame copied into the file must
+be durable in the log first, or a crash could keep the copy and lose the frame, leaving a file that
+matches no committed prefix. fdatasync(2): a flush makes durable what was written before it began.
+Within a generation a committed frame's slot is never written again (`frame_cache_high_water`).
+
+**Evidence.** fedora, 2026-10-20, 32 writers, one group, three runs each of one binary with the
+mark on and off, alternating, load 5.6–8.5 (`bench/records/2026-10-20-fedora-32-writers-mark-*.jsonl`):
+a checkpoint pass took 10.9–12.2 ms against 12.6–14.1 ms (the log's flush gone; the file's flush
+is most of what remains), and the checkpointer flushed the log 27 fewer times a second. Writes
+didn't move beyond the noise: 7,116–8,095 a second against 7,096–7,877, p99 6.5–8.3 ms against
+6.5–8.2. A test holds a flush and commits while it runs: the checkpoint after it leaves that commit
+uncopied (`tests/crash.rs`, `a_commit_that_lands_during_a_flush_is_not_counted_durable_by_it`). It
+fails with the flusher noting the log's end after its flush instead of before, and with a flusher
+claiming the whole log durable, which also fails crash injection (integrity check and checksum
+failures in 10,000 seeds); the real flusher passes both.
+
+**Falsified by.** A checkpoint that copies a frame no flush made durable (the test above), or an
+acknowledged batch lost or torn by a power cut during checkpoints (`tests/crash.rs`).

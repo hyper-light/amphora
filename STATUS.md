@@ -31,8 +31,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   writer's 22,000. `Store::put_then` tells a sender once its batch is durable (decision 11).
 - **Crash injection** (T-T1.1.1, `crates/amphora/tests/crash.rs`, docs/design/store.md): the store on
   a simulated disk that loses its power at any change, unflushed writes surviving whole, torn or not
-  at all. 10,000 seeds: no acknowledged batch lost, no refused batch kept, no batch torn, the
-  integrity check passing (2026-10-20). Every gate runs 200.
+  at all, its flushes taking time and covering what was written before they began, batches left in
+  flight so commits land during flushes. 10,000 seeds: no acknowledged batch lost, no refused batch
+  kept, no batch torn, the integrity check passing (2026-10-20). Every gate runs 200. A test holds a
+  flush and commits during it: no checkpoint copies that commit before a later flush (decision 15).
 - **Stores on Turso** (`crates/amphora/src/turso.rs`): a database opened for the pipeline, its
   readers, its flusher, its checkpoints and its log's restart.
 - **Turso, vendored** (`vendor/turso`, `UPSTREAM.md`): tursodatabase/turso at 3e09a82, the four
@@ -45,13 +47,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 ## Next
 
 - **One thread making everything durable**: on btrfs every flush is a commit of the filesystem's
-  log, one at a time, so the checkpointer's flushes of the file (and of the log before each pass)
-  hold up the flusher's, and with it every write (docs/design/store.md, decision 4: commits stalled
-  up to 97 ms, writes at 512 writers lost a third of their rate). Closing it: the checkpoint copies
-  only frames the flusher has made durable (no flush of the log of its own), and the file's flush
-  goes to the flusher's thread, between its flushes of the log, before the log starts again. It
-  changes when Turso's checkpoint makes what it copied durable; T-T1.1.1's crash injection proves
-  it.
+  log, one at a time, so the checkpointer's flushes of the file hold up the flusher's, and with it
+  every write (docs/design/store.md, decision 4: commits stalled up to 97 ms, writes at 512 writers
+  lost a third of their rate). The checkpoint now copies only frames the flusher made durable and
+  flushes no log of its own (decision 15); a pass still flushes the file, 10.9–12.2 ms of each at 32
+  writers. Left: the file's flush goes to the flusher's thread, between its flushes of the log,
+  before the log starts again. It changes when Turso's checkpoint makes what it copied durable;
+  T-T1.1.1's crash injection proves it.
 - **CP-T1.1**: kiln vendors Amphora and its conversation store runs on `amphora::store` in place of its one writer thread; the soak bench for drops (AC-T1.1.5) and the stalled-disk test (T-T1.1.2); the bar measured on a quiet machine, best of 3 (AC-T1.1.2–4), with vanilla Turso, SQLite and Vitess beside Amphora (`bench/`).
 - **CP-T1.2**: Baselines on a quiet machine against SQLite, Postgres 17, Vitess, CockroachDB and TiDB; the research; the client protocol; `docs/design/` written to it.
 - **CP-T1.3**: Turso's MVCC with `BEGIN CONCURRENT` made serializable and production-grade, and the engine multi-writer on it.

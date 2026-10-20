@@ -139,7 +139,13 @@ impl Default for Config {
             commit_rows: 512,
             readers: 4,
             checkpoint_every: Duration::from_millis(25),
-            log_frames: 16_384,
+            // Each restart of the log holds the writer for 10-14 ms (on fedora's btrfs: what is
+            // left copied, the file flushed, a new header synced). At 32 writers, whose commits
+            // write about 73 frames each, a bound of 16,384 restarted 27 times in 20 s, and the
+            // writes it held made p99.9 12-16 ms; at 131,072, 3-4 times, p99.9 9.1-10.6 ms, as with
+            // no checkpoint at all (fedora, 2026-10-20). A log takes up to twice this many frames
+            // of disk (1 GiB of 4 KiB pages) and keeps it.
+            log_frames: 131_072,
             idle_every: Duration::from_secs(1),
             flushers: 1,
         }

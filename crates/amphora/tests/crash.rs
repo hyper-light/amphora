@@ -1,8 +1,9 @@
 //! Crash injection (T-T1.1.1; AC-T1.1.1: no update is dropped unsaid): the store on a simulated
-//! disk that loses its power at a chosen change. What a flush made durable survives; each change
-//! made since survives whole, torn or not at all, in any combination. After the restart, every batch
-//! acknowledged durable is there, every batch the engine refused isn't, every other batch is there
-//! whole or not at all, and the database passes Turso's integrity check.
+//! disk that loses its power at a chosen change. A flush takes time, as a disk's does, and makes
+//! durable what was written before it began; each change not made durable survives whole, torn or
+//! not at all, in any combination. After the restart, every batch acknowledged durable is there,
+//! every batch the engine refused isn't, every other batch is there whole or not at all, and the
+//! database passes Turso's integrity check.
 
 #![cfg_attr(
     test,
@@ -18,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use amphora::store::{Checkpointed, Config, Engine, Flush, Opener, Refused, Store};
@@ -66,13 +67,31 @@ fn apply(bytes: &mut Vec<u8>, change: &Change) {
     }
 }
 
-/// What a file holds: what its last flush made durable, the changes made since (in order), and
-/// what a reader sees (both).
+/// What a file holds: what its flushes made durable, the changes not yet durable (in order), how
+/// many changes were made durable in all, and what a reader sees (both).
 #[derive(Default)]
 struct Held {
     durable: Vec<u8>,
     since: Vec<Change>,
+    flushed: u64,
     seen: Vec<u8>,
+}
+
+/// How long a flush takes. A change made while one runs isn't part of it, so a commit can land
+/// during a flush and still be unflushed after it, and a checkpoint can run meanwhile, as on a real
+/// disk (fedora's takes 2.7 ms; a fifth of a millisecond keeps 10,000 seeds quick).
+const FLUSH_TAKES: Duration = Duration::from_micros(200);
+
+/// Parks this thread for `d` (a park ends early for no reason sometimes: the rest is parked again).
+fn pause(d: Duration) {
+    let until = Instant::now() + d;
+    loop {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        std::thread::park_timeout(left);
+    }
 }
 
 /// Gives each disk its own files: Turso keeps one database open per file a process opens, so a
@@ -95,6 +114,9 @@ struct Disk {
     /// What the cut did with each change since a flush that touched the database's first page or
     /// the log's header (for a failing seed's account).
     told: Mutex<Vec<String>>,
+    /// While true, a flush waits (after taking what it makes durable) until it is let go; with the
+    /// number of flushes waiting.
+    holding: (Mutex<(bool, u64)>, Condvar),
 }
 
 fn power_out() -> LimboError {
@@ -115,6 +137,7 @@ impl Disk {
                         held: Mutex::new(Held {
                             durable: bytes.clone(),
                             since: Vec::new(),
+                            flushed: 0,
                             seen: bytes,
                         }),
                     });
@@ -131,6 +154,7 @@ impl Disk {
                 image: Mutex::new(None),
                 rng: Mutex::new(Rng(seed | 1)),
                 told: Mutex::new(Vec::new()),
+                holding: (Mutex::new((false, 0)), Condvar::new()),
             }
         })
     }
@@ -143,6 +167,38 @@ impl Disk {
 
     fn crashed(&self) -> bool {
         self.image.lock().unwrap().is_some()
+    }
+
+    /// Flushes from now wait until [`Disk::let_go`].
+    fn hold(&self) {
+        self.holding.0.lock().unwrap().0 = true;
+    }
+
+    /// Waits until `n` flushes are held.
+    fn held(&self, n: u64) {
+        let mut h = self.holding.0.lock().unwrap();
+        while h.1 < n {
+            h = self.holding.1.wait(h).unwrap();
+        }
+    }
+
+    fn let_go(&self) {
+        self.holding.0.lock().unwrap().0 = false;
+        self.holding.1.notify_all();
+    }
+
+    /// A flush, once it knows what it makes durable: waits while flushes are held.
+    fn flushing(&self) {
+        let mut h = self.holding.0.lock().unwrap();
+        if !h.0 {
+            return;
+        }
+        h.1 += 1;
+        self.holding.1.notify_all();
+        while h.0 {
+            h = self.holding.1.wait(h).unwrap();
+        }
+        h.1 -= 1;
     }
 
     /// `f` made to `held`, unless the power is out; the change that reaches the crash point cuts it.
@@ -256,8 +312,9 @@ impl File for SimFile {
             let held = self.held.lock().unwrap();
             let dst = c.as_read().buf().as_mut_slice();
             let pos = usize::try_from(pos).unwrap();
-            let n = held.seen.len().saturating_sub(pos).min(dst.len());
-            dst[..n].copy_from_slice(&held.seen[pos..pos + n]);
+            let src = held.seen.get(pos..).unwrap_or_default();
+            let n = src.len().min(dst.len());
+            dst[..n].copy_from_slice(&src[..n]);
             n
         };
         c.complete(i32::try_from(n).unwrap());
@@ -287,10 +344,24 @@ impl File for SimFile {
     }
 
     fn sync(&self, c: Completion, _sync_type: FileSyncType) -> turso_core::Result<Completion> {
+        // What was written before the flush began is what it makes durable (a flush begun later
+        // may already have made it durable).
+        let target = {
+            let held = self.held.lock().unwrap();
+            held.flushed + held.since.len() as u64
+        };
+        if let Some(disk) = self.disk.upgrade() {
+            disk.flushing();
+        }
+        pause(FLUSH_TAKES);
         self.change(|held| {
-            for change in held.since.drain(..) {
+            let n = usize::try_from(target.saturating_sub(held.flushed))
+                .unwrap()
+                .min(held.since.len());
+            for change in held.since.drain(..n) {
                 apply(&mut held.durable, &change);
             }
+            held.flushed += n as u64;
         })?;
         c.complete(0);
         Ok(c)
@@ -525,9 +596,11 @@ fn one_seed(seed: u64) -> Result<Seen, String> {
 
     let soon = || Instant::now() + Duration::from_secs(10);
     let mut sent: Vec<Sent> = Vec::new();
+    // Batches handed over and not yet waited for: up to a few stay in flight, so commits land
+    // while flushes run and checkpoints copy.
+    let mut tickets = std::collections::VecDeque::new();
     while sent.len() < 150 && !disk.crashed() {
-        // A few batches handed over together, then each waited for: they share commits.
-        let mut tickets = Vec::new();
+        // A few batches handed over together: they share commits.
         for _ in 0..1 + rng.below(3) {
             let batch = sent.len();
             let n = 1 + usize::try_from(rng.below(4)).unwrap();
@@ -543,19 +616,27 @@ fn one_seed(seed: u64) -> Result<Seen, String> {
                     batch,
                 })
                 .collect();
-            tickets.push((batch, store.put_wait(rows, soon())));
+            tickets.push_back((batch, store.put_wait(rows, soon())));
             sent.push(Sent {
                 rows: n,
                 bad,
                 told: None,
             });
         }
-        for (batch, ticket) in tickets {
+        let in_flight = usize::try_from(rng.below(4)).unwrap();
+        while tickets.len() > in_flight {
+            let (batch, ticket) = tickets.pop_front().unwrap();
             sent[batch].told = Some(match ticket {
                 Ok(t) => store.durable(&t, soon()),
                 Err(e) => Err(e),
             });
         }
+    }
+    for (batch, ticket) in tickets {
+        sent[batch].told = Some(match ticket {
+            Ok(t) => store.durable(&t, soon()),
+            Err(e) => Err(e),
+        });
     }
     let counted = store.counters();
     drop(store);
@@ -632,13 +713,41 @@ fn one_seed(seed: u64) -> Result<Seen, String> {
 /// `n` seeds from `from`: every one passes, and between them they cut the power midway in most,
 /// and acknowledged and refused batches to check.
 fn seeds(n: u64, from: u64) {
+    // Seeds side by side, each on a disk of its own (its files named apart in Turso's registry).
+    let next = AtomicU64::new(from);
+    let results: Mutex<Vec<(u64, Result<Seen, String>)>> = Mutex::new(Vec::new());
+    let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                loop {
+                    let seed = next.fetch_add(1, Ordering::Relaxed);
+                    if seed >= from + n {
+                        return;
+                    }
+                    let seen = std::panic::catch_unwind(|| one_seed(seed)).unwrap_or_else(|p| {
+                        Err(format!(
+                            "panicked: {}",
+                            p.downcast_ref::<String>().map_or_else(
+                                || p.downcast_ref::<&str>().copied().unwrap_or("?").to_owned(),
+                                Clone::clone
+                            )
+                        ))
+                    });
+                    results.lock().unwrap().push((seed, seen));
+                }
+            });
+        }
+    });
+    let mut results = results.into_inner().unwrap();
+    results.sort_by_key(|(seed, _)| *seed);
     let (mut failed, mut midway, mut acknowledged, mut refused) =
         (Vec::new(), 0u64, 0usize, 0usize);
     let (mut checkpoints, mut restarts) = (0u64, 0u64);
     // What whole workloads changed, to draw crash points from.
     let mut whole: Vec<u64> = Vec::new();
-    for seed in from..from + n {
-        match one_seed(seed) {
+    for (seed, seen) in results {
+        match seen {
             Ok(seen) => {
                 if !seen.cut_midway {
                     whole.push(seen.changes);
@@ -677,6 +786,34 @@ fn seeds(n: u64, from: u64) {
         checkpoints > 0 && restarts > 0,
         "{checkpoints} checkpoints and {restarts} restarts of the log before a cut"
     );
+}
+
+/// T-T1.1.1, the flusher's mark (docs/design/store.md, decision 15): a flush counts durable only
+/// what the log held when it began. A commit that lands while a flush runs, held here, is not
+/// copied by a checkpoint after it, which flushes no log of its own for what the mark covers.
+#[test]
+fn a_commit_that_lands_during_a_flush_is_not_counted_durable_by_it() {
+    let disk = Disk::new(1, HashMap::new());
+    let db = Db::open_with(std::path::Path::new(PATH), disk.clone()).unwrap();
+    db.exec("CREATE TABLE t (n INTEGER)").unwrap();
+    db.exec("INSERT INTO t (n) VALUES (1)").unwrap();
+    let flush = db.flusher();
+    disk.hold();
+    let flushing = std::thread::spawn(flush);
+    disk.held(1);
+    db.exec("INSERT INTO t (n) VALUES (2)").unwrap();
+    disk.let_go();
+    flushing.join().unwrap().unwrap();
+    let mut reader = db.reader().unwrap();
+    let copied = reader.checkpoint().unwrap();
+    assert!(
+        copied.left > 0,
+        "a checkpoint copied a commit no flush made durable: {copied:?}"
+    );
+    // A flush begun after it: now it is copied.
+    db.flusher()().unwrap();
+    let copied = reader.checkpoint().unwrap();
+    assert_eq!(copied.left, 0, "{copied:?}");
 }
 
 /// T-T1.1.1, a sample run in every gate: a power cut at a change drawn from each seed's workload,

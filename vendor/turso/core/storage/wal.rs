@@ -589,6 +589,10 @@ trait WalCoordination: Debug + Send + Sync {
     /// as SQLite's are.
     fn truncates_orphans(&self) -> bool;
 
+    /// Amphora: whether every frame up to `frame` of the log as it is now is known durable
+    /// (`WalSharedRuntime::durable`, in the log's current generation).
+    fn durable_through(&self, frame: u64) -> bool;
+
     /// Return the current WAL header snapshot.
     fn wal_header(&self) -> WalHeader;
 
@@ -1270,6 +1274,13 @@ impl WalCoordination for InProcessWalCoordination {
 
     fn truncates_orphans(&self) -> bool {
         false
+    }
+
+    fn durable_through(&self, frame: u64) -> bool {
+        let shared = self.shared.read();
+        let generation = shared.metadata.wal_header.lock().checkpoint_seq;
+        let durable = *shared.runtime.durable.lock();
+        durable.is_some_and(|(g, f)| g == generation && frame <= f)
     }
 
     fn prepare_truncate(&self) -> Result<Arc<dyn File>> {
@@ -2362,6 +2373,11 @@ impl WalCoordination for ShmWalCoordination {
         true
     }
 
+    fn durable_through(&self, _frame: u64) -> bool {
+        // Other processes write this log: what this one flushed says nothing of their frames.
+        false
+    }
+
     fn wal_header(&self) -> WalHeader {
         let snapshot = self.authority.snapshot();
         let mut header = self.fallback.wal_header();
@@ -2977,6 +2993,10 @@ pub struct WalSharedRuntime {
     /// Tracks how far the process-local `frame_cache` is known to be complete
     /// for overflow fallback in the current WAL generation.
     pub overflow_fallback_coverage: Arc<SpinLock<OverflowFallbackCoverage>>,
+    /// Amphora: the log known durable, as (its generation, the header's `checkpoint_seq`; the last
+    /// frame): every frame up to it was in the file when a flush of the file began, and that flush
+    /// ended. A checkpoint of frames within it flushes no log of its own. None until a flush says.
+    pub durable: SpinLock<Option<(u32, u64)>>,
     #[cfg(test)]
     pub(crate) frames_compared: AtomicU64,
 }
@@ -5054,7 +5074,10 @@ impl WalFile {
                     // checkpoint locks), so it covers exactly the frames that
                     // will be backfilled. Skipped only under synchronous=OFF,
                     // which forgoes crash durability entirely.
-                    let needs_wal_sync = !to_checkpoint.is_empty() && sync_mode != SyncMode::Off;
+                    // Amphora: and for frames a flush already made durable (`durable_through`).
+                    let needs_wal_sync = !to_checkpoint.is_empty()
+                        && sync_mode != SyncMode::Off
+                        && !self.coordination.durable_through(oc_max_frame);
                     {
                         let mut oc = self.ongoing_checkpoint.write();
                         oc.pages_to_checkpoint = to_checkpoint;
@@ -5921,6 +5944,7 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                durable: SpinLock::new(None),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },
@@ -5999,6 +6023,7 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                durable: SpinLock::new(None),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },
@@ -6043,6 +6068,7 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                durable: SpinLock::new(None),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },

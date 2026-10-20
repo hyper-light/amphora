@@ -3024,6 +3024,42 @@ impl Database {
         ))
     }
 
+    /// Amphora: where the log ends, as (its generation, the header's `checkpoint_seq`; its last
+    /// committed frame). A flush of the log's file begun after this makes every frame up to it
+    /// durable ([`Database::wal_durable`]).
+    pub fn wal_end(&self) -> (u32, u64) {
+        let shared = self.shared_wal.read();
+        let generation = shared.metadata.wal_header.lock().checkpoint_seq;
+        (
+            generation,
+            shared.metadata.max_frame.load(Ordering::Acquire),
+        )
+    }
+
+    /// Amphora: every frame up to `frame` of the log's generation `generation` is durable: a flush
+    /// begun after [`Database::wal_end`] answered them has ended. A checkpoint of frames within it
+    /// flushes no log of its own. A generation the log has since left is ignored (a restart holds
+    /// the shared log's write lock, so none happens between the check and the update).
+    pub fn wal_durable(&self, generation: u32, frame: u64) {
+        let shared = self.shared_wal.read();
+        if shared.metadata.wal_header.lock().checkpoint_seq != generation {
+            return;
+        }
+        let mut durable = shared.runtime.durable.lock();
+        match *durable {
+            Some((g, f)) if g == generation && f >= frame => {}
+            _ => *durable = Some((generation, frame)),
+        }
+    }
+
+    /// Amphora: the last frame of the log known durable in its current generation.
+    pub fn wal_durable_frame(&self) -> Option<u64> {
+        let shared = self.shared_wal.read();
+        let generation = shared.metadata.wal_header.lock().checkpoint_seq;
+        let durable = *shared.runtime.durable.lock();
+        durable.and_then(|(g, f)| if g == generation { Some(f) } else { None })
+    }
+
     pub fn shared_wal_open_telemetry(&self) -> Result<SharedWalOpenTelemetry> {
         let shared_wal = self.shared_wal.read();
         let loaded_from_disk_scan = shared_wal
