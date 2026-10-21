@@ -64,6 +64,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   statement runs, so an index seeks it; a BLOB matches no GLOB or LIKE (SQLite's recommended
   `SQLITE_LIKE_DOESNT_MATCH_BLOBS`). The suite asks SQLite's dialect for GLOB where it asks the
   others for LIKE, as their LIKE heeds case.
+- **Skip-scan** (docs/design/planner.md decision 4, `crates/engine/tests/skip_scan.rs`): a constraint
+  on an index's second column alone seeks it once for each value of its first, where ANALYZE
+  counted at least 18 rows to a value, as SQLite does. `count_range` 165 → 2,476 statements a
+  second at 1 client and 2,644 → 32,892 at 32 (fedora, best of 3 at load 2–7, not recorded runs).
 - **Readers keep their pages across commits** (docs/design/store.md decision 18,
   `crates/engine/storage/changes.rs`): a connection starting a read transaction forgets only the
   pages written since its last one, where SQLite and Turso forget its whole cache; it forgets

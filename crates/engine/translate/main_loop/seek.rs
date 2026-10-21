@@ -93,6 +93,8 @@ pub(super) struct SeekEmitter<'a, 'plan> {
     loop_end: BranchOffset,
     seek_index: Option<&'a Arc<Index>>,
     is_index: bool,
+    /// Amphora: where a skip-scan seeks the next distinct value of its skipped columns.
+    skip_next: Option<BranchOffset>,
 }
 
 impl<'a, 'plan> SeekEmitter<'a, 'plan> {
@@ -117,12 +119,69 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             loop_end,
             seek_index,
             is_index: seek_index.is_some(),
+            skip_next: None,
         }
+    }
+
+    /// The registers `key` takes: the skipped columns' and the key's own.
+    fn key_len(&self, key: &SeekKey) -> Result<usize> {
+        self.seek_def
+            .skip
+            .checked_add(self.seek_def.size(key))
+            .ok_or_else(|| crate::LimboError::InternalError("seek key too long".to_string()))
+    }
+
+    /// The first register of the key's own components, after the skipped columns'.
+    fn key_reg(&self) -> Result<usize> {
+        self.start_reg
+            .checked_add(self.seek_def.skip)
+            .ok_or_else(|| crate::LimboError::InternalError("seek key too long".to_string()))
+    }
+
+    /// Affinities for `key`: none for the skipped columns, read from the index as they are.
+    fn key_affinities(&self, key: &SeekKey) -> String {
+        std::iter::repeat_n(affinity::SQLITE_AFF_BLOB, self.seek_def.skip)
+            .chain(index_seek_affinities(self.seek_def, key).chars())
+            .collect()
+    }
+
+    /// Amphora: a skip-scan's outer loop, as SQLite codes it (`codeAllEqualityTerms`,
+    /// `docs/design/planner.md` decision 4): the first entry's skipped columns go to the key's
+    /// first registers, the seek within them follows, and when their range ends the next
+    /// distinct value is the first entry past them.
+    fn emit_skip_scan_start(&mut self) {
+        let first = self.program.allocate_label();
+        let skip_next = self.program.allocate_label();
+        self.program.emit_insn(Insn::Rewind {
+            cursor_id: self.seek_cursor_id,
+            pc_if_empty: self.loop_end,
+        });
+        self.program.emit_insn(Insn::Goto { target_pc: first });
+        self.program.preassign_label_to_next_insn(skip_next);
+        self.program.emit_insn(Insn::SeekGT {
+            is_index: true,
+            cursor_id: self.seek_cursor_id,
+            start_reg: self.start_reg,
+            num_regs: self.seek_def.skip,
+            target_pc: self.loop_end,
+        });
+        self.program.preassign_label_to_next_insn(first);
+        for (column, dest) in (0..self.seek_def.skip).zip(self.start_reg..) {
+            self.program.emit_insn(Insn::Column {
+                cursor_id: self.seek_cursor_id,
+                column,
+                dest,
+                default: None,
+            });
+        }
+        self.skip_next = Some(skip_next);
     }
 
     /// Emit the start bound and position the cursor at the first candidate row.
     fn emit_start_bound(&mut self, use_bloom_filter: bool) -> Result<()> {
-        if self.seek_def.prefix.is_empty()
+        if self.seek_def.skip > 0 {
+            self.emit_skip_scan_start();
+        } else if self.seek_def.prefix.is_empty()
             && matches!(self.seek_def.start.last_component, SeekKeyComponent::None)
         {
             match self.seek_def.iter_dir {
@@ -168,8 +227,9 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             return Ok(());
         }
 
+        let key_reg = self.key_reg()?;
         for (i, key) in self.seek_def.iter(&self.seek_def.start).enumerate() {
-            let reg = self.start_reg + i;
+            let reg = key_reg + i;
             match key {
                 SeekKeyComponent::Expr(expr) => {
                     translate_expr_no_constant_opt(
@@ -199,13 +259,15 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 }
             }
         }
-        let num_regs = self.seek_def.size(&self.seek_def.start);
+        let num_regs = self.key_len(&self.seek_def.start)?;
         // Which key components match NULL rather than comparing with `=`; the
         // seek and the bloom-filter probe keep their "NULL key cannot match"
-        // shortcut for the rest.
+        // shortcut for the rest. A skipped column's NULLs are a value it holds.
         let mut null_matching_bits = BitSet::default();
         for i in 0..num_regs {
-            if self.seek_def.is_null_matching_key_component(i) {
+            if i.checked_sub(self.seek_def.skip)
+                .is_none_or(|pos| self.seek_def.is_null_matching_key_component(pos))
+            {
                 null_matching_bits.set(i)?;
             }
         }
@@ -216,12 +278,12 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 self.program,
                 self.tables,
                 idx,
-                self.start_reg,
-                num_regs,
-                0,
+                key_reg,
+                self.seek_def.size(&self.seek_def.start),
+                self.seek_def.skip,
                 &self.t_ctx.resolver,
             )?;
-            let affinities = index_seek_affinities(self.seek_def, &self.seek_def.start);
+            let affinities = self.key_affinities(&self.seek_def.start);
             if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
                 self.program.emit_insn(Insn::Affinity {
                     start_reg: self.start_reg,
@@ -251,13 +313,16 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             }
         }
 
+        // A skip-scan's seek that finds nothing for one value of its skipped columns goes on to the
+        // next value.
+        let not_found = self.skip_next.unwrap_or(self.loop_end);
         match self.seek_def.start.op {
             SeekOp::GE { eq_only } => self.program.emit_insn(Insn::SeekGE {
                 is_index: self.is_index,
                 cursor_id: self.seek_cursor_id,
                 start_reg: self.start_reg,
                 num_regs,
-                target_pc: self.loop_end,
+                target_pc: not_found,
                 eq_only,
                 null_matching_mask,
             }),
@@ -266,14 +331,14 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 cursor_id: self.seek_cursor_id,
                 start_reg: self.start_reg,
                 num_regs,
-                target_pc: self.loop_end,
+                target_pc: not_found,
             }),
             SeekOp::LE { eq_only } => self.program.emit_insn(Insn::SeekLE {
                 is_index: self.is_index,
                 cursor_id: self.seek_cursor_id,
                 start_reg: self.start_reg,
                 num_regs,
-                target_pc: self.loop_end,
+                target_pc: not_found,
                 eq_only,
                 null_matching_mask,
             }),
@@ -282,7 +347,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 cursor_id: self.seek_cursor_id,
                 start_reg: self.start_reg,
                 num_regs,
-                target_pc: self.loop_end,
+                target_pc: not_found,
             }),
         };
 
@@ -291,7 +356,8 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
 
     /// Emit the end bound check and anchor the loop-start label.
     fn emit_termination(&mut self, loop_start: BranchOffset) -> Result<()> {
-        if self.seek_def.prefix.is_empty()
+        if self.seek_def.skip == 0
+            && self.seek_def.prefix.is_empty()
             && matches!(self.seek_def.end.last_component, SeekKeyComponent::None)
         {
             self.program.preassign_label_to_next_insn(loop_start);
@@ -326,8 +392,8 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             return Ok(());
         }
 
-        let num_regs = self.seek_def.size(&self.seek_def.end);
-        let last_reg = self.start_reg + self.seek_def.prefix.len();
+        let num_regs = self.key_len(&self.seek_def.end)?;
+        let last_reg = self.key_reg()? + self.seek_def.prefix.len();
         match &self.seek_def.end.last_component {
             SeekKeyComponent::Expr(expr) => {
                 translate_expr_no_constant_opt(
@@ -339,16 +405,23 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     NoConstantOptReason::RegisterReuse,
                 )?;
                 if let Some(idx) = self.seek_index {
+                    let last_col = self
+                        .seek_def
+                        .skip
+                        .checked_add(self.seek_def.prefix.len())
+                        .ok_or_else(|| {
+                            crate::LimboError::InternalError("seek key too long".to_string())
+                        })?;
                     encode_seek_keys_for_custom_types(
                         self.program,
                         self.tables,
                         idx,
                         last_reg,
                         1,
-                        self.seek_def.prefix.len(),
+                        last_col,
                         &self.t_ctx.resolver,
                     )?;
-                    let affinities = index_seek_affinities(self.seek_def, &self.seek_def.end);
+                    let affinities = self.key_affinities(&self.seek_def.end);
                     if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
                         self.program.emit_insn(Insn::Affinity {
                             start_reg: self.start_reg,
@@ -396,30 +469,32 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             };
         }
 
+        // Past a skip-scan's range for one value of its skipped columns, the next value.
+        let range_end = self.skip_next.unwrap_or(self.loop_end);
         match (self.is_index, self.seek_def.end.op) {
             (true, SeekOp::GE { .. }) => self.program.emit_insn(Insn::IdxGE {
                 cursor_id: self.seek_cursor_id,
                 start_reg: self.start_reg,
                 num_regs,
-                target_pc: self.loop_end,
+                target_pc: range_end,
             }),
             (true, SeekOp::GT) => self.program.emit_insn(Insn::IdxGT {
                 cursor_id: self.seek_cursor_id,
                 start_reg: self.start_reg,
                 num_regs,
-                target_pc: self.loop_end,
+                target_pc: range_end,
             }),
             (true, SeekOp::LE { .. }) => self.program.emit_insn(Insn::IdxLE {
                 cursor_id: self.seek_cursor_id,
                 start_reg: self.start_reg,
                 num_regs,
-                target_pc: self.loop_end,
+                target_pc: range_end,
             }),
             (true, SeekOp::LT) => self.program.emit_insn(Insn::IdxLT {
                 cursor_id: self.seek_cursor_id,
                 start_reg: self.start_reg,
                 num_regs,
-                target_pc: self.loop_end,
+                target_pc: range_end,
             }),
             (false, SeekOp::GE { .. }) => self.program.emit_insn(Insn::Ge {
                 lhs: rowid_reg.unwrap(),

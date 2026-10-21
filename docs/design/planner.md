@@ -102,3 +102,50 @@ mutant) the scan comparison and the bounds' test fail.
 
 **Falsified by.** A row a GLOB matches that its seek misses; a statement that relied on a BLOB
 matching a LIKE or a GLOB.
+
+## 4. A constraint on an index's second column skip-scans it
+
+**Decision.** Where no constraint seeks an index's first column but one seeks its second, and
+ANALYZE counted at least 18 rows to each value of the first, the planner costs a skip-scan too
+(`access_method.rs`, `skip_scan_refs`): a seek for each distinct value of the first column, with
+the constraint's range within it. The first column must be a plain ascending one with its NULLs
+first and the index not partial; the scan reads forwards. Its cost is a seek for each value,
+counted 1.375 times over, each reading its value's share of the rows the constraints keep
+(`cost.rs`, `estimate_skip_scan_cost`). The bytecode rewinds the index, reads the first entry's
+first column into the key's first register and seeks within that value (`seek.rs`,
+`emit_skip_scan_start`); where the range ends, or a seek within a value finds nothing, a `SeekGT`
+on that one column finds the next value, and the key is built again for it. A NULL is a value like
+any other: the skipped column's key component matches NULL, and a one-sided range keeps its NULL
+boundary within each value as within an equality prefix. EXPLAIN words it as SQLite does:
+`ANY(grp) AND created>=? AND created<=?`.
+
+**Why.** The suite's `count_range` (`COUNT(*)` of a 10,000-row range of `created`, which only
+`items_grp_created (grp, created)` holds, second) scanned the whole table: 160 statements a second
+at 1 client against SQLite's 4,553, the widest gap to an engine of its kind in the suite. SQLite's
+plan for it is this skip-scan.
+
+**Sources.** SQLite's `whereLoopAddBtreeIndex` (`src/where.c`): a skip-scan is tried where no WHERE
+term constrains an index's left-most column and ANALYZE (`sqlite_stat1`) found that column's values
+repeated 18 times or more on average ("scanning 17 rows is almost always quicker than an index
+seek"), its iterations given a 1.375 fudge factor; its code (`codeAllEqualityTerms`,
+`sqlite3WhereEnd`): a rewind, the skipped column read into the key, `OP_SeekGT` on it for the next
+value. "The SQLite Query Optimizer Overview", section "The Skip-Scan Optimization": the same
+conditions in words, ANALYZE among them.
+
+**Evidence.** `crates/engine/tests/skip_scan.rs`: after ANALYZE the plan is `SEARCH t USING
+COVERING INDEX t_idx (ANY(g) AND c>=? AND c<=?)`; none before ANALYZE, with a first column all but
+unique, or with the first column constrained. Ten shapes of filter (ranges open and closed, an
+equality, `IS NULL`, an empty range, a residual on the first column) on four tables (an integer
+first column, a case-blind text one, a descending second column, a third column after it), each
+read five ways (rows, aggregates, ordered by the index, ordered by the second column, under a
+LIMIT) and inside a join, read exactly what the same statements read from an unindexed copy; 41
+of them skip-scan. Counting about 530 rows of 30,000 runs fewer than 2,700 instructions, where a
+scan runs some for every row. Four mutants each fail them: the skipped column not matching NULL, a
+seek that finds nothing in one value ending the scan, a range's end ending it, no NULL boundary
+within a value. Release binaries on fedora (200,000 items, best of 3 in turns; load 2–7 from other
+work, so checks, not recorded runs): `count_range` 165 → 2,476 statements a second at 1 client
+(p99 7.4 → 0.47 ms) and 2,644 → 32,892 at 32 (p99 14.8 → 1.5 ms); `range_secondary_100` and
+`order_by_index`, seeks of the same index, unchanged.
+
+**Falsified by.** A row a skip-scan misses or adds; a statement a skip-scan makes slower than the
+scan it replaced (a first column whose values hold few rows each, where ANALYZE's average misleads).

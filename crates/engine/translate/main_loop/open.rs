@@ -571,9 +571,9 @@ pub(super) fn emit_table_read_start(
                         })
                     };
 
-                    let max_registers = seek_def
-                        .size(&seek_def.start)
-                        .max(seek_def.size(&seek_def.end));
+                    let max_registers = seek_def.key_registers().ok_or_else(|| {
+                        crate::LimboError::InternalError("seek key too long".to_string())
+                    })?;
                     let start_reg = program.alloc_registers(max_registers);
                     SeekEmitter::new(
                         program,

@@ -3622,6 +3622,10 @@ pub struct SeekDef {
     pub end: SeekKey,
     /// The direction of the scan that follows the seek.
     pub iter_dir: IterationDirection,
+    /// Amphora: leading index columns no constraint names, read from the index before the key
+    /// (`docs/design/planner.md`, decision 4). With one, the seek runs once for each distinct
+    /// value of them: a skip-scan, as SQLite's. Zero for every other seek.
+    pub skip: usize,
 }
 
 pub struct SeekDefKeyIterator<'a, T> {
@@ -3685,6 +3689,12 @@ impl SeekDef {
                 SeekKeyComponent::None => 0,
             }
     }
+    /// Amphora: the registers a seek's keys take: its skipped columns' and its longer key's.
+    pub fn key_registers(&self) -> Option<usize> {
+        self.skip
+            .checked_add(self.size(&self.start).max(self.size(&self.end)))
+    }
+
     /// iterate over value expressions in the given seek key
     pub fn iter<'a>(
         &'a self,

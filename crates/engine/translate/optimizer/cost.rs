@@ -477,6 +477,15 @@ fn estimate_rows_from_analyze_stats(
 ) -> Option<f64> {
     let index = ctx.index?;
 
+    // Amphora: a skip-scan's refs start past the index's first column, where the per-prefix
+    // averages don't line up with them; its rows are the selectivity estimate's (decision 4).
+    if constraint_refs
+        .first()
+        .is_some_and(|cref| cref.index_col_pos > 0)
+    {
+        return None;
+    }
+
     // Only count leading equality-constrained columns. ANALYZE stats give
     // avg rows per distinct prefix value, which is only meaningful for
     // equality lookups. A range constraint (>, <, >=, <=) scans a portion
@@ -516,6 +525,43 @@ fn estimate_rows_from_analyze_stats(
         // Return None to fall through to selectivity-based estimation.
         None
     }
+}
+
+/// Amphora: SQLite counts a skip-scan's seeks 1.375 times over, its estimates being uncertain, to
+/// make one "slightly less likely" (`whereLoopAddBtreeIndex`, "TUNING").
+const SKIP_SCAN_SEEK_FUDGE: f64 = 1.375;
+
+/// Amphora: a skip-scan's cost (`docs/design/planner.md`, decision 4), as SQLite's
+/// `whereLoopAddBtreeIndex` reckons one: a seek for each distinct value of the index's first column
+/// (`rows_per_value` rows share one, as ANALYZE counted), each reading the rows of its value that
+/// the constraints on the columns after it keep.
+pub(super) fn estimate_skip_scan_cost(
+    index_info: IndexInfo,
+    constraints: &[Constraint],
+    constraint_refs: &[RangeConstraintRef],
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    rows_per_value: f64,
+    params: &CostModelParams,
+) -> Cost {
+    let rows = estimate_rows_per_seek(
+        index_info,
+        constraints,
+        constraint_refs,
+        base_row_count,
+        None,
+        params,
+    );
+    let base_row_count = *base_row_count;
+    let values = (base_row_count / rows_per_value.max(1.0)).max(1.0);
+    estimate_index_cost(
+        base_row_count,
+        estimate_btree_depth(base_row_count, params.rows_per_table_page),
+        index_info,
+        input_cardinality * values * SKIP_SCAN_SEEK_FUDGE,
+        rows / values,
+        params,
+    )
 }
 
 /// Estimate the cost of a scan or seek operation.

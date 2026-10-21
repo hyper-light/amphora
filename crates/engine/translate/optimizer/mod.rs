@@ -4462,8 +4462,12 @@ pub fn build_seek_def_from_constraints(
                 op: end_op,
                 affinity: Affinity::Blob,
             },
+            skip: 0,
         });
     }
+    // Amphora: refs that start past the index's first column leave the columns before them to a
+    // skip-scan (`docs/design/planner.md`, decision 4); every other seek's refs start at it.
+    let skip = constraint_refs.first().map_or(0, |cref| cref.index_col_pos);
     // Extract the key values and operators
     let key = constraint_refs
         .iter()
@@ -4472,7 +4476,7 @@ pub fn build_seek_def_from_constraints(
         })
         .collect();
 
-    let seek_def = build_seek_def(iter_dir, key)?;
+    let seek_def = build_seek_def(iter_dir, key, skip)?;
     Ok(seek_def)
 }
 
@@ -4504,6 +4508,7 @@ pub fn build_seek_def_from_constraints(
 fn build_seek_def(
     iter_dir: IterationDirection,
     mut key: Vec<SeekRangeConstraint>,
+    skip: usize,
 ) -> Result<SeekDef> {
     turso_assert!(!key.is_empty());
     let last = key.last().unwrap();
@@ -4527,6 +4532,7 @@ fn build_seek_def(
                 op: end_op,
                 affinity: Affinity::Blob,
             },
+            skip,
         });
     }
     turso_assert!(last.lower_bound.is_some() || last.upper_bound.is_some());
@@ -4537,7 +4543,8 @@ fn build_seek_def(
     // after that all key components must be equality constraints
     turso_debug_assert!(key.iter().all(|k| k.eq.is_some()));
 
-    let has_prefix = !key.is_empty();
+    // Amphora: a skip-scan's skipped columns are a prefix of each of its seeks.
+    let has_prefix = !key.is_empty() || skip > 0;
     let apply_null_boundaries = |start: &mut SeekKey, end: &mut SeekKey| {
         // Sometimes we must add an extra NULL to the key on purpose.
         // We do this so scans over composite indexes match SQLite exactly.
@@ -4730,6 +4737,7 @@ fn build_seek_def(
                 iter_dir,
                 start,
                 end,
+                skip,
             }
         }
         IterationDirection::Backwards => {
@@ -4851,6 +4859,7 @@ fn build_seek_def(
                 iter_dir,
                 start,
                 end,
+                skip,
             }
         }
     })

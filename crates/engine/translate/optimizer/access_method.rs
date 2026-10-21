@@ -13,7 +13,7 @@ use crate::translate::expr::{as_binary_components, comparison_affinity, walk_exp
 use crate::translate::optimizer::constraints::{
     convert_to_vtab_constraint, expr_uses_custom_collation, ordered_ephemeral_key_columns,
     partial_index, partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
-    RangeConstraintRef,
+    ConstraintRef, RangeConstraintRef,
 };
 use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
 use crate::translate::optimizer::cost_params::CostModelParams;
@@ -38,7 +38,8 @@ use super::{
     cost::{
         constraints_selectivity, estimate_btree_depth, estimate_cost_for_scan_or_seek,
         estimate_ephemeral_index_build_cost, estimate_index_cost, estimate_rows_per_seek,
-        estimate_scan_cost, estimate_sort_cpu_cost, AnalyzeCtx, Cost, IndexInfo,
+        estimate_scan_cost, estimate_skip_scan_cost, estimate_sort_cpu_cost, AnalyzeCtx, Cost,
+        IndexInfo,
     },
     join::JoinPlanningContext,
     multi_index::{
@@ -189,6 +190,63 @@ pub(super) enum BranchReadMode {
     FullRow,
 }
 
+/// Amphora: SQLite skip-scans an index only where ANALYZE found at least 18 rows sharing each value
+/// of its first column (`whereLoopAddBtreeIndex`, `aiRowLogEst[1] >= 42`, 42 the LogEst of 18):
+/// scanning 17 rows is almost always quicker than a seek, and extra seeks can cost far more.
+const SKIP_SCAN_MIN_ROWS_PER_VALUE: u64 = 18;
+
+/// Amphora: the constraint refs a skip-scan of `index` seeks with, past its first column, and how
+/// many rows share a value of that column (`docs/design/planner.md`, decision 4). Only where
+/// ANALYZE counted at least [SKIP_SCAN_MIN_ROWS_PER_VALUE] of them, the column is a plain ascending
+/// one with its NULLs first, the index is not partial, and a constraint seeks the column after it.
+fn skip_scan_refs(
+    index: &Index,
+    table: &JoinedTable,
+    constraints: &[Constraint],
+    refs: &[ConstraintRef],
+    lhs_mask: &TableMask,
+    table_idx: usize,
+    analyze_stats: &AnalyzeStats,
+) -> Option<(SmallVec<[RangeConstraintRef; 2]>, f64)> {
+    let first = index.columns.first()?;
+    if index.columns.len() < 2
+        || index.where_clause.is_some()
+        || first.expr.is_some()
+        || first.order != SortOrder::Asc
+        || first.effective_nulls_order() != ast::NullsOrder::First
+    {
+        return None;
+    }
+    let rows_per_value = *analyze_stats
+        .table_stats(table.table.get_name())?
+        .index_stats
+        .get(&index.name)?
+        .avg_rows_per_distinct_prefix
+        .first()?;
+    if rows_per_value < SKIP_SCAN_MIN_ROWS_PER_VALUE {
+        return None;
+    }
+    // The refs on the columns after the first, as if those led the index.
+    let after_first: SmallVec<[ConstraintRef; 4]> = refs
+        .iter()
+        .filter_map(|cref| {
+            Some(ConstraintRef {
+                index_col_pos: cref.index_col_pos.checked_sub(1)?,
+                ..cref.clone()
+            })
+        })
+        .collect();
+    let mut usable =
+        usable_constraints_for_lhs_mask(constraints, &after_first, lhs_mask, table_idx);
+    if usable.is_empty() {
+        return None;
+    }
+    for cref in usable.iter_mut() {
+        cref.index_col_pos = cref.index_col_pos.checked_add(1)?;
+    }
+    Some((usable, rows_per_value as f64))
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Choose the best ordinary btree lookup candidate for one table under the
 /// current join-order prefix.
@@ -261,14 +319,33 @@ pub(super) fn choose_best_btree_candidate(
     };
 
     // Estimate cost for each candidate index (including the rowid index) and
-    // keep the best candidate.
-    for candidate in rhs_constraints.candidates.iter() {
+    // keep the best candidate. Amphora: an index whose first column no constraint
+    // seeks is tried as a skip-scan too (`docs/design/planner.md`, decision 4).
+    let trials = rhs_constraints.candidates.iter().flat_map(|candidate| {
         let usable_constraint_refs = usable_constraints_for_lhs_mask(
             &rhs_constraints.constraints,
             &candidate.refs,
             lhs_mask,
             rhs_table_idx,
         );
+        let skip_scan = match &candidate.index {
+            Some(index) if usable_constraint_refs.is_empty() && !keeps_right_rows => {
+                skip_scan_refs(
+                    index,
+                    rhs_table,
+                    &rhs_constraints.constraints,
+                    &candidate.refs,
+                    lhs_mask,
+                    rhs_table_idx,
+                    analyze_stats,
+                )
+            }
+            _ => None,
+        };
+        iter::once((candidate, usable_constraint_refs, None))
+            .chain(skip_scan.map(|(refs, rows_per_value)| (candidate, refs, Some(rows_per_value))))
+    });
+    for (candidate, usable_constraint_refs, skip_rows_per_value) in trials {
         // The unmatched-row pass reads expressions from the table cursor after
         // a full index scan ends. An expression-index cursor cannot supply
         // values to that pass. A constrained seek remains safe because the
@@ -347,6 +424,11 @@ pub(super) fn choose_best_btree_candidate(
         } else {
             (IterationDirection::Forwards, false)
         };
+        // A skip-scan reads forwards alone.
+        let (iter_dir, is_index_ordered) = match (skip_rows_per_value, iter_dir) {
+            (Some(_), IterationDirection::Backwards) => (IterationDirection::Forwards, false),
+            _ => (iter_dir, is_index_ordered),
+        };
 
         let analyze_ctx = AnalyzeCtx {
             rhs_table,
@@ -375,16 +457,27 @@ pub(super) fn choose_best_btree_candidate(
             }
             None => base_row_count,
         };
-        let cost = estimate_cost_for_scan_or_seek(
-            Some(index_info),
-            &rhs_constraints.constraints,
-            &usable_constraint_refs,
-            input_cardinality,
-            candidate_base_row_count,
-            is_index_ordered,
-            params,
-            Some(&analyze_ctx),
-        );
+        let cost = match skip_rows_per_value {
+            Some(rows_per_value) => estimate_skip_scan_cost(
+                index_info,
+                &rhs_constraints.constraints,
+                &usable_constraint_refs,
+                input_cardinality,
+                candidate_base_row_count,
+                rows_per_value,
+                params,
+            ),
+            None => estimate_cost_for_scan_or_seek(
+                Some(index_info),
+                &rhs_constraints.constraints,
+                &usable_constraint_refs,
+                input_cardinality,
+                candidate_base_row_count,
+                is_index_ordered,
+                params,
+                Some(&analyze_ctx),
+            ),
+        };
 
         // Residual filter output adjustment (mirrors SQLite's whereLoopOutputAdjust).
         //

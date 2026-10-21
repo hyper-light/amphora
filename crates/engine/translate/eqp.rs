@@ -425,16 +425,22 @@ fn key_constraint_parts<'a>(
     name: impl Fn(usize) -> Option<&'a str>,
 ) -> Vec<String> {
     let mut parts = Vec::new();
+    // Amphora: a skip-scan's skipped columns, as SQLite words them (`planner.md`, decision 4).
+    for i in 0..seek_def.skip {
+        if let Some(col) = name(i) {
+            parts.push(format!("ANY({col})"));
+        }
+    }
     // Equality prefix constraints
-    for (i, _constraint) in seek_def.prefix.iter().enumerate() {
+    for (i, _constraint) in (seek_def.skip..).zip(seek_def.prefix.iter()) {
         if let Some(col) = name(i) {
             parts.push(format!("{col}=?"));
         }
     }
     // Range constraint from start key
-    let range_col_idx = seek_def.prefix.len();
+    let range_col_idx = seek_def.skip.checked_add(seek_def.prefix.len());
     if let SeekKeyComponent::Expr(_) = &seek_def.start.last_component {
-        if let Some(col) = name(range_col_idx) {
+        if let Some(col) = range_col_idx.and_then(&name) {
             let op_str = match seek_def.start.op {
                 SeekOp::GE { .. } => ">=",
                 SeekOp::GT => ">",
@@ -448,7 +454,7 @@ fn key_constraint_parts<'a>(
     // The end key's SeekOp is the B-tree termination condition (the negation of the
     // user-facing SQL operator), so we reverse it for display.
     if let SeekKeyComponent::Expr(_) = &seek_def.end.last_component {
-        if let Some(col) = name(range_col_idx) {
+        if let Some(col) = range_col_idx.and_then(&name) {
             let op_str = match seek_def.end.op {
                 SeekOp::GE { .. } => "<",
                 SeekOp::GT => "<=",

@@ -54,5 +54,5 @@ Kiln vendors it at `vendor/amphora` and reaches it only through kiln-seams' `Rec
 | Transactions across groups and follower reads | CP-T1.10 | open |
 | Regions: region-local groups, the global root, the multi-region class | CP-T1.11 | open |
 | The engine: Turso's four crates made Amphora's own (`crates/engine*`, its `ORIGIN.md`), not vendored; CLAUDE.md §1 on every line Amphora writes, the rest counted down (`scripts/engine-ratchet.toml`) | Ada, 2026-10-20 | made |
-| The planner's cost model where the bench suite found it choosing far more work: closed ranges, sorts (`planner.md`) | CP-T1.2 | made |
-| The executor's work repeated on every run of a statement: ephemeral tables kept between runs (`executor.md`) | CP-T1.2 | made |
+| The planner where the bench suite found it choosing far more work: closed ranges, sorts, GLOB prefixes, skip-scans (`planner.md`) | CP-T1.2 | made |
+| The executor's work repeated on every run of a statement or row: ephemeral tables kept between runs, an IN subquery's list searched once a row (`executor.md`) | CP-T1.2 | made |
