@@ -85,6 +85,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   `crates/engine/tests/ephemeral_reuse.rs`): a statement keeps each ephemeral table of at most 16
   pages (an IN list's keys, an IN subquery's rows) and empties it on its next run, where building
   one each run (a temp file, a pager, a transaction, a B-tree) was a third of `in_list_10`'s time.
+- **`IN (SELECT ...)` searches its list once a row** (docs/design/executor.md decision 2,
+  `crates/engine/tests/in_subquery.rs`): as a condition a miss fails the row at once; as a value or
+  under `NOT IN`, a one-column list's first entry says whether it holds a NULL, where every miss
+  read the whole list. `subquery_in` 213 → 784 statements a second at 1 client, 2,846 → 6,833 at
+  32 (fedora, best of 3 in turns, not recorded runs).
 
 ## Measured
 

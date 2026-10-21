@@ -443,6 +443,13 @@ fn translate_subquery_result_expr(
 
             // Null checking loop: scan ephemeral for any all-NULL tuples.
             // If found, result is NULL (unknown). If not found, result depends on IN vs NOT IN.
+            // Amphora: a one-column list is an index whose NULLs sort first, so its first row
+            // decides, as in SQLite's `sqlite3ExprCodeIN` (`docs/design/executor.md`, decision 2).
+            let label_row_differs = if lhs_column_count == 1 {
+                label_on_no_null
+            } else {
+                label_null_checks_next
+            };
             program.preassign_label_to_next_insn(label_null_rewind);
             program.emit_insn(Insn::Rewind {
                 cursor_id: *cursor_id,
@@ -461,7 +468,7 @@ fn translate_subquery_result_expr(
                 program.emit_insn(Insn::Ne {
                     lhs: lhs_column_regs_start + i,
                     rhs: column_check_reg,
-                    target_pc: label_null_checks_next,
+                    target_pc: label_row_differs,
                     flags: CmpInsFlags::default().with_affinity(affinity),
                     collation: program.curr_collation(),
                 });
@@ -470,17 +477,19 @@ fn translate_subquery_result_expr(
             program.emit_insn(Insn::Goto {
                 target_pc: label_null_result,
             });
-            program.preassign_label_to_next_insn(label_null_checks_next);
-            program.emit_insn(Insn::Next {
-                cursor_id: *cursor_id,
-                pc_if_next: label_null_checks_loop_start,
-                fullscan: false,
-                is_index: false,
-            });
-            // Loop exhausted without finding all-NULL row
-            program.emit_insn(Insn::Goto {
-                target_pc: label_on_no_null,
-            });
+            if lhs_column_count > 1 {
+                program.preassign_label_to_next_insn(label_null_checks_next);
+                program.emit_insn(Insn::Next {
+                    cursor_id: *cursor_id,
+                    pc_if_next: label_null_checks_loop_start,
+                    fullscan: false,
+                    is_index: false,
+                });
+                // Loop exhausted without finding all-NULL row
+                program.emit_insn(Insn::Goto {
+                    target_pc: label_on_no_null,
+                });
+            }
             // Final result handling:
             // label_include_row: result = 1 (TRUE)
             // label_skip_row: result = 0 (FALSE)

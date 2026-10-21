@@ -349,6 +349,70 @@ pub fn translate_condition_expr(
     }
 }
 
+/// Amphora: `lhs IN (SELECT ...)` as a condition, answered by one search of the subquery's list. A
+/// condition fails on NULL as on FALSE (`emit_cond_jump`), so neither a NULL on the left nor one in
+/// the list needs telling from a miss: SQLite's `sqlite3ExprCodeIN` when its FALSE and NULL
+/// destinations are one (`docs/design/executor.md`, decision 2).
+fn translate_in_subquery_condition(
+    program: &mut ProgramBuilder,
+    referenced_tables: &TableReferences,
+    lhs: &ast::Expr,
+    cursor_id: usize,
+    affinity_str: &str,
+    condition_metadata: ConditionMetadata,
+    resolver: &Resolver,
+) -> Result<()> {
+    let lhs_columns: Vec<&ast::Expr> = match unwrap_parens(lhs)? {
+        ast::Expr::Parenthesized(exprs) => exprs.iter().map(|e| e.as_ref()).collect(),
+        expr => vec![expr],
+    };
+    let count = lhs_columns.len();
+    let start = program.alloc_registers(count);
+    // A row the list doesn't hold fails: on past the condition where it jumps on TRUE.
+    let not_true = if condition_metadata.jump_if_condition_is_true {
+        program.allocate_label()
+    } else {
+        condition_metadata.jump_target_when_false
+    };
+    for (reg, column) in (start..).zip(lhs_columns) {
+        translate_expr(program, Some(referenced_tables), column, reg, resolver)?;
+        program.emit_insn(Insn::IsNull {
+            reg,
+            target_pc: not_true,
+        });
+    }
+    if affinity_str
+        .chars()
+        .map(Affinity::from_char)
+        .any(|a| a != Affinity::Blob)
+    {
+        if let Ok(count) = std::num::NonZeroUsize::try_from(count) {
+            program.emit_insn(Insn::Affinity {
+                start_reg: start,
+                count,
+                affinities: affinity_str.to_owned(),
+            });
+        }
+    }
+    if condition_metadata.jump_if_condition_is_true {
+        program.emit_insn(Insn::Found {
+            cursor_id,
+            target_pc: condition_metadata.jump_target_when_true,
+            record_reg: start,
+            num_regs: count,
+        });
+        program.preassign_label_to_next_insn(not_true);
+    } else {
+        program.emit_insn(Insn::NotFound {
+            cursor_id,
+            target_pc: condition_metadata.jump_target_when_false,
+            record_reg: start,
+            num_regs: count,
+        });
+    }
+    Ok(())
+}
+
 /// Translates a condition that is not an AND, an OR, or a parenthesized
 /// condition. It is never inlined, so that the recursion over AND and OR in
 /// [translate_condition_expr()] does not pay for its stack frame at every level.
@@ -361,9 +425,31 @@ fn translate_leaf_condition_expr(
     resolver: &Resolver,
 ) -> Result<()> {
     match expr {
-        ast::Expr::SubqueryResult { query_type, .. } => match query_type {
+        ast::Expr::SubqueryResult {
+            lhs,
+            not_in,
+            query_type,
+            ..
+        } => match query_type {
             SubqueryType::Exists { result_reg } => {
                 emit_cond_jump(program, condition_metadata, *result_reg);
+            }
+            SubqueryType::In {
+                cursor_id,
+                affinity_str,
+            } if !*not_in => {
+                let Some(lhs) = lhs.as_deref() else {
+                    crate::bail_parse_error!("IN (SELECT ...) has no left-hand side");
+                };
+                translate_in_subquery_condition(
+                    program,
+                    referenced_tables,
+                    lhs,
+                    *cursor_id,
+                    affinity_str.as_str(),
+                    condition_metadata,
+                    resolver,
+                )?;
             }
             SubqueryType::In { .. } => {
                 let result_reg = program.alloc_register();
