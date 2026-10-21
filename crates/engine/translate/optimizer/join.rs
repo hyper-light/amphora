@@ -25,9 +25,9 @@ use crate::{
                 AccessMethodParams,
             },
             cost::{
-                estimate_rows_per_seek, index_access_is_unique_point_lookup,
-                rows_per_leaf_page_for_index, where_expr_steps, AnalyzeCtx, Cost, IndexInfo,
-                RowCountEstimate,
+                constraints_selectivity, estimate_rows_per_seek,
+                index_access_is_unique_point_lookup, rows_per_leaf_page_for_index,
+                where_expr_steps, AnalyzeCtx, Cost, IndexInfo, RowCountEstimate,
             },
             order::plan_satisfies_order_target,
         },
@@ -104,54 +104,18 @@ fn constraint_output_multipliers_for(
     params: &CostModelParams,
     include: impl Fn(&super::constraints::Constraint) -> bool,
 ) -> f64 {
-    let mut multiplier = 1.0;
-    let mut bounds: SmallVec<[(Option<usize>, bool, bool); 4]> = SmallVec::new();
-
-    let record_bound = |bounds: &mut SmallVec<[(Option<usize>, bool, bool); 4]>,
-                        dominated_col: Option<usize>,
-                        is_lower: bool,
-                        is_upper: bool| {
-        if !(is_lower || is_upper) {
-            return;
-        }
-        if let Some(entry) = bounds.iter_mut().find(|(col, _, _)| *col == dominated_col) {
-            entry.1 |= is_lower;
-            entry.2 |= is_upper;
-        } else {
-            bounds.push((dominated_col, is_lower, is_upper));
-        }
-    };
-
-    for constraint in rhs_constraints.constraints.iter().filter(|constraint| {
-        (lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask)
-            || constraint.lhs_mask == rhs_self_mask
-            || constraint.lhs_mask.is_empty())
-            && !consumed_where_terms.get(constraint.where_clause_pos.0)
-            && !skipped_where_terms.get(constraint.where_clause_pos.0)
-            && !where_clause[constraint.where_clause_pos.0].consumed
-            && include(constraint)
-    }) {
-        multiplier *= constraint.selectivity;
-
-        let dominated_col = constraint.table_col_pos;
-        let is_lower = matches!(
-            constraint.operator.as_ast_operator(),
-            Some(Operator::Greater | Operator::GreaterEquals)
-        );
-        let is_upper = matches!(
-            constraint.operator.as_ast_operator(),
-            Some(Operator::Less | Operator::LessEquals)
-        );
-        record_bound(&mut bounds, dominated_col, is_lower, is_upper);
-    }
-
-    for (_, has_lower, has_upper) in &bounds {
-        if *has_lower && *has_upper {
-            multiplier *= params.closed_range_selectivity_factor;
-        }
-    }
-
-    multiplier
+    constraints_selectivity(
+        rhs_constraints.constraints.iter().filter(|constraint| {
+            (lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask)
+                || constraint.lhs_mask == rhs_self_mask
+                || constraint.lhs_mask.is_empty())
+                && !consumed_where_terms.get(constraint.where_clause_pos.0)
+                && !skipped_where_terms.get(constraint.where_clause_pos.0)
+                && !where_clause[constraint.where_clause_pos.0].consumed
+                && include(constraint)
+        }),
+        params,
+    )
 }
 
 /// Return the row count after one table and its ready filters.
@@ -2168,6 +2132,7 @@ fn get_best_seek_score(
             &usable_constraint_refs,
             base_row_count,
             Some(&analyze_ctx),
+            params,
         )
         .max(1.0);
         let base_rows = (*base_row_count).max(1.0);

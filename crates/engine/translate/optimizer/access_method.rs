@@ -36,9 +36,9 @@ use super::{
         usable_constraints_for_join_order, usable_constraints_for_lhs_mask, TableConstraints,
     },
     cost::{
-        estimate_btree_depth, estimate_cost_for_scan_or_seek, estimate_ephemeral_index_build_cost,
-        estimate_index_cost, estimate_rows_per_seek, estimate_scan_cost, estimate_sort_cpu_cost,
-        AnalyzeCtx, Cost, IndexInfo,
+        constraints_selectivity, estimate_btree_depth, estimate_cost_for_scan_or_seek,
+        estimate_ephemeral_index_build_cost, estimate_index_cost, estimate_rows_per_seek,
+        estimate_scan_cost, estimate_sort_cpu_cost, AnalyzeCtx, Cost, IndexInfo,
     },
     join::JoinPlanningContext,
     multi_index::{
@@ -244,6 +244,22 @@ pub(super) fn choose_best_btree_candidate(
     let mut rhs_table_mask = TableMask::default();
     rhs_table_mask.set(rhs_table_idx)?;
 
+    // Sorting this table's rows costs the same whichever candidate reads them: its rows after
+    // every filter ready here, not the whole table (a 50-row seek must not be charged for
+    // sorting 200,000 rows and lose to an ordered scan of all of them).
+    let sort_cost = match maybe_order_target {
+        Some(_) => {
+            let ready = rhs_constraints.constraints.iter().filter(|c| {
+                lhs_mask.contains_all_set_bits_of(&c.lhs_mask) || c.lhs_mask == rhs_table_mask
+            });
+            let rows = input_cardinality.max(1.0)
+                * *base_row_count
+                * constraints_selectivity(ready, params);
+            estimate_sort_cpu_cost(rows, params)
+        }
+        None => Cost(0.0),
+    };
+
     // Estimate cost for each candidate index (including the rowid index) and
     // keep the best candidate.
     for candidate in rhs_constraints.candidates.iter() {
@@ -279,65 +295,58 @@ pub(super) fn choose_best_btree_candidate(
                     params.rows_per_table_page,
                 ),
             },
+            // The table's own B-tree holds every column: read in rowid order, a page is read
+            // once, never once as an index page and again as a table page.
             None => IndexInfo {
                 unique: true,
-                covering: !usable_constraint_refs.is_empty(),
+                covering: true,
                 column_count: 1,
                 rows_per_leaf_page: params.rows_per_table_page,
             },
         };
 
-        let (iter_dir, is_index_ordered, order_satisfiability_bonus) =
-            if let Some(order_target) = maybe_order_target {
-                // Reuse the same index-vs-order matching logic as final plan
-                // validation, but allow any equality-constrained seek prefix to
-                // be skipped here. Candidate scoring only needs to know whether
-                // this specific access path can emit rows ordered after its seek
-                // key; final global ORDER BY validation is stricter and only
-                // skips globally constant prefixes.
-                let all_same_direction = btree_access_order_consumed(
-                    rhs_table,
-                    IterationDirection::Forwards,
-                    candidate.index.as_deref(),
-                    &usable_constraint_refs,
-                    order_target,
-                    0,
-                    schema,
-                    EqualityPrefixScope::AnyEquality,
-                )
-                .consumed
-                    == order_target.columns.len();
-                let all_opposite_direction = btree_access_order_consumed(
-                    rhs_table,
-                    IterationDirection::Backwards,
-                    candidate.index.as_deref(),
-                    &usable_constraint_refs,
-                    order_target,
-                    0,
-                    schema,
-                    EqualityPrefixScope::AnyEquality,
-                )
-                .consumed
-                    == order_target.columns.len();
+        let (iter_dir, is_index_ordered) = if let Some(order_target) = maybe_order_target {
+            // Reuse the same index-vs-order matching logic as final plan
+            // validation, but allow any equality-constrained seek prefix to
+            // be skipped here. Candidate scoring only needs to know whether
+            // this specific access path can emit rows ordered after its seek
+            // key; final global ORDER BY validation is stricter and only
+            // skips globally constant prefixes.
+            let all_same_direction = btree_access_order_consumed(
+                rhs_table,
+                IterationDirection::Forwards,
+                candidate.index.as_deref(),
+                &usable_constraint_refs,
+                order_target,
+                0,
+                schema,
+                EqualityPrefixScope::AnyEquality,
+            )
+            .consumed
+                == order_target.columns.len();
+            let all_opposite_direction = btree_access_order_consumed(
+                rhs_table,
+                IterationDirection::Backwards,
+                candidate.index.as_deref(),
+                &usable_constraint_refs,
+                order_target,
+                0,
+                schema,
+                EqualityPrefixScope::AnyEquality,
+            )
+            .consumed
+                == order_target.columns.len();
 
-                let satisfies_order = all_same_direction || all_opposite_direction;
-                if satisfies_order {
-                    let sort_cost_saved = estimate_sort_cpu_cost(*base_row_count, params);
-                    (
-                        if all_same_direction {
-                            IterationDirection::Forwards
-                        } else {
-                            IterationDirection::Backwards
-                        },
-                        true,
-                        sort_cost_saved,
-                    )
-                } else {
-                    (IterationDirection::Forwards, false, Cost(0.0))
-                }
+            if all_same_direction {
+                (IterationDirection::Forwards, true)
+            } else if all_opposite_direction {
+                (IterationDirection::Backwards, true)
             } else {
-                (IterationDirection::Forwards, false, Cost(0.0))
-            };
+                (IterationDirection::Forwards, false)
+            }
+        } else {
+            (IterationDirection::Forwards, false)
+        };
 
         let analyze_ctx = AnalyzeCtx {
             rhs_table,
@@ -451,17 +460,17 @@ pub(super) fn choose_best_btree_candidate(
         // Adjusted output: lower means the loop delivers fewer rows downstream.
         let adjusted_output = residual_selectivity;
 
-        // Only apply the order bonus when this candidate satisfies order but
-        // the current best does not. When both satisfy order, switching saves
-        // no additional sort cost.
-        let effective_bonus = if is_index_ordered && !best_is_ordered {
-            order_satisfiability_bonus
-        } else {
-            Cost(0.0)
+        // Of an ordered and an unordered candidate, the unordered one pays for the sort,
+        // whichever of the two came first; two of a kind compare as they are.
+        let (candidate_total, best_total) = match (is_index_ordered, best_is_ordered) {
+            (true, false) => (cost, Cost(best_cost.0 + sort_cost.0)),
+            (false, true) => (Cost(cost.0 + sort_cost.0), best_cost),
+            _ => (cost, best_cost),
         };
-        let adjusted_best = best_cost + effective_bonus;
-        let costs_equal = (cost.0 - adjusted_best.0).abs() < 1e-9;
-        if cost < adjusted_best || (costs_equal && adjusted_output < best_adjusted_output - 1e-12) {
+        let costs_equal = (candidate_total.0 - best_total.0).abs() < 1e-9;
+        if candidate_total < best_total
+            || (costs_equal && adjusted_output < best_adjusted_output - 1e-12)
+        {
             best_cost = cost;
             best_adjusted_output = adjusted_output;
             best_is_ordered = is_index_ordered;
@@ -906,6 +915,7 @@ fn find_best_access_method_for_btree(
             &best.constraint_refs,
             access_base_row_count,
             Some(&analyze_ctx),
+            params,
         )
     };
     let mut consumed_where_terms = consumed_where_terms_from_constraint_refs(
@@ -984,6 +994,7 @@ fn find_best_access_method_for_btree(
                 &constraint_refs,
                 base_row_count,
                 None,
+                params,
             );
             let scan_cost = estimate_cost_for_scan_or_seek(
                 None,
@@ -1989,6 +2000,7 @@ fn find_best_access_method_for_subquery(
                 &usable_constraint_refs,
                 base_row_count,
                 None,
+                params,
             )
         };
     let one_pass_scan_cost =

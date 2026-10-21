@@ -5,6 +5,7 @@ use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::RangeConstraintRef;
 use crate::translate::plan::JoinedTable;
 use amphora_engine_parser::ast;
+use smallvec::SmallVec;
 
 use super::constraints::Constraint;
 use super::cost_params::CostModelParams;
@@ -322,12 +323,85 @@ pub struct AnalyzeCtx<'a> {
     pub stats: &'a AnalyzeStats,
 }
 
+/// The fraction of rows one column's range keeps. A closed range keeps `sel_closed_range`, not
+/// the product of its bounds' own estimates, the same as [constraints_selectivity] gives it as a
+/// filter: a range must not cost five times more driving a seek than filtering one, or the
+/// planner probes a table once per row of another to avoid it (docs/design/planner.md, decision 1).
+fn range_selectivity(
+    cref: &RangeConstraintRef,
+    constraints: &[Constraint],
+    params: &CostModelParams,
+) -> f64 {
+    let bound = |pos: usize| constraints.get(pos).map_or(1.0, |c| c.selectivity);
+    match (cref.lower_bound, cref.upper_bound) {
+        (Some(_), Some(_)) => params.sel_closed_range,
+        (Some(pos), None) | (None, Some(pos)) => bound(pos),
+        (None, None) => 1.0,
+    }
+}
+
+/// A column's range bounds, as [constraints_selectivity] gathers them.
+struct ColumnBounds {
+    /// The column's position in its table, and whether it is the rowid.
+    key: (Option<usize>, bool),
+    lower: bool,
+    upper: bool,
+    /// The product of its bounds' selectivities.
+    product: f64,
+}
+
+/// The fraction of rows `constraints` keep together: the product of their selectivities, except
+/// that a column bounded from both sides keeps `sel_closed_range` in place of its bounds' product,
+/// as a seek's range does ([range_selectivity]).
+pub(crate) fn constraints_selectivity<'a>(
+    constraints: impl Iterator<Item = &'a Constraint>,
+    params: &CostModelParams,
+) -> f64 {
+    let mut fraction = 1.0;
+    let mut columns: SmallVec<[ColumnBounds; 4]> = SmallVec::new();
+    for constraint in constraints {
+        let (lower, upper) = match constraint.operator.as_ast_operator() {
+            Some(ast::Operator::Greater | ast::Operator::GreaterEquals) => (true, false),
+            Some(ast::Operator::Less | ast::Operator::LessEquals) => (false, true),
+            _ => (false, false),
+        };
+        // A bound on an expression stands alone: two need not bound the same expression.
+        if !(lower || upper) || (constraint.table_col_pos.is_none() && !constraint.is_rowid) {
+            fraction *= constraint.selectivity;
+            continue;
+        }
+        let key = (constraint.table_col_pos, constraint.is_rowid);
+        match columns.iter_mut().find(|column| column.key == key) {
+            Some(column) => {
+                column.lower |= lower;
+                column.upper |= upper;
+                column.product *= constraint.selectivity;
+            }
+            None => columns.push(ColumnBounds {
+                key,
+                lower,
+                upper,
+                product: constraint.selectivity,
+            }),
+        }
+    }
+    for column in columns {
+        fraction *= if column.lower && column.upper {
+            params.sel_closed_range
+        } else {
+            column.product
+        };
+    }
+    fraction
+}
+
 pub(crate) fn estimate_rows_per_seek(
     index_info: IndexInfo,
     constraints: &[Constraint],
     usable_constraint_refs: &[RangeConstraintRef],
     base_row_count: RowCountEstimate,
     analyze_ctx: Option<&AnalyzeCtx>,
+    params: &CostModelParams,
 ) -> f64 {
     let join_probe_constant_selectivity =
         join_probe_constant_selectivity(constraints, usable_constraint_refs);
@@ -349,16 +423,7 @@ pub(crate) fn estimate_rows_per_seek(
                     .count();
                 let range_selectivity: f64 = usable_constraint_refs[eq_prefix_len..]
                     .iter()
-                    .map(|cref| {
-                        let mut sel = 1.0;
-                        if let Some(lb) = cref.lower_bound {
-                            sel *= constraints[lb].selectivity;
-                        }
-                        if let Some(ub) = cref.upper_bound {
-                            sel *= constraints[ub].selectivity;
-                        }
-                        sel
-                    })
+                    .map(|cref| range_selectivity(cref, constraints, params))
                     .product();
                 return (eq_prefix_rows * range_selectivity).max(1.0)
                     * join_probe_constant_selectivity;
@@ -372,14 +437,7 @@ pub(crate) fn estimate_rows_per_seek(
             if let Some(ref eq) = cref.eq {
                 return constraints[eq.constraint_pos].selectivity;
             }
-            let mut selectivity = 1.0;
-            if let Some(lower_bound) = cref.lower_bound {
-                selectivity *= constraints[lower_bound].selectivity;
-            }
-            if let Some(upper_bound) = cref.upper_bound {
-                selectivity *= constraints[upper_bound].selectivity;
-            }
-            selectivity
+            range_selectivity(cref, constraints, params)
         })
         .product();
 
@@ -495,6 +553,7 @@ pub fn estimate_cost_for_scan_or_seek(
         usable_constraint_refs,
         RowCountEstimate::AnalyzeStats(base_row_count),
         analyze_ctx,
+        params,
     );
 
     let base_cost = estimate_index_cost(

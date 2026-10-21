@@ -31,6 +31,12 @@ pub struct CostModelParams {
     /// Selectivity for range predicates (>, >=, <, <=).
     pub sel_range: f64,
 
+    /// Selectivity for a closed range on one column (`x > ? AND x < ?`, `x BETWEEN ? AND ?`), in
+    /// place of its two bounds' own: PostgreSQL's `DEFAULT_RANGE_INEQ_SEL`
+    /// (src/include/utils/selfuncs.h), what it assumes of a range no statistics place. A seek's
+    /// range and a filter's take the same estimate (docs/design/planner.md, decision 1).
+    pub sel_closed_range: f64,
+
     /// Selectivity for IS NULL predicate.
     pub sel_is_null: f64,
 
@@ -85,11 +91,6 @@ pub struct CostModelParams {
 
     /// Estimated bytes per row for hash table spill estimation.
     pub hash_bytes_per_row: f64,
-
-    // === Join Optimization ===
-    /// Selectivity heuristic factor for closed ranges (e.g., `x > 5 AND x < 10`).
-    /// Applied when both lower and upper bounds exist on an index column.
-    pub closed_range_selectivity_factor: f64,
 }
 
 impl CostModelParams {
@@ -104,6 +105,7 @@ impl CostModelParams {
             sel_eq_unindexed: 0.1,
             sel_eq_indexed: 0.001,
             sel_range: 0.4,
+            sel_closed_range: 0.005,
             sel_is_null: 0.1,
             sel_is_not_null: 0.9,
             sel_like: 0.2,
@@ -126,9 +128,6 @@ impl CostModelParams {
             hash_insert_cost: 0.002,
             hash_lookup_cost: 0.003,
             hash_bytes_per_row: 100.0,
-
-            // Join optimization
-            closed_range_selectivity_factor: 0.2,
         }
     }
 }
@@ -203,6 +202,7 @@ impl CostModelParams {
             ("sel_eq_unindexed", self.sel_eq_unindexed),
             ("sel_eq_indexed", self.sel_eq_indexed),
             ("sel_range", self.sel_range),
+            ("sel_closed_range", self.sel_closed_range),
             ("sel_is_null", self.sel_is_null),
             ("sel_is_not_null", self.sel_is_not_null),
             ("sel_like", self.sel_like),

@@ -405,38 +405,57 @@ impl Display for EqpDetail {
 /// Build the human-readable key constraints for an index seek,
 /// e.g. `["label=?", "fromId>?"]`.
 pub(crate) fn seek_constraint_parts(index: &Index, seek_def: &SeekDef) -> Vec<String> {
+    key_constraint_parts(seek_def, |i| {
+        index.columns.get(i).map(|col| col.name.as_str())
+    })
+}
+
+/// The key constraints of a seek on the table's own B-tree: its key is the rowid alone, so a
+/// range reads `rowid>=? AND rowid<=?` rather than the `rowid=?` of a point lookup.
+fn rowid_constraint_parts(seek_def: &SeekDef) -> Vec<String> {
+    key_constraint_parts(seek_def, |i| match i {
+        0 => Some("rowid"),
+        _ => None,
+    })
+}
+
+/// A seek's key constraints, naming the key's columns by position with `name`.
+fn key_constraint_parts<'a>(
+    seek_def: &SeekDef,
+    name: impl Fn(usize) -> Option<&'a str>,
+) -> Vec<String> {
     let mut parts = Vec::new();
     // Equality prefix constraints
     for (i, _constraint) in seek_def.prefix.iter().enumerate() {
-        if let Some(col) = index.columns.get(i) {
-            parts.push(format!("{}=?", col.name));
+        if let Some(col) = name(i) {
+            parts.push(format!("{col}=?"));
         }
     }
     // Range constraint from start key
     let range_col_idx = seek_def.prefix.len();
     if let SeekKeyComponent::Expr(_) = &seek_def.start.last_component {
-        if let Some(col) = index.columns.get(range_col_idx) {
+        if let Some(col) = name(range_col_idx) {
             let op_str = match seek_def.start.op {
                 SeekOp::GE { .. } => ">=",
                 SeekOp::GT => ">",
                 SeekOp::LE { .. } => "<=",
                 SeekOp::LT => "<",
             };
-            parts.push(format!("{}{op_str}?", col.name));
+            parts.push(format!("{col}{op_str}?"));
         }
     }
     // Range constraint from end key.
     // The end key's SeekOp is the B-tree termination condition (the negation of the
     // user-facing SQL operator), so we reverse it for display.
     if let SeekKeyComponent::Expr(_) = &seek_def.end.last_component {
-        if let Some(col) = index.columns.get(range_col_idx) {
+        if let Some(col) = name(range_col_idx) {
             let op_str = match seek_def.end.op {
                 SeekOp::GE { .. } => "<",
                 SeekOp::GT => "<=",
                 SeekOp::LE { .. } => ">",
                 SeekOp::LT => ">=",
             };
-            parts.push(format!("{}{op_str}?", col.name));
+            parts.push(format!("{col}{op_str}?"));
         }
     }
     parts
@@ -497,7 +516,7 @@ pub(crate) fn eqp_detail_for_table_op(
                         .map(|index| eqp_index(index, table.utilizes_covering_index())),
                     match index {
                         Some(index) => seek_constraint_parts(index, seek_def),
-                        None => vec!["rowid=?".to_string()],
+                        None => rowid_constraint_parts(seek_def),
                     },
                     seek_def.iter_dir == IterationDirection::Backwards,
                 ),

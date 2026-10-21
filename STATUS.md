@@ -53,6 +53,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   savepoints rolled back amid spills. On the bench so far it cost writes at 32 writers (6,216 and
   5,887 a second against 7,903, `bench/records/2026-10-20-fedora-packed-log.jsonl`), so it isn't the
   default until the comprehensive bench shows where it helps.
+- **The planner where the suite found it choosing far more work** (docs/design/planner.md,
+  `crates/engine/tests/planner.rs`): a closed range with unknown bounds is 0.5% of its table whether
+  it drives a seek or filters one, so a join from a key range looks each row's partner up by key; a
+  sort is charged to the access path that needs it, on the rows it sorts, so a page by key reads in
+  key order. EXPLAIN words a range on the rowid as one. Checks on fedora, 1 client (not recorded
+  runs): `join_pk` 71 → 94,710 statements a second, `join_three` 56 → 1,598, `offset_deep` 25 → 64.
 
 ## Measured
 

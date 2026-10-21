@@ -1960,9 +1960,9 @@ fn estimate_bound_expr_selectivity(
         Expr::NotNull(_) => params.sel_is_not_null,
         Expr::Between { not, .. } => {
             if *not {
-                1.0 - params.sel_range
+                1.0 - params.sel_closed_range
             } else {
-                params.sel_range
+                params.sel_closed_range
             }
         }
         Expr::InList { lhs, not, rhs } => {
