@@ -109,4 +109,10 @@ if env.get("SERVER_CONTAINER"):
     })
 print(json.dumps(record))
 PY
+  # A server left running loads the machine under every target after it (an idle CedarDB,
+  # ClickHouse or MySQL took half a core to two-thirds of one each): stopped once its record is
+  # made, unless AMPHORA_BENCH_KEEP=1.
+  if [[ -n "$e" && "${AMPHORA_BENCH_KEEP:-0}" != 1 ]]; then
+    bash "servers/$e.sh" stop
+  fi
 done
