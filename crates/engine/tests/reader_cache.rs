@@ -166,12 +166,12 @@ fn run(seed: u64, packed: bool, reader_pages: i64) {
 }
 
 /// Do: 400 random steps of writes, checkpoints and reads for each of 12 seeds. Expect: every read
-/// the model's. A page-a-frame log, a reader that caches 8 pages: most commits write more than it
-/// holds, and it forgets everything.
+/// the model's. A page-a-frame log, a reader that caches 200 pages (the least a cache keeps): the
+/// larger commits write more than it holds and it forgets everything, the others page by page.
 #[test]
 fn a_small_cache_never_reads_a_row_from_before_a_commit_it_follows() {
     for seed in 0..12 {
-        run(seed, false, 8);
+        run(seed, false, 200);
     }
 }
 
@@ -187,7 +187,7 @@ fn a_large_cache_never_reads_a_row_from_before_a_commit_it_follows() {
 #[test]
 fn a_small_cache_on_a_packed_log_never_reads_a_stale_row() {
     for seed in 0..12 {
-        run(seed, true, 8);
+        run(seed, true, 200);
     }
 }
 

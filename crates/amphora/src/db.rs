@@ -250,6 +250,15 @@ impl Db {
             .map_err(|e| anyhow::anyhow!("packing {}'s log: {e}", self.path.display()))
     }
 
+    /// Shares the pages this database's connections read among them, `pages` at most
+    /// (docs/design/store.md, decision 20): a page one reader read in, the others read from
+    /// memory. Not unless this asks, while the bench weighs it (`AMPHORA_SHARED_PAGES`).
+    pub fn share_pages(&self, pages: usize) -> anyhow::Result<()> {
+        self.db
+            .share_pages(pages)
+            .map_err(|e| anyhow::anyhow!("sharing {}'s pages: {e}", self.path.display()))
+    }
+
     /// Statements that answer nothing, one after another.
     pub fn exec(&self, sql: &str) -> anyhow::Result<()> {
         for one in sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {

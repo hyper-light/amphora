@@ -5,6 +5,7 @@ use crate::storage::page_transform::{
     page_codec_completion_error, page_codec_encryption_context, page_codec_from_encryption,
     PageCodec, PageCodecContext, PageLocation, PageTransform,
 };
+use crate::storage::shared_pages::SharedPages;
 use crate::storage::sqlite3_ondisk::PageSize;
 use crate::sync::Arc;
 use crate::{io::Completion, Buffer, CompletionError, LimboError, Result};
@@ -139,11 +140,44 @@ pub trait DatabaseStorage: Send + Sync {
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion>;
     fn size(&self) -> Result<u64>;
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion>;
+
+    /// Amphora: the pages this database's connections share, once sharing is on
+    /// (`storage/shared_pages.rs`, Amphora's `docs/design/store.md` decision 20).
+    fn shared_pages(&self) -> Option<&Arc<SharedPages>> {
+        None
+    }
+
+    /// Amphora: shares the pages read from this storage among its connections, dropping a page's
+    /// file version before the page is written; refused by a storage that can't.
+    fn share_pages(&self, _shared: Arc<SharedPages>) -> Result<()> {
+        Err(LimboError::InvalidArgument(
+            "this storage doesn't share its pages".into(),
+        ))
+    }
 }
 
 #[derive(Clone)]
 pub struct DatabaseFile {
     file: Arc<dyn crate::io::File>,
+    /// Amphora: the pages this file's connections share, once sharing is on (decision 20).
+    shared: crate::sync::OnceLock<Arc<SharedPages>>,
+}
+
+#[cfg(feature = "fs")]
+impl DatabaseFile {
+    /// Amphora: drops the shared file versions of `count` pages from `first` before they are
+    /// written, so no connection reads a page's old version from memory once its write begins.
+    fn forget_shared(&self, first: usize, count: usize) {
+        let Some(shared) = self.shared.get() else {
+            return;
+        };
+        for page in first..first.saturating_add(count) {
+            match u64::try_from(page) {
+                Ok(page) => shared.forget_file_page(page),
+                Err(_) => shared.forget_file(),
+            }
+        }
+    }
 }
 
 impl DatabaseStorage for DatabaseFile {
@@ -308,6 +342,7 @@ impl DatabaseStorage for DatabaseFile {
             PageTransform::Checksum(ctx) => checksum_buffer(page_idx, buffer, ctx),
             PageTransform::None => buffer,
         };
+        self.forget_shared(page_idx, 1);
         self.file.pwrite(pos, buffer, c)
     }
 
@@ -347,6 +382,7 @@ impl DatabaseStorage for DatabaseFile {
                 .collect::<Vec<_>>(),
             PageTransform::None => buffers,
         };
+        self.forget_shared(first_page_idx, buffers.len());
         let c = self.file.pwritev(pos, buffers, c)?;
         Ok(c)
     }
@@ -363,15 +399,31 @@ impl DatabaseStorage for DatabaseFile {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
+        if let Some(shared) = self.shared.get() {
+            shared.forget_file();
+        }
         let c = self.file.truncate(len as u64, c)?;
         Ok(c)
+    }
+
+    fn shared_pages(&self) -> Option<&Arc<SharedPages>> {
+        self.shared.get()
+    }
+
+    fn share_pages(&self, shared: Arc<SharedPages>) -> Result<()> {
+        self.shared.set(shared).map_err(|_| {
+            LimboError::InvalidArgument("this database already shares its pages".into())
+        })
     }
 }
 
 #[cfg(feature = "fs")]
 impl DatabaseFile {
     pub fn new(file: Arc<dyn crate::io::File>) -> Self {
-        Self { file }
+        Self {
+            file,
+            shared: crate::sync::OnceLock::new(),
+        }
     }
 }
 
@@ -584,6 +636,7 @@ mod page_codec_tests {
     #[test]
     fn page_codec_read_decodes_into_original_database_buffer() {
         let db_file = DatabaseFile {
+            shared: crate::sync::OnceLock::new(),
             file: Arc::new(MockFile {
                 read_result: Ok(4096),
                 writes_submitted: Arc::new(AtomicUsize::new(0)),
@@ -610,6 +663,7 @@ mod page_codec_tests {
     #[test]
     fn page_codec_zero_byte_read_reaches_original_completion() {
         let db_file = DatabaseFile {
+            shared: crate::sync::OnceLock::new(),
             file: Arc::new(MockFile {
                 read_result: Ok(0),
                 writes_submitted: Arc::new(AtomicUsize::new(0)),
@@ -647,6 +701,7 @@ mod page_codec_tests {
     #[test]
     fn page_codec_database_read_forwards_transport_error() {
         let db_file = DatabaseFile {
+            shared: crate::sync::OnceLock::new(),
             file: Arc::new(MockFile {
                 read_result: Err(CompletionError::Aborted),
                 writes_submitted: Arc::new(AtomicUsize::new(0)),
@@ -678,6 +733,7 @@ mod page_codec_tests {
     #[test]
     fn page_codec_partial_database_read_fails_before_decode() {
         let db_file = DatabaseFile {
+            shared: crate::sync::OnceLock::new(),
             file: Arc::new(MockFile {
                 read_result: Ok(128),
                 writes_submitted: Arc::new(AtomicUsize::new(0)),
@@ -712,6 +768,7 @@ mod page_codec_tests {
     fn page_codec_database_write_error_does_not_submit_io() {
         let writes_submitted = Arc::new(AtomicUsize::new(0));
         let db_file = DatabaseFile {
+            shared: crate::sync::OnceLock::new(),
             file: Arc::new(MockFile {
                 read_result: Ok(0),
                 writes_submitted: writes_submitted.clone(),
@@ -741,6 +798,7 @@ mod page_codec_tests {
     fn page_codec_vectored_encode_error_does_not_submit_io() {
         let writes_submitted = Arc::new(AtomicUsize::new(0));
         let db_file = DatabaseFile {
+            shared: crate::sync::OnceLock::new(),
             file: Arc::new(MockFile {
                 read_result: Ok(0),
                 writes_submitted: writes_submitted.clone(),
@@ -774,6 +832,7 @@ mod page_codec_tests {
     #[test]
     fn page_codec_database_read_reports_decode_error() {
         let db_file = DatabaseFile {
+            shared: crate::sync::OnceLock::new(),
             file: Arc::new(MockFile {
                 read_result: Ok(512),
                 writes_submitted: Arc::new(AtomicUsize::new(0)),
@@ -847,6 +906,7 @@ mod tests {
     #[test]
     fn checksum_read_wrapper_propagates_callback_errors() {
         let db_file = DatabaseFile {
+            shared: crate::sync::OnceLock::new(),
             file: Arc::new(MockFile { read_result: Ok(0) }),
         };
         let io_ctx = IOContext::default();
@@ -886,6 +946,7 @@ mod tests {
     #[test]
     fn checksum_read_wrapper_propagates_transport_errors_to_original_completion() {
         let db_file = DatabaseFile {
+            shared: crate::sync::OnceLock::new(),
             file: Arc::new(MockFile {
                 read_result: Err(CompletionError::Aborted),
             }),

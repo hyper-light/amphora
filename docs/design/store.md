@@ -566,11 +566,13 @@ across transactions, and a page changed is replaced alone.
 
 **Evidence.** `crates/engine/storage/pager.rs`,
 `a_reader_forgets_only_the_pages_written_since_its_last_read`: a reader caching a 400-row table
-keeps every page but the one a one-row update wrote and reads the new row; it forgets everything
-when a commit writes more pages than it caches, and after a checkpoint that restarted the log.
+keeps every page but the one a one-row update wrote and reads the new row; it forgets everything,
+another table's pages too, when a commit writes more pages than it caches, and after a checkpoint
+that restarted the log.
 `crates/engine/tests/reader_cache.rs`: 400 random steps of transactions (one row to hundreds, rows
 growing into overflow pages and shrinking, inserts, deletes and rollbacks), checkpoints of every
-mode and reads, 12 seeds, page-a-frame and packed logs, readers caching 8 pages and 2,000: every
+mode and reads, 12 seeds, page-a-frame and packed logs, readers caching 200 pages (the least a cache
+keeps) and 2,000: every
 read is the model's. With a listed change forgotten not at all (a mutant) both fail, the model at
 seed 0, step 4; with a range's last frame left out (a mutant), the model fails at seed 0, step 11.
 
@@ -607,3 +609,59 @@ a second with 2,000 pages, and at 72,402 with 128 (45,128 before).
 
 **Falsified by.** A working set that settles in the cache yet misses; a hot page evicted before a
 page read once.
+
+## 20. Pages one connection read in, every connection reads from memory
+
+**Decision.** A database can share the pages its connections read (`Database::share_pages`,
+`crates/engine/storage/shared_pages.rs`). A page a connection misses in its own cache is looked up
+there before it is read: under the version it is (a frame of the log in the log's generation, or
+the file's), its image as committed, kept by whichever connection read it in first. The images
+never change: only a connection in a read transaction and holding no write lock shares, so no frame
+of a write in progress is kept, and a file version is dropped before the file's page is written or
+the file cut. A connection about to write a shared buffer copies it first (`Pager::add_dirty`, which
+every write goes through before it touches a page: it keeps the page's contents for savepoints).
+At most the pages it was made for are kept, in 64 shards by page number with a lock each, evicted
+by CLOCK. Refused under another process's authority (its writes are unseen), with MVCC and with a
+packed log. Not on by default (`Db::share_pages`, the bench's `AMPHORA_SHARED_PAGES`): it is a
+trade of memory for reads (Evidence), and its budget is a database's alone, while a store has a
+database a group.
+
+**Why.** Each connection's cache is its own: 32 readers each missing a working set larger than its
+cache read the same pages from the file 32 times, each a `pread`, a 4 KiB copy and a checksum, and
+evicted for them. A profile of the suite's `order_by_sort` at 32 clients (2,000 pages a reader):
+reading pages in 27% of the time and evicting 19%, the CPU a statement took 4.4 times what it took
+at 1 client.
+
+**Sources.** PostgreSQL's shared buffers (its documentation, "Resource Consumption",
+`shared_buffers`) and InnoDB's buffer pool (MySQL's reference manual, "Buffer Pool"): one cache all
+sessions read, a page read once for all. CLOCK (Corbató, "A Paging Experiment with the Multics
+System", MIT Project MAC, 1968): a reference bit a page, cleared as the hand passes, the first page
+found unreferenced evicted.
+
+**Evidence.** `crates/engine/tests/shared_pages.rs`: a second reader reads every page a first read
+in from memory, from the log and from the file; a writer that holds a shared page updates it, and
+the other readers read the old row while the write is open and after it is rolled back; a reader
+after a checkpoint that wrote the file reads every new row; a writer whose spilled frames a rolled
+back write used again reads, and leaves, only what committed; 300 random steps for 16 seeds, four
+readers, a writer of up to hundreds of rows a transaction, rollbacks, checkpoints of every mode:
+every read the model's. With no copy before a write (a mutant) the writer's test and the model fail
+(a reader saw the write in progress); with a file write forgetting nothing, the checkpoint's test
+and the model fail (a row read from a version written over); with a writer sharing its own frames,
+the rolled-back write's test fails (it read the rolled-back value). The suite, fedora, one client
+and 32, 200,000 rows, 2,000 pages a reader, sharing 65,536 pages (256 MiB) against none (checks at
+loads 6–30, not recorded runs): at 32 clients `order_by_sort` 7,664 a second against 3,183,
+`group_by_having` 7,137 against 2,907, `count_distinct` 7,277 against 2,844, `join_group` 1,366
+against 687, `exists_subquery` 10,562 against 5,185, `table_group_by` 79 against 36, the peak
+resident set 410 MB against 414; at one client the same gains, 2.2–2.4 times, the resident set 249
+MB against 51 (the shared pages filled). Sharing 16,384 pages (64 MiB), smaller than the working
+set, gains half as much (`order_by_sort` 5,314 at 32 clients) for more memory at 32 clients (611
+MB: buffers the shared pages evicted live on in readers' caches beside their next copies). K0's
+load (32 writers, 4 readers, two runs each): without sharing 163,682 and 163,620 writes (p99 6.3
+ms), reads 1.36 and 1.32 million (p50 0.054 ms, p99 0.12 ms), 82–84 MB; sharing 65,536 pages,
+153,178 and 157,216 writes (p99 7.0 ms), reads 1.94 and 1.92 million (p50 0.037 ms, p99 0.082–0.086
+ms), 339–341 MB; sharing 16,384, writes 154,464 and 154,744 (p99 6.8–8.2 ms), reads unchanged,
+150 MB. So it is on where reads matter more than memory, until one budget for the process's
+databases (and readers' own caches smaller while sharing) makes it a win in both.
+
+**Falsified by.** A read of a version the reader's snapshot doesn't see; reads slower shared than
+not; more memory shared than the budget and the readers' own caches together.

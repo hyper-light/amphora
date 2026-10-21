@@ -612,9 +612,19 @@ pub fn finish_read_page(page_idx: usize, buffer: Arc<Buffer>, page: PageRef) {
     tracing::trace!("finish_read_page(page_idx = {page_idx})");
     {
         let inner = page.get();
+        // Amphora: a version other connections may read is theirs too once read (decision 20);
+        // an empty read (a page past the file's end) is no one's.
+        let publish = page.take_publish().filter(|_| !buffer.is_empty());
+        if let Some(publish) = &publish {
+            let (shared, key) = &**publish;
+            shared.insert(*key, buffer.clone());
+        }
         inner.set_buffer(buffer);
         page.clear_locked();
         page.set_loaded();
+        if publish.is_some() {
+            page.set_shared();
+        }
         // we set the wal tag only when reading page from log, or in allocate_page,
         // we clear it here for safety in case page is being re-loaded.
         page.clear_wal_tag();

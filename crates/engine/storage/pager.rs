@@ -48,6 +48,7 @@ use super::btree::{
     btree_init_page, payload_overflow_threshold_max, payload_overflow_threshold_min, PayloadLimits,
 };
 use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey, SpillResult};
+use super::shared_pages::{Key, Version};
 use super::sqlite3_ondisk::{
     begin_write_btree_page, read_btree_cell, read_u32, BTreeCell, FREELIST_LEAF_PTR_SIZE,
     FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR, FREELIST_TRUNK_OFFSET_LEAF_COUNT,
@@ -160,6 +161,14 @@ mod page_inner {
         data_len: usize,
         /// Overflow cells during btree operations
         pub overflow_cells: crate::alloc::Vec<OverflowCell>,
+        /// Amphora: where the buffer a read in flight brings is shared once read
+        /// (`finish_read_page`, decision 20).
+        pub publish: Option<
+            Box<(
+                Arc<crate::storage::shared_pages::SharedPages>,
+                crate::storage::shared_pages::Key,
+            )>,
+        >,
     }
 
     // SAFETY: data_ptr and data_len only cache the address and length of the
@@ -197,6 +206,7 @@ mod page_inner {
                 data_ptr: std::ptr::NonNull::dangling(),
                 data_len: 0,
                 overflow_cells: crate::alloc::vec![],
+                publish: None,
             }
         }
 
@@ -206,18 +216,20 @@ mod page_inner {
             self.buffer.as_ref()
         }
 
-        /// Installs the page data buffer.
+        /// Installs the page data buffer: the page's own until shared (Amphora).
         pub fn set_buffer(&mut self, buffer: Arc<Buffer>) {
             self.data_ptr = std::ptr::NonNull::new(buffer.as_mut_ptr())
                 .expect("a page buffer is never at address zero");
             self.data_len = buffer.len();
             self.buffer = Some(buffer);
+            self.flags.fetch_and(!PAGE_SHARED, Ordering::AcqRel);
         }
 
         /// Removes the page data buffer, leaving the page unloaded.
         pub fn take_buffer(&mut self) -> Option<Arc<Buffer>> {
             self.data_ptr = std::ptr::NonNull::dangling();
             self.data_len = 0;
+            self.flags.fetch_and(!PAGE_SHARED, Ordering::AcqRel);
             self.buffer.take()
         }
 
@@ -1023,6 +1035,9 @@ const PAGE_DIRTY: usize = 0b1000;
 const PAGE_LOADED: usize = 0b10000;
 /// Page has been spilled to WAL (can be evicted even though dirty).
 const PAGE_SPILLED: usize = 0b100000;
+/// Amphora: the page's buffer is one the shared pages hold (`storage/shared_pages.rs`): every
+/// connection's, so written only as a copy (`Pager::add_dirty`).
+const PAGE_SHARED: usize = 0b1000000;
 
 impl Page {
     pub fn new(id: i64) -> Self {
@@ -1052,6 +1067,38 @@ impl Page {
     #[inline]
     pub fn is_locked(&self) -> bool {
         self.get().flags.load(Ordering::Acquire) & PAGE_LOCKED != 0
+    }
+
+    /// Amphora: whether the page's buffer is one the shared pages hold (decision 20).
+    #[inline]
+    pub fn is_shared(&self) -> bool {
+        self.get().flags.load(Ordering::Acquire) & PAGE_SHARED != 0
+    }
+
+    /// Amphora: marks the page's buffer as one the shared pages hold.
+    pub fn set_shared(&self) {
+        self.get().flags.fetch_or(PAGE_SHARED, Ordering::AcqRel);
+    }
+
+    /// Amphora: shares the buffer the page's read brings under `key`, once read.
+    pub fn set_publish(
+        &self,
+        shared: Arc<crate::storage::shared_pages::SharedPages>,
+        key: crate::storage::shared_pages::Key,
+    ) {
+        self.get().publish = Some(Box::new((shared, key)));
+    }
+
+    /// Amphora: where the page's read is to be shared, taken once.
+    pub fn take_publish(
+        &self,
+    ) -> Option<
+        Box<(
+            Arc<crate::storage::shared_pages::SharedPages>,
+            crate::storage::shared_pages::Key,
+        )>,
+    > {
+        self.get().publish.take()
     }
 
     #[inline]
@@ -3828,7 +3875,7 @@ impl Pager {
     pub fn read_page_into(
         &self,
         page_idx: i64,
-        group: Option<&mut CompletionGroup>,
+        mut group: Option<&mut CompletionGroup>,
     ) -> IOResultOr<(PageRef, Option<Completion>)> {
         turso_assert_greater_than_or_equal!(page_idx, 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
         tracing::debug!("read_page_nonblock(page_idx = {})", page_idx);
@@ -3877,15 +3924,25 @@ impl Pager {
             }
 
             tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
-            let (page, c) = self.read_page_no_cache(page_idx, None, false, group)?;
-            self.insert_pending_read(
-                page_idx,
-                PendingRead {
-                    page: page.clone(),
-                    disk_read: Some(c.clone()),
-                },
-            );
-            (page, Some(c))
+            // Amphora: a version another connection read in is shared, and one read now is
+            // shared once read (decision 20).
+            let (page, c) = match self.read_shared(page_idx, group.as_deref_mut())? {
+                Some(read) => read,
+                None => {
+                    let (page, c) = self.read_page_no_cache(page_idx, None, false, group)?;
+                    (page, Some(c))
+                }
+            };
+            if let Some(c) = &c {
+                self.insert_pending_read(
+                    page_idx,
+                    PendingRead {
+                        page: page.clone(),
+                        disk_read: Some(c.clone()),
+                    },
+                );
+            }
+            (page, c)
         };
 
         match self.cache_insert(page_idx as usize, page.clone())? {
@@ -4066,6 +4123,11 @@ impl Pager {
             "page must be loaded in add_dirty() so its contents can be subjournaled",
             { "page_id": page.get().id() }
         );
+        // Amphora: a buffer the shared pages hold is every connection's: written only as this
+        // connection's own copy (decision 20).
+        if page.is_shared() {
+            self.unshare(page)?;
+        }
         self.subjournal_page_if_required(page)?;
         let mut dirty_pages = self.dirty_pages.write();
         dirty_pages.insert(page.get().id() as u32);
@@ -4083,6 +4145,79 @@ impl Pager {
         }
         page.set_dirty();
         Ok(())
+    }
+
+    /// Amphora: gives `page` a copy of its shared buffer of its own, before it is written.
+    fn unshare(&self, page: &Page) -> Result<()> {
+        let inner = page.get();
+        let Some(shared) = inner.buffer().cloned() else {
+            return Err(LimboError::InternalError(format!(
+                "shared page {} holds no buffer",
+                inner.id()
+            )));
+        };
+        let copy = self.buffer_pool.get_page();
+        if copy.len() != shared.len() {
+            return Err(LimboError::InternalError(format!(
+                "page {}: a copy of {} bytes for a buffer of {}",
+                inner.id(),
+                copy.len(),
+                shared.len()
+            )));
+        }
+        copy.as_mut_slice().copy_from_slice(shared.as_slice());
+        #[allow(clippy::arc_with_non_send_sync)]
+        inner.set_buffer(Arc::new(copy));
+        Ok(())
+    }
+
+    /// Amphora: reads `page_idx` through the pages the database's connections share (decision
+    /// 20): the version this connection sees, as another connection read it in (`(page, None)`:
+    /// no read), or read now and shared once read (`(page, Some(read))`). None when this
+    /// connection doesn't share now: no shared pages, outside a read transaction, or inside a
+    /// write transaction, whose own frames no other connection may see.
+    fn read_shared(
+        &self,
+        page_idx: i64,
+        group: Option<&mut CompletionGroup>,
+    ) -> Result<Option<(PageRef, Option<Completion>)>> {
+        let (Some(shared), Some(wal)) = (self.db_file.shared_pages(), self.wal.as_ref()) else {
+            return Ok(None);
+        };
+        if !wal.holds_read_lock() || wal.holds_write_lock() {
+            return Ok(None);
+        }
+        let page_no = u64::try_from(page_idx).map_err(|_| LimboError::IntegerOverflow)?;
+        let frame = wal.find_frame(page_no, None)?;
+        let version = match frame {
+            Some(frame) => Version::Frame {
+                generation: wal.connection_wal_pos().0,
+                frame,
+            },
+            None => Version::File,
+        };
+        let key = Key {
+            page: page_no,
+            version,
+        };
+        let page = Arc::new(Page::new(page_idx));
+        if let Some(buffer) = shared.get(&key) {
+            page.get().set_buffer(buffer);
+            page.set_loaded();
+            page.set_shared();
+            return Ok(Some((page, None)));
+        }
+        page.set_publish(shared.clone(), key);
+        let read = match frame {
+            Some(frame) => wal.read_frame(frame, page.clone(), self.buffer_pool.clone(), group)?,
+            None => {
+                page.set_locked();
+                let io_ctx = self.io_ctx.read();
+                let at = usize::try_from(page_idx).map_err(|_| LimboError::IntegerOverflow)?;
+                self.begin_read_disk_page(at, page.clone(), false, &io_ctx, group)?
+            }
+        };
+        Ok(Some((page, Some(read))))
     }
 
     pub fn wal_state(&self) -> Result<WalState> {
@@ -6736,9 +6871,9 @@ mod tests {
     /// Do: a reader reads a table, so its cache holds the table's pages; another connection updates
     /// one row; the reader starts its next read transaction. Expect: it forgets the page that commit
     /// wrote and keeps the rest, and reads the new row (Amphora's `docs/design/store.md`, decision
-    /// 18; AC-T1.1.1). Then a commit writes more pages than the reader caches, and one follows a
-    /// checkpoint that restarted the log: each time the reader forgets everything, and reads the
-    /// rows as committed.
+    /// 18; AC-T1.1.1). Then a commit writes more pages than the reader caches (it forgets everything,
+    /// another table's pages too), and one follows a checkpoint that restarted the log (the same):
+    /// each time it reads the rows as committed.
     #[test]
     fn a_reader_forgets_only_the_pages_written_since_its_last_read() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -6780,16 +6915,43 @@ mod tests {
         );
         assert_eq!(read("SELECT body FROM t WHERE id = 200"), "changed");
 
-        // More pages written than the reader caches: forgetting them one by one costs more.
-        reader.execute("PRAGMA cache_size = 8").unwrap();
-        read("SELECT sum(length(body)) FROM t");
+        // More pages written than the reader caches (200, the least a cache keeps): clearing
+        // costs less than forgetting them one by one, so the pages of a table the commit didn't
+        // touch go too.
+        writer.execute("BEGIN").unwrap();
+        for id in 401..=5000 {
+            writer
+                .execute(format!(
+                    "INSERT INTO t VALUES ({id}, '{}')",
+                    "x".repeat(200)
+                ))
+                .unwrap();
+        }
         writer
-            .execute("UPDATE t SET body = 'every' WHERE id % 10 = 0")
+            .execute("CREATE TABLE u (id INTEGER PRIMARY KEY, body TEXT)")
             .unwrap();
+        for id in 1..=600 {
+            writer
+                .execute(format!(
+                    "INSERT INTO u VALUES ({id}, '{}')",
+                    "y".repeat(200)
+                ))
+                .unwrap();
+        }
+        writer.execute("COMMIT").unwrap();
+        reader.execute("PRAGMA cache_size = 200").unwrap();
+        read("SELECT sum(length(body)) FROM t");
+        read("SELECT sum(length(body)) FROM u");
+        assert!(pager.cached_pages() > 30, "u's pages are cached");
+        writer.execute("UPDATE t SET body = 'every'").unwrap();
         pager.begin_read_tx().unwrap();
-        assert_eq!(pager.cached_pages(), 0);
+        assert_eq!(
+            pager.cached_pages(),
+            0,
+            "a commit of more pages than the cache holds clears it"
+        );
         pager.end_read_tx();
-        assert_eq!(read("SELECT count(*) FROM t WHERE body = 'every'"), "40");
+        assert_eq!(read("SELECT count(*) FROM t WHERE body = 'every'"), "5000");
 
         // A restarted log: the frames from before are gone, and with them what changed.
         reader.execute("PRAGMA cache_size = 2000").unwrap();

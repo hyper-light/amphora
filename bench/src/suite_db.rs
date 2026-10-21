@@ -5,7 +5,8 @@
 //! - **amphora**: reads on the store's readers, on what is committed; writes handed to its writer
 //!   (one group: the suite's data isn't split by key), committed with whatever else came, and
 //!   answered once its flusher made them durable. AMPHORA_PACK_LOG=1 packs its log;
-//!   AMPHORA_READER_PAGES sets each reader's page budget;
+//!   AMPHORA_READER_PAGES sets each reader's page budget; AMPHORA_SHARED_PAGES=<pages> shares
+//!   pages among its connections;
 //! - **turso**: upstream Turso at 3e09a82 with its defaults, a connection a client;
 //! - **sqlite**: SQLite in WAL with `synchronous = FULL`, a connection a client;
 //! - **postgres**, **orioledb**, **cedardb**: a connection a client, as `pg.rs` sets each up;
@@ -189,6 +190,10 @@ mod amphora_target {
             let db = Db::open(&path)?;
             if std::env::var("AMPHORA_PACK_LOG").ok().as_deref() == Some("1") {
                 db.pack_log(true)?;
+            }
+            // AMPHORA_SHARED_PAGES: pages the store's connections share at most (decision 20).
+            if let Some(pages) = std::env::var("AMPHORA_SHARED_PAGES").ok().and_then(|v| v.parse().ok()) {
+                db.share_pages(pages)?;
             }
             let reader_pages = std::env::var("AMPHORA_READER_PAGES").ok().and_then(|v| v.parse().ok());
             Ok(Self { loader: Mutex::new(Some(db)), groups: OnceLock::new(), sql: Arc::new(Mutex::new(HashMap::new())), readers: clients.max(1), reader_pages })

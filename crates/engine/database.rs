@@ -3063,12 +3063,49 @@ impl Database {
                 "a packed log is read by one process; this one is shared between processes".into(),
             ));
         }
+        if pack && self.db_file.shared_pages().is_some() {
+            return Err(LimboError::InvalidArgument(
+                "a packed log's pages aren't shared; this database shares its pages".into(),
+            ));
+        }
         self.shared_wal
             .read()
             .runtime
             .pack
             .store(pack, Ordering::Release);
         Ok(())
+    }
+
+    /// Amphora: shares the pages this database's connections read among them, `pages` at most
+    /// (`storage/shared_pages.rs`, Amphora's `docs/design/store.md` decision 20). Refused under
+    /// another process's authority (the file can change under it unseen), with MVCC, and with a
+    /// packed log.
+    pub fn share_pages(&self, pages: usize) -> Result<()> {
+        #[cfg(host_shared_wal)]
+        if self.shared_wal_coordination()?.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "shared pages are one process's; this database is shared between processes".into(),
+            ));
+        }
+        if self.mv_store.load().is_some() {
+            return Err(LimboError::InvalidArgument(
+                "shared pages aren't kept for an MVCC database".into(),
+            ));
+        }
+        if self.shared_wal.read().runtime.pack.load(Ordering::Acquire) {
+            return Err(LimboError::InvalidArgument(
+                "a packed log's pages aren't shared".into(),
+            ));
+        }
+        self.db_file
+            .share_pages(Arc::new(crate::storage::shared_pages::SharedPages::new(
+                pages,
+            )))
+    }
+
+    /// Amphora: the shared pages' lookups and additions so far, if they're shared.
+    pub fn shared_page_counts(&self) -> Option<crate::storage::shared_pages::Counts> {
+        self.db_file.shared_pages().map(|shared| shared.counts())
     }
 
     /// Amphora: the last frame of the log known durable in its current generation.

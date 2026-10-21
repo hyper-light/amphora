@@ -197,10 +197,15 @@ impl Amphora {
         };
         // AMPHORA_PACK_LOG=1: packed logs (docs/design/store.md, decisions 16 and 17).
         let pack_log = env("AMPHORA_PACK_LOG") == Some(1);
+        // AMPHORA_SHARED_PAGES: pages a group's connections share at most (decision 20).
+        let shared_pages = env("AMPHORA_SHARED_PAGES").and_then(|p| usize::try_from(p).ok());
         let groups = Groups::start(groups, config, |g| {
             let db = Db::open(&dir.join(format!("bench-{g}.db")))?;
             if pack_log {
                 db.pack_log(true)?;
+            }
+            if let Some(pages) = shared_pages {
+                db.share_pages(pages)?;
             }
             for s in schema::SCHEMA {
                 db.exec(s)?;
