@@ -64,8 +64,8 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   pages written since its last one, where SQLite and Turso forget its whole cache; it forgets
   everything when the log can't say (another generation, a gap, more pages than it caches). A model
   test of random transactions, checkpoints and restarts, both log formats, never reads a stale row,
-  and catches a reader that forgets nothing. Readers still keep decision 5's 128 pages until a
-  bigger budget is measured under K0's writes.
+  and catches a reader that forgets nothing. With it, readers keep 2,000 pages (decision 5): K0's
+  reads are as fast as at 128, the suite's at 32 clients up to 62 times faster, for 8 MiB a reader.
 - **The page cache evicts as SIEVE does** (docs/design/store.md decision 19): a new page joins the
   queue's head, so the hand reaches it after every older page; inserted after the hand, as Turso
   had it, a new working set never settled in a full cache (`order_by_index` after

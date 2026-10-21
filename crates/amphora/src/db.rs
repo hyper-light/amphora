@@ -24,12 +24,12 @@ const LOCK_WAIT: Duration = Duration::from_secs(15);
 /// after this, this many times.
 const BUSY_WAIT: Duration = Duration::from_millis(1);
 const BUSY_TRIES: u32 = 10_000;
-/// Pages each connection keeps in memory, by what it does (Turso keeps 2,000, 8 MiB, on every
-/// connection; a store has a writer, readers and a checkpointer, and a reader's miss is a read of the
-/// file through the system's page cache): the writer keeps the inner pages of its indexes, a reader
-/// what one read touches, the checkpointer next to nothing.
+/// Pages each connection keeps in memory, by what it does (docs/design/store.md, decision 5): the
+/// writer keeps the inner pages of its indexes; a reader 2,000 (8 MiB, Turso's own default), since
+/// it forgets only what commits wrote (decision 18), so its cache serves the reads after them; the
+/// checkpointer next to nothing.
 pub const WRITER_PAGES: i64 = 1024;
-pub const READER_PAGES: i64 = 128;
+pub const READER_PAGES: i64 = 2000;
 
 fn fail(e: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("{e}")

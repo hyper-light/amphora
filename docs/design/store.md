@@ -137,20 +137,32 @@ against the 16,384-frame runs before.
 
 ## 5. Page budgets by what a connection does
 
-**Decision.** The writer keeps 1,024 pages of the database in memory, each reader 128 (Turso keeps
-2,000, 8 MiB, on every connection). A reader's miss is a read of the file through the system's page
-cache; the writer keeps its indexes' inner pages.
+**Decision.** The writer keeps 1,024 pages of the database in memory, each reader 2,000 (8 MiB,
+Turso's default for every connection), the checkpointer next to nothing. A reader's miss is a read of
+the file through the system's page cache; the writer keeps its indexes' inner pages. Readers kept 128
+until decision 18: a reader that cleared its cache whole at every commit gained nothing from a larger
+one under writes.
 
 **Sources.** Turso's page cache (`crates/engine/storage/page_cache.rs`): one per connection, 2,000
 pages by default, kept consistent with the log by the connection itself.
 
-**Evidence.** Amphora's bench (`bench/`), fedora, 2026-10-20, K0's load: at Turso's 2,000 pages a
-connection, 78–86 MB resident and reads p99 0.74 ms; at 1,024/128, 47–49 MB and reads p99 0.27 ms
-(p50 0.085 ms against 0.101); writes the same. Smaller caches read faster under writes: the pages
-writes change are fewer to bring up to date.
+**Evidence.** Amphora's bench, fedora, 2026-10-20, K0's load, before decision 18: at 2,000 pages a
+connection, 78–86 MB resident and reads p99 0.74 ms; at 1,024/128, 47–49 MB and reads p99 0.27 ms.
+With decision 18 and 19 (commit f597f5a), 2026-10-21, K0's load (32 writers, 4 readers, 20 s), three runs
+each in turn (`bench/records/2026-10-21-fedora-k0-reader-pages-{128,2000}.jsonl`): at 128 pages
+reads p99 0.128–0.144 ms, 1.21–1.22 million reads, writes p99 6.5–7.0 ms, 47–51 MB resident; at
+2,000 pages reads p99 0.122–0.138 ms, 1.24–1.27 million reads, writes p99 6.3–7.4 ms, 80–90 MB.
+The comprehensive suite, each statement on its own, 200,000 rows
+(`bench/records/2026-10-21-fedora-suite.jsonl` and `-suite-amphora-2000-pages.jsonl`): at 32
+clients, 2,000 pages read `order_by_index` at 1,049,700 a second against 172,600 at 128,
+`filter_is_null` 74,100 against 10,500, `range_pk_100` 394,700 against 139,200 and `table_count`
+196,300 against 3,162; at 1 client the gains are smaller (`order_by_index` 142,000 against 63,100,
+`point_secondary` 319,600 against 271,500). The suite's peak resident set at 32 readers: 494 MB
+against 248 MB. Loads before the runs 1.3–6.4 (the K0 runs' own load included).
 
-**Falsified by.** A workload whose reads slow down past a bigger budget's (a working set of hot
-sessions larger than what readers keep, read faster from memory than from the system's cache).
+**Falsified by.** Reads under writes slower with the larger budget; a working set that fits in it
+read slower than from the system's cache. Its memory, 8 MiB a reader, is the case for one cache all
+readers share.
 
 ## 6. One flusher
 
