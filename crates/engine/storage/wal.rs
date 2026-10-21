@@ -20,8 +20,9 @@ use std::fmt::{Debug, Formatter};
 use std::{fmt, sync::Arc};
 
 use super::buffer_pool::BufferPool;
+use super::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use super::packed::{self, Record, Records};
-use super::pager::{PageRef, Pager};
+use super::pager::{Logged, PageRef, Pager};
 use super::sqlite3_ondisk::{
     self, checksum_wal, DatabaseHeader, WalHeader, WAL_MAGIC_BE, WAL_MAGIC_LE,
 };
@@ -474,6 +475,297 @@ pub struct PreparedFrames {
     /// Amphora: the packed records the frames are, as (first slot, slots), in order; each holds the
     /// pages of `metadata` that map to its first slot. Empty when each frame is a page.
     pub records: Vec<(u64, u32)>,
+    /// Amphora: for packed records, each page's depth in its record (as `metadata`), the records
+    /// decoded (as `records`), and the log's generation they were made in.
+    pub(crate) depths: Vec<u8>,
+    pub(crate) decoded: Vec<Arc<Record>>,
+    pub(crate) generation: u32,
+}
+
+/// Amphora: what a page's delta is made against: the log's generation, the last frame the writer
+/// sees, and the most bytes a delta may take.
+struct Against {
+    generation: u32,
+    upto: u64,
+    most: usize,
+}
+
+/// Amphora: a read of pages from packed records (`WalFile::begin_read_record`): each page's
+/// version at `head`, rebuilt from the records of its chain, each record read at most once.
+struct RecordRead {
+    head: u64,
+    generation: u32,
+    page_size: usize,
+    page_len: i32,
+    frame_len: usize,
+    file: Arc<dyn File>,
+    records: Arc<SpinLock<Records>>,
+    readers: Vec<PageReader>,
+    state: SpinLock<ReadState>,
+    /// What the read's callers wait on, finished (and taken) once every record is in.
+    done: SpinLock<Option<Completion>>,
+}
+
+/// Amphora: a page a [`RecordRead`] reads.
+struct PageReader {
+    page: u32,
+    /// The page's last frames up to the read's head, oldest first: its chain ends them.
+    frames: Vec<u64>,
+    complete: Box<ReadComplete>,
+    image: Arc<Buffer>,
+}
+
+/// Amphora: the records a [`RecordRead`] has, the reads it waits on, and the first failure.
+#[derive(Default)]
+struct ReadState {
+    have: FxHashMap<u64, Arc<Record>>,
+    pending: usize,
+    failed: Option<CompletionError>,
+}
+
+/// Amphora: where a page's chain stands in the records read so far.
+enum Walk {
+    /// Back to its image.
+    Whole,
+    /// The record at this frame is wanted next.
+    Wants(u64),
+    /// It doesn't hold: a record without the page, or no image within its frames.
+    Broken,
+}
+
+impl RecordRead {
+    /// Moves the read on: reads the records its chains want next (those not decoded already),
+    /// and finishes once none is wanted. Records found decoded let it go on at once; once it
+    /// waits on a read, the last read to end calls it again ([`RecordRead::arrived`]). While it
+    /// issues reads it holds a count of its own, so a read that ends at once never calls it back
+    /// within itself.
+    fn drive(self: &Arc<Self>) {
+        loop {
+            let (failed, wants) = {
+                let st = self.state.lock();
+                let wants: Vec<u64> = match st.failed {
+                    Some(_) => Vec::new(),
+                    None => {
+                        let mut wants: Vec<u64> = self
+                            .readers
+                            .iter()
+                            .filter_map(|reader| match Self::walk(reader, &st.have) {
+                                Walk::Wants(frame) => Some(frame),
+                                Walk::Whole | Walk::Broken => None,
+                            })
+                            .collect();
+                        wants.sort_unstable();
+                        wants.dedup();
+                        wants
+                    }
+                };
+                (st.failed, wants)
+            };
+            if failed.is_some() || wants.is_empty() {
+                let Some(done) = self.done.lock().take() else {
+                    return;
+                };
+                match failed {
+                    Some(err) => done.error(err),
+                    None => done.complete(0),
+                }
+                return;
+            }
+            let found: Vec<(u64, Option<Arc<Record>>)> = {
+                let records = self.records.lock();
+                wants
+                    .into_iter()
+                    .map(|frame| (frame, records.decoded(self.generation, frame)))
+                    .collect()
+            };
+            let mut reads = Vec::new();
+            {
+                let mut st = self.state.lock();
+                for (frame, record) in found {
+                    match record {
+                        Some(record) => {
+                            st.have.insert(frame, record);
+                        }
+                        None => reads.push(frame),
+                    }
+                }
+                st.pending = st.pending.saturating_add(reads.len()).saturating_add(1);
+            }
+            for frame in reads {
+                if let Err(err) = self.issue(frame) {
+                    let mut st = self.state.lock();
+                    st.failed = st.failed.or(Some(err));
+                    st.pending = st.pending.saturating_sub(1);
+                }
+            }
+            let waiting = {
+                let mut st = self.state.lock();
+                st.pending = st.pending.saturating_sub(1);
+                st.pending > 0
+            };
+            if waiting {
+                return;
+            }
+        }
+    }
+
+    /// Starts the read of the record at `frame`.
+    fn issue(self: &Arc<Self>, frame: u64) -> std::result::Result<(), CompletionError> {
+        let corrupt = CompletionError::PackedRecordCorrupt {
+            frame_id: frame,
+            page_idx: 0,
+        };
+        let slots = self.records.lock().slots_of(frame).ok_or(corrupt)?;
+        let len = usize::try_from(slots)
+            .ok()
+            .and_then(|slots| slots.checked_mul(self.frame_len))
+            .ok_or(corrupt)?;
+        let offset = frame
+            .checked_sub(1)
+            .and_then(|index| index.checked_mul(u64::try_from(self.frame_len).ok()?))
+            .and_then(|at| at.checked_add(WAL_HEADER_SIZE as u64))
+            .ok_or(corrupt)?;
+        let me = self.clone();
+        let c = Completion::new_read(Arc::new(Buffer::new_temporary(len)), move |res| {
+            me.arrived(frame, len, offset, res);
+            None
+        });
+        match self.file.pread(offset, c) {
+            Ok(_) => Ok(()),
+            Err(LimboError::CompletionError(err)) => Err(err),
+            Err(_) => Err(CompletionError::IOError(
+                std::io::ErrorKind::Other,
+                "packed log read",
+            )),
+        }
+    }
+
+    /// The read of the record at `frame` ended: the last of a round moves the read on.
+    fn arrived(
+        self: &Arc<Self>,
+        frame: u64,
+        len: usize,
+        offset: u64,
+        res: std::result::Result<(Arc<Buffer>, i32), CompletionError>,
+    ) {
+        let record = match res {
+            Err(err) => Err(err),
+            Ok((buf, read)) if usize::try_from(read).ok() == Some(len) => {
+                packed::gather(buf.as_slice(), self.page_size)
+                    .and_then(|payload| Record::decode(&payload, self.page_size))
+                    .map_err(|e| {
+                        mark_unlikely();
+                        tracing::error!("packed log record at frame {frame}: {e}");
+                        CompletionError::PackedRecordCorrupt {
+                            frame_id: frame,
+                            page_idx: 0,
+                        }
+                    })
+            }
+            Ok((_, read)) => Err(CompletionError::ShortReadWalFrame {
+                offset,
+                expected: len,
+                actual: usize::try_from(read).unwrap_or(0),
+            }),
+        };
+        let record = record.map(Arc::new);
+        if let Ok(record) = &record {
+            self.records
+                .lock()
+                .keep(self.generation, frame, record.clone());
+        }
+        let last = {
+            let mut st = self.state.lock();
+            match record {
+                Ok(record) => {
+                    st.have.insert(frame, record);
+                }
+                Err(err) => st.failed = st.failed.or(Some(err)),
+            }
+            st.pending = st.pending.saturating_sub(1);
+            st.pending == 0
+        };
+        if last {
+            self.drive();
+        }
+    }
+
+    /// Where `reader`'s chain stands in `have`.
+    fn walk(reader: &PageReader, have: &FxHashMap<u64, Arc<Record>>) -> Walk {
+        for frame in reader.frames.iter().rev() {
+            let Some(record) = have.get(frame) else {
+                return Walk::Wants(*frame);
+            };
+            match record.body(reader.page) {
+                None => return Walk::Broken,
+                Some(packed::Body::Image(_)) => return Walk::Whole,
+                Some(packed::Body::Delta { .. }) => {}
+            }
+        }
+        Walk::Broken
+    }
+
+    /// `reader`'s page rebuilt from its chain in `have`, checking that the chain's depths count
+    /// down to its image.
+    fn rebuild(&self, reader: &PageReader, have: &FxHashMap<u64, Arc<Record>>) -> Result<Vec<u8>> {
+        let broken = || LimboError::Corrupt(format!("packed log: page {}'s chain", reader.page));
+        let mut chain = Vec::new();
+        for frame in reader.frames.iter().rev() {
+            let body = have
+                .get(frame)
+                .and_then(|record| record.body(reader.page))
+                .ok_or_else(broken)?;
+            let image = matches!(body, packed::Body::Image(_));
+            chain.push(body);
+            if image {
+                break;
+            }
+        }
+        let deltas = chain.len().checked_sub(1).ok_or_else(broken)?;
+        for (newer, body) in chain.iter().enumerate() {
+            if usize::from(body.depth()).checked_add(newer) != Some(deltas) {
+                return Err(broken());
+            }
+        }
+        packed::rebuild(&chain, self.page_size)
+    }
+
+    /// Gives each reader its page (or `res`'s error), returning the first error any gave back.
+    fn deliver(
+        &self,
+        res: std::result::Result<(Arc<Buffer>, i32), CompletionError>,
+    ) -> Option<CompletionError> {
+        let have = self.state.lock().have.clone();
+        let mut first = None;
+        for reader in &self.readers {
+            let given = match &res {
+                Err(err) => {
+                    (reader.complete)(Err(*err));
+                    Some(*err)
+                }
+                Ok(_) => match self.rebuild(reader, &have) {
+                    Ok(page) if page.len() == reader.image.len() => {
+                        reader.image.as_mut_slice().copy_from_slice(&page);
+                        (reader.complete)(Ok((reader.image.clone(), self.page_len)))
+                    }
+                    rebuilt => {
+                        mark_unlikely();
+                        if let Err(e) = rebuilt {
+                            tracing::error!("packed log at frame {}: {e}", self.head);
+                        }
+                        let err = CompletionError::PackedRecordCorrupt {
+                            frame_id: self.head,
+                            page_idx: usize::try_from(reader.page).unwrap_or(usize::MAX),
+                        };
+                        (reader.complete)(Err(err));
+                        Some(err)
+                    }
+                },
+            };
+            first = first.or(given);
+        }
+        first
+    }
 }
 
 /// Metadata published by the coordination backend once a WAL commit becomes visible.
@@ -621,6 +913,12 @@ trait WalCoordination: Debug + Send + Sync {
     /// Amphora: records a packed record of `slots` slots appended at `head`: its slots, then each
     /// of `pages` at `head`, `cache_frame`'s rewind guard applying to the record as a whole.
     fn cache_record(&self, head: u64, slots: u32, pages: &mut dyn Iterator<Item = u64>);
+
+    /// Amphora: the last frame holding `page_id` up to `upto`, backfilled or not.
+    fn latest_frame(&self, page_id: u64, upto: u64) -> Option<u64>;
+
+    /// Amphora: the last `most` frames holding `page_id` up to `upto`, oldest first.
+    fn page_frames(&self, page_id: u64, upto: u64, most: usize) -> Vec<u64>;
 
     /// Drop any cached frame mappings newer than `max_frame`.
     fn rollback_cache(&self, max_frame: u64);
@@ -1461,6 +1759,27 @@ impl WalCoordination for InProcessWalCoordination {
             .runtime
             .frame_cache_high_water
             .store(last, Ordering::Release);
+    }
+
+    fn latest_frame(&self, page_id: u64, upto: u64) -> Option<u64> {
+        let shared = self.shared.read();
+        let frame_cache = shared.runtime.frame_cache.lock();
+        let frames = frame_cache.get(&page_id)?;
+        let end = frames.partition_point(|&frame| frame <= upto);
+        frames.get(..end)?.last().copied()
+    }
+
+    fn page_frames(&self, page_id: u64, upto: u64, most: usize) -> Vec<u64> {
+        let shared = self.shared.read();
+        let frame_cache = shared.runtime.frame_cache.lock();
+        let Some(frames) = frame_cache.get(&page_id) else {
+            return Vec::new();
+        };
+        let end = frames.partition_point(|&frame| frame <= upto);
+        frames
+            .get(end.saturating_sub(most)..end)
+            .map(<[u64]>::to_vec)
+            .unwrap_or_default()
     }
 
     fn rollback_cache(&self, max_frame: u64) {
@@ -2531,6 +2850,14 @@ impl WalCoordination for ShmWalCoordination {
         }
     }
 
+    fn latest_frame(&self, page_id: u64, upto: u64) -> Option<u64> {
+        self.fallback.latest_frame(page_id, upto)
+    }
+
+    fn page_frames(&self, page_id: u64, upto: u64, most: usize) -> Vec<u64> {
+        self.fallback.page_frames(page_id, upto, most)
+    }
+
     fn rollback_cache(&self, max_frame: u64) {
         self.fallback.rollback_cache(max_frame);
         self.authority.rollback_frames(max_frame);
@@ -3427,10 +3754,11 @@ impl WalFile {
         Ok(())
     }
 
-    /// Amphora: `pages` as packed records for `prepare_frames` and `append_frames_vectored`: cut
-    /// into records of up to `packed::pages_per_record` pages, each laid in the slots it takes
-    /// from frame `first`, the slots' checksums chained from `checksum`; the last slot carries
-    /// `db_size` (0 when no commit ends here).
+    /// Amphora: `pages` as packed records for `prepare_frames` and `append_frames_vectored`: each
+    /// page's entry (a delta where its base is its latest version in this generation of the log,
+    /// else its image), cut into records of up to `packed::RECORD_BYTES`, each laid in the slots
+    /// it takes from frame `first`, the slots' checksums chained from `checksum`; the last slot
+    /// carries `db_size` (0 when no commit ends here).
     fn prepare_records(
         &self,
         pages: &[PageRef],
@@ -3443,30 +3771,86 @@ impl WalFile {
         let page_size =
             usize::try_from(header.page_size).map_err(|_| LimboError::IntegerOverflow)?;
         let page_transform = self.io_ctx.read().page_transform().clone();
-        let per_record = packed::pages_per_record(page_size);
-        let count = pages.len().div_ceil(per_record);
-        let scratch = per_record
+        // A delta compares the page's buffer with what the log holds, which differ in the page's
+        // checksum at most; a codec's output can't be compared.
+        let tail = match &page_transform {
+            PageTransform::None => Some(0),
+            PageTransform::Checksum(_) => Some(usize::from(CHECKSUM_REQUIRED_RESERVED_BYTES)),
+            PageTransform::Codec(_) => None,
+        };
+        let against = Against {
+            generation: header.checkpoint_seq,
+            upto: self.max_frame.load(Ordering::Acquire),
+            most: page_size.checked_div(2).unwrap_or(0),
+        };
+        let len = pages
+            .len()
             .checked_mul(page_size)
             .ok_or(LimboError::IntegerOverflow)?;
-        let mut images = vec![0u8; scratch];
+        let mut images = vec![0u8; len];
+        let mut numbers = Vec::with_capacity(pages.len());
+        let mut deltas = Vec::with_capacity(pages.len());
+        for (page, image) in pages.iter().zip(images.chunks_exact_mut(page_size)) {
+            let number = u32::try_from(page.get().id()).map_err(|_| LimboError::IntegerOverflow)?;
+            Self::transform_page(&page_transform, number, page.get_contents().as_ptr(), image)?;
+            numbers.push(number);
+            // The base is used up whatever is written, and the buffer holds no version of the log
+            // until this one is published.
+            let base = page.take_log_base();
+            let logged = page.logged();
+            page.clear_logged();
+            let delta = match (tail, base.as_deref(), logged) {
+                (Some(tail), Some(base), _) => {
+                    self.delta(number, base.version, &base.image, image, tail, &against)
+                }
+                // Spilled and unchanged since: the buffer is its base.
+                (Some(tail), None, Some(version)) => {
+                    let buffer = page.get_contents().as_ptr();
+                    self.delta(number, version, buffer, image, tail, &against)
+                }
+                _ => None,
+            };
+            deltas.push(delta);
+        }
+        let entries: Vec<(u32, packed::Body<'_>)> = numbers
+            .iter()
+            .zip(images.chunks_exact(page_size))
+            .zip(&deltas)
+            .map(|((number, image), delta)| {
+                let body = match delta {
+                    Some((depth, runs)) => packed::Body::Delta {
+                        depth: *depth,
+                        runs,
+                    },
+                    None => packed::Body::Image(image),
+                };
+                (*number, body)
+            })
+            .collect();
+        // Records end where the next entry would take one past its bound.
+        let mut cuts = Vec::new();
+        let (mut from, mut size) = (0usize, 0usize);
+        for (index, (_, body)) in entries.iter().enumerate() {
+            let take = body.raw_len();
+            if index > from && size.saturating_add(take) > packed::RECORD_BYTES {
+                cuts.push(from..index);
+                (from, size) = (index, 0);
+            }
+            size = size.saturating_add(take);
+        }
+        cuts.push(from..entries.len());
+        let count = cuts.len();
         let mut bufs = Vec::new();
         let mut metadata = Vec::with_capacity(pages.len());
+        let mut depths = Vec::with_capacity(pages.len());
         let mut records = Vec::with_capacity(count);
+        let mut decoded = Vec::with_capacity(count);
         let mut next = first;
-        for (index, chunk) in pages.chunks(per_record).enumerate() {
-            let mut numbers = Vec::with_capacity(chunk.len());
-            for (page, image) in chunk.iter().zip(images.chunks_exact_mut(page_size)) {
-                let number =
-                    u32::try_from(page.get().id()).map_err(|_| LimboError::IntegerOverflow)?;
-                Self::transform_page(&page_transform, number, page.get_contents().as_ptr(), image)?;
-                numbers.push(number);
-            }
-            let held: Vec<(u32, &[u8])> = numbers
-                .iter()
-                .copied()
-                .zip(images.chunks_exact(page_size))
-                .collect();
-            let payload = packed::encode(&held, page_size)?;
+        for (index, cut) in cuts.into_iter().enumerate() {
+            let held = entries
+                .get(cut.clone())
+                .ok_or_else(|| LimboError::InternalError("a record past its entries".into()))?;
+            let (payload, record) = packed::encode(held, page_size)?;
             let slots = packed::slots(payload.len(), page_size)?;
             let ends = index.checked_add(1) == Some(count);
             for slot in 0..slots {
@@ -3490,10 +3874,15 @@ impl WalFile {
                 checksum = recompute_wal_frame_checksum(frame.as_mut_slice(), header, checksum);
                 bufs.push(frame);
             }
-            for page in chunk {
+            let held_pages = pages
+                .get(cut)
+                .ok_or_else(|| LimboError::InternalError("a record past its pages".into()))?;
+            for (page, (_, body)) in held_pages.iter().zip(held) {
                 metadata.push((page.clone(), next, checksum));
+                depths.push(body.depth());
             }
             records.push((next, slots));
+            decoded.push(Arc::new(record));
             next = next
                 .checked_add(u64::from(slots))
                 .ok_or(LimboError::IntegerOverflow)?;
@@ -3507,13 +3896,44 @@ impl WalFile {
             final_max_frame,
             epoch,
             records,
+            depths,
+            decoded,
+            generation: against.generation,
         })
     }
 
-    /// Amphora: reads the packed record at `head` for `readers`, each a page it holds and what to
-    /// give that page's image (as the log holds it) to: from the records decoded when it is
-    /// there, else one read of its slots, decoded and kept. Every reader is given its page or an
-    /// error: the read's, or the record's when it doesn't decode or doesn't hold the page.
+    /// Amphora: the delta that turns `version` of a page (`base`, its bytes as the page's buffer
+    /// held them) into `image` (as the log will hold it), as (its depth, its runs): only while
+    /// `version` is of this generation of the log and the page's latest in it, fewer than
+    /// `packed::MOST_DELTAS` deltas from its image, and the delta saves half the page.
+    fn delta(
+        &self,
+        page: u32,
+        version: Logged,
+        base: &[u8],
+        image: &[u8],
+        tail: usize,
+        against: &Against,
+    ) -> Option<(u8, Vec<u8>)> {
+        if version.generation != against.generation || version.depth >= packed::MOST_DELTAS {
+            return None;
+        }
+        if self
+            .coordination
+            .latest_frame(u64::from(page), against.upto)
+            != Some(version.frame)
+        {
+            return None;
+        }
+        let runs = packed::diff(base, image, tail, against.most)?;
+        Some((version.depth.checked_add(1)?, runs))
+    }
+
+    /// Amphora: reads `readers`' pages as of the packed record at `head`, each a page the record
+    /// holds and what to give its image (as the log holds it) to: each page rebuilt from its
+    /// chain (its entry there, back through its deltas to its last image), every record read once
+    /// and kept decoded. Every reader is given its page, or an error: a read's, or a record's when
+    /// one doesn't decode or a chain doesn't hold. What it returns finishes once all have been.
     fn begin_read_record(
         &self,
         head: u64,
@@ -3525,123 +3945,88 @@ impl WalFile {
         let page_size =
             usize::try_from(header.page_size).map_err(|_| LimboError::IntegerOverflow)?;
         let page_len = i32::try_from(page_size).map_err(|_| LimboError::IntegerOverflow)?;
-        let generation = header.checkpoint_seq;
-        let records = self.with_shared(|shared| shared.runtime.records.clone());
-        let images: Vec<Arc<Buffer>> = readers
-            .iter()
-            .map(|_| Arc::new(buffer_pool.get_page()))
-            .collect();
-        // Ok: the record decoded. Err(Some): the read failed. Err(None): it doesn't decode.
-        let finish = move |outcome: std::result::Result<&Record, Option<CompletionError>>| {
-            let mut failed = None;
-            for ((page, complete), image) in readers.iter().zip(&images) {
-                let bytes = outcome.as_ref().ok().and_then(|record| record.image(*page));
-                let result = match (bytes, outcome) {
-                    (Some(bytes), _) if bytes.len() == image.len() => {
-                        image.as_mut_slice().copy_from_slice(bytes);
-                        complete(Ok((image.clone(), page_len)))
-                    }
-                    (_, Err(Some(err))) => {
-                        complete(Err(err));
-                        Some(err)
-                    }
-                    _ => {
-                        mark_unlikely();
-                        let err = CompletionError::PackedRecordCorrupt {
-                            frame_id: head,
-                            page_idx: usize::try_from(*page).unwrap_or(usize::MAX),
-                        };
-                        complete(Err(err));
-                        Some(err)
-                    }
-                };
-                failed = failed.or(result);
-            }
-            failed
-        };
-        let decoded = records.lock().decoded(generation, head);
-        if let Some(record) = decoded {
-            // Decoded for an earlier read: no IO.
-            let c =
-                Completion::new_read(Arc::new(Buffer::new_temporary(0)), move |res| match res {
-                    Ok(_) => finish(Ok(&record)),
-                    Err(err) => finish(Err(Some(err))),
-                });
-            if let Some(group) = group {
-                group.add(&c);
-            }
-            c.complete(0);
-            return Ok(c);
-        }
-        let Some(slots) = records.lock().slots_of(head) else {
-            return Err(LimboError::Corrupt(format!(
-                "packed log: no record begins at frame {head}"
-            )));
-        };
-        let frame = WAL_FRAME_HEADER_SIZE
+        let frame_len = WAL_FRAME_HEADER_SIZE
             .checked_add(page_size)
             .ok_or(LimboError::IntegerOverflow)?;
-        let len = usize::try_from(slots)
-            .ok()
-            .and_then(|slots| slots.checked_mul(frame))
-            .ok_or(LimboError::IntegerOverflow)?;
-        let offset = self.frame_offset(head);
-        let c = Completion::new_read(Arc::new(Buffer::new_temporary(len)), move |res| {
-            let (buf, read) = match res {
-                Ok(done) => done,
-                Err(err) => return finish(Err(Some(err))),
-            };
-            if usize::try_from(read).ok() != Some(len) {
-                return finish(Err(Some(CompletionError::ShortReadWalFrame {
-                    offset,
-                    expected: len,
-                    actual: usize::try_from(read).unwrap_or(0),
-                })));
-            }
-            match packed::gather(buf.as_slice(), page_size)
-                .and_then(|payload| Record::decode(&payload, page_size))
-            {
-                Ok(record) => {
-                    let record = Arc::new(record);
-                    records.lock().keep(generation, head, record.clone());
-                    finish(Ok(&record))
+        let most = usize::from(packed::MOST_DELTAS).saturating_add(1);
+        let readers = readers
+            .into_iter()
+            .map(|(page, complete)| {
+                // A chain is the last of the page's frames up to `head`.
+                let mut frames = self.coordination.page_frames(u64::from(page), head, most);
+                if frames.last() != Some(&head) {
+                    frames = vec![head];
                 }
-                Err(e) => {
-                    tracing::error!("packed log record at frame {head}: {e}");
-                    finish(Err(None))
+                PageReader {
+                    page,
+                    frames,
+                    complete,
+                    image: Arc::new(buffer_pool.get_page()),
                 }
-            }
+            })
+            .collect();
+        let read = Arc::new(RecordRead {
+            head,
+            generation: header.checkpoint_seq,
+            page_size,
+            page_len,
+            frame_len,
+            file: self.coordination.wal_file()?,
+            records: self.with_shared(|shared| shared.runtime.records.clone()),
+            readers,
+            state: SpinLock::new(ReadState::default()),
+            done: SpinLock::new(None),
         });
+        let job = read.clone();
+        // Finished by hand once the records are in: a read like any other to those who wait on it
+        // (a statement's reset drains it).
+        let done = Completion::new_read(Arc::new(Buffer::new_temporary(0)), move |res| {
+            job.deliver(res)
+        });
+        *read.done.lock() = Some(done.clone());
         if let Some(group) = group {
-            group.add(&c);
+            group.add(&done);
         }
-        let file = self.coordination.wal_file()?;
-        file.pread(offset, c)
+        read.drive();
+        Ok(done)
     }
 
-    /// Amphora: publishes a packed batch's records.
+    /// Amphora: publishes a packed batch's records, and keeps them decoded.
     fn cache_records(&self, batch: &PreparedFrames) {
-        Self::publish_records(self.coordination.as_ref(), &batch.records, &batch.metadata);
+        let records = self.with_shared(|shared| shared.runtime.records.clone());
+        Self::publish_records(
+            self.coordination.as_ref(),
+            &records,
+            batch.generation,
+            &batch.records,
+            &batch.decoded,
+            &batch.metadata,
+        );
     }
 
-    /// Amphora: publishes `records`, each with the pages of `metadata` that map to its first slot.
+    /// Amphora: publishes `records`, each with the pages of `metadata` that map to its first slot,
+    /// then keeps them decoded (`decoded`, as `records`).
     fn publish_records(
         coordination: &dyn WalCoordination,
+        registry: &SpinLock<Records>,
+        generation: u32,
         records: &[(u64, u32)],
+        decoded: &[Arc<Record>],
         metadata: &[(PageRef, u64, (u32, u32))],
     ) {
-        for &(head, slots) in records {
+        for (&(head, slots), record) in records.iter().zip(decoded) {
             let mut pages = metadata
                 .iter()
                 .filter(|(_, frame, _)| *frame == head)
                 .map(|(page, _, _)| page.get().id() as u64);
             coordination.cache_record(head, slots, &mut pages);
+            registry.lock().keep(generation, head, record.clone());
         }
     }
 
     /// Amphora: `append_frames_vectored` for a packed generation: `pages` as records after the
-    /// connection's last frame, published (their pages' WAL tags, their slots, then their pages)
-    /// once their write has succeeded.
+    /// connection's last frame, published (their pages' WAL tags and logged versions, their
+    /// slots, then their pages) once their write has succeeded.
     fn append_records(
         &self,
         pages: &[PageRef],
@@ -3665,8 +4050,12 @@ impl WalFile {
             .try_fold(0usize, |sum, buf| sum.checked_add(buf.len()))
             .ok_or(LimboError::IntegerOverflow)?;
         let records = prepared.records.clone();
+        let decoded = prepared.decoded.clone();
         let metadata = prepared.metadata.clone();
+        let depths = prepared.depths.clone();
+        let generation = prepared.generation;
         let coordination = self.coordination.clone();
+        let registry = self.with_shared(|shared| shared.runtime.records.clone());
         let c = Completion::new_write(move |res| {
             let Ok(written) = res else {
                 return;
@@ -3678,10 +4067,26 @@ impl WalFile {
                 tracing::error!("packed log: a spill wrote {written} of {total} bytes");
                 return;
             }
-            for (page, frame, _) in &metadata {
+            for ((page, frame, _), depth) in metadata.iter().zip(&depths) {
+                // A page changed while its write was under way holds what it wrote no longer.
+                let kept = !page.changed_since_write_began();
                 page.set_wal_tag(*frame, epoch);
+                if kept {
+                    page.set_logged(Logged {
+                        frame: *frame,
+                        generation,
+                        depth: *depth,
+                    });
+                }
             }
-            Self::publish_records(coordination.as_ref(), &records, &metadata);
+            Self::publish_records(
+                coordination.as_ref(),
+                &registry,
+                generation,
+                &records,
+                &decoded,
+                &metadata,
+            );
         });
         let file = self.coordination.wal_file()?;
         let c = file.pwritev(prepared.offset, prepared.bufs, c)?;
@@ -5118,6 +5523,9 @@ impl Wal for WalFile {
             final_max_frame: next_frame_id - 1,
             epoch,
             records: Vec::new(),
+            depths: Vec::new(),
+            decoded: Vec::new(),
+            generation: header.checkpoint_seq,
         })
     }
 
@@ -5149,6 +5557,14 @@ impl Wal for WalFile {
             for (page, frame_id, _) in &batch.metadata {
                 page.clear_dirty();
                 page.set_wal_tag(*frame_id, batch.epoch);
+            }
+            // Amphora: a packed batch's pages hold what the log now holds.
+            for ((page, frame, _), depth) in batch.metadata.iter().zip(&batch.depths) {
+                page.set_logged(Logged {
+                    frame: *frame,
+                    generation: batch.generation,
+                    depth: *depth,
+                });
             }
         }
     }

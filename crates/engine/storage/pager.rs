@@ -143,6 +143,14 @@ mod page_inner {
         /// The WAL frame number this page was loaded from (0 if loaded from main DB file)
         /// This tracks which version of the page we have in memory
         pub wal_tag: AtomicU64,
+        /// Amphora: the version of the page in a packed log that `buffer` holds, while it holds
+        /// one as it was written there (`Page::logged`): its frame, and its generation and depth
+        /// packed in `logged_as` ([`super::LOGGED_NONE`] when it holds none).
+        pub logged_frame: AtomicU64,
+        pub logged_as: AtomicU64,
+        /// Amphora: the version the page held when last made dirty, with its bytes: the base of
+        /// its next delta (`Pager::add_dirty`, `Page::keep_log_base`).
+        pub log_base: Option<Box<super::LogBase>>,
         /// The actual page data buffer. None if not loaded.
         buffer: Option<Arc<Buffer>>,
         /// Start and length of the bytes of `buffer`, kept next to it so a page
@@ -182,6 +190,9 @@ mod page_inner {
                 header_offset: Self::header_offset_of(id),
                 pin_count: AtomicUsize::new(0),
                 wal_tag: AtomicU64::new(TAG_UNSET),
+                logged_frame: AtomicU64::new(0),
+                logged_as: AtomicU64::new(super::LOGGED_NONE),
+                log_base: None,
                 buffer: None,
                 data_ptr: std::ptr::NonNull::dangling(),
                 data_len: 0,
@@ -242,6 +253,11 @@ mod page_inner {
         pub fn set_id(&mut self, id: usize) {
             self.id = id;
             self.header_offset = Self::header_offset_of(id);
+            // Amphora: renumbered (a balance reassigns its siblings' numbers), the buffer holds
+            // no version of this page as a packed log holds it: in such a log every page of a
+            // record shares its frame, so another page's version could pass for this one's.
+            self.logged_as.store(super::LOGGED_NONE, Ordering::Release);
+            self.log_base = None;
         }
 
         const fn header_offset_of(id: usize) -> u8 {
@@ -962,6 +978,28 @@ pub fn unpack_tag_pair(tag: u64) -> (u64, u32) {
     (frame, epoch)
 }
 
+/// Amphora: a version of a page in a packed log (`storage/packed.rs`): the frame of the record
+/// that holds it, the log's generation (its header's checkpoint sequence), and its depth (deltas
+/// since the page's last whole image there).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Logged {
+    pub frame: u64,
+    pub generation: u32,
+    pub depth: u8,
+}
+
+/// Amphora: the version a page held when it was last made dirty, and its bytes as the page's
+/// buffer held them: the base of the page's next delta.
+#[derive(Debug)]
+pub struct LogBase {
+    pub version: Logged,
+    pub image: Box<[u8]>,
+}
+
+/// Amphora: `PageInner::logged_as` when the buffer holds no version of a packed log (a generation
+/// and depth pack into at most 40 bits).
+pub const LOGGED_NONE: u64 = u64::MAX;
+
 #[derive(Debug)]
 pub struct Page {
     pub inner: UnsafeCell<PageInner>,
@@ -1036,6 +1074,7 @@ impl Page {
     pub fn set_dirty(&self) {
         tracing::debug!("set_dirty(page={})", self.get().id());
         self.clear_wal_tag();
+        self.clear_logged();
         // Clear spilled flag since page is being modified again
         self.get().flags.fetch_and(!PAGE_SPILLED, Ordering::Release);
         self.get().flags.fetch_or(PAGE_DIRTY, Ordering::Release);
@@ -1215,6 +1254,60 @@ impl Page {
         );
         self.get().wal_tag.store(new_tag, Ordering::Release);
         true
+    }
+
+    /// Amphora: the buffer holds `version` of the page as a packed log holds it.
+    pub fn set_logged(&self, version: Logged) {
+        let inner = self.get();
+        inner.logged_as.store(LOGGED_NONE, Ordering::Release);
+        inner.logged_frame.store(version.frame, Ordering::Release);
+        let packed = (u64::from(version.generation) << 8) | u64::from(version.depth);
+        inner.logged_as.store(packed, Ordering::Release);
+    }
+
+    /// Amphora: whether the page changed since a write of it began ([`Page::set_write_pending`]):
+    /// a change clears its WAL tag ([`Page::set_dirty`]).
+    pub fn changed_since_write_began(&self) -> bool {
+        self.get().wal_tag.load(Ordering::Acquire) == TAG_UNSET
+    }
+
+    /// Amphora: the version of a packed log the buffer holds, if it holds one as written there.
+    pub fn logged(&self) -> Option<Logged> {
+        let inner = self.get();
+        let packed = inner.logged_as.load(Ordering::Acquire);
+        if packed == LOGGED_NONE {
+            return None;
+        }
+        let frame = inner.logged_frame.load(Ordering::Acquire);
+        let generation = u32::try_from(packed >> 8).ok()?;
+        let depth = u8::try_from(packed & 0xff).ok()?;
+        Some(Logged {
+            frame,
+            generation,
+            depth,
+        })
+    }
+
+    /// Amphora: the buffer no longer holds a version as a packed log holds it.
+    pub fn clear_logged(&self) {
+        self.get().logged_as.store(LOGGED_NONE, Ordering::Release);
+    }
+
+    /// Amphora: before the page changes, keeps the version its buffer holds (if it holds one as a
+    /// packed log does) and a copy of its bytes, as the base of its next delta.
+    pub fn keep_log_base(&self) {
+        let base = self.logged().map(|version| {
+            Box::new(LogBase {
+                version,
+                image: self.get().as_ptr().to_vec().into_boxed_slice(),
+            })
+        });
+        self.get().log_base = base;
+    }
+
+    /// Amphora: takes the base kept for the page's next delta.
+    pub fn take_log_base(&self) -> Option<Box<LogBase>> {
+        self.get().log_base.take()
     }
 
     #[inline]
@@ -3942,6 +4035,8 @@ impl Pager {
         if !page.is_dirty() || page.is_spilled() {
             let key = PageCacheKey::new(page.get().id());
             self.page_cache.write().notify_page_dirty(key);
+            // Amphora: the version it holds is its next delta's base (`storage/packed.rs`).
+            page.keep_log_base();
         }
         page.set_dirty();
         Ok(())

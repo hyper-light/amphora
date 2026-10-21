@@ -1,8 +1,8 @@
-//! The packed log (`storage/packed.rs`; Amphora's `docs/design/store.md`, decision 16): what a
-//! packed log holds reads back the same through each way the engine reads its log (a connection
-//! with nothing cached, the checkpoint, recovery on open), whole commits or none survive a cut, and
-//! a record whose checksums hold but that doesn't decode is refused rather than read
-//! (AC-T1.4.4, AC-T1.3.1).
+//! The packed log (`storage/packed.rs`; Amphora's `docs/design/store.md`, decisions 16 and 17):
+//! what a packed log holds, whole images and deltas, reads back the same through each way the
+//! engine reads its log (a connection with nothing cached, the checkpoint, recovery on open), whole
+//! commits or none survive a cut, and a record whose checksums hold but that doesn't decode is
+//! refused rather than read (AC-T1.4.4, AC-T1.3.1).
 
 use amphora_engine::{
     CheckpointMode, ConnectOpts, Connection, Database, DatabaseOpts, LimboError, Numeric,
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// The log header's file format for a packed generation, and for SQLite's one page a frame.
-const PACKED_FORMAT: u32 = 0x414d_5001;
+const PACKED_FORMAT: u32 = 0x414d_5002;
 const PAGE_FORMAT: u32 = 3_007_000;
 const HEADER: usize = 32;
 const FRAME_HEADER: usize = 24;
@@ -98,7 +98,7 @@ fn insert_in(
 fn table(conn: &Arc<Connection>) -> Vec<(i64, Vec<u8>)> {
     let mut stmt = conn.prepare("SELECT id, body FROM t ORDER BY id").unwrap();
     stmt.run_collect_rows()
-        .unwrap()
+        .unwrap_or_else(|e| panic!("reading the table: {e}"))
         .into_iter()
         .map(|row| {
             let id = match &row[0] {
@@ -179,6 +179,220 @@ fn what_a_packed_log_holds_reads_back_through_every_path() {
     let conn = connect(&db);
     assert_eq!(table(&conn), want);
     integrity(&conn);
+}
+
+/// The entries of every record in a packed log with no restart behind it, as (kind, depth): 0 an
+/// image, 1 a delta.
+fn entries(wal: &[u8]) -> Vec<(u8, u8)> {
+    let frame = FRAME_HEADER + PAGE;
+    let mut found = Vec::new();
+    for (head, slots) in records(wal) {
+        let payload: Vec<u8> = (0..slots as usize)
+            .flat_map(|i| {
+                let at = head + i * frame + FRAME_HEADER;
+                wal[at..at + PAGE].iter().copied()
+            })
+            .collect();
+        let stored = u32::from_be_bytes(payload[0..4].try_into().unwrap()) as usize;
+        let raw_len = u32::from_be_bytes(payload[4..8].try_into().unwrap()) as usize;
+        let raw = if stored == 0 {
+            payload[8..8 + raw_len].to_vec()
+        } else {
+            let mut raw = vec![0u8; raw_len];
+            lz4_flex::block::decompress_into(&payload[8..8 + stored], &mut raw).unwrap();
+            raw
+        };
+        let count = u32::from_be_bytes(raw[0..4].try_into().unwrap()) as usize;
+        for e in 0..count {
+            let at = 4 + e * 12;
+            found.push((raw[at + 4], raw[at + 5]));
+        }
+    }
+    found
+}
+
+/// Do: in a packed log, change a few bytes of the same rows commit after commit, more times than
+/// a page's deltas may run in a row; read the rows on a fresh connection, after a checkpoint and
+/// after opening the database again. Expect: deltas in the log, at depths up to the most allowed
+/// and never past it, and every row as last written each time.
+#[test]
+fn pages_changed_again_and_again_are_logged_as_deltas_and_read_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("deltas.db");
+    let mut want: Vec<(i64, Vec<u8>)>;
+    {
+        let db = open(&path);
+        db.wal_pack(true).unwrap();
+        let conn = connect(&db);
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)")
+            .unwrap();
+        want = insert(&conn, 0..300, 500, false);
+        let mut update = conn.prepare("UPDATE t SET body = ? WHERE id = ?").unwrap();
+        for round in 0..30u8 {
+            conn.execute("BEGIN").unwrap();
+            for row in want
+                .iter_mut()
+                .filter(|(id, _)| (*id as u8) % 3 == round % 3)
+            {
+                row.1[usize::from(round) * 7 % 500] = round;
+                update.reset().unwrap();
+                update
+                    .bind_at(NonZero::new(1).unwrap(), Value::from_slice(&row.1).unwrap())
+                    .unwrap();
+                update
+                    .bind_at(NonZero::new(2).unwrap(), Value::from_i64(row.0))
+                    .unwrap();
+                update.run_ignore_rows().unwrap();
+            }
+            conn.execute("COMMIT").unwrap();
+            if round % 10 == 9 {
+                assert_eq!(table(&connect(&db)), want, "after round {round}");
+            }
+        }
+        let wal = std::fs::read(wal_path(&path)).unwrap();
+        let entries = entries(&wal);
+        let deltas = entries.iter().filter(|(kind, _)| *kind == 1).count();
+        let deepest = entries.iter().map(|(_, depth)| *depth).max().unwrap();
+        assert!(
+            deltas * 2 > entries.len(),
+            "{deltas} deltas of {} entries",
+            entries.len()
+        );
+        assert_eq!(deepest, 8, "chains run to the most allowed, and no further");
+        integrity(&connect(&db));
+        truncate(&conn);
+        assert_eq!(table(&connect(&db)), want);
+        let mut update = conn.prepare("UPDATE t SET body = ? WHERE id = ?").unwrap();
+        for row in want.iter_mut().take(50) {
+            row.1[499] ^= 0xff;
+            update.reset().unwrap();
+            update
+                .bind_at(NonZero::new(1).unwrap(), Value::from_slice(&row.1).unwrap())
+                .unwrap();
+            update
+                .bind_at(NonZero::new(2).unwrap(), Value::from_i64(row.0))
+                .unwrap();
+            update.run_ignore_rows().unwrap();
+        }
+    }
+    let db = open(&path);
+    let conn = connect(&db);
+    assert_eq!(table(&conn), want);
+    integrity(&conn);
+}
+
+/// A xorshift's next number.
+fn next(x: &mut u64) -> u64 {
+    *x ^= *x << 13;
+    *x ^= *x >> 7;
+    *x ^= *x << 17;
+    *x
+}
+
+fn run(conn: &Arc<Connection>, sql: &str, params: Vec<Value>) {
+    let mut stmt = conn.prepare(sql).unwrap();
+    for (i, p) in params.into_iter().enumerate() {
+        stmt.bind_at(NonZero::new(i + 1).unwrap(), p).unwrap();
+    }
+    stmt.run_ignore_rows().unwrap();
+}
+
+/// Do: in a packed log with a connection cache of 16 pages (so pages spill into the log and come
+/// back), run transactions of random inserts, small changes to rows, deletes, savepoints, and
+/// rollbacks to savepoints, checking a model of the table: a seed per run, eight runs. Expect:
+/// after every commit and after opening the database again, exactly the rows the model kept (a
+/// page whose last version in the log was rolled back away must not be the base of its next
+/// delta).
+#[test]
+fn savepoints_rolled_back_amid_spills_keep_exactly_what_was_kept() {
+    for pack in [false, true] {
+        for seed in 1..=8u64 {
+            savepoints_amid_spills(pack, seed);
+        }
+    }
+}
+
+fn savepoints_amid_spills(pack: bool, seed: u64) {
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("savepoints.db");
+        let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut model: std::collections::BTreeMap<i64, Vec<u8>> = Default::default();
+        {
+            let db = open(&path);
+            db.wal_pack(pack).unwrap();
+            let conn = connect(&db);
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)")
+                .unwrap();
+            conn.execute("PRAGMA cache_size = 16").unwrap();
+            for txn in 0..6 {
+                conn.execute("BEGIN").unwrap();
+                let mut working = model.clone();
+                let mut saved: Vec<std::collections::BTreeMap<i64, Vec<u8>>> = Vec::new();
+                for _ in 0..80 {
+                    let id = (next(&mut x) % 300) as i64;
+                    match next(&mut x) % 10 {
+                        0..=3 => {
+                            let b: Vec<u8> = (0..1500).map(|_| next(&mut x) as u8).collect();
+                            run(
+                                &conn,
+                                "INSERT OR REPLACE INTO t (id, body) VALUES (?, ?)",
+                                vec![Value::from_i64(id), Value::from_slice(&b).unwrap()],
+                            );
+                            working.insert(id, b);
+                        }
+                        4..=6 => {
+                            if let Some(b) = working.get_mut(&id) {
+                                let at = (next(&mut x) % 1500) as usize;
+                                b[at] = b[at].wrapping_add(1);
+                                run(
+                                    &conn,
+                                    "UPDATE t SET body = ? WHERE id = ?",
+                                    vec![Value::from_slice(b).unwrap(), Value::from_i64(id)],
+                                );
+                            }
+                        }
+                        7 => {
+                            conn.execute(format!("SAVEPOINT s{}", saved.len())).unwrap();
+                            saved.push(working.clone());
+                        }
+                        8 => {
+                            if let Some(kept) = saved.pop() {
+                                let name = format!("s{}", saved.len());
+                                conn.execute(format!("ROLLBACK TO {name}")).unwrap();
+                                conn.execute(format!("RELEASE {name}")).unwrap();
+                                working = kept;
+                            }
+                        }
+                        _ => {
+                            run(
+                                &conn,
+                                "DELETE FROM t WHERE id = ?",
+                                vec![Value::from_i64(id)],
+                            );
+                            working.remove(&id);
+                        }
+                    }
+                }
+                conn.execute("COMMIT").unwrap();
+                model = working;
+                let want: Vec<(i64, Vec<u8>)> = model.clone().into_iter().collect();
+                assert_eq!(
+                    table(&connect(&db)),
+                    want,
+                    "pack {pack}, seed {seed}, transaction {txn}"
+                );
+            }
+            integrity(&connect(&db));
+        }
+        let db = open(&path);
+        let want: Vec<(i64, Vec<u8>)> = model.into_iter().collect();
+        assert_eq!(
+            table(&connect(&db)),
+            want,
+            "pack {pack}, seed {seed}, opened again"
+        );
+    }
 }
 
 /// Do: in a packed log, write a transaction too large for its connection's cache, so its pages

@@ -414,28 +414,26 @@ acknowledged batch lost or torn by a power cut during checkpoints (`tests/crash.
 
 **Decision.** Every generation of the log Amphora writes is packed (`Db::open_with` asks for it,
 `Database::wal_pack`; the format in `crates/engine/storage/packed.rs`). A commit's pages, or a
-spill's, are cut into records of up to 256 KiB of pages (64 pages of 4 KiB), each record's pages
-compressed together with LZ4, or kept as they are where that doesn't make them smaller, and laid
-into as many of the log's fixed-size frame slots as it takes. A record's first slot carries its
-slot count where a frame carries its page number, the slots after it a continuation mark, and its
-last slot the commit's database size when it ends a commit; the slots' checksums chain as frames'
-do, and every page of a record maps to its first slot, so frame numbers keep their meaning for read
-marks, backfill, the durable mark (decision 15) and restarts. The log header's file format says
-which a generation is, and a generation keeps the format it began with, so a log is always read as
-it was written and a page-a-frame log from before reads as ever. A read decodes a whole record and
-keeps it (16 MiB of decoded records, the oldest dropped first past that); the checkpoint reads a
-record once for all the pages it copies from it; recovery reads record by record. A record whose
-slots don't all hold ends the log there, as a torn frame does; one whose slots all hold but that
-doesn't decode refuses the log, since no torn write leaves that. The raw frame interface (Turso's
-sync's) and the multi-process authority refuse a packed log.
+spill's, become entries (decision 17 says which are whole images and which are deltas), cut into
+records of up to 256 KiB, each record's entries compressed together with LZ4, or kept as they are
+where that doesn't make them smaller, and laid into as many of the log's fixed-size frame slots as
+it takes. A record's first slot carries its slot count where a frame carries its page number, the
+slots after it a continuation mark, and its last slot the commit's database size when it ends a
+commit; the slots' checksums chain as frames' do, and every page of a record maps to its first
+slot, so frame numbers keep their meaning for read marks, backfill, the durable mark (decision 15)
+and restarts. The log header's file format says which a generation is, and a generation keeps the
+format it began with, so a log is always read as it was written and a page-a-frame log from before
+reads as ever. Records are kept decoded (4 MiB a database, the oldest dropped first past that; the
+writer keeps those it writes), the checkpoint reads a record once for all the pages it copies from
+it, and recovery reads record by record: a record whose slots don't all hold ends the log there, as
+a torn frame does; one whose slots all hold but that doesn't decode refuses the log, since no torn
+write leaves that. The raw frame interface (Turso's sync's) and the multi-process authority refuse
+a packed log.
 
 **Why.** At 10,000 writers in 12 groups a 200-byte row cost about 1.8 page frames (7 KiB) of log,
-about 1.7 GB/s, and as much again copied into the files: the disk's write bandwidth bounded the
-writes. Those pages compress: in a sample of 30,000 frames of that run, 123.6 MB of whole pages took
-41.2 MB compressed (3.0x, zlib at level 1 standing in for LZ4), and the bytes that changed since a
-page's last image, compressed, 9.7 MB (12.8x). This decision is the first step: records, and the
-compression. Writing only the bytes that changed (decision 17, to come) puts its deltas in the same
-records.
+about 1.7 GB/s, and the checkpoint copies besides: the disk's write bandwidth bounded the writes.
+Those pages compress: in a sample of 30,000 frames of that run, 123.6 MB of whole pages took 41.2
+MB compressed (3.0x, zlib at level 1 standing in for LZ4).
 
 **Sources.** The LZ4 block format (`lz4_Block_format.md`, lz4/lz4 on GitHub): a match reaches at
 most 65,535 bytes back, so records much larger than 64 KiB compress little better while a read
@@ -452,8 +450,64 @@ one page, of many records and of more than one batch (1,024 pages), compressed a
 read back on a connection with nothing cached, after a checkpoint, in the next generation and after
 recovery; a transaction spilled into the log and rolled back, then one committed; a generation
 keeping its format across a change of the setting; a record cut short taking only its commit; and a
-record whose checksums hold but that doesn't decode refusing the log.
+record whose checksums hold but that doesn't decode refusing the log. Crash injection
+(`tests/crash.rs`, 10,000 power cuts, 2026-10-20): none lost an acknowledged batch on packed
+records; with a commit's size on a record's first slot instead of its last (a mutant), 4,318 of
+10,000 did, and with continuation slots' checksums unchecked in recovery, 60 left a log refused as
+corrupt (so the cuts land inside records).
 
 **Falsified by.** A row read back other than as written, or an acknowledged batch lost or torn by a
 power cut (`tests/crash.rs`, `crates/engine/tests/packed_log.rs`); fewer writes a second or longer
 tails packed than page-a-frame at any of the writer counts above.
+
+## 17. Only the bytes that changed: deltas in the packed log
+
+**Decision.** In a packed log a page whose last version is in the log's current generation is
+written as the bytes that changed since (a delta: runs of offset, length and bytes, runs closer
+than a run's header merged), at most 8 deltas in a row (`packed::MOST_DELTAS`) before its next
+whole image, and only where the delta takes less than half a page; otherwise its image. The base
+is what the page's buffer held when the page was last made dirty: `Pager::add_dirty` keeps a copy
+while the buffer holds a version as written to the log (`Page::logged`, set when a commit or a
+spill is published), and the delta is made only while that version is still the page's latest
+frame in the log's current generation. The page's checksum (its last 8 bytes, which its buffer
+doesn't keep up to date) is carried in every delta. A read rebuilds a page from its chain, its
+entry at the frame read back through its deltas (each the page's previous frame) to its image,
+every record read once and kept decoded, and checks that the depths count down to the image; the
+checkpoint reads the same way. Under a page codec (encryption) pages are written whole.
+
+**Why.** In the sample of decision 16, 83% of the frames were later versions of pages already in
+the log, changed by 311 bytes on average (p50 48, p90 326, p99 3,735). Deltas merged and compressed
+took 9.7 MB where whole pages took 123.6 MB and compressed whole pages 41.2 MB (12.8x against
+3.0x). Deltas against the database file's copy of a page's first version in a generation (10.1 MB)
+gained nothing over compressing that version whole, so first versions stay whole, and no chain
+reaches outside the log.
+
+**Sources.** ARIES (Mohan, Haderle, Lindsay, Pirahesh and Schwarz, ACM TODS 17(1), 1992): redo
+records describe the change made to a page, not the page. PostgreSQL's `full_page_writes` (its
+documentation, `runtime-config-wal`): a page's first change after a checkpoint logs the whole page,
+later ones only the change, the split used here at a generation's start.
+
+**Evidence.** The engine's tests: a delta turns a page into its next version, the checksum's bytes
+are carried whole even where the buffer's stale copy matches the new one (a test found that case:
+a run merged with the carried tail had dropped its first byte, and the page's checksum refused the
+rebuilt page), chains of up to 8 deltas rebuild every version, damaged records are refused, and
+(`packed_log.rs`) rows changed commit after commit are logged mostly as deltas, at depths up to 8
+and never past it, and read back on fresh connections, after a checkpoint and after recovery. A
+model test there (random inserts, changes and deletes with savepoints rolled back amid spills, 8
+seeds, both formats) found that a balance renumbers its siblings' page objects, so one could carry
+another page's logged version: every page of a record shares its frame, so the check that the
+base is the page's latest frame passed, and a delta was made against the wrong page. A renumbered
+page now holds no logged version (`PageInner::set_id`); the test fails without it.
+
+Crash injection (`tests/crash.rs`, 10,000 power cuts, 2026-10-20): none lost an acknowledged batch
+with deltas. Mutants: the checksum's bytes not carried whole, 1,553 of 10,000 failed (checksum
+mismatches on rebuilt pages); chains never ending in an image, 29 (a chain past what a read looks
+back through); deltas applied newest first, 9,552. With the check that a base is the page's latest
+frame removed, no test fails: no path found leaves a page holding a version that isn't its latest
+(a savepoint's rollback restores pages as new objects, and a spilled page is journaled first), so
+the check stays as a guard. The log's bytes a row and what reads pay for chains: to be measured
+beside decision 16's.
+
+**Falsified by.** A page read back other than as written; a chain longer than 8; an acknowledged
+batch lost or torn by a power cut; writes or reads slower with deltas than with compressed whole
+pages at any writer count.

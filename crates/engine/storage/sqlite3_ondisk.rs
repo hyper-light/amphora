@@ -617,6 +617,9 @@ pub fn finish_read_page(page_idx: usize, buffer: Arc<Buffer>, page: PageRef) {
         // we set the wal tag only when reading page from log, or in allocate_page,
         // we clear it here for safety in case page is being re-loaded.
         page.clear_wal_tag();
+        // Amphora: nor does a reloaded buffer hold a version as a packed log's writes left it.
+        page.clear_logged();
+        drop(page.take_log_base());
     }
 }
 
@@ -2036,7 +2039,7 @@ impl StreamingWalReader {
         };
         for page in record.pages() {
             st.pending_frames
-                .entry(u64::from(*page))
+                .entry(u64::from(page))
                 .or_default()
                 .push(head);
         }
