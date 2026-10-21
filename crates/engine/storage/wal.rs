@@ -788,6 +788,13 @@ trait WalCoordination: Debug + Send + Sync {
     /// Load the current authoritative WAL snapshot.
     fn load_snapshot(&self) -> WalSnapshot;
 
+    /// Amphora: whether `ensure_local_frame_cache_covers` has anything to do: only under another
+    /// process's authority is there a fallback cache to fill, so a reader in one process builds no
+    /// snapshot for it on every page it looks up.
+    fn fills_local_frame_cache(&self) -> bool {
+        false
+    }
+
     /// Ensure any process-local fallback cache is complete for `snapshot`.
     fn ensure_local_frame_cache_covers(
         &self,
@@ -2374,6 +2381,10 @@ impl WalCoordination for ShmWalCoordination {
             checkpoint_seq: snapshot.checkpoint_seq,
             transaction_count: snapshot.transaction_count,
         }
+    }
+
+    fn fills_local_frame_cache(&self) -> bool {
+        true
     }
 
     fn ensure_local_frame_cache_covers(
@@ -4594,11 +4605,16 @@ impl Wal for WalFile {
         //
         // if it's not, than pages from WAL range [frame_watermark..nBackfill] are already in the DB file,
         // and in case if page first occurrence in WAL was after frame_watermark - we will be unable to read proper previous version of the page
-        let nbackfills = self.load_coordination_snapshot().nbackfills;
-        if frame_watermark.is_some_and(|watermark| watermark < nbackfills) {
-            return Err(LimboError::InvalidArgument(format!(
-                "frame_watermark {frame_watermark:?} is smaller than WAL backfill amount {nbackfills}"
-            )));
+        //
+        // Amphora: the shared snapshot is loaded only to check a watermark: loaded for every page
+        // a reader looked up, its header lock was the most contended lock of 32 readers.
+        if let Some(watermark) = frame_watermark {
+            let nbackfills = self.load_coordination_snapshot().nbackfills;
+            if watermark < nbackfills {
+                return Err(LimboError::InvalidArgument(format!(
+                    "frame_watermark {frame_watermark:?} is smaller than WAL backfill amount {nbackfills}"
+                )));
+            }
         }
 
         // A fully backfilled snapshot (max_frame < min_frame, that is
@@ -4619,16 +4635,18 @@ impl Wal for WalFile {
         }
         let min_frame = self.min_frame.load(Ordering::Acquire);
         let max_frame = self.max_frame.load(Ordering::Acquire);
-        self.coordination.ensure_local_frame_cache_covers(
-            &self.io,
-            WalSnapshot {
-                max_frame,
-                nbackfills: self.min_frame.load(Ordering::Acquire).saturating_sub(1),
-                last_checksum: self.last_checksum(),
-                checkpoint_seq: self.coordination.wal_header().checkpoint_seq,
-                transaction_count: self.transaction_count.load(Ordering::Acquire),
-            },
-        )?;
+        if self.coordination.fills_local_frame_cache() {
+            self.coordination.ensure_local_frame_cache_covers(
+                &self.io,
+                WalSnapshot {
+                    max_frame,
+                    nbackfills: self.min_frame.load(Ordering::Acquire).saturating_sub(1),
+                    last_checksum: self.last_checksum(),
+                    checkpoint_seq: self.coordination.wal_header().checkpoint_seq,
+                    transaction_count: self.transaction_count.load(Ordering::Acquire),
+                },
+            )?;
+        }
         tracing::debug!(
             "find_frame(page_id={}, frame_watermark={:?}): min_frame={}, max_frame={}",
             page_id,

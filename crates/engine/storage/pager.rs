@@ -3925,9 +3925,10 @@ impl Pager {
         io_ctx: &IOContext,
         group: Option<&mut CompletionGroup>,
     ) -> Result<Completion> {
+        // Amphora: lent, not cloned: a clone a read made every reader bump one shared count.
         sqlite3_ondisk::begin_read_page(
             self.db_file.as_ref(),
-            self.buffer_pool.clone(),
+            &self.buffer_pool,
             page,
             page_idx,
             allow_empty_read,

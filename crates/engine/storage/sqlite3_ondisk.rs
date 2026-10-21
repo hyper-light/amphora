@@ -551,7 +551,7 @@ pub struct OverflowCell {
 /// when given, before it is submitted.
 pub fn begin_read_page(
     db_file: &dyn DatabaseStorage,
-    buffer_pool: Arc<BufferPool>,
+    buffer_pool: &BufferPool,
     page: PageRef,
     page_idx: usize,
     allow_empty_read: bool,
