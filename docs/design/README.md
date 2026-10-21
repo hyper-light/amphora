@@ -39,7 +39,7 @@ Kiln vendors it at `vendor/amphora` and reaches it only through kiln-seams' `Rec
 - **Turso, made Amphora's own.** The engine (`crates/engine*`) is Turso's four crates as of 3e09a82
   and Amphora's own code since (its `ORIGIN.md`): each change keeps its suites passing and meets
   this repository's rules, and what is left of the inherited code that breaks them is counted down
-  (CLAUDE.md §1). A change worth Turso's having can still be offered upstream.
+  (CLAUDE.md §1). Nothing is synced with Turso in either direction: Amphora is a database of its own.
 
 ## Decisions
 

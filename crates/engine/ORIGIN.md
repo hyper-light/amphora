@@ -5,8 +5,8 @@
 (`turso_parser`), `macros` (`turso_macros`) and `extensions/core` (`turso_ext`), taken from
 https://github.com/tursodatabase/turso at commit `3e09a82750d8290ef96e3830896e7205b7c0b9e6`
 (2026-10-18, version 0.9.0-pre.1) under the MIT license (`LICENSE.md` and `NOTICE.md` here, kept as
-it requires). Since 2026-10-20 they are Amphora's own code, not vendored: nothing tracks upstream,
-and a change is an Amphora commit. A fix from upstream is ported by hand, its commit cited.
+it requires). Since 2026-10-20 they are Amphora's own code, and Amphora is a database of its own:
+nothing is synced with Turso in either direction, and a change is an Amphora commit.
 
 - **How Amphora builds it:** `amphora-engine` with `default-features = false` and
   `features = ["fs", "json", "pure-rust-crypto", "checksum"]` (each page checksummed:
