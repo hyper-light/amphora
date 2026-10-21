@@ -149,3 +149,42 @@ work, so checks, not recorded runs): `count_range` 165 → 2,476 statements a se
 
 **Falsified by.** A row a skip-scan misses or adds; a statement a skip-scan makes slower than the
 scan it replaced (a first column whose values hold few rows each, where ANALYZE's average misleads).
+
+## 5. A table lookup reads a page unless the connection's cache holds it
+
+**Decision.** Through an index that lacks columns a statement needs, each row is a seek of the
+table of its own. Its cost is the table pages those lookups read, by Mackert and Lohman's
+approximation for a finite LRU buffer (`cost.rs`, `table_pages_fetched`), plus a seek's CPU for each
+row. The buffer is what a read finds without reading the file: the connection's page cache and the
+pages its database shares (`Pager::cached_page_capacity`), taken at prepare, so a statement
+prepared after `PRAGMA cache_size` changes is planned for the new cache. The model charged instead
+the table's pages in the rows' proportion, as if every row it looked up shared a page with the
+next.
+
+**Why.** The suite's `table_group_by` (`GROUP BY grp` over 200,000 rows) walked
+`items_grp_created` for its order and looked every row up in the table at random, 4 statements a
+second. Timed on fedora on a copy of its table (a probe of the engine, release): that plan took 257
+ms with the connection's 2,000-page cache and 90 ms with the table all cached; a scan of the table
+and a sort took 75 and 36 ms. Mackert and Lohman count about 188,000 pages read for 200,000
+lookups among 33,000 pages with 2,000 cached; the model counted the table's 33,000 pages once.
+
+**Sources.** Mackert and Lohman, "Index Scans Using a Finite LRU Buffer: A Validated I/O Model",
+ACM TODS 14(3), 1989: the pages a scan of `Ns` rows at random among `T` pages reads with `b` cached.
+PostgreSQL's `index_pages_fetched` (`src/backend/optimizer/path/costsize.c`): the same formula, its
+three cases, used for every index scan's table reads (with `effective_cache_size` for `b`: here
+only what spares a read of the file counts, since a page the OS caches still costs one). SQLite's
+`whereLoopAddBtreeIndex` (`src/where.c`): a non-covering index adds the cost of a search of the
+table for each row it returns.
+
+**Evidence.** `cost.rs`, `table_pages_fetched_follows_mackert_and_lohman`: the three cases.
+`crates/engine/tests/planner.rs`, `a_whole_table_group_by_scans_and_sorts_where_lookups_would_read_pages`:
+with a 200-page cache the GROUP BY scans and sorts; with the table cached it keeps the index's
+order. Of the suite's 50 statements, `--explain` before and after: only `table_group_by` changes
+plan. Release binaries on fedora (200,000 items, best of 2 in turns, each run started at load under
+2; checks, not recorded runs): `table_group_by` 4.0 → 14.2 statements a second at 1 client (p99 270
+→ 74 ms) and 35.2 → 167.5 at 32 (p99 1,163 → 238 ms); `group_by_range` and `point_secondary`
+unchanged.
+
+**Falsified by.** A statement the model now sends to a plan that reads more. It knows a table's
+pages only as its rows over 50 (`rows_per_table_page`), not their real size: a table of wide rows
+has many more, which makes its scans look cheaper than they are.

@@ -11,9 +11,9 @@ use crate::{
 use super::pager::PageRef;
 
 #[cfg(not(target_family = "wasm"))]
-const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES: usize = 2000;
+pub(crate) const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES: usize = 2000;
 #[cfg(target_family = "wasm")]
-const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES: usize = 100000;
+pub(crate) const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES: usize = 100000;
 
 /// Minimum safe cache size in pages.
 /// This accounts for:

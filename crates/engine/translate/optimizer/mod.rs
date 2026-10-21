@@ -1069,9 +1069,11 @@ fn find_select_plan_form(
 ) -> Result<Option<TableAccessPlan>> {
     let schema = resolver.schema();
     #[cfg(feature = "optimizer_params")]
-    let params: &cost_params::CostModelParams = &cost_params::LOADED_PARAMS;
+    let base: &cost_params::CostModelParams = &cost_params::LOADED_PARAMS;
     #[cfg(not(feature = "optimizer_params"))]
-    let params: &cost_params::CostModelParams = &cost_params::DEFAULT_PARAMS;
+    let base: &cost_params::CostModelParams = &cost_params::DEFAULT_PARAMS;
+    // Amphora: what a table lookup costs depends on the connection's cache (decision 5).
+    let params = &base.with_cache_pages(resolver.cache_pages());
     plan.estimated_output_rows = None;
     plan.estimated_cost = None;
 
@@ -2483,9 +2485,11 @@ fn find_table_access_plan(
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
     #[cfg(feature = "optimizer_params")]
-    let params: &cost_params::CostModelParams = &cost_params::LOADED_PARAMS;
+    let base: &cost_params::CostModelParams = &cost_params::LOADED_PARAMS;
     #[cfg(not(feature = "optimizer_params"))]
-    let params: &cost_params::CostModelParams = &cost_params::DEFAULT_PARAMS;
+    let base: &cost_params::CostModelParams = &cost_params::DEFAULT_PARAMS;
+    // Amphora: what a table lookup costs depends on the connection's cache (decision 5).
+    let params = &base.with_cache_pages(resolver.cache_pages());
 
     if table_references.joined_tables().is_empty() {
         return Ok(None);

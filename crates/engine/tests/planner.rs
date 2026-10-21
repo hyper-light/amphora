@@ -133,3 +133,28 @@ fn a_page_by_key_reads_in_key_order_without_sorting() {
         assert_eq!(steps, vec!["SCAN items".to_owned()], "ORDER BY id {order}");
     }
 }
+
+/// Do: GROUP BY the first column of an index that lacks the aggregated columns, over the whole
+/// table, with the connection's cache a fraction of the table and then holding all of it. Expect:
+/// a scan of the table and a sort while each lookup through the index would read a page of its
+/// own (docs/design/planner.md, decision 5); the index's order, unsorted, once the cache holds
+/// the table.
+#[test]
+fn a_whole_table_group_by_scans_and_sorts_where_lookups_would_read_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = tables(dir.path());
+    let sql = "SELECT grp, COUNT(*), AVG(price) FROM items GROUP BY grp";
+    conn.execute("PRAGMA cache_size = 200").unwrap();
+    assert_eq!(
+        plan(&conn, sql),
+        vec![
+            "SCAN items".to_owned(),
+            "USE SORTER FOR GROUP BY".to_owned()
+        ]
+    );
+    conn.execute("PRAGMA cache_size = 100000").unwrap();
+    assert_eq!(
+        plan(&conn, sql),
+        vec!["SCAN items USING INDEX items_grp_created".to_owned()]
+    );
+}

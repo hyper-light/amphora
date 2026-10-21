@@ -71,6 +71,11 @@ pub struct CostModelParams {
     /// CPU cost per index seek (key comparisons).
     pub cpu_cost_per_seek: f64,
 
+    /// Amphora: pages a read finds without reading the file (`docs/design/planner.md`, decision 5):
+    /// the connection's page cache and its database's shared pages. The default is the engine's
+    /// default page cache, 2,000 pages; planning replaces it with the connection's.
+    pub cache_pages: f64,
+
     /// Bonus subtracted from cost when using an index (encourages index usage).
     pub index_bonus: f64,
 
@@ -118,6 +123,7 @@ impl CostModelParams {
             cpu_cost_per_row: 0.003,
             cpu_cost_per_where_step: 0.003,
             cpu_cost_per_seek: 0.01,
+            cache_pages: 2000.0,
             index_bonus: 0.5,
 
             // Sort costs
@@ -142,6 +148,16 @@ pub static DEFAULT_PARAMS: CostModelParams = CostModelParams::new();
 impl Default for CostModelParams {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl CostModelParams {
+    /// Amphora: these parameters with the connection's cache, `pages` (decision 5).
+    pub fn with_cache_pages(&self, pages: usize) -> Self {
+        Self {
+            cache_pages: pages as f64,
+            ..self.clone()
+        }
     }
 }
 
@@ -236,6 +252,9 @@ impl CostModelParams {
         }
 
         // Cache reuse factor must be in [0, 1)
+        if self.cache_pages < 1.0 {
+            return Err("cache_pages must be at least 1".into());
+        }
         if self.cache_reuse_factor < 0.0 || self.cache_reuse_factor >= 1.0 {
             return Err(format!(
                 "cache_reuse_factor must be in [0, 1), got {}",

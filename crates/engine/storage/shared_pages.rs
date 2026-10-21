@@ -202,6 +202,11 @@ impl SharedPages {
         }
     }
 
+    /// Pages it keeps at most.
+    pub fn capacity(&self) -> usize {
+        self.per_shard.saturating_mul(SHARDS)
+    }
+
     /// Images kept now.
     pub fn len(&self) -> usize {
         self.shards

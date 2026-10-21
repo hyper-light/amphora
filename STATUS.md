@@ -68,6 +68,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   next literal is found with `memchr2` in either case, as SQLite's `patternCompare` finds it with
   `strcspn`. `like_substring` 67 → 222 statements a second at 1 client and 867 → 2,556 at 32
   (fedora, best of 3 at load under 2, not recorded runs).
+- **Table lookups cost what the cache can't hold** (docs/design/planner.md decision 5): a row read
+  through an index that lacks its columns costs a page read by Mackert and Lohman's finite-buffer
+  formula, with the connection's own cache (and shared pages), as PostgreSQL's
+  `index_pages_fetched` counts them. Of the suite's 50 plans only `table_group_by` changes: it scans
+  the table and sorts instead of looking every row up through `items_grp_created`: 4.0 → 14.2
+  statements a second at 1 client and 35.2 → 167.5 at 32 (fedora, best of 2 at load under 2, not
+  recorded runs).
 - **Skip-scan** (docs/design/planner.md decision 4, `crates/engine/tests/skip_scan.rs`): a constraint
   on an index's second column alone seeks it once for each value of its first, where ANALYZE
   counted at least 18 rows to a value, as SQLite does. `count_range` 165 → 2,476 statements a

@@ -4075,6 +4075,18 @@ impl Pager {
     }
 
     /// Changes the size of the page cache.
+    /// Amphora: the pages a read finds without reading the file: this connection's page cache and
+    /// the pages its database shares (decision 20), as the planner counts them
+    /// (`docs/design/planner.md`, decision 5).
+    pub fn cached_page_capacity(&self) -> usize {
+        let private = self.page_cache.read().capacity();
+        let shared = self
+            .db_file
+            .shared_pages()
+            .map_or(0, |shared| shared.capacity());
+        private.saturating_add(shared)
+    }
+
     pub fn change_page_cache_size(&self, capacity: usize) -> Result<CacheResizeResult> {
         let mut page_cache = self.page_cache.write();
         Ok(page_cache.resize(capacity))

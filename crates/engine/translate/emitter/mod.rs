@@ -188,6 +188,10 @@ pub struct Resolver<'a> {
     /// triggers follow SQLite's looser resolution rules and may access objects
     /// across schemas.
     pub(crate) trigger_context: Option<TriggerDatabaseContext>,
+    /// Amphora: the pages a read finds without reading the file, which decides what a table lookup
+    /// costs (`docs/design/planner.md`, decision 5): the connection's, set at prepare; the engine's
+    /// default page cache until then.
+    cache_pages: usize,
     /// Cached flag: true when this connection has an active temp database.
     ///
     /// Computed once at Resolver construction to avoid repeated
@@ -311,6 +315,7 @@ impl<'a> Resolver<'a> {
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             dialect,
             trigger_context: None,
+            cache_pages: crate::storage::page_cache::DEFAULT_PAGE_CACHE_SIZE_IN_PAGES,
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
             unqualified_database_search_path: unqualified_database_search_path.clone(),
@@ -335,6 +340,16 @@ impl<'a> Resolver<'a> {
         self.has_temp_schema
     }
 
+    /// Amphora: the pages a read finds without reading the file (decision 5).
+    pub fn cache_pages(&self) -> usize {
+        self.cache_pages
+    }
+
+    /// Amphora: sets the pages a read finds without reading the file: the connection's.
+    pub(crate) fn set_cache_pages(&mut self, pages: usize) {
+        self.cache_pages = pages;
+    }
+
     pub fn fork(&self) -> Resolver<'a> {
         Resolver {
             schema: self.schema,
@@ -356,6 +371,7 @@ impl<'a> Resolver<'a> {
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
+            cache_pages: self.cache_pages,
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
@@ -383,6 +399,7 @@ impl<'a> Resolver<'a> {
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
+            cache_pages: self.cache_pages,
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),

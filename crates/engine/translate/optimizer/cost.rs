@@ -164,6 +164,26 @@ pub(super) fn estimate_btree_depth(row_count: f64, rows_per_page: f64) -> f64 {
     }
 }
 
+/// Amphora: the table pages that `rows` looked up at random among `table_pages` read from the file,
+/// `cache_pages` kept between reads: Mackert and Lohman's approximation for a finite LRU buffer
+/// ("Index Scans Using a Finite LRU Buffer: A Validated I/O Model", ACM TODS 14(3), 1989), as
+/// PostgreSQL's `index_pages_fetched` computes it (`docs/design/planner.md`, decision 5).
+pub(super) fn table_pages_fetched(rows: f64, table_pages: f64, cache_pages: f64) -> f64 {
+    let t = table_pages.max(1.0);
+    let b = cache_pages.max(1.0);
+    let n = rows.max(0.0);
+    if t <= b {
+        (2.0 * t * n / (2.0 * t + n)).min(t)
+    } else {
+        let fills = 2.0 * t * b / (2.0 * t - b);
+        if n <= fills {
+            2.0 * t * n / (2.0 * t + n)
+        } else {
+            b + (n - fills) * (t - b) / t
+        }
+    }
+}
+
 /// Estimate IO and CPU cost for index-based access.
 ///
 /// This properly separates the number of B-tree seeks from the number of rows
@@ -231,13 +251,15 @@ pub fn estimate_index_cost(
             + (input_cardinality - 1.0) * index_leaf_pages_count * params.cache_reuse_factor
     };
 
-    // For non-covering indexes, we need to fetch from the table for each row.
+    // For non-covering indexes, we need to fetch from the table for each row. Amphora: each row
+    // is a seek of the table of its own, its page read unless the cache holds it (decision 5).
     let table_lookup_cost = if index_info.covering {
         0.0
     } else {
         let table_pages_count = (base_row_count / params.rows_per_table_page).max(1.0);
-        let selectivity = rows_per_seek / base_row_count.max(1.0);
-        input_cardinality * selectivity * table_pages_count
+        let looked_up = input_cardinality * rows_per_seek;
+        table_pages_fetched(looked_up, table_pages_count, params.cache_pages)
+            + looked_up * params.cpu_cost_per_seek
     };
 
     let io_cost = seek_cost + leaf_scan_cost + table_lookup_cost;
@@ -639,6 +661,37 @@ mod tests {
             covering: true,
             rows_per_leaf_page: 100.0,
         }
+    }
+
+    /// Amphora: do: look up rows at random in a table bigger than the cache and in one it holds.
+    /// Expect: Mackert and Lohman's three cases (decision 5): a page a row while the cache fills,
+    /// then every lookup a read but for the fraction of the table cached; at most the table's
+    /// pages once the cache holds it.
+    #[test]
+    fn table_pages_fetched_follows_mackert_and_lohman() {
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-6 * b.max(1.0);
+        // T > b, Ns > 2Tb/(2T - b): 200,000 lookups, 33,000 pages, 2,000 cached.
+        let fills = 2.0 * 33_000.0 * 2_000.0 / (2.0 * 33_000.0 - 2_000.0);
+        let want = 2_000.0 + (200_000.0 - fills) * 31_000.0 / 33_000.0;
+        assert!(close(
+            table_pages_fetched(200_000.0, 33_000.0, 2_000.0),
+            want
+        ));
+        assert!((187_000.0..189_000.0).contains(&want), "{want}");
+        // T > b, Ns <= 2Tb/(2T - b): a lookup a page, nearly.
+        let few = table_pages_fetched(100.0, 33_000.0, 2_000.0);
+        assert!(close(few, 2.0 * 33_000.0 * 100.0 / (66_000.0 + 100.0)));
+        assert!((99.0..100.0).contains(&few), "{few}");
+        // T <= b: never more than the table's pages.
+        assert!(close(
+            table_pages_fetched(200_000.0, 4_000.0, 100_000.0),
+            4_000.0
+        ));
+        assert!(close(
+            table_pages_fetched(1_000.0, 4_000.0, 100_000.0),
+            2.0 * 4_000.0 * 1_000.0 / (8_000.0 + 1_000.0)
+        ));
+        assert_eq!(table_pages_fetched(0.0, 4_000.0, 2_000.0), 0.0);
     }
 
     #[test]
