@@ -582,6 +582,10 @@ fn one_seed(seed: u64) -> Result<Seen, String> {
     let disk = Disk::new(seed, HashMap::new());
     let path = std::path::Path::new(PATH);
     let db = Db::open_with(path, disk.clone()).map_err(|e| format!("open: {e:#}"))?;
+    // Every other seed on a packed log (docs/design/store.md, decisions 16 and 17).
+    if seed.is_multiple_of(2) {
+        db.pack_log(true).map_err(|e| format!("pack: {e:#}"))?;
+    }
     db.exec("CREATE TABLE events (key TEXT, seq INTEGER CHECK (seq >= 0), batch INTEGER); CREATE INDEX by_key ON events (key, seq)")
         .map_err(|e| format!("schema: {e:#}"))?;
     // The schema durable first: the crash point is drawn among the workload's changes.

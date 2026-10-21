@@ -412,8 +412,10 @@ acknowledged batch lost or torn by a power cut during checkpoints (`tests/crash.
 
 ## 16. The log packed: a commit's pages compressed into records
 
-**Decision.** Every generation of the log Amphora writes is packed (`Db::open_with` asks for it,
-`Database::wal_pack`; the format in `crates/engine/storage/packed.rs`). A commit's pages, or a
+**Decision.** A log can be packed (`Db::pack_log`, `Database::wal_pack`; the format in
+`crates/engine/storage/packed.rs`). Amphora doesn't pack by default: on the one bench run so far it
+cost writes at 32 writers (Evidence), so it waits on the comprehensive bench to show where it helps
+before it is turned on. In a packed log a commit's pages, or a
 spill's, become entries (decision 17 says which are whole images and which are deltas), cut into
 records of up to 256 KiB, each record's entries compressed together with LZ4, or kept as they are
 where that doesn't make them smaller, and laid into as many of the log's fixed-size frame slots as
@@ -443,9 +445,16 @@ same reason. SQLite's WAL format (sqlite.org/fileformat2.html, "The WAL File For
 header, the checksum chain from the header's salts, and recovery stopping at the first frame that
 doesn't hold, all of which a record's slots keep.
 
-**Evidence.** To be measured: the log's bytes a row, writes a second and tails at 32, 1,000,
-10,000, 100,000 and 1,000,000 writers, packed against page-a-frame (`AMPHORA_LOG_PAGES=1`), and
-the CPU the compression takes. The engine's tests (`crates/engine/tests/packed_log.rs`): commits of
+**Evidence.** The bench, fedora, 2026-10-20, 32 writers in one group, one run each at load 2.9–3.0
+(`bench/records/2026-10-20-fedora-packed-log.jsonl`): page-a-frame 7,903 writes a second, p50 3.97
+ms, p99 6.5 ms, p99.9 9.6 ms; packed and compressed whole (this decision alone) 6,216, 4.93, 8.8,
+10.4; with deltas (decision 17) 5,887, 5.12, 9.0, 14.2. The process wrote 23.4, 18.6 and 18.2 KB a
+row: most of it the checkpoint's copies into the file, which packing doesn't shrink. It used 0.58,
+0.73 and 0.78 ms of CPU a row. A profile of the deltas' run (load 18) finds LZ4's compression 90%
+of what preparing records costs the writer, yet the writer is on a CPU 3% of the run, while its
+commits took 2.3 s longer in all over 20 s: most of the cost is a wait not yet found. At 10,000
+writers only page-a-frame ran (234,071 writes a second, 21 KB written a row) before other work
+loaded the machine. The engine's tests (`crates/engine/tests/packed_log.rs`): commits of
 one page, of many records and of more than one batch (1,024 pages), compressed and stored records,
 read back on a connection with nothing cached, after a checkpoint, in the next generation and after
 recovery; a transaction spilled into the log and rolled back, then one committed; a generation
@@ -457,15 +466,16 @@ records; with a commit's size on a record's first slot instead of its last (a mu
 corrupt (so the cuts land inside records).
 
 **Falsified by.** A row read back other than as written, or an acknowledged batch lost or torn by a
-power cut (`tests/crash.rs`, `crates/engine/tests/packed_log.rs`); fewer writes a second or longer
-tails packed than page-a-frame at any of the writer counts above.
+power cut (`tests/crash.rs`, every other seed packed; `crates/engine/tests/packed_log.rs`); as a
+default, fewer writes a second or longer tails packed than page-a-frame on the comprehensive bench.
 
 ## 17. Only the bytes that changed: deltas in the packed log
 
-**Decision.** In a packed log a page whose last version is in the log's current generation is
-written as the bytes that changed since (a delta: runs of offset, length and bytes, runs closer
-than a run's header merged), at most 8 deltas in a row (`packed::MOST_DELTAS`) before its next
-whole image, and only where the delta takes less than half a page; otherwise its image. The base
+**Decision.** In a packed log (opt-in, decision 16) a page whose last version is in the log's
+current generation is written as the bytes that changed since (a delta: runs of offset, length and
+bytes, runs closer than a run's header merged), at most 8 deltas in a row (`packed::MOST_DELTAS`)
+before its next whole image, and only where the delta takes less than half a page; otherwise its
+image. The base
 is what the page's buffer held when the page was last made dirty: `Pager::add_dirty` keeps a copy
 while the buffer holds a version as written to the log (`Page::logged`, set when a commit or a
 spill is published), and the delta is made only while that version is still the page's latest

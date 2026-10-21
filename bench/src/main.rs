@@ -18,6 +18,8 @@ mod pg;
 mod pool;
 mod schema;
 mod store;
+mod suite;
+mod suite_db;
 mod vanilla;
 mod vitess;
 
@@ -459,6 +461,10 @@ fn summary(h: Hist) -> serde_json::Value {
 }
 
 fn main() -> anyhow::Result<()> {
+    // The comprehensive suite: every kind of statement, each on its own (`suite.rs`).
+    if std::env::args().any(|a| a == "--suite") {
+        return suite::main();
+    }
     let o = opts()?;
     let (k, q) = (o.connections, o.queue);
     // A server's own port on this machine (bench/servers/<engine>.sh) unless --dsn names another.

@@ -195,12 +195,12 @@ impl Amphora {
             queue: env("AMPHORA_QUEUE").and_then(|q| usize::try_from(q).ok()).unwrap_or(defaults.queue),
             ..defaults
         };
-        // AMPHORA_LOG_PAGES=1: logs of one page a frame, for comparison (Amphora packs them).
-        let log_pages = env("AMPHORA_LOG_PAGES") == Some(1);
+        // AMPHORA_PACK_LOG=1: packed logs (docs/design/store.md, decisions 16 and 17).
+        let pack_log = env("AMPHORA_PACK_LOG") == Some(1);
         let groups = Groups::start(groups, config, |g| {
             let db = Db::open(&dir.join(format!("bench-{g}.db")))?;
-            if log_pages {
-                db.pack_log(false)?;
+            if pack_log {
+                db.pack_log(true)?;
             }
             for s in schema::SCHEMA {
                 db.exec(s)?;

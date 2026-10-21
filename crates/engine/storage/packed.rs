@@ -369,6 +369,8 @@ struct Entry {
 #[derive(Debug)]
 pub(crate) struct Record {
     entries: Vec<Entry>,
+    /// The entries' indexes ordered by page: a page's entry is found by binary search.
+    by_page: Vec<(u32, usize)>,
     raw: Vec<u8>,
 }
 
@@ -452,7 +454,23 @@ impl Record {
         if body_at != raw.len() {
             return Err(corrupt("bytes after the last entry"));
         }
-        Ok(Self { entries, raw })
+        let mut by_page: Vec<(u32, usize)> = entries
+            .iter()
+            .enumerate()
+            .map(|(index, e)| (e.page, index))
+            .collect();
+        by_page.sort_unstable();
+        if by_page
+            .windows(2)
+            .any(|w| matches!(w, [a, b] if a.0 == b.0))
+        {
+            return Err(corrupt("a page twice in a record"));
+        }
+        Ok(Self {
+            entries,
+            by_page,
+            raw,
+        })
     }
 
     /// The pages the record holds, in its order.
@@ -462,7 +480,9 @@ impl Record {
 
     /// The entry of `page`, if the record holds it.
     pub(crate) fn body(&self, page: u32) -> Option<Body<'_>> {
-        let e = self.entries.iter().find(|e| e.page == page)?;
+        let at = self.by_page.binary_search_by_key(&page, |(p, _)| *p).ok()?;
+        let (_, index) = self.by_page.get(at)?;
+        let e = self.entries.get(*index)?;
         let bytes = self.raw.get(e.start..e.end)?;
         Some(if e.kind == IMAGE {
             Body::Image(bytes)
@@ -476,7 +496,11 @@ impl Record {
 
     /// The bytes it holds once decoded, for a cache's budget.
     pub(crate) fn size(&self) -> usize {
-        self.raw.len()
+        let per_entry =
+            std::mem::size_of::<Entry>().saturating_add(std::mem::size_of::<(u32, usize)>());
+        self.raw
+            .len()
+            .saturating_add(self.entries.len().saturating_mul(per_entry))
     }
 }
 
@@ -712,6 +736,10 @@ mod tests {
         let many: Vec<(u32, &[u8])> = (1..=1025u32).map(|p| (p, &a[..])).collect();
         assert!(encode(&images(&many), size).is_err());
         assert!(encode(&images(&many[..1024]), size).is_ok());
+        assert!(
+            encode(&images(&[(3, &a[..]), (3, &a[..])]), size).is_err(),
+            "a page twice"
+        );
     }
 
     #[test]

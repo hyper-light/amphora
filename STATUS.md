@@ -43,6 +43,16 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   in every gate; what is left of the inherited code that breaks CLAUDE.md §1 is counted, lint by lint,
   against `scripts/engine-ratchet.toml`, and may only fall. The bench's vanilla Turso is upstream at
   3e09a82, none of Amphora's changes.
+- **The packed log** (`crates/engine/storage/packed.rs`, docs/design/store.md decisions 16 and 17),
+  opt-in (`Db::pack_log`): a packed log holds records, not a page a frame: a commit's pages as whole images, or
+  as the bytes that changed since their last version in the log (at most 8 deltas in a row),
+  compressed together with LZ4 into the log's frame slots. Reads rebuild a page from its chain, on a
+  fresh connection, in the checkpoint and in recovery alike; a record torn by a crash ends the log,
+  one whose checksums hold but that doesn't decode refuses it. Crash injection, 10,000 power cuts on
+  the committed tree: nothing lost (2026-10-20); the engine's tests include a model test of
+  savepoints rolled back amid spills. On the bench so far it cost writes at 32 writers (6,216 and
+  5,887 a second against 7,903, `bench/records/2026-10-20-fedora-packed-log.jsonl`), so it isn't the
+  default until the comprehensive bench shows where it helps.
 
 ## Measured
 
