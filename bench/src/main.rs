@@ -302,6 +302,13 @@ fn written_and_cpu() -> (Option<u64>, Option<f64>) {
     (written, cpu)
 }
 
+/// This process's resident memory now, in MiB (Linux's `VmRSS`); none where the system doesn't say.
+fn rss_mb() -> Option<f64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kb: f64 = status.lines().find_map(|l| l.strip_prefix("VmRSS:"))?.trim().trim_end_matches("kB").trim().parse().ok()?;
+    Some((kb / 1024.0 * 10.0).round() / 10.0)
+}
+
 /// The most memory this process held at once (its resident set's high-water mark), in MiB; none
 /// where the system doesn't say (it's Linux's `VmHWM`).
 fn rss_max_mb() -> Option<f64> {
@@ -630,59 +637,7 @@ fn main() -> anyhow::Result<()> {
     let stats_after_mixed = driver.stats();
     let (written_after, cpu_after) = written_and_cpu();
     if let (Some(prefix), Some(guard)) = (&profile, profiler) {
-        let report = guard.report().build()?;
-        report.flamegraph(std::fs::File::create(format!("{prefix}.svg"))?)?;
-        // The frames most samples were in, by leaf and by any frame on the stack: every thread's,
-        // then the writer's alone.
-        type Counts = std::collections::HashMap<String, usize>;
-        let mut threads: Counts = Counts::new();
-        let tally = |only: Option<&str>| {
-            let (mut leaf, mut any, mut total) = (Counts::new(), Counts::new(), 0usize);
-            for (frames, count) in &report.data {
-                if only.is_some_and(|t| frames.thread_name != t) {
-                    continue;
-                }
-                let count = usize::try_from(*count).unwrap_or(0);
-                total += count;
-                let names: Vec<String> = frames.frames.iter().map(|f| f.iter().map(|s| s.name()).next().unwrap_or_default()).collect();
-                if let Some(first) = names.first() {
-                    *leaf.entry(first.clone()).or_default() += count;
-                }
-                let mut seen = std::collections::HashSet::new();
-                for n in names {
-                    if seen.insert(n.clone()) {
-                        *any.entry(n).or_default() += count;
-                    }
-                }
-            }
-            (leaf, any, total)
-        };
-        for (frames, count) in &report.data {
-            *threads.entry(frames.thread_name.clone()).or_default() += usize::try_from(*count).unwrap_or(0);
-        }
-        let top = |m: Counts, total: usize, n: usize| {
-            let mut v: Vec<(String, usize)> = m.into_iter().collect();
-            v.sort_by(|a, b| b.1.cmp(&a.1));
-            v.into_iter().take(n).map(|(k, c)| format!("{:6.2}% {k}", c as f64 * 100.0 / total.max(1) as f64)).collect::<Vec<_>>().join("\n")
-        };
-        let mut out = String::new();
-        let all: usize = threads.values().sum();
-        out.push_str(&format!("== threads ==\n{}\n\n", top(threads, all, 40)));
-        for (title, only) in [("writer", Some("amphora-writer")), ("all", None)] {
-            let (leaf, any, total) = tally(only);
-            out.push_str(&format!("== {title}: samples {total}, by leaf ==\n{}\n\n== {title}: inclusive ==\n{}\n\n", top(leaf, total, 60), top(any, total, 150)));
-        }
-        std::fs::write(format!("{prefix}.txt"), out)?;
-        // Every stack, root first, inlined frames each their own, for any tally after the run.
-        let mut folded = String::new();
-        for (frames, count) in &report.data {
-            let mut names: Vec<String> = Vec::new();
-            for f in frames.frames.iter().rev() {
-                names.extend(f.iter().rev().map(|s| s.name()));
-            }
-            folded.push_str(&format!("{};{} {count}\n", frames.thread_name, names.join(";")));
-        }
-        std::fs::write(format!("{prefix}.folded"), folded)?;
+        write_profile(prefix, &guard)?;
     }
 
     // Search: a common word, the rare one, and one none says.
@@ -741,5 +696,64 @@ fn main() -> anyhow::Result<()> {
         "stats_after_mixed": stats_after_mixed,
     });
     println!("{report}");
+    Ok(())
+}
+
+/// Writes what `guard` sampled: `<prefix>.svg` (a flamegraph), `<prefix>.txt` (the frames most
+/// samples were in) and `<prefix>.folded` (every stack, for any tally after the run).
+pub fn write_profile(prefix: &str, guard: &pprof::ProfilerGuard) -> anyhow::Result<()> {
+    let report = guard.report().build()?;
+    report.flamegraph(std::fs::File::create(format!("{prefix}.svg"))?)?;
+    // The frames most samples were in, by leaf and by any frame on the stack: every thread's,
+    // then the writer's alone.
+    type Counts = std::collections::HashMap<String, usize>;
+    let mut threads: Counts = Counts::new();
+    let tally = |only: Option<&str>| {
+        let (mut leaf, mut any, mut total) = (Counts::new(), Counts::new(), 0usize);
+        for (frames, count) in &report.data {
+            if only.is_some_and(|t| frames.thread_name != t) {
+                continue;
+            }
+            let count = usize::try_from(*count).unwrap_or(0);
+            total += count;
+            let names: Vec<String> = frames.frames.iter().map(|f| f.iter().map(|s| s.name()).next().unwrap_or_default()).collect();
+            if let Some(first) = names.first() {
+                *leaf.entry(first.clone()).or_default() += count;
+            }
+            let mut seen = std::collections::HashSet::new();
+            for n in names {
+                if seen.insert(n.clone()) {
+                    *any.entry(n).or_default() += count;
+                }
+            }
+        }
+        (leaf, any, total)
+    };
+    for (frames, count) in &report.data {
+        *threads.entry(frames.thread_name.clone()).or_default() += usize::try_from(*count).unwrap_or(0);
+    }
+    let top = |m: Counts, total: usize, n: usize| {
+        let mut v: Vec<(String, usize)> = m.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.into_iter().take(n).map(|(k, c)| format!("{:6.2}% {k}", c as f64 * 100.0 / total.max(1) as f64)).collect::<Vec<_>>().join("\n")
+    };
+    let mut out = String::new();
+    let all: usize = threads.values().sum();
+    out.push_str(&format!("== threads ==\n{}\n\n", top(threads, all, 40)));
+    for (title, only) in [("writer", Some("amphora-writer")), ("all", None)] {
+        let (leaf, any, total) = tally(only);
+        out.push_str(&format!("== {title}: samples {total}, by leaf ==\n{}\n\n== {title}: inclusive ==\n{}\n\n", top(leaf, total, 60), top(any, total, 150)));
+    }
+    std::fs::write(format!("{prefix}.txt"), out)?;
+    // Every stack, root first, inlined frames each their own, for any tally after the run.
+    let mut folded = String::new();
+    for (frames, count) in &report.data {
+        let mut names: Vec<String> = Vec::new();
+        for f in frames.frames.iter().rev() {
+            names.extend(f.iter().rev().map(|s| s.name()));
+        }
+        folded.push_str(&format!("{};{} {count}\n", frames.thread_name, names.join(";")));
+    }
+    std::fs::write(format!("{prefix}.folded"), folded)?;
     Ok(())
 }

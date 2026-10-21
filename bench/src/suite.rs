@@ -79,6 +79,26 @@ impl Shape {
     fn range(&self, rng: &mut Rng, len: i64) -> i64 {
         1 + (rng.next() % ((self.items - len).max(1) as u64)) as i64
     }
+
+    /// The ids client `c` of `n` writes: a slice of its own, so no two clients write a row at once
+    /// (contention is its own question, not this suite's).
+    fn slice(&self, c: usize, n: usize) -> (i64, i64) {
+        let n = n.max(1) as i64;
+        let per = (self.items / n).max(1);
+        let first = 1 + per * (c as i64 % n);
+        (first, first + per - 1)
+    }
+
+    /// An id of client `c`'s slice, and the first of `len` there.
+    fn own(&self, rng: &mut Rng, c: (usize, usize)) -> i64 {
+        let (first, last) = self.slice(c.0, c.1);
+        first + (rng.next() % ((last - first + 1).max(1) as u64)) as i64
+    }
+
+    fn own_range(&self, rng: &mut Rng, c: (usize, usize), len: i64) -> i64 {
+        let (first, last) = self.slice(c.0, c.1);
+        first + (rng.next() % ((last - first + 1 - len).max(1) as u64)) as i64
+    }
 }
 
 /// splitmix64's finalizer: a row's values from its id, the same everywhere.
@@ -216,9 +236,9 @@ fn insert_items(d: Dialect, rows: usize) -> String {
     format!("INSERT INTO items ({ITEM_COLUMNS}) VALUES {}", vec![item_values(d); rows].join(", "))
 }
 
-/// The load, a batch of rows a statement and many to a transaction: (statement, its parameters).
-pub fn load_batches(d: Dialect, shape: &Shape, batch: usize) -> Vec<Vec<(String, Vec<P>)>> {
-    let mut txns = Vec::new();
+/// The load, a batch of rows a statement and many to a transaction, each transaction handed to
+/// `each` as it is made (so the harness never holds the whole load): (statement, its parameters).
+pub fn load(d: Dialect, shape: &Shape, batch: usize, mut each: impl FnMut(Vec<(String, Vec<P>)>) -> anyhow::Result<()>) -> anyhow::Result<()> {
     let mut txn = Vec::new();
     let regions: Vec<P> = (1..=shape.regions).flat_map(region_params).collect();
     txn.push((format!("INSERT INTO regions (id, name) VALUES {}", vec!["(?, ?)"; shape.regions as usize].join(", ")), regions));
@@ -229,21 +249,28 @@ pub fn load_batches(d: Dialect, shape: &Shape, batch: usize) -> Vec<Vec<(String,
         txn.push((format!("INSERT INTO owners (id, name, region, score) VALUES {}", vec!["(?, ?, ?, ?)"; (last - id + 1) as usize].join(", ")), params));
         id = last + 1;
     }
-    txns.push(std::mem::take(&mut txn));
+    each(std::mem::take(&mut txn))?;
     let mut id = 1;
     while id <= shape.items {
         let last = (id + batch as i64 - 1).min(shape.items);
         let params: Vec<P> = (id..=last).flat_map(|i| item_params(i, shape.owners)).collect();
         txn.push((insert_items(d, (last - id + 1) as usize), params));
         if txn.len() >= 50 {
-            txns.push(std::mem::take(&mut txn));
+            each(std::mem::take(&mut txn))?;
         }
         id = last + 1;
     }
     if !txn.is_empty() {
-        txns.push(txn);
+        each(txn)?;
     }
-    txns
+    Ok(())
+}
+
+/// Forgets the process's memory high-water marks (Linux's `clear_refs` 5 resets VmHWM; the heap's
+/// peak starts again from what it holds now): what the runs hold, not the load the harness made.
+fn forget_peaks() {
+    let _ = std::fs::write("/proc/self/clear_refs", "5");
+    crate::HEAP_PEAK.store(crate::HEAP.load(Ordering::Relaxed), Ordering::Relaxed);
 }
 
 /// A statement of the suite: its name, whether it writes, and what it exercises.
@@ -440,9 +467,11 @@ pub fn statements(op: &str, d: Dialect) -> Option<Vec<String>> {
     one(s)
 }
 
-/// The parameters of each of `op`'s statements, drawn for one run of it.
-pub fn params(op: &str, rng: &mut Rng, shape: &Shape) -> Vec<Vec<P>> {
-    let id = shape.id(rng);
+/// The parameters of each of `op`'s statements, drawn for one run of it by client `c.0` of `c.1`:
+/// reads anywhere in the table, writes in the client's own slice of it.
+pub fn params(op: &str, rng: &mut Rng, shape: &Shape, c: (usize, usize)) -> Vec<Vec<P>> {
+    let write = OPS.iter().any(|o| o.name == op && o.kind == Kind::Write);
+    let id = if write { shape.own(rng, c) } else { shape.id(rng) };
     let grp = || P::I((mix(id as u64 ^ 0x1111) % 100) as i64);
     let region = (rng.next() % shape.regions as u64) as i64 + 1;
     let word = WORDS[(rng.next() % WORDS.len() as u64) as usize];
@@ -516,7 +545,7 @@ pub fn params(op: &str, rng: &mut Rng, shape: &Shape) -> Vec<Vec<P>> {
         }
         "update_json" => one(vec![P::T(format!(r#"{{"a":{},"b":"{word}","c":[{}]}}"#, rng.next() % 100, rng.next() % 10)), P::I(id)]),
         "update_range" => {
-            let a = shape.range(rng, 10);
+            let a = shape.own_range(rng, c, 10);
             one(vec![P::I(a), P::I(a + 9)])
         }
         "upsert" => {
@@ -526,11 +555,11 @@ pub fn params(op: &str, rng: &mut Rng, shape: &Shape) -> Vec<Vec<P>> {
         }
         "delete_insert" => vec![vec![P::I(id)], item_params(id, shape.owners)],
         "delete_range_insert" => {
-            let a = shape.range(rng, 10);
+            let a = shape.own_range(rng, c, 10);
             vec![vec![P::I(a), P::I(a + 9)], (a..a + 10).flat_map(|i| item_params(i, shape.owners)).collect()]
         }
         "txn_read_write" => {
-            let b = shape.id(rng);
+            let b = shape.own(rng, c);
             vec![vec![P::I(id)], vec![P::I(id)], vec![P::I(b)], vec![P::I(b)], item_params(new_id(), shape.owners)]
         }
         _ => vec![],
@@ -546,10 +575,12 @@ struct Opts {
     seconds: f64,
     warmup: f64,
     only: Option<String>,
+    /// Each statement's plan (its database's EXPLAIN) instead of timing it.
+    explain: bool,
 }
 
 fn opts() -> anyhow::Result<Opts> {
-    let mut o = Opts { target: String::new(), dir: "/tmp/amphora-suite".into(), dsn: None, items: 200_000, clients: vec![1, 32], seconds: 5.0, warmup: 1.0, only: None };
+    let mut o = Opts { target: String::new(), dir: "/tmp/amphora-suite".into(), dsn: None, items: 200_000, clients: vec![1, 32], seconds: 5.0, warmup: 1.0, only: None, explain: false };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut v = || args.next().ok_or_else(|| anyhow::anyhow!("{a} takes a value"));
@@ -563,7 +594,8 @@ fn opts() -> anyhow::Result<Opts> {
             "--seconds" => o.seconds = v()?.parse()?,
             "--warmup" => o.warmup = v()?.parse()?,
             "--only" => o.only = Some(v()?),
-            other => anyhow::bail!("unknown argument {other} (the suite takes --target, --dir, --dsn, --items, --clients, --seconds, --warmup, --only)"),
+            "--explain" => o.explain = true,
+            other => anyhow::bail!("unknown argument {other} (the suite takes --target, --dir, --dsn, --items, --clients, --seconds, --warmup, --only, --explain)"),
         }
     }
     Ok(o)
@@ -575,6 +607,16 @@ struct Outcome {
     rows: u64,
     errors: u64,
     error: Option<String>,
+    /// Runs a database asked to be tried again (a conflict, a deadlock, a busy database), tried
+    /// again as an application would: their time counts in the run's latency.
+    retries: u64,
+}
+
+/// Whether a database's refusal asks to be tried again (serialization failures, deadlocks, write
+/// conflicts, a locked database).
+fn retryable(e: &anyhow::Error) -> bool {
+    let s = format!("{e:#}").to_lowercase();
+    ["could not serialize", "deadlock", "conflict with concurrent", "lock wait timeout", "database is locked", "busy", "try restarting transaction", "concurrently modified"].iter().any(|m| s.contains(m))
 }
 
 /// Runs `op` from `clients` clients for the warmup and then `seconds`, each client on a session of
@@ -584,14 +626,14 @@ fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &A
     let began = Instant::now();
     let count_from = began + Duration::from_secs_f64(warmup);
     let until = count_from + Duration::from_secs_f64(seconds);
-    let total = Arc::new(Mutex::new(Outcome { hist: Hist::new(), rows: 0, errors: 0, error: None }));
+    let total = Arc::new(Mutex::new(Outcome { hist: Hist::new(), rows: 0, errors: 0, error: None, retries: 0 }));
     let seed = AtomicU64::new(0x2545_f491_4f6c_dd1d ^ mix(op.name.len() as u64));
     std::thread::scope(|s| {
         for c in 0..clients {
             let (target, stmts, shape, stop, total) = (target.clone(), stmts.clone(), shape.clone(), stop.clone(), total.clone());
             let mut rng = Rng(mix(seed.fetch_add(1, Ordering::Relaxed) ^ (c as u64 + 1)) | 1);
             s.spawn(move || {
-                let mut mine = Outcome { hist: Hist::new(), rows: 0, errors: 0, error: None };
+                let mut mine = Outcome { hist: Hist::new(), rows: 0, errors: 0, error: None, retries: 0 };
                 match target.session() {
                     Err(e) => {
                         mine.errors += 1;
@@ -605,9 +647,18 @@ fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &A
                                 stop.store(true, Ordering::Relaxed);
                                 break;
                             }
-                            let p = params(op.name, &mut rng, &shape);
+                            let p = params(op.name, &mut rng, &shape, (c, clients));
                             let t = Instant::now();
-                            let got = session.run(op.kind, &stmts, &p);
+                            let mut got = session.run(op.kind, &stmts, &p);
+                            for _ in 0..20 {
+                                match &got {
+                                    Err(e) if retryable(e) => {
+                                        mine.retries += 1;
+                                        got = session.run(op.kind, &stmts, &p);
+                                    }
+                                    _ => break,
+                                }
+                            }
                             let us = u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX);
                             match got {
                                 Ok(rows) => {
@@ -637,6 +688,7 @@ fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &A
                     t.hist.merge(&mine.hist);
                     t.rows += mine.rows;
                     t.errors += mine.errors;
+                    t.retries += mine.retries;
                     if t.error.is_none() {
                         t.error = mine.error;
                     }
@@ -644,7 +696,7 @@ fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &A
             });
         }
     });
-    Arc::try_unwrap(total).ok().and_then(|m| m.into_inner().ok()).unwrap_or(Outcome { hist: Hist::new(), rows: 0, errors: 0, error: Some("lost the run's outcome".into()) })
+    Arc::try_unwrap(total).ok().and_then(|m| m.into_inner().ok()).unwrap_or(Outcome { hist: Hist::new(), rows: 0, errors: 0, error: Some("lost the run's outcome".into()), retries: 0 })
 }
 
 pub fn main() -> anyhow::Result<()> {
@@ -656,9 +708,7 @@ pub fn main() -> anyhow::Result<()> {
 
     let began = Instant::now();
     target.setup(&tables(d, o.target == "cedardb").into_iter().map(|s| (s, vec![])).collect::<Vec<_>>())?;
-    for txn in load_batches(d, &shape, 100) {
-        target.setup(&txn)?;
-    }
+    load(d, &shape, 100, |txn| target.setup(&txn))?;
     let loaded_s = began.elapsed().as_secs_f64();
     for s in indexes(d) {
         // A statement a database refuses here (its statistics, say) is said, not fatal.
@@ -668,6 +718,29 @@ pub fn main() -> anyhow::Result<()> {
     }
     target.ready()?;
     let indexed_s = began.elapsed().as_secs_f64() - loaded_s;
+    let rss_after_load_mb = crate::rss_mb();
+    forget_peaks();
+
+    if o.explain {
+        let mut session = target.session()?;
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut plans = serde_json::Map::new();
+        for op in OPS {
+            if o.only.as_deref().is_some_and(|only| !only.split(',').any(|n| op.name.starts_with(n))) {
+                continue;
+            }
+            let Some(stmts) = statements(op.name, d) else { continue };
+            let p = params(op.name, &mut rng, &shape, (0, 1));
+            let (Some(sql), Some(first)) = (stmts.first(), p.first()) else { continue };
+            let plan = match session.explain(&placeholders(d, sql), first) {
+                Ok(lines) => serde_json::json!(lines),
+                Err(e) => serde_json::json!(format!("error: {e:#}")),
+            };
+            plans.insert(op.name.to_owned(), plan);
+        }
+        println!("{}", serde_json::json!({ "suite": 1, "explain": true, "target": o.target, "items": shape.items, "plans": plans }));
+        return Ok(());
+    }
 
     let mut results = Vec::new();
     for op in OPS {
@@ -683,7 +756,17 @@ pub fn main() -> anyhow::Result<()> {
         let stmts = Arc::new(stmts.iter().map(|s| placeholders(d, s)).collect::<Vec<_>>());
         for &clients in &o.clients {
             eprintln!("== {} {} clients={clients}", o.target, op.name);
+            // AMPHORA_PROFILE=<prefix>: each statement's run sampled 997 times a second, written as
+            // <prefix>-<target>-<statement>-<clients>.{svg,txt,folded} (main.rs, write_profile).
+            let profile = std::env::var("AMPHORA_PROFILE").ok();
+            let profiler = match &profile {
+                Some(_) => Some(pprof::ProfilerGuardBuilder::default().frequency(997).blocklist(&["libc", "libgcc", "pthread", "vdso"]).build()?),
+                None => None,
+            };
             let out = run_op(&target, op, &stmts, &shape, clients, o.warmup, o.seconds);
+            if let (Some(prefix), Some(guard)) = (&profile, profiler) {
+                crate::write_profile(&format!("{prefix}-{}-{}-{clients}", o.target, op.name), &guard)?;
+            }
             let n = out.hist.n;
             results.push(serde_json::json!({
                 "op": op.name,
@@ -694,6 +777,7 @@ pub fn main() -> anyhow::Result<()> {
                 "rows_per_op": if n == 0 { 0.0 } else { out.rows as f64 / n as f64 },
                 "ms": summary(out.hist),
                 "errors": out.errors,
+                "retries": out.retries,
                 "error": out.error,
             }));
         }
@@ -710,6 +794,7 @@ pub fn main() -> anyhow::Result<()> {
         "load_s": loaded_s,
         "index_s": indexed_s,
         "results": results,
+        "rss_after_load_mb": rss_after_load_mb,
         "rss_max_mb": crate::rss_max_mb(),
         "heap_peak_mb": crate::heap_mb(&crate::HEAP_PEAK),
         "heap_end_mb": crate::heap_mb(&crate::HEAP),

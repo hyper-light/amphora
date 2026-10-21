@@ -44,6 +44,11 @@ pub trait Session: Send {
     /// `stmts` with `params` (a list each): a read's rows taken whole, how many came; a write's
     /// statements in one transaction, returned once durable.
     fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize>;
+    /// The plan the database makes for `sql` with `params` (its EXPLAIN), a line a step.
+    fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
+        let _ = (sql, params);
+        anyhow::bail!("no EXPLAIN here")
+    }
 }
 
 pub fn open(target: &str, dir: &str, dsn: Option<&str>, clients: usize) -> anyhow::Result<Arc<dyn Target>> {
@@ -270,6 +275,23 @@ mod amphora_target {
                 }
             }
         }
+
+        fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
+            // AMPHORA_EQP_JSON=1: the plan with the optimizer's estimates (EXPLAIN QUERY PLAN FORMAT=JSON).
+            let format = if std::env::var("AMPHORA_EQP_JSON").ok().as_deref() == Some("1") { "FORMAT=JSON " } else { "" };
+            let plan = leak(&self.sql, &format!("EXPLAIN QUERY PLAN {format}{sql}"))?;
+            let p = params.to_vec();
+            let lines = move |db: &mut Db| -> anyhow::Result<Vec<String>> {
+                let mut out = Vec::new();
+                db.query(plan, p.iter().map(value), |r| {
+                    out.push(r.get_values().map(|v| v.to_string()).collect::<Vec<_>>().join(" | "));
+                    Ok(true)
+                })?;
+                Ok(out)
+            };
+            let on_writer = lines.clone();
+            self.groups.read_committed("", Instant::now() + WAIT, lines, move |e: &mut SqlEngine| on_writer(&mut e.db))
+        }
     }
 }
 
@@ -405,6 +427,26 @@ impl TursoSession {
 }
 
 impl Session for TursoSession {
+    fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(format!("EXPLAIN QUERY PLAN {sql}")).map_err(|e| anyhow::anyhow!("{e}"))?;
+        for (i, p) in params.iter().enumerate() {
+            stmt.bind_at(NonZero::new(i + 1).ok_or_else(|| anyhow::anyhow!("parameter 0"))?, turso_value(p)).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        let mut out = Vec::new();
+        loop {
+            match stmt.step().map_err(|e| anyhow::anyhow!("{e}"))? {
+                turso_core::StepResult::Row => {
+                    if let Some(r) = stmt.row() {
+                        out.push(r.get_values().map(|v| v.to_string()).collect::<Vec<_>>().join(" | "));
+                    }
+                }
+                turso_core::StepResult::Done => return Ok(out),
+                turso_core::StepResult::IO | turso_core::StepResult::Yield => self.io.step().map_err(|e| anyhow::anyhow!("{e}"))?,
+                other => anyhow::bail!("EXPLAIN stopped: {other:?}"),
+            }
+        }
+    }
+
     fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize> {
         match (kind, stmts) {
             (Kind::Write, [_, _, ..]) => self.transaction(stmts, params).map(|()| 0),
@@ -503,6 +545,16 @@ struct SqliteSession {
 }
 
 impl Session for SqliteSession {
+    fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
+        let mut stmt = self.c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params.iter().map(sqlite_value)))?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            out.push(r.get::<_, String>(3)?);
+        }
+        Ok(out)
+    }
+
     fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize> {
         if kind == Kind::Write && stmts.len() > 1 {
             let tx = self.c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -635,13 +687,20 @@ fn pg_rows(rows: &[postgres::Row]) -> anyhow::Result<usize> {
     for r in rows {
         for i in 0..r.len() {
             let v: Option<Raw> = r.try_get(i)?;
-            std::hint::black_box(v);
+            std::hint::black_box(v.map(|raw| raw.0));
         }
     }
     Ok(rows.len())
 }
 
 impl Session for PgSession {
+    fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
+        let owned = pg_params(params);
+        let refs: Vec<&(dyn postgres::types::ToSql + Sync)> = owned.iter().map(|b| b.as_ref()).collect();
+        let rows = self.c.query(format!("EXPLAIN {sql}").as_str(), &refs)?;
+        rows.iter().map(|r| r.try_get::<_, String>(0).map_err(Into::into)).collect()
+    }
+
     fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize> {
         let prepared: Vec<postgres::Statement> = stmts.iter().map(|s| self.statement(s)).collect::<anyhow::Result<_>>()?;
         if kind == Kind::Write && stmts.len() > 1 {
@@ -743,6 +802,12 @@ struct MySqlSession {
 }
 
 impl Session for MySqlSession {
+    fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
+        use mysql::prelude::Queryable;
+        let rows: Vec<String> = self.c.exec(format!("EXPLAIN FORMAT=TREE {sql}"), mysql_params(params))?;
+        Ok(rows.iter().flat_map(|r| r.lines().map(str::to_owned).collect::<Vec<_>>()).collect())
+    }
+
     fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize> {
         if kind == Kind::Write && stmts.len() > 1 {
             let mut tx = self.c.start_transaction(mysql::TxOpts::default())?;
@@ -862,6 +927,11 @@ struct ClickHouseSession {
 }
 
 impl Session for ClickHouseSession {
+    fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
+        let out = post(&self.agent, &self.url, &format!("EXPLAIN indexes = 1 {} FORMAT TSV", inline(sql, params)))?;
+        Ok(out.lines().map(str::to_owned).collect())
+    }
+
     fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize> {
         let mut n = 0;
         for (s, p) in stmts.iter().zip(params) {
