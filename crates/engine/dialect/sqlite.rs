@@ -401,6 +401,8 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "subtype" => Ok(Some(Func::Scalar(ScalarFunc::Subtype))),
         "last_insert_rowid" => Ok(Some(Func::Scalar(ScalarFunc::LastInsertRowid))),
         "unicode" => Ok(Some(Func::Scalar(ScalarFunc::Unicode))),
+        "glob_lower_bound" => Ok(Some(Func::Scalar(ScalarFunc::GlobLowerBound))),
+        "glob_upper_bound" => Ok(Some(Func::Scalar(ScalarFunc::GlobUpperBound))),
         "unistr" => Ok(Some(Func::Scalar(ScalarFunc::Unistr))),
         "unistr_quote" => Ok(Some(Func::Scalar(ScalarFunc::UnistrQuote))),
         "quote" => Ok(Some(Func::Scalar(ScalarFunc::Quote))),

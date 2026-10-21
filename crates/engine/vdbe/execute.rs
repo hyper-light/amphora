@@ -10078,6 +10078,17 @@ pub fn op_function(
 
                 if matches!(pattern_value, Value::Null) || matches!(match_value, Value::Null) {
                     state.registers[*dest].set_null();
+                } else if matches!(match_value, Value::Blob(_)) {
+                    // Amphora: a BLOB never matches a GLOB (SQLite's recommended
+                    // SQLITE_LIKE_DOESNT_MATCH_BLOBS), so a GLOB on a text column is a range of
+                    // its index (`docs/design/planner.md`, decision 3).
+                    let Some(result) = state.registers.get_mut(*dest) else {
+                        return Err(LimboError::InternalError(
+                            "GLOB's result register is missing".into(),
+                        )
+                        .into());
+                    };
+                    result.set_int(0);
                 } else {
                     let pattern_cow = match pattern_value {
                         Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
@@ -10122,6 +10133,15 @@ pub fn op_function(
                 // 1. Check for NULL inputs
                 if matches!(pattern_value, Value::Null) || matches!(match_value, Value::Null) {
                     state.registers[*dest].set_null();
+                } else if matches!(match_value, Value::Blob(_)) {
+                    // Amphora: nor a LIKE, as GLOB (decision 3).
+                    let Some(result) = state.registers.get_mut(*dest) else {
+                        return Err(LimboError::InternalError(
+                            "LIKE's result register is missing".into(),
+                        )
+                        .into());
+                    };
+                    result.set_int(0);
                 } else {
                     // 2. Resolve Escape Character (if 3rd arg exists)
                     let mut escape_char = None;
@@ -10271,6 +10291,8 @@ pub fn op_function(
             | ScalarFunc::Subtype
             | ScalarFunc::Typeof
             | ScalarFunc::Unicode
+            | ScalarFunc::GlobLowerBound
+            | ScalarFunc::GlobUpperBound
             | ScalarFunc::Unistr
             | ScalarFunc::UnistrQuote
             | ScalarFunc::Quote
@@ -10289,6 +10311,8 @@ pub fn op_function(
                     ScalarFunc::Subtype => Some(reg_value.exec_subtype()),
                     ScalarFunc::Typeof => Some(reg_value.exec_typeof()),
                     ScalarFunc::Unicode => Some(reg_value.exec_unicode()),
+                    ScalarFunc::GlobLowerBound => Some(reg_value.exec_glob_lower_bound()?),
+                    ScalarFunc::GlobUpperBound => Some(reg_value.exec_glob_upper_bound()?),
                     ScalarFunc::Unistr => Some(reg_value.exec_unistr()?),
                     ScalarFunc::Quote => Some(reg_value.exec_quote()),
                     ScalarFunc::UnistrQuote => Some(reg_value.exec_unistr_quote()),

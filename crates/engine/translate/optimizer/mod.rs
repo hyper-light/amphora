@@ -3788,6 +3788,10 @@ fn mark_seek_constraints_consumed(
         ] {
             let Some(pos) = pos else { continue };
             let constraint = &constraints[pos];
+            // Amphora: an implied bound leaves its term to filter (decision 3).
+            if constraint.implied {
+                continue;
+            }
             let where_term = &mut where_clause[constraint.where_clause_pos.0];
             if where_term.consumed {
                 continue;

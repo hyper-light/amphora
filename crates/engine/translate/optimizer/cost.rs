@@ -360,6 +360,10 @@ pub(crate) fn constraints_selectivity<'a>(
     let mut fraction = 1.0;
     let mut columns: SmallVec<[ColumnBounds; 4]> = SmallVec::new();
     for constraint in constraints {
+        // Amphora: an implied bound filters nothing its term doesn't (decision 3).
+        if constraint.implied {
+            continue;
+        }
         let (lower, upper) = match constraint.operator.as_ast_operator() {
             Some(ast::Operator::Greater | ast::Operator::GreaterEquals) => (true, false),
             Some(ast::Operator::Less | ast::Operator::LessEquals) => (false, true),

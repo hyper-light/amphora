@@ -442,6 +442,7 @@ pub(super) fn choose_best_btree_candidate(
             .enumerate()
             .filter(|(i, c)| {
                 !consumed.contains(i)
+                    && !c.implied
                     && c.usable
                     && c.outer_join_compatible
                     && allowed_mask.contains_all_set_bits_of(&c.lhs_mask)
@@ -503,8 +504,12 @@ fn consumed_where_terms_from_constraint_refs(
         .into_iter()
         .flatten()
         {
-            let where_term_idx = constraints[constraint_idx].where_clause_pos.0;
-            consumed.set(where_term_idx)?;
+            let constraint = &constraints[constraint_idx];
+            // Amphora: an implied bound leaves its term to filter (decision 3).
+            if constraint.implied {
+                continue;
+            }
+            consumed.set(constraint.where_clause_pos.0)?;
         }
     }
     Ok(consumed)

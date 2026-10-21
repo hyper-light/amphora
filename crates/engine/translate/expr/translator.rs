@@ -1426,6 +1426,8 @@ fn translate_function_call_expr(
                 | ScalarFunc::Subtype
                 | ScalarFunc::Typeof
                 | ScalarFunc::Unicode
+                | ScalarFunc::GlobLowerBound
+                | ScalarFunc::GlobUpperBound
                 | ScalarFunc::Unistr
                 | ScalarFunc::UnistrQuote
                 | ScalarFunc::Quote

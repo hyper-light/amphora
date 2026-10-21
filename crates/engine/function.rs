@@ -874,6 +874,11 @@ pub enum ScalarFunc {
     Subtype,
     Typeof,
     Unicode,
+    /// Amphora: the least text a `GLOB` with the argument as its pattern matches, and a value
+    /// every text it matches is less than: an index range the planner seeks for a GLOB
+    /// (`docs/design/planner.md`, decision 3).
+    GlobLowerBound,
+    GlobUpperBound,
     Unistr,
     UnistrQuote,
     Quote,
@@ -1013,6 +1018,8 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::Subtype => true,
             ScalarFunc::Typeof => true,
             ScalarFunc::Unicode => true,
+            ScalarFunc::GlobLowerBound => true,
+            ScalarFunc::GlobUpperBound => true,
             ScalarFunc::Unistr => true,
             ScalarFunc::UnistrQuote => true,
             ScalarFunc::Quote => true,
@@ -1162,6 +1169,8 @@ impl Display for ScalarFunc {
             Self::Subtype => "subtype",
             Self::Typeof => "typeof",
             Self::Unicode => "unicode",
+            Self::GlobLowerBound => "glob_lower_bound",
+            Self::GlobUpperBound => "glob_upper_bound",
             Self::Unistr => "unistr",
             Self::UnistrQuote => "unistr_quote",
             Self::Quote => "quote",
@@ -1304,6 +1313,8 @@ impl ScalarFunc {
             | Self::Subtype
             | Self::Typeof
             | Self::Unicode
+            | Self::GlobLowerBound
+            | Self::GlobUpperBound
             | Self::Unistr
             | Self::Upper
             | Self::ZeroBlob

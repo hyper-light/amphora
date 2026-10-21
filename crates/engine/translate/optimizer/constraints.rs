@@ -107,6 +107,83 @@ pub struct Constraint {
     /// many NULL keys, so such a constraint can match many rows and its cost
     /// and row estimates must not be taken from equality statistics.
     pub null_matching: bool,
+    /// Amphora: implied by its WHERE term rather than all it says (a GLOB's prefix bounds,
+    /// [glob_bound_constraints]): a seek may use it, but the term still filters, so using it never
+    /// consumes the term, and as a filter of its own it counts for nothing, the term counting
+    /// (`docs/design/planner.md`, decision 3).
+    pub implied: bool,
+}
+
+/// Amphora: the index range a GLOB with a constant pattern implies on a text column of
+/// `table_reference`: `col >= glob_lower_bound(p)` and `col < glob_upper_bound(p)`, implied
+/// constraints of the GLOB's WHERE term at `pos` (`docs/design/planner.md`, decision 3). Only
+/// where the range holds every match: a column of TEXT affinity (its values text, BLOB or NULL,
+/// and neither a BLOB nor NULL matches a GLOB) in BINARY order (GLOB's), and a pattern that is a
+/// literal or a bound parameter.
+fn glob_bound_constraints(
+    pos: usize,
+    expr: &ast::Expr,
+    table_reference: &JoinedTable,
+    outer_join_compatible: bool,
+    params: &CostModelParams,
+) -> Option<[Constraint; 2]> {
+    let ast::Expr::Like {
+        lhs,
+        not: false,
+        op: ast::LikeOperator::Glob,
+        rhs,
+        escape: None,
+    } = unwrap_parens(expr).ok()?
+    else {
+        return None;
+    };
+    let ast::Expr::Column { table, column, .. } = unwrap_parens(lhs).ok()? else {
+        return None;
+    };
+    if *table != table_reference.internal_id {
+        return None;
+    }
+    let col = table_reference.table.columns().get(*column)?;
+    if col.affinity() != Affinity::Text || col.collation() != CollationSeq::Binary {
+        return None;
+    }
+    let pattern = unwrap_parens(rhs).ok()?;
+    if !matches!(pattern, ast::Expr::Literal(_) | ast::Expr::Variable(_)) {
+        return None;
+    }
+    let bound = |name: &str, op: ast::Operator| Constraint {
+        where_clause_pos: (pos, BinaryExprSide::Rhs),
+        operator: op.into(),
+        table_col_pos: Some(*column),
+        expr: None,
+        constraining_expr: Some((
+            op,
+            ast::Expr::FunctionCall {
+                name: ast::Name::exact(name.to_owned()),
+                distinctness: None,
+                args: vec![Box::new(pattern.clone())],
+                order_by: vec![],
+                within_group: vec![],
+                filter_over: ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
+            },
+            Affinity::Text,
+        )),
+        lhs_mask: TableMask::default(),
+        selectivity: params.sel_range,
+        usable: true,
+        outer_join_compatible,
+        is_rowid: false,
+        comparison_affinity: Some(Affinity::Text),
+        null_matching: false,
+        implied: true,
+    };
+    Some([
+        bound("glob_lower_bound", ast::Operator::GreaterEquals),
+        bound("glob_upper_bound", ast::Operator::Less),
+    ])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -826,6 +903,17 @@ pub fn constraints_from_where_clause(
                 let null_matching = |constraining_expr: &ast::Expr| {
                     is_op && !is_non_null_literal(constraining_expr)
                 };
+                // Amphora: a GLOB with a constant pattern bounds a text column: an index on it seeks
+                // the range, the GLOB still filters (decision 3).
+                if let Some(bounds) = glob_bound_constraints(
+                    i,
+                    &term.expr,
+                    table_reference,
+                    outer_join_compatible,
+                    params,
+                ) {
+                    cs.constraints.extend(bounds);
+                }
                 // If either the LHS or RHS of the constraint is a column from the table, add the constraint.
                 match lhs {
                     ast::Expr::Column { table, column, .. } => {
@@ -853,6 +941,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(rhs),
+                                implied: false,
                             });
                         }
                     }
@@ -885,6 +974,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(rhs),
+                                implied: false,
                             });
                         }
                     }
@@ -926,6 +1016,7 @@ pub fn constraints_from_where_clause(
                             is_rowid: false,
                             comparison_affinity: cmp_aff,
                             null_matching: null_matching(rhs),
+                            implied: false,
                         });
                     }
                     _ => {}
@@ -956,6 +1047,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(lhs),
+                                implied: false,
                             });
                         }
                     }
@@ -988,6 +1080,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(lhs),
+                                implied: false,
                             });
                         }
                     }
@@ -1029,6 +1122,7 @@ pub fn constraints_from_where_clause(
                             is_rowid: false,
                             comparison_affinity: cmp_aff,
                             null_matching: null_matching(lhs),
+                            implied: false,
                         });
                     }
                     _ => {}
@@ -1084,6 +1178,7 @@ pub fn constraints_from_where_clause(
                             is_rowid,
                             comparison_affinity: cmp_aff,
                             null_matching: false,
+                            implied: false,
                         });
                     }
                     ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -1103,6 +1198,7 @@ pub fn constraints_from_where_clause(
                             is_rowid: true,
                             comparison_affinity: cmp_aff,
                             null_matching: false,
+                            implied: false,
                         });
                     }
                     _ => {}
@@ -1183,6 +1279,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid,
                                 comparison_affinity: cmp_aff,
                                 null_matching: false,
+                                implied: false,
                             });
                         }
                         ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -1202,6 +1299,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
                                 null_matching: false,
+                                implied: false,
                             });
                         }
                         _ => {}
@@ -2342,6 +2440,7 @@ pub(crate) fn analyze_binary_term_for_index(
         is_rowid,
         comparison_affinity: Some(affinity),
         null_matching,
+        implied: false,
     };
 
     Some(AnalyzedTerm {

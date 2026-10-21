@@ -67,3 +67,38 @@ SQLite's, the table in rowid order. The rest is the engine's speed through rows,
 **Falsified by.** A query where a candidate the model now prefers for its order does more work in
 measurement than the sorted alternative it beat (the model has no notion of LIMIT stopping an
 ordered scan early, nor of a sort spilling).
+
+## 3. A GLOB's literal prefix is a range of the index; a BLOB matches no GLOB or LIKE
+
+**Decision.** `col GLOB p`, with `col` a column of TEXT affinity in BINARY order and `p` a literal
+or a bound parameter, implies `col >= glob_lower_bound(p)` and `col < glob_upper_bound(p)`
+(`constraints.rs`, `glob_bound_constraints`): the pattern's literal prefix, up to its first `*`,
+`?` or `[`, and that prefix with its last ASCII character advanced (what follows it dropped, so the
+bytes stay UTF-8; an empty BLOB, after all text, when nothing is left). Both are computed when the
+statement runs, so a prepared statement's parameter serves. An index on the column seeks the range;
+the GLOB still filters, as the bounds are implied (`Constraint::implied`: using them consumes
+nothing, and as filters they count for nothing beside the GLOB). A BLOB matches neither GLOB nor
+LIKE: so the range holds every match, since a TEXT-affinity column holds only text, BLOBs and
+NULLs.
+
+**Why.** The suite's `like_prefix` (a prefix of an indexed name, 50 rows) read the whole index:
+Amphora's LIKE and GLOB never used one. Its LIKE ignored case where PostgreSQL's and MySQL's with
+binary collations heed it, so the suite asked SQLite's dialect for more than the others: it now asks
+it for GLOB, the same match (`bench/src/suite.rs`).
+
+**Sources.** SQLite's LIKE optimization ("The SQLite Query Optimizer Overview", section "The LIKE
+Optimization"): the conditions above (the column's TEXT affinity, BINARY collation for GLOB, a
+literal or a bound parameter as the pattern) and the bounds, the prefix's last character
+incremented. SQLite's compile-time options ("Recommended Compile-time Options",
+`SQLITE_LIKE_DOESNT_MATCH_BLOBS`): LIKE and GLOB return false for a BLOB, recommended as it lets the
+LIKE optimization run without a second pass over BLOBs, which SQLite makes otherwise.
+
+**Evidence.** `crates/engine/tests/glob_range.rs`: the plan seeks `t_name (name>=? AND name<?)` for
+a parameter and for a literal, and not for NOT GLOB; for 36 patterns (wildcards first, last and in
+classes, the last ASCII character `~` and DEL, accents and other scripts, digits, the empty
+pattern) a seek reads exactly the rows a scan of an unindexed copy reads, and never a NULL or a
+BLOB; the bounds of each shape of pattern. With the upper bound left as the prefix itself (a
+mutant) the scan comparison and the bounds' test fail.
+
+**Falsified by.** A row a GLOB matches that its seek misses; a statement that relied on a BLOB
+matching a LIKE or a GLOB.

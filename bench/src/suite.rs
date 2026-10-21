@@ -300,7 +300,7 @@ pub const OPS: &[Op] = &[
     r("filter_multi_column", "an indexed equality, a range and a boolean, LIMIT"),
     r("filter_no_index", "COUNT(*) of a filter no index serves: a whole scan"),
     r("filter_is_null", "an indexed equality and IS NULL, LIMIT"),
-    r("like_prefix", "LIKE 'prefix%' on an indexed text column"),
+    r("like_prefix", "a case-sensitive prefix match on an indexed text column: LIKE, GLOB where LIKE ignores case"),
     r("like_substring", "LIKE '%word%' on long text: a whole scan"),
     r("order_by_index", "ORDER BY an index's second column, DESC, LIMIT 20"),
     r("order_by_sort", "ORDER BY an unindexed column, LIMIT 20: a sort"),
@@ -407,6 +407,9 @@ pub fn statements(op: &str, d: Dialect) -> Option<Vec<String>> {
         "filter_multi_column" => "SELECT id, price FROM items WHERE grp = ? AND price > ? AND flag LIMIT 100".into(),
         "filter_no_index" => "SELECT COUNT(*) FROM items WHERE qty = ? AND price < ?".into(),
         "filter_is_null" => "SELECT id FROM items WHERE grp = ? AND note IS NULL LIMIT 100".into(),
+        // LIKE ignores case in SQLite's dialect, the others' (binary collations) heed it: GLOB is
+        // the same match there.
+        "like_prefix" if d == Dialect::Sqlite => "SELECT id, name FROM items WHERE name GLOB ? LIMIT 50".into(),
         "like_prefix" => "SELECT id, name FROM items WHERE name LIKE ? LIMIT 50".into(),
         "like_substring" => "SELECT id FROM items WHERE body LIKE ? LIMIT 20".into(),
         "order_by_index" => "SELECT id, price, created FROM items WHERE grp = ? ORDER BY created DESC LIMIT 20".into(),
@@ -469,7 +472,7 @@ pub fn statements(op: &str, d: Dialect) -> Option<Vec<String>> {
 
 /// The parameters of each of `op`'s statements, drawn for one run of it by client `c.0` of `c.1`:
 /// reads anywhere in the table, writes in the client's own slice of it.
-pub fn params(op: &str, rng: &mut Rng, shape: &Shape, c: (usize, usize)) -> Vec<Vec<P>> {
+pub fn params(op: &str, rng: &mut Rng, shape: &Shape, c: (usize, usize), d: Dialect) -> Vec<Vec<P>> {
     let write = OPS.iter().any(|o| o.name == op && o.kind == Kind::Write);
     let id = if write { shape.own(rng, c) } else { shape.id(rng) };
     let grp = || P::I((mix(id as u64 ^ 0x1111) % 100) as i64);
@@ -495,7 +498,10 @@ pub fn params(op: &str, rng: &mut Rng, shape: &Shape, c: (usize, usize)) -> Vec<
         "filter_multi_column" => one(vec![grp(), P::F((rng.next() % 10_000) as f64)]),
         "filter_no_index" => one(vec![P::I((rng.next() % 100) as i64), P::F((rng.next() % 1000) as f64)]),
         "filter_is_null" | "order_by_index" | "order_by_sort" | "count_distinct" | "cte" | "group_by_having" => one(vec![grp()]),
-        "like_prefix" => one(vec![P::T(format!("{word}-{:x}%", rng.next() % 16))]),
+        "like_prefix" => {
+            let wildcard = if d == Dialect::Sqlite { '*' } else { '%' };
+            one(vec![P::T(format!("{word}-{:x}{wildcard}", rng.next() % 16))])
+        }
         "like_substring" => one(vec![P::T("%zephyr%".into())]),
         "offset_deep" => one(vec![P::I(shape.range(rng, 20) - 1)]),
         "count_range" => {
@@ -628,6 +634,7 @@ fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &A
     let until = count_from + Duration::from_secs_f64(seconds);
     let total = Arc::new(Mutex::new(Outcome { hist: Hist::new(), rows: 0, errors: 0, error: None, retries: 0 }));
     let seed = AtomicU64::new(0x2545_f491_4f6c_dd1d ^ mix(op.name.len() as u64));
+    let d = target.dialect();
     std::thread::scope(|s| {
         for c in 0..clients {
             let (target, stmts, shape, stop, total) = (target.clone(), stmts.clone(), shape.clone(), stop.clone(), total.clone());
@@ -647,7 +654,7 @@ fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &A
                                 stop.store(true, Ordering::Relaxed);
                                 break;
                             }
-                            let p = params(op.name, &mut rng, &shape, (c, clients));
+                            let p = params(op.name, &mut rng, &shape, (c, clients), d);
                             let t = Instant::now();
                             let mut got = session.run(op.kind, &stmts, &p);
                             for _ in 0..20 {
@@ -730,7 +737,7 @@ pub fn main() -> anyhow::Result<()> {
                 continue;
             }
             let Some(stmts) = statements(op.name, d) else { continue };
-            let p = params(op.name, &mut rng, &shape, (0, 1));
+            let p = params(op.name, &mut rng, &shape, (0, 1), d);
             let (Some(sql), Some(first)) = (stmts.first(), p.first()) else { continue };
             let plan = match session.explain(&placeholders(d, sql), first) {
                 Ok(lines) => serde_json::json!(lines),

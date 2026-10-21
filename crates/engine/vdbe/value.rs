@@ -1366,6 +1366,53 @@ impl Value {
         Ok(pattern_compare(pattern, text, &LIKE_INFO, escape) == CompareResult::Match)
     }
 
+    /// Amphora: a `GLOB` pattern as the text GLOB compares it as: None for NULL.
+    fn glob_pattern(&self) -> Result<Option<std::borrow::Cow<'_, str>>, LimboError> {
+        match self {
+            Value::Null => Ok(None),
+            Value::Text(s) => Ok(Some(std::borrow::Cow::Borrowed(s.as_str()))),
+            v => match v.exec_cast("TEXT")? {
+                Value::Text(s) => Ok(Some(std::borrow::Cow::Owned(s.to_string()))),
+                _ => Ok(None),
+            },
+        }
+    }
+
+    /// Amphora: the least text a `GLOB` with this value as its pattern matches: the pattern's
+    /// literal prefix, up to its first `*`, `?` or `[` (`docs/design/planner.md`, decision 3).
+    /// NULL for a NULL pattern, which matches nothing.
+    pub fn exec_glob_lower_bound(&self) -> Result<Value, LimboError> {
+        let Some(pattern) = self.glob_pattern()? else {
+            return Ok(Value::Null);
+        };
+        let prefix = pattern.split(['*', '?', '[']).next().unwrap_or_default();
+        Ok(Value::build_text(prefix.to_owned()))
+    }
+
+    /// Amphora: a value every text a `GLOB` with this value as its pattern matches is less than:
+    /// the literal prefix with its last ASCII character advanced (the characters after it dropped,
+    /// so the bytes stay UTF-8), or an empty BLOB, after all text, when the prefix has none.
+    pub fn exec_glob_upper_bound(&self) -> Result<Value, LimboError> {
+        let Some(pattern) = self.glob_pattern()? else {
+            return Ok(Value::Null);
+        };
+        let mut bound = pattern
+            .split(['*', '?', '['])
+            .next()
+            .unwrap_or_default()
+            .as_bytes()
+            .to_vec();
+        while let Some(last) = bound.pop() {
+            if let Some(next) = last.checked_add(1).filter(|_| last < 0x7f) {
+                bound.push(next);
+                let text = String::from_utf8(bound)
+                    .map_err(|e| LimboError::InternalError(format!("a GLOB bound: {e}")))?;
+                return Ok(Value::build_text(text));
+            }
+        }
+        Value::from_slice(&[]).map_err(|e| LimboError::InternalError(format!("a GLOB bound: {e}")))
+    }
+
     pub fn exec_glob(pattern: &str, text: &str) -> Result<bool, LimboError> {
         const MAX_GLOB_PATTERN_LENGTH: usize = 50000;
         const GLOB_CHARS: [char; 3] = ['*', '?', '['];

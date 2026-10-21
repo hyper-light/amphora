@@ -59,6 +59,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   sort is charged to the access path that needs it, on the rows it sorts, so a page by key reads in
   key order. EXPLAIN words a range on the rowid as one. Checks on fedora, 1 client (not recorded
   runs): `join_pk` 71 → 94,710 statements a second, `join_three` 56 → 1,598, `offset_deep` 25 → 64.
+- **A GLOB prefix seeks its index** (docs/design/planner.md decision 3, `crates/engine/tests/glob_range.rs`):
+  `col GLOB p` on a TEXT column implies the range of `p`'s literal prefix, computed when the
+  statement runs, so an index seeks it; a BLOB matches no GLOB or LIKE (SQLite's recommended
+  `SQLITE_LIKE_DOESNT_MATCH_BLOBS`). The suite asks SQLite's dialect for GLOB where it asks the
+  others for LIKE, as their LIKE heeds case.
 - **Readers keep their pages across commits** (docs/design/store.md decision 18,
   `crates/engine/storage/changes.rs`): a connection starting a read transaction forgets only the
   pages written since its last one, where SQLite and Turso forget its whole cache; it forgets
