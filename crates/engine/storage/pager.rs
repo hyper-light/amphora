@@ -14,7 +14,7 @@ use crate::storage::{
         CELL_PTR_SIZE_BYTES, INTERIOR_PAGE_HEADER_SIZE_BYTES, LEAF_PAGE_HEADER_SIZE_BYTES,
         MINIMUM_CELL_SIZE,
     },
-    wal::{CheckpointResult, RollbackTo, Wal, IOV_MAX},
+    wal::{CheckpointResult, ReadChange, RollbackTo, Wal, IOV_MAX},
 };
 use crate::sync::atomic::{
     AtomicBool, AtomicIsize, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
@@ -3418,12 +3418,54 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return Ok(());
         };
-        let changed = wal.begin_read_tx()?;
-        if changed {
-            // Someone else changed the database -> assume our page cache is invalid (this is default SQLite behavior, we can probably do better with more granular invalidation)
-            self.clear_page_cache(false);
-            // Invalidate cached schema cookie to force re-read on next access
-            self.set_schema_cookie(None);
+        // Forgetting page by page costs less than clearing only while the pages to forget are
+        // fewer than the cache holds.
+        let most = self.page_cache.read().capacity();
+        match wal.begin_read_tx(most)? {
+            ReadChange::Unchanged => {}
+            // Amphora: only the pages written since this connection's last read transaction
+            // (Amphora's `docs/design/store.md`, decision 18), where SQLite and Turso forget all.
+            ReadChange::Pages(pages) => {
+                self.forget_pages(&pages)?;
+                self.set_schema_cookie(None);
+            }
+            ReadChange::Everything => {
+                self.clear_page_cache(false);
+                // Invalidate cached schema cookie to force re-read on next access
+                self.set_schema_cookie(None);
+            }
+        }
+        Ok(())
+    }
+
+    /// The pages the cache holds: what a read transaction forgot, for tests.
+    #[cfg(test)]
+    pub(crate) fn cached_pages(&self) -> usize {
+        self.page_cache.read().len()
+    }
+
+    /// Amphora: drops `pages` from the page cache, for a read transaction that starts after other
+    /// connections wrote them (decision 18). Each is dropped as `clear_page_cache` drops every
+    /// page, and cursors are told; a page a cursor still pins, or one being read, can't be dropped
+    /// alone, so then the whole cache is cleared instead.
+    fn forget_pages(&self, pages: &[u64]) -> Result<()> {
+        self.invalidate_all_cursors();
+        let mut cache = self.page_cache.write();
+        for &page in pages {
+            let Ok(id) = usize::try_from(page) else {
+                drop(cache);
+                self.clear_page_cache(false);
+                return Ok(());
+            };
+            match cache.delete(PageCacheKey::new(id)) {
+                Ok(()) => {}
+                Err(CacheError::Pinned { .. } | CacheError::Locked { .. }) => {
+                    drop(cache);
+                    self.clear_page_cache(false);
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
         Ok(())
     }
@@ -6688,6 +6730,77 @@ mod tests {
             assert_eq!(unloaded.id(), id);
             assert_eq!(unloaded.offset(), offset);
         }
+    }
+
+    /// Do: a reader reads a table, so its cache holds the table's pages; another connection updates
+    /// one row; the reader starts its next read transaction. Expect: it forgets the page that commit
+    /// wrote and keeps the rest, and reads the new row (Amphora's `docs/design/store.md`, decision
+    /// 18; AC-T1.1.1). Then a commit writes more pages than the reader caches, and one follows a
+    /// checkpoint that restarted the log: each time the reader forgets everything, and reads the
+    /// rows as committed.
+    #[test]
+    fn a_reader_forgets_only_the_pages_written_since_its_last_read() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db =
+            crate::Database::open_file(io, "forget.db", Arc::new(crate::SqliteDialect)).unwrap();
+        let writer = db.connect(crate::ConnectOpts::new()).unwrap();
+        let reader = db.connect(crate::ConnectOpts::new()).unwrap();
+        writer
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        writer.execute("BEGIN").unwrap();
+        for id in 1..=400 {
+            writer
+                .execute(format!(
+                    "INSERT INTO t VALUES ({id}, '{}')",
+                    "x".repeat(200)
+                ))
+                .unwrap();
+        }
+        writer.execute("COMMIT").unwrap();
+        let read = |sql: &str| -> String {
+            let rows = reader.prepare(sql).unwrap().run_collect_rows().unwrap();
+            rows[0][0].to_string()
+        };
+        assert_eq!(read("SELECT sum(length(body)) FROM t"), "80000");
+        let pager = reader.pager.load();
+        let cached = pager.cached_pages();
+        assert!(cached > 20, "the table's pages are cached: {cached}");
+
+        writer
+            .execute("UPDATE t SET body = 'changed' WHERE id = 200")
+            .unwrap();
+        pager.begin_read_tx().unwrap();
+        let kept = pager.cached_pages();
+        pager.end_read_tx();
+        assert!(
+            kept < cached && kept + 2 >= cached,
+            "kept {kept} of {cached} pages"
+        );
+        assert_eq!(read("SELECT body FROM t WHERE id = 200"), "changed");
+
+        // More pages written than the reader caches: forgetting them one by one costs more.
+        reader.execute("PRAGMA cache_size = 8").unwrap();
+        read("SELECT sum(length(body)) FROM t");
+        writer
+            .execute("UPDATE t SET body = 'every' WHERE id % 10 = 0")
+            .unwrap();
+        pager.begin_read_tx().unwrap();
+        assert_eq!(pager.cached_pages(), 0);
+        pager.end_read_tx();
+        assert_eq!(read("SELECT count(*) FROM t WHERE body = 'every'"), "40");
+
+        // A restarted log: the frames from before are gone, and with them what changed.
+        reader.execute("PRAGMA cache_size = 2000").unwrap();
+        read("SELECT sum(length(body)) FROM t");
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        writer
+            .execute("UPDATE t SET body = 'again' WHERE id = 1")
+            .unwrap();
+        pager.begin_read_tx().unwrap();
+        assert_eq!(pager.cached_pages(), 0);
+        pager.end_read_tx();
+        assert_eq!(read("SELECT body FROM t WHERE id = 1"), "again");
     }
 
     #[test]

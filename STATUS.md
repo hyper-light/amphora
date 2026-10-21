@@ -59,6 +59,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   sort is charged to the access path that needs it, on the rows it sorts, so a page by key reads in
   key order. EXPLAIN words a range on the rowid as one. Checks on fedora, 1 client (not recorded
   runs): `join_pk` 71 → 94,710 statements a second, `join_three` 56 → 1,598, `offset_deep` 25 → 64.
+- **Readers keep their pages across commits** (docs/design/store.md decision 18,
+  `crates/engine/storage/changes.rs`): a connection starting a read transaction forgets only the
+  pages written since its last one, where SQLite and Turso forget its whole cache; it forgets
+  everything when the log can't say (another generation, a gap, more pages than it caches). A model
+  test of random transactions, checkpoints and restarts, both log formats, never reads a stale row,
+  and catches a reader that forgets nothing. Readers still keep decision 5's 128 pages until a
+  bigger budget is measured under K0's writes.
 
 ## Measured
 

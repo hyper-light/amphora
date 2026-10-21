@@ -54,6 +54,7 @@ use bytemuck::{Pod, Zeroable};
 use pack1::{I32BE, U16BE, U32BE};
 use tracing::{instrument, Level};
 
+use super::changes::ChangeLog;
 use super::packed::{self, Record, Records};
 use super::pager::PageRef;
 pub use super::pager::{PageContent, PageInner};
@@ -1590,6 +1591,7 @@ impl BuildSharedWal {
                 durable: SpinLock::new(None),
                 pack: AtomicBool::new(false),
                 records: Arc::new(SpinLock::new(Records::default())),
+                changes: SpinLock::new(ChangeLog::default()),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },

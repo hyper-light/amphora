@@ -20,6 +20,7 @@ use std::fmt::{Debug, Formatter};
 use std::{fmt, sync::Arc};
 
 use super::buffer_pool::BufferPool;
+use super::changes::ChangeLog;
 use super::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use super::packed::{self, Record, Records};
 use super::pager::{Logged, PageRef, Pager};
@@ -923,6 +924,13 @@ trait WalCoordination: Debug + Send + Sync {
     /// Drop any cached frame mappings newer than `max_frame`.
     fn rollback_cache(&self, max_frame: u64);
 
+    /// Amphora: the distinct pages frames `after + 1 ..= upto` hold, at most `most` of them, or
+    /// None when the backend can't say (`changes::ChangeLog`; another process's frames are never
+    /// listed): a reader then forgets every page it cached.
+    fn changed_pages(&self, _after: u64, _upto: u64, _most: usize) -> Option<Vec<u64>> {
+        None
+    }
+
     /// Whether a process-local "last connection" close may run shutdown checkpointing.
     fn should_checkpoint_on_close(&self) -> bool;
 
@@ -950,8 +958,10 @@ trait WalCoordination: Debug + Send + Sync {
 #[aristo::intent("The WAL subsystem maintains LSN monotonicity, frame commitment ordering, recovery idempotency, checkpoint safety, and group commit atomicity.", id = "wal_protocol_correctness", verify = "neural")]
 pub trait Wal: Debug + Send + Sync {
     /// Begin a read transaction.
-    /// Returns whether the database state has changed since the last read transaction.
-    fn begin_read_tx(&self) -> Result<bool>;
+    /// Returns what of the database changed since the connection's last read transaction, for its
+    /// page cache to forget: nothing, the pages written since (when they are at most `most`), or
+    /// everything (Amphora's `docs/design/store.md`, decision 18).
+    fn begin_read_tx(&self, most: usize) -> Result<ReadChange>;
     /// MVCC helper: check if WAL state changed without starting a read tx.
     fn mvcc_refresh_if_db_changed(&self) -> bool;
 
@@ -1714,6 +1724,12 @@ impl WalCoordination for InProcessWalCoordination {
                 frame_cache.insert(page_id, vec![frame_id]);
             }
         }
+        // Amphora: listed in frame order for readers to forget (decision 18).
+        shared
+            .runtime
+            .changes
+            .lock()
+            .record(frame_id, 1, std::iter::once(page_id));
         shared
             .runtime
             .frame_cache_high_water
@@ -1743,7 +1759,8 @@ impl WalCoordination for InProcessWalCoordination {
         // The record's slots are known before any page maps to it.
         records.publish(head, slots);
         drop(records);
-        for page_id in pages {
+        let pages: Vec<u64> = pages.collect();
+        for &page_id in &pages {
             match frame_cache.get_mut(&page_id) {
                 Some(frames) => frames.push(head),
                 None => {
@@ -1751,6 +1768,11 @@ impl WalCoordination for InProcessWalCoordination {
                 }
             }
         }
+        shared
+            .runtime
+            .changes
+            .lock()
+            .record(head, u64::from(slots), pages.into_iter());
         let last = head
             .checked_add(u64::from(slots))
             .and_then(|end| end.checked_sub(1))
@@ -1791,8 +1813,13 @@ impl WalCoordination for InProcessWalCoordination {
             }
             !frames.is_empty()
         });
-        // Amphora: and the packed records past it.
+        // Amphora: and the packed records past it, and its listed changes.
         shared.runtime.records.lock().drop_after(max_frame);
+        shared
+            .runtime
+            .changes
+            .lock()
+            .drop_from(max_frame.saturating_add(1));
         // Keep the high-water consistent with the truncation so a subsequent
         // append at `max_frame + 1` is not misread as a rewind.
         if shared
@@ -1810,6 +1837,15 @@ impl WalCoordination for InProcessWalCoordination {
 
     fn should_checkpoint_on_close(&self) -> bool {
         true
+    }
+
+    fn changed_pages(&self, after: u64, upto: u64, most: usize) -> Option<Vec<u64>> {
+        self.shared
+            .read()
+            .runtime
+            .changes
+            .lock()
+            .pages(after, upto, most)
     }
 
     #[cfg(test)]
@@ -3405,6 +3441,10 @@ pub struct WalSharedRuntime {
     /// Amphora: the packed records of the log's generation, and those decoded (`packed::Records`).
     /// A leaf lock: nothing else is locked while it is held, and it is never held across IO.
     pub(crate) records: Arc<SpinLock<Records>>,
+    /// Amphora: the pages the generation's recent frames hold, in frame order, for readers to
+    /// forget only those (`changes::ChangeLog`, decision 18). Taken after `frame_cache`'s lock
+    /// when both are held; a leaf lock.
+    pub(crate) changes: SpinLock<ChangeLog>,
     #[cfg(test)]
     pub(crate) frames_compared: AtomicU64,
 }
@@ -3639,9 +3679,21 @@ impl Drop for CheckpointLocks {
 }
 
 /// Result of try_begin_read_tx - either success or a retriable condition.
+/// What of the database changed since a connection's last read transaction (`Wal::begin_read_tx`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadChange {
+    /// Nothing any page reads as.
+    Unchanged,
+    /// These pages, each written by a frame committed since: the connection forgets them alone.
+    Pages(Vec<u64>),
+    /// More than the log can say, or more pages than are worth forgetting one by one: the
+    /// connection forgets every page it cached.
+    Everything,
+}
+
 enum TryBeginReadResult {
-    /// Successfully started read transaction, returns whether DB changed
-    Ok(bool),
+    /// Successfully started read transaction, returns what changed since the last one
+    Ok(ReadChange),
     /// Transient condition, caller should retry immediately (like SQLite's WAL_RETRY)
     Retry,
     /// Non-retriable failure while preparing the local WAL view.
@@ -4238,7 +4290,7 @@ impl WalFile {
 
     /// Try to begin a read transaction. Returns Retry for transient conditions
     /// that should be retried immediately, Ok for success.
-    fn try_begin_read_tx(&self) -> TryBeginReadResult {
+    fn try_begin_read_tx(&self, most: usize) -> TryBeginReadResult {
         turso_assert!(
             self.max_frame_read_lock_index
                 .load(Ordering::Acquire)
@@ -4291,11 +4343,11 @@ impl WalFile {
             };
         }
 
-        // Check if database changed since this connection's last read transaction.
-        // If it has, the connection will invalidate its page cache.
-        let db_changed = self.db_changed_against(shared_snapshot, self.connection_state());
+        // What changed since this connection's last read transaction, for its page cache to
+        // forget (Amphora: the pages written since, where the log can say; decision 18).
+        let change = self.read_change(shared_snapshot, self.connection_state().snapshot, most);
 
-        tracing::debug!("try_begin_read_tx: db_changed={}", db_changed);
+        tracing::debug!("try_begin_read_tx: change={:?}", change);
 
         // If WAL is fully checkpointed (shared_max == nbackfills), readers can ignore
         // the WAL and read directly from the DB file by holding read_locks[0].
@@ -4319,12 +4371,41 @@ impl WalFile {
             read_guard.lock_index(),
             shared_snapshot.max_frame
         );
-        TryBeginReadResult::Ok(db_changed)
+        TryBeginReadResult::Ok(change)
+    }
+
+    /// Amphora: what a connection whose last read transaction saw `local` forgets to read at
+    /// `snapshot`: nothing when no frame was committed since (a checkpoint's backfill alone
+    /// changes no page's contents); the pages the frames since hold, in the same generation of the
+    /// log, when the coordination lists them all and they are at most `most`; else everything
+    /// (decision 18).
+    fn read_change(&self, snapshot: WalSnapshot, local: WalSnapshot, most: usize) -> ReadChange {
+        if snapshot == local {
+            return ReadChange::Unchanged;
+        }
+        let same_generation = snapshot.checkpoint_seq == local.checkpoint_seq;
+        if same_generation
+            && snapshot.max_frame == local.max_frame
+            && snapshot.last_checksum == local.last_checksum
+            && snapshot.transaction_count == local.transaction_count
+        {
+            return ReadChange::Unchanged;
+        }
+        if !same_generation || snapshot.max_frame <= local.max_frame {
+            return ReadChange::Everything;
+        }
+        match self
+            .coordination
+            .changed_pages(local.max_frame, snapshot.max_frame, most)
+        {
+            Some(pages) => ReadChange::Pages(pages),
+            None => ReadChange::Everything,
+        }
     }
 }
 
 impl Wal for WalFile {
-    fn begin_read_tx(&self) -> Result<bool> {
+    fn begin_read_tx(&self, most: usize) -> Result<ReadChange> {
         // Implement progressive backoff because transient lock contention
         // should resolve quickly, but under heavy contention busy-spinning wastes
         // CPU. SQLite uses quadratic backoff after 5 retries, with total delay
@@ -4333,7 +4414,7 @@ impl Wal for WalFile {
         let mut cnt = 0u32;
         loop {
             tracing::trace!("begin_read_tx: cnt={cnt}");
-            match self.try_begin_read_tx() {
+            match self.try_begin_read_tx(most) {
                 TryBeginReadResult::Ok(changed) => return Ok(changed),
                 TryBeginReadResult::Err(err) => return Err(err),
                 TryBeginReadResult::Busy => return Err(LimboError::Busy),
@@ -6872,6 +6953,7 @@ impl WalFileShared {
                 durable: SpinLock::new(None),
                 pack: AtomicBool::new(false),
                 records: Arc::new(SpinLock::new(Records::default())),
+                changes: SpinLock::new(ChangeLog::default()),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },
@@ -6953,6 +7035,7 @@ impl WalFileShared {
                 durable: SpinLock::new(None),
                 pack: AtomicBool::new(false),
                 records: Arc::new(SpinLock::new(Records::default())),
+                changes: SpinLock::new(ChangeLog::default()),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },
@@ -7000,6 +7083,7 @@ impl WalFileShared {
                 durable: SpinLock::new(None),
                 pack: AtomicBool::new(false),
                 records: Arc::new(SpinLock::new(Records::default())),
+                changes: SpinLock::new(ChangeLog::default()),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },
@@ -7047,6 +7131,7 @@ impl WalFileShared {
             .frame_cache_high_water
             .store(0, Ordering::Release);
         self.runtime.records.lock().clear();
+        self.runtime.changes.lock().reset();
         // read-marks
         self.runtime.read_locks[0].set_value_exclusive(0);
         self.runtime.read_locks[1].set_value_exclusive(0);
@@ -7070,6 +7155,7 @@ impl WalFileShared {
         self.runtime.frame_cache = restored.runtime.frame_cache;
         // Amphora: in place, as connections hold the registry's `Arc`.
         *self.runtime.records.lock() = std::mem::take(&mut *restored.runtime.records.lock());
+        self.runtime.changes.lock().reset();
         self.runtime.file = restored.runtime.file;
         self.runtime.epoch.store(
             restored.runtime.epoch.load(Ordering::Acquire),
@@ -8939,7 +9025,7 @@ pub mod test {
 
         // Same through the WAL front door: no Retry, so no backoff sleeps.
         assert!(
-            matches!(reader_wal.try_begin_read_tx(), TryBeginReadResult::Ok(_)),
+            matches!(reader_wal.try_begin_read_tx(0), TryBeginReadResult::Ok(_)),
             "reader should start while the checkpoint holds read-mark 0"
         );
         assert_eq!(reader_wal.get_max_frame(), 5);
@@ -9664,7 +9750,7 @@ pub mod test {
             buffer_pool,
         );
 
-        wal.begin_read_tx().unwrap();
+        wal.begin_read_tx(0).unwrap();
         reopened_authority.mark_frame_index_overflowed_for_tests();
 
         assert!(
@@ -9678,7 +9764,7 @@ pub mod test {
 
         wal.end_read_tx();
         assert!(
-            matches!(wal.begin_read_tx(), Err(LimboError::Busy)),
+            matches!(wal.begin_read_tx(0), Err(LimboError::Busy)),
             "new readers must also refuse an uncovered overflowed frame index without blocking"
         );
     }
@@ -10976,7 +11062,7 @@ pub mod test {
         vacuum_wal.begin_vacuum_blocking_tx().unwrap();
 
         assert!(
-            matches!(reader_wal.try_begin_read_tx(), TryBeginReadResult::Busy),
+            matches!(reader_wal.try_begin_read_tx(0), TryBeginReadResult::Busy),
             "VACUUM lock should block new WAL readers before they take a read-mark slot"
         );
         assert!(
@@ -10993,7 +11079,7 @@ pub mod test {
         vacuum_wal.release_vacuum_checkpoint_lock();
 
         assert!(
-            matches!(reader_wal.try_begin_read_tx(), TryBeginReadResult::Ok(_)),
+            matches!(reader_wal.try_begin_read_tx(0), TryBeginReadResult::Ok(_)),
             "reader should start after VACUUM releases the lock"
         );
         reader_wal.end_read_tx();
@@ -11005,7 +11091,7 @@ pub mod test {
         let vacuum_wal = make_test_wal_from_shared(shared);
 
         assert!(matches!(
-            reader_wal.try_begin_read_tx(),
+            reader_wal.try_begin_read_tx(0),
             TryBeginReadResult::Ok(_)
         ));
         vacuum_wal.try_begin_vacuum_checkpoint_lock().unwrap();
@@ -11047,7 +11133,7 @@ pub mod test {
         }
 
         assert!(
-            matches!(retry_reader.try_begin_read_tx(), TryBeginReadResult::Retry),
+            matches!(retry_reader.try_begin_read_tx(0), TryBeginReadResult::Retry),
             "reader should retry when all read-mark slots are transiently unavailable"
         );
         assert!(
@@ -11098,7 +11184,7 @@ pub mod test {
             CheckpointLocks::from_held_vacuum_checkpoint_lock(vacuum_wal.coordination.clone())
                 .unwrap();
         assert!(
-            matches!(contender_wal.try_begin_read_tx(), TryBeginReadResult::Busy),
+            matches!(contender_wal.try_begin_read_tx(0), TryBeginReadResult::Busy),
             "VACUUM lock should continue blocking readers during final checkpoint"
         );
 
@@ -11109,13 +11195,13 @@ pub mod test {
         );
         contender_wal.release_vacuum_checkpoint_lock();
         assert!(
-            matches!(contender_wal.try_begin_read_tx(), TryBeginReadResult::Busy),
+            matches!(contender_wal.try_begin_read_tx(0), TryBeginReadResult::Busy),
             "checkpoint cleanup must not release the VACUUM lock"
         );
 
         vacuum_wal.release_vacuum_lock();
         assert!(matches!(
-            contender_wal.try_begin_read_tx(),
+            contender_wal.try_begin_read_tx(0),
             TryBeginReadResult::Ok(_)
         ));
         contender_wal.end_read_tx();
@@ -11236,7 +11322,7 @@ pub mod test {
         let readmark = {
             let pager = conn2.pager.load();
             let wal2 = pager.wal.as_ref().unwrap();
-            wal2.begin_read_tx().unwrap();
+            wal2.begin_read_tx(0).unwrap();
             wal2.get_max_frame()
         };
 
@@ -11311,7 +11397,7 @@ pub mod test {
             .wal
             .as_ref()
             .unwrap()
-            .begin_read_tx()
+            .begin_read_tx(0)
             .unwrap();
 
         // checkpoint should succeed here because the wal is fully checkpointed (empty)
@@ -11420,7 +11506,7 @@ pub mod test {
         let r1_max_frame = {
             let pager = conn_r1.pager.load();
             let wal = pager.wal.as_ref().unwrap();
-            wal.begin_read_tx().unwrap();
+            wal.begin_read_tx(0).unwrap();
             wal.get_max_frame()
         };
         bulk_inserts(&conn_writer, 5, 10);
@@ -11429,7 +11515,7 @@ pub mod test {
         let r2_max_frame = {
             let pager = conn_r2.pager.load();
             let wal = pager.wal.as_ref().unwrap();
-            wal.begin_read_tx().unwrap();
+            wal.begin_read_tx(0).unwrap();
             wal.get_max_frame()
         };
 
@@ -11508,7 +11594,7 @@ pub mod test {
         {
             let pager = conn2.pager.load();
             let wal = pager.wal.as_ref().unwrap();
-            let _ = wal.begin_read_tx().unwrap();
+            let _ = wal.begin_read_tx(0).unwrap();
             wal.begin_write_tx(WalAutoActions::all_enabled()).unwrap();
         }
 
@@ -11795,7 +11881,7 @@ pub mod test {
         {
             let pager = conn2.pager.load();
             let wal = pager.wal.as_ref().unwrap();
-            wal.begin_read_tx().unwrap();
+            wal.begin_read_tx(0).unwrap();
         }
         // Make changes using conn1
         bulk_inserts(&conn1, 5, 5);
@@ -11813,7 +11899,7 @@ pub mod test {
             let pager = conn2.pager.load();
             let wal = pager.wal.as_ref().unwrap();
             wal.end_read_tx();
-            wal.begin_read_tx().unwrap();
+            wal.begin_read_tx(0).unwrap();
         }
         // Now write transaction should work
         let result = {
@@ -11849,7 +11935,7 @@ pub mod test {
         {
             let pager = conn2.pager.load();
             let wal = pager.wal.as_ref().unwrap();
-            wal.begin_read_tx().unwrap();
+            wal.begin_read_tx(0).unwrap();
         }
         // should use slot 0, as everything is backfilled
         assert!(check_read_lock_slot(&conn2, 0));
@@ -11943,7 +12029,7 @@ pub mod test {
         {
             let pager = reader.pager.load();
             let wal = pager.wal.as_ref().unwrap();
-            wal.begin_read_tx().unwrap();
+            wal.begin_read_tx(0).unwrap();
         }
         let r_snapshot = {
             let pager = reader.pager.load();

@@ -521,3 +521,46 @@ beside decision 16's.
 **Falsified by.** A page read back other than as written; a chain longer than 8; an acknowledged
 batch lost or torn by a power cut; writes or reads slower with deltas than with compressed whole
 pages at any writer count.
+
+## 18. A reader forgets only what was written since it last read
+
+**Decision.** A connection starting a read transaction after others committed forgets only the
+pages those commits wrote (`Pager::begin_read_tx`, `Wal::begin_read_tx` answering a `ReadChange`),
+not its whole page cache. The log lists the pages its recent frames hold, in frame order, beside
+its frame index and under its lock (`crates/engine/storage/changes.rs`: at most 65,536 entries, 1
+MiB, the oldest half dropped past that). The list vouches only for frames it saw appended one after
+another in the current generation: a reader whose last read was in another generation (the log
+restarted), or before what the list holds (dropped for the bound, or appended past a gap, as frames
+recovered or restored whole are), or behind more changed pages than its cache holds, forgets
+everything, as before. A checkpoint's backfill alone changes no page's contents and forgets
+nothing. A page a cursor still pins, or one being read, can't be dropped alone, so then the whole
+cache is cleared. Under another process's authority (the shared-memory index) no list is kept, and
+readers forget everything.
+
+**Why.** SQLite's pager, and Turso's, cleared a connection's page cache whenever the database had
+changed since its last read (the comment it came with: "we can probably do better with more
+granular invalidation"). Under writes every read began cold, and a larger cache only cost more to
+clear and fill: that is why decision 5's readers keep 128 pages. The comprehensive suite
+(`bench --suite`) shows what a small cache costs reads. A reader caching 20,000 pages reads the
+suite's `order_by_index` at 139,710 a second, against 45,822 at 2,000 pages and 43,783 at 128;
+`point_secondary` 378,174, against 306,489 and 229,422 (fedora, 1 client, load 8: a check, not a
+recorded run). With this decision a reader's cache outlives commits, so decision 5's budget can be
+chosen for what reads need.
+
+**Sources.** SQLite's pager (`src/pager.c`): `pagerBeginReadTransaction` resets the cache when the
+log's read reports a change (`sqlite3WalBeginReadTransaction`), which this replaces. PostgreSQL's
+shared buffers (its documentation, "Resource Consumption", `shared_buffers`): pages stay cached
+across transactions, and a page changed is replaced alone.
+
+**Evidence.** `crates/engine/storage/pager.rs`,
+`a_reader_forgets_only_the_pages_written_since_its_last_read`: a reader caching a 400-row table
+keeps every page but the one a one-row update wrote and reads the new row; it forgets everything
+when a commit writes more pages than it caches, and after a checkpoint that restarted the log.
+`crates/engine/tests/reader_cache.rs`: 400 random steps of transactions (one row to hundreds, rows
+growing into overflow pages and shrinking, inserts, deletes and rollbacks), checkpoints of every
+mode and reads, 12 seeds, page-a-frame and packed logs, readers caching 8 pages and 2,000: every
+read is the model's. With a listed change forgotten not at all (a mutant) both fail, the model at
+seed 0, step 4; with a range's last frame left out (a mutant), the model fails at seed 0, step 11.
+
+**Falsified by.** A read returning a row as it was before a commit its read transaction started
+after; reads under writes slower than when every commit cleared the cache.
