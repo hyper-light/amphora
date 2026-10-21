@@ -285,6 +285,21 @@ fn rss_anon_mb() -> Option<f64> {
     Some((kb / 1024.0 * 10.0).round() / 10.0)
 }
 
+/// What this process has had written to storage (bytes) and the CPU it has used (s), where the
+/// system says: Linux's `/proc/self/io` (`write_bytes`, counted as pages are dirtied, so what
+/// in-process stores write to their logs and files) and `/proc/self/stat` (`utime` and `stime`, in
+/// USER_HZ, 100 a second on Linux).
+fn written_and_cpu() -> (Option<u64>, Option<f64>) {
+    let written = std::fs::read_to_string("/proc/self/io").ok().and_then(|io| io.lines().find_map(|l| l.strip_prefix("write_bytes:")).and_then(|v| v.trim().parse().ok()));
+    let cpu = std::fs::read_to_string("/proc/self/stat").ok().and_then(|stat| {
+        // After the command's closing parenthesis: the state, then utime and stime 11 and 12 on.
+        let fields: Vec<&str> = stat.get(stat.rfind(')')? + 1..)?.split_whitespace().collect();
+        let ticks = fields.get(11)?.parse::<f64>().ok()? + fields.get(12)?.parse::<f64>().ok()?;
+        Some(ticks / 100.0)
+    });
+    (written, cpu)
+}
+
 /// The most memory this process held at once (its resident set's high-water mark), in MiB; none
 /// where the system doesn't say (it's Linux's `VmHWM`).
 fn rss_max_mb() -> Option<f64> {
@@ -510,6 +525,7 @@ fn main() -> anyhow::Result<()> {
     let slots = usize::try_from(o.seconds).unwrap_or(0) + 2;
     let per_second: Arc<Vec<(AtomicU64, AtomicU64)>> = Arc::new((0..slots).map(|_| (AtomicU64::new(0), AtomicU64::new(0))).collect());
     let mixed = Instant::now();
+    let (written_before, cpu_before) = written_and_cpu();
     let count_from = mixed + Duration::from_secs(o.warmup);
     // The most anonymous memory held during the mixed phase, looked at every 100 ms.
     let anon_peak = Arc::new(AtomicU64::new(0));
@@ -606,6 +622,7 @@ fn main() -> anyhow::Result<()> {
     let _ = sampler.join();
     let writes = written.hist();
     let stats_after_mixed = driver.stats();
+    let (written_after, cpu_after) = written_and_cpu();
     if let (Some(prefix), Some(guard)) = (&profile, profiler) {
         let report = guard.report().build()?;
         report.flamegraph(std::fs::File::create(format!("{prefix}.svg"))?)?;
@@ -703,6 +720,10 @@ fn main() -> anyhow::Result<()> {
         "search_ms": summary(searches),
         "write_rate": o.write_rate,
         "disjoint": o.disjoint,
+        // The mixed phase's: what this process wrote to storage (an in-process store's log and
+        // files) and the CPU it used, warmup included.
+        "mixed_written_mb": written_before.zip(written_after).map(|(b, a)| (a.saturating_sub(b) as f64 / 1048576.0 * 10.0).round() / 10.0),
+        "mixed_cpu_s": cpu_before.zip(cpu_after).map(|(b, a)| ((a - b) * 100.0).round() / 100.0),
         "rss_max_mb": rss_max_mb(),
         "rss_anon_max_mb": anon_peak.load(Ordering::Relaxed) as f64 / 10.0,
         "heap_peak_mb": heap_mb(&HEAP_PEAK),
