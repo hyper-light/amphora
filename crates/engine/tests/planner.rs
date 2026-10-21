@@ -158,3 +158,49 @@ fn a_whole_table_group_by_scans_and_sorts_where_lookups_would_read_pages() {
         vec!["SCAN items USING INDEX items_grp_created".to_owned()]
     );
 }
+
+/// Do: join a grouped CTE (the sums of a few hundred owners' items) to the owners it names,
+/// written as a CTE and as a subquery in FROM. Expect: its rows drive, each owner looked up by
+/// key, rather than every owner scanned to probe an index built on it (docs/design/planner.md,
+/// decision 6: the owners' pages fit in the cache, so after one search a search of them reads
+/// nothing); and the rows the same join without a subquery returns.
+#[test]
+fn a_grouped_cte_drives_lookups_of_the_owners_it_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = tables(dir.path());
+    let grouped = "SELECT owner, SUM(price) AS s FROM items WHERE grp = 7 GROUP BY owner";
+    let forms = [
+        format!("WITH t AS ({grouped}) SELECT o.name, t.s FROM t JOIN owners o ON o.id = t.owner ORDER BY t.s DESC, o.name LIMIT 5"),
+        format!("SELECT o.name, t.s FROM ({grouped}) t JOIN owners o ON o.id = t.owner ORDER BY t.s DESC, o.name LIMIT 5"),
+    ];
+    let joined = "SELECT o.name, SUM(i.price) FROM items i JOIN owners o ON o.id = i.owner WHERE i.grp = 7 GROUP BY o.id ORDER BY 2 DESC, o.name LIMIT 5";
+    let mut want = conn.prepare(joined).unwrap();
+    let want: Vec<String> = want
+        .run_collect_rows()
+        .unwrap()
+        .iter()
+        .map(|row| format!("{} {}", row[0], row[1]))
+        .collect();
+    assert_eq!(want.len(), 5);
+    for sql in &forms {
+        assert_eq!(
+            plan(&conn, sql),
+            vec![
+                "SCAN t".to_owned(),
+                "SEARCH items USING INDEX items_grp_created (grp=?)".to_owned(),
+                "USE SORTER FOR GROUP BY".to_owned(),
+                "SEARCH o USING INTEGER PRIMARY KEY (rowid=?)".to_owned(),
+                "USE SORTER FOR ORDER BY".to_owned(),
+            ],
+            "{sql}"
+        );
+        let mut stmt = conn.prepare(sql).unwrap();
+        let got: Vec<String> = stmt
+            .run_collect_rows()
+            .unwrap()
+            .iter()
+            .map(|row| format!("{} {}", row[0], row[1]))
+            .collect();
+        assert_eq!(got, want, "{sql}");
+    }
+}

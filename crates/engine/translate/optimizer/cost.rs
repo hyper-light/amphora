@@ -262,7 +262,24 @@ pub fn estimate_index_cost(
             + looked_up * params.cpu_cost_per_seek
     };
 
-    let io_cost = seek_cost + leaf_scan_cost + table_lookup_cost;
+    // Amphora: many searches of an index the cache holds whole read each of its pages once at
+    // most (decision 6): its leaves as Mackert and Lohman count them, its inner pages once. One
+    // pass is read in order, and an index bigger than the cache keeps its searches' pages, as
+    // estimated above.
+    let leaf_pages = (base_row_count / index_info.rows_per_leaf_page).max(1.0);
+    let index_pages = leaf_pages + leaf_pages / index_info.rows_per_leaf_page.max(2.0) + tree_depth;
+    let index_io = if input_cardinality > 1.0 && index_pages <= params.cache_pages {
+        let reads = table_pages_fetched(
+            input_cardinality * index_leaf_pages_count,
+            leaf_pages,
+            params.cache_pages,
+        ) + (tree_depth - 1.0).max(0.0);
+        (seek_cost + leaf_scan_cost).min(reads)
+    } else {
+        seek_cost + leaf_scan_cost
+    };
+
+    let io_cost = index_io + table_lookup_cost;
 
     // CPU cost: key comparisons during seeks + row processing
     let total_rows = input_cardinality * rows_per_seek;
@@ -694,10 +711,35 @@ mod tests {
         assert_eq!(table_pages_fetched(0.0, 4_000.0, 2_000.0), 0.0);
     }
 
+    /// Amphora: do: search an index of 1,000 leaf pages 200 times, with a cache that holds it and
+    /// with one of a page. Expect: held, no more than its leaf pages and its inner pages once
+    /// (decision 6); not held, every search's pages as before.
+    #[test]
+    fn repeated_searches_read_no_more_than_the_cache_cannot_hold() {
+        let held = DEFAULT_PARAMS.with_cache_pages(100_000);
+        let cost = estimate_index_cost(100_000.0, 4.0, covering_index(), 200.0, 1.0, &held);
+        let cpu = 200.0 * held.cpu_cost_per_seek + 200.0 * held.cpu_cost_per_row;
+        let reads = table_pages_fetched(200.0, 1_000.0, 100_000.0) + 3.0;
+        assert!(((cost.0 + held.index_bonus - cpu) - reads).abs() < 1e-9);
+        assert!(reads < 200.0, "{reads}");
+        let none = DEFAULT_PARAMS.with_cache_pages(1);
+        let uncached = estimate_index_cost(100_000.0, 4.0, covering_index(), 200.0, 1.0, &none);
+        let per_search = 4.0 + 199.0 * (3.0 + none.cache_reuse_factor);
+        assert!(((uncached.0 + none.index_bonus - cpu) - per_search).abs() < 1e-9);
+        assert!(cost < uncached);
+    }
+
     #[test]
     fn repeated_point_seeks_keep_non_root_page_costs() {
-        let cost =
-            estimate_index_cost(100_000.0, 4.0, covering_index(), 10.0, 1.0, &DEFAULT_PARAMS);
+        // Amphora: a cache of one page, which holds none of the index (decision 6).
+        let cost = estimate_index_cost(
+            100_000.0,
+            4.0,
+            covering_index(),
+            10.0,
+            1.0,
+            &DEFAULT_PARAMS.with_cache_pages(1),
+        );
         let repeated_tree_search_cost = 3.0 + DEFAULT_PARAMS.cache_reuse_factor;
         let expected_tree_search_cost = 4.0 + 9.0 * repeated_tree_search_cost;
         let expected_cpu_cost =
@@ -714,7 +756,7 @@ mod tests {
             covering_index(),
             10.0,
             100.0,
-            &DEFAULT_PARAMS,
+            &DEFAULT_PARAMS.with_cache_pages(1),
         );
         let repeated_tree_search_cost = 2.0 + DEFAULT_PARAMS.cache_reuse_factor;
         let expected_tree_search_cost = 4.0 + 9.0 * repeated_tree_search_cost;
@@ -730,10 +772,12 @@ mod tests {
     fn lower_cache_reuse_factor_reduces_repeated_read_cost() {
         let low_reuse_cost = CostModelParams {
             cache_reuse_factor: 0.8,
+            cache_pages: 1.0,
             ..DEFAULT_PARAMS.clone()
         };
         let high_reuse_cost = CostModelParams {
             cache_reuse_factor: 0.2,
+            cache_pages: 1.0,
             ..DEFAULT_PARAMS.clone()
         };
 

@@ -188,3 +188,35 @@ unchanged.
 **Falsified by.** A statement the model now sends to a plan that reads more. It knows a table's
 pages only as its rows over 50 (`rows_per_table_page`), not their real size: a table of wide rows
 has many more, which makes its scans look cheaper than they are.
+
+## 6. Many searches of an index the cache holds read its pages once
+
+**Decision.** The searches of a nested loop's inner side, of an index whose pages all fit in the
+connection's cache, are charged each page once at most: its leaf pages as Mackert and Lohman count
+them for that many searches, its inner pages once (`estimate_index_cost`). One pass, and an index
+bigger than the cache, keep the model's charges for each search. The model charged every search
+but the first the pages below the root, even of a table of eight pages that never leaves the cache,
+while it charged an index built on a subquery's rows CPU alone for each probe: so it would rather
+build one than search a small table by its key.
+
+**Why.** The suite's `cte` (`WITH t AS (SELECT owner, SUM(price) ... WHERE grp = ? GROUP BY
+owner) SELECT o.name, t.s FROM t JOIN owners o ON o.id = t.owner ORDER BY t.s DESC LIMIT 5`) scanned
+all 4,000 owners and probed an index built on t's rows for each, where t's 1,650 rows, each looking
+its owner up by key, do less. On the planner test's copy, 200 searches of `owners` (eight pages)
+were charged 240 pages and 400 probes of the built index 4.
+
+**Sources.** Mackert and Lohman, as in decision 5. PostgreSQL applies `index_pages_fetched` to an
+index's own pages over a scan's repetitions as to its table's (`genericcostestimate`,
+`src/backend/utils/adt/selfuncs.c`, with `loop_count`): an index read many times costs the pages
+those reads fetch, not each read's pages.
+
+**Evidence.** `cost.rs`, `repeated_searches_read_no_more_than_the_cache_cannot_hold`: 200 searches
+of a 1,000-leaf index the cache holds cost its leaves as Mackert and Lohman count them and its inner
+pages once; with a one-page cache, every search's pages as before (the model's other tests run so).
+`crates/engine/tests/planner.rs`, `a_grouped_cte_drives_lookups_of_the_owners_it_names`: the CTE,
+and the same subquery in FROM, drive lookups of `owners` by key, and return the rows of the same
+join without a subquery. Of the suite's 50 statements, `--explain` before and after: only `cte`
+changes plan.
+
+**Falsified by.** A nested loop the model now prefers that reads more than the plan it replaced;
+an index the cache doesn't hold although the model, counting its pages from its rows, says it does.
