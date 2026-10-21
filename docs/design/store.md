@@ -664,8 +664,12 @@ ms), 339–341 MB; sharing 16,384, writes 154,464 and 154,744 (p99 6.8–8.2 ms)
 (`bench/records/2026-10-21-fedora-suite-amphora-39549dc.jsonl`, `-shared-256mib.jsonl`, loads
 1.7 and 3.4): the analytic reads gain as above, but reads whose pages each reader's cache mostly
 holds ran slower shared, `point_pk` 263,000 a second against 426,000 at one client,
-`point_pk_one_column` 561,000 against 1,064,000 and `join_three` 10,500 against 23,400 at 32: not
-yet explained. So it is on where reads matter more than memory, until one budget for the process's
+`point_pk_one_column` 561,000 against 1,064,000 and `join_three` 10,500 against 23,400 at 32. Run
+alone for 5 s after a second's warmup, `point_pk` at one client is faster shared (567,847 and
+665,306 a second against 421,239 and 458,198, no read from the file left in its profile): the
+suite's slowdown is likely its first statements' 2.5 s right after the load, while the
+checkpointer drains the log and restarts it (every frame version kept then is a key no reader asks
+for again), to be confirmed. So it is on where reads matter more than memory, until one budget for the process's
 databases (and readers' own caches smaller while sharing) makes it a win in both, and the slower
 reads are understood.
 
