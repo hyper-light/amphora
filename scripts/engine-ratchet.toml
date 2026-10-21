@@ -4,7 +4,7 @@
 # the engine became Amphora's own (Rust 1.99.1).
 [left.x86_64-unknown-linux-gnu]
 "clippy::panic" = 201
-"clippy::unwrap_used" = 456
+"clippy::unwrap_used" = 455
 "clippy::expect_used" = 876
 "clippy::unreachable" = 469
 "clippy::todo" = 11

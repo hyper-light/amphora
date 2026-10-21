@@ -564,3 +564,34 @@ seed 0, step 4; with a range's last frame left out (a mutant), the model fails a
 
 **Falsified by.** A read returning a row as it was before a commit its read transaction started
 after; reads under writes slower than when every commit cleared the cache.
+
+## 19. The page cache evicts the oldest page not looked at again
+
+**Decision.** A page new to a connection's cache joins at the head of its queue, and the clock
+hand sweeps from the tail toward the head (`crates/engine/storage/page_cache.rs`), as SIEVE has
+it: the hand evicts the first page it finds unmarked, taking a mark off each marked page it
+passes, so a page new to the cache is examined after every older one. Turso's cache inserted a new
+page just after the hand, where the sweep looks next.
+
+**Why.** Inserted there, a page read once was the next the sweep examined: with the cache full,
+each miss evicted the page the previous miss brought in, the pages cached before stayed, and a new
+working set never settled unless each of its pages was looked at again before the next miss. The
+suite found it: the same reader running `point_secondary` and then `order_by_index`, whose working
+set is about 600 pages, read `order_by_index` at 49,044 a second with 2,000 pages cached, against
+151,719 from an empty cache (fedora, 1 client, load 6: checks, not recorded runs). Readers live
+across statements in a store, where Turso's bench target opens connections afresh.
+
+**Sources.** Zhang, Yang, Yue, Vigfusson and Rashmi, "SIEVE is Simpler than LRU: an Efficient
+Turn-Key Eviction Algorithm for Web Caches" (NSDI 2024): new objects are inserted at the head, and
+the hand moves from the tail toward the head, evicting the first object not visited since it last
+passed.
+
+**Evidence.** `page_cache.rs`, `a_new_working_set_settles_in_a_full_cache`: a cache of 100 pages
+full of pages read once, then a working set of 40 read round after round: every read after the
+first round a hit; with the insertion after the hand, 360 misses in the 9 rounds after the first,
+every read. Two of Turso's tests asserted the old order (the newest page evicted first) and now
+assert SIEVE's. With it, the same reader reads `order_by_index` after `point_secondary` at 147,133
+a second with 2,000 pages, and at 72,402 with 128 (45,128 before).
+
+**Falsified by.** A working set that settles in the cache yet misses; a hot page evicted before a
+page read once.

@@ -66,6 +66,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   test of random transactions, checkpoints and restarts, both log formats, never reads a stale row,
   and catches a reader that forgets nothing. Readers still keep decision 5's 128 pages until a
   bigger budget is measured under K0's writes.
+- **The page cache evicts as SIEVE does** (docs/design/store.md decision 19): a new page joins the
+  queue's head, so the hand reaches it after every older page; inserted after the hand, as Turso
+  had it, a new working set never settled in a full cache (`order_by_index` after
+  `point_secondary`, 2,000 pages: 49,044 → 147,133 a second, a check on fedora at 1 client).
 
 ## Measured
 

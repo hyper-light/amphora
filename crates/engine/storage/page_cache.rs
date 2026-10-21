@@ -301,24 +301,18 @@ impl PageCache {
 
         let entry = PageCacheEntry::new(key, value);
 
+        // Amphora: a new page joins at the head (the queue's back), as SIEVE has it (Zhang et al.,
+        // "SIEVE is Simpler than LRU", NSDI 2024): the hand sweeps from the tail (the front) toward
+        // the head, so it reaches a new page after every older one. Inserted just after the hand,
+        // a page read once was the next the sweep examined: the pages cached before stayed while a
+        // new working set never settled (Amphora's docs/design/store.md, decision 19).
+        self.queue.push_back(entry);
+        let entry_ptr = self.queue.back().get().ok_or_else(|| {
+            CacheError::InternalError("Failed to get inserted entry pointer".into())
+        })? as *const PageCacheEntry as *mut PageCacheEntry;
+        self.map.insert(key, entry_ptr);
         if self.clock_hand.is_null() {
-            // First entry - just push it
-            self.queue.push_back(entry);
-            let entry_ptr = self.queue.back().get().unwrap() as *const _ as *mut PageCacheEntry;
-            self.map.insert(key, entry_ptr);
             self.clock_hand = entry_ptr;
-        } else {
-            // Insert after clock hand (in circular list semantics, this makes it the new head/MRU)
-            unsafe {
-                let mut cursor = self.queue.cursor_mut_from_ptr(self.clock_hand);
-                cursor.insert_after(entry);
-                // The inserted entry is now at the next position after clock hand
-                cursor.move_next();
-                let entry_ptr = cursor.get().ok_or_else(|| {
-                    CacheError::InternalError("Failed to get inserted entry pointer".into())
-                })? as *const PageCacheEntry as *mut PageCacheEntry;
-                self.map.insert(key, entry_ptr);
-            }
         }
 
         // Update evictable count after successful insertion
@@ -1131,13 +1125,44 @@ mod tests {
         assert!(cache.get(&key1).unwrap().is_some());
         let key4 = insert_page(&mut cache, 4);
         assert!(cache.get(&key1).unwrap().is_some(), "key1 should survive");
-        assert!(cache.get(&key2).unwrap().is_some(), "key2 remains");
+        assert!(cache.get(&key3).unwrap().is_some(), "key3 remains");
         assert!(cache.get(&key4).unwrap().is_some(), "key4 inserted");
+        // SIEVE evicts the oldest unvisited page: key2, cached before key3 (decision 19).
         assert!(
-            cache.get(&key3).unwrap().is_none(),
-            "key3 (next after tail) evicted"
+            cache.get(&key2).unwrap().is_none(),
+            "key2 (next after tail, the oldest unvisited) evicted"
         );
         assert_eq!(cache.len(), 3);
+        cache.verify_cache_integrity();
+    }
+
+    /// Do: fill a cache of 100 pages with pages read once (a workload before), then read a working
+    /// set of 40 pages round after round, each page looked up again only after the 39 others (as
+    /// queries that each touch a few pages of a larger set do). Expect: the working set settles in
+    /// the cache after its first round, every later read a hit, the pages from before evicted
+    /// oldest first, as SIEVE evicts (Amphora's docs/design/store.md, decision 19).
+    #[test]
+    fn a_new_working_set_settles_in_a_full_cache() {
+        let mut cache = PageCache::new_with_spill(100, true);
+        for id in 2..102 {
+            insert_page(&mut cache, id);
+        }
+        let mut misses_after_the_first_round = 0;
+        for round in 0..10 {
+            for id in 1000..1040 {
+                if cache.get(&create_key(id)).unwrap().is_none() {
+                    if round > 0 {
+                        misses_after_the_first_round += 1;
+                    }
+                    insert_page(&mut cache, id);
+                }
+            }
+        }
+        assert_eq!(misses_after_the_first_round, 0);
+        assert!(
+            cache.get(&create_key(2)).unwrap().is_none(),
+            "the oldest page went first"
+        );
         cache.verify_cache_integrity();
     }
 
@@ -1744,20 +1769,20 @@ mod tests {
 
         let key4 = insert_page(&mut cache, 4);
         // CLOCK sweep from hand:
-        // - key1 marked -> decrement, continue
-        // - key3 (MRU) unmarked -> evict
+        // - key1 marked (and page 1, never evicted) -> continue
+        // - key2, the oldest unmarked -> evict: SIEVE never evicts the newest first (decision 19)
         assert!(
             cache.get(&key1).unwrap().is_some(),
             "key1 had ref bit set, got second chance"
         );
         assert!(
-            cache.get(&key3).unwrap().is_none(),
-            "key3 (MRU) should be evicted"
+            cache.get(&key2).unwrap().is_none(),
+            "key2 (the oldest unmarked) should be evicted"
         );
         assert!(cache.get(&key4).unwrap().is_some(), "key4 just inserted");
         assert!(
-            cache.get(&key2).unwrap().is_some(),
-            "key2 (middle) should remain"
+            cache.get(&key3).unwrap().is_some(),
+            "key3 (newer) should remain"
         );
         cache.verify_cache_integrity();
     }
