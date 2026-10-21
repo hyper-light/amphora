@@ -69,3 +69,33 @@ items, best of 3 in turns, each run started at load under 2, not recorded runs):
 **Falsified by.** An `IN` or `NOT IN` that answers other than SQL's three values; a list kept where
 a NULL does not sort first (a descending or `NULLS LAST` index would make the first entry say
 nothing).
+
+## 3. LIKE jumps to where the literal after a `%` can match
+
+**Decision.** Matching an ASCII pattern against ASCII text (`like_ascii`, the usual case), the
+bytes after each `%` start where the pattern's next byte, a literal, next appears in the text in
+either case (`like_literal_from`: `memchr2` on its lower and upper case), not at every position in
+turn; a wildcard after the `%`, or the pattern's end, searches as before.
+
+**Why.** The suite's `like_substring` (`body LIKE '%zephyr%' LIMIT 20` on 400 bytes of text, one
+row in a thousand matching, so about 20,000 rows read) ran at 68 statements a second
+(`bench/records/2026-10-21-fedora-suite-amphora-39549dc.jsonl`) against SQLite's 417 on the same
+rows (`2026-10-21-fedora-suite.jsonl`): some 730 ns a row against 120. Every position of every text
+was a try of the pattern's first literal, a compare and a branch a byte.
+
+**Sources.** SQLite's `patternCompare` (`src/func.c`): past a `%` followed by an ASCII literal, it
+finds the next position holding that character in either case with `strcspn` and tries the rest of
+the pattern only there. `memchr2` (the `memchr` crate, already built for Amphora's parser) finds the
+first of two bytes with vector compares, as glibc's `strcspn` does.
+
+**Evidence.** `crates/engine/vdbe/value.rs`: `like_ascii` answers as `pattern_compare` (SQLite's
+algorithm) for every pattern of up to four of `a`, `B`, `%`, `_` against every text of up to five
+of `a`, `b`, `A`, `B`, and for thirteen patterns against texts of 0 to 1,000 bytes (the lengths
+around 16, 32 and 64 that vector searches handle apart) holding the word early, late, in the other
+case or not at all; with `memchr` searching the pattern's own case alone (a mutant), both fail. Release
+binaries on fedora (200,000 items, best of 3 in turns, each run started at load under 2; checks,
+not recorded runs): `like_substring` 67 → 222 statements a second at 1 client (p99 16.4 → 4.9 ms)
+and 867 → 2,556 at 32 (p99 70.7 → 15.1 ms); `filter_no_index` and `point_text` unchanged. What is
+left of SQLite's lead is mostly the table's pages read from the file, a few thousand a statement.
+
+**Falsified by.** A text and pattern where `like_ascii` and `pattern_compare` disagree.

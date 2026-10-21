@@ -1640,6 +1640,7 @@ fn like_ascii(pattern: &[u8], text: &[u8]) -> bool {
     while t < text.len() {
         match pattern.get(p) {
             Some(b'%') => {
+                t = like_literal_from(p.checked_add(1).and_then(|n| pattern.get(n)), text, t);
                 backtrack = Some((p, t));
                 p += 1;
             }
@@ -1652,7 +1653,7 @@ fn like_ascii(pattern: &[u8], text: &[u8]) -> bool {
             _ => match backtrack {
                 Some((star_p, star_t)) => {
                     p = star_p + 1;
-                    t = star_t + 1;
+                    t = like_literal_from(pattern.get(p), text, star_t + 1);
                     backtrack = Some((star_p, t));
                 }
                 None => return false,
@@ -1660,6 +1661,21 @@ fn like_ascii(pattern: &[u8], text: &[u8]) -> bool {
         }
     }
     pattern[p..].iter().all(|&c| c == b'%')
+}
+
+/// Amphora: where in `text`, from `from` on, a LIKE pattern's byte `next` after a `%` can match:
+/// the next place `text` holds it in either case, found many bytes at a time, as SQLite's
+/// `patternCompare` finds it with `strcspn` (`src/func.c`); `from` itself where `next` is a
+/// wildcard or the pattern's end; the text's end where `text` holds it nowhere.
+fn like_literal_from(next: Option<&u8>, text: &[u8], from: usize) -> usize {
+    match next {
+        Some(&c) if c != b'%' && c != b'_' => text
+            .get(from..)
+            .and_then(|rest| memchr::memchr2(c.to_ascii_lowercase(), c.to_ascii_uppercase(), rest))
+            .and_then(|at| from.checked_add(at))
+            .unwrap_or(text.len()),
+        _ => from,
+    }
 }
 
 const GLOB_INFO: PatternInfo = PatternInfo {
@@ -2968,8 +2984,8 @@ mod tests {
             }
             all
         }
-        for pattern in words(b"ab%_", 4) {
-            for text in words(b"abA", 4) {
+        for pattern in words(b"aB%_", 4) {
+            for text in words(b"abAB", 5) {
                 let pattern_str = std::str::from_utf8(&pattern).unwrap();
                 let text_str = std::str::from_utf8(&text).unwrap();
                 let expected =
@@ -2985,6 +3001,52 @@ mod tests {
                     expected,
                     "exec_like: pattern {pattern_str:?}, text {text_str:?}"
                 );
+            }
+        }
+    }
+
+    /// Amphora: do: LIKE patterns whose literals follow `%` in either case, against long texts
+    /// holding them early, late, in the other case, or nowhere (where `like_literal_from`
+    /// searches many bytes at a time). Expect: what `pattern_compare` answers.
+    #[test]
+    fn like_ascii_agrees_on_long_text() {
+        let patterns = [
+            "%ab%", "%Ab_%", "%z", "a%B%b", "%%b", "_%a", "%zephyr%", "%ZEPHYR%", "%-%-%", "%b_a",
+            "%", "%%", "b%",
+        ];
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        for len in [
+            0usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 200, 401, 1000,
+        ] {
+            for variant in 0..8 {
+                let mut text: Vec<u8> = (0..len)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        b"xyAB-cd"[(seed % 7) as usize]
+                    })
+                    .collect();
+                if len > 10 {
+                    let word: &[u8] = if variant % 2 == 0 {
+                        b"zephyr"
+                    } else {
+                        b"ZePhYr"
+                    };
+                    let at = (len - 7) * variant / 8;
+                    text[at..at + 6].copy_from_slice(word);
+                }
+                let text_str = std::str::from_utf8(&text).unwrap();
+                for pattern in patterns {
+                    let expected =
+                        super::pattern_compare(pattern, text_str, &super::LIKE_INFO, None)
+                            == super::CompareResult::Match;
+                    assert_eq!(
+                        super::like_ascii(pattern.as_bytes(), &text),
+                        expected,
+                        "pattern {pattern:?}, text {text_str:?}"
+                    );
+                }
             }
         }
     }

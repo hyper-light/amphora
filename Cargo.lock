@@ -122,6 +122,7 @@ dependencies = [
  "libm",
  "loom",
  "lz4_flex",
+ "memchr",
  "memory-stats",
  "miette",
  "num-bigint 0.4.8",
