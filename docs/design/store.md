@@ -660,8 +660,14 @@ load (32 writers, 4 readers, two runs each): without sharing 163,682 and 163,620
 ms), reads 1.36 and 1.32 million (p50 0.054 ms, p99 0.12 ms), 82–84 MB; sharing 65,536 pages,
 153,178 and 157,216 writes (p99 7.0 ms), reads 1.94 and 1.92 million (p50 0.037 ms, p99 0.082–0.086
 ms), 339–341 MB; sharing 16,384, writes 154,464 and 154,744 (p99 6.8–8.2 ms), reads unchanged,
-150 MB. So it is on where reads matter more than memory, until one budget for the process's
-databases (and readers' own caches smaller while sharing) makes it a win in both.
+150 MB. The recorded suite at 39549dc, without sharing and with 256 MiB shared
+(`bench/records/2026-10-21-fedora-suite-amphora-39549dc.jsonl`, `-shared-256mib.jsonl`, loads
+1.7 and 3.4): the analytic reads gain as above, but reads whose pages each reader's cache mostly
+holds ran slower shared, `point_pk` 263,000 a second against 426,000 at one client,
+`point_pk_one_column` 561,000 against 1,064,000 and `join_three` 10,500 against 23,400 at 32: not
+yet explained. So it is on where reads matter more than memory, until one budget for the process's
+databases (and readers' own caches smaller while sharing) makes it a win in both, and the slower
+reads are understood.
 
 **Falsified by.** A read of a version the reader's snapshot doesn't see; reads slower shared than
 not; more memory shared than the budget and the readers' own caches together.
