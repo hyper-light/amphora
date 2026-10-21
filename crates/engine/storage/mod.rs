@@ -16,6 +16,7 @@ pub(crate) mod checksum;
 pub mod database;
 pub(crate) mod encryption;
 pub(crate) mod journal_mode;
+pub(crate) mod packed;
 #[cfg(feature = "aristo-instr")]
 pub mod page_cache;
 #[cfg(not(feature = "aristo-instr"))]

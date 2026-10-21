@@ -289,6 +289,9 @@ pub enum CompletionError {
     },
     #[error("tursodb not compiled with checksum feature")]
     ChecksumNotEnabled,
+    /// Amphora: a packed log record that doesn't decode, or doesn't hold the page asked of it.
+    #[error("packed log record at frame {frame_id} doesn't give page {page_idx}")]
+    PackedRecordCorrupt { frame_id: u64, page_idx: usize },
 }
 
 /// Convert a `std::io::Error` into a `LimboError` with an operation label.

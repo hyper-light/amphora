@@ -409,3 +409,51 @@ failures in 10,000 seeds); the real flusher passes both.
 
 **Falsified by.** A checkpoint that copies a frame no flush made durable (the test above), or an
 acknowledged batch lost or torn by a power cut during checkpoints (`tests/crash.rs`).
+
+## 16. The log packed: a commit's pages compressed into records
+
+**Decision.** Every generation of the log Amphora writes is packed (`Db::open_with` asks for it,
+`Database::wal_pack`; the format in `crates/engine/storage/packed.rs`). A commit's pages, or a
+spill's, are cut into records of up to 256 KiB of pages (64 pages of 4 KiB), each record's pages
+compressed together with LZ4, or kept as they are where that doesn't make them smaller, and laid
+into as many of the log's fixed-size frame slots as it takes. A record's first slot carries its
+slot count where a frame carries its page number, the slots after it a continuation mark, and its
+last slot the commit's database size when it ends a commit; the slots' checksums chain as frames'
+do, and every page of a record maps to its first slot, so frame numbers keep their meaning for read
+marks, backfill, the durable mark (decision 15) and restarts. The log header's file format says
+which a generation is, and a generation keeps the format it began with, so a log is always read as
+it was written and a page-a-frame log from before reads as ever. A read decodes a whole record and
+keeps it (16 MiB of decoded records, the oldest dropped first past that); the checkpoint reads a
+record once for all the pages it copies from it; recovery reads record by record. A record whose
+slots don't all hold ends the log there, as a torn frame does; one whose slots all hold but that
+doesn't decode refuses the log, since no torn write leaves that. The raw frame interface (Turso's
+sync's) and the multi-process authority refuse a packed log.
+
+**Why.** At 10,000 writers in 12 groups a 200-byte row cost about 1.8 page frames (7 KiB) of log,
+about 1.7 GB/s, and as much again copied into the files: the disk's write bandwidth bounded the
+writes. Those pages compress: in a sample of 30,000 frames of that run, 123.6 MB of whole pages took
+41.2 MB compressed (3.0x, zlib at level 1 standing in for LZ4), and the bytes that changed since a
+page's last image, compressed, 9.7 MB (12.8x). This decision is the first step: records, and the
+compression. Writing only the bytes that changed (decision 17, to come) puts its deltas in the same
+records.
+
+**Sources.** The LZ4 block format (`lz4_Block_format.md`, lz4/lz4 on GitHub): a match reaches at
+most 65,535 bytes back, so records much larger than 64 KiB compress little better while a read
+decodes all of one. PostgreSQL's `wal_compression` (its documentation, "Write Ahead Log",
+`runtime-config-wal`): the full-page images in its log compressed with pglz, LZ4 or zstd, for the
+same reason. SQLite's WAL format (sqlite.org/fileformat2.html, "The WAL File Format"): the frame
+header, the checksum chain from the header's salts, and recovery stopping at the first frame that
+doesn't hold, all of which a record's slots keep.
+
+**Evidence.** To be measured: the log's bytes a row, writes a second and tails at 32, 1,000,
+10,000, 100,000 and 1,000,000 writers, packed against page-a-frame (`AMPHORA_LOG_PAGES=1`), and
+the CPU the compression takes. The engine's tests (`crates/engine/tests/packed_log.rs`): commits of
+one page, of many records and of more than one batch (1,024 pages), compressed and stored records,
+read back on a connection with nothing cached, after a checkpoint, in the next generation and after
+recovery; a transaction spilled into the log and rolled back, then one committed; a generation
+keeping its format across a change of the setting; a record cut short taking only its commit; and a
+record whose checksums hold but that doesn't decode refusing the log.
+
+**Falsified by.** A row read back other than as written, or an acknowledged batch lost or torn by a
+power cut (`tests/crash.rs`, `crates/engine/tests/packed_log.rs`); fewer writes a second or longer
+tails packed than page-a-frame at any of the writer counts above.

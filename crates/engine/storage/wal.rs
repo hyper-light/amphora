@@ -20,6 +20,7 @@ use std::fmt::{Debug, Formatter};
 use std::{fmt, sync::Arc};
 
 use super::buffer_pool::BufferPool;
+use super::packed::{self, Record, Records};
 use super::pager::{PageRef, Pager};
 use super::sqlite3_ondisk::{
     self, checksum_wal, DatabaseHeader, WalHeader, WAL_MAGIC_BE, WAL_MAGIC_LE,
@@ -27,7 +28,7 @@ use super::sqlite3_ondisk::{
 use crate::fast_lock::SpinLock;
 use crate::io::clock::MonotonicInstant;
 use crate::io::CompletionGroup;
-use crate::io::{File, IO};
+use crate::io::{File, ReadComplete, IO};
 use crate::storage::database::DatabaseStorage;
 use crate::storage::page_transform::{
     page_codec_completion_error, PageCodecContext, PageLocation, PageTransform,
@@ -470,6 +471,9 @@ pub struct PreparedFrames {
     pub final_max_frame: u64,
     /// Epoch at preparation time
     pub epoch: u32,
+    /// Amphora: the packed records the frames are, as (first slot, slots), in order; each holds the
+    /// pages of `metadata` that map to its first slot. Empty when each frame is a page.
+    pub records: Vec<(u64, u32)>,
 }
 
 /// Metadata published by the coordination backend once a WAL commit becomes visible.
@@ -613,6 +617,10 @@ trait WalCoordination: Debug + Send + Sync {
 
     /// Record a newly appended frame in the backend's page-to-frame lookup state.
     fn cache_frame(&self, page_id: u64, frame_id: u64);
+
+    /// Amphora: records a packed record of `slots` slots appended at `head`: its slots, then each
+    /// of `pages` at `head`, `cache_frame`'s rewind guard applying to the record as a whole.
+    fn cache_record(&self, head: u64, slots: u32, pages: &mut dyn Iterator<Item = u64>);
 
     /// Drop any cached frame mappings newer than `max_frame`.
     fn rollback_cache(&self, max_frame: u64);
@@ -1348,6 +1356,12 @@ impl WalCoordination for InProcessWalCoordination {
                 hdr.salt_1 = io.generate_random_number() as u32;
                 hdr.salt_2 = io.generate_random_number() as u32;
             }
+            // Amphora: a generation takes its format as its header is written, and keeps it.
+            hdr.file_format = if shared.runtime.pack.load(Ordering::Acquire) {
+                packed::PACKED_FORMAT
+            } else {
+                packed::PAGE_FORMAT
+            };
 
             let prefix = &hdr.as_bytes()[..WAL_HEADER_SIZE - 8];
             let use_native = (hdr.magic & 1) != 0;
@@ -1408,6 +1422,47 @@ impl WalCoordination for InProcessWalCoordination {
             .store(frame_id, Ordering::Release);
     }
 
+    fn cache_record(&self, head: u64, slots: u32, pages: &mut dyn Iterator<Item = u64>) {
+        let shared = self.shared.read();
+        let mut frame_cache = shared.runtime.frame_cache.lock();
+        let mut records = shared.runtime.records.lock();
+        let high_water = shared
+            .runtime
+            .frame_cache_high_water
+            .load(Ordering::Acquire);
+        if head <= high_water {
+            // `cache_frame`'s guard: the slots from `head` up are written again, and with them any
+            // record they cut into.
+            let from = records.covering(head).unwrap_or(head);
+            frame_cache.retain(|_page_id, frames| {
+                while frames.last().is_some_and(|&frame| frame >= from) {
+                    frames.pop();
+                }
+                !frames.is_empty()
+            });
+            records.drop_after(from.saturating_sub(1));
+        }
+        // The record's slots are known before any page maps to it.
+        records.publish(head, slots);
+        drop(records);
+        for page_id in pages {
+            match frame_cache.get_mut(&page_id) {
+                Some(frames) => frames.push(head),
+                None => {
+                    frame_cache.insert(page_id, vec![head]);
+                }
+            }
+        }
+        let last = head
+            .checked_add(u64::from(slots))
+            .and_then(|end| end.checked_sub(1))
+            .unwrap_or(head);
+        shared
+            .runtime
+            .frame_cache_high_water
+            .store(last, Ordering::Release);
+    }
+
     fn rollback_cache(&self, max_frame: u64) {
         let shared = self.shared.read();
         let mut frame_cache = shared.runtime.frame_cache.lock();
@@ -1417,6 +1472,8 @@ impl WalCoordination for InProcessWalCoordination {
             }
             !frames.is_empty()
         });
+        // Amphora: and the packed records past it.
+        shared.runtime.records.lock().drop_after(max_frame);
         // Keep the high-water consistent with the truncation so a subsequent
         // append at `max_frame + 1` is not misread as a rewind.
         if shared
@@ -2463,6 +2520,17 @@ impl WalCoordination for ShmWalCoordination {
         self.authority.record_frame(page_id, frame_id);
     }
 
+    fn cache_record(&self, head: u64, slots: u32, pages: &mut dyn Iterator<Item = u64>) {
+        // A packed log is refused under this authority (`Database::build_wal`): other processes
+        // can't read its records. Kept whole here all the same.
+        let pages: Vec<u64> = pages.collect();
+        self.fallback
+            .cache_record(head, slots, &mut pages.iter().copied());
+        for page_id in pages {
+            self.authority.record_frame(page_id, head);
+        }
+    }
+
     fn rollback_cache(&self, max_frame: u64) {
         self.fallback.rollback_cache(max_frame);
         self.authority.rollback_frames(max_frame);
@@ -3005,6 +3073,11 @@ pub struct WalSharedRuntime {
     /// frame): every frame up to it was in the file when a flush of the file began, and that flush
     /// ended. A checkpoint of frames within it flushes no log of its own. None until a flush says.
     pub durable: SpinLock<Option<(u32, u64)>>,
+    /// Amphora: new generations of the log are packed (`packed.rs`, decision 16).
+    pub(crate) pack: AtomicBool,
+    /// Amphora: the packed records of the log's generation, and those decoded (`packed::Records`).
+    /// A leaf lock: nothing else is locked while it is held, and it is never held across IO.
+    pub(crate) records: Arc<SpinLock<Records>>,
     #[cfg(test)]
     pub(crate) frames_compared: AtomicU64,
 }
@@ -3301,22 +3374,363 @@ impl WalFile {
             { "frame_body_len": frame_body.len(), "input_len": page.len() }
         );
 
-        match page_transform {
-            PageTransform::Codec(codec) => codec.encode_page(
-                PageCodecContext::new(page_number, PageLocation::Wal),
-                page,
-                frame_body,
-            )?,
-            PageTransform::Checksum(checksum) => {
-                frame_body.copy_from_slice(page);
-                checksum.add_checksum_to_page(frame_body, page_number as usize)?;
-            }
-            PageTransform::None => frame_body.copy_from_slice(page),
-        }
+        Self::transform_page(page_transform, page_number, page, frame_body)?;
 
         let checksum =
             recompute_wal_frame_checksum(frame.as_mut_slice(), wal_header, previous_checksums);
         Ok((checksum, frame))
+    }
+
+    /// `page` as the log holds it, into `out` (a page long): encoded by the codec, or stamped
+    /// with its checksum.
+    fn transform_page(
+        page_transform: &PageTransform,
+        page_number: u32,
+        page: &[u8],
+        out: &mut [u8],
+    ) -> Result<()> {
+        if out.len() != page.len() {
+            return Err(LimboError::InternalError(format!(
+                "a log page body of {} bytes for a page of {}",
+                out.len(),
+                page.len()
+            )));
+        }
+        match page_transform {
+            PageTransform::Codec(codec) => codec.encode_page(
+                PageCodecContext::new(page_number, PageLocation::Wal),
+                page,
+                out,
+            )?,
+            PageTransform::Checksum(checksum) => {
+                out.copy_from_slice(page);
+                let id = usize::try_from(page_number).map_err(|_| LimboError::IntegerOverflow)?;
+                checksum.add_checksum_to_page(out, id)?;
+            }
+            PageTransform::None => out.copy_from_slice(page),
+        }
+        Ok(())
+    }
+
+    /// Amphora: whether the log's generation of `header` is packed (`packed.rs`).
+    fn is_packed(header: &WalHeader) -> bool {
+        header.file_format == packed::PACKED_FORMAT
+    }
+
+    /// Amphora: refuses what reads or writes the log a page a frame when its generation is packed.
+    fn refuse_packed(&self, what: &str) -> Result<()> {
+        if Self::is_packed(&self.coordination.wal_header()) {
+            return Err(LimboError::InvalidArgument(format!(
+                "{what} reads or writes the log a page a frame, and this log is packed"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Amphora: `pages` as packed records for `prepare_frames` and `append_frames_vectored`: cut
+    /// into records of up to `packed::pages_per_record` pages, each laid in the slots it takes
+    /// from frame `first`, the slots' checksums chained from `checksum`; the last slot carries
+    /// `db_size` (0 when no commit ends here).
+    fn prepare_records(
+        &self,
+        pages: &[PageRef],
+        header: &WalHeader,
+        mut checksum: (u32, u32),
+        first: u64,
+        db_size: u32,
+        epoch: u32,
+    ) -> Result<PreparedFrames> {
+        let page_size =
+            usize::try_from(header.page_size).map_err(|_| LimboError::IntegerOverflow)?;
+        let page_transform = self.io_ctx.read().page_transform().clone();
+        let per_record = packed::pages_per_record(page_size);
+        let count = pages.len().div_ceil(per_record);
+        let scratch = per_record
+            .checked_mul(page_size)
+            .ok_or(LimboError::IntegerOverflow)?;
+        let mut images = vec![0u8; scratch];
+        let mut bufs = Vec::new();
+        let mut metadata = Vec::with_capacity(pages.len());
+        let mut records = Vec::with_capacity(count);
+        let mut next = first;
+        for (index, chunk) in pages.chunks(per_record).enumerate() {
+            let mut numbers = Vec::with_capacity(chunk.len());
+            for (page, image) in chunk.iter().zip(images.chunks_exact_mut(page_size)) {
+                let number =
+                    u32::try_from(page.get().id()).map_err(|_| LimboError::IntegerOverflow)?;
+                Self::transform_page(&page_transform, number, page.get_contents().as_ptr(), image)?;
+                numbers.push(number);
+            }
+            let held: Vec<(u32, &[u8])> = numbers
+                .iter()
+                .copied()
+                .zip(images.chunks_exact(page_size))
+                .collect();
+            let payload = packed::encode(&held, page_size)?;
+            let slots = packed::slots(payload.len(), page_size)?;
+            let ends = index.checked_add(1) == Some(count);
+            for slot in 0..slots {
+                let field = if slot == 0 {
+                    slots
+                } else {
+                    packed::CONTINUATION
+                };
+                let last = slot.checked_add(1) == Some(slots);
+                let frame_db_size = if ends && last { db_size } else { 0 };
+                let frame =
+                    prepare_wal_frame_header(&self.buffer_pool, header, field, frame_db_size);
+                let body = frame
+                    .as_mut_slice()
+                    .get_mut(WAL_FRAME_HEADER_SIZE..)
+                    .ok_or_else(|| {
+                        LimboError::InternalError("a log frame shorter than its header".into())
+                    })?;
+                let at = usize::try_from(slot).map_err(|_| LimboError::IntegerOverflow)?;
+                packed::fill_slot(&payload, at, body)?;
+                checksum = recompute_wal_frame_checksum(frame.as_mut_slice(), header, checksum);
+                bufs.push(frame);
+            }
+            for page in chunk {
+                metadata.push((page.clone(), next, checksum));
+            }
+            records.push((next, slots));
+            next = next
+                .checked_add(u64::from(slots))
+                .ok_or(LimboError::IntegerOverflow)?;
+        }
+        let final_max_frame = next.checked_sub(1).ok_or(LimboError::IntegerOverflow)?;
+        Ok(PreparedFrames {
+            offset: self.frame_offset(first),
+            bufs,
+            metadata,
+            final_checksum: checksum,
+            final_max_frame,
+            epoch,
+            records,
+        })
+    }
+
+    /// Amphora: reads the packed record at `head` for `readers`, each a page it holds and what to
+    /// give that page's image (as the log holds it) to: from the records decoded when it is
+    /// there, else one read of its slots, decoded and kept. Every reader is given its page or an
+    /// error: the read's, or the record's when it doesn't decode or doesn't hold the page.
+    fn begin_read_record(
+        &self,
+        head: u64,
+        readers: Vec<(u32, Box<ReadComplete>)>,
+        header: &WalHeader,
+        buffer_pool: &Arc<BufferPool>,
+        group: Option<&mut CompletionGroup>,
+    ) -> Result<Completion> {
+        let page_size =
+            usize::try_from(header.page_size).map_err(|_| LimboError::IntegerOverflow)?;
+        let page_len = i32::try_from(page_size).map_err(|_| LimboError::IntegerOverflow)?;
+        let generation = header.checkpoint_seq;
+        let records = self.with_shared(|shared| shared.runtime.records.clone());
+        let images: Vec<Arc<Buffer>> = readers
+            .iter()
+            .map(|_| Arc::new(buffer_pool.get_page()))
+            .collect();
+        // Ok: the record decoded. Err(Some): the read failed. Err(None): it doesn't decode.
+        let finish = move |outcome: std::result::Result<&Record, Option<CompletionError>>| {
+            let mut failed = None;
+            for ((page, complete), image) in readers.iter().zip(&images) {
+                let bytes = outcome.as_ref().ok().and_then(|record| record.image(*page));
+                let result = match (bytes, outcome) {
+                    (Some(bytes), _) if bytes.len() == image.len() => {
+                        image.as_mut_slice().copy_from_slice(bytes);
+                        complete(Ok((image.clone(), page_len)))
+                    }
+                    (_, Err(Some(err))) => {
+                        complete(Err(err));
+                        Some(err)
+                    }
+                    _ => {
+                        mark_unlikely();
+                        let err = CompletionError::PackedRecordCorrupt {
+                            frame_id: head,
+                            page_idx: usize::try_from(*page).unwrap_or(usize::MAX),
+                        };
+                        complete(Err(err));
+                        Some(err)
+                    }
+                };
+                failed = failed.or(result);
+            }
+            failed
+        };
+        let decoded = records.lock().decoded(generation, head);
+        if let Some(record) = decoded {
+            // Decoded for an earlier read: no IO.
+            let c =
+                Completion::new_read(Arc::new(Buffer::new_temporary(0)), move |res| match res {
+                    Ok(_) => finish(Ok(&record)),
+                    Err(err) => finish(Err(Some(err))),
+                });
+            if let Some(group) = group {
+                group.add(&c);
+            }
+            c.complete(0);
+            return Ok(c);
+        }
+        let Some(slots) = records.lock().slots_of(head) else {
+            return Err(LimboError::Corrupt(format!(
+                "packed log: no record begins at frame {head}"
+            )));
+        };
+        let frame = WAL_FRAME_HEADER_SIZE
+            .checked_add(page_size)
+            .ok_or(LimboError::IntegerOverflow)?;
+        let len = usize::try_from(slots)
+            .ok()
+            .and_then(|slots| slots.checked_mul(frame))
+            .ok_or(LimboError::IntegerOverflow)?;
+        let offset = self.frame_offset(head);
+        let c = Completion::new_read(Arc::new(Buffer::new_temporary(len)), move |res| {
+            let (buf, read) = match res {
+                Ok(done) => done,
+                Err(err) => return finish(Err(Some(err))),
+            };
+            if usize::try_from(read).ok() != Some(len) {
+                return finish(Err(Some(CompletionError::ShortReadWalFrame {
+                    offset,
+                    expected: len,
+                    actual: usize::try_from(read).unwrap_or(0),
+                })));
+            }
+            match packed::gather(buf.as_slice(), page_size)
+                .and_then(|payload| Record::decode(&payload, page_size))
+            {
+                Ok(record) => {
+                    let record = Arc::new(record);
+                    records.lock().keep(generation, head, record.clone());
+                    finish(Ok(&record))
+                }
+                Err(e) => {
+                    tracing::error!("packed log record at frame {head}: {e}");
+                    finish(Err(None))
+                }
+            }
+        });
+        if let Some(group) = group {
+            group.add(&c);
+        }
+        let file = self.coordination.wal_file()?;
+        file.pread(offset, c)
+    }
+
+    /// Amphora: publishes a packed batch's records.
+    fn cache_records(&self, batch: &PreparedFrames) {
+        Self::publish_records(self.coordination.as_ref(), &batch.records, &batch.metadata);
+    }
+
+    /// Amphora: publishes `records`, each with the pages of `metadata` that map to its first slot.
+    fn publish_records(
+        coordination: &dyn WalCoordination,
+        records: &[(u64, u32)],
+        metadata: &[(PageRef, u64, (u32, u32))],
+    ) {
+        for &(head, slots) in records {
+            let mut pages = metadata
+                .iter()
+                .filter(|(_, frame, _)| *frame == head)
+                .map(|(page, _, _)| page.get().id() as u64);
+            coordination.cache_record(head, slots, &mut pages);
+        }
+    }
+
+    /// Amphora: `append_frames_vectored` for a packed generation: `pages` as records after the
+    /// connection's last frame, published (their pages' WAL tags, their slots, then their pages)
+    /// once their write has succeeded.
+    fn append_records(
+        &self,
+        pages: &[PageRef],
+        header: &WalHeader,
+        epoch: u32,
+    ) -> Result<Completion> {
+        let first = self
+            .max_frame
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .ok_or(LimboError::IntegerOverflow)?;
+        let checksum = if first == 1 {
+            (header.checksum_1, header.checksum_2)
+        } else {
+            self.last_checksum()
+        };
+        let prepared = self.prepare_records(pages, header, checksum, first, 0, epoch)?;
+        let total = prepared
+            .bufs
+            .iter()
+            .try_fold(0usize, |sum, buf| sum.checked_add(buf.len()))
+            .ok_or(LimboError::IntegerOverflow)?;
+        let records = prepared.records.clone();
+        let metadata = prepared.metadata.clone();
+        let coordination = self.coordination.clone();
+        let c = Completion::new_write(move |res| {
+            let Ok(written) = res else {
+                return;
+            };
+            if usize::try_from(written).ok() != Some(total) {
+                // The backends finish a write or fail it. Unpublished, the pages keep no WAL tag,
+                // so they stay dirty in the cache (`Pager::spill_append_frames_to_wal`).
+                mark_unlikely();
+                tracing::error!("packed log: a spill wrote {written} of {total} bytes");
+                return;
+            }
+            for (page, frame, _) in &metadata {
+                page.set_wal_tag(*frame, epoch);
+            }
+            Self::publish_records(coordination.as_ref(), &records, &metadata);
+        });
+        let file = self.coordination.wal_file()?;
+        let c = file.pwritev(prepared.offset, prepared.bufs, c)?;
+        // As `append_frames_vectored`: the connection's write position moves at once.
+        self.dirty.store(true, Ordering::Release);
+        self.set_last_checksum(prepared.final_checksum);
+        self.max_frame
+            .store(prepared.final_max_frame, Ordering::Release);
+        Ok(c)
+    }
+
+    /// Amphora: the checkpoint's reads of `page_ids`, all of the packed record at `head`: one read
+    /// of the record, each page's image given to a buffer slot of its own.
+    fn issue_record_reads(
+        &self,
+        head: u64,
+        page_ids: &[usize],
+        header: &WalHeader,
+        group: &mut CompletionGroup,
+    ) -> Result<Vec<InflightRead>> {
+        let mut readers = Vec::with_capacity(page_ids.len());
+        let mut slots = Vec::with_capacity(page_ids.len());
+        {
+            let io_ctx = self.io_ctx.read();
+            for &page_id in page_ids {
+                let buf: Arc<SpinLock<Option<Arc<Buffer>>>> = Arc::new(SpinLock::new(None));
+                let slot = buf.clone();
+                let complete: Box<ReadComplete> = Box::new(move |res| {
+                    if let Ok((page, _)) = res {
+                        *slot.lock() = Some(page);
+                    }
+                    None
+                });
+                let number = u32::try_from(page_id).map_err(|_| LimboError::IntegerOverflow)?;
+                let complete =
+                    sqlite3_ondisk::wal_page_reader(complete, &self.buffer_pool, page_id, &io_ctx)?;
+                readers.push((number, complete));
+                slots.push((page_id, buf));
+            }
+        }
+        let c = self.begin_read_record(head, readers, header, &self.buffer_pool, Some(group))?;
+        Ok(slots
+            .into_iter()
+            .map(|(page_id, buf)| InflightRead {
+                completion: c.clone(),
+                page_id,
+                buf,
+            })
+            .collect())
     }
 
     /// Load the authoritative WAL snapshot through the coordination backend.
@@ -3794,6 +4208,24 @@ impl Wal for WalFile {
             frame.set_wal_tag(frame_id, epoch_at_issue);
             None
         });
+        // Amphora: a packed generation's page is read from its record.
+        let header = self.coordination.wal_header();
+        if Self::is_packed(&header) {
+            let number = u32::try_from(page_idx).map_err(|_| LimboError::IntegerOverflow)?;
+            let complete = sqlite3_ondisk::wal_page_reader(
+                complete,
+                &buffer_pool,
+                page_idx,
+                &self.io_ctx.read(),
+            )?;
+            return self.begin_read_record(
+                frame_id,
+                vec![(number, complete)],
+                &header,
+                &buffer_pool,
+                group,
+            );
+        }
         // important not to hold shared state locks beyond this point to avoid deadlock with
         // completions that re-enter WAL state while a writer is waiting.
         let file = self.coordination.wal_file()?;
@@ -3817,6 +4249,7 @@ impl Wal for WalFile {
         scratch_buf: Option<Arc<Buffer>>,
         group: Option<&mut CompletionGroup>,
     ) -> Result<Completion> {
+        self.refuse_packed("read_frames_batch")?;
         turso_assert!(
             !pages.is_empty(),
             "read_frames_batch requires at least one page"
@@ -3971,6 +4404,7 @@ impl Wal for WalFile {
     // this method involves IO and cross "async" boundary - so juggling with references is bad and dangerous
     fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<Completion> {
         tracing::debug!("read_frame_raw({})", frame_id);
+        self.refuse_packed("read_frame_raw")?;
         let offset = self.frame_offset(frame_id);
         let expected_frame_len = WAL_FRAME_HEADER_SIZE + self.page_size() as usize;
         if frame.len() != expected_frame_len {
@@ -4058,6 +4492,7 @@ impl Wal for WalFile {
             bail_corrupt_error!("invalid page size: {}", page.len());
         };
         self.ensure_header_if_needed(page_size, sync_type)?;
+        self.refuse_packed("write_frame_raw")?;
         tracing::debug!("write_raw_frame({})", frame_id);
         // if page_size wasn't initialized before - we will initialize it during that raw write
         if self.page_size() != 0 && page.len() != self.page_size() as usize {
@@ -4444,6 +4879,7 @@ impl Wal for WalFile {
     }
 
     fn changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>> {
+        self.refuse_packed("changed_pages_after")?;
         let frame_count = self.get_max_frame();
         let page_size = self.page_size();
         let mut frame = vec![0u8; page_size as usize + WAL_FRAME_HEADER_SIZE];
@@ -4630,6 +5066,17 @@ impl Wal for WalFile {
             rolling_checksum = (header.checksum_1, header.checksum_2);
         }
 
+        if Self::is_packed(&header) {
+            return self.prepare_records(
+                pages,
+                &header,
+                rolling_checksum,
+                next_frame_id,
+                db_size_on_commit.unwrap_or(0),
+                epoch,
+            );
+        }
+
         let first_frame_id = next_frame_id;
 
         let mut bufs: Vec<Arc<Buffer>> = Vec::with_capacity(pages.len());
@@ -4670,6 +5117,7 @@ impl Wal for WalFile {
             final_checksum: rolling_checksum,
             final_max_frame: next_frame_id - 1,
             epoch,
+            records: Vec::new(),
         })
     }
 
@@ -4677,9 +5125,15 @@ impl Wal for WalFile {
     /// and advance max_frame to make frames visible to readers.
     fn commit_prepared_frames(&self, batches: &[PreparedFrames]) {
         for batch in batches {
-            for (page, frame_id, checksum) in &batch.metadata {
-                // Update WAL index mapping page -> frame
-                self.complete_append_frame(page.get().id() as u64, *frame_id, *checksum);
+            if batch.records.is_empty() {
+                for (page, frame_id, checksum) in &batch.metadata {
+                    // Update WAL index mapping page -> frame
+                    self.complete_append_frame(page.get().id() as u64, *frame_id, *checksum);
+                }
+            } else {
+                // Amphora: a packed batch, its pages published record by record.
+                self.dirty.store(true, Ordering::Release);
+                self.cache_records(batch);
             }
             // Update rolling checksum
             self.set_last_checksum(batch.final_checksum);
@@ -4728,6 +5182,9 @@ impl Wal for WalFile {
             "page size mismatch, tried to change page size after WAL header was already initialized",
             { "shared_page_size": shared_page_size, "page_size": page_sz.get() }
         );
+        if Self::is_packed(&header) {
+            return self.append_records(&pages, &header, epoch);
+        }
 
         // Prepare write buffers and bookkeeping
         let mut iovecs: Vec<Arc<Buffer>> = Vec::with_capacity(pages.len());
@@ -5132,7 +5589,7 @@ impl WalFile {
                 // if at all possible, at the cost of some batching potential.
                 CheckpointState::Processing => {
                     // Gather I/O completions using a completion group
-                    let mut nr_completions = 0;
+                    let mut nr_completions: usize = 0;
                     let mut group = CompletionGroup::new(|_| {});
                     let mut ongoing_chkpt = self.ongoing_checkpoint.write();
 
@@ -5157,6 +5614,8 @@ impl WalFile {
                         return Err(LimboError::CompletionError(e).into());
                     }
                     let epoch = self.coordination.checkpoint_epoch();
+                    let header = self.coordination.wal_header();
+                    let packed = Self::is_packed(&header);
                     // Issue reads until we hit limits
                     'inner: while ongoing_chkpt.should_issue_reads() {
                         let (page_id, target_frame) = {
@@ -5180,6 +5639,39 @@ impl WalFile {
                                     (page_id, target_frame);
                                 ongoing_chkpt.current_page += 1;
                             }
+                            continue 'inner;
+                        }
+                        // Amphora: in a packed generation the pages of a record (in order, as
+                        // sorted by frame) are read with one read of it.
+                        if packed {
+                            let current = usize::try_from(ongoing_chkpt.current_page)
+                                .map_err(|_| LimboError::IntegerOverflow)?;
+                            let room = MAX_INFLIGHT_READS
+                                .saturating_sub(ongoing_chkpt.inflight_reads.len())
+                                .max(1);
+                            let run = ongoing_chkpt
+                                .pages_to_checkpoint
+                                .get(current..)
+                                .unwrap_or_default()
+                                .iter()
+                                .take_while(|(_, frame)| *frame == target_frame)
+                                .take(room)
+                                .map(|(page, _)| {
+                                    usize::try_from(*page).map_err(|_| LimboError::IntegerOverflow)
+                                })
+                                .collect::<Result<Vec<usize>>>()?;
+                            let reads =
+                                self.issue_record_reads(target_frame, &run, &header, &mut group)?;
+                            nr_completions = nr_completions
+                                .checked_add(1)
+                                .ok_or(LimboError::IntegerOverflow)?;
+                            let taken = u64::try_from(reads.len())
+                                .map_err(|_| LimboError::IntegerOverflow)?;
+                            ongoing_chkpt.current_page = ongoing_chkpt
+                                .current_page
+                                .checked_add(taken)
+                                .ok_or(LimboError::IntegerOverflow)?;
+                            ongoing_chkpt.inflight_reads.extend(reads);
                             continue 'inner;
                         }
                         // Issue read if page wasn't found in the page cache or doesnt meet
@@ -5962,6 +6454,8 @@ impl WalFileShared {
                     OverflowFallbackCoverage::default(),
                 )),
                 durable: SpinLock::new(None),
+                pack: AtomicBool::new(false),
+                records: Arc::new(SpinLock::new(Records::default())),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },
@@ -6041,6 +6535,8 @@ impl WalFileShared {
                     OverflowFallbackCoverage::default(),
                 )),
                 durable: SpinLock::new(None),
+                pack: AtomicBool::new(false),
+                records: Arc::new(SpinLock::new(Records::default())),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },
@@ -6086,6 +6582,8 @@ impl WalFileShared {
                     OverflowFallbackCoverage::default(),
                 )),
                 durable: SpinLock::new(None),
+                pack: AtomicBool::new(false),
+                records: Arc::new(SpinLock::new(Records::default())),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },
@@ -6132,6 +6630,7 @@ impl WalFileShared {
         self.runtime
             .frame_cache_high_water
             .store(0, Ordering::Release);
+        self.runtime.records.lock().clear();
         // read-marks
         self.runtime.read_locks[0].set_value_exclusive(0);
         self.runtime.read_locks[1].set_value_exclusive(0);
@@ -6153,6 +6652,8 @@ impl WalFileShared {
     pub fn replace_after_external_restore(&mut self, restored: WalFileShared) {
         self.metadata = restored.metadata;
         self.runtime.frame_cache = restored.runtime.frame_cache;
+        // Amphora: in place, as connections hold the registry's `Arc`.
+        *self.runtime.records.lock() = std::mem::take(&mut *restored.runtime.records.lock());
         self.runtime.file = restored.runtime.file;
         self.runtime.epoch.store(
             restored.runtime.epoch.load(Ordering::Acquire),

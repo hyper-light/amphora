@@ -54,6 +54,7 @@ use bytemuck::{Pod, Zeroable};
 use pack1::{I32BE, U16BE, U32BE};
 use tracing::{instrument, Level};
 
+use super::packed::{self, Record, Records};
 use super::pager::PageRef;
 pub use super::pager::{PageContent, PageInner};
 use super::wal::{OverflowFallbackCoverage, TursoRwLock, WalSharedMetadata, WalSharedRuntime};
@@ -1584,6 +1585,8 @@ impl BuildSharedWal {
                     OverflowFallbackCoverage::default(),
                 )),
                 durable: SpinLock::new(None),
+                pack: AtomicBool::new(false),
+                records: Arc::new(SpinLock::new(Records::default())),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },
@@ -1677,6 +1680,11 @@ impl BuildSharedWal {
                     }
                 }
                 BuildSharedWalPhase::Done => {
+                    // Amphora: a packed record checksummed whole that doesn't decode is no torn
+                    // write: the log is refused, not cut short there.
+                    if let Some(why) = self.reader.as_ref().and_then(|r| r.corrupt()) {
+                        return Err(LimboError::Corrupt(format!("packed log: {why}")).into());
+                    }
                     return Ok(IOResult::Done(self.wal_file_shared.clone()));
                 }
             }
@@ -1716,6 +1724,16 @@ struct StreamingState {
     page_size: usize,
     use_native_endian: bool,
     header_valid: bool,
+    /// Amphora: the generation is packed (its header's format, `packed.rs`).
+    packed: bool,
+    /// Amphora: the most slots a record takes (`packed::most_slots`).
+    most_slots: u32,
+    /// Amphora: the packed record being read: its first slot, its slots, its payload so far.
+    record: Option<(u64, u32, Vec<u8>)>,
+    /// Amphora: the packed records read since the last commit, as (first slot, slots).
+    pending_records: Vec<(u64, u32)>,
+    /// Amphora: why the log is refused: a record checksummed whole that doesn't decode.
+    corrupt: Option<String>,
 }
 
 impl StreamingWalReader {
@@ -1742,6 +1760,11 @@ impl StreamingWalReader {
                 page_size: 0,
                 use_native_endian: false,
                 header_valid: false,
+                packed: false,
+                most_slots: 0,
+                record: None,
+                pending_records: Vec::new(),
+                corrupt: None,
             }),
         }
     }
@@ -1804,7 +1827,7 @@ impl StreamingWalReader {
             return;
         }
 
-        let (page_sz, c1, c2, use_native, ok) = {
+        let (page_sz, c1, c2, use_native, ok, format) = {
             let mut h = self.header.lock();
             let s = buf.as_slice();
             h.magic = u32::from_be_bytes(s[0..4].try_into().unwrap());
@@ -1825,6 +1848,7 @@ impl StreamingWalReader {
                 h.checksum_2,
                 use_native,
                 calc == (h.checksum_1, h.checksum_2),
+                h.file_format,
             )
         };
         #[cfg(debug_assertions)]
@@ -1854,6 +1878,16 @@ impl StreamingWalReader {
             st.cumulative_checksum = (c1, c2);
             st.last_valid_checksum = (c1, c2);
             st.header_valid = true;
+            st.packed = format == packed::PACKED_FORMAT;
+            if st.packed {
+                match usize::try_from(page_sz)
+                    .map_err(|_| LimboError::IntegerOverflow)
+                    .and_then(packed::most_slots)
+                {
+                    Ok(most) => st.most_slots = most,
+                    Err(e) => st.corrupt = Some(e.to_string()),
+                }
+            }
         }
         self.off_atomic
             .store(WAL_HEADER_SIZE as u64, Ordering::Release);
@@ -1937,27 +1971,87 @@ impl StreamingWalReader {
             }
 
             st.cumulative_checksum = calc;
-            let frame_idx = st.frame_idx;
-            st.pending_frames
-                .entry(page_no as u64)
-                .or_default()
-                .push(frame_idx);
+            if st.packed {
+                if !self.take_slot(&mut st, page_no, db_size, page) {
+                    break;
+                }
+            } else {
+                let frame_idx = st.frame_idx;
+                st.pending_frames
+                    .entry(page_no as u64)
+                    .or_default()
+                    .push(frame_idx);
 
-            if db_size > 0 {
-                st.last_valid_frame = st.frame_idx;
-                st.last_valid_checksum = calc;
-                tracing::debug!(
-                    "WAL_SCAN commit frame={} page_no={} db_size={}",
-                    st.frame_idx,
-                    page_no,
-                    db_size
-                );
-                self.flush_pending_frames(&mut st);
+                if db_size > 0 {
+                    st.last_valid_frame = st.frame_idx;
+                    st.last_valid_checksum = calc;
+                    tracing::debug!(
+                        "WAL_SCAN commit frame={} page_no={} db_size={}",
+                        st.frame_idx,
+                        page_no,
+                        db_size
+                    );
+                    self.flush_pending_frames(&mut st);
+                }
             }
             st.frame_idx += 1;
             pos += frame_size;
         }
         pos
+    }
+
+    /// Amphora: takes a slot of a packed generation, its salts and checksum already checked: its
+    /// frame header's page field and database size, and its page body. False when the log ends
+    /// before it, at a slot out of a record's order. A record whose slots all hold but that
+    /// doesn't decode ends it too, kept in `corrupt` so the log is refused.
+    fn take_slot(&self, st: &mut StreamingState, field: u32, db_size: u32, body: &[u8]) -> bool {
+        let frame = st.frame_idx;
+        let (head, slots, mut payload) = match st.record.take() {
+            None if packed::is_first_slot(field) && field <= st.most_slots => {
+                let capacity = usize::try_from(field)
+                    .ok()
+                    .and_then(|slots| slots.checked_mul(body.len()))
+                    .unwrap_or(0);
+                (frame, field, Vec::with_capacity(capacity))
+            }
+            Some(record) if field == packed::CONTINUATION => record,
+            _ => return false,
+        };
+        payload.extend_from_slice(body);
+        let taken = frame.checked_sub(head).and_then(|n| n.checked_add(1));
+        if taken != Some(u64::from(slots)) {
+            // A commit ends a record, never a slot before its last.
+            if db_size != 0 {
+                return false;
+            }
+            st.record = Some((head, slots, payload));
+            return true;
+        }
+        let record = match Record::decode(&payload, st.page_size) {
+            Ok(record) => record,
+            Err(e) => {
+                st.corrupt = Some(format!("the record at frame {head}: {e}"));
+                return false;
+            }
+        };
+        for page in record.pages() {
+            st.pending_frames
+                .entry(u64::from(*page))
+                .or_default()
+                .push(head);
+        }
+        st.pending_records.push((head, slots));
+        if db_size > 0 {
+            st.last_valid_frame = frame;
+            st.last_valid_checksum = st.cumulative_checksum;
+            self.flush_pending_frames(st);
+        }
+        true
+    }
+
+    /// Amphora: why the log is refused, if it is.
+    fn corrupt(&self) -> Option<String> {
+        self.state.read().corrupt.clone()
     }
 
     fn flush_pending_frames(&self, state: &mut StreamingState) {
@@ -1966,6 +2060,13 @@ impl StreamingWalReader {
         }
         let wfs = self.wal_shared.read();
         let mut frame_cache = wfs.runtime.frame_cache.lock();
+        // Amphora: a packed generation's records, known before their pages map to them.
+        if !state.pending_records.is_empty() {
+            let mut records = wfs.runtime.records.lock();
+            for (head, slots) in state.pending_records.drain(..) {
+                records.publish(head, slots);
+            }
+        }
         for (page, mut frames) in state.pending_frames.drain() {
             // Only include frames up to last valid commit
             frames.retain(|&f| f <= state.last_valid_frame);
@@ -2002,6 +2103,7 @@ impl StreamingWalReader {
                 frames.retain(|&f| f <= max_frame);
             }
             frame_cache.retain(|_, frames| !frames.is_empty());
+            wfs.runtime.records.lock().drop_after(max_frame);
             let header = wfs.metadata.wal_header.lock();
             wfs.runtime.overflow_fallback_coverage.lock().record(
                 header.checkpoint_seq,
@@ -2062,7 +2164,23 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
     );
     let buf = buffer_pool.get_page();
     let buf = Arc::new(buf);
+    let complete = wal_page_reader(complete, &buffer_pool, page_idx, io_ctx)?;
+    let c = Completion::new_read(buf, complete);
+    if let Some(group) = group {
+        group.add(&c);
+    }
+    io.pread(offset, c)
+}
 
+/// `complete` behind what a page body read from the log owes before it is used: the codec's
+/// decoding, or the check of its checksum. Amphora: apart from `begin_read_wal_frame`, for the
+/// pages of packed records too.
+pub fn wal_page_reader(
+    complete: Box<ReadComplete>,
+    buffer_pool: &Arc<BufferPool>,
+    page_idx: usize,
+    io_ctx: &IOContext,
+) -> Result<Box<ReadComplete>> {
     let complete: Box<ReadComplete> = match io_ctx.page_transform() {
         PageTransform::Codec(ctx) => {
             let page_codec = ctx.clone();
@@ -2129,11 +2247,7 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
         }
         PageTransform::None => complete,
     };
-    let c = Completion::new_read(buf, complete);
-    if let Some(group) = group {
-        group.add(&c);
-    }
-    io.pread(offset, c)
+    Ok(complete)
 }
 
 pub fn parse_wal_frame_header(frame: &[u8]) -> (WalFrameHeader, &[u8]) {

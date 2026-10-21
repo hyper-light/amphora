@@ -37,6 +37,9 @@ either = { version = "1.15" }
 windows-sys = "0.61.2"
 loom = { version = "0.7" }
 shuttle = { version = "0.8.1" }
+# Amphora: the packed log's records (crates/engine/storage/packed.rs): pure Rust, decoding memory
+# safe on damaged input.
+lz4_flex = { version = "0.13", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
 
 [workspace.package]
 version = "0.1.0"

@@ -122,6 +122,9 @@ impl Db {
                 opened => break opened.map_err(|e| anyhow::anyhow!("opening {name}: {e}"))?,
             }
         };
+        // Each generation of the log from here on is packed (docs/design/store.md, decision 16).
+        db.wal_pack(true)
+            .map_err(|e| anyhow::anyhow!("packing {name}'s log: {e}"))?;
         let conn = db
             .connect(ConnectOpts::new())
             .map_err(|e| anyhow::anyhow!("connecting to {name}: {e}"))?;
@@ -239,6 +242,15 @@ impl Db {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Whether the log's generations from the next one written are packed: they are unless this
+    /// says not (to compare the two: bench's `AMPHORA_LOG_PAGES`). A generation keeps the format
+    /// it began with.
+    pub fn pack_log(&self, pack: bool) -> anyhow::Result<()> {
+        self.db
+            .wal_pack(pack)
+            .map_err(|e| anyhow::anyhow!("packing {}'s log: {e}", self.path.display()))
     }
 
     /// Statements that answer nothing, one after another.

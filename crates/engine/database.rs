@@ -3052,6 +3052,25 @@ impl Database {
         }
     }
 
+    /// Amphora: new generations of the log are packed, or not (`storage/packed.rs`; Amphora's
+    /// `docs/design/store.md`, decision 16): a generation takes its format when its header is
+    /// written, so the log's current one keeps its own. Refused for a log shared between
+    /// processes, whose other processes couldn't read the records.
+    pub fn wal_pack(&self, pack: bool) -> Result<()> {
+        #[cfg(host_shared_wal)]
+        if pack && self.shared_wal_coordination()?.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "a packed log is read by one process; this one is shared between processes".into(),
+            ));
+        }
+        self.shared_wal
+            .read()
+            .runtime
+            .pack
+            .store(pack, Ordering::Release);
+        Ok(())
+    }
+
     /// Amphora: the last frame of the log known durable in its current generation.
     pub fn wal_durable_frame(&self) -> Option<u64> {
         let shared = self.shared_wal.read();
@@ -3175,6 +3194,19 @@ impl Database {
     ) -> Result<Arc<dyn Wal>> {
         #[cfg(host_shared_wal)]
         if let Some(authority) = self.shared_wal_coordination()? {
+            // Amphora: other processes couldn't read a packed log's records.
+            let format = self
+                .shared_wal
+                .read()
+                .metadata
+                .wal_header
+                .lock()
+                .file_format;
+            if format == crate::storage::packed::PACKED_FORMAT {
+                return Err(LimboError::InvalidArgument(
+                    "this log is packed, and a packed log is read by one process".into(),
+                ));
+            }
             return Ok(Arc::new(WalFile::new_with_shared_coordination(
                 self.io.clone(),
                 self.shared_wal.clone(),
