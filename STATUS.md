@@ -99,6 +99,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   past the suite's first seconds, every read measured is faster shared (point reads 1.33–1.49 times
   at one client), with 32 readers for less memory. Not on by default: that, and its budget, are
   the person's call.
+- **A page read records itself only when it must wait** (docs/design/store.md decision 21): a page
+  read from the file goes straight into the cache, recorded for a resumed call only when a spill
+  holds it up; every read had taken two write locks and a hash insert and remove. Whole scans
+  5–7% faster (a probe of the engine on fedora, checks).
 - **Ephemeral tables kept between runs** (docs/design/executor.md decision 1,
   `crates/engine/tests/ephemeral_reuse.rs`): a statement keeps each ephemeral table of at most 16
   pages (an IN list's keys, an IN subquery's rows) and empties it on its next run, where building

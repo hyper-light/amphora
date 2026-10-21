@@ -689,3 +689,31 @@ smaller while sharing, for the process with few readers.
 
 **Falsified by.** A read of a version the reader's snapshot doesn't see; reads slower shared than
 not; more memory shared than the budget and the readers' own caches together.
+
+## 21. A page read records itself only when it must wait for the cache
+
+**Decision.** A page read from the file goes straight into the connection's cache; only a read
+whose page the cache can't take yet (full of pages it can't evict, a spill in flight) is recorded in
+`pending_reads`, so the call that resumes it reuses its page and its read rather than reading again
+(`Pager::read_page_into`). Every read used to record itself before the cache took it and remove the
+record after: two write locks, a hash map insert and remove, and two reference counts, for each page
+read from the file.
+
+**Why.** A profile of the suite's `filter_no_index` (a whole scan of 200,000 rows, 1 client,
+2,000 pages cached): reading pages from the file 60% of its time, and removing the read's record
+alone 11.6%, nearly all of it the record's last reference counts, on lines cold by then.
+
+**Sources.** SQLite's pager reads a page it misses into its cache and keeps no record of the read
+(`getPageNormal`, `src/pager.c`): its reads are synchronous, so nothing resumes them. Amphora's
+reads stay resumable, as they are when the cache must spill first; only that case needs the record.
+
+**Evidence.** `storage/pager.rs`, `a_read_waiting_on_a_spill_is_recorded_and_reused`: a read whose
+insert into the cache must wait (a test hook makes it) is recorded, and the next call reuses its
+page and its read and clears the record; with the record left out on that path (a mutant) it fails.
+`read_page_nonblock_reentry_reuses_pending_entry` still holds. A probe of the engine on fedora (a
+200,000-row copy of the suite's table, release, 2,000 pages cached, best of 3 in turns against the
+binary before, load 2.6–2.7; checks, not recorded runs): a whole scan counted 33.64 → 31.35 ms, a
+scan to row 90,000 30.21 → 28.58 ms. With 65,536 pages shared they take 16.88 and 14.24 ms: a page
+found shared costs about a fifth of one read from the file.
+
+**Falsified by.** A read resumed after a spill that reads its page twice, or another's.

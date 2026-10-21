@@ -1773,6 +1773,9 @@ pub struct Pager {
     has_pending_reads: AtomicBool,
     #[cfg(test)]
     spill_yield: SpillYieldHook,
+    /// Test-only: yields once in `cache_insert` for an armed page, as a spill in flight makes it.
+    #[cfg(test)]
+    insert_yield: SpillYieldHook,
     /// Dirty pages as a bitmap, naturally sorted by page number.
     dirty_pages: Arc<RwLock<RoaringBitmap>>,
     subjournal: RwLock<Option<Subjournal>>,
@@ -2082,6 +2085,8 @@ impl Pager {
             has_pending_reads: AtomicBool::new(false),
             #[cfg(test)]
             spill_yield: SpillYieldHook::new(),
+            #[cfg(test)]
+            insert_yield: SpillYieldHook::new(),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
             subjournal: RwLock::new(None),
             savepoints: Arc::new(RwLock::new(Vec::new())),
@@ -3888,11 +3893,11 @@ impl Pager {
         } else {
             None
         };
-        let (page, c_disk) = if let Some(pending) = pending {
+        let (page, c_disk, resumed) = if let Some(pending) = pending {
             // Re-entry: previous call yielded on spill before completing
             // `cache_insert`. Reuse the same PageRef and in-flight disk read
             // rather than issuing duplicate IO.
-            (pending.page, pending.disk_read)
+            (pending.page, pending.disk_read, true)
         } else {
             // Fast path: cache hit.
             {
@@ -3933,27 +3938,30 @@ impl Pager {
                     (page, Some(c))
                 }
             };
-            if let Some(c) = &c {
-                self.insert_pending_read(
-                    page_idx,
-                    PendingRead {
-                        page: page.clone(),
-                        disk_read: Some(c.clone()),
-                    },
-                );
-            }
-            (page, c)
+            (page, c, false)
         };
 
         match self.cache_insert(page_idx as usize, page.clone())? {
             IOResult::Done(()) => {
-                self.remove_pending_read(page_idx);
+                if resumed {
+                    self.remove_pending_read(page_idx);
+                }
                 Ok(IOResult::Done((page, c_disk)))
             }
             IOResult::IO(IOCompletions(spill_c)) => {
-                // Leave the pending entry in place; the next call to
-                // `read_page_nonblock(page_idx)` will recover it and retry
-                // `cache_insert` without re-issuing the disk read.
+                // Amphora: only a read that must wait on a spill is recorded, so the next call to
+                // `read_page_nonblock(page_idx)` recovers it and retries `cache_insert` without
+                // re-issuing the disk read; one that goes straight into the cache, nearly every
+                // read, takes no lock for it (docs/design/store.md, decision 21).
+                if let (false, Some(c)) = (resumed, c_disk) {
+                    self.insert_pending_read(
+                        page_idx,
+                        PendingRead {
+                            page,
+                            disk_read: Some(c),
+                        },
+                    );
+                }
                 io_yield_one!(spill_c);
             }
         }
@@ -4001,6 +4009,10 @@ impl Pager {
     /// read (mirroring SQLite, where `cache_size` may be exceeded while all
     /// pages are in use); later inserts drain the excess.
     fn cache_insert(&self, page_idx: usize, page: PageRef) -> IOResultOr<()> {
+        #[cfg(test)]
+        if i64::try_from(page_idx).is_ok_and(|idx| self.insert_yield.should_yield_for(idx)) {
+            io_yield_one!(crate::Completion::new_yield());
+        }
         {
             let mut page_cache = self.page_cache.write();
             let page_key = PageCacheKey::new(page_idx);
@@ -4035,6 +4047,13 @@ impl Pager {
     #[cfg(test)]
     pub(crate) fn arm_spill_yield_on_read(&self, page_id: i64, skip: usize) {
         self.spill_yield.arm(page_id, skip);
+    }
+
+    /// Test-only: arm `cache_insert` to return `IO(yield)` once for `page_id`, as when the cache
+    /// is full and a spill is in flight.
+    #[cfg(test)]
+    pub(crate) fn arm_insert_yield(&self, page_id: i64) {
+        self.insert_yield.arm(page_id, 0);
     }
 
     // Get a page from the cache, if it exists.
@@ -7480,6 +7499,45 @@ mod ptrmap_tests {
             pager.pending_reads.read().get(&target_idx).is_none(),
             "pending_reads entry must be cleared once read_page_nonblock returns Done"
         );
+    }
+
+    /// Amphora: do: read a page from the file while the cache can't take it yet (a spill in
+    /// flight), then read it again. Expect: the waiting read is recorded, and the second call
+    /// reuses its page and its read, then clears the record; with the cache free, a read records
+    /// nothing (docs/design/store.md, decision 21).
+    #[test]
+    fn a_read_waiting_on_a_spill_is_recorded_and_reused() {
+        let pager = test_pager_setup(4096, 10);
+        pager.begin_read_tx().unwrap();
+        pager.clear_page_cache(false);
+        pager.arm_insert_yield(1);
+        assert!(
+            matches!(pager.read_page(1).unwrap(), IOResult::IO(_)),
+            "the cache can't take the page yet"
+        );
+        let pending = pager
+            .pending_reads
+            .read()
+            .get(&1)
+            .cloned()
+            .expect("the waiting read is recorded");
+        assert!(pending.disk_read.is_some());
+        let IOResult::Done((page, read)) = pager.read_page(1).unwrap() else {
+            panic!("the cache takes the page the second time");
+        };
+        assert!(
+            Arc::ptr_eq(&page, &pending.page),
+            "the second call reuses the page the first read into"
+        );
+        assert!(read.is_some(), "and returns its read to wait on");
+        assert!(pager.pending_reads.read().is_empty());
+        pager.clear_page_cache(false);
+        let IOResult::Done((again, _)) = pager.read_page(1).unwrap() else {
+            panic!("a read the cache takes at once completes");
+        };
+        assert_eq!(again.get().id(), 1);
+        assert!(pager.pending_reads.read().is_empty());
+        pager.end_read_tx();
     }
 
     /// Concurrency contract: a page can be cache-resident while its disk read
