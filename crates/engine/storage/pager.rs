@@ -3438,8 +3438,8 @@ impl Pager {
         Ok(())
     }
 
-    /// The pages the cache holds: what a read transaction forgot, for tests.
-    #[cfg(test)]
+    /// The pages the cache holds: how large an ephemeral table is (`ProgramState::reset`), and what
+    /// a read transaction forgot.
     pub(crate) fn cached_pages(&self) -> usize {
         self.page_cache.read().len()
     }

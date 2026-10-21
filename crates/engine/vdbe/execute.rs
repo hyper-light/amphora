@@ -15034,6 +15034,7 @@ pub fn op_close(
         deferred_seek.take();
     }
     state.ephemeral_temp_files.remove(cursor_id);
+    state.ephemeral_kept.remove(cursor_id);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -16076,6 +16077,13 @@ pub fn op_open_ephemeral(
             // A NullRow placeholder is not a real ephemeral btree; drop it.
             if matches!(state.cursors[cursor_id], Some(Cursor::NullRow)) {
                 state.cursors[cursor_id] = None;
+            }
+            // Amphora: the table the statement's last run kept, emptied below as one opened
+            // again in the same run is.
+            if let Some(slot) = state.cursors.get_mut(cursor_id) {
+                if slot.is_none() {
+                    *slot = state.ephemeral_kept.remove(&cursor_id);
+                }
             }
             if state.cursors[cursor_id].is_some() {
                 *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::ClearExisting;

@@ -867,6 +867,11 @@ pub struct SequenceInnerTxState {
     )>,
 }
 
+/// Amphora: pages an ephemeral table may hold in its pager's cache and still be kept from one run of
+/// its statement to the next (64 KiB of 4 KiB pages): an IN list or a small materialized subquery
+/// is a page or two, and a large one is not worth the memory between runs.
+const KEPT_EPHEMERAL_PAGES: usize = 16;
+
 pub struct ProgramState {
     /// Instructions left before the next interrupt/progress check of
     /// normal_step; reloaded with `check_interval` each time it reaches zero.
@@ -959,6 +964,12 @@ pub struct ProgramState {
     /// TempFile handles for ephemeral cursors, keyed by cursor_id.
     /// Dropping removes the temp file from disk.
     ephemeral_temp_files: HashMap<usize, TempFile>,
+    /// Amphora: the statement's small ephemeral tables, kept by cursor id from one run to the next
+    /// (their temp files stay in `ephemeral_temp_files`), each emptied when the next run opens it:
+    /// one built again each run (a temp file, a pager, a transaction, a B-tree) was a third of a
+    /// ten-key IN lookup's time. At most [`KEPT_EPHEMERAL_PAGES`] pages each; dropped when the
+    /// statement is prepared again or the cursor closed.
+    ephemeral_kept: HashMap<usize, Cursor>,
     /// Attached pagers that have open savepoints for statement rollback.
     attached_savepoint_pagers: Vec<Arc<Pager>>,
     /// Pending error to return after FAIL mode commit completes.
@@ -1094,6 +1105,7 @@ impl ProgramState {
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
             ephemeral_temp_files: HashMap::default(),
+            ephemeral_kept: HashMap::default(),
             uses_subjournal: false,
             skipped_subjournal: false,
             is_active_write: false,
@@ -1184,11 +1196,18 @@ impl ProgramState {
             registers.resize_with(max_registers, || Register::Value(Value::Null));
             self.registers = registers.into_boxed_slice();
         }
+        // Amphora: a statement prepared again has other cursors; the same one runs again on what
+        // it kept.
+        let keep_ephemeral = max_cursors.is_none();
+        if !keep_ephemeral {
+            self.ephemeral_kept.clear();
+        }
         // reset cursors as they can have cached information which will be no longer relevant on next program execution
-        for (cursor, context) in self
+        for (cursor_id, (cursor, context)) in self
             .cursors
             .iter_mut()
             .zip(self.index_method_contexts.iter_mut())
+            .enumerate()
         {
             if let (Some(Cursor::IndexMethod(cursor)), Some(context)) =
                 (cursor.as_mut(), context.as_ref())
@@ -1196,6 +1215,14 @@ impl ProgramState {
                 cursor.close(context);
             }
             match cursor.take() {
+                Some(Cursor::BTree(btree, info))
+                    if keep_ephemeral
+                        && self.ephemeral_temp_files.contains_key(&cursor_id)
+                        && btree.pager.cached_pages() <= KEPT_EPHEMERAL_PAGES =>
+                {
+                    self.ephemeral_kept
+                        .insert(cursor_id, Cursor::BTree(btree, info));
+                }
                 Some(Cursor::BTree(cursor, ..)) => {
                     crate::storage::btree::CursorTrait::recycle(cursor)
                 }
@@ -1259,7 +1286,9 @@ impl ProgramState {
             self.hash_tables.clear();
         }
         if !self.ephemeral_temp_files.is_empty() {
-            self.ephemeral_temp_files.clear();
+            let kept = &self.ephemeral_kept;
+            self.ephemeral_temp_files
+                .retain(|cursor_id, _| kept.contains_key(cursor_id));
         }
         self.uses_subjournal = false;
         self.skipped_subjournal = false;

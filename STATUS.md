@@ -70,6 +70,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   queue's head, so the hand reaches it after every older page; inserted after the hand, as Turso
   had it, a new working set never settled in a full cache (`order_by_index` after
   `point_secondary`, 2,000 pages: 49,044 → 147,133 a second, a check on fedora at 1 client).
+- **Ephemeral tables kept between runs** (docs/design/executor.md decision 1,
+  `crates/engine/tests/ephemeral_reuse.rs`): a statement keeps each ephemeral table of at most 16
+  pages (an IN list's keys, an IN subquery's rows) and empties it on its next run, where building
+  one each run (a temp file, a pager, a transaction, a B-tree) was a third of `in_list_10`'s time.
 
 ## Measured
 
