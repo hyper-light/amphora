@@ -25,7 +25,8 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         impl #struct_name {
-            #[no_mangle]
+            #[cfg_attr(not(amphora_engine_core), no_mangle)]
+            #[allow(non_snake_case)]
             unsafe extern "C" fn #create_fn_name(
                 argv: *const ::amphora_engine_ext::Value, argc: i32
             ) -> ::amphora_engine_ext::VTabCreateResult {
@@ -52,7 +53,8 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 }
             }
 
-            #[no_mangle]
+            #[cfg_attr(not(amphora_engine_core), no_mangle)]
+            #[allow(non_snake_case)]
             unsafe extern "C" fn #open_fn_name(table: *const ::std::ffi::c_void, conn: *const ::amphora_engine_ext::Conn) -> *const ::std::ffi::c_void {
                 if table.is_null() {
                     return ::std::ptr::null();
@@ -67,7 +69,8 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 }
             }
 
-            #[no_mangle]
+            #[cfg_attr(not(amphora_engine_core), no_mangle)]
+            #[allow(non_snake_case)]
             unsafe extern "C" fn #close_fn_name(
                 cursor: *const ::std::ffi::c_void
             ) -> ::amphora_engine_ext::ResultCode {
@@ -79,7 +82,8 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 <<#struct_name as ::amphora_engine_ext::VTabModule>::Table as ::amphora_engine_ext::VTable>::Cursor::close(&*cursor)
             }
 
-            #[no_mangle]
+            #[cfg_attr(not(amphora_engine_core), no_mangle)]
+            #[allow(non_snake_case)]
             unsafe extern "C" fn #filter_fn_name(
                 cursor: *const ::std::ffi::c_void,
                 argc: i32,
@@ -100,7 +104,8 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 <<#struct_name as ::amphora_engine_ext::VTabModule>::Table as ::amphora_engine_ext::VTable>::Cursor::filter(cursor, args, idx_str)
             }
 
-            #[no_mangle]
+            #[cfg_attr(not(amphora_engine_core), no_mangle)]
+            #[allow(non_snake_case)]
             unsafe extern "C" fn #column_fn_name(
                 cursor: *const ::std::ffi::c_void,
                 idx: u32,
@@ -115,7 +120,8 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 }
             }
 
-            #[no_mangle]
+            #[cfg_attr(not(amphora_engine_core), no_mangle)]
+            #[allow(non_snake_case)]
             unsafe extern "C" fn #next_fn_name(
                 cursor: *const ::std::ffi::c_void,
             ) -> ::amphora_engine_ext::ResultCode {
@@ -126,7 +132,8 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 <<#struct_name as ::amphora_engine_ext::VTabModule>::Table as ::amphora_engine_ext::VTable>::Cursor::next(cursor)
             }
 
-            #[no_mangle]
+            #[cfg_attr(not(amphora_engine_core), no_mangle)]
+            #[allow(non_snake_case)]
             unsafe extern "C" fn #eof_fn_name(
                 cursor: *const ::std::ffi::c_void,
             ) -> bool {
@@ -137,7 +144,8 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 <<#struct_name as ::amphora_engine_ext::VTabModule>::Table as ::amphora_engine_ext::VTable>::Cursor::eof(cursor)
             }
 
-            #[no_mangle]
+            #[cfg_attr(not(amphora_engine_core), no_mangle)]
+            #[allow(non_snake_case)]
             unsafe extern "C" fn #update_fn_name(
                 table: *const ::std::ffi::c_void,
                 argc: i32,
@@ -189,7 +197,8 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 return ::amphora_engine_ext::ResultCode::Error;
             }
 
-            #[no_mangle]
+            #[cfg_attr(not(amphora_engine_core), no_mangle)]
+            #[allow(non_snake_case)]
             pub unsafe extern "C" fn #rowid_fn_name(cursor: *const ::std::ffi::c_void) -> i64 {
                 if cursor.is_null() {
                     return -1;
@@ -198,7 +207,8 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 <<#struct_name as ::amphora_engine_ext::VTabModule>::Table as ::amphora_engine_ext::VTable>::Cursor::rowid(cursor)
             }
 
-            #[no_mangle]
+            #[cfg_attr(not(amphora_engine_core), no_mangle)]
+            #[allow(non_snake_case)]
             unsafe extern "C" fn #destroy_fn_name(
                 table: *const ::std::ffi::c_void,
             ) -> ::amphora_engine_ext::ResultCode {
@@ -216,7 +226,8 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 return ::amphora_engine_ext::ResultCode::OK;
             }
 
-            #[no_mangle]
+            #[cfg_attr(not(amphora_engine_core), no_mangle)]
+            #[allow(non_snake_case)]
             pub unsafe extern "C" fn #best_idx_fn_name(
                 constraints: *const ::amphora_engine_ext::ConstraintInfo,
                 n_constraints: i32,
@@ -231,7 +242,8 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 }
             }
 
-            #[no_mangle]
+            #[cfg_attr(not(amphora_engine_core), no_mangle)]
+            #[allow(non_snake_case)]
             pub unsafe extern "C" fn #begin_fn_name(
                 table: *mut ::std::ffi::c_void,
             ) -> ::amphora_engine_ext::ResultCode {
@@ -246,7 +258,8 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 ::amphora_engine_ext::ResultCode::OK
             }
 
-            #[no_mangle]
+            #[cfg_attr(not(amphora_engine_core), no_mangle)]
+            #[allow(non_snake_case)]
             pub unsafe extern "C" fn #rollback_fn_name(
                 table: *mut ::std::ffi::c_void,
             ) -> ::amphora_engine_ext::ResultCode {
@@ -261,7 +274,8 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 ::amphora_engine_ext::ResultCode::OK
             }
 
-            #[no_mangle]
+            #[cfg_attr(not(amphora_engine_core), no_mangle)]
+            #[allow(non_snake_case)]
             pub unsafe extern "C" fn #commit_fn_name(
                 table: *mut ::std::ffi::c_void,
             ) -> ::amphora_engine_ext::ResultCode {
@@ -276,7 +290,8 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 ::amphora_engine_ext::ResultCode::OK
             }
 
-            #[no_mangle]
+            #[cfg_attr(not(amphora_engine_core), no_mangle)]
+            #[allow(non_snake_case)]
             pub unsafe extern "C" fn #rename_fn_name(
                 table: *mut ::std::ffi::c_void,
                 name: *const ::std::ffi::c_char,
@@ -300,7 +315,8 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 ::amphora_engine_ext::ResultCode::OK
             }
 
-            #[no_mangle]
+            #[cfg_attr(not(amphora_engine_core), no_mangle)]
+            #[allow(non_snake_case)]
             pub unsafe extern "C" fn #register_fn_name(
                 api: *const ::amphora_engine_ext::ExtensionApi
             ) -> ::amphora_engine_ext::ResultCode {

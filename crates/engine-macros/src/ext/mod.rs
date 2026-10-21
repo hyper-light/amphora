@@ -106,7 +106,8 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
               }
 
             #[cfg(not(feature = "static"))]
-            #[no_mangle]
+            #[cfg_attr(not(amphora_engine_core), no_mangle)]
+            #[allow(non_snake_case)]
             pub unsafe extern "C" fn register_extension(api: &::amphora_engine_ext::ExtensionApi) -> ::amphora_engine_ext::ResultCode {
                 #(#scalar_calls)*
 

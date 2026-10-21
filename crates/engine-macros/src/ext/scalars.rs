@@ -50,7 +50,8 @@ pub fn scalar(attr: TokenStream, input: TokenStream) -> TokenStream {
     };
 
     let expanded = quote! {
-        #[no_mangle]
+        #[cfg_attr(not(amphora_engine_core), no_mangle)]
+        #[allow(non_snake_case)]
         pub unsafe extern "C" fn #register_fn_name(
             api: *const ::amphora_engine_ext::ExtensionApi
         ) -> ::amphora_engine_ext::ResultCode {
@@ -75,7 +76,8 @@ pub fn scalar(attr: TokenStream, input: TokenStream) -> TokenStream {
             ::amphora_engine_ext::ResultCode::OK
         }
 
-        #[no_mangle]
+        #[cfg_attr(not(amphora_engine_core), no_mangle)]
+        #[allow(non_snake_case)]
         pub unsafe extern "C" fn #fn_name(
             _context: usize,
             argc: i32,
@@ -115,7 +117,8 @@ pub fn derive_scalar(input: TokenStream) -> TokenStream {
     let register_fn_name = format_ident!("register_{}", struct_name);
 
     let expanded = quote! {
-        #[no_mangle]
+        #[cfg_attr(not(amphora_engine_core), no_mangle)]
+        #[allow(non_snake_case)]
         pub unsafe extern "C" fn #call_fn_name(
             context: usize,
             argc: i32,
@@ -134,7 +137,8 @@ pub fn derive_scalar(input: TokenStream) -> TokenStream {
             <#struct_name as ::amphora_engine_ext::ScalarFunc>::call(state, args)
         }
 
-        #[no_mangle]
+        #[cfg_attr(not(amphora_engine_core), no_mangle)]
+        #[allow(non_snake_case)]
         pub unsafe extern "C" fn #drop_fn_name(context: usize) {
             if context != 0 {
                 drop(unsafe {
@@ -145,7 +149,8 @@ pub fn derive_scalar(input: TokenStream) -> TokenStream {
             }
         }
 
-        #[no_mangle]
+        #[cfg_attr(not(amphora_engine_core), no_mangle)]
+        #[allow(non_snake_case)]
         pub unsafe extern "C" fn #register_fn_name(
             api: *const ::amphora_engine_ext::ExtensionApi
         ) -> ::amphora_engine_ext::ResultCode {

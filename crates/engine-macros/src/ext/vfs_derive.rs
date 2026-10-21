@@ -47,7 +47,8 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
             ::std::boxed::Box::into_raw(::std::boxed::Box::new(vfs_mod)) as *const ::amphora_engine_ext::VfsImpl
         }
 
-        #[no_mangle]
+        #[cfg_attr(not(amphora_engine_core), no_mangle)]
+        #[allow(non_snake_case)]
         pub unsafe extern "C" fn #register_fn_name(api: &::amphora_engine_ext::ExtensionApi) -> ::amphora_engine_ext::ResultCode {
             let ctx = #struct_name::default();
             let ctx = ::std::boxed::Box::into_raw(::std::boxed::Box::new(ctx)) as *const ::std::ffi::c_void;
@@ -80,7 +81,8 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
             callback
         }
 
-        #[no_mangle]
+        #[cfg_attr(not(amphora_engine_core), no_mangle)]
+        #[allow(non_snake_case)]
         pub unsafe extern "C" fn #open_fn_name(
             ctx: *const ::std::ffi::c_void,
             path: *const ::std::ffi::c_char,
@@ -102,7 +104,8 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
             ::std::boxed::Box::into_raw(::std::boxed::Box::new(vfs_file)) as *const ::std::ffi::c_void
         }
 
-        #[no_mangle]
+        #[cfg_attr(not(amphora_engine_core), no_mangle)]
+        #[allow(non_snake_case)]
         pub unsafe extern "C" fn #remove_fn_name(
             ctx: *const ::std::ffi::c_void,
             path: *const ::std::ffi::c_char,
@@ -118,7 +121,8 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
             ::amphora_engine_ext::ResultCode::OK
         }
 
-        #[no_mangle]
+        #[cfg_attr(not(amphora_engine_core), no_mangle)]
+        #[allow(non_snake_case)]
         pub unsafe extern "C" fn #close_fn_name(file_ptr: *const ::std::ffi::c_void) -> ::amphora_engine_ext::ResultCode {
             if file_ptr.is_null() {
                 return ::amphora_engine_ext::ResultCode::Error;
@@ -135,7 +139,8 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
             ::amphora_engine_ext::ResultCode::OK
         }
 
-          #[no_mangle]
+          #[cfg_attr(not(amphora_engine_core), no_mangle)]
+          #[allow(non_snake_case)]
           pub unsafe extern "C" fn #read_fn_name(file_ptr: *const ::std::ffi::c_void, buf: ::amphora_engine_ext::BufferRef, offset: i64, cb: ::amphora_engine_ext::IOCallback) -> ::amphora_engine_ext::ResultCode {
             if file_ptr.is_null() {
                 return ::amphora_engine_ext::ResultCode::Error;
@@ -150,7 +155,8 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
           ::amphora_engine_ext::ResultCode::OK
         }
 
-        #[no_mangle]
+        #[cfg_attr(not(amphora_engine_core), no_mangle)]
+        #[allow(non_snake_case)]
         pub unsafe extern "C" fn #run_once_fn_name(ctx: *const ::std::ffi::c_void) -> ::amphora_engine_ext::ResultCode {
             if ctx.is_null() {
                 return ::amphora_engine_ext::ResultCode::Error;
@@ -162,7 +168,8 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
             ::amphora_engine_ext::ResultCode::OK
         }
 
-        #[no_mangle]
+        #[cfg_attr(not(amphora_engine_core), no_mangle)]
+        #[allow(non_snake_case)]
         pub unsafe extern "C" fn #write_fn_name(file_ptr: *const ::std::ffi::c_void, buf: ::amphora_engine_ext::BufferRef, offset: i64, cb: ::amphora_engine_ext::IOCallback) -> ::amphora_engine_ext::ResultCode {
             if file_ptr.is_null() {
                 return ::amphora_engine_ext::ResultCode::Error;
@@ -177,7 +184,8 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
           ::amphora_engine_ext::ResultCode::OK
         }
 
-        #[no_mangle]
+        #[cfg_attr(not(amphora_engine_core), no_mangle)]
+        #[allow(non_snake_case)]
         pub unsafe extern "C" fn #lock_fn_name(file_ptr: *const ::std::ffi::c_void, exclusive: bool) -> ::amphora_engine_ext::ResultCode {
             if file_ptr.is_null() {
                 return ::amphora_engine_ext::ResultCode::Error;
@@ -191,7 +199,8 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
             ::amphora_engine_ext::ResultCode::OK
         }
 
-        #[no_mangle]
+        #[cfg_attr(not(amphora_engine_core), no_mangle)]
+        #[allow(non_snake_case)]
         pub unsafe extern "C" fn #unlock_fn_name(file_ptr: *const ::std::ffi::c_void) -> ::amphora_engine_ext::ResultCode {
             if file_ptr.is_null() {
                 return ::amphora_engine_ext::ResultCode::Error;
@@ -205,7 +214,8 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
             ::amphora_engine_ext::ResultCode::OK
         }
 
-        #[no_mangle]
+        #[cfg_attr(not(amphora_engine_core), no_mangle)]
+        #[allow(non_snake_case)]
         pub unsafe extern "C" fn #sync_fn_name(file_ptr: *const ::std::ffi::c_void, cb: ::amphora_engine_ext::IOCallback) -> ::amphora_engine_ext::ResultCode {
             if file_ptr.is_null() {
                 return ::amphora_engine_ext::ResultCode::Error;
@@ -220,7 +230,8 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
             ::amphora_engine_ext::ResultCode::OK
         }
 
-        #[no_mangle]
+        #[cfg_attr(not(amphora_engine_core), no_mangle)]
+        #[allow(non_snake_case)]
         pub unsafe extern "C" fn #trunc_fn_name(file_ptr: *const ::std::ffi::c_void, len: i64, cb: ::amphora_engine_ext::IOCallback) -> ::amphora_engine_ext::ResultCode {
             if file_ptr.is_null() {
                 return amphora_engine_ext::ResultCode::Error;
@@ -235,7 +246,8 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
             ::amphora_engine_ext::ResultCode::OK
         }
 
-        #[no_mangle]
+        #[cfg_attr(not(amphora_engine_core), no_mangle)]
+        #[allow(non_snake_case)]
         pub unsafe extern "C" fn #size_fn_name(file_ptr: *const ::std::ffi::c_void) -> i64 {
             if file_ptr.is_null() {
                 return -1;
@@ -246,13 +258,15 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
             <#struct_name as ::amphora_engine_ext::VfsExtension>::File::size(file)
         }
 
-        #[no_mangle]
+        #[cfg_attr(not(amphora_engine_core), no_mangle)]
+        #[allow(non_snake_case)]
         pub unsafe extern "C" fn #generate_random_number_fn_name() -> i64 {
             let obj = #struct_name::default();
             <#struct_name as ::amphora_engine_ext::VfsExtension>::generate_random_number(&obj)
         }
 
-        #[no_mangle]
+        #[cfg_attr(not(amphora_engine_core), no_mangle)]
+        #[allow(non_snake_case)]
         pub unsafe extern "C" fn #get_current_time_fn_name() -> *const ::std::ffi::c_char {
             let obj = #struct_name::default();
             let time = <#struct_name as ::amphora_engine_ext::VfsExtension>::get_current_time(&obj);

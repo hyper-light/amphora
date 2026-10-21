@@ -14,6 +14,9 @@ and a change is an Amphora commit. A fix from upstream is ported by hand, its co
   no `fts` (zstd-sys is C and fails on musl). Its own default features are Turso's without `simd`
   and with `pure-rust-crypto` and `checksum`, so its tests run as Amphora runs it. Nothing is
   compiled from C, its tests included.
+- **Its symbols:** the extension macros export a function unmangled (`#[no_mangle]`) only outside
+  the engine itself (`cfg(amphora_engine_core)`, set by its build script): its built-ins register
+  by pointer, and a binary linking it beside another copy of Turso carries no symbol twice.
 - **Its clippy configuration:** each of its crates holds a `clippy.toml` of its own (none of
   Amphora's disallowed lists, which `scripts/check-production.sh` counts it against instead).
 - **Its rules:** its crates keep the edition (2021) and the lints they came with. CLAUDE.md's rules

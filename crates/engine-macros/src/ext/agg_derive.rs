@@ -14,7 +14,8 @@ pub fn derive_agg_func(input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         impl #struct_name {
-            #[no_mangle]
+            #[cfg_attr(not(amphora_engine_core), no_mangle)]
+            #[allow(non_snake_case)]
             pub extern "C" fn #init_fn_name(_context: usize) -> *mut ::amphora_engine_ext::AggCtx {
                 let state = ::std::boxed::Box::new(<#struct_name as ::amphora_engine_ext::AggFunc>::State::default());
                 let ctx = ::std::boxed::Box::new(::amphora_engine_ext::AggCtx {
@@ -23,7 +24,8 @@ pub fn derive_agg_func(input: TokenStream) -> TokenStream {
                 ::std::boxed::Box::into_raw(ctx)
             }
 
-            #[no_mangle]
+            #[cfg_attr(not(amphora_engine_core), no_mangle)]
+            #[allow(non_snake_case)]
             pub extern "C" fn #step_fn_name(
                 _context: usize,
                 ctx: *mut ::amphora_engine_ext::AggCtx,
@@ -43,7 +45,8 @@ pub fn derive_agg_func(input: TokenStream) -> TokenStream {
                 ::amphora_engine_ext::Value::null()
             }
 
-            #[no_mangle]
+            #[cfg_attr(not(amphora_engine_core), no_mangle)]
+            #[allow(non_snake_case)]
             pub extern "C" fn #finalize_fn_name(
                 _context: usize,
                 ctx: *mut ::amphora_engine_ext::AggCtx
@@ -60,7 +63,8 @@ pub fn derive_agg_func(input: TokenStream) -> TokenStream {
                 }
             }
 
-            #[no_mangle]
+            #[cfg_attr(not(amphora_engine_core), no_mangle)]
+            #[allow(non_snake_case)]
             pub unsafe extern "C" fn #register_fn_name(
                 api: *const ::amphora_engine_ext::ExtensionApi
             ) -> ::amphora_engine_ext::ResultCode {
