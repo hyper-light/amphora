@@ -3081,6 +3081,18 @@ impl Database {
     /// another process's authority (the file can change under it unseen), with MVCC, and with a
     /// packed log.
     pub fn share_pages(&self, pages: usize) -> Result<()> {
+        self.share_pages_in(&Arc::new(crate::storage::shared_pages::SharedPages::new(
+            pages,
+        )))
+    }
+
+    /// Amphora: shares this database's pages in `pool`, with every other database that shares
+    /// it: one budget for them all, each database's pages under keys of its own (decision 20).
+    /// Refused as [`Database::share_pages`] is.
+    pub fn share_pages_in(
+        &self,
+        pool: &Arc<crate::storage::shared_pages::SharedPages>,
+    ) -> Result<()> {
         #[cfg(host_shared_wal)]
         if self.shared_wal_coordination()?.is_some() {
             return Err(LimboError::InvalidArgument(
@@ -3098,14 +3110,15 @@ impl Database {
             ));
         }
         self.db_file
-            .share_pages(Arc::new(crate::storage::shared_pages::SharedPages::new(
-                pages,
-            )))
+            .share_pages(crate::storage::shared_pages::SharedFile::join(pool.clone()))
     }
 
-    /// Amphora: the shared pages' lookups and additions so far, if they're shared.
+    /// Amphora: the shared pages' lookups and additions so far, if they're shared: the pool's, for
+    /// every database that shares it.
     pub fn shared_page_counts(&self) -> Option<crate::storage::shared_pages::Counts> {
-        self.db_file.shared_pages().map(|shared| shared.counts())
+        self.db_file
+            .shared_pages()
+            .map(|shared| shared.pages().counts())
     }
 
     /// Amphora: the last frame of the log known durable in its current generation.

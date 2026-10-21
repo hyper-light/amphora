@@ -94,8 +94,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (`Db::share_pages`): a page one connection read in, every connection reads from memory, keyed by
   the version it is; a writer copies a shared buffer first, a file write drops the file's version.
   Sharing 256 MiB, the suite's analytic reads run 2–2.6 times as fast at 1 and 32 clients and K0's
-  reads 43% faster, for K0's resident set 340 MB against 83 and 5% fewer writes; on by default once
-  one budget serves a process's databases.
+  reads 43% faster, for K0's resident set 340 MB against 83 and 5% fewer writes. One pool now serves
+  a process's databases (`Db::share_pages_in`), each database's pages under keys of its own; run
+  past the suite's first seconds, every read measured is faster shared (point reads 1.33–1.49 times
+  at one client), with 32 readers for less memory. Not on by default: that, and its budget, are
+  the person's call.
 - **Ephemeral tables kept between runs** (docs/design/executor.md decision 1,
   `crates/engine/tests/ephemeral_reuse.rs`): a statement keeps each ephemeral table of at most 16
   pages (an IN list's keys, an IN subquery's rows) and empties it on its next run, where building

@@ -359,3 +359,62 @@ fn readers_sharing_pages_never_read_a_version_they_dont_see() {
         model(seed);
     }
 }
+
+/// Two tables page for page, their rows spelled from `prefix`: the same pages, other contents.
+fn table_of(conn: &Arc<Connection>, n: i64, prefix: &str) {
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for first in (1..=n).step_by(200) {
+        let values: Vec<String> = (first..(first + 200).min(n + 1))
+            .map(|id| format!("({id}, '{prefix}{id}-{}')", "x".repeat(190)))
+            .collect();
+        conn.execute(format!("INSERT INTO t VALUES {}", values.join(", ")))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+}
+
+/// Do: two databases whose tables have the same pages, frame for frame, but other rows share one
+/// pool (`Database::share_pages_in`, one budget for both); read each in turn twice, from the log
+/// and after a checkpoint of one of them. Expect: each reads its own rows alone, the second reads
+/// from memory, and the pool keeps no more than its bound (decision 20).
+#[test]
+fn databases_sharing_one_pool_read_only_their_own_pages() {
+    use amphora_engine::storage::shared_pages::SharedPages;
+    let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let pool = Arc::new(SharedPages::new(4096));
+    let (a, b) = (open(dir_a.path(), false), open(dir_b.path(), false));
+    a.share_pages_in(&pool).unwrap();
+    b.share_pages_in(&pool).unwrap();
+    table_of(&connect(&a), 2000, "a");
+    table_of(&connect(&b), 2000, "b");
+    for checkpoint in [false, true] {
+        if checkpoint {
+            connect(&a)
+                .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+        }
+        for round in 0..2 {
+            let before = pool.counts();
+            for (db, prefix) in [(&a, "a"), (&b, "b")] {
+                let read = rows(&connect(db), "SELECT id, v FROM t ORDER BY id");
+                assert_eq!(read.len(), 2000, "{prefix}, checkpointed {checkpoint}");
+                assert!(
+                    read.iter()
+                        .all(|(id, v)| v.starts_with(&format!("{prefix}{id}-"))),
+                    "{prefix} read another's rows (checkpointed {checkpoint}, round {round})"
+                );
+            }
+            let after = pool.counts();
+            if round == 1 {
+                assert!(
+                    after.hits - before.hits > 40,
+                    "the second reads came from memory: {before:?} -> {after:?}"
+                );
+            }
+        }
+    }
+    assert!(pool.len() <= pool.capacity());
+    assert_eq!(a.shared_page_counts(), b.shared_page_counts());
+}

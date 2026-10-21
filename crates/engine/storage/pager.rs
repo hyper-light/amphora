@@ -48,7 +48,7 @@ use super::btree::{
     btree_init_page, payload_overflow_threshold_max, payload_overflow_threshold_min, PayloadLimits,
 };
 use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey, SpillResult};
-use super::shared_pages::{Key, Version};
+use super::shared_pages::Version;
 use super::sqlite3_ondisk::{
     begin_write_btree_page, read_btree_cell, read_u32, BTreeCell, FREELIST_LEAF_PTR_SIZE,
     FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR, FREELIST_TRUNK_OFFSET_LEAF_COUNT,
@@ -4083,7 +4083,7 @@ impl Pager {
         let shared = self
             .db_file
             .shared_pages()
-            .map_or(0, |shared| shared.capacity());
+            .map_or(0, |shared| shared.pages().capacity());
         private.saturating_add(shared)
     }
 
@@ -4208,18 +4208,15 @@ impl Pager {
             },
             None => Version::File,
         };
-        let key = Key {
-            page: page_no,
-            version,
-        };
+        let key = shared.key(page_no, version);
         let page = Arc::new(Page::new(page_idx));
-        if let Some(buffer) = shared.get(&key) {
+        if let Some(buffer) = shared.pages().get(&key) {
             page.get().set_buffer(buffer);
             page.set_loaded();
             page.set_shared();
             return Ok(Some((page, None)));
         }
-        page.set_publish(shared.clone(), key);
+        page.set_publish(shared.pages().clone(), key);
         let read = match frame {
             Some(frame) => wal.read_frame(frame, page.clone(), self.buffer_pool.clone(), group)?,
             None => {

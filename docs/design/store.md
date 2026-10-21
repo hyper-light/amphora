@@ -622,9 +622,11 @@ the file cut. A connection about to write a shared buffer copies it first (`Page
 every write goes through before it touches a page: it keeps the page's contents for savepoints).
 At most the pages it was made for are kept, in 64 shards by page number with a lock each, evicted
 by CLOCK. Refused under another process's authority (its writes are unseen), with MVCC and with a
-packed log. Not on by default (`Db::share_pages`, the bench's `AMPHORA_SHARED_PAGES`): it is a
-trade of memory for reads (Evidence), and its budget is a database's alone, while a store has a
-database a group.
+packed log. One pool can serve a process's databases, a budget for them all
+(`Database::share_pages_in`, `Db::share_pages_in`): each database file that joins it gets a number
+of its own, part of every key its pages take (`SharedFile`), so two databases' pages never meet, and
+forgetting one's file versions leaves the others'. Not on by default (`Db::share_pages`, the bench's
+`AMPHORA_SHARED_PAGES`, one pool for all of K0's groups).
 
 **Why.** Each connection's cache is its own: 32 readers each missing a working set larger than its
 cache read the same pages from the file 32 times, each a `pread`, a 4 KiB copy and a checksum, and
@@ -669,9 +671,21 @@ alone for 5 s after a second's warmup, `point_pk` at one client is faster shared
 665,306 a second against 421,239 and 458,198, no read from the file left in its profile): the
 suite's slowdown is likely its first statements' 2.5 s right after the load, while the
 checkpointer drains the log and restarts it (every frame version kept then is a key no reader asks
-for again), to be confirmed. So it is on where reads matter more than memory, until one budget for the process's
-databases (and readers' own caches smaller while sharing) makes it a win in both, and the slower
-reads are understood.
+for again), to be confirmed. Confirmed: at f2105d2, the statements that read slower shared run
+after a 3 s warmup, sharing 65,536 pages against none, in turns, best of 2 (fedora, load 2.8–2.9,
+checks): `point_pk` 578,820 a second against 426,838 at one client (1,118,528 against 1,080,926 at
+32), `point_pk_one_column` 667,829 against 449,580 (1,132,324 against 1,078,408),
+`point_secondary` 429,388 against 322,838 (1,123,615 against 1,065,232), `join_three` 2,109
+against 1,729 (31,325 against 24,631), `order_by_sort` 766 against 384 (8,704 against 3,798),
+`exists_subquery` 947 against 484 (11,450 against 5,932), `table_count` at 32 clients 255,748
+against 76,860 (at one, 20,837 and 29,699 against 4,732 and 38,656: it varies eightfold unshared);
+the peak resident set 265–297 MB against 333 (32 readers' caches hold one copy of a page between
+them, not one each). `crates/engine/tests/shared_pages.rs`: two databases whose tables have the
+same pages, frame for frame, share one pool and each reads its own rows alone, from the log and
+after a checkpoint of one, the second time from memory; with every file given the same number (a
+mutant) one reads the other's rows. So every read measured is faster shared, at 32 readers for less
+memory; what is left before it is on by default is the default budget, and readers' own caches
+smaller while sharing, for the process with few readers.
 
 **Falsified by.** A read of a version the reader's snapshot doesn't see; reads slower shared than
 not; more memory shared than the budget and the readers' own caches together.

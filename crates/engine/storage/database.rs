@@ -5,7 +5,7 @@ use crate::storage::page_transform::{
     page_codec_completion_error, page_codec_encryption_context, page_codec_from_encryption,
     PageCodec, PageCodecContext, PageLocation, PageTransform,
 };
-use crate::storage::shared_pages::SharedPages;
+use crate::storage::shared_pages::SharedFile;
 use crate::storage::sqlite3_ondisk::PageSize;
 use crate::sync::Arc;
 use crate::{io::Completion, Buffer, CompletionError, LimboError, Result};
@@ -143,13 +143,13 @@ pub trait DatabaseStorage: Send + Sync {
 
     /// Amphora: the pages this database's connections share, once sharing is on
     /// (`storage/shared_pages.rs`, Amphora's `docs/design/store.md` decision 20).
-    fn shared_pages(&self) -> Option<&Arc<SharedPages>> {
+    fn shared_pages(&self) -> Option<&SharedFile> {
         None
     }
 
     /// Amphora: shares the pages read from this storage among its connections, dropping a page's
     /// file version before the page is written; refused by a storage that can't.
-    fn share_pages(&self, _shared: Arc<SharedPages>) -> Result<()> {
+    fn share_pages(&self, _shared: SharedFile) -> Result<()> {
         Err(LimboError::InvalidArgument(
             "this storage doesn't share its pages".into(),
         ))
@@ -160,7 +160,7 @@ pub trait DatabaseStorage: Send + Sync {
 pub struct DatabaseFile {
     file: Arc<dyn crate::io::File>,
     /// Amphora: the pages this file's connections share, once sharing is on (decision 20).
-    shared: crate::sync::OnceLock<Arc<SharedPages>>,
+    shared: crate::sync::OnceLock<SharedFile>,
 }
 
 #[cfg(feature = "fs")]
@@ -173,7 +173,7 @@ impl DatabaseFile {
         };
         for page in first..first.saturating_add(count) {
             match u64::try_from(page) {
-                Ok(page) => shared.forget_file_page(page),
+                Ok(page) => shared.forget_page(page),
                 Err(_) => shared.forget_file(),
             }
         }
@@ -406,11 +406,11 @@ impl DatabaseStorage for DatabaseFile {
         Ok(c)
     }
 
-    fn shared_pages(&self) -> Option<&Arc<SharedPages>> {
+    fn shared_pages(&self) -> Option<&SharedFile> {
         self.shared.get()
     }
 
-    fn share_pages(&self, shared: Arc<SharedPages>) -> Result<()> {
+    fn share_pages(&self, shared: SharedFile) -> Result<()> {
         self.shared.set(shared).map_err(|_| {
             LimboError::InvalidArgument("this database already shares its pages".into())
         })

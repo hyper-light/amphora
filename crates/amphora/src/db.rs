@@ -18,6 +18,9 @@ use amphora_engine::{
 
 use crate::store::{Checkpointed, Flush, Opener};
 
+/// The pages a process's databases share (docs/design/store.md, decision 20).
+pub use amphora_engine::storage::shared_pages::SharedPages;
+
 /// How long opening waits for another process's hold on the file to go.
 const LOCK_WAIT: Duration = Duration::from_secs(15);
 /// A statement that finds the database busy (another connection writing, a checkpoint) tries again
@@ -256,6 +259,14 @@ impl Db {
     pub fn share_pages(&self, pages: usize) -> anyhow::Result<()> {
         self.db
             .share_pages(pages)
+            .map_err(|e| anyhow::anyhow!("sharing {}'s pages: {e}", self.path.display()))
+    }
+
+    /// Shares this database's pages in `pool`, with every database that shares it: one budget for
+    /// a process's databases (docs/design/store.md, decision 20).
+    pub fn share_pages_in(&self, pool: &Arc<SharedPages>) -> anyhow::Result<()> {
+        self.db
+            .share_pages_in(pool)
             .map_err(|e| anyhow::anyhow!("sharing {}'s pages: {e}", self.path.display()))
     }
 
