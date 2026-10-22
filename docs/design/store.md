@@ -717,3 +717,34 @@ scan to row 90,000 30.21 → 28.58 ms. With 65,536 pages shared they take 16.88 
 found shared costs about a fifth of one read from the file.
 
 **Falsified by.** A read resumed after a spill that reads its page twice, or another's.
+
+## 22. A shared page found in one lookup, and counted where it was found
+
+**Decision.** A shard of the shared pages keeps each image in its map's entry, beside the bit CLOCK
+reads, and its ring holds only the keys, in the order the hand passes them
+(`storage/shared_pages.rs`): a page found is one lookup, where it was the slot's number from the map
+and then the slot. The pool's counts of lookups found, lookups missed and images added are kept in
+each shard, written under the lock the lookup holds anyway, and summed when asked; they were one
+count for the pool, written by every reader's every lookup.
+
+**Why.** A profile of the suite's `group_by_having` sharing pages (1 client): finding pages in the
+pool 21% of its time, half of it the slot reached after the map's entry, a second line from memory.
+And a line every reader writes at every lookup moves between their cores each time: point reads
+gained 1.36 times shared at one client, 1.03–1.05 times at 32 (decision 20).
+
+**Sources.** CLOCK as in decision 20. Intel's optimization reference manual on false sharing: a line
+written by many cores moves between their caches at each write. Counters split by CPU or by shard
+and summed when read are the usual remedy (the Linux kernel's `percpu_counter`).
+
+**Evidence.** `storage/shared_pages.rs` and `crates/engine/tests/shared_pages.rs` pass unchanged:
+each version found under its own key and the counts summed, eviction by CLOCK under the bound, two
+files' pages kept apart, readers never reading a version their snapshot doesn't see. Release
+binaries on fedora sharing 65,536 pages (200,000 items, best of 2 in turns, each run started at
+load under 2; checks, not recorded runs): at 32 clients `order_by_sort` 8,566 → 11,660 statements a
+second, `exists_subquery` 11,330 → 15,483, `group_by_having` 8,169 → 9,851, `table_count` 266,452
+→ 274,682; point reads unchanged at the bench's own ceiling (about 1.13 million a second); at one
+client within the runs' spread (each statement varied 10–25% between rounds of one binary, on a
+machine with heavy I/O pressure from other work).
+
+**Falsified by.** Counts that differ from one count for the pool; reads slower at 32 clients than
+before, or at one client beyond the spread of runs of one binary.

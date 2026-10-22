@@ -42,18 +42,24 @@ pub struct Key {
     pub version: Version,
 }
 
-struct Slot {
-    key: Key,
+/// An image kept, and its key's place in its shard's ring.
+struct Entry {
     buffer: Arc<Buffer>,
     /// Read since the hand last passed.
     visited: bool,
+    at: usize,
 }
 
 #[derive(Default)]
 struct Shard {
-    map: FxHashMap<Key, usize>,
-    slots: Vec<Option<Slot>>,
+    /// Each image under its key, found by one lookup.
+    map: FxHashMap<Key, Entry>,
+    /// The keys in the order the hand passes them; `None` where an image was dropped.
+    ring: Vec<Option<Key>>,
     hand: usize,
+    /// Counted under the shard's lock, which every lookup holds anyway: one count for the pool,
+    /// written by every reader's every lookup, would move its line between their cores each time.
+    counts: Counts,
 }
 
 /// Lookups that found an image, lookups that didn't, and images added: for tests and meters.
@@ -69,9 +75,6 @@ pub struct SharedPages {
     shards: Box<[Mutex<Shard>]>,
     /// Pages each shard keeps at most.
     per_shard: usize,
-    hits: AtomicU64,
-    misses: AtomicU64,
-    added: AtomicU64,
     /// The number the next file to join gets.
     files: AtomicU64,
 }
@@ -83,9 +86,6 @@ impl SharedPages {
         Self {
             shards: (0..SHARDS).map(|_| Mutex::new(Shard::default())).collect(),
             per_shard,
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            added: AtomicU64::new(0),
             files: AtomicU64::new(0),
         }
     }
@@ -103,17 +103,16 @@ impl SharedPages {
 
     /// The image of `key`, if one is kept.
     pub fn get(&self, key: &Key) -> Option<Arc<Buffer>> {
-        let found = self.shard(key.page).and_then(|shard| {
-            let mut shard = shard.lock();
-            let at = *shard.map.get(key)?;
-            let slot = shard.slots.get_mut(at)?.as_mut()?;
-            slot.visited = true;
-            Some(slot.buffer.clone())
+        let mut shard = self.shard(key.page)?.lock();
+        let found = shard.map.get_mut(key).map(|entry| {
+            entry.visited = true;
+            entry.buffer.clone()
         });
+        let counts = &mut shard.counts;
         if found.is_some() {
-            self.hits.fetch_add(1, Ordering::Relaxed);
+            counts.hits = counts.hits.wrapping_add(1);
         } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
+            counts.misses = counts.misses.wrapping_add(1);
         }
         found
     }
@@ -125,55 +124,57 @@ impl SharedPages {
             return;
         };
         let mut shard = shard.lock();
-        if let Some(&at) = shard.map.get(&key) {
-            if let Some(Some(slot)) = shard.slots.get_mut(at) {
-                slot.visited = true;
-            }
+        if let Some(entry) = shard.map.get_mut(&key) {
+            entry.visited = true;
             return;
         }
-        let at = if shard.slots.len() < self.per_shard {
-            shard.slots.push(None);
-            shard.slots.len().checked_sub(1)
+        let at = if shard.ring.len() < self.per_shard {
+            shard.ring.push(None);
+            shard.ring.len().checked_sub(1)
         } else {
             Self::victim(&mut shard)
         };
         let Some(at) = at else {
             return;
         };
-        if let Some(entry) = shard.slots.get_mut(at) {
-            *entry = Some(Slot {
+        if let Some(place) = shard.ring.get_mut(at) {
+            *place = Some(key);
+            shard.map.insert(
                 key,
-                buffer,
-                visited: false,
-            });
-            shard.map.insert(key, at);
-            drop(shard);
-            self.added.fetch_add(1, Ordering::Relaxed);
+                Entry {
+                    buffer,
+                    visited: false,
+                    at,
+                },
+            );
+            shard.counts.added = shard.counts.added.wrapping_add(1);
         }
     }
 
     /// The slot CLOCK frees in a full shard: the first empty one the hand meets, or the first
     /// not read since the hand last passed, its image dropped (two turns at most).
     fn victim(shard: &mut Shard) -> Option<usize> {
-        let len = shard.slots.len();
+        let len = shard.ring.len();
         for _ in 0..len.saturating_mul(2) {
             let at = shard.hand;
             shard.hand = match at.checked_add(1) {
                 Some(next) if next < len => next,
                 _ => 0,
             };
-            match shard.slots.get_mut(at) {
+            let key = match shard.ring.get(at) {
+                Some(Some(key)) => *key,
                 Some(None) => return Some(at),
-                Some(Some(slot)) if slot.visited => slot.visited = false,
-                Some(Some(slot)) => {
-                    let key = slot.key;
+                None => return None,
+            };
+            match shard.map.get_mut(&key) {
+                Some(entry) if entry.visited => entry.visited = false,
+                _ => {
                     shard.map.remove(&key);
-                    if let Some(entry) = shard.slots.get_mut(at) {
-                        *entry = None;
+                    if let Some(place) = shard.ring.get_mut(at) {
+                        *place = None;
                     }
                     return Some(at);
                 }
-                None => return None,
             }
         }
         None
@@ -188,9 +189,9 @@ impl SharedPages {
         };
         if let Some(shard) = self.shard(page) {
             let mut shard = shard.lock();
-            if let Some(at) = shard.map.remove(&key) {
-                if let Some(entry) = shard.slots.get_mut(at) {
-                    *entry = None;
+            if let Some(entry) = shard.map.remove(&key) {
+                if let Some(place) = shard.ring.get_mut(entry.at) {
+                    *place = None;
                 }
             }
         }
@@ -204,12 +205,12 @@ impl SharedPages {
                 .map
                 .iter()
                 .filter(|(key, _)| key.file == file && key.version == Version::File)
-                .map(|(key, at)| (*key, *at))
+                .map(|(key, entry)| (*key, entry.at))
                 .collect();
             for (key, at) in files {
                 shard.map.remove(&key);
-                if let Some(entry) = shard.slots.get_mut(at) {
-                    *entry = None;
+                if let Some(place) = shard.ring.get_mut(at) {
+                    *place = None;
                 }
             }
         }
@@ -232,13 +233,16 @@ impl SharedPages {
         self.len() == 0
     }
 
-    /// Lookups and additions so far.
+    /// Lookups and additions so far, the shards' summed.
     pub fn counts(&self) -> Counts {
-        Counts {
-            hits: self.hits.load(Ordering::Relaxed),
-            misses: self.misses.load(Ordering::Relaxed),
-            added: self.added.load(Ordering::Relaxed),
-        }
+        self.shards.iter().fold(Counts::default(), |sum, shard| {
+            let shard = shard.lock().counts;
+            Counts {
+                hits: sum.hits.wrapping_add(shard.hits),
+                misses: sum.misses.wrapping_add(shard.misses),
+                added: sum.added.wrapping_add(shard.added),
+            }
+        })
     }
 }
 

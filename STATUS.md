@@ -105,6 +105,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   past the suite's first seconds, every read measured is faster shared (point reads 1.33–1.49 times
   at one client), with 32 readers for less memory. Not on by default: that, and its budget, are
   the person's call.
+- **A shared page found in one lookup** (docs/design/store.md decision 22): the pool keeps each image
+  in its map's entry and counts lookups in each shard, under the lock it holds anyway, where one
+  count for the pool moved between 32 readers' cores at every lookup. Sharing 256 MiB at 32 clients:
+  `order_by_sort` 8,566 → 11,660 statements a second, `exists_subquery` 11,330 → 15,483,
+  `group_by_having` 8,169 → 9,851 (fedora, best of 2 at load under 2, not recorded runs).
 - **A page read records itself only when it must wait** (docs/design/store.md decision 21): a page
   read from the file goes straight into the cache, recorded for a resumed call only when a spill
   holds it up; every read had taken two write locks and a hash insert and remove. Whole scans
