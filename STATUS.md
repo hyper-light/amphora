@@ -123,6 +123,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   `Db::transaction_while_room`); statements of a hundred rows had made commits of 3,400 pages
   through a 1,024-page cache. At 32 clients `insert_batch_100` 333 → 456 statements a second (p99
   203 → 131 ms), `delete_range_insert` 2,841 → 3,136, peak resident 102 → 59 MB (fedora, checks).
+- **The checkpointer lists the pages of the frames it copies** (docs/design/store.md decision 24):
+  from the frames' own list, copied out under its lock and sorted after, where every checkpoint had
+  scanned every page the log holds under the lock each page read from the log takes; the scan stays
+  for ranges the list doesn't hold. A model test checks the list against the scan over random
+  appends, packed records, rewinds, rollbacks and restarts.
 - **Ephemeral tables kept between runs** (docs/design/executor.md decision 1,
   `crates/engine/tests/ephemeral_reuse.rs`): a statement keeps each ephemeral table of at most 16
   pages (an IN list's keys, an IN subquery's rows) and empties it on its next run, where building

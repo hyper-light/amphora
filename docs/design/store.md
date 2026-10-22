@@ -802,3 +802,33 @@ keeps decision 5's 1,024 pages.
 
 **Falsified by.** A batch committed in parts, or lost; fewer statements a second or longer tails
 with the bound than without on the suite's writes.
+
+## 24. The checkpointer lists the pages of the frames it copies
+
+**Decision.** A checkpoint finds the pages it copies, each at its latest frame in the checkpoint's
+range, in the frames' own list (decision 18's, in frame order: `storage/changes.rs`), copied out
+under the list's lock and sorted by page after it (`InProcessWalCoordination::iter_latest_frames`,
+`changes::latest_by_page`). Only when the list doesn't hold the whole range (past its bound, after
+a gap a recovery or a restore left) does the checkpoint scan every page the log holds, as before. A
+record cut into by a rewind leaves the list as it leaves the frame cache (`cache_record`).
+
+**Why.** The scan walked every page with a frame in the log, at every checkpoint, holding the frame
+cache's spin lock: the lock every page read from the log takes (`find_frame`). Past its bound the
+checkpointer copies without pausing (decision 4), and a log of 131,072 frames holds tens of
+thousands of pages. In a profile of the suite's `insert_batch_100` at 32 clients the writer spent
+5.4% of its time spinning on that lock in `find_frame`.
+
+**Sources.** SQLite's checkpoint iterates only the frames past the last backfill, sorted by page
+from its WAL index (`walIteratorInit`, `src/wal.c`): its work is the frames it copies, not the pages
+the log holds.
+
+**Evidence.** `storage/wal.rs`, `the_checkpointers_list_is_what_a_scan_of_every_page_finds`: 20
+seeds of 400 random appends of frames and packed records, rewinds by frames and by records, rollbacks
+and restarts, each followed by three ranges: every range's list is the scan's, more than 10,000 of
+them answered by the frames' list; with the cut record left in the list (a mutant) it fails at the
+first seed. `storage/changes.rs`, `lists_each_pages_latest_frame_in_a_range`. A checkpoint with
+frames to copy now searches no page's frames
+(`in_process_checkpoint_with_no_frames_to_backfill_compares_no_frames`).
+
+**Falsified by.** A checkpoint that copies a page at other than its latest frame in its range, or
+misses one; checkpoints that list their pages slower than the scan did.

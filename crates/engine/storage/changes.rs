@@ -96,6 +96,23 @@ impl ChangeLog {
         Some(pages)
     }
 
+    /// `(page, frame)` for each page each of frames `after + 1 ..= upto` holds, as listed; None
+    /// when not all of those frames are listed. Copied out, for [`latest_by_page`] to sort once
+    /// the list's lock is let go (Amphora's `docs/design/store.md`, decision 24).
+    pub(crate) fn entries(&self, after: u64, upto: u64) -> Option<Vec<(u64, u64)>> {
+        if after < self.floor || upto >= self.next || after > upto {
+            return None;
+        }
+        let start = self.entries.partition_point(|&(f, _)| f <= after);
+        Some(
+            self.entries
+                .range(start..)
+                .take_while(|&&(frame, _)| frame <= upto)
+                .map(|&(frame, page)| (page, frame))
+                .collect(),
+        )
+    }
+
     /// Drops the oldest [`DROP`] entries, and with them every entry of the last frame they reach,
     /// so a frame is listed whole or not at all.
     fn drop_oldest(&mut self) {
@@ -115,9 +132,23 @@ impl ChangeLog {
     }
 }
 
+/// Each page of `entries` (`(page, frame)`) once, with the latest frame it is listed at, by page:
+/// what a checkpoint of their frames copies, found from the frames' own list rather than among
+/// every page the log holds (decision 24).
+pub(crate) fn latest_by_page(mut entries: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    // By page, its latest frame first: the one each page keeps.
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    entries.dedup_by_key(|&mut (page, _)| page);
+    entries
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn latest_frames(log: &ChangeLog, after: u64, upto: u64) -> Option<Vec<(u64, u64)>> {
+        log.entries(after, upto).map(latest_by_page)
+    }
 
     fn one(log: &mut ChangeLog, frame: u64, page: u64) {
         log.record(frame, 1, std::iter::once(page));
@@ -136,6 +167,28 @@ mod tests {
         assert_eq!(log.pages(5, 5, 100), Some(vec![]));
         assert_eq!(log.pages(4, 6, 100), None);
         assert_eq!(log.pages(0, 5, 3), None, "more entries than asked for");
+    }
+
+    /// Do: frames 1..=5 of pages 7, 8, 7, 9, 10, then a record of pages 7 and 11 on slots 6 and
+    /// 7. Expect: each page of a range once, with the latest frame of the range that holds it, by
+    /// page; a range past the last listed frame refused.
+    #[test]
+    fn lists_each_pages_latest_frame_in_a_range() {
+        let mut log = ChangeLog::default();
+        for (frame, page) in [(1, 7), (2, 8), (3, 7), (4, 9), (5, 10)] {
+            one(&mut log, frame, page);
+        }
+        log.record(6, 2, [7, 11].into_iter());
+        assert_eq!(
+            latest_frames(&log, 0, 5),
+            Some(vec![(7, 3), (8, 2), (9, 4), (10, 5)])
+        );
+        assert_eq!(
+            latest_frames(&log, 3, 7),
+            Some(vec![(7, 6), (9, 4), (10, 5), (11, 6)])
+        );
+        assert_eq!(latest_frames(&log, 5, 5), Some(vec![]));
+        assert_eq!(latest_frames(&log, 0, 8), None);
     }
 
     /// Do: a packed record of three pages on four slots, then a frame. Expect: the record's pages

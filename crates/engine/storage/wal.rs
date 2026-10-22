@@ -20,7 +20,7 @@ use std::fmt::{Debug, Formatter};
 use std::{fmt, sync::Arc};
 
 use super::buffer_pool::BufferPool;
-use super::changes::ChangeLog;
+use super::changes::{latest_by_page, ChangeLog};
 use super::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use super::packed::{self, Record, Records};
 use super::pager::{Logged, PageRef, Pager};
@@ -1336,16 +1336,18 @@ impl WalCoordination for InProcessWalCoordination {
 
     fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)> {
         let shared = self.shared.read();
-        let frame_cache = shared.runtime.frame_cache.lock();
-        let mut list = Vec::with_capacity(frame_cache.len());
-        let range = min_frame..=max_frame;
-        for (&page_id, frames) in frame_cache.iter() {
-            if let Some(frame_id) = shared.runtime.latest_frame_in_range(frames, &range) {
-                list.push((page_id, frame_id));
-            }
+        // Amphora: the pages of the frames to copy, from the frames' own list when it holds them
+        // all, rather than from every page the log holds, under the lock every page read takes
+        // (docs/design/store.md, decision 24).
+        let listed = shared
+            .runtime
+            .changes
+            .lock()
+            .entries(min_frame.saturating_sub(1), max_frame);
+        match listed {
+            Some(entries) => latest_by_page(entries),
+            None => shared.runtime.scan_latest_frames(min_frame, max_frame),
         }
-        list.sort_unstable_by_key(|&(page_id, _)| page_id);
-        list
     }
 
     fn checkpoint_epoch(&self) -> u32 {
@@ -1751,6 +1753,7 @@ impl WalCoordination for InProcessWalCoordination {
             .runtime
             .frame_cache_high_water
             .load(Ordering::Acquire);
+        let mut cut = None;
         if head <= high_water {
             // `cache_frame`'s guard: the slots from `head` up are written again, and with them any
             // record they cut into.
@@ -1762,6 +1765,7 @@ impl WalCoordination for InProcessWalCoordination {
                 !frames.is_empty()
             });
             records.drop_after(from.saturating_sub(1));
+            cut = Some(from);
         }
         // The record's slots are known before any page maps to it.
         records.publish(head, slots);
@@ -1775,11 +1779,14 @@ impl WalCoordination for InProcessWalCoordination {
                 }
             }
         }
-        shared
-            .runtime
-            .changes
-            .lock()
-            .record(head, u64::from(slots), pages.into_iter());
+        let mut changes = shared.runtime.changes.lock();
+        // The frames the cut record began at are gone from the cache: from the list too, which the
+        // checkpointer reads as the cache (decision 24).
+        if let Some(from) = cut {
+            changes.drop_from(from);
+        }
+        changes.record(head, u64::from(slots), pages.into_iter());
+        drop(changes);
         let last = head
             .checked_add(u64::from(slots))
             .and_then(|end| end.checked_sub(1))
@@ -3461,6 +3468,22 @@ pub struct WalSharedRuntime {
 }
 
 impl WalSharedRuntime {
+    /// Each page with a frame in `min_frame ..= max_frame`, and the latest such frame, by page:
+    /// found among every page the log holds.
+    fn scan_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)> {
+        let frame_cache = self.frame_cache.lock();
+        let mut list = Vec::with_capacity(frame_cache.len());
+        let range = min_frame..=max_frame;
+        for (&page_id, frames) in frame_cache.iter() {
+            if let Some(frame_id) = self.latest_frame_in_range(frames, &range) {
+                list.push((page_id, frame_id));
+            }
+        }
+        drop(frame_cache);
+        list.sort_unstable_by_key(|&(page_id, _)| page_id);
+        list
+    }
+
     fn latest_frame_in_range(
         &self,
         frames: &[u64],
@@ -7583,7 +7606,10 @@ pub mod test {
         frames_compared();
         let checkpoint = run_checkpoint_until_done(&pager, passive);
         assert_eq!(checkpoint.wal_total_backfilled, held_frame);
-        assert!(frames_compared() > 0);
+        assert!(checkpoint.wal_checkpoint_backfilled > 0);
+        // Amphora: its pages listed from the frames' own list, no page's frames searched
+        // (docs/design/store.md, decision 24).
+        assert_eq!(frames_compared(), 0);
 
         let checkpoint = run_checkpoint_until_done(&pager, passive);
         assert_eq!(checkpoint.wal_total_backfilled, held_frame);
@@ -8750,12 +8776,114 @@ pub mod test {
                 Some(max_frame)
             );
             assert!((1..=max_frames_compared).contains(&frames_compared()));
+            // Amphora: the checkpointer's list comes from the frames' own list (decision 24); the
+            // scan of every page it falls back on compares as few frames.
             assert_eq!(
                 coordination.iter_latest_frames(min_frame, max_frame),
                 vec![(7, max_frame)]
             );
+            assert_eq!(frames_compared(), 0);
+            assert_eq!(
+                shared
+                    .read()
+                    .runtime
+                    .scan_latest_frames(min_frame, max_frame),
+                vec![(7, max_frame)]
+            );
             assert!((1..=max_frames_compared).contains(&frames_compared()));
         }
+    }
+
+    /// Do: random appends of frames and of packed records, rewinds into frames and records,
+    /// rollbacks and restarts, and after each the latest frames of random ranges. Expect: what a
+    /// scan of every page the log holds finds, the frames' own list answering most of the ranges
+    /// (Amphora's `docs/design/store.md`, decision 24).
+    #[test]
+    fn the_checkpointers_list_is_what_a_scan_of_every_page_finds() {
+        use rand_chacha::{
+            rand_core::{RngCore, SeedableRng},
+            ChaCha8Rng,
+        };
+        let mut listed = 0u64;
+        for seed in 0..20u64 {
+            let shared = WalFileShared::new_noop();
+            let coordination = make_test_coordination(&shared);
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            // The frame the next append goes to.
+            let mut next = 1u64;
+            for _ in 0..400 {
+                match rng.next_u64() % 10 {
+                    0..=5 => {
+                        coordination.cache_frame(rng.next_u64() % 40, next);
+                        next += 1;
+                    }
+                    6 => {
+                        let slots = u32::try_from(1 + rng.next_u64() % 3).unwrap();
+                        let pages: Vec<u64> = (0..1 + rng.next_u64() % 4)
+                            .map(|_| rng.next_u64() % 40)
+                            .collect();
+                        let mut pages = pages.into_iter();
+                        coordination.cache_record(next, slots, &mut pages);
+                        next += u64::from(slots);
+                    }
+                    7 if next > 2 => {
+                        // Slots written again from below the end, by a frame or a record: a
+                        // rewind, which may cut into a record.
+                        next = 1 + rng.next_u64() % (next - 1);
+                        if rng.next_u64() % 2 == 0 {
+                            coordination.cache_frame(rng.next_u64() % 40, next);
+                            next += 1;
+                        } else {
+                            let slots = u32::try_from(1 + rng.next_u64() % 3).unwrap();
+                            let mut pages = [rng.next_u64() % 40, rng.next_u64() % 40].into_iter();
+                            coordination.cache_record(next, slots, &mut pages);
+                            next += u64::from(slots);
+                        }
+                    }
+                    8 if next > 2 => {
+                        let to = rng.next_u64() % (next - 1);
+                        coordination.rollback_cache(to);
+                        next = to + 1;
+                    }
+                    9 if rng.next_u64() % 8 == 0 => {
+                        shared.write().runtime.frame_cache.lock().clear();
+                        shared
+                            .read()
+                            .runtime
+                            .frame_cache_high_water
+                            .store(0, Ordering::Release);
+                        shared.read().runtime.records.lock().clear();
+                        shared.read().runtime.changes.lock().reset();
+                        next = 1;
+                    }
+                    _ => {}
+                }
+                for _ in 0..3 {
+                    let max_frame = rng.next_u64() % (next + 1);
+                    let min_frame = 1 + rng.next_u64() % (max_frame + 1);
+                    let scanned = shared
+                        .read()
+                        .runtime
+                        .scan_latest_frames(min_frame, max_frame);
+                    if shared
+                        .read()
+                        .runtime
+                        .changes
+                        .lock()
+                        .entries(min_frame - 1, max_frame)
+                        .is_some()
+                    {
+                        listed += 1;
+                    }
+                    assert_eq!(
+                        coordination.iter_latest_frames(min_frame, max_frame),
+                        scanned,
+                        "seed {seed}, frames {min_frame}..={max_frame}"
+                    );
+                }
+            }
+        }
+        assert!(listed > 10_000, "the list answered {listed} ranges");
     }
 
     #[test]
