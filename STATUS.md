@@ -79,7 +79,8 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   nested loop's searches of an index the connection's cache holds whole are charged its pages
   once at most (Mackert and Lohman, as PostgreSQL charges an index read over many loops). Of the
   suite's 50 plans only `cte` changes: its grouped rows drive lookups of `owners` by key, instead of
-  every owner probing an index built on them.
+  every owner probing an index built on them. `cte` 218 → 324 statements a second at 1 client and
+  2,372 → 2,904 at 32 (fedora, best of 3 at load under 2, not recorded runs).
 - **Skip-scan** (docs/design/planner.md decision 4, `crates/engine/tests/skip_scan.rs`): a constraint
   on an index's second column alone seeks it once for each value of its first, where ANALYZE
   counted at least 18 rows to a value, as SQLite does. `count_range` 165 → 2,476 statements a

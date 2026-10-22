@@ -208,3 +208,38 @@ fn a_skip_scans_work_grows_with_its_values_not_the_table() {
     let bound = 21 * 20 + 4 * want as u64 + 100;
     assert!(insns < bound, "{insns} instructions, bound {bound}");
 }
+
+/// Do: UPDATE and DELETE through a skip-scan (a column outside the index, the scanned column
+/// itself moved past the range and within it, rows deleted), the same on the unindexed copy.
+/// Expect: the same rows after each, the skip-scan planned for each (AC-T1.1.1).
+#[test]
+fn writes_through_a_skip_scan_change_what_a_scan_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open(dir.path());
+    load(&conn, "t", "INTEGER", "(g, c)", 20_000);
+    conn.execute("ANALYZE").unwrap();
+    let writes = [
+        "UPDATE {t} SET d = d + 100 WHERE c BETWEEN 10 AND 20",
+        "UPDATE {t} SET c = c + 1000 WHERE c BETWEEN 30 AND 40",
+        "UPDATE {t} SET c = c + 1 WHERE c BETWEEN 50 AND 60",
+        "DELETE FROM {t} WHERE c BETWEEN 70 AND 75",
+    ];
+    for write in writes {
+        let shown = plan(&conn, &write.replace("{t}", "t"));
+        assert!(shown.contains("ANY(g)"), "{write}: {shown}");
+        conn.execute(write.replace("{t}", "t")).unwrap();
+        conn.execute(write.replace("{t}", "plain_t")).unwrap();
+        let all = "SELECT id, g, c, d FROM {t} ORDER BY id";
+        assert_eq!(
+            rows(&conn, &all.replace("{t}", "t")),
+            rows(&conn, &all.replace("{t}", "plain_t")),
+            "after {write}"
+        );
+    }
+    let check = "SELECT id FROM t WHERE c BETWEEN 0 AND 2000 ORDER BY id";
+    assert_eq!(
+        rows(&conn, check),
+        rows(&conn, &check.replace(" t ", " plain_t ")),
+        "the index agrees with the table"
+    );
+}

@@ -132,20 +132,22 @@ seek"), its iterations given a 1.375 fudge factor; its code (`codeAllEqualityTer
 value. "The SQLite Query Optimizer Overview", section "The Skip-Scan Optimization": the same
 conditions in words, ANALYZE among them.
 
-**Evidence.** `crates/engine/tests/skip_scan.rs`: after ANALYZE the plan is `SEARCH t USING
-COVERING INDEX t_idx (ANY(g) AND c>=? AND c<=?)`; none before ANALYZE, with a first column all but
-unique, or with the first column constrained. Ten shapes of filter (ranges open and closed, an
-equality, `IS NULL`, an empty range, a residual on the first column) on four tables (an integer
-first column, a case-blind text one, a descending second column, a third column after it), each
-read five ways (rows, aggregates, ordered by the index, ordered by the second column, under a
-LIMIT) and inside a join, read exactly what the same statements read from an unindexed copy; 41
-of them skip-scan. Counting about 530 rows of 30,000 runs fewer than 2,700 instructions, where a
-scan runs some for every row. Four mutants each fail them: the skipped column not matching NULL, a
-seek that finds nothing in one value ending the scan, a range's end ending it, no NULL boundary
-within a value. Release binaries on fedora (200,000 items, best of 3 in turns; load 2–7 from other
-work, so checks, not recorded runs): `count_range` 165 → 2,476 statements a second at 1 client
-(p99 7.4 → 0.47 ms) and 2,644 → 32,892 at 32 (p99 14.8 → 1.5 ms); `range_secondary_100` and
-`order_by_index`, seeks of the same index, unchanged.
+**Evidence.** `crates/engine/tests/skip_scan.rs`: after ANALYZE the plan is `SEARCH t USING COVERING
+INDEX t_idx (ANY(g) AND c>=? AND c<=?)`; none before ANALYZE, with a first column all but unique, or
+with the first column constrained. Ten shapes of filter (ranges open and closed, an equality, `IS
+NULL`, an empty range, a residual on the first column) on four tables (an integer first column, a
+case-blind text one, a descending second column, a third column after it), each read five ways
+(rows, aggregates, ordered by the index, ordered by the second column, under a LIMIT) and inside a
+join, read exactly what the same statements read from an unindexed copy; 41 of them skip-scan.
+UPDATE and DELETE through a skip-scan (of a column outside the index, of the scanned column moved
+past its range and within it, of rows deleted) leave the rows the same writes leave in the unindexed
+copy, the index agreeing with the table after. Counting about 530 rows of 30,000 runs fewer than
+2,700 instructions, where a scan runs some for every row. Four mutants each fail them: the skipped
+column not matching NULL, a seek that finds nothing in one value ending the scan, a range's end
+ending it, no NULL boundary within a value. Release binaries on fedora (200,000 items, best of 3 in
+turns; load 2–7 from other work, so checks, not recorded runs): `count_range` 165 → 2,476 statements
+a second at 1 client (p99 7.4 → 0.47 ms) and 2,644 → 32,892 at 32 (p99 14.8 → 1.5 ms);
+`range_secondary_100` and `order_by_index`, seeks of the same index, unchanged.
 
 **Falsified by.** A row a skip-scan misses or adds; a statement a skip-scan makes slower than the
 scan it replaced (a first column whose values hold few rows each, where ANALYZE's average misleads).
@@ -216,7 +218,10 @@ pages once; with a one-page cache, every search's pages as before (the model's o
 `crates/engine/tests/planner.rs`, `a_grouped_cte_drives_lookups_of_the_owners_it_names`: the CTE,
 and the same subquery in FROM, drive lookups of `owners` by key, and return the rows of the same
 join without a subquery. Of the suite's 50 statements, `--explain` before and after: only `cte`
-changes plan.
+changes plan. Release binaries on fedora (200,000 items, best of 3 in turns, each run started at
+load under 2; checks, not recorded runs): `cte` 218 → 324 statements a second at 1 client and
+2,372 → 2,904 at 32; `order_by_sort` and `group_by_having`, which no plan change touches, about 6%
+faster at 1 client from decision 21 of `store.md`, built into the second binary only.
 
 **Falsified by.** A nested loop the model now prefers that reads more than the plan it replaced;
 an index the cache doesn't hold although the model, counting its pages from its rows, says it does.
