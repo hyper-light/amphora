@@ -12,6 +12,7 @@
 //!
 //! Each run prints one JSON line: throughput and latency percentiles of each part.
 
+mod blink;
 mod clickhouse;
 mod mysql;
 mod pg;
@@ -471,6 +472,10 @@ fn main() -> anyhow::Result<()> {
     // The comprehensive suite: every kind of statement, each on its own (`suite.rs`).
     if std::env::args().any(|a| a == "--suite") {
         return suite::main();
+    }
+    // The versioned storage's B-link tree on its own (`blink.rs`).
+    if std::env::args().any(|a| a == "--blink") {
+        return blink::main();
     }
     let o = opts()?;
     let (k, q) = (o.connections, o.queue);

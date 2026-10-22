@@ -132,6 +132,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   decision 25): past its bound it had passed about 10,000 times a second copying nothing, each pass
   taking locks and lines the writer takes at every commit; a pass that copies nothing now waits for
   the next flush.
+- **Many writers, stage 1** (docs/design/engine.md, `crates/engine/storage/versioned`): B-link
+  trees on one shared buffer pool, in memory: writers on different leaves at once, readers through
+  copies of inner pages validated by version; rows versioned in place (snapshots, first writer
+  wins, rollback, collection by the oldest open snapshot); not yet under the executor. One tree,
+  2,000,000 random keys, unversioned: 660,371 puts a second at one thread, 8.55 million at 32
+  (fedora, a check).
 - **Ephemeral tables kept between runs** (docs/design/executor.md decision 1,
   `crates/engine/tests/ephemeral_reuse.rs`): a statement keeps each ephemeral table of at most 16
   pages (an IN list's keys, an IN subquery's rows) and empties it on its next run, where building
@@ -168,7 +174,7 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   T-T1.1.1's crash injection proves it.
 - **CP-T1.1**: kiln vendors Amphora and its conversation store runs on `amphora::store` in place of its one writer thread; the soak bench for drops (AC-T1.1.5) and the stalled-disk test (T-T1.1.2); the bar measured on a quiet machine, best of 3 (AC-T1.1.2–4), with vanilla Turso, SQLite and Vitess beside Amphora (`bench/`).
 - **CP-T1.2**: Baselines on a quiet machine against SQLite, Postgres 17, Vitess, CockroachDB and TiDB; the research; the client protocol; `docs/design/` written to it.
-- **CP-T1.3**: Turso's MVCC with `BEGIN CONCURRENT` made serializable and production-grade, and the engine multi-writer on it.
+- **CP-T1.3**: many writers on one database: the storage of docs/design/engine.md (in-place versions with undo in one shared buffer pool, B-link trees, row-level redo at commit, serializable by precision locking), built beside the current engine and the default once the suite says so. Turso's MVCC was measured as the way there and set aside: on the whole suite, reads 0.64 times the store's at the median, point reads at 32 clients 0.2 times, 4.5 GB resident against 1.3 (fedora, 2026-10-22, checks).
 
 ## Open
 

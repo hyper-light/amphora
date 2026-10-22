@@ -46,7 +46,7 @@ Kiln vendors it at `vendor/amphora` and reaches it only through kiln-seams' `Rec
 | Decision | Made by | Status |
 |---|---|---|
 | The commit pipeline: adaptive group commit, its batch budget | CP-T1.1, CP-T1.4 | open |
-| The MVCC scheme: SSI or OCC with precision locking | CP-T1.2, CP-T1.3 | open |
+| The MVCC scheme and the storage under it: in-place versions with undo in one shared buffer pool, B-link trees, row-level redo at commit, serializable by precision locking (`engine.md`) | CP-T1.2, CP-T1.3 | made, being built |
 | I/O per platform: io_uring and direct I/O, `F_BARRIERFSYNC`/`F_FULLFSYNC`, `FlushFileBuffers` | CP-T1.4 | open |
 | The client protocol: libSQL's Hrana, the Postgres wire protocol, or both | CP-T1.2 | open |
 | Replication: hyper-raft groups, the Raft log as the write-ahead log, commit classes | CP-T1.8 | open |
