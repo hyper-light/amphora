@@ -833,6 +833,12 @@ impl PageCache {
         self.capacity
     }
 
+    /// Amphora: the pages it holds before a page added to it makes it spill dirty pages into the
+    /// log (Amphora's `docs/design/store.md`, decision 23).
+    pub fn spill_threshold(&self) -> usize {
+        self.spill_threshold
+    }
+
     #[cfg(test)]
     fn verify_cache_integrity(&self) {
         use rustc_hash::FxHashSet as HashSet;

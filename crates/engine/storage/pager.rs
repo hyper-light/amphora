@@ -4106,6 +4106,18 @@ impl Pager {
         private.saturating_add(shared)
     }
 
+    /// Amphora: the pages the transaction under way has written, which its commit writes into the
+    /// log (Amphora's `docs/design/store.md`, decision 23).
+    pub fn dirty_page_count(&self) -> usize {
+        usize::try_from(self.dirty_pages.read().len()).unwrap_or(usize::MAX)
+    }
+
+    /// Amphora: the pages the cache holds before it spills dirty pages into the log mid-transaction
+    /// (decision 23).
+    pub fn pages_before_spill(&self) -> usize {
+        self.page_cache.read().spill_threshold()
+    }
+
     pub fn change_page_cache_size(&self, capacity: usize) -> Result<CacheResizeResult> {
         let mut page_cache = self.page_cache.write();
         Ok(page_cache.resize(capacity))

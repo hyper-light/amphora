@@ -5,8 +5,9 @@
 //! - **amphora**: reads on the store's readers, on what is committed; writes handed to its writer
 //!   (one group: the suite's data isn't split by key), committed with whatever else came, and
 //!   answered once its flusher made them durable. AMPHORA_PACK_LOG=1 packs its log;
-//!   AMPHORA_READER_PAGES sets each reader's page budget; AMPHORA_SHARED_PAGES=<pages> shares
-//!   pages among its connections;
+//!   AMPHORA_READER_PAGES sets each reader's page budget, AMPHORA_WRITER_PAGES its writer's;
+//!   AMPHORA_COMMIT_ROWS the statements a commit takes at most; AMPHORA_SHARED_PAGES=<pages>
+//!   shares pages among its connections;
 //! - **turso**: upstream Turso at 3e09a82 with its defaults, a connection a client;
 //! - **sqlite**: SQLite in WAL with `synchronous = FULL`, a connection a client;
 //! - **postgres**, **orioledb**, **cedardb**: a connection a client, as `pg.rs` sets each up;
@@ -140,6 +141,25 @@ mod amphora_target {
             })
         }
 
+        // As many statements to a commit as the writer's cache holds the pages of (store.md, decision 23).
+        fn apply_batches(&mut self, rows: &[SqlRow], ends: &[usize]) -> anyhow::Result<(usize, usize)> {
+            let mut start = 0;
+            let batches = ends.iter().map(|&end| {
+                let batch = rows.get(start..end).unwrap_or_default();
+                start = end;
+                batch
+            });
+            let mut written = 0;
+            let committed = self.db.transaction_while_room(batches, |db, batch| {
+                for row in batch {
+                    read_all(db, &row.stmts, &row.params)?;
+                }
+                written += batch.len();
+                Ok(())
+            })?;
+            Ok((committed, written))
+        }
+
         fn flusher(&self) -> Option<Flush> {
             Some(self.db.flusher())
         }
@@ -172,6 +192,7 @@ mod amphora_target {
         sql: Arc<Mutex<HashMap<String, &'static str>>>,
         readers: usize,
         reader_pages: Option<i64>,
+        commit_rows: Option<usize>,
     }
 
     fn leak(cache: &Mutex<HashMap<String, &'static str>>, s: &str) -> anyhow::Result<&'static str> {
@@ -195,8 +216,12 @@ mod amphora_target {
             if let Some(pages) = std::env::var("AMPHORA_SHARED_PAGES").ok().and_then(|v| v.parse().ok()) {
                 db.share_pages(pages)?;
             }
+            if let Some(pages) = std::env::var("AMPHORA_WRITER_PAGES").ok().and_then(|v| v.parse().ok()) {
+                db.keep_pages(pages)?;
+            }
             let reader_pages = std::env::var("AMPHORA_READER_PAGES").ok().and_then(|v| v.parse().ok());
-            Ok(Self { loader: Mutex::new(Some(db)), groups: OnceLock::new(), sql: Arc::new(Mutex::new(HashMap::new())), readers: clients.max(1), reader_pages })
+            let commit_rows = std::env::var("AMPHORA_COMMIT_ROWS").ok().and_then(|v| v.parse().ok());
+            Ok(Self { loader: Mutex::new(Some(db)), groups: OnceLock::new(), sql: Arc::new(Mutex::new(HashMap::new())), readers: clients.max(1), reader_pages, commit_rows })
         }
     }
 
@@ -223,7 +248,8 @@ mod amphora_target {
             let db = self.loader.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.take().ok_or_else(|| anyhow::anyhow!("started twice"))?;
             let mut slot = Some(SqlEngine { db, reader_pages: self.reader_pages });
             // As many readers as clients: a read never waits for another's reader.
-            let config = Config { readers: self.readers, ..Config::default() };
+            let defaults = Config::default();
+            let config = Config { readers: self.readers, commit_rows: self.commit_rows.unwrap_or(defaults.commit_rows), ..defaults };
             let groups = Groups::start(1, config, |_| slot.take().ok_or_else(|| anyhow::anyhow!("one group")))?;
             self.groups.set(Arc::new(groups)).map_err(|_| anyhow::anyhow!("started twice"))?;
             Ok(())

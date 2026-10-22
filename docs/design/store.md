@@ -477,6 +477,15 @@ records; with a commit's size on a record's first slot instead of its last (a mu
 10,000 did, and with continuation slots' checksums unchecked in recovery, 60 left a log refused as
 corrupt (so the cuts land inside records).
 
+The comprehensive suite's writes, fedora, 2026-10-22, packed (with deltas) against page-a-frame,
+one binary (4a60ada), each run started at load under 2, one round each (checks, not recorded runs):
+at 32 clients `insert_batch_100` 392 → 44 statements a second (p99 172 → 705 ms),
+`delete_range_insert` 2,800 → 1,011, `update_plain` 7,787 → 6,134, `upsert` 7,531 → 6,288,
+`update_indexed`, `update_text` and `txn_read_write` 12% fewer; at one client `insert_batch_100`
+159 → 96, the single-row writes as before. By the falsifier below it is not the default: packed,
+a statement that writes hundreds of pages waits on something page-a-frame doesn't, the wait not yet
+found above.
+
 **Falsified by.** A row read back other than as written, or an acknowledged batch lost or torn by a
 power cut (`tests/crash.rs`, every other seed packed; `crates/engine/tests/packed_log.rs`); as a
 default, fewer writes a second or longer tails packed than page-a-frame on the comprehensive bench.
@@ -748,3 +757,48 @@ machine with heavy I/O pressure from other work).
 
 **Falsified by.** Counts that differ from one count for the pool; reads slower at 32 clients than
 before, or at one client beyond the spread of runs of one binary.
+
+## 23. A commit ends before its pages outgrow the writer's cache
+
+**Decision.** The writer commits what waits for it in as many commits as its cache holds the pages
+of: a commit takes whole batches, in order, and ends before the next once the pages written so far,
+and as many again as the last batch wrote, would pass the point where the cache spills written pages
+into the log (90% of it); the rest go into the next commit at once (`Engine::apply_batches`,
+`Db::transaction_while_room`). The first batch always goes in, however large. Decision 10's row
+bound stays.
+
+**Why.** A profile of the suite's `insert_batch_100` at 32 clients (a hundred rows of `items`, which
+has four secondary indexes, to a statement): about 24 statements a commit, each commit writing about
+3,400 pages through a writer that keeps 1,024; 13% of the writer's time went to spilling written
+pages into the log mid-commit (to make room for a page a split allocates) and 21% to reading pages
+back. Decision 10's bound counts rows, which for an engine of SQL statements are statements of any
+size: it was meant to keep a commit's pages in the writer's cache, and with statements of a hundred
+rows it doesn't.
+
+**Sources.** SQLite's pager spills dirty pages into the log mid-transaction when its cache is full
+(`pagerStress`, `src/pager.c`; `PRAGMA cache_spill`), and its pages are read back when the
+transaction needs them again; Amphora's engine spills at 90% of its cache
+(`storage/page_cache.rs`). Group commit as in decision 1: what a commit takes is a trade between
+its fixed cost, paid fewer times by larger commits, and the work it causes itself.
+
+**Evidence.** `crates/amphora/tests/store.rs`: ten batches of about 45 pages each handed to a held
+writer that keeps 200 pages are committed in more than one commit and fewer than ten, each batch
+durable and whole; with Amphora's 1,024 pages, in one;
+`a_transaction_over_batches_ends_before_one_its_cache_might_not_hold`: a transaction over such
+batches takes more than one and fewer than ten and commits exactly those, and a first batch larger
+than the cache goes in whole, alone. With the bound left out (a mutant), both fail. Before the
+bound, release binaries of 4a60ada on fedora, `insert_batch_100`, 200,000 items, one round each,
+each run started at load under 2 (checks, not recorded runs): at 32 clients 351 statements a second
+(p99 184 ms, 100 MB resident at most); at two statements to a commit (`AMPHORA_COMMIT_ROWS=2`, a
+stand-in for the bound) 526 (p99 100 ms, 57 MB); keeping 4,096 pages instead, 512 (p99 139 ms,
+114 MB); 16,384 pages, 685 (p99 131 ms, 209 MB), the larger caches slower at one client (196, 159
+and 125 a second). With the bound, against the binary before it, the suite's writes in turns
+(one round each, the binary before twice): at 32 clients `insert_batch_100` 333 and 325 → 456
+statements a second (p99 203 and 197 → 131 ms), `delete_range_insert` 2,841 and 2,764 → 3,136
+(p99 32 and 36 → 19 ms), `update_indexed` 7,145 and 7,170 → 8,486, `insert_one` and
+`txn_read_write` within the runs' spread; peak resident 102 MB → 59 MB, the heap's peak 61 → 21
+MB. With the bound and 4,096 pages kept, `insert_batch_100` 528 at 97 MB resident; the writer
+keeps decision 5's 1,024 pages.
+
+**Falsified by.** A batch committed in parts, or lost; fewer statements a second or longer tails
+with the bound than without on the suite's writes.

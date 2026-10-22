@@ -2860,6 +2860,18 @@ impl Connection {
         self.statement_journals.load(Ordering::SeqCst)
     }
 
+    /// Amphora: the pages the transaction under way has written, which its commit writes into the
+    /// log (Amphora's `docs/design/store.md`, decision 23).
+    pub fn dirty_pages(&self) -> usize {
+        self.pager.load().dirty_page_count()
+    }
+
+    /// Amphora: the pages this connection's cache holds before it spills dirty pages into the log,
+    /// a transaction's pages written twice and read back (decision 23).
+    pub fn pages_before_spill(&self) -> usize {
+        self.pager.load().pages_before_spill()
+    }
+
     /// Clear the poison marker after BEGIN, COMMIT, or ROLLBACK.
     pub(crate) fn clear_tx_poison(&self) {
         self.poisoned_tx.store(false, Ordering::SeqCst);

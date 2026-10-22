@@ -313,6 +313,35 @@ impl Db {
         }
         done
     }
+
+    /// `f` on each of `batches`, in order, in one transaction ([`Db::transaction`]) that ends
+    /// before a batch its cache might not hold: once the pages written so far, and as many again
+    /// as the last batch wrote, pass what the cache holds before it spills written pages into the
+    /// log (docs/design/store.md, decision 23). The first batch always goes in. How many it
+    /// committed: the rest are the caller's to hand to the next.
+    pub fn transaction_while_room<B>(
+        &mut self,
+        batches: impl IntoIterator<Item = B>,
+        mut f: impl FnMut(&mut Self, B) -> anyhow::Result<()>,
+    ) -> anyhow::Result<usize> {
+        self.transaction(|db| {
+            let mut done = 0usize;
+            let mut last = 0usize;
+            for batch in batches {
+                if done > 0 {
+                    let written = db.conn.dirty_pages();
+                    let grew = written.saturating_sub(last);
+                    if written.saturating_add(grew) > db.conn.pages_before_spill() {
+                        break;
+                    }
+                    last = written;
+                }
+                f(db, batch)?;
+                done = done.saturating_add(1);
+            }
+            Ok(done)
+        })
+    }
 }
 
 /// Runs `stmt` with `params` to its end, handing each row to `each` until it says stop (false).

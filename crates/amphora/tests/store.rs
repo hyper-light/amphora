@@ -47,19 +47,24 @@ impl Engine for Events {
     }
 
     fn apply(&mut self, rows: &[Row]) -> anyhow::Result<usize> {
-        let n = rows.len();
-        self.db.transaction(|db| {
-            for r in rows {
-                let params = [
-                    Value::from_text(r.key.clone()),
-                    Value::from_i64(r.seq),
-                    Value::from_text(r.text.clone()),
-                ];
-                db.query(INSERT, params, |_| Ok(true))?;
-            }
+        self.db.transaction(|db| insert(db, rows))?;
+        Ok(rows.len())
+    }
+
+    fn apply_batches(&mut self, rows: &[Row], ends: &[usize]) -> anyhow::Result<(usize, usize)> {
+        let mut start = 0;
+        let batches = ends.iter().map(|&end| {
+            let batch = &rows[start..end];
+            start = end;
+            batch
+        });
+        let mut written = 0;
+        let committed = self.db.transaction_while_room(batches, |db, batch| {
+            insert(db, batch)?;
+            written += batch.len();
             Ok(())
         })?;
-        Ok(n)
+        Ok((committed, written))
     }
 
     fn flusher(&self) -> Option<Flush> {
@@ -87,6 +92,18 @@ impl Engine for Events {
     }
 }
 
+fn insert(db: &mut Db, rows: &[Row]) -> anyhow::Result<()> {
+    for r in rows {
+        let params = [
+            Value::from_text(r.key.clone()),
+            Value::from_i64(r.seq),
+            Value::from_text(r.text.clone()),
+        ];
+        db.query(INSERT, params, |_| Ok(true))?;
+    }
+    Ok(())
+}
+
 fn count_on(db: &mut Db, key: &str) -> anyhow::Result<i64> {
     let mut n = 0;
     db.query(COUNT, [Value::from_text(key.to_owned())], |r| {
@@ -104,9 +121,17 @@ struct Lab {
 }
 
 fn lab(config: Config, flush: Option<Flush>) -> Lab {
+    lab_keeping(config, flush, None)
+}
+
+/// A lab whose writer keeps `pages` pages in memory (None: Amphora's default).
+fn lab_keeping(config: Config, flush: Option<Flush>, pages: Option<i64>) -> Lab {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.db");
     let db = Db::open(&path).unwrap();
+    if let Some(pages) = pages {
+        db.keep_pages(pages).unwrap();
+    }
     // A row of negative seq can't be written: a batch that holds one fails.
     db.exec("CREATE TABLE events (key TEXT, seq INTEGER CHECK (seq >= 0), text TEXT); CREATE INDEX by_key ON events (key, seq)")
         .unwrap();
@@ -337,6 +362,103 @@ fn a_batch_that_fails_is_refused_to_its_sender_and_the_rest_of_its_commit_is_kep
     assert_eq!(count(&lab.store, "a"), 2);
     assert_eq!(count(&lab.store, "b"), 1);
     assert_eq!(lab.store.counters().failed, 1);
+}
+
+/// Do: hand ten batches to a held writer, each a key's 400 rows of 400 bytes (about 45 pages of
+/// the table), the writer keeping 200 pages (the fewest a cache keeps). Expect: more than one
+/// commit and fewer than ten, each batch durable and whole; with Amphora's default pages, one
+/// commit (docs/design/store.md, decision 23; AC-T1.1.1).
+#[test]
+fn batches_that_outgrow_the_writers_cache_take_more_than_one_commit_each_whole() {
+    for (pages, one_commit) in [(Some(200), false), (None, true)] {
+        // No row bound in the way: the commits are cut by pages alone.
+        let config = Config {
+            commit_rows: 100_000,
+            ..Config::default()
+        };
+        let lab = lab_keeping(config, None, pages);
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let busy = lab.store.clone();
+        let job = std::thread::spawn(move || {
+            busy.run(soon(), move |_| {
+                held_tx.send(()).unwrap();
+                go_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                Ok(())
+            })
+        });
+        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let tickets: Vec<_> = (0..10)
+            .map(|b| {
+                let key = format!("k{b}");
+                let rows = (0..400)
+                    .map(|seq| Row {
+                        key: key.clone(),
+                        seq,
+                        text: "x".repeat(400),
+                    })
+                    .collect();
+                lab.store.put(rows).unwrap()
+            })
+            .collect();
+        go_tx.send(()).unwrap();
+        job.join().unwrap().unwrap();
+        for t in &tickets {
+            assert_eq!(lab.store.durable(t, soon()), Ok(()));
+        }
+        for b in 0..10 {
+            assert_eq!(count(&lab.store, &format!("k{b}")), 400, "batch {b}");
+        }
+        let commits = lab.store.counters().commits;
+        if one_commit {
+            assert_eq!(commits, 1, "a cache that holds them all");
+        } else {
+            assert!((2..10).contains(&commits), "{commits} commits");
+        }
+    }
+}
+
+/// Do: a transaction over ten batches of about 45 pages each, the connection keeping 200 pages
+/// (the fewest a cache keeps); then one over batches whose first alone outgrows the cache. Expect:
+/// the first takes more than one batch and fewer than ten and commits exactly those; the second
+/// takes its first batch whole, alone (docs/design/store.md, decision 23).
+#[test]
+fn a_transaction_over_batches_ends_before_one_its_cache_might_not_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Db::open(&dir.path().join("t.db")).unwrap();
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, text TEXT)")
+        .unwrap();
+    db.keep_pages(200).unwrap();
+    let text = "x".repeat(400);
+    let mut id = 0;
+    let mut rows_of = |db: &mut Db, n: i64| -> anyhow::Result<()> {
+        for _ in 0..n {
+            id += 1;
+            let params = [Value::from_i64(id), Value::from_text(text.clone())];
+            db.query("INSERT INTO t VALUES (?1, ?2)", params, |_| Ok(true))?;
+        }
+        Ok(())
+    };
+    let count = |db: &mut Db| {
+        let mut n = 0;
+        db.query("SELECT count(*) FROM t", [], |r| {
+            n = r.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(true)
+        })
+        .unwrap();
+        n
+    };
+    let taken = db
+        .transaction_while_room(0..10, |db, _| rows_of(db, 400))
+        .unwrap();
+    assert!((2..10).contains(&taken), "{taken} batches");
+    assert_eq!(count(&mut db), 400 * i64::try_from(taken).unwrap());
+    let before = count(&mut db);
+    let taken = db
+        .transaction_while_room([5_000, 100, 100], |db, n| rows_of(db, n))
+        .unwrap();
+    assert_eq!(taken, 1);
+    assert_eq!(count(&mut db), before + 5_000);
 }
 
 /// The writer keeps no statement journal, so a statement that fails after writing can't be undone

@@ -48,6 +48,20 @@ pub trait Engine: Send + 'static {
     /// the store's: a commit that fails is tried again with fewer of them.
     fn apply(&mut self, rows: &[Self::Row]) -> anyhow::Result<usize>;
 
+    /// The rows of whole batches (batch `i`'s end in `rows` at `ends[i]`), as many from the first
+    /// as one commit of the engine holds, at least one, in one transaction: how many batches it
+    /// committed and how many rows it wrote. The rest are handed to it again. By default all of
+    /// them, as [`Engine::apply`] commits them; an engine whose commit outgrows its memory takes
+    /// fewer (docs/design/store.md, decision 23).
+    fn apply_batches(
+        &mut self,
+        rows: &[Self::Row],
+        ends: &[usize],
+    ) -> anyhow::Result<(usize, usize)> {
+        let written = self.apply(rows)?;
+        Ok((ends.len(), written))
+    }
+
     /// How what it committed is flushed beside its writer (None: a commit is durable as it ends).
     fn flusher(&self) -> Option<Flush> {
         None
@@ -111,7 +125,8 @@ pub enum ForReaders {
 pub struct Config {
     /// Batches of rows waiting for the writer, at most.
     pub queue: usize,
-    /// Rows that make a commit at once, however many more wait.
+    /// Rows that make a commit at once, however many more wait. A commit of fewer rows still ends
+    /// where its engine's commit is full (decision 23).
     pub commit_rows: usize,
     /// Reading connections, at most.
     pub readers: usize,
@@ -1235,8 +1250,9 @@ struct Batch {
 }
 
 /// The writer: rows are committed as soon as nothing else waits in the queue (or at the commit's
-/// row bound), so what came while it committed shares the next commit; a job commits what waits
-/// first, so it sees everything sent before it. A commit that fails is tried again batch by batch.
+/// row bound), so what came while it committed shares the next commit, in as many commits as the
+/// engine needs to hold them (decision 23); a job commits what waits first, so it sees everything
+/// sent before it. A commit that fails is tried again batch by batch.
 fn writer<E: Engine>(
     mut engine: E,
     rx: &mpsc::Receiver<Msg<E>>,
@@ -1258,41 +1274,62 @@ fn writer<E: Engine>(
         if batches.is_empty() {
             return;
         }
-        let mut apply = |rows: &[E::Row], commits: &mut u64| {
-            let began = Instant::now();
-            let applied = engine.apply(rows);
-            if let Ok(n) = applied {
-                *commits = commits.saturating_add(1);
-                meter.committed(n, began.elapsed());
-                notify(watchers);
-            }
-            applied.map(|_| *commits)
+        // A commit made: counted, its watchers told; its number, for its batches' fates.
+        let made = |commits: &mut u64, written: usize, began: Instant| {
+            *commits = commits.saturating_add(1);
+            meter.committed(written, began.elapsed());
+            notify(watchers);
+            *commits
         };
-        match apply(pending, commits) {
-            Ok(commit) => {
-                for b in batches.iter() {
-                    b.fate.state.store(commit, Ordering::Release);
-                }
-            }
-            Err(e) => {
-                tracing::warn!(target: "amphora.store", event = "commit_failed", error = %format!("{e:#}"), batches = batches.len(), "a commit failed; its batches are tried one by one");
-                // Each batch alone: one that can't be committed takes no other with it.
-                let mut start = 0;
-                for b in batches.iter() {
-                    let rows = pending.get(start..b.end).unwrap_or_default();
-                    start = b.end;
-                    match apply(rows, commits) {
-                        Ok(commit) => b.fate.state.store(commit, Ordering::Release),
-                        Err(e) => {
-                            b.fate.state.store(FAILED, Ordering::Release);
-                            let failed = meter.failed();
-                            if failed.is_power_of_two() {
-                                tracing::warn!(target: "amphora.store", event = "batch_failed", error = %format!("{e:#}"), failed, "a batch couldn't be committed; its sender is told");
+        // The batches in as few commits as the engine takes them in (decision 23): `from` the
+        // first batch not committed yet, `start` its first row.
+        let (mut from, mut start) = (0usize, 0usize);
+        while let Some(rest) = batches.get(from..).filter(|rest| !rest.is_empty()) {
+            let ends: Vec<usize> = rest.iter().map(|b| b.end.saturating_sub(start)).collect();
+            let began = Instant::now();
+            let failure = match engine
+                .apply_batches(pending.get(start..).unwrap_or_default(), &ends)
+            {
+                Ok((n, written)) => {
+                    let n = n.min(rest.len());
+                    match n.checked_sub(1).and_then(|last| rest.get(last)) {
+                        Some(last) => {
+                            let commit = made(commits, written, began);
+                            for b in rest.iter().take(n) {
+                                b.fate.state.store(commit, Ordering::Release);
                             }
+                            start = last.end;
+                            from = from.saturating_add(n);
+                            continue;
+                        }
+                        None => {
+                            anyhow::anyhow!("the engine committed none of {} batches", rest.len())
+                        }
+                    }
+                }
+                Err(e) => e,
+            };
+            tracing::warn!(target: "amphora.store", event = "commit_failed", error = %format!("{failure:#}"), batches = rest.len(), "a commit failed; its batches are tried one by one");
+            // Each batch alone: one that can't be committed takes no other with it.
+            for b in rest {
+                let rows = pending.get(start..b.end).unwrap_or_default();
+                start = b.end;
+                let began = Instant::now();
+                match engine.apply(rows) {
+                    Ok(written) => {
+                        let commit = made(commits, written, began);
+                        b.fate.state.store(commit, Ordering::Release);
+                    }
+                    Err(e) => {
+                        b.fate.state.store(FAILED, Ordering::Release);
+                        let failed = meter.failed();
+                        if failed.is_power_of_two() {
+                            tracing::warn!(target: "amphora.store", event = "batch_failed", error = %format!("{e:#}"), failed, "a batch couldn't be committed; its sender is told");
                         }
                     }
                 }
             }
+            break;
         }
         pending.clear();
         // Senders to tell once their batches are durable, or that they failed.

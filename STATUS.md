@@ -52,7 +52,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   the committed tree: nothing lost (2026-10-20); the engine's tests include a model test of
   savepoints rolled back amid spills. On the bench so far it cost writes at 32 writers (6,216 and
   5,887 a second against 7,903, `bench/records/2026-10-20-fedora-packed-log.jsonl`), so it isn't the
-  default until the comprehensive bench shows where it helps.
+  default until the comprehensive bench shows where it helps. The comprehensive bench shows where it
+  hurts: statements that write hundreds of pages, `insert_batch_100` at 32 clients 392 → 44 a
+  second, `delete_range_insert` 2,800 → 1,011 (fedora, 2026-10-22, checks); single-row writes as
+  before.
 - **The planner where the suite found it choosing far more work** (docs/design/planner.md,
   `crates/engine/tests/planner.rs`): a closed range with unknown bounds is 0.5% of its table whether
   it drives a seek or filters one, so a join from a key range looks each row's partner up by key; a
@@ -114,6 +117,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   read from the file goes straight into the cache, recorded for a resumed call only when a spill
   holds it up; every read had taken two write locks and a hash insert and remove. Whole scans
   5–7% faster (a probe of the engine on fedora, checks).
+- **A commit ends before its pages outgrow the writer's cache** (docs/design/store.md decision 23):
+  the writer takes whole batches into a commit until the next might make its cache spill written
+  pages into the log, and commits the rest at once after (`Engine::apply_batches`,
+  `Db::transaction_while_room`); statements of a hundred rows had made commits of 3,400 pages
+  through a 1,024-page cache. At 32 clients `insert_batch_100` 333 → 456 statements a second (p99
+  203 → 131 ms), `delete_range_insert` 2,841 → 3,136, peak resident 102 → 59 MB (fedora, checks).
 - **Ephemeral tables kept between runs** (docs/design/executor.md decision 1,
   `crates/engine/tests/ephemeral_reuse.rs`): a statement keeps each ephemeral table of at most 16
   pages (an IN list's keys, an IN subquery's rows) and empties it on its next run, where building
