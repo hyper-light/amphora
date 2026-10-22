@@ -457,6 +457,29 @@ impl Sends {
         self.noticed.notify_all();
     }
 
+    /// The commits durable so far, once more than `seen` are, or `most` has passed, or the store
+    /// stops or its disk failed: what a checkpointer that copied everything durable waits for
+    /// (decision 25).
+    fn flushed_past(&self, seen: u64, most: Duration) -> u64 {
+        let began = Instant::now();
+        let mut durable = locked(&self.durable);
+        while durable.commits <= seen
+            && !self.stopping.load(Ordering::Relaxed)
+            && !self.disk_failed.load(Ordering::SeqCst)
+        {
+            let left = most.saturating_sub(began.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            durable = self
+                .flushed
+                .wait_timeout(durable, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        durable.commits
+    }
+
     /// The batches of a commit (numbered `commit`, or none: it failed) that have a sender to tell.
     fn to_tell(&self, fates: impl Iterator<Item = (Arc<Fate>, Option<u64>)>) {
         let mut notices = locked(&self.notices);
@@ -800,6 +823,7 @@ impl<R: Send + 'static> Readers<R> {
         checkpoint: fn(&mut R) -> anyhow::Result<Checkpointed>,
         every: Duration,
         bound: u64,
+        sends: Arc<Sends>,
     ) {
         *locked(&self.open) = Some(open.clone());
         let checkpointer = match open() {
@@ -811,20 +835,31 @@ impl<R: Send + 'static> Readers<R> {
                     .name("amphora-checkpoint".into())
                     .spawn(move || {
                         let mut failures = 0u64;
-                        // Past its bound, the log is copied without pausing.
+                        // Past its bound, the log is copied without pausing, until a pass copies
+                        // nothing new: only what a flush made durable is copied (decision 15), so
+                        // the next pass waits for a flush (decision 25).
                         let mut draining = false;
+                        let mut caught_up = false;
+                        // The frames the last pass left copied, and the commits durable then.
+                        let mut copied_through: Option<u64> = None;
+                        let mut durable = 0u64;
                         let drained = (bound / 64).max(1);
-                        // A restart asked for is the writer's to make: no pass holds it up.
-                        let pause = |draining: bool| {
-                            if draining && !restart.load(Ordering::Relaxed) {
-                                Duration::ZERO
-                            } else {
+                        loop {
+                            // A restart asked for is the writer's to make: no pass holds it up.
+                            let pause = if !draining || restart.load(Ordering::Relaxed) {
                                 every
+                            } else {
+                                if caught_up {
+                                    durable = sends.flushed_past(durable, every);
+                                }
+                                Duration::ZERO
+                            };
+                            if !matches!(
+                                rx.recv_timeout(pause),
+                                Err(mpsc::RecvTimeoutError::Timeout)
+                            ) {
+                                break;
                             }
-                        };
-                        while let Err(mpsc::RecvTimeoutError::Timeout) =
-                            rx.recv_timeout(pause(draining))
-                        {
                             let _copying = gate.read().unwrap_or_else(PoisonError::into_inner);
                             let began = Instant::now();
                             let copied = checkpoint(&mut reader);
@@ -832,6 +867,9 @@ impl<R: Send + 'static> Readers<R> {
                             match copied {
                                 Ok(c) => {
                                     draining = c.log > bound;
+                                    let through = c.log.saturating_sub(c.left);
+                                    caught_up = copied_through == Some(through);
+                                    copied_through = Some(through);
                                     // What the writer's restart copies is what is left, and what
                                     // was committed since.
                                     if draining
@@ -842,6 +880,7 @@ impl<R: Send + 'static> Readers<R> {
                                 }
                                 Err(e) => {
                                     draining = false;
+                                    caught_up = false;
                                     failures = failures.saturating_add(1);
                                     if failures.is_power_of_two() {
                                         tracing::warn!(target: "amphora.store", event = "checkpoint_failed", error = %format!("{e:#}"), failures, "the log couldn't be copied into the file");
@@ -998,6 +1037,7 @@ impl<E: Engine> Store<E> {
                 E::checkpoint,
                 config.checkpoint_every,
                 config.log_frames,
+                sends.clone(),
             );
         }
         match flush.or_else(|| engine.flusher()) {
@@ -1259,7 +1299,7 @@ fn writer<E: Engine>(
     config: &Config,
     meter: &Meter,
     watchers: &Mutex<Vec<Watcher>>,
-    sends: &Sends,
+    sends: &Arc<Sends>,
     readers: &Readers<E::Reader>,
 ) {
     let mut pending: Vec<E::Row> = Vec::new();
@@ -1411,6 +1451,7 @@ fn writer<E: Engine>(
                                 E::checkpoint,
                                 config.checkpoint_every,
                                 config.log_frames,
+                                sends.clone(),
                             );
                         }
                     }

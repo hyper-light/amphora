@@ -832,3 +832,32 @@ frames to copy now searches no page's frames
 
 **Falsified by.** A checkpoint that copies a page at other than its latest frame in its range, or
 misses one; checkpoints that list their pages slower than the scan did.
+
+## 25. A checkpointer that copied everything durable waits for a flush
+
+**Decision.** Past its bound the checkpointer passes without pausing only while its passes copy
+something. A pass that copies nothing new (it copies only what a flush made durable, decision 15)
+makes the next wait until a flush makes more durable, or a checkpoint period passes, or the store
+stops (`Sends::flushed_past`, on the condition variable the flusher already signals at every
+flush).
+
+**Why.** With decisions 23 and 24, a profile of the suite's `insert_batch_100` at 32 clients: the
+checkpointer passed about 10,000 times a second (784,505 times in a 70-second run of five
+statements), nearly every pass copying nothing, each taking the gate, the log's coordination locks
+and its file's reference count, lines the writer takes at every commit and page read. The
+checkpointer's samples rose to 923, a third of the writer's, 18% of them on the log file's reference
+count alone; and with decision 24's spinning gone (0 samples, from 5.4% of the writer's time), the
+writer wrote no faster (`insert_batch_100` 448 and 399 statements a second against 456–463).
+
+**Sources.** Decision 15: nothing that isn't durable is copied, so until a flush ends a pass has
+nothing new to copy. Decision 4: past its bound, passes without pause keep what a restart must
+copy small; a pass that copies something is still followed by the next at once.
+
+**Evidence.** `crates/amphora/tests/store.rs`,
+`a_checkpointer_with_nothing_durable_to_copy_waits_for_a_flush`: with flushes held and the log
+past its bound and short of twice it, at most ten passes in 500 ms (the test's checkpoint period
+100 ms), every row durable and read back once the flushes go; with the wait left out (a mutant),
+135,526 passes in those 500 ms.
+
+**Falsified by.** A log that stays longer past its bound (its restarts later or fewer) or writes
+slower than with passes without pause.

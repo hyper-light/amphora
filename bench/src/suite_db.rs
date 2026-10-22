@@ -58,13 +58,14 @@ pub fn open(target: &str, dir: &str, dsn: Option<&str>, clients: usize) -> anyho
     Ok(match target {
         "amphora" => Arc::new(Amphora::open(dir, clients)?),
         "turso" => Arc::new(Turso::open(dir)?),
+        "mvcc" => Arc::new(mvcc_target::Mvcc::open(dir)?),
         "sqlite" => Arc::new(Sqlite::open(dir)?),
         "postgres" => Arc::new(Pg::open(&dsn("postgres://postgres@127.0.0.1:55432/postgres"), PgKind::Postgres)?),
         "orioledb" => Arc::new(Pg::open(&dsn("postgres://postgres@127.0.0.1:55433/postgres"), PgKind::Orioledb)?),
         "cedardb" => Arc::new(Pg::open(&dsn("postgres://postgres:amphorabenchlocalonly2026@127.0.0.1:55434/postgres"), PgKind::Cedardb)?),
         "mysql" => Arc::new(MySql::open(&dsn("mysql://root@127.0.0.1:33306/convo"), clients + 4)?),
         "clickhouse" => Arc::new(ClickHouse::open(&dsn("http://127.0.0.1:58123"), clients + 4)?),
-        t => anyhow::bail!("the suite has no target {t} (amphora, turso, sqlite, postgres, orioledb, cedardb, mysql, clickhouse)"),
+        t => anyhow::bail!("the suite has no target {t} (amphora, mvcc, turso, sqlite, postgres, orioledb, cedardb, mysql, clickhouse)"),
     })
 }
 
@@ -327,6 +328,201 @@ mod amphora_target {
 }
 
 use amphora_target::Amphora;
+
+// ---------------------------------------------------------------------------------------------
+// Amphora's engine in MVCC (`PRAGMA journal_mode = 'mvcc'`): a connection a client, every write in
+// `BEGIN CONCURRENT`, tried again when it conflicts with another, every commit flushed
+// (`synchronous = FULL`). Measures the engine's concurrent writers on their own, without the store.
+
+mod mvcc_target {
+    use super::*;
+    use amphora_engine::{ConnectOpts, Connection, Database, DatabaseOpts, IO, LimboError, OpenOptions, PlatformIO, SqliteDialect, Statement, StepResult, Value};
+
+    pub struct Mvcc {
+        io: Arc<dyn IO>,
+        db: Arc<Database>,
+    }
+
+    impl Mvcc {
+        pub fn open(dir: &str) -> anyhow::Result<Self> {
+            let path = fresh(dir)?;
+            let name = path.to_str().ok_or_else(|| anyhow::anyhow!("a path that isn't UTF-8"))?;
+            let io: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(|e| anyhow::anyhow!("{e}"))?);
+            let db = Database::open(io.clone(), name, OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new())).map_err(|e| anyhow::anyhow!("{e}"))?;
+            // AMPHORA_MVCC_CHECKPOINT_MS: commits never checkpoint; a thread of its own does, this
+            // often (unset: each commit past the log's threshold checkpoints, as the engine ships).
+            let background = std::env::var("AMPHORA_MVCC_CHECKPOINT_MS").ok().and_then(|v| v.parse().ok()).map(Duration::from_millis);
+            let m = Self { io, db };
+            let mut s = m.connect()?;
+            let mut rows = 0;
+            if let Err(Retry) = s.step("PRAGMA journal_mode = 'mvcc'", &[], &mut rows)? {
+                anyhow::bail!("couldn't turn MVCC on");
+            }
+            if let Some(every) = background {
+                if let Err(Retry) = s.step("PRAGMA mvcc_checkpoint_threshold = -1", &[], &mut rows)? {
+                    anyhow::bail!("couldn't turn inline checkpoints off");
+                }
+                let mut c = m.connect()?;
+                std::thread::Builder::new().name("mvcc-checkpoint".into()).spawn(move || {
+                    loop {
+                        std::thread::sleep(every);
+                        let mut rows = 0;
+                        if let Err(e) = c.step("PRAGMA wal_checkpoint(TRUNCATE)", &[], &mut rows) {
+                            eprintln!("mvcc checkpoint: {e:#}");
+                        }
+                    }
+                })?;
+            }
+            Ok(m)
+        }
+
+        fn connect(&self) -> anyhow::Result<MvccSession> {
+            let conn = self.db.connect(ConnectOpts::new()).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let mut s = MvccSession { io: self.io.clone(), conn, stmts: HashMap::new() };
+            let mut rows = 0;
+            if let Err(Retry) = s.step("PRAGMA synchronous = FULL", &[], &mut rows)? {
+                anyhow::bail!("couldn't set synchronous");
+            }
+            Ok(s)
+        }
+    }
+
+    impl Target for Mvcc {
+        fn dialect(&self) -> Dialect {
+            Dialect::Sqlite
+        }
+
+        fn setup(&self, stmts: &[(String, Vec<P>)]) -> anyhow::Result<()> {
+            let mut s = self.connect()?;
+            let sql: Vec<String> = stmts.iter().map(|(s, _)| s.clone()).collect();
+            let params: Vec<Vec<P>> = stmts.iter().map(|(_, p)| p.clone()).collect();
+            s.transaction("BEGIN", &sql, &params)
+        }
+
+        fn session(&self) -> anyhow::Result<Box<dyn Session>> {
+            Ok(Box::new(self.connect()?))
+        }
+    }
+
+    pub struct MvccSession {
+        io: Arc<dyn IO>,
+        conn: Arc<Connection>,
+        stmts: HashMap<String, Statement>,
+    }
+
+    /// A statement that met another writer (a conflict, a busy database): the transaction goes again.
+    struct Retry;
+
+    impl MvccSession {
+        fn step(&mut self, sql: &str, params: &[P], rows: &mut usize) -> anyhow::Result<Result<(), Retry>> {
+            if !self.stmts.contains_key(sql) {
+                let stmt = self.conn.prepare(sql).map_err(|e| anyhow::anyhow!("{e}"))?;
+                self.stmts.insert(sql.to_owned(), stmt);
+            }
+            let io = self.io.clone();
+            let stmt = self.stmts.get_mut(sql).ok_or_else(|| anyhow::anyhow!("lost a statement"))?;
+            stmt.reset().map_err(|e| anyhow::anyhow!("{e}"))?;
+            for (i, p) in params.iter().enumerate() {
+                stmt.bind_at(NonZero::new(i + 1).ok_or_else(|| anyhow::anyhow!("parameter 0"))?, value(p)).map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            loop {
+                match stmt.step() {
+                    Ok(StepResult::Row) => {
+                        if let Some(r) = stmt.row() {
+                            for v in r.get_values() {
+                                std::hint::black_box(v);
+                            }
+                        }
+                        *rows += 1;
+                    }
+                    Ok(StepResult::Done) => return Ok(Ok(())),
+                    Ok(StepResult::IO | StepResult::Yield) => io.step().map_err(|e| anyhow::anyhow!("{e}"))?,
+                    Ok(StepResult::Sleep { duration }) => {
+                        std::thread::sleep(duration);
+                        io.step().map_err(|e| anyhow::anyhow!("{e}"))?;
+                    }
+                    Ok(StepResult::Busy) => return Ok(Err(Retry)),
+                    Err(e) if matches!(e, LimboError::Busy | LimboError::BusySnapshot | LimboError::WriteWriteConflict | LimboError::CommitDependencyAborted | LimboError::TxTerminated) => return Ok(Err(Retry)),
+                    Ok(StepResult::Interrupt) => anyhow::bail!("interrupted"),
+                    Err(e) => return Err(anyhow::anyhow!("{e}")),
+                }
+            }
+        }
+
+        /// `stmts` in one transaction begun by `begin`, tried again while it meets another writer.
+        fn transaction(&mut self, begin: &str, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<()> {
+            let began = Instant::now();
+            loop {
+                let mut rows = 0;
+                let attempt = (|| -> anyhow::Result<Result<(), Retry>> {
+                    if let Err(r) = self.step(begin, &[], &mut rows)? {
+                        return Ok(Err(r));
+                    }
+                    for (s, p) in stmts.iter().zip(params) {
+                        if let Err(r) = self.step(s, p, &mut rows)? {
+                            return Ok(Err(r));
+                        }
+                    }
+                    self.step("COMMIT", &[], &mut rows)
+                })();
+                match attempt {
+                    Ok(Ok(())) => return Ok(()),
+                    Ok(Err(Retry)) => {
+                        if !self.conn.get_auto_commit() {
+                            let _ = self.step("ROLLBACK", &[], &mut rows);
+                        }
+                        if began.elapsed() > WAIT {
+                            anyhow::bail!("the transaction kept meeting other writers");
+                        }
+                    }
+                    Err(e) => {
+                        if !self.conn.get_auto_commit() {
+                            let _ = self.step("ROLLBACK", &[], &mut rows);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    fn value(p: &P) -> Value {
+        match p {
+            P::I(i) => Value::from_i64(*i),
+            P::F(f) => Value::from_f64(*f),
+            P::T(s) => Value::from_text(s.clone()),
+            P::B(b) => Value::from_slice(b).unwrap_or(Value::Null),
+            P::Z(z) => Value::from_i64(i64::from(*z)),
+            P::N => Value::Null,
+        }
+    }
+
+    impl Session for MvccSession {
+        fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize> {
+            match kind {
+                Kind::Write => {
+                    self.transaction("BEGIN CONCURRENT", stmts, params)?;
+                    Ok(0)
+                }
+                _ => {
+                    let began = Instant::now();
+                    'again: loop {
+                        let mut rows = 0;
+                        for (s, p) in stmts.iter().zip(params) {
+                            if let Err(Retry) = self.step(s, p, &mut rows)? {
+                                if began.elapsed() > WAIT {
+                                    anyhow::bail!("the database stayed busy");
+                                }
+                                continue 'again;
+                            }
+                        }
+                        return Ok(rows);
+                    }
+                }
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------------------------
 // Turso (upstream)

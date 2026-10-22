@@ -128,6 +128,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   scanned every page the log holds under the lock each page read from the log takes; the scan stays
   for ranges the list doesn't hold. A model test checks the list against the scan over random
   appends, packed records, rewinds, rollbacks and restarts.
+- **A checkpointer that copied everything durable waits for a flush** (docs/design/store.md
+  decision 25): past its bound it had passed about 10,000 times a second copying nothing, each pass
+  taking locks and lines the writer takes at every commit; a pass that copies nothing now waits for
+  the next flush.
 - **Ephemeral tables kept between runs** (docs/design/executor.md decision 1,
   `crates/engine/tests/ephemeral_reuse.rs`): a statement keeps each ephemeral table of at most 16
   pages (an IN list's keys, an IN subquery's rows) and empties it on its next run, where building

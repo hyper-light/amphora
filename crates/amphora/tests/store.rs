@@ -121,11 +121,16 @@ struct Lab {
 }
 
 fn lab(config: Config, flush: Option<Flush>) -> Lab {
-    lab_keeping(config, flush, None)
+    lab_keeping(config, |_| flush, None)
 }
 
-/// A lab whose writer keeps `pages` pages in memory (None: Amphora's default).
-fn lab_keeping(config: Config, flush: Option<Flush>, pages: Option<i64>) -> Lab {
+/// A lab whose writer keeps `pages` pages in memory (None: Amphora's default), flushed as `flush`
+/// says given the database (None: the engine's own flusher).
+fn lab_keeping(
+    config: Config,
+    flush: impl FnOnce(&Db) -> Option<Flush>,
+    pages: Option<i64>,
+) -> Lab {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.db");
     let db = Db::open(&path).unwrap();
@@ -135,6 +140,7 @@ fn lab_keeping(config: Config, flush: Option<Flush>, pages: Option<i64>) -> Lab 
     // A row of negative seq can't be written: a batch that holds one fails.
     db.exec("CREATE TABLE events (key TEXT, seq INTEGER CHECK (seq >= 0), text TEXT); CREATE INDEX by_key ON events (key, seq)")
         .unwrap();
+    let flush = flush(&db);
     let next = Arc::new(std::sync::Mutex::new(Vec::new()));
     let engine = Events {
         db,
@@ -376,7 +382,7 @@ fn batches_that_outgrow_the_writers_cache_take_more_than_one_commit_each_whole()
             commit_rows: 100_000,
             ..Config::default()
         };
-        let lab = lab_keeping(config, None, pages);
+        let lab = lab_keeping(config, |_| None, pages);
         let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
         let busy = lab.store.clone();
@@ -577,6 +583,63 @@ fn the_log_stays_bounded_under_writes_and_reads_that_never_pause() {
     assert_eq!(count(&lab.store, "a"), 4000);
     // 256 frames of 4 KiB is 1 MiB; a log that never started again holds every commit's pages.
     assert!(most < 16 << 20, "the log grew to {most} bytes");
+}
+
+/// Do: let one flush go, then hold every flush until let go and write until the log is past its
+/// bound (64 frames) and short of twice it, so the checkpointer has nothing durable to copy, and
+/// watch it for 500 ms; then let the flushes go. Expect: about a pass a checkpoint period (100 ms
+/// here) in those 500 ms, where it had passed again and again without pause, each pass taking locks
+/// every commit takes; every row durable and read back after (docs/design/store.md, decision 25).
+#[test]
+fn a_checkpointer_with_nothing_durable_to_copy_waits_for_a_flush() {
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let go = std::sync::Mutex::new(go_rx);
+    let config = Config {
+        log_frames: 64,
+        checkpoint_every: Duration::from_millis(100),
+        ..Config::default()
+    };
+    let lab = lab_keeping(
+        config,
+        move |db| {
+            let flush = db.flusher();
+            let held: Flush = Box::new(move || {
+                // Held until let go, or until the test lets go of every flush at once.
+                let _ = go.lock().unwrap().recv();
+                flush()
+            });
+            Some(held)
+        },
+        None,
+    );
+    let wal = {
+        let mut p = lab.path.clone().into_os_string();
+        p.push("-wal");
+        std::path::PathBuf::from(p)
+    };
+    // The log's header and its frames, each a 24-byte header and a 4 KiB page.
+    let frames = || std::fs::metadata(&wal).map_or(0, |m| m.len().saturating_sub(32) / (24 + 4096));
+    // One flush let go: the log's durable end is known, and checkpoints copy only up to it.
+    lab.store.put(vec![row("a", 0)]).unwrap();
+    go_tx.send(()).unwrap();
+    lab.store.sync(soon()).unwrap();
+    let mut seq = 1;
+    while frames() <= 64 {
+        lab.store.put(vec![row("a", seq)]).unwrap();
+        seq += 1;
+        assert_eq!(count(&lab.store, "a"), seq);
+    }
+    assert!(frames() < 128, "{} frames", frames());
+    let before = lab.store.counters().checkpoints;
+    let until = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < until {
+        std::thread::park_timeout(until - Instant::now());
+    }
+    let passes = lab.store.counters().checkpoints - before;
+    assert!(passes <= 10, "{passes} passes with nothing durable to copy");
+    drop(go_tx);
+    lab.store.sync(soon()).unwrap();
+    assert_eq!(count(&lab.store, "a"), seq);
 }
 
 /// While the engine replaces its file, its readers let it go and reads go to the writer; then they
