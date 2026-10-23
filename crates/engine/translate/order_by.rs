@@ -702,12 +702,20 @@ impl EmitOrderBy {
             });
             program.preassign_label_to_next_insn(skip_label.unwrap());
         } else {
+            // Amphora: only the rows the LIMIT (and OFFSET) can return need keeping; the sorter
+            // reads how many at its first insert, after the LIMIT is evaluated
+            // (docs/design/executor.md, decision 5).
+            let limit_reg = t_ctx
+                .limit_ctx
+                .as_ref()
+                .map(|limit| t_ctx.reg_limit_offset_sum.unwrap_or(limit.reg_limit));
             sorter_insert(
                 program,
                 start_reg,
                 orderby_sorter_column_count,
                 *sort_cursor,
                 *reg_sorter_data,
+                limit_reg,
             );
         }
         Ok(())
@@ -715,13 +723,16 @@ impl EmitOrderBy {
 }
 
 /// Emits the bytecode for inserting a row into a sorter.
-/// This can be either a GROUP BY sorter or an ORDER BY sorter.
+/// This can be either a GROUP BY sorter or an ORDER BY sorter. Amphora: `limit_reg`, an ORDER BY's
+/// LIMIT plus OFFSET, lets the sorter keep only the rows its reader will take
+/// (`docs/design/executor.md`, decision 5).
 pub fn sorter_insert(
     program: &mut ProgramBuilder,
     start_reg: usize,
     column_count: usize,
     cursor_id: usize,
     record_reg: usize,
+    limit_reg: Option<usize>,
 ) {
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u32(start_reg),
@@ -733,6 +744,7 @@ pub fn sorter_insert(
     program.emit_insn(Insn::SorterInsert {
         cursor_id,
         record_reg,
+        limit_reg,
     });
 }
 

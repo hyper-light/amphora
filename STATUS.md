@@ -155,6 +155,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   under `NOT IN`, a one-column list's first entry says whether it holds a NULL, where every miss
   read the whole list. `subquery_in` 213 → 784 statements a second at 1 client, 2,846 → 6,833 at
   32 (fedora, best of 3 in turns, not recorded runs).
+- **GROUP BY in a hash table; ORDER BY ... LIMIT keeps its top rows** (docs/design/executor.md
+  decisions 4 and 5, `crates/engine/tests/top_n.rs`,
+  `crates/engine/vdbe/group_table.rs`, `crates/engine/tests/hash_group_by.rs`): a GROUP BY whose
+  rows aren't in group order and whose aggregates keep small states aggregates each row into its
+  group as it arrives, where every row was sorted first; the groups past a 64 MiB budget go to the
+  sorter as before and the two merge in group order. An ORDER BY with a LIMIT (and OFFSET) of up
+  to 65,536 rows keeps only those rows in its sorter, where every row was sorted (the engine's heap
+  for it was chosen only where a LIMIT's registers already existed, almost never).
 
 ## Measured
 

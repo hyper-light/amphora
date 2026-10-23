@@ -996,6 +996,7 @@ fn emit_compound_order_by(
         sorter_column_count,
         sort_cursor,
         reg_sorter_data,
+        None,
     );
 
     program.emit_insn(Insn::Next {

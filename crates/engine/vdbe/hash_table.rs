@@ -57,7 +57,7 @@ fn hash_text_nocase(hasher: &mut impl Hasher, text: &str) {
 
 /// Hash function for join keys using rapidhash
 /// Takes collation into account when hashing text values
-fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
+pub(crate) fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
     let mut hasher = RapidHasher::new(DEFAULT_SEED);
 
     for (idx, value) in key_values.iter().enumerate() {
@@ -178,7 +178,11 @@ fn values_equal_distinct(v1: ValueRef, v2: ValueRef, collation: CollationSeq) ->
     }
 }
 
-fn keys_equal_distinct(key1: &[Value], key2: &[ValueRef], collations: &[CollationSeq]) -> bool {
+pub(crate) fn keys_equal_distinct(
+    key1: &[Value],
+    key2: &[ValueRef],
+    collations: &[CollationSeq],
+) -> bool {
     if key1.len() != key2.len() {
         return false;
     }

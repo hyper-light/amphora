@@ -1477,14 +1477,18 @@ pub fn insn_to_row(
             Insn::SorterInsert {
                 cursor_id,
                 record_reg,
+                limit_reg,
             } => (
                 "SorterInsert",
                 *cursor_id as i64,
                 *record_reg as i64,
-                0,
+                limit_reg.map_or(0, |r| i64::try_from(r).unwrap_or(i64::MAX)),
                 Value::from_i64(0),
                 0,
-                format!("key=r[{record_reg}]"),
+                match limit_reg {
+                    Some(limit) => format!("key=r[{record_reg}] keep=r[{limit}]"),
+                    None => format!("key=r[{record_reg}]"),
+                },
             ),
             Insn::SorterSort {
                 cursor_id,
@@ -2641,6 +2645,61 @@ pub fn insn_to_row(
             Value::build_text(""),
             0,
             String::new(),
+        ),
+        Insn::GroupFind { data } => (
+            "GroupFind",
+            i64::try_from(data.table_id).unwrap_or(i64::MAX),
+            i64::try_from(data.values_start).unwrap_or(i64::MAX),
+            i64::from(data.target_pc_full.as_debug_int()),
+            Value::build_text(""),
+            0,
+            format!(
+                "group of {} keys from r[{}] in table {}, {} accumulators from r[{}]",
+                data.num_keys, data.values_start, data.table_id, data.num_accs, data.acc_start
+            ),
+        ),
+        Insn::GroupClear { table_id } => (
+            "GroupClear",
+            i64::try_from(*table_id).unwrap_or(i64::MAX),
+            0,
+            0,
+            Value::build_text(""),
+            0,
+            format!("table {table_id}"),
+        ),
+        Insn::GroupSave {
+            table_id,
+            acc_start,
+            num_accs,
+        } => (
+            "GroupSave",
+            i64::try_from(*table_id).unwrap_or(i64::MAX),
+            i64::try_from(*acc_start).unwrap_or(i64::MAX),
+            i64::try_from(*num_accs).unwrap_or(i64::MAX),
+            Value::build_text(""),
+            0,
+            format!("{num_accs} accumulators from r[{acc_start}] to table {table_id}"),
+        ),
+        Insn::GroupSort { data } => (
+            "GroupSort",
+            i64::try_from(data.table_id).unwrap_or(i64::MAX),
+            0,
+            0,
+            Value::build_text(""),
+            0,
+            format!("table {}", data.table_id),
+        ),
+        Insn::GroupDrain { data } => (
+            "GroupDrain",
+            i64::try_from(data.table_id).unwrap_or(i64::MAX),
+            i64::try_from(data.dest_start).unwrap_or(i64::MAX),
+            i64::from(data.target_pc_done.as_debug_int()),
+            Value::build_text(""),
+            0,
+            match data.bound_start {
+                Some(b) => format!("next group of table {} before r[{b}]", data.table_id),
+                None => format!("next group of table {}", data.table_id),
+            },
         ),
         Insn::HashClear { hash_table_id: hash_table_reg } => (
             "HashClear",

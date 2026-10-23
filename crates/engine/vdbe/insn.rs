@@ -379,6 +379,49 @@ pub struct HashDistinctData {
     pub target_pc: BranchOffset,
 }
 
+/// Amphora: data for [Insn::GroupFind] (boxed to keep Insn small; `docs/design/executor.md`,
+/// decision 4).
+#[derive(Debug, Clone)]
+pub struct GroupFindData {
+    pub table_id: usize,
+    /// The non-aggregate expressions' registers, the GROUP BY keys first: a new group keeps them.
+    pub values_start: usize,
+    pub num_values: usize,
+    pub num_keys: usize,
+    /// Each key's collation, as the GROUP BY compares it.
+    pub collations: Vec<CollationSeq>,
+    /// The aggregates' accumulator registers.
+    pub acc_start: usize,
+    pub num_accs: usize,
+    /// Where a row goes whose group the table doesn't hold and, its budget spent, won't make.
+    pub target_pc_full: BranchOffset,
+}
+
+/// Amphora: data for [Insn::GroupSort].
+#[derive(Debug, Clone)]
+pub struct GroupSortData {
+    pub table_id: usize,
+    /// The GROUP BY sorter's order of the keys.
+    pub key_info: Vec<KeyInfo>,
+}
+
+/// Amphora: data for [Insn::GroupDrain].
+#[derive(Debug, Clone)]
+pub struct GroupDrainData {
+    pub table_id: usize,
+    /// Registers holding the keys the groups drained must order before; None drains every group.
+    pub bound_start: Option<usize>,
+    pub key_info: Vec<KeyInfo>,
+    /// For each non-aggregate value a group keeps, whether it is a result column: those are
+    /// written, in order, from `dest_start`.
+    pub result_mask: Vec<bool>,
+    pub dest_start: usize,
+    pub acc_start: usize,
+    pub num_accs: usize,
+    /// Where the bytecode goes once no group is left to drain.
+    pub target_pc_done: BranchOffset,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClearBtreeCount {
     Nothing,
@@ -1264,6 +1307,10 @@ pub enum Insn {
     SorterInsert {
         cursor_id: CursorID,
         record_reg: usize,
+        /// Amphora: a register holding the most rows the sorter's reader will take (an ORDER BY's
+        /// LIMIT plus its OFFSET), read at the first insert: within [`crate::vdbe::sorter::MAX_KEPT`]
+        /// the sorter keeps only that many (`docs/design/executor.md`, decision 5).
+        limit_reg: Option<usize>,
     },
 
     /// `cursor_id` is a sorter cursor. This instruction compares a prefix of the record blob in register `sorted_record_reg`
@@ -1984,6 +2031,36 @@ pub enum Insn {
         data: Box<HashDistinctData>,
     },
 
+    /// Amphora: finds the group of a row's GROUP BY keys in a hash table, making it if there is
+    /// none, and loads its accumulators into the aggregate registers; jumps to `target_pc_full` if
+    /// there is none and the table's budget is spent (`docs/design/executor.md`, decision 4).
+    GroupFind {
+        data: Box<GroupFindData>,
+    },
+
+    /// Amphora: empties a GROUP BY hash table, as each run of the GROUP BY begins.
+    GroupClear {
+        table_id: usize,
+    },
+
+    /// Amphora: saves the aggregate registers back into the group the last GroupFind loaded.
+    GroupSave {
+        table_id: usize,
+        acc_start: usize,
+        num_accs: usize,
+    },
+
+    /// Amphora: puts a GROUP BY hash table's groups in the order its sorter gives keys.
+    GroupSort {
+        data: Box<GroupSortData>,
+    },
+
+    /// Amphora: loads the next group in order (one whose keys order before the bound, if there is
+    /// one) into the result and aggregate registers, or jumps to `target_pc_done`.
+    GroupDrain {
+        data: Box<GroupDrainData>,
+    },
+
     /// Finalize the hash table build phase. Transitions the hash table from Building to Probing state.
     /// Should be called after the HashBuild loop completes.
     HashBuildFinalize {
@@ -2366,6 +2443,11 @@ impl InsnVariants {
             InsnVariants::Filter => execute::op_filter,
             InsnVariants::HashBuild => execute::op_hash_build,
             InsnVariants::HashDistinct => execute::op_hash_distinct,
+            InsnVariants::GroupFind => execute::op_group_find,
+            InsnVariants::GroupClear => execute::op_group_clear,
+            InsnVariants::GroupSave => execute::op_group_save,
+            InsnVariants::GroupSort => execute::op_group_sort,
+            InsnVariants::GroupDrain => execute::op_group_drain,
             InsnVariants::HashBuildFinalize => execute::op_hash_build_finalize,
             InsnVariants::HashProbe => execute::op_hash_probe,
             InsnVariants::HashNext => execute::op_hash_next,

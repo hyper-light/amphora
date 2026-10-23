@@ -7,7 +7,7 @@ use super::{
     plan::{Distinctness, GroupBy, SelectPlan, SubqueryEvalPhase, SubqueryOrigin},
     result_row::emit_select_result,
 };
-use crate::function::AccumulatorFunc;
+use crate::function::{AccumulatorFunc, AggFunc};
 use crate::translate::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
     expression_index::selected_expression_index,
@@ -27,7 +27,7 @@ use crate::{
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{Insn, SorterOpenData},
+        insn::{GroupDrainData, GroupSortData, Insn, SorterOpenData},
         BranchOffset,
     },
     Result,
@@ -182,14 +182,53 @@ impl EmitGroupBy {
                 .try_collect::<Result<crate::alloc::Vec<_>>>()??;
 
             // Resolve custom type comparators for GROUP BY columns (e.g. array_lt).
-            let comparators = group_by
-                .exprs
-                .iter()
-                .map(|expr| {
-                    custom_type_comparator(expr, &plan.table_references, t_ctx.resolver.schema())
-                })
-                .try_collect()?;
+            let comparators: crate::alloc::Vec<Option<crate::vdbe::insn::SortComparatorType>> =
+                group_by
+                    .exprs
+                    .iter()
+                    .map(|expr| {
+                        custom_type_comparator(
+                            expr,
+                            &plan.table_references,
+                            t_ctx.resolver.schema(),
+                        )
+                    })
+                    .try_collect()?;
 
+            let collations: Vec<CollationSeq> = order_collations_nulls
+                .iter()
+                .map(|(_, collation, _)| collation.unwrap_or_default())
+                .collect();
+            let hash = if hash_groups_eligible(
+                plan,
+                group_by,
+                t_ctx.non_aggregate_expressions.len(),
+                &collations,
+                comparators.iter().any(Option::is_some),
+            ) {
+                let table_id = program.alloc_hash_table_id();
+                program.emit_insn(Insn::GroupClear { table_id });
+                Some(HashGroups {
+                    table_id,
+                    num_keys: group_by.exprs.len(),
+                    key_info: order_collations_nulls
+                        .iter()
+                        .map(|(sort_order, collation, nulls_order)| KeyInfo {
+                            sort_order: *sort_order,
+                            collation: collation.unwrap_or_default(),
+                            nulls_order: *nulls_order,
+                        })
+                        .collect(),
+                    collations,
+                    result_mask: t_ctx
+                        .non_aggregate_expressions
+                        .iter()
+                        .map(|(_, in_result)| *in_result)
+                        .collect(),
+                })
+            } else {
+                None
+            };
             program.emit_insn(Insn::SorterOpen {
                 data: Box::new(SorterOpenData {
                     cursor_id: sort_cursor,
@@ -202,7 +241,11 @@ impl EmitGroupBy {
                 program,
                 false,
                 crate::translate::eqp::EqpDetail::GroupBy {
-                    method: crate::translate::eqp::EqpSortMethod::Sorter,
+                    method: if hash.is_some() {
+                        crate::translate::eqp::EqpGroupMethod::HashTable
+                    } else {
+                        crate::translate::eqp::EqpGroupMethod::Sorter
+                    },
                 }
             );
             let pseudo_cursor = group_by_create_pseudo_table(program, column_count);
@@ -212,6 +255,7 @@ impl EmitGroupBy {
                 reg_sorter_key,
                 sorter_column_count: column_count,
                 start_reg_dest: reg_non_aggregate_exprs_acc,
+                hash,
             }
         } else {
             GroupByRowSource::MainLoop {
@@ -625,6 +669,101 @@ pub fn emit_group_by_sort_loop_end(
     program.preassign_label_to_next_insn(label_sort_loop_end);
 }
 
+/// Amphora: a GROUP BY aggregated in a hash table (`docs/design/executor.md`, decision 4).
+#[derive(Debug)]
+pub struct HashGroups {
+    pub table_id: usize,
+    /// The GROUP BY keys: the first of the non-aggregate expressions.
+    pub num_keys: usize,
+    /// Each key's collation, as groups compare.
+    pub collations: Vec<CollationSeq>,
+    /// The sorter's order of the keys: the groups are drained in it.
+    pub key_info: Vec<KeyInfo>,
+    /// For each non-aggregate expression, whether it is a result column: what a group's drain
+    /// writes, in order, from the destination registers, as the sorter path stores them.
+    pub result_mask: Vec<bool>,
+}
+
+/// Amphora: whether a GROUP BY may aggregate in a hash table (`docs/design/executor.md`,
+/// decision 4): its keys hash as they compare (no custom collation, no type's comparator), each
+/// aggregate's state is a few values (no group_concat or JSON aggregate that grows with its group,
+/// no DISTINCT one), no window runs over its groups, and no bare column would take its value from
+/// the row a min() or max() chose.
+fn hash_groups_eligible(
+    plan: &SelectPlan,
+    group_by: &GroupBy,
+    non_aggregates: usize,
+    collations: &[CollationSeq],
+    custom_comparators: bool,
+) -> bool {
+    let small_states = plan.aggregates.iter().all(|agg| {
+        matches!(
+            agg.func,
+            AggFunc::Count
+                | AggFunc::Count0
+                | AggFunc::Sum
+                | AggFunc::Total
+                | AggFunc::Avg
+                | AggFunc::Min
+                | AggFunc::Max
+        ) && !agg.is_distinct()
+            && agg.fraction_reg.is_none()
+    });
+    let min_max = plan
+        .aggregates
+        .iter()
+        .any(|agg| matches!(agg.func, AggFunc::Min | AggFunc::Max));
+    let bare_columns = non_aggregates > group_by.exprs.len();
+    !group_by.sort_elided
+        && plan.window.is_none()
+        && small_states
+        && !(min_max && bare_columns)
+        && !custom_comparators
+        && collations
+            .iter()
+            .all(|c| !matches!(c, CollationSeq::Custom(_)))
+}
+
+/// Amphora: emits the drain of a hash GROUP BY's groups (`docs/design/executor.md`, decision 4):
+/// each group in order (each before the keys in `bound_start`'s registers, if given) is loaded
+/// into the result and aggregate registers and emitted by the output subroutine, as a sorted
+/// group is.
+fn emit_hash_groups_drain(
+    program: &mut ProgramBuilder,
+    hash: &HashGroups,
+    bound_start: Option<usize>,
+    dest_start: usize,
+    (acc_start, num_accs): (usize, usize),
+    registers: &GroupByRegisters,
+    labels: &GroupByLabels,
+) {
+    let next = program.allocate_label();
+    let done = program.allocate_label();
+    program.preassign_label_to_next_insn(next);
+    program.emit_insn(Insn::GroupDrain {
+        data: Box::new(GroupDrainData {
+            table_id: hash.table_id,
+            bound_start,
+            key_info: hash.key_info.clone(),
+            result_mask: hash.result_mask.clone(),
+            dest_start,
+            acc_start,
+            num_accs,
+            target_pc_done: done,
+        }),
+    });
+    program.emit_insn(Insn::Integer {
+        value: 1,
+        dest: registers.reg_data_in_acc_flag,
+    });
+    program.emit_insn(Insn::Gosub {
+        target_pc: labels.label_subrtn_acc_output,
+        return_reg: registers.reg_subrtn_acc_output_return_offset,
+    });
+    program.emit_insn(Insn::Goto { target_pc: next });
+    program.preassign_label_to_next_insn(done);
+}
+
 /// Enum representing the source for the rows processed during a GROUP BY.
 /// In case sorting is needed (which is most of the time), the variant
 /// [GroupByRowSource::Sorter] encodes the necessary information about that
@@ -646,6 +785,9 @@ pub enum GroupByRowSource {
         /// Number of columns in the GROUP BY sorter
         sorter_column_count: usize,
         start_reg_dest: usize,
+        /// Amphora: the groups aggregated in a hash table, the sorter taking only the rows of
+        /// groups past its budget (`docs/design/executor.md`, decision 4).
+        hash: Option<HashGroups>,
     },
     MainLoop {
         /// If GROUP BY rows are read directly in the main loop, start_reg is the first register
@@ -757,6 +899,28 @@ pub fn group_by_process_single_group(
         target_pc: labels.label_subrtn_acc_output,
         return_reg: registers.reg_subrtn_acc_output_return_offset,
     });
+
+    // Amphora: the hash table's groups that order before this sorted group go out first, so the
+    // two merge in group order (executor.md, decision 4).
+    if let GroupByRowSource::Sorter {
+        hash: Some(hash),
+        start_reg_dest,
+        ..
+    } = row_source
+    {
+        let acc_start = t_ctx
+            .reg_agg_start
+            .unwrap_or(registers.reg_non_aggregate_exprs_acc);
+        emit_hash_groups_drain(
+            program,
+            hash,
+            Some(groups_start_reg),
+            *start_reg_dest,
+            (acc_start, plan.aggregates.len()),
+            registers,
+            labels,
+        );
+    }
 
     // New group, move current group by columns into the comparison register
     program.emit_insn(Insn::Move {
@@ -1005,6 +1169,17 @@ pub fn group_by_agg_phase(
     let label_sort_loop_start = labels.label_sort_loop_start;
     let label_sort_loop_end = labels.label_sort_loop_end;
 
+    if let GroupByRowSource::Sorter {
+        hash: Some(hash), ..
+    } = row_source
+    {
+        program.emit_insn(Insn::GroupSort {
+            data: Box::new(GroupSortData {
+                table_id: hash.table_id,
+                key_info: hash.key_info.clone(),
+            }),
+        });
+    }
     if matches!(row_source, GroupByRowSource::Sorter { .. }) {
         emit_group_by_sort_loop_start(program, row_source, label_sort_loop_end)?;
     }
@@ -1033,7 +1208,9 @@ pub fn group_by_emit_row_phase<'a>(
 ) -> Result<()> {
     let group_by = plan.group_by.as_ref().expect("group by not found");
     let GroupByMetadata {
-        labels, registers, ..
+        labels,
+        registers,
+        row_source,
     } = t_ctx
         .meta_group_by
         .as_ref()
@@ -1043,6 +1220,26 @@ pub fn group_by_emit_row_phase<'a>(
         target_pc: labels.label_subrtn_acc_output,
         return_reg: registers.reg_subrtn_acc_output_return_offset,
     });
+    // Amphora: then the hash table's groups after the last sorted one (executor.md, decision 4).
+    if let GroupByRowSource::Sorter {
+        hash: Some(hash),
+        start_reg_dest,
+        ..
+    } = row_source
+    {
+        let acc_start = t_ctx
+            .reg_agg_start
+            .unwrap_or(registers.reg_non_aggregate_exprs_acc);
+        emit_hash_groups_drain(
+            program,
+            hash,
+            None,
+            *start_reg_dest,
+            (acc_start, plan.aggregates.len()),
+            registers,
+            labels,
+        );
+    }
 
     program.add_comment(program.offset(), "group by finished");
     program.emit_insn(Insn::Goto {

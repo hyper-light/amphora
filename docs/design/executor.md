@@ -99,3 +99,82 @@ and 867 → 2,556 at 32 (p99 70.7 → 15.1 ms); `filter_no_index` and `point_tex
 left of SQLite's lead is mostly the table's pages read from the file, a few thousand a statement.
 
 **Falsified by.** A text and pattern where `like_ascii` and `pattern_compare` disagree.
+
+## 4. GROUP BY aggregates each row into its group in a hash table
+
+**Decision.** A GROUP BY whose rows don't arrive in group order (no index gives it) aggregates each
+row where it arrives, when its aggregates keep a few values each (COUNT, SUM, TOTAL, AVG, MIN, MAX;
+no DISTINCT aggregate, no group_concat or JSON aggregate that grows with its group), no window runs
+over its groups, its keys have no custom collation or type comparator, and no bare column sits
+beside a MIN or MAX (whose row would choose its value). The row's keys are hashed as the hash join
+and DISTINCT hash them (an integer and the equal real alike, text by its collation), its group found
+or made, and the group's accumulators loaded into the aggregate registers for the row's steps and
+saved back (`vdbe/group_table.rs`; `GroupFind`, `GroupSave`); a new group keeps the values its first
+row gave the query's other non-aggregate expressions, as the sorter path keeps its first sorted
+row's. After the scan the groups are sorted in the order the GROUP BY's sorter gives keys and
+drained in it through the output subroutine a sorted group goes through, HAVING, ORDER BY and LIMIT
+included (`GroupSort`, `GroupDrain`). The table holds at most the hash join's budget (64 MiB; none
+with `temp_store=memory`): past it, a row of a group the table doesn't hold goes to the sorter as
+every row did before, so a group is wholly in one or the other, and the sorter's groups are merged
+with the table's by key as both are emitted, so the output keeps the sorter's order. Each run of the
+GROUP BY begins with its table emptied (`GroupClear`): a correlated subquery runs it again within a
+statement, perhaps after a LIMIT left groups undrained. `EXPLAIN QUERY PLAN` says `USE HASH TABLE
+FOR GROUP BY`.
+
+**Why.** Every grouped row went through the sorter: made into a record, sorted with every other row
+(spilled to files past the sorter's memory), read back and compared with its neighbor, however few
+the groups. The suite's `table_group_by` (`GROUP BY grp`: 20 groups over every row) completed no
+statement within its two seconds at ten million rows (fedora, 2026-10-22, a check), and the GROUP BYs
+over a twentieth of the table (`group_by_having`, `cte`: some 185,000 owners among 500,000 rows) ran
+6 and 4 statements a second.
+
+**Sources.** Graefe, "Query Evaluation Techniques for Large Databases" (ACM Computing Surveys 25(2),
+1993), §4.2: aggregation by hashing reads its input once where the groups fit in memory, against
+sorting's O(N log N), and overflow sends what doesn't fit to be partitioned or sorted. PostgreSQL's
+HashAggregate (`src/backend/executor/nodeAgg.c`): a hash table of groups, each holding its
+aggregates' transition states, spilling past `work_mem` since PostgreSQL 13. SQLite groups by sorter
+or index alone (`src/select.c`, its GROUP BY coding), the path this replaces where it may.
+
+**Evidence.** `crates/engine/tests/hash_group_by.rs` (the debug build's budget is 32 KiB, so the
+larger tables overflow into the sorter): COUNT, SUM, MIN, MAX, TOTAL and a FILTERed COUNT over 2,000
+rows in 40 groups and 6,000 rows in 5,000 groups, against an oracle, the groups in key order with
+NULL first; ORDER BY the key descending, ORDER BY COUNT(*) DESC after a HAVING with a LIMIT, and a
+bare LIMIT, past the budget; two-column keys, keys under NOCASE, and 1 and 1.0 as one group; a
+correlated subquery whose GROUP BY runs once an outer row with a LIMIT leaving groups undrained;
+the plan's hash table where the conditions hold and its sorter where they don't. Four mutants each
+fail the tests written for them: no merge at the sorter's group boundaries, no table emptied at a
+run's start, keys hashed as BINARY whatever their collation, and groups sorted ascending whatever
+the order asked. `cargo test -p amphora-engine`: 2,766 tests pass, two planner tests now naming the
+hash table where they named the sorter.
+
+**Falsified by.** A GROUP BY whose hashed answer differs from its sorted one; a hashed GROUP BY
+slower than the sorted one on the suite.
+
+## 5. An ORDER BY with a LIMIT keeps only the rows its reader takes
+
+**Decision.** An ORDER BY whose output a LIMIT cuts tells its sorter where the LIMIT (plus any
+OFFSET) is: the register that holds it once evaluated, before the first row arrives (`SorterInsert`'s
+`limit_reg`). At the first insert, a count from 1 to 65,536 (`MAX_KEPT`) makes the sorter keep only
+that many rows, in a max-heap: a row enters while fewer are kept, or when its key orders before the
+worst kept row's (compared from its decoded key, with no copy), which then leaves; the rest are
+dropped as they arrive. Each kept row carries its arrival number, so rows that tie keep arrival order,
+which is what the stable sort of every row gives them. The sort and the reads after it are the
+sorter's own, OFFSET and LIMIT applied as before. A larger count, none, or a negative one (no limit)
+sorts every row as before. DISTINCT deduplicates before the insert and a GROUP BY's groups arrive
+through its output subroutine, so both keep their top rows the same way.
+
+**Why.** Every ordered row went into the sorter, sorted with every other (spilled to files past the
+sorter's memory), to emit a few. The engine had a heap for this (an ephemeral index the old row left
+by `Last` and `Delete`), but it was chosen only where a LIMIT's registers already existed when the
+ORDER BY's sorter was opened, which the main select path sets up only afterwards: an ordinary
+`ORDER BY ... LIMIT` sorted every row. The suite's `order_by_sort` sorts some 500,000 rows at ten
+million for its top 20; `group_by_having`, `cte` and `join_group` sort up to 185,000 groups for their
+top 10, 5 and 10.
+
+**Sources.** PostgreSQL's bounded heap sort (`src/backend/utils/sort/tuplesort.c`,
+`tuplesort_set_bound`; EXPLAIN's "Sort Method: top-N heapsort"), used for a sort a LIMIT bounds, over
+a scan's or an aggregate's output alike. SQLite's sorter limit (`src/select.c`, `pushOntoSorter`:
+with a LIMIT, past LIMIT+OFFSET rows it deletes the last before each insert).
+
+**Falsified by.** An ordered, limited answer that differs from the whole ordering's rows at its OFFSET;
+a limited ORDER BY slower than the whole sort on the suite.

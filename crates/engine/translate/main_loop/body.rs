@@ -1,3 +1,4 @@
+use crate::translate::group_by::HashGroups;
 use crate::translate::plan::Operation::HashJoin;
 use crate::translate::plan::SimpleAggregate;
 use crate::translate::{
@@ -5,7 +6,7 @@ use crate::translate::{
     order_by::{custom_type_comparator, EmitOrderBy},
     window::EmitWindow,
 };
-use crate::vdbe::insn::AggStepData;
+use crate::vdbe::insn::{AggStepData, GroupFindData};
 
 use super::*;
 
@@ -129,6 +130,90 @@ impl<'prog, 'ctx, 'plan> LoopBody<'prog, 'ctx, 'plan> {
     }
 }
 
+/// Amphora: a row's step of a hash GROUP BY (`docs/design/executor.md`, decision 4): its group
+/// found (or made) from the non-aggregate values in `values_start`'s registers, the GROUP BY keys
+/// first, its accumulators loaded, each aggregate stepped with the row, and saved back; then a
+/// jump past the sorter's insert. A row the table won't take falls through to that insert. The
+/// label after the insert, which the caller places.
+fn emit_hash_group_step(
+    program: &mut ProgramBuilder,
+    t_ctx: &TranslateCtx,
+    plan: &SelectPlan,
+    hash: &HashGroups,
+    values_start: usize,
+) -> Result<BranchOffset> {
+    let after_row = program.allocate_label();
+    let to_sorter = program.allocate_label();
+    let acc_start = match t_ctx.reg_agg_start {
+        Some(reg) => reg,
+        None if plan.aggregates.is_empty() => 0,
+        None => {
+            return Err(crate::LimboError::InternalError(
+                "a hash GROUP BY's aggregate registers are not allocated".to_string(),
+            ))
+        }
+    };
+    program.emit_insn(Insn::GroupFind {
+        data: Box::new(GroupFindData {
+            table_id: hash.table_id,
+            values_start,
+            num_values: t_ctx.non_aggregate_expressions.len(),
+            num_keys: hash.num_keys,
+            collations: hash.collations.clone(),
+            acc_start,
+            num_accs: plan.aggregates.len(),
+            target_pc_full: to_sorter,
+        }),
+    });
+    for (i, agg) in plan.aggregates.iter().enumerate() {
+        let agg_result_reg = acc_start
+            .checked_add(i)
+            .ok_or(crate::LimboError::IntegerOverflow)?;
+        // FILTER: skip the step if its condition is false.
+        let filter_skip = match &agg.filter_expr {
+            Some(filter_expr) => {
+                let label = program.allocate_label();
+                let filter_reg = program.alloc_register();
+                translate_expr(
+                    program,
+                    Some(&plan.table_references),
+                    filter_expr,
+                    filter_reg,
+                    &t_ctx.resolver,
+                )?;
+                program.emit_insn(Insn::IfNot {
+                    reg: filter_reg,
+                    target_pc: label,
+                    jump_if_null: true,
+                });
+                Some(label)
+            }
+            None => None,
+        };
+        translate_aggregation_step(
+            program,
+            &plan.table_references,
+            AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness),
+            agg_result_reg,
+            &t_ctx.resolver,
+            agg.fraction_reg,
+        )?;
+        if let Some(label) = filter_skip {
+            program.preassign_label_to_next_insn(label);
+        }
+    }
+    program.emit_insn(Insn::GroupSave {
+        table_id: hash.table_id,
+        acc_start,
+        num_accs: plan.aggregates.len(),
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: after_row,
+    });
+    program.preassign_label_to_next_insn(to_sorter);
+    Ok(after_row)
+}
+
 /// This is a helper function for inner_loop_emit,
 /// which does a different thing depending on the emit target.
 /// See the InnerLoopEmitTarget enum for more details.
@@ -175,8 +260,18 @@ fn emit_loop_source<'a>(
                     sort_cursor,
                     sorter_column_count,
                     reg_sorter_key,
+                    hash,
                     ..
                 } => {
+                    // Amphora: a hash GROUP BY aggregates the row into its group where it is;
+                    // only a row of a group the table won't make (its budget spent) goes on to
+                    // the sorter (docs/design/executor.md, decision 4).
+                    let after_row = match hash {
+                        Some(hash) => {
+                            Some(emit_hash_group_step(program, t_ctx, plan, hash, start_reg)?)
+                        }
+                        None => None,
+                    };
                     // Sorter path: store only unique leaf columns from aggregate args.
                     // Full expressions are re-evaluated from the pseudo cursor during aggregation.
                     for leaf_expr in t_ctx.agg_leaf_columns.iter() {
@@ -196,7 +291,11 @@ fn emit_loop_source<'a>(
                         *sorter_column_count,
                         *sort_cursor,
                         *reg_sorter_key,
+                        None,
                     );
+                    if let Some(after_row) = after_row {
+                        program.preassign_label_to_next_insn(after_row);
+                    }
                 }
                 GroupByRowSource::MainLoop { .. } => {
                     for agg in plan.aggregates.iter() {

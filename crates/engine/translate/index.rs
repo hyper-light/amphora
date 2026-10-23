@@ -537,6 +537,7 @@ pub(crate) fn emit_refill_index(
         program.emit_insn(Insn::SorterInsert {
             cursor_id: sorter_cursor_id,
             record_reg,
+            limit_reg: None,
         });
 
         if let Some(skip_row_label) = skip_row_label {

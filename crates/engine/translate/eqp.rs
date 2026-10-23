@@ -188,6 +188,16 @@ pub enum EqpSortMethod {
     Sorter,
 }
 
+/// How a GROUP BY brings each group's rows together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EqpGroupMethod {
+    /// Every row sorted by its keys, each group a run of the sorted rows.
+    Sorter,
+    /// Amphora: each row aggregated into its group in a hash table, the rows of groups past its
+    /// budget sorted as before (`docs/design/executor.md`, decision 4).
+    HashTable,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EqpCompoundOp {
     UnionAll,
@@ -278,7 +288,7 @@ pub enum EqpDetail {
         method: EqpSortMethod,
     },
     GroupBy {
-        method: EqpSortMethod,
+        method: EqpGroupMethod,
     },
     /// Parent of the arms of a UNION/INTERSECT/EXCEPT query.
     Compound,
@@ -379,7 +389,10 @@ impl Display for EqpDetail {
                 EqpSortMethod::TempBTree => write!(f, "USE TEMP B-TREE FOR ORDER BY"),
                 EqpSortMethod::Sorter => write!(f, "USE SORTER FOR ORDER BY"),
             },
-            Self::GroupBy { .. } => write!(f, "USE SORTER FOR GROUP BY"),
+            Self::GroupBy { method } => match method {
+                EqpGroupMethod::Sorter => write!(f, "USE SORTER FOR GROUP BY"),
+                EqpGroupMethod::HashTable => write!(f, "USE HASH TABLE FOR GROUP BY"),
+            },
             Self::Compound => write!(f, "COMPOUND QUERY"),
             Self::CompoundArm { op, .. } => match op {
                 EqpCompoundOp::UnionAll => write!(f, "UNION ALL"),
@@ -849,9 +862,15 @@ impl EqpDetail {
                     },
                 );
             }
-            Self::GroupBy { .. } => {
+            Self::GroupBy { method } => {
                 obj.str("type", "group_by");
-                obj.str("method", "sorter");
+                obj.str(
+                    "method",
+                    match method {
+                        EqpGroupMethod::Sorter => "sorter",
+                        EqpGroupMethod::HashTable => "hash",
+                    },
+                );
             }
             Self::Compound => obj.str("type", "compound"),
             Self::CompoundArm { op, temp_btree } => {

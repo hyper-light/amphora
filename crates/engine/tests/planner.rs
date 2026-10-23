@@ -136,9 +136,9 @@ fn a_page_by_key_reads_in_key_order_without_sorting() {
 
 /// Do: GROUP BY the first column of an index that lacks the aggregated columns, over the whole
 /// table, with the connection's cache a fraction of the table and then holding all of it. Expect:
-/// a scan of the table and a sort while each lookup through the index would read a page of its
-/// own (docs/design/planner.md, decision 5); the index's order, unsorted, once the cache holds
-/// the table.
+/// a scan of the table, its groups hashed (docs/design/executor.md, decision 4), while each lookup
+/// through the index would read a page of its own (docs/design/planner.md, decision 5); the
+/// index's order, ungrouped by hash or sort, once the cache holds the table.
 #[test]
 fn a_whole_table_group_by_scans_and_sorts_where_lookups_would_read_pages() {
     let dir = tempfile::tempdir().unwrap();
@@ -149,7 +149,7 @@ fn a_whole_table_group_by_scans_and_sorts_where_lookups_would_read_pages() {
         plan(&conn, sql),
         vec![
             "SCAN items".to_owned(),
-            "USE SORTER FOR GROUP BY".to_owned()
+            "USE HASH TABLE FOR GROUP BY".to_owned()
         ]
     );
     conn.execute("PRAGMA cache_size = 100000").unwrap();
@@ -188,7 +188,7 @@ fn a_grouped_cte_drives_lookups_of_the_owners_it_names() {
             vec![
                 "SCAN t".to_owned(),
                 "SEARCH items USING INDEX items_grp_created (grp=?)".to_owned(),
-                "USE SORTER FOR GROUP BY".to_owned(),
+                "USE HASH TABLE FOR GROUP BY".to_owned(),
                 "SEARCH o USING INTEGER PRIMARY KEY (rowid=?)".to_owned(),
                 "USE SORTER FOR ORDER BY".to_owned(),
             ],

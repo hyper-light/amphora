@@ -152,6 +152,116 @@ enum InitChunkHeapState {
     PushChunk { chunk_idx: usize },
 }
 
+/// Amphora: the most rows a sorter keeps when its reader will take only some
+/// (`docs/design/executor.md`, decision 5): an ORDER BY's LIMIT plus OFFSET up to this keeps that
+/// many rows in a heap; a larger one sorts every row as before, spilling to files, rather than hold
+/// that many rows in memory.
+pub const MAX_KEPT: usize = 65_536;
+
+/// Amphora: a row a bounded sorter keeps, and when it arrived: rows that compare equal keep their
+/// arrival order, as the stable sort of every row keeps it.
+struct KeptRecord {
+    record: Box<BoxedSortableRecord>,
+    arrived: u64,
+}
+
+impl Ord for KeptRecord {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.record
+            .cmp(&other.record)
+            .then(self.arrived.cmp(&other.arrived))
+    }
+}
+
+impl PartialOrd for KeptRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for KeptRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for KeptRecord {}
+
+/// Amphora: the rows a bounded sorter keeps: the first `limit` in sort order of those offered, in a
+/// max-heap, so the worst of them is the one a new row must beat; then, sorted, in reverse output
+/// order (served from the end, as `Sorter::records` are).
+struct Kept {
+    limit: usize,
+    heap: BinaryHeap<KeptRecord>,
+    arrived: u64,
+    sorted: Vec<KeptRecord>,
+}
+
+impl Kept {
+    /// Offers `record`: kept if fewer than `limit` are, or if it orders before the worst kept one,
+    /// which then goes. A row that can't be kept is dropped with no copy.
+    fn offer(
+        &mut self,
+        record: &ImmutableRecord,
+        key_len: usize,
+        index_key_info: &Rc<Vec<KeyInfo>>,
+        comparators: &Rc<Vec<Option<SortComparator>>>,
+    ) -> Result<()> {
+        let arrived = self.arrived;
+        self.arrived = self.arrived.saturating_add(1);
+        if self.heap.len() >= self.limit {
+            let Some(worst) = self.heap.peek() else {
+                return Ok(());
+            };
+            if !orders_before(record, key_len, index_key_info, comparators, &worst.record)? {
+                return Ok(());
+            }
+            self.heap.pop();
+        }
+        let payload = record.get_payload();
+        let mut copy = ImmutableRecord::new(payload.len())?;
+        copy.start_serialization(payload)?;
+        let record = Box::new(BoxedSortableRecord::new(
+            copy,
+            key_len,
+            index_key_info.clone(),
+            comparators.clone(),
+        )?);
+        self.heap.try_push(KeptRecord { record, arrived })?;
+        Ok(())
+    }
+}
+
+/// Amphora: whether `record`'s sort key orders strictly before `kept`'s, as the boxed records'
+/// comparison orders them (a row tying with the worst kept row arrived later, so it doesn't).
+fn orders_before(
+    record: &ImmutableRecord,
+    key_len: usize,
+    index_key_info: &[KeyInfo],
+    comparators: &[Option<SortComparator>],
+    kept: &BoxedSortableRecord,
+) -> Result<bool> {
+    if kept.deserialization_error.is_some() {
+        return Ok(false);
+    }
+    let mut values = Vec::try_with_capacity_ext(key_len)?;
+    let mut iter = record.iter()?;
+    for _ in 0..key_len {
+        match iter.next() {
+            Some(Ok(value)) => values.try_push(value)?,
+            Some(Err(e)) => return Err(e),
+            None => crate::bail_corrupt_error!("Not enough columns in record"),
+        }
+    }
+    let (norm_key, norm_decisive) = normalized_first_key(&values, index_key_info, comparators);
+    let ord = match norm_key.cmp(&kept.norm_key) {
+        Ordering::Equal if norm_decisive && kept.norm_decisive => Ordering::Equal,
+        Ordering::Equal => boxed_full_cmp(&values, &kept.key_values, index_key_info, comparators),
+        ord => ord,
+    };
+    Ok(ord == Ordering::Less)
+}
+
 pub struct Sorter {
     /// Arena allocator for records - provides fast bump allocation and bulk deallocation.
     /// All record data (payload bytes, key_values) is stored here for in-memory sorting.
@@ -198,6 +308,10 @@ pub struct Sorter {
     pending_completion: Option<(Completion, usize)>,
     /// Temp storage mode (memory vs file) for spilled data
     temp_store: crate::TempStore,
+    /// Amphora: the rows kept when the reader takes only some (decision 5), else None.
+    kept: Option<Kept>,
+    /// Amphora: whether the first insert has decided `kept`.
+    limit_decided: bool,
 }
 
 impl Sorter {
@@ -244,12 +358,39 @@ impl Sorter {
             init_chunk_heap_state: InitChunkHeapState::Start,
             pending_completion: None,
             temp_store,
+            kept: None,
+            limit_decided: false,
         };
         Ok(this)
     }
 
-    pub const fn is_empty(&self) -> bool {
-        self.records.is_empty() && self.chunks.is_empty()
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+            && self.chunks.is_empty()
+            && self
+                .kept
+                .as_ref()
+                .is_none_or(|kept| kept.heap.is_empty() && kept.sorted.is_empty())
+    }
+
+    /// Amphora: keeps only the first `limit` rows in sort order from here on (decision 5), if no
+    /// row is in yet and `limit` is within [`MAX_KEPT`]; asked before each insert, decided at the
+    /// first.
+    pub fn limit_to(&mut self, limit: Option<usize>) {
+        if self.limit_decided {
+            return;
+        }
+        self.limit_decided = true;
+        if let Some(limit) = limit.filter(|&l| l > 0 && l <= MAX_KEPT) {
+            if self.records.is_empty() && self.chunks.is_empty() {
+                self.kept = Some(Kept {
+                    limit,
+                    heap: BinaryHeap::new(),
+                    arrived: 0,
+                    sorted: Vec::new(),
+                });
+            }
+        }
     }
 
     pub const fn has_more(&self) -> bool {
@@ -261,7 +402,14 @@ impl Sorter {
         loop {
             match self.sort_state {
                 SortState::Start => {
-                    if self.chunks.is_empty() {
+                    if let Some(kept) = self.kept.as_mut() {
+                        // The kept rows in output order, last first: served from the end.
+                        let mut rows = std::mem::take(&mut kept.heap).into_vec();
+                        rows.sort_unstable();
+                        rows.reverse();
+                        kept.sorted = rows;
+                        self.sort_state = SortState::Next;
+                    } else if self.chunks.is_empty() {
                         // Sort ascending then reverse - we pop from end so this gives ascending output.
                         // NOTE: We can't just sort descending because stable sort preserves insertion
                         // order for equal elements, and descending sort doesn't reverse equal elements.
@@ -311,6 +459,10 @@ impl Sorter {
 
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> IOResultOr<()> {
+        if let Some(kept) = self.kept.as_mut() {
+            self.current = kept.sorted.pop().map(|kept| kept.record.record);
+            return Ok(IOResult::Done(()));
+        }
         if self.chunks.is_empty() {
             match self.records.pop() {
                 Some(ptr) => {
@@ -374,6 +526,15 @@ impl Sorter {
     }
 
     pub fn insert(&mut self, record: &ImmutableRecord) -> IOResultOr<()> {
+        if let Some(kept) = self.kept.as_mut() {
+            kept.offer(
+                record,
+                self.key_len,
+                &self.index_key_info,
+                &self.comparators,
+            )?;
+            return Ok(IOResult::Done(()));
+        }
         let payload_size = record.get_payload().len();
         loop {
             match self.insert_state {
@@ -1082,30 +1243,44 @@ impl BoxedSortableRecord {
 impl BoxedSortableRecord {
     /// Full key comparison; only reached when the normalized keys tie.
     fn full_cmp(&self, other: &Self) -> Ordering {
-        for (i, ((&self_val, &other_val), key_info)) in self
-            .key_values
-            .iter()
-            .zip(other.key_values.iter())
-            .zip(self.index_key_info.iter())
-            .enumerate()
-        {
-            let cmp = if let Some(Some(comparator)) = self.comparators.get(i) {
-                comparator(&self_val, &other_val).expect("Memory allocation failed here")
-            } else {
-                match (self_val, other_val) {
-                    (ValueRef::Text(left), ValueRef::Text(right)) => {
-                        key_info.collation.compare_strings(&left, &right)
-                    }
-                    _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
-                }
-            };
-            let cmp = cmp_with_sort(cmp, &self_val, &other_val, key_info);
-            if cmp != Ordering::Equal {
-                return cmp;
-            }
-        }
-        Ordering::Equal
+        boxed_full_cmp(
+            &self.key_values,
+            &other.key_values,
+            &self.index_key_info,
+            &self.comparators,
+        )
     }
+}
+
+/// The boxed records' full key comparison, of two keys' values.
+fn boxed_full_cmp(
+    self_values: &[ValueRef],
+    other_values: &[ValueRef],
+    index_key_info: &[KeyInfo],
+    comparators: &[Option<SortComparator>],
+) -> Ordering {
+    for (i, ((&self_val, &other_val), key_info)) in self_values
+        .iter()
+        .zip(other_values.iter())
+        .zip(index_key_info.iter())
+        .enumerate()
+    {
+        let cmp = if let Some(Some(comparator)) = comparators.get(i) {
+            comparator(&self_val, &other_val).expect("Memory allocation failed here")
+        } else {
+            match (self_val, other_val) {
+                (ValueRef::Text(left), ValueRef::Text(right)) => {
+                    key_info.collation.compare_strings(&left, &right)
+                }
+                _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
+            }
+        };
+        let cmp = cmp_with_sort(cmp, &self_val, &other_val, key_info);
+        if cmp != Ordering::Equal {
+            return cmp;
+        }
+    }
+    Ordering::Equal
 }
 
 impl Ord for BoxedSortableRecord {
@@ -1172,6 +1347,54 @@ mod tests {
                     .expect("Failed to parse SEED environment variable as u64")
             },
         ) as u64
+    }
+
+    /// Do: a sorter told to keep 5 rows and an unbounded one, each offered the same 1,000 rows whose
+    /// descending key takes 50 values (twenty rows to a key), then sorted. Expect: the bounded one
+    /// never holds more than 5, and serves exactly the unbounded one's first 5, ties in arrival
+    /// order (docs/design/executor.md, decision 5).
+    #[test]
+    fn a_sorter_told_a_limit_keeps_only_that_many_and_serves_what_the_full_sort_begins_with() {
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let new_sorter = || {
+            Sorter::new(
+                &[SortOrder::Desc],
+                try_vec![CollationSeq::Binary].unwrap(),
+                try_vec![None].unwrap(),
+                try_vec![None].unwrap(),
+                1 << 20,
+                4096,
+                io.clone(),
+                crate::TempStore::Default,
+            )
+            .unwrap()
+        };
+        let (mut bounded, mut full) = (new_sorter(), new_sorter());
+        bounded.limit_to(Some(5));
+        full.limit_to(None);
+        let mut x = 7u64;
+        for i in 0..1000i64 {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let key = ((x >> 33) % 50) as i64;
+            let values = [Value::from_i64(key), Value::from_i64(i)];
+            let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+            io.block(|| bounded.insert(&record)).unwrap();
+            io.block(|| full.insert(&record)).unwrap();
+            assert!(bounded.kept.as_ref().unwrap().heap.len() <= 5);
+        }
+        io.block(|| bounded.sort()).unwrap();
+        io.block(|| full.sort()).unwrap();
+        for _ in 0..5 {
+            let want = full.record().unwrap().get_values().unwrap();
+            let got = bounded.record().unwrap().get_values().unwrap();
+            assert_eq!(got, want);
+            io.block(|| bounded.next()).unwrap();
+            io.block(|| full.next()).unwrap();
+        }
+        assert!(!bounded.has_more());
+        assert!(full.has_more());
     }
 
     #[test]

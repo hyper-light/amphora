@@ -46,6 +46,7 @@ use crate::util::{
 use crate::vdbe::affinity::{
     apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
 };
+use crate::vdbe::group_table;
 use crate::vdbe::hash_table::{
     HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
 };
@@ -9431,12 +9432,24 @@ pub fn op_sorter_insert(
         SorterInsert {
             cursor_id,
             record_reg,
+            limit_reg,
         },
         insn
+    );
+    // Amphora: the rows an ORDER BY's reader will take, its LIMIT plus OFFSET evaluated before the
+    // first insert (docs/design/executor.md, decision 5); none if not a positive integer.
+    let limit = limit_reg.and_then(
+        |reg| match state.registers.get(reg).map(Register::get_value) {
+            Some(Value::Numeric(Numeric::Integer(n))) => {
+                usize::try_from(*n).ok().filter(|&n| n > 0)
+            }
+            _ => None,
+        },
     );
     {
         let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_sorter_mut();
+        cursor.limit_to(limit);
         let record = match &state.registers[*record_reg] {
             Register::Record(record) => record,
             _ => unreachable!("SorterInsert on non-record register"),
@@ -17979,6 +17992,197 @@ pub fn op_hash_distinct(
         }
         IOResult::IO(io) => Ok(state.suspend_on_io(io)),
     }
+}
+
+fn group_error(what: &str) -> LimboError {
+    LimboError::InternalError(format!("hash GROUP BY: {what}"))
+}
+
+fn next_pc(state: &ProgramState) -> Result<crate::vdbe::InsnReference> {
+    state.pc.checked_add(1).ok_or(LimboError::IntegerOverflow)
+}
+
+/// Swaps `regs` with a group's accumulators: loading them for a row's steps, or saving them back.
+fn swap_accumulators(regs: &mut [Register], accs: &mut [Register]) -> Result<()> {
+    if regs.len() != accs.len() {
+        return Err(group_error("accumulator count differs from the group's"));
+    }
+    for (r, a) in regs.iter_mut().zip(accs.iter_mut()) {
+        std::mem::swap(r, a);
+    }
+    Ok(())
+}
+
+/// Amphora: [Insn::GroupFind] (`docs/design/executor.md`, decision 4).
+pub fn op_group_find(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(GroupFind { data }, insn);
+    // A table past its budget sends its new groups' rows to the sorter; with temp_store=memory
+    // there is no budget, as for the hash join's tables.
+    let budget = if matches!(
+        program.connection.get_temp_store(),
+        crate::TempStore::Memory
+    ) {
+        usize::MAX
+    } else {
+        DEFAULT_MEM_BUDGET
+    };
+    let table = state.group_tables.entry(data.table_id).or_insert_with(|| {
+        group_table::GroupTable::new(data.num_keys, data.collations.clone(), budget)
+    });
+    let end = data
+        .values_start
+        .checked_add(data.num_values)
+        .ok_or(LimboError::IntegerOverflow)?;
+    let values: SmallVec<[&Value; 8]> = state
+        .registers
+        .get(data.values_start..end)
+        .ok_or_else(|| group_error("value registers out of range"))?
+        .iter()
+        .map(Register::get_value)
+        .collect();
+    let found = table.find_or_insert(&values, data.num_accs)?;
+    drop(values);
+    if found.is_none() {
+        state.pc = data.target_pc_full.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    let acc_end = data
+        .acc_start
+        .checked_add(data.num_accs)
+        .ok_or(LimboError::IntegerOverflow)?;
+    let regs = state
+        .registers
+        .get_mut(data.acc_start..acc_end)
+        .ok_or_else(|| group_error("accumulator registers out of range"))?;
+    swap_accumulators(regs, table.current_accumulators()?)?;
+    state.pc = next_pc(state)?;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Amphora: [Insn::GroupClear]: the GROUP BY's run begins with no groups (a correlated subquery
+/// runs it again within one statement, maybe after a LIMIT left groups undrained).
+pub fn op_group_clear(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(GroupClear { table_id }, insn);
+    state.group_tables.remove(table_id);
+    state.pc = next_pc(state)?;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Amphora: [Insn::GroupSave].
+pub fn op_group_save(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        GroupSave {
+            table_id,
+            acc_start,
+            num_accs
+        },
+        insn
+    );
+    let table = state
+        .group_tables
+        .get_mut(table_id)
+        .ok_or_else(|| group_error("a save with no table"))?;
+    let end = acc_start
+        .checked_add(*num_accs)
+        .ok_or(LimboError::IntegerOverflow)?;
+    let regs = state
+        .registers
+        .get_mut(*acc_start..end)
+        .ok_or_else(|| group_error("accumulator registers out of range"))?;
+    swap_accumulators(regs, table.current_accumulators()?)?;
+    state.pc = next_pc(state)?;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Amphora: [Insn::GroupSort]. No table: no row reached the GROUP BY.
+pub fn op_group_sort(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(GroupSort { data }, insn);
+    if let Some(table) = state.group_tables.get_mut(&data.table_id) {
+        table.sort(&data.key_info)?;
+    }
+    state.pc = next_pc(state)?;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Amphora: [Insn::GroupDrain].
+pub fn op_group_drain(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(GroupDrain { data }, insn);
+    let Some(table) = state.group_tables.get_mut(&data.table_id) else {
+        state.pc = data.target_pc_done.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    let drained = match data.bound_start {
+        Some(start) => {
+            let end = start
+                .checked_add(data.key_info.len())
+                .ok_or(LimboError::IntegerOverflow)?;
+            let bound: SmallVec<[ValueRef; 4]> = state
+                .registers
+                .get(start..end)
+                .ok_or_else(|| group_error("bound registers out of range"))?
+                .iter()
+                .map(|r| r.get_value().as_ref())
+                .collect();
+            table.drain_next(Some(&bound), &data.key_info)?
+        }
+        None => table.drain_next(None, &data.key_info)?,
+    };
+    let Some((values, accs)) = drained else {
+        state.pc = data.target_pc_done.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    let mut dest = data.dest_start;
+    for (value, &in_result) in values.into_iter().zip(data.result_mask.iter()) {
+        if in_result {
+            let reg = state
+                .registers
+                .get_mut(dest)
+                .ok_or_else(|| group_error("result registers out of range"))?;
+            *reg = Register::Value(value);
+            dest = dest.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+        }
+    }
+    let acc_end = data
+        .acc_start
+        .checked_add(data.num_accs)
+        .ok_or(LimboError::IntegerOverflow)?;
+    let regs = state
+        .registers
+        .get_mut(data.acc_start..acc_end)
+        .ok_or_else(|| group_error("accumulator registers out of range"))?;
+    if regs.len() != accs.len() {
+        return Err(group_error("accumulator count differs from the group's").into());
+    }
+    for (r, a) in regs.iter_mut().zip(accs) {
+        *r = a;
+    }
+    state.pc = next_pc(state)?;
+    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_hash_build_finalize(

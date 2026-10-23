@@ -30,6 +30,7 @@ pub mod bloom_filter;
 pub mod builder;
 pub mod execute;
 pub mod explain;
+pub mod group_table;
 #[allow(dead_code)]
 pub mod hash_table;
 pub mod insn;
@@ -961,6 +962,8 @@ pub struct ProgramState {
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
     hash_tables: HashMap<usize, HashTable>,
+    /// Amphora: each hash-aggregated GROUP BY's groups (`group_table.rs`), by table id.
+    group_tables: HashMap<usize, group_table::GroupTable>,
     /// TempFile handles for ephemeral cursors, keyed by cursor_id.
     /// Dropping removes the temp file from disk.
     ephemeral_temp_files: HashMap<usize, TempFile>,
@@ -1104,6 +1107,7 @@ impl ProgramState {
             spare_agg_payloads: Vec::new(),
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
+            group_tables: HashMap::default(),
             ephemeral_temp_files: HashMap::default(),
             ephemeral_kept: HashMap::default(),
             uses_subjournal: false,
@@ -1284,6 +1288,9 @@ impl ProgramState {
         }
         if !self.hash_tables.is_empty() {
             self.hash_tables.clear();
+        }
+        if !self.group_tables.is_empty() {
+            self.group_tables.clear();
         }
         if !self.ephemeral_temp_files.is_empty() {
             let kept = &self.ephemeral_kept;
