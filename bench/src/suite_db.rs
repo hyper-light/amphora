@@ -29,6 +29,13 @@ pub trait Target: Send + Sync {
     /// `stmts`, each with its parameters, in one transaction, durably: the tables, the load, the
     /// indexes.
     fn setup(&self, stmts: &[(String, Vec<P>)]) -> anyhow::Result<()>;
+    /// The load and the indexes are in: everything they wrote into the database's own files, as its
+    /// checkpoint puts it, so no run reads against what the load left to copy (SQLite checkpoints
+    /// as it loads; Amphora's loader leaves the whole load in its log for the store's checkpointer).
+    /// Timed as `settle_s`. A database with no such statement does nothing here.
+    fn settle(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// The load and the indexes are in: the runs begin.
     fn ready(&self) -> anyhow::Result<()> {
         Ok(())
@@ -194,6 +201,8 @@ mod amphora_target {
         readers: usize,
         reader_pages: Option<i64>,
         commit_rows: Option<usize>,
+        /// The pages its connections share, if they do: their counts go into the run's stats.
+        pool: Option<Arc<amphora::db::SharedPages>>,
     }
 
     fn leak(cache: &Mutex<HashMap<String, &'static str>>, s: &str) -> anyhow::Result<&'static str> {
@@ -209,20 +218,22 @@ mod amphora_target {
     impl Amphora {
         pub fn open(dir: &str, clients: usize) -> anyhow::Result<Self> {
             let path = fresh(dir)?;
-            let db = Db::open(&path)?;
+            let sharing = amphora_sharing()?;
+            let pool = match &sharing {
+                amphora::db::Sharing::Process => Some(amphora::db::process_pages()),
+                amphora::db::Sharing::Pool(pool) => Some(pool.clone()),
+                amphora::db::Sharing::Off => None,
+            };
+            let db = Db::open_sharing(&path, &sharing)?;
             if std::env::var("AMPHORA_PACK_LOG").ok().as_deref() == Some("1") {
                 db.pack_log(true)?;
-            }
-            // AMPHORA_SHARED_PAGES: pages the store's connections share at most (decision 20).
-            if let Some(pages) = std::env::var("AMPHORA_SHARED_PAGES").ok().and_then(|v| v.parse().ok()) {
-                db.share_pages(pages)?;
             }
             if let Some(pages) = std::env::var("AMPHORA_WRITER_PAGES").ok().and_then(|v| v.parse().ok()) {
                 db.keep_pages(pages)?;
             }
             let reader_pages = std::env::var("AMPHORA_READER_PAGES").ok().and_then(|v| v.parse().ok());
             let commit_rows = std::env::var("AMPHORA_COMMIT_ROWS").ok().and_then(|v| v.parse().ok());
-            Ok(Self { loader: Mutex::new(Some(db)), groups: OnceLock::new(), sql: Arc::new(Mutex::new(HashMap::new())), readers: clients.max(1), reader_pages, commit_rows })
+            Ok(Self { loader: Mutex::new(Some(db)), groups: OnceLock::new(), sql: Arc::new(Mutex::new(HashMap::new())), readers: clients.max(1), reader_pages, commit_rows, pool })
         }
     }
 
@@ -243,6 +254,15 @@ mod amphora_target {
             })?;
             db.flusher()()?;
             Ok(())
+        }
+
+        fn settle(&self) -> anyhow::Result<()> {
+            let loader = self.loader.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
+            let db = loader.as_ref().ok_or_else(|| anyhow::anyhow!("the store has started"))?;
+            // No reader exists yet, so nothing holds the log: the checkpoint copies all of it and
+            // cuts the file, as SQLite's and Turso's settles do. A restart alone kept the load's 7.5
+            // GB of log, whose pages then crowded the database out of the unit's OS cache.
+            db.exec("PRAGMA wal_checkpoint(TRUNCATE)")
         }
 
         fn ready(&self) -> anyhow::Result<()> {
@@ -271,6 +291,10 @@ mod amphora_target {
                 "flushes": c.flushes, "flush_ms": c.flush_ms, "failed": c.failed, "timeouts": c.timeouts,
                 "checkpoints": c.checkpoints, "checkpoint_ms": c.checkpoint_ms, "restarts": c.restarts,
                 "restart_ms": c.restart_ms, "longest_us": c.longest_us,
+                "pool": self.pool.as_ref().map(|p| {
+                    let n = p.counts();
+                    serde_json::json!({ "hits": n.hits, "misses": n.misses, "added": n.added, "held": p.len(), "capacity": p.capacity() })
+                }),
             })
         }
     }
@@ -327,6 +351,26 @@ mod amphora_target {
     }
 }
 
+pub use amphora_target::value as amphora_value;
+
+/// How the bench's Amphora databases share the pages their connections read (docs/design/store.md,
+/// decisions 20 and 26): `AMPHORA_SHARED_PAGES` unset or 0, none, as Amphora ships; `process`, the
+/// process's pool (a quarter of the memory it may use); a number, a pool of that many pages. A
+/// packed log (`AMPHORA_PACK_LOG=1`) shares none.
+pub fn amphora_sharing() -> anyhow::Result<amphora::db::Sharing> {
+    use amphora::db::{SharedPages, Sharing};
+    if std::env::var("AMPHORA_PACK_LOG").ok().as_deref() == Some("1") {
+        return Ok(Sharing::Off);
+    }
+    Ok(match std::env::var("AMPHORA_SHARED_PAGES").ok().as_deref() {
+        None | Some("0") => Sharing::Off,
+        Some("process") => Sharing::Process,
+        Some(pages) => {
+            let pages = pages.parse::<usize>().map_err(|e| anyhow::anyhow!("AMPHORA_SHARED_PAGES={pages}: {e} (a number of pages, 0 or process)"))?;
+            Sharing::Pool(Arc::new(SharedPages::new(pages)))
+        }
+    })
+}
 use amphora_target::Amphora;
 
 // ---------------------------------------------------------------------------------------------
@@ -559,6 +603,15 @@ impl Target for Turso {
         s.transaction(&sql, &params)
     }
 
+    fn settle(&self) -> anyhow::Result<()> {
+        let mut s = self.connect()?;
+        let mut rows = 0;
+        if let Err(Busy) = s.step("PRAGMA wal_checkpoint(TRUNCATE)", &[], &mut rows)? {
+            anyhow::bail!("the checkpoint found the database busy");
+        }
+        Ok(())
+    }
+
     fn session(&self) -> anyhow::Result<Box<dyn Session>> {
         Ok(Box::new(self.connect()?))
     }
@@ -720,7 +773,7 @@ impl Sqlite {
     }
 }
 
-fn sqlite_value(p: &P) -> rusqlite::types::Value {
+pub fn sqlite_value(p: &P) -> rusqlite::types::Value {
     use rusqlite::types::Value;
     match p {
         P::I(i) => Value::Integer(*i),
@@ -759,6 +812,12 @@ impl Target for Sqlite {
             sqlite_rows(&tx, s, p)?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    fn settle(&self) -> anyhow::Result<()> {
+        let c = self.connect()?;
+        sqlite_rows(&c, "PRAGMA wal_checkpoint(TRUNCATE)", &[])?;
         Ok(())
     }
 
@@ -886,6 +945,11 @@ impl Target for Pg {
             tx.execute(s.as_str(), &refs).map_err(|e| anyhow::anyhow!("{e} (in: {})", s.chars().take(200).collect::<String>()))?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    fn settle(&self) -> anyhow::Result<()> {
+        self.client()?.batch_execute("CHECKPOINT")?;
         Ok(())
     }
 

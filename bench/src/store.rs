@@ -4,12 +4,12 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use amphora::groups::Groups;
 use amphora::store::{Checkpointed, Config, Engine, Flush, Opener};
-use amphora::db::{Db, SharedPages};
+use amphora::db::Db;
 use amphora_engine::Value;
 
 use crate::schema;
@@ -197,16 +197,12 @@ impl Amphora {
         };
         // AMPHORA_PACK_LOG=1: packed logs (docs/design/store.md, decisions 16 and 17).
         let pack_log = env("AMPHORA_PACK_LOG") == Some(1);
-        // AMPHORA_SHARED_PAGES: pages the groups' connections share at most, in one pool for the
-        // process (decision 20).
-        let shared_pages = env("AMPHORA_SHARED_PAGES").and_then(|p| usize::try_from(p).ok()).map(|p| Arc::new(SharedPages::new(p)));
+        // How the groups share pages (decisions 20 and 26): one pool for them all either way.
+        let sharing = crate::suite_db::amphora_sharing()?;
         let groups = Groups::start(groups, config, |g| {
-            let db = Db::open(&dir.join(format!("bench-{g}.db")))?;
+            let db = Db::open_sharing(&dir.join(format!("bench-{g}.db")), &sharing)?;
             if pack_log {
                 db.pack_log(true)?;
-            }
-            if let Some(pool) = &shared_pages {
-                db.share_pages_in(pool)?;
             }
             for s in schema::SCHEMA {
                 db.exec(s)?;

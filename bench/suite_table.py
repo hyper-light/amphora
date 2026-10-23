@@ -38,12 +38,20 @@ def value(x):
     if x.get("errors") and not x.get("ms"):
         return None, "failed: " + (x.get("error") or "")[:40]
     ms = x.get("ms") or {}
-    return x.get("ops_per_s"), f"{x.get('ops_per_s', 0):,.0f}/s p99 {ms.get('p99', '–')}"
+    rate = x.get("ops_per_s") or 0
+    if not ms:
+        # Nothing answered within the window: how long its longest run took (records before
+        # longest_ms have none to say).
+        longest = x.get("longest_ms")
+        return None, f"0/s (longest {longest / 1000:,.1f} s)" if longest else "0/s"
+    shown = f"{rate:,.1f}" if rate < 10 else f"{rate:,.0f}"
+    return rate, f"{shown}/s p99 {ms.get('p99', '–')}"
 
 
 for t, (r, rep) in runs.items():
     mem = r.get("server_mem_held_peak_mb") or rep.get("rss_max_mb")
-    print(f"- {t}: load {r.get('load_before')}–{r.get('load_after')}, items {rep['items']}, load {rep['load_s']:.1f} s, memory {mem} MB, commit {str(r.get('commit'))[:7]}")
+    settle = f" + settle {rep['settle_s']:.1f} s" if "settle_s" in rep else ""
+    print(f"- {t}: load {r.get('load_before')}–{r.get('load_after')}, items {rep['items']}, load {rep['load_s']:.1f} s + index {rep.get('index_s', 0):.1f} s{settle}, memory {mem} MB, commit {str(r.get('commit'))[:7]}")
 print()
 losses = []
 for c in clients:
@@ -61,7 +69,9 @@ for c in clients:
             ratio = f"{amph / best:.2f}x ({who})"
             losses.append((amph / best, op, c, who))
         elif others and not amph:
-            ratio = "Amphora can't"
+            a = row.get("amphora") or {}
+            answered_none = a and not a.get("unsupported") and not (a.get("errors") and not a.get("ms"))
+            ratio = "0x (none answered in the window)" if answered_none else "Amphora can't"
             losses.append((0.0, op, c, max(others)[1]))
         print(f"| {op} | " + " | ".join(vals[t][1] for t in targets) + f" | {ratio} |")
     print()

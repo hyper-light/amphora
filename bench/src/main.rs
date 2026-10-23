@@ -17,6 +17,7 @@ mod clickhouse;
 mod mysql;
 mod pg;
 mod pool;
+mod query;
 mod schema;
 mod store;
 mod suite;
@@ -472,6 +473,10 @@ fn main() -> anyhow::Result<()> {
     // The comprehensive suite: every kind of statement, each on its own (`suite.rs`).
     if std::env::args().any(|a| a == "--suite") {
         return suite::main();
+    }
+    // A statement on a database a suite run left behind: plans and times (`query.rs`).
+    if std::env::args().any(|a| a == "--query") {
+        return query::main();
     }
     // The versioned storage's B-link tree on its own (`blink.rs`).
     if std::env::args().any(|a| a == "--blink") {

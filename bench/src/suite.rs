@@ -5,7 +5,8 @@
 //! - **Data**: `items` (`--items` rows: integers, a real, a boolean, a timestamp in µs, short and
 //!   long text, a blob, a JSON document, a text column NULL in half the rows), `owners` (one for 50
 //!   items) and `regions` (20), every value a function of its row's id, the same in every database.
-//!   Indexes are made after the load, then each database's planner statistics.
+//!   Indexes are made after the load, then each database's planner statistics, then each
+//!   database's checkpoint (`settle_s`: what the load left in its log goes into its files first).
 //! - **Statements** ([`OPS`]): point lookups by primary key, secondary index and text; `IN`; ranges
 //!   by key and by secondary index; filters on several columns, on NULL, by `LIKE` prefix and
 //!   substring, and with no index (whole scans); sorts by index and by sorting, deep `OFFSET`;
@@ -16,14 +17,17 @@
 //!   indexed one, long text, JSON and a range, an upsert, deletes by key and by range (each row put
 //!   back, so the table keeps its size), and a transaction that reads and writes.
 //! - **Runs**: each statement for `--seconds` after `--warmup`, at each of `--clients` (closed loop:
-//!   each client runs it again as soon as it is answered; writes answered once durable). A statement
+//!   each client runs it again as soon as it is answered; writes answered once durable). A run
+//!   counts in the window if it is answered within it, whenever it began. A statement
 //!   a database's dialect has no form for is recorded unsupported; one it refuses, failed, with the
 //!   first error: both are findings.
 //!
 //! One JSON line: each statement's throughput, latency percentiles, rows and errors at each client
-//! count, and the memory the process held (servers' is added by `run.sh`).
+//! count, its longest run (`longest_ms`, warmup included: a statement that answers nothing within
+//! the window says how long it took), and the memory the process held (servers' is added by
+//! `run.sh`).
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -616,6 +620,9 @@ struct Outcome {
     /// Runs a database asked to be tried again (a conflict, a deadlock, a busy database), tried
     /// again as an application would: their time counts in the run's latency.
     retries: u64,
+    /// The longest run, in µs, whenever it began and ended (warmup included): a statement that
+    /// answers nothing within the window says how long it took.
+    longest_us: u64,
 }
 
 /// Whether a database's refusal asks to be tried again (serialization failures, deadlocks, write
@@ -632,15 +639,18 @@ fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &A
     let began = Instant::now();
     let count_from = began + Duration::from_secs_f64(warmup);
     let until = count_from + Duration::from_secs_f64(seconds);
-    let total = Arc::new(Mutex::new(Outcome { hist: Hist::new(), rows: 0, errors: 0, error: None, retries: 0 }));
-    let seed = AtomicU64::new(0x2545_f491_4f6c_dd1d ^ mix(op.name.len() as u64));
+    let total = Arc::new(Mutex::new(Outcome { hist: Hist::new(), rows: 0, errors: 0, error: None, retries: 0, longest_us: 0 }));
+    // Each statement's clients draw from streams of their own: mix is a bijection, so no two
+    // clients' seeds are equal (adding the client's number and then XORing it in made clients 0, 2,
+    // 4, ... draw the same parameters, and statements whose names were as long drew the same).
+    let base = op.name.bytes().fold(0x2545_f491_4f6c_dd1d_u64, |h, b| mix(h ^ u64::from(b)));
     let d = target.dialect();
     std::thread::scope(|s| {
         for c in 0..clients {
             let (target, stmts, shape, stop, total) = (target.clone(), stmts.clone(), shape.clone(), stop.clone(), total.clone());
-            let mut rng = Rng(mix(seed.fetch_add(1, Ordering::Relaxed) ^ (c as u64 + 1)) | 1);
+            let mut rng = Rng(mix(base ^ mix(c as u64 + 1)) | 1);
             s.spawn(move || {
-                let mut mine = Outcome { hist: Hist::new(), rows: 0, errors: 0, error: None, retries: 0 };
+                let mut mine = Outcome { hist: Hist::new(), rows: 0, errors: 0, error: None, retries: 0, longest_us: 0 };
                 match target.session() {
                     Err(e) => {
                         mine.errors += 1;
@@ -666,11 +676,17 @@ fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &A
                                     _ => break,
                                 }
                             }
-                            let us = u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX);
+                            let ended = Instant::now();
+                            let us = u64::try_from(ended.duration_since(t).as_micros()).unwrap_or(u64::MAX);
+                            mine.longest_us = mine.longest_us.max(us);
                             match got {
                                 Ok(rows) => {
                                     failing = 0;
-                                    if t >= count_from {
+                                    // A run counts where it ended: answered within the window,
+                                    // whenever it began. Counting runs begun in the window instead
+                                    // dropped every run a slow one ahead of it pushed past the warmup,
+                                    // and counted runs answered long after the window closed.
+                                    if ended >= count_from && ended <= until {
                                         mine.hist.record(us);
                                         mine.rows += rows as u64;
                                     }
@@ -696,6 +712,7 @@ fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &A
                     t.rows += mine.rows;
                     t.errors += mine.errors;
                     t.retries += mine.retries;
+                    t.longest_us = t.longest_us.max(mine.longest_us);
                     if t.error.is_none() {
                         t.error = mine.error;
                     }
@@ -703,7 +720,7 @@ fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &A
             });
         }
     });
-    Arc::try_unwrap(total).ok().and_then(|m| m.into_inner().ok()).unwrap_or(Outcome { hist: Hist::new(), rows: 0, errors: 0, error: Some("lost the run's outcome".into()), retries: 0 })
+    Arc::try_unwrap(total).ok().and_then(|m| m.into_inner().ok()).unwrap_or(Outcome { hist: Hist::new(), rows: 0, errors: 0, error: Some("lost the run's outcome".into()), retries: 0, longest_us: 0 })
 }
 
 pub fn main() -> anyhow::Result<()> {
@@ -728,8 +745,14 @@ pub fn main() -> anyhow::Result<()> {
             eprintln!("setup: {s}: {e:#}");
         }
     }
-    target.ready()?;
     let indexed_s = began.elapsed().as_secs_f64() - loaded_s;
+    let settling = Instant::now();
+    // A database that refuses its checkpoint is said, not stopped: its runs read what it left.
+    if let Err(e) = target.settle() {
+        eprintln!("settle: {e:#}");
+    }
+    let settle_s = settling.elapsed().as_secs_f64();
+    target.ready()?;
     let rss_after_load_mb = crate::rss_mb();
     forget_peaks();
 
@@ -791,6 +814,7 @@ pub fn main() -> anyhow::Result<()> {
                 "errors": out.errors,
                 "retries": out.retries,
                 "error": out.error,
+                "longest_ms": out.longest_us as f64 / 1000.0,
             }));
         }
     }
@@ -805,6 +829,7 @@ pub fn main() -> anyhow::Result<()> {
         "warmup": o.warmup,
         "load_s": loaded_s,
         "index_s": indexed_s,
+        "settle_s": settle_s,
         "results": results,
         "rss_after_load_mb": rss_after_load_mb,
         "rss_max_mb": crate::rss_max_mb(),
