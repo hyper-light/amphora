@@ -37,7 +37,7 @@ run() {
   # Its socket directory belongs to the image's own user; the calling user gets one of its own. No
   # health check (the only image here with one): it would run a probe inside the server's
   # container through every run.
-  docker run -d --name "$NAME" --network host --user "$(id -u):$(id -g)" --memory 8g --memory-swap 8g --tmpfs /var/run/postgresql:mode=1777 --no-healthcheck \
+  docker run -d --name "$NAME" --network host --user "$(id -u):$(id -g)" $(limits) --tmpfs /var/run/postgresql:mode=1777 --no-healthcheck \
     -e HOME=/var/lib/cedardb/data -e PORT="$PORT" -e PASSWORD="$PASSWORD" -v "$DATA:/var/lib/cedardb/data" \
     --entrypoint bash "$IMAGE" -c "$SERVE"
 }

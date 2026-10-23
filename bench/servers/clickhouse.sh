@@ -35,7 +35,7 @@ run() {
     <interserver_http_port remove="1"/>
 </clickhouse>
 XML
-  docker run -d --name "$NAME" --network host --user "$(id -u):$(id -g)" --memory 8g --memory-swap 8g --ulimit nofile=262144:262144 \
+  docker run -d --name "$NAME" --network host --user "$(id -u):$(id -g)" $(limits) --ulimit nofile=262144:262144 \
     -e CLICKHOUSE_SKIP_USER_SETUP=1 -v "$DATA/data:/var/lib/clickhouse" -v "$DATA/log:/var/log/clickhouse-server" \
     -v "$DATA/ports.xml:/etc/clickhouse-server/config.d/docker_related_config.xml:ro" "$IMAGE"
 }

@@ -21,7 +21,7 @@ DATA=${AMPHORA_BENCH_DATA:-$HOME/.cache/amphora-bench-data-nocow}/mysql
 
 run() {
   # secure_file_priv's directory belongs to the image's own user; the calling user gets one of its own.
-  docker run -d --name "$NAME" --network host --user "$(id -u):$(id -g)" --memory 8g --memory-swap 8g \
+  docker run -d --name "$NAME" --network host --user "$(id -u):$(id -g)" $(limits) \
     --tmpfs "/var/lib/mysql-files:uid=$(id -u),gid=$(id -g),mode=0750" \
     -e MYSQL_ALLOW_EMPTY_PASSWORD=yes -e MYSQL_DATABASE=convo -v "$DATA:/var/lib/mysql" \
     "$IMAGE" --port="$PORT" --bind-address=127.0.0.1 --mysqlx=OFF --max-connections=1100 \

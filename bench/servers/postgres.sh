@@ -18,7 +18,7 @@ DATA=${AMPHORA_BENCH_DATA:-$HOME/.cache/amphora-bench-data-nocow}/postgres
 
 run() {
   # Parallel queries take their shared memory from /dev/shm: Docker's 64 MB can run out.
-  docker run -d --name "$NAME" --network host --user "$(id -u):$(id -g)" --memory 8g --memory-swap 8g --shm-size 256m \
+  docker run -d --name "$NAME" --network host --user "$(id -u):$(id -g)" $(limits) --shm-size 256m \
     -e POSTGRES_HOST_AUTH_METHOD=trust -v "$DATA:/var/lib/postgresql/data" \
     "$IMAGE" postgres -c listen_addresses=127.0.0.1 -c port="$PORT" -c max_connections=1100
 }

@@ -21,7 +21,7 @@ DATA=${AMPHORA_BENCH_DATA:-$HOME/.cache/amphora-bench-data-nocow}/orioledb
 
 run() {
   # initdb wants the calling user in /etc/passwd, and this image has no nss_wrapper to fake one.
-  docker run -d --name "$NAME" --network host --user "$(id -u):$(id -g)" -v /etc/passwd:/etc/passwd:ro --memory 8g --memory-swap 8g --shm-size 256m \
+  docker run -d --name "$NAME" --network host --user "$(id -u):$(id -g)" -v /etc/passwd:/etc/passwd:ro $(limits) --shm-size 256m \
     -e POSTGRES_HOST_AUTH_METHOD=trust -v "$DATA:/var/lib/postgresql/data" \
     "$IMAGE" postgres -c listen_addresses=127.0.0.1 -c port="$PORT" -c max_connections=1100 \
     -c shared_preload_libraries=orioledb -c default_table_access_method=orioledb -c orioledb.main_buffers=512MB -c orioledb.undo_buffers=256MB -c max_wal_size=8GB

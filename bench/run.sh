@@ -22,6 +22,12 @@ data="${AMPHORA_BENCH_DATA:-$HOME/.cache/amphora-bench-data}"
 targets="$1"
 shift
 host=$(hostname -s)
+# The host's limits on every target (servers/lib.sh), recorded with each run.
+host_env="${AMPHORA_BENCH_HOST_ENV:-$HOME/.config/amphora-bench/host.env}"
+if [[ -f "$host_env" ]]; then
+  # shellcheck disable=SC1090
+  . "$host_env"
+fi
 cpu=$(lscpu 2>/dev/null | sed -n 's/^Model name: *//p' | head -1)
 cores=$(nproc)
 mkdir -p "$data"
@@ -86,6 +92,7 @@ record = {
     "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)", "host": "$host", "cpu": "$cpu", "cores": $cores,
     "disk": "$disk", "fs": "$fs", "kernel": "$kernel", "commit": "$commit", "dirty_files": $dirty,
     "load_before": $load, "load_after": $load_after, "args": "$*", "report": report,
+    "limits": {"memory": "${AMPHORA_BENCH_MEMORY:-8g}", "write_bps": "${AMPHORA_BENCH_WRITE_BPS:-}", "write_devices": "${AMPHORA_BENCH_WRITE_DEVICES:-}"},
 }
 env = os.environ
 if env.get("SERVER_CONTAINER"):
