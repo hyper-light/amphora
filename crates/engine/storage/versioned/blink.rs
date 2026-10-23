@@ -499,6 +499,45 @@ impl Tree {
         Ok(out)
     }
 
+    /// Clears every cell's versions and drops removed rows' cells (recovery: no snapshot outlives
+    /// the process, decision 8). A leaf is written only if a cell of it needs this, so leaves
+    /// without one stay clean; recovery runs alone, so none changes between the read and the write.
+    pub fn clear_versions(&self, pool: &Pool, d: &mut Descender) -> Result<()> {
+        let mut leaf = self.leftmost(pool, d)?;
+        let mut moves = 0u64;
+        loop {
+            let (flagged, right) = {
+                let r = pool.read(leaf)?;
+                let mut flagged = false;
+                for i in 0..page::count(&r)? {
+                    let f = page::flags(&r, i)?;
+                    flagged |= f.versioned || f.removed;
+                }
+                (flagged, page::right(&r)?)
+            };
+            if flagged {
+                let mut w = pool.write(leaf)?;
+                // Each turn removes a cell or moves past one.
+                let mut i = 0usize;
+                while i < page::count(&w)? {
+                    let f = page::flags(&w, i)?;
+                    if f.removed {
+                        page::remove(&mut w, i)?;
+                        continue;
+                    }
+                    if f.versioned {
+                        page::set_flags(&mut w, i, page::Flags::default())?;
+                    }
+                    i = i.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+                }
+            }
+            match right {
+                Some(next) => leaf = step_right(pool, &mut moves, leaf, Some(next))?,
+                None => return Ok(()),
+            }
+        }
+    }
+
     /// The leftmost leaf.
     fn leftmost(&self, pool: &Pool, d: &mut Descender) -> Result<u64> {
         let mut page = self.root();

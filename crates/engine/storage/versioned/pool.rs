@@ -13,7 +13,7 @@
 
 use super::page::PAGE_SIZE;
 use crate::error::LimboError;
-use crate::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::Result;
 use std::ops::{Deref, DerefMut};
@@ -23,6 +23,8 @@ struct Frame {
     page: RwLock<Box<[u8]>>,
     /// Exclusive holds ended.
     version: AtomicU64,
+    /// Written since the last checkpoint copied it.
+    dirty: AtomicBool,
 }
 
 /// The frames, and the next page number to hand out.
@@ -52,10 +54,12 @@ impl Deref for PageRead<'_> {
     }
 }
 
-/// A page written under its frame's exclusive latch; its frame's version moves on as it ends.
+/// A page written under its frame's exclusive latch; its frame's version moves on as it ends, and
+/// it is dirty until a checkpoint copies it.
 pub struct PageWrite<'a> {
     guard: RwLockWriteGuard<'a, Box<[u8]>>,
     version: &'a AtomicU64,
+    dirty: &'a AtomicBool,
 }
 
 impl Deref for PageWrite<'_> {
@@ -73,6 +77,7 @@ impl DerefMut for PageWrite<'_> {
 
 impl Drop for PageWrite<'_> {
     fn drop(&mut self) {
+        self.dirty.store(true, Ordering::Release);
         self.version.fetch_add(1, Ordering::Release);
     }
 }
@@ -84,6 +89,7 @@ impl Pool {
             .map(|_| Frame {
                 page: RwLock::new(vec![0u8; PAGE_SIZE].into_boxed_slice()),
                 version: AtomicU64::new(0),
+                dirty: AtomicBool::new(false),
             })
             .collect();
         Self {
@@ -149,7 +155,48 @@ impl Pool {
         Ok(PageWrite {
             guard: frame.page.write(),
             version: &frame.version,
+            dirty: &frame.dirty,
         })
+    }
+
+    /// The pages written since the last call, each now clean: a checkpoint's to copy (call while
+    /// no page can be written, or a write after the call is a write the next checkpoint copies).
+    pub fn take_dirty(&self) -> Result<Vec<u64>> {
+        let mut out = Vec::new();
+        let allocated =
+            usize::try_from(self.allocated()).map_err(|_| LimboError::IntegerOverflow)?;
+        for (i, frame) in self.frames.iter().take(allocated).enumerate() {
+            if frame.dirty.swap(false, Ordering::AcqRel) {
+                let page = u64::try_from(i)
+                    .ok()
+                    .and_then(|i| i.checked_add(1))
+                    .ok_or(LimboError::IntegerOverflow)?;
+                out.push(page);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Puts `bytes`, page `page` as a file holds it, into its frame (recovery), clean; the pages
+    /// handed out cover it after.
+    pub fn load(&self, page: u64, bytes: &[u8]) -> Result<()> {
+        let at = page
+            .checked_sub(1)
+            .and_then(|i| usize::try_from(i).ok())
+            .ok_or(LimboError::IntegerOverflow)?;
+        let frame = self.frames.get(at).ok_or(LimboError::DatabaseFull)?;
+        let mut w = frame.page.write();
+        if bytes.len() != w.len() {
+            return Err(LimboError::Corrupt(format!(
+                "versioned storage: page {page} of {} bytes",
+                bytes.len()
+            )));
+        }
+        w.copy_from_slice(bytes);
+        drop(w);
+        frame.version.fetch_add(1, Ordering::Release);
+        self.allocated.fetch_max(page, Ordering::AcqRel);
+        Ok(())
     }
 
     /// `page`'s frame's version now, unlatched.

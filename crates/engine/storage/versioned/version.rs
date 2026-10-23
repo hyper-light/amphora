@@ -21,6 +21,7 @@
 use super::blink::{Cell, Change, Descender, Tree};
 use super::page::Flags;
 use super::pool::Pool;
+use super::redo::Op;
 use crate::error::LimboError;
 use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::Mutex;
@@ -88,6 +89,8 @@ pub struct Txn {
     pub id: u64,
     pub start: Ts,
     changed: Vec<(u64, Vec<u8>)>,
+    /// Its changes in the order made: its redo record (decision 6).
+    ops: Vec<Op>,
 }
 
 impl Txn {
@@ -164,6 +167,7 @@ impl Clock {
             id,
             start,
             changed: Vec::new(),
+            ops: Vec::new(),
         })
     }
 
@@ -182,19 +186,36 @@ impl Clock {
         }
     }
 
-    /// Publishes `txn`'s commit: its timestamp, after every commit before it.
-    fn commit(&self, txn: &Txn) -> Result<Ts> {
+    /// Publishes `txn`'s commit: its timestamp, after every commit before it; `log` given the
+    /// timestamp first, under the same lock (so commits are logged in timestamp order), and a
+    /// failure of it leaves the transaction open, for its caller to roll back.
+    fn commit(&self, txn: &Txn, log: impl FnOnce(Ts, &[Op]) -> Result<()>) -> Result<Ts> {
         let mut last = self.publish.lock();
         let ts = last.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
         if ts >= TX {
             return Err(LimboError::IntegerOverflow);
         }
+        log(ts, &txn.ops)?;
         self.states(txn.id)?
             .lock()
             .insert(txn.id, State::Committed(ts));
         *last = ts;
         self.visible.store(ts, Ordering::Release);
         Ok(ts)
+    }
+
+    /// `f` with the last commit's timestamp, while no commit can be published: a checkpoint's
+    /// timestamp and the redo log's switch at it (decisions 6 and 7).
+    pub fn at_publish<R>(&self, f: impl FnOnce(Ts) -> R) -> R {
+        let last = self.publish.lock();
+        f(*last)
+    }
+
+    /// After recovery: commits up to `ts` are in, published, and the next is after it.
+    pub fn recovered(&self, ts: Ts) {
+        let mut last = self.publish.lock();
+        *last = (*last).max(ts);
+        self.visible.store(*last, Ordering::Release);
     }
 
     fn set_aborted(&self, txn: &Txn) -> Result<()> {
@@ -275,9 +296,13 @@ impl VTree {
         if !c.flags.versioned {
             return Ok(row_of(Some(c)));
         }
-        let head = head.ok_or_else(|| {
-            LimboError::Corrupt("versioned storage: a versioned cell without its versions".into())
-        })?;
+        // Heads come and go under the leaf's exclusive latch with their cells' flags, and
+        // recovery clears the flags it reads back: a versioned cell has a head.
+        let Some(head) = head else {
+            return Err(LimboError::InternalError(
+                "versioned storage: a versioned cell with no versions beside it".into(),
+            ));
+        };
         let cell_seen = match clock.resolve(head.writer)? {
             Writer::Open(id) => snap.own == Some(id),
             Writer::Committed(ts) => ts <= snap.start,
@@ -408,6 +433,11 @@ impl VTree {
                 versioned: true,
                 removed: false,
             };
+            txn.ops.push(Op::Put {
+                tree: self.id,
+                key: key.to_vec(),
+                value: value.to_vec(),
+            });
             Ok((Change::Put(value.to_vec(), flags), before))
         })
     }
@@ -444,8 +474,61 @@ impl VTree {
                 versioned: true,
                 removed: true,
             };
+            txn.ops.push(Op::Remove {
+                tree: self.id,
+                key: key.to_vec(),
+            });
             Ok((Change::Mark(flags), before))
         })
+    }
+
+    /// `op` made directly, with no versions: recovery's corrections and replay (decision 8).
+    pub fn apply_plain(&self, pool: &Pool, d: &mut Descender, op: &Op) -> Result<()> {
+        match op {
+            Op::Put { key, value, .. } => {
+                Tree::check_row(key, value)?;
+                self.tree.modify(pool, d, key, |_| {
+                    Ok((Change::Put(value.clone(), Flags::default()), ()))
+                })
+            }
+            Op::Remove { key, .. } => self.tree.modify(pool, d, key, |_| Ok((Change::Remove, ()))),
+        }
+    }
+
+    /// The rows whose cell isn't their version as of `ts` (a change of a transaction still open,
+    /// or committed after `ts`), each with that version: a checkpoint's list (decision 7). Asked
+    /// while no page can change.
+    fn corrections(&self, clock: &Clock, ts: Ts, out: &mut Vec<Op>) -> Result<()> {
+        for shard in &self.heads {
+            let heads = shard.lock();
+            for (key, head) in heads.iter() {
+                if matches!(clock.resolve(head.writer)?, Writer::Committed(w) if w <= ts) {
+                    continue;
+                }
+                let then = head
+                    .older
+                    .iter()
+                    .find(|o| o.written <= ts)
+                    .and_then(|o| o.value.clone());
+                out.push(match then {
+                    Some(value) => Op::Put {
+                        tree: self.id,
+                        key: key.clone(),
+                        value,
+                    },
+                    None => Op::Remove {
+                        tree: self.id,
+                        key: key.clone(),
+                    },
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The tree's root page.
+    pub fn root(&self) -> u64 {
+        self.tree.root()
     }
 
     /// Puts back the version `txn` replaced under `key` (its rollback).
@@ -515,6 +598,47 @@ impl Versioned {
         })
     }
 
+    /// The trees whose roots are `roots`, in `pool` (recovery).
+    pub fn open(
+        pool: Pool,
+        roots: &[u64],
+        cmp: impl Fn() -> super::blink::Comparator,
+    ) -> Result<Self> {
+        let mut trees = Vec::with_capacity(roots.len());
+        for (id, &root) in roots.iter().enumerate() {
+            let id = u64::try_from(id).map_err(|_| LimboError::IntegerOverflow)?;
+            trees.push(VTree::new(id, Tree::open(root, cmp())));
+        }
+        Ok(Self {
+            pool,
+            clock: Clock::new(),
+            trees,
+        })
+    }
+
+    /// Each tree's root page, by tree.
+    pub fn roots(&self) -> Vec<u64> {
+        self.trees.iter().map(VTree::root).collect()
+    }
+
+    /// Clears the versions on every tree's cells, dropping removed rows' (recovery, which starts
+    /// with no heads: each cell is every snapshot's).
+    pub fn clear_versions(&self, d: &mut Descender) -> Result<()> {
+        for t in &self.trees {
+            t.tree.clear_versions(&self.pool, d)?;
+        }
+        Ok(())
+    }
+
+    /// Every tree's rows whose cell isn't their version as of `ts`, with that version (decision 7).
+    pub fn corrections(&self, ts: Ts) -> Result<Vec<Op>> {
+        let mut out = Vec::new();
+        for t in &self.trees {
+            t.corrections(&self.clock, ts, &mut out)?;
+        }
+        Ok(out)
+    }
+
     pub fn tree(&self, id: u64) -> Result<&VTree> {
         usize::try_from(id)
             .ok()
@@ -523,9 +647,27 @@ impl Versioned {
     }
 
     /// Commits `txn`: its changes visible to every snapshot from its timestamp on, which it
-    /// returns; its versions then name the timestamp, not the transaction.
-    pub fn commit(&self, txn: Txn) -> Result<Ts> {
-        let ts = self.clock.commit(&txn)?;
+    /// returns; its versions then name the timestamp, not the transaction. A commit that fails is
+    /// rolled back.
+    pub fn commit(&self, txn: Txn, d: &mut Descender) -> Result<Ts> {
+        self.commit_logged(txn, d, |_, _| Ok(()))
+    }
+
+    /// [`Versioned::commit`], `log` given the timestamp and the changes under the publish lock
+    /// (the redo log's append, in timestamp order); a failure of `log` rolls `txn` back.
+    pub fn commit_logged(
+        &self,
+        txn: Txn,
+        d: &mut Descender,
+        log: impl FnOnce(Ts, &[Op]) -> Result<()>,
+    ) -> Result<Ts> {
+        let ts = match self.clock.commit(&txn, log) {
+            Ok(ts) => ts,
+            Err(e) => {
+                self.abort(txn, d)?;
+                return Err(e);
+            }
+        };
         for (tree, key) in &txn.changed {
             let t = self.tree(*tree)?;
             let mut heads = t.heads(key)?.lock();
@@ -628,7 +770,7 @@ mod tests {
         let mut setup = v.clock.begin().unwrap();
         t.put(&v.pool, &mut d, &v.clock, &mut setup, b"a", b"1")
             .unwrap();
-        v.commit(setup).unwrap();
+        v.commit(setup, &mut d).unwrap();
 
         let reader = v.clock.snapshot().unwrap();
         let mut w = v.clock.begin().unwrap();
@@ -649,7 +791,7 @@ mod tests {
             t.get(&v.pool, &mut d, &v.clock, &reader, b"b").unwrap(),
             None
         );
-        v.commit(w).unwrap();
+        v.commit(w, &mut d).unwrap();
         assert_eq!(
             t.get(&v.pool, &mut d, &v.clock, &reader, b"a").unwrap(),
             Some(b"1".to_vec())
@@ -699,7 +841,7 @@ mod tests {
             t.remove(&v.pool, &mut d, &v.clock, &mut b, b"k"),
             Err(LimboError::WriteWriteConflict)
         ));
-        v.commit(a).unwrap();
+        v.commit(a, &mut d).unwrap();
         assert!(matches!(
             t.put(&v.pool, &mut d, &v.clock, &mut b, b"k", b"b"),
             Err(LimboError::WriteWriteConflict)
@@ -711,7 +853,7 @@ mod tests {
                 .unwrap(),
             Some(b"a".to_vec())
         );
-        v.commit(c).unwrap();
+        v.commit(c, &mut d).unwrap();
     }
 
     /// Do: a transaction changes, adds and removes rows, then rolls back. Expect: every row as it
@@ -726,7 +868,7 @@ mod tests {
             t.put(&v.pool, &mut d, &v.clock, &mut setup, k, b"0")
                 .unwrap();
         }
-        v.commit(setup).unwrap();
+        v.commit(setup, &mut d).unwrap();
         let mut w = v.clock.begin().unwrap();
         t.put(&v.pool, &mut d, &v.clock, &mut w, b"a", b"1")
             .unwrap();
@@ -771,7 +913,7 @@ mod tests {
             t.put(&v.pool, &mut d, &v.clock, &mut setup, &[k], &[0])
                 .unwrap();
         }
-        v.commit(setup).unwrap();
+        v.commit(setup, &mut d).unwrap();
         let early = v.clock.snapshot().unwrap();
         for round in 1..5u8 {
             let mut w = v.clock.begin().unwrap();
@@ -783,7 +925,7 @@ mod tests {
                         .unwrap();
                 }
             }
-            v.commit(w).unwrap();
+            v.commit(w, &mut d).unwrap();
         }
         v.collect(&mut d).unwrap();
         assert_eq!(v.versioned_rows(), 100, "the early reader's versions stay");
@@ -833,7 +975,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            v.commit(setup).unwrap();
+            v.commit(setup, &mut d).unwrap();
         }
         let total = start * u64::from(accounts);
         let amount = |bytes: &[u8]| u64::from_be_bytes(bytes.try_into().unwrap());
@@ -902,7 +1044,7 @@ mod tests {
                         })();
                         match attempt {
                             Ok(()) => {
-                                v.commit(txn).unwrap();
+                                v.commit(txn, &mut d).unwrap();
                                 moved += 1;
                             }
                             Err(LimboError::WriteWriteConflict) => v.abort(txn, &mut d).unwrap(),

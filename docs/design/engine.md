@@ -190,20 +190,33 @@ Neumann, Leis, "Rethinking Logging, Checkpoints, and Recovery for High-Performan
 "Speedy Transactions in Multicore In-Memory Databases" (Silo, SOSP 2013): redo-only value logging
 at commit.
 
+**Built** (`storage/versioned/redo.rs`): one record a commit (its changes, its timestamp, each
+record's length and XXH3), appended under the clock's publish lock to the pending bytes of the
+current one of two files; whoever next needs a commit durable takes the flush lock and writes and
+flushes everything pending at once, so one flush serves every commit appended before it began, with
+no timer. A flush that fails stops the log: nothing more is logged or made durable until the
+database is reopened (store.md, decision 9). Recovery reads each file up to its first torn or
+damaged record and cuts the file there, so an append past it can't leave a torn record's leftovers
+to be read back behind it.
+
 **Falsified by.** An acknowledged commit lost after a crash at any write (crash injection,
-T-T1.1.1, extended to this engine); log bytes per row on the suite not less than a quarter of
-page-a-frame's.
+T-T1.3.1); log bytes per row on the suite not less than a quarter of page-a-frame's.
 
 ## 7. Checkpoints: dirty pages copied in a pause, and the rows to correct
 
-**Decision.** A checkpoint takes a timestamp T (every commit at or before it is in the redo log),
-then, while row changes wait (each change holds a gate shared for as long as it changes its page;
-the checkpoint holds it exclusive), copies every page changed since the last checkpoint and lists
-the rows whose copied version isn't the one committed at or before T (a change of a transaction
-still open, or committed after T), each with its version as of T. The pause is the copies' memory
-time. The copies, the list and T go into a checkpoint journal, flushed; then the copies are written
-over their pages in the file, flushed; then the redo log before T is dropped. Splits wait for the
-pause like any change, so the copies are one consistent tree.
+**Decision.** A checkpoint holds a gate exclusive (each row change, commit and rollback holds it
+shared for as long as it changes pages or publishes), takes the last commit's timestamp T and
+switches the redo log's file at it, copies every page changed since the last checkpoint and lists
+the rows whose copied version isn't their version as of T (changes of transactions still open),
+each with that version. Taken under the gate, T splits no commit, and no commit after it exists
+until the gate is released. The pause is the copies' memory time. The copies, the list and T go into
+a checkpoint journal, flushed; then the copies and a header naming the checkpoint are written over
+the data file, flushed; then the redo file switched from, which holds only commits up to T, is cut.
+Journals take turns by the checkpoint's sequence number, so a checkpoint never writes over the
+journal recovery may need, and making a database is checkpoint 0 (its empty trees journaled first,
+like any other). A checkpoint that fails leaves the database making nothing more durable until it
+is reopened: the pages it took as copied may not have reached the file. Splits wait for the pause
+like any change, so the copies are one consistent tree.
 
 **Why.** Writing each page as of T (undoing newer changes in the copy) can need more than a page:
 a row whose older version is larger than its newer one no longer fits the page it was split for.
@@ -221,13 +234,17 @@ or misses one that did; a pause longer than the copies' memory time.
 
 ## 8. Recovery: the file's pages, the last journal, its list, then the redo after T
 
-**Decision.** Opening a database writes a complete last checkpoint journal over its pages again
-(the write may have been torn), applies the journal's list (each row back to its version as of
-T), replays every redo record committed after T in order, and clears the versions' flags (no
-snapshot outlives the process), removing the cells of removed rows.
+**Decision.** Opening a database takes the newest complete journal at or after the checkpoint its
+header names (a damaged header, any complete journal) and writes its pages and header over the
+data file again: a power cut may keep a checkpoint's header and not every page it wrote. It then
+applies the journal's list (each row back to its version as of T), replays every redo record
+committed after T, in timestamp order across both files, and clears the versions' flags (no
+snapshot outlives the process), removing the cells of removed rows. A data file with no complete
+journal is made anew only when it is empty and no commit is logged; otherwise it is refused as
+corrupt, never replaced by an empty database.
 
 **Falsified by.** Recovery that ends in a state no prefix of acknowledged commits explains
-(T-T1.1.1).
+(T-T1.3.1).
 
 ## 9. Beside the engine it replaces, behind the cursor the SQL layer already uses
 
@@ -249,13 +266,30 @@ with 64-byte values, puts and gets a second at 1, 2, 4, 8, 16 and 32 threads: 66
 1.24 and 1.73 million; 2.33 and 3.29 million; 3.63 and 4.89 million; 6.38 and 8.42 million; 8.55
 and 11.64 million.
 
+Stage 2 (`storage/versioned/{disk,redo,durable}.rs`): the files behind a seam (`Disk`), as a
+directory's files and as a simulator whose writes are durable only once flushed and which crashes
+after any number of operations, keeping of each unflushed write all, none or a prefix of its sectors.
+`durable.rs`'s tests: commits survive a reopen and a power cut; a checkpoint taken while one
+transaction is open and another rolls back keeps only what commits; a checkpoint whose header
+reached the file and whose page didn't is finished from its journal; a damaged header is recovered
+from its journal, and with the journals gone the file is refused, not made anew; a checkpoint that
+fails refuses the commits after it; a torn redo tail is cut before appends reach it; eight writers
+committing while one checkpoints every 20 commits, and 57 crash points through a workload of
+commits and checkpoints, recover a prefix of the commits at least as long as the last acknowledged
+durable. `redo.rs`'s: records decode up to the first torn or damaged one; one flush makes every
+commit appended before it durable. Five mutants each fail the test written for them: recovery
+without rewriting the newest journal, making a database whenever the header is unreadable,
+checkpoints that don't stop the log when they fail, redo tails left uncut, and versions left on
+recovered cells (which fails five).
+
 ## Stages, each measured
 
 1. The buffer pool and the B-link tree, versioned rows, in memory: concurrent inserts and reads
    against a model (a sorted map), from 1 to 32 threads; a micro-bench of concurrent inserts
    against the current engine's single writer.
 2. The redo log, group commit, checkpoints with their pause and list, and recovery: crash injection
-   at every write; the pool still holds every page (eviction to the file follows).
+   at every write; the pool still holds every page (eviction to the file follows). Built (above);
+   measured with the rest of the storage through the suite once stage 3 puts it under SQL.
 3. The executor on the new storage: the comprehensive suite, both engines.
 4. Serializable validation, garbage collection, memory bounds; Elle histories (AC-T1.3).
 5. The default, once the suite says so.

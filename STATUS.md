@@ -138,6 +138,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   wins, rollback, collection by the oldest open snapshot); not yet under the executor. One tree,
   2,000,000 random keys, unversioned: 660,371 puts a second at one thread, 8.55 million at 32
   (fedora, a check).
+- **Many writers, stage 2** (docs/design/engine.md decisions 6 to 8,
+  `crates/engine/storage/versioned/{disk,redo,durable}.rs`): a redo record a commit, group-committed
+  by one flush for every commit appended before it; checkpoints in a brief pause (copies of the
+  pages written since the last, and the rows open transactions changed, put back as of the
+  checkpoint) through alternating journals; recovery from the newest complete journal and the redo
+  after it, never an empty database over an existing file. Crash points through commits and
+  checkpoints recover a prefix of the commits at least as long as the last acknowledged durable;
+  the pool still holds every page, and nothing runs it under SQL yet (stage 3).
 - **Ephemeral tables kept between runs** (docs/design/executor.md decision 1,
   `crates/engine/tests/ephemeral_reuse.rs`): a statement keeps each ephemeral table of at most 16
   pages (an IN list's keys, an IN subquery's rows) and empties it on its next run, where building
