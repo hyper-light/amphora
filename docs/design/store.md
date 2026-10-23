@@ -861,3 +861,178 @@ past its bound and short of twice it, at most ten passes in 500 ms (the test's c
 
 **Falsified by.** A log that stays longer past its bound (its restarts later or fewer) or writes
 slower than with passes without pause.
+
+## 26. One pool of pages a process's databases can share, a quarter of its memory
+
+**Decision.** A database opened with `Sharing::Process` (`Db::open_sharing`) joins the process's
+pool of shared pages (decision 20): one pool for every database the process opens that way, made
+when the first opens, holding at most a quarter of the memory the process may use, in 4 KiB pages
+(`db::process_pages`, `db::default_pages`, `memory::limit`): on Linux the
+smallest memory limit of the control groups it runs in (cgroup v2, else v1, each group up to the
+root) and the machine's memory; where the system doesn't say (macOS, Windows: their interfaces need
+`unsafe`, which the crate denies), 65,536 pages (256 MiB, decision 20's measured size); never under
+4,096 pages. `Sharing::Pool` gives a database a pool of the caller's, `Sharing::Off` none (a packed
+log, decision 16, needs `Off`). `Db::open` still shares nothing: whether it should share the
+process's pool by default, and that budget, are the person's call (STATUS.md). A storage that refuses to
+share (another process's authority over the file, MVCC, a packed log: one this process packs or,
+new with this decision, one whose generation on disk is packed, which recovery reads as written
+without anything asking for packing again) leaves each connection its own cache and says so
+(`amphora.store` event `pages_unshared`). The pool only holds pages connections have read:
+a cap, not a reservation. A database that closes takes its pages out of the pool
+(`SharedFile`'s membership, `SharedPages::forget_all`), so a pool that outlives its databases keeps
+none of theirs.
+
+**Why.** At ten million rows (6.7 GB of pages) each reader's 2,000 pages hold neither the table's
+leaves nor even its inner pages (about 5,500): a lookup by rowid misses twice, each miss a log
+lookup, a `pread`, a 4 KiB copy, a checksum and an eviction, about 20 µs a lookup against SQLite's
+~1 µs from a warm OS cache. One pool for the process, sized from its memory, is the budget a
+process has to give it, where a pool a database each multiplies with the databases (K0 runs one a
+group).
+
+**Sources.** PostgreSQL's documentation ("Resource Consumption", `shared_buffers`): on a dedicated
+server with 1 GB or more, "a reasonable starting value for `shared_buffers` is 25% of the memory in
+your system" (its shipped default is 128 MB). CedarDB's configuration reference: its buffer pool
+(`buffersize`) defaults to 45% of available memory. DuckDB's configuration reference:
+`memory_limit` defaults to 80% of RAM. A quarter is the cautious end of what databases that size
+their caches from memory take. Control groups v2 (the kernel's `Documentation/admin-guide/
+cgroup-v2.rst`, `memory.max`): a group's limit bounds every group under it, so the smallest along
+the path is the process's.
+
+**Evidence.** `crates/amphora/src/memory.rs`' tests: a process finds its memory group in cgroup
+v2, v1 and hybrid hierarchies; limits read as bytes, "max" and v1's no-limit value as none; every
+group above a group bounds it; this process's limit is no larger than its machine.
+`db.rs`, `the_process_pool_is_a_quarter_of_its_memory`: 32 GiB gives 2,097,152 pages, 16 MiB the
+floor, none said the fallback, no overflow. `storage/shared_pages.rs`,
+`a_file_that_leaves_the_pool_takes_its_pages_with_it`: a file's pages stay while a handle is left
+and all go with the last, the other file's untouched; with the membership's drop left empty (a
+mutant) it fails. `crates/engine/tests/packed_log.rs`,
+`a_database_opened_on_a_packed_log_doesnt_share_its_pages`: reopened on a packed generation, the
+database refuses to share and reads every row; with the check of the log's format on disk left
+out (a mutant) it fails. `crates/amphora/tests/crash.rs`: the power-cut seeds that don't pack their
+log now share the process's pages through every crash and recovery, and lose nothing acknowledged.
+The suite at ten million rows (adacachy, 2026-10-23, loads 65 to 117, checks rather than recorded
+runs; `ab-v4-10m.jsonl`), the process's pool (8 GiB in the bench's 32 GiB unit; 98.8% of 628
+million lookups found their page) against none: `insert_one` 3,023 and 1,302 a second at 32
+clients, `update_indexed` 3,182 and 1,921, `txn_read_write` 2,469 and 1,521, `exists_subquery`
+8.6 and 0.6 at one client, `join_pk` 430,752 and 272,128 at 32 clients; slower where many readers
+scan the same pages at once (`table_group_by` at 32 clients 50 s a query against 15 s,
+`window_row_number` 7,300 a second against 13,977), and for the statements right after the load
+(`point_pk` at one client 8,968 against 172,322: the pool and the OS's cache of 14 GB of database
+and log no longer both fit the unit). With decisions 27 to 29 and planner decision 7 in, and the
+suite's settle cutting the log so the OS's cache of the database stays warm (`ab-v6-10m.jsonl`):
+no pool reads faster still (`case_aggregate` at 32 clients 43,339 a second against 21,751,
+`join_pk` 547,680 against 165,541, `union_all` at one client 206,733 against 17,936 while the pool
+fills), the pool ahead on writes at 32 clients (`update_indexed` 4,696 against 3,265,
+`txn_read_write` 2,497 against 2,025). A pool beside a warm OS cache holds every page twice and pays
+a lookup and an insert on every miss; it pays where the OS can't keep the pages.
+
+**Falsified by.** A process sharing the pool whose reads run slower than with none once the pool
+is warm (the scans above, until the pool's lookups stop contending); a process whose other memory
+the pool crowds out (its memory pressure rising with the pool); a closed database's pages found in
+the pool.
+
+## 27. A writer reads committed pages through the pool, and keeps none of what it reads
+
+**Decision.** A connection holding the write lock looks pages up in the shared pool like a reader,
+but only versions committed before its write transaction began: the log's committed end is
+recorded when the transaction begins (`WalFile::write_base`, after any restart it makes), and a
+page whose latest frame for the writer lies past it (a frame the transaction itself wrote, spilled
+from its cache) isn't looked up. What the writer reads on a miss it doesn't keep in the pool: it
+reads the pages it is about to change, whose committed images its commit supersedes. Pages it
+changes it copies first, as decision 20's writers did (`Pager::add_dirty`).
+
+**Why.** Decision 20 kept the writer out of the pool while it held the write lock. At ten million
+rows the writer's 1,024 pages (decision 5) hold none of six B-trees' leaves and few of their inner
+pages, so each commit read pages from the file that readers had already brought into memory. The
+first version of this decision let the writer keep what it read too: the suite's 10M load then
+filled the 8 GiB pool with log versions that all died when the settle restarted the log, and with
+the pool on the suite's reads ran slower than with none (pool off against on at 32 clients:
+`date_bucket` 9.1x, `string_functions` 8x, `case_aggregate` 5.6x; at one client `string_functions`
+3.4x; `ab-v3-10m.jsonl`). A pool hit itself costs less than a read from the OS cache (one query of
+340 pages through a 200-page reader cache, one client: 0.34 ms from the pool, 0.6 ms without, with
+reads up to 2.9 ms), so the loss was the pool's contents, not its lookups.
+
+**Sources.** Decision 20's invariant: only committed images are kept. SQLite's WAL (its
+documentation, "Write-Ahead Logging", and `wal.c`): a writer's snapshot is the latest commit plus
+its own uncommitted frames, appended past the committed end; frames up to that end are committed.
+
+**Evidence.** `crates/engine/tests/shared_pages.rs`:
+`a_writer_in_a_transaction_reads_committed_pages_from_memory` (a writer caching 200 pages that
+updates 200 rows on 100 leaves in a transaction finds at least 50 of its pages in the pool, from
+the log and after a checkpoint from the file, while a reader reads the old rows until it commits);
+`a_writer_keeps_nothing_it_reads_in_the_shared_pages` (with nothing read in, the writer's
+transaction adds at most its schema read to the pool, a reader after it the table's pages); the
+model (300 random steps for 16 seeds) and `a_write_rolled_back_leaves_no_shared_page` still pass.
+Mutants: a writer keeping what it reads fails the second; one keeping even its own spilled frames
+fails `a_write_rolled_back_leaves_no_shared_page` (a reader read a rolled-back value); one whose
+transaction's base is 0 fails the first. With the process's pool at ten million rows, writes run as
+decision 26's evidence gives (`insert_one` at 32 clients 3,023 a second against 1,302 with no pool,
+`update_indexed` 3,182 against 1,921).
+
+**Falsified by.** A reader or a writer reading a version its snapshot doesn't see (the model's
+check), or a write workload running slower with the writer reading the pool.
+
+## 28. A reader's snapshot takes the log's generation without a lock; spin locks test first
+
+**Decision.** The log's header keeps a copy of its generation (`checkpoint_seq`) that reads take
+without the header's lock (`wal::HeaderCell`): every guard of the header refreshes the copy as it
+is dropped, so no write to the header leaves it stale, and every write to the header holds the
+shared log's write lock, so a reader under its read lock sees the copy and the other snapshot fields
+together, as it saw them under the header's lock. A reader's snapshot (`snapshot_of`, taken at
+every transaction a reader begins, and again to check it) reads the copy. And the engine's spin
+lock (`fast_lock::SpinLock`) tests before it takes: a waiter spins on a plain load and swaps only
+once the lock looks free.
+
+**Why.** A profile of the suite's `point_pk` at 32 clients, ten million rows (v3, 2026-10-23):
+19.5% of the time beginning read transactions, 18% loading the snapshot, 17.6% in the header
+lock's swap alone. Every point read is a read transaction, so 32 readers took one lock line from
+each other at every query; the spin lock swapped in its loop, so each waiter wrote the line at
+every turn.
+
+**Sources.** Anderson, "The Performance of Spin Lock Alternatives for Shared-Memory
+Multiprocessors" (IEEE TPDS 1, 1990): test-and-test-and-set spins in the cache and goes to the
+interconnect only when the lock is released. SQLite's WAL index header (`wal.c`,
+`walIndexTryHdr`): readers copy the header without a lock and check the copy.
+
+**Evidence.** `storage/wal.rs`, `a_header_cells_generation_follows_every_write`: the copy is the
+header's after a field write and after the whole header is replaced. `fast_lock.rs`'s test: 1,000
+threads incrementing under the lock lose no increment. The suite at ten million rows with no pool
+(adacachy, checks rather than recorded runs, loads near 100 and 80): `point_pk` at 32 clients
+701,613 a second before (`ab-v3-10m.jsonl`) and 1,572,331 after (`ab-v4-10m.jsonl`),
+`point_pk_one_column` 589,372 and 1,713,766.
+
+**Falsified by.** A reader's snapshot naming a generation the log isn't in (the WAL tests, the
+model, the crash injection), or point reads at 32 clients no faster.
+
+## 29. A pool lookup reads under its shard's read lock and copies the page out
+
+**Decision.** A lookup in the shared pages (`SharedPages::copy_into`) takes its shard's read lock,
+copies the page's image into a buffer of the reader's own, and lets the lock go: readers of the
+same shard proceed together, and no reader holds a count on a buffer every other reader of that
+page shares. The mark CLOCK reads (read since the hand last passed) is an atomic each entry, set by
+lookups only when not already set; the shard's hits and misses are atomics beside its lock.
+Additions, evictions and forgetting take the shard's write lock. A page read on a miss still keeps
+the buffer it publishes (one reader, one count).
+
+**Why.** With decision 27, the process's pool at ten million rows hit 98.8% of 628 million lookups
+and still lost to no pool where many readers scanned the same pages at once (`table_group_by` at 32
+clients 50 s a query against 15 s, `window_row_number` 7,300 a second against 13,977): each hit took
+its shard's mutex and a count on the page's shared buffer, and released both, so 32 readers in step
+took the same two lines from each other at every page.
+
+**Sources.** The kernel's page cache serves the same reads without a lock a page (`filemap_read`,
+the page cache's xarray read under RCU): what the pool's lookups lose to. Corbató's CLOCK (decision
+20): only the reference bit is written on a hit.
+
+**Evidence.** `storage/shared_pages.rs`, `a_lookup_copies_the_image_out_and_holds_nothing`: a hit
+copies the image's bytes and adds no holder of the pool's buffer; a buffer of another size gets
+nothing. The suite at ten million rows with the process's pool (adacachy, 2026-10-23, checks
+rather than recorded runs; `ab-v4-10m.jsonl` before, `ab-v5-10m.jsonl` after, 98.8% of lookups
+found both times), 32 clients: `window_row_number` 7,300 → 15,146 a second, `string_functions`
+134,293 → 214,902, `group_by_range` 1,545 → 2,340, `date_bucket` 1,530 → 2,470, `aggregates_range`
+21,591 → 24,428; against no pool in the same run, the pool now ahead or level on those, and
+behind on `case_aggregate` (26,274 against 36,065) and on `union_all` at one client (53,790
+against 75,565).
+
+**Falsified by.** Scans many readers make of the same pages at once still slower with the pool than
+without, or single readers slower (a 4 KiB copy a hit costing more than the count it saves).

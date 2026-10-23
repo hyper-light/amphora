@@ -181,6 +181,34 @@ fn what_a_packed_log_holds_reads_back_through_every_path() {
     integrity(&conn);
 }
 
+/// Do: commit to a packed log, close the database, open it again (its log's generation packed on
+/// disk, though this process never asked for packing) and ask it to share its pages. Expect: the
+/// sharing refused, as it is for a database that packs its log now, and every row read back
+/// (decisions 20 and 26: a process's databases share pages by default, a packed log's don't).
+#[test]
+fn a_database_opened_on_a_packed_log_doesnt_share_its_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("packed.db");
+    let want = {
+        let db = open(&path);
+        db.wal_pack(true).unwrap();
+        let conn = connect(&db);
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)")
+            .unwrap();
+        let want = insert(&conn, 0..200, 3000, false);
+        assert_eq!(wal_format(&path), PACKED_FORMAT);
+        assert!(db.share_pages(1024).is_err(), "shared while packing");
+        want
+    };
+    assert_eq!(wal_format(&path), PACKED_FORMAT);
+    let db = open(&path);
+    assert!(
+        db.share_pages(1024).is_err(),
+        "a database whose log on disk is packed shared its pages"
+    );
+    assert_eq!(table(&connect(&db)), want);
+}
+
 /// The entries of every record in a packed log with no restart behind it, as (kind, depth): 0 an
 /// image, 1 a delta.
 fn entries(wal: &[u8]) -> Vec<(u8, u8)> {

@@ -4216,9 +4216,9 @@ impl Pager {
 
     /// Amphora: reads `page_idx` through the pages the database's connections share (decision
     /// 20): the version this connection sees, as another connection read it in (`(page, None)`:
-    /// no read), or read now and shared once read (`(page, Some(read))`). None when this
-    /// connection doesn't share now: no shared pages, outside a read transaction, or inside a
-    /// write transaction, whose own frames no other connection may see.
+    /// no read), or read now (`(page, Some(read))`), shared once read unless this connection
+    /// writes (decision 27). None when this connection doesn't share now: no shared pages,
+    /// outside a read transaction, or a frame its own write transaction wrote.
     fn read_shared(
         &self,
         page_idx: i64,
@@ -4227,11 +4227,23 @@ impl Pager {
         let (Some(shared), Some(wal)) = (self.db_file.shared_pages(), self.wal.as_ref()) else {
             return Ok(None);
         };
-        if !wal.holds_read_lock() || wal.holds_write_lock() {
+        if !wal.holds_read_lock() {
             return Ok(None);
         }
+        // Amphora: a writer reads committed versions through the pages too, keeping none of what it
+        // reads (below); a frame its own transaction wrote (a spill) isn't looked up (decision 27).
+        let own_after = match (wal.holds_write_lock(), wal.write_base()) {
+            (false, _) => None,
+            (true, Some(base)) => Some(base),
+            (true, None) => return Ok(None),
+        };
         let page_no = u64::try_from(page_idx).map_err(|_| LimboError::IntegerOverflow)?;
         let frame = wal.find_frame(page_no, None)?;
+        if let (Some(base), Some(frame)) = (own_after, frame) {
+            if frame > base {
+                return Ok(None);
+            }
+        }
         let version = match frame {
             Some(frame) => Version::Frame {
                 generation: wal.connection_wal_pos().0,
@@ -4241,13 +4253,20 @@ impl Pager {
         };
         let key = shared.key(page_no, version);
         let page = Arc::new(Page::new(page_idx));
-        if let Some(buffer) = shared.pages().get(&key) {
-            page.get().set_buffer(buffer);
+        // A copy of its own: no count on a buffer every reader of the page shares (decision 29).
+        let copy = self.buffer_pool.get_page();
+        if shared.pages().copy_into(&key, copy.as_mut_slice()) {
+            #[allow(clippy::arc_with_non_send_sync)]
+            page.get().set_buffer(Arc::new(copy));
             page.set_loaded();
-            page.set_shared();
             return Ok(Some((page, None)));
         }
-        page.set_publish(shared.pages().clone(), key);
+        // Amphora: what a writer reads isn't kept: it reads the pages it is about to change, whose
+        // committed images its commit supersedes (a 10M-row load kept 8 GiB of them, every one
+        // dead once its log restarted; decision 27).
+        if own_after.is_none() {
+            page.set_publish(shared.pages().clone(), key);
+        }
         let read = match frame {
             Some(frame) => wal.read_frame(frame, page.clone(), self.buffer_pool.clone(), group)?,
             None => {

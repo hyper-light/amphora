@@ -1565,7 +1565,7 @@ impl BuildSharedWal {
     pub fn begin(file: &Arc<dyn File>) -> Result<Self> {
         let size = file.size()?;
 
-        let header = Arc::new(SpinLock::new(WalHeader::default()));
+        let header = Arc::new(crate::storage::wal::HeaderCell::new(WalHeader::default()));
         let read_locks = std::array::from_fn(|_| TursoRwLock::new());
         for (i, l) in read_locks.iter().enumerate() {
             l.write();
@@ -1720,7 +1720,7 @@ pub fn build_shared_wal(
 pub(super) struct StreamingWalReader {
     file: Arc<dyn File>,
     wal_shared: Arc<RwLock<WalFileShared>>,
-    header: Arc<SpinLock<WalHeader>>,
+    header: Arc<crate::storage::wal::HeaderCell>,
     file_size: u64,
     state: RwLock<StreamingState>,
     off_atomic: AtomicU64,
@@ -1755,7 +1755,7 @@ impl StreamingWalReader {
     fn new(
         file: Arc<dyn File>,
         wal_shared: Arc<RwLock<WalFileShared>>,
-        header: Arc<SpinLock<WalHeader>>,
+        header: Arc<crate::storage::wal::HeaderCell>,
         file_size: u64,
     ) -> Self {
         Self {

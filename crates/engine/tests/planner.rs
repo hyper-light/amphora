@@ -135,27 +135,37 @@ fn a_page_by_key_reads_in_key_order_without_sorting() {
 }
 
 /// Do: GROUP BY the first column of an index that lacks the aggregated columns, over the whole
-/// table, with the connection's cache a fraction of the table and then holding all of it. Expect:
-/// a scan of the table, its groups hashed (docs/design/executor.md, decision 4), while each lookup
-/// through the index would read a page of its own (docs/design/planner.md, decision 5); the
-/// index's order, ungrouped by hash or sort, once the cache holds the table.
+/// table, with the connection's cache a fraction of the table and then holding all of it: with
+/// aggregates a hash table keeps, and with a COUNT(DISTINCT), which a sort groups. Expect: the
+/// hashed GROUP BY scans the table and hashes its 100 groups whatever the cache holds (a probe a
+/// row costs less than the index order's seek a row, cached or not; docs/design/planner.md,
+/// decision 7); the sorted one scans and sorts while each lookup would read a page of its own
+/// (decision 5), and takes the index's order once the cache holds the table.
 #[test]
 fn a_whole_table_group_by_scans_and_sorts_where_lookups_would_read_pages() {
     let dir = tempfile::tempdir().unwrap();
     let conn = tables(dir.path());
-    let sql = "SELECT grp, COUNT(*), AVG(price) FROM items GROUP BY grp";
+    let hashed = "SELECT grp, COUNT(*), AVG(price) FROM items GROUP BY grp";
+    let sorted = "SELECT grp, COUNT(DISTINCT owner) FROM items GROUP BY grp";
+    let scan_and_hash = vec![
+        "SCAN items".to_owned(),
+        "USE HASH TABLE FOR GROUP BY".to_owned(),
+    ];
+    // The COUNT(DISTINCT) keeps its own hash table of values either way; what changes is how its
+    // groups come: scanned and sorted, or in the index's order.
+    let sorted_plan = |conn: &Arc<Connection>| {
+        let steps = plan(conn, sorted);
+        let sorter = steps.iter().any(|s| s == "USE SORTER FOR GROUP BY");
+        (steps.first().cloned().unwrap_or_default(), sorter)
+    };
     conn.execute("PRAGMA cache_size = 200").unwrap();
-    assert_eq!(
-        plan(&conn, sql),
-        vec![
-            "SCAN items".to_owned(),
-            "USE HASH TABLE FOR GROUP BY".to_owned()
-        ]
-    );
+    assert_eq!(plan(&conn, hashed), scan_and_hash);
+    assert_eq!(sorted_plan(&conn), ("SCAN items".to_owned(), true));
     conn.execute("PRAGMA cache_size = 100000").unwrap();
+    assert_eq!(plan(&conn, hashed), scan_and_hash);
     assert_eq!(
-        plan(&conn, sql),
-        vec!["SCAN items USING INDEX items_grp_created".to_owned()]
+        sorted_plan(&conn),
+        ("SCAN items USING INDEX items_grp_created".to_owned(), false)
     );
 }
 

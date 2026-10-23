@@ -696,7 +696,20 @@ fn hash_groups_eligible(
     collations: &[CollationSeq],
     custom_comparators: bool,
 ) -> bool {
-    let small_states = plan.aggregates.iter().all(|agg| {
+    let bare_columns = non_aggregates > group_by.exprs.len();
+    !group_by.sort_elided
+        && plan.window.is_none()
+        && aggregates_keep_small_states(plan)
+        && !(has_min_max(plan) && bare_columns)
+        && !custom_comparators
+        && collations
+            .iter()
+            .all(|c| !matches!(c, CollationSeq::Custom(_)))
+}
+
+/// Whether every aggregate keeps a state of a few values the group table can hold.
+fn aggregates_keep_small_states(plan: &SelectPlan) -> bool {
+    plan.aggregates.iter().all(|agg| {
         matches!(
             agg.func,
             AggFunc::Count
@@ -708,20 +721,35 @@ fn hash_groups_eligible(
                 | AggFunc::Max
         ) && !agg.is_distinct()
             && agg.fraction_reg.is_none()
-    });
-    let min_max = plan
-        .aggregates
+    })
+}
+
+fn has_min_max(plan: &SelectPlan) -> bool {
+    plan.aggregates
         .iter()
-        .any(|agg| matches!(agg.func, AggFunc::Min | AggFunc::Max));
-    let bare_columns = non_aggregates > group_by.exprs.len();
-    !group_by.sort_elided
-        && plan.window.is_none()
-        && small_states
-        && !(min_max && bare_columns)
-        && !custom_comparators
-        && collations
-            .iter()
-            .all(|c| !matches!(c, CollationSeq::Custom(_)))
+        .any(|agg| matches!(agg.func, AggFunc::Min | AggFunc::Max))
+}
+
+/// Amphora: whether `plan`'s GROUP BY would group in a hash table were its rows not read in its
+/// order, as far as the planner can tell before it chooses how to read them (`docs/design/
+/// planner.md` decision 7): `hash_groups_eligible`'s test on what the plan says, with a result
+/// column that is neither an aggregate nor a grouped expression taken as a bare column. Its
+/// collations it can't resolve yet: a GROUP BY under a custom one the planner takes as hashed and
+/// the sorter then groups, which costs only the plan, never its answer.
+pub(crate) fn groups_may_hash(plan: &SelectPlan) -> bool {
+    let Some(group_by) = plan.group_by.as_ref() else {
+        return false;
+    };
+    let bare_columns = plan.result_columns.iter().any(|column| {
+        !column.contains_aggregates
+            && !group_by
+                .exprs
+                .iter()
+                .any(|expr| exprs_are_equivalent(expr, &column.expr))
+    });
+    plan.window.is_none()
+        && aggregates_keep_small_states(plan)
+        && !(has_min_max(plan) && bare_columns)
 }
 
 /// Amphora: emits the drain of a hash GROUP BY's groups (`docs/design/executor.md`, decision 4):

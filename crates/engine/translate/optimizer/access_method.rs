@@ -38,8 +38,7 @@ use super::{
     cost::{
         constraints_selectivity, estimate_btree_depth, estimate_cost_for_scan_or_seek,
         estimate_ephemeral_index_build_cost, estimate_index_cost, estimate_rows_per_seek,
-        estimate_scan_cost, estimate_skip_scan_cost, estimate_sort_cpu_cost, AnalyzeCtx, Cost,
-        IndexInfo,
+        estimate_scan_cost, estimate_skip_scan_cost, AnalyzeCtx, Cost, IndexInfo,
     },
     join::JoinPlanningContext,
     multi_index::{
@@ -306,14 +305,16 @@ pub(super) fn choose_best_btree_candidate(
     // every filter ready here, not the whole table (a 50-row seek must not be charged for
     // sorting 200,000 rows and lose to an ordered scan of all of them).
     let sort_cost = match maybe_order_target {
-        Some(_) => {
+        Some(target) => {
             let ready = rhs_constraints.constraints.iter().filter(|c| {
                 lhs_mask.contains_all_set_bits_of(&c.lhs_mask) || c.lhs_mask == rhs_table_mask
             });
             let rows = input_cardinality.max(1.0)
                 * *base_row_count
                 * constraints_selectivity(ready, params);
-            estimate_sort_cpu_cost(rows, params)
+            // Amphora: a sort, or a GROUP BY's probes and groups (`docs/design/planner.md`,
+            // decision 7).
+            crate::translate::optimizer::cost::order_cost(target, rows, params)
         }
         None => Cost(0.0),
     };
@@ -2296,7 +2297,9 @@ fn materialized_subquery_order_properties(
         return (IterationDirection::Forwards, false, Cost(0.0));
     }
 
-    let order_bonus = estimate_sort_cpu_cost(*base_row_count, params);
+    // Amphora: what the order saves: a sort, or a GROUP BY's probes and groups (decision 7).
+    let order_bonus =
+        crate::translate::optimizer::cost::order_cost(order_target, *base_row_count, params);
     (
         if all_same_direction {
             IterationDirection::Forwards

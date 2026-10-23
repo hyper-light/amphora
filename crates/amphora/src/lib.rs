@@ -19,11 +19,14 @@
 //!   parallel.
 //! - [`db`]: stores on Amphora's engine (`crates/engine`).
 //! - [`meter`]: what a store counts.
+//! - [`memory`]: the memory this process may use, as the system says (the process's page pool is a
+//!   part of it).
 //!
 //! The `amphora` binary says what it is ([`reply`]).
 
 pub mod db;
 pub mod groups;
+pub mod memory;
 pub mod meter;
 pub mod store;
 

@@ -155,6 +155,22 @@ pub(super) fn estimate_sort_cpu_cost(row_count: f64, params: &CostModelParams) -
     Cost(row_count * row_count.max(1.0).log2() * params.sort_cpu_per_row)
 }
 
+/// Amphora: what reading `rows` out of `target`'s order costs a plan: a sort of them, or, for a
+/// GROUP BY that groups in a hash table, a probe a row and a sort of the groups as the table
+/// drains (`docs/design/planner.md` decision 7). Its plans' other costs are the same either way.
+pub(super) fn order_cost(
+    target: &super::order::OrderTarget,
+    rows: f64,
+    params: &CostModelParams,
+) -> Cost {
+    match target.hashed_groups {
+        Some(groups) => Cost(
+            rows * params.cpu_cost_per_row + estimate_sort_cpu_cost(groups.min(rows), params).0,
+        ),
+        None => estimate_sort_cpu_cost(rows, params),
+    }
+}
+
 /// Estimate how many B-tree levels an index search reads.
 pub(super) fn estimate_btree_depth(row_count: f64, rows_per_page: f64) -> f64 {
     if row_count <= 1.0 {
@@ -678,6 +694,30 @@ mod tests {
             covering: true,
             rows_per_leaf_page: 100.0,
         }
+    }
+
+    /// Amphora: do: price reading 10 million rows out of a GROUP BY's order, for a GROUP BY that
+    /// sorts and for one that hashes its 100 groups. Expect: a sort of the rows for the first; a
+    /// probe a row and a sort of the 100 groups for the second, far less (decision 7).
+    #[test]
+    fn a_hashed_group_by_costs_a_probe_a_row_and_a_sort_of_its_groups() {
+        use crate::translate::optimizer::order::{
+            EliminatesSortBy, OrderTarget, OrderTargetPurpose,
+        };
+        let mut target = OrderTarget {
+            columns: Vec::new(),
+            purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group),
+            hashed_groups: None,
+        };
+        let rows = 10_000_000.0;
+        let sorted = order_cost(&target, rows, &DEFAULT_PARAMS).0;
+        assert!((sorted - estimate_sort_cpu_cost(rows, &DEFAULT_PARAMS).0).abs() < 1e-6);
+        target.hashed_groups = Some(100.0);
+        let hashed = order_cost(&target, rows, &DEFAULT_PARAMS).0;
+        let want = rows * DEFAULT_PARAMS.cpu_cost_per_row
+            + estimate_sort_cpu_cost(100.0, &DEFAULT_PARAMS).0;
+        assert!((hashed - want).abs() < 1e-6);
+        assert!(hashed * 10.0 < sorted);
     }
 
     /// Amphora: do: look up rows at random in a table bigger than the cache and in one it holds.

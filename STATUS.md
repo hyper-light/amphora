@@ -107,7 +107,24 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   a process's databases (`Db::share_pages_in`), each database's pages under keys of its own; run
   past the suite's first seconds, every read measured is faster shared (point reads 1.33–1.49 times
   at one client), with 32 readers for less memory. Not on by default: that, and its budget, are
-  the person's call.
+  the person's call. A process's pool (decision 26, `Sharing::Process`, `Db::open_sharing`) holds a
+  quarter of the memory the process may use (its cgroups' smallest limit and the machine's, on
+  Linux; 256 MiB elsewhere); a database that closes takes its pages out, and one whose log on disk
+  is packed refuses to share. A lookup copies its page out under its shard's read lock (decision
+  29), so readers of the same pages no longer take each other's lines: at ten million rows with the
+  process's pool, scans at 32 clients ran 1.5–2 times as fast as before it. Against no pool with
+  the OS's cache of the database warm (the suite's settle now cuts the log, so it stays warm),
+  reads still run faster with no pool (`case_aggregate` at 32 clients 43,339 a second against
+  21,751; `union_all` at one client 206,733 against 17,936 while the pool fills), and the pool's
+  gains are writes at 32 clients (`update_indexed` 4,696 against 3,265) and caches the OS can't
+  hold. So the default stays unshared.
+- **The writer reads committed pages from the pool, keeping none** (docs/design/store.md decision
+  27): pages committed before its transaction began it finds in memory; what it reads it doesn't
+  keep, since it is about to change it. Keeping them filled the 8 GiB pool with a 10M-row load's
+  log versions, all dead once the log restarted.
+- **A reader's snapshot takes no lock** (docs/design/store.md decision 28): the log's generation is
+  read from a copy every header guard refreshes, and spin locks test before they take. Point reads
+  at 32 clients, ten million rows, no pool: 701,613 → 1,572,331 a second.
 - **A shared page found in one lookup** (docs/design/store.md decision 22): the pool keeps each image
   in its map's entry and counts lookups in each shard, under the lock it holds anyway, where one
   count for the pool moved between 32 readers' cores at every lookup. Sharing 256 MiB at 32 clients:
@@ -163,6 +180,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   sorter as before and the two merge in group order. An ORDER BY with a LIMIT (and OFFSET) of up
   to 65,536 rows keeps only those rows in its sorter, where every row was sorted (the engine's heap
   for it was chosen only where a LIMIT's registers already existed, almost never).
+
+- **The suite counts what it measures** (`bench/src/suite.rs`): a run counts if it ends within the
+  window, whenever it began (one begun in the warmup that outlasted the window used to blank a
+  client's whole run: `exists_subquery` read 0/s on Amphora, SQLite and PostgreSQL at ten million
+  rows), each statement records its longest run, every client draws its own parameters (clients
+  0, 2, 4, ... drew the same), and every database checkpoints after its load before any run
+  (`settle_s`; Amphora's loader had left the whole load, 7.5 GB, in its log). `--query` runs a
+  statement on a database a run left behind.
 
 ## Measured
 

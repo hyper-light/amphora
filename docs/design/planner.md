@@ -225,3 +225,42 @@ faster at 1 client from decision 21 of `store.md`, built into the second binary 
 
 **Falsified by.** A nested loop the model now prefers that reads more than the plan it replaced;
 an index the cache doesn't hold although the model, counting its pages from its rows, says it does.
+
+## 7. A GROUP BY that groups in a hash table costs a probe a row, not a sort
+
+**Decision.** Where the planner weighs reading a GROUP BY's rows in its order (an index that
+supplies it) against reading them out of it, what reading them out of order costs depends on how
+the GROUP BY would then group. One that would group in a hash table (`docs/design/executor.md`
+decision 4: aggregates of a few values, no DISTINCT, no window; `group_by::groups_may_hash`) costs
+a probe a row and a sort of its groups as the table drains (`cost::order_cost`), when ANALYZE
+counts its groups (the distinct values of an index of its table those columns lead) and they fit
+the table's budget as it charges them (`group_table::groups_in_budget`, 64 MiB). Otherwise it costs
+a sort of the rows, as before. The same cost stands where the plan pays for the GROUP BY itself
+(`required_group_sort_and_read_cost`), which then reads back its groups, not its rows.
+
+**Why.** The executor stopped sorting such GROUP BYs, but the planner still priced not supplying
+their order as a sort of every row (a sort's `n log n`), so an index that supplied it saved, by
+the model, a sort that would never have run. With the cache large (the process's page pool,
+decision 26 of store.md, or a large `cache_size`), decision 5 priced the index's lookups at a page
+each once and a seek's CPU, and the model chose to walk `items_grp_created` and look up every row:
+the suite's `table_group_by` at ten million rows, `SCAN items USING INDEX items_grp_created`, 87% of
+its time in seeks (`seek_deferred_row`, profile of 2026-10-23), 16.7 s a statement at one client
+and 50 s at 32, where the scan and the hash table took 4 to 5 s and 15 s (`ab-v4-10m.jsonl`).
+Decision 5's own measurement already had the index's order losing with the table all cached (90 ms
+against 36 ms for a scan and a sort, 200,000 rows).
+
+**Sources.** SQLite's planner charges a GROUP BY or ORDER BY a sorter only on a path that leaves
+its order unmet (`whereSortingCost`, `src/where.c`); PostgreSQL costs hashed and sorted
+grouping apart and keeps the cheaper (`create_agg_path` with `AGG_HASHED` against `AGG_SORTED`,
+`cost_agg` in `src/backend/optimizer/path/costsize.c`), a hash aggregate's cost a probe a row
+(`cpu_operator_cost` per grouping column a row).
+
+**Evidence.** `crates/engine/tests/planner.rs`,
+`a_whole_table_group_by_scans_and_sorts_where_lookups_would_read_pages`: the hashed GROUP BY scans
+and hashes its 100 groups with a 200-page cache and with the table all cached; a COUNT(DISTINCT)
+GROUP BY, which sorts, scans and sorts with the small cache and takes the index's order with the
+table cached, as decision 5 has it. `cost.rs`,
+`a_hashed_group_by_costs_a_probe_a_row_and_a_sort_of_its_groups`.
+
+**Falsified by.** A GROUP BY this sends to a scan and a hash table that an index's order would have
+answered faster (groups ANALYZE undercounts, which overflow the table into the sorter).

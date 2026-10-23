@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
-use amphora::db::Db;
+use amphora::db::{Db, Sharing};
 use amphora::store::{Checkpointed, Config, Engine, Flush, Opener, Refused, Store};
 use amphora_engine::io::{FileId, FileSyncType};
 use amphora_engine::{
@@ -581,9 +581,18 @@ fn one_seed(seed: u64) -> Result<Seen, String> {
     let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
     let disk = Disk::new(seed, HashMap::new());
     let path = std::path::Path::new(PATH);
-    let db = Db::open_with(path, disk.clone()).map_err(|e| format!("open: {e:#}"))?;
-    // Every other seed on a packed log (docs/design/store.md, decisions 16 and 17).
-    if seed.is_multiple_of(2) {
+    // Every other seed on a packed log (docs/design/store.md, decisions 16 and 17), whose pages
+    // aren't shared; the others share the process's pages (decision 26). Reopened, a packed log
+    // refuses to share by itself.
+    let packed = seed.is_multiple_of(2);
+    let sharing = if packed {
+        Sharing::Off
+    } else {
+        Sharing::Process
+    };
+    let db =
+        Db::open_with_sharing(path, disk.clone(), &sharing).map_err(|e| format!("open: {e:#}"))?;
+    if packed {
         db.pack_log(true).map_err(|e| format!("pack: {e:#}"))?;
     }
     db.exec("CREATE TABLE events (key TEXT, seq INTEGER CHECK (seq >= 0), batch INTEGER); CREATE INDEX by_key ON events (key, seq)")

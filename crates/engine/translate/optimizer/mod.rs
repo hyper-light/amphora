@@ -1117,6 +1117,11 @@ fn find_select_plan_form(
     }
 
     plan.simple_aggregate = detect_simple_aggregate(plan);
+    let hashed_aggregates = if crate::translate::group_by::groups_may_hash(plan) {
+        Some(plan.aggregates.len())
+    } else {
+        None
+    };
     let table_plan = find_table_access_plan(
         schema,
         resolver,
@@ -1132,6 +1137,7 @@ fn find_select_plan_form(
         &mut plan.offset,
         plan.input_cardinality_hint.unwrap_or(1.0),
         cost_limit,
+        hashed_aggregates,
     )?;
 
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::MinMax(_)))
@@ -1248,7 +1254,74 @@ fn required_group_sort_and_read_cost(
         return Cost(0.0);
     }
     let rows = table_plan.join.output_cardinality;
-    estimate_sort_cpu_cost(rows, params) + estimate_scan_cost(rows, 1.0, params)
+    // Amphora: a GROUP BY grouped in a hash table reads back its groups, not its rows (decision 7).
+    match table_plan.order_target.as_ref() {
+        Some(target) => {
+            let read_back = target.hashed_groups.map_or(rows, |groups| groups.min(rows));
+            Cost(
+                cost::order_cost(target, rows, params).0
+                    + estimate_scan_cost(read_back, 1.0, params).0,
+            )
+        }
+        None => estimate_sort_cpu_cost(rows, params) + estimate_scan_cost(rows, 1.0, params),
+    }
+}
+
+/// Amphora: the groups a GROUP BY over `target`'s columns makes, as ANALYZE counts the distinct
+/// values of an index of their one table that those columns lead, if a hash table of `num_accs`
+/// accumulators holds them within its budget (`docs/design/planner.md` decision 7). None when
+/// ANALYZE doesn't say or they don't fit: not supplying the order is then costed as a sort.
+fn estimate_hashed_groups(
+    target: &OrderTarget,
+    num_accs: usize,
+    tables: &TableReferences,
+    available_indexes: &AvailableIndexes,
+    schema: &Schema,
+) -> Option<f64> {
+    let table_id = target.columns.first()?.table_id;
+    let mut columns = Vec::with_capacity(target.columns.len());
+    for column in &target.columns {
+        match column.target {
+            ColumnTarget::Column(pos) if column.table_id == table_id => columns.push(pos),
+            _ => return None,
+        }
+    }
+    let btree = tables.find_joined_table_by_internal_id(table_id)?.btree()?;
+    let stats = schema.analyze_stats.table_stats(&btree.name)?;
+    let leading = columns.len();
+    let groups = available_indexes
+        .indexes_for_table(table_id)?
+        .iter()
+        .filter(|index| {
+            index.index_method.is_none()
+                && index.columns.len() >= leading
+                && index
+                    .columns
+                    .iter()
+                    .take(leading)
+                    .all(|c| columns.contains(&c.pos_in_table))
+        })
+        .find_map(|index| {
+            let stat = stats.index_stats.get(&index.name)?;
+            let total = stat.total_rows.or(stats.row_count)?;
+            let per_group = *stat
+                .avg_rows_per_distinct_prefix
+                .get(leading.checked_sub(1)?)?;
+            if per_group == 0 {
+                return None;
+            }
+            Some(total as f64 / per_group as f64)
+        })?;
+    let room = crate::vdbe::group_table::groups_in_budget(
+        leading,
+        num_accs,
+        crate::vdbe::hash_table::DEFAULT_MEM_BUDGET,
+    ) as f64;
+    if groups <= room {
+        Some(groups)
+    } else {
+        None
+    }
 }
 
 /// Write the winning table plan into one version of a query.
@@ -2445,6 +2518,7 @@ fn optimize_table_access(
         offset,
         initial_input_cardinality,
         None,
+        None,
     )?
     else {
         return Ok(None);
@@ -2481,6 +2555,9 @@ fn find_table_access_plan(
     offset: &mut Option<Box<Expr>>,
     initial_input_cardinality: f64,
     cost_limit: Option<Cost>,
+    // Amphora: the aggregates of a GROUP BY that would group in a hash table were its rows not
+    // read in its order (`docs/design/planner.md` decision 7), None for one that would sort.
+    hashed_aggregates: Option<usize>,
 ) -> Result<Option<TableAccessPlan>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
@@ -2646,9 +2723,25 @@ fn find_table_access_plan(
     } else {
         Vec::new()
     };
-    let maybe_order_target = simple_aggregate
+    let mut maybe_order_target = simple_aggregate
         .and_then(|sa| simple_aggregate_order_target(sa, table_references))
         .or_else(|| compute_order_target(order_by, group_by.as_mut(), table_references));
+    if let (Some(target), Some(num_accs)) = (maybe_order_target.as_mut(), hashed_aggregates) {
+        if matches!(
+            target.purpose,
+            OrderTargetPurpose::EliminatesSort(
+                EliminatesSortBy::Group | EliminatesSortBy::GroupByAndOrder
+            )
+        ) {
+            target.hashed_groups = estimate_hashed_groups(
+                target,
+                num_accs,
+                table_references,
+                available_indexes,
+                schema,
+            );
+        }
+    }
 
     add_implied_column_equalities(where_clause, table_references)?;
     let mut constraints_per_table = constraints_from_where_clause(

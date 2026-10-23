@@ -993,6 +993,13 @@ pub trait Wal: Debug + Send + Sync {
     /// Returns true if this WAL instance currently holds the write lock.
     fn holds_write_lock(&self) -> bool;
 
+    /// Amphora: while this connection holds the write lock, the log's committed end when its
+    /// write transaction began: frames past it are the transaction's own (decision 27). None
+    /// otherwise, and from a log that doesn't track it.
+    fn write_base(&self) -> Option<u64> {
+        None
+    }
+
     /// Whether shutdown checkpointing is valid when this process closes its last connection.
     fn should_checkpoint_on_close(&self) -> bool;
 
@@ -1225,7 +1232,8 @@ impl InProcessWalCoordination {
     }
 
     fn snapshot_of(shared: &WalFileShared) -> WalSnapshot {
-        let checkpoint_seq = shared.metadata.wal_header.lock().checkpoint_seq;
+        // Amphora: the generation without the header's lock (decision 28).
+        let checkpoint_seq = shared.metadata.wal_header.checkpoint_seq();
         WalSnapshot {
             max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
             nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
@@ -3289,6 +3297,9 @@ pub struct WalFile {
 
     syncing: Arc<AtomicBool>,
     write_lock_held: AtomicBool,
+    /// Amphora: the log's committed end when this connection's write transaction began (after any
+    /// restart it made): every frame past it is the transaction's own until it commits (decision 27).
+    write_base: AtomicU64,
 
     ongoing_checkpoint: RwLock<OngoingCheckpoint>,
     /// This is the index to the read_lock in WalFileShared that we are holding. This lock contains
@@ -3392,10 +3403,78 @@ impl fmt::Debug for WalFile {
 ** writing new content beginning at frame 1.
 */
 
+/// Amphora: the log's header, with its generation (`checkpoint_seq`) readable without its lock. A
+/// reader's snapshot takes the generation at every transaction it begins; taken under the header's
+/// lock, that lock took nearly a fifth of 32 point readers' time (store.md, decision 28). Every
+/// guard refreshes the copy before it lets the lock go, so no write to the header leaves it stale.
+pub struct HeaderCell {
+    header: SpinLock<WalHeader>,
+    checkpoint_seq: AtomicU32,
+}
+
+impl HeaderCell {
+    pub fn new(header: WalHeader) -> Self {
+        let checkpoint_seq = AtomicU32::new(header.checkpoint_seq);
+        Self {
+            header: SpinLock::new(header),
+            checkpoint_seq,
+        }
+    }
+
+    pub fn lock(&self) -> HeaderGuard<'_> {
+        HeaderGuard {
+            locked: self.header.lock(),
+            copy: &self.checkpoint_seq,
+        }
+    }
+
+    /// The header's `checkpoint_seq` as its last guard left it.
+    pub fn checkpoint_seq(&self) -> u32 {
+        self.checkpoint_seq.load(Ordering::Acquire)
+    }
+}
+
+impl std::fmt::Debug for HeaderCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeaderCell")
+            .field("checkpoint_seq", &self.checkpoint_seq())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The header, locked; dropped, it leaves its `checkpoint_seq` readable without the lock. Its fields
+/// are named unlike any of the header's: a field of the guard would hide the header's of the same
+/// name from code reaching it through `Deref`.
+pub struct HeaderGuard<'a> {
+    locked: crate::fast_lock::SpinLockGuard<'a, WalHeader>,
+    copy: &'a AtomicU32,
+}
+
+impl std::ops::Deref for HeaderGuard<'_> {
+    type Target = WalHeader;
+
+    fn deref(&self) -> &WalHeader {
+        &self.locked
+    }
+}
+
+impl std::ops::DerefMut for HeaderGuard<'_> {
+    fn deref_mut(&mut self) -> &mut WalHeader {
+        &mut self.locked
+    }
+}
+
+impl Drop for HeaderGuard<'_> {
+    fn drop(&mut self) {
+        self.copy
+            .store(self.locked.checkpoint_seq, Ordering::Release);
+    }
+}
+
 /// Authoritative WAL metadata currently shared by all connections in a process.
 pub struct WalSharedMetadata {
     pub enabled: AtomicBool,
-    pub wal_header: Arc<SpinLock<WalHeader>>,
+    pub wal_header: Arc<HeaderCell>,
     pub min_frame: AtomicU64,
     pub max_frame: AtomicU64,
     pub nbackfills: AtomicU64,
@@ -4555,12 +4634,17 @@ impl Wal for WalFile {
         }
 
         if !allowed_auto_actions.contains(WalAutoActions::Restart) {
+            self.write_base
+                .store(self.max_frame.load(Ordering::Acquire), Ordering::Release);
             return Ok(());
         }
 
         let result = self.try_restart_log_before_write();
         if let Err(LimboError::Busy) | Ok(()) = &result {
             // it's fine if we were unable to restart WAL file due to Busy errors
+            // Amphora: taken after a restart, which starts the log again from frame 0.
+            self.write_base
+                .store(self.max_frame.load(Ordering::Acquire), Ordering::Release);
             return Ok(());
         }
 
@@ -4596,6 +4680,11 @@ impl Wal for WalFile {
     /// Returns true if this WAL instance currently holds the write lock.
     fn holds_write_lock(&self) -> bool {
         self.write_lock_held.load(Ordering::Acquire)
+    }
+
+    fn write_base(&self) -> Option<u64> {
+        self.holds_write_lock()
+            .then(|| self.write_base.load(Ordering::Acquire))
     }
 
     fn should_checkpoint_on_close(&self) -> bool {
@@ -5908,6 +5997,7 @@ impl WalFile {
             checkpoint_seq: AtomicU32::new(0),
             syncing: Arc::new(AtomicBool::new(false)),
             write_lock_held: AtomicBool::new(false),
+            write_base: AtomicU64::new(0),
             vacuum_lock_guard: RwLock::new(None),
             min_frame: AtomicU64::new(0),
             transaction_count: AtomicU64::new(0),
@@ -6969,7 +7059,7 @@ impl WalFileShared {
         let shared = WalFileShared {
             metadata: WalSharedMetadata {
                 enabled: AtomicBool::new(true),
-                wal_header: Arc::new(SpinLock::new(wal_header)),
+                wal_header: Arc::new(HeaderCell::new(wal_header)),
                 min_frame: AtomicU64::new(0),
                 max_frame: AtomicU64::new(snapshot.max_frame),
                 nbackfills: AtomicU64::new(snapshot.nbackfills),
@@ -7051,7 +7141,7 @@ impl WalFileShared {
         let shared = WalFileShared {
             metadata: WalSharedMetadata {
                 enabled: AtomicBool::new(false),
-                wal_header: Arc::new(SpinLock::new(wal_header)),
+                wal_header: Arc::new(HeaderCell::new(wal_header)),
                 min_frame: AtomicU64::new(0),
                 max_frame: AtomicU64::new(0),
                 nbackfills: AtomicU64::new(0),
@@ -7099,7 +7189,7 @@ impl WalFileShared {
         let shared = WalFileShared {
             metadata: WalSharedMetadata {
                 enabled: AtomicBool::new(true),
-                wal_header: Arc::new(SpinLock::new(wal_header)),
+                wal_header: Arc::new(HeaderCell::new(wal_header)),
                 min_frame: AtomicU64::new(0),
                 max_frame: AtomicU64::new(0),
                 nbackfills: AtomicU64::new(0),
@@ -8736,6 +8826,29 @@ pub mod test {
             wal.connection_state(),
             WalConnectionState::new(updated, ReadGuardKind::None)
         );
+    }
+
+    /// Do: make a header cell, write the header's generation through a guard, then replace the
+    /// whole header through another. Expect: the generation read without the lock is the
+    /// header's each time (store.md decision 28: a reader's snapshot takes it lock-free).
+    #[test]
+    fn a_header_cells_generation_follows_every_write() {
+        use super::{HeaderCell, WalHeader};
+        let cell = HeaderCell::new(WalHeader {
+            checkpoint_seq: 3,
+            ..WalHeader::new()
+        });
+        assert_eq!(cell.checkpoint_seq(), 3);
+        cell.lock().checkpoint_seq = 7;
+        assert_eq!(cell.checkpoint_seq(), 7);
+        *cell.lock() = WalHeader {
+            checkpoint_seq: 9,
+            salt_1: 1,
+            ..WalHeader::new()
+        };
+        assert_eq!(cell.checkpoint_seq(), 9);
+        assert_eq!(cell.lock().salt_1, 1);
+        assert_eq!(cell.checkpoint_seq(), cell.lock().checkpoint_seq);
     }
 
     #[test]

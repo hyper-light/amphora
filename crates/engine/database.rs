@@ -3104,7 +3104,15 @@ impl Database {
                 "shared pages aren't kept for an MVCC database".into(),
             ));
         }
-        if self.shared_wal.read().runtime.pack.load(Ordering::Acquire) {
+        // Packing asked for now, or the log's generation on disk packed (recovery reads it as it
+        // was written; nothing asks again after a restart of the process).
+        let packed = {
+            let shared = self.shared_wal.read();
+            shared.runtime.pack.load(Ordering::Acquire)
+                || shared.metadata.wal_header.lock().file_format
+                    == crate::storage::packed::PACKED_FORMAT
+        };
+        if packed {
             return Err(LimboError::InvalidArgument(
                 "a packed log's pages aren't shared".into(),
             ));

@@ -144,6 +144,90 @@ fn a_writer_copies_a_shared_page_before_it_writes_it() {
     assert_eq!(text(&connect(&db), row), "committed");
 }
 
+/// Do: a reader reads a table in, from the log and then, after a checkpoint, from the file; a writer
+/// caching 200 pages updates every 10th row of 2,000 in a transaction (about 20 rows to a leaf, so
+/// two updates a leaf, 100 leaves), then rolls it back, then makes the updates again and commits.
+/// Expect: the writer's reads in its transaction are found in the shared pages (their hits grow by
+/// at least half the leaves it updates), and the reader reads the old rows until the commit and
+/// the new ones after (decision 27: a writer reads committed versions from memory too).
+#[test]
+fn a_writer_in_a_transaction_reads_committed_pages_from_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), true);
+    table(&connect(&db), 2000);
+    let reader = connect(&db);
+    let writer = connect(&db);
+    writer.execute("PRAGMA cache_size = 200").unwrap();
+    for checkpoint in [false, true] {
+        if checkpoint {
+            writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        let old = rows(&reader, "SELECT id, v FROM t ORDER BY id");
+        assert_eq!(old.len(), 2000);
+        let updated: Vec<i64> = (5..=2000).step_by(10).collect();
+        for outcome in ["ROLLBACK", "COMMIT"] {
+            writer.execute("BEGIN").unwrap();
+            let hits = db.shared_page_counts().unwrap().hits;
+            for id in &updated {
+                writer
+                    .execute(format!(
+                        "UPDATE t SET v = '{outcome}-{checkpoint}-{id}' WHERE id = {id}"
+                    ))
+                    .unwrap();
+            }
+            let found = db.shared_page_counts().unwrap().hits - hits;
+            assert!(
+                found >= 50,
+                "the writer found {found} of its pages in memory (checkpoint {checkpoint})"
+            );
+            assert_eq!(
+                rows(&reader, "SELECT id, v FROM t ORDER BY id"),
+                old,
+                "a write in progress seen"
+            );
+            writer.execute(outcome).unwrap();
+        }
+        for (id, v) in rows(&reader, "SELECT id, v FROM t ORDER BY id") {
+            if updated.contains(&id) {
+                assert_eq!(v, format!("COMMIT-{checkpoint}-{id}"), "row {id}");
+            }
+        }
+    }
+}
+
+/// Do: with nothing read into the shared pages, a writer caching 200 pages updates every 10th row
+/// of 2,000 in a transaction (two updates a leaf, 100 leaves) and commits; then a reader reads the
+/// table. Expect: the writer adds at most its schema read to the shared pages, not the leaves it
+/// read (pages it is about to change), the reader adds the table's pages, and reads every new row
+/// (decision 27).
+#[test]
+fn a_writer_keeps_nothing_it_reads_in_the_shared_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), true);
+    table(&connect(&db), 2000);
+    let writer = connect(&db);
+    writer.execute("PRAGMA cache_size = 200").unwrap();
+    let before = db.shared_page_counts().unwrap().added;
+    writer.execute("BEGIN").unwrap();
+    for id in (5..=2000).step_by(10) {
+        writer
+            .execute(format!("UPDATE t SET v = 'w-{id}' WHERE id = {id}"))
+            .unwrap();
+    }
+    writer.execute("COMMIT").unwrap();
+    let kept = db.shared_page_counts().unwrap().added - before;
+    assert!(kept < 10, "the writer kept {kept} pages it read");
+    let reader = connect(&db);
+    let read = rows(&reader, "SELECT id, v FROM t ORDER BY id");
+    let added = db.shared_page_counts().unwrap().added - before - kept;
+    assert!(added >= 100, "the reader kept {added} pages");
+    for (id, v) in read {
+        if id >= 5 && (id - 5) % 10 == 0 {
+            assert_eq!(v, format!("w-{id}"), "row {id}");
+        }
+    }
+}
+
 /// Do: readers read a checkpointed table from the file (shared file versions), a writer rewrites
 /// every row, and a checkpoint writes the new versions into the file and starts the log again.
 /// Expect: a reader that reads afterwards, from the file, reads every new row.

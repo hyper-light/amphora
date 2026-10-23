@@ -42,6 +42,17 @@ fn value_bytes(v: &Value) -> usize {
     held.saturating_add(std::mem::size_of::<Value>())
 }
 
+/// The groups of `num_values` values that are neither text nor blob and `num_accs` accumulators a
+/// table of `budget` bytes holds, as `find` charges them: what the planner counts on grouping in
+/// the table before the sorter takes the rest (`docs/design/planner.md` decision 7).
+pub fn groups_in_budget(num_values: usize, num_accs: usize, budget: usize) -> usize {
+    let per_group = num_values
+        .saturating_mul(std::mem::size_of::<Value>())
+        .saturating_add(num_accs.saturating_mul(std::mem::size_of::<Register>()))
+        .saturating_add(GROUP_OVERHEAD);
+    budget.checked_div(per_group).unwrap_or(0)
+}
+
 fn missing(what: &str) -> LimboError {
     LimboError::InternalError(format!("group table: {what}"))
 }

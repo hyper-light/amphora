@@ -69,6 +69,11 @@ pub enum OrderTargetPurpose {
 pub struct OrderTarget {
     pub columns: Vec<ColumnOrder>,
     pub purpose: OrderTargetPurpose,
+    /// Amphora: for a GROUP BY that would group in a hash table were its rows not in its order
+    /// (`docs/design/executor.md` decision 4), the groups ANALYZE says it makes, if they fit the
+    /// table's budget: what not supplying the order costs is then a probe a row and a sort of the
+    /// groups, not a sort of the rows (`docs/design/planner.md` decision 7).
+    pub hashed_groups: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +106,7 @@ impl OrderTarget {
         Some(OrderTarget {
             columns: cols,
             purpose,
+            hashed_groups: None,
         })
     }
 
@@ -670,6 +676,7 @@ fn finalized_scan_subquery_order_consumed(
                 &OrderTarget {
                     columns: mapped_target,
                     purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
+                    hashed_groups: None,
                 },
                 0,
                 schema,

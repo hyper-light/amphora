@@ -47,10 +47,18 @@ impl<T> SpinLock<T> {
     }
 
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
-        while self.locked.swap(true, Ordering::Acquire) {
-            spin_loop();
+        // Amphora: a waiter spins on a plain load and swaps only once the lock looks free, so
+        // waiters share the line instead of taking it from each other at every turn (Anderson,
+        // "The Performance of Spin Lock Alternatives for Shared-Memory Multiprocessors", IEEE
+        // TPDS 1990: test-and-test-and-set; store.md decision 28).
+        loop {
+            if !self.locked.swap(true, Ordering::Acquire) {
+                return SpinLockGuard { lock: self };
+            }
+            while self.locked.load(Ordering::Relaxed) {
+                spin_loop();
+            }
         }
-        SpinLockGuard { lock: self }
     }
 
     pub fn into_inner(self) -> UnsafeCell<T> {

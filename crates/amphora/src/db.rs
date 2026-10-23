@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use amphora_engine::io::FileSyncType;
@@ -33,6 +33,60 @@ const BUSY_TRIES: u32 = 10_000;
 /// checkpointer next to nothing.
 pub const WRITER_PAGES: i64 = 1024;
 pub const READER_PAGES: i64 = 2000;
+
+/// The bytes of a page of Amphora's databases (the engine's default page size): what a pool's page
+/// budget is counted in.
+const PAGE_BYTES: u64 = 4096;
+/// The process's pool takes up to this part of the memory the process may use (decision 26):
+/// PostgreSQL's documentation advises a quarter of a dedicated server's memory for its shared
+/// buffers ("Resource Consumption", `shared_buffers`); CedarDB's buffer pool takes up to 45% and
+/// DuckDB's memory limit is 80% by default, so a quarter is the cautious end of what databases
+/// that size from memory take.
+const MEMORY_SHARE_DIVISOR: u64 = 4;
+/// The process's pool where the system doesn't say how much memory there is: 256 MiB, what
+/// decision 20 measured on the suite at 200,000 rows.
+const UNKNOWN_MEMORY_PAGES: usize = 65_536;
+/// The process's pool at least, whatever the memory (16 MiB).
+const MIN_PROCESS_PAGES: usize = 4096;
+
+/// Whose shared pages a database's connections read through (docs/design/store.md, decisions 20
+/// and 26): a page one connection read in, the others read from memory. [`Db::open`] shares none;
+/// whether it should share the process's pool by default, and its budget, are the person's call
+/// (STATUS.md).
+#[derive(Clone)]
+pub enum Sharing {
+    /// The process's pool ([`process_pages`]), which every database opened so joins.
+    Process,
+    /// A pool of the caller's: one budget for the databases it gives it to.
+    Pool(Arc<SharedPages>),
+    /// None: each connection keeps its own cache alone (a packed log needs this; decision 16).
+    Off,
+}
+
+/// The pool every database opened with [`Sharing::Process`] shares: made when the first opens,
+/// with room for [`default_pages`] of the memory this process may use.
+pub fn process_pages() -> Arc<SharedPages> {
+    static POOL: OnceLock<Arc<SharedPages>> = OnceLock::new();
+    POOL.get_or_init(|| Arc::new(SharedPages::new(default_pages(crate::memory::limit()))))
+        .clone()
+}
+
+/// The pages a process's pool keeps at most, given the bytes of memory the process may use: a
+/// [`MEMORY_SHARE_DIVISOR`]th of them, at least [`MIN_PROCESS_PAGES`]; [`UNKNOWN_MEMORY_PAGES`]
+/// when the system doesn't say.
+#[must_use]
+pub fn default_pages(memory: Option<u64>) -> usize {
+    let Some(bytes) = memory else {
+        return UNKNOWN_MEMORY_PAGES;
+    };
+    let pages = bytes
+        .checked_div(MEMORY_SHARE_DIVISOR)
+        .and_then(|share| share.checked_div(PAGE_BYTES))
+        .unwrap_or(0);
+    usize::try_from(pages)
+        .unwrap_or(usize::MAX)
+        .max(MIN_PROCESS_PAGES)
+}
 
 fn fail(e: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("{e}")
@@ -97,16 +151,32 @@ impl Db {
     /// journal: a transaction ([`Db::transaction`]) is committed whole or rolled back whole, so one
     /// that fails is never undone alone (docs/design/store.md, decision 7).
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        Self::open_sharing(path, &Sharing::Off)
+    }
+
+    /// [`Db::open`], its connections reading through `sharing`'s pages.
+    pub fn open_sharing(path: &Path, sharing: &Sharing) -> anyhow::Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         in_place(path);
         in_place(&wal_path(path));
-        Self::open_with(path, Arc::new(PlatformIO::new().map_err(fail)?))
+        Self::open_with_sharing(path, Arc::new(PlatformIO::new().map_err(fail)?), sharing)
     }
 
     /// [`Db::open`] on `io`: the system's files, or a simulator's disk.
     pub fn open_with(path: &Path, io: Arc<dyn IO>) -> anyhow::Result<Self> {
+        Self::open_with_sharing(path, io, &Sharing::Off)
+    }
+
+    /// [`Db::open_with`], its connections reading through `sharing`'s pages. A pool the caller
+    /// names that the database refuses is an error; the process's pool, refused (a storage that
+    /// can't share), leaves each connection its own cache, and says so.
+    pub fn open_with_sharing(
+        path: &Path,
+        io: Arc<dyn IO>,
+        sharing: &Sharing,
+    ) -> anyhow::Result<Self> {
         let name = path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("the path isn't UTF-8: {}", path.display()))?;
@@ -139,6 +209,15 @@ impl Db {
         d.exec("PRAGMA synchronous = NORMAL")?;
         d.exec("PRAGMA wal_autocheckpoint = 0")?;
         d.exec(&format!("PRAGMA cache_size = {WRITER_PAGES}"))?;
+        match sharing {
+            Sharing::Process => {
+                if let Err(e) = d.share_pages_in(&process_pages()) {
+                    tracing::info!(target: "amphora.store", event = "pages_unshared", error = %format!("{e:#}"), "the database's connections each keep their own pages");
+                }
+            }
+            Sharing::Pool(pool) => d.share_pages_in(pool)?,
+            Sharing::Off => {}
+        }
         Ok(d)
     }
 
@@ -246,7 +325,8 @@ impl Db {
 
     /// Whether the log's generations from the next one written are packed (docs/design/store.md,
     /// decisions 16 and 17): not unless this asks, while the bench weighs them (`AMPHORA_PACK_LOG`).
-    /// A generation keeps the format it began with.
+    /// A generation keeps the format it began with. A packed log's pages aren't shared: a database
+    /// that packs it is opened with [`Sharing::Off`].
     pub fn pack_log(&self, pack: bool) -> anyhow::Result<()> {
         self.db
             .wal_pack(pack)
@@ -255,7 +335,7 @@ impl Db {
 
     /// Shares the pages this database's connections read among them, `pages` at most
     /// (docs/design/store.md, decision 20): a page one reader read in, the others read from
-    /// memory. Not unless this asks, while the bench weighs it (`AMPHORA_SHARED_PAGES`).
+    /// memory. For a database opened with [`Sharing::Off`]; one that shares already refuses.
     pub fn share_pages(&self, pages: usize) -> anyhow::Result<()> {
         self.db
             .share_pages(pages)
@@ -263,7 +343,8 @@ impl Db {
     }
 
     /// Shares this database's pages in `pool`, with every database that shares it: one budget for
-    /// a process's databases (docs/design/store.md, decision 20).
+    /// a process's databases (docs/design/store.md, decision 20). For a database opened with
+    /// [`Sharing::Off`]; one that shares already refuses.
     pub fn share_pages_in(&self, pool: &Arc<SharedPages>) -> anyhow::Result<()> {
         self.db
             .share_pages_in(pool)
@@ -381,5 +462,21 @@ pub fn step(
             }
             StepResult::Interrupt => anyhow::bail!("a statement was interrupted"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Do: size the process's pool for 32 GiB, for 16 MiB, for none said and for more than a
+    /// `usize` holds. Expect: a quarter in 4 KiB pages, the floor, the fallback, and no overflow
+    /// (decision 26; AC-T1.13.4: reads at their latency).
+    #[test]
+    fn the_process_pool_is_a_quarter_of_its_memory() {
+        assert_eq!(default_pages(Some(32 << 30)), (8 << 30) / 4096);
+        assert_eq!(default_pages(Some(16 << 20)), MIN_PROCESS_PAGES);
+        assert_eq!(default_pages(None), UNKNOWN_MEMORY_PAGES);
+        assert!(default_pages(Some(u64::MAX)) >= MIN_PROCESS_PAGES);
     }
 }
