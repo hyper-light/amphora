@@ -715,7 +715,12 @@ pub fn main() -> anyhow::Result<()> {
 
     let began = Instant::now();
     target.setup(&tables(d, o.target == "cedardb").into_iter().map(|s| (s, vec![])).collect::<Vec<_>>())?;
-    load(d, &shape, 100, |txn| target.setup(&txn))?;
+    // A hundred rows a statement keeps every placeholder-bound engine under its parameter limit
+    // (SQLite 32,766, PostgreSQL's and MySQL's 65,535). ClickHouse makes each INSERT a part it then
+    // merges, and asks for bulk inserts of at least 1,000 rows, better 10,000 to 100,000 (its
+    // documentation, "Bulk inserts"): at ten million rows, a hundred a statement is 100,000 parts.
+    let batch = if d == Dialect::ClickHouse { 20_000 } else { 100 };
+    load(d, &shape, batch, |txn| target.setup(&txn))?;
     let loaded_s = began.elapsed().as_secs_f64();
     for s in indexes(d) {
         // A statement a database refuses here (its statistics, say) is said, not fatal.
