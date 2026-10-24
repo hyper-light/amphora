@@ -1,0 +1,62 @@
+{
+  "what": "The correctness corpus's sources (G2 step 2): each repository and the revision read, what of it was read, and how. The oracle is SQLite 3.54.0 (Python's sqlite3 over the system library); translation is sqlglot 30.24.0. corpus.sh runs them: each `checkout` is a directory under CORPUS_SRC, at its `revision`.",
+  "oracle": {
+    "engine": "SQLite",
+    "version": "3.54.0",
+    "through": "Python 3.14 sqlite3, the system libsqlite3 (compile options in the run's record)"
+  },
+  "translator": {
+    "name": "sqlglot",
+    "version": "30.24.0",
+    "url": "https://github.com/tobymao/sqlglot"
+  },
+  "sources": {
+    "slt": {
+      "name": "sqllogictest",
+      "repository": "https://github.com/gregrahn/sqllogictest.git",
+      "upstream": "https://www.sqlite.org/sqllogictest (fossil); the mirror carries its test tree unchanged",
+      "revision": "c93ac416f05635ff5cc490009add936d9753d01d",
+      "read": "test/**/*.test, all 622 files (evidence, index, random, select1-5), whole",
+      "how": "each file run on SQLite as slt_sqlite.c runs it (slt.py), its answers checked against the file's",
+      "checkout": "corpus-slt-gregrahn"
+    },
+    "duckdb": {
+      "name": "DuckDB's test suite",
+      "repository": "https://github.com/duckdb/duckdb.git",
+      "revision": "1641475ef1db08ec063631ff6a8f08d9d6736ae7",
+      "read": "test/sql/**/*.test and *.test_slow; a file is left out whole when it needs DuckDB's runner (require, load, restart, reconnect, loop, foreach, concurrentloop, mode, attach, unzip, test-env, tags)",
+      "how": "each record translated from DuckDB's dialect to SQLite's (sqlglot), run on SQLite, compared with DuckDB's expected answer; kept records written as sqllogictest files with SQLite's answers",
+      "checkout": "corpus-duckdb"
+    },
+    "cockroach": {
+      "name": "CockroachDB's logic tests",
+      "repository": "https://github.com/cockroachdb/cockroach.git",
+      "revision": "d30c905fff79ef825adc96bcc647f1872a90f2ff",
+      "read": "pkg/sql/logictest/testdata/logic_test/*",
+      "how": "as DuckDB's, read in PostgreSQL's dialect (CockroachDB's own); sessions a file switches between run on one connection",
+      "checkout": "cockroach"
+    },
+    "postgres": {
+      "name": "PostgreSQL's regression suite",
+      "repository": "https://github.com/postgres/postgres.git",
+      "revision": "126976a8ffcfa47f40d3df09243ebf4606001912",
+      "read": "src/test/regress/sql/*.sql except test_setup.sql, on the suite's base tables (test_setup.sql and data/*.data), written once as postgres/base.test, the fixture each file runs first",
+      "how": "each statement translated and run on SQLite; run as written on PostgreSQL 17 (a container of the corpus's own) and the answers compared",
+      "checkout": "corpus-postgres"
+    },
+    "kiln": {
+      "name": "kiln's own statements",
+      "repository": "https://github.com/hyper-light/kiln.git",
+      "revision": "8adeadba572e164d4e2e342ba2a7d518c43d1b10",
+      "revision_is": "the commit production runs: KilnCD default/kiln-production's last deployment, image kiln:8adeadba572e164d4e2e342ba2a7d518c43d1b10 (2026-10-24 05:34Z)",
+      "read": "every SQL string literal in crates/** at that revision (tests and vendor left out), and crates/kiln/src/store/migrations/*.sql, its production schema",
+      "how": "kiln_queries.py: the schema made, then each statement run with its parameters unbound (NULL), written as one sqllogictest file with SQLite's answers"
+    },
+    "written": {
+      "name": "the written cases",
+      "repository": "this one",
+      "read": "bench/corpus/written_cases.py",
+      "how": "at least ten cases for every inventory entry, and families for the step's named features (window frames, recursive CTEs, JSON, UPSERT and RETURNING, generated columns, STRICT, collations, triggers, PRAGMAs), each group its own file with SQLite's answers"
+    }
+  }
+}

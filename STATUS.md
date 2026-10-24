@@ -208,6 +208,24 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   NOCASE)` is 1 where SQLite says 0 (the left operand's collation decides), and `PRAGMA index_xinfo`
   names the rowid's column '' where SQLite gives NULL. CedarDB's server dies on
   `SELECT 0 OR NULL, 1 OR NULL`, and again when it's tried a second time.
+- **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
+  in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
+  114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691
+  counted coarser, by statement kind and the syntax, functions, operators and PRAGMAs it uses), and
+  every one of the 570 inventoried entries exercised by at least ten distinct statements. Six sources:
+  sqllogictest whole, 622 files and 5,939,879 records run as its own runner runs them (32-bit integers,
+  SQLite's `%.3f`, text by bytes), every answer agreeing but one, the file's own unfinished `sum()`
+  overflow record; DuckDB's, CockroachDB's and PostgreSQL's suites translated by sqlglot where SQLite
+  takes them, 152,337 records read and 47,181 kept; kiln's 507 statements at the commit production
+  runs (8adeadba); and 6,410 written cases, at least ten for every entry and families for window
+  frames, recursive CTEs, JSON, UPSERT and RETURNING, generated columns, STRICT, collations, triggers
+  and PRAGMAs. Every answer the corpus carries is SQLite's own: the translated sources' files run back
+  on SQLite agree, 48,128 records, after six PostgreSQL queries reading stored 'now' were kept as
+  statements. Against the source engines' own answers the kept records disagree 7,474 times, each
+  under its cause: the same SQL meaning something else on SQLite 2,728, PostgreSQL refusing what
+  SQLite accepts 1,734, types SQLite doesn't have 1,274, rows from data the translation couldn't carry
+  654, dates and times 542, order 356, plans and catalogs 126, PostgreSQL's aborted transactions 57,
+  integer division 3.
 - **The v6 matrix: the suite at ten million rows and K0, eight engines, best of 3** (adacachy,
   2026-10-23; `bench/records/2026-10-23-adacachy-matrix-v6-{suite,k0}.jsonl`, scored by
   `python3 bench/best_of.py` into `2026-10-23-adacachy-matrix-v6.md`; the code measured is this

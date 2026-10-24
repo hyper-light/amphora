@@ -1,0 +1,10 @@
+{
+  "slt": [
+    {
+      "cause": "the file's own unfinished record",
+      "count": 1,
+      "why": "the record is marked TBD-EVIDENCE-OF R-08904-24719: sum() over integers that overflow raises \"integer overflow\" (lang_aggfunc.html), and SQLite 3.54.0 does; the file expects an empty answer, what its generator wrote for a query that failed",
+      "example": "test/evidence/slt_lang_aggfunc.test:480"
+    }
+  ]
+}
