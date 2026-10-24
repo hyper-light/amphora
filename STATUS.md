@@ -191,6 +191,24 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Measured
 
+- **The v6 matrix: the suite at ten million rows and K0, eight engines, best of 3** (adacachy,
+  2026-10-23; `bench/records/2026-10-23-adacachy-matrix-v6-{suite,k0}.jsonl`, scored by
+  `python3 bench/best_of.py` into `2026-10-23-adacachy-matrix-v6.md`; the code measured is this
+  round's, 4acff7d; load 3.5–124 from other work, so not the quiet machine CLAUDE.md §7 asks). Of
+  the suite's 99 cells Amphora is first in 19 and ahead of every row store in 37. Losses first:
+  whole-table and grouped statements against CedarDB and ClickHouse by two to four orders of
+  magnitude (`order_by_sort` at 1 client 0.4 a second against CedarDB's 2,397, `filter_no_index`
+  0.6 against 2,608, `table_group_by` 0.2 against 276, `table_count` at 32 clients 140 against
+  ClickHouse's 14,127), and against the best row store too (`order_by_sort` 0.04x, `table_group_by`
+  0.12x, `case_aggregate` 0.19x); one client's point reads against SQLite (`blob_read` 0.31x,
+  `text_read` 0.43x, `point_pk` 0.82x); inserts at 32 clients (`insert_batch_100` 0.17x CedarDB,
+  `delete_range_insert` 0.47x, `insert_one` 0.76x PostgreSQL). Ahead: updates, upserts and
+  read-write transactions at 32 clients 1.65–3x the best competitor, `point_pk` at 32 clients 1.1x
+  CedarDB, `in_list_10` and `like_prefix` at 32 clients 5x. K0:
+  Amphora writes 7,601 events a second at p99 9.3 ms (PostgreSQL 5,272 at 10.9 ms, the rest 1,399
+  and fewer), history reads at p99 0.109 ms (PostgreSQL 0.218), in 83 MB (PostgreSQL 253, CedarDB
+  938, ClickHouse 1,435); search loses (p50 74 ms against CedarDB's 2.9 and SQLite's 6.0). The 50
+  statements are the suite's whole reach: G2's corpus replaces it.
 - **Against every competitor, 32 to 1,000,000 writers** (`bench/records/2026-10-20-fedora-matrix.jsonl`,
   `python3 bench/table.py`; fedora, one run each, load 1.4–66 with other work on the machine, so not
   yet the quiet best of 3 CP-T1.2 asks). Amphora's best (one group at 32 writers, 12 above) against
