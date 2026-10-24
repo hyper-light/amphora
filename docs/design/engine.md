@@ -93,13 +93,15 @@ beyond the pool's budget.
 **Decision.** B-link trees (each page knows its right sibling and its upper bound, so a reader that
 arrives at a page just split follows the link). A writer latches a leaf exclusively and, when it
 must split, latches the parent only after the leaf's split is published, never holding two latches
-on the way down. Inner pages change only on splits; readers descend through them without taking
-their latches: each thread keeps copies of the inner pages it has read, keyed by page and the
-frame's version counter, and uses its copy while the counter it reads (an atomic load, a read of a
-line no reader writes) still matches. Leaves are latched shared for reads. Rows and index keys stay
-the executor's SQLite records, so comparisons and the planner's statistics stay as they are, in
-cells of a page format of this storage's own (`storage/versioned/page.rs`: slotted, each page
-bounded above and linked right).
+on the way down. The root is the exception: its split makes the new root before the root's latch
+goes, so no writer reaches the root's new page before the level above it exists (released first, a
+writer that moved right into that page could split it and find no level to post to). Inner pages
+change only on splits; readers descend through them without taking their latches: each thread keeps
+copies of the inner pages it has read, keyed by page and the frame's version counter, and uses its
+copy while the counter it reads (an atomic load, a read of a line no reader writes) still matches.
+Leaves are latched shared for reads. Rows and index keys stay the executor's SQLite records, so
+comparisons and the planner's statistics stay as they are, in cells of a page format of this
+storage's own (`storage/versioned/page.rs`: slotted, each page bounded above and linked right).
 
 **Why.** A shared latch on the root at every descent is a write to one line by every reader: at 32
 clients it moves between their caches at each read (the decision 22 effect, store.md). Lock-free
@@ -109,13 +111,18 @@ copies, validated by a counter, and the copy is made once per change of the page
 split.
 
 **Sources.** Lehman, Yao, "Efficient Locking for Concurrent Operations on B-Trees" (ACM TODS 6(4),
-1981). Graefe, "A Survey of B-Tree Locking Techniques" (ACM TODS 35(3), 2010). Leis, Scheibner,
-Kemper, Neumann, "The ART of Practical Synchronization" (DaMoN 2016): optimistic lock coupling,
-version validation.
+1981): the inserter holds the node it split until it has the parent. PostgreSQL's nbtree README
+(src/backend/access/nbtree/README): a split page stays locked until its downlink, or for the root
+the new root, is in place, and a page split again before its downlink exists leaves no place to
+post (notes: docs/research/blink-root-split.md). Graefe, "A Survey of B-Tree Locking Techniques"
+(ACM TODS 35(3), 2010). Leis, Scheibner, Kemper, Neumann, "The ART of Practical Synchronization"
+(DaMoN 2016): optimistic lock coupling, version validation.
 
 **Falsified by.** A reader that misses a committed row its snapshot sees, or sees one twice, during
-splits (model test against a sorted map under a nemesis of concurrent splits); point reads at 32
-clients that stop scaling with clients while the leaves they read are distinct.
+splits (model test against a sorted map under a nemesis of concurrent splits); a writer that splits
+the root's new page while the root's splitter is held after releasing the root's latch, and finds
+no level above it (blink.rs, `a_root_split_is_whole_before_another_writer_reaches_its_new_page`);
+point reads at 32 clients that stop scaling with clients while the leaves they read are distinct.
 
 ## 4. Versions: undo records, commit timestamps, a low watermark
 

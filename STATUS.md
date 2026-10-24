@@ -151,8 +151,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   the next flush.
 - **Many writers, stage 1** (docs/design/engine.md, `crates/engine/storage/versioned`): B-link
   trees on one shared buffer pool, in memory: writers on different leaves at once, readers through
-  copies of inner pages validated by version; rows versioned in place (snapshots, first writer
-  wins, rollback, collection by the oldest open snapshot); not yet under the executor. One tree,
+  copies of inner pages validated by version, a root split whole under the root's latch (decision
+  3; its race reproduced by a test that pauses the splitter, then 50 of 50 runs of the concurrent
+  test beside the whole lib suite on fedora and on the Mac, 2026-10-24); rows versioned in place
+  (snapshots, first writer wins, rollback, collection by the oldest open snapshot); not yet under
+  the executor. One tree,
   2,000,000 random keys, unversioned: 660,371 puts a second at one thread, 8.55 million at 32
   (fedora, a check).
 - **Many writers, stage 2** (docs/design/engine.md decisions 6 to 8,
@@ -288,10 +291,8 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   fixed (the oracles' cause E); left, from a failing test, `index_xinfo`'s NULL; then the missing
   features by how often users reach them (ORDER BY in aggregates, median and percentiles, the JSON
   functions, the PRAGMAs), each against the probe that found it.
-- **What the oracles left open** (`bench/oracles/findings.md`): the B-link tree's concurrent test
-  failing under the whole suite's load (`storage/versioned/blink.rs`, kiln goal
-  01a16eb1702a7299ae839a03083cfbef); a subquery a folded AND or OR still runs (goal
-  01a16f23f567754ab32edfe5c2abc36d); CERT's estimates, with the planner researched and audited (goal
+- **What the oracles left open** (`bench/oracles/findings.md`): a subquery a folded AND or OR still
+  runs (goal 01a16f23f567754ab32edfe5c2abc36d); CERT's estimates, with the planner researched and audited (goal
   01a16e788f3e735fbadbbdaa30d38d29, plan 01a16eab7f457673b4cf9933adacfc4d).
 - **One thread making everything durable**: on btrfs every flush is a commit of the filesystem's
   log, one at a time, so the checkpointer's flushes of the file hold up the flusher's, and with it

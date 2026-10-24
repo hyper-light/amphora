@@ -7,6 +7,9 @@
 //! the one they were copied under ([`Descender`]); leaves are latched shared to read and exclusive
 //! to write. A writer holds at most two latches, a page and the new page it splits into, and then
 //! the parent alone; pages are never merged (an emptied page stays, as in Lehman and Yao's tree).
+//! A split of the root makes the new root before the root's latch goes, as Lehman and Yao's
+//! splitter holds the page it split until it has the level above: otherwise a writer that moved
+//! right into the new page could split it in turn and find no level above it to post to.
 //! Every loop over pages is bounded: by the tree's height going down, and by the pages handed out
 //! moving right.
 
@@ -14,7 +17,6 @@ use super::page::{self, Compare, Kind, Tail};
 use super::pool::Pool;
 use crate::error::LimboError;
 use crate::sync::atomic::{AtomicU64, Ordering};
-use crate::sync::Mutex;
 use crate::Result;
 use rustc_hash::FxHashMap;
 use std::cmp::Ordering as Order;
@@ -28,12 +30,22 @@ const COPIES: usize = 1024;
 /// Orders keys: a tree's comparison.
 pub type Comparator = Box<dyn Fn(&[u8], &[u8]) -> Order + Send + Sync>;
 
-/// A B-link tree in a pool: its root, which a split of the root replaces.
+/// A B-link tree in a pool: its root, which a split of the root replaces under the root's latch
+/// (so one split at a time replaces it).
 pub struct Tree {
     root: AtomicU64,
-    /// Held to replace the root, so two splits of it make one new root at a time.
-    rooting: Mutex<()>,
     cmp: Comparator,
+    /// A test's pause of the next root split (`Tree::pause_next_root_split`).
+    #[cfg(test)]
+    pause: crate::sync::Mutex<Option<Pause>>,
+}
+
+/// Holds the next root split once the root's latch is released: `entered` says it has paused, and
+/// it goes on when `release` says so (or is dropped).
+#[cfg(test)]
+struct Pause {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 /// The copies of inner pages one reader or writer descends through, by page, each under the
@@ -102,8 +114,9 @@ impl Tree {
         }
         Ok(Self {
             root: AtomicU64::new(root),
-            rooting: Mutex::new(()),
             cmp,
+            #[cfg(test)]
+            pause: crate::sync::Mutex::new(None),
         })
     }
 
@@ -111,8 +124,9 @@ impl Tree {
     pub fn open(root: u64, cmp: Comparator) -> Self {
         Self {
             root: AtomicU64::new(root),
-            rooting: Mutex::new(()),
             cmp,
+            #[cfg(test)]
+            pause: crate::sync::Mutex::new(None),
         }
     }
 
@@ -258,8 +272,17 @@ impl Tree {
                 }
             }
         };
+        // A split root makes the new root before its latch goes (the module's note).
+        let grew = match &split {
+            Some(split) => self.grow(pool, split)?,
+            None => false,
+        };
         drop(w);
-        if let Some(split) = split {
+        #[cfg(test)]
+        if grew {
+            self.pause_after_root_split();
+        }
+        if let (Some(split), false) = (split, grew) {
             self.post(pool, d, split, &path)?;
         }
         Ok(out)
@@ -332,11 +355,9 @@ impl Tree {
         for _ in 0..MAX_LEVELS {
             let parent = match levels.next() {
                 Some(&p) => p,
-                None => match self.grow(pool, &split)? {
-                    Some(()) => return Ok(()),
-                    // The root had already grown: the parent is found from the new root.
-                    None => self.parent_of(pool, d, &split)?,
-                },
+                // The tree grew since the descent: the parent is found from the root, which is
+                // above this split's page (a split root grows before its latch goes).
+                None => self.parent_of(pool, d, &split)?,
             };
             let mut node = parent;
             let mut moves = 0u64;
@@ -352,7 +373,14 @@ impl Tree {
                 if page::insert(&mut w, at, &split.separator, Tail::Child(split.right))? {
                     return Ok(());
                 }
-                break self.split_inner(pool, &mut w, node, &split)?;
+                let next = self.split_inner(pool, &mut w, node, &split)?;
+                if self.grow(pool, &next)? {
+                    drop(w);
+                    #[cfg(test)]
+                    self.pause_after_root_split();
+                    return Ok(());
+                }
+                break next;
             };
             split = next;
         }
@@ -387,12 +415,12 @@ impl Tree {
         })
     }
 
-    /// Makes a new root over a split root: Some once made, None if the root had already grown past
-    /// the split page (another split made it).
-    fn grow(&self, pool: &Pool, split: &Split) -> Result<Option<()>> {
-        let _rooting = self.rooting.lock();
+    /// Makes a new root over `split` if its page is the root: true once made. Called under the
+    /// latch of the page that split, so the root it compares with can't change meanwhile: only
+    /// this, under the root's latch, replaces the root.
+    fn grow(&self, pool: &Pool, split: &Split) -> Result<bool> {
         if self.root() != split.left {
-            return Ok(None);
+            return Ok(false);
         }
         let level = split.level.checked_add(1).ok_or_else(too_tall)?;
         if usize::from(level) >= MAX_LEVELS {
@@ -410,7 +438,7 @@ impl Tree {
             }
         }
         self.root.store(root, Ordering::Release);
-        Ok(Some(()))
+        Ok(true)
     }
 
     /// The page one level above `split`'s pages whose keys include its separator, found from the
@@ -549,6 +577,28 @@ impl Tree {
             page = page::first(image)?;
         }
         Err(too_tall())
+    }
+}
+
+#[cfg(test)]
+impl Tree {
+    /// Pauses the next split of the root once the root's latch is released: a receiver that hears
+    /// when it has, and a sender that lets it go on.
+    fn pause_next_root_split(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release) = std::sync::mpsc::channel();
+        *self.pause.lock() = Some(Pause { entered, release });
+        (entered_rx, release_tx)
+    }
+
+    fn pause_after_root_split(&self) {
+        let pause = self.pause.lock().take();
+        if let Some(pause) = pause {
+            pause.entered.send(()).ok();
+            pause.release.recv().ok();
+        }
     }
 }
 
@@ -696,6 +746,69 @@ mod tests {
         }
         let all = tree.scan(&pool, &mut d, None, usize::MAX).unwrap();
         assert_eq!(u64::try_from(all.len()).unwrap(), writers * each);
+        assert!(all.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+
+    /// Do: split the root, a leaf and then an inner page, with the splitter paused once the root's
+    /// latch is released, and meanwhile put keys past the split until the root's new right page
+    /// splits too. Expect: every put done and every key read back after: the level above the new
+    /// page exists before another writer reaches it. (Under load, `many_at_once`'s writers met
+    /// this: one splitting that page while the splitter of the root was descheduled found no level
+    /// above it, Corrupt "no level above a split page".) Many writers at once: AC-T1.3.1.
+    #[test]
+    fn a_root_split_is_whole_before_another_writer_reaches_its_new_page() {
+        for level in [0u8, 1] {
+            root_split_raced(level);
+        }
+    }
+
+    /// Of keys 0, 1, ... put in order into a new tree, the first whose put splits a root of `level`.
+    fn root_split_at(level: u8) -> u64 {
+        let pool = Pool::new(4_000);
+        let tree = Tree::create(&pool, bytes()).unwrap();
+        let mut d = Descender::new();
+        (0..100_000u64)
+            .find(|&n| {
+                tree.put(&pool, &mut d, &key(n), &key(n)).unwrap();
+                page::level(&pool.read(tree.root()).unwrap()).unwrap() > level
+            })
+            .unwrap()
+    }
+
+    fn root_split_raced(level: u8) {
+        let n = root_split_at(level);
+        let pool = Arc::new(Pool::new(4_000));
+        let tree = Arc::new(Tree::create(&pool, bytes()).unwrap());
+        let mut d = Descender::new();
+        for k in 0..n {
+            tree.put(&pool, &mut d, &key(k), &key(k)).unwrap();
+        }
+        let (entered, release) = tree.pause_next_root_split();
+        let splitter = {
+            let (pool, tree) = (pool.clone(), tree.clone());
+            std::thread::spawn(move || tree.put(&pool, &mut Descender::new(), &key(n), &key(n)))
+        };
+        entered.recv().unwrap();
+        // As many keys again, all past the split's separator: the root's new right page fills and
+        // splits while the splitter waits.
+        for k in n + 1..=2 * n {
+            let put = tree.put(&pool, &mut d, &key(k), &key(k));
+            assert!(
+                put.is_ok(),
+                "key {k} put while a root of level {level} split: {put:?}"
+            );
+        }
+        release.send(()).unwrap();
+        assert!(splitter.join().unwrap().is_ok());
+        for k in 0..=2 * n {
+            assert_eq!(
+                tree.get(&pool, &mut d, &key(k)).unwrap(),
+                Some(key(k)),
+                "key {k}"
+            );
+        }
+        let all = tree.scan(&pool, &mut d, None, usize::MAX).unwrap();
+        assert_eq!(u64::try_from(all.len()).unwrap(), 2 * n + 1);
         assert!(all.windows(2).all(|w| w[0].0 < w[1].0));
     }
 
