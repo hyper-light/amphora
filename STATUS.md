@@ -183,6 +183,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   sorter as before and the two merge in group order. An ORDER BY with a LIMIT (and OFFSET) of up
   to 65,536 rows keeps only those rows in its sorter, where every row was sorted (the engine's heap
   for it was chosen only where a LIMIT's registers already existed, almost never).
+- **A subquery runs where it is read** (docs/design/executor.md decision 6,
+  `crates/engine/tests/oracle_findings.rs`): a subquery outside FROM is a subroutine each read
+  calls, an uncorrelated one's body behind its own Once, so one that no row reaches never runs
+  (over an empty table, past a WHERE term no row passes, in a CASE branch none takes), as in
+  SQLite. A correlated one in WHERE, the select list or ORDER BY of a query whose rows go straight
+  out runs at each read, for the row in hand, and a WHERE term holding a subquery is tested in the
+  first loop, not before the loops. Correlated ones elsewhere still run at every row (goal
+  01a1704d3be97309b55a5863391f3182).
 
 - **The suite counts what it measures** (`bench/src/suite.rs`): a run counts if it ends within the
   window, whenever it began (one begun in the warmup that outlasted the window used to blank a
@@ -204,13 +212,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   databases, 35,104 and 154,695 checks, 70 and 84 findings), the injected bug's (1,759 databases,
   71,127 checks, 245 findings), and seeds 13 and 14 on the fixes (24,321 and 27,091 databases, 983,406
   and 1,096,012 checks, 61 and 70 findings, 37 and then 12 of them not CERT's). 49 causes fixed in
-  Amphora, each from a failing test (`crates/engine/tests/oracle_findings.rs`, 54 tests; `real_text.rs`,
+  Amphora, each from a failing test (`crates/engine/tests/oracle_findings.rs`, 59 tests; `real_text.rs`,
   4,756 REALs as SQLite writes them), among them SQLite 3.54's evaluation order, its number in text
   holding a NUL, NULL routing under NOT, comparisons that kept their conversions, and two panics of
   subqueries run after the read that needs them; the oracles' own artifacts, fixed; five not Amphora's
   (SQLite's own bugs, evaluation order, the BLOB LIKE option, ill-formed UTF-8 per
   `docs/design/semantics.md`, SQLite's names in a folded AND). Open: CERT's estimates (87 findings,
-  cause AG, the planner's goal) and one subquery a folded branch still runs (its own goal). **The
+  cause AG, the planner's goal), and a correlated subquery outside a direct-output SELECT, which
+  still runs at every row, read or not (goal 01a1704d3be97309b55a5863391f3182). **The
   test:** a wrong-result bug injected into the optimizer (`x IS NULL` taken as rejecting NULLs) was
   caught by one nightly run: 125 findings, the first at 0.47 s of the 1,800 s (`bench/oracles/injected.sh`).
 - **The SQLite language against every engine** (G2 step 1, `bench/corpus/run.sh`; published in
@@ -291,9 +300,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   fixed (the oracles' cause E); left, from a failing test, `index_xinfo`'s NULL; then the missing
   features by how often users reach them (ORDER BY in aggregates, median and percentiles, the JSON
   functions, the PRAGMAs), each against the probe that found it.
-- **What the oracles left open** (`bench/oracles/findings.md`): an uncorrelated subquery runs before
-  the loops whether it is read or not, where SQLite runs it where read (goal
-  01a16fcff30576398869ef792267f2eb); CERT's estimates, with the planner researched and audited (goal
+- **What the oracles left open** (`bench/oracles/findings.md`): a correlated subquery outside a
+  direct-output SELECT (an aggregate's, a GROUP BY's, a window's, a RIGHT or FULL JOIN's unmatched
+  rows', a write statement's) runs at every row, read or not, where SQLite runs it where read (goal
+  01a1704d3be97309b55a5863391f3182); CERT's estimates, with the planner researched and audited (goal
   01a16e788f3e735fbadbbdaa30d38d29, plan 01a16eab7f457673b4cf9933adacfc4d).
 - **One thread making everything durable**: on btrfs every flush is a commit of the filesystem's
   log, one at a time, so the checkpointer's flushes of the file hold up the flusher's, and with it

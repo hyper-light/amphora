@@ -15,7 +15,10 @@ step 3: all answer as SQLite does but for the CERT findings of AG (87), which th
 holds (kiln goal 01a16e788f3e735fbadbbdaa30d38d29, "the oracles' CERT clean"), and the ones that
 are not Amphora's (Q, AH, AN). BE and BD answer as SQLite does since the fix that followed: an AND
 a literal 0 settles is folded before names are resolved, and a subquery a settled branch drops
-never runs.
+never runs. What BE left, a subquery run before the loops where SQLite runs it later or never,
+answers as SQLite since a subquery runs where it is read (`docs/design/executor.md`, decision 6;
+`an_unread_subquery_never_runs`), but for a correlated one outside a direct-output SELECT (kiln goal
+01a1704d3be97309b55a5863391f3182).
 
 ## Campaign 1: seed 11, 607 s, 2026-10-24
 

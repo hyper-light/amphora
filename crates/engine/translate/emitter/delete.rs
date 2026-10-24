@@ -874,9 +874,14 @@ fn emit_delete_row_common(
                 emit_non_from_clause_subquery(
                     program,
                     &t_ctx.resolver,
+                    subquery.internal_id,
                     *subquery_plan,
                     &subquery.query_type,
-                    subquery.correlated || rerun_for_target_scan,
+                    if subquery.correlated || rerun_for_target_scan {
+                        crate::translate::plan::SubqueryRun::EveryRow
+                    } else {
+                        crate::translate::plan::SubqueryRun::Once
+                    },
                     true,
                 )?;
             }

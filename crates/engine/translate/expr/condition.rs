@@ -477,12 +477,13 @@ fn translate_leaf_condition_expr(
 ) -> Result<()> {
     match expr {
         ast::Expr::SubqueryResult {
+            subquery_id,
             lhs,
             not_in,
             query_type,
-            ..
         } => match query_type {
             SubqueryType::Exists { result_reg } => {
+                program.emit_lazy_subquery_call(*subquery_id, *result_reg);
                 emit_cond_jump(program, condition_metadata, *result_reg);
             }
             // One search answers it only where NULL goes where FALSE does (not under a NOT).
@@ -496,6 +497,7 @@ fn translate_leaf_condition_expr(
                 let Some(lhs) = lhs.as_deref() else {
                     crate::bail_parse_error!("IN (SELECT ...) has no left-hand side");
                 };
+                program.emit_lazy_subquery_call(*subquery_id, *cursor_id);
                 translate_in_subquery_condition(
                     program,
                     referenced_tables,

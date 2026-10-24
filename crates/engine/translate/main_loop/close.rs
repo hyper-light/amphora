@@ -915,7 +915,7 @@ fn replace_subquery_output(
                 }
                 Ok(found)
             }
-            InSeekSource::Subquery { cursor_id } => {
+            InSeekSource::Subquery { cursor_id, .. } => {
                 // An IN search stores only its result cursor. The old result
                 // identifies the search that must use the new cursor.
                 let (
@@ -1005,9 +1005,14 @@ fn emit_unmatched_rows_subquery(
         emit_non_from_clause_subquery(
             program,
             resolver,
+            subquery.internal_id,
             *subquery_plan,
             &subquery.query_type,
-            subquery.correlated,
+            if subquery.correlated {
+                crate::translate::plan::SubqueryRun::EveryRow
+            } else {
+                crate::translate::plan::SubqueryRun::Once
+            },
             false,
         )
     })

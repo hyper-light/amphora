@@ -164,7 +164,13 @@ pub(super) fn open_in_seek_source_cursor(
             }
             Ok(eph_cursor)
         }
-        InSeekSource::Subquery { cursor_id } => Ok(*cursor_id),
+        InSeekSource::Subquery {
+            internal_id,
+            cursor_id,
+        } => {
+            program.emit_lazy_subquery_call(*internal_id, *cursor_id);
+            Ok(*cursor_id)
+        }
     }
 }
 

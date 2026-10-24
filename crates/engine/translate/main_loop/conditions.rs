@@ -113,9 +113,14 @@ fn emit_correlated_subqueries(
         emit_non_from_clause_subquery(
             program,
             resolver,
+            subquery.internal_id,
             *subquery_plan,
             &subquery.query_type,
-            true,
+            if subquery.runs_where_read {
+                crate::translate::plan::SubqueryRun::EveryRead
+            } else {
+                crate::translate::plan::SubqueryRun::EveryRow
+            },
             false,
         )?;
     }

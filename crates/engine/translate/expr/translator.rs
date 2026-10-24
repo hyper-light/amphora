@@ -407,14 +407,20 @@ fn translate_subquery_result_expr(
     resolver: &Resolver,
 ) -> Result<usize> {
     let ast::Expr::SubqueryResult {
+        subquery_id,
         lhs,
         not_in,
         query_type,
-        ..
     } = expr
     else {
         unreachable!("translate_subquery_result_expr expects Expr::SubqueryResult");
     };
+    // A subquery that runs where it is read runs here, before anything reads its result (an IN's
+    // before its left operand, as SQLite's sqlite3ExprCodeIN builds its right side first).
+    program.emit_lazy_subquery_call(
+        *subquery_id,
+        crate::translate::subquery::subquery_result(query_type),
+    );
     match query_type {
         SubqueryType::Exists { result_reg } => {
             program.emit_insn(Insn::Copy {

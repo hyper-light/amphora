@@ -37,8 +37,8 @@ use crate::{
             outer_columns_read, plan_has_outer_scope_dependency, plan_is_correlated,
             select_plan_has_outer_scope_dependency, ColumnUsedMask, EvalAt, JoinInfo,
             JoinOrderMember, JoinedTable, NonFromClauseSubquery, OuterQueryReference, Plan,
-            SubqueryEvalPhase, SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences,
-            WhereTerm, WhereTermOrigin,
+            SubqueryEvalPhase, SubqueryOrigin, SubqueryPosition, SubqueryRun, SubqueryState,
+            TableReferences, WhereTerm, WhereTermOrigin,
         },
         select::prepare_select_plan,
     },
@@ -849,6 +849,7 @@ fn get_subquery_parser<'a>(
                     origin,
                     eval_phase: origin.phase_floor(),
                     preferred_eval_after_table: None,
+                    runs_where_read: false,
                 });
                 Ok(WalkControl::Continue)
             }
@@ -994,6 +995,7 @@ fn get_subquery_parser<'a>(
                     origin: effective_origin,
                     eval_phase: effective_origin.phase_floor(),
                     preferred_eval_after_table: None,
+                    runs_where_read: false,
                 });
                 if let Some(key) = cse_key {
                     cse_map.push((key, expr.clone()));
@@ -1154,6 +1156,7 @@ fn get_subquery_parser<'a>(
                     origin,
                     eval_phase: origin.phase_floor(),
                     preferred_eval_after_table: None,
+                    runs_where_read: false,
                 });
                 Ok(WalkControl::Continue)
             }
@@ -2322,9 +2325,35 @@ fn emit_materialized_subquery_table(
     Ok((result_columns_start_reg, cursor_id, shared_table))
 }
 
+/// What a read of a subquery's result reads first: an EXISTS's register, a row value's first, or
+/// an IN's ephemeral cursor (ProgramBuilder::emit_lazy_subquery_call finds the subquery by it).
+pub(crate) fn subquery_result(query_type: &SubqueryType) -> usize {
+    match query_type {
+        SubqueryType::Exists { result_reg } => *result_reg,
+        SubqueryType::RowValue {
+            result_reg_start, ..
+        } => *result_reg_start,
+        SubqueryType::In { cursor_id, .. } => *cursor_id,
+    }
+}
+
+/// Every result a subquery writes and a read may start from: an EXISTS's register, each of a row
+/// value's (UPDATE reads `SET (a, b) = (SELECT ...)` a register at a time), or an IN's cursor.
+fn subquery_results(query_type: &SubqueryType) -> Result<std::ops::Range<usize>> {
+    let first = subquery_result(query_type);
+    let count = match query_type {
+        SubqueryType::RowValue { num_regs, .. } => *num_regs,
+        SubqueryType::Exists { .. } | SubqueryType::In { .. } => 1,
+    };
+    let end = first
+        .checked_add(count)
+        .ok_or(crate::LimboError::IntegerOverflow)?;
+    Ok(first..end)
+}
+
 /// Translate a subquery that is not part of the FROM clause.
 /// If a subquery is uncorrelated (i.e. does not reference columns from the outer query),
-/// it will be executed only once.
+/// it runs once, where it is first read: its code is a subroutine each read calls.
 ///
 /// If it is correlated (i.e. references columns from the outer query),
 /// it will be executed for each row of the outer query.
@@ -2337,11 +2366,13 @@ fn emit_materialized_subquery_table(
 pub fn emit_non_from_clause_subquery(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
+    internal_id: TableInternalId,
     plan: Plan,
     query_type: &SubqueryType,
-    is_correlated: bool,
+    run: SubqueryRun,
     preserve_outer_expr_cache: bool,
 ) -> Result<()> {
+    let is_correlated = run != SubqueryRun::Once;
     program.nested(|program| {
         let subquery_id = program.next_subquery_eqp_id();
         match query_type {
@@ -2371,12 +2402,23 @@ pub fn emit_non_from_clause_subquery(
             }
         }
 
-        let label_skip_after_first_run = if !is_correlated {
-            let label = program.allocate_label();
-            program.emit_insn(Insn::Once {
-                target_pc_when_reentered: label,
-            });
-            Some(label)
+        // A subquery runs where it is read, as SQLite's do (sqlite3CodeSubselect): a subroutine
+        // out of the line of code that each read calls (ProgramBuilder::emit_lazy_subquery_call),
+        // an uncorrelated one's body behind its own Once, a correlated one's run for the row in
+        // hand at each read.
+        let lazy = if run != SubqueryRun::EveryRow {
+            let past = program.allocate_label();
+            program.emit_insn(Insn::Goto { target_pc: past });
+            let start = program.allocate_label();
+            program.preassign_label_to_next_insn(start);
+            let return_reg = program.alloc_register();
+            let ran = program.allocate_label();
+            if !is_correlated {
+                program.emit_insn(Insn::Once {
+                    target_pc_when_reentered: ran,
+                });
+            }
+            Some((past, start, return_reg, ran))
         } else {
             None
         };
@@ -2457,8 +2499,16 @@ pub fn emit_non_from_clause_subquery(
         if !matches!(query_type, SubqueryType::Exists { .. }) {
             program.pop_current_parent_explain();
         }
-        if let Some(label) = label_skip_after_first_run {
-            program.preassign_label_to_next_insn(label);
+        if let Some((past, start, return_reg, ran)) = lazy {
+            program.preassign_label_to_next_insn(ran);
+            program.emit_insn(Insn::Return {
+                return_reg,
+                can_fallthrough: false,
+            });
+            program.preassign_label_to_next_insn(past);
+            for result in subquery_results(query_type)? {
+                program.set_lazy_subquery(internal_id, result, return_reg, start, !is_correlated);
+            }
         }
         Ok(())
     })
@@ -2517,9 +2567,10 @@ pub fn emit_non_from_clause_subqueries_for_phase(
         emit_non_from_clause_subquery(
             program,
             outer_cache_resolver.as_ref().unwrap_or(resolver),
+            subquery.internal_id,
             *subquery_plan,
             &subquery.query_type,
-            subquery.correlated,
+            subquery.run(),
             !in_loops || outer_cache_resolver.is_some(),
         )?;
     }
@@ -2600,6 +2651,21 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
             SubqueryOrigin::SelectGroupBy => true,
             _ => false,
         } || aggregate_subquery_ids.contains(&subquery.internal_id);
+        // A correlated subquery from WHERE, the select list or ORDER BY of a query whose rows go
+        // straight out is read only while its loop's row is current, so it runs at each read, as
+        // SQLite's does. Elsewhere it still runs at every row of its loop: an aggregate, a GROUP
+        // BY or a window reads its value after the loops, from what each row stored then, and a
+        // RIGHT or FULL JOIN's unmatched rows enter the row body past the loops that would call
+        // it. Write statements emit their own subqueries (update.rs, delete.rs, insert.rs).
+        subquery.runs_where_read = subquery.correlated
+            && has_direct_row_output
+            && !has_unmatched_right_rows
+            && matches!(
+                subquery.origin,
+                SubqueryOrigin::SelectWhere
+                    | SubqueryOrigin::SelectList
+                    | SubqueryOrigin::SelectOrderBy
+            );
         subquery.eval_phase = match subquery.origin {
             // The unmatched-rows pass of a RIGHT or FULL JOIN enters the row
             // body directly, skipping the loops where a correlated subquery

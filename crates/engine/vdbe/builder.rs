@@ -291,6 +291,12 @@ pub struct ProgramBuilder {
     /// Maps table internal_id to result_columns_start_reg for FROM clause subqueries.
     /// Used when nested subqueries need to reference columns from outer query subqueries.
     subquery_result_regs: HashMap<TableInternalId, usize>,
+    /// Subqueries that run where they are read, as SQLite's do (sqlite3CodeSubselect): each one's
+    /// subroutine, the register its Gosub returns through, its first instruction and whether it
+    /// runs once (uncorrelated) or at every read (correlated), by its id and a result register
+    /// (each of a row value's) or its IN cursor. A copy of a subquery, made for a join's unmatched
+    /// rows, keeps the id and writes elsewhere, so its reads find its own.
+    lazy_subqueries: HashMap<(TableInternalId, usize), (usize, BranchOffset, bool)>,
     /// The mode in which the query is being executed.
     mode: BuilderQueryMode,
     pub flags: ProgramBuilderFlags,
@@ -751,6 +757,7 @@ impl ProgramBuilder {
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),
             subquery_result_regs: HashMap::default(),
+            lazy_subqueries: HashMap::default(),
             next_cte_id: 0,
             materialized_ctes: HashMap::default(),
             ctes_being_defined: Vec::new(),
@@ -932,6 +939,43 @@ impl ProgramBuilder {
     /// Returns None if the subquery hasn't been emitted yet.
     pub fn get_subquery_result_reg(&self, internal_id: TableInternalId) -> Option<usize> {
         self.subquery_result_regs.get(&internal_id).copied()
+    }
+
+    /// Records that the subquery `internal_id`, read through `result` (a result register or its IN
+    /// cursor), runs where it is read: its subroutine starts at `start` and returns through
+    /// `return_reg`, once in all (`once`) or at every read.
+    pub fn set_lazy_subquery(
+        &mut self,
+        internal_id: TableInternalId,
+        result: usize,
+        return_reg: usize,
+        start: BranchOffset,
+        once: bool,
+    ) {
+        self.lazy_subqueries
+            .insert((internal_id, result), (return_reg, start, once));
+    }
+
+    /// Runs the subquery `internal_id`, read through `result`, here when it runs where read: a
+    /// Gosub to its subroutine. One that runs once is skipped once this place has made it (the
+    /// subroutine's own Once runs it once in all); a correlated one runs at each read, for the row
+    /// in hand. A subquery that runs elsewhere has nothing to emit.
+    pub fn emit_lazy_subquery_call(&mut self, internal_id: TableInternalId, result: usize) {
+        let Some(&(return_reg, start, once)) = self.lazy_subqueries.get(&(internal_id, result))
+        else {
+            return;
+        };
+        let made = self.allocate_label();
+        if once {
+            self.emit_insn(Insn::Once {
+                target_pc_when_reentered: made,
+            });
+        }
+        self.emit_insn(Insn::Gosub {
+            target_pc: start,
+            return_reg,
+        });
+        self.preassign_label_to_next_insn(made);
     }
 
     /// Mark that this statement may modify/insert multiple rows (mirrors SQLite's sqlite3MultiWrite).

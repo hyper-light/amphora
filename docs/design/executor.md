@@ -178,3 +178,44 @@ with a LIMIT, past LIMIT+OFFSET rows it deletes the last before each insert).
 
 **Falsified by.** An ordered, limited answer that differs from the whole ordering's rows at its OFFSET;
 a limited ORDER BY slower than the whole sort on the suite.
+
+## 6. A subquery runs where it is read
+
+**Decision.** A subquery outside the FROM clause is coded once, out of the line of code, as a
+subroutine (`subquery.rs`, `emit_non_from_clause_subquery`): an uncorrelated one's body sits behind
+its own `Once`, and a correlated one's runs for the row in hand. Each read calls it before using its
+result (`ProgramBuilder::emit_lazy_subquery_call`): a scalar's or a row value's registers, an
+EXISTS's, an IN's list, an IN that drives a seek, LIMIT and OFFSET. An uncorrelated subquery's call is
+a `Once` and a `Gosub`, so it runs at most once, where control first reads it. A correlated one in
+WHERE, the select list or ORDER BY of a query whose rows go straight out (no aggregate, GROUP BY,
+window, or RIGHT or FULL JOIN) is called at each read, while its loop's row is current; elsewhere it
+still runs at every row of its loop. A WHERE term holding a subquery is tested in the first loop,
+after the terms that hold none, rather than before the loops (`planner.rs`,
+`determine_where_to_eval_term`), but where a RIGHT or FULL JOIN's unmatched rows would skip that loop.
+
+**Why.** Amphora ran each uncorrelated subquery before its loops, read or not, and each correlated one
+at every row of its loop. One that no row reaches still ran and raised its error where SQLite answers:
+the oracles' finding error-99fb1658e34f78cb (sum's integer overflow under `WHERE 1 OR (SELECT
+sum(x) ...)`), and with it the same subquery over an empty table, past a WHERE term no row passes,
+in a CASE branch no row takes, or beside `WHERE 0`. Its work was spent for nothing too.
+
+**Sources.** SQLite 3.54.0's `sqlite3CodeSubselect` (`src/expr.c`) codes a subquery where it is first
+read, as a subroutine (`OP_BeginSubrtn` ... `OP_Return`) whose body sits behind `OP_Once` unless it
+is correlated; a later read is an `OP_Gosub` to it. `sqlite3WhereBegin` (`src/where.c`) tests a WHERE
+term before its loops (its False-WHERE-Term-Bypass) only if it reads none of the loops' tables and
+`exprIsDeterministic` holds, which fails on any subquery (`sqlite3SelectWalkFail`);
+`sqlite3WhereCodeOneLoopStart` (`src/wherecode.c`) codes a term holding a correlated subquery
+(`TERM_VARSELECT`) after the loop's other terms.
+
+**Evidence.** `crates/engine/tests/oracle_findings.rs`: `an_unread_subquery_never_runs` and
+`an_unread_correlated_subquery_never_runs` failed before the change with the subquery's integer
+overflow; with it they answer as SQLite 3.54.0 does, both where nothing reads the subquery and where
+something does (a seek key, an IN that drives a seek, LIMIT, an aggregate's output, which raise the
+error as SQLite does). `a_subquery_read_in_two_places_is_coded_once` (GROUP BY and the select list,
+an UPDATE's row value) finds the subquery listed once by EXPLAIN QUERY PLAN and its body coded once,
+and `a_triggers_subqueries_run_afresh_at_each_firing` finds a trigger's subqueries run afresh at each
+firing.
+
+**Falsified by.** A subquery that runs where SQLite's doesn't (an error SQLite doesn't raise); an
+uncorrelated one run more than once in one run of the query that holds it, or a correlated one run
+twice for one read; a subquery statement of the suite slower than before.

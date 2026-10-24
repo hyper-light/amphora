@@ -3868,8 +3868,12 @@ pub enum InSeekSource {
         affinity: Affinity,
     },
     /// Subquery already materialized by emit_non_from_clause_subquery;
-    /// open_loop reuses the existing ephemeral cursor.
-    Subquery { cursor_id: CursorID },
+    /// open_loop reuses the existing ephemeral cursor, running the subquery first when it runs
+    /// where it is read.
+    Subquery {
+        internal_id: TableInternalId,
+        cursor_id: CursorID,
+    },
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -4279,9 +4283,34 @@ pub struct NonFromClauseSubquery {
     pub eval_phase: SubqueryEvalPhase,
     /// Run after this table when a later loop needs fewer calls.
     pub preferred_eval_after_table: Option<TableInternalId>,
+    /// A correlated subquery every read of which comes while its loop's row is current: it runs
+    /// at each read, as SQLite runs it (coded where read), not at every row.
+    pub runs_where_read: bool,
+}
+
+/// When a subquery that is not part of the FROM clause runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubqueryRun {
+    /// Once, where it is first read: an uncorrelated subquery.
+    Once,
+    /// At each read, for the row in hand: a correlated subquery read only while its loop's row is
+    /// current (`NonFromClauseSubquery::runs_where_read`).
+    EveryRead,
+    /// Where it is emitted, for every row of its loop.
+    EveryRow,
 }
 
 impl NonFromClauseSubquery {
+    /// When this subquery runs where it is placed by its own nature: once if uncorrelated, at each
+    /// read if it may, else for every row.
+    pub fn run(&self) -> SubqueryRun {
+        match (self.correlated, self.runs_where_read) {
+            (false, _) => SubqueryRun::Once,
+            (true, true) => SubqueryRun::EveryRead,
+            (true, false) => SubqueryRun::EveryRow,
+        }
+    }
+
     /// Returns true if the subquery has been evaluated (translated into bytecode).
     pub fn has_been_evaluated(&self) -> bool {
         matches!(self.state, SubqueryState::Evaluated { .. })

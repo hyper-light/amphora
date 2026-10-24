@@ -1262,9 +1262,14 @@ fn emit_update_insns<'a>(
         emit_non_from_clause_subquery(
             program,
             &t_ctx.resolver,
+            subquery.internal_id,
             *subquery_plan,
             &subquery.query_type,
-            subquery.correlated,
+            if subquery.correlated {
+                crate::translate::plan::SubqueryRun::EveryRow
+            } else {
+                crate::translate::plan::SubqueryRun::Once
+            },
             false,
         )?;
     }
@@ -2483,9 +2488,14 @@ fn emit_update_insns<'a>(
                         emit_non_from_clause_subquery(
                             program,
                             &t_ctx.resolver,
+                            subquery.internal_id,
                             *subquery_plan,
                             &subquery.query_type,
-                            subquery.correlated || rerun_for_target_scan,
+                            if subquery.correlated || rerun_for_target_scan {
+                                crate::translate::plan::SubqueryRun::EveryRow
+                            } else {
+                                crate::translate::plan::SubqueryRun::Once
+                            },
                             true,
                         )?;
                     }

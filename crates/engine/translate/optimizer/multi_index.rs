@@ -325,9 +325,11 @@ fn in_seek_source_from_expr(
             affinity: chosen.affinity,
         }),
         ast::Expr::SubqueryResult {
+            subquery_id,
             query_type: ast::SubqueryType::In { cursor_id, .. },
             ..
         } => Some(InSeekSource::Subquery {
+            internal_id: *subquery_id,
             cursor_id: *cursor_id,
         }),
         _ => None,

@@ -1501,3 +1501,142 @@ fn a_subquery_a_settled_branch_drops_never_runs() {
         .unwrap();
     assert_eq!(rows(&io, &conn, "SELECT count(*) FROM t1"), ["2"]);
 }
+
+/// Do: read an uncorrelated subquery that raises an error (sum's integer overflow) only where no row
+/// reaches it: over an empty table, past a WHERE term no row passes, in a CASE branch no row takes,
+/// beside `WHERE 0`, as an IN filter past a failing term, and compared in the WHERE of an empty
+/// table. Expect: SQLite's rows. SQLite codes a
+/// subquery where it is read (sqlite3CodeSubselect, behind OP_Once when uncorrelated) and keeps a
+/// WHERE term holding one out of the terms it tests before its loops, so a subquery no row reaches
+/// never runs; one read where a loop is set up (an IN that drives a seek, a seek key, LIMIT) or
+/// in an aggregate's output still runs and still raises its error there. Amphora ran each
+/// uncorrelated subquery before the loops, read or not.
+#[test]
+fn an_unread_subquery_never_runs() {
+    let (io, conn) = open();
+    let error = |sql: &str| match conn.prepare(sql).and_then(|mut stmt| loop {
+        match stmt.step()? {
+            StepResult::IO => io.step()?,
+            StepResult::Done => break Ok(()),
+            _ => {}
+        }
+    }) {
+        Ok(()) => "no error".to_owned(),
+        Err(e) => e.to_string(),
+    };
+    conn.execute("CREATE TABLE t0(c0 INT)").unwrap();
+    conn.execute("INSERT INTO t0 VALUES (10), (9223372036854775807), (7)")
+        .unwrap();
+    conn.execute("CREATE TABLE e(x INTEGER PRIMARY KEY, y INT)")
+        .unwrap();
+    conn.execute("CREATE INDEX e_y ON e(y)").unwrap();
+    let s = "(SELECT sum(c0) FROM t0 WHERE c0)";
+    for (sql, want) in [
+        (format!("SELECT {s} FROM e"), vec![]),
+        (format!("SELECT {s} FROM t0 WHERE c0 = 99"), vec![]),
+        ("SELECT c0 FROM t0 WHERE c0 = 99 AND EXISTS (SELECT sum(c0) FROM t0 WHERE c0 HAVING sum(c0))".to_owned(), vec![]),
+        (format!("SELECT CASE WHEN c0 = 99 THEN {s} END FROM t0"), vec!["NULL", "NULL", "NULL"]),
+        (format!("SELECT {s} FROM t0 WHERE 0"), vec![]),
+        (format!("SELECT c0 FROM t0 WHERE c0 = 99 AND c0 IN {s}"), vec![]),
+        (format!("SELECT x FROM e WHERE y > 0 AND {s} > 0"), vec![]),
+    ] {
+        assert_eq!(error(&sql), "no error", "{sql}");
+        assert_eq!(rows(&io, &conn, &sql), want, "{sql}");
+    }
+    for sql in [
+        format!("SELECT {s}"),
+        format!("SELECT 1 AND {s}"),
+        format!("SELECT count(*), {s} FROM t0 WHERE 0"),
+        format!("SELECT x FROM e WHERE y IN {s}"),
+        format!("SELECT x FROM e WHERE x IN {s}"),
+        format!("SELECT x FROM e WHERE y = {s}"),
+        format!("SELECT x FROM e LIMIT {s}"),
+    ] {
+        assert!(
+            error(&sql).contains("integer overflow"),
+            "{sql}: {}",
+            error(&sql)
+        );
+    }
+}
+
+/// Do: read a correlated subquery that raises an error (sum's integer overflow) only in a CASE
+/// branch no row takes. Expect: SQLite's three NULL rows: it codes the subquery inside the branch,
+/// so no row runs it. Amphora ran a correlated subquery for every row of its loop, read or not.
+#[test]
+fn an_unread_correlated_subquery_never_runs() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t0(c0 INT)").unwrap();
+    conn.execute("INSERT INTO t0 VALUES (10), (9223372036854775807), (7)")
+        .unwrap();
+    assert_eq!(
+        rows(&io, &conn, "SELECT CASE WHEN a.c0 = 99 THEN (SELECT sum(b.c0) FROM t0 AS b WHERE b.c0 >= a.c0 - a.c0) END FROM t0 AS a"),
+        ["NULL", "NULL", "NULL"]
+    );
+}
+
+/// Do: read one uncorrelated subquery in two places: in GROUP BY and the select list (planned once
+/// for both), and as the row value an UPDATE sets two columns from, a column at a time. Expect:
+/// SQLite's rows, EXPLAIN QUERY PLAN listing the subquery once and EXPLAIN coding its body once
+/// (one OpenRead of the table only it reads): each read calls that one body, which runs once.
+#[test]
+fn a_subquery_read_in_two_places_is_coded_once() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t0(c0 INT, c1 INT)").unwrap();
+    conn.execute("CREATE TABLE t1(c0 INT)").unwrap();
+    conn.execute("INSERT INTO t0 VALUES (1, 2), (3, 4)")
+        .unwrap();
+    conn.execute("INSERT INTO t1 VALUES (5), (6)").unwrap();
+    let root = rows(
+        &io,
+        &conn,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 't1'",
+    );
+    for (sql, want) in [
+        (
+            "SELECT (SELECT max(c0) FROM t1), count(*) FROM t0 GROUP BY (SELECT max(c0) FROM t1)",
+            ["6|2"].as_slice(),
+        ),
+        (
+            "UPDATE t0 SET (c0, c1) = (SELECT max(c0), min(c0) FROM t1) RETURNING c0, c1",
+            ["6|5", "6|5"].as_slice(),
+        ),
+    ] {
+        let listed = rows(&io, &conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+        assert_eq!(
+            listed
+                .iter()
+                .filter(|step| step.contains("SUBQUERY"))
+                .count(),
+            1,
+            "{sql}: {listed:?}"
+        );
+        let coded = rows(&io, &conn, &format!("EXPLAIN {sql}"));
+        let opens = coded
+            .iter()
+            .filter(|insn| {
+                let fields: Vec<&str> = insn.split('|').collect();
+                fields[1] == "'OpenRead'" && fields[3] == root[0]
+            })
+            .count();
+        assert_eq!(opens, 1, "{sql}: {coded:#?}");
+        assert_eq!(rows(&io, &conn, sql), want, "{sql}");
+    }
+}
+
+/// Do: fire a trigger three times whose body reads uncorrelated subqueries: in an INSERT's values
+/// (one reading NEW) and in an UPDATE's SET. Expect: SQLite's rows: each firing runs each subquery
+/// afresh where it reads it, as SQLite's own run of the trigger program does.
+#[test]
+fn a_triggers_subqueries_run_afresh_at_each_firing() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t(a INT)").unwrap();
+    conn.execute("CREATE TABLE log(n INT, m INT)").unwrap();
+    conn.execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES ((SELECT count(*) FROM t), (SELECT max(a) FROM t WHERE a < new.a)); UPDATE log SET m = (SELECT sum(a) FROM t) WHERE n = 1; END").unwrap();
+    conn.execute("INSERT INTO t VALUES (10), (20), (30)")
+        .unwrap();
+    assert_eq!(
+        rows(&io, &conn, "SELECT n, m FROM log ORDER BY n"),
+        ["1|60", "2|10", "3|20"]
+    );
+}

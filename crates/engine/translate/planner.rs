@@ -18,7 +18,7 @@ use crate::translate::{
     emitter::Resolver,
     expr::{
         expr_contains_nondeterministic_scalar_function, expr_vector_size, folded_false_ands,
-        unwrap_parens, BindingBehavior, WalkControl,
+        has_subquery, unwrap_parens, BindingBehavior, WalkControl,
     },
     plan::{NonFromClauseSubquery, SubqueryState},
     subquery::outer_query_refs_for_correlated_subquery,
@@ -2691,6 +2691,18 @@ pub fn determine_where_to_eval_term(
     let Some(table_references) = table_references else {
         return Ok(eval_at);
     };
+    // SQLite tests a WHERE term before its loops only if it holds no subquery (sqlite3WhereBegin's
+    // false-term bypass: exprIsDeterministic fails on one) and codes one that does in its first
+    // loop, so the subquery, run where it is read, never runs when no row comes. A RIGHT or FULL
+    // JOIN's unmatched rows skip the first loop, so there the term stays before the loops.
+    if eval_at == EvalAt::BeforeLoop
+        && !join_order.is_empty()
+        && term.origin.join_origin().is_none()
+        && !table_references.has_right_or_full_join()
+        && has_subquery(&term.expr)
+    {
+        eval_at = EvalAt::Loop(0);
+    }
     let referenced_tables = table_mask_from_expr(&term.expr, table_references, subqueries)?;
 
     if term.origin.join_origin().is_none() {

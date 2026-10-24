@@ -927,9 +927,11 @@ pub fn fire_trigger(
                 emit_non_from_clause_subquery(
                     program,
                     resolver,
+                    subquery.internal_id,
                     *plan,
                     &subquery.query_type,
-                    true, // always re-evaluate: trigger WHEN is checked per-row
+                    // always re-evaluate: trigger WHEN is checked per-row
+                    crate::translate::plan::SubqueryRun::EveryRow,
                     false,
                 )?;
             }

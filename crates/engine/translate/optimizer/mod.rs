@@ -3835,9 +3835,11 @@ fn in_seek_source(in_expr: &Expr, affinity: Affinity) -> Result<InSeekSource> {
             affinity,
         }),
         Expr::SubqueryResult {
+            subquery_id,
             query_type: SubqueryType::In { cursor_id, .. },
             ..
         } => Ok(InSeekSource::Subquery {
+            internal_id: *subquery_id,
             cursor_id: *cursor_id,
         }),
         _ => Err(LimboError::InternalError(
