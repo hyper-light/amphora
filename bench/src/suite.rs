@@ -24,8 +24,12 @@
 //!
 //! One JSON line: each statement's throughput, latency percentiles, rows and errors at each client
 //! count, its longest run (`longest_ms`, warmup included: a statement that answers nothing within
-//! the window says how long it took), and the memory the process held (servers' is added by
-//! `run.sh`).
+//! the window says how long it took), the process's user and system CPU seconds in the window
+//! (`cpu_user_s`, `cpu_sys_s`), and the memory the process held (servers' is added by `run.sh`).
+//!
+//! Profiling: `--only name$` runs the one statement it names, `--reuse` runs on the database a run
+//! left in `--dir` instead of loading again, and AMPHORA_PERF_CTL turns perf's counting on and off
+//! around each measured window (`perf_ctl`), so a profile holds that window alone.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -587,10 +591,14 @@ struct Opts {
     only: Option<String>,
     /// Each statement's plan (its database's EXPLAIN) instead of timing it.
     explain: bool,
+    /// The database a run left in `dir`, as that run loaded, indexed and settled it, instead of a
+    /// new one: a statement profiled again without loading ten million rows again. A diagnosis,
+    /// never a record (its runs follow whatever the last run's writes left).
+    reuse: bool,
 }
 
 fn opts() -> anyhow::Result<Opts> {
-    let mut o = Opts { target: String::new(), dir: "/tmp/amphora-suite".into(), dsn: None, items: 200_000, clients: vec![1, 32], seconds: 5.0, warmup: 1.0, only: None, explain: false };
+    let mut o = Opts { target: String::new(), dir: "/tmp/amphora-suite".into(), dsn: None, items: 200_000, clients: vec![1, 32], seconds: 5.0, warmup: 1.0, only: None, explain: false, reuse: false };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut v = || args.next().ok_or_else(|| anyhow::anyhow!("{a} takes a value"));
@@ -605,7 +613,8 @@ fn opts() -> anyhow::Result<Opts> {
             "--warmup" => o.warmup = v()?.parse()?,
             "--only" => o.only = Some(v()?),
             "--explain" => o.explain = true,
-            other => anyhow::bail!("unknown argument {other} (the suite takes --target, --dir, --dsn, --items, --clients, --seconds, --warmup, --only, --explain)"),
+            "--reuse" => o.reuse = true,
+            other => anyhow::bail!("unknown argument {other} (the suite takes --target, --dir, --dsn, --items, --clients, --seconds, --warmup, --only, --explain, --reuse)"),
         }
     }
     Ok(o)
@@ -623,6 +632,9 @@ struct Outcome {
     /// The longest run, in µs, whenever it began and ended (warmup included): a statement that
     /// answers nothing within the window says how long it took.
     longest_us: u64,
+    /// This process's user and system CPU seconds in the measured window ([`cpu_times`]): an
+    /// embedded database's work and its clients', a server's clients' alone.
+    cpu: Option<(f64, f64)>,
 }
 
 /// Whether a database's refusal asks to be tried again (serialization failures, deadlocks, write
@@ -632,6 +644,36 @@ fn retryable(e: &anyhow::Error) -> bool {
     ["could not serialize", "deadlock", "conflict with concurrent", "lock wait timeout", "database is locked", "busy", "try restarting transaction", "concurrently modified"].iter().any(|m| s.contains(m))
 }
 
+/// This process's user and system CPU seconds, every thread's, ended ones too: Linux's
+/// /proc/self/stat (proc(5): fields 14 and 15, in clock ticks, 100 a second on every Linux). None
+/// where there is no /proc.
+fn cpu_times() -> Option<(f64, f64)> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // The command's name (field 2) is in parentheses and may hold spaces: count from after it.
+    let mut fields = stat.get(stat.rfind(')')? + 1..)?.split_whitespace();
+    let user: f64 = fields.nth(11)?.parse().ok()?;
+    let system: f64 = fields.next()?.parse().ok()?;
+    Some((user / 100.0, system / 100.0))
+}
+
+/// AMPHORA_PERF_CTL=<control fifo>,<ack fifo>: perf (`perf stat|record --control
+/// fifo:<control>,<ack> --delay=-1`, started first: perf opens both ends, so neither open here
+/// blocks) counts each statement's measured window and nothing else: not the load, the warmup or
+/// another statement. Each command waits for perf's ack before the window goes on.
+fn perf_ctl(cmd: &str) {
+    use std::io::{Read, Write};
+    let Some(spec) = std::env::var("AMPHORA_PERF_CTL").ok() else { return };
+    let Some((ctl, ack)) = spec.split_once(',') else {
+        eprintln!("AMPHORA_PERF_CTL takes <control fifo>,<ack fifo>");
+        return;
+    };
+    let fifo = |path: &str| std::fs::OpenOptions::new().read(true).write(true).open(path);
+    let done = fifo(ctl).and_then(|mut f| f.write_all(format!("{cmd}\n").as_bytes())).and_then(|()| fifo(ack)).and_then(|mut f| f.read_exact(&mut [0u8; 4]));
+    if let Err(e) = done {
+        eprintln!("perf {cmd}: {e}");
+    }
+}
+
 /// Runs `op` from `clients` clients for the warmup and then `seconds`, each client on a session of
 /// its own, closed loop.
 fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &Arc<Shape>, clients: usize, warmup: f64, seconds: f64) -> Outcome {
@@ -639,18 +681,34 @@ fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &A
     let began = Instant::now();
     let count_from = began + Duration::from_secs_f64(warmup);
     let until = count_from + Duration::from_secs_f64(seconds);
-    let total = Arc::new(Mutex::new(Outcome { hist: Hist::new(), rows: 0, errors: 0, error: None, retries: 0, longest_us: 0 }));
+    let total = Arc::new(Mutex::new(Outcome { hist: Hist::new(), rows: 0, errors: 0, error: None, retries: 0, longest_us: 0, cpu: None }));
     // Each statement's clients draw from streams of their own: mix is a bijection, so no two
     // clients' seeds are equal (adding the client's number and then XORing it in made clients 0, 2,
     // 4, ... draw the same parameters, and statements whose names were as long drew the same).
     let base = op.name.bytes().fold(0x2545_f491_4f6c_dd1d_u64, |h, b| mix(h ^ u64::from(b)));
     let d = target.dialect();
-    std::thread::scope(|s| {
+    let cpu = std::thread::scope(|s| {
+        // The measured window's own thread: the process's CPU time in it, and perf on and off
+        // around it (perf_ctl).
+        let window = s.spawn(move || {
+            std::thread::sleep(count_from.saturating_duration_since(Instant::now()));
+            let before = cpu_times();
+            // An empty window turns nothing on, so perf counts nothing for it.
+            let counted = until > count_from;
+            if counted {
+                perf_ctl("enable");
+            }
+            std::thread::sleep(until.saturating_duration_since(Instant::now()));
+            if counted {
+                perf_ctl("disable");
+            }
+            before.zip(cpu_times()).map(|((u0, s0), (u1, s1))| (u1 - u0, s1 - s0))
+        });
         for c in 0..clients {
             let (target, stmts, shape, stop, total) = (target.clone(), stmts.clone(), shape.clone(), stop.clone(), total.clone());
             let mut rng = Rng(mix(base ^ mix(c as u64 + 1)) | 1);
             s.spawn(move || {
-                let mut mine = Outcome { hist: Hist::new(), rows: 0, errors: 0, error: None, retries: 0, longest_us: 0 };
+                let mut mine = Outcome { hist: Hist::new(), rows: 0, errors: 0, error: None, retries: 0, longest_us: 0, cpu: None };
                 match target.session() {
                     Err(e) => {
                         mine.errors += 1;
@@ -719,25 +777,32 @@ fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &A
                 }
             });
         }
+        window.join().ok().flatten()
     });
-    Arc::try_unwrap(total).ok().and_then(|m| m.into_inner().ok()).unwrap_or(Outcome { hist: Hist::new(), rows: 0, errors: 0, error: Some("lost the run's outcome".into()), retries: 0, longest_us: 0 })
+    let lost = || Outcome { hist: Hist::new(), rows: 0, errors: 0, error: Some("lost the run's outcome".into()), retries: 0, longest_us: 0, cpu: None };
+    let mut out = Arc::try_unwrap(total).ok().and_then(|m| m.into_inner().ok()).unwrap_or_else(lost);
+    out.cpu = cpu;
+    out
 }
 
-pub fn main() -> anyhow::Result<()> {
-    let o = opts()?;
-    let shape = Arc::new(Shape::new(o.items));
-    let readers = o.clients.iter().copied().max().unwrap_or(1);
-    let target: Arc<dyn Target> = suite_db::open(&o.target, &o.dir, o.dsn.as_deref(), readers)?;
-    let d = target.dialect();
+/// Whether `--only` takes statement `name`: every statement without it; with it, those its
+/// comma-separated names begin, or with a trailing `$` the one it names (`point_pk$`, not
+/// `point_pk_one_column`).
+fn selected(only: Option<&str>, name: &str) -> bool {
+    only.is_none_or(|only| only.split(',').any(|n| n.strip_suffix('$').map_or(name.starts_with(n), |exact| name == exact)))
+}
 
+/// Makes the suite's tables, loads them, builds their indexes and settles the database: each
+/// step's seconds.
+fn load_all(target: &Arc<dyn Target>, d: Dialect, shape: &Shape, cedardb: bool) -> anyhow::Result<(f64, f64, f64)> {
     let began = Instant::now();
-    target.setup(&tables(d, o.target == "cedardb").into_iter().map(|s| (s, vec![])).collect::<Vec<_>>())?;
+    target.setup(&tables(d, cedardb).into_iter().map(|s| (s, vec![])).collect::<Vec<_>>())?;
     // A hundred rows a statement keeps every placeholder-bound engine under its parameter limit
     // (SQLite 32,766, PostgreSQL's and MySQL's 65,535). ClickHouse makes each INSERT a part it then
     // merges, and asks for bulk inserts of at least 1,000 rows, better 10,000 to 100,000 (its
     // documentation, "Bulk inserts"): at ten million rows, a hundred a statement is 100,000 parts.
     let batch = if d == Dialect::ClickHouse { 20_000 } else { 100 };
-    load(d, &shape, batch, |txn| target.setup(&txn))?;
+    load(d, shape, batch, |txn| target.setup(&txn))?;
     let loaded_s = began.elapsed().as_secs_f64();
     for s in indexes(d) {
         // A statement a database refuses here (its statistics, say) is said, not fatal.
@@ -751,7 +816,18 @@ pub fn main() -> anyhow::Result<()> {
     if let Err(e) = target.settle() {
         eprintln!("settle: {e:#}");
     }
-    let settle_s = settling.elapsed().as_secs_f64();
+    Ok((loaded_s, indexed_s, settling.elapsed().as_secs_f64()))
+}
+
+pub fn main() -> anyhow::Result<()> {
+    let o = opts()?;
+    let shape = Arc::new(Shape::new(o.items));
+    let readers = o.clients.iter().copied().max().unwrap_or(1);
+    let target: Arc<dyn Target> = suite_db::open(&o.target, &o.dir, o.dsn.as_deref(), readers, o.reuse)?;
+    let d = target.dialect();
+
+    // --reuse: the database a run left, as that run loaded, indexed and settled it.
+    let (loaded_s, indexed_s, settle_s) = if o.reuse { (0.0, 0.0, 0.0) } else { load_all(&target, d, &shape, o.target == "cedardb")? };
     target.ready()?;
     let rss_after_load_mb = crate::rss_mb();
     forget_peaks();
@@ -761,7 +837,7 @@ pub fn main() -> anyhow::Result<()> {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         let mut plans = serde_json::Map::new();
         for op in OPS {
-            if o.only.as_deref().is_some_and(|only| !only.split(',').any(|n| op.name.starts_with(n))) {
+            if !selected(o.only.as_deref(), op.name) {
                 continue;
             }
             let Some(stmts) = statements(op.name, d) else { continue };
@@ -779,7 +855,7 @@ pub fn main() -> anyhow::Result<()> {
 
     let mut results = Vec::new();
     for op in OPS {
-        if o.only.as_deref().is_some_and(|only| !only.split(',').any(|n| op.name.starts_with(n))) {
+        if !selected(o.only.as_deref(), op.name) {
             continue;
         }
         let Some(stmts) = statements(op.name, d) else {
@@ -815,6 +891,8 @@ pub fn main() -> anyhow::Result<()> {
                 "retries": out.retries,
                 "error": out.error,
                 "longest_ms": out.longest_us as f64 / 1000.0,
+                "cpu_user_s": out.cpu.map(|c| c.0),
+                "cpu_sys_s": out.cpu.map(|c| c.1),
             }));
         }
     }
@@ -830,6 +908,7 @@ pub fn main() -> anyhow::Result<()> {
         "load_s": loaded_s,
         "index_s": indexed_s,
         "settle_s": settle_s,
+        "reused": o.reuse,
         "results": results,
         "rss_after_load_mb": rss_after_load_mb,
         "rss_max_mb": crate::rss_max_mb(),

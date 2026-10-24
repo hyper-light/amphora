@@ -60,13 +60,16 @@ pub trait Session: Send {
     }
 }
 
-pub fn open(target: &str, dir: &str, dsn: Option<&str>, clients: usize) -> anyhow::Result<Arc<dyn Target>> {
+/// `reuse`: the file databases (Amphora, Turso, SQLite) open the database a run left in `dir`
+/// instead of a new one (`--reuse`); the servers keep their data where they keep it.
+pub fn open(target: &str, dir: &str, dsn: Option<&str>, clients: usize, reuse: bool) -> anyhow::Result<Arc<dyn Target>> {
     let dsn = |local: &str| dsn.unwrap_or(local).to_owned();
+    anyhow::ensure!(!reuse || matches!(target, "amphora" | "turso" | "sqlite"), "--reuse opens a file database a run left behind: amphora, turso or sqlite, not {target}");
     Ok(match target {
-        "amphora" => Arc::new(Amphora::open(dir, clients)?),
-        "turso" => Arc::new(Turso::open(dir)?),
+        "amphora" => Arc::new(Amphora::open(dir, clients, reuse)?),
+        "turso" => Arc::new(Turso::open(dir, reuse)?),
         "mvcc" => Arc::new(mvcc_target::Mvcc::open(dir)?),
-        "sqlite" => Arc::new(Sqlite::open(dir)?),
+        "sqlite" => Arc::new(Sqlite::open(dir, reuse)?),
         "postgres" => Arc::new(Pg::open(&dsn("postgres://postgres@127.0.0.1:55432/postgres"), PgKind::Postgres)?),
         "orioledb" => Arc::new(Pg::open(&dsn("postgres://postgres@127.0.0.1:55433/postgres"), PgKind::Orioledb)?),
         "cedardb" => Arc::new(Pg::open(&dsn("postgres://postgres:amphorabenchlocalonly2026@127.0.0.1:55434/postgres"), PgKind::Cedardb)?),
@@ -81,6 +84,16 @@ fn fresh(dir: &str) -> anyhow::Result<PathBuf> {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir)?;
     Ok(dir.join("suite.db"))
+}
+
+/// The suite's database in `dir`: a new one, or with `reuse` the one a run left there.
+fn suite_db(dir: &str, reuse: bool) -> anyhow::Result<PathBuf> {
+    if !reuse {
+        return fresh(dir);
+    }
+    let path = Path::new(dir).join("suite.db");
+    anyhow::ensure!(path.exists(), "--reuse: no database at {}", path.display());
+    Ok(path)
 }
 
 const WAIT: Duration = Duration::from_secs(120);
@@ -216,8 +229,8 @@ mod amphora_target {
     }
 
     impl Amphora {
-        pub fn open(dir: &str, clients: usize) -> anyhow::Result<Self> {
-            let path = fresh(dir)?;
+        pub fn open(dir: &str, clients: usize, reuse: bool) -> anyhow::Result<Self> {
+            let path = suite_db(dir, reuse)?;
             let sharing = amphora_sharing()?;
             let pool = match &sharing {
                 amphora::db::Sharing::Process => Some(amphora::db::process_pages()),
@@ -577,8 +590,8 @@ struct Turso {
 }
 
 impl Turso {
-    fn open(dir: &str) -> anyhow::Result<Self> {
-        let path = fresh(dir)?;
+    fn open(dir: &str, reuse: bool) -> anyhow::Result<Self> {
+        let path = suite_db(dir, reuse)?;
         let name = path.to_str().ok_or_else(|| anyhow::anyhow!("a path that isn't UTF-8"))?;
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().map_err(|e| anyhow::anyhow!("{e}"))?);
         let db = turso_core::Database::open(io.clone(), name, turso_core::OpenOptions::new(Arc::new(turso_core::SqliteDialect)).db_opts(turso_core::DatabaseOpts::new())).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -762,8 +775,8 @@ struct Sqlite {
 }
 
 impl Sqlite {
-    fn open(dir: &str) -> anyhow::Result<Self> {
-        Ok(Self { path: fresh(dir)? })
+    fn open(dir: &str, reuse: bool) -> anyhow::Result<Self> {
+        Ok(Self { path: suite_db(dir, reuse)? })
     }
 
     fn connect(&self) -> anyhow::Result<rusqlite::Connection> {
