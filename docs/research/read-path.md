@@ -33,18 +33,38 @@ samples; per-statement counters; each statement's measured window alone; Amphora
 SQLite on the same ten million rows). User mode only (perf_event_paranoid 2): the kernel's share is
 the process's own system time. Rates are from a shared machine at load 33–85.
 
-**Per statement, Amphora against SQLite** (instructions are the stable measure here: three repeats
-within 4.9%, cycles within 17.6%):
+**Per statement, Amphora against SQLite**, every profiled statement (instructions are the stable
+measure here: three repeats within 4.9%, cycles within 17.6%; the record has cycles, dTLB and cache
+misses, branch misses and the top-down split beside these):
 
-| statement, clients | instructions/stmt | cycles/stmt | IPC | L1d misses/stmt | kernel share | bound by (top-down) |
+| statement, clients | instructions/stmt | IPC | L1d misses/stmt | kernel share | bound by (top-down) | Amphora's largest parts |
 |---|---|---|---|---|---|---|
-| text_read, 1 | 21,138 vs 9,688 (2.2x) | 14,165 vs 4,920 | 1.49 vs 1.97 | 276 vs 113 | 28% vs 55% | frontend (both) |
-| blob_read, 1 | 20,914 vs 9,713 (2.2x) | 13,098 vs 5,626 | 1.60 vs 1.73 | 243 vs 141 | 28% vs 56% | frontend (both) |
-| table_count, 1 | 198.6 M vs 21.5 M (9.3x) | 151.6 M vs 10.9 M | 1.31 vs 1.97 | 1.98 M vs 0.36 M | 39% vs 81% | backend stalls vs frontend |
-| filter_no_index, 1 | 10.74 G vs 5.71 G (1.9x) | 6.36 G vs 2.15 G | 1.69 vs 2.65 | 77.2 M vs 27.2 M | 33% vs 61% | backend stalls vs instructions |
-| order_by_sort, 1 | 1.17 G vs 0.38 G (3.1x) | 0.80 G vs 0.19 G | 1.45 vs 1.98 | 16.2 M vs 4.7 M | 36% vs 65% | frontend (both) |
-| count_distinct, 1 | 1.20 G vs 0.59 G (2.0x) | 0.91 G vs 0.35 G | 1.31 vs 1.67 | 24.2 M vs 10.6 M | 34% vs 52% | backend stalls vs frontend |
-| table_count, 32 | 311 M vs 42 M | 3.19 G vs 0.27 G | 0.10 vs 0.15 | 5.6 M vs 3.6 M | 8% vs 92% | backend stalls vs frontend |
+| blob_read, 1 | 20,914 vs 9,713 (2.2x) | 1.60 vs 1.73 | 243 vs 141 | 28% vs 56% | frontend (both) | the log 28.3%, page cache and pager 19.2% |
+| case_aggregate, 1 | 2.6 M vs 1.0 M (2.5x) | 1.67 vs 3.36 | 22.4 K vs 2,468 | 32% vs 45% | backend stalls vs frontend | the log 27.1%, statement and binding 22.2% |
+| count_distinct, 1 | 1.20 G vs 591.5 M (2.0x) | 1.31 vs 1.67 | 24.2 M vs 10.6 M | 34% vs 52% | backend stalls vs frontend | the log 32.1%, B-tree search 15.6% |
+| count_range, 1 | 10.2 M vs 4.2 M (2.4x) | 2.69 vs 2.97 | 37.8 K vs 13.9 K | 15% vs 24% | instructions (both) | B-tree search 43.7%, statement and binding 12.5% |
+| filter_no_index, 1 | 10.74 G vs 5.71 G (1.9x) | 1.69 vs 2.65 | 77.2 M vs 27.2 M | 33% vs 61% | backend stalls vs instructions | the log 37.0%, page cache and pager 12.6% |
+| group_by_range, 1 | 34.8 M vs 25.8 M (1.3x) | 1.68 vs 2.38 | 383.3 K vs 125.2 K | 33% vs 23% | backend stalls vs frontend | interpreter 24.9%, the log 23.4% |
+| in_list_10, 1 | 182,496 vs 68,647 (2.7x) | 1.35 vs 1.69 | 2,373 vs 1,334 | 36% vs 60% | backend stalls vs frontend | the log 29.4%, B-tree search 23.5% |
+| json_field, 1 | 28,663 vs 13,254 (2.2x) | 1.42 vs 1.64 | 448 vs 207 | 29% vs 53% | frontend (both) | the log 23.1%, page cache and pager 15.6% |
+| order_by_sort, 1 | 1.17 G vs 379.0 M (3.1x) | 1.45 vs 1.98 | 16.2 M vs 4.7 M | 36% vs 65% | frontend (both) | the log 36.3%, page cache and pager 16.9% |
+| point_pk, 1 | 23,319 vs 14,097 (1.7x) | 1.48 vs 1.74 | 332 vs 206 | 27% vs 48% | frontend (both) | the log 25.1%, page cache and pager 18.6% |
+| point_pk_one_column, 1 | 20,995 vs 9,412 (2.2x) | 1.40 vs 1.61 | 332 vs 148 | 29% vs 55% | frontend (both) | the log 27.5%, page cache and pager 18.8% |
+| point_secondary, 1 | 37,530 vs 49,889 (0.8x) | 1.42 vs 2.24 | 576 vs 641 | 28% vs 34% | backend stalls vs frontend | the log 24.9%, page cache and pager 20.9% |
+| point_text, 1 | 41,814 vs 47,630 (0.9x) | 1.53 vs 2.15 | 597 vs 751 | 26% vs 34% | backend stalls vs frontend | the log 25.4%, B-tree search 23.0% |
+| range_pk_100, 1 | 242,435 vs 158,544 (1.5x) | 1.79 vs 2.73 | 2,383 vs 558 | 30% vs 41% | frontend vs instructions | the log 31.1%, statement and binding 19.5% |
+| table_count, 1 | 198.6 M vs 21.5 M (9.3x) | 1.31 vs 1.97 | 2.0 M vs 363.7 K | 39% vs 81% | backend stalls vs frontend | the log 51.4%, page cache and pager 16.4% |
+| table_group_by, 1 | 26.35 G (SQLite answered none in its window) | 2.50 | 174.2 M | 27% | backend stalls | interpreter 25.9%, the log 24.2% |
+| text_read, 1 | 21,138 vs 9,688 (2.2x) | 1.49 vs 1.97 | 276 vs 113 | 28% vs 55% | frontend (both) | the log 27.3%, page cache and pager 21.4% |
+| filter_no_index, 32 | no statement finished inside the counted window | - | - | - | - | the log 90.7%, page cache and pager 3.4% |
+| point_pk, 32 | 28,591 vs 15,631 (1.8x) | 0.16 vs 0.31 | 768 vs 714 | 12% vs 90% | frontend (both) | the log 66.0%, locks 14.6% |
+| point_secondary, 32 | 41,508 vs 53,667 (0.8x) | 0.18 vs 0.32 | 1,131 vs 2,161 | 11% vs 85% | backend stalls vs frontend | the log 63.1%, locks 16.1% |
+| range_pk_100, 32 | 289,779 vs 166,802 (1.7x) | 0.18 vs 0.68 | 3,878 vs 2,953 | 8% vs 88% | frontend (both) | the log 86.7%, page cache and pager 4.6% |
+| table_count, 32 | 310.6 M vs 41.9 M (7.4x) | 0.10 vs 0.15 | 5.6 M vs 3.6 M | 8% vs 92% | backend stalls vs frontend | the log 92.3%, page cache and pager 3.5% |
+
+`point_secondary` and `point_text` take fewer instructions in Amphora than in SQLite because the
+bench's SQLite compiles them again on every call (below); every other statement takes 1.3–9.3x
+SQLite's instructions.
 
 **Where Amphora's user cycles go** (share of sampled cycles, by part, from the leaf frames):
 
