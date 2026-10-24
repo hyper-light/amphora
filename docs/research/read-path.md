@@ -138,7 +138,13 @@ SQLite serialized on those mutexes, to be measured again against a fair build (f
    statement cache. G2's harness builds SQLite with its recommended options (no
    `SQLITE_ENABLE_MEMORY_MANAGEMENT`, `SQLITE_DEFAULT_MEMSTATUS=0`, STAT4 off as SQLite ships it),
    keeps each session's prepared statements by handle as Amphora's session does, and measures every
-   SQLite comparison again, those at 32 clients first.
+   SQLite comparison again, those at 32 clients first. Predicted: SQLite's point reads at one client
+   1.36–2.06x faster with its mutexes' 26.5–51.5% gone, so the gap Amphora has to close widens.
+   Falsified if its mutexes stay above 5% of its point reads in the recommended build.
+
+Where each lands in kiln's goal stack: 1(a) and 7 in G2's harness (step 4), before the corpus's
+performance runs; 1(b) G3 step 2; 2 G3 step 3; 6 G3 steps 4 and 5; 3, 4 and 5 G5 steps 2 and 3.
+Each step cites the shares above and states the falsifier given here.
 
 ## Sources
 
