@@ -208,7 +208,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   Amphora writes 7,601 events a second at p99 9.3 ms (PostgreSQL 5,272 at 10.9 ms, the rest 1,399
   and fewer), history reads at p99 0.109 ms (PostgreSQL 0.218), in 83 MB (PostgreSQL 253, CedarDB
   938, ClickHouse 1,435); search loses (p50 74 ms against CedarDB's 2.9 and SQLite's 6.0). The 50
-  statements are the suite's whole reach: G2's corpus replaces it.
+  statements are the suite's whole reach: G2's corpus replaces it. Two caveats from the read-path
+  profiles (`bench/records/2026-10-23-adacachy-read-path.md`): Amphora's reads ran with its load's
+  whole log still in place (the settle's TRUNCATE checkpoint left it), and the bench's SQLite is
+  rusqlite's bundled build, which serializes its connections on a shared page cache's mutex and an
+  allocator mutex and recompiles `point_secondary` on every call. Five of the 37 leads over every
+  row store are leads over that SQLite (`join_pk` 1.97x, `join_three` 1.55x, `like_prefix` 1.19x
+  and `point_secondary` 1.02x at one client, `count_range` 8.55x at 32): none is claimed until a
+  fair SQLite build is measured (G2's harness).
 - **Against every competitor, 32 to 1,000,000 writers** (`bench/records/2026-10-20-fedora-matrix.jsonl`,
   `python3 bench/table.py`; fedora, one run each, load 1.4–66 with other work on the machine, so not
   yet the quiet best of 3 CP-T1.2 asks). Amphora's best (one group at 32 writers, 12 above) against

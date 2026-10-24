@@ -4,8 +4,9 @@ call graphs through `perf script`, puts every sample's leaf frame in a part by i
 Rust paths, SQLite's C functions), and weighs parts by the samples' periods. Kernel time isn't
 sampled (perf_event_paranoid 2 here): each run's record gives it as cpu_sys_s, shown beside.
 
-usage: python3 bench/prof_parts.py <dir of <target>-<statement>-<clients>.data and -core.json>
-  prints a markdown table per statement: each part's share for Amphora and SQLite.
+usage: python3 bench/prof_parts.py <dir of <target>-<statement>-<clients>.data and -core.json> [--top N]
+  prints a markdown table per statement: each part's share for Amphora and SQLite; with --top, each
+  engine's N leaf functions with the most cycles beside it.
 """
 import collections
 import json
@@ -75,12 +76,16 @@ def samples(path):
         yield leaf, period
 
 
-def shares(path):
-    tot = collections.Counter()
+def shares(path, top):
+    """Each part's share of a recording's sampled cycles, the samples' total, and its `top` leaf
+    functions' shares as (function, part, share)."""
+    tot, funcs = collections.Counter(), collections.Counter()
     for (sym, dso), period in samples(path):
-        tot[part_of(sym, dso)] += period
+        part = part_of(sym, dso)
+        tot[part] += period
+        funcs[(sym, part)] += period
     s = sum(tot.values()) or 1
-    return {k: v / s for k, v in tot.items()}, sum(tot.values())
+    return {k: v / s for k, v in tot.items()}, sum(tot.values()), [(f, p, v / s) for (f, p), v in funcs.most_common(top)]
 
 
 def cpu(json_path):
@@ -94,6 +99,7 @@ def cpu(json_path):
 
 def main():
     d = sys.argv[1]
+    top = int(sys.argv[sys.argv.index("--top") + 1]) if "--top" in sys.argv else 0
     runs = collections.defaultdict(dict)
     for f in sorted(os.listdir(d)):
         m = re.match(r"(amphora|sqlite)-(.+)-(1|32)\.data$", f)
@@ -104,9 +110,9 @@ def main():
         cols = {}
         for t in ("amphora", "sqlite"):
             if t in by:
-                sh, n = shares(by[t])
+                sh, n, funcs = shares(by[t], top)
                 u, s, ops = cpu(by[t].replace(".data", "-record.json"))
-                cols[t] = (sh, n, u, s, ops)
+                cols[t] = (sh, n, u, s, ops, funcs)
         print(f"### {stmt} at {clients} client{'s' if clients > 1 else ''}")
         print()
         hdr = "| part | " + " | ".join(cols) + " |"
@@ -119,6 +125,13 @@ def main():
         print("| kernel share of CPU (cpu_sys_s / (user + sys)) | " + " | ".join(f"{100 * cols[t][3] / (cols[t][2] + cols[t][3]):.0f}%" if cols[t][2] else "-" for t in cols) + " |")
         print("| statements a second in the profiled run | " + " | ".join(f"{cols[t][4]:,.0f}" if cols[t][4] else "-" for t in cols) + " |")
         print()
+        for t in cols if top else ():
+            print(f"| {t}: top leaf functions | part | share |")
+            print("|---|---|---:|")
+            for f, p, v in cols[t][5]:
+                name = re.sub(r"<([^<>]+) as [^<>]+>::", r"<\1>::", f)[:110].replace("|", "\\|")
+                print(f"| `{name}` | {p} | {100 * v:.1f}% |")
+            print()
 
 
 main()

@@ -4,8 +4,8 @@ G1 steps 4 and 5 (kiln plan "G1 Ground truth"). Ten million rows of the suite's 
 into each engine (`bench/src/suite.rs --reuse`), each statement's measured window profiled alone
 (`AMPHORA_PERF_CTL`): 17 statements at 1 client and 5 at 32, Amphora and SQLite.
 
-- host: adacachy, AMD Ryzen 9 9950X3D2 (16 cores, 32 threads, 192 MiB L3), Samsung 9100 PRO
-  (btrfs), kernel 7.2.9-2-cachyos; a shared machine, load 33–85 during the session
+- host: adacachy, AMD Ryzen 9 9950X3D2 (16 cores, 32 threads; 48 KiB of L1d and 1 MiB of L2 a core;
+  192 MiB of L3 in two 96 MiB halves, one per eight cores: sysfs), Samsung 9100 PRO (btrfs), kernel 7.2.9-2-cachyos; a shared machine, load 33–85 during the session
   (2026-10-23T20:00:17-07:00 to 2026-10-23T20:15:34-07:00), so absolute rates are noisy (CLAUDE.md §7 asks a quiet machine).
 - binaries: the bench at 41bba4e (Amphora's engine as committed in 4acff7d), built with frame
   pointers in Rust and in the bundled SQLite's C (`-C force-frame-pointers=yes`,
@@ -21,7 +21,20 @@ into each engine (`bench/src/suite.rs --reuse`), each statement's measured windo
   1,834,934 frames into the file but left the log whole (checkpoint sequence 0, every frame's salts
   valid), so reads consult a 1.8-million-frame index and read pages from the log. The v6 matrix's
   database is in the same state (its log is the same size): this is what Amphora's reads cost as
-  measured there.
+  measured there. SQLite's settle left no log: its directory holds `suite.db` alone, Amphora's
+  `suite.db` and a 7,559,928,112-byte `suite.db-wal`.
+- SQLite as the bench builds it: rusqlite 0.40.2's bundled SQLite (libsqlite3-sys 0.38.2's
+  `build.rs`) is compiled with `SQLITE_ENABLE_MEMORY_MANAGEMENT`, `SQLITE_ENABLE_STAT4` and
+  `SQLITE_THREADSAFE=1`, and its connections open in rusqlite's default multi-thread mode. In
+  SQLite's source (f879fb18cd81586e8caad7cc532575525ac1bd8e): `pcache1.c` "Always use a unified
+  cache (mode-2) if ENABLE_MEMORY_MANAGEMENT", so every connection's pages sit in one group behind
+  one mutex; `malloc.c` takes `mem0.mutex` around each allocation while memory statistics are on
+  (`SQLITE_DEFAULT_MEMSTATUS` is 1 unless set; SQLite's recommended options set it to 0, "This
+  helps the sqlite3_malloc() routines run much faster"); and with STAT4 after the settle's
+  `ANALYZE`, `vdbeapi.c` expires a statement whose new binding "might influence the choice of query
+  plan", so `point_secondary` (`k = ?`) and `point_text` (`name = ?`) are compiled again on every
+  call. Hence SQLite's `pthread_mutex_lock` and `pthread_mutex_unlock` among its top functions
+  below, and its `sqlite3RunParser`: these numbers measure that build, not SQLite at its best.
 
 ## Repeat test
 
@@ -88,7 +101,9 @@ instructions and IPC, cycles beside.
 Parts come from `bench/prof_parts.py`'s symbol patterns (Amphora's Rust paths, SQLite's C
 functions); "libc internals (no symbols)" is libc's stripped internal code on this system
 (memcpy's variants, lock waits), "unresolved addresses" frames outside any mapped object.
-Every profile below attributes at least 90.7% of its samples to named parts.
+Every profile below attributes at least 90.7% of its samples to named parts. Beside each
+statement's parts, each engine's eight leaf functions with the most cycles (`--top 8`; a trait
+method `<X as Trait>::f` is shown as `<X>::f`).
 
 ### blob_read at 1 client
 
@@ -114,6 +129,28 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | (user samples) | 20,231,551,558 | 11,104,887,748 |
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 27% | 57% |
 | statements a second in the profiled run | 293,572 | 378,583 |
+
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 15.4% |
+| `<amphora_engine::storage::btree::BTreeCursor>::move_to` | B-tree search | 8.4% |
+| `<amphora_engine::storage::pager::Pager>::read_page_into` | page cache and pager | 7.8% |
+| `twox_hash::xxhash3_64::impl_241_plus_bytes::do_avx2` | checksums | 4.0% |
+| `<amphora_bench::suite_db::amphora_target::AmphoraSession>::run` | bench: timing and harness | 3.4% |
+| `amphora_engine::vdbe::execute::op_transaction` | interpreter | 2.1% |
+| `<amphora_engine::storage::pager::Pager>::read_header_page` | page cache and pager | 2.0% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::wal_header` | write-ahead log: frame lookups and reads | 1.9% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `pthread_mutex_lock` | locks | 19.5% |
+| `pthread_mutex_unlock` | locks | 12.7% |
+| `sqlite3BtreeTableMoveto` | B-tree search | 9.2% |
+| `[unknown]` | unresolved addresses | 6.5% |
+| `sqlite3VdbeExec` | interpreter | 5.8% |
+| `<rusqlite::cache::StatementCache>::get` | bench: timing and harness | 4.5% |
+| `sqlite3GetVarint` | record decoding | 4.2% |
+| `amphora_bench::suite::params` | bench: timing and harness | 3.4% |
 
 ### case_aggregate at 1 client
 
@@ -141,6 +178,28 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 28% | 47% |
 | statements a second in the profiled run | 3,231 | 9,992 |
 
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `<amphora_engine::statement::Statement>::_step` | statement and binding | 22.2% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 18.1% |
+| `amphora_engine::vdbe::execute::op_column_fetch` | interpreter | 11.5% |
+| `amphora_engine::vdbe::execute::op_agg_step` | aggregation | 5.5% |
+| `twox_hash::xxhash3_64::impl_241_plus_bytes::do_avx2` | checksums | 4.5% |
+| `<amphora_engine::storage::btree::BTreeCursor>::get_next_record` | B-tree search | 3.4% |
+| `<amphora_engine::storage::pager::Pager>::read_page_into` | page cache and pager | 3.1% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::wal_header` | write-ahead log: frame lookups and reads | 2.3% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `sqlite3VdbeExec` | interpreter | 45.0% |
+| `pthread_mutex_lock` | locks | 8.7% |
+| `kahanBabuskaNeumaierStep` | aggregation | 7.4% |
+| `pthread_mutex_unlock` | locks | 5.7% |
+| `sumStep` | aggregation | 5.5% |
+| `btreeParseCellPtr` | B-tree search | 4.6% |
+| `sqlite3BtreeNext.isra.0` | B-tree search | 4.2% |
+| `[unknown]` | unresolved addresses | 3.3% |
+
 ### count_distinct at 1 client
 
 | part | amphora | sqlite |
@@ -164,6 +223,28 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | (user samples) | 18,465,856,326 | 10,015,584,948 |
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 36% | 56% |
 | statements a second in the profiled run | 4 | 5 |
+
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 21.7% |
+| `<amphora_engine::storage::pager::Pager>::read_page_into` | page cache and pager | 6.5% |
+| `[unknown]` | libc internals (no symbols) | 6.0% |
+| `twox_hash::xxhash3_64::impl_241_plus_bytes::do_avx2` | checksums | 4.3% |
+| `<amphora_engine::storage::btree::BTreeCursor>::move_to` | B-tree search | 4.3% |
+| `<amphora_engine::vdbe::hash_table::HashTable>::insert_distinct` | hash tables (GROUP BY, DISTINCT, joins) | 4.2% |
+| `<amphora_engine::storage::btree::BTreeCursor>::move_to_root_nonblock` | B-tree search | 2.5% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::wal_header` | write-ahead log: frame lookups and reads | 2.1% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `pthread_mutex_lock` | locks | 19.4% |
+| `sqlite3BtreeIndexMoveto` | B-tree search | 12.9% |
+| `pthread_mutex_unlock` | locks | 10.8% |
+| `vdbeRecordCompareInt` | B-tree search | 7.4% |
+| `sqlite3BtreeTableMoveto` | B-tree search | 6.7% |
+| `sqlite3VdbeExec` | interpreter | 6.6% |
+| `sqlite3GetVarint` | record decoding | 4.0% |
+| `[unknown]` | libc internals (no symbols) | 3.8% |
 
 ### count_range at 1 client
 
@@ -189,6 +270,28 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 15% | 30% |
 | statements a second in the profiled run | 1,332 | 1,865 |
 
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `amphora_engine::types::compare_payload_generic::<amphora_engine::types::ValueRef, core::iter::adapters::map::M` | B-tree search | 14.5% |
+| `<amphora_engine::statement::Statement>::_step` | statement and binding | 12.4% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 7.2% |
+| `<amphora_engine::storage::btree::BTreeCursor>::indexbtree_move_to_internal` | B-tree search | 7.1% |
+| `<amphora_engine::storage::btree::BTreeCursor>::record_payload` | B-tree search | 5.6% |
+| `amphora_engine::vdbe::execute::op_agg_step` | aggregation | 5.5% |
+| `amphora_engine::types::compare_record::<amphora_engine::types::ValueRef, core::iter::adapters::map::Map<core::` | B-tree search | 5.2% |
+| `<amphora_engine::storage::btree::BTreeCursor>::indexbtree_seek_inner` | B-tree search | 3.8% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `sqlite3VdbeExec` | interpreter | 23.8% |
+| `sqlite3VdbeRecordCompareWithSkip` | B-tree search | 16.1% |
+| `sqlite3BtreeNext.isra.0` | B-tree search | 7.8% |
+| `sqlite3BtreeIndexMoveto` | B-tree search | 7.5% |
+| `btreeParseCellPtrIndex` | B-tree search | 7.4% |
+| `countStep` | aggregation | 7.3% |
+| `pthread_mutex_lock` | locks | 6.7% |
+| `pthread_mutex_unlock` | locks | 5.6% |
+
 ### filter_no_index at 1 client
 
 | part | amphora | sqlite |
@@ -210,6 +313,28 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | (user samples) | 18,946,329,960 | 10,757,608,708 |
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 32% | 61% |
 | statements a second in the profiled run | 0 | 1 |
+
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 24.3% |
+| `amphora_engine::vdbe::execute::op_column_fetch` | interpreter | 10.0% |
+| `<amphora_engine::statement::Statement>::_step` | statement and binding | 7.7% |
+| `twox_hash::xxhash3_64::impl_241_plus_bytes::do_avx2` | checksums | 5.6% |
+| `<amphora_engine::storage::btree::BTreeCursor>::get_next_record` | B-tree search | 5.4% |
+| `<amphora_engine::storage::pager::Pager>::read_page_into` | page cache and pager | 4.0% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::wal_header` | write-ahead log: frame lookups and reads | 2.7% |
+| `[unknown]` | libc internals (no symbols) | 2.5% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `sqlite3VdbeExec` | interpreter | 44.4% |
+| `pthread_mutex_lock` | locks | 11.9% |
+| `sqlite3BtreeNext.isra.0` | B-tree search | 9.1% |
+| `btreeParseCellPtr` | B-tree search | 7.8% |
+| `pthread_mutex_unlock` | locks | 7.0% |
+| `[unknown]` | unresolved addresses | 6.8% |
+| `getCellInfo` | B-tree search | 4.3% |
+| `sqlite3VdbeSerialGet` | record decoding | 3.3% |
 
 ### group_by_range at 1 client
 
@@ -239,6 +364,28 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 24% | 24% |
 | statements a second in the profiled run | 265 | 396 |
 
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 14.6% |
+| `amphora_engine::vdbe::execute::op_group_find` | interpreter | 11.8% |
+| `<amphora_engine::statement::Statement>::_step` | statement and binding | 9.7% |
+| `amphora_engine::vdbe::execute::op_column_fetch` | interpreter | 5.9% |
+| `amphora_engine::vdbe::execute::op_group_save` | interpreter | 4.4% |
+| `amphora_engine::vdbe::execute::op_agg_step` | aggregation | 3.9% |
+| `twox_hash::xxhash3_64::impl_241_plus_bytes::do_avx2` | checksums | 3.8% |
+| `<std::hash::random::RandomState>::hash_one::<&amphora_engine_parser::ast::TableInternalId>` | std hashing (SipHash) | 3.0% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `sqlite3VdbeExec` | interpreter | 31.4% |
+| `vdbeSorterCompareInt` | sorting | 28.6% |
+| `vdbeSorterMerge` | sorting | 15.9% |
+| `[unknown]` | libc internals (no symbols) | 3.0% |
+| `sqlite3VdbeSerialGet` | record decoding | 2.2% |
+| `pthread_mutex_lock` | locks | 2.0% |
+| `sqlite3VdbeSorterWrite` | sorting | 1.9% |
+| `kahanBabuskaNeumaierStep` | aggregation | 1.9% |
+
 ### in_list_10 at 1 client
 
 | part | amphora | sqlite |
@@ -263,6 +410,28 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | (user samples) | 18,739,895,527 | 11,291,562,576 |
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 35% | 59% |
 | statements a second in the profiled run | 28,703 | 55,161 |
+
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 17.5% |
+| `<amphora_engine::storage::btree::BTreeCursor>::move_to` | B-tree search | 11.2% |
+| `<amphora_engine::storage::pager::Pager>::read_page_into` | page cache and pager | 7.7% |
+| `twox_hash::xxhash3_64::impl_241_plus_bytes::do_avx2` | checksums | 3.5% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::wal_header` | write-ahead log: frame lookups and reads | 3.2% |
+| `[unknown]` | libc internals (no symbols) | 2.8% |
+| `<amphora_engine::statement::Statement>::_step` | statement and binding | 2.5% |
+| `<amphora_engine::storage::btree::BTreeCursor>::seek` | B-tree search | 2.1% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `pthread_mutex_lock` | locks | 22.5% |
+| `pthread_mutex_unlock` | locks | 15.9% |
+| `sqlite3BtreeTableMoveto` | B-tree search | 12.2% |
+| `sqlite3VdbeExec` | interpreter | 7.4% |
+| `sqlite3GetVarint` | record decoding | 6.1% |
+| `[unknown]` | libc internals (no symbols) | 5.0% |
+| `[unknown]` | unresolved addresses | 4.9% |
+| `amphora_bench::suite_db::sqlite_rows` | bench: timing and harness | 3.7% |
 
 ### json_field at 1 client
 
@@ -290,6 +459,28 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 25% | 56% |
 | statements a second in the profiled run | 227,982 | 311,448 |
 
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 13.0% |
+| `<amphora_engine::storage::btree::BTreeCursor>::move_to` | B-tree search | 7.6% |
+| `<amphora_engine::storage::pager::Pager>::read_page_into` | page cache and pager | 6.2% |
+| `[unknown]` | libc internals (no symbols) | 3.0% |
+| `<amphora_bench::suite_db::amphora_target::AmphoraSession>::run` | bench: timing and harness | 3.0% |
+| `twox_hash::xxhash3_64::impl_241_plus_bytes::do_avx2` | checksums | 2.8% |
+| `<amphora_engine::json::jsonb::Jsonb>::deserialize_value` | JSON | 2.1% |
+| `amphora_engine::vdbe::execute::op_transaction` | interpreter | 1.6% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `pthread_mutex_lock` | locks | 17.9% |
+| `pthread_mutex_unlock` | locks | 11.4% |
+| `[unknown]` | libc internals (no symbols) | 7.1% |
+| `sqlite3BtreeTableMoveto` | B-tree search | 7.0% |
+| `sqlite3VdbeExec` | interpreter | 5.9% |
+| `jsonTranslateTextToBlob` | JSON | 5.0% |
+| `[unknown]` | unresolved addresses | 4.8% |
+| `sqlite3GetVarint` | record decoding | 3.4% |
+
 ### order_by_sort at 1 client
 
 | part | amphora | sqlite |
@@ -312,6 +503,28 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | (user samples) | 17,990,883,937 | 9,938,567,949 |
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 37% | 65% |
 | statements a second in the profiled run | 5 | 11 |
+
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 24.5% |
+| `<amphora_engine::storage::pager::Pager>::read_page_into` | page cache and pager | 7.5% |
+| `twox_hash::xxhash3_64::impl_241_plus_bytes::do_avx2` | checksums | 4.9% |
+| `<amphora_engine::storage::btree::BTreeCursor>::move_to` | B-tree search | 4.3% |
+| `<amphora_engine::storage::btree::BTreeCursor>::move_to_root_nonblock` | B-tree search | 2.8% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::wal_header` | write-ahead log: frame lookups and reads | 2.8% |
+| `<amphora_engine::storage::btree::BTreeCursor>::rowid::index_rowid` | B-tree search | 2.7% |
+| `<amphora_engine::storage::pager::Pager>::read_page_no_cache` | page cache and pager | 2.5% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `pthread_mutex_lock` | locks | 32.1% |
+| `pthread_mutex_unlock` | locks | 17.8% |
+| `sqlite3VdbeExec` | interpreter | 11.7% |
+| `sqlite3BtreeTableMoveto` | B-tree search | 11.4% |
+| `sqlite3GetVarint` | record decoding | 5.5% |
+| `[unknown]` | unresolved addresses | 4.8% |
+| `pcache1FetchStage2` | page cache and pager | 2.3% |
+| `getCellInfo` | B-tree search | 2.0% |
 
 ### point_pk at 1 client
 
@@ -339,6 +552,28 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 25% | 48% |
 | statements a second in the profiled run | 270,132 | 363,619 |
 
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 14.2% |
+| `<amphora_engine::storage::btree::BTreeCursor>::move_to` | B-tree search | 8.9% |
+| `<amphora_engine::storage::pager::Pager>::read_page_into` | page cache and pager | 7.5% |
+| `<amphora_bench::suite_db::amphora_target::AmphoraSession>::run` | bench: timing and harness | 3.6% |
+| `twox_hash::xxhash3_64::impl_241_plus_bytes::do_avx2` | checksums | 3.1% |
+| `amphora_engine::vdbe::execute::op_column_range_fetch` | interpreter | 2.2% |
+| `<amphora_engine::storage::pager::Pager>::read_header_page` | page cache and pager | 2.1% |
+| `<amphora_engine::storage::page_cache::PageCache>::get` | page cache and pager | 2.0% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `pthread_mutex_lock` | locks | 16.2% |
+| `pthread_mutex_unlock` | locks | 10.3% |
+| `amphora_bench::suite_db::sqlite_rows` | bench: timing and harness | 10.1% |
+| `sqlite3VdbeExec` | interpreter | 10.0% |
+| `sqlite3BtreeTableMoveto` | B-tree search | 7.2% |
+| `[unknown]` | unresolved addresses | 4.8% |
+| `<rusqlite::cache::StatementCache>::get` | bench: timing and harness | 3.6% |
+| `sqlite3GetVarint` | record decoding | 3.1% |
+
 ### point_pk_one_column at 1 client
 
 | part | amphora | sqlite |
@@ -363,6 +598,28 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | (user samples) | 20,258,570,917 | 11,579,687,196 |
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 26% | 54% |
 | statements a second in the profiled run | 274,290 | 413,485 |
+
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 14.7% |
+| `<amphora_engine::storage::btree::BTreeCursor>::move_to` | B-tree search | 9.5% |
+| `<amphora_engine::storage::pager::Pager>::read_page_into` | page cache and pager | 7.5% |
+| `<amphora_bench::suite_db::amphora_target::AmphoraSession>::run` | bench: timing and harness | 3.8% |
+| `twox_hash::xxhash3_64::impl_241_plus_bytes::do_avx2` | checksums | 3.6% |
+| `[unknown]` | libc internals (no symbols) | 2.1% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::wal_header` | write-ahead log: frame lookups and reads | 2.1% |
+| `<amphora_engine::storage::page_cache::PageCache>::get` | page cache and pager | 2.0% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `pthread_mutex_lock` | locks | 21.4% |
+| `pthread_mutex_unlock` | locks | 13.7% |
+| `sqlite3BtreeTableMoveto` | B-tree search | 9.4% |
+| `[unknown]` | unresolved addresses | 6.9% |
+| `sqlite3VdbeExec` | interpreter | 4.6% |
+| `<rusqlite::cache::StatementCache>::get` | bench: timing and harness | 4.6% |
+| `sqlite3GetVarint` | record decoding | 3.7% |
+| `<rusqlite::cache::StatementCache>::cache_stmt` | bench: timing and harness | 3.3% |
 
 ### point_secondary at 1 client
 
@@ -390,6 +647,28 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 27% | 32% |
 | statements a second in the profiled run | 160,245 | 150,620 |
 
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 13.7% |
+| `<amphora_engine::storage::pager::Pager>::read_page_into` | page cache and pager | 9.1% |
+| `<amphora_engine::storage::btree::BTreeCursor>::move_to` | B-tree search | 4.9% |
+| `<amphora_engine::storage::btree::BTreeCursor>::indexbtree_move_to_internal` | B-tree search | 4.2% |
+| `twox_hash::xxhash3_64::impl_241_plus_bytes::do_avx2` | checksums | 3.6% |
+| `[unknown]` | libc internals (no symbols) | 2.8% |
+| `<amphora_engine::storage::page_cache::PageCache>::get` | page cache and pager | 2.2% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::wal_header` | write-ahead log: frame lookups and reads | 2.0% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `pthread_mutex_lock` | locks | 28.6% |
+| `pthread_mutex_unlock` | locks | 22.9% |
+| `sqlite3RunParser` | statement: parse and plan | 4.6% |
+| `sqlite3BtreeTableMoveto` | B-tree search | 2.7% |
+| `[unknown]` | libc internals (no symbols) | 2.4% |
+| `sqlite3VdbeExec` | interpreter | 2.1% |
+| `sqlite3BtreeIndexMoveto` | B-tree search | 1.9% |
+| `vdbeRecordCompareInt` | B-tree search | 1.9% |
+
 ### point_text at 1 client
 
 | part | amphora | sqlite |
@@ -414,6 +693,28 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | (user samples) | 20,485,933,453 | 17,233,793,925 |
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 26% | 35% |
 | statements a second in the profiled run | 153,818 | 165,003 |
+
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 15.0% |
+| `<amphora_engine::storage::pager::Pager>::read_page_into` | page cache and pager | 7.7% |
+| `<amphora_engine::storage::btree::BTreeCursor>::move_to` | B-tree search | 5.8% |
+| `[unknown]` | libc internals (no symbols) | 3.8% |
+| `<amphora_engine::storage::btree::BTreeCursor>::indexbtree_move_to_internal` | B-tree search | 3.5% |
+| `amphora_engine::types::compare_payload_string::<&amphora_engine::types::ValueRef, core::slice::iter::Iter<amph` | B-tree search | 3.5% |
+| `twox_hash::xxhash3_64::impl_241_plus_bytes::do_avx2` | checksums | 3.3% |
+| `<amphora_engine::storage::page_cache::PageCache>::get` | page cache and pager | 2.2% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `pthread_mutex_lock` | locks | 29.0% |
+| `pthread_mutex_unlock` | locks | 19.4% |
+| `[unknown]` | libc internals (no symbols) | 4.6% |
+| `sqlite3RunParser` | statement: parse and plan | 4.0% |
+| `[unknown]` | unresolved addresses | 2.8% |
+| `sqlite3BtreeTableMoveto` | B-tree search | 2.4% |
+| `vdbeRecordCompareString` | B-tree search | 2.1% |
+| `sqlite3VdbeExec` | interpreter | 2.0% |
 
 ### range_pk_100 at 1 client
 
@@ -440,6 +741,28 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 30% | 43% |
 | statements a second in the profiled run | 29,473 | 50,567 |
 
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 20.1% |
+| `<amphora_engine::statement::Statement>::_step` | statement and binding | 19.4% |
+| `amphora_engine::vdbe::execute::op_column_fetch` | interpreter | 7.6% |
+| `<amphora_engine::storage::pager::Pager>::read_page_into` | page cache and pager | 4.2% |
+| `twox_hash::xxhash3_64::impl_241_plus_bytes::do_avx2` | checksums | 4.1% |
+| `<amphora_engine::storage::btree::BTreeCursor>::get_next_record` | B-tree search | 3.4% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::wal_header` | write-ahead log: frame lookups and reads | 2.8% |
+| `[unknown]` | libc internals (no symbols) | 2.2% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `amphora_bench::suite_db::sqlite_rows` | bench: timing and harness | 27.7% |
+| `sqlite3VdbeExec` | interpreter | 26.5% |
+| `pthread_mutex_lock` | locks | 5.6% |
+| `pthread_mutex_unlock` | locks | 4.8% |
+| `<rusqlite::statement::Statement>::value_ref` | statement and binding | 4.1% |
+| `columnMem` | values and rows | 3.4% |
+| `[unknown]` | unresolved addresses | 3.1% |
+| `btreeParseCellPtr` | B-tree search | 2.8% |
+
 ### table_count at 1 client
 
 | part | amphora | sqlite |
@@ -459,6 +782,28 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | (user samples) | 17,887,249,196 | 4,381,698,575 |
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 39% | 82% |
 | statements a second in the profiled run | 22 | 82 |
+
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 36.0% |
+| `twox_hash::xxhash3_64::impl_241_plus_bytes::do_avx2` | checksums | 6.9% |
+| `<amphora_engine::storage::pager::Pager>::read_page_into` | page cache and pager | 5.7% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::wal_header` | write-ahead log: frame lookups and reads | 3.7% |
+| `<amphora_engine::storage::pager::Pager>::read_page_no_cache` | page cache and pager | 3.5% |
+| `[unknown]` | libc internals (no symbols) | 3.2% |
+| `<amphora_engine::storage::wal::WalFile>::read_frame::{closure#0}` | write-ahead log: frame lookups and reads | 2.9% |
+| `[unknown]` | unresolved addresses | 2.9% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `pthread_mutex_lock` | locks | 46.1% |
+| `[unknown]` | unresolved addresses | 25.5% |
+| `pthread_mutex_unlock` | locks | 23.1% |
+| `pcache1Unpin` | page cache and pager | 0.8% |
+| `pcache1FetchStage2` | page cache and pager | 0.5% |
+| `[unknown]` | libc internals (no symbols) | 0.5% |
+| `sqlite3PcacheRelease` | page cache and pager | 0.4% |
+| `sqlite3BtreeCount` | B-tree search | 0.3% |
 
 ### table_group_by at 1 client
 
@@ -486,6 +831,28 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 25% | 69% |
 | statements a second in the profiled run | 0 | - |
 
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 16.3% |
+| `amphora_engine::vdbe::execute::op_group_find` | interpreter | 11.7% |
+| `amphora_engine::vdbe::execute::op_column_fetch` | interpreter | 8.3% |
+| `<amphora_engine::statement::Statement>::_step` | statement and binding | 6.1% |
+| `amphora_engine::vdbe::execute::op_agg_step` | aggregation | 5.4% |
+| `<std::hash::random::RandomState>::hash_one::<&amphora_engine_parser::ast::TableInternalId>` | std hashing (SipHash) | 4.3% |
+| `twox_hash::xxhash3_64::impl_241_plus_bytes::do_avx2` | checksums | 3.6% |
+| `amphora_engine::vdbe::execute::op_group_save` | interpreter | 3.5% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `pthread_mutex_lock` | locks | 31.1% |
+| `pthread_mutex_unlock` | locks | 18.2% |
+| `sqlite3VdbeExec` | interpreter | 13.9% |
+| `sqlite3BtreeTableMoveto` | B-tree search | 9.3% |
+| `[unknown]` | unresolved addresses | 5.0% |
+| `sqlite3GetVarint` | record decoding | 3.9% |
+| `pcache1FetchStage2` | page cache and pager | 1.7% |
+| `kahanBabuskaNeumaierStep` | aggregation | 1.5% |
+
 ### text_read at 1 client
 
 | part | amphora | sqlite |
@@ -511,6 +878,28 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 27% | 52% |
 | statements a second in the profiled run | 312,218 | 456,548 |
 
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 15.2% |
+| `<amphora_engine::storage::pager::Pager>::read_page_into` | page cache and pager | 9.6% |
+| `<amphora_engine::storage::btree::BTreeCursor>::move_to` | B-tree search | 7.7% |
+| `<amphora_bench::suite_db::amphora_target::AmphoraSession>::run` | bench: timing and harness | 3.9% |
+| `twox_hash::xxhash3_64::impl_241_plus_bytes::do_avx2` | checksums | 3.1% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::wal_header` | write-ahead log: frame lookups and reads | 2.2% |
+| `<amphora_engine::storage::page_cache::PageCache>::get` | page cache and pager | 2.2% |
+| `[unknown]` | libc internals (no symbols) | 2.1% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `pthread_mutex_lock` | locks | 22.8% |
+| `pthread_mutex_unlock` | locks | 13.7% |
+| `sqlite3BtreeTableMoveto` | B-tree search | 8.8% |
+| `[unknown]` | unresolved addresses | 5.7% |
+| `sqlite3VdbeExec` | interpreter | 5.3% |
+| `<rusqlite::cache::StatementCache>::get` | bench: timing and harness | 4.1% |
+| `sqlite3GetVarint` | record decoding | 4.0% |
+| `<rusqlite::cache::StatementCache>::cache_stmt` | bench: timing and harness | 4.0% |
+
 ### filter_no_index at 32 clients
 
 | part | amphora | sqlite |
@@ -529,6 +918,28 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | (user samples) | 475,188,341,981 | 21,231,095,176 |
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 9% | 87% |
 | statements a second in the profiled run | - | - |
+
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 79.9% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::wal_header` | write-ahead log: frame lookups and reads | 7.8% |
+| `<amphora_engine::storage::wal::WalFile>::read_frame` | write-ahead log: frame lookups and reads | 1.5% |
+| `<amphora_engine::storage::pager::Pager>::read_page_no_cache` | page cache and pager | 1.4% |
+| `<parking_lot::raw_rwlock::RawRwLock>::lock_shared_slow` | locks | 1.2% |
+| `<amphora_engine::storage::page_cache::PageCache>::evict_one` | page cache and pager | 1.0% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::wal_file` | write-ahead log: frame lookups and reads | 0.8% |
+| `<alloc::sync::Arc<amphora_engine::io::Buffer>>::drop_slow` | atomics and reference counts | 0.7% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `pthread_mutex_lock` | locks | 21.9% |
+| `[unknown]` | unresolved addresses | 21.8% |
+| `pthread_mutex_unlock` | locks | 16.3% |
+| `sqlite3VdbeExec` | interpreter | 12.9% |
+| `[unknown]` | libc internals (no symbols) | 10.6% |
+| `pcache1FetchStage2` | page cache and pager | 4.0% |
+| `sqlite3BtreeNext.isra.0` | B-tree search | 2.3% |
+| `pcache1Unpin` | page cache and pager | 1.7% |
 
 ### point_pk at 32 clients
 
@@ -553,6 +964,28 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 11% | 90% |
 | statements a second in the profiled run | 468,989 | 161,497 |
 
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 26.9% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::wal_header` | write-ahead log: frame lookups and reads | 23.4% |
+| `<parking_lot::raw_rwlock::RawRwLock>::lock_shared_slow` | locks | 13.2% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::wal_file` | write-ahead log: frame lookups and reads | 2.9% |
+| `<amphora_engine::storage::wal::WalFile>::read_frame` | write-ahead log: frame lookups and reads | 2.6% |
+| `<amphora_engine::storage::pager::Pager>::read_page_into` | page cache and pager | 2.6% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::try_begin_read_tx` | write-ahead log: frame lookups and reads | 2.2% |
+| `<amphora_engine::storage::btree::BTreeCursor>::move_to` | B-tree search | 1.9% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `pthread_mutex_lock` | locks | 22.2% |
+| `[unknown]` | unresolved addresses | 20.6% |
+| `pthread_mutex_unlock` | locks | 13.5% |
+| `[unknown]` | libc internals (no symbols) | 6.5% |
+| `pcache1FetchStage2` | page cache and pager | 4.0% |
+| `sqlite3BtreeTableMoveto` | B-tree search | 3.6% |
+| `sqlite3VdbeExec` | interpreter | 3.3% |
+| `amphora_bench::suite_db::sqlite_rows` | bench: timing and harness | 2.4% |
+
 ### point_secondary at 32 clients
 
 | part | amphora | sqlite |
@@ -575,6 +1008,28 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 11% | 85% |
 | statements a second in the profiled run | 362,778 | 47,731 |
 
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 26.1% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::wal_header` | write-ahead log: frame lookups and reads | 20.1% |
+| `<parking_lot::raw_rwlock::RawRwLock>::lock_shared_slow` | locks | 15.4% |
+| `<amphora_engine::storage::wal::WalFile>::read_frame` | write-ahead log: frame lookups and reads | 3.9% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::wal_file` | write-ahead log: frame lookups and reads | 3.7% |
+| `<amphora_engine::storage::pager::Pager>::read_page_into` | page cache and pager | 3.3% |
+| `<amphora_engine::storage::btree::BTreeCursor>::indexbtree_move_to_internal` | B-tree search | 2.4% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::try_begin_read_tx` | write-ahead log: frame lookups and reads | 1.9% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `pthread_mutex_lock` | locks | 24.6% |
+| `[unknown]` | unresolved addresses | 17.7% |
+| `pthread_mutex_unlock` | locks | 16.9% |
+| `[unknown]` | libc internals (no symbols) | 6.9% |
+| `pcache1FetchStage2` | page cache and pager | 2.1% |
+| `sqlite3VdbeExec` | interpreter | 1.9% |
+| `sqlite3RunParser` | statement: parse and plan | 1.9% |
+| `sqlite3BtreeIndexMoveto` | B-tree search | 1.8% |
+
 ### range_pk_100 at 32 clients
 
 | part | amphora | sqlite |
@@ -596,6 +1051,28 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 9% | 89% |
 | statements a second in the profiled run | 62,032 | 32,840 |
 
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 76.7% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::wal_header` | write-ahead log: frame lookups and reads | 6.3% |
+| `<amphora_engine::statement::Statement>::_step` | statement and binding | 1.8% |
+| `<parking_lot::raw_rwlock::RawRwLock>::lock_shared_slow` | locks | 1.7% |
+| `<amphora_engine::storage::wal::WalFile>::read_frame` | write-ahead log: frame lookups and reads | 1.5% |
+| `<amphora_engine::storage::pager::Pager>::read_page_no_cache` | page cache and pager | 1.5% |
+| `<amphora_engine::storage::page_cache::PageCache>::evict_one` | page cache and pager | 1.5% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::wal_file` | write-ahead log: frame lookups and reads | 1.2% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `pthread_mutex_lock` | locks | 19.6% |
+| `[unknown]` | unresolved addresses | 18.3% |
+| `pthread_mutex_unlock` | locks | 12.4% |
+| `sqlite3VdbeExec` | interpreter | 9.4% |
+| `amphora_bench::suite_db::sqlite_rows` | bench: timing and harness | 9.4% |
+| `[unknown]` | libc internals (no symbols) | 7.5% |
+| `pcache1FetchStage2` | page cache and pager | 3.3% |
+| `pcache1FetchNoMutex` | page cache and pager | 1.4% |
+
 ### table_count at 32 clients
 
 | part | amphora | sqlite |
@@ -613,3 +1090,24 @@ Every profile below attributes at least 90.7% of its samples to named parts.
 | kernel share of CPU (cpu_sys_s / (user + sys)) | 8% | 92% |
 | statements a second in the profiled run | 34 | 21 |
 
+| amphora: top leaf functions | part | share |
+|---|---|---:|
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::find_frame` | write-ahead log: frame lookups and reads | 79.2% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::wal_header` | write-ahead log: frame lookups and reads | 9.6% |
+| `<amphora_engine::storage::wal::WalFile>::read_frame` | write-ahead log: frame lookups and reads | 1.7% |
+| `<amphora_engine::storage::pager::Pager>::read_page_no_cache` | page cache and pager | 1.5% |
+| `<parking_lot::raw_rwlock::RawRwLock>::lock_shared_slow` | locks | 1.2% |
+| `<amphora_engine::storage::wal::InProcessWalCoordination>::wal_file` | write-ahead log: frame lookups and reads | 1.0% |
+| `<amphora_engine::storage::page_cache::PageCache>::evict_one` | page cache and pager | 0.9% |
+| `<alloc::sync::Arc<amphora_engine::io::Buffer>>::drop_slow` | atomics and reference counts | 0.7% |
+
+| sqlite: top leaf functions | part | share |
+|---|---|---:|
+| `pthread_mutex_lock` | locks | 29.5% |
+| `[unknown]` | unresolved addresses | 25.7% |
+| `pthread_mutex_unlock` | locks | 18.9% |
+| `[unknown]` | libc internals (no symbols) | 11.4% |
+| `pcache1FetchStage2` | page cache and pager | 5.1% |
+| `pcache1Unpin` | page cache and pager | 2.7% |
+| `pcache1Fetch` | page cache and pager | 1.3% |
+| `pcache1FetchNoMutex` | page cache and pager | 1.3% |
