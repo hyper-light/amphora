@@ -656,13 +656,33 @@ pub fn apply_numeric_affinity(val: ValueRef, try_for_int: bool) -> Option<ValueR
         return None; // Only apply to text values
     };
 
-    let text_str = text.as_str();
+    // SQLite 3.54 reads the number in the text before its first NUL (sqlite3AtoF on the C string),
+    // and there takes it for an integer only if exact within 2^51 (alsoAnInt: sqlite3Atoi64 sees
+    // the NUL), a REAL otherwise.
+    let full = text.as_str();
+    let (text_str, nul) = full
+        .split_once('\0')
+        .map_or((full, false), |(head, _)| (head, true));
     let (parse_result, parsed_value) = try_for_float(text_str.as_bytes());
 
     // Only convert if we have a complete valid number (not just a prefix)
     match parse_result {
         NumericParseResult::NotNumeric | NumericParseResult::ValidPrefixOnly => {
             None // Leave as text
+        }
+        NumericParseResult::PureInteger if nul => {
+            if let Some(int_val) = parsed_value
+                .as_integer()
+                .filter(|i| (-2_251_799_813_685_248..2_251_799_813_685_248).contains(i))
+            {
+                return Some(ValueRef::Numeric(Numeric::Integer(int_val)));
+            }
+            let res = ValueRef::from_f64(crate::numeric::str_to_f64(text_str).map(f64::from)?);
+            if try_for_int {
+                apply_integer_affinity(res).or(Some(res))
+            } else {
+                Some(res)
+            }
         }
         NumericParseResult::PureInteger => {
             if let Some(int_val) = parsed_value.as_integer() {

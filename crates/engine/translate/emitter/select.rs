@@ -951,7 +951,7 @@ fn build_materialized_build_input_plan(
                 joined_table,
                 &mut where_clause,
                 is_outer_join,
-            );
+            )?;
         }
     }
 

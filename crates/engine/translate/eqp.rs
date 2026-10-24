@@ -923,6 +923,7 @@ pub(crate) fn eqp_details_for_right_join(table: &JoinedTable) -> (EqpDetail, Eqp
 ///   "version": 1,
 ///   "sql": "...",
 ///   "result_columns": ["a", "b"],
+///   "output_rows": 2500.0,
 ///   "nodes": [
 ///     {"id": 3, "parent": null, "detail": "SCAN users", "op": {"type": "scan", ...}}
 ///   ],
@@ -946,6 +947,17 @@ pub fn program_plan_json(program: &Program) -> String {
         })
         .collect();
     top.str_array("result_columns", &column_names);
+    // The rows the join is estimated to give: the last access's in the join order, which the
+    // nodes' order (a hash join's build listed after its probe) does not tell.
+    if let Some(estimate) = program
+        .table_references
+        .joined_tables()
+        .iter()
+        .filter_map(|table| table.plan_estimate.as_ref())
+        .max_by_key(|estimate| estimate.position)
+    {
+        top.float("output_rows", estimate.output_rows);
+    }
 
     let nodes = top.key("nodes");
     nodes.push('[');

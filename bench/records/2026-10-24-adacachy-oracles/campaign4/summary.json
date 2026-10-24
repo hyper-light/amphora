@@ -1,0 +1,694 @@
+{
+  "duplicates": 2,
+  "findings": {
+    "cert-02cc065dd12394f3": {
+      "at_seconds": 243.964191509,
+      "detail": "the more restrictive query is estimated at 5000000000000000 rows, the query at 25000000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 3
+    },
+    "cert-0660d880279ab36e": {
+      "at_seconds": 681.524329344,
+      "detail": "the more restrictive query is estimated at 1.7600000000000002 rows, the query at 1.1",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 10
+    },
+    "cert-0854cde78b72647c": {
+      "at_seconds": 268.334495444,
+      "detail": "the more restrictive query is estimated at 129600000000 rows, the query at 5000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-1251e74d55b42456": {
+      "at_seconds": 888.282935602,
+      "detail": "the more restrictive query is estimated at 1000000 rows, the query at 400000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-13b53ac7c48a6ae0": {
+      "at_seconds": 426.026107999,
+      "detail": "the more restrictive query is estimated at 160000000000 rows, the query at 5000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-14ad33e0916c2b9b": {
+      "at_seconds": 797.872786485,
+      "detail": "the more restrictive query is estimated at 5 rows, the query at 2.5",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 5
+    },
+    "cert-18faf303f6630186": {
+      "at_seconds": 856.166584586,
+      "detail": "the more restrictive query is estimated at 6 rows, the query at 3.6",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 5
+    },
+    "cert-263e8f1b3a5a3f28": {
+      "at_seconds": 572.64561828,
+      "detail": "the more restrictive query is estimated at 1000000000000 rows, the query at 1000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-324d52deea75b40e": {
+      "at_seconds": 417.277324548,
+      "detail": "the more restrictive query is estimated at 106.48000000000002 rows, the query at 9.680014697496697",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 9
+    },
+    "cert-35eb9562eac6b97e": {
+      "at_seconds": 98.662627984,
+      "detail": "the more restrictive query is estimated at 16000000000.000004 rows, the query at 5000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-36fc7f489d754292": {
+      "at_seconds": 158.268676724,
+      "detail": "the more restrictive query is estimated at 160000000000000000 rows, the query at 5000000000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-40e810dd4ca43c99": {
+      "at_seconds": 545.274514824,
+      "detail": "the more restrictive query is estimated at 71.68 rows, the query at 64.00268370102322",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 11
+    },
+    "cert-4a05bd8cdb19320e": {
+      "at_seconds": 317.005384715,
+      "detail": "the more restrictive query is estimated at 22.5 rows, the query at 20",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 6
+    },
+    "cert-4b9cdc9fe3b3a370": {
+      "at_seconds": 611.556998314,
+      "detail": "the more restrictive query is estimated at 2 rows, the query at 1.018730753077982",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 5
+    },
+    "cert-4e15c26a57a607fc": {
+      "at_seconds": 36.965559095,
+      "detail": "the more restrictive query is estimated at 7.2 rows, the query at 5.760597268646702",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 6
+    },
+    "cert-558d838c56b6a1b9": {
+      "at_seconds": 818.999630176,
+      "detail": "the more restrictive query is estimated at 1000000 rows, the query at 100000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-5bb3eadd803f2175": {
+      "at_seconds": 702.61691163,
+      "detail": "the more restrictive query is estimated at 24999.999999999996 rows, the query at 21353.35283236613",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 4
+    },
+    "cert-5d6787cd0c0f6a4f": {
+      "at_seconds": 507.027410442,
+      "detail": "the more restrictive query is estimated at 1367879.4411714424 rows, the query at 1000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-5e87d87ca49b7e75": {
+      "at_seconds": 294.757256137,
+      "detail": "the more restrictive query is estimated at 2 rows, the query at 0.4270670566473226",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 4
+    },
+    "cert-5f644442db62e267": {
+      "at_seconds": 593.661950838,
+      "detail": "the more restrictive query is estimated at 160000000000000000 rows, the query at 5000000000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-6163526dbbea5873": {
+      "at_seconds": 764.63141611,
+      "detail": "the more restrictive query is estimated at 32000000000.000008 rows, the query at 1000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-67fef1ee61557851": {
+      "at_seconds": 737.089146755,
+      "detail": "the more restrictive query is estimated at 16000000000000000 rows, the query at 499999999999999.94",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-69bbb35b094b1b24": {
+      "at_seconds": 742.120705842,
+      "detail": "the more restrictive query is estimated at 1000000 rows, the query at 400000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-760a54e8b77f547c": {
+      "at_seconds": 510.668179708,
+      "detail": "the more restrictive query is estimated at 2 rows, the query at 0.4270670566473226",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 3
+    },
+    "cert-76a106e6bb9c1301": {
+      "at_seconds": 124.456909572,
+      "detail": "the more restrictive query is estimated at 2 rows, the query at 1",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 5
+    },
+    "cert-7b783b97edd6e87a": {
+      "at_seconds": 583.96803768,
+      "detail": "the more restrictive query is estimated at 160000000000 rows, the query at 5000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-7c28cd78a8a23873": {
+      "at_seconds": 916.772759129,
+      "detail": "the more restrictive query is estimated at 2000000 rows, the query at 400000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 4
+    },
+    "cert-7ebcb34f31160ff5": {
+      "at_seconds": 449.238809601,
+      "detail": "the more restrictive query is estimated at 2 rows, the query at 1.3678794411714423",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 5
+    },
+    "cert-7f4551bf1c5dcf0d": {
+      "at_seconds": 333.324966976,
+      "detail": "the more restrictive query is estimated at 2 rows, the query at 1.2493289641172216",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 6
+    },
+    "cert-868b8afcbe0ae79c": {
+      "at_seconds": 361.70548701,
+      "detail": "the more restrictive query is estimated at 32000000000 rows, the query at 5000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-86ed36a779f41ded": {
+      "at_seconds": 158.705792511,
+      "detail": "the more restrictive query is estimated at 2 rows, the query at 0.4270670566473226",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 5
+    },
+    "cert-888f804fa2b2507d": {
+      "at_seconds": 325.801164128,
+      "detail": "the more restrictive query is estimated at 100000000000 rows, the query at 1000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 3
+    },
+    "cert-89727568e70488da": {
+      "at_seconds": 441.584589945,
+      "detail": "the more restrictive query is estimated at 1000000 rows, the query at 100000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-8bff550eb0c70147": {
+      "at_seconds": 73.294768304,
+      "detail": "the more restrictive query is estimated at 64000000000.000015 rows, the query at 2000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-8c0c9c3eddf21539": {
+      "at_seconds": 208.945739697,
+      "detail": "the more restrictive query is estimated at 64000000000.000015 rows, the query at 2000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-8c6aa818ec65405a": {
+      "at_seconds": 327.364389865,
+      "detail": "the more restrictive query is estimated at 100000000000 rows, the query at 1367879.4411714424",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-9cbfc82c8ee9e699": {
+      "at_seconds": 818.538470822,
+      "detail": "the more restrictive query is estimated at 25600000000.000004 rows, the query at 5000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-9dd71b43c18f87e4": {
+      "at_seconds": 433.85175143,
+      "detail": "the more restrictive query is estimated at 100000000000000000 rows, the query at 1000000000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-abebb41ff6fe579a": {
+      "at_seconds": 742.502949197,
+      "detail": "the more restrictive query is estimated at 2 rows, the query at 0.4270670566473226",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 4
+    },
+    "cert-b27b47407ef4e572": {
+      "at_seconds": 882.053400789,
+      "detail": "the more restrictive query is estimated at 4 rows, the query at 1.2800000000000002",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 6
+    },
+    "cert-b2c97ca0f527072c": {
+      "at_seconds": 443.70776435,
+      "detail": "the more restrictive query is estimated at 1000000 rows, the query at 213533.5283236613",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 4
+    },
+    "cert-be52c7702ea4ce3b": {
+      "at_seconds": 482.348584163,
+      "detail": "the more restrictive query is estimated at 8 rows, the query at 6.4",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 6
+    },
+    "cert-c526976f84134ed8": {
+      "at_seconds": 184.073677649,
+      "detail": "the more restrictive query is estimated at 5000 rows, the query at 2000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-d291ce2f6bd93d8a": {
+      "at_seconds": 6.18077109,
+      "detail": "the more restrictive query is estimated at 10 rows, the query at 4",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 11
+    },
+    "cert-dcd27b8e263afb74": {
+      "at_seconds": 593.208727262,
+      "detail": "the more restrictive query is estimated at 5000 rows, the query at 2000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-e724e6b7e9c765aa": {
+      "at_seconds": 479.211065526,
+      "detail": "the more restrictive query is estimated at 3.6 rows, the query at 1.0979233446124312",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 5
+    },
+    "cert-e749d7942a5b1c1d": {
+      "at_seconds": 10.176968121,
+      "detail": "the more restrictive query is estimated at 400000000 rows, the query at 1000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 3
+    },
+    "cert-e9ee7bf9ed6505b1": {
+      "at_seconds": 123.217040294,
+      "detail": "the more restrictive query is estimated at 1000000 rows, the query at 10000.000000000002",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 4
+    },
+    "cert-eae97bac894c06da": {
+      "at_seconds": 550.612068865,
+      "detail": "the more restrictive query is estimated at 1000000 rows, the query at 200000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-ee780f202c055593": {
+      "at_seconds": 181.92686982,
+      "detail": "the more restrictive query is estimated at 6 rows, the query at 3.122454662045154",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 4
+    },
+    "cert-ef61a3fd88672424": {
+      "at_seconds": 32.520435557,
+      "detail": "the more restrictive query is estimated at 51840000000000010 rows, the query at 2000000000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-efdd50675ca47b3f": {
+      "at_seconds": 405.446153303,
+      "detail": "the more restrictive query is estimated at 1000000 rows, the query at 213533.5283236613",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 4
+    },
+    "cert-f1f6328dad6e8abc": {
+      "at_seconds": 62.468497865,
+      "detail": "the more restrictive query is estimated at 25600000000.000008 rows, the query at 5000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-f486152fc309b7fd": {
+      "at_seconds": 506.852407529,
+      "detail": "the more restrictive query is estimated at 1.6 rows, the query at 0.4997315856468887",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 4
+    },
+    "cert-f591b5163ab48df5": {
+      "at_seconds": 511.67655421,
+      "detail": "the more restrictive query is estimated at 100000000000 rows, the query at 1000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-fb5e0f02fc50d36a": {
+      "at_seconds": 432.08790013,
+      "detail": "the more restrictive query is estimated at 1000000 rows, the query at 10676.676416183063",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 5
+    },
+    "cert-fdae13133b54743e": {
+      "at_seconds": 420.043688773,
+      "detail": "the more restrictive query is estimated at 2 rows, the query at 1.7082682265892903",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 4
+    },
+    "cert-ff37524f86bd0e66": {
+      "at_seconds": 290.484717505,
+      "detail": "the more restrictive query is estimated at 23040000000000000 rows, the query at 720000000000000.1",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "diff-83a685b59204ffff": {
+      "at_seconds": 235.669386402,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-a67a6d3509fcca74": {
+      "at_seconds": 395.070281119,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "dqp-7377d45ae6b4af5d": {
+      "at_seconds": 438.472819482,
+      "detail": "another plan gives other rows",
+      "kind": "Wrong",
+      "oracle": "dqp",
+      "statements": 5
+    },
+    "eet-e419ed8b8cc2a867": {
+      "at_seconds": 6.363122341,
+      "detail": "cursor id 0 is None",
+      "kind": "Panic",
+      "oracle": "eet",
+      "statements": 4
+    },
+    "error-15c526dd5edf1a96": {
+      "at_seconds": 581.465974536,
+      "detail": "Amphora errors where SQLite finds the pivot: JSON cannot hold BLOB values",
+      "kind": "Error",
+      "oracle": "pqs",
+      "statements": 3
+    },
+    "error-23d2039dced3bbc4": {
+      "at_seconds": 413.185120922,
+      "detail": "Amphora errors where SQLite finds the pivot: FLAGS parameter to json_valid() must be between 1 and 15",
+      "kind": "Error",
+      "oracle": "pqs",
+      "statements": 3
+    },
+    "error-3bc86eecad84b39b": {
+      "at_seconds": 10.715862796,
+      "detail": "the partitions' aggregate errors on Amphora, not on SQLite: Parse error: no such table: a2",
+      "kind": "Error",
+      "oracle": "tlp",
+      "statements": 1
+    },
+    "error-493c667725cb13ff": {
+      "at_seconds": 209.549874279,
+      "detail": "Amphora errors where SQLite finds the pivot: Parse error: malformed JSON",
+      "kind": "Error",
+      "oracle": "pqs",
+      "statements": 2
+    },
+    "error-99fb1658e34f78cb": {
+      "at_seconds": 243.796536181,
+      "detail": "Amphora errors where SQLite finds the pivot: integer overflow",
+      "kind": "Error",
+      "oracle": "pqs",
+      "statements": 6
+    },
+    "error-dcaca8f9a487ab22": {
+      "at_seconds": 706.992316646,
+      "detail": "Amphora errors where SQLite finds the pivot: json_array_insert() needs an odd number of arguments",
+      "kind": "Error",
+      "oracle": "pqs",
+      "statements": 3
+    },
+    "error-dfd3551986fdeacf": {
+      "at_seconds": 324.388253859,
+      "detail": "Amphora errors where SQLite finds the pivot: json_object() requires an even number of arguments",
+      "kind": "Error",
+      "oracle": "pqs",
+      "statements": 3
+    },
+    "tlp-418079162ffed350": {
+      "at_seconds": 180.786083958,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    }
+  },
+  "functions": 101,
+  "label": "",
+  "oracles": {
+    "cert": {
+      "checks": 154798,
+      "failed": 58,
+      "passed": 140219,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "no estimate": 14521
+      }
+    },
+    "diff": {
+      "checks": 154797,
+      "failed": 2,
+      "passed": 115647,
+      "plans_changed": 0,
+      "refused": {
+        "ESCAPE expression must be a single character": 5,
+        "FLAGS parameter to json_valid() must be between # and ##": 13,
+        "JSON cannot hold BLOB values": 16,
+        "JSON path error near: \"#\"": 8,
+        "JSON path error near: \"##\"": 2,
+        "JSON path error near: \"###\"": 4,
+        "JSON path error near: \"################\"": 1,
+        "JSON path error near: \"###################\"": 1,
+        "JSON path error near: \"################.#\"": 1,
+        "JSON path error near: \"###.#\"": 2,
+        "JSON path error near: \"#.#\"": 4,
+        "JSON path error near: \"-###################\"": 1,
+        "JSON path error near: \"-#.#\"": 3,
+        "JSON path error near: \"-#.################e+##\"": 1,
+        "JSON path error near: \"-#.#e-###\"": 1,
+        "Parse error: Unexpected character": 12,
+        "Parse error: Unexpected end of input": 4,
+        "Parse error: bad JSON path: ' a'": 1,
+        "Parse error: bad JSON path: '##'": 2,
+        "Parse error: bad JSON path: '##:##:##'": 1,
+        "Parse error: bad JSON path: '#.#'": 2,
+        "Parse error: bad JSON path: '#e#'": 1,
+        "Parse error: bad JSON path: '#x##'": 1,
+        "Parse error: bad JSON path: '%'": 1,
+        "Parse error: bad JSON path: ''": 1,
+        "Parse error: bad JSON path: '-#'": 1,
+        "Parse error: bad JSON path: 'A'": 1,
+        "Parse error: bad JSON path: 'a '": 2,
+        "Parse error: bad JSON path: '{\"a\":#,\"b\":[#,#]}'": 1,
+        "Parse error: bad JSON path: 'é'": 3,
+        "Parse error: bad JSON path: 'ÿ'": 1,
+        "Parse error: malformed JSON": 76,
+        "integer overflow": 3,
+        "json_array_insert() needs an odd number of arguments": 16,
+        "json_insert() needs an odd number of arguments": 10,
+        "json_object() labels must be TEXT": 7,
+        "json_object() requires an even number of arguments": 23,
+        "json_replace() needs an odd number of arguments": 4,
+        "json_set() needs an odd number of arguments": 6,
+        "string or blob too big": 3
+      },
+      "skipped": {
+        "SQLite's answer holds ill-formed UTF-8 (garbage in, garbage out)": 3,
+        "a bare column: its row is any of its group's": 13940,
+        "sqlite refused": 24959
+      }
+    },
+    "dqp": {
+      "checks": 154797,
+      "failed": 1,
+      "passed": 107592,
+      "plans_changed": 38254,
+      "refused": {},
+      "skipped": {
+        "a bare column: its row is any of its group's": 13822,
+        "a derived query meets a value's error (evaluation order)": 180,
+        "amphora refused the base": 24869,
+        "the index can't serve the query": 8333
+      }
+    },
+    "eet": {
+      "checks": 154799,
+      "failed": 1,
+      "passed": 114316,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a bare column: its row is any of its group's": 16134,
+        "a derived query errors on SQLite too": 1,
+        "a derived query meets a value's error (evaluation order)": 113,
+        "amphora refused the base": 24234
+      }
+    },
+    "norec": {
+      "checks": 154797,
+      "failed": 0,
+      "passed": 135766,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a derived query errors on SQLite too": 3,
+        "a derived query meets a value's error (evaluation order)": 1466,
+        "amphora refused both": 17562
+      }
+    },
+    "pqs": {
+      "checks": 140136,
+      "failed": 8,
+      "passed": 124910,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "sqlite can't evaluate it": 12841,
+        "sqlite misses its own pivot": 2377
+      }
+    },
+    "same": {
+      "checks": 27091,
+      "failed": 0,
+      "passed": 27091,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {}
+    },
+    "tlp": {
+      "checks": 154797,
+      "failed": 2,
+      "passed": 122359,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a derived query errors on SQLite too": 1962,
+        "a derived query meets a value's error (evaluation order)": 6113,
+        "a partition's sum overflows": 8,
+        "amphora refused the base": 24353
+      }
+    }
+  },
+  "seconds": 916.773402879,
+  "seed": 14,
+  "setup_refused": {},
+  "sqlite": "3.54.0",
+  "sqlite_options": [
+    "ATOMIC_INTRINSICS=1",
+    "COMPILER=gcc-16.2.1 20260810",
+    "DEFAULT_AUTOVACUUM",
+    "DEFAULT_CACHE_SIZE=-2000",
+    "DEFAULT_FILE_FORMAT=4",
+    "DEFAULT_JOURNAL_SIZE_LIMIT=-1",
+    "DEFAULT_MMAP_SIZE=0",
+    "DEFAULT_PAGE_SIZE=4096",
+    "DEFAULT_PCACHE_INITSZ=20",
+    "DEFAULT_RECURSIVE_TRIGGERS",
+    "DEFAULT_SECTOR_SIZE=4096",
+    "DEFAULT_SYNCHRONOUS=2",
+    "DEFAULT_WAL_AUTOCHECKPOINT=1000",
+    "DEFAULT_WAL_SYNCHRONOUS=2",
+    "DEFAULT_WORKER_THREADS=0",
+    "DIRECT_OVERFLOW_READ",
+    "ENABLE_COLUMN_METADATA",
+    "ENABLE_DBSTAT_VTAB",
+    "ENABLE_FTS3",
+    "ENABLE_FTS3_PARENTHESIS",
+    "ENABLE_FTS4",
+    "ENABLE_FTS5",
+    "ENABLE_MATH_FUNCTIONS",
+    "ENABLE_PERCENTILE",
+    "ENABLE_PREUPDATE_HOOK",
+    "ENABLE_RTREE",
+    "ENABLE_SESSION",
+    "ENABLE_STAT4",
+    "ENABLE_STMTVTAB",
+    "ENABLE_UNLOCK_NOTIFY",
+    "HAVE_ISNAN",
+    "LIKE_DOESNT_MATCH_BLOBS",
+    "MALLOC_SOFT_LIMIT=1024",
+    "MAX_ATTACHED=10",
+    "MAX_COLUMN=2000",
+    "MAX_COMPOUND_SELECT=500",
+    "MAX_DEFAULT_PAGE_SIZE=8192",
+    "MAX_EXPR_DEPTH=10000",
+    "MAX_FUNCTION_ARG=1000",
+    "MAX_LENGTH=1000000000",
+    "MAX_LIKE_PATTERN_LENGTH=50000",
+    "MAX_MMAP_SIZE=0x7fff0000",
+    "MAX_PAGE_COUNT=0xfffffffe",
+    "MAX_PAGE_SIZE=65536",
+    "MAX_SCHEMA=10000000",
+    "MAX_SQL_LENGTH=1000000000",
+    "MAX_TRIGGER_DEPTH=1000",
+    "MAX_VARIABLE_NUMBER=250000",
+    "MAX_VDBE_OP=250000000",
+    "MAX_WORKER_THREADS=8",
+    "MUTEX_PTHREADS",
+    "SECURE_DELETE",
+    "SYSTEM_MALLOC",
+    "TEMP_STORE=1",
+    "THREADSAFE=1"
+  ],
+  "states": 27091
+}

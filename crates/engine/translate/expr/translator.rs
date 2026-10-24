@@ -99,10 +99,23 @@ pub fn translate_expr(
     resolver: &Resolver,
 ) -> Result<usize> {
     let constant_span = if expr.is_constant(resolver) {
-        if !program.constant_span_is_open() {
-            Some(program.constant_span_start())
-        } else {
+        if program.constant_span_is_open() {
             None
+        } else if calls_function(expr) {
+            if resolver.resolve_cached_expr_reg(expr).is_none() {
+                return translate_constant_call_once(
+                    program,
+                    referenced_tables,
+                    expr,
+                    target_register,
+                    resolver,
+                );
+            }
+            // Kept where it was first reached, not at the program's start: so is the copy of it
+            // (moved to the start, it would read the register before anything is kept there).
+            None
+        } else {
+            Some(program.constant_span_start())
         }
     } else {
         program.constant_span_end_all();
@@ -132,6 +145,61 @@ pub fn translate_expr(
         program.constant_span_end(span);
     }
 
+    Ok(target_register)
+}
+
+/// Whether `expr` calls a function anywhere in it (SQLite's EP_HasFunc), LIKE and GLOB among them.
+fn calls_function(expr: &ast::Expr) -> bool {
+    let mut calls = false;
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        calls |= matches!(
+            e,
+            ast::Expr::FunctionCall { .. }
+                | ast::Expr::FunctionCallStar { .. }
+                | ast::Expr::Like { .. }
+        );
+        Ok(if calls {
+            WalkControl::SkipChildren
+        } else {
+            WalkControl::Continue
+        })
+    });
+    calls
+}
+
+/// A constant expression that calls a function is computed where it is first reached and kept
+/// for the rest of the statement, as SQLite's sqlite3ExprCodeRunJustOnce computes one (OP_Once
+/// in place). Moved to the program's start with the other constants, it would run where the query
+/// never reaches it, and the function's error (malformed JSON, an odd json_object) would fail a
+/// statement SQLite completes: over an empty table, behind a WHERE no row passes.
+#[inline(never)]
+fn translate_constant_call_once(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let kept = program.alloc_register();
+    let reached = program.allocate_label();
+    program.emit_insn(Insn::Once {
+        target_pc_when_reentered: reached,
+    });
+    // A span open over the expression keeps its parts from being moved to the start; dropped
+    // after, they run here, under the Once.
+    let next_span_idx = program.constant_spans_next_idx();
+    let span = program.constant_span_start();
+    if !try_emit_expression_index_value_if_any(program, referenced_tables, expr, kept, resolver)? {
+        translate_expr_by_kind(program, referenced_tables, expr, kept, resolver)?;
+    }
+    program.constant_span_end(span);
+    program.constant_spans_invalidate_after(next_span_idx);
+    program.preassign_label_to_next_insn(reached);
+    program.emit_insn(Insn::Copy {
+        src_reg: kept,
+        dst_reg: target_register,
+        extra_amount: 0,
+    });
     Ok(target_register)
 }
 
@@ -178,13 +246,19 @@ fn translate_expr_by_kind(
         ast::Expr::MergedColumn(_) => {
             translate_merged_column(program, referenced_tables, expr, target_register, resolver)
         }
-        ast::Expr::FunctionCall { .. } => translate_function_call_expr(
-            program,
-            referenced_tables,
-            expr,
-            target_register,
-            resolver,
-        ),
+        ast::Expr::FunctionCall { .. } => {
+            let reg = translate_function_call_expr(
+                program,
+                referenced_tables,
+                expr,
+                target_register,
+                resolver,
+            )?;
+            // A function's value carries the first explicit COLLATE of its arguments, not a
+            // column's collation (upper(c) over a NOCASE column compares by BINARY).
+            set_explicit_collation(program, expr, resolver)?;
+            Ok(reg)
+        }
         ast::Expr::FunctionCallStar { .. } => translate_function_call_star_expr(
             program,
             referenced_tables,
@@ -573,6 +647,45 @@ fn translate_binary_expr(
         return Ok(target_register);
     }
 
+    if matches!(op, ast::Operator::And | ast::Operator::Or) {
+        // An AND or an OR an operand settles is that operand's truth, the other never read
+        // (SQLite's exprCodeTargetAndOr: sqlite3ExprSimplifiedAndOr, then OP_And of it with
+        // itself).
+        let simplified = simplified_and_or(expr);
+        if !std::ptr::eq(simplified, expr) {
+            translate_expr(
+                program,
+                referenced_tables,
+                simplified,
+                target_register,
+                resolver,
+            )?;
+            program.emit_insn(Insn::And {
+                lhs: target_register,
+                rhs: target_register,
+                dest: target_register,
+            });
+            return Ok(target_register);
+        }
+        // Beside a subquery the other side goes first, and alone gives the answer where it settles
+        // it (SQLite 3.54's exprCodeTargetAndOr).
+        let first = match (has_subquery(e1), has_subquery(e2)) {
+            (true, false) => Some((e2.as_ref(), e1.as_ref())),
+            (_, true) => Some((e1.as_ref(), e2.as_ref())),
+            (false, false) => None,
+        };
+        if let Some((first, second)) = first {
+            return translate_and_or_first(
+                program,
+                referenced_tables,
+                (first, second),
+                *op == ast::Operator::And,
+                target_register,
+                resolver,
+            );
+        }
+    }
+
     binary_expr_shared(
         program,
         referenced_tables,
@@ -583,6 +696,61 @@ fn translate_binary_expr(
         resolver,
         BinaryEmitMode::Value,
     )?;
+    Ok(target_register)
+}
+
+/// `first AND second` or `first OR second` as a value, `first` computed first: where it settles the
+/// result (FALSE for AND, TRUE for OR) the answer is its truth and `second` is never computed
+/// (SQLite 3.54's exprCodeTargetAndOr with a subquery on one side).
+#[inline(never)]
+fn translate_and_or_first(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    (first, second): (&ast::Expr, &ast::Expr),
+    and: bool,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let first_reg = program.alloc_register();
+    let second_reg = program.alloc_register();
+    let settled = program.allocate_label();
+    let end = program.allocate_label();
+    translate_expr(program, referenced_tables, first, first_reg, resolver)?;
+    if and {
+        program.emit_insn(Insn::IfNot {
+            reg: first_reg,
+            target_pc: settled,
+            jump_if_null: false,
+        });
+    } else {
+        program.emit_insn(Insn::If {
+            reg: first_reg,
+            target_pc: settled,
+            jump_if_null: false,
+        });
+    }
+    translate_expr(program, referenced_tables, second, second_reg, resolver)?;
+    if and {
+        program.emit_insn(Insn::And {
+            lhs: first_reg,
+            rhs: second_reg,
+            dest: target_register,
+        });
+    } else {
+        program.emit_insn(Insn::Or {
+            lhs: first_reg,
+            rhs: second_reg,
+            dest: target_register,
+        });
+    }
+    program.emit_insn(Insn::Goto { target_pc: end });
+    program.preassign_label_to_next_insn(settled);
+    program.emit_insn(Insn::Or {
+        lhs: first_reg,
+        rhs: first_reg,
+        dest: target_register,
+    });
+    program.preassign_label_to_next_insn(end);
     Ok(target_register)
 }
 
@@ -636,6 +804,55 @@ fn try_translate_custom_type_operator(
     Ok(true)
 }
 
+/// A simple CASE's base: its expression, the register it is in, and its collation context.
+struct CaseBase<'a> {
+    expr: &'a ast::Expr,
+    reg: usize,
+    collation: Option<(CollationSeq, bool)>,
+}
+
+/// The jump past a WHEN that fails: for `CASE x WHEN y`, x and y compared as `x = y` compares them,
+/// and for a WHEN whose condition could not be translated as one, the value's truth.
+fn emit_case_when_jump(
+    program: &mut ProgramBuilder,
+    base: Option<CaseBase<'_>>,
+    when_expr: &ast::Expr,
+    expr_reg: usize,
+    next_case_label: BranchOffset,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) {
+    match base {
+        // CASE 1 WHEN 0 THEN 0 ELSE 1 becomes 1==0, Ne branch to next clause. The two compare
+        // as `1 = 0` would, by their affinity and collation, as SQLite compares them.
+        Some(base) => {
+            program.set_collation(comparison_collation_ctx(
+                base.collation,
+                program.curr_collation_ctx(),
+            ));
+            let affinity =
+                comparison_affinity(base.expr, when_expr, referenced_tables, Some(resolver));
+            program.emit_insn(Insn::Ne {
+                lhs: base.reg,
+                rhs: expr_reg,
+                target_pc: next_case_label,
+                // A NULL result is considered untrue when evaluating WHEN terms.
+                flags: CmpInsFlags::default()
+                    .jump_if_null()
+                    .with_affinity(affinity),
+                collation: program.curr_collation(),
+            });
+            program.reset_collation();
+        }
+        // CASE WHEN 0 THEN 0 ELSE 1 becomes ifnot 0 branch to next clause
+        None => program.emit_insn(Insn::IfNot {
+            reg: expr_reg,
+            target_pc: next_case_label,
+            jump_if_null: true,
+        }),
+    };
+}
+
 #[inline(never)]
 fn translate_case_expr(
     program: &mut ProgramBuilder,
@@ -664,43 +881,62 @@ fn translate_case_expr(
     // Only allocate a reg to hold the base expression if one was provided.
     // And base_reg then becomes the flag we check to see which sort of
     // case statement we're processing.
-    let base_reg = base.as_ref().map(|_| program.alloc_register());
+    let base = base
+        .as_deref()
+        .map(|base_expr| (base_expr, program.alloc_register()));
     let expr_reg = program.alloc_register();
-    if let Some(base_expr) = base {
-        translate_expr(
-            program,
-            referenced_tables,
-            base_expr,
-            base_reg.unwrap(),
-            resolver,
-        )?;
+    let mut base_collation_ctx = None;
+    if let Some((base_expr, base_reg)) = base {
+        program.reset_collation();
+        translate_expr(program, referenced_tables, base_expr, base_reg, resolver)?;
+        base_collation_ctx = program.curr_collation_ctx();
     };
     for (when_expr, then_expr) in when_then_pairs {
-        translate_expr_no_constant_opt(
-            program,
-            referenced_tables,
-            when_expr,
-            expr_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
-        match base_reg {
-            // CASE 1 WHEN 0 THEN 0 ELSE 1 becomes 1==0, Ne branch to next clause
-            Some(base_reg) => program.emit_insn(Insn::Ne {
-                lhs: base_reg,
-                rhs: expr_reg,
-                target_pc: next_case_label,
-                // A NULL result is considered untrue when evaluating WHEN terms.
-                flags: CmpInsFlags::default().jump_if_null(),
-                collation: program.curr_collation(),
-            }),
-            // CASE WHEN 0 THEN 0 ELSE 1 becomes ifnot 0 branch to next clause
-            None => program.emit_insn(Insn::IfNot {
-                reg: expr_reg,
-                target_pc: next_case_label,
-                jump_if_null: true,
-            }),
-        };
+        program.reset_collation();
+        match (base, referenced_tables) {
+            // CASE WHEN p: p is a condition, as SQLite codes it (sqlite3ExprIfFalse, NULL as
+            // FALSE), so it keeps its short circuits: a NULL that settles an AND never reads the
+            // operand after it, which can fail.
+            (None, Some(tables)) => {
+                let when_true = program.allocate_label();
+                translate_condition_expr(
+                    program,
+                    tables,
+                    when_expr,
+                    ConditionMetadata {
+                        jump_if_condition_is_true: false,
+                        jump_target_when_true: when_true,
+                        jump_target_when_false: next_case_label,
+                        jump_target_when_null: next_case_label,
+                    },
+                    resolver,
+                )?;
+                program.preassign_label_to_next_insn(when_true);
+            }
+            _ => {
+                translate_expr_no_constant_opt(
+                    program,
+                    referenced_tables,
+                    when_expr,
+                    expr_reg,
+                    resolver,
+                    NoConstantOptReason::RegisterReuse,
+                )?;
+                emit_case_when_jump(
+                    program,
+                    base.map(|(expr, reg)| CaseBase {
+                        expr,
+                        reg,
+                        collation: base_collation_ctx,
+                    }),
+                    when_expr,
+                    expr_reg,
+                    next_case_label,
+                    referenced_tables,
+                    resolver,
+                );
+            }
+        }
         // THEN...
         translate_expr_no_constant_opt(
             program,
@@ -738,7 +974,36 @@ fn translate_case_expr(
         }
     };
     program.preassign_label_to_next_insn(return_label);
+    // A CASE compares by the first explicit COLLATE in it, its base's before its branches', and
+    // never by a column's collation.
+    set_explicit_collation(program, expr, resolver)?;
     Ok(target_register)
+}
+
+/// Sets the collation the value of `expr`, no column, compares by: the first explicit COLLATE in
+/// it (an argument's, a CASE's base before its branches), or none, as SQLite's
+/// sqlite3ExprCollSeq reads it.
+fn set_explicit_collation(
+    program: &mut ProgramBuilder,
+    expr: &ast::Expr,
+    resolver: &Resolver,
+) -> Result<()> {
+    let mut explicit = None;
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::Collate(_, name) = e {
+            explicit.get_or_insert(name);
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    match explicit {
+        Some(name) => {
+            let collation = resolver.resolve_collation(name.as_str())?;
+            program.set_collation(Some((collation, true)));
+        }
+        None => program.reset_collation(),
+    }
+    Ok(())
 }
 
 #[inline(never)]
@@ -866,6 +1131,49 @@ fn translate_collate_expr(
     Ok(target_register)
 }
 
+/// The collation a function that compares its arguments compares by: the first argument's that
+/// has one, as SQLite's sqlite3ExprCollSeq of each in turn (an explicit COLLATE in it, else a
+/// column's own collation, BINARY for a column with none, which ends the search too).
+fn arguments_collation(
+    args: &[Box<ast::Expr>],
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<Option<CollationSeq>> {
+    for arg in args {
+        let mut explicit = None;
+        walk_expr(arg, &mut |e: &ast::Expr| -> Result<WalkControl> {
+            if let ast::Expr::Collate(_, name) = e {
+                explicit.get_or_insert(name);
+                return Ok(WalkControl::SkipChildren);
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        if let Some(name) = explicit {
+            return Ok(Some(resolver.resolve_collation(name.as_str())?));
+        }
+        let mut operand = arg.as_ref();
+        loop {
+            operand = match operand {
+                ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => match exprs.first() {
+                    Some(only) => only,
+                    None => break,
+                },
+                ast::Expr::Unary(ast::UnaryOperator::Positive, inner)
+                | ast::Expr::Cast { expr: inner, .. } => inner,
+                _ => break,
+            };
+        }
+        if matches!(operand, ast::Expr::Column { .. } | ast::Expr::RowId { .. }) {
+            let declared = match referenced_tables {
+                Some(tables) => crate::translate::collate::get_collseq_from_expr(operand, tables)?,
+                None => None,
+            };
+            return Ok(Some(declared.unwrap_or(CollationSeq::Binary)));
+        }
+    }
+    Ok(None)
+}
+
 #[inline(never)]
 fn translate_function_call_expr(
     program: &mut ProgramBuilder,
@@ -886,15 +1194,19 @@ fn translate_function_call_expr(
         unreachable!("translate_function_call_expr expects Expr::FunctionCall");
     };
     let args_count = args.len();
-    let func_type = resolver.resolve_function(name.as_str(), args_count)?;
-
-    if func_type.is_none() {
+    let Some(func) = resolver.resolve_function(name.as_str(), args_count)? else {
         crate::bail_parse_error!("no such function: {}", name.as_str());
-    }
-
+    };
+    let collation = match func {
+        Func::Scalar(ScalarFunc::Nullif | ScalarFunc::Min | ScalarFunc::Max) if args_count > 1 => {
+            arguments_collation(args, referenced_tables, resolver)?
+        }
+        _ => None,
+    };
     let func_ctx = FuncCtx {
-        func: func_type.unwrap(),
+        func,
         arg_count: args_count,
+        collation,
     };
 
     match &func_ctx.func {
@@ -948,7 +1260,13 @@ fn translate_function_call_expr(
             | JsonFunc::JsonbReplace
             | JsonFunc::JsonbRemove
             | JsonFunc::JsonInsert
-            | JsonFunc::JsonbInsert => translate_function(
+            | JsonFunc::JsonbInsert
+            | JsonFunc::JsonArrayInsert
+            | JsonFunc::JsonbArrayInsert
+            // SQLite counts json_object's arguments when it runs it, not when it prepares it, so
+            // one it never reaches raises nothing.
+            | JsonFunc::JsonObject
+            | JsonFunc::JsonbObject => translate_function(
                 program,
                 args,
                 referenced_tables,
@@ -987,18 +1305,6 @@ fn translate_function_call_expr(
                     func: func_ctx,
                 });
                 Ok(target_register)
-            }
-            JsonFunc::JsonObject | JsonFunc::JsonbObject => {
-                let args = expect_arguments_even!(args, j);
-
-                translate_function(
-                    program,
-                    args,
-                    referenced_tables,
-                    resolver,
-                    target_register,
-                    func_ctx,
-                )
             }
             JsonFunc::JsonValid => {
                 let args = expect_arguments_max!(args, 2, j);

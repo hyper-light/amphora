@@ -369,18 +369,15 @@ impl PathOperation for SetOperation {
             let (JsonbHeader(_, array_value_size), array_value_header_size) =
                 json.read_header(array_value_idx)?;
 
-            let delta =
-                value.len() as isize - (array_value_size + array_value_header_size) as isize;
-
             let end_pos = array_value_idx + array_value_size + array_value_header_size;
-            json.data
-                .splice(array_value_idx..end_pos, value.iter().copied());
+            let delta = json.replace_element(array_value_idx, end_pos, value)?;
 
-            // update parent
-            let h_delta = if matches!(
-                target.field_key_index,
-                JsonLocationKind::ObjectProperty(_) | JsonLocationKind::DocumentRoot
-            ) {
+            // update parent, unless it kept its size
+            let h_delta = if delta != 0
+                && matches!(
+                    target.field_key_index,
+                    JsonLocationKind::ObjectProperty(_) | JsonLocationKind::DocumentRoot
+                ) {
                 let new_h_delta = json.write_element_header(
                     obj_value_idx,
                     ElementType::ARRAY,
@@ -397,12 +394,8 @@ impl PathOperation for SetOperation {
             let old_value_idx = target.field_value_index;
             let (JsonbHeader(_, old_value_size), old_value_header_size) =
                 json.read_header(old_value_idx)?;
-            let delta = value.len() as isize - (old_value_header_size + old_value_size) as isize;
-
             let end_pos = old_value_idx + old_value_header_size + old_value_size;
-
-            json.data
-                .splice(old_value_idx..end_pos, value.iter().copied());
+            let delta = json.replace_element(old_value_idx, end_pos, value)?;
 
             json.update_parent_references(stack, delta + target.delta)?;
         }
@@ -534,18 +527,15 @@ impl PathOperation for ReplaceOperation {
             let (JsonbHeader(_, array_value_size), array_value_header_size) =
                 json.read_header(array_value_idx)?;
 
-            let delta =
-                value.len() as isize - (array_value_size + array_value_header_size) as isize;
-
             let end_pos = array_value_idx + array_value_size + array_value_header_size;
-            json.data
-                .splice(array_value_idx..end_pos, value.iter().copied());
+            let delta = json.replace_element(array_value_idx, end_pos, value)?;
 
-            // update parent
-            let h_delta = if matches!(
-                target.field_key_index,
-                JsonLocationKind::ObjectProperty(_) | JsonLocationKind::DocumentRoot
-            ) {
+            // update parent, unless it kept its size
+            let h_delta = if delta != 0
+                && matches!(
+                    target.field_key_index,
+                    JsonLocationKind::ObjectProperty(_) | JsonLocationKind::DocumentRoot
+                ) {
                 let new_h_delta = json.write_element_header(
                     obj_value_idx,
                     ElementType::ARRAY,
@@ -562,12 +552,8 @@ impl PathOperation for ReplaceOperation {
             let old_value_idx = target.field_value_index;
             let (JsonbHeader(_, old_value_size), old_value_header_size) =
                 json.read_header(old_value_idx)?;
-            let delta = value.len() as isize - (old_value_header_size + old_value_size) as isize;
-
             let end_pos = old_value_idx + old_value_header_size + old_value_size;
-
-            json.data
-                .splice(old_value_idx..end_pos, value.iter().copied());
+            let delta = json.replace_element(old_value_idx, end_pos, value)?;
 
             json.update_parent_references(stack, delta + target.delta)?;
         }
@@ -615,18 +601,15 @@ impl PathOperation for InsertOperation {
             let (JsonbHeader(_, array_value_size), array_value_header_size) =
                 json.read_header(array_value_idx)?;
 
-            let delta =
-                value.len() as isize - (array_value_size + array_value_header_size) as isize;
-
             let end_pos = array_value_idx + array_value_size + array_value_header_size;
-            json.data
-                .splice(array_value_idx..end_pos, value.iter().copied());
+            let delta = json.replace_element(array_value_idx, end_pos, value)?;
 
-            // update parent
-            let h_delta = if matches!(
-                target.field_key_index,
-                JsonLocationKind::ObjectProperty(_) | JsonLocationKind::DocumentRoot
-            ) {
+            // update parent, unless it kept its size
+            let h_delta = if delta != 0
+                && matches!(
+                    target.field_key_index,
+                    JsonLocationKind::ObjectProperty(_) | JsonLocationKind::DocumentRoot
+                ) {
                 let new_h_delta = json.write_element_header(
                     obj_value_idx,
                     ElementType::ARRAY,
@@ -643,17 +626,75 @@ impl PathOperation for InsertOperation {
             let old_value_idx = target.field_value_index;
             let (JsonbHeader(_, old_value_size), old_value_header_size) =
                 json.read_header(old_value_idx)?;
-            let delta = value.len() as isize - (old_value_header_size + old_value_size) as isize;
-
             let end_pos = old_value_idx + old_value_header_size + old_value_size;
-
-            json.data
-                .splice(old_value_idx..end_pos, value.iter().copied());
+            let delta = json.replace_element(old_value_idx, end_pos, value)?;
 
             json.update_parent_references(stack, delta + target.delta)?;
         }
 
         Ok(())
+    }
+}
+
+/// json_array_insert's edit of an element found at an array index (SQLite's JEDIT_AINS): the value
+/// goes in before it, and the array is one element longer.
+pub struct ArrayInsertOperation {
+    value: Jsonb,
+    mode: PathOperationMode,
+}
+
+impl ArrayInsertOperation {
+    pub fn new(value: Jsonb) -> Self {
+        Self {
+            value,
+            mode: PathOperationMode::ReplaceExisting,
+        }
+    }
+}
+
+impl PathOperation for ArrayInsertOperation {
+    fn operation_mode(&self) -> PathOperationMode {
+        self.mode
+    }
+
+    fn execute(&mut self, json: &mut Jsonb, mut stack: Vec<JsonTraversalResult>) -> Result<()> {
+        let malformed = || LimboError::ParseError("malformed JSON".to_string());
+        let target = stack.pop().ok_or_else(|| {
+            LimboError::InternalError("json_array_insert found no element".to_string())
+        })?;
+        let element_idx = target.get_array_index().ok_or_else(|| {
+            LimboError::InternalError("json_array_insert's element is in no array".to_string())
+        })?;
+        if element_idx > json.data.len() {
+            return Err(malformed());
+        }
+        let array_idx = target.field_value_index;
+        let (JsonbHeader(_, array_size), array_header_size) = json.read_header(array_idx)?;
+        let value = &self.value.data;
+        let grown = array_size.checked_add(value.len()).ok_or_else(malformed)?;
+        let delta = isize::try_from(value.len()).map_err(|_| malformed())?;
+        json.data
+            .splice(element_idx..element_idx, value.iter().copied());
+        // As SetOperation: the array's own header here when a key or the root holds it; an
+        // array inside an array is resized with its parents.
+        let header_delta = if matches!(
+            target.field_key_index,
+            JsonLocationKind::ObjectProperty(_) | JsonLocationKind::DocumentRoot
+        ) {
+            let header_size =
+                json.write_element_header(array_idx, ElementType::ARRAY, grown, true)?;
+            let new = isize::try_from(header_size).map_err(|_| malformed())?;
+            let old = isize::try_from(array_header_size).map_err(|_| malformed())?;
+            new.checked_sub(old).ok_or_else(malformed)?
+        } else {
+            0
+        };
+        let total = target
+            .delta
+            .checked_add(delta)
+            .and_then(|d| d.checked_add(header_delta))
+            .ok_or_else(malformed)?;
+        json.update_parent_references(stack, total)
     }
 }
 
@@ -951,6 +992,15 @@ impl Jsonb {
     pub fn make_empty_obj(size: usize) -> Result<Self> {
         let mut jsonb = Self::new(size.max(1))?;
         jsonb.write_element_header(0, ElementType::OBJECT, 0, false)?;
+        Ok(jsonb)
+    }
+
+    /// One TEXTRAW element holding `text` as it is: what SQLite's jsonFunctionArgToBlob makes of
+    /// SQL text given to json_set, json_insert, json_replace or json_array_insert.
+    pub fn text_raw(text: &str) -> Result<Self> {
+        let mut jsonb = Self::new(text.len().checked_add(9).ok_or(LimboError::OutOfMemory)?)?;
+        jsonb.write_element_header(0, ElementType::TEXTRAW, text.len(), false)?;
+        jsonb.data.try_extend(text.bytes())?;
         Ok(jsonb)
     }
 
@@ -2313,11 +2363,12 @@ impl Jsonb {
                         len += 1;
                     }
 
-                    // Exponent must have at least one digit
+                    // Exponent must have at least one digit; SQLite reports one missing at the
+                    // `e`, or at the sign after it.
                     if pos >= input.len() || !input[pos].is_ascii_digit() {
                         return Err(PError::Message {
                             msg: "malformed JSON".to_string(),
-                            location: Some(pos),
+                            location: pos.checked_sub(1),
                         });
                     }
                 }
@@ -2511,11 +2562,12 @@ impl Jsonb {
         // Skip any trailing whitespace
         pos = skip_whitespace_tracking(input, pos, &mut info);
 
-        // Check for any non-whitespace characters after the JSON value
+        // Check for any non-whitespace characters after the JSON value. SQLite fails these
+        // without an offset (jsonConvertTextToBlob leaves iErr 0), so json_error_position says 1.
         if pos < input.len() {
             return Err(PError::Message {
                 msg: "Unexpected input after json".to_string(),
-                location: Some(pos),
+                location: Some(0),
             });
         }
 
@@ -2645,6 +2697,71 @@ impl Jsonb {
         result
     }
 
+    /// Puts `value`, one element, in place of the element at `start..end`, as SQLite's jsonBlobEdit
+    /// does, and says how many bytes the blob grew by (negative when it shrank). A value one to
+    /// eight bytes shorter whose header can be widened by the difference is written in the old
+    /// one's place with the wider header (jsonBlobOverwrite): nothing after it moves, no container
+    /// changes size, and the bytes are SQLite's.
+    fn replace_element(&mut self, start: usize, end: usize, value: &[u8]) -> Result<isize> {
+        let malformed = || LimboError::ParseError("malformed JSON".to_string());
+        let old_len = end.checked_sub(start).ok_or_else(malformed)?;
+        let widened = old_len
+            .checked_sub(value.len())
+            .filter(|d| (1..=8).contains(d))
+            .and_then(|d| widened_element(value, d));
+        if let Some(widened) = widened {
+            let place = self.data.get_mut(start..end).ok_or_else(malformed)?;
+            if place.len() != widened.len() {
+                return Err(malformed());
+            }
+            place.copy_from_slice(&widened);
+            return Ok(0);
+        }
+        if end > self.data.len() {
+            return Err(malformed());
+        }
+        self.data.try_reserve(value.len().saturating_sub(old_len))?;
+        self.data.splice(start..end, value.iter().copied());
+        let grown = isize::try_from(value.len()).map_err(|_| malformed())?;
+        let old_len = isize::try_from(old_len).map_err(|_| malformed())?;
+        grown.checked_sub(old_len).ok_or_else(malformed)
+    }
+
+    /// Appends a key and its value, each a JSONB element, after the last key of the object at
+    /// `path`, as SQLite's jsonMergePatch appends a key its target lacks.
+    fn append_to_object(&mut self, path: &JsonPath, label: &[u8], value: &[u8]) -> Result<()> {
+        let malformed = || LimboError::ParseError("malformed JSON".to_string());
+        let stack = self.navigate_path(path, PathOperationMode::ReplaceExisting)?;
+        let end = self.skip_element(stack.last().ok_or_else(malformed)?.field_value_index)?;
+        if end > self.data.len() {
+            return Err(malformed());
+        }
+        let added = label.len().checked_add(value.len()).ok_or_else(malformed)?;
+        self.data.try_reserve(added)?;
+        self.data
+            .splice(end..end, label.iter().chain(value).copied());
+        self.update_parent_references(stack, isize::try_from(added).map_err(|_| malformed())?)
+    }
+
+    /// Puts an empty object in place of the element `stack` ends at, as SQLite's jsonMergePatch
+    /// empties a target that isn't an object before merging an object into it (its payload
+    /// removed, never a header widened in its place).
+    fn empty_object_at(&mut self, mut stack: Vec<JsonTraversalResult>) -> Result<()> {
+        let malformed = || LimboError::ParseError("malformed JSON".to_string());
+        let start = stack.pop().ok_or_else(malformed)?.field_value_index;
+        let end = self.skip_element(start)?;
+        if end > self.data.len() {
+            return Err(malformed());
+        }
+        let empty = JsonbHeader::make_obj().into_bytes();
+        let empty = empty.as_bytes();
+        self.data.splice(start..end, empty.iter().copied());
+        let old_len = isize::try_from(end.checked_sub(start).ok_or_else(malformed)?)
+            .map_err(|_| malformed())?;
+        let new_len = isize::try_from(empty.len()).map_err(|_| malformed())?;
+        self.update_parent_references(stack, new_len.checked_sub(old_len).ok_or_else(malformed)?)
+    }
+
     fn update_parent_references(
         &mut self,
         stack: Vec<JsonTraversalResult>,
@@ -2657,6 +2774,13 @@ impl Jsonb {
         // the change twice.
         let mut last_container: Option<usize> = None;
         for parent in stack.iter().rev() {
+            // A container whose contents kept their size keeps its header, as SQLite's does
+            // (jsonAfterEditSizeAdjust runs only on a change): one SQLite wrote wide stays wide.
+            if delta == 0 {
+                delta = parent.delta;
+                last_container = Some(parent.field_value_index);
+                continue;
+            }
             let (JsonbHeader(el_type, el_size), el_header_len) =
                 self.read_header(parent.field_value_index)?;
 
@@ -3239,9 +3363,15 @@ impl Jsonb {
     pub fn patch(&mut self, patch: &Jsonb) -> Result<()> {
         let (patch_header, _) = patch.read_header(0)?;
 
+        // A patch that isn't an object replaces the target, put in its place as SQLite's
+        // jsonMergePatch puts it (jsonBlobEdit).
         if patch_header.0 != ElementType::OBJECT {
-            self.data.clear();
-            self.data.extend_from_slice(&patch.data);
+            let end = self.skip_element(0)?;
+            let patch_root = patch
+                .data
+                .get(..patch.skip_element(0)?)
+                .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+            self.replace_element(0, end, patch_root)?;
             return Ok(());
         }
 
@@ -3279,16 +3409,15 @@ impl Jsonb {
                 // Read the value
                 let value_cursor = key_start + key_header.1;
                 let (value_header, value_header_size) = patch.read_header(value_cursor)?;
-                let key_text = if matches!(
-                    key_header.0,
-                    ElementType::TEXT5 | ElementType::TEXTJ | ElementType::TEXTRAW
-                ) {
+                // TEXT and TEXTRAW labels hold no escapes: a backslash in one is a backslash.
+                let key_text = if matches!(key_header.0, ElementType::TEXT5 | ElementType::TEXTJ) {
                     Cow::Owned(unescape_string(key_text))
                 } else {
                     Cow::Borrowed(key_text)
                 };
 
                 key_values.push((
+                    patch_key_cursor,
                     key_text,
                     value_header.0,
                     value_cursor,
@@ -3299,65 +3428,59 @@ impl Jsonb {
                 patch_key_cursor = value_cursor + value_header_size + value_header.1;
             }
 
-            for (key_text, value_type, value_cursor, value_header_size, value_size) in key_values {
+            // Each key as SQLite's jsonMergePatch merges it: the patch's label and value bytes go
+            // in as the patch holds them.
+            for (label_start, key_text, value_type, value_cursor, value_header_size, value_size) in
+                key_values
+            {
                 // Create a path to this key
                 let mut key_path = path.clone();
 
                 key_path.elements.push(PathElement::Key(key_text, false));
 
-                match value_type {
-                    ElementType::NULL => {
+                let malformed = || LimboError::ParseError("malformed JSON".to_string());
+                let value_end = value_cursor
+                    .checked_add(value_header_size)
+                    .and_then(|end| end.checked_add(value_size))
+                    .ok_or_else(malformed)?;
+                let label = patch
+                    .data
+                    .get(label_start..value_cursor)
+                    .ok_or_else(malformed)?;
+                let value_data = patch
+                    .data
+                    .get(value_cursor..value_end)
+                    .ok_or_else(malformed)?;
+                let found = result.navigate_path(&key_path, PathOperationMode::ReplaceExisting);
+
+                match (value_type, found) {
+                    // A NULL deletes the key, where there is one.
+                    (ElementType::NULL, Ok(_)) => {
                         let mut op = DeleteOperation::new();
-
-                        let _ = result.operate_on_path(&key_path, &mut op);
+                        result.operate_on_path(&key_path, &mut op)?;
                     }
-                    ElementType::OBJECT => {
-                        let value_data = &patch.data
-                            [value_cursor..value_cursor + value_header_size + value_size];
-
-                        let target_path_result =
-                            result.navigate_path(&key_path, PathOperationMode::ReplaceExisting);
-
-                        if let Ok(target_stack) = target_path_result {
-                            let target_value_idx = target_stack
-                                .last()
-                                .ok_or_else(|| {
-                                    LimboError::InternalError(
-                                        "target stack should not be empty".to_string(),
-                                    )
-                                })?
-                                .field_value_index;
-                            let (target_header, _) = result.read_header(target_value_idx)?;
-
-                            if target_header.0 == ElementType::OBJECT {
-                                work_stack.push_back((key_path, value_cursor));
-                            } else {
-                                let patch_obj = Jsonb::from_raw_data(value_data)?;
-                                let mut op = ReplaceOperation::new(patch_obj);
-                                result.operate_on_path(&key_path, &mut op)?;
-                                let _ = result.operate_on_path(&key_path, &mut op);
-
-                                work_stack.push_back((key_path, value_cursor));
-                            }
-                        } else {
-                            let empty_obj = Jsonb::from_raw_data(
-                                JsonbHeader::make_obj().into_bytes().as_bytes(),
-                            )?;
-                            let mut op = SetOperation::new(empty_obj);
-                            let _ = result.operate_on_path(&key_path, &mut op);
-
-                            work_stack.push_back((key_path, value_cursor));
+                    (ElementType::NULL, Err(_)) => {}
+                    // An object merges into the target's value, emptied first where it isn't an
+                    // object; a key the target lacks comes last, with an empty object to merge into.
+                    (ElementType::OBJECT, Ok(stack)) => {
+                        let at = stack.last().ok_or_else(malformed)?.field_value_index;
+                        let (JsonbHeader(target_type, _), _) = result.read_header(at)?;
+                        if target_type != ElementType::OBJECT {
+                            result.empty_object_at(stack)?;
                         }
+                        work_stack.push_back((key_path, value_cursor));
                     }
-                    _ => {
-                        let value_data = &patch.data
-                            [value_cursor..value_cursor + value_header_size + value_size];
-                        let patch_value = Jsonb::from_raw_data(value_data)?;
-
-                        let mut op = SetOperation::new(patch_value);
-
-                        let _ = result.operate_on_path(&key_path, &mut op);
+                    (ElementType::OBJECT, Err(_)) => {
+                        let empty = JsonbHeader::make_obj().into_bytes();
+                        result.append_to_object(&path, label, empty.as_bytes())?;
+                        work_stack.push_back((key_path, value_cursor));
                     }
+                    // Any other value takes the target's value's place, or comes last.
+                    (_, Ok(_)) => {
+                        let mut op = ReplaceOperation::new(Jsonb::from_raw_data(value_data)?);
+                        result.operate_on_path(&key_path, &mut op)?;
+                    }
+                    (_, Err(_)) => result.append_to_object(&path, label, value_data)?,
                 }
             }
         }
@@ -3553,6 +3676,41 @@ impl std::str::FromStr for Jsonb {
 /// UTF-8 well-formedness of the payload may be assumed here: an unchecked
 /// decode would hand invalid UTF-8 to `&str` consumers such as
 /// [`unescape_string`], which is undefined behaviour.
+/// `value`, one JSONB element, with its header `d` bytes wider (one to eight) where that is a size
+/// JSONB's headers come in (2, 3, 5 or 9 bytes), as SQLite's jsonBlobOverwrite writes it; NULL,
+/// true and false never grow.
+fn widened_element(value: &[u8], d: usize) -> Option<Vec<u8>> {
+    let first = *value.first()?;
+    if first & 0x0f <= 2 {
+        return None;
+    }
+    let header_len: usize = match first >> 4 {
+        12 => 2,
+        13 => 3,
+        14 => 5,
+        15 => 9,
+        _ => 1,
+    };
+    let widened_len = header_len.checked_add(d)?;
+    let size_nibble: u8 = match widened_len {
+        2 => 0xc0,
+        3 => 0xd0,
+        5 => 0xe0,
+        9 => 0xf0,
+        _ => return None,
+    };
+    let payload = value.get(header_len..)?;
+    let size = u64::try_from(payload.len()).ok()?.to_be_bytes();
+    let size = size.get(size.len().checked_sub(widened_len.checked_sub(1)?)?..)?;
+    let mut out = Vec::new();
+    out.try_reserve(widened_len.checked_add(payload.len())?)
+        .ok()?;
+    out.push((first & 0x0f) | size_nibble);
+    out.extend_from_slice(size);
+    out.extend_from_slice(payload);
+    Some(out)
+}
+
 fn read_text_payload(data: &[u8], start: usize, len: usize) -> Result<&str> {
     let Some(end) = start.checked_add(len) else {
         bail_parse_error!("malformed JSON: text payload size overflow");
@@ -3563,19 +3721,14 @@ fn read_text_payload(data: &[u8], start: usize, len: usize) -> Result<&str> {
     from_utf8(bytes).map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
 }
 
-/// Picks the element type for an object key created from a path label.
-/// A quoted label that contains a backslash carries escape sequences
-/// that must stay escape sequences, so it is stored as TEXT5 exactly
-/// like SQLite stores it; a quoted label without escapes is raw text
-/// (TEXTRAW). An unquoted label keeps the historical TEXT encoding,
-/// whose serialization also escapes the raw bytes.
+/// Picks the element type for an object key created from a path label, as SQLite's jsonLookupStep
+/// does: a quoted label that contains a backslash carries escape sequences that must stay escape
+/// sequences, so it is stored as TEXT5; any other label is raw text (TEXTRAW).
 fn new_key_element_type(path_key: &str, is_quoted: bool) -> ElementType {
     if is_quoted && path_key.contains('\\') {
         ElementType::TEXT5
-    } else if is_quoted {
-        ElementType::TEXTRAW
     } else {
-        ElementType::TEXT
+        ElementType::TEXTRAW
     }
 }
 

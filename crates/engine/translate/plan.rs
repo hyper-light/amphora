@@ -190,6 +190,10 @@ pub struct GroupBy {
     pub sort_elided: bool,
     /// having clause split into a vec at 'AND' boundaries.
     pub having: Option<Vec<ast::Expr>>,
+    /// This query's columns that a subquery run after grouping (in HAVING or ORDER BY) reads as
+    /// outer references, which no clause of this query need name: the GROUP BY carries them with
+    /// the group's row, as SQLite's AggInfo carries a subquery's columns (`outer_columns_read`).
+    pub carried: Vec<ast::Expr>,
 }
 
 /// The JOIN that supplied a term and whether that JOIN keeps unmatched rows.
@@ -1788,6 +1792,8 @@ pub struct TablePlanEstimate {
     pub access_cost: f64,
     /// Cost of the join prefix through this table access.
     pub total_cost: f64,
+    /// The access's place in the join order: the last one's `output_rows` are the join's.
+    pub position: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -4295,6 +4301,22 @@ impl NonFromClauseSubquery {
         }
     }
 
+    /// The earliest place the subquery can run in this join order: before the loops when it reads
+    /// no table of the parent query, else after the last table it reads.
+    pub fn required_eval_at(
+        &self,
+        join_order: &[JoinOrderMember],
+        table_references: Option<&TableReferences>,
+    ) -> Result<EvalAt> {
+        match &self.state {
+            SubqueryState::Unevaluated { plan: Some(plan) } => {
+                eval_at_for_plan(plan, join_order, table_references)
+            }
+            SubqueryState::Unevaluated { plan: None } => Ok(EvalAt::BeforeLoop),
+            SubqueryState::Evaluated { evaluated_at, .. } => Ok(*evaluated_at),
+        }
+    }
+
     /// Returns the loop index where the subquery should be evaluated in this join order.
     ///
     /// If the subquery references tables from the parent query, it is evaluated at
@@ -4499,6 +4521,72 @@ pub fn plan_has_outer_scope_dependency(plan: &Plan) -> bool {
 
 pub fn select_plan_has_outer_scope_dependency(plan: &SelectPlan) -> bool {
     select_plan_has_outer_scope_dependency_with_tables(plan, &mut Vec::new())
+}
+
+/// The columns of `tables` (a query's own tables) that `plan`, one of its subqueries, reads as
+/// outer references, its own subqueries' included: each once, a column as the binder writes it
+/// and a rowid as `RowId`. The plans are walked from a stack, as deep as the statement nests them.
+pub fn outer_columns_read(plan: &Plan, tables: &TableReferences) -> Vec<ast::Expr> {
+    let mut read: Vec<ast::Expr> = Vec::new();
+    let mut plans: Vec<&Plan> = vec![plan];
+    let mut selects: Vec<&SelectPlan> = Vec::new();
+    while let Some(plan) = plans.pop() {
+        match plan {
+            Plan::Select(select) => selects.push(select),
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                selects.extend(left.iter().map(|(select, _)| select));
+                selects.push(right_most);
+            }
+            Plan::RecursiveCte(recursive_cte) => {
+                plans.push(&recursive_cte.initial_query);
+                plans.push(&recursive_cte.recursive_query);
+            }
+            Plan::Delete(_) | Plan::Update(_) => {}
+        }
+        while let Some(select) = selects.pop() {
+            for outer_ref in select.table_references.outer_query_refs() {
+                let Some(table) = tables.find_joined_table_by_internal_id(outer_ref.internal_id)
+                else {
+                    continue;
+                };
+                let columns = outer_ref.col_used_mask.iter().filter_map(|column| {
+                    let is_rowid_alias = table.columns().get(column)?.is_rowid_alias();
+                    Some(ast::Expr::Column {
+                        database: None,
+                        table: outer_ref.internal_id,
+                        column,
+                        is_rowid_alias,
+                    })
+                });
+                let rowid = if outer_ref.rowid_referenced {
+                    Some(ast::Expr::RowId {
+                        database: None,
+                        table: outer_ref.internal_id,
+                    })
+                } else {
+                    None
+                };
+                for expr in columns.chain(rowid) {
+                    if !read.contains(&expr) {
+                        read.push(expr);
+                    }
+                }
+            }
+            for subquery in &select.non_from_clause_subqueries {
+                if let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state {
+                    plans.push(plan);
+                }
+            }
+            for joined in select.table_references.joined_tables() {
+                if let Table::FromClauseSubquery(subquery) = &joined.table {
+                    plans.push(subquery.plan.as_ref());
+                }
+            }
+        }
+    }
+    read
 }
 
 /// Determine when a SELECT plan can be evaluated, including nested non-FROM and FROM-clause subqueries.

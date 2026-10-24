@@ -90,6 +90,153 @@ pub fn truth_test_rhs(expr: &ast::Expr) -> Option<bool> {
     }
 }
 
+/// The truth SQLite's parser gives a literal of its own (EP_IsTrue and EP_IsFalse): TRUE, FALSE,
+/// or an integer that fits in 32 bits, inside any parentheses; and `x ISNULL`, `x NOTNULL`,
+/// `x IS NULL` and `x IS NOT NULL` with x a number, a string or a BLOB (behind unary + and -),
+/// which its parser makes the integer 0 or 1 (sqlite3PExprIsNull). `None` for anything else, a
+/// REAL and a negated integer among them.
+pub fn literal_truth(expr: &ast::Expr) -> Option<bool> {
+    let mut expr = expr;
+    while let ast::Expr::Parenthesized(exprs) = expr {
+        let [only] = exprs.as_slice() else {
+            return None;
+        };
+        expr = only;
+    }
+    let is_constant_value = |mut operand: &ast::Expr| {
+        while let ast::Expr::Unary(
+            ast::UnaryOperator::Positive | ast::UnaryOperator::Negative,
+            inner,
+        ) = operand
+        {
+            operand = inner;
+        }
+        matches!(
+            operand,
+            ast::Expr::Literal(
+                ast::Literal::Numeric(_) | ast::Literal::String(_) | ast::Literal::Blob(_)
+            )
+        )
+    };
+    // A NULL test the parser folds is the integer 0 or 1, so a NULL test of it folds too:
+    // `(2.0 NOTNULL) NOTNULL` is 1.
+    let folds = |mut operand: &ast::Expr| loop {
+        while let ast::Expr::Parenthesized(exprs) = operand {
+            let [only] = exprs.as_slice() else {
+                return false;
+            };
+            operand = only;
+        }
+        match operand {
+            ast::Expr::IsNull(inner) | ast::Expr::NotNull(inner) => operand = inner,
+            ast::Expr::Binary(inner, ast::Operator::Is | ast::Operator::IsNot, null)
+                if matches!(null.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
+            {
+                operand = inner
+            }
+            _ => return is_constant_value(operand),
+        }
+    };
+    match expr {
+        ast::Expr::IsNull(operand) if folds(operand) => return Some(false),
+        ast::Expr::NotNull(operand) if folds(operand) => return Some(true),
+        ast::Expr::Binary(operand, op @ (ast::Operator::Is | ast::Operator::IsNot), null)
+            if matches!(null.as_ref(), ast::Expr::Literal(ast::Literal::Null))
+                && folds(operand) =>
+        {
+            return Some(matches!(op, ast::Operator::IsNot));
+        }
+        _ => {}
+    }
+    match expr {
+        ast::Expr::Literal(ast::Literal::True) => Some(true),
+        ast::Expr::Literal(ast::Literal::False) => Some(false),
+        ast::Expr::Literal(ast::Literal::Numeric(digits)) => {
+            let value = match digits
+                .strip_prefix("0x")
+                .or_else(|| digits.strip_prefix("0X"))
+            {
+                Some(hex) => i64::from_str_radix(hex, 16).ok()?,
+                None => digits.parse::<i64>().ok()?,
+            };
+            i32::try_from(value).ok().map(|value| value != 0)
+        }
+        _ => None,
+    }
+}
+
+/// What SQLite's sqlite3ExprSimplifiedAndOr makes of an AND or an OR: an operand always true or
+/// always false (a literal's truth, [literal_truth]) settles it, its own ANDs and ORs simplified
+/// first, so `x OR (1 OR y)` is `1` and `x AND (y AND 0)` is `0`; `x AND 1` is `x`. Anything else
+/// is the expression itself. What it drops is never read, so an error it would raise never comes
+/// up. Children go before parents on a stack of its own (no recursion, CLAUDE.md section 11).
+pub fn simplified_and_or(expr: &ast::Expr) -> &ast::Expr {
+    let mut todo: Vec<(&ast::Expr, bool)> = vec![(expr, false)];
+    let mut done: Vec<&ast::Expr> = Vec::new();
+    while let Some((node, children_done)) = todo.pop() {
+        let mut inner = node;
+        while let ast::Expr::Parenthesized(exprs) = inner {
+            let [only] = exprs.as_slice() else {
+                break;
+            };
+            inner = only;
+        }
+        let ast::Expr::Binary(lhs, op @ (ast::Operator::And | ast::Operator::Or), rhs) = inner
+        else {
+            done.push(node);
+            continue;
+        };
+        if !children_done {
+            todo.push((node, true));
+            todo.push((rhs, false));
+            todo.push((lhs, false));
+            continue;
+        }
+        let (Some(rhs), Some(lhs)) = (done.pop(), done.pop()) else {
+            return expr;
+        };
+        let and = matches!(op, ast::Operator::And);
+        done.push(
+            if literal_truth(lhs) == Some(true) || literal_truth(rhs) == Some(false) {
+                if and {
+                    rhs
+                } else {
+                    lhs
+                }
+            } else if literal_truth(rhs) == Some(true) || literal_truth(lhs) == Some(false) {
+                if and {
+                    lhs
+                } else {
+                    rhs
+                }
+            } else {
+                node
+            },
+        );
+    }
+    done.pop().unwrap_or(expr)
+}
+
+/// Whether `expr` holds a subquery anywhere in it: SQLite's EP_Subquery, which a parent takes from
+/// its children and by which 3.54 orders what it computes (exprEvalRhsFirst, exprComputeOperands).
+pub fn has_subquery(expr: &ast::Expr) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if matches!(
+            e,
+            ast::Expr::SubqueryResult { .. }
+                | ast::Expr::Exists(_)
+                | ast::Expr::Subquery(_)
+                | ast::Expr::InSelect { .. }
+        ) {
+            found = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
 /// Recursively unwrap parentheses from an owned Expr.
 /// Returns how many pairs of parentheses were removed.
 pub fn unwrap_parens_owned(expr: ast::Expr) -> Result<(ast::Expr, usize)> {

@@ -11,14 +11,14 @@ use super::{
     plan::{Aggregate, Operation, QueryDestination, Search, SelectPlan},
     planner::{resolve_window_and_aggregate_functions, TableMask},
 };
-use crate::translate::expr::comparison_affinity;
+use crate::translate::expr::in_subquery_affinity;
 use crate::turso_assert;
 use crate::{
     alloc::TursoIteratorExt,
     emit_explain,
     schema::{BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, Table},
     translate::{
-        collate::get_collseq_from_expr,
+        collate::{get_collseq_from_expr, resolve_comparison_collseq_across},
         compound_select::emit_program_for_compound_select,
         emitter::select::{
             emit_materialized_build_inputs, emit_program_for_select,
@@ -31,7 +31,7 @@ use crate::{
         expr::{get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut, WalkControl},
         optimizer::optimize_select_plan,
         plan::{
-            plan_has_outer_scope_dependency, plan_is_correlated,
+            outer_columns_read, plan_has_outer_scope_dependency, plan_is_correlated,
             select_plan_has_outer_scope_dependency, ColumnUsedMask, EvalAt, JoinInfo,
             JoinOrderMember, JoinedTable, NonFromClauseSubquery, OuterQueryReference, Plan,
             SubqueryEvalPhase, SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences,
@@ -995,25 +995,24 @@ fn get_subquery_parser<'a>(
                         result_columns.len()
                     );
                 }
-                // Collect affinity and LHS collation in a single pass over lhs_columns.
-                // "x IN (SELECT y ...)" uses the collation of x
-                // (https://www.sqlite.org/datatype3.html#collation §7.1),
-                // so the ephemeral index must use the LHS collation for correct
-                // NotFound/Found probe comparisons.
+                // Collect affinity and the LHS in a single pass over lhs_columns.
+                // "x IN (SELECT y ...)" collates as "x = y" does
+                // (https://www.sqlite.org/datatype3.html#collation §7.1), so the
+                // ephemeral index uses that collation for correct NotFound/Found
+                // probe comparisons.
                 let mut affinity_chars = String::with_capacity(lhs_column_count);
-                let mut lhs_collations = Vec::with_capacity(lhs_column_count);
-                for (i, lhs_expr) in lhs_columns.enumerate() {
+                let mut lhs_exprs = Vec::with_capacity(lhs_column_count);
+                for (result_column, lhs_expr) in result_columns.iter().zip(lhs_columns) {
                     let lhs_affinity = get_expr_affinity(lhs_expr, Some(referenced_tables), None);
                     affinity_chars.push(
-                        comparison_affinity(
-                            &result_columns[i].expr,
+                        in_subquery_affinity(
+                            &result_column.expr,
                             lhs_affinity,
                             Some(table_references),
-                            None,
                         )
                         .aff_mask(),
                     );
-                    lhs_collations.push(get_collseq_from_expr(lhs_expr, referenced_tables)?);
+                    lhs_exprs.push(lhs_expr);
                 }
                 let in_affinity_str: Arc<String> = Arc::new(affinity_chars);
 
@@ -1021,13 +1020,23 @@ fn get_subquery_parser<'a>(
                     .iter()
                     .enumerate()
                     .map(|(i, c)| {
-                        let rhs_collation = get_collseq_from_expr(&c.expr, table_references)?;
+                        // x and y compare as `x = y` does: a column on the left (even one of
+                        // BINARY) before one on the right.
+                        let collation = match lhs_exprs.get(i) {
+                            Some(lhs_expr) => Some(resolve_comparison_collseq_across(
+                                lhs_expr,
+                                referenced_tables,
+                                &c.expr,
+                                table_references,
+                            )?),
+                            None => get_collseq_from_expr(&c.expr, table_references)?,
+                        };
                         Ok::<_, crate::LimboError>(IndexColumn {
                             name: c.name(table_references).unwrap_or("").to_string(),
                             order: SortOrder::Asc,
                             nulls_order: None,
                             pos_in_table: i,
-                            collation: lhs_collations[i].or(rhs_collation),
+                            collation,
                             default: None,
                             expr: None,
                         })
@@ -2257,16 +2266,24 @@ pub fn emit_non_from_clause_subqueries_for_phase(
         };
 
         let subquery_plan = subquery.consume_plan(evaluated_at);
+        // A subquery run in the loops reads its parent's rows from their cursors; but what an
+        // enclosing query's output phase read into registers, when this query is a subquery run
+        // there, it reads from those registers as this query does.
+        let in_loops = matches!(
+            phase,
+            SubqueryEvalPhase::BeforeLoop | SubqueryEvalPhase::Loop(_)
+        );
+        let outer_cache_resolver = match table_references {
+            Some(own) if in_loops => resolver.fork_with_outer_expr_cache(own),
+            _ => None,
+        };
         emit_non_from_clause_subquery(
             program,
-            resolver,
+            outer_cache_resolver.as_ref().unwrap_or(resolver),
             *subquery_plan,
             &subquery.query_type,
             subquery.correlated,
-            !matches!(
-                phase,
-                SubqueryEvalPhase::BeforeLoop | SubqueryEvalPhase::Loop(_)
-            ),
+            !in_loops || outer_cache_resolver.is_some(),
         )?;
     }
 
@@ -2376,6 +2393,30 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
         if !rc.contains_aggregates && expr_reads_subquery(&rc.expr, &outer_aggregate_subquery_ids) {
             rc.contains_aggregates = true;
         }
+    }
+
+    // A subquery run after grouping reads this query's columns from the group's row, so the
+    // GROUP BY carries the ones its outer references name; otherwise it would read the table's
+    // cursor, which the scan has left behind (NULL).
+    let mut carried: Vec<ast::Expr> = Vec::new();
+    for subquery in &plan.non_from_clause_subqueries {
+        let SubqueryState::Unevaluated {
+            plan: Some(subplan),
+        } = &subquery.state
+        else {
+            continue;
+        };
+        if !matches!(subquery.eval_phase, SubqueryEvalPhase::GroupedOutput) {
+            continue;
+        }
+        for expr in outer_columns_read(subplan, &plan.table_references) {
+            if !carried.contains(&expr) {
+                carried.push(expr);
+            }
+        }
+    }
+    if let Some(group_by) = plan.group_by.as_mut() {
+        group_by.carried = carried;
     }
 }
 

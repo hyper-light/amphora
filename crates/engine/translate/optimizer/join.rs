@@ -7,7 +7,7 @@ use amphora_engine_parser::ast::{Operator, SubqueryType, TableInternalId};
 
 use super::{
     access_method::{add_where_cost, find_best_access_method_for_join_order, AccessMethod},
-    constraints::{usable_constraints_for_lhs_mask, TableConstraints},
+    constraints::{usable_constraints_for_lhs_mask, Constraint, TableConstraints},
     cost_params::CostModelParams,
     order::OrderTarget,
     AvailableIndexes, IndexMethodCandidate,
@@ -106,9 +106,13 @@ fn constraint_output_multipliers_for(
 ) -> f64 {
     constraints_selectivity(
         rhs_constraints.constraints.iter().filter(|constraint| {
-            (lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask)
-                || constraint.lhs_mask == rhs_self_mask
-                || constraint.lhs_mask.is_empty())
+            // Ready once every table its other side reads is joined, this one among them: a
+            // side reading this table and an earlier one (`a0.c2 IS f(a0.c2, a1.c3)`) counts as
+            // well as one reading either alone, so the estimate doesn't hang on the join order.
+            constraint
+                .lhs_mask
+                .iter()
+                .all(|table| lhs_mask.get(table) || rhs_self_mask.get(table))
                 && !consumed_where_terms.get(constraint.where_clause_pos.0)
                 && !skipped_where_terms.get(constraint.where_clause_pos.0)
                 && !where_clause[constraint.where_clause_pos.0].consumed
@@ -116,6 +120,95 @@ fn constraint_output_multipliers_for(
         }),
         params,
     )
+}
+
+/// The selectivity of the terms this table completes that are homed on a table read earlier: a
+/// term whose most selective constraint is on that table (`a1.c0 NOT IN (1, a0.c0)`, on a1, read
+/// a1 then a0) counts when it becomes ready, as the change it makes to its home table's
+/// constraints' selectivity: a bound joining another on the same column makes a closed range
+/// there, as it does when both are read at that table's step. With every term counted on its home
+/// table in every join order, a join's estimate does not depend on the order its tables are read
+/// in; the oracles' CERT check found estimates that rose when a query was made more restrictive
+/// and its join order changed.
+fn completed_terms_selectivity(
+    method: &AccessMethod,
+    lhs_mask: &TableMask,
+    completed: &Completed<'_>,
+    where_clause: &[WhereTerm],
+    params: &CostModelParams,
+) -> f64 {
+    let terms: SmallVec<[(usize, usize); 4]> = where_clause
+        .iter()
+        .zip(completed.where_terms)
+        .enumerate()
+        .filter(|(term_idx, (term, info))| {
+            !term.consumed
+                && !term.origin.is_outer_join()
+                && !method.consumed_where_terms.get(*term_idx)
+                && info.table_mask.get(completed.rhs_table_number)
+                && completed
+                    .joined_mask
+                    .contains_all_set_bits_of(&info.table_mask)
+        })
+        .filter_map(|(term_idx, (_, info))| {
+            let home = info.home_table?;
+            if home == completed.rhs_table_number {
+                None
+            } else {
+                Some((term_idx, home))
+            }
+        })
+        .collect();
+    let homed_on = |term_idx: usize, table_idx: usize| {
+        completed
+            .where_terms
+            .get(term_idx)
+            .is_some_and(|info| info.home_table == Some(table_idx))
+    };
+    let ready_before = |term_idx: usize| {
+        where_clause
+            .get(term_idx)
+            .is_some_and(|term| !term.consumed)
+            && completed
+                .where_terms
+                .get(term_idx)
+                .is_some_and(|info| lhs_mask.contains_all_set_bits_of(&info.table_mask))
+    };
+    let mut fraction = 1.0;
+    let mut homes: SmallVec<[usize; 4]> = SmallVec::new();
+    for &(_, home) in &terms {
+        if homes.contains(&home) {
+            continue;
+        }
+        homes.push(home);
+        let Some(table) = completed.all_constraints.get(home) else {
+            continue;
+        };
+        let before_here = |c: &&Constraint| {
+            homed_on(c.where_clause_pos.0, home) && ready_before(c.where_clause_pos.0)
+        };
+        let before = constraints_selectivity(table.constraints.iter().filter(before_here), params);
+        let after = constraints_selectivity(
+            table
+                .constraints
+                .iter()
+                .filter(|c| before_here(c) || terms.contains(&(c.where_clause_pos.0, home))),
+            params,
+        );
+        if before > 0.0 {
+            fraction *= (after / before).clamp(0.0, 1.0);
+        }
+    }
+    fraction
+}
+
+/// What `completed_terms_selectivity` reads of a join step: each term's tables and home table,
+/// every table's constraints, the table read, and the tables joined with it.
+struct Completed<'a> {
+    where_terms: &'a [WhereTermInfo],
+    all_constraints: &'a [TableConstraints],
+    rhs_table_number: usize,
+    joined_mask: &'a TableMask,
 }
 
 /// Return the row count after one table and its ready filters.
@@ -128,6 +221,7 @@ fn rows_after_join(
     rhs_mask: TableMask,
     rhs_table: &JoinedTable,
     where_clause: &[WhereTerm],
+    completed: &Completed<'_>,
     params: &CostModelParams,
 ) -> f64 {
     if rhs_table
@@ -141,8 +235,21 @@ fn rows_after_join(
         .join_info
         .as_ref()
         .is_some_and(|join_info| join_info.is_outer());
+    let completed_selectivity =
+        completed_terms_selectivity(method, lhs_mask, completed, where_clause, params);
+    // A term counts on its home table (`completed_terms_selectivity`); one with no information
+    // counts here.
+    let homed_here = |constraint: &super::constraints::Constraint| {
+        completed
+            .where_terms
+            .get(constraint.where_clause_pos.0)
+            .is_none_or(|info| {
+                info.home_table
+                    .is_none_or(|home| home == completed.rhs_table_number)
+            })
+    };
     if !is_outer_join {
-        let remaining_filter_selectivity = constraint_output_multipliers(
+        let remaining_filter_selectivity = constraint_output_multipliers_for(
             rhs_constraints,
             lhs_mask,
             rhs_mask,
@@ -150,10 +257,12 @@ fn rows_after_join(
             &Default::default(),
             where_clause,
             params,
+            homed_here,
         );
         return input_cardinality
             * method.estimated_rows_per_outer_row
-            * remaining_filter_selectivity;
+            * remaining_filter_selectivity
+            * completed_selectivity;
     }
 
     let is_on_term = |constraint: &super::constraints::Constraint| {
@@ -208,14 +317,16 @@ fn rows_after_join(
         &Default::default(),
         where_clause,
         params,
-        |constraint| !is_on_term(constraint) && !selects_unmatched_rows(constraint),
+        |constraint| {
+            !is_on_term(constraint) && !selects_unmatched_rows(constraint) && homed_here(constraint)
+        },
     );
     let rows_per_input = if selects_only_unmatched_rows {
         unmatched_probability
     } else {
         outer_join_rows_per_input
     };
-    input_cardinality * rows_per_input * where_selectivity
+    input_cardinality * rows_per_input * where_selectivity * completed_selectivity
 }
 
 /// Count calls to each subquery when all of its outer tables have been read.
@@ -353,6 +464,31 @@ pub(super) fn count_subquery_calls_for_plan(
                     // anti join loop, a failed filter looks like a missing
                     // match, which emits the outer row instead of rejecting it.
                     let later_table = &joined_tables[plan.data[later_loop].0];
+                    // Nor can a RIGHT or FULL JOIN's right table, or a loop after it: its unmatched
+                    // rows run those loops again with the tables before it NULL, where the filter
+                    // would reject them.
+                    if later_table
+                        .join_info
+                        .as_ref()
+                        .is_some_and(|join_info| join_info.keeps_right_rows())
+                    {
+                        break;
+                    }
+                    // Nor a table an index seeks by a term holding the subquery, or a loop after
+                    // it: the seek's key, read before that table's loop, needs the value.
+                    let seeks_by_it = plan
+                        .data
+                        .get(later_loop)
+                        .and_then(|(_, method)| access_methods.get(*method))
+                        .is_some_and(|method| {
+                            where_clause.iter().enumerate().any(|(index, term)| {
+                                method.consumed_where_terms.get(index)
+                                    && expr_references_subquery_id(&term.expr, subquery_id)
+                            })
+                        });
+                    if seeks_by_it {
+                        break;
+                    }
                     if later_table
                         .join_info
                         .as_ref()
@@ -368,16 +504,13 @@ pub(super) fn count_subquery_calls_for_plan(
             }
             estimates.push(estimate);
         }
-        input_cardinality = rows_after_join(
-            input_cardinality,
-            method,
-            &constraints[*table_number],
-            &prior_tables,
-            table_mask,
-            &joined_tables[*table_number],
-            where_clause,
-            params,
-        );
+        // The rows the join search estimated after this table, which the calls of a subquery
+        // evaluated after it follow.
+        input_cardinality = plan
+            .prefix_cardinalities
+            .get(loop_index)
+            .copied()
+            .unwrap_or(input_cardinality);
         prior_tables.set(*table_number)?;
     }
     Ok(estimates)
@@ -419,6 +552,11 @@ struct WhereTermInfo {
     table_mask: TableMask,
     extra_steps: usize,
     equal_tables: Option<(TableInternalId, TableInternalId, Option<TableInternalId>)>,
+    /// The table whose constraint for the term is the most selective (the first such, by table
+    /// number; implied bounds aside): the estimate counts the term there and only there, at that
+    /// table's step or, if a later table completes it, at that one's; `None` when the term
+    /// constrains no table.
+    home_table: Option<usize>,
 }
 
 impl JoinN {
@@ -1046,6 +1184,12 @@ fn join_lhs_and_rhs<'a>(
         rhs_self_mask,
         &joined_tables[rhs_table_number],
         where_clause,
+        &Completed {
+            where_terms,
+            all_constraints,
+            rhs_table_number,
+            joined_mask: &joined_mask,
+        },
         params,
     );
 
@@ -1261,7 +1405,8 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // The DP algorithm has O(2^n) complexity which becomes prohibitively slow
     // beyond ~12 tables. The greedy algorithm is O(n²) and produces good
     // (though not always optimal) plans.
-    let where_terms = build_where_term_info(where_clause, table_references, subqueries)?;
+    let where_terms =
+        build_where_term_info(where_clause, table_references, subqueries, constraints)?;
     if num_tables > GREEDY_JOIN_THRESHOLD {
         return compute_greedy_join_order(
             joined_tables,
@@ -2237,16 +2382,29 @@ fn compute_naive_left_deep_plan<'a>(
     Ok(best_plan)
 }
 
-/// Read the table IDs and extra work for each `WHERE` term once.
+/// Read the table IDs, extra work and selectivity of each `WHERE` term once.
 fn build_where_term_info(
     where_clause: &[WhereTerm],
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
+    constraints: &[TableConstraints],
 ) -> Result<Vec<WhereTermInfo>> {
+    let mut homes: Vec<Option<(usize, f64)>> = vec![None; where_clause.len()];
+    for (table_idx, table) in constraints.iter().enumerate() {
+        for constraint in table.constraints.iter().filter(|c| !c.implied) {
+            if let Some(home) = homes.get_mut(constraint.where_clause_pos.0) {
+                if home.is_none_or(|(_, selectivity)| constraint.selectivity < selectivity) {
+                    *home = Some((table_idx, constraint.selectivity));
+                }
+            }
+        }
+    }
     where_clause
         .iter()
-        .map(|term| {
+        .zip(homes)
+        .map(|(term, home)| {
             Ok(WhereTermInfo {
+                home_table: home.map(|(table_idx, _)| table_idx),
                 table_mask: table_mask_from_expr(&term.expr, table_references, subqueries)?,
                 // FIXME: The row cost also includes one simple condition. Give row work
                 // and condition work separate costs so this does not need to subtract one.
@@ -2539,7 +2697,7 @@ mod tests {
             Operator::Or,
             Box::new(check(second_id)),
         ))];
-        let where_terms = build_where_term_info(&two_table_where, &table_references, &[])?;
+        let where_terms = build_where_term_info(&two_table_where, &table_references, &[], &[])?;
 
         let mut joined_mask = TableMask::default();
         joined_mask.set(0)?;
@@ -2557,7 +2715,7 @@ mod tests {
         ));
         term.origin = WhereTermOrigin::Join(JoinOrigin::Outer(second_id));
         let outer_join_where = vec![term];
-        let where_terms = build_where_term_info(&outer_join_where, &table_references, &[])?;
+        let where_terms = build_where_term_info(&outer_join_where, &table_references, &[], &[])?;
 
         let mut joined_mask = TableMask::default();
         joined_mask.set(0)?;

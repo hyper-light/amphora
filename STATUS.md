@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-10-20. A piece is done when its tests pass in the gate (`scripts/gates.sh`: Linux, with the
+Updated 2026-10-24. A piece is done when its tests pass in the gate (`scripts/gates.sh`: Linux, with the
 macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Implemented
@@ -191,6 +191,25 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Measured
 
+- **The oracles: wrong answers and slow plans** (G2 step 3; `amphora-bench --oracle`, `bench/src/oracle`,
+  `docs/research/oracles.md`; the registry `bench/oracles/findings.md`; every run in
+  `bench/records/2026-10-24-adacachy-oracles/`; nightly in `.kiln/oracles.yaml`): random databases and
+  queries over the inventory's features, each query checked by TLP, NoREC, PQS, DQP, EET and CERT, by
+  the tables' rows, and against SQLite 3.54.0 built with the system's options and
+  `SQLITE_LIKE_DOESNT_MATCH_BLOBS` (`bench/oracles/sqlite.sh`); every finding cut down to its smallest
+  form and filed under its cause. Five runs on adacachy, 2026-10-24: seeds 11 and 12 (978 and 3,824
+  databases, 35,104 and 154,695 checks, 70 and 84 findings), the injected bug's (1,759 databases,
+  71,127 checks, 245 findings), and seeds 13 and 14 on the fixes (24,321 and 27,091 databases, 983,406
+  and 1,096,012 checks, 61 and 70 findings, 37 and then 12 of them not CERT's). 49 causes fixed in
+  Amphora, each from a failing test (`crates/engine/tests/oracle_findings.rs`, 54 tests; `real_text.rs`,
+  4,756 REALs as SQLite writes them), among them SQLite 3.54's evaluation order, its number in text
+  holding a NUL, NULL routing under NOT, comparisons that kept their conversions, and two panics of
+  subqueries run after the read that needs them; the oracles' own artifacts, fixed; five not Amphora's
+  (SQLite's own bugs, evaluation order, the BLOB LIKE option, ill-formed UTF-8 per
+  `docs/design/semantics.md`, SQLite's names in a folded AND). Open: CERT's estimates (87 findings,
+  cause AG, the planner's goal) and one subquery a folded branch still runs (its own goal). **The
+  test:** a wrong-result bug injected into the optimizer (`x IS NULL` taken as rejecting NULLs) was
+  caught by one nightly run: 125 findings, the first at 0.47 s of the 1,800 s (`bench/oracles/injected.sh`).
 - **The SQLite language against every engine** (G2 step 1, `bench/corpus/run.sh`; published in
   `bench/corpus/matrix.md`, every cell in `matrix.json`, the probes' answers in
   `bench/records/2026-10-24-adacachy-corpus-probes/`): SQLite's documentation (3.54.1) inventoried into
@@ -265,10 +284,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Next
 
-- **What the language matrix found** (`bench/corpus/matrix.md`): the two wrong answers fixed, each
-  from a failing test (the IN operator's collation, `index_xinfo`'s NULL), then the missing features
-  by how often users reach them (ORDER BY in aggregates, median and percentiles, the JSON functions,
-  the PRAGMAs), each against the probe that found it.
+- **What the language matrix found** (`bench/corpus/matrix.md`): the IN operator's collation is
+  fixed (the oracles' cause E); left, from a failing test, `index_xinfo`'s NULL; then the missing
+  features by how often users reach them (ORDER BY in aggregates, median and percentiles, the JSON
+  functions, the PRAGMAs), each against the probe that found it.
+- **What the oracles left open** (`bench/oracles/findings.md`): the B-link tree's concurrent test
+  failing under the whole suite's load (`storage/versioned/blink.rs`, kiln goal
+  01a16eb1702a7299ae839a03083cfbef); a subquery a folded AND or OR still runs (goal
+  01a16f23f567754ab32edfe5c2abc36d); CERT's estimates, with the planner researched and audited (goal
+  01a16e788f3e735fbadbbdaa30d38d29, plan 01a16eab7f457673b4cf9933adacfc4d).
 - **One thread making everything durable**: on btrfs every flush is a commit of the filesystem's
   log, one at a time, so the checkpointer's flushes of the file hold up the flusher's, and with it
   every write (docs/design/store.md, decision 4: commits stalled up to 97 ms, writes at 512 writers

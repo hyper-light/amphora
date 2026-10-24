@@ -191,9 +191,16 @@ fn coerce_to_string(value: &Value) -> String {
         Value::Null => String::new(),
         Value::Numeric(Numeric::Integer(i)) => i.to_string(),
         Value::Numeric(Numeric::Float(f)) => format_float(f64::from(*f)),
-        Value::Text(t) => t.as_str().to_string(),
-        Value::Blob(b) => String::from_utf8_lossy(b).to_string(),
+        // Text ends at its first NUL, as SQLite's sqlite3_value_text reads it.
+        Value::Text(t) => crate::vdbe::value::sqlite_text_prefix(t.as_str()).to_string(),
+        Value::Blob(b) => blob_text_prefix(b),
     }
+}
+
+/// A BLOB read as text, to its first NUL, as SQLite's sqlite3_value_text reads it.
+fn blob_text_prefix(b: &[u8]) -> String {
+    let end = crate::vdbe::value::first_nul(b).unwrap_or(b.len());
+    String::from_utf8_lossy(b.get(..end).unwrap_or_default()).into_owned()
 }
 
 // ── Formatting helpers ──────────────────────────────────────────
@@ -1172,6 +1179,54 @@ fn format_sql_quote_wrap(output: &mut String, value: &Value, spec: &FormatSpec) 
     }
 }
 
+/// %j and %J (SQLite 3.54): the argument written as the inside of a JSON string literal, %J with
+/// its double quotes; NULL writes nothing for %j and an unquoted null for %J. The precision counts
+/// what is taken from the argument, the width what is written.
+fn format_json_string(output: &mut String, value: &Value, spec: &FormatSpec, quoted: bool) {
+    let mut flags = spec.flags.clone();
+    flags.zero_pad = false;
+    let s = match value {
+        Value::Null => {
+            apply_width(
+                output,
+                "",
+                if quoted { "null" } else { "" },
+                spec.width,
+                &flags,
+                false,
+            );
+            return;
+        }
+        Value::Blob(b) => {
+            let end = b.iter().position(|&byte| byte == 0).unwrap_or(b.len());
+            String::from_utf8_lossy(b.get(..end).unwrap_or_default()).into_owned()
+        }
+        _ => coerce_to_string(value),
+    };
+    let taken = truncate_to_precision(&s, spec.precision, &spec.flags);
+    let mut literal = String::new();
+    if quoted {
+        literal.push('"');
+    }
+    for c in taken.chars() {
+        match c {
+            '"' => literal.push_str("\\\""),
+            '\\' => literal.push_str("\\\\"),
+            '\u{8}' => literal.push_str("\\b"),
+            '\t' => literal.push_str("\\t"),
+            '\n' => literal.push_str("\\n"),
+            '\u{c}' => literal.push_str("\\f"),
+            '\r' => literal.push_str("\\r"),
+            c if u32::from(c) < 0x20 => literal.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => literal.push(c),
+        }
+    }
+    if quoted {
+        literal.push('"');
+    }
+    apply_width(output, "", &literal, spec.width, &flags, false);
+}
+
 fn format_sql_identifier(output: &mut String, value: &Value, spec: &FormatSpec) {
     // %w: double double-quotes (no wrapping quotes in SQL context); NULL → (NULL).
     let mut flags = spec.flags.clone();
@@ -1329,7 +1384,7 @@ pub fn printf_c_arg_plan(format: &str) -> Vec<PrintfCArg> {
                 PrintfCArg::Uint32
             }),
             Some('f' | 'e' | 'E' | 'g' | 'G') => plan.push(PrintfCArg::Double),
-            Some('s' | 'q' | 'Q' | 'w') => plan.push(PrintfCArg::Text),
+            Some('s' | 'q' | 'Q' | 'w' | 'j' | 'J') => plan.push(PrintfCArg::Text),
             Some('z') => plan.push(PrintfCArg::OwnedText),
             Some('c') => plan.push(PrintfCArg::CharCode),
             Some('p') => plan.push(PrintfCArg::Int64),
@@ -1346,8 +1401,9 @@ pub fn printf_c_arg_plan(format: &str) -> Vec<PrintfCArg> {
 pub fn exec_printf_values(format: &Value, args: &[&Value]) -> crate::Result<Value> {
     // SQLite converts the format argument to text if not already text.
     let fmt_owned: String;
+    // The format ends at its first NUL, as SQLite reads it.
     let format_str = match format {
-        Value::Text(t) => t.as_str(),
+        Value::Text(t) => crate::vdbe::value::sqlite_text_prefix(t.as_str()),
         Value::Null => return Ok(Value::Null),
         Value::Numeric(Numeric::Integer(i)) => {
             fmt_owned = i.to_string();
@@ -1358,35 +1414,25 @@ pub fn exec_printf_values(format: &Value, args: &[&Value]) -> crate::Result<Valu
             fmt_owned.as_str()
         }
         Value::Blob(b) => {
-            fmt_owned = String::from_utf8_lossy(b).to_string();
+            fmt_owned = blob_text_prefix(b);
             fmt_owned.as_str()
         }
     };
 
+    // A format that is not NULL gives TEXT, '' when nothing comes of it (an empty format, or an
+    // unknown conversion first), as in SQLite 3.54 (3.53 gave NULL for those).
     let mut result = String::new();
     let mut args_index = 0;
     let mut chars = format_str.chars().peekable();
-    if format_str.is_empty() {
-        return Ok(Value::Null);
-    }
-
-    // Track whether any output or specifier processing happened. SQLite's
-    // internal StrAccum buffer stays NULL until something triggers allocation
-    // (any literal text, %%, trailing %, or any specifier including %n).
-    // When an unknown specifier triggers early return before any allocation,
-    // the result is NULL. Otherwise it's the accumulated text (possibly "").
-    let mut touched = false;
 
     while let Some(c) = chars.next() {
         if c != '%' {
-            touched = true;
             result.push(c);
             continue;
         }
 
         // Check for %%
         if chars.peek() == Some(&'%') {
-            touched = true;
             chars.next();
             result.push('%');
             continue;
@@ -1433,20 +1479,13 @@ pub fn exec_printf_values(format: &Value, args: &[&Value]) -> crate::Result<Valu
             'q' => format_sql_quote(&mut result, arg, &spec),
             'Q' => format_sql_quote_wrap(&mut result, arg, &spec),
             'w' => format_sql_identifier(&mut result, arg, &spec),
+            'j' => format_json_string(&mut result, arg, &spec, false),
+            'J' => format_json_string(&mut result, arg, &spec, true),
             'r' => format_ordinal(&mut result, arg, &spec),
             'n' => { /* silently ignored, no arg consumed */ }
-            _ => {
-                // Unknown specifier: return NULL if nothing was processed
-                // before this point, otherwise return accumulated text.
-                // This matches SQLite where the internal buffer (zText) stays
-                // NULL until any append is attempted.
-                if !touched {
-                    return Ok(Value::Null);
-                }
-                break;
-            }
+            // An unknown conversion ends the text there.
+            _ => break,
         }
-        touched = true;
     }
 
     Ok(Value::build_text(result))
@@ -1713,16 +1752,17 @@ mod tests {
             ),
             // Trailing % is preserved
             (vec![text("test%")], text("test%")),
-            // Unknown specifier: NULL if nothing processed before, else accumulated text
+            // An unknown conversion ends the text, '' when it comes first
             (vec![text("%d%j"), integer(42)], text("42")),
             (vec![text("hello%j")], text("hello")),
+            (vec![text("%j")], text("")),
             // Negative zero should not show minus sign
             (vec![text("%f"), float(-0.0)], text("0.000000")),
         ];
         for (input, expected) in test_cases {
             assert_eq!(exec_printf(&input).unwrap(), *expected.get_value());
         }
-        assert_eq!(exec_printf(&[text("")]).unwrap(), Value::Null);
+        assert_eq!(exec_printf(&[text("")]).unwrap(), *text("").get_value());
         assert_eq!(
             exec_printf(&[text("%s"), text("")]).unwrap(),
             *text("").get_value()
@@ -2110,10 +2150,10 @@ mod tests {
 
     #[test]
     fn test_unknown_specifier_returns_early() {
-        // Unknown specifier as first thing → NULL (SQLite's StrAccum never allocated)
+        // Unknown specifier as first thing → '' (SQLite 3.54; 3.53 gave NULL)
         assert_eq!(
             exec_printf(&[text("%b"), integer(42)]).unwrap(),
-            Value::Null,
+            *text("").get_value(),
         );
         // Unknown specifier after literal text → accumulated text
         assert_eq!(

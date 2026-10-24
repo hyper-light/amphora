@@ -59,7 +59,11 @@ pub(super) fn translate_in_list(
 ) -> Result<()> {
     let lhs_arity = expr_vector_size(lhs)?;
     let lhs_reg = program.alloc_registers(lhs_arity);
+    program.reset_collation();
     let _ = translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
+    // `x IN (y1, y2, ...)` compares by x's collation alone, not by each y's (SQLite's
+    // sqlite3ExprCodeIN takes it from the left operand only).
+    let lhs_collation = program.curr_collation();
     let mut check_null_reg = 0;
     let mut check_null_in_row_values_reg = 0;
     let label_ok = program.allocate_label();
@@ -119,7 +123,7 @@ pub(super) fn translate_in_list(
                         rhs: rhs_reg,
                         target_pc: label_ok,
                         flags: cmp_flags,
-                        collation: program.curr_collation(),
+                        collation: lhs_collation,
                     });
                 } else {
                     program.emit_insn(Insn::NotNull {
@@ -133,7 +137,7 @@ pub(super) fn translate_in_list(
                     rhs: rhs_reg,
                     target_pc: condition_metadata.jump_target_when_false,
                     flags: cmp_flags.jump_if_null(),
-                    collation: program.curr_collation(),
+                    collation: lhs_collation,
                 });
             } else {
                 program.emit_insn(Insn::IsNull {
@@ -277,12 +281,32 @@ pub fn translate_condition_expr(
         emit_cond_jump(program, condition_metadata, reg);
         return Ok(());
     }
+    // An AND or an OR an operand settles is that operand, the other never read (SQLite's
+    // sqlite3ExprSimplifiedAndOr).
+    let expr = simplified_and_or(expr);
     match expr {
         ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
+            // The side without a subquery goes first where the other holds one, and settles it
+            // alone where it can (SQLite 3.54's exprEvalRhsFirst).
+            let (lhs, rhs) = if has_subquery(lhs) && !has_subquery(rhs) {
+                (rhs, lhs)
+            } else {
+                (lhs, rhs)
+            };
             // In a binary AND, never jump to the parent 'jump_target_when_true' label on the first condition, because
             // the second condition MUST also be true. Instead we instruct the child expression to jump to a local
             // true label.
             let jump_target_when_true = program.allocate_label();
+            // A NULL left side settles the AND only where NULL goes where FALSE does (NULL AND x is
+            // FALSE or NULL); elsewhere the right side decides it, as SQLite's sqlite3ExprIfTrue
+            // reads it (NOT (NULL AND 0) is TRUE).
+            let lhs_null = if condition_metadata.jump_target_when_null
+                == condition_metadata.jump_target_when_false
+            {
+                condition_metadata.jump_target_when_false
+            } else {
+                jump_target_when_true
+            };
             translate_condition_expr(
                 program,
                 referenced_tables,
@@ -290,6 +314,7 @@ pub fn translate_condition_expr(
                 ConditionMetadata {
                     jump_if_condition_is_true: false,
                     jump_target_when_true,
+                    jump_target_when_null: lhs_null,
                     ..condition_metadata
                 },
                 resolver,
@@ -304,6 +329,11 @@ pub fn translate_condition_expr(
             )
         }
         ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
+            let (lhs, rhs) = if has_subquery(lhs) && !has_subquery(rhs) {
+                (rhs, lhs)
+            } else {
+                (lhs, rhs)
+            };
             // In a binary OR, never jump to the parent 'jump_target_when_false' or
             // 'jump_target_when_null' label on the first condition, because the second
             // condition CAN also be true. Instead we instruct the child expression to
@@ -311,6 +341,17 @@ pub fn translate_condition_expr(
             // This is critical for cases like `x IN (NULL, 3) OR b` where the left side
             // evaluates to NULL — we must still evaluate the right side.
             let jump_target_when_false = program.allocate_label();
+            // Where a NULL goes where TRUE does, a NULL left side settles the OR as a TRUE one does
+            // (NULL OR x is TRUE or NULL), and the right side is never read: SQLite's
+            // sqlite3ExprIfTrue with jumpIfNull (WHERE NOT (a OR b) is such a place). Elsewhere the
+            // right side decides it.
+            let lhs_null = if condition_metadata.jump_target_when_null
+                == condition_metadata.jump_target_when_true
+            {
+                condition_metadata.jump_target_when_true
+            } else {
+                jump_target_when_false
+            };
             translate_condition_expr(
                 program,
                 referenced_tables,
@@ -318,7 +359,7 @@ pub fn translate_condition_expr(
                 ConditionMetadata {
                     jump_if_condition_is_true: true,
                     jump_target_when_false,
-                    jump_target_when_null: jump_target_when_false,
+                    jump_target_when_null: lhs_null,
                     ..condition_metadata
                 },
                 resolver,
@@ -337,6 +378,16 @@ pub fn translate_condition_expr(
             referenced_tables,
             &exprs[0],
             condition_metadata,
+            resolver,
+        ),
+        // NOT is its operand's condition with TRUE and FALSE swapped (NULL stays NULL), as SQLite
+        // codes it: the operand keeps its own short circuits, so in `NOT (x < a OR x > jsonb(y))`
+        // a row `x < a` decides never reads jsonb(y), which can fail.
+        ast::Expr::Unary(ast::UnaryOperator::Not, inner) => translate_condition_expr(
+            program,
+            referenced_tables,
+            inner,
+            condition_metadata.negated(),
             resolver,
         ),
         _ => translate_leaf_condition_expr(
@@ -434,10 +485,14 @@ fn translate_leaf_condition_expr(
             SubqueryType::Exists { result_reg } => {
                 emit_cond_jump(program, condition_metadata, *result_reg);
             }
+            // One search answers it only where NULL goes where FALSE does (not under a NOT).
             SubqueryType::In {
                 cursor_id,
                 affinity_str,
-            } if !*not_in => {
+            } if !*not_in
+                && condition_metadata.jump_target_when_null
+                    == condition_metadata.jump_target_when_false =>
+            {
                 let Some(lhs) = lhs.as_deref() else {
                     crate::bail_parse_error!("IN (SELECT ...) has no left-hand side");
                 };
@@ -471,8 +526,13 @@ fn translate_leaf_condition_expr(
                 "Register in WHERE clause is currently unused. Consider removing Resolver::expr_to_reg_cache and using Expr::Register instead"
             );
         }
+        // A COLLATE changes how its operand compares, not whether it is true: the condition is
+        // its operand's truth, as in SQLite.
         ast::Expr::Collate(_, _) => {
-            crate::bail_parse_error!("Collate in WHERE clause is not supported");
+            let result_reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), expr, result_reg, resolver)?;
+            program.reset_collation();
+            emit_cond_jump(program, condition_metadata, result_reg);
         }
         ast::Expr::DoublyQualified(_, _, _) | ast::Expr::Id(_) | ast::Expr::Qualified(_, _) => {
             crate::bail_parse_error!(
@@ -662,21 +722,12 @@ fn translate_leaf_condition_expr(
         ast::Expr::Like { not, .. } => {
             let cur_reg = program.alloc_register();
             translate_like_base(program, Some(referenced_tables), expr, cur_reg, resolver)?;
-            if !*not {
-                emit_cond_jump(program, condition_metadata, cur_reg);
-            } else if condition_metadata.jump_if_condition_is_true {
-                program.emit_insn(Insn::IfNot {
-                    reg: cur_reg,
-                    target_pc: condition_metadata.jump_target_when_true,
-                    jump_if_null: false,
-                });
+            let condition_metadata = if *not {
+                condition_metadata.negated()
             } else {
-                program.emit_insn(Insn::If {
-                    reg: cur_reg,
-                    target_pc: condition_metadata.jump_target_when_false,
-                    jump_if_null: true,
-                });
-            }
+                condition_metadata
+            };
+            emit_cond_jump(program, condition_metadata, cur_reg);
         }
         ast::Expr::Parenthesized(exprs) => {
             turso_assert!(exprs.len() != 1);

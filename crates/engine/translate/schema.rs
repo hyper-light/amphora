@@ -560,6 +560,7 @@ fn resolve_json_func_return_type(func: &crate::function::JsonFunc) -> Result<Che
         | JsonFunc::JsonRemove
         | JsonFunc::JsonReplace
         | JsonFunc::JsonInsert
+        | JsonFunc::JsonArrayInsert
         | JsonFunc::JsonSet
         | JsonFunc::JsonPretty
         | JsonFunc::JsonQuote
@@ -573,6 +574,7 @@ fn resolve_json_func_return_type(func: &crate::function::JsonFunc) -> Result<Che
         | JsonFunc::JsonbRemove
         | JsonFunc::JsonbReplace
         | JsonFunc::JsonbInsert
+        | JsonFunc::JsonbArrayInsert
         | JsonFunc::JsonbSet => Ok(CheckExprType::Blob),
 
         // Functions that return INTEGER

@@ -456,14 +456,6 @@ impl Value {
         }
     }
 
-    pub fn exec_nullif(&self, second_value: &Self) -> Self {
-        if self != second_value {
-            self.clone()
-        } else {
-            Value::Null
-        }
-    }
-
     pub fn exec_substring(
         value: &Value,
         start_value: &Value,
@@ -505,13 +497,11 @@ impl Value {
             let len = len as i64;
             let mut p2 = match length_value {
                 Some(Value::Numeric(Numeric::Integer(length))) => *length,
-                // SQLite uses SQLITE_LIMIT_LENGTH (default 1 billion) when no explicit length.
-                // Using len causes wrong results when p1 is large negative number.
-                _ => Value::MAX_BLOB_LENGTH,
+                // SQLite 3.54 takes the largest integer when no length is given: a start far
+                // below the first character then shortens what is taken by as far
+                // (substr('abc', -9223372036854775807) is 'abc').
+                _ => i64::MAX,
             };
-
-            // Track if length was explicitly provided
-            let explicit_length = length_value.is_some();
 
             // Handle negative start position (count from end)
             if p1 < 0 {
@@ -526,10 +516,9 @@ impl Value {
                 }
             } else if p1 > 0 {
                 p1 -= 1; // Convert 1-indexed to 0-indexed
-            } else if p2 > 0 && explicit_length {
-                // SQLite quirk: when p1==0, p2>0, and explicit length, decrement p2
-                // This means substr('x', 0, 3) returns 2 chars, not 3
-                // But substr('x', 0) with no length returns whole string
+            } else if p2 > 0 {
+                // SQLite quirk: a start of 0 takes one character fewer (substr('x', 0, 3) is
+                // two characters)
                 p2 -= 1;
             }
 
@@ -687,8 +676,11 @@ impl Value {
                     None => Value::Null,
                 },
                 Some(ignore) => match ignore {
-                    Value::Text(_) => {
-                        let input = self.to_string();
+                    // Y is read as text whatever its type, as SQLite's sqlite3_value_text reads it.
+                    Value::Text(_) | Value::Numeric(_) | Value::Blob(_) => {
+                        // X ends at its first NUL, as SQLite reads it.
+                        let text = self.to_string();
+                        let input = sqlite_text_prefix(&text);
                         let ignore = ignore.to_string();
                         let mut chars = input.chars().peekable();
                         let mut out =
@@ -877,18 +869,24 @@ impl Value {
             return Value::Null;
         };
 
-        let precision = match precision.map(|v| Numeric::from_value(v).map(|v| v.to_f64())) {
-            None => 0.0,
-            Some(Some(v)) => v,
-            Some(None) => return Value::Null,
+        // The precision is read as sqlite3_value_int64 reads it: text and a BLOB by the integer
+        // they begin with ('1.0e+308' is 1), a REAL truncated; then held to 0..=30 (roundFunc).
+        let precision = match precision {
+            None => 0,
+            Some(Value::Null) => return Value::Null,
+            Some(Value::Numeric(Numeric::Integer(i))) => *i,
+            Some(Value::Numeric(Numeric::Float(r))) => real_to_i64(f64::from(*r)),
+            Some(Value::Text(t)) => crate::numeric::str_to_i64(t.as_str()).unwrap_or(0),
+            Some(Value::Blob(b)) => {
+                crate::numeric::str_to_i64(String::from_utf8_lossy(b)).unwrap_or(0)
+            }
         };
 
         if !(-4503599627370496.0..=4503599627370496.0).contains(&f) {
             return Value::from_f64(f);
         }
 
-        let precision = if precision < 1.0 { 0.0 } else { precision };
-        let precision = precision.clamp(0.0, 30.0) as usize;
+        let precision = usize::try_from(precision.clamp(0, 30)).unwrap_or(0);
 
         if precision == 0 {
             return Value::from_f64(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
@@ -919,7 +917,9 @@ impl Value {
                     Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
                     _ => std::borrow::Cow::Owned(p.to_string()),
                 };
-                let p_str = pat_cow.as_ref();
+                // The characters end at the first NUL, as SQLite's trimFunc reads them; the text
+                // trimmed keeps its own.
+                let p_str = pat_cow.split('\0').next().unwrap_or_default();
                 match trim_type {
                     TrimType::All => text_cow.trim_matches(|c| p_str.contains(c)),
                     TrimType::Left => text_cow.trim_start_matches(|c| p_str.contains(c)),
@@ -953,8 +953,11 @@ impl Value {
         let length: i64 = match self {
             Value::Numeric(Numeric::Integer(i)) => *i,
             Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i64,
-            Value::Text(s) => s.as_str().parse().unwrap_or(0),
-            _ => 0,
+            // Text and a BLOB give the integer they begin with ('3.0' is 3, '1e1' is 1),
+            // saturated, as SQLite's sqlite3_value_int64 reads them.
+            Value::Text(s) => crate::numeric::str_to_i64(s.as_str()).unwrap_or(0),
+            Value::Blob(b) => crate::numeric::str_to_i64(String::from_utf8_lossy(b)).unwrap_or(0),
+            Value::Null => 0,
         }
         .max(0);
 
@@ -1065,16 +1068,22 @@ impl Value {
         // string Y in string X. The BINARY collating sequence is used for comparisons. If Y is an empty string
         // then return X unchanged. If Z is not initially a string, it is cast to a UTF-8 string prior to processing.
 
-        // If any of the arguments is NULL, the result is NULL.
-        if matches!(source, Value::Null)
-            || matches!(pattern, Value::Null)
-            || matches!(replacement, Value::Null)
-        {
+        // A NULL X or Y gives NULL; then an empty Y gives X, even beside a NULL Z; then a NULL Z
+        // gives NULL: SQLite's replaceFunc, in that order.
+        if matches!(source, Value::Null) || matches!(pattern, Value::Null) {
             return Ok(Value::Null);
         }
 
         let source = source.exec_cast("TEXT")?;
         let pattern = pattern.exec_cast("TEXT")?;
+        if let (Value::Text(source), Value::Text(pattern)) = (&source, &pattern) {
+            if pattern.as_str().is_empty() || pattern.as_str().starts_with('\0') {
+                return Ok(Value::Text(source.clone()));
+            }
+        }
+        if matches!(replacement, Value::Null) {
+            return Ok(Value::Null);
+        }
         let replacement = replacement.exec_cast("TEXT")?;
 
         // If any of the casts failed, panic as text casting is not expected to fail.
@@ -1178,7 +1187,14 @@ impl Value {
     /// the result by 1 ulp relative to SQLite's ratio.
     #[allow(unused_unsafe)]
     pub fn exec_math_log(&self, base: Option<&Value>) -> Value {
-        let Some(f) = Numeric::from_value_strict(self).map(|v| v.to_f64()) else {
+        // With a base, the operand is read as sqlite3_value_double reads it, whatever its type
+        // (SQLite's logFunc checks the base's numeric type twice and never the operand's): '1e30.0'
+        // is 1e30, a BLOB the number its bytes begin with, NULL 0. Alone, it must be a number.
+        let operand = match base {
+            Some(_) => Some(Numeric::from_value(self).map_or(0.0, |v| v.to_f64())),
+            None => Numeric::from_value_strict(self).map(|v| v.to_f64()),
+        };
+        let Some(f) = operand else {
             return Value::Null;
         };
 
@@ -1268,16 +1284,7 @@ impl Value {
         &self,
         rhs: &Value,
     ) -> std::result::Result<Value, crate::alloc::TryReserveError> {
-        if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
-            let mut blob =
-                <crate::ValueBlob as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
-                    lhs.len() + rhs.len(),
-                )?;
-            blob.extend_from_slice(lhs);
-            blob.extend_from_slice(rhs);
-            return Ok(Value::Blob(blob));
-        }
-
+        // TEXT whatever the operands, two BLOBs too, as SQLite's OP_Concat gives.
         let Some(lhs) = self.cast_text_ref() else {
             return Ok(Value::Null);
         };
@@ -1452,38 +1459,6 @@ impl Value {
         Ok(pattern_compare(pattern, text, &GLOB_INFO, None) == CompareResult::Match)
     }
 
-    pub fn exec_min<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
-        // SQLite: multi-arg min() returns NULL if ANY argument is NULL
-        let mut result: Option<&Value> = None;
-        for v in regs {
-            if matches!(v, Value::Null) {
-                return Value::Null;
-            }
-            result = Some(match result {
-                None => v,
-                Some(cur) if v <= cur => v,
-                Some(cur) => cur,
-            });
-        }
-        result.map(|v| v.to_owned()).unwrap_or(Value::Null)
-    }
-
-    pub fn exec_max<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
-        // SQLite: multi-arg max() returns NULL if ANY argument is NULL
-        let mut result: Option<&Value> = None;
-        for v in regs {
-            if matches!(v, Value::Null) {
-                return Value::Null;
-            }
-            result = Some(match result {
-                None => v,
-                Some(cur) if v > cur => v,
-                Some(cur) => cur,
-            });
-        }
-        result.map(|v| v.to_owned()).unwrap_or(Value::Null)
-    }
-
     /// Fallibly concatenate another value onto this Text value, converting it to a string.
     /// Panics if self is not a Text value.
     pub fn exec_group_concat(
@@ -1573,13 +1548,13 @@ impl Value {
                     }
                     Value::Null => 0,
                 };
-                // Invalid codepoints (negative, surrogates, or > U+10FFFF)
-                // become U+FFFD, matching SQLite.
-                if codepoint >= 0 {
-                    char::from_u32(codepoint as u32).unwrap_or('\u{FFFD}')
-                } else {
-                    '\u{FFFD}'
-                }
+                // Negative codepoints and those past U+10FFFF become U+FFFD, as in SQLite, the
+                // integer read whole; so do surrogates, which SQLite writes as ill-formed UTF-8
+                // and Amphora's TEXT never holds (docs/design/semantics.md, decision 1).
+                u32::try_from(codepoint)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .unwrap_or('\u{FFFD}')
             })
             .collect();
         Value::build_text(result)
@@ -1909,12 +1884,17 @@ mod tests {
         result.expect(crate::alloc::ALLOC_ERR_MSG)
     }
 
+    /// Two BLOBs concatenate to TEXT holding their bytes, as in SQLite (hex(x'0102' || x'0304') is
+    /// '01020304', its typeof 'text').
     #[test]
-    fn exec_concat_builds_blob_fallibly() {
+    fn exec_concat_of_blobs_is_text() {
         let lhs = blob(&[1, 2]);
         let rhs = blob(&[3, 4]);
 
-        assert_eq!(lhs.exec_concat(&rhs).unwrap(), blob(&[1, 2, 3, 4]));
+        assert_eq!(
+            lhs.exec_concat(&rhs).unwrap(),
+            Value::build_text("\u{1}\u{2}\u{3}\u{4}")
+        );
     }
 
     #[test]
@@ -2401,7 +2381,8 @@ mod tests {
                 .map(f64::from)
                 .unwrap(),
         );
-        let expected = Value::build_text("2.042747795102219097e+05");
+        // SQLite 3.54.0's quote(): "%!0.17g", shortened while the double round-trips
+        let expected = Value::build_text("204274.77951022191");
         assert_eq!(input.exec_quote(), expected);
     }
 
@@ -2611,68 +2592,6 @@ mod tests {
         assert_eq!(
             Value::build_text("a\0\t").exec_unistr_quote(),
             Value::build_text("'a'")
-        );
-    }
-
-    #[test]
-    fn test_min_max() {
-        let input_int_vec = [
-            Register::Value(Value::from_i64(-1)),
-            Register::Value(Value::from_i64(10)),
-        ];
-        assert_eq!(
-            Value::exec_min(input_int_vec.iter().map(|v| v.get_value())),
-            Value::from_i64(-1)
-        );
-        assert_eq!(
-            Value::exec_max(input_int_vec.iter().map(|v| v.get_value())),
-            Value::from_i64(10)
-        );
-
-        let str1 = Register::Value(Value::build_text("A"));
-        let str2 = Register::Value(Value::build_text("z"));
-        let input_str_vec = [&str2, &str1];
-        assert_eq!(
-            Value::exec_min(input_str_vec.iter().map(|v| v.get_value())),
-            Value::build_text("A")
-        );
-        assert_eq!(
-            Value::exec_max(input_str_vec.iter().map(|v| v.get_value())),
-            Value::build_text("z")
-        );
-
-        let input_null_vec = [Register::Value(Value::Null), Register::Value(Value::Null)];
-        assert_eq!(
-            Value::exec_min(input_null_vec.iter().map(|v| v.get_value())),
-            Value::Null
-        );
-        assert_eq!(
-            Value::exec_max(input_null_vec.iter().map(|v| v.get_value())),
-            Value::Null
-        );
-
-        let input_mixed_vec = [Register::Value(Value::from_i64(10)), str1];
-        assert_eq!(
-            Value::exec_min(input_mixed_vec.iter().map(|v| v.get_value())),
-            Value::from_i64(10)
-        );
-        assert_eq!(
-            Value::exec_max(input_mixed_vec.iter().map(|v| v.get_value())),
-            Value::build_text("A")
-        );
-
-        // SQLite: multi-arg min/max returns NULL if ANY argument is NULL
-        let input_with_null = [
-            Register::Value(Value::from_i64(1)),
-            Register::Value(Value::Null),
-        ];
-        assert_eq!(
-            Value::exec_min(input_with_null.iter().map(|v| v.get_value())),
-            Value::Null
-        );
-        assert_eq!(
-            Value::exec_max(input_with_null.iter().map(|v| v.get_value())),
-            Value::Null
         );
     }
 
@@ -3232,35 +3151,6 @@ mod tests {
         let reg = Value::Null;
         assert!(!reg.exec_if(false, false));
         assert!(!reg.exec_if(false, true));
-    }
-
-    #[test]
-    fn test_nullif() {
-        assert_eq!(
-            Value::from_i64(1).exec_nullif(&Value::from_i64(1)),
-            Value::Null
-        );
-        assert_eq!(
-            Value::from_f64(1.1).exec_nullif(&Value::from_f64(1.1)),
-            Value::Null
-        );
-        assert_eq!(
-            Value::build_text("limbo").exec_nullif(&Value::build_text("limbo")),
-            Value::Null
-        );
-
-        assert_eq!(
-            Value::from_i64(1).exec_nullif(&Value::from_i64(2)),
-            Value::from_i64(1)
-        );
-        assert_eq!(
-            Value::from_f64(1.1).exec_nullif(&Value::from_f64(1.2)),
-            Value::from_f64(1.1)
-        );
-        assert_eq!(
-            Value::build_text("limbo").exec_nullif(&Value::build_text("limb")),
-            Value::build_text("limbo")
-        );
     }
 
     #[test]

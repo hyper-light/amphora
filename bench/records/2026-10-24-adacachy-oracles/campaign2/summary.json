@@ -1,0 +1,772 @@
+{
+  "duplicates": 10,
+  "findings": {
+    "cert-09cb5188785d39d4": {
+      "at_seconds": 196.823349316,
+      "detail": "the more restrictive query is estimated at 1000000000000000000 rows, the query at 100000000000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-109cae3de971e4ba": {
+      "at_seconds": 199.638745694,
+      "detail": "the more restrictive query is estimated at 900000000000 rows, the query at 360000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-1da931d48db93f1e": {
+      "at_seconds": 64.638224761,
+      "detail": "the more restrictive query is estimated at 1000000000000 rows, the query at 400000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-2eed0703b3886d4e": {
+      "at_seconds": 423.89465787,
+      "detail": "the more restrictive query is estimated at 1000000000000000000 rows, the query at 810000000000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-4226f96a82c68760": {
+      "at_seconds": 201.010110649,
+      "detail": "the more restrictive query is estimated at 100000000000 rows, the query at 10000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-4d95060617e830c2": {
+      "at_seconds": 527.995885026,
+      "detail": "the more restrictive query is estimated at 1000000000000000000 rows, the query at 400000000000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-4dce4b0c2c727cfa": {
+      "at_seconds": 549.064189272,
+      "detail": "the more restrictive query is estimated at 400000000000 rows, the query at 5000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-50d4acc3fb3a85cd": {
+      "at_seconds": 40.717544748,
+      "detail": "the more restrictive query is estimated at 160000000000.00003 rows, the query at 1000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-525ebed4b11f3ff1": {
+      "at_seconds": 613.724593085,
+      "detail": "the more restrictive query is estimated at 200000000000000000 rows, the query at 80000000000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 3
+    },
+    "cert-6052a1d86bc2f915": {
+      "at_seconds": 20.228338466,
+      "detail": "the more restrictive query is estimated at 1000000000000 rows, the query at 400000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-682ec4bf3032df6d": {
+      "at_seconds": 814.578701931,
+      "detail": "the more restrictive query is estimated at 1000000000000000000 rows, the query at 100000000000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-6ff42b8efc037bc0": {
+      "at_seconds": 858.195493458,
+      "detail": "the more restrictive query is estimated at 900000000000000000 rows, the query at 2700000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 3
+    },
+    "cert-70d3e0baf8df5914": {
+      "at_seconds": 42.785310474,
+      "detail": "the more restrictive query is estimated at 320000 rows, the query at 10000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-772c8888334249d3": {
+      "at_seconds": 464.722527765,
+      "detail": "the more restrictive query is estimated at 160000000000.00003 rows, the query at 1000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-7777d572d268c452": {
+      "at_seconds": 860.082684798,
+      "detail": "the more restrictive query is estimated at 900000000000 rows, the query at 100000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-7d6d54d6b9d577b8": {
+      "at_seconds": 614.374006312,
+      "detail": "the more restrictive query is estimated at 900000000000000000 rows, the query at 810000000000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-81910a95e7e21ac6": {
+      "at_seconds": 698.129583546,
+      "detail": "the more restrictive query is estimated at 1000000000000 rows, the query at 400000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-8cb64024d391d342": {
+      "at_seconds": 188.550023405,
+      "detail": "the more restrictive query is estimated at 1000000000000000000 rows, the query at 900000000000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-9476355420fef1b1": {
+      "at_seconds": 64.93620421,
+      "detail": "the more restrictive query is estimated at 900000000000 rows, the query at 100000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-9a9fe4a01836ea17": {
+      "at_seconds": 245.08465281,
+      "detail": "the more restrictive query is estimated at 1000000000000000000 rows, the query at 1000000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-a14e165140d90d46": {
+      "at_seconds": 313.864095897,
+      "detail": "the more restrictive query is estimated at 100000000000000000 rows, the query at 1000000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-b20903a9e9f421ab": {
+      "at_seconds": 421.952837832,
+      "detail": "the more restrictive query is estimated at 32000000000000010 rows, the query at 20000000000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-bae9c4dcf94932e8": {
+      "at_seconds": 570.888622207,
+      "detail": "the more restrictive query is estimated at 64000000000.000015 rows, the query at 2000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-ca23fe27bf667496": {
+      "at_seconds": 202.567722753,
+      "detail": "the more restrictive query is estimated at 160000000000.00003 rows, the query at 64000000000.000015",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-cb68eceb4b7b2039": {
+      "at_seconds": 191.367374064,
+      "detail": "the more restrictive query is estimated at 900000000000 rows, the query at 360000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-cf99e08c3a872fdd": {
+      "at_seconds": 357.592157753,
+      "detail": "the more restrictive query is estimated at 0.5 rows, the query at 0.05",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 6
+    },
+    "cert-d21baac10b908d6e": {
+      "at_seconds": 20.61325773,
+      "detail": "the more restrictive query is estimated at 1000000000000 rows, the query at 100000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-d3428a10afc24ec1": {
+      "at_seconds": 485.308903847,
+      "detail": "the more restrictive query is estimated at 1000000000000000000 rows, the query at 400000000000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-d591d139515a7b98": {
+      "at_seconds": 638.097180341,
+      "detail": "the more restrictive query is estimated at 1000000000.0000002 rows, the query at 1000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-d6ae63edf11db3cc": {
+      "at_seconds": 881.906279151,
+      "detail": "the more restrictive query is estimated at 1000000000000000000 rows, the query at 900000000000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-e0de3889098beff3": {
+      "at_seconds": 592.618911743,
+      "detail": "the more restrictive query is estimated at 900000000000 rows, the query at 100000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-e22ae1d506b4d50c": {
+      "at_seconds": 549.76528745,
+      "detail": "the more restrictive query is estimated at 900000000000 rows, the query at 360000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-e85d6420818b41aa": {
+      "at_seconds": 400.437809968,
+      "detail": "the more restrictive query is estimated at 1000000000000000000 rows, the query at 400000000000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-eb023bc7ab011e00": {
+      "at_seconds": 267.293680049,
+      "detail": "the more restrictive query is estimated at 900000000000 rows, the query at 1800000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-eb229dede378d999": {
+      "at_seconds": 855.422310832,
+      "detail": "the more restrictive query is estimated at 400000000000 rows, the query at 160000000000.00003",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-eeda9ae9e0541d06": {
+      "at_seconds": 224.824683601,
+      "detail": "the more restrictive query is estimated at 1000000000000000000 rows, the query at 100000000000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-f0c149c09ddb4159": {
+      "at_seconds": 834.879210033,
+      "detail": "the more restrictive query is estimated at 1000000000000 rows, the query at 900000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "diff-0085db196704f7c6": {
+      "at_seconds": 903.875830285,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-009b42f65c3809d0": {
+      "at_seconds": 727.150218163,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-0fd2c9fd1e1b32fd": {
+      "at_seconds": 804.367070555,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-115cf478f39ecd02": {
+      "at_seconds": 571.809649378,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-11af048f5a05f537": {
+      "at_seconds": 334.384003418,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 6
+    },
+    "diff-32382ffe39fddc36": {
+      "at_seconds": 795.620265609,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-447aec4be3cb4e91": {
+      "at_seconds": 774.695620194,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-447e5cd98471f368": {
+      "at_seconds": 201.950603624,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-47f77ee9651e9862": {
+      "at_seconds": 616.59328943,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-5d93535ab30e1a1f": {
+      "at_seconds": 571.440095451,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-6f48f87d917c2ec9": {
+      "at_seconds": 506.468291154,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 5
+    },
+    "diff-71c1e0bf6c444565": {
+      "at_seconds": 639.780613348,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-80c10ac4f2640ff6": {
+      "at_seconds": 168.163189651,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-9dd429c4533ccdda": {
+      "at_seconds": 269.94680314,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-a62ad1ae63b7be27": {
+      "at_seconds": 198.991473771,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-ad49cc9ac6bb23b8": {
+      "at_seconds": 444.624330392,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-af2d686b405d659d": {
+      "at_seconds": 291.302175124,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-af5b1131b3704f85": {
+      "at_seconds": 127.334437147,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-b87f0f152642840a": {
+      "at_seconds": 269.488352975,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-bb6f2d9fb4efe313": {
+      "at_seconds": 424.425109982,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-beeb2de1b1ede67c": {
+      "at_seconds": 201.191031853,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-bfd1b6d8dfe4f372": {
+      "at_seconds": 748.536629441,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-c34e3acbde539eab": {
+      "at_seconds": 106.099632826,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-c80b05a8f96cc686": {
+      "at_seconds": 203.358576837,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-db01a8bc85316606": {
+      "at_seconds": 85.965995668,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-dc743ffde9d09bd3": {
+      "at_seconds": 858.962076744,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-e069531311f743f4": {
+      "at_seconds": 358.620425557,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-ef836c597f80f233": {
+      "at_seconds": 801.806082788,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-fd2b5dce5b864501": {
+      "at_seconds": 661.501400532,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "dqp-f2037376ef2b5b64": {
+      "at_seconds": 358.022621147,
+      "detail": "another plan gives other rows",
+      "kind": "Wrong",
+      "oracle": "dqp",
+      "statements": 3
+    },
+    "eet-bf8667f3062df78f": {
+      "at_seconds": 671.548445501,
+      "detail": "an equivalent form gives other rows",
+      "kind": "Wrong",
+      "oracle": "eet",
+      "statements": 4
+    },
+    "error-15c526dd5edf1a96": {
+      "at_seconds": 195.143871631,
+      "detail": "Amphora errors where SQLite finds the pivot: JSON cannot hold BLOB values",
+      "kind": "Error",
+      "oracle": "pqs",
+      "statements": 4
+    },
+    "error-2ca8ffc19f3a6362": {
+      "at_seconds": 358.879085152,
+      "detail": "Amphora errors where SQLite finds the pivot: Parse error: Unexpected character",
+      "kind": "Error",
+      "oracle": "pqs",
+      "statements": 2
+    },
+    "error-30d4c79dd110f070": {
+      "at_seconds": 85.46200369,
+      "detail": "the optimized form errors on Amphora, not on SQLite: ESCAPE expression must be a single character",
+      "kind": "Error",
+      "oracle": "norec",
+      "statements": 3
+    },
+    "error-327aa6bdaaacbc20": {
+      "at_seconds": 270.654742546,
+      "detail": "Amphora errors where SQLite finds the pivot: JSON path error near: \"0\"",
+      "kind": "Error",
+      "oracle": "pqs",
+      "statements": 7
+    },
+    "error-493c667725cb13ff": {
+      "at_seconds": 42.516902003,
+      "detail": "Amphora errors where SQLite finds the pivot: Parse error: malformed JSON",
+      "kind": "Error",
+      "oracle": "pqs",
+      "statements": 5
+    },
+    "error-95a30b3d763ff2ad": {
+      "at_seconds": 485.427363636,
+      "detail": "the unoptimized form errors on Amphora, not on SQLite: Parse error: Unexpected end of input",
+      "kind": "Error",
+      "oracle": "norec",
+      "statements": 2
+    },
+    "error-99fb1658e34f78cb": {
+      "at_seconds": 40.959628854,
+      "detail": "Amphora errors where SQLite finds the pivot: integer overflow",
+      "kind": "Error",
+      "oracle": "pqs",
+      "statements": 5
+    },
+    "error-9c5ff875d92402a3": {
+      "at_seconds": 267.835252468,
+      "detail": "Amphora errors where SQLite finds the pivot: json_set() needs an odd number of arguments",
+      "kind": "Error",
+      "oracle": "pqs",
+      "statements": 3
+    },
+    "error-dfd3551986fdeacf": {
+      "at_seconds": 859.79538753,
+      "detail": "Amphora errors where SQLite finds the pivot: json_object() requires an even number of arguments",
+      "kind": "Error",
+      "oracle": "pqs",
+      "statements": 2
+    },
+    "pqs-0b02ce25704beac1": {
+      "at_seconds": 640.530002499,
+      "detail": "the pivot (rowid 2), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 2
+    },
+    "pqs-75e02faf1f64380f": {
+      "at_seconds": 857.154087608,
+      "detail": "the pivot (rowid 255), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 2
+    },
+    "pqs-9ecd014772c7388d": {
+      "at_seconds": 42.153153773,
+      "detail": "the pivot (rowid 2), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 2
+    },
+    "pqs-b90da0b3526a0c3b": {
+      "at_seconds": 613.947224844,
+      "detail": "the pivot (rowid 2), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 2
+    },
+    "pqs-c624714a4abc1e56": {
+      "at_seconds": 754.492151403,
+      "detail": "the pivot (rowid 8), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 5
+    },
+    "tlp-45df033cac38b046": {
+      "at_seconds": 20.028806098,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 5
+    },
+    "tlp-fe2fef30016eedb6": {
+      "at_seconds": 379.200000937,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 4
+    }
+  },
+  "functions": 101,
+  "label": "",
+  "oracles": {
+    "cert": {
+      "checks": 21848,
+      "failed": 37,
+      "passed": 19762,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "no estimate": 2049
+      }
+    },
+    "diff": {
+      "checks": 21848,
+      "failed": 29,
+      "passed": 16242,
+      "plans_changed": 0,
+      "refused": {
+        "FLAGS parameter to json_valid() must be between # and ##": 1,
+        "JSON cannot hold BLOB values": 3,
+        "JSON path error near: \"#\"": 2,
+        "JSON path error near: \"##\"": 1,
+        "JSON path error near: \"#.#\"": 3,
+        "JSON path error near: \"-#\"": 1,
+        "JSON path error near: \"-###\"": 2,
+        "Parse error: Unexpected character": 1,
+        "Parse error: bad JSON path: '#e#'": 1,
+        "Parse error: bad JSON path: ''": 1,
+        "Parse error: bad JSON path: '-###'": 1,
+        "Parse error: bad JSON path: 'A'": 1,
+        "Parse error: bad JSON path: '_'": 2,
+        "Parse error: malformed JSON": 12,
+        "integer overflow": 1,
+        "json_array_insert() needs an odd number of arguments": 1,
+        "json_insert() needs an odd number of arguments": 2,
+        "json_object() labels must be TEXT": 4,
+        "json_object() requires an even number of arguments": 2,
+        "json_set() needs an odd number of arguments": 1,
+        "string or blob too big": 1
+      },
+      "skipped": {
+        "a bare column: its row is any of its group's": 2011,
+        "sqlite refused": 3522
+      }
+    },
+    "dqp": {
+      "checks": 21847,
+      "failed": 2,
+      "passed": 15230,
+      "plans_changed": 5460,
+      "refused": {},
+      "skipped": {
+        "a bare column: its row is any of its group's": 1909,
+        "a derived query meets a value's error (evaluation order)": 29,
+        "amphora refused the base": 3493,
+        "the index can't serve the query": 1184
+      }
+    },
+    "eet": {
+      "checks": 21848,
+      "failed": 1,
+      "passed": 16190,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a bare column: its row is any of its group's": 2209,
+        "a derived query errors on SQLite too": 1,
+        "a derived query meets a value's error (evaluation order)": 22,
+        "amphora refused the base": 3425
+      }
+    },
+    "norec": {
+      "checks": 21847,
+      "failed": 6,
+      "passed": 19149,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a derived query errors on SQLite too": 11,
+        "a derived query meets a value's error (evaluation order)": 228,
+        "amphora refused both": 2453
+      }
+    },
+    "pqs": {
+      "checks": 19786,
+      "failed": 17,
+      "passed": 17637,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "sqlite can't evaluate it": 1773,
+        "sqlite misses its own pivot": 359
+      }
+    },
+    "same": {
+      "checks": 3824,
+      "failed": 0,
+      "passed": 3824,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {}
+    },
+    "tlp": {
+      "checks": 21847,
+      "failed": 2,
+      "passed": 17218,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a derived query errors on SQLite too": 267,
+        "a derived query meets a value's error (evaluation order)": 872,
+        "a partition's sum overflows": 2,
+        "amphora refused the base": 3486
+      }
+    }
+  },
+  "seconds": 903.895764578,
+  "seed": 12,
+  "setup_refused": {},
+  "sqlite": "3.54.0",
+  "sqlite_options": [
+    "ATOMIC_INTRINSICS=1",
+    "COMPILER=gcc-16.2.1 20260810",
+    "DEFAULT_AUTOVACUUM",
+    "DEFAULT_CACHE_SIZE=-2000",
+    "DEFAULT_FILE_FORMAT=4",
+    "DEFAULT_JOURNAL_SIZE_LIMIT=-1",
+    "DEFAULT_MMAP_SIZE=0",
+    "DEFAULT_PAGE_SIZE=4096",
+    "DEFAULT_PCACHE_INITSZ=20",
+    "DEFAULT_RECURSIVE_TRIGGERS",
+    "DEFAULT_SECTOR_SIZE=4096",
+    "DEFAULT_SYNCHRONOUS=2",
+    "DEFAULT_WAL_AUTOCHECKPOINT=1000",
+    "DEFAULT_WAL_SYNCHRONOUS=2",
+    "DEFAULT_WORKER_THREADS=0",
+    "DIRECT_OVERFLOW_READ",
+    "ENABLE_COLUMN_METADATA",
+    "ENABLE_DBSTAT_VTAB",
+    "ENABLE_FTS3",
+    "ENABLE_FTS3_PARENTHESIS",
+    "ENABLE_FTS4",
+    "ENABLE_FTS5",
+    "ENABLE_MATH_FUNCTIONS",
+    "ENABLE_PERCENTILE",
+    "ENABLE_PREUPDATE_HOOK",
+    "ENABLE_RTREE",
+    "ENABLE_SESSION",
+    "ENABLE_STAT4",
+    "ENABLE_STMTVTAB",
+    "ENABLE_UNLOCK_NOTIFY",
+    "HAVE_ISNAN",
+    "LIKE_DOESNT_MATCH_BLOBS",
+    "MALLOC_SOFT_LIMIT=1024",
+    "MAX_ATTACHED=10",
+    "MAX_COLUMN=2000",
+    "MAX_COMPOUND_SELECT=500",
+    "MAX_DEFAULT_PAGE_SIZE=8192",
+    "MAX_EXPR_DEPTH=10000",
+    "MAX_FUNCTION_ARG=1000",
+    "MAX_LENGTH=1000000000",
+    "MAX_LIKE_PATTERN_LENGTH=50000",
+    "MAX_MMAP_SIZE=0x7fff0000",
+    "MAX_PAGE_COUNT=0xfffffffe",
+    "MAX_PAGE_SIZE=65536",
+    "MAX_SCHEMA=10000000",
+    "MAX_SQL_LENGTH=1000000000",
+    "MAX_TRIGGER_DEPTH=1000",
+    "MAX_VARIABLE_NUMBER=250000",
+    "MAX_VDBE_OP=250000000",
+    "MAX_WORKER_THREADS=8",
+    "MUTEX_PTHREADS",
+    "SECURE_DELETE",
+    "SYSTEM_MALLOC",
+    "TEMP_STORE=1",
+    "THREADSAFE=1"
+  ],
+  "states": 3824
+}

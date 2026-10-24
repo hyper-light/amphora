@@ -56,3 +56,4 @@ Kiln vendors it at `vendor/amphora` and reaches it only through kiln-seams' `Rec
 | The engine: Turso's four crates made Amphora's own (`crates/engine*`, its `ORIGIN.md`), not vendored; CLAUDE.md §1 on every line Amphora writes, the rest counted down (`scripts/engine-ratchet.toml`) | Ada, 2026-10-20 | made |
 | The planner where the bench suite found it choosing far more work: closed ranges, sorts, GLOB prefixes, skip-scans (`planner.md`) | CP-T1.2 | made |
 | The executor's work repeated on every run of a statement or row: ephemeral tables kept between runs, an IN subquery's list searched once a row (`executor.md`) | CP-T1.2 | made |
+| Where answers depart from SQLite's, each for a stated reason: TEXT is well-formed UTF-8 (`semantics.md`) | G2 step 3 | made |

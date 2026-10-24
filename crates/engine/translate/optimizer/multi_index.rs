@@ -761,14 +761,11 @@ fn evaluate_multi_index_branches(
                 consumed_where_terms.set(term_idx)?;
             }
         }
-        for branch in &branch_params {
-            if let MultiIndexBranchAccessParams::Seek { constraints, .. } = &branch.access {
-                for constraint in constraints {
-                    let where_term_idx = constraint.where_clause_pos.0;
-                    consumed_where_terms.set(where_term_idx)?;
-                }
-            }
-        }
+        // The scan consumes its own term, and an intersection the terms it was decomposed from;
+        // nothing else. A union's branches are planned over their own disjunct's terms, whose
+        // positions are not the query's: read as the query's, they had marked another of its
+        // terms consumed, and the estimate lost that term's selectivity (the oracles' CERT check:
+        // `c0 < c0 AND (c0 = '1' OR ...)` estimated above `c0 < c0` alone).
         Ok(Some(AccessMethod {
             cost: multi_index_cost,
             estimated_rows_per_outer_row: estimated_rows,

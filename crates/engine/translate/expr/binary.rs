@@ -130,7 +130,9 @@ pub(super) fn emit_binary_expr_scalar(
                 Some(resolver),
             )?,
         }
-        if op.is_comparison() {
+        // An operator's value carries its operands' explicit COLLATE, not a column's collation
+        // (SQLite: (c || '') over a NOCASE column compares by BINARY).
+        if op.is_comparison() || matches!(program.curr_collation_ctx(), Some((_, false))) {
             program.reset_collation();
         }
         Ok(target_register)
@@ -138,13 +140,43 @@ pub(super) fn emit_binary_expr_scalar(
         let e1_reg = program.alloc_registers(2);
         let e2_reg = e1_reg + 1;
 
+        // Beside a subquery, an operand that is NULL settles the result, and the subquery's side
+        // is never computed (SQLite 3.54's exprComputeOperands): a NULL goes where the condition
+        // sends it, or is the value.
+        let (rhs_first, lhs_null_check) = operands_beside_subquery(op, e1, e2);
+        let null_target = match emit_mode {
+            _ if !rhs_first && !lhs_null_check => None,
+            BinaryEmitMode::Condition(metadata) => Some(metadata.jump_target_when_null),
+            BinaryEmitMode::Value => Some(program.allocate_label()),
+        };
+        let mut right_collation_ctx = None;
+        if rhs_first {
+            program.reset_collation();
+            translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
+            right_collation_ctx = program.curr_collation_ctx();
+            if let Some(target_pc) = null_target {
+                program.emit_insn(Insn::IsNull {
+                    reg: e2_reg,
+                    target_pc,
+                });
+            }
+        }
+
         program.reset_collation();
         translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
         let left_collation_ctx = program.curr_collation_ctx();
 
-        program.reset_collation();
-        translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
-        let right_collation_ctx = program.curr_collation_ctx();
+        if !rhs_first {
+            if let (true, Some(target_pc)) = (lhs_null_check, null_target) {
+                program.emit_insn(Insn::IsNull {
+                    reg: e1_reg,
+                    target_pc,
+                });
+            }
+            program.reset_collation();
+            translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
+            right_collation_ctx = program.curr_collation_ctx();
+        }
 
         /*
          * The rules for determining which collating function to use for a binary comparison
@@ -160,19 +192,10 @@ pub(super) fn emit_binary_expr_scalar(
          *
          * 3. Otherwise, the BINARY collating function is used for comparison.
          */
-        let collation_ctx = {
-            match (left_collation_ctx, right_collation_ctx) {
-                (Some((c_left, true)), _) => Some((c_left, true)),
-                (_, Some((c_right, true))) => Some((c_right, true)),
-                (Some((c_left, from_collate_left)), None) => Some((c_left, from_collate_left)),
-                (None, Some((c_right, from_collate_right))) => Some((c_right, from_collate_right)),
-                (Some((c_left, from_collate_left)), Some((_, false))) => {
-                    Some((c_left, from_collate_left))
-                }
-                _ => None,
-            }
-        };
-        program.set_collation(collation_ctx);
+        program.set_collation(comparison_collation_ctx(
+            left_collation_ctx,
+            right_collation_ctx,
+        ));
 
         match emit_mode {
             BinaryEmitMode::Value => emit_binary_insn(
@@ -199,15 +222,74 @@ pub(super) fn emit_binary_expr_scalar(
                 Some(resolver),
             )?,
         }
+        if let (BinaryEmitMode::Value, Some(null_label)) = (emit_mode, null_target) {
+            let end = program.allocate_label();
+            program.emit_insn(Insn::Goto { target_pc: end });
+            program.preassign_label_to_next_insn(null_label);
+            program.emit_insn(Insn::Null {
+                dest: target_register,
+                dest_end: None,
+            });
+            program.preassign_label_to_next_insn(end);
+        }
         // Only reset collation for comparison operators, which consume it.
         // Non-comparison operators (Concat, Add, etc.) must propagate the
         // collation to the parent expression so that e.g.
         //   (name COLLATE NOCASE || '') <> 'admin'
-        // correctly applies NOCASE to the Ne comparison.
-        if op.is_comparison() {
+        // correctly applies NOCASE to the Ne comparison. A column's own collation does not
+        // carry past the operator (SQLite: (c || '') over a NOCASE column compares by BINARY).
+        if op.is_comparison() || matches!(program.curr_collation_ctx(), Some((_, false))) {
             program.reset_collation();
         }
         Ok(target_register)
+    }
+}
+
+/// For a comparison (not IS) or an arithmetic, bitwise or concatenation operator with a subquery on
+/// one side, SQLite 3.54's exprComputeOperands: whether to compute the right side first and stop at
+/// its NULL (the subquery is on the left only), or else to stop at the left side's NULL before
+/// computing the right (the subquery is on the right).
+fn operands_beside_subquery(op: &ast::Operator, e1: &ast::Expr, e2: &ast::Expr) -> (bool, bool) {
+    if !matches!(
+        op,
+        ast::Operator::Equals
+            | ast::Operator::NotEquals
+            | ast::Operator::Less
+            | ast::Operator::LessEquals
+            | ast::Operator::Greater
+            | ast::Operator::GreaterEquals
+            | ast::Operator::Add
+            | ast::Operator::Subtract
+            | ast::Operator::Multiply
+            | ast::Operator::Divide
+            | ast::Operator::Modulus
+            | ast::Operator::BitwiseAnd
+            | ast::Operator::BitwiseOr
+            | ast::Operator::LeftShift
+            | ast::Operator::RightShift
+            | ast::Operator::Concat
+    ) {
+        return (false, false);
+    }
+    let (left, right) = (has_subquery(e1), has_subquery(e2));
+    let rhs_first = left && !right && e2.can_be_null();
+    (rhs_first, !rhs_first && right && e1.can_be_null())
+}
+
+/// The collation a comparison uses, from its operands' collation contexts by the rules above: an
+/// explicit COLLATE first, the left operand's before the right's, then a column's, the left's
+/// first. `CASE x WHEN y` compares by them too.
+pub(super) fn comparison_collation_ctx(
+    left: Option<(CollationSeq, bool)>,
+    right: Option<(CollationSeq, bool)>,
+) -> Option<(CollationSeq, bool)> {
+    match (left, right) {
+        (Some((c_left, true)), _) => Some((c_left, true)),
+        (_, Some((c_right, true))) => Some((c_right, true)),
+        (Some((c_left, from_collate_left)), None) => Some((c_left, from_collate_left)),
+        (None, Some((c_right, from_collate_right))) => Some((c_right, from_collate_right)),
+        (Some((c_left, from_collate_left)), Some((_, false))) => Some((c_left, from_collate_left)),
+        _ => None,
     }
 }
 
@@ -717,6 +799,7 @@ pub(super) fn emit_binary_insn(
                 func: FuncCtx {
                     func: Func::Json(json_func),
                     arg_count: 2,
+                    collation: None,
                 },
             })
         }
@@ -772,6 +855,7 @@ pub(super) fn emit_binary_insn(
                 func: FuncCtx {
                     func: Func::Scalar(func),
                     arg_count: 2,
+                    collation: None,
                 },
             });
         }
@@ -945,21 +1029,10 @@ pub(super) fn emit_binary_condition_insn(
     };
 
     // For conditional jumps that don't have a clear "opposite op" (e.g. x+y), we check whether the result is nonzero/nonnull
-    // (or zero/null) depending on the condition metadata.
+    // (or zero/null) depending on the condition metadata, a NULL going where it says (under a NOT,
+    // where TRUE goes).
     let eval_result = |program: &mut ProgramBuilder, result_reg: usize| {
-        if condition_metadata.jump_if_condition_is_true {
-            program.emit_insn(Insn::If {
-                reg: result_reg,
-                target_pc,
-                jump_if_null: false,
-            });
-        } else {
-            program.emit_insn(Insn::IfNot {
-                reg: result_reg,
-                target_pc,
-                jump_if_null: true,
-            });
-        }
+        emit_cond_jump(program, condition_metadata, result_reg)
     };
 
     match op_to_use {
@@ -1138,6 +1211,7 @@ pub(super) fn emit_binary_condition_insn(
                 func: FuncCtx {
                     func: Func::Json(json_func),
                     arg_count: 2,
+                    collation: None,
                 },
             });
             eval_result(program, target_register);
@@ -1192,6 +1266,7 @@ pub(super) fn emit_binary_condition_insn(
                 func: FuncCtx {
                     func: Func::Scalar(func),
                     arg_count: 2,
+                    collation: None,
                 },
             });
             eval_result(program, target_register);

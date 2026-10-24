@@ -616,7 +616,7 @@ fn consume_partial_index_predicate_terms(
     where_clause: &[WhereTerm],
 ) -> Result<()> {
     let predicate_terms = partial_index_predicate_terms(index, rhs_table, where_clause)
-        .expect("selected partial index predicate must be implied by query");
+        .ok_or_else(|| super::unproven_partial_index(index))?;
     for term_idx in predicate_terms {
         consumed.set(term_idx)?;
     }

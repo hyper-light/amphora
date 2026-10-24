@@ -477,6 +477,7 @@ fn collect_non_aggregate_expressions<'a>(
         .map(|col| &col.expr)
         .chain(order_by.iter().map(|(e, _, _)| e.as_ref()))
         .chain(group_by.having.iter().flatten())
+        .chain(group_by.carried.iter())
     {
         collect_result_columns(expr, plan, &mut result_columns)?;
     }
@@ -541,8 +542,10 @@ fn collect_result_columns<'a>(
             ast::Expr::SubqueryResult {
                 subquery_id, lhs, ..
             } => {
+                // A subquery run after grouping has no value to carry, but the columns its
+                // left-hand side reads are read then too: walk on into it.
                 if is_deferred_grouped_output_subquery(plan, *subquery_id) {
-                    return Ok(WalkControl::SkipChildren);
+                    return Ok(WalkControl::Continue);
                 }
                 if let Some(ref lhs) = lhs {
                     let mut lhs_contains_agg = false;

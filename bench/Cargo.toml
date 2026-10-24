@@ -16,6 +16,9 @@ amphora-engine = { path = "../crates/engine", default-features = false, features
 # Vanilla Turso: upstream at the revision Amphora's engine was taken from, none of Amphora's changes.
 turso_core = { git = "https://github.com/tursodatabase/turso", rev = "3e09a82750d8290ef96e3830896e7205b7c0b9e6", default-features = false, features = ["fs", "json", "pure-rust-crypto"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# The oracles' reference (`--oracle`): the system's SQLite, loaded at run time, so it's the release
+# the correctness corpus is checked on, not the bundled one the benchmarks link.
+libloading = "0.8.9"
 mysql = { version = "26", default-features = false, features = ["minimal"] }
 # PostgreSQL, OrioleDB and CedarDB (Postgres's protocol): the synchronous client, here only.
 postgres = "0.19"

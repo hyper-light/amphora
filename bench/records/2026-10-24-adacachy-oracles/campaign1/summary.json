@@ -1,0 +1,549 @@
+{
+  "duplicates": 135,
+  "findings": {
+    "cert-183ef92e38891107": {
+      "detail": "the more restrictive query is estimated at 0.16000000000000003 rows, the query at 0.006839397205857212",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 3
+    },
+    "cert-773031135e2103ca": {
+      "detail": "the more restrictive query is estimated at 200000000000 rows, the query at 145800000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-d07da3204b082fa0": {
+      "detail": "the more restrictive query is estimated at 400000.6 rows, the query at 5000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "cert-d7adf5887d0edbc2": {
+      "detail": "the more restrictive query is estimated at 1000000000000 rows, the query at 400000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 1
+    },
+    "diff-03d12f6ac26442eb": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-10675722aa29abaa": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-10d2005998dd43df": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-125ad13d60da0c20": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-1b5e437de6b3f450": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-3235a88c3fd346bf": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-35b7052c9ed3a1fb": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-40dd229adb385868": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-478a939948c8bb7b": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-47fdef2d819a9c74": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-4a8b9fa2064fb21f": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-4aef5f0d9d2be013": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-4cd6dbe52f9cfe7c": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-51c8725621e0b586": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-54adfd8f371e1f4c": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-56aaad520ada7b4b": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-5f02ee5ded1cda59": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-6038292e81ec494d": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-6043d55fb3d98918": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-62ded893dd636664": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 6
+    },
+    "diff-654a3482133a8839": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-66ac896debee6c37": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 5
+    },
+    "diff-796014c0f470047e": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-7e00aa5c0425cd62": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-85daa6593e3ee049": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-87d1150149e243b6": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-88786185ab21e328": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-8dff79b31f30b7a0": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-91e350f55dad4c41": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-92872c1e764ba4b1": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-9368dc86a69c7e90": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-a7001dd4d6182c33": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-aa3b7b0e6fb12626": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-abc98f0b19b0bf2e": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 6
+    },
+    "diff-af5ef200abdb39e2": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-b228d937eb524af1": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-be3eb718f2a2f0f5": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-c6e3dc6ae61053b4": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-d72307bc1fdeec13": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-d8adeec90811268d": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-db7032dd26d1931a": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-ddc2dd86d22aad8e": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-e08cfad77a60e714": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-e2cbf3052a1f0f74": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-e81bd8507fe19b3f": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-f44a64c6fbb7792a": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-f728f9cd2ac0aa59": {
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "error-033d5f13426f5305": {
+      "detail": "a partition errors on Amphora, not on SQLite: Parse error: no such function: json_array_insert",
+      "kind": "Error",
+      "oracle": "tlp",
+      "statements": 1
+    },
+    "error-23d2039dced3bbc4": {
+      "detail": "the partitions' aggregate errors on Amphora, not on SQLite: FLAGS parameter to json_valid() must be between 1 and 15",
+      "kind": "Error",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "error-327aa6bdaaacbc20": {
+      "detail": "Amphora errors where SQLite finds the pivot: JSON path error near: \"0\"",
+      "kind": "Error",
+      "oracle": "pqs",
+      "statements": 2
+    },
+    "error-40f23311aa753214": {
+      "detail": "a partition errors on Amphora, not on SQLite: Parse error: Collate in WHERE clause is not supported",
+      "kind": "Error",
+      "oracle": "tlp",
+      "statements": 1
+    },
+    "error-493c667725cb13ff": {
+      "detail": "Amphora errors where SQLite finds the pivot: Parse error: malformed JSON",
+      "kind": "Error",
+      "oracle": "pqs",
+      "statements": 7
+    },
+    "error-f64f26a38065868e": {
+      "detail": "the partitions' UNION errors on Amphora, not on SQLite: Parse error: no such function: jsonb_array_insert",
+      "kind": "Error",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "pqs-05c9b3cfaa0a3fe5": {
+      "detail": "the pivot (rowid 2), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 2
+    },
+    "pqs-273539be46d477be": {
+      "detail": "the pivot (rowid 8), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 4
+    },
+    "pqs-30f7e4e71cdd2614": {
+      "detail": "the pivot (rowid 8), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 5
+    },
+    "pqs-4db0b805a83e693a": {
+      "detail": "the pivot (rowid 11), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 8
+    },
+    "pqs-50c5686c4c1c8de2": {
+      "detail": "the pivot (rowid 10), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 5
+    },
+    "pqs-547601b066301724": {
+      "detail": "the pivot (rowid 1), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 2
+    },
+    "pqs-57a3d29e0cae0bbd": {
+      "detail": "the pivot (rowid 2), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 3
+    },
+    "pqs-79175f371e928d0a": {
+      "detail": "the pivot (rowid 2), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 2
+    },
+    "pqs-d3c0f00ee68ce1b7": {
+      "detail": "the pivot (rowid 12), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 6
+    },
+    "same-a8b01f3df3577f7e": {
+      "detail": "the statements leave t2 with other rows",
+      "kind": "Wrong",
+      "oracle": "same",
+      "statements": 2
+    },
+    "same-df9785643242f7c5": {
+      "detail": "the statements leave t1 with other rows",
+      "kind": "Wrong",
+      "oracle": "same",
+      "statements": 2
+    },
+    "same-f7444aa73d685d79": {
+      "detail": "the statements leave t0 with other rows",
+      "kind": "Wrong",
+      "oracle": "same",
+      "statements": 2
+    },
+    "tlp-3bfc03fdfdf40714": {
+      "detail": "selected partial index predicate must be implied by query",
+      "kind": "Panic",
+      "oracle": "tlp",
+      "statements": 1
+    }
+  },
+  "functions": 101,
+  "label": "",
+  "oracles": {
+    "cert": {
+      "checks": 4951,
+      "failed": 4,
+      "passed": 4313,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "no estimate": 634
+      }
+    },
+    "diff": {
+      "checks": 4941,
+      "failed": 47,
+      "passed": 3618,
+      "plans_changed": 0,
+      "refused": {
+        "JSON cannot hold BLOB values": 1,
+        "JSON path error near: \"#\"": 3,
+        "JSON path error near: \"##\"": 1,
+        "JSON path error near: \"##.#\"": 1,
+        "JSON path error near: \"#.#\"": 1,
+        "JSON path error near: \"-###################\"": 1,
+        "Parse error: Unexpected character": 1,
+        "Parse error: Unexpected end of input": 1,
+        "Parse error: bad JSON path: '#'": 1,
+        "Parse error: bad JSON path: '#.#e+###'": 1,
+        "Parse error: bad JSON path: '#x##'": 1,
+        "Parse error: bad JSON path: '%'": 1,
+        "Parse error: bad JSON path: ''": 1,
+        "Parse error: bad JSON path: 'ABC'": 1,
+        "Parse error: bad JSON path: '_'": 1,
+        "Parse error: json_object function requires an even number of arguments": 12,
+        "Parse error: jsonb_object function requires an even number of arguments": 7,
+        "Parse error: malformed JSON": 7,
+        "Parse error: no such function: json_array_insert": 19,
+        "Parse error: no such function: jsonb_array_insert": 18,
+        "integer overflow": 1,
+        "json_insert() needs an odd number of arguments": 1,
+        "json_object() labels must be TEXT": 2,
+        "json_replace() needs an odd number of arguments": 2,
+        "string or blob too big": 1
+      },
+      "skipped": {
+        "a bare column: its row is any of its group's": 418,
+        "sqlite refused": 771
+      }
+    },
+    "dqp": {
+      "checks": 4940,
+      "failed": 2,
+      "passed": 3377,
+      "plans_changed": 1176,
+      "refused": {},
+      "skipped": {
+        "a bare column: its row is any of its group's": 438,
+        "a derived query meets a value's error (evaluation order)": 4,
+        "amphora refused the base": 844,
+        "the index can't serve the query": 275
+      }
+    },
+    "eet": {
+      "checks": 4949,
+      "failed": 1,
+      "passed": 3532,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a bare column: its row is any of its group's": 499,
+        "a derived query meets a value's error (evaluation order)": 1,
+        "amphora refused the base": 916
+      }
+    },
+    "norec": {
+      "checks": 4947,
+      "failed": 1,
+      "passed": 4284,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a derived query errors on SQLite too": 1,
+        "a derived query meets a value's error (evaluation order)": 35,
+        "amphora refused both": 626
+      }
+    },
+    "pqs": {
+      "checks": 4456,
+      "failed": 16,
+      "passed": 3977,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "sqlite can't evaluate it": 395,
+        "sqlite misses its own pivot": 68
+      }
+    },
+    "same": {
+      "checks": 978,
+      "failed": 111,
+      "passed": 867,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {}
+    },
+    "tlp": {
+      "checks": 4942,
+      "failed": 23,
+      "passed": 3790,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a derived query errors on SQLite too": 82,
+        "a derived query meets a value's error (evaluation order)": 205,
+        "amphora refused the base": 842
+      }
+    }
+  },
+  "seconds": 606.87401453,
+  "seed": 11,
+  "setup_refused": {},
+  "sqlite": "3.54.0",
+  "states": 978
+}

@@ -373,6 +373,27 @@ pub fn get_collseq_from_expr_with_symbols(
     Ok(explicit.or(column))
 }
 
+/// The collation `lhs` compares with `rhs` by when each is read in its own query's tables (an IN's
+/// left side in the outer query, its subquery's column in the subquery): SQLite's rule for a
+/// binary comparison, an explicit COLLATE first (the left's), then a column's (the left's), then
+/// BINARY. `x IN (SELECT y ...)` compares as `x = y` does.
+pub(crate) fn resolve_comparison_collseq_across(
+    lhs: &Expr,
+    lhs_tables: &TableReferences,
+    rhs: &Expr,
+    rhs_tables: &TableReferences,
+) -> Result<CollationSeq> {
+    let (lhs_explicit, _) = get_collseq_parts_from_expr_with_symbols(lhs, lhs_tables, None, None)?;
+    let (rhs_explicit, _) = get_collseq_parts_from_expr_with_symbols(rhs, rhs_tables, None, None)?;
+    let lhs_column = comparison_operand_column_collseq(lhs, lhs_tables)?;
+    let rhs_column = comparison_operand_column_collseq(rhs, rhs_tables)?;
+    Ok(lhs_explicit
+        .or(rhs_explicit)
+        .or(lhs_column)
+        .or(rhs_column)
+        .unwrap_or(CollationSeq::Binary))
+}
+
 pub fn resolve_comparison_collseq_with_resolver(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
@@ -408,7 +429,6 @@ pub fn get_expr_collation_ctx_with_symbols(
     referenced_tables: &TableReferences,
     symbol_table: Option<&SymbolTable>,
 ) -> Result<Option<(CollationSeq, bool)>> {
-    let mut maybe_column_collseq = None;
     let mut maybe_explicit_collseq = None;
 
     walk_expr(top_expr, &mut |expr: &Expr| -> Result<WalkControl> {
@@ -428,43 +448,29 @@ pub fn get_expr_collation_ctx_with_symbols(
                 let first_column = columns
                     .first()
                     .expect("a merged column must have at least two source columns");
-                if let Some((collation, explicit)) = get_expr_collation_ctx_with_symbols(
+                if let Some((collation, true)) = get_expr_collation_ctx_with_symbols(
                     first_column,
                     referenced_tables,
                     symbol_table,
                 )? {
-                    if explicit && maybe_explicit_collseq.is_none() {
+                    if maybe_explicit_collseq.is_none() {
                         maybe_explicit_collseq = Some(collation);
-                    } else if !explicit && maybe_column_collseq.is_none() {
-                        maybe_column_collseq = Some(collation);
                     }
                 }
                 return Ok(WalkControl::SkipChildren);
             }
-            Expr::Column { table, column, .. }
-                // generated columns (the SELF_TABLE placeholder) don't inherit an implicit
-                // collation from their expression, so we skip them
-                if !table.is_self_table() => {
-                    let (_, table_ref) = referenced_tables
-                        .find_table_by_internal_id(*table)
-                        .ok_or_else(|| {
-                            crate::LimboError::ParseError("table not found".to_string())
-                        })?;
-                    let column = table_ref.get_column_at(*column).ok_or_else(|| {
-                        crate::LimboError::ParseError("column not found".to_string())
-                    })?;
-                    if maybe_column_collseq.is_none() {
-                        maybe_column_collseq = Some(column.collation());
-                    }
-                }
             _ => {}
         }
         Ok(WalkControl::Continue)
     })?;
 
+    // A column's collation only where the expression is that column (behind parentheses, unary +
+    // and CAST), as fresh translation leaves it; generated columns (the SELF_TABLE placeholder)
+    // inherit none.
+    let column = comparison_operand_column_collseq(top_expr, referenced_tables)?;
     Ok(maybe_explicit_collseq
         .map(|collation| (collation, true))
-        .or_else(|| maybe_column_collseq.map(|collation| (collation, false))))
+        .or_else(|| column.map(|collation| (collation, false))))
 }
 
 /// Resolve the collation for a binary comparison (=, <, >, etc.) per SQLite rules:
@@ -556,14 +562,16 @@ fn comparison_operand_column_collseq(
 /// Returns (explicit_collation, column_collation) from a single expression.
 /// Explicit collation comes from COLLATE operators; column collation comes from
 /// column definitions. These are kept separate to allow proper precedence resolution
-/// in binary comparisons.
+/// in binary comparisons. As SQLite's sqlite3ExprCollSeq reads them, a COLLATE anywhere in the
+/// expression counts (the leftmost), and a column's collation only where the expression is that
+/// column, behind parentheses, unary + and CAST: a function of it, or an operator over it, carries
+/// none (`printf('%s', c)` over an RTRIM column compares, sorts and deduplicates by BINARY).
 fn get_collseq_parts_from_expr_with_symbols(
     top_expr: &Expr,
     referenced_tables: &TableReferences,
     symbol_table: Option<&SymbolTable>,
     resolver: Option<&Resolver>,
 ) -> Result<(Option<CollationSeq>, Option<CollationSeq>)> {
-    let mut maybe_column_collseq = None;
     let mut maybe_explicit_collseq = None;
 
     walk_expr(top_expr, &mut |expr: &Expr| -> Result<WalkControl> {
@@ -578,18 +586,6 @@ fn get_collseq_parts_from_expr_with_symbols(
                 // Skip children since we've found a COLLATE operator
                 return Ok(WalkControl::SkipChildren);
             }
-            Expr::Column { table, column, .. } if table.is_self_table() => {
-                if maybe_column_collseq.is_none() {
-                    maybe_column_collseq =
-                        resolver.and_then(|resolver| resolver.self_table_collation(Some(*column)));
-                }
-            }
-            Expr::RowId { table, .. } if table.is_self_table() => {
-                if maybe_column_collseq.is_none() {
-                    maybe_column_collseq =
-                        resolver.and_then(|resolver| resolver.self_table_collation(None));
-                }
-            }
             Expr::MergedColumn(columns) => {
                 // A merged USING column takes the collation of its first column
                 // only, so a NOCASE later column is ignored even when the first
@@ -597,7 +593,7 @@ fn get_collseq_parts_from_expr_with_symbols(
                 let first_column = columns
                     .first()
                     .expect("a merged column must have at least two source columns");
-                let (explicit, column) = get_collseq_parts_from_expr_with_symbols(
+                let (explicit, _) = get_collseq_parts_from_expr_with_symbols(
                     first_column,
                     referenced_tables,
                     symbol_table,
@@ -606,10 +602,48 @@ fn get_collseq_parts_from_expr_with_symbols(
                 if maybe_explicit_collseq.is_none() {
                     maybe_explicit_collseq = explicit;
                 }
-                if maybe_column_collseq.is_none() {
-                    maybe_column_collseq = column;
-                }
                 return Ok(WalkControl::SkipChildren);
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+
+    let column = operand_column_collseq(top_expr, referenced_tables, resolver)?;
+    Ok((maybe_explicit_collseq, column))
+}
+
+/// The declared collation of the column `top_expr` is, behind parentheses, unary + and CAST
+/// (`None` when it declares none, or when the expression is no column).
+fn operand_column_collseq(
+    top_expr: &Expr,
+    referenced_tables: &TableReferences,
+    resolver: Option<&Resolver>,
+) -> Result<Option<CollationSeq>> {
+    let mut expr = top_expr;
+    loop {
+        match expr {
+            Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+                let Some(inner) = exprs.first() else {
+                    return Ok(None);
+                };
+                expr = inner;
+            }
+            Expr::Unary(amphora_engine_parser::ast::UnaryOperator::Positive, inner)
+            | Expr::Cast { expr: inner, .. } => expr = inner,
+            Expr::MergedColumn(columns) => {
+                let Some(first) = columns.first() else {
+                    return Ok(None);
+                };
+                expr = first;
+            }
+            Expr::Column { table, column, .. } if table.is_self_table() => {
+                return Ok(
+                    resolver.and_then(|resolver| resolver.self_table_collation(Some(*column)))
+                );
+            }
+            Expr::RowId { table, .. } if table.is_self_table() => {
+                return Ok(resolver.and_then(|resolver| resolver.self_table_collation(None)));
             }
             Expr::Column { table, column, .. } => {
                 let (_, table_ref) = referenced_tables
@@ -618,30 +652,22 @@ fn get_collseq_parts_from_expr_with_symbols(
                 let column = table_ref
                     .get_column_at(*column)
                     .ok_or_else(|| crate::LimboError::ParseError("column not found".to_string()))?;
-                if maybe_column_collseq.is_none() {
-                    maybe_column_collseq = column.collation_opt();
-                }
-                return Ok(WalkControl::Continue);
+                return Ok(column.collation_opt());
             }
             Expr::RowId { table, .. } => {
                 let (_, table_ref) = referenced_tables
                     .find_table_by_internal_id(*table)
                     .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
-                if let Some(btree) = table_ref.btree() {
-                    if let Some((_, rowid_alias_col)) = btree.get_rowid_alias_column() {
-                        if maybe_column_collseq.is_none() {
-                            maybe_column_collseq = rowid_alias_col.collation_opt();
-                        }
-                    }
-                }
-                return Ok(WalkControl::Continue);
+                let Some(btree) = table_ref.btree() else {
+                    return Ok(None);
+                };
+                return Ok(btree
+                    .get_rowid_alias_column()
+                    .and_then(|(_, column)| column.collation_opt()));
             }
-            _ => {}
+            _ => return Ok(None),
         }
-        Ok(WalkControl::Continue)
-    })?;
-
-    Ok((maybe_explicit_collseq, maybe_column_collseq))
+    }
 }
 
 #[cfg(test)]
@@ -821,12 +847,14 @@ mod tests {
     }
 
     #[test]
-    fn test_get_collseq_from_expr_column_plus_column_leftside_column_wins() {
+    fn test_get_collseq_from_expr_column_plus_column_carries_no_column_collation() {
         let table_references = get_table_references_two_tables_single_column_with_collations(
             Some(CollationSeq::NoCase),
             Some(CollationSeq::Rtrim),
         );
-        // col1 + col2 -- col1's NOCASE collation wins since it's on the left side
+        // col1 + col2 -- no collation: an operator over columns carries none of theirs, only an
+        // explicit COLLATE (SQLite's sqlite3ExprCollSeq; (c || '') over a NOCASE c compares by
+        // BINARY)
         let lhs = Expr::Column {
             database: None,
             table: TableInternalId::from(1),
@@ -841,7 +869,7 @@ mod tests {
         };
         let expr = Expr::binary(lhs, Operator::Add, rhs);
         let collseq = get_collseq_from_expr(&expr, &table_references).unwrap();
-        assert_eq!(collseq, Some(CollationSeq::NoCase));
+        assert_eq!(collseq, None);
     }
 
     #[test]

@@ -216,6 +216,24 @@ pub fn comparison_affinity(
     do_comparison_affinity(lhs, rhs)
 }
 
+/// The affinity `x IN (SELECT y)` compares by: SQLite's sqlite3CompareAffinity of y and x
+/// (exprINAffinity), where a lone column's affinity stays what it is: REAL makes an integer probe a
+/// REAL (OP_Affinity), so 9223372036854775806 finds 2^63, where [comparison_affinity]'s NUMERIC
+/// would leave it an integer.
+pub(crate) fn in_subquery_affinity(
+    rhs: &ast::Expr,
+    lhs: Affinity,
+    referenced_tables: Option<&TableReferences>,
+) -> Affinity {
+    let rhs = get_expr_affinity(rhs, referenced_tables, None);
+    match (lhs != Affinity::None, rhs != Affinity::None) {
+        (true, true) if lhs.is_numeric() || rhs.is_numeric() => Affinity::Numeric,
+        (true, true) | (false, false) => Affinity::Blob,
+        (_, true) => rhs,
+        (true, false) => lhs,
+    }
+}
+
 pub(crate) trait HasComparableAffinity {
     fn comparison_affinity(
         &self,

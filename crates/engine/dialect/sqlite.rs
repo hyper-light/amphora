@@ -452,6 +452,10 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         #[cfg(feature = "json")]
         "jsonb_insert" => Ok(Some(Func::Json(JsonFunc::JsonbInsert))),
         #[cfg(feature = "json")]
+        "json_array_insert" => Ok(Some(Func::Json(JsonFunc::JsonArrayInsert))),
+        #[cfg(feature = "json")]
+        "jsonb_array_insert" => Ok(Some(Func::Json(JsonFunc::JsonbArrayInsert))),
+        #[cfg(feature = "json")]
         "jsonb_replace" => Ok(Some(Func::Json(JsonFunc::JsonbReplace))),
         #[cfg(feature = "json")]
         "json_pretty" => Ok(Some(Func::Json(JsonFunc::JsonPretty))),

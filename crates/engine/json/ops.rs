@@ -1,7 +1,10 @@
 use super::{
     convert_dbtype_to_jsonb, curry_convert_dbtype_to_jsonb, json_edit_path,
-    json_path_from_db_value, json_string_to_db_type,
-    jsonb::{DeleteOperation, InsertOperation, ReplaceOperation},
+    json_path_from_db_value, json_path_text, json_string_to_db_type,
+    jsonb::{
+        ArrayInsertOperation, DeleteOperation, InsertOperation, PathOperationMode, ReplaceOperation,
+    },
+    path::PathElement,
     Conv, JsonCacheCell, OutputVariant,
 };
 use crate::{
@@ -28,14 +31,13 @@ pub fn json_patch(
     let make_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let patch = cache.get_or_insert_with(patch, make_jsonb)?;
 
-    if patch.element_type()? != super::jsonb::ElementType::OBJECT {
-        target = patch;
-    } else {
-        if target.element_type()? != super::jsonb::ElementType::OBJECT {
-            target = super::jsonb::Jsonb::make_empty_obj(0)?;
-        }
-        target.patch(&patch)?;
+    if patch.element_type()? == super::jsonb::ElementType::OBJECT
+        && target.element_type()? != super::jsonb::ElementType::OBJECT
+    {
+        target = super::jsonb::Jsonb::make_empty_obj(0)?;
     }
+    // A patch that isn't an object takes the target's place, put there as SQLite puts it.
+    target.patch(&patch)?;
 
     let element_type = target.element_type()?;
 
@@ -63,14 +65,13 @@ pub fn jsonb_patch(
     let make_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let patch = cache.get_or_insert_with(patch, make_jsonb)?;
 
-    if patch.element_type()? != super::jsonb::ElementType::OBJECT {
-        target = patch;
-    } else {
-        if target.element_type()? != super::jsonb::ElementType::OBJECT {
-            target = super::jsonb::Jsonb::make_empty_obj(0)?;
-        }
-        target.patch(&patch)?;
+    if patch.element_type()? == super::jsonb::ElementType::OBJECT
+        && target.element_type()? != super::jsonb::ElementType::OBJECT
+    {
+        target = super::jsonb::Jsonb::make_empty_obj(0)?;
     }
+    // A patch that isn't an object takes the target's place, put there as SQLite puts it.
+    target.patch(&patch)?;
 
     let element_type = target.element_type()?;
 
@@ -99,8 +100,16 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
+    // A NULL document gives NULL before any path is read, as in SQLite.
+    if matches!(first_arg.as_value_ref(), ValueRef::Null) {
+        return Ok(Value::Null);
+    }
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
     for arg in args {
+        // A NULL path or `$` removes the whole document: NULL, as in SQLite.
+        if matches!(arg.as_value_ref(), ValueRef::Null) {
+            return Ok(Value::Null);
+        }
         if let ValueRef::Text(s) = arg.as_value_ref() {
             if s.as_str() == "$" {
                 return Ok(Value::Null);
@@ -132,8 +141,16 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
+    // A NULL document gives NULL before any path is read, as in SQLite.
+    if matches!(first_arg.as_value_ref(), ValueRef::Null) {
+        return Ok(Value::Null);
+    }
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
     for arg in args {
+        // A NULL path or `$` removes the whole document: NULL, as in SQLite.
+        if matches!(arg.as_value_ref(), ValueRef::Null) {
+            return Ok(Value::Null);
+        }
         if let ValueRef::Text(s) = arg.as_value_ref() {
             if s.as_str() == "$" {
                 return Ok(Value::Null);
@@ -163,6 +180,10 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
+    // A NULL document gives NULL before any path is read, as in SQLite.
+    if matches!(first_arg.as_value_ref(), ValueRef::Null) {
+        return Ok(Value::Null);
+    }
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
     while args.len() > 1 {
@@ -202,6 +223,10 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
+    // A NULL document gives NULL before any path is read, as in SQLite.
+    if matches!(first_arg.as_value_ref(), ValueRef::Null) {
+        return Ok(Value::Null);
+    }
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
     while args.len() > 1 {
@@ -241,6 +266,10 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
+    // A NULL document gives NULL before any path is read, as in SQLite.
+    if matches!(first_arg.as_value_ref(), ValueRef::Null) {
+        return Ok(Value::Null);
+    }
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
 
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
@@ -281,6 +310,10 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
+    // A NULL document gives NULL before any path is read, as in SQLite.
+    if matches!(first_arg.as_value_ref(), ValueRef::Null) {
+        return Ok(Value::Null);
+    }
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
 
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
@@ -304,6 +337,68 @@ where
     let el_type = json.element_type()?;
 
     json_string_to_db_type(json, el_type, OutputVariant::Binary)
+}
+
+/// json_array_insert() and jsonb_array_insert() (SQLite 3.54, its JEDIT_AINS edit), `variant`
+/// choosing text or JSONB. Each value goes into an array at its path's index, the elements from
+/// there on moving up one, or at the end when the index is the array's length, creating what the
+/// path names on the way as json_insert() does; a path that reaches nothing changes nothing, and
+/// one that ends in a key is refused ("not an array element") once it reaches an object, where
+/// json_insert() would find or create that key.
+pub fn json_array_insert<I, E, V>(
+    args: I,
+    json_cache: &JsonCacheCell,
+    variant: OutputVariant,
+) -> crate::Result<Value>
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let mut args = args.into_iter();
+    let Some(first_arg) = args.next() else {
+        return Ok(Value::Null);
+    };
+    // A NULL document gives NULL before any path is read, as in SQLite.
+    if matches!(first_arg.as_value_ref(), ValueRef::Null) {
+        return Ok(Value::Null);
+    }
+    let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
+    let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
+    while let (Some(path_arg), Some(value_arg)) = (args.next(), args.next()) {
+        let Some(path) = json_edit_path(&path_arg, &value_arg)? else {
+            continue;
+        };
+        let value = convert_dbtype_to_jsonb(&value_arg, Conv::SetValue)?;
+        match path.elements.last() {
+            Some(PathElement::ArrayLocator(_)) => {
+                let mut before = ArrayInsertOperation::new(value.clone());
+                if json.operate_on_path(&path, &mut before).is_err() {
+                    let mut insert = InsertOperation::new(value);
+                    let _ = json.operate_on_path(&path, &mut insert);
+                }
+            }
+            // `$` alone names no array element, and SQLite leaves the document as it is.
+            Some(PathElement::Root()) | None => {}
+            Some(_) => {
+                let found = json
+                    .clone()
+                    .navigate_path(&path, PathOperationMode::ReplaceExisting)
+                    .is_ok();
+                let mut probe = json.clone();
+                let _ = probe.operate_on_path(&path, &mut InsertOperation::new(value));
+                if found || probe != json {
+                    let text = json_path_text(path_arg.as_value_ref()).unwrap_or_default();
+                    crate::bail_constraint_error!(
+                        "not an array element: '{}'",
+                        text.replace('\'', "''")
+                    );
+                }
+            }
+        }
+    }
+    let el_type = json.element_type()?;
+    json_string_to_db_type(json, el_type, variant)
 }
 
 #[cfg(test)]

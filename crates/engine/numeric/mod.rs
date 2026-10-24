@@ -1,6 +1,7 @@
 use crate::{types::AsValueRef, Value, ValueRef};
 
 pub mod decimal;
+pub mod fp;
 pub mod nonnan;
 
 use nonnan::NonNan;
@@ -67,13 +68,21 @@ impl Numeric {
             Value::Null | Value::Blob(_) => None,
             Value::Numeric(n) => Some(*n),
             Value::Text(text) => {
-                let s = text.as_str();
+                // The number before a NUL is the text's (SQLite 3.54's applyNumericAffinity): an
+                // integer if exact below 2^51 (alsoAnInt's sqlite3RealSameAsInt), a REAL past it.
+                let full = text.as_str();
+                let (s, nul) = full
+                    .split_once('\0')
+                    .map_or((full, false), |(head, _)| (head, true));
 
                 match str_to_f64(s) {
                     None
                     | Some(StrToF64::FractionalPrefix(_))
                     | Some(StrToF64::DecimalPrefix(_)) => None,
                     Some(StrToF64::Fractional(value)) => Some(Self::Float(value)),
+                    Some(StrToF64::Decimal(real)) if nul => Some(
+                        real_same_as_int(f64::from(real)).map_or(Self::Float(real), Self::Integer),
+                    ),
                     Some(StrToF64::Decimal(real)) => Some(match str_to_i64_checked(s) {
                         Ok(integer) => Self::Integer(integer),
                         Err(_) => Self::Float(real),
@@ -185,13 +194,20 @@ impl From<Option<Numeric>> for Value {
 
 impl<T: AsRef<str>> From<T> for Numeric {
     fn from(value: T) -> Self {
-        let text = value.as_ref();
+        // SQLite 3.54 reads the number in the text before its first NUL (sqlite3AtoF), and an
+        // integer only where the whole text is one (computeNumericType's sqlite3Atoi64):
+        // `'5' || char(0)` is 5.0.
+        let full = value.as_ref();
+        let (text, nul) = full
+            .split_once('\0')
+            .map_or((full, false), |(head, _)| (head, true));
 
         match str_to_f64(text) {
             None => Self::Integer(0),
             Some(StrToF64::Fractional(value) | StrToF64::FractionalPrefix(value)) => {
                 Self::Float(value)
             }
+            Some(StrToF64::Decimal(real)) if nul => Self::Float(real),
             Some(StrToF64::Decimal(real) | StrToF64::DecimalPrefix(real)) => {
                 match str_to_i64_checked(text) {
                     Ok(integer) => Self::Integer(integer),
@@ -525,6 +541,17 @@ impl std::ops::MulAssign for DoubleDouble {
     }
 }
 
+/// The integer a REAL is exactly, within 2^51 either side of zero: SQLite's sqlite3RealSameAsInt,
+/// whose margin under the 53-bit mantissa keeps the integer's text reading back the same REAL.
+pub fn real_same_as_int(r: f64) -> Option<i64> {
+    const LIMIT: f64 = 2_251_799_813_685_248.0;
+    if r == 0.0 {
+        return Some(0);
+    }
+    (r.fract() == 0.0 && (-LIMIT..LIMIT).contains(&r))
+        .then(|| crate::vdbe::affinity::real_to_i64(r))
+}
+
 pub fn str_to_i64(input: impl AsRef<str>) -> Option<i64> {
     Some(match str_to_i64_checked(input) {
         Ok(v) => v,
@@ -766,174 +793,26 @@ pub fn round_half_away_from_zero_tie(f: f64, precision: usize) -> Option<f64> {
     Some(result)
 }
 
-enum FloatParts {
-    Special(String),
-    Normal {
-        negative: bool,
-        digits: Vec<u8>,
-        exp: i32,
-    },
-}
-
-fn decompose_float(v: f64, precision: usize) -> FloatParts {
-    if v.is_nan() {
-        return FloatParts::Special("".to_string());
-    }
-
-    if v.is_infinite() {
-        return FloatParts::Special(if v.is_sign_negative() { "-Inf" } else { "Inf" }.to_string());
-    }
-
-    if v == 0.0 {
-        return FloatParts::Special("0.0".to_string());
-    }
-
-    let negative = v < 0.0;
-    let mut d = DoubleDouble(v.abs(), 0.0);
-    let mut exp = 0;
-
-    if d.0 > 9.223_372_036_854_775e18 {
-        while d.0 > 9.223_372_036_854_774e118 {
-            exp += 100;
-            d *= DoubleDouble::NEG_E100;
-        }
-        while d.0 > 9.223_372_036_854_774e28 {
-            exp += 10;
-            d *= DoubleDouble::NEG_E10;
-        }
-        while d.0 > 9.223_372_036_854_775e18 {
-            exp += 1;
-            d *= DoubleDouble::NEG_E1;
-        }
-    } else {
-        while d.0 < 9.223_372_036_854_775e-83 {
-            exp -= 100;
-            d *= DoubleDouble::E100;
-        }
-        while d.0 < 9.223_372_036_854_775e7 {
-            exp -= 10;
-            d *= DoubleDouble::E10;
-        }
-        while d.0 < 9.223_372_036_854_775e17 {
-            exp -= 1;
-            d *= DoubleDouble::E1;
-        }
-    }
-
-    let mut digits = u64::from(d).to_string().into_bytes();
-    let mut decimal_pos = digits.len() as i32 + exp;
-
-    'out: {
-        if digits.len() > precision {
-            let round_up = digits[precision] >= b'5';
-            digits.truncate(precision);
-
-            if round_up {
-                for i in (0..precision).rev() {
-                    if digits[i] < b'9' {
-                        digits[i] += 1;
-                        break 'out;
-                    }
-                    digits[i] = b'0';
-                }
-
-                digits.insert(0, b'1');
-                decimal_pos += 1;
-            }
-        }
-    }
-
-    while digits.len() > 1 && digits[digits.len() - 1] == b'0' {
-        digits.pop();
-    }
-
-    FloatParts::Normal {
-        negative,
-        digits,
-        exp: decimal_pos - 1,
-    }
-}
-
-fn format_float_scientific(v: f64, precision: usize) -> String {
-    match decompose_float(v, precision) {
-        FloatParts::Special(s) => s,
-        FloatParts::Normal {
-            negative,
-            digits,
-            exp,
-        } => {
-            let first = digits.first().cloned().unwrap_or(b'0') as char;
-            let rest = digits
-                .get(1..)
-                .filter(|v| !v.is_empty())
-                .map(|v| unsafe { str::from_utf8_unchecked(v) })
-                .unwrap_or("0");
-            format!(
-                "{}{}.{}e{}{:0width$}",
-                if negative { "-" } else { "" },
-                first,
-                rest,
-                if exp.is_positive() { "+" } else { "-" },
-                exp.abs(),
-                width = if exp.abs() > 99 { 3 } else { 2 }
-            )
-        }
-    }
-}
-
+/// A REAL as text, as SQLite converts one: CAST(x AS TEXT), TEXT affinity, printf's %s
+/// (numeric/fp.rs: SQLite 3.54's `%!.17g`, the fewest of up to 17 digits that round-trip).
 pub fn format_float(v: f64) -> String {
-    match decompose_float(v, 15) {
-        FloatParts::Special(s) => s,
-        FloatParts::Normal {
-            negative,
-            digits,
-            exp,
-        } => {
-            let decimal_pos = exp + 1;
-            if (-4..=14).contains(&exp) {
-                format!(
-                    "{}{}.{}{}",
-                    if negative { "-" } else { Default::default() },
-                    if decimal_pos > 0 {
-                        let zeroes = (decimal_pos - digits.len() as i32).max(0) as usize;
-                        let digits = digits
-                            .get(0..(decimal_pos.min(digits.len() as i32) as usize))
-                            .unwrap();
-                        (unsafe { str::from_utf8_unchecked(digits) }).to_owned()
-                            + &"0".repeat(zeroes)
-                    } else {
-                        "0".to_string()
-                    },
-                    "0".repeat(decimal_pos.min(0).unsigned_abs() as usize),
-                    digits
-                        .get((decimal_pos.max(0) as usize)..)
-                        .filter(|v| !v.is_empty())
-                        .map(|v| unsafe { str::from_utf8_unchecked(v) })
-                        .unwrap_or("0")
-                )
-            } else {
-                format_float_scientific(v, 15)
-            }
-        }
-    }
+    fp::real_to_text(v)
 }
 
+/// A REAL as quote() writes it (`%!0.17g`: infinity as 9.0e+999).
 pub fn format_float_for_quote(v: f64) -> String {
-    let default = format_float(v);
-    if str_to_f64(&default).map(f64::from) == Some(v) {
-        return default;
-    }
-    format_float_scientific(v, 19)
+    fp::real_to_quoted(v)
 }
 
 #[test]
 fn test_decode_float() {
-    assert_eq!(format_float(9.93e-322), "9.93071948140905e-322");
+    // SQLite 3.54.0's own text for each (CAST(x AS TEXT))
+    assert_eq!(format_float(9.93e-322), "9.9307194814090555e-322");
     assert_eq!(format_float(9.93), "9.93");
     assert_eq!(format_float(0.093), "0.093");
     assert_eq!(format_float(-0.093), "-0.093");
     assert_eq!(format_float(0.0), "0.0");
-    assert_eq!(format_float(4.94e-322), "4.94065645841247e-322");
+    assert_eq!(format_float(4.94e-322), "4.9406564584124654e-322");
     assert_eq!(format_float(-20228007.0), "-20228007.0");
 }
 

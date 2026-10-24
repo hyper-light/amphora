@@ -7,8 +7,8 @@ pub(crate) mod vtab;
 
 use crate::json::error::Error as JsonError;
 pub use crate::json::ops::{
-    json_insert, json_patch, json_remove, json_replace, jsonb_insert, jsonb_patch, jsonb_remove,
-    jsonb_replace,
+    json_array_insert, json_insert, json_patch, json_remove, json_replace, jsonb_insert,
+    jsonb_patch, jsonb_remove, jsonb_replace,
 };
 use crate::json::path::{json_path, JsonPath, PathElement};
 use crate::numeric::{str_to_i64, Numeric};
@@ -21,7 +21,6 @@ use jsonb::{
     ParseInfo, PathOperationMode, SearchOperation, SetOperation,
 };
 use std::borrow::Cow;
-use std::fmt::Write as _;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy)]
@@ -214,14 +213,14 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                     &str[..str.find('\0').unwrap_or(str.len())]
                 };
                 Jsonb::from_str_with_mode(str, strict)
+            } else if matches!(strict, Conv::SetValue) {
+                // A json_set, json_insert, json_replace or json_array_insert value is its text as
+                // it is (TEXTRAW), as SQLite's jsonFunctionArgToBlob stores it.
+                return Jsonb::text_raw(text.as_str());
             } else {
-                // Handle as a string literal otherwise
-                // Escape backslashes first, then double quotes
-                let mut str = text.replace('\\', "\\\\").replace('"', "\\\"");
-                // Quote the string to make it a JSON string
-                str.insert(0, '"');
-                str.push('"');
-                Jsonb::from_str(&str)
+                // A string literal otherwise, escaped as SQLite escapes it, control characters
+                // too: JSONB built from it has the bytes SQLite's has (TEXTJ, not raw text).
+                Jsonb::from_str(&json_string_literal(text.as_str()))
             };
             res.map_err(malformed_json_error)
         }
@@ -287,28 +286,9 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                 };
                 Jsonb::from_str(json_str).map_err(malformed_json_error)
             } else {
-                let mut buff = ryu::Buffer::new();
-                let s_ryu = buff.format(float);
-                let mut s = Cow::Borrowed(s_ryu);
-
-                if let Some(e_idx) = s_ryu.find('e') {
-                    // Scientific notation case
-                    s = Cow::Owned(String::with_capacity(s_ryu.len() + 4));
-                    let inner = s.to_mut();
-                    let mantissa = &s_ryu[..e_idx];
-                    let exponent = &s_ryu[e_idx + 1..];
-
-                    inner.push_str(mantissa);
-                    if !mantissa.contains('.') {
-                        inner.push_str(".0");
-                    }
-                    inner.push('e');
-                    if !exponent.starts_with('-') && !exponent.starts_with('+') {
-                        inner.push('+');
-                    }
-                    inner.push_str(exponent);
-                }
-
+                // As quote() writes it: SQLite 3.54's "%!0.17g", shortened while it reads back
+                // the same (crate::numeric::fp).
+                let s = crate::numeric::format_float_for_quote(float);
                 Jsonb::from_str(&s).map_err(malformed_json_error)
             }
         }
@@ -316,6 +296,31 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
             Jsonb::from_str(&int.to_string()).map_err(malformed_json_error)
         }
     }
+}
+
+/// `text` as a JSON string literal, quoted and escaped as SQLite's jsonAppendString escapes it: a
+/// quote and a backslash with a backslash, \b \f \n \r \t, every other control character as
+/// \u00xx.
+fn json_string_literal(text: &str) -> String {
+    let mut literal = String::new();
+    literal.push('"');
+    for c in text.chars() {
+        match c {
+            '"' | '\\' => {
+                literal.push('\\');
+                literal.push(c);
+            }
+            '\u{0008}' => literal.push_str("\\b"),
+            '\u{000c}' => literal.push_str("\\f"),
+            '\n' => literal.push_str("\\n"),
+            '\r' => literal.push_str("\\r"),
+            '\t' => literal.push_str("\\t"),
+            c if u32::from(c) < 0x20 => literal.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => literal.push(c),
+        }
+    }
+    literal.push('"');
+    literal
 }
 
 pub(crate) fn ensure_blob_arg_is_jsonb(value: ValueRef<'_>) -> crate::Result<()> {
@@ -416,6 +421,10 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
+    // A NULL document gives NULL before any path is read, as in SQLite.
+    if matches!(first_arg.as_value_ref(), ValueRef::Null) {
+        return Ok(Value::Null);
+    }
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
 
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
@@ -457,6 +466,10 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
+    // A NULL document gives NULL before any path is read, as in SQLite.
+    if matches!(first_arg.as_value_ref(), ValueRef::Null) {
+        return Ok(Value::Null);
+    }
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
 
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
@@ -676,7 +689,15 @@ pub fn json_string_to_db_type(
     element_type: ElementType,
     flag: OutputVariant,
 ) -> crate::Result<Value> {
-    if element_type == ElementType::NULL {
+    // A JSON null is SQL NULL where the function gives a value out of the document (json_extract),
+    // and the document `null` where it gives the document itself (json_insert, json_set), as in
+    // SQLite.
+    if element_type == ElementType::NULL
+        && matches!(
+            flag,
+            OutputVariant::ElementType | OutputVariant::ElementTypePlain
+        )
+    {
         return Ok(Value::Null);
     }
     if matches!(flag, OutputVariant::Binary) {
@@ -1105,29 +1126,7 @@ pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
                 return Ok(value.to_owned()?);
             }
 
-            let mut escaped_value = String::with_capacity(t.value.len() + 4);
-            escaped_value.push('"');
-
-            for c in t.as_str().chars() {
-                match c {
-                    '"' | '\\' => {
-                        escaped_value.push('\\');
-                        escaped_value.push(c);
-                    }
-                    '\u{0008}' => escaped_value.push_str("\\b"),
-                    '\u{000c}' => escaped_value.push_str("\\f"),
-                    '\n' => escaped_value.push_str("\\n"),
-                    '\r' => escaped_value.push_str("\\r"),
-                    '\t' => escaped_value.push_str("\\t"),
-                    c if (c as u32) < 0x20 => {
-                        let _ = write!(escaped_value, "\\u{:04x}", c as u32);
-                    }
-                    c => escaped_value.push(c),
-                }
-            }
-            escaped_value.push('"');
-
-            Ok(Value::Text(Text::json(escaped_value)))
+            Ok(Value::Text(Text::json(json_string_literal(t.as_str()))))
         }
         // Numbers are unquoted in json, but must be returned as TEXT
         ValueRef::Numeric(n) => match n {

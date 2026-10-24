@@ -2434,9 +2434,9 @@ impl Display for ValueRef<'_> {
         match self {
             Self::Null => write!(f, "NULL"),
             Self::Numeric(Numeric::Integer(i)) => write!(f, "{i}"),
+            // As SQLite writes a REAL as text (and Value does), not Rust's debug digits.
             Self::Numeric(Numeric::Float(fl)) => {
-                let fval: f64 = (*fl).into();
-                write!(f, "{fval:?}")
+                f.write_str(&crate::numeric::format_float(f64::from(*fl)))
             }
             Self::Text(s) => write!(f, "{}", s.as_str()),
             Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b)),

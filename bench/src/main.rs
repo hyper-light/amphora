@@ -15,6 +15,7 @@
 mod blink;
 mod clickhouse;
 mod mysql;
+mod oracle;
 mod pg;
 mod pool;
 mod probe;
@@ -482,6 +483,10 @@ fn main() -> anyhow::Result<()> {
     // The SQLite language's probes on Amphora or Turso (`probe.rs`, bench/corpus).
     if std::env::args().any(|a| a == "--probe") {
         return probe::main();
+    }
+    // The oracles for logic bugs and slow plans on Amphora, SQLite the reference (`oracle/`).
+    if std::env::args().any(|a| a == "--oracle") {
+        return oracle::main();
     }
     // The versioned storage's B-link tree on its own (`blink.rs`).
     if std::env::args().any(|a| a == "--blink") {

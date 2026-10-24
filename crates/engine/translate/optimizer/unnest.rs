@@ -624,6 +624,7 @@ fn try_rewrite_single_value_aggregate(
         nulls_order: vec![None; column_count],
         sort_elided: false,
         having: None,
+        carried: Vec::new(),
     });
 
     let mut grouped_table = JoinedTable::new_subquery(
@@ -820,6 +821,7 @@ fn rewrite_aggregate_as_join_then_group(
         nulls_order: vec![None],
         sort_elided: false,
         having: Some(vec![having]),
+        carried: Vec::new(),
     });
     plan.non_from_clause_subqueries.remove(subquery_index);
     Ok(Some(AggregateRewrite::Joined))

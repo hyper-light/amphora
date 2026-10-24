@@ -1842,21 +1842,57 @@ pub(super) fn partial_index_predicate_terms(
     rewrite_between_exprs(&mut bound).ok()?;
     let mut index_conjuncts: Vec<ast::Expr> = Vec::new();
     break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
+    // A WHERE term had its BETWEENs rewritten when it was parsed (`parse_where`), as `bound` has;
+    // an ON term keeps them. Each term is compared in the rewritten form, or an automatic index's
+    // filter, copied from an ON term, would not match the term it was copied from.
+    let query_exprs: Vec<Option<ast::Expr>> = query_where_clause
+        .iter()
+        .map(|term| between_rewritten(&term.expr))
+        .collect();
     let mut matched_terms = SmallVec::<[usize; 4]>::new();
     for index_conjunct in index_conjuncts.iter() {
-        let (term_idx, term) = query_where_clause.iter().enumerate().find(|(_, term)| {
-            can_use_query_term(term) && query_term_implies_predicate(&term.expr, index_conjunct)
-        })?;
+        let (term_idx, term_expr) = query_where_clause
+            .iter()
+            .zip(&query_exprs)
+            .enumerate()
+            .map(|(term_idx, (term, rewritten))| {
+                (term_idx, term, rewritten.as_ref().unwrap_or(&term.expr))
+            })
+            .find(|(_, term, term_expr)| {
+                can_use_query_term(term) && query_term_implies_predicate(term_expr, index_conjunct)
+            })
+            .map(|(term_idx, _, term_expr)| (term_idx, term_expr))?;
         // A query term that proves one branch of an OR makes the partial index
         // usable, but does not make that term true for every row in the index.
         // Keep it as a residual filter unless the whole conjunct matched.
-        if exprs_are_equivalent(index_conjunct, &term.expr) && !matched_terms.contains(&term_idx) {
+        if exprs_are_equivalent(index_conjunct, term_expr) && !matched_terms.contains(&term_idx) {
             matched_terms.push(term_idx);
         }
     }
     Some(matched_terms)
     // TODO: recognize implication beyond syntactic equivalence (e.g. `x = 5` implies
     // `x IS NOT NULL`, `x > 10` implies `x > 5`).
+}
+
+/// `expr` with its BETWEENs rewritten to comparisons, as `parse_where` leaves a WHERE term, or
+/// `None` when it has none or can't be rewritten (the term is then compared as it is).
+fn between_rewritten(expr: &ast::Expr) -> Option<ast::Expr> {
+    let mut has_between = false;
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        has_between |= matches!(e, ast::Expr::Between { .. });
+        Ok(if has_between {
+            WalkControl::SkipChildren
+        } else {
+            WalkControl::Continue
+        })
+    })
+    .ok()?;
+    if !has_between {
+        return None;
+    }
+    let mut rewritten = expr.clone();
+    rewrite_between_exprs(&mut rewritten).ok()?;
+    Some(rewritten)
 }
 
 pub(crate) fn partial_index(index: Option<&Arc<Index>>) -> Option<&Index> {

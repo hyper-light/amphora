@@ -292,6 +292,8 @@ pub enum JsonFunc {
     JsonbReplace,
     JsonInsert,
     JsonbInsert,
+    JsonArrayInsert,
+    JsonbArrayInsert,
     JsonPretty,
     JsonSet,
     JsonbSet,
@@ -334,6 +336,8 @@ impl Display for JsonFunc {
                 Self::JsonbReplace => "jsonb_replace",
                 Self::JsonInsert => "json_insert",
                 Self::JsonbInsert => "jsonb_insert",
+                Self::JsonArrayInsert => "json_array_insert",
+                Self::JsonbArrayInsert => "jsonb_array_insert",
                 Self::JsonPretty => "json_pretty",
                 Self::JsonSet => "json_set",
                 Self::JsonbSet => "jsonb_set",
@@ -1615,6 +1619,10 @@ impl Display for Func {
 pub struct FuncCtx {
     pub func: Func,
     pub arg_count: usize,
+    /// The collation a function that compares its arguments compares by (nullif, and min and max
+    /// of two or more): the first argument's that has one, as SQLite passes it to its
+    /// SQLITE_FUNC_NEEDCOLL functions. `None` for the rest, and BINARY when none has one.
+    pub collation: Option<crate::translate::collate::CollationSeq>,
 }
 
 impl Deterministic for Func {

@@ -1886,6 +1886,68 @@ fn plan_correlated_subqueries(
     cache: &mut SubqueryPlanCache,
     save_plans: bool,
 ) -> Result<()> {
+    // A RIGHT or FULL JOIN's unmatched rows go through the loops from its right table on again,
+    // the tables before it NULL. A correlated subquery that reads only tables before that right
+    // table, in a term those loops evaluate, runs at the right table then, inside what the pass
+    // runs again: not after its own last table, a loop the pass skips, where it would keep its
+    // value for the last matched row (SQLite gives the NULL row's); and no later, since an index
+    // may seek by the term, its key read before the term's own table. RIGHT and FULL JOINs are
+    // reordering barriers, so the FROM order says which tables come before one.
+    let mut term_tables: SmallVec<[(TableInternalId, TableInternalId); 2]> = SmallVec::new();
+    if plan.table_references.has_right_or_full_join() {
+        let tables = plan.table_references.joined_tables();
+        let from_order = default_join_order(&plan.table_references);
+        for term in &plan.where_clause {
+            let Ok(crate::translate::plan::EvalAt::Loop(term_position)) =
+                crate::translate::planner::determine_where_to_eval_term(
+                    term,
+                    &from_order,
+                    &plan.non_from_clause_subqueries,
+                    Some(&plan.table_references),
+                )
+            else {
+                continue;
+            };
+            // The last such right table at or before the term, not the one whose ON the term is:
+            // the pass reads no ON of its own table.
+            let on_table = match term.origin {
+                WhereTermOrigin::Join(JoinOrigin::Inner(id) | JoinOrigin::Outer(id)) => {
+                    tables.iter().position(|table| table.internal_id == id)
+                }
+                _ => None,
+            };
+            let Some((region, region_table)) = tables.get(..=term_position).and_then(|before| {
+                before.iter().enumerate().rev().find(|(position, table)| {
+                    Some(*position) != on_table
+                        && table
+                            .join_info
+                            .as_ref()
+                            .is_some_and(|join_info| join_info.keeps_right_rows())
+                })
+            }) else {
+                continue;
+            };
+            walk_expr(&term.expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+                if let ast::Expr::SubqueryResult { subquery_id, .. } = e {
+                    let reads_before_region = plan
+                        .non_from_clause_subqueries
+                        .iter()
+                        .find(|subquery| subquery.internal_id == *subquery_id)
+                        .map(|subquery| {
+                            subquery.required_eval_at(&from_order, Some(&plan.table_references))
+                        })
+                        .transpose()?
+                        .is_some_and(|eval_at| {
+                            matches!(eval_at, crate::translate::plan::EvalAt::Loop(position) if position < region)
+                        });
+                    if reads_before_region {
+                        term_tables.push((*subquery_id, region_table.internal_id));
+                    }
+                }
+                Ok(WalkControl::Continue)
+            })?;
+        }
+    }
     for subquery in &mut plan.non_from_clause_subqueries {
         // Write statements plan their subqueries while the statement is built.
         // Planning them again can reuse changed fields such as an ORDER BY that
@@ -1896,8 +1958,11 @@ fn plan_correlated_subqueries(
         let estimate = subquery_calls
             .iter()
             .find(|estimate| estimate.subquery_id == subquery.internal_id);
-        subquery.preferred_eval_after_table =
-            estimate.and_then(|estimate| estimate.eval_after_table);
+        subquery.preferred_eval_after_table = term_tables
+            .iter()
+            .find(|(subquery_id, _)| *subquery_id == subquery.internal_id)
+            .map(|(_, table)| *table)
+            .or_else(|| estimate.and_then(|estimate| estimate.eval_after_table));
         let call_count = estimate
             .map(|estimate| estimate.calls)
             .unwrap_or_else(|| plan.input_cardinality_hint.unwrap_or(1.0))
@@ -3067,7 +3132,7 @@ fn operation_for_unmatched_right_rows(
                     unmatched_table,
                     where_clause_for_unmatched_rows,
                     false,
-                );
+                )?;
             }
             if constraint_refs.is_empty() {
                 return Ok(Operation::Scan(Scan::BTreeTable { iter_dir, index }));
@@ -3235,6 +3300,7 @@ fn apply_table_access_plan(
             output_rows,
             access_cost: access_method.cost.0,
             total_cost,
+            position,
         });
         input_rows = output_rows;
     }
@@ -3390,7 +3456,7 @@ fn apply_table_access_plan(
                             &table_references.joined_tables()[table_idx],
                             where_clause,
                             is_outer_join,
-                        );
+                        )?;
                     }
                     table_references.joined_tables_mut()[table_idx].op =
                         Operation::Scan(Scan::BTreeTable {
@@ -3410,7 +3476,7 @@ fn apply_table_access_plan(
                             &table_references.joined_tables()[table_idx],
                             where_clause,
                             is_outer_join,
-                        );
+                        )?;
                     }
                     mark_seek_constraints_consumed(
                         &constraints_per_table[table_idx].constraints,
@@ -3572,7 +3638,7 @@ fn apply_table_access_plan(
                         &table_references.joined_tables()[table_idx],
                         where_clause,
                         is_outer_join,
-                    );
+                    )?;
                 }
                 where_clause[*where_term_idx].consumed = true;
                 table_references.joined_tables_mut()[table_idx].op =
@@ -3909,9 +3975,9 @@ pub(crate) fn mark_partial_index_predicate_terms_consumed(
     table_reference: &JoinedTable,
     where_clause: &mut [WhereTerm],
     is_outer_join: bool,
-) {
+) -> Result<()> {
     let predicate_terms = partial_index_predicate_terms(index, table_reference, where_clause)
-        .expect("selected partial index predicate must be implied by query");
+        .ok_or_else(|| unproven_partial_index(index))?;
     for term_idx in predicate_terms {
         let where_term = &mut where_clause[term_idx];
         if where_term.consumed {
@@ -3925,6 +3991,16 @@ pub(crate) fn mark_partial_index_predicate_terms_consumed(
         }
         where_term.consumed = true;
     }
+    Ok(())
+}
+
+/// The planner chose a partial index whose filter the query doesn't prove: its rows would be
+/// missing some of the query's, so the statement is refused rather than answered from it.
+pub(crate) fn unproven_partial_index(index: &Index) -> LimboError {
+    LimboError::InternalError(format!(
+        "the planner chose index {} without proving its WHERE from the query",
+        index.name
+    ))
 }
 
 #[derive(Debug, PartialEq, Clone)]

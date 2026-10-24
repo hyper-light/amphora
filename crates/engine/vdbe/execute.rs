@@ -178,13 +178,14 @@ use crate::vdbe::vacuum::{
 #[cfg(feature = "json")]
 use crate::{
     function::JsonFunc, json, json::convert_dbtype_to_raw_jsonb, json::ensure_blob_arg_is_jsonb,
-    json::get_json, json::is_json_valid, json::json_array, json::json_array_length,
-    json::json_arrow_extract, json::json_arrow_shift_extract, json::json_error_position,
-    json::json_extract, json::json_from_raw_bytes_agg, json::json_insert, json::json_object,
-    json::json_patch, json::json_quote, json::json_remove, json::json_replace, json::json_set,
-    json::json_type, json::jsonb, json::jsonb_array, json::jsonb_extract, json::jsonb_insert,
-    json::jsonb_object, json::jsonb_patch, json::jsonb_remove, json::jsonb_replace,
-    json::jsonb_set, json::raw_jsonb_element_len, json::Conv,
+    json::get_json, json::is_json_valid, json::json_array, json::json_array_insert,
+    json::json_array_length, json::json_arrow_extract, json::json_arrow_shift_extract,
+    json::json_error_position, json::json_extract, json::json_from_raw_bytes_agg,
+    json::json_insert, json::json_object, json::json_patch, json::json_quote, json::json_remove,
+    json::json_replace, json::json_set, json::json_type, json::jsonb, json::jsonb_array,
+    json::jsonb_extract, json::jsonb_insert, json::jsonb_object, json::jsonb_patch,
+    json::jsonb_remove, json::jsonb_replace, json::jsonb_set, json::raw_jsonb_element_len,
+    json::Conv,
 };
 
 use super::{Program, ProgramState, Register};
@@ -1268,24 +1269,9 @@ fn op_comparison_slow(
         op.compare(lhs_for_compare, rhs_for_compare, collation)
     };
 
-    match (new_lhs, new_rhs) {
-        (Some(new_lhs), None) => {
-            state.registers[lhs].set_value(new_lhs.as_value_ref().to_owned()?);
-        }
-        (None, Some(new_rhs)) => {
-            state.registers[rhs].set_value(new_rhs.as_value_ref().to_owned()?);
-        }
-        (Some(new_lhs), Some(new_rhs)) => {
-            let (new_lhs, new_rhs) = (
-                new_lhs.as_value_ref().to_owned()?,
-                new_rhs.as_value_ref().to_owned()?,
-            );
-            state.registers[lhs].set_value(new_lhs);
-            state.registers[rhs].set_value(new_rhs);
-        }
-        (None, None) => {}
-    }
-
+    // The conversion is the comparison's own: the registers keep their values, as SQLite's
+    // OP_Eq undoes what applyAffinity() did to them, so a CASE base, a BETWEEN's left side or a
+    // constant compared again reads as it was.
     take_jump_if!(should_jump);
 }
 
@@ -9961,6 +9947,33 @@ pub fn op_function(
                 )?;
                 state.registers[*dest].set_value(json);
             }
+            JsonFunc::JsonArrayInsert | JsonFunc::JsonbArrayInsert => {
+                if arg_count % 2 == 0 {
+                    bail_constraint_error!("json_array_insert() needs an odd number of arguments")
+                }
+                let variant = if matches!(json_func, JsonFunc::JsonArrayInsert) {
+                    json::OutputVariant::String
+                } else {
+                    json::OutputVariant::Binary
+                };
+                let args = start_reg
+                    .checked_add(arg_count)
+                    .and_then(|end| state.registers.get(*start_reg..end))
+                    .ok_or_else(|| {
+                        LimboError::InternalError(
+                            "json_array_insert's arguments are missing".into(),
+                        )
+                    })?;
+                let json =
+                    json_array_insert(registers_to_ref_values(args), &state.json_cache, variant)?;
+                let Some(result) = state.registers.get_mut(*dest) else {
+                    return Err(LimboError::InternalError(
+                        "json_array_insert's result register is missing".into(),
+                    )
+                    .into());
+                };
+                result.set_value(json);
+            }
             JsonFunc::JsonbInsert => {
                 if arg_count % 2 == 0 {
                     bail_constraint_error!("json_insert() needs an odd number of arguments")
@@ -10089,12 +10102,12 @@ pub fn op_function(
                 let pattern_value = pattern_reg.get_value();
                 let match_value = match_reg.get_value();
 
-                if matches!(pattern_value, Value::Null) || matches!(match_value, Value::Null) {
-                    state.registers[*dest].set_null();
-                } else if matches!(match_value, Value::Blob(_)) {
+                if matches!(pattern_value, Value::Blob(_)) || matches!(match_value, Value::Blob(_))
+                {
                     // Amphora: a BLOB never matches a GLOB (SQLite's recommended
                     // SQLITE_LIKE_DOESNT_MATCH_BLOBS), so a GLOB on a text column is a range of
-                    // its index (`docs/design/planner.md`, decision 3).
+                    // its index (`docs/design/planner.md`, decision 3). As in SQLite, a BLOB on
+                    // either side answers 0 before a NULL on the other is looked at.
                     let Some(result) = state.registers.get_mut(*dest) else {
                         return Err(LimboError::InternalError(
                             "GLOB's result register is missing".into(),
@@ -10102,6 +10115,15 @@ pub fn op_function(
                         .into());
                     };
                     result.set_int(0);
+                } else if matches!(pattern_value, Value::Null) || matches!(match_value, Value::Null)
+                {
+                    let Some(result) = state.registers.get_mut(*dest) else {
+                        return Err(LimboError::InternalError(
+                            "GLOB's result register is missing".into(),
+                        )
+                        .into());
+                    };
+                    result.set_null();
                 } else {
                     let pattern_cow = match pattern_value {
                         Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
@@ -10143,11 +10165,10 @@ pub fn op_function(
                 let pattern_value = pattern_reg.get_value();
                 let match_value = match_reg.get_value();
 
-                // 1. Check for NULL inputs
-                if matches!(pattern_value, Value::Null) || matches!(match_value, Value::Null) {
-                    state.registers[*dest].set_null();
-                } else if matches!(match_value, Value::Blob(_)) {
-                    // Amphora: nor a LIKE, as GLOB (decision 3).
+                if matches!(pattern_value, Value::Blob(_)) || matches!(match_value, Value::Blob(_))
+                {
+                    // Amphora: nor a LIKE, as GLOB (decision 3), whatever its other operand or
+                    // ESCAPE.
                     let Some(result) = state.registers.get_mut(*dest) else {
                         return Err(LimboError::InternalError(
                             "LIKE's result register is missing".into(),
@@ -10155,6 +10176,15 @@ pub fn op_function(
                         .into());
                     };
                     result.set_int(0);
+                } else if matches!(pattern_value, Value::Null) || matches!(match_value, Value::Null)
+                {
+                    let Some(result) = state.registers.get_mut(*dest) else {
+                        return Err(LimboError::InternalError(
+                            "LIKE's result register is missing".into(),
+                        )
+                        .into());
+                    };
+                    result.set_null();
                 } else {
                     // 2. Resolve Escape Character (if 3rd arg exists)
                     let mut escape_char = None;
@@ -10437,23 +10467,73 @@ pub fn op_function(
                     .exec_round(precision_value.map(|x| x.get_value()));
                 state.registers[*dest].set_value(result);
             }
-            ScalarFunc::Min => {
-                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                state.registers[*dest]
-                    .set_value(Value::exec_min(reg_values.iter().map(|v| v.get_value())));
-            }
-            ScalarFunc::Max => {
-                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                state.registers[*dest]
-                    .set_value(Value::exec_max(reg_values.iter().map(|v| v.get_value())));
+            ScalarFunc::Min | ScalarFunc::Max => {
+                // By the collation the arguments give (SQLite's minmaxFunc): NULL if any is NULL;
+                // of equal ones min takes the later, max keeps the earlier.
+                let collation = func.collation.unwrap_or_default();
+                let end = start_reg.checked_add(arg_count).ok_or_else(|| {
+                    LimboError::InternalError("min/max: argument registers overflow".into())
+                })?;
+                let values = state.registers.get(*start_reg..end).ok_or_else(|| {
+                    LimboError::InternalError("min/max: argument registers out of range".into())
+                })?;
+                let mut best: Option<&Value> = None;
+                let mut null = false;
+                for value in values.iter().map(|register| register.get_value()) {
+                    if matches!(value, Value::Null) {
+                        null = true;
+                        break;
+                    }
+                    best = Some(match best {
+                        None => value,
+                        Some(current) => {
+                            let order =
+                                compare_with_program_collation(program, current, value, collation)?;
+                            let take = if matches!(scalar_func, ScalarFunc::Min) {
+                                order.is_ge()
+                            } else {
+                                order.is_lt()
+                            };
+                            if take {
+                                value
+                            } else {
+                                current
+                            }
+                        }
+                    });
+                }
+                let result = match best {
+                    Some(value) if !null => value.clone(),
+                    _ => Value::Null,
+                };
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Nullif => {
-                let first_value = &state.registers[*start_reg];
-                let second_value = &state.registers[*start_reg + 1];
-                state.registers[*dest].set_value(Value::exec_nullif(
-                    first_value.get_value(),
-                    second_value.get_value(),
-                ));
+                // NULL where the two compare equal by the arguments' collation (SQLite's
+                // nullifFunc: sqlite3MemCompare with it), else the first.
+                let collation = func.collation.unwrap_or_default();
+                let first = state.registers.get(*start_reg).ok_or_else(|| {
+                    LimboError::InternalError("nullif: argument registers out of range".into())
+                })?;
+                let second = start_reg
+                    .checked_add(1)
+                    .and_then(|second| state.registers.get(second))
+                    .ok_or_else(|| {
+                        LimboError::InternalError("nullif: argument registers out of range".into())
+                    })?;
+                let equal = compare_with_program_collation(
+                    program,
+                    first.get_value(),
+                    second.get_value(),
+                    collation,
+                )?
+                .is_eq();
+                let result = if equal {
+                    Value::Null
+                } else {
+                    first.get_value().clone()
+                };
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Substr | ScalarFunc::Substring => {
                 let str_value = &state.registers[*start_reg];
@@ -17640,6 +17720,11 @@ fn handle_text_sum(
     // as approximate, so SUM returns real instead of integer. Non-integer inputs
     // (e.g. BLOB) should also force approximate results.
     let is_approx = force_approx || matches!(parse_result, NumericParseResult::ValidPrefixOnly);
+    // A value that is no integer clears an earlier integer overflow, as in SQLite's sumStep:
+    // the floating-point total then stands, without the error.
+    if is_approx || !matches!(parsed_number, ParsedNumber::Integer(_)) {
+        sum_state.ovrfl = false;
+    }
     match parsed_number {
         ParsedNumber::Integer(i) => {
             if is_approx {
@@ -18818,6 +18903,18 @@ fn apply_affinity_char_slow(target: &mut Register, affinity: Affinity) -> bool {
                 }
 
                 if let Value::Text(t) = value {
+                    // The number before a NUL is the text's, as SQLite 3.54's applyNumericAffinity
+                    // reads it (apply_numeric_affinity says how).
+                    if t.as_str().contains('\0') {
+                        let Some(Ok(converted)) =
+                            apply_numeric_affinity(value.as_value_ref(), true)
+                                .map(|v| v.to_owned())
+                        else {
+                            return false;
+                        };
+                        *value = converted;
+                        return true;
+                    }
                     let text = trim_ascii_whitespace(t.as_str());
 
                     // Handle hex numbers - they shouldn't be converted
@@ -18877,6 +18974,19 @@ fn apply_affinity_char_slow(target: &mut Register, affinity: Affinity) -> bool {
                     return true;
                 }
                 Value::Text(t) => {
+                    // The number before a NUL, whole, is the text's REAL (SQLite 3.54's
+                    // applyNumericAffinity, then REAL affinity).
+                    if let Some((head, _)) = t.as_str().split_once('\0') {
+                        let Some(
+                            crate::numeric::StrToF64::Decimal(real)
+                            | crate::numeric::StrToF64::Fractional(real),
+                        ) = crate::numeric::str_to_f64(head)
+                        else {
+                            return false;
+                        };
+                        *value = Value::from_f64(f64::from(real));
+                        return true;
+                    }
                     let text = trim_ascii_whitespace(t.as_str());
                     if text.starts_with("0x") {
                         return false;

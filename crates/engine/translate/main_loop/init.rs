@@ -91,8 +91,14 @@ impl InitLoop {
                 1,
                 "DISTINCT aggregate functions must have exactly one argument"
             );
+            // The set is keyed by the argument's collation, as SQLite's KeyInfo over the
+            // aggregate's arguments: count(DISTINCT c) over a NOCASE column counts 'a' and 'A'
+            // once.
+            let Some(argument) = agg.args.first() else {
+                crate::bail_parse_error!("DISTINCT aggregate functions must have one argument");
+            };
             let collations = vec![get_collseq_from_expr_with_symbols(
-                &agg.original_expr,
+                argument,
                 tables,
                 Some(t_ctx.resolver.symbol_table),
             )?

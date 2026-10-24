@@ -9,6 +9,18 @@ pub struct ConditionMetadata {
     pub jump_target_when_null: BranchOffset,
 }
 
+impl ConditionMetadata {
+    /// The condition's negation (NOT, NOT LIKE): TRUE and FALSE swapped, NULL where it went.
+    pub(super) fn negated(self) -> Self {
+        Self {
+            jump_if_condition_is_true: !self.jump_if_condition_is_true,
+            jump_target_when_true: self.jump_target_when_false,
+            jump_target_when_false: self.jump_target_when_true,
+            jump_target_when_null: self.jump_target_when_null,
+        }
+    }
+}
+
 #[inline(never)]
 pub(super) fn translate_between_expr(
     program: &mut ProgramBuilder,
@@ -111,17 +123,34 @@ pub(super) fn emit_cond_jump(
     cond_meta: ConditionMetadata,
     reg: usize,
 ) {
+    // A NULL goes where the condition sends it: with the jump when that is its target, on to what
+    // follows when that is (FALSE after a jump on TRUE, TRUE after a jump on FALSE: NOT swaps TRUE
+    // and FALSE but not NULL), and otherwise by a jump of its own.
     if cond_meta.jump_if_condition_is_true {
+        let null_with_true = cond_meta.jump_target_when_null == cond_meta.jump_target_when_true;
+        if !null_with_true && cond_meta.jump_target_when_null != cond_meta.jump_target_when_false {
+            program.emit_insn(Insn::IsNull {
+                reg,
+                target_pc: cond_meta.jump_target_when_null,
+            });
+        }
         program.emit_insn(Insn::If {
             reg,
             target_pc: cond_meta.jump_target_when_true,
-            jump_if_null: false,
+            jump_if_null: null_with_true,
         });
     } else {
+        let null_with_false = cond_meta.jump_target_when_null == cond_meta.jump_target_when_false;
+        if !null_with_false && cond_meta.jump_target_when_null != cond_meta.jump_target_when_true {
+            program.emit_insn(Insn::IsNull {
+                reg,
+                target_pc: cond_meta.jump_target_when_null,
+            });
+        }
         program.emit_insn(Insn::IfNot {
             reg,
             target_pc: cond_meta.jump_target_when_false,
-            jump_if_null: true,
+            jump_if_null: null_with_false,
         });
     }
 }
@@ -347,25 +376,6 @@ macro_rules! expect_arguments_min {
         } else {
             crate::bail_parse_error!("{} function with no arguments", $func.to_string());
         };
-        args
-    }};
-}
-
-#[allow(unused_macros)]
-macro_rules! expect_arguments_even {
-    (
-        $args:expr,
-        $func:ident
-    ) => {{
-        let args = $args;
-        if args.len() % 2 != 0 {
-            crate::bail_parse_error!(
-                "{} function requires an even number of arguments",
-                $func.to_string()
-            );
-        };
-        // The only function right now that requires an even number is `json_object` and it allows
-        // to have no arguments, so thats why in this macro we do not bail with the `function with no arguments` error
         args
     }};
 }

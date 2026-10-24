@@ -1,0 +1,5 @@
+bench/oracles/injected.sh bench/oracles/injected/is-null-rejects-nulls.patch <clean bench> <out>, adacachy, 2026-10-24 (seed 20261024, 1,800 s):
+1759 databases, 71127 checks, 245 findings (4 more of the same), in 1809 s
+caught: 125 findings are the injected bug's (is-null-rejects-nulls.patch)
+injected exit 0
+first of the injected bug's: diff-a78b77f9e0e7f06a at 0.474551968 s

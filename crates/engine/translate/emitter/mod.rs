@@ -406,6 +406,40 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// A fork that keeps the cached expressions that read none of `own` tables: what an enclosing
+    /// query's output phase read into registers (a group's columns, its aggregates), so that a
+    /// subquery of a subquery run there reads them from those registers as its parent does, and
+    /// not from the enclosing query's cursors, which its scan has left behind. `None` when there
+    /// are none to keep.
+    pub fn fork_with_outer_expr_cache(&self, own: &TableReferences) -> Option<Resolver<'a>> {
+        if !self.expr_to_reg_cache_enabled {
+            return None;
+        }
+        let reads_own = |expr: &ast::Expr| {
+            let mut reads = false;
+            let _ = walk_expr(expr, &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
+                if let ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } = e {
+                    reads |= own.find_joined_table_by_internal_id(*table).is_some();
+                }
+                Ok(if reads {
+                    WalkControl::SkipChildren
+                } else {
+                    WalkControl::Continue
+                })
+            });
+            reads
+        };
+        let mut forked = self.fork_with_expr_cache();
+        forked
+            .expr_to_reg_cache
+            .retain(|entry| !reads_own(&entry.expr));
+        if forked.expr_to_reg_cache.is_empty() {
+            None
+        } else {
+            Some(forked)
+        }
+    }
+
     pub fn require_custom_types(&self, feature: &str) -> crate::Result<()> {
         if !self.enable_custom_types {
             crate::bail_parse_error!("{} require --experimental-custom-types flag", feature);
@@ -1488,6 +1522,7 @@ fn emit_cdc_insns_v1(
     let unixepoch_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
+        collation: None,
     };
 
     program.emit_insn(Insn::Function {
@@ -1599,6 +1634,7 @@ fn emit_cdc_insns_v2(
     let unixepoch_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
+        collation: None,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1616,6 +1652,7 @@ fn emit_cdc_insns_v2(
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
+        collation: None,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1721,6 +1758,7 @@ pub fn emit_cdc_commit_insns(
     let unixepoch_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
+        collation: None,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1736,6 +1774,7 @@ pub fn emit_cdc_commit_insns(
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
+        collation: None,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1795,6 +1834,7 @@ pub fn emit_cdc_autocommit_commit(
         let is_autocommit_fn_ctx = crate::function::FuncCtx {
             func: Func::Scalar(crate::function::ScalarFunc::IsAutocommit),
             arg_count: 0,
+            collation: None,
         };
         let autocommit_reg = program.alloc_register();
         program.emit_insn(Insn::Function {
@@ -1851,6 +1891,7 @@ pub fn emit_cdc_explicit_commit_insns(
         func: crate::function::FuncCtx {
             func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
             arg_count: 1,
+            collation: None,
         },
     });
 

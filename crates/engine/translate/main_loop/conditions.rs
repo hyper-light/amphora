@@ -7,6 +7,28 @@ fn condition_references_subquery(expr: &Expr, subqueries: &[NonFromClauseSubquer
         .any(|s| expr_references_subquery_id(expr, s.internal_id))
 }
 
+/// Whether the table is a hash join's probe that keeps the build side's unmatched rows (LEFT, anti
+/// or FULL), which it reads in a path of their own after the probe.
+fn keeps_unmatched_build_rows(
+    table_references: &TableReferences,
+    table_id: TableInternalId,
+) -> bool {
+    table_references
+        .joined_tables()
+        .iter()
+        .find(|table| table.internal_id == table_id)
+        .is_some_and(|table| {
+            matches!(
+                &table.op,
+                Operation::HashJoin(hash_join)
+                    if matches!(
+                        hash_join.join_type,
+                        HashJoinType::LeftOuter | HashJoinType::LeftAnti | HashJoinType::FullOuter
+                    )
+            )
+        })
+}
+
 /// Emit correlated subqueries at the loop that checks their conditions.
 ///
 /// A RIGHT JOIN can move a WHERE condition past the subquery's first possible
@@ -40,14 +62,37 @@ fn emit_correlated_subqueries(
             })
             .peekable();
         if conditions.peek().is_some() {
-            if conditions.any(|condition| {
+            let conditions: Vec<&WhereTerm> = conditions.collect();
+            let at_condition = conditions.iter().any(|condition| {
                 condition.should_eval_at_loop(
                     join_index,
                     join_order,
                     subqueries,
                     Some(table_references),
                 )
-            }) {
+            });
+            // A hash join that keeps unmatched build rows checks its conditions again, in a path
+            // of its own that reads the subquery's result: a subquery whose condition such a join
+            // checks runs at its own earliest loop, before the join, where both paths see it.
+            let before_hash_join = !at_condition
+                && subquery.get_eval_at(join_order, Some(table_references))?
+                    == EvalAt::Loop(join_index)
+                && join_order
+                    .iter()
+                    .enumerate()
+                    .skip_while(|(later, _)| *later <= join_index)
+                    .any(|(later, member)| {
+                        keeps_unmatched_build_rows(table_references, member.table_id)
+                            && conditions.iter().any(|condition| {
+                                condition.should_eval_at_loop(
+                                    later,
+                                    join_order,
+                                    subqueries,
+                                    Some(table_references),
+                                )
+                            })
+                    });
+            if at_condition || before_hash_join {
                 subqueries_to_emit.push(subquery_index);
             }
             continue;
