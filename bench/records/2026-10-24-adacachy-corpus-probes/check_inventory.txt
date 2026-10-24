@@ -1,0 +1,17 @@
+lang.html topics                         40 of   40  100%
+syntaxdiagrams.html productions          71 of   71  100%
+lang_corefunc.html index                 51 of   51  100%
+lang_aggfunc.html index                  12 of   12  100%
+lang_mathfunc.html index                 29 of   29  100%
+lang_datefunc.html signatures             7 of    7  100%
+json1.html headings                      28 of   28  100%
+windowfunctions.html built-ins           11 of   11  100%
+pragma.html list                         74 of   74  100%
+lang_keywords.html list                 147 of  147  100%
+syntax diagrams' words                  154 of  154  100%
+lang_expr.html operator table            38 of   38  100%
+lang_expr.html NOT forms                  6 of    6  100%
+SQLite's function_list (build 3.54.0)   143 of  143  100%
+SQLite's pragma_list (build 3.54.0)      66 of   66  100%
+
+nothing documented missing: 570 entries

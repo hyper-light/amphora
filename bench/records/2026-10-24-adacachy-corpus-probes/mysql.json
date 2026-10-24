@@ -1,0 +1,6419 @@
+{
+ "engine": "mysql",
+ "version": "MySQL 8.4.13",
+ "sqlglot": "30.24.0",
+ "seconds": 163.4,
+ "crashes": 0,
+ "results": [
+  {
+   "id": "function.core:abs",
+   "sql": "SELECT ABS(-3), ABS(2.5), ABS(NULL)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3,
+     2.5,
+     null
+    ]
+   ]
+  },
+  {
+   "id": "function.core:changes",
+   "sql": "SELECT row_count()",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     4
+    ]
+   ]
+  },
+  {
+   "id": "function.core:char",
+   "sql": "SELECT CHAR(72, 105)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "x'4869'"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:coalesce",
+   "sql": "SELECT COALESCE(NULL, NULL, 3)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.core:concat",
+   "sql": "SELECT CONCAT('a', COALESCE(NULL, ''), 'b', COALESCE(1, ''))",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "ab1"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:concat_ws",
+   "sql": "SELECT CONCAT_WS('-', 'a', NULL, 'b')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "a-b"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:format",
+   "sql": "SELECT FORMAT('%d-%s', 7, 'x')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "0.0000000"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:glob",
+   "sql": "SELECT REGEXP_LIKE('abc', '^a.*$', 'c'), REGEXP_LIKE('bc', '^a.*$', 'c')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "function.core:hex",
+   "sql": "SELECT HEX('AB'), HEX(255)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "4142",
+     "FF"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:if",
+   "sql": "SELECT IF(1 > 2, 'a', 'b')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "b"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:ifnull",
+   "sql": "SELECT COALESCE(NULL, 'z')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "z"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:iif",
+   "sql": "SELECT IF(1 < 2, 'yes', 'no')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "yes"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:instr",
+   "sql": "SELECT LOCATE('ll', 'hello')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.core:last_insert_rowid",
+   "sql": "SELECT last_insert_id() >= 0",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.core:length",
+   "sql": "SELECT CHAR_LENGTH('h\u00e9llo'), CHAR_LENGTH(x'0102'), CHAR_LENGTH(NULL)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     5,
+     2,
+     null
+    ]
+   ]
+  },
+  {
+   "id": "function.core:like",
+   "sql": "SELECT 'abc' LIKE 'a%', 'a%' LIKE 'a\\\\%' ESCAPE '\\\\'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.core:likelihood",
+   "sql": "SELECT 1 = 1",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.core:likely",
+   "sql": "SELECT 1 = 1",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.core:load_extension",
+   "status": "no equivalent",
+   "error": "none: MySQL loads plugins with INSTALL PLUGIN, a statement"
+  },
+  {
+   "id": "function.core:lower",
+   "sql": "SELECT LOWER('AbC')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "abc"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:ltrim",
+   "sql": "SELECT LTRIM('  ab'), TRIM(LEADING 'x' FROM 'xxab')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "ab",
+     "ab"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:max",
+   "sql": "SELECT GREATEST(1, 5, 3)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "function.core:min",
+   "sql": "SELECT LEAST(4, 2, 8)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "function.core:nullif",
+   "sql": "SELECT NULLIF(3, 3), NULLIF(3, 4)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     null,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.core:octet_length",
+   "sql": "SELECT OCTET_LENGTH('h\u00e9llo')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     6
+    ]
+   ]
+  },
+  {
+   "id": "function.core:printf",
+   "sql": "SELECT CONCAT(LPAD(FORMAT(3.14159, 2), 5, ' '), '|', RPAD('a', 3, ' '), '|', LPAD(7, 3, '0'))",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     " 3.14|a  |007"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:quote",
+   "sql": "SELECT QUOTE('it''s'), QUOTE(NULL), QUOTE(HEX(x'ab'))",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "'it\\'s'",
+     "NULL",
+     "'AB'"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:random",
+   "sql": "SELECT RAND() >= 0",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.core:randomblob",
+   "sql": "SELECT length(random_bytes(8))",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     8
+    ]
+   ]
+  },
+  {
+   "id": "function.core:replace",
+   "sql": "SELECT REPLACE('banana', 'an', 'AN')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "bANANa"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:round",
+   "sql": "SELECT ROUND(2.567, 2), ROUND(2.5), ROUND(-2.5)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2.57,
+     3,
+     -3
+    ]
+   ]
+  },
+  {
+   "id": "function.core:rtrim",
+   "sql": "SELECT RTRIM('ab  '), TRIM(TRAILING 'y' FROM 'abyy')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "ab",
+     "ab"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:sign",
+   "sql": "SELECT SIGN(-7), SIGN(0), SIGN(2.5)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     -1,
+     0,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.core:soundex",
+   "sql": "SELECT SOUNDEX('Robert')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "R163"
+    ]
+   ],
+   "requires": "SQLITE_SOUNDEX"
+  },
+  {
+   "id": "function.core:sqlite_compileoption_get",
+   "status": "no equivalent",
+   "error": "none: MySQL has no compile-option query"
+  },
+  {
+   "id": "function.core:sqlite_compileoption_used",
+   "status": "no equivalent",
+   "error": "none: MySQL has no compile-option query"
+  },
+  {
+   "id": "function.core:sqlite_offset",
+   "status": "no equivalent",
+   "error": "none: MySQL rows have no byte offset query",
+   "requires": "SQLITE_ENABLE_OFFSET_SQL_FUNC"
+  },
+  {
+   "id": "function.core:sqlite_source_id",
+   "status": "no equivalent",
+   "error": "none: MySQL has no source identifier function"
+  },
+  {
+   "id": "function.core:sqlite_version",
+   "sql": "SELECT version() IS NOT NULL",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.core:substr",
+   "sql": "SELECT SUBSTRING('database', 2, 3), SUBSTRING('database', -4), SUBSTRING('database', 5)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "ata",
+     "base",
+     "base"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:substring",
+   "sql": "SELECT SUBSTRING('database', 2, 3)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "ata"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:total_changes",
+   "status": "no equivalent",
+   "error": "none: MySQL keeps no per-connection count of rows changed"
+  },
+  {
+   "id": "function.core:trim",
+   "sql": "SELECT TRIM('  ab  '), TRIM('x' FROM 'xxabxx')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "ab",
+     "ab"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:typeof",
+   "status": "no equivalent",
+   "error": "none: MySQL has no function that names a value's type"
+  },
+  {
+   "id": "function.core:unhex",
+   "sql": "SELECT UNHEX('4142') = BINARY 'AB'",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.core:unicode",
+   "sql": "SELECT ord('A')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     65
+    ]
+   ]
+  },
+  {
+   "id": "function.core:unistr",
+   "status": "no equivalent",
+   "error": "none: MySQL has no unistr(); CHAR(... USING utf8mb4) builds text from code points"
+  },
+  {
+   "id": "function.core:unistr_quote",
+   "status": "no equivalent",
+   "error": "none: MySQL has no unistr_quote()"
+  },
+  {
+   "id": "function.core:unlikely",
+   "sql": "SELECT 1 = 2",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "function.core:upper",
+   "sql": "SELECT UPPER('aBc')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "ABC"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:zeroblob",
+   "sql": "SELECT length(repeat(char(0), 4))",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     4
+    ]
+   ]
+  },
+  {
+   "id": "function.math:acos",
+   "sql": "SELECT ROUND(ACOS(0.5), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1.047198
+    ]
+   ]
+  },
+  {
+   "id": "function.math:acosh",
+   "sql": "SELECT ROUND(LN(2 + SQRT(2 * 2 - 1)), 6)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1.316958
+    ]
+   ]
+  },
+  {
+   "id": "function.math:asin",
+   "sql": "SELECT ROUND(ASIN(0.5), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0.523599
+    ]
+   ]
+  },
+  {
+   "id": "function.math:asinh",
+   "sql": "SELECT ROUND(LN(1 + SQRT(1 * 1 + 1)), 6)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     0.881374
+    ]
+   ]
+  },
+  {
+   "id": "function.math:atan",
+   "sql": "SELECT ROUND(ATAN(1), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0.785398
+    ]
+   ]
+  },
+  {
+   "id": "function.math:atan2",
+   "sql": "SELECT ROUND(ATAN2(1, 2), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0.463648
+    ]
+   ]
+  },
+  {
+   "id": "function.math:atanh",
+   "sql": "SELECT ROUND(0.5 * LN((1 + 0.5) / (1 - 0.5)), 6)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     0.549306
+    ]
+   ]
+  },
+  {
+   "id": "function.math:ceil",
+   "sql": "SELECT CEIL(2.1), CEIL(-2.1)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3,
+     -2
+    ]
+   ]
+  },
+  {
+   "id": "function.math:ceiling",
+   "sql": "SELECT CEIL(2.1)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.math:cos",
+   "sql": "SELECT ROUND(COS(1), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0.540302
+    ]
+   ]
+  },
+  {
+   "id": "function.math:cosh",
+   "sql": "SELECT ROUND((EXP(1) + EXP(-1)) / 2, 6)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1.543081
+    ]
+   ]
+  },
+  {
+   "id": "function.math:degrees",
+   "sql": "SELECT ROUND(DEGREES(PI()), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     180
+    ]
+   ]
+  },
+  {
+   "id": "function.math:exp",
+   "sql": "SELECT ROUND(EXP(1), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2.718282
+    ]
+   ]
+  },
+  {
+   "id": "function.math:floor",
+   "sql": "SELECT FLOOR(2.9), FLOOR(-2.1)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2,
+     -3
+    ]
+   ]
+  },
+  {
+   "id": "function.math:ln",
+   "sql": "SELECT ROUND(LN(10), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2.302585
+    ]
+   ]
+  },
+  {
+   "id": "function.math:log",
+   "sql": "SELECT ROUND(LOG(100), 6), ROUND(LOG(2, 8), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     4.60517,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.math:log10",
+   "sql": "SELECT ROUND(LOG(10, 1000), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.math:log2",
+   "sql": "SELECT ROUND(LOG(2, 8), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.math:mod",
+   "sql": "SELECT 7 % 3, 7.5 % 2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1.5
+    ]
+   ]
+  },
+  {
+   "id": "function.math:pi",
+   "sql": "SELECT ROUND(PI(), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3.141593
+    ]
+   ]
+  },
+  {
+   "id": "function.math:pow",
+   "sql": "SELECT POWER(2, 10)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1024
+    ]
+   ]
+  },
+  {
+   "id": "function.math:power",
+   "sql": "SELECT POWER(3, 3)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     27
+    ]
+   ]
+  },
+  {
+   "id": "function.math:radians",
+   "sql": "SELECT ROUND(RADIANS(180), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3.141593
+    ]
+   ]
+  },
+  {
+   "id": "function.math:sin",
+   "sql": "SELECT ROUND(SIN(1), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0.841471
+    ]
+   ]
+  },
+  {
+   "id": "function.math:sinh",
+   "sql": "SELECT ROUND((EXP(1) - EXP(-1)) / 2, 6)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1.175201
+    ]
+   ]
+  },
+  {
+   "id": "function.math:sqrt",
+   "sql": "SELECT SQRT(16), SQRT(2.25)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     4,
+     1.5
+    ]
+   ]
+  },
+  {
+   "id": "function.math:tan",
+   "sql": "SELECT ROUND(TAN(1), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1.557408
+    ]
+   ]
+  },
+  {
+   "id": "function.math:tanh",
+   "sql": "SELECT ROUND((EXP(1) - EXP(-1)) / (EXP(1) + EXP(-1)), 6)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     0.761594
+    ]
+   ]
+  },
+  {
+   "id": "function.math:trunc",
+   "sql": "SELECT TRUNCATE(2.7, 0), TRUNCATE(-2.7, 0)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2,
+     -2
+    ]
+   ]
+  },
+  {
+   "id": "function.datetime:date",
+   "sql": "SELECT DATE_FORMAT(DATE_ADD('2024-02-28', INTERVAL 1 DAY), '%Y-%m-%d'), DATE_FORMAT(FROM_UNIXTIME(0), '%Y-%m-%d')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-02-29",
+     "1970-01-01"
+    ]
+   ]
+  },
+  {
+   "id": "function.datetime:time",
+   "sql": "SELECT TIME_FORMAT(TIME('2024-01-01 13:45:30'), '%H:%i:%s'), TIME_FORMAT(ADDTIME('13:45:00', '00:30:00'), '%H:%i:%s')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "13:45:30",
+     "14:15:00"
+    ]
+   ]
+  },
+  {
+   "id": "function.datetime:datetime",
+   "sql": "SELECT DATE_FORMAT(DATE_ADD('2024-01-31 10:00:00', INTERVAL 1 MONTH), '%Y-%m-%d %H:%i:%s'), DATE_FORMAT(FROM_UNIXTIME(1700000000), '%Y-%m-%d %H:%i:%s')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-02-29 10:00:00",
+     "2023-11-14 22:13:20"
+    ]
+   ]
+  },
+  {
+   "id": "function.datetime:julianday",
+   "sql": "SELECT TO_DAYS('2000-01-01 12:00:00') + 1721059.5 + TIME_TO_SEC(TIME('2000-01-01 12:00:00')) / 86400",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     2451545
+    ]
+   ]
+  },
+  {
+   "id": "function.datetime:unixepoch",
+   "sql": "SELECT UNIX_TIMESTAMP('2024-01-01 00:00:00')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1704067200
+    ]
+   ]
+  },
+  {
+   "id": "function.datetime:strftime",
+   "sql": "SELECT DATE_FORMAT('2024-03-15 08:05:00', '%Y-%m-%d %H:%i %j %w')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-15 08:05 075 5"
+    ]
+   ]
+  },
+  {
+   "id": "function.datetime:timediff",
+   "sql": "SELECT TIMEDIFF('2024-03-15', '2024-01-01')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "0:00:00"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:NNN days",
+   "sql": "SELECT DATE_FORMAT(DATE_ADD('2024-01-01', INTERVAL 10 DAY), '%Y-%m-%d')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-01-11"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:NNN hours",
+   "sql": "SELECT DATE_FORMAT(DATE_ADD('2024-01-01', INTERVAL 5 HOUR), '%Y-%m-%d %H:%i:%s')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-01-01 05:00:00"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:NNN minutes",
+   "sql": "SELECT DATE_FORMAT(DATE_SUB('2024-01-01', INTERVAL 90 MINUTE), '%Y-%m-%d %H:%i:%s')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2023-12-31 22:30:00"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:NNN seconds",
+   "sql": "SELECT DATE_FORMAT(DATE_ADD('2024-01-01', INTERVAL 3600 SECOND), '%Y-%m-%d %H:%i:%s')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-01-01 01:00:00"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:NNN months",
+   "sql": "SELECT DATE_FORMAT(DATE_ADD('2024-01-31', INTERVAL 1 MONTH), '%Y-%m-%d')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-02-29"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:NNN years",
+   "sql": "SELECT DATE_FORMAT(DATE_ADD('2024-02-29', INTERVAL 1 YEAR), '%Y-%m-%d')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2025-02-28"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:start of month",
+   "sql": "SELECT DATE_FORMAT('2024-03-15', '%Y-%m-01')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-01"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:start of year",
+   "sql": "SELECT DATE_FORMAT('2024-03-15', '%Y-01-01')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-01-01"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:start of day",
+   "sql": "SELECT DATE_FORMAT('2024-03-15 10:11:12', '%Y-%m-%d 00:00:00')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-15 00:00:00"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:weekday N",
+   "sql": "SELECT DATE_FORMAT(DATE_ADD('2024-03-15', INTERVAL (8 - DAYOFWEEK('2024-03-15')) % 7 DAY), '%Y-%m-%d')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-17"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:unixepoch",
+   "sql": "SELECT DATE_FORMAT(FROM_UNIXTIME(1710460800), '%Y-%m-%d %H:%i:%s')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-15 00:00:00"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:julianday",
+   "sql": "SELECT DATE_FORMAT(FROM_DAYS(FLOOR(2460385.5 - 1721059.5)), '%Y-%m-%d')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-16"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:auto",
+   "sql": "SELECT DATE_FORMAT(FROM_UNIXTIME(1710460800), '%Y-%m-%d %H:%i:%s')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-15 00:00:00"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:localtime",
+   "sql": "SELECT DATE_FORMAT(CONVERT_TZ('2024-03-15 00:00:00', '+00:00', @@session.time_zone), '%Y-%m-%d %H:%i:%s') IS NOT NULL",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:utc",
+   "sql": "SELECT DATE_FORMAT(CONVERT_TZ('2024-03-15 00:00:00', @@session.time_zone, '+00:00'), '%Y-%m-%d %H:%i:%s') IS NOT NULL",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:subsec",
+   "sql": "SELECT DATE_FORMAT(NOW(3), '%Y-%m-%d %H:%i:%s.%f') IS NOT NULL",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:subsecond",
+   "sql": "SELECT DATE_FORMAT(NOW(3), '%Y-%m-%d %H:%i:%s.%f') IS NOT NULL",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:ceiling",
+   "sql": "SELECT DATE_FORMAT(DATE_ADD(DATE_ADD(DATE_FORMAT('2024-01-31', '%Y-%m-01'), INTERVAL 1 MONTH), INTERVAL DAY('2024-01-31') - 1 DAY), '%Y-%m-%d')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-02"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:floor",
+   "sql": "SELECT DATE_FORMAT(DATE_ADD('2024-01-31', INTERVAL 1 MONTH), '%Y-%m-%d')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-02-29"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json",
+   "sql": "SELECT CAST(' {\"x\" : 1} ' AS JSON)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "{\"x\": 1}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_array",
+   "sql": "SELECT JSON_ARRAY(1, 'a', NULL, 2.5)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "[1, \"a\", null, 2.5]"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_array_insert",
+   "sql": "SELECT JSON_ARRAY_INSERT('[1,3]', '$[1]', 2)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "[1, 2, 3]"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_array_length",
+   "sql": "SELECT JSON_LENGTH('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.b')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_each",
+   "sql": "SELECT jt.k, JSON_EXTRACT('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', CONCAT('$.', jt.k)), LOWER(JSON_TYPE(JSON_EXTRACT('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', CONCAT('$.', jt.k)))) FROM JSON_TABLE(JSON_KEYS('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}'), '$[*]' COLUMNS (k VARCHAR(16) PATH '$')) AS jt ORDER BY jt.k",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "a",
+     "1",
+     "integer"
+    ],
+    [
+     "b",
+     "[1, 2, {\"c\": 3}]",
+     "array"
+    ],
+    [
+     "d",
+     "null",
+     "null"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_error_position",
+   "status": "no equivalent",
+   "error": "none: MySQL tells valid JSON from invalid (JSON_VALID) but not where it breaks"
+  },
+  {
+   "id": "function.json:json_extract",
+   "sql": "SELECT JSON_UNQUOTE(JSON_EXTRACT('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.b[2].c')), JSON_EXTRACT('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.a', '$.d')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "3",
+     "[1, null]"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_group_array",
+   "sql": "SELECT JSON_ARRAYAGG(a) FROM (SELECT a FROM t ORDER BY a) AS s",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "[1, 2, 3, 4, 5]"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_group_object",
+   "sql": "SELECT JSON_OBJECTAGG(b, a) FROM (SELECT a, b FROM t WHERE b IS NOT NULL ORDER BY a) AS s",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "{\"one\": 1, \"two\": 2, \"five\": 5, \"three\": 3}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_insert",
+   "sql": "SELECT JSON_INSERT('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.e', 5, '$.a', 9)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\": 1, \"b\": [1, 2, {\"c\": 3}], \"d\": null, \"e\": 5}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_object",
+   "sql": "SELECT JSON_OBJECT('k', 1, 'v', 'x')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"k\": 1, \"v\": \"x\"}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_patch",
+   "sql": "SELECT JSON_MERGE_PATCH('{\"a\":1,\"b\":2}', '{\"b\":null,\"c\":3}')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\": 1, \"c\": 3}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_pretty",
+   "sql": "SELECT JSON_PRETTY('{\"a\":[1,2]}')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "{\n  \"a\": [\n    1,\n    2\n  ]\n}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_quote",
+   "sql": "SELECT JSON_QUOTE('a\"b'), CAST(3 AS JSON)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "\"a\\\"b\"",
+     "3"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_remove",
+   "sql": "SELECT JSON_REMOVE('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.b', '$.d')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\": 1}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_replace",
+   "sql": "SELECT JSON_REPLACE('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.a', 7, '$.zz', 1)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\": 7, \"b\": [1, 2, {\"c\": 3}], \"d\": null}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_set",
+   "sql": "SELECT JSON_SET('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.a', 8, '$.e', 'n')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\": 8, \"b\": [1, 2, {\"c\": 3}], \"d\": null, \"e\": \"n\"}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_tree",
+   "status": "no equivalent",
+   "error": "none: MySQL has no recursive JSON walk with SQLite's fullkey and type columns"
+  },
+  {
+   "id": "function.json:json_type",
+   "sql": "SELECT LOWER(JSON_TYPE(JSON_EXTRACT('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.b'))), LOWER(JSON_TYPE(JSON_EXTRACT('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.d')))",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "array",
+     "null"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_valid",
+   "sql": "SELECT JSON_VALID('{\"a\":1}'), JSON_VALID('{a:1}'), JSON_VALID('{a:1}')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb",
+   "sql": "SELECT CAST('{\"a\":1}' AS JSON)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\": 1}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_array",
+   "sql": "SELECT JSON_ARRAY(1, 2)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "[1, 2]"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_array_insert",
+   "sql": "SELECT JSON_ARRAY_INSERT('[1,3]', '$[1]', 2)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "[1, 2, 3]"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_each",
+   "sql": "SELECT jt.k FROM JSON_TABLE(JSON_KEYS('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}'), '$[*]' COLUMNS (k VARCHAR(16) PATH '$')) AS jt ORDER BY jt.k",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "a"
+    ],
+    [
+     "b"
+    ],
+    [
+     "d"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_extract",
+   "sql": "SELECT JSON_EXTRACT('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.b')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "[1, 2, {\"c\": 3}]"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_group_array",
+   "sql": "SELECT JSON_ARRAYAGG(a) FROM (SELECT a FROM t ORDER BY a) AS s",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "[1, 2, 3, 4, 5]"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_group_object",
+   "sql": "SELECT JSON_OBJECTAGG(b, a) FROM (SELECT a, b FROM t WHERE b IS NOT NULL ORDER BY a) AS s",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "{\"one\": 1, \"two\": 2, \"five\": 5, \"three\": 3}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_insert",
+   "sql": "SELECT JSON_INSERT('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.e', 5)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\": 1, \"b\": [1, 2, {\"c\": 3}], \"d\": null, \"e\": 5}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_object",
+   "sql": "SELECT JSON_OBJECT('k', 1)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "{\"k\": 1}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_patch",
+   "sql": "SELECT JSON_MERGE_PATCH('{\"a\":1}', '{\"b\":2}')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\": 1, \"b\": 2}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_remove",
+   "sql": "SELECT JSON_REMOVE('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.b')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\": 1, \"d\": null}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_replace",
+   "sql": "SELECT JSON_REPLACE('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.a', 2)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\": 2, \"b\": [1, 2, {\"c\": 3}], \"d\": null}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_set",
+   "sql": "SELECT JSON_SET('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.a', 3)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\": 3, \"b\": [1, 2, {\"c\": 3}], \"d\": null}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_tree",
+   "status": "no equivalent",
+   "error": "none: MySQL has no recursive JSON walk with SQLite's columns"
+  },
+  {
+   "id": "function.aggregate:avg",
+   "sql": "SELECT AVG(c), AVG(a) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3.5,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:count",
+   "sql": "SELECT COUNT(*), COUNT(b), COUNT(DISTINCT a % 2) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     5,
+     4,
+     2
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:group_concat",
+   "sql": "SELECT GROUP_CONCAT(b ORDER BY a SEPARATOR '|') FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "one|two|three|five"
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:string_agg",
+   "sql": "SELECT GROUP_CONCAT(b ORDER BY a DESC SEPARATOR ',') FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "five,three,two,one"
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:max",
+   "sql": "SELECT MAX(c), MAX(b) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     5.5,
+     "two"
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:min",
+   "sql": "SELECT MIN(c), MIN(b) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1.5,
+     "five"
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:sum",
+   "sql": "SELECT SUM(a), SUM(c) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     15,
+     14
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:total",
+   "sql": "SELECT COALESCE(SUM(c), 0) + 0.0, 0.0 FROM t",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     14,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:median",
+   "status": "no equivalent",
+   "error": "none: MySQL has no percentile or median aggregate (PERCENT_RANK and CUME_DIST are window functions)"
+  },
+  {
+   "id": "function.aggregate:percentile",
+   "status": "no equivalent",
+   "error": "none: MySQL has no percentile or median aggregate (PERCENT_RANK and CUME_DIST are window functions)"
+  },
+  {
+   "id": "function.aggregate:percentile_cont",
+   "status": "no equivalent",
+   "error": "none: MySQL has no percentile or median aggregate (PERCENT_RANK and CUME_DIST are window functions)"
+  },
+  {
+   "id": "function.aggregate:percentile_disc",
+   "status": "no equivalent",
+   "error": "none: MySQL has no percentile or median aggregate (PERCENT_RANK and CUME_DIST are window functions)"
+  },
+  {
+   "id": "function.window:row_number",
+   "sql": "SELECT a, ROW_NUMBER() OVER (ORDER BY a) FROM t ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     4,
+     4
+    ],
+    [
+     5,
+     5
+    ]
+   ]
+  },
+  {
+   "id": "function.window:rank",
+   "sql": "SELECT a, RANK() OVER (ORDER BY a % 2) FROM t ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     3
+    ],
+    [
+     2,
+     1
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     4,
+     1
+    ],
+    [
+     5,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.window:dense_rank",
+   "sql": "SELECT a, DENSE_RANK() OVER (ORDER BY a % 2) FROM t ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     2
+    ],
+    [
+     2,
+     1
+    ],
+    [
+     3,
+     2
+    ],
+    [
+     4,
+     1
+    ],
+    [
+     5,
+     2
+    ]
+   ]
+  },
+  {
+   "id": "function.window:percent_rank",
+   "sql": "SELECT a, PERCENT_RANK() OVER (ORDER BY a) FROM t ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ],
+    [
+     2,
+     0.25
+    ],
+    [
+     3,
+     0.5
+    ],
+    [
+     4,
+     0.75
+    ],
+    [
+     5,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.window:cume_dist",
+   "sql": "SELECT a, CUME_DIST() OVER (ORDER BY a) FROM t ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0.2
+    ],
+    [
+     2,
+     0.4
+    ],
+    [
+     3,
+     0.6
+    ],
+    [
+     4,
+     0.8
+    ],
+    [
+     5,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.window:ntile",
+   "sql": "SELECT a, NTILE(2) OVER (ORDER BY a) FROM t ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     1
+    ],
+    [
+     3,
+     1
+    ],
+    [
+     4,
+     2
+    ],
+    [
+     5,
+     2
+    ]
+   ]
+  },
+  {
+   "id": "function.window:lag",
+   "sql": "SELECT a, LAG(b) OVER (ORDER BY a), LAG(b, 2, 'none') OVER (ORDER BY a) FROM t ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     null,
+     "none"
+    ],
+    [
+     2,
+     "one",
+     "none"
+    ],
+    [
+     3,
+     "two",
+     "one"
+    ],
+    [
+     4,
+     "three",
+     "two"
+    ],
+    [
+     5,
+     null,
+     "three"
+    ]
+   ]
+  },
+  {
+   "id": "function.window:lead",
+   "sql": "SELECT a, LEAD(b) OVER (ORDER BY a) FROM t ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "two"
+    ],
+    [
+     2,
+     "three"
+    ],
+    [
+     3,
+     null
+    ],
+    [
+     4,
+     "five"
+    ],
+    [
+     5,
+     null
+    ]
+   ]
+  },
+  {
+   "id": "function.window:first_value",
+   "sql": "SELECT a, FIRST_VALUE(b) OVER (ORDER BY a) FROM t ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "one"
+    ],
+    [
+     2,
+     "one"
+    ],
+    [
+     3,
+     "one"
+    ],
+    [
+     4,
+     "one"
+    ],
+    [
+     5,
+     "one"
+    ]
+   ]
+  },
+  {
+   "id": "function.window:last_value",
+   "sql": "SELECT a, LAST_VALUE(b) OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "five"
+    ],
+    [
+     2,
+     "five"
+    ],
+    [
+     3,
+     "five"
+    ],
+    [
+     4,
+     "five"
+    ],
+    [
+     5,
+     "five"
+    ]
+   ]
+  },
+  {
+   "id": "function.window:nth_value",
+   "sql": "SELECT a, NTH_VALUE(b, 2) OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "two"
+    ],
+    [
+     2,
+     "two"
+    ],
+    [
+     3,
+     "two"
+    ],
+    [
+     4,
+     "two"
+    ],
+    [
+     5,
+     "two"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#rows",
+   "sql": "SELECT a, SUM(a) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     3
+    ],
+    [
+     2,
+     6
+    ],
+    [
+     3,
+     9
+    ],
+    [
+     4,
+     12
+    ],
+    [
+     5,
+     9
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#range",
+   "sql": "SELECT a, SUM(a) OVER (ORDER BY a RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     3,
+     5
+    ],
+    [
+     4,
+     7
+    ],
+    [
+     5,
+     9
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#groups",
+   "status": "no equivalent",
+   "error": "none: MySQL has no GROUPS frames"
+  },
+  {
+   "id": "syntax:frame-spec#exclude-current-row",
+   "status": "no equivalent",
+   "error": "none: MySQL has no EXCLUDE clause in a window frame"
+  },
+  {
+   "id": "syntax:frame-spec#exclude-group",
+   "status": "no equivalent",
+   "error": "none: MySQL has no EXCLUDE clause in a window frame"
+  },
+  {
+   "id": "syntax:frame-spec#exclude-ties",
+   "status": "no equivalent",
+   "error": "none: MySQL has no EXCLUDE clause in a window frame"
+  },
+  {
+   "id": "syntax:frame-spec#partition",
+   "sql": "SELECT a, SUM(a) OVER (PARTITION BY a % 2 ORDER BY a) FROM t ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     3,
+     4
+    ],
+    [
+     4,
+     6
+    ],
+    [
+     5,
+     9
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#named-window",
+   "sql": "SELECT a, SUM(a) OVER w, COUNT(*) OVER w FROM t WINDOW w AS (ORDER BY a) ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1,
+     1
+    ],
+    [
+     2,
+     3,
+     2
+    ],
+    [
+     3,
+     6,
+     3
+    ],
+    [
+     4,
+     10,
+     4
+    ],
+    [
+     5,
+     15,
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#window-chaining",
+   "sql": "SELECT a, SUM(a) OVER (w ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t WINDOW w AS (ORDER BY a) ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     3,
+     5
+    ],
+    [
+     4,
+     7
+    ],
+    [
+     5,
+     9
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#aggregate-filter",
+   "sql": "SELECT a, SUM(CASE WHEN a > 2 THEN 1 ELSE 0 END) OVER (ORDER BY a) FROM t ORDER BY a",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ],
+    [
+     2,
+     0
+    ],
+    [
+     3,
+     1
+    ],
+    [
+     4,
+     2
+    ],
+    [
+     5,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "operator:~",
+   "sql": "SELECT ~5",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     18446744073709551610
+    ]
+   ]
+  },
+  {
+   "id": "operator:+ (unary)",
+   "sql": "SELECT 3, 'x'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3,
+     "x"
+    ]
+   ]
+  },
+  {
+   "id": "operator:- (unary)",
+   "sql": "SELECT -(3), -'4'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     -3,
+     -4
+    ]
+   ]
+  },
+  {
+   "id": "operator:+",
+   "sql": "SELECT 1 + 2, 1.5 + 2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3,
+     3.5
+    ]
+   ]
+  },
+  {
+   "id": "operator:-",
+   "sql": "SELECT 5 - 7, 2.5 - 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     -2,
+     1.5
+    ]
+   ]
+  },
+  {
+   "id": "operator:COLLATE",
+   "sql": "SELECT 'a' = 'A' COLLATE utf8mb4_0900_ai_ci",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:||",
+   "sql": "SELECT CONCAT('a', 'b', 1)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "ab1"
+    ]
+   ]
+  },
+  {
+   "id": "operator:->",
+   "sql": "SELECT JSON_EXTRACT('{\"a\":{\"b\":2}}', '$.a')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"b\": 2}"
+    ]
+   ]
+  },
+  {
+   "id": "operator:->>",
+   "sql": "SELECT JSON_UNQUOTE(JSON_EXTRACT('{\"a\":{\"b\":2}}', '$.a.b'))",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2"
+    ]
+   ]
+  },
+  {
+   "id": "operator:*",
+   "sql": "SELECT 6 * 7",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     42
+    ]
+   ]
+  },
+  {
+   "id": "operator:/",
+   "sql": "SELECT 7 / 2, 7.0 / 2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3.5,
+     3.5
+    ]
+   ]
+  },
+  {
+   "id": "operator:%",
+   "sql": "SELECT 7 % 3",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:&",
+   "sql": "SELECT 6 & 3",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "operator:|",
+   "sql": "SELECT 6 | 3",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     7
+    ]
+   ]
+  },
+  {
+   "id": "operator:<<",
+   "sql": "SELECT 1 << 4",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     16
+    ]
+   ]
+  },
+  {
+   "id": "operator:>>",
+   "sql": "SELECT 256 >> 2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     64
+    ]
+   ]
+  },
+  {
+   "id": "operator:<",
+   "sql": "SELECT 1 < 2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:>",
+   "sql": "SELECT 2 > 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:<=",
+   "sql": "SELECT 2 <= 2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:>=",
+   "sql": "SELECT 2 >= 3",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "operator:=",
+   "sql": "SELECT 1 = 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:==",
+   "sql": "SELECT 1 = 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:<>",
+   "sql": "SELECT 1 <> 2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:!=",
+   "sql": "SELECT 1 <> 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "operator:IS",
+   "sql": "SELECT NULL <=> NULL, 1 <=> 1",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:IS NOT",
+   "sql": "SELECT NOT 1 IS NULL",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:IS DISTINCT FROM",
+   "sql": "SELECT NOT 1 <=> NULL",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:IS NOT DISTINCT FROM",
+   "sql": "SELECT NULL <=> NULL",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:IN",
+   "sql": "SELECT 2 IN (1, 2, 3), 5 IN (SELECT a FROM t)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT IN",
+   "sql": "SELECT NOT 9 IN (1, 2)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:LIKE",
+   "sql": "SELECT 'Abc' LIKE 'a%'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT LIKE",
+   "sql": "SELECT 'abc' NOT LIKE 'b%'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:GLOB",
+   "sql": "SELECT REGEXP_LIKE('abc', '^a.c$', 'c')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT GLOB",
+   "sql": "SELECT NOT REGEXP_LIKE('abc', '^A', 'c')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:REGEXP",
+   "sql": "SELECT REGEXP_LIKE('abc', 'b'), REGEXP_LIKE('abc', '^b')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT REGEXP",
+   "sql": "SELECT NOT REGEXP_LIKE('abc', 'z')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:ESCAPE",
+   "sql": "SELECT 'a%' LIKE 'a!%' ESCAPE '!'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:BETWEEN",
+   "sql": "SELECT 2 BETWEEN 1 AND 3",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT BETWEEN",
+   "sql": "SELECT NOT 5 BETWEEN 1 AND 3",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:ISNULL",
+   "sql": "SELECT NULL IS NULL",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOTNULL",
+   "sql": "SELECT NOT 1 IS NULL",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT NULL",
+   "sql": "SELECT NOT 1 IS NULL",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:EXISTS",
+   "sql": "SELECT EXISTS(SELECT 1 FROM t WHERE a = 3)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT EXISTS",
+   "sql": "SELECT NOT EXISTS(SELECT 1 FROM t WHERE a = 9)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:CASE",
+   "sql": "SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 2 > 1 THEN 'b' ELSE 'c' END, CASE 3 WHEN 3 THEN 'x' END",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "b",
+     "x"
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT#1",
+   "sql": "SELECT NOT 0, NOT 5",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT#2",
+   "sql": "SELECT NOT FALSE, NOT TRUE",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "operator:AND#1",
+   "sql": "SELECT 1 AND 0, 1 AND NULL",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     null
+    ]
+   ]
+  },
+  {
+   "id": "operator:AND#2",
+   "sql": "SELECT TRUE AND FALSE, TRUE AND NULL",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     null
+    ]
+   ]
+  },
+  {
+   "id": "operator:OR#1",
+   "sql": "SELECT 0 OR NULL, 1 OR NULL",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     null,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:OR#2",
+   "sql": "SELECT FALSE OR NULL, TRUE OR NULL",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     null,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:CAST#1",
+   "sql": "SELECT CAST(5 AS CHAR), CAST('7' AS SIGNED), CAST(2 AS FLOAT)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "5",
+     7,
+     2
+    ]
+   ]
+  },
+  {
+   "id": "operator:CAST#2",
+   "sql": "SELECT CAST(3.9 AS SIGNED), CAST(-3.9 AS SIGNED)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     4,
+     -4
+    ]
+   ]
+  },
+  {
+   "id": "operator:CAST#3",
+   "sql": "SELECT CAST('12abc' AS SIGNED), CAST('abc' AS SIGNED)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     12,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "operator:MATCH",
+   "sql": "SELECT body FROM ft WHERE MATCH(body) AGAINST ('hello')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE ft(body TEXT, FULLTEXT (body)) ENGINE = InnoDB",
+    "INSERT INTO ft VALUES ('hello world'), ('goodbye')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "hello world"
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT MATCH",
+   "status": "no equivalent",
+   "error": "none: SQLite's NOT MATCH needs an application-defined match(); MySQL negates NOT MATCH(...) AGAINST (...)",
+   "requires": "an application-defined match() function"
+  },
+  {
+   "id": "affinity:TEXT",
+   "sql": "SELECT TYPEOF(x) FROM (SELECT CAST(12 AS CHAR) AS x)",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "OperationalError: (1248, 'Every derived table must have its own alias')"
+  },
+  {
+   "id": "affinity:NUMERIC",
+   "sql": "SELECT TYPEOF(CAST('12' AS DECIMAL)), TYPEOF(CAST('1.5' AS DECIMAL)), TYPEOF(CAST('abc' AS DECIMAL))",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "OperationalError: (1305, 'FUNCTION probe_3380202_210.TYPEOF does not exist')"
+  },
+  {
+   "id": "affinity:INTEGER",
+   "sql": "SELECT TYPEOF(v) FROM (SELECT CAST('7' AS SIGNED) AS v)",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "OperationalError: (1248, 'Every derived table must have its own alias')"
+  },
+  {
+   "id": "affinity:REAL",
+   "sql": "SELECT TYPEOF(CAST(7 AS FLOAT))",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "OperationalError: (1305, 'FUNCTION probe_3380202_212.TYPEOF does not exist')"
+  },
+  {
+   "id": "affinity:BLOB",
+   "sql": "SELECT TYPEOF(CAST('ab' AS VARBINARY))",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "ProgrammingError: (1064, \"You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'VARBINARY))' at line 1\")"
+  },
+  {
+   "id": "affinity:column",
+   "sql": "SELECT TYPEOF(n), TYPEOF(s), TYPEOF(i) FROM ta",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "OperationalError: (1305, 'FUNCTION probe_3380202_214.TYPEOF does not exist')"
+  },
+  {
+   "id": "collation:BINARY",
+   "sql": "SELECT 'a' < 'B' COLLATE utf8mb4_bin",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "collation:NOCASE",
+   "sql": "SELECT b FROM t WHERE b = 'ONE' COLLATE utf8mb4_0900_ai_ci",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "one"
+    ]
+   ]
+  },
+  {
+   "id": "collation:RTRIM",
+   "sql": "SELECT 'a  ' = 'a' COLLATE RTRIM",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "OperationalError: (1273, \"Unknown collation: 'RTRIM'\")"
+  },
+  {
+   "id": "storage_class:NULL",
+   "sql": "SELECT TYPEOF(NULL)",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "OperationalError: (1305, 'FUNCTION probe_3380202_218.TYPEOF does not exist')"
+  },
+  {
+   "id": "storage_class:INTEGER",
+   "sql": "SELECT TYPEOF(1)",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "OperationalError: (1305, 'FUNCTION probe_3380202_219.TYPEOF does not exist')"
+  },
+  {
+   "id": "storage_class:REAL",
+   "sql": "SELECT TYPEOF(1.5)",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "OperationalError: (1305, 'FUNCTION probe_3380202_220.TYPEOF does not exist')"
+  },
+  {
+   "id": "storage_class:TEXT",
+   "sql": "SELECT TYPEOF('t')",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "OperationalError: (1305, 'FUNCTION probe_3380202_221.TYPEOF does not exist')"
+  },
+  {
+   "id": "storage_class:BLOB",
+   "status": "no equivalent",
+   "error": "none: MySQL has no function that names a value's type"
+  },
+  {
+   "id": "expression:scalar subquery",
+   "sql": "SELECT (SELECT MAX(a) FROM t), (SELECT b FROM t WHERE a = 2)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     5,
+     "two"
+    ]
+   ]
+  },
+  {
+   "id": "expression:correlated subquery",
+   "sql": "SELECT a, (SELECT COUNT(*) FROM u WHERE u.a = t.a) FROM t ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     3,
+     0
+    ],
+    [
+     4,
+     0
+    ],
+    [
+     5,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "expression:row value",
+   "sql": "SELECT (1, 2) = (1, 2), (1, 2) < (1, 3), (2, 'y') IN (SELECT a, d FROM u)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "expression:boolean expression",
+   "sql": "SELECT CASE WHEN 'abc' THEN 1 ELSE 0 END, CASE WHEN '1x' THEN 1 ELSE 0 END, CASE WHEN 0.5 THEN 1 ELSE 0 END, NOT 'abc'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     1,
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.affinity:INT gives INTEGER",
+   "sql": "SELECT TYPEOF(x), TYPEOF(y) FROM r",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "OperationalError: (1305, 'FUNCTION probe_3380202_226.TYPEOF does not exist')"
+  },
+  {
+   "id": "rule.affinity:CHAR, CLOB or TEXT gives TEXT",
+   "sql": "SELECT TYPEOF(a), TYPEOF(b), TYPEOF(c) FROM r",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "ProgrammingError: (1064, \"You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'NTEXT)' at line 1\")"
+  },
+  {
+   "id": "rule.affinity:BLOB or no type gives BLOB",
+   "sql": "SELECT TYPEOF(a), TYPEOF(b) FROM r",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "ProgrammingError: (1064, \"You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near ', b)' at line 1\")"
+  },
+  {
+   "id": "rule.affinity:REAL, FLOA or DOUB gives REAL",
+   "sql": "SELECT TYPEOF(a), TYPEOF(b), TYPEOF(c) FROM r",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "OperationalError: (1305, 'FUNCTION probe_3380202_229.TYPEOF does not exist')"
+  },
+  {
+   "id": "rule.affinity:otherwise NUMERIC",
+   "sql": "SELECT TYPEOF(a), a, TYPEOF(b), TYPEOF(c) FROM r",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "OperationalError: (1305, 'FUNCTION probe_3380202_230.TYPEOF does not exist')"
+  },
+  {
+   "id": "rule.affinity:the rules apply in order",
+   "status": "no equivalent",
+   "error": "none: MySQL takes only its own type names: SQLite's affinity from the letters of any declared type has no counterpart there"
+  },
+  {
+   "id": "rule.expression-affinity:an IN list has no affinity",
+   "sql": "SELECT 1 IN (SELECT t FROM r), 1 IN ('1')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.expression-affinity:a column keeps its affinity",
+   "sql": "SELECT n = '5', (n) = '5' FROM r",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.expression-affinity:an operator removes affinity",
+   "sql": "SELECT n = '5', n + 0 = '5' FROM r",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.expression-affinity:CAST gives its type's affinity",
+   "sql": "SELECT CAST(5 AS CHAR) = 5, CAST('5' AS SIGNED) = '5'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.expression-affinity:COLLATE keeps its operand's affinity",
+   "sql": "SELECT (n COLLATE utf8mb4_0900_ai_ci) = '5' FROM r",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE r (n INT)",
+    "INSERT INTO r VALUES (5)"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.expression-affinity:otherwise no affinity",
+   "sql": "SELECT 5 = '5', '5' = 5",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.expression-affinity:view and subquery columns",
+   "sql": "SELECT x = '1', y = '1' FROM rv",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.expression-affinity:compound view columns",
+   "sql": "SELECT COUNT(*) FROM (SELECT a AS c FROM r UNION ALL SELECT b FROM s) WHERE c = '2'",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "OperationalError: (1248, 'Every derived table must have its own alias')"
+  },
+  {
+   "id": "rule.comparison:NULL is less than any value",
+   "sql": "SELECT x FROM (SELECT 1 AS x UNION ALL SELECT NULL UNION ALL SELECT -5) ORDER BY x",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "OperationalError: (1248, 'Every derived table must have its own alias')"
+  },
+  {
+   "id": "rule.comparison:numbers before text and blobs",
+   "sql": "SELECT 1 < '0', 2 < x'01', 99.5 < ''",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     0,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:numbers compare numerically",
+   "sql": "SELECT 2 < 10, 2.5 < 3, 3 = 3.0",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:text before blobs",
+   "sql": "SELECT 'zzz' < x'00'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:text compares by collation",
+   "sql": "SELECT 'a' < 'B', 'a' < 'B' COLLATE utf8mb4_0900_ai_ci",
+   "spelling": "rule",
+   "setup_sql": [],
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:blobs compare by memcmp",
+   "sql": "SELECT x'0102' < x'0201', x'01' < x'0100'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:numeric affinity goes to the other operand",
+   "sql": "SELECT n > '9', n = '10.0' FROM r",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:text affinity goes to an operand with none",
+   "sql": "SELECT t = 10, t > 9 FROM r",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:otherwise compared as is",
+   "sql": "SELECT '10' = 10, x'31' = '1'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:BETWEEN is two comparisons",
+   "sql": "SELECT t BETWEEN 1 AND 9, t BETWEEN 10 AND 20 FROM r",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:IN compares as equality",
+   "sql": "SELECT (SELECT n IN (SELECT t FROM s) FROM r), '1' IN (SELECT n FROM r)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.sort:ORDER BY orders by storage class",
+   "sql": "SELECT x FROM (SELECT x'00' AS x UNION ALL SELECT 'b' UNION ALL SELECT 2 UNION ALL SELECT NULL UNION ALL SELECT 1.5 UNION ALL SELECT 'A') ORDER BY x",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "OperationalError: (1248, 'Every derived table must have its own alias')"
+  },
+  {
+   "id": "rule.sort:GROUP BY keeps classes apart",
+   "sql": "SELECT COUNT(*) AS n FROM (SELECT 1 AS x UNION ALL SELECT 1.0 UNION ALL SELECT '1') GROUP BY x ORDER BY n",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "OperationalError: (1248, 'Every derived table must have its own alias')"
+  },
+  {
+   "id": "rule.sort:compound SELECTs compare as is",
+   "sql": "SELECT COUNT(*) FROM (SELECT n FROM r UNION SELECT '1')",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "OperationalError: (1248, 'Every derived table must have its own alias')"
+  },
+  {
+   "id": "rule.collation:columns default to BINARY",
+   "sql": "SELECT t = 'A' FROM r",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.collation:an explicit COLLATE wins, left first",
+   "sql": "SELECT t = 'A' COLLATE utf8mb4_bin, 'A' COLLATE utf8mb4_0900_ai_ci = t COLLATE utf8mb4_bin FROM r",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE r (t TEXT COLLATE utf8mb4_0900_ai_ci)",
+    "INSERT INTO r VALUES ('a')"
+   ],
+   "status": "error",
+   "error": "OperationalError: (1267, \"Illegal mix of collations (utf8mb4_0900_ai_ci,EXPLICIT) and (utf8mb4_bin,EXPLICIT) for operation '='\")"
+  },
+  {
+   "id": "rule.collation:then a column's collation, left first",
+   "sql": "SELECT x = y, y = x FROM r",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE r (x TEXT COLLATE utf8mb4_0900_ai_ci, y TEXT COLLATE `BINARY`)",
+    "INSERT INTO r VALUES ('a', 'A')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "rule.collation:otherwise BINARY",
+   "sql": "SELECT 'a' = 'A'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.collation:the leftmost COLLATE anywhere wins",
+   "sql": "SELECT 'a' COLLATE utf8mb4_0900_ai_ci = ('A' COLLATE utf8mb4_bin), 'x' = CONCAT('X' COLLATE utf8mb4_0900_ai_ci, '')",
+   "spelling": "rule",
+   "setup_sql": [],
+   "status": "error",
+   "error": "OperationalError: (1267, \"Illegal mix of collations (utf8mb4_0900_ai_ci,EXPLICIT) and (utf8mb4_bin,EXPLICIT) for operation '='\")"
+  },
+  {
+   "id": "rule.collation:IN uses the left operand's collation",
+   "sql": "SELECT 'a' COLLATE utf8mb4_0900_ai_ci IN ('A'), 'a' IN ('A' COLLATE utf8mb4_0900_ai_ci)",
+   "spelling": "rule",
+   "setup_sql": [],
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.collation:ORDER BY uses COLLATE, then the column's#1",
+   "sql": "SELECT t FROM r ORDER BY t COLLATE utf8mb4_bin",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE r (t TEXT COLLATE utf8mb4_0900_ai_ci)",
+    "INSERT INTO r VALUES ('b'), ('A'), ('a'), ('B')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "A"
+    ],
+    [
+     "B"
+    ],
+    [
+     "a"
+    ],
+    [
+     "b"
+    ]
+   ]
+  },
+  {
+   "id": "rule.collation:ORDER BY uses COLLATE, then the column's#2",
+   "sql": "SELECT t FROM r ORDER BY t, t COLLATE utf8mb4_bin",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE r (t TEXT COLLATE utf8mb4_0900_ai_ci)",
+    "INSERT INTO r VALUES ('b'), ('A'), ('a'), ('B')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "A"
+    ],
+    [
+     "a"
+    ],
+    [
+     "B"
+    ],
+    [
+     "b"
+    ]
+   ]
+  },
+  {
+   "id": "word:TRUE",
+   "sql": "SELECT TRUE, TRUE + 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     2
+    ]
+   ]
+  },
+  {
+   "id": "word:FALSE",
+   "sql": "SELECT FALSE, FALSE IS FALSE",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "word:STRICT#1",
+   "status": "no equivalent",
+   "error": "none: MySQL's column types are always enforced there; it has no ANY type and no rowid to leave out"
+  },
+  {
+   "id": "word:STRICT#2",
+   "status": "no equivalent",
+   "error": "none: MySQL's column types are always enforced there; it has no ANY type and no rowid to leave out"
+  },
+  {
+   "id": "word:STORED",
+   "sql": "SELECT b FROM gs",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     6
+    ]
+   ]
+  },
+  {
+   "id": "word:ROWID",
+   "status": "no equivalent",
+   "error": "none: MySQL's tables there have no rowid: a primary key table is already clustered by it (InnoDB) or keeps rows apart from its indexes"
+  },
+  {
+   "id": "word:EXPRESSIONS",
+   "status": "no equivalent",
+   "error": "none: MySQL has no REINDEX"
+  },
+  {
+   "id": "word:E",
+   "sql": "SELECT 1e3, 2.5E-1, 1E+2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1000,
+     0.25,
+     100
+    ]
+   ]
+  },
+  {
+   "id": "keyword:INNER",
+   "sql": "SELECT t.a, u.d FROM t INNER JOIN u ON t.a = u.a ORDER BY t.a, u.d",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ],
+    [
+     2,
+     "yy"
+    ]
+   ]
+  },
+  {
+   "id": "keyword:CONSTRAINT",
+   "sql": "INSERT INTO kc VALUES (1);\nSELECT a FROM kc",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "keyword:FAIL",
+   "sql": "INSERT INTO kp VALUES (2); SELECT count(*) FROM kp",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE kp (k INT PRIMARY KEY)",
+    "INSERT INTO kp VALUES (1)"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "keyword:NO",
+   "sql": "INSERT INTO kn VALUES (1);\nSELECT COUNT(*) FROM kn",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "keyword:ACTION",
+   "sql": "INSERT INTO ka VALUES (1);\nSELECT COUNT(*) FROM ka",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "keyword:RESTRICT",
+   "sql": "INSERT INTO kr VALUES (1);\nSELECT COUNT(*) FROM kr",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "keyword:OTHERS",
+   "sql": "SELECT a, SUM(a) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY a",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     3
+    ],
+    [
+     2,
+     6
+    ],
+    [
+     3,
+     9
+    ],
+    [
+     4,
+     12
+    ],
+    [
+     5,
+     9
+    ]
+   ]
+  },
+  {
+   "id": "parameter:?NNN",
+   "status": "n/a",
+   "error": "a client-side parameter syntax: each driver binds its own"
+  },
+  {
+   "id": "parameter:?",
+   "status": "n/a",
+   "error": "a client-side parameter syntax: each driver binds its own"
+  },
+  {
+   "id": "parameter::AAAA",
+   "status": "n/a",
+   "error": "a client-side parameter syntax: each driver binds its own"
+  },
+  {
+   "id": "parameter:@AAAA",
+   "status": "n/a",
+   "error": "a client-side parameter syntax: each driver binds its own"
+  },
+  {
+   "id": "parameter:$AAAA",
+   "status": "n/a",
+   "error": "a client-side parameter syntax: each driver binds its own"
+  },
+  {
+   "id": "syntax:select-stmt#1",
+   "sql": "SELECT a, b FROM t WHERE a > 1 ORDER BY a DESC LIMIT 2 OFFSET 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     4,
+     null
+    ],
+    [
+     3,
+     "three"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:select-stmt#2",
+   "sql": "SELECT DISTINCT a % 2 FROM t ORDER BY 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ],
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:select-stmt#3",
+   "sql": "SELECT a FROM t ORDER BY a LIMIT 2 OFFSET 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ],
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:select-core#1",
+   "sql": "SELECT a % 2 AS g, COUNT(*), SUM(a) FROM t GROUP BY g HAVING COUNT(*) > 1 ORDER BY g",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     2,
+     6
+    ],
+    [
+     1,
+     3,
+     9
+    ]
+   ]
+  },
+  {
+   "id": "syntax:select-core#2",
+   "sql": "VALUES ROW(1, 'a'), ROW(2, 'b')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "a"
+    ],
+    [
+     2,
+     "b"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:select-core#3",
+   "sql": "SELECT 1 + 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:simple-select-stmt",
+   "sql": "SELECT a FROM t ORDER BY CASE WHEN a IS NULL THEN 1 ELSE 0 END, a LIMIT 3",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:factored-select-stmt",
+   "sql": "WITH x AS (SELECT a FROM t) SELECT a FROM x ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     3
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:compound-select-stmt#1",
+   "sql": "SELECT a FROM t UNION SELECT a FROM u ORDER BY 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     3
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ]
+   ]
+  },
+  {
+   "id": "syntax:compound-select-stmt#2",
+   "sql": "SELECT a FROM t UNION ALL SELECT a FROM u ORDER BY 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     3
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ]
+   ]
+  },
+  {
+   "id": "syntax:compound-select-stmt#3",
+   "sql": "SELECT a FROM t INTERSECT SELECT a FROM u ORDER BY 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:compound-select-stmt#4",
+   "sql": "SELECT a FROM t EXCEPT SELECT a FROM u ORDER BY 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:compound-operator",
+   "sql": "SELECT 1 UNION ALL SELECT 2 ORDER BY 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:common-table-expression#1",
+   "status": "no equivalent",
+   "error": "none: MySQL takes no materialization hint on a CTE: its optimizer decides"
+  },
+  {
+   "id": "syntax:common-table-expression#2",
+   "status": "no equivalent",
+   "error": "none: MySQL takes no materialization hint on a CTE: its optimizer decides"
+  },
+  {
+   "id": "syntax:recursive-cte#1",
+   "sql": "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5) SELECT i FROM n ORDER BY i",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     3
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:recursive-cte#2",
+   "sql": "WITH RECURSIVE f(i, v) AS (SELECT 1, 1 UNION ALL SELECT i + 1, v * (i + 1) FROM f WHERE i < 6) SELECT v FROM f ORDER BY i DESC LIMIT 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     720
+    ]
+   ]
+  },
+  {
+   "id": "syntax:with-clause",
+   "sql": "WITH a1 AS (SELECT 1 AS v), a2 AS (SELECT v + 1 AS v FROM a1) SELECT v FROM a2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:cte-table-name",
+   "sql": "WITH x(p, q) AS (SELECT 1, 2) SELECT p + q FROM x",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-clause#1",
+   "sql": "SELECT t.a, u.d FROM t JOIN u ON t.a = u.a ORDER BY t.a, u.d",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ],
+    [
+     2,
+     "yy"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-clause#2",
+   "sql": "SELECT t.a, u.d FROM t LEFT JOIN u ON t.a = u.a ORDER BY t.a, u.d",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ],
+    [
+     2,
+     "yy"
+    ],
+    [
+     3,
+     null
+    ],
+    [
+     4,
+     null
+    ],
+    [
+     5,
+     null
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-clause#3",
+   "sql": "SELECT t.a, u.d FROM t RIGHT JOIN u ON t.a = u.a ORDER BY u.a, u.d",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ],
+    [
+     2,
+     "yy"
+    ],
+    [
+     null,
+     "z"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-clause#4",
+   "sql": "SELECT a, d FROM (SELECT t.a AS a, u.d AS d, COALESCE(t.a, u.a) AS k FROM t LEFT JOIN u ON t.a = u.a UNION ALL SELECT t.a, u.d, u.a FROM t RIGHT JOIN u ON t.a = u.a WHERE t.a IS NULL) AS f ORDER BY k, d",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ],
+    [
+     2,
+     "yy"
+    ],
+    [
+     3,
+     null
+    ],
+    [
+     4,
+     null
+    ],
+    [
+     5,
+     null
+    ],
+    [
+     null,
+     "z"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-clause#5",
+   "sql": "SELECT COUNT(*) FROM t CROSS JOIN u",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     20
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-clause#6",
+   "sql": "SELECT a, d FROM t NATURAL JOIN u ORDER BY a, d",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ],
+    [
+     2,
+     "yy"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-constraint",
+   "sql": "SELECT a, b, d FROM t JOIN u USING (a) ORDER BY a, d",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "one",
+     "x"
+    ],
+    [
+     2,
+     "two",
+     "y"
+    ],
+    [
+     2,
+     "two",
+     "yy"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-operator#1",
+   "sql": "SELECT COUNT(*) FROM t CROSS JOIN u WHERE t.a = u.a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-operator#2",
+   "sql": "SELECT COUNT(*) FROM t LEFT OUTER JOIN u ON t.a = u.a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     6
+    ]
+   ]
+  },
+  {
+   "id": "syntax:table-or-subquery#1",
+   "sql": "SELECT s.x FROM (SELECT a * 2 AS x FROM t) AS s ORDER BY s.x",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ],
+    [
+     4
+    ],
+    [
+     6
+    ],
+    [
+     8
+    ],
+    [
+     10
+    ]
+   ]
+  },
+  {
+   "id": "syntax:table-or-subquery#2",
+   "sql": "SELECT value FROM JSON_TABLE('[3,1,2]', '$[*]' COLUMNS (value INT PATH '$')) AS j ORDER BY value",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:result-column#1",
+   "sql": "SELECT t.*, u.d FROM t JOIN u ON t.a = u.a ORDER BY t.a, u.d",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "one",
+     1.5,
+     "x"
+    ],
+    [
+     2,
+     "two",
+     2.5,
+     "y"
+    ],
+    [
+     2,
+     "two",
+     2.5,
+     "yy"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:result-column#2",
+   "sql": "SELECT * FROM u ORDER BY a, d",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ],
+    [
+     2,
+     "yy"
+    ],
+    [
+     6,
+     "z"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:ordering-term#1",
+   "sql": "SELECT b FROM t ORDER BY CASE WHEN b COLLATE utf8mb4_0900_ai_ci IS NULL THEN 1 ELSE 0 END DESC, b COLLATE utf8mb4_0900_ai_ci DESC",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     null
+    ],
+    [
+     "two"
+    ],
+    [
+     "three"
+    ],
+    [
+     "one"
+    ],
+    [
+     "five"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:ordering-term#2",
+   "sql": "SELECT b FROM t ORDER BY CASE WHEN b IS NULL THEN 1 ELSE 0 END, b ASC",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "five"
+    ],
+    [
+     "one"
+    ],
+    [
+     "three"
+    ],
+    [
+     "two"
+    ],
+    [
+     null
+    ]
+   ]
+  },
+  {
+   "id": "syntax:qualified-table-name",
+   "sql": "SELECT a FROM t FORCE INDEX (ti) WHERE a > 3 ORDER BY a",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')",
+    "CREATE INDEX ti ON t(a)"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     4
+    ],
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:insert-stmt#1",
+   "status": "no equivalent",
+   "error": "none: MySQL returns no rows from a change (RETURNING is not in its grammar)"
+  },
+  {
+   "id": "syntax:insert-stmt#2",
+   "sql": "INSERT IGNORE INTO pk VALUES (1, 'dup')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')",
+    "CREATE TABLE pk (k INT PRIMARY KEY, v VARCHAR(255))",
+    "INSERT INTO pk VALUES (1, 'one')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:insert-stmt#3",
+   "sql": "REPLACE INTO pk VALUES (1, 'new')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')",
+    "CREATE TABLE pk (k INT PRIMARY KEY, v VARCHAR(255))",
+    "INSERT INTO pk VALUES (1, 'one')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:insert-stmt#4",
+   "sql": "INSERT INTO t SELECT a + 100, b, c FROM t WHERE a < 3",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:insert-stmt#5",
+   "sql": "INSERT INTO t () VALUES ()",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')",
+    "CREATE TABLE pk (k INT PRIMARY KEY, v VARCHAR(255))",
+    "INSERT INTO pk VALUES (1, 'one')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:insert-stmt#6",
+   "sql": "REPLACE INTO pk VALUES (2, 'two')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:upsert-clause#1",
+   "sql": "INSERT INTO pk VALUES (1, 'up') ON DUPLICATE KEY UPDATE v = CONCAT(VALUES(v), '!'); SELECT k, v FROM pk WHERE k = 1",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')",
+    "CREATE TABLE pk (k INT PRIMARY KEY, v VARCHAR(255))",
+    "INSERT INTO pk VALUES (1, 'one')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "up!"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:upsert-clause#2",
+   "sql": "INSERT IGNORE INTO pk VALUES (1, 'no')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')",
+    "CREATE TABLE pk (k INT PRIMARY KEY, v VARCHAR(255))",
+    "INSERT INTO pk VALUES (1, 'one')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:returning-clause#1",
+   "status": "no equivalent",
+   "error": "none: MySQL returns no rows from a change (RETURNING is not in its grammar)"
+  },
+  {
+   "id": "syntax:returning-clause#2",
+   "status": "no equivalent",
+   "error": "none: MySQL returns no rows from a change (RETURNING is not in its grammar)"
+  },
+  {
+   "id": "syntax:update-stmt#1",
+   "sql": "UPDATE t SET b = UPPER(b), c = c + 1 WHERE a < 3",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:update-stmt#2",
+   "sql": "UPDATE IGNORE t SET a = a WHERE a = 1",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:update-stmt#3",
+   "sql": "UPDATE t SET b = 'p', c = 9.5 WHERE a = 2",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:update-stmt#4",
+   "sql": "UPDATE t JOIN u ON TRUE SET t.b = u.d WHERE t.a = u.a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:update-stmt-limited",
+   "sql": "UPDATE t SET b = 'lim' WHERE a > 0 ORDER BY a LIMIT 2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [],
+   "requires": "SQLITE_ENABLE_UPDATE_DELETE_LIMIT"
+  },
+  {
+   "id": "syntax:delete-stmt",
+   "sql": "DELETE FROM t WHERE a IN (SELECT a FROM u)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:delete-stmt-limited",
+   "sql": "DELETE FROM t WHERE a > 0 ORDER BY a DESC LIMIT 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [],
+   "requires": "SQLITE_ENABLE_UPDATE_DELETE_LIMIT"
+  },
+  {
+   "id": "syntax:create-table-stmt#1",
+   "sql": "CREATE TABLE IF NOT EXISTS ct (a INT PRIMARY KEY, b VARCHAR(255) NOT NULL DEFAULT 'x', c DOUBLE CHECK (c >= 0), UNIQUE (b))",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-table-stmt#2",
+   "sql": "CREATE TEMPORARY TABLE ctt AS SELECT a, b FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-table-stmt#3",
+   "sql": "CREATE TEMPORARY TABLE ctt2 (x INT)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:column-def#1",
+   "sql": "CREATE TABLE cd (a INT PRIMARY KEY AUTO_INCREMENT, v VARCHAR(255));\nINSERT INTO cd (v) VALUES ('x'), ('y');\nSELECT a, v FROM cd ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:column-def#2",
+   "sql": "CREATE TABLE cd(b VARCHAR(10) COLLATE utf8mb4_0900_ai_ci); INSERT INTO cd VALUES ('Abc'); SELECT count(*) FROM cd WHERE b = 'aBC'",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:column-def#3",
+   "sql": "CREATE TABLE cd (a INT, c INT GENERATED ALWAYS AS (a * 2) STORED);\nINSERT INTO cd (a) VALUES (4);\nSELECT c FROM cd",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     8
+    ]
+   ]
+  },
+  {
+   "id": "syntax:column-def#4",
+   "sql": "CREATE TABLE cd (a INT, d INT GENERATED ALWAYS AS (a + 1) VIRTUAL);\nINSERT INTO cd (a) VALUES (4);\nSELECT d FROM cd",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:column-constraint#1",
+   "status": "no equivalent",
+   "error": "none: MySQL resolves conflicts per statement (REPLACE, INSERT ... ON DUPLICATE KEY UPDATE), not per constraint"
+  },
+  {
+   "id": "syntax:column-constraint#2",
+   "sql": "CREATE TABLE cc (b INT UNIQUE NOT NULL);\nINSERT INTO cc VALUES (1);\nSELECT COUNT(*) FROM cc",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:column-constraint#3",
+   "sql": "CREATE TABLE cc (c INT REFERENCES pk (k) ON DELETE CASCADE);\nINSERT INTO cc VALUES (1);\nDELETE FROM pk;\nSELECT COUNT(*) FROM cc",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:column-constraint#4",
+   "sql": "CREATE TABLE cc (d INT DEFAULT (1 + 1), e VARCHAR(255));\nINSERT INTO cc (e) VALUES ('x');\nSELECT d FROM cc",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:table-constraint#1",
+   "sql": "CREATE TABLE tc (a INT, b INT, PRIMARY KEY (a, b), CHECK (a < b));\nINSERT INTO tc VALUES (1, 2);\nSELECT COUNT(*) FROM tc",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:table-constraint#2",
+   "status": "no equivalent",
+   "error": "none: MySQL checks foreign keys at once: it has no deferrable constraints"
+  },
+  {
+   "id": "syntax:foreign-key-clause",
+   "sql": "CREATE TABLE fk(a INT, FOREIGN KEY (a) REFERENCES pk(k) ON UPDATE SET NULL ON DELETE SET DEFAULT)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')",
+    "CREATE TABLE pk (k INT PRIMARY KEY, v VARCHAR(255))"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:conflict-clause",
+   "status": "no equivalent",
+   "error": "none: MySQL resolves conflicts per statement (INSERT IGNORE), not per constraint"
+  },
+  {
+   "id": "syntax:table-options#1",
+   "status": "no equivalent",
+   "error": "none: MySQL's tables there have no rowid: a primary key table is already clustered by it (InnoDB) or keeps rows apart from its indexes"
+  },
+  {
+   "id": "syntax:table-options#2",
+   "status": "no equivalent",
+   "error": "none: MySQL's column types are always enforced there; it has no ANY type and no rowid to leave out"
+  },
+  {
+   "id": "syntax:table-options#3",
+   "status": "no equivalent",
+   "error": "none: MySQL's column types are always enforced there; it has no ANY type and no rowid to leave out"
+  },
+  {
+   "id": "syntax:type-name#1",
+   "sql": "CREATE TABLE tn (a VARCHAR(20), b DECIMAL(10, 2), c DOUBLE);\nINSERT INTO tn VALUES ('x', 1.25, 2.5);\nSELECT a, b, c FROM tn",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "x",
+     1.25,
+     2.5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:type-name#2",
+   "sql": "CREATE TABLE tn(d BIGINT UNSIGNED); INSERT INTO tn VALUES (7); SELECT d FROM tn",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     7
+    ]
+   ]
+  },
+  {
+   "id": "syntax:create-index-stmt#1",
+   "sql": "CREATE UNIQUE INDEX ix ON t(a DESC)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-index-stmt#2",
+   "status": "no equivalent",
+   "error": "none: MySQL has no partial indexes"
+  },
+  {
+   "id": "syntax:create-index-stmt#3",
+   "sql": "CREATE INDEX ex ON t((LOWER(b)))",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-index-stmt#4",
+   "status": "no equivalent",
+   "error": "none: MySQL takes a column's collation from the column's definition, not from an index"
+  },
+  {
+   "id": "syntax:indexed-column",
+   "status": "no equivalent",
+   "error": "none: MySQL takes a column's collation from the column's definition, not from an index"
+  },
+  {
+   "id": "syntax:create-view-stmt#1",
+   "sql": "CREATE OR REPLACE VIEW v1 (x, y) AS SELECT a, b FROM t",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-view-stmt#2",
+   "status": "no equivalent",
+   "error": "none: MySQL has no temporary views"
+  },
+  {
+   "id": "syntax:create-trigger-stmt#1",
+   "sql": "CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW BEGIN IF NEW.a > 100 THEN INSERT INTO u VALUES (NEW.a, 'trig'); END IF; END",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')",
+    "CREATE VIEW v1 AS SELECT a, b FROM t"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-trigger-stmt#2",
+   "status": "no equivalent",
+   "error": "none: MySQL can't skip a row from a trigger (SQLite's RAISE(IGNORE))"
+  },
+  {
+   "id": "syntax:create-trigger-stmt#3",
+   "sql": "CREATE TRIGGER tu AFTER UPDATE ON t FOR EACH ROW UPDATE u SET d = NEW.b WHERE a = NEW.a",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')",
+    "CREATE VIEW v1 AS SELECT a, b FROM t"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-trigger-stmt#4",
+   "status": "no equivalent",
+   "error": "none: MySQL has no INSTEAD OF triggers (no trigger on a view)"
+  },
+  {
+   "id": "syntax:raise-function",
+   "status": "no equivalent",
+   "error": "none: MySQL signals errors with SIGNAL SQLSTATE in a trigger body"
+  },
+  {
+   "id": "syntax:create-virtual-table-stmt#1",
+   "status": "no equivalent",
+   "error": "none: SQLite's virtual-table modules (FTS5, R-Tree) are its own; a FULLTEXT index is the counterpart, with its own syntax"
+  },
+  {
+   "id": "syntax:create-virtual-table-stmt#2",
+   "status": "no equivalent",
+   "error": "none: SQLite's virtual-table modules (FTS5, R-Tree) are its own; a SPATIAL index is the counterpart, with its own syntax"
+  },
+  {
+   "id": "syntax:alter-table-stmt#1",
+   "sql": "ALTER TABLE t RENAME t9",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:alter-table-stmt#2",
+   "sql": "ALTER TABLE t RENAME COLUMN b TO bb",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:alter-table-stmt#3",
+   "sql": "ALTER TABLE t ADD COLUMN e VARCHAR(255) DEFAULT 'e'",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:alter-table-stmt#4",
+   "sql": "ALTER TABLE t DROP COLUMN c",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:drop-table-stmt",
+   "sql": "DROP TABLE IF EXISTS u",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:drop-index-stmt",
+   "sql": "DROP INDEX ti ON t",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')",
+    "CREATE INDEX ti ON t(a)"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:drop-view-stmt",
+   "sql": "DROP VIEW IF EXISTS nope",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:drop-trigger-stmt",
+   "sql": "DROP TRIGGER IF EXISTS nope",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:analyze-stmt#1",
+   "sql": "ANALYZE TABLE t, u",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "probe_3380202_346.t",
+     "analyze",
+     "status",
+     "OK"
+    ],
+    [
+     "probe_3380202_346.u",
+     "analyze",
+     "status",
+     "OK"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:analyze-stmt#2",
+   "sql": "ANALYZE TABLE t",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "probe_3380202_347.t",
+     "analyze",
+     "status",
+     "OK"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:attach-stmt",
+   "status": "no equivalent",
+   "error": "none: MySQL reaches other databases another way (every database of the server is open to a session)"
+  },
+  {
+   "id": "syntax:detach-stmt",
+   "status": "no equivalent",
+   "error": "none: MySQL reaches other databases another way (every database of the server is open to a session)"
+  },
+  {
+   "id": "syntax:begin-stmt#1",
+   "sql": "START TRANSACTION",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:begin-stmt#2",
+   "sql": "START TRANSACTION",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:begin-stmt#3",
+   "sql": "START TRANSACTION",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:commit-stmt#1",
+   "sql": "COMMIT",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:commit-stmt#2",
+   "sql": "COMMIT",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')",
+    "START TRANSACTION"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:rollback-stmt",
+   "sql": "ROLLBACK TO SAVEPOINT sp1",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')",
+    "BEGIN",
+    "SAVEPOINT sp1"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:savepoint-stmt",
+   "sql": "SAVEPOINT sp1",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')",
+    "BEGIN"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:release-stmt",
+   "sql": "RELEASE SAVEPOINT sp1",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')",
+    "BEGIN",
+    "SAVEPOINT sp1"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:reindex-stmt#1",
+   "status": "no equivalent",
+   "error": "none: MySQL rebuilds indexes with ALTER TABLE ... FORCE or OPTIMIZE TABLE, per table"
+  },
+  {
+   "id": "syntax:reindex-stmt#2",
+   "sql": "ALTER TABLE t FORCE",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:vacuum-stmt",
+   "sql": "OPTIMIZE TABLE t",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "probe_3380202_357.t",
+     "optimize",
+     "note",
+     "Table does not support optimize, doing recreate + analyze instead"
+    ],
+    [
+     "probe_3380202_357.t",
+     "optimize",
+     "status",
+     "OK"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:pragma-stmt#1",
+   "sql": "SELECT ordinal_position - 1 AS cid, column_name AS name, upper(data_type) AS type, (is_nullable = 'NO') AS notnull, column_default AS dflt_value, 0 AS pk FROM information_schema.columns WHERE table_name = 't' AND table_schema = database()",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     "a",
+     "INT",
+     0,
+     null,
+     0
+    ],
+    [
+     1,
+     "b",
+     "VARCHAR",
+     0,
+     null,
+     0
+    ],
+    [
+     2,
+     "c",
+     "FLOAT",
+     0,
+     null,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "syntax:pragma-stmt#2",
+   "status": "no equivalent",
+   "error": "none: MySQL keeps no user version number in a database"
+  },
+  {
+   "id": "syntax:pragma-value",
+   "status": "no equivalent",
+   "error": "none: MySQL sizes its cache in the server's configuration (innodb_buffer_pool_size)"
+  },
+  {
+   "id": "syntax:expr",
+   "sql": "SELECT (1 + 2) * 3, -a, NOT a IS NULL, b LIKE 't%' FROM t ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     9,
+     -1,
+     1,
+     0
+    ],
+    [
+     9,
+     -2,
+     1,
+     1
+    ],
+    [
+     9,
+     -3,
+     1,
+     1
+    ],
+    [
+     9,
+     -4,
+     1,
+     null
+    ],
+    [
+     9,
+     -5,
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "syntax:literal-value",
+   "sql": "SELECT 1, 1.5, 'txt', x'0F', NULL, TRUE, FALSE, CURRENT_DATE IS NOT NULL, CURRENT_TIME IS NOT NULL, CURRENT_TIMESTAMP IS NOT NULL",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1.5,
+     "txt",
+     "x'0f'",
+     null,
+     1,
+     0,
+     1,
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:numeric-literal",
+   "sql": "SELECT x'1F', 1e3, 0.5, 1 AS _000_000, 2.5E-1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "x'1f'",
+     1000,
+     0.5,
+     1,
+     0.25
+    ]
+   ]
+  },
+  {
+   "id": "syntax:signed-number",
+   "sql": "CREATE TABLE sn (a INT DEFAULT -1, b FLOAT DEFAULT 2.5)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:function-arguments#1",
+   "sql": "SELECT COUNT(DISTINCT a), GROUP_CONCAT(DISTINCT b SEPARATOR ',') FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     5,
+     "five,one,three,two"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:function-arguments#2",
+   "sql": "SELECT COUNT(*) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:simple-function-invocation",
+   "sql": "SELECT ABS(-1)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:aggregate-function-invocation#1",
+   "sql": "SELECT SUM(DISTINCT a % 3) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:aggregate-function-invocation#2",
+   "sql": "SELECT GROUP_CONCAT(b ORDER BY a DESC SEPARATOR ',') FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "five,three,two,one"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:window-function-invocation",
+   "sql": "SELECT a, SUM(CASE WHEN a > 1 THEN a END) OVER (ORDER BY a) FROM t ORDER BY a",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     null
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     3,
+     5
+    ],
+    [
+     4,
+     9
+    ],
+    [
+     5,
+     14
+    ]
+   ]
+  },
+  {
+   "id": "syntax:over-clause",
+   "sql": "SELECT a, COUNT(*) OVER (PARTITION BY a % 2) FROM t ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     3
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     4,
+     2
+    ],
+    [
+     5,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:window-defn",
+   "sql": "SELECT a, MAX(a) OVER w FROM t WINDOW w AS (PARTITION BY a % 2 ORDER BY a RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     4,
+     4
+    ],
+    [
+     5,
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:filter-clause#1",
+   "sql": "SELECT SUM(CASE WHEN b IS NULL THEN 1 ELSE 0 END) FROM t",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:filter-clause#2",
+   "sql": "SELECT SUM(CASE WHEN a > 2 THEN 1 ELSE 0 END), SUM(CASE WHEN b IS NOT NULL THEN a END) FROM t",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     3,
+     11
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec",
+   "sql": "SELECT a, SUM(a) OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t ORDER BY a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     3,
+     6
+    ],
+    [
+     4,
+     10
+    ],
+    [
+     5,
+     15
+    ]
+   ]
+  },
+  {
+   "id": "syntax:column-name-list",
+   "sql": "UPDATE t SET a = 1, b = 'z' WHERE a = 4",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:comment-syntax#1",
+   "sql": "SELECT 1 /* a comment */",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:comment-syntax#2",
+   "sql": "/* inline */ SELECT 2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:sql-stmt#1",
+   "sql": "EXPLAIN SELECT 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "SIMPLE",
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     "No tables used"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:sql-stmt#2",
+   "sql": "EXPLAIN FORMAT=TREE SELECT a FROM t WHERE a = 1",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "-> Filter: (t.a = 1)  (cost=0.75 rows=1)\n    -> Table scan on t  (cost=0.75 rows=5)\n"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:sql-stmt-list",
+   "sql": "SELECT 1;\nSELECT 2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "pragma:analysis_limit",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA analysis_limit"
+  },
+  {
+   "id": "pragma:application_id",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA application_id"
+  },
+  {
+   "id": "pragma:auto_vacuum",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA auto_vacuum"
+  },
+  {
+   "id": "pragma:automatic_index",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA automatic_index"
+  },
+  {
+   "id": "pragma:busy_timeout",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA busy_timeout"
+  },
+  {
+   "id": "pragma:cache_size",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA cache_size"
+  },
+  {
+   "id": "pragma:cache_spill",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA cache_spill"
+  },
+  {
+   "id": "pragma:case_sensitive_like",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA case_sensitive_like"
+  },
+  {
+   "id": "pragma:cell_size_check",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA cell_size_check"
+  },
+  {
+   "id": "pragma:checkpoint_fullfsync",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA checkpoint_fullfsync"
+  },
+  {
+   "id": "pragma:collation_list",
+   "sql": "SELECT collation_name FROM information_schema.collations LIMIT 0",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "pragma:compile_options",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA compile_options"
+  },
+  {
+   "id": "pragma:count_changes",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA count_changes"
+  },
+  {
+   "id": "pragma:data_store_directory",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA data_store_directory",
+   "requires": "Windows's VFS"
+  },
+  {
+   "id": "pragma:data_version",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA data_version"
+  },
+  {
+   "id": "pragma:database_list",
+   "sql": "SELECT 0, database(), ''",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     "probe_3380202_381",
+     ""
+    ]
+   ]
+  },
+  {
+   "id": "pragma:default_cache_size",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA default_cache_size"
+  },
+  {
+   "id": "pragma:defer_foreign_keys",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA defer_foreign_keys"
+  },
+  {
+   "id": "pragma:empty_result_callbacks",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA empty_result_callbacks"
+  },
+  {
+   "id": "pragma:encoding",
+   "sql": "SELECT @@character_set_database",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "utf8mb4"
+    ]
+   ]
+  },
+  {
+   "id": "pragma:foreign_key_check",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA foreign_key_check"
+  },
+  {
+   "id": "pragma:foreign_key_list",
+   "sql": "SELECT constraint_name FROM information_schema.table_constraints WHERE table_name = 't' AND constraint_type = 'FOREIGN KEY' AND table_schema = database()",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "pragma:foreign_keys",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA foreign_keys"
+  },
+  {
+   "id": "pragma:freelist_count",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA freelist_count"
+  },
+  {
+   "id": "pragma:full_column_names",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA full_column_names"
+  },
+  {
+   "id": "pragma:fullfsync",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA fullfsync"
+  },
+  {
+   "id": "pragma:function_list",
+   "sql": "SELECT routine_name FROM information_schema.routines LIMIT 0",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "pragma:hard_heap_limit",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA hard_heap_limit"
+  },
+  {
+   "id": "pragma:ignore_check_constraints",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA ignore_check_constraints"
+  },
+  {
+   "id": "pragma:incremental_vacuum",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA incremental_vacuum"
+  },
+  {
+   "id": "pragma:index_info",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA index_info"
+  },
+  {
+   "id": "pragma:index_list",
+   "sql": "SELECT DISTINCT index_name FROM information_schema.statistics WHERE table_name = 't' AND table_schema = database()",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')",
+    "CREATE INDEX ti ON t(a)"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "ti"
+    ]
+   ]
+  },
+  {
+   "id": "pragma:index_xinfo",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA index_xinfo"
+  },
+  {
+   "id": "pragma:integrity_check",
+   "sql": "CHECK TABLE t",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "probe_3380202_386.t",
+     "check",
+     "status",
+     "OK"
+    ]
+   ]
+  },
+  {
+   "id": "pragma:journal_mode",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA journal_mode"
+  },
+  {
+   "id": "pragma:journal_size_limit",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA journal_size_limit"
+  },
+  {
+   "id": "pragma:legacy_alter_table",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA legacy_alter_table"
+  },
+  {
+   "id": "pragma:legacy_file_format",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA legacy_file_format",
+   "requires": "nothing: it no longer functions (a no-op)"
+  },
+  {
+   "id": "pragma:locking_mode",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA locking_mode"
+  },
+  {
+   "id": "pragma:max_page_count",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA max_page_count"
+  },
+  {
+   "id": "pragma:mmap_size",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA mmap_size"
+  },
+  {
+   "id": "pragma:module_list",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA module_list"
+  },
+  {
+   "id": "pragma:optimize",
+   "sql": "ANALYZE TABLE t",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "probe_3380202_387.t",
+     "analyze",
+     "status",
+     "OK"
+    ]
+   ]
+  },
+  {
+   "id": "pragma:page_count",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA page_count"
+  },
+  {
+   "id": "pragma:page_size",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA page_size"
+  },
+  {
+   "id": "pragma:parser_trace",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA parser_trace",
+   "requires": "SQLITE_DEBUG"
+  },
+  {
+   "id": "pragma:pragma_list",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA pragma_list"
+  },
+  {
+   "id": "pragma:query_only",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA query_only"
+  },
+  {
+   "id": "pragma:quick_check",
+   "sql": "CHECK TABLE t QUICK",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "probe_3380202_388.t",
+     "check",
+     "status",
+     "OK"
+    ]
+   ]
+  },
+  {
+   "id": "pragma:read_uncommitted",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA read_uncommitted"
+  },
+  {
+   "id": "pragma:recursive_triggers",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA recursive_triggers"
+  },
+  {
+   "id": "pragma:reverse_unordered_selects",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA reverse_unordered_selects"
+  },
+  {
+   "id": "pragma:schema_version",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA schema_version"
+  },
+  {
+   "id": "pragma:secure_delete",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA secure_delete"
+  },
+  {
+   "id": "pragma:short_column_names",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA short_column_names"
+  },
+  {
+   "id": "pragma:shrink_memory",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA shrink_memory"
+  },
+  {
+   "id": "pragma:soft_heap_limit",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA soft_heap_limit"
+  },
+  {
+   "id": "pragma:stats",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA stats",
+   "requires": "a testing build (its output is deliberately undocumented)"
+  },
+  {
+   "id": "pragma:synchronous",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA synchronous"
+  },
+  {
+   "id": "pragma:table_info",
+   "sql": "SELECT ordinal_position - 1 AS cid, column_name AS name, upper(data_type) AS type, (is_nullable = 'NO') AS notnull, column_default AS dflt_value, 0 AS pk FROM information_schema.columns WHERE table_name = 't' AND table_schema = database()",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     "a",
+     "INT",
+     0,
+     null,
+     0
+    ],
+    [
+     1,
+     "b",
+     "VARCHAR",
+     0,
+     null,
+     0
+    ],
+    [
+     2,
+     "c",
+     "FLOAT",
+     0,
+     null,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:table_list",
+   "sql": "SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_schema = database()",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b VARCHAR(255), c FLOAT)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d VARCHAR(255))",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "probe_3380202_390",
+     "t",
+     "BASE TABLE"
+    ],
+    [
+     "probe_3380202_390",
+     "u",
+     "BASE TABLE"
+    ]
+   ]
+  },
+  {
+   "id": "pragma:table_xinfo",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA table_xinfo"
+  },
+  {
+   "id": "pragma:temp_store",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA temp_store"
+  },
+  {
+   "id": "pragma:temp_store_directory",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA temp_store_directory"
+  },
+  {
+   "id": "pragma:threads",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA threads"
+  },
+  {
+   "id": "pragma:trusted_schema",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA trusted_schema"
+  },
+  {
+   "id": "pragma:user_version",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA user_version"
+  },
+  {
+   "id": "pragma:vdbe_addoptrace",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA vdbe_addoptrace",
+   "requires": "SQLITE_DEBUG"
+  },
+  {
+   "id": "pragma:vdbe_debug",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA vdbe_debug",
+   "requires": "SQLITE_DEBUG"
+  },
+  {
+   "id": "pragma:vdbe_listing",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA vdbe_listing",
+   "requires": "SQLITE_DEBUG"
+  },
+  {
+   "id": "pragma:vdbe_trace",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA vdbe_trace",
+   "requires": "SQLITE_DEBUG"
+  },
+  {
+   "id": "pragma:wal_autocheckpoint",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA wal_autocheckpoint"
+  },
+  {
+   "id": "pragma:wal_checkpoint",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA wal_checkpoint"
+  },
+  {
+   "id": "pragma:writable_schema",
+   "status": "no equivalent",
+   "error": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA writable_schema"
+  }
+ ]
+}

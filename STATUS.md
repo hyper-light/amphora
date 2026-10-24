@@ -191,6 +191,23 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Measured
 
+- **The SQLite language against every engine** (G2 step 1, `bench/corpus/run.sh`; published in
+  `bench/corpus/matrix.md`, every cell in `matrix.json`, the probes' answers in
+  `bench/records/2026-10-24-adacachy-corpus-probes/`): SQLite's documentation (3.54.1) inventoried into
+  570 entries: 71 syntax productions, 144 functions, 19 date modifiers, 74 PRAGMAs, 51 operators, 5
+  parameter forms, 4 expression forms, 35 rules of affinity, comparison, sorting and collation, 13
+  types and collations, 147 keywords and 7 context words. `check_inventory.py` finds nothing documented
+  missing against every list the documentation keeps and against SQLite 3.54.0's own function and
+  PRAGMA catalogs. 510 probes ran on nine engines, SQLite the reference; every entry has its status and
+  its spelling in each (sqlglot's translation, one of 468 hand-written spellings, or one of 441 reasons
+  an engine has none). Answering as SQLite does: Turso 466 of 570, Amphora 463, PostgreSQL and OrioleDB
+  309, DuckDB 292, MySQL 278, CedarDB 259, ClickHouse 252. Where Amphora doesn't (57 entries): no ORDER
+  BY inside aggregates; no median or percentiles; no json_array_insert, jsonb_array_insert, jsonb_each
+  or jsonb_tree; ATTACH, VACUUM, WITHOUT ROWID and generated columns behind experimental flags; about
+  thirty PRAGMAs that answer nothing; and two wrong answers it shares with Turso: `'a' IN ('A' COLLATE
+  NOCASE)` is 1 where SQLite says 0 (the left operand's collation decides), and `PRAGMA index_xinfo`
+  names the rowid's column '' where SQLite gives NULL. CedarDB's server dies on
+  `SELECT 0 OR NULL, 1 OR NULL`, and again when it's tried a second time.
 - **The v6 matrix: the suite at ten million rows and K0, eight engines, best of 3** (adacachy,
   2026-10-23; `bench/records/2026-10-23-adacachy-matrix-v6-{suite,k0}.jsonl`, scored by
   `python3 bench/best_of.py` into `2026-10-23-adacachy-matrix-v6.md`; the code measured is this
@@ -230,6 +247,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Next
 
+- **What the language matrix found** (`bench/corpus/matrix.md`): the two wrong answers fixed, each
+  from a failing test (the IN operator's collation, `index_xinfo`'s NULL), then the missing features
+  by how often users reach them (ORDER BY in aggregates, median and percentiles, the JSON functions,
+  the PRAGMAs), each against the probe that found it.
 - **One thread making everything durable**: on btrfs every flush is a commit of the filesystem's
   log, one at a time, so the checkpointer's flushes of the file hold up the flusher's, and with it
   every write (docs/design/store.md, decision 4: commits stalled up to 97 ms, writes at 512 writers

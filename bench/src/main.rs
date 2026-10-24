@@ -17,6 +17,7 @@ mod clickhouse;
 mod mysql;
 mod pg;
 mod pool;
+mod probe;
 mod query;
 mod schema;
 mod store;
@@ -477,6 +478,10 @@ fn main() -> anyhow::Result<()> {
     // A statement on a database a suite run left behind: plans and times (`query.rs`).
     if std::env::args().any(|a| a == "--query") {
         return query::main();
+    }
+    // The SQLite language's probes on Amphora or Turso (`probe.rs`, bench/corpus).
+    if std::env::args().any(|a| a == "--probe") {
+        return probe::main();
     }
     // The versioned storage's B-link tree on its own (`blink.rs`).
     if std::env::args().any(|a| a == "--blink") {

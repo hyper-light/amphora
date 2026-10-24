@@ -1,0 +1,8329 @@
+{
+ "engine": "sqlite",
+ "version": "SQLite 3.54.0 (Python's sqlite3)",
+ "sqlglot": "30.24.0",
+ "seconds": 82.1,
+ "crashes": 0,
+ "results": [
+  {
+   "id": "function.core:abs",
+   "sql": "SELECT abs(-3), abs(2.5), abs(NULL)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3,
+     2.5,
+     null
+    ]
+   ]
+  },
+  {
+   "id": "function.core:changes",
+   "sql": "SELECT changes()",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     4
+    ]
+   ]
+  },
+  {
+   "id": "function.core:char",
+   "sql": "SELECT char(72, 105)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "Hi"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:coalesce",
+   "sql": "SELECT coalesce(NULL, NULL, 3)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.core:concat",
+   "sql": "SELECT concat('a', NULL, 'b', 1)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "ab1"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:concat_ws",
+   "sql": "SELECT concat_ws('-', 'a', NULL, 'b')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "a-b"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:format",
+   "sql": "SELECT format('%d-%s', 7, 'x')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "7-x"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:glob",
+   "sql": "SELECT glob('a*', 'abc'), glob('a*', 'bc')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "function.core:hex",
+   "sql": "SELECT hex('AB'), hex(255)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "4142",
+     "323535"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:if",
+   "sql": "SELECT if(1 > 2, 'a', 'b')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "b"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:ifnull",
+   "sql": "SELECT ifnull(NULL, 'z')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "z"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:iif",
+   "sql": "SELECT iif(1 < 2, 'yes', 'no')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "yes"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:instr",
+   "sql": "SELECT instr('hello', 'll')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.core:last_insert_rowid",
+   "sql": "SELECT last_insert_rowid() > 0",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.core:length",
+   "sql": "SELECT length('h\u00e9llo'), length(x'0102'), length(NULL)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     5,
+     2,
+     null
+    ]
+   ]
+  },
+  {
+   "id": "function.core:like",
+   "sql": "SELECT like('a%', 'abc'), like('a\\%', 'a%', '\\')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.core:likelihood",
+   "sql": "SELECT likelihood(1 = 1, 0.5)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.core:likely",
+   "sql": "SELECT likely(1 = 1)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.core:load_extension",
+   "sql": "SELECT load_extension('/nonexistent/probe-extension')",
+   "spelling": "sqlite",
+   "status": "error",
+   "error": "OperationalError: not authorized"
+  },
+  {
+   "id": "function.core:lower",
+   "sql": "SELECT lower('AbC')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "abc"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:ltrim",
+   "sql": "SELECT ltrim('  ab'), ltrim('xxab', 'x')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "ab",
+     "ab"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:max",
+   "sql": "SELECT max(1, 5, 3)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "function.core:min",
+   "sql": "SELECT min(4, 2, 8)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "function.core:nullif",
+   "sql": "SELECT nullif(3, 3), nullif(3, 4)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     null,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.core:octet_length",
+   "sql": "SELECT octet_length('h\u00e9llo')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     6
+    ]
+   ]
+  },
+  {
+   "id": "function.core:printf",
+   "sql": "SELECT printf('%5.2f|%-3s|%03d', 3.14159, 'a', 7)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     " 3.14|a  |007"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:quote",
+   "sql": "SELECT quote('it''s'), quote(NULL), quote(x'ab')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "'it''s'",
+     "NULL",
+     "X'AB'"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:random",
+   "sql": "SELECT typeof(random())",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "integer"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:randomblob",
+   "sql": "SELECT length(randomblob(8))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     8
+    ]
+   ]
+  },
+  {
+   "id": "function.core:replace",
+   "sql": "SELECT replace('banana', 'an', 'AN')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "bANANa"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:round",
+   "sql": "SELECT round(2.567, 2), round(2.5), round(-2.5)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2.57,
+     3,
+     -3
+    ]
+   ]
+  },
+  {
+   "id": "function.core:rtrim",
+   "sql": "SELECT rtrim('ab  '), rtrim('abyy', 'y')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "ab",
+     "ab"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:sign",
+   "sql": "SELECT sign(-7), sign(0), sign(2.5)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     -1,
+     0,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.core:soundex",
+   "sql": "SELECT soundex('Robert')",
+   "spelling": "sqlite",
+   "status": "error",
+   "error": "OperationalError: no such function: soundex",
+   "requires": "SQLITE_SOUNDEX"
+  },
+  {
+   "id": "function.core:sqlite_compileoption_get",
+   "sql": "SELECT typeof(sqlite_compileoption_get(0))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "text"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:sqlite_compileoption_used",
+   "sql": "SELECT typeof(sqlite_compileoption_used('THREADSAFE'))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "integer"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:sqlite_offset",
+   "sql": "SELECT typeof(sqlite_offset(a)) FROM t LIMIT 1",
+   "spelling": "sqlite",
+   "status": "error",
+   "error": "OperationalError: no such function: sqlite_offset",
+   "requires": "SQLITE_ENABLE_OFFSET_SQL_FUNC"
+  },
+  {
+   "id": "function.core:sqlite_source_id",
+   "sql": "SELECT typeof(sqlite_source_id())",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "text"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:sqlite_version",
+   "sql": "SELECT typeof(sqlite_version())",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "text"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:substr",
+   "sql": "SELECT substr('database', 2, 3), substr('database', -4), substr('database', 5)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "ata",
+     "base",
+     "base"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:substring",
+   "sql": "SELECT substring('database', 2, 3)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "ata"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:total_changes",
+   "sql": "SELECT typeof(total_changes())",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "integer"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:trim",
+   "sql": "SELECT trim('  ab  '), trim('xxabxx', 'x')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "ab",
+     "ab"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:typeof",
+   "sql": "SELECT typeof(1), typeof(1.5), typeof('a'), typeof(x'00'), typeof(NULL)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "integer",
+     "real",
+     "text",
+     "blob",
+     "null"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:unhex",
+   "sql": "SELECT unhex('4142') = CAST('AB' AS BLOB)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.core:unicode",
+   "sql": "SELECT unicode('A')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     65
+    ]
+   ]
+  },
+  {
+   "id": "function.core:unistr",
+   "sql": "SELECT unistr('\\u0041\\u00e9')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "A\u00e9"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:unistr_quote",
+   "sql": "SELECT unistr_quote('a''b')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "'a''b'"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:unlikely",
+   "sql": "SELECT unlikely(1 = 2)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "function.core:upper",
+   "sql": "SELECT upper('aBc')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "ABC"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:zeroblob",
+   "sql": "SELECT length(zeroblob(4)), typeof(zeroblob(1))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     4,
+     "blob"
+    ]
+   ]
+  },
+  {
+   "id": "function.math:acos",
+   "sql": "SELECT round(acos(0.5), 6)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1.047198
+    ]
+   ]
+  },
+  {
+   "id": "function.math:acosh",
+   "sql": "SELECT round(acosh(2), 6)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1.316958
+    ]
+   ]
+  },
+  {
+   "id": "function.math:asin",
+   "sql": "SELECT round(asin(0.5), 6)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0.523599
+    ]
+   ]
+  },
+  {
+   "id": "function.math:asinh",
+   "sql": "SELECT round(asinh(1), 6)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0.881374
+    ]
+   ]
+  },
+  {
+   "id": "function.math:atan",
+   "sql": "SELECT round(atan(1), 6)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0.785398
+    ]
+   ]
+  },
+  {
+   "id": "function.math:atan2",
+   "sql": "SELECT round(atan2(1, 2), 6)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0.463648
+    ]
+   ]
+  },
+  {
+   "id": "function.math:atanh",
+   "sql": "SELECT round(atanh(0.5), 6)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0.549306
+    ]
+   ]
+  },
+  {
+   "id": "function.math:ceil",
+   "sql": "SELECT ceil(2.1), ceil(-2.1)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3,
+     -2
+    ]
+   ]
+  },
+  {
+   "id": "function.math:ceiling",
+   "sql": "SELECT ceiling(2.1)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.math:cos",
+   "sql": "SELECT round(cos(1), 6)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0.540302
+    ]
+   ]
+  },
+  {
+   "id": "function.math:cosh",
+   "sql": "SELECT round(cosh(1), 6)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1.543081
+    ]
+   ]
+  },
+  {
+   "id": "function.math:degrees",
+   "sql": "SELECT round(degrees(pi()), 6)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     180
+    ]
+   ]
+  },
+  {
+   "id": "function.math:exp",
+   "sql": "SELECT round(exp(1), 6)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2.718282
+    ]
+   ]
+  },
+  {
+   "id": "function.math:floor",
+   "sql": "SELECT floor(2.9), floor(-2.1)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2,
+     -3
+    ]
+   ]
+  },
+  {
+   "id": "function.math:ln",
+   "sql": "SELECT round(ln(10), 6)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2.302585
+    ]
+   ]
+  },
+  {
+   "id": "function.math:log",
+   "sql": "SELECT round(log(100), 6), round(log(2, 8), 6)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.math:log10",
+   "sql": "SELECT round(log10(1000), 6)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.math:log2",
+   "sql": "SELECT round(log2(8), 6)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.math:mod",
+   "sql": "SELECT mod(7, 3), mod(7.5, 2)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1.5
+    ]
+   ]
+  },
+  {
+   "id": "function.math:pi",
+   "sql": "SELECT round(pi(), 6)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3.141593
+    ]
+   ]
+  },
+  {
+   "id": "function.math:pow",
+   "sql": "SELECT pow(2, 10)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1024
+    ]
+   ]
+  },
+  {
+   "id": "function.math:power",
+   "sql": "SELECT power(3, 3)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     27
+    ]
+   ]
+  },
+  {
+   "id": "function.math:radians",
+   "sql": "SELECT round(radians(180), 6)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3.141593
+    ]
+   ]
+  },
+  {
+   "id": "function.math:sin",
+   "sql": "SELECT round(sin(1), 6)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0.841471
+    ]
+   ]
+  },
+  {
+   "id": "function.math:sinh",
+   "sql": "SELECT round(sinh(1), 6)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1.175201
+    ]
+   ]
+  },
+  {
+   "id": "function.math:sqrt",
+   "sql": "SELECT sqrt(16), sqrt(2.25)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     4,
+     1.5
+    ]
+   ]
+  },
+  {
+   "id": "function.math:tan",
+   "sql": "SELECT round(tan(1), 6)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1.557408
+    ]
+   ]
+  },
+  {
+   "id": "function.math:tanh",
+   "sql": "SELECT round(tanh(1), 6)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0.761594
+    ]
+   ]
+  },
+  {
+   "id": "function.math:trunc",
+   "sql": "SELECT trunc(2.7), trunc(-2.7)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2,
+     -2
+    ]
+   ]
+  },
+  {
+   "id": "function.datetime:date",
+   "sql": "SELECT date('2024-02-28', '+1 day'), date(0, 'unixepoch')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "2024-02-29",
+     "1970-01-01"
+    ]
+   ]
+  },
+  {
+   "id": "function.datetime:time",
+   "sql": "SELECT time('2024-01-01 13:45:30'), time('13:45', '+30 minutes')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "13:45:30",
+     "14:15:00"
+    ]
+   ]
+  },
+  {
+   "id": "function.datetime:datetime",
+   "sql": "SELECT datetime('2024-01-31 10:00:00', '+1 month'), datetime(1700000000, 'unixepoch')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-02 10:00:00",
+     "2023-11-14 22:13:20"
+    ]
+   ]
+  },
+  {
+   "id": "function.datetime:julianday",
+   "sql": "SELECT julianday('2000-01-01 12:00:00')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2451545
+    ]
+   ]
+  },
+  {
+   "id": "function.datetime:unixepoch",
+   "sql": "SELECT unixepoch('2024-01-01 00:00:00')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1704067200
+    ]
+   ]
+  },
+  {
+   "id": "function.datetime:strftime",
+   "sql": "SELECT strftime('%Y-%m-%d %H:%M %j %w', '2024-03-15 08:05:00')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-15 08:05 075 5"
+    ]
+   ]
+  },
+  {
+   "id": "function.datetime:timediff",
+   "sql": "SELECT timediff('2024-03-15', '2024-01-01')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "+0000-02-14 00:00:00.000"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:NNN days",
+   "sql": "SELECT date('2024-01-01', '+10 days')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "2024-01-11"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:NNN hours",
+   "sql": "SELECT datetime('2024-01-01', '+5 hours')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "2024-01-01 05:00:00"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:NNN minutes",
+   "sql": "SELECT datetime('2024-01-01', '-90 minutes')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "2023-12-31 22:30:00"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:NNN seconds",
+   "sql": "SELECT datetime('2024-01-01', '+3600 seconds')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "2024-01-01 01:00:00"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:NNN months",
+   "sql": "SELECT date('2024-01-31', '+1 months')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-02"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:NNN years",
+   "sql": "SELECT date('2024-02-29', '+1 years')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "2025-03-01"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:start of month",
+   "sql": "SELECT date('2024-03-15', 'start of month')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-01"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:start of year",
+   "sql": "SELECT date('2024-03-15', 'start of year')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "2024-01-01"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:start of day",
+   "sql": "SELECT datetime('2024-03-15 10:11:12', 'start of day')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-15 00:00:00"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:weekday N",
+   "sql": "SELECT date('2024-03-15', 'weekday 0')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-17"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:unixepoch",
+   "sql": "SELECT datetime(1710460800, 'unixepoch')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-15 00:00:00"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:julianday",
+   "sql": "SELECT date(2460385.5, 'julianday')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-16"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:auto",
+   "sql": "SELECT datetime(1710460800, 'auto')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-15 00:00:00"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:localtime",
+   "sql": "SELECT typeof(datetime('2024-03-15', 'localtime'))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "text"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:utc",
+   "sql": "SELECT typeof(datetime('2024-03-15', 'utc'))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "text"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:subsec",
+   "sql": "SELECT typeof(datetime('now', 'subsec'))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "text"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:subsecond",
+   "sql": "SELECT typeof(datetime('now', 'subsecond'))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "text"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:ceiling",
+   "sql": "SELECT date('2024-01-31', '+1 month', 'ceiling')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-02"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:floor",
+   "sql": "SELECT date('2024-01-31', '+1 month', 'floor')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "2024-02-29"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json",
+   "sql": "SELECT json(' {\"x\" : 1} ')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"x\":1}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_array",
+   "sql": "SELECT json_array(1, 'a', NULL, 2.5)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "[1,\"a\",null,2.5]"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_array_insert",
+   "sql": "SELECT json_array_insert('[1,3]', '$[1]', 2)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "[1,2,3]"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_array_length",
+   "sql": "SELECT json_array_length('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.b')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_each",
+   "sql": "SELECT key, value, type FROM json_each('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}') ORDER BY key",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "a",
+     1,
+     "integer"
+    ],
+    [
+     "b",
+     "[1,2,{\"c\":3}]",
+     "array"
+    ],
+    [
+     "d",
+     null,
+     "null"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_error_position",
+   "sql": "SELECT json_error_position('{\"a\":}')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     6
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_extract",
+   "sql": "SELECT json_extract('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.b[2].c'), json_extract('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.a', '$.d')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3,
+     "[1,null]"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_group_array",
+   "sql": "SELECT json_group_array(a) FROM (SELECT a FROM t ORDER BY a)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "[1,2,3,4,5]"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_group_object",
+   "sql": "SELECT json_group_object(b, a) FROM (SELECT a, b FROM t WHERE b IS NOT NULL ORDER BY a)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"one\":1,\"two\":2,\"three\":3,\"five\":5}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_insert",
+   "sql": "SELECT json_insert('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.e', 5, '$.a', 9)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null,\"e\":5}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_object",
+   "sql": "SELECT json_object('k', 1, 'v', 'x')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"k\":1,\"v\":\"x\"}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_patch",
+   "sql": "SELECT json_patch('{\"a\":1,\"b\":2}', '{\"b\":null,\"c\":3}')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\":1,\"c\":3}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_pretty",
+   "sql": "SELECT json_pretty('{\"a\":[1,2]}')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "{\n    \"a\": [\n        1,\n        2\n    ]\n}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_quote",
+   "sql": "SELECT json_quote('a\"b'), json_quote(3)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "\"a\\\"b\"",
+     "3"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_remove",
+   "sql": "SELECT json_remove('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.b', '$.d')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\":1}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_replace",
+   "sql": "SELECT json_replace('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.a', 7, '$.zz', 1)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\":7,\"b\":[1,2,{\"c\":3}],\"d\":null}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_set",
+   "sql": "SELECT json_set('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.a', 8, '$.e', 'n')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\":8,\"b\":[1,2,{\"c\":3}],\"d\":null,\"e\":\"n\"}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_tree",
+   "sql": "SELECT fullkey, type FROM json_tree('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}') ORDER BY fullkey",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "$",
+     "object"
+    ],
+    [
+     "$.a",
+     "integer"
+    ],
+    [
+     "$.b",
+     "array"
+    ],
+    [
+     "$.b[0]",
+     "integer"
+    ],
+    [
+     "$.b[1]",
+     "integer"
+    ],
+    [
+     "$.b[2]",
+     "object"
+    ],
+    [
+     "$.b[2].c",
+     "integer"
+    ],
+    [
+     "$.d",
+     "null"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_type",
+   "sql": "SELECT json_type('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.b'), json_type('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.d')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "array",
+     "null"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_valid",
+   "sql": "SELECT json_valid('{\"a\":1}'), json_valid('{a:1}'), json_valid('{a:1}', 2)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb",
+   "sql": "SELECT json(jsonb('{\"a\":1}'))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\":1}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_array",
+   "sql": "SELECT json(jsonb_array(1, 2))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "[1,2]"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_array_insert",
+   "sql": "SELECT json(jsonb_array_insert('[1,3]', '$[1]', 2))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "[1,2,3]"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_each",
+   "sql": "SELECT key FROM jsonb_each(jsonb('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}')) ORDER BY key",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "a"
+    ],
+    [
+     "b"
+    ],
+    [
+     "d"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_extract",
+   "sql": "SELECT json(jsonb_extract(jsonb('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}'), '$.b'))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "[1,2,{\"c\":3}]"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_group_array",
+   "sql": "SELECT json(jsonb_group_array(a)) FROM (SELECT a FROM t ORDER BY a)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "[1,2,3,4,5]"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_group_object",
+   "sql": "SELECT json(jsonb_group_object(b, a)) FROM (SELECT a, b FROM t WHERE b IS NOT NULL ORDER BY a)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"one\":1,\"two\":2,\"three\":3,\"five\":5}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_insert",
+   "sql": "SELECT json(jsonb_insert('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.e', 5))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null,\"e\":5}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_object",
+   "sql": "SELECT json(jsonb_object('k', 1))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"k\":1}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_patch",
+   "sql": "SELECT json(jsonb_patch('{\"a\":1}', '{\"b\":2}'))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\":1,\"b\":2}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_remove",
+   "sql": "SELECT json(jsonb_remove('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.b'))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\":1,\"d\":null}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_replace",
+   "sql": "SELECT json(jsonb_replace('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.a', 2))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\":2,\"b\":[1,2,{\"c\":3}],\"d\":null}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_set",
+   "sql": "SELECT json(jsonb_set('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.a', 3))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\":3,\"b\":[1,2,{\"c\":3}],\"d\":null}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_tree",
+   "sql": "SELECT count(*) FROM jsonb_tree(jsonb('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}'))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     8
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:avg",
+   "sql": "SELECT avg(c), avg(a) FROM t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3.5,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:count",
+   "sql": "SELECT count(*), count(b), count(DISTINCT a % 2) FROM t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     5,
+     4,
+     2
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:group_concat",
+   "sql": "SELECT group_concat(b, '|' ORDER BY a) FROM t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "one|two|three|five"
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:string_agg",
+   "sql": "SELECT string_agg(b, ',' ORDER BY a DESC) FROM t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "five,three,two,one"
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:max",
+   "sql": "SELECT max(c), max(b) FROM t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     5.5,
+     "two"
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:min",
+   "sql": "SELECT min(c), min(b) FROM t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1.5,
+     "five"
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:sum",
+   "sql": "SELECT sum(a), sum(c) FROM t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     15,
+     14
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:total",
+   "sql": "SELECT total(c), total(NULL) FROM t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     14,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:median",
+   "sql": "SELECT median(c) FROM t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3.5
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:percentile",
+   "sql": "SELECT percentile(c, 50) FROM t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3.5
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:percentile_cont",
+   "sql": "SELECT percentile_cont(c, 0.25) FROM t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2.25
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:percentile_disc",
+   "sql": "SELECT percentile_disc(c, 0.25) FROM t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1.5
+    ]
+   ]
+  },
+  {
+   "id": "function.window:row_number",
+   "sql": "SELECT a, row_number() OVER (ORDER BY a) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     4,
+     4
+    ],
+    [
+     5,
+     5
+    ]
+   ]
+  },
+  {
+   "id": "function.window:rank",
+   "sql": "SELECT a, rank() OVER (ORDER BY a % 2) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     3
+    ],
+    [
+     2,
+     1
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     4,
+     1
+    ],
+    [
+     5,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.window:dense_rank",
+   "sql": "SELECT a, dense_rank() OVER (ORDER BY a % 2) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     2
+    ],
+    [
+     2,
+     1
+    ],
+    [
+     3,
+     2
+    ],
+    [
+     4,
+     1
+    ],
+    [
+     5,
+     2
+    ]
+   ]
+  },
+  {
+   "id": "function.window:percent_rank",
+   "sql": "SELECT a, percent_rank() OVER (ORDER BY a) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ],
+    [
+     2,
+     0.25
+    ],
+    [
+     3,
+     0.5
+    ],
+    [
+     4,
+     0.75
+    ],
+    [
+     5,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.window:cume_dist",
+   "sql": "SELECT a, cume_dist() OVER (ORDER BY a) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0.2
+    ],
+    [
+     2,
+     0.4
+    ],
+    [
+     3,
+     0.6
+    ],
+    [
+     4,
+     0.8
+    ],
+    [
+     5,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.window:ntile",
+   "sql": "SELECT a, ntile(2) OVER (ORDER BY a) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     1
+    ],
+    [
+     3,
+     1
+    ],
+    [
+     4,
+     2
+    ],
+    [
+     5,
+     2
+    ]
+   ]
+  },
+  {
+   "id": "function.window:lag",
+   "sql": "SELECT a, lag(b) OVER (ORDER BY a), lag(b, 2, 'none') OVER (ORDER BY a) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     null,
+     "none"
+    ],
+    [
+     2,
+     "one",
+     "none"
+    ],
+    [
+     3,
+     "two",
+     "one"
+    ],
+    [
+     4,
+     "three",
+     "two"
+    ],
+    [
+     5,
+     null,
+     "three"
+    ]
+   ]
+  },
+  {
+   "id": "function.window:lead",
+   "sql": "SELECT a, lead(b) OVER (ORDER BY a) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "two"
+    ],
+    [
+     2,
+     "three"
+    ],
+    [
+     3,
+     null
+    ],
+    [
+     4,
+     "five"
+    ],
+    [
+     5,
+     null
+    ]
+   ]
+  },
+  {
+   "id": "function.window:first_value",
+   "sql": "SELECT a, first_value(b) OVER (ORDER BY a) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "one"
+    ],
+    [
+     2,
+     "one"
+    ],
+    [
+     3,
+     "one"
+    ],
+    [
+     4,
+     "one"
+    ],
+    [
+     5,
+     "one"
+    ]
+   ]
+  },
+  {
+   "id": "function.window:last_value",
+   "sql": "SELECT a, last_value(b) OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "five"
+    ],
+    [
+     2,
+     "five"
+    ],
+    [
+     3,
+     "five"
+    ],
+    [
+     4,
+     "five"
+    ],
+    [
+     5,
+     "five"
+    ]
+   ]
+  },
+  {
+   "id": "function.window:nth_value",
+   "sql": "SELECT a, nth_value(b, 2) OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "two"
+    ],
+    [
+     2,
+     "two"
+    ],
+    [
+     3,
+     "two"
+    ],
+    [
+     4,
+     "two"
+    ],
+    [
+     5,
+     "two"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#rows",
+   "sql": "SELECT a, sum(a) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     3
+    ],
+    [
+     2,
+     6
+    ],
+    [
+     3,
+     9
+    ],
+    [
+     4,
+     12
+    ],
+    [
+     5,
+     9
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#range",
+   "sql": "SELECT a, sum(a) OVER (ORDER BY a RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     3,
+     5
+    ],
+    [
+     4,
+     7
+    ],
+    [
+     5,
+     9
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#groups",
+   "sql": "SELECT a, count(*) OVER (ORDER BY a % 2 GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     3
+    ],
+    [
+     2,
+     5
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     4,
+     5
+    ],
+    [
+     5,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#exclude-current-row",
+   "sql": "SELECT a, sum(a) OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     14
+    ],
+    [
+     2,
+     13
+    ],
+    [
+     3,
+     12
+    ],
+    [
+     4,
+     11
+    ],
+    [
+     5,
+     10
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#exclude-group",
+   "sql": "SELECT a, count(*) OVER (ORDER BY a % 2 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     2
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     3,
+     2
+    ],
+    [
+     4,
+     3
+    ],
+    [
+     5,
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#exclude-ties",
+   "sql": "SELECT a, count(*) OVER (ORDER BY a % 2 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     3
+    ],
+    [
+     2,
+     4
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     4,
+     4
+    ],
+    [
+     5,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#partition",
+   "sql": "SELECT a, sum(a) OVER (PARTITION BY a % 2 ORDER BY a) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     3,
+     4
+    ],
+    [
+     4,
+     6
+    ],
+    [
+     5,
+     9
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#named-window",
+   "sql": "SELECT a, sum(a) OVER w, count(*) OVER w FROM t WINDOW w AS (ORDER BY a) ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1,
+     1
+    ],
+    [
+     2,
+     3,
+     2
+    ],
+    [
+     3,
+     6,
+     3
+    ],
+    [
+     4,
+     10,
+     4
+    ],
+    [
+     5,
+     15,
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#window-chaining",
+   "sql": "SELECT a, sum(a) OVER (w ROWS 1 PRECEDING) FROM t WINDOW w AS (ORDER BY a) ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     3,
+     5
+    ],
+    [
+     4,
+     7
+    ],
+    [
+     5,
+     9
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#aggregate-filter",
+   "sql": "SELECT a, count(*) FILTER (WHERE a > 2) OVER (ORDER BY a) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ],
+    [
+     2,
+     0
+    ],
+    [
+     3,
+     1
+    ],
+    [
+     4,
+     2
+    ],
+    [
+     5,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "operator:~",
+   "sql": "SELECT ~5",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     -6
+    ]
+   ]
+  },
+  {
+   "id": "operator:+ (unary)",
+   "sql": "SELECT +3, +'x'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3,
+     "x"
+    ]
+   ]
+  },
+  {
+   "id": "operator:- (unary)",
+   "sql": "SELECT -(3), -'4'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     -3,
+     -4
+    ]
+   ]
+  },
+  {
+   "id": "operator:+",
+   "sql": "SELECT 1 + 2, 1.5 + 2",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3,
+     3.5
+    ]
+   ]
+  },
+  {
+   "id": "operator:-",
+   "sql": "SELECT 5 - 7, 2.5 - 1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     -2,
+     1.5
+    ]
+   ]
+  },
+  {
+   "id": "operator:COLLATE",
+   "sql": "SELECT 'a' = 'A' COLLATE NOCASE",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:||",
+   "sql": "SELECT 'a' || 'b' || 1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "ab1"
+    ]
+   ]
+  },
+  {
+   "id": "operator:->",
+   "sql": "SELECT '{\"a\":{\"b\":2}}' -> '$.a'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"b\":2}"
+    ]
+   ]
+  },
+  {
+   "id": "operator:->>",
+   "sql": "SELECT '{\"a\":{\"b\":2}}' ->> '$.a.b'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "operator:*",
+   "sql": "SELECT 6 * 7",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     42
+    ]
+   ]
+  },
+  {
+   "id": "operator:/",
+   "sql": "SELECT 7 / 2, 7.0 / 2",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3,
+     3.5
+    ]
+   ]
+  },
+  {
+   "id": "operator:%",
+   "sql": "SELECT 7 % 3",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:&",
+   "sql": "SELECT 6 & 3",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "operator:|",
+   "sql": "SELECT 6 | 3",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     7
+    ]
+   ]
+  },
+  {
+   "id": "operator:<<",
+   "sql": "SELECT 1 << 4",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     16
+    ]
+   ]
+  },
+  {
+   "id": "operator:>>",
+   "sql": "SELECT 256 >> 2",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     64
+    ]
+   ]
+  },
+  {
+   "id": "operator:<",
+   "sql": "SELECT 1 < 2",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:>",
+   "sql": "SELECT 2 > 1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:<=",
+   "sql": "SELECT 2 <= 2",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:>=",
+   "sql": "SELECT 2 >= 3",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "operator:=",
+   "sql": "SELECT 1 = 1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:==",
+   "sql": "SELECT 1 == 1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:<>",
+   "sql": "SELECT 1 <> 2",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:!=",
+   "sql": "SELECT 1 != 1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "operator:IS",
+   "sql": "SELECT NULL IS NULL, 1 IS 1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:IS NOT",
+   "sql": "SELECT 1 IS NOT NULL",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:IS DISTINCT FROM",
+   "sql": "SELECT 1 IS DISTINCT FROM NULL",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:IS NOT DISTINCT FROM",
+   "sql": "SELECT NULL IS NOT DISTINCT FROM NULL",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:IN",
+   "sql": "SELECT 2 IN (1, 2, 3), 5 IN (SELECT a FROM t)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT IN",
+   "sql": "SELECT 9 NOT IN (1, 2)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:LIKE",
+   "sql": "SELECT 'Abc' LIKE 'a%'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT LIKE",
+   "sql": "SELECT 'abc' NOT LIKE 'b%'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:GLOB",
+   "sql": "SELECT 'abc' GLOB 'a?c'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT GLOB",
+   "sql": "SELECT 'abc' NOT GLOB 'A*'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:REGEXP",
+   "sql": "SELECT 'abc' REGEXP 'b', 'abc' REGEXP '^b'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT REGEXP",
+   "sql": "SELECT 'abc' NOT REGEXP 'z'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:ESCAPE",
+   "sql": "SELECT 'a%' LIKE 'a!%' ESCAPE '!'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:BETWEEN",
+   "sql": "SELECT 2 BETWEEN 1 AND 3",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT BETWEEN",
+   "sql": "SELECT 5 NOT BETWEEN 1 AND 3",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:ISNULL",
+   "sql": "SELECT NULL ISNULL",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOTNULL",
+   "sql": "SELECT 1 NOTNULL",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT NULL",
+   "sql": "SELECT 1 NOT NULL",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:EXISTS",
+   "sql": "SELECT EXISTS (SELECT 1 FROM t WHERE a = 3)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT EXISTS",
+   "sql": "SELECT NOT EXISTS (SELECT 1 FROM t WHERE a = 9)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:CASE",
+   "sql": "SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 2 > 1 THEN 'b' ELSE 'c' END, CASE 3 WHEN 3 THEN 'x' END",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "b",
+     "x"
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT#1",
+   "sql": "SELECT NOT 0, NOT 5",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT#2",
+   "sql": "SELECT NOT FALSE, NOT TRUE",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "operator:AND#1",
+   "sql": "SELECT 1 AND 0, 1 AND NULL",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     null
+    ]
+   ]
+  },
+  {
+   "id": "operator:AND#2",
+   "sql": "SELECT TRUE AND FALSE, TRUE AND NULL",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     null
+    ]
+   ]
+  },
+  {
+   "id": "operator:OR#1",
+   "sql": "SELECT 0 OR NULL, 1 OR NULL",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     null,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:OR#2",
+   "sql": "SELECT FALSE OR NULL, TRUE OR NULL",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     null,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:CAST#1",
+   "sql": "SELECT CAST(5 AS TEXT), CAST('7' AS INTEGER), CAST(2 AS REAL)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "5",
+     7,
+     2
+    ]
+   ]
+  },
+  {
+   "id": "operator:CAST#2",
+   "sql": "SELECT CAST(3.9 AS INTEGER), CAST(-3.9 AS INTEGER)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3,
+     -3
+    ]
+   ]
+  },
+  {
+   "id": "operator:CAST#3",
+   "sql": "SELECT CAST('12abc' AS INTEGER), CAST('abc' AS INTEGER)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     12,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "operator:MATCH",
+   "sql": "SELECT body FROM ft WHERE ft MATCH 'hello'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "hello world"
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT MATCH",
+   "sql": "SELECT 'abc' NOT MATCH 'x'",
+   "spelling": "sqlite",
+   "status": "error",
+   "error": "OperationalError: unable to use function MATCH in the requested context",
+   "requires": "an application-defined match() function"
+  },
+  {
+   "id": "affinity:TEXT",
+   "sql": "SELECT typeof(x) FROM (SELECT CAST(12 AS TEXT) AS x)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "text"
+    ]
+   ]
+  },
+  {
+   "id": "affinity:NUMERIC",
+   "sql": "SELECT typeof(CAST('12' AS NUMERIC)), typeof(CAST('1.5' AS NUMERIC)), typeof(CAST('abc' AS NUMERIC))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "integer",
+     "real",
+     "integer"
+    ]
+   ]
+  },
+  {
+   "id": "affinity:INTEGER",
+   "sql": "SELECT typeof(v) FROM (SELECT CAST('7' AS INTEGER) AS v)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "integer"
+    ]
+   ]
+  },
+  {
+   "id": "affinity:REAL",
+   "sql": "SELECT typeof(CAST(7 AS REAL))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "real"
+    ]
+   ]
+  },
+  {
+   "id": "affinity:BLOB",
+   "sql": "SELECT typeof(CAST('ab' AS BLOB))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "blob"
+    ]
+   ]
+  },
+  {
+   "id": "affinity:column",
+   "sql": "SELECT typeof(n), typeof(s), typeof(i) FROM ta",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "integer",
+     "text",
+     "integer"
+    ]
+   ]
+  },
+  {
+   "id": "collation:BINARY",
+   "sql": "SELECT 'a' < 'B' COLLATE BINARY",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "collation:NOCASE",
+   "sql": "SELECT b FROM t WHERE b = 'ONE' COLLATE NOCASE",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "one"
+    ]
+   ]
+  },
+  {
+   "id": "collation:RTRIM",
+   "sql": "SELECT 'a  ' = 'a' COLLATE RTRIM",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "storage_class:NULL",
+   "sql": "SELECT typeof(NULL)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "null"
+    ]
+   ]
+  },
+  {
+   "id": "storage_class:INTEGER",
+   "sql": "SELECT typeof(1)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "integer"
+    ]
+   ]
+  },
+  {
+   "id": "storage_class:REAL",
+   "sql": "SELECT typeof(1.5)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "real"
+    ]
+   ]
+  },
+  {
+   "id": "storage_class:TEXT",
+   "sql": "SELECT typeof('t')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "text"
+    ]
+   ]
+  },
+  {
+   "id": "storage_class:BLOB",
+   "sql": "SELECT typeof(x'01')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "blob"
+    ]
+   ]
+  },
+  {
+   "id": "expression:scalar subquery",
+   "sql": "SELECT (SELECT max(a) FROM t), (SELECT b FROM t WHERE a = 2)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     5,
+     "two"
+    ]
+   ]
+  },
+  {
+   "id": "expression:correlated subquery",
+   "sql": "SELECT a, (SELECT count(*) FROM u WHERE u.a = t.a) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     3,
+     0
+    ],
+    [
+     4,
+     0
+    ],
+    [
+     5,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "expression:row value",
+   "sql": "SELECT (1, 2) = (1, 2), (1, 2) < (1, 3), (2, 'y') IN (SELECT a, d FROM u)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "expression:boolean expression",
+   "sql": "SELECT CASE WHEN 'abc' THEN 1 ELSE 0 END, CASE WHEN '1x' THEN 1 ELSE 0 END, CASE WHEN 0.5 THEN 1 ELSE 0 END, NOT 'abc'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     1,
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.affinity:INT gives INTEGER",
+   "sql": "SELECT typeof(x), typeof(y) FROM r",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "integer",
+     "integer"
+    ]
+   ]
+  },
+  {
+   "id": "rule.affinity:CHAR, CLOB or TEXT gives TEXT",
+   "sql": "SELECT typeof(a), typeof(b), typeof(c) FROM r",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "text",
+     "text",
+     "text"
+    ]
+   ]
+  },
+  {
+   "id": "rule.affinity:BLOB or no type gives BLOB",
+   "sql": "SELECT typeof(a), typeof(b) FROM r",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "text",
+     "text"
+    ]
+   ]
+  },
+  {
+   "id": "rule.affinity:REAL, FLOA or DOUB gives REAL",
+   "sql": "SELECT typeof(a), typeof(b), typeof(c) FROM r",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "real",
+     "real",
+     "real"
+    ]
+   ]
+  },
+  {
+   "id": "rule.affinity:otherwise NUMERIC",
+   "sql": "SELECT typeof(a), a, typeof(b), typeof(c) FROM r",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "integer",
+     1,
+     "integer",
+     "text"
+    ]
+   ]
+  },
+  {
+   "id": "rule.affinity:the rules apply in order",
+   "sql": "SELECT typeof(a), typeof(b) FROM r",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "integer",
+     "integer"
+    ]
+   ]
+  },
+  {
+   "id": "rule.expression-affinity:an IN list has no affinity",
+   "sql": "SELECT 1 IN (SELECT t FROM r), 1 IN ('1')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "rule.expression-affinity:a column keeps its affinity",
+   "sql": "SELECT n = '5', (n) = '5' FROM r",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.expression-affinity:an operator removes affinity",
+   "sql": "SELECT +n = '5', n + 0 = '5' FROM r",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "rule.expression-affinity:CAST gives its type's affinity",
+   "sql": "SELECT CAST(5 AS TEXT) = 5, CAST('5' AS INTEGER) = '5'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.expression-affinity:COLLATE keeps its operand's affinity",
+   "sql": "SELECT (n COLLATE NOCASE) = '5' FROM r",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.expression-affinity:otherwise no affinity",
+   "sql": "SELECT 5 = '5', '5' = 5",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "rule.expression-affinity:view and subquery columns",
+   "sql": "SELECT x = '1', y = '1' FROM rv",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "rule.expression-affinity:compound view columns",
+   "sql": "SELECT count(*) FROM (SELECT a AS c FROM r UNION ALL SELECT b FROM s) WHERE c = '2'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:NULL is less than any value",
+   "sql": "SELECT x FROM (SELECT 1 AS x UNION ALL SELECT NULL UNION ALL SELECT -5) ORDER BY x",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     null
+    ],
+    [
+     -5
+    ],
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:numbers before text and blobs",
+   "sql": "SELECT 1 < '0', 2 < x'01', 99.5 < ''",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:numbers compare numerically",
+   "sql": "SELECT 2 < 10, 2.5 < 3, 3 = 3.0",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:text before blobs",
+   "sql": "SELECT 'zzz' < x'00'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:text compares by collation",
+   "sql": "SELECT 'a' < 'B', 'a' < 'B' COLLATE NOCASE",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:blobs compare by memcmp",
+   "sql": "SELECT x'0102' < x'0201', x'01' < x'0100'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:numeric affinity goes to the other operand",
+   "sql": "SELECT n > '9', n = '10.0' FROM r",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:text affinity goes to an operand with none",
+   "sql": "SELECT t = 10, t > 9 FROM r",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:otherwise compared as is",
+   "sql": "SELECT '10' = 10, x'31' = '1'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:BETWEEN is two comparisons",
+   "sql": "SELECT t BETWEEN 1 AND 9, t BETWEEN 10 AND 20 FROM r",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:IN compares as equality",
+   "sql": "SELECT (SELECT n IN (SELECT t FROM s) FROM r), '1' IN (SELECT n FROM r)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.sort:ORDER BY orders by storage class",
+   "sql": "SELECT x FROM (SELECT x'00' AS x UNION ALL SELECT 'b' UNION ALL SELECT 2 UNION ALL SELECT NULL UNION ALL SELECT 1.5 UNION ALL SELECT 'A') ORDER BY x",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     null
+    ],
+    [
+     1.5
+    ],
+    [
+     2
+    ],
+    [
+     "A"
+    ],
+    [
+     "b"
+    ],
+    [
+     "x'00'"
+    ]
+   ]
+  },
+  {
+   "id": "rule.sort:GROUP BY keeps classes apart",
+   "sql": "SELECT count(*) AS n FROM (SELECT 1 AS x UNION ALL SELECT 1.0 UNION ALL SELECT '1') GROUP BY x ORDER BY n",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "rule.sort:compound SELECTs compare as is",
+   "sql": "SELECT count(*) FROM (SELECT n FROM r UNION SELECT '1')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "rule.collation:columns default to BINARY",
+   "sql": "SELECT t = 'A' FROM r",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "rule.collation:an explicit COLLATE wins, left first",
+   "sql": "SELECT t = 'A' COLLATE BINARY, 'A' COLLATE NOCASE = t COLLATE BINARY FROM r",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.collation:then a column's collation, left first",
+   "sql": "SELECT x = y, y = x FROM r",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "rule.collation:otherwise BINARY",
+   "sql": "SELECT 'a' = 'A'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "rule.collation:the leftmost COLLATE anywhere wins",
+   "sql": "SELECT 'a' COLLATE NOCASE = ('A' COLLATE BINARY), 'x' = ('X' COLLATE NOCASE) || ''",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.collation:IN uses the left operand's collation",
+   "sql": "SELECT 'a' COLLATE NOCASE IN ('A'), 'a' IN ('A' COLLATE NOCASE)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "rule.collation:ORDER BY uses COLLATE, then the column's#1",
+   "sql": "SELECT t FROM r ORDER BY t COLLATE BINARY",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "A"
+    ],
+    [
+     "B"
+    ],
+    [
+     "a"
+    ],
+    [
+     "b"
+    ]
+   ]
+  },
+  {
+   "id": "rule.collation:ORDER BY uses COLLATE, then the column's#2",
+   "sql": "SELECT t FROM r ORDER BY t, t COLLATE BINARY",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "A"
+    ],
+    [
+     "a"
+    ],
+    [
+     "B"
+    ],
+    [
+     "b"
+    ]
+   ]
+  },
+  {
+   "id": "word:TRUE",
+   "sql": "SELECT TRUE, TRUE + 1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     2
+    ]
+   ]
+  },
+  {
+   "id": "word:FALSE",
+   "sql": "SELECT FALSE, FALSE IS FALSE",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "word:STRICT#1",
+   "sql": "SELECT typeof(k), typeof(v) FROM st",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "integer",
+     "text"
+    ]
+   ]
+  },
+  {
+   "id": "word:STRICT#2",
+   "sql": "INSERT INTO st VALUES ('abc', 1)",
+   "spelling": "sqlite",
+   "status": "error",
+   "error": "IntegrityError: cannot store TEXT value in INTEGER column st.k"
+  },
+  {
+   "id": "word:STORED",
+   "sql": "SELECT b FROM gs",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     6
+    ]
+   ]
+  },
+  {
+   "id": "word:ROWID",
+   "sql": "SELECT k, v FROM wr",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "a"
+    ]
+   ]
+  },
+  {
+   "id": "word:EXPRESSIONS",
+   "sql": "REINDEX EXPRESSIONS; SELECT count(*) FROM t WHERE lower(b) = 'one'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "word:E",
+   "sql": "SELECT 1e3, 2.5E-1, 1E+2",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1000,
+     0.25,
+     100
+    ]
+   ]
+  },
+  {
+   "id": "keyword:INNER",
+   "sql": "SELECT t.a, u.d FROM t INNER JOIN u ON t.a = u.a ORDER BY t.a, u.d",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ],
+    [
+     2,
+     "yy"
+    ]
+   ]
+  },
+  {
+   "id": "keyword:CONSTRAINT",
+   "sql": "INSERT INTO kc VALUES (1); SELECT a FROM kc",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "keyword:FAIL",
+   "sql": "INSERT OR FAIL INTO kp VALUES (2); SELECT count(*) FROM kp",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "keyword:NO",
+   "sql": "INSERT INTO kn VALUES (1); SELECT count(*) FROM kn",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "keyword:ACTION",
+   "sql": "INSERT INTO ka VALUES (1); SELECT count(*) FROM ka",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "keyword:RESTRICT",
+   "sql": "INSERT INTO kr VALUES (1); SELECT count(*) FROM kr",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "keyword:OTHERS",
+   "sql": "SELECT a, sum(a) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE NO OTHERS) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     3
+    ],
+    [
+     2,
+     6
+    ],
+    [
+     3,
+     9
+    ],
+    [
+     4,
+     12
+    ],
+    [
+     5,
+     9
+    ]
+   ]
+  },
+  {
+   "id": "parameter:?NNN",
+   "sql": "SELECT ?1 + 1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     42
+    ]
+   ]
+  },
+  {
+   "id": "parameter:?",
+   "sql": "SELECT ? * 2",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     42
+    ]
+   ]
+  },
+  {
+   "id": "parameter::AAAA",
+   "sql": "SELECT :v IS NULL",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "parameter:@AAAA",
+   "sql": "SELECT @w + 0",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "parameter:$AAAA",
+   "sql": "SELECT $x || 'y'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "xy"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:select-stmt#1",
+   "sql": "SELECT a, b FROM t WHERE a > 1 ORDER BY a DESC LIMIT 2 OFFSET 1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     4,
+     null
+    ],
+    [
+     3,
+     "three"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:select-stmt#2",
+   "sql": "SELECT DISTINCT a % 2 FROM t ORDER BY 1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ],
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:select-stmt#3",
+   "sql": "SELECT ALL a FROM t ORDER BY a LIMIT 1, 2",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ],
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:select-core#1",
+   "sql": "SELECT a % 2 AS g, count(*), sum(a) FROM t GROUP BY g HAVING count(*) > 1 ORDER BY g",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     2,
+     6
+    ],
+    [
+     1,
+     3,
+     9
+    ]
+   ]
+  },
+  {
+   "id": "syntax:select-core#2",
+   "sql": "VALUES (1, 'a'), (2, 'b')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "a"
+    ],
+    [
+     2,
+     "b"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:select-core#3",
+   "sql": "SELECT 1 + 1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:simple-select-stmt",
+   "sql": "SELECT a FROM t ORDER BY a NULLS LAST LIMIT 3",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:factored-select-stmt",
+   "sql": "WITH x AS (SELECT a FROM t) SELECT a FROM x ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     3
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:compound-select-stmt#1",
+   "sql": "SELECT a FROM t UNION SELECT a FROM u ORDER BY 1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     3
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ]
+   ]
+  },
+  {
+   "id": "syntax:compound-select-stmt#2",
+   "sql": "SELECT a FROM t UNION ALL SELECT a FROM u ORDER BY 1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     3
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ]
+   ]
+  },
+  {
+   "id": "syntax:compound-select-stmt#3",
+   "sql": "SELECT a FROM t INTERSECT SELECT a FROM u ORDER BY 1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:compound-select-stmt#4",
+   "sql": "SELECT a FROM t EXCEPT SELECT a FROM u ORDER BY 1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:compound-operator",
+   "sql": "SELECT 1 UNION ALL SELECT 2 ORDER BY 1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:common-table-expression#1",
+   "sql": "WITH x(v) AS MATERIALIZED (SELECT a FROM t) SELECT count(*) FROM x",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:common-table-expression#2",
+   "sql": "WITH x(v) AS NOT MATERIALIZED (SELECT a FROM t) SELECT sum(v) FROM x",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     15
+    ]
+   ]
+  },
+  {
+   "id": "syntax:recursive-cte#1",
+   "sql": "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5) SELECT i FROM n ORDER BY i",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     3
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:recursive-cte#2",
+   "sql": "WITH RECURSIVE f(i, v) AS (SELECT 1, 1 UNION ALL SELECT i + 1, v * (i + 1) FROM f WHERE i < 6) SELECT v FROM f ORDER BY i DESC LIMIT 1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     720
+    ]
+   ]
+  },
+  {
+   "id": "syntax:with-clause",
+   "sql": "WITH a1 AS (SELECT 1 AS v), a2 AS (SELECT v + 1 AS v FROM a1) SELECT v FROM a2",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:cte-table-name",
+   "sql": "WITH x(p, q) AS (SELECT 1, 2) SELECT p + q FROM x",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-clause#1",
+   "sql": "SELECT t.a, u.d FROM t JOIN u ON t.a = u.a ORDER BY t.a, u.d",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ],
+    [
+     2,
+     "yy"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-clause#2",
+   "sql": "SELECT t.a, u.d FROM t LEFT JOIN u ON t.a = u.a ORDER BY t.a, u.d",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ],
+    [
+     2,
+     "yy"
+    ],
+    [
+     3,
+     null
+    ],
+    [
+     4,
+     null
+    ],
+    [
+     5,
+     null
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-clause#3",
+   "sql": "SELECT t.a, u.d FROM t RIGHT JOIN u ON t.a = u.a ORDER BY u.a, u.d",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ],
+    [
+     2,
+     "yy"
+    ],
+    [
+     null,
+     "z"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-clause#4",
+   "sql": "SELECT t.a, u.d FROM t FULL OUTER JOIN u ON t.a = u.a ORDER BY coalesce(t.a, u.a), u.d",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ],
+    [
+     2,
+     "yy"
+    ],
+    [
+     3,
+     null
+    ],
+    [
+     4,
+     null
+    ],
+    [
+     5,
+     null
+    ],
+    [
+     null,
+     "z"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-clause#5",
+   "sql": "SELECT count(*) FROM t CROSS JOIN u",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     20
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-clause#6",
+   "sql": "SELECT a, d FROM t NATURAL JOIN u ORDER BY a, d",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ],
+    [
+     2,
+     "yy"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-constraint",
+   "sql": "SELECT a, b, d FROM t JOIN u USING (a) ORDER BY a, d",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "one",
+     "x"
+    ],
+    [
+     2,
+     "two",
+     "y"
+    ],
+    [
+     2,
+     "two",
+     "yy"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-operator#1",
+   "sql": "SELECT count(*) FROM t, u WHERE t.a = u.a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-operator#2",
+   "sql": "SELECT count(*) FROM t LEFT OUTER JOIN u ON t.a = u.a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     6
+    ]
+   ]
+  },
+  {
+   "id": "syntax:table-or-subquery#1",
+   "sql": "SELECT s.x FROM (SELECT a * 2 AS x FROM t) AS s ORDER BY s.x",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ],
+    [
+     4
+    ],
+    [
+     6
+    ],
+    [
+     8
+    ],
+    [
+     10
+    ]
+   ]
+  },
+  {
+   "id": "syntax:table-or-subquery#2",
+   "sql": "SELECT value FROM json_each('[3,1,2]') ORDER BY value",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:result-column#1",
+   "sql": "SELECT t.*, u.d FROM t JOIN u ON t.a = u.a ORDER BY t.a, u.d",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "one",
+     1.5,
+     "x"
+    ],
+    [
+     2,
+     "two",
+     2.5,
+     "y"
+    ],
+    [
+     2,
+     "two",
+     2.5,
+     "yy"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:result-column#2",
+   "sql": "SELECT * FROM u ORDER BY a, d",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ],
+    [
+     2,
+     "yy"
+    ],
+    [
+     6,
+     "z"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:ordering-term#1",
+   "sql": "SELECT b FROM t ORDER BY b COLLATE NOCASE DESC NULLS FIRST",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     null
+    ],
+    [
+     "two"
+    ],
+    [
+     "three"
+    ],
+    [
+     "one"
+    ],
+    [
+     "five"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:ordering-term#2",
+   "sql": "SELECT b FROM t ORDER BY b ASC NULLS LAST",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "five"
+    ],
+    [
+     "one"
+    ],
+    [
+     "three"
+    ],
+    [
+     "two"
+    ],
+    [
+     null
+    ]
+   ]
+  },
+  {
+   "id": "syntax:qualified-table-name",
+   "sql": "SELECT a FROM main.t INDEXED BY ti WHERE a > 3 ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     4
+    ],
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:insert-stmt#1",
+   "sql": "INSERT INTO t(a, b) VALUES (10, 'ten') RETURNING a, b",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     10,
+     "ten"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:insert-stmt#2",
+   "sql": "INSERT OR IGNORE INTO pk VALUES (1, 'dup')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:insert-stmt#3",
+   "sql": "INSERT OR REPLACE INTO pk VALUES (1, 'new')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:insert-stmt#4",
+   "sql": "INSERT INTO t SELECT a + 100, b, c FROM t WHERE a < 3",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:insert-stmt#5",
+   "sql": "INSERT INTO t DEFAULT VALUES",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:insert-stmt#6",
+   "sql": "REPLACE INTO pk VALUES (2, 'two')",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:upsert-clause#1",
+   "sql": "INSERT INTO pk VALUES (1, 'up') ON CONFLICT(k) DO UPDATE SET v = excluded.v || '!' RETURNING k, v",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "up!"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:upsert-clause#2",
+   "sql": "INSERT INTO pk VALUES (1, 'no') ON CONFLICT DO NOTHING",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:returning-clause#1",
+   "sql": "DELETE FROM t WHERE a = 5 RETURNING *",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     5,
+     "five",
+     5.5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:returning-clause#2",
+   "sql": "UPDATE t SET c = 0 WHERE a = 1 RETURNING a, c * 2 AS dbl",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "syntax:update-stmt#1",
+   "sql": "UPDATE t SET b = upper(b), c = c + 1 WHERE a < 3",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:update-stmt#2",
+   "sql": "UPDATE OR IGNORE t SET a = a WHERE a = 1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:update-stmt#3",
+   "sql": "UPDATE t SET (b, c) = ('p', 9.5) WHERE a = 2",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:update-stmt#4",
+   "sql": "UPDATE t SET b = u.d FROM u WHERE t.a = u.a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:update-stmt-limited",
+   "sql": "UPDATE t SET b = 'lim' WHERE a > 0 ORDER BY a LIMIT 2",
+   "spelling": "sqlite",
+   "status": "error",
+   "error": "OperationalError: near \"ORDER\": syntax error",
+   "requires": "SQLITE_ENABLE_UPDATE_DELETE_LIMIT"
+  },
+  {
+   "id": "syntax:delete-stmt",
+   "sql": "DELETE FROM t WHERE a IN (SELECT a FROM u)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:delete-stmt-limited",
+   "sql": "DELETE FROM t WHERE a > 0 ORDER BY a DESC LIMIT 1",
+   "spelling": "sqlite",
+   "status": "error",
+   "error": "OperationalError: near \"ORDER\": syntax error",
+   "requires": "SQLITE_ENABLE_UPDATE_DELETE_LIMIT"
+  },
+  {
+   "id": "syntax:create-table-stmt#1",
+   "sql": "CREATE TABLE IF NOT EXISTS ct(a INTEGER PRIMARY KEY, b TEXT NOT NULL DEFAULT 'x', c REAL CHECK (c >= 0), UNIQUE (b))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-table-stmt#2",
+   "sql": "CREATE TEMP TABLE ctt AS SELECT a, b FROM t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-table-stmt#3",
+   "sql": "CREATE TEMPORARY TABLE ctt2(x INT)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:column-def#1",
+   "sql": "CREATE TABLE cd(a INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT); INSERT INTO cd(v) VALUES ('x'), ('y'); SELECT a, v FROM cd ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:column-def#2",
+   "sql": "CREATE TABLE cd(b TEXT COLLATE NOCASE); INSERT INTO cd VALUES ('Abc'); SELECT count(*) FROM cd WHERE b = 'aBC'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:column-def#3",
+   "sql": "CREATE TABLE cd(a INT, c INT GENERATED ALWAYS AS (a * 2) STORED); INSERT INTO cd(a) VALUES (4); SELECT c FROM cd",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     8
+    ]
+   ]
+  },
+  {
+   "id": "syntax:column-def#4",
+   "sql": "CREATE TABLE cd(a INT, d INT AS (a + 1) VIRTUAL); INSERT INTO cd(a) VALUES (4); SELECT d FROM cd",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:column-constraint#1",
+   "sql": "CREATE TABLE cc(a INT PRIMARY KEY DESC ON CONFLICT REPLACE, v TEXT); INSERT INTO cc VALUES (1, 'x'); INSERT INTO cc VALUES (1, 'y'); SELECT v FROM cc",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "y"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:column-constraint#2",
+   "sql": "CREATE TABLE cc(b INT UNIQUE NOT NULL); INSERT INTO cc VALUES (1); SELECT count(*) FROM cc",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:column-constraint#3",
+   "sql": "CREATE TABLE cc(c INT REFERENCES pk(k) ON DELETE CASCADE); INSERT INTO cc VALUES (1); DELETE FROM pk; SELECT count(*) FROM cc",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "syntax:column-constraint#4",
+   "sql": "CREATE TABLE cc(d INT DEFAULT (1 + 1), e TEXT); INSERT INTO cc(e) VALUES ('x'); SELECT d FROM cc",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:table-constraint#1",
+   "sql": "CREATE TABLE tc(a INT, b INT, PRIMARY KEY (a, b), CHECK (a < b)); INSERT INTO tc VALUES (1, 2); SELECT count(*) FROM tc",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:table-constraint#2",
+   "sql": "CREATE TABLE tc(a INT, FOREIGN KEY (a) REFERENCES pk(k) DEFERRABLE INITIALLY DEFERRED); INSERT INTO tc VALUES (1); SELECT count(*) FROM tc",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:foreign-key-clause",
+   "sql": "CREATE TABLE fk(a INT REFERENCES pk(k) ON UPDATE SET NULL ON DELETE SET DEFAULT MATCH SIMPLE)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:conflict-clause",
+   "sql": "CREATE TABLE cf(a INT UNIQUE ON CONFLICT IGNORE)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:table-options#1",
+   "sql": "CREATE TABLE wr(k INT PRIMARY KEY, v TEXT) WITHOUT ROWID",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:table-options#2",
+   "sql": "CREATE TABLE st(k INTEGER, v TEXT) STRICT",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:table-options#3",
+   "sql": "CREATE TABLE sw(k INT PRIMARY KEY, v ANY) STRICT, WITHOUT ROWID",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:type-name#1",
+   "sql": "CREATE TABLE tn(a VARCHAR(20), b DECIMAL(10, 2), c DOUBLE PRECISION); INSERT INTO tn VALUES ('x', 1.25, 2.5); SELECT a, b, c FROM tn",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "x",
+     1.25,
+     2.5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:type-name#2",
+   "sql": "CREATE TABLE tn(d UNSIGNED BIG INT); INSERT INTO tn VALUES (7); SELECT d FROM tn",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     7
+    ]
+   ]
+  },
+  {
+   "id": "syntax:create-index-stmt#1",
+   "sql": "CREATE UNIQUE INDEX IF NOT EXISTS ix ON t(a DESC)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-index-stmt#2",
+   "sql": "CREATE INDEX px ON t(a) WHERE b IS NOT NULL",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-index-stmt#3",
+   "sql": "CREATE INDEX ex ON t(lower(b))",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-index-stmt#4",
+   "sql": "CREATE INDEX cx ON t(b COLLATE NOCASE)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:indexed-column",
+   "sql": "CREATE INDEX ic ON t(b COLLATE NOCASE ASC)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-view-stmt#1",
+   "sql": "CREATE VIEW IF NOT EXISTS v1(x, y) AS SELECT a, b FROM t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-view-stmt#2",
+   "sql": "CREATE TEMP VIEW v2 AS SELECT count(*) FROM t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-trigger-stmt#1",
+   "sql": "CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW WHEN new.a > 100 BEGIN INSERT INTO u VALUES (new.a, 'trig'); END",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-trigger-stmt#2",
+   "sql": "CREATE TRIGGER tb BEFORE DELETE ON t BEGIN SELECT RAISE(IGNORE); END",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-trigger-stmt#3",
+   "sql": "CREATE TRIGGER tu AFTER UPDATE OF b ON t BEGIN UPDATE u SET d = new.b WHERE a = new.a; END",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-trigger-stmt#4",
+   "sql": "CREATE TEMP TRIGGER IF NOT EXISTS ti INSTEAD OF INSERT ON v1 BEGIN SELECT 1; END",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:raise-function",
+   "sql": "CREATE TRIGGER rf BEFORE INSERT ON pk WHEN new.k < 0 BEGIN SELECT RAISE(ABORT, 'negative'); END",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-virtual-table-stmt#1",
+   "sql": "CREATE VIRTUAL TABLE IF NOT EXISTS vt USING fts5(body)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-virtual-table-stmt#2",
+   "sql": "CREATE VIRTUAL TABLE rt USING rtree(id, x0, x1)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:alter-table-stmt#1",
+   "sql": "ALTER TABLE t RENAME TO t9",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:alter-table-stmt#2",
+   "sql": "ALTER TABLE t RENAME COLUMN b TO bb",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:alter-table-stmt#3",
+   "sql": "ALTER TABLE t ADD COLUMN e TEXT DEFAULT 'e'",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:alter-table-stmt#4",
+   "sql": "ALTER TABLE t DROP COLUMN c",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:drop-table-stmt",
+   "sql": "DROP TABLE IF EXISTS u",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:drop-index-stmt",
+   "sql": "DROP INDEX IF EXISTS ti",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:drop-view-stmt",
+   "sql": "DROP VIEW IF EXISTS nope",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:drop-trigger-stmt",
+   "sql": "DROP TRIGGER IF EXISTS nope",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:analyze-stmt#1",
+   "sql": "ANALYZE",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:analyze-stmt#2",
+   "sql": "ANALYZE t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:attach-stmt",
+   "sql": "ATTACH DATABASE ':memory:' AS aux",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:detach-stmt",
+   "sql": "DETACH DATABASE aux",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:begin-stmt#1",
+   "sql": "BEGIN DEFERRED TRANSACTION",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:begin-stmt#2",
+   "sql": "BEGIN IMMEDIATE",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:begin-stmt#3",
+   "sql": "BEGIN EXCLUSIVE",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:commit-stmt#1",
+   "sql": "COMMIT",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:commit-stmt#2",
+   "sql": "END TRANSACTION",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:rollback-stmt",
+   "sql": "ROLLBACK TO SAVEPOINT sp1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:savepoint-stmt",
+   "sql": "SAVEPOINT sp1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:release-stmt",
+   "sql": "RELEASE SAVEPOINT sp1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:reindex-stmt#1",
+   "sql": "REINDEX",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:reindex-stmt#2",
+   "sql": "REINDEX t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:vacuum-stmt",
+   "sql": "VACUUM",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:pragma-stmt#1",
+   "sql": "PRAGMA table_info(t)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     "a",
+     "INTEGER",
+     0,
+     null,
+     0
+    ],
+    [
+     1,
+     "b",
+     "TEXT",
+     0,
+     null,
+     0
+    ],
+    [
+     2,
+     "c",
+     "REAL",
+     0,
+     null,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "syntax:pragma-stmt#2",
+   "sql": "PRAGMA main.user_version = 3",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:pragma-value",
+   "sql": "PRAGMA cache_size = -2000",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:expr",
+   "sql": "SELECT (1 + 2) * 3, -a, a IS NOT NULL, b LIKE 't%' FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     9,
+     -1,
+     1,
+     0
+    ],
+    [
+     9,
+     -2,
+     1,
+     1
+    ],
+    [
+     9,
+     -3,
+     1,
+     1
+    ],
+    [
+     9,
+     -4,
+     1,
+     null
+    ],
+    [
+     9,
+     -5,
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "syntax:literal-value",
+   "sql": "SELECT 1, 1.5, 'txt', x'0F', NULL, TRUE, FALSE, typeof(CURRENT_DATE), typeof(CURRENT_TIME), typeof(CURRENT_TIMESTAMP)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1.5,
+     "txt",
+     "x'0f'",
+     null,
+     1,
+     0,
+     "text",
+     "text",
+     "text"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:numeric-literal",
+   "sql": "SELECT 0x1F, 1e3, .5, 1_000_000, 2.5E-1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     31,
+     1000,
+     0.5,
+     1000000,
+     0.25
+    ]
+   ]
+  },
+  {
+   "id": "syntax:signed-number",
+   "sql": "CREATE TABLE sn(a INT DEFAULT -1, b REAL DEFAULT +2.5)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:function-arguments#1",
+   "sql": "SELECT count(DISTINCT a), group_concat(DISTINCT b) FROM t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     5,
+     "one,two,three,five"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:function-arguments#2",
+   "sql": "SELECT count(*) FROM t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:simple-function-invocation",
+   "sql": "SELECT abs(-1)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:aggregate-function-invocation#1",
+   "sql": "SELECT sum(DISTINCT a % 3) FROM t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:aggregate-function-invocation#2",
+   "sql": "SELECT group_concat(b ORDER BY a DESC) FROM t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "five,three,two,one"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:window-function-invocation",
+   "sql": "SELECT a, sum(a) FILTER (WHERE a > 1) OVER (ORDER BY a) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     null
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     3,
+     5
+    ],
+    [
+     4,
+     9
+    ],
+    [
+     5,
+     14
+    ]
+   ]
+  },
+  {
+   "id": "syntax:over-clause",
+   "sql": "SELECT a, count(*) OVER (PARTITION BY a % 2) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     3
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     4,
+     2
+    ],
+    [
+     5,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:window-defn",
+   "sql": "SELECT a, max(a) OVER w FROM t WINDOW w AS (PARTITION BY a % 2 ORDER BY a RANGE UNBOUNDED PRECEDING) ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     4,
+     4
+    ],
+    [
+     5,
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:filter-clause#1",
+   "sql": "SELECT count(*) FILTER (WHERE b IS NULL) FROM t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:filter-clause#2",
+   "sql": "SELECT count(*) FILTER (WHERE a > 2), sum(a) FILTER (WHERE b IS NOT NULL) FROM t",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3,
+     11
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec",
+   "sql": "SELECT a, sum(a) OVER (ORDER BY a ROWS UNBOUNDED PRECEDING) FROM t ORDER BY a",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     3,
+     6
+    ],
+    [
+     4,
+     10
+    ],
+    [
+     5,
+     15
+    ]
+   ]
+  },
+  {
+   "id": "syntax:column-name-list",
+   "sql": "UPDATE t SET (a, b) = (SELECT 1, 'z') WHERE a = 4",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:comment-syntax#1",
+   "sql": "SELECT 1 -- a comment",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:comment-syntax#2",
+   "sql": "SELECT /* inline */ 2",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:sql-stmt#1",
+   "sql": "EXPLAIN SELECT 1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     "Init",
+     0,
+     4,
+     0,
+     null,
+     0,
+     null
+    ],
+    [
+     1,
+     "Integer",
+     1,
+     1,
+     0,
+     null,
+     0,
+     null
+    ],
+    [
+     2,
+     "ResultRow",
+     1,
+     1,
+     0,
+     null,
+     0,
+     null
+    ],
+    [
+     3,
+     "Halt",
+     0,
+     0,
+     0,
+     null,
+     0,
+     null
+    ],
+    [
+     4,
+     "Goto",
+     0,
+     1,
+     0,
+     null,
+     0,
+     null
+    ]
+   ]
+  },
+  {
+   "id": "syntax:sql-stmt#2",
+   "sql": "EXPLAIN QUERY PLAN SELECT a FROM t WHERE a = 1",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2,
+     0,
+     216,
+     "SCAN t"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:sql-stmt-list",
+   "sql": "SELECT 1; SELECT 2",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "pragma:analysis_limit",
+   "sql": "PRAGMA analysis_limit",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:application_id",
+   "sql": "PRAGMA application_id",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:auto_vacuum",
+   "sql": "PRAGMA auto_vacuum",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:automatic_index",
+   "sql": "PRAGMA automatic_index",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "pragma:busy_timeout",
+   "sql": "PRAGMA busy_timeout",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:cache_size",
+   "sql": "PRAGMA cache_size",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     -2000
+    ]
+   ]
+  },
+  {
+   "id": "pragma:cache_spill",
+   "sql": "PRAGMA cache_spill",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     483
+    ]
+   ]
+  },
+  {
+   "id": "pragma:case_sensitive_like",
+   "sql": "PRAGMA case_sensitive_like",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "pragma:cell_size_check",
+   "sql": "PRAGMA cell_size_check",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:checkpoint_fullfsync",
+   "sql": "PRAGMA checkpoint_fullfsync",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:collation_list",
+   "sql": "PRAGMA collation_list",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     "RTRIM"
+    ],
+    [
+     1,
+     "NOCASE"
+    ],
+    [
+     2,
+     "BINARY"
+    ]
+   ]
+  },
+  {
+   "id": "pragma:compile_options",
+   "sql": "PRAGMA compile_options",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "ATOMIC_INTRINSICS=1"
+    ],
+    [
+     "COMPILER=clang-23.1.1"
+    ],
+    [
+     "DEFAULT_AUTOVACUUM"
+    ],
+    [
+     "DEFAULT_CACHE_SIZE=-2000"
+    ],
+    [
+     "DEFAULT_FILE_FORMAT=4"
+    ],
+    [
+     "DEFAULT_JOURNAL_SIZE_LIMIT=-1"
+    ],
+    [
+     "DEFAULT_MMAP_SIZE=0"
+    ],
+    [
+     "DEFAULT_PAGE_SIZE=4096"
+    ],
+    [
+     "DEFAULT_PCACHE_INITSZ=20"
+    ],
+    [
+     "DEFAULT_RECURSIVE_TRIGGERS"
+    ],
+    [
+     "DEFAULT_SECTOR_SIZE=4096"
+    ],
+    [
+     "DEFAULT_SYNCHRONOUS=2"
+    ],
+    [
+     "DEFAULT_WAL_AUTOCHECKPOINT=1000"
+    ],
+    [
+     "DEFAULT_WAL_SYNCHRONOUS=2"
+    ],
+    [
+     "DEFAULT_WORKER_THREADS=0"
+    ],
+    [
+     "DIRECT_OVERFLOW_READ"
+    ],
+    [
+     "ENABLE_COLUMN_METADATA"
+    ],
+    [
+     "ENABLE_DBSTAT_VTAB"
+    ],
+    [
+     "ENABLE_FTS3"
+    ],
+    [
+     "ENABLE_FTS3_PARENTHESIS"
+    ],
+    [
+     "ENABLE_FTS4"
+    ],
+    [
+     "ENABLE_FTS5"
+    ],
+    [
+     "ENABLE_MATH_FUNCTIONS"
+    ],
+    [
+     "ENABLE_PERCENTILE"
+    ],
+    [
+     "ENABLE_PREUPDATE_HOOK"
+    ],
+    [
+     "ENABLE_RTREE"
+    ],
+    [
+     "ENABLE_SESSION"
+    ],
+    [
+     "ENABLE_STAT4"
+    ],
+    [
+     "ENABLE_STMTVTAB"
+    ],
+    [
+     "ENABLE_UNLOCK_NOTIFY"
+    ],
+    [
+     "HAVE_ISNAN"
+    ],
+    [
+     "MALLOC_SOFT_LIMIT=1024"
+    ],
+    [
+     "MAX_ATTACHED=10"
+    ],
+    [
+     "MAX_COLUMN=2000"
+    ],
+    [
+     "MAX_COMPOUND_SELECT=500"
+    ],
+    [
+     "MAX_DEFAULT_PAGE_SIZE=8192"
+    ],
+    [
+     "MAX_EXPR_DEPTH=10000"
+    ],
+    [
+     "MAX_FUNCTION_ARG=1000"
+    ],
+    [
+     "MAX_LENGTH=1000000000"
+    ],
+    [
+     "MAX_LIKE_PATTERN_LENGTH=50000"
+    ],
+    [
+     "MAX_MMAP_SIZE=0x7fff0000"
+    ],
+    [
+     "MAX_PAGE_COUNT=0xfffffffe"
+    ],
+    [
+     "MAX_PAGE_SIZE=65536"
+    ],
+    [
+     "MAX_SCHEMA=10000000"
+    ],
+    [
+     "MAX_SQL_LENGTH=1000000000"
+    ],
+    [
+     "MAX_TRIGGER_DEPTH=1000"
+    ],
+    [
+     "MAX_VARIABLE_NUMBER=250000"
+    ],
+    [
+     "MAX_VDBE_OP=250000000"
+    ],
+    [
+     "MAX_WORKER_THREADS=8"
+    ],
+    [
+     "MUTEX_PTHREADS"
+    ],
+    [
+     "SECURE_DELETE"
+    ],
+    [
+     "SYSTEM_MALLOC"
+    ],
+    [
+     "TEMP_STORE=1"
+    ],
+    [
+     "THREADSAFE=1"
+    ]
+   ]
+  },
+  {
+   "id": "pragma:count_changes",
+   "sql": "PRAGMA count_changes",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:data_store_directory",
+   "sql": "PRAGMA data_store_directory",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [],
+   "requires": "Windows's VFS"
+  },
+  {
+   "id": "pragma:data_version",
+   "sql": "PRAGMA data_version",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "pragma:database_list",
+   "sql": "PRAGMA database_list",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     "main",
+     "/home/adalundhe/.cache/probe-v7uzdtlp/452.db"
+    ]
+   ]
+  },
+  {
+   "id": "pragma:default_cache_size",
+   "sql": "PRAGMA default_cache_size",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     -2000
+    ]
+   ]
+  },
+  {
+   "id": "pragma:defer_foreign_keys",
+   "sql": "PRAGMA defer_foreign_keys",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:empty_result_callbacks",
+   "sql": "PRAGMA empty_result_callbacks",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:encoding",
+   "sql": "PRAGMA encoding",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "UTF-8"
+    ]
+   ]
+  },
+  {
+   "id": "pragma:foreign_key_check",
+   "sql": "PRAGMA foreign_key_check",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "pragma:foreign_key_list",
+   "sql": "PRAGMA foreign_key_list(t)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "pragma:foreign_keys",
+   "sql": "PRAGMA foreign_keys",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:freelist_count",
+   "sql": "PRAGMA freelist_count",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:full_column_names",
+   "sql": "PRAGMA full_column_names",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:fullfsync",
+   "sql": "PRAGMA fullfsync",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:function_list",
+   "sql": "PRAGMA function_list",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "->",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "->>",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "abs",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "acos",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "acosh",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "asin",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "asinh",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "atan",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "atan2",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "atanh",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "avg",
+     1,
+     "w",
+     "utf8",
+     1,
+     2097152
+    ],
+    [
+     "bm25",
+     0,
+     "s",
+     "utf8",
+     -1,
+     0
+    ],
+    [
+     "ceil",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "ceiling",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "changes",
+     1,
+     "s",
+     "utf8",
+     0,
+     2097152
+    ],
+    [
+     "char",
+     1,
+     "s",
+     "utf8",
+     -1,
+     2099200
+    ],
+    [
+     "coalesce",
+     1,
+     "s",
+     "utf8",
+     -4,
+     2099200
+    ],
+    [
+     "concat",
+     1,
+     "s",
+     "utf8",
+     -3,
+     2099200
+    ],
+    [
+     "concat_ws",
+     1,
+     "s",
+     "utf8",
+     -4,
+     2099200
+    ],
+    [
+     "cos",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "cosh",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "count",
+     1,
+     "w",
+     "utf8",
+     0,
+     2097152
+    ],
+    [
+     "count",
+     1,
+     "w",
+     "utf8",
+     1,
+     2097152
+    ],
+    [
+     "cume_dist",
+     1,
+     "w",
+     "utf8",
+     0,
+     2097152
+    ],
+    [
+     "current_date",
+     1,
+     "s",
+     "utf8",
+     0,
+     2097152
+    ],
+    [
+     "current_time",
+     1,
+     "s",
+     "utf8",
+     0,
+     2097152
+    ],
+    [
+     "current_timestamp",
+     1,
+     "s",
+     "utf8",
+     0,
+     2097152
+    ],
+    [
+     "date",
+     1,
+     "s",
+     "utf8",
+     -1,
+     2099200
+    ],
+    [
+     "datetime",
+     1,
+     "s",
+     "utf8",
+     -1,
+     2099200
+    ],
+    [
+     "degrees",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "dense_rank",
+     1,
+     "w",
+     "utf8",
+     0,
+     2097152
+    ],
+    [
+     "exp",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "first_value",
+     1,
+     "w",
+     "utf8",
+     1,
+     2097152
+    ],
+    [
+     "floor",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "format",
+     1,
+     "s",
+     "utf8",
+     -1,
+     2099200
+    ],
+    [
+     "fts3_tokenizer",
+     0,
+     "s",
+     "utf8",
+     1,
+     524288
+    ],
+    [
+     "fts3_tokenizer",
+     0,
+     "s",
+     "utf8",
+     2,
+     524288
+    ],
+    [
+     "fts5",
+     0,
+     "s",
+     "utf8",
+     1,
+     0
+    ],
+    [
+     "fts5_get_locale",
+     0,
+     "s",
+     "utf8",
+     -1,
+     0
+    ],
+    [
+     "fts5_insttoken",
+     0,
+     "s",
+     "utf8",
+     1,
+     2097152
+    ],
+    [
+     "fts5_locale",
+     0,
+     "s",
+     "utf8",
+     2,
+     3145728
+    ],
+    [
+     "fts5_source_id",
+     0,
+     "s",
+     "utf8",
+     0,
+     2099200
+    ],
+    [
+     "glob",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "group_concat",
+     1,
+     "w",
+     "utf8",
+     1,
+     2097152
+    ],
+    [
+     "group_concat",
+     1,
+     "w",
+     "utf8",
+     2,
+     2097152
+    ],
+    [
+     "hex",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "highlight",
+     0,
+     "s",
+     "utf8",
+     -1,
+     0
+    ],
+    [
+     "if",
+     1,
+     "s",
+     "utf8",
+     -4,
+     2099200
+    ],
+    [
+     "ifnull",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "iif",
+     1,
+     "s",
+     "utf8",
+     -4,
+     2099200
+    ],
+    [
+     "instr",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "json",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "json_array",
+     1,
+     "s",
+     "utf8",
+     -1,
+     3147776
+    ],
+    [
+     "json_array_insert",
+     1,
+     "s",
+     "utf8",
+     -1,
+     3147776
+    ],
+    [
+     "json_array_length",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "json_array_length",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "json_error_position",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "json_extract",
+     1,
+     "s",
+     "utf8",
+     -1,
+     2099200
+    ],
+    [
+     "json_group_array",
+     1,
+     "w",
+     "utf8",
+     1,
+     3147776
+    ],
+    [
+     "json_group_object",
+     1,
+     "w",
+     "utf8",
+     2,
+     3147776
+    ],
+    [
+     "json_insert",
+     1,
+     "s",
+     "utf8",
+     -1,
+     3147776
+    ],
+    [
+     "json_object",
+     1,
+     "s",
+     "utf8",
+     -1,
+     3147776
+    ],
+    [
+     "json_patch",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "json_pretty",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "json_pretty",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "json_quote",
+     1,
+     "s",
+     "utf8",
+     1,
+     3147776
+    ],
+    [
+     "json_remove",
+     1,
+     "s",
+     "utf8",
+     -1,
+     2099200
+    ],
+    [
+     "json_replace",
+     1,
+     "s",
+     "utf8",
+     -1,
+     3147776
+    ],
+    [
+     "json_set",
+     1,
+     "s",
+     "utf8",
+     -1,
+     3147776
+    ],
+    [
+     "json_type",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "json_type",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "json_valid",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "json_valid",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "jsonb",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "jsonb_array",
+     1,
+     "s",
+     "utf8",
+     -1,
+     3147776
+    ],
+    [
+     "jsonb_array_insert",
+     1,
+     "s",
+     "utf8",
+     -1,
+     3147776
+    ],
+    [
+     "jsonb_extract",
+     1,
+     "s",
+     "utf8",
+     -1,
+     2099200
+    ],
+    [
+     "jsonb_group_array",
+     1,
+     "w",
+     "utf8",
+     1,
+     3147776
+    ],
+    [
+     "jsonb_group_object",
+     1,
+     "w",
+     "utf8",
+     2,
+     3147776
+    ],
+    [
+     "jsonb_insert",
+     1,
+     "s",
+     "utf8",
+     -1,
+     3147776
+    ],
+    [
+     "jsonb_object",
+     1,
+     "s",
+     "utf8",
+     -1,
+     3147776
+    ],
+    [
+     "jsonb_patch",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "jsonb_remove",
+     1,
+     "s",
+     "utf8",
+     -1,
+     2099200
+    ],
+    [
+     "jsonb_replace",
+     1,
+     "s",
+     "utf8",
+     -1,
+     3147776
+    ],
+    [
+     "jsonb_set",
+     1,
+     "s",
+     "utf8",
+     -1,
+     3147776
+    ],
+    [
+     "julianday",
+     1,
+     "s",
+     "utf8",
+     -1,
+     2099200
+    ],
+    [
+     "lag",
+     1,
+     "w",
+     "utf8",
+     1,
+     2097152
+    ],
+    [
+     "lag",
+     1,
+     "w",
+     "utf8",
+     2,
+     2097152
+    ],
+    [
+     "lag",
+     1,
+     "w",
+     "utf8",
+     3,
+     2097152
+    ],
+    [
+     "last_insert_rowid",
+     1,
+     "s",
+     "utf8",
+     0,
+     2097152
+    ],
+    [
+     "last_value",
+     1,
+     "w",
+     "utf8",
+     1,
+     2097152
+    ],
+    [
+     "lead",
+     1,
+     "w",
+     "utf8",
+     1,
+     2097152
+    ],
+    [
+     "lead",
+     1,
+     "w",
+     "utf8",
+     2,
+     2097152
+    ],
+    [
+     "lead",
+     1,
+     "w",
+     "utf8",
+     3,
+     2097152
+    ],
+    [
+     "length",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "like",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "like",
+     1,
+     "s",
+     "utf8",
+     3,
+     2099200
+    ],
+    [
+     "likelihood",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "likely",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "ln",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "load_extension",
+     1,
+     "s",
+     "utf8",
+     1,
+     524288
+    ],
+    [
+     "load_extension",
+     1,
+     "s",
+     "utf8",
+     2,
+     524288
+    ],
+    [
+     "log",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "log",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "log10",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "log2",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "lower",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "ltrim",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "ltrim",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "match",
+     0,
+     "s",
+     "utf8",
+     2,
+     0
+    ],
+    [
+     "matchinfo",
+     0,
+     "s",
+     "utf8",
+     1,
+     0
+    ],
+    [
+     "matchinfo",
+     0,
+     "s",
+     "utf8",
+     2,
+     0
+    ],
+    [
+     "max",
+     1,
+     "s",
+     "utf8",
+     -3,
+     2099200
+    ],
+    [
+     "max",
+     1,
+     "w",
+     "utf8",
+     1,
+     2097152
+    ],
+    [
+     "median",
+     1,
+     "w",
+     "utf8",
+     1,
+     0
+    ],
+    [
+     "min",
+     1,
+     "s",
+     "utf8",
+     -3,
+     2099200
+    ],
+    [
+     "min",
+     1,
+     "w",
+     "utf8",
+     1,
+     2097152
+    ],
+    [
+     "mod",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "nth_value",
+     1,
+     "w",
+     "utf8",
+     2,
+     2097152
+    ],
+    [
+     "ntile",
+     1,
+     "w",
+     "utf8",
+     1,
+     2097152
+    ],
+    [
+     "nullif",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "octet_length",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "offsets",
+     0,
+     "s",
+     "utf8",
+     1,
+     0
+    ],
+    [
+     "optimize",
+     0,
+     "s",
+     "utf8",
+     1,
+     0
+    ],
+    [
+     "percent_rank",
+     1,
+     "w",
+     "utf8",
+     0,
+     2097152
+    ],
+    [
+     "percentile",
+     1,
+     "w",
+     "utf8",
+     2,
+     0
+    ],
+    [
+     "percentile_cont",
+     1,
+     "w",
+     "utf8",
+     2,
+     0
+    ],
+    [
+     "percentile_disc",
+     1,
+     "w",
+     "utf8",
+     2,
+     0
+    ],
+    [
+     "pi",
+     1,
+     "s",
+     "utf8",
+     0,
+     2099200
+    ],
+    [
+     "pow",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "power",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "printf",
+     1,
+     "s",
+     "utf8",
+     -1,
+     2099200
+    ],
+    [
+     "quote",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "radians",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "random",
+     1,
+     "s",
+     "utf8",
+     0,
+     2097152
+    ],
+    [
+     "randomblob",
+     1,
+     "s",
+     "utf8",
+     1,
+     2097152
+    ],
+    [
+     "rank",
+     1,
+     "w",
+     "utf8",
+     0,
+     2097152
+    ],
+    [
+     "regexp",
+     0,
+     "s",
+     "utf8",
+     2,
+     2048
+    ],
+    [
+     "replace",
+     1,
+     "s",
+     "utf8",
+     3,
+     2099200
+    ],
+    [
+     "round",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "round",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "row_number",
+     1,
+     "w",
+     "utf8",
+     0,
+     2097152
+    ],
+    [
+     "rtreecheck",
+     0,
+     "s",
+     "utf8",
+     -1,
+     0
+    ],
+    [
+     "rtreedepth",
+     0,
+     "s",
+     "utf8",
+     1,
+     0
+    ],
+    [
+     "rtreenode",
+     0,
+     "s",
+     "utf8",
+     2,
+     0
+    ],
+    [
+     "rtrim",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "rtrim",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "sign",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "sin",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "sinh",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "snippet",
+     0,
+     "s",
+     "utf8",
+     -1,
+     0
+    ],
+    [
+     "sqlite_compileoption_get",
+     1,
+     "s",
+     "utf8",
+     1,
+     2097152
+    ],
+    [
+     "sqlite_compileoption_used",
+     1,
+     "s",
+     "utf8",
+     1,
+     2097152
+    ],
+    [
+     "sqlite_log",
+     1,
+     "s",
+     "utf8",
+     2,
+     524288
+    ],
+    [
+     "sqlite_source_id",
+     1,
+     "s",
+     "utf8",
+     0,
+     2097152
+    ],
+    [
+     "sqlite_version",
+     1,
+     "s",
+     "utf8",
+     0,
+     2097152
+    ],
+    [
+     "sqrt",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "strftime",
+     1,
+     "s",
+     "utf8",
+     -1,
+     2099200
+    ],
+    [
+     "string_agg",
+     1,
+     "w",
+     "utf8",
+     2,
+     2097152
+    ],
+    [
+     "substr",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "substr",
+     1,
+     "s",
+     "utf8",
+     3,
+     2099200
+    ],
+    [
+     "substring",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "substring",
+     1,
+     "s",
+     "utf8",
+     3,
+     2099200
+    ],
+    [
+     "subtype",
+     1,
+     "s",
+     "utf8",
+     1,
+     3147776
+    ],
+    [
+     "sum",
+     1,
+     "w",
+     "utf8",
+     1,
+     2097152
+    ],
+    [
+     "tan",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "tanh",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "time",
+     1,
+     "s",
+     "utf8",
+     -1,
+     2099200
+    ],
+    [
+     "timediff",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "total",
+     1,
+     "w",
+     "utf8",
+     1,
+     2097152
+    ],
+    [
+     "total_changes",
+     1,
+     "s",
+     "utf8",
+     0,
+     2097152
+    ],
+    [
+     "trim",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "trim",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "trunc",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "typeof",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "unhex",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "unhex",
+     1,
+     "s",
+     "utf8",
+     2,
+     2099200
+    ],
+    [
+     "unicode",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "unistr",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "unistr_quote",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "unixepoch",
+     1,
+     "s",
+     "utf8",
+     -1,
+     2099200
+    ],
+    [
+     "unlikely",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "upper",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ],
+    [
+     "zeroblob",
+     1,
+     "s",
+     "utf8",
+     1,
+     2099200
+    ]
+   ]
+  },
+  {
+   "id": "pragma:hard_heap_limit",
+   "sql": "PRAGMA hard_heap_limit",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:ignore_check_constraints",
+   "sql": "PRAGMA ignore_check_constraints",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:incremental_vacuum",
+   "sql": "PRAGMA incremental_vacuum",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "pragma:index_info",
+   "sql": "PRAGMA index_info(ti)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     0,
+     "a"
+    ]
+   ]
+  },
+  {
+   "id": "pragma:index_list",
+   "sql": "PRAGMA index_list(t)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     "ti",
+     0,
+     "c",
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:index_xinfo",
+   "sql": "PRAGMA index_xinfo(ti)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     0,
+     "a",
+     0,
+     "BINARY",
+     1
+    ],
+    [
+     1,
+     -1,
+     null,
+     0,
+     "BINARY",
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:integrity_check",
+   "sql": "PRAGMA integrity_check",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "ok"
+    ]
+   ]
+  },
+  {
+   "id": "pragma:journal_mode",
+   "sql": "PRAGMA journal_mode",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "delete"
+    ]
+   ]
+  },
+  {
+   "id": "pragma:journal_size_limit",
+   "sql": "PRAGMA journal_size_limit",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     -1
+    ]
+   ]
+  },
+  {
+   "id": "pragma:legacy_alter_table",
+   "sql": "PRAGMA legacy_alter_table",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:legacy_file_format",
+   "sql": "PRAGMA legacy_file_format",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [],
+   "requires": "nothing: it no longer functions (a no-op)"
+  },
+  {
+   "id": "pragma:locking_mode",
+   "sql": "PRAGMA locking_mode",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "normal"
+    ]
+   ]
+  },
+  {
+   "id": "pragma:max_page_count",
+   "sql": "PRAGMA max_page_count",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     4294967294
+    ]
+   ]
+  },
+  {
+   "id": "pragma:mmap_size",
+   "sql": "PRAGMA mmap_size",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:module_list",
+   "sql": "PRAGMA module_list",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "dbstat"
+    ],
+    [
+     "fts3"
+    ],
+    [
+     "fts3tokenize"
+    ],
+    [
+     "fts4"
+    ],
+    [
+     "fts4aux"
+    ],
+    [
+     "fts5"
+    ],
+    [
+     "fts5vocab"
+    ],
+    [
+     "rtree"
+    ],
+    [
+     "rtree_i32"
+    ],
+    [
+     "sqlite_stmt"
+    ]
+   ]
+  },
+  {
+   "id": "pragma:optimize",
+   "sql": "PRAGMA optimize",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "pragma:page_count",
+   "sql": "PRAGMA page_count",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "pragma:page_size",
+   "sql": "PRAGMA page_size",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     4096
+    ]
+   ]
+  },
+  {
+   "id": "pragma:parser_trace",
+   "sql": "PRAGMA parser_trace",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [],
+   "requires": "SQLITE_DEBUG"
+  },
+  {
+   "id": "pragma:pragma_list",
+   "sql": "PRAGMA pragma_list",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "analysis_limit"
+    ],
+    [
+     "application_id"
+    ],
+    [
+     "auto_vacuum"
+    ],
+    [
+     "automatic_index"
+    ],
+    [
+     "busy_timeout"
+    ],
+    [
+     "cache_size"
+    ],
+    [
+     "cache_spill"
+    ],
+    [
+     "case_sensitive_like"
+    ],
+    [
+     "cell_size_check"
+    ],
+    [
+     "checkpoint_fullfsync"
+    ],
+    [
+     "collation_list"
+    ],
+    [
+     "compile_options"
+    ],
+    [
+     "count_changes"
+    ],
+    [
+     "data_version"
+    ],
+    [
+     "database_list"
+    ],
+    [
+     "default_cache_size"
+    ],
+    [
+     "defer_foreign_keys"
+    ],
+    [
+     "empty_result_callbacks"
+    ],
+    [
+     "encoding"
+    ],
+    [
+     "foreign_key_check"
+    ],
+    [
+     "foreign_key_list"
+    ],
+    [
+     "foreign_keys"
+    ],
+    [
+     "freelist_count"
+    ],
+    [
+     "full_column_names"
+    ],
+    [
+     "fullfsync"
+    ],
+    [
+     "function_list"
+    ],
+    [
+     "hard_heap_limit"
+    ],
+    [
+     "ignore_check_constraints"
+    ],
+    [
+     "incremental_vacuum"
+    ],
+    [
+     "index_info"
+    ],
+    [
+     "index_list"
+    ],
+    [
+     "index_xinfo"
+    ],
+    [
+     "integrity_check"
+    ],
+    [
+     "journal_mode"
+    ],
+    [
+     "journal_size_limit"
+    ],
+    [
+     "legacy_alter_table"
+    ],
+    [
+     "locking_mode"
+    ],
+    [
+     "max_page_count"
+    ],
+    [
+     "mmap_size"
+    ],
+    [
+     "module_list"
+    ],
+    [
+     "optimize"
+    ],
+    [
+     "page_count"
+    ],
+    [
+     "page_size"
+    ],
+    [
+     "pragma_list"
+    ],
+    [
+     "query_only"
+    ],
+    [
+     "quick_check"
+    ],
+    [
+     "read_uncommitted"
+    ],
+    [
+     "recursive_triggers"
+    ],
+    [
+     "reverse_unordered_selects"
+    ],
+    [
+     "schema_version"
+    ],
+    [
+     "secure_delete"
+    ],
+    [
+     "short_column_names"
+    ],
+    [
+     "shrink_memory"
+    ],
+    [
+     "soft_heap_limit"
+    ],
+    [
+     "synchronous"
+    ],
+    [
+     "table_info"
+    ],
+    [
+     "table_list"
+    ],
+    [
+     "table_xinfo"
+    ],
+    [
+     "temp_store"
+    ],
+    [
+     "temp_store_directory"
+    ],
+    [
+     "threads"
+    ],
+    [
+     "trusted_schema"
+    ],
+    [
+     "user_version"
+    ],
+    [
+     "wal_autocheckpoint"
+    ],
+    [
+     "wal_checkpoint"
+    ],
+    [
+     "writable_schema"
+    ]
+   ]
+  },
+  {
+   "id": "pragma:query_only",
+   "sql": "PRAGMA query_only",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:quick_check",
+   "sql": "PRAGMA quick_check",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "ok"
+    ]
+   ]
+  },
+  {
+   "id": "pragma:read_uncommitted",
+   "sql": "PRAGMA read_uncommitted",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:recursive_triggers",
+   "sql": "PRAGMA recursive_triggers",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:reverse_unordered_selects",
+   "sql": "PRAGMA reverse_unordered_selects",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:schema_version",
+   "sql": "PRAGMA schema_version",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "pragma:secure_delete",
+   "sql": "PRAGMA secure_delete",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "pragma:short_column_names",
+   "sql": "PRAGMA short_column_names",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "pragma:shrink_memory",
+   "sql": "PRAGMA shrink_memory",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "pragma:soft_heap_limit",
+   "sql": "PRAGMA soft_heap_limit",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:stats",
+   "sql": "PRAGMA stats",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [],
+   "requires": "a testing build (its output is deliberately undocumented)"
+  },
+  {
+   "id": "pragma:synchronous",
+   "sql": "PRAGMA synchronous",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "pragma:table_info",
+   "sql": "PRAGMA table_info(t)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     "a",
+     "INTEGER",
+     0,
+     null,
+     0
+    ],
+    [
+     1,
+     "b",
+     "TEXT",
+     0,
+     null,
+     0
+    ],
+    [
+     2,
+     "c",
+     "REAL",
+     0,
+     null,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:table_list",
+   "sql": "PRAGMA table_list",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     "main",
+     "sqlite_schema",
+     "table",
+     5,
+     0,
+     0
+    ],
+    [
+     "main",
+     "t",
+     "table",
+     3,
+     0,
+     0
+    ],
+    [
+     "main",
+     "u",
+     "table",
+     2,
+     0,
+     0
+    ],
+    [
+     "temp",
+     "sqlite_temp_schema",
+     "table",
+     5,
+     0,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:table_xinfo",
+   "sql": "PRAGMA table_xinfo(t)",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     "a",
+     "INTEGER",
+     0,
+     null,
+     0,
+     0
+    ],
+    [
+     1,
+     "b",
+     "TEXT",
+     0,
+     null,
+     0,
+     0
+    ],
+    [
+     2,
+     "c",
+     "REAL",
+     0,
+     null,
+     0,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:temp_store",
+   "sql": "PRAGMA temp_store",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:temp_store_directory",
+   "sql": "PRAGMA temp_store_directory",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "pragma:threads",
+   "sql": "PRAGMA threads",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:trusted_schema",
+   "sql": "PRAGMA trusted_schema",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "pragma:user_version",
+   "sql": "PRAGMA user_version",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:vdbe_addoptrace",
+   "sql": "PRAGMA vdbe_addoptrace",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [],
+   "requires": "SQLITE_DEBUG"
+  },
+  {
+   "id": "pragma:vdbe_debug",
+   "sql": "PRAGMA vdbe_debug",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [],
+   "requires": "SQLITE_DEBUG"
+  },
+  {
+   "id": "pragma:vdbe_listing",
+   "sql": "PRAGMA vdbe_listing",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [],
+   "requires": "SQLITE_DEBUG"
+  },
+  {
+   "id": "pragma:vdbe_trace",
+   "sql": "PRAGMA vdbe_trace",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [],
+   "requires": "SQLITE_DEBUG"
+  },
+  {
+   "id": "pragma:wal_autocheckpoint",
+   "sql": "PRAGMA wal_autocheckpoint",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     1000
+    ]
+   ]
+  },
+  {
+   "id": "pragma:wal_checkpoint",
+   "sql": "PRAGMA wal_checkpoint",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     -1,
+     -1
+    ]
+   ]
+  },
+  {
+   "id": "pragma:writable_schema",
+   "sql": "PRAGMA writable_schema",
+   "spelling": "sqlite",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  }
+ ]
+}

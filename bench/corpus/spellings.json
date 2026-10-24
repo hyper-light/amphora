@@ -1,0 +1,2618 @@
+{
+ "collation:BINARY": {
+  "mysql": {
+   "query": "SELECT 'a' < 'B' COLLATE utf8mb4_bin",
+   "setup_tail": []
+  },
+  "postgres": {
+   "query": "SELECT 'a' < 'B' COLLATE \"C\"",
+   "setup_tail": [
+    "CREATE COLLATION nocase (provider = icu, locale = 'und-u-ks-level2', deterministic = false)"
+   ]
+  }
+ },
+ "collation:NOCASE": {
+  "mysql": {
+   "query": "SELECT b FROM t WHERE b = 'ONE' COLLATE utf8mb4_0900_ai_ci",
+   "setup_tail": []
+  },
+  "postgres": {
+   "query": "SELECT b FROM t WHERE b = 'ONE' COLLATE nocase",
+   "setup_tail": [
+    "CREATE COLLATION nocase (provider = icu, locale = 'und-u-ks-level2', deterministic = false)"
+   ]
+  }
+ },
+ "datetime.modifier:NNN days": {
+  "clickhouse": {
+   "query": "SELECT toString(addDays(toDate('2024-01-01'), 10))"
+  },
+  "duckdb": {
+   "query": "SELECT (DATE '2024-01-01' + INTERVAL 10 DAY)::DATE::VARCHAR"
+  },
+  "mysql": {
+   "query": "SELECT DATE_FORMAT(DATE_ADD('2024-01-01', INTERVAL 10 DAY), '%Y-%m-%d')"
+  },
+  "postgres": {
+   "query": "SELECT (date '2024-01-01' + 10)::text"
+  }
+ },
+ "datetime.modifier:NNN hours": {
+  "clickhouse": {
+   "query": "SELECT formatDateTime(toDateTime('2024-01-01 00:00:00', 'UTC') + INTERVAL 5 HOUR, '%Y-%m-%d %H:%i:%S')"
+  },
+  "duckdb": {
+   "query": "SELECT strftime(TIMESTAMP '2024-01-01' + INTERVAL 5 HOUR, '%Y-%m-%d %H:%M:%S')"
+  },
+  "mysql": {
+   "query": "SELECT DATE_FORMAT(DATE_ADD('2024-01-01', INTERVAL 5 HOUR), '%Y-%m-%d %H:%i:%s')"
+  },
+  "postgres": {
+   "query": "SELECT to_char(timestamp '2024-01-01' + interval '5 hours', 'YYYY-MM-DD HH24:MI:SS')"
+  }
+ },
+ "datetime.modifier:NNN minutes": {
+  "clickhouse": {
+   "query": "SELECT formatDateTime(toDateTime('2024-01-01 00:00:00', 'UTC') - INTERVAL 90 MINUTE, '%Y-%m-%d %H:%i:%S')"
+  },
+  "duckdb": {
+   "query": "SELECT strftime(TIMESTAMP '2024-01-01' - INTERVAL 90 MINUTE, '%Y-%m-%d %H:%M:%S')"
+  },
+  "mysql": {
+   "query": "SELECT DATE_FORMAT(DATE_SUB('2024-01-01', INTERVAL 90 MINUTE), '%Y-%m-%d %H:%i:%s')"
+  },
+  "postgres": {
+   "query": "SELECT to_char(timestamp '2024-01-01' - interval '90 minutes', 'YYYY-MM-DD HH24:MI:SS')"
+  }
+ },
+ "datetime.modifier:NNN months": {
+  "clickhouse": {
+   "query": "SELECT toString(addMonths(toDate('2024-01-31'), 1))"
+  },
+  "duckdb": {
+   "query": "SELECT (DATE '2024-01-31' + INTERVAL 1 MONTH)::DATE::VARCHAR"
+  },
+  "mysql": {
+   "query": "SELECT DATE_FORMAT(DATE_ADD('2024-01-31', INTERVAL 1 MONTH), '%Y-%m-%d')"
+  },
+  "postgres": {
+   "query": "SELECT (date '2024-01-31' + interval '1 month')::date::text"
+  }
+ },
+ "datetime.modifier:NNN seconds": {
+  "clickhouse": {
+   "query": "SELECT formatDateTime(toDateTime('2024-01-01 00:00:00', 'UTC') + INTERVAL 3600 SECOND, '%Y-%m-%d %H:%i:%S')"
+  },
+  "duckdb": {
+   "query": "SELECT strftime(TIMESTAMP '2024-01-01' + INTERVAL 3600 SECOND, '%Y-%m-%d %H:%M:%S')"
+  },
+  "mysql": {
+   "query": "SELECT DATE_FORMAT(DATE_ADD('2024-01-01', INTERVAL 3600 SECOND), '%Y-%m-%d %H:%i:%s')"
+  },
+  "postgres": {
+   "query": "SELECT to_char(timestamp '2024-01-01' + interval '3600 seconds', 'YYYY-MM-DD HH24:MI:SS')"
+  }
+ },
+ "datetime.modifier:NNN years": {
+  "clickhouse": {
+   "query": "SELECT toString(addYears(toDate('2024-02-29'), 1))"
+  },
+  "duckdb": {
+   "query": "SELECT (DATE '2024-02-29' + INTERVAL 1 YEAR)::DATE::VARCHAR"
+  },
+  "mysql": {
+   "query": "SELECT DATE_FORMAT(DATE_ADD('2024-02-29', INTERVAL 1 YEAR), '%Y-%m-%d')"
+  },
+  "postgres": {
+   "query": "SELECT (date '2024-02-29' + interval '1 year')::date::text"
+  }
+ },
+ "datetime.modifier:auto": {
+  "clickhouse": {
+   "query": "SELECT formatDateTime(toDateTime(1710460800, 'UTC'), '%Y-%m-%d %H:%i:%S')"
+  },
+  "duckdb": {
+   "query": "SELECT strftime(epoch_ms(1710460800000), '%Y-%m-%d %H:%M:%S')"
+  },
+  "mysql": {
+   "query": "SELECT DATE_FORMAT(FROM_UNIXTIME(1710460800), '%Y-%m-%d %H:%i:%s')"
+  },
+  "postgres": {
+   "query": "SELECT to_char(to_timestamp(1710460800) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')"
+  }
+ },
+ "datetime.modifier:ceiling": {
+  "clickhouse": {
+   "query": "SELECT toString(addDays(addMonths(toStartOfMonth(toDate('2024-01-31')), 1), toDayOfMonth(toDate('2024-01-31')) - 1))"
+  },
+  "duckdb": {
+   "query": "SELECT (date_trunc('month', DATE '2024-01-31') + INTERVAL 1 MONTH + INTERVAL (day(DATE '2024-01-31') - 1) DAY)::DATE::VARCHAR"
+  },
+  "mysql": {
+   "query": "SELECT DATE_FORMAT(DATE_ADD(DATE_ADD(DATE_FORMAT('2024-01-31', '%Y-%m-01'), INTERVAL 1 MONTH), INTERVAL DAY('2024-01-31') - 1 DAY), '%Y-%m-%d')"
+  },
+  "postgres": {
+   "query": "SELECT (date_trunc('month', date '2024-01-31') + interval '1 month' + (extract(day from date '2024-01-31')::int - 1) * interval '1 day')::date::text"
+  }
+ },
+ "datetime.modifier:floor": {
+  "clickhouse": {
+   "query": "SELECT toString(addMonths(toDate('2024-01-31'), 1))"
+  },
+  "duckdb": {
+   "query": "SELECT (DATE '2024-01-31' + INTERVAL 1 MONTH)::DATE::VARCHAR"
+  },
+  "mysql": {
+   "query": "SELECT DATE_FORMAT(DATE_ADD('2024-01-31', INTERVAL 1 MONTH), '%Y-%m-%d')"
+  },
+  "postgres": {
+   "query": "SELECT (date '2024-01-31' + interval '1 month')::date::text"
+  }
+ },
+ "datetime.modifier:julianday": {
+  "clickhouse": {
+   "query": "SELECT toString(addDays(toDate('1970-01-01'), toInt32(2460385.5 - 2440587.5)))"
+  },
+  "duckdb": {
+   "query": "SELECT (TIMESTAMP '1970-01-01' + INTERVAL (2460385.5 - 2440587.5) DAY)::DATE::VARCHAR"
+  },
+  "mysql": {
+   "query": "SELECT DATE_FORMAT(FROM_DAYS(FLOOR(2460385.5 - 1721059.5)), '%Y-%m-%d')"
+  },
+  "postgres": {
+   "query": "SELECT (timestamp 'epoch' + (2460385.5 - 2440587.5) * interval '1 day')::date::text"
+  }
+ },
+ "datetime.modifier:localtime": {
+  "clickhouse": {
+   "query": "SELECT toTypeName(formatDateTime(toDateTime('2024-03-15 00:00:00', 'UTC'), '%Y-%m-%d %H:%i:%S'))"
+  },
+  "duckdb": {
+   "query": "SELECT typeof(strftime(TIMESTAMPTZ '2024-03-15 00:00:00+00', '%Y-%m-%d %H:%M:%S'))"
+  },
+  "mysql": {
+   "query": "SELECT DATE_FORMAT(CONVERT_TZ('2024-03-15 00:00:00', '+00:00', @@session.time_zone), '%Y-%m-%d %H:%i:%s') IS NOT NULL"
+  },
+  "postgres": {
+   "query": "SELECT pg_typeof(to_char(timestamptz '2024-03-15 00:00:00+00' AT TIME ZONE current_setting('TimeZone'), 'YYYY-MM-DD HH24:MI:SS'))::text"
+  }
+ },
+ "datetime.modifier:start of day": {
+  "clickhouse": {
+   "query": "SELECT formatDateTime(toStartOfDay(toDateTime('2024-03-15 10:11:12', 'UTC')), '%Y-%m-%d %H:%i:%S')"
+  },
+  "duckdb": {
+   "query": "SELECT strftime(date_trunc('day', TIMESTAMP '2024-03-15 10:11:12'), '%Y-%m-%d %H:%M:%S')"
+  },
+  "mysql": {
+   "query": "SELECT DATE_FORMAT('2024-03-15 10:11:12', '%Y-%m-%d 00:00:00')"
+  },
+  "postgres": {
+   "query": "SELECT to_char(date_trunc('day', timestamp '2024-03-15 10:11:12'), 'YYYY-MM-DD HH24:MI:SS')"
+  }
+ },
+ "datetime.modifier:start of month": {
+  "clickhouse": {
+   "query": "SELECT toString(toStartOfMonth(toDate('2024-03-15')))"
+  },
+  "duckdb": {
+   "query": "SELECT date_trunc('month', DATE '2024-03-15')::DATE::VARCHAR"
+  },
+  "mysql": {
+   "query": "SELECT DATE_FORMAT('2024-03-15', '%Y-%m-01')"
+  },
+  "postgres": {
+   "query": "SELECT date_trunc('month', date '2024-03-15')::date::text"
+  }
+ },
+ "datetime.modifier:start of year": {
+  "clickhouse": {
+   "query": "SELECT toString(toStartOfYear(toDate('2024-03-15')))"
+  },
+  "duckdb": {
+   "query": "SELECT date_trunc('year', DATE '2024-03-15')::DATE::VARCHAR"
+  },
+  "mysql": {
+   "query": "SELECT DATE_FORMAT('2024-03-15', '%Y-01-01')"
+  },
+  "postgres": {
+   "query": "SELECT date_trunc('year', date '2024-03-15')::date::text"
+  }
+ },
+ "datetime.modifier:subsec": {
+  "clickhouse": {
+   "query": "SELECT toTypeName(formatDateTime(now64(3), '%Y-%m-%d %H:%i:%S.%f'))"
+  },
+  "duckdb": {
+   "query": "SELECT typeof(strftime(now(), '%Y-%m-%d %H:%M:%S.%g'))"
+  },
+  "mysql": {
+   "query": "SELECT DATE_FORMAT(NOW(3), '%Y-%m-%d %H:%i:%s.%f') IS NOT NULL"
+  },
+  "postgres": {
+   "query": "SELECT pg_typeof(to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.MS'))::text"
+  }
+ },
+ "datetime.modifier:subsecond": {
+  "clickhouse": {
+   "query": "SELECT toTypeName(formatDateTime(now64(3), '%Y-%m-%d %H:%i:%S.%f'))"
+  },
+  "duckdb": {
+   "query": "SELECT typeof(strftime(now(), '%Y-%m-%d %H:%M:%S.%g'))"
+  },
+  "mysql": {
+   "query": "SELECT DATE_FORMAT(NOW(3), '%Y-%m-%d %H:%i:%s.%f') IS NOT NULL"
+  },
+  "postgres": {
+   "query": "SELECT pg_typeof(to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.MS'))::text"
+  }
+ },
+ "datetime.modifier:unixepoch": {
+  "clickhouse": {
+   "query": "SELECT formatDateTime(toDateTime(1710460800, 'UTC'), '%Y-%m-%d %H:%i:%S')"
+  },
+  "duckdb": {
+   "query": "SELECT strftime(epoch_ms(1710460800000), '%Y-%m-%d %H:%M:%S')"
+  },
+  "mysql": {
+   "query": "SELECT DATE_FORMAT(FROM_UNIXTIME(1710460800), '%Y-%m-%d %H:%i:%s')"
+  },
+  "postgres": {
+   "query": "SELECT to_char(to_timestamp(1710460800) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')"
+  }
+ },
+ "datetime.modifier:utc": {
+  "clickhouse": {
+   "query": "SELECT toTypeName(formatDateTime(toDateTime('2024-03-15 00:00:00', 'UTC'), '%Y-%m-%d %H:%i:%S'))"
+  },
+  "duckdb": {
+   "query": "SELECT typeof(strftime(TIMESTAMP '2024-03-15 00:00:00', '%Y-%m-%d %H:%M:%S'))"
+  },
+  "mysql": {
+   "query": "SELECT DATE_FORMAT(CONVERT_TZ('2024-03-15 00:00:00', @@session.time_zone, '+00:00'), '%Y-%m-%d %H:%i:%s') IS NOT NULL"
+  },
+  "postgres": {
+   "query": "SELECT pg_typeof(to_char(timestamp '2024-03-15 00:00:00' AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))::text"
+  }
+ },
+ "datetime.modifier:weekday N": {
+  "clickhouse": {
+   "query": "SELECT toString(addDays(toDate('2024-03-15'), (7 - toDayOfWeek(toDate('2024-03-15'), 2)) % 7))"
+  },
+  "duckdb": {
+   "query": "SELECT (DATE '2024-03-15' + INTERVAL ((7 - dayofweek(DATE '2024-03-15')) % 7) DAY)::DATE::VARCHAR"
+  },
+  "mysql": {
+   "query": "SELECT DATE_FORMAT(DATE_ADD('2024-03-15', INTERVAL (8 - DAYOFWEEK('2024-03-15')) % 7 DAY), '%Y-%m-%d')"
+  },
+  "postgres": {
+   "query": "SELECT (date '2024-03-15' + (7 - extract(dow from date '2024-03-15')::int) % 7)::text"
+  }
+ },
+ "expression:boolean expression": {
+  "clickhouse": "none: ClickHouse: a condition must be boolean there: text has no truth value",
+  "duckdb": "none: DuckDB: a condition must be boolean there: text has no truth value",
+  "postgres": "none: PostgreSQL: a condition must be boolean there: text has no truth value"
+ },
+ "function.aggregate:group_concat": {
+  "clickhouse": {
+   "query": "SELECT arrayStringConcat(arrayMap(x -> x.2, arraySort(x -> x.1, groupArray(tuple(a, b)))), '|') FROM t WHERE b IS NOT NULL"
+  }
+ },
+ "function.aggregate:median": {
+  "mysql": "none: MySQL has no percentile or median aggregate (PERCENT_RANK and CUME_DIST are window functions)"
+ },
+ "function.aggregate:percentile": {
+  "clickhouse": {
+   "query": "SELECT quantileExactInclusive(0.5)(c) FROM t"
+  },
+  "duckdb": {
+   "query": "SELECT quantile_cont(c, 0.5) FROM t"
+  },
+  "mysql": "none: MySQL has no percentile or median aggregate (PERCENT_RANK and CUME_DIST are window functions)",
+  "postgres": {
+   "query": "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY c) FROM t"
+  }
+ },
+ "function.aggregate:percentile_cont": {
+  "clickhouse": {
+   "query": "SELECT quantileExactInclusive(0.25)(c) FROM t"
+  },
+  "mysql": "none: MySQL has no percentile or median aggregate (PERCENT_RANK and CUME_DIST are window functions)"
+ },
+ "function.aggregate:percentile_disc": {
+  "clickhouse": {
+   "query": "SELECT quantileExactLow(0.25)(c) FROM t"
+  },
+  "mysql": "none: MySQL has no percentile or median aggregate (PERCENT_RANK and CUME_DIST are window functions)"
+ },
+ "function.aggregate:string_agg": {
+  "clickhouse": {
+   "query": "SELECT arrayStringConcat(arrayMap(x -> x.2, arrayReverseSort(x -> x.1, groupArray(tuple(a, b)))), ',') FROM t WHERE b IS NOT NULL"
+  }
+ },
+ "function.aggregate:total": {
+  "clickhouse": {
+   "query": "SELECT toFloat64(ifNull(sum(c), 0)), toFloat64(0) FROM t"
+  },
+  "duckdb": {
+   "query": "SELECT coalesce(sum(c), 0)::DOUBLE, coalesce(sum(NULL::DOUBLE), 0)::DOUBLE FROM t"
+  },
+  "mysql": {
+   "query": "SELECT COALESCE(SUM(c), 0) + 0.0, 0.0 FROM t"
+  },
+  "postgres": {
+   "query": "SELECT coalesce(sum(c), 0)::float8, coalesce(sum(NULL::float8), 0)::float8 FROM t"
+  }
+ },
+ "function.core:changes": {
+  "clickhouse": "none: ClickHouse reports rows written to the client",
+  "duckdb": "none: DuckDB reports rows changed to the client",
+  "mysql": {
+   "query": "SELECT row_count()"
+  },
+  "postgres": "none: PostgreSQL reports rows changed to the client (the command tag, GET DIAGNOSTICS in PL/pgSQL)"
+ },
+ "function.core:char": {
+  "clickhouse": {
+   "query": "SELECT char(72, 105)"
+  },
+  "postgres": {
+   "query": "SELECT chr(72) || chr(105)"
+  }
+ },
+ "function.core:format": {
+  "clickhouse": {
+   "query": "SELECT format('{}-{}', 7, 'x')"
+  },
+  "postgres": {
+   "query": "SELECT format('%s-%s', 7, 'x')"
+  }
+ },
+ "function.core:glob": {
+  "clickhouse": {
+   "query": "SELECT match('abc', '^a.*$'), match('bc', '^a.*$')"
+  },
+  "mysql": {
+   "query": "SELECT REGEXP_LIKE('abc', '^a.*$', 'c'), REGEXP_LIKE('bc', '^a.*$', 'c')"
+  },
+  "postgres": {
+   "query": "SELECT 'abc' ~ '^a.*$', 'bc' ~ '^a.*$'"
+  }
+ },
+ "function.core:hex": {
+  "postgres": {
+   "query": "SELECT upper(encode('AB'::bytea, 'hex')), upper(encode('255'::bytea, 'hex'))"
+  }
+ },
+ "function.core:instr": {
+  "clickhouse": {
+   "query": "SELECT position('hello', 'll')"
+  },
+  "postgres": {
+   "query": "SELECT strpos('hello', 'll')"
+  }
+ },
+ "function.core:last_insert_rowid": {
+  "clickhouse": "none: ClickHouse has no rowid",
+  "duckdb": "none: DuckDB has no rowid counter; INSERT ... RETURNING gives a new key",
+  "mysql": {
+   "query": "SELECT last_insert_id() >= 0"
+  },
+  "postgres": "none: PostgreSQL has no rowid; INSERT ... RETURNING or currval() give a new key"
+ },
+ "function.core:length": {
+  "clickhouse": {
+   "query": "SELECT lengthUTF8('h\u00e9llo'), length(unhex('0102')), lengthUTF8(NULL)"
+  },
+  "duckdb": {
+   "query": "SELECT length('h\u00e9llo'), octet_length('\\x01\\x02'::BLOB), length(NULL)"
+  }
+ },
+ "function.core:likelihood": {
+  "clickhouse": {
+   "query": "SELECT 1 = 1"
+  },
+  "duckdb": {
+   "query": "SELECT 1 = 1"
+  },
+  "mysql": {
+   "query": "SELECT 1 = 1"
+  },
+  "postgres": {
+   "query": "SELECT 1 = 1"
+  }
+ },
+ "function.core:likely": {
+  "clickhouse": {
+   "query": "SELECT 1 = 1"
+  },
+  "duckdb": {
+   "query": "SELECT 1 = 1"
+  },
+  "mysql": {
+   "query": "SELECT 1 = 1"
+  },
+  "postgres": {
+   "query": "SELECT 1 = 1"
+  }
+ },
+ "function.core:load_extension": {
+  "clickhouse": "none: ClickHouse has no loadable extensions",
+  "duckdb": "none: DuckDB loads extensions with INSTALL and LOAD, statements",
+  "mysql": "none: MySQL loads plugins with INSTALL PLUGIN, a statement",
+  "postgres": "none: PostgreSQL loads extensions with CREATE EXTENSION, a statement"
+ },
+ "function.core:max": {
+  "clickhouse": {
+   "query": "SELECT greatest(1, 5, 3)"
+  },
+  "duckdb": {
+   "query": "SELECT greatest(1, 5, 3)"
+  }
+ },
+ "function.core:min": {
+  "clickhouse": {
+   "query": "SELECT least(4, 2, 8)"
+  },
+  "duckdb": {
+   "query": "SELECT least(4, 2, 8)"
+  }
+ },
+ "function.core:octet_length": {
+  "duckdb": {
+   "query": "SELECT octet_length(encode('h\u00e9llo'))"
+  }
+ },
+ "function.core:printf": {
+  "mysql": {
+   "query": "SELECT CONCAT(LPAD(FORMAT(3.14159, 2), 5, ' '), '|', RPAD('a', 3, ' '), '|', LPAD(7, 3, '0'))"
+  },
+  "postgres": {
+   "query": "SELECT lpad(to_char(3.14159, 'FM990.00'), 5) || '|' || rpad('a', 3) || '|' || lpad('7', 3, '0')"
+  }
+ },
+ "function.core:quote": {
+  "clickhouse": "none: ClickHouse has no function that writes a value as an SQL literal",
+  "duckdb": "none: DuckDB has no function that writes a value as an SQL literal",
+  "mysql": {
+   "query": "SELECT QUOTE('it''s'), QUOTE(NULL), QUOTE(HEX(x'ab'))"
+  },
+  "postgres": {
+   "query": "SELECT quote_literal('it''s'), quote_nullable(NULL), 'X''AB'''"
+  }
+ },
+ "function.core:random": {
+  "clickhouse": {
+   "query": "SELECT toTypeName(rand64())"
+  },
+  "mysql": {
+   "query": "SELECT RAND() >= 0"
+  },
+  "postgres": {
+   "query": "SELECT pg_typeof(random())::text"
+  }
+ },
+ "function.core:randomblob": {
+  "clickhouse": {
+   "query": "SELECT length(randomString(8))"
+  },
+  "duckdb": "none: DuckDB has no random-bytes function",
+  "mysql": {
+   "query": "SELECT length(random_bytes(8))"
+  },
+  "postgres": {
+   "query": "SELECT length(decode(md5(random()::text) || md5(random()::text), 'hex')) >= 8"
+  }
+ },
+ "function.core:soundex": {
+  "clickhouse": "none: ClickHouse has no soundex()",
+  "duckdb": "none: DuckDB has no soundex()",
+  "postgres": "none: PostgreSQL's soundex() is in the fuzzystrmatch extension, not installed by default"
+ },
+ "function.core:sqlite_compileoption_get": {
+  "clickhouse": {
+   "query": "SELECT toTypeName(value) FROM system.build_options LIMIT 1"
+  },
+  "duckdb": "none: DuckDB has no compile-option query",
+  "mysql": "none: MySQL has no compile-option query",
+  "postgres": "none: PostgreSQL reports build options with pg_config, outside SQL"
+ },
+ "function.core:sqlite_compileoption_used": {
+  "clickhouse": "none: ClickHouse lists its build options in system.build_options",
+  "duckdb": "none: DuckDB has no compile-option query",
+  "mysql": "none: MySQL has no compile-option query",
+  "postgres": "none: PostgreSQL reports build options with pg_config, outside SQL"
+ },
+ "function.core:sqlite_offset": {
+  "clickhouse": "none: ClickHouse rows have no byte offset query",
+  "duckdb": "none: DuckDB rows have no byte offset query",
+  "mysql": "none: MySQL rows have no byte offset query",
+  "postgres": "none: PostgreSQL rows have no byte offset in a file (ctid names a row's page and slot)"
+ },
+ "function.core:sqlite_source_id": {
+  "clickhouse": "none: ClickHouse has no source identifier function",
+  "duckdb": {
+   "query": "SELECT typeof(source_id) FROM pragma_version()"
+  },
+  "mysql": "none: MySQL has no source identifier function",
+  "postgres": "none: PostgreSQL has no source identifier function (version() names the release)"
+ },
+ "function.core:sqlite_version": {
+  "clickhouse": {
+   "query": "SELECT toTypeName(version())"
+  },
+  "duckdb": {
+   "query": "SELECT typeof(version())"
+  },
+  "mysql": {
+   "query": "SELECT version() IS NOT NULL"
+  },
+  "postgres": {
+   "query": "SELECT pg_typeof(version())::text = 'text'"
+  }
+ },
+ "function.core:total_changes": {
+  "clickhouse": "none: ClickHouse keeps no per-connection count of rows changed",
+  "duckdb": "none: DuckDB keeps no per-connection count of rows changed",
+  "mysql": "none: MySQL keeps no per-connection count of rows changed",
+  "postgres": "none: PostgreSQL keeps no per-connection count of rows changed"
+ },
+ "function.core:typeof": {
+  "clickhouse": {
+   "query": "SELECT toTypeName(1), toTypeName(1.5), toTypeName('a'), toTypeName(unhex('00')), toTypeName(NULL)"
+  },
+  "mysql": "none: MySQL has no function that names a value's type",
+  "postgres": {
+   "query": "SELECT pg_typeof(1)::text, pg_typeof(1.5)::text, pg_typeof('a'::text)::text, pg_typeof('\\x00'::bytea)::text, pg_typeof(NULL)::text"
+  }
+ },
+ "function.core:unhex": {
+  "mysql": {
+   "query": "SELECT UNHEX('4142') = BINARY 'AB'"
+  },
+  "postgres": {
+   "query": "SELECT decode('4142', 'hex')"
+  }
+ },
+ "function.core:unicode": {
+  "clickhouse": {
+   "query": "SELECT ascii('A')"
+  },
+  "mysql": {
+   "query": "SELECT ord('A')"
+  },
+  "postgres": {
+   "query": "SELECT ascii('A')"
+  }
+ },
+ "function.core:unistr": {
+  "clickhouse": "none: ClickHouse has no unistr()",
+  "duckdb": "none: DuckDB has no unistr(); chr() builds one character at a time",
+  "mysql": "none: MySQL has no unistr(); CHAR(... USING utf8mb4) builds text from code points"
+ },
+ "function.core:unistr_quote": {
+  "clickhouse": "none: ClickHouse has no unistr_quote()",
+  "duckdb": "none: DuckDB has no unistr_quote()",
+  "mysql": "none: MySQL has no unistr_quote()",
+  "postgres": "none: PostgreSQL has no function that writes text as a unistr() literal"
+ },
+ "function.core:unlikely": {
+  "clickhouse": {
+   "query": "SELECT 1 = 2"
+  },
+  "duckdb": {
+   "query": "SELECT 1 = 2"
+  },
+  "mysql": {
+   "query": "SELECT 1 = 2"
+  },
+  "postgres": {
+   "query": "SELECT 1 = 2"
+  }
+ },
+ "function.core:zeroblob": {
+  "clickhouse": {
+   "query": "SELECT length(repeat('\\0', 4))"
+  },
+  "duckdb": {
+   "query": "SELECT octet_length(repeat('\\x00'::BLOB, 4))"
+  },
+  "mysql": {
+   "query": "SELECT length(repeat(char(0), 4))"
+  },
+  "postgres": {
+   "query": "SELECT length(decode(repeat('00', 4), 'hex'))"
+  }
+ },
+ "function.datetime:date": {
+  "clickhouse": {
+   "query": "SELECT toString(addDays(toDate('2024-02-28'), 1)), toString(toDate(toDateTime(0, 'UTC')))"
+  },
+  "duckdb": {
+   "query": "SELECT (DATE '2024-02-28' + INTERVAL 1 DAY)::DATE::VARCHAR, epoch_ms(0)::DATE::VARCHAR"
+  },
+  "mysql": {
+   "query": "SELECT DATE_FORMAT(DATE_ADD('2024-02-28', INTERVAL 1 DAY), '%Y-%m-%d'), DATE_FORMAT(FROM_UNIXTIME(0), '%Y-%m-%d')"
+  },
+  "postgres": {
+   "query": "SELECT (date '2024-02-28' + interval '1 day')::date::text, (to_timestamp(0) AT TIME ZONE 'UTC')::date::text"
+  }
+ },
+ "function.datetime:datetime": {
+  "clickhouse": {
+   "query": "SELECT formatDateTime(addMonths(toDateTime('2024-01-31 10:00:00', 'UTC'), 1), '%Y-%m-%d %H:%i:%S'), formatDateTime(toDateTime(1700000000, 'UTC'), '%Y-%m-%d %H:%i:%S')"
+  },
+  "duckdb": {
+   "query": "SELECT strftime(TIMESTAMP '2024-01-31 10:00:00' + INTERVAL 1 MONTH, '%Y-%m-%d %H:%M:%S'), strftime(epoch_ms(1700000000000), '%Y-%m-%d %H:%M:%S')"
+  },
+  "mysql": {
+   "query": "SELECT DATE_FORMAT(DATE_ADD('2024-01-31 10:00:00', INTERVAL 1 MONTH), '%Y-%m-%d %H:%i:%s'), DATE_FORMAT(FROM_UNIXTIME(1700000000), '%Y-%m-%d %H:%i:%s')"
+  },
+  "postgres": {
+   "query": "SELECT to_char(timestamp '2024-01-31 10:00:00' + interval '1 month', 'YYYY-MM-DD HH24:MI:SS'), to_char(to_timestamp(1700000000) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')"
+  }
+ },
+ "function.datetime:julianday": {
+  "clickhouse": {
+   "query": "SELECT toUnixTimestamp(toDateTime('2000-01-01 12:00:00', 'UTC')) / 86400 + 2440587.5"
+  },
+  "duckdb": {
+   "query": "SELECT julian(TIMESTAMP '2000-01-01 12:00:00')"
+  },
+  "mysql": {
+   "query": "SELECT TO_DAYS('2000-01-01 12:00:00') + 1721059.5 + TIME_TO_SEC(TIME('2000-01-01 12:00:00')) / 86400"
+  },
+  "postgres": {
+   "query": "SELECT extract(julian from timestamp '2000-01-01 12:00:00') - 0.5"
+  }
+ },
+ "function.datetime:strftime": {
+  "clickhouse": {
+   "query": "SELECT formatDateTime(toDateTime('2024-03-15 08:05:00', 'UTC'), '%Y-%m-%d %H:%i %j %w')"
+  }
+ },
+ "function.datetime:time": {
+  "clickhouse": {
+   "query": "SELECT formatDateTime(toDateTime('2024-01-01 13:45:30', 'UTC'), '%H:%i:%S'), formatDateTime(toDateTime('1970-01-01 13:45:00', 'UTC') + INTERVAL 30 MINUTE, '%H:%i:%S')"
+  },
+  "duckdb": {
+   "query": "SELECT (TIMESTAMP '2024-01-01 13:45:30')::TIME::VARCHAR, (TIME '13:45' + INTERVAL 30 MINUTE)::VARCHAR"
+  },
+  "mysql": {
+   "query": "SELECT TIME_FORMAT(TIME('2024-01-01 13:45:30'), '%H:%i:%s'), TIME_FORMAT(ADDTIME('13:45:00', '00:30:00'), '%H:%i:%s')"
+  },
+  "postgres": {
+   "query": "SELECT (timestamp '2024-01-01 13:45:30')::time::text, (time '13:45' + interval '30 minutes')::text"
+  }
+ },
+ "function.datetime:timediff": {
+  "clickhouse": {
+   "query": "SELECT dateDiff('day', toDate('2024-01-01'), toDate('2024-03-15'))"
+  },
+  "duckdb": {
+   "query": "SELECT age(TIMESTAMP '2024-03-15', TIMESTAMP '2024-01-01')::VARCHAR"
+  },
+  "postgres": {
+   "query": "SELECT to_char(age(timestamp '2024-03-15', timestamp '2024-01-01'), '\"+\"YYYY-MM-DD HH24:MI:SS.MS')"
+  }
+ },
+ "function.datetime:unixepoch": {
+  "clickhouse": {
+   "query": "SELECT toUnixTimestamp(toDateTime('2024-01-01 00:00:00', 'UTC'))"
+  },
+  "duckdb": {
+   "query": "SELECT epoch(TIMESTAMP '2024-01-01 00:00:00')::BIGINT"
+  },
+  "mysql": {
+   "query": "SELECT UNIX_TIMESTAMP('2024-01-01 00:00:00')"
+  },
+  "postgres": {
+   "query": "SELECT extract(epoch from timestamp '2024-01-01 00:00:00')::bigint"
+  }
+ },
+ "function.json:json": {
+  "clickhouse": {
+   "query": "SELECT toString(' {\"x\" : 1} '::JSON)"
+  },
+  "mysql": {
+   "query": "SELECT CAST(' {\"x\" : 1} ' AS JSON)"
+  }
+ },
+ "function.json:json_array": {
+  "clickhouse": {
+   "query": "SELECT toJSONString(tuple(1, 'a', NULL, 2.5))"
+  }
+ },
+ "function.json:json_array_insert": {
+  "clickhouse": "none: ClickHouse has no function that edits a JSON document",
+  "duckdb": "none: DuckDB has no function that inserts into a JSON array",
+  "mysql": {
+   "query": "SELECT JSON_ARRAY_INSERT('[1,3]', '$[1]', 2)"
+  },
+  "postgres": {
+   "query": "SELECT jsonb_insert('[1,3]'::jsonb, '{1}', '2')::text"
+  }
+ },
+ "function.json:json_array_length": {
+  "clickhouse": {
+   "query": "SELECT JSONLength('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', 'b')"
+  },
+  "mysql": {
+   "query": "SELECT JSON_LENGTH('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.b')"
+  },
+  "postgres": {
+   "query": "SELECT jsonb_array_length('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}'::jsonb -> 'b')"
+  }
+ },
+ "function.json:json_each": {
+  "clickhouse": {
+   "query": "SELECT kv.1 AS key, kv.2 AS value, lower(toString(JSONType('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', kv.1))) FROM (SELECT arrayJoin(JSONExtractKeysAndValuesRaw('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}')) AS kv) ORDER BY key"
+  },
+  "mysql": {
+   "query": "SELECT jt.k, JSON_EXTRACT('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', CONCAT('$.', jt.k)), LOWER(JSON_TYPE(JSON_EXTRACT('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', CONCAT('$.', jt.k)))) FROM JSON_TABLE(JSON_KEYS('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}'), '$[*]' COLUMNS (k VARCHAR(16) PATH '$')) AS jt ORDER BY jt.k"
+  },
+  "postgres": {
+   "query": "SELECT key, value, jsonb_typeof(value) FROM jsonb_each('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}'::jsonb) ORDER BY key"
+  }
+ },
+ "function.json:json_error_position": {
+  "clickhouse": "none: ClickHouse tells valid JSON from invalid (isValidJSON) but not where it breaks",
+  "duckdb": "none: DuckDB tells valid JSON from invalid (json_valid) but not where it breaks",
+  "mysql": "none: MySQL tells valid JSON from invalid (JSON_VALID) but not where it breaks",
+  "postgres": "none: PostgreSQL tells valid JSON from invalid (IS JSON) but not where it breaks"
+ },
+ "function.json:json_extract": {
+  "clickhouse": {
+   "query": "SELECT JSONExtractInt('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', 'b', 3, 'c'), concat('[', JSONExtractRaw('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', 'a'), ',', JSONExtractRaw('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', 'd'), ']')"
+  },
+  "mysql": {
+   "query": "SELECT JSON_UNQUOTE(JSON_EXTRACT('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.b[2].c')), JSON_EXTRACT('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.a', '$.d')"
+  }
+ },
+ "function.json:json_group_array": {
+  "clickhouse": {
+   "query": "SELECT toJSONString(groupArray(a)) FROM (SELECT a FROM t ORDER BY a)"
+  },
+  "duckdb": {
+   "query": "SELECT json_group_array(a) FROM (SELECT a FROM t ORDER BY a)"
+  },
+  "mysql": {
+   "query": "SELECT JSON_ARRAYAGG(a) FROM (SELECT a FROM t ORDER BY a) AS s"
+  }
+ },
+ "function.json:json_group_object": {
+  "clickhouse": {
+   "query": "SELECT toJSONString(CAST(groupArray(tuple(b, a)), 'Map(String, Int32)')) FROM (SELECT a, b FROM t WHERE b IS NOT NULL ORDER BY a)"
+  },
+  "mysql": {
+   "query": "SELECT JSON_OBJECTAGG(b, a) FROM (SELECT a, b FROM t WHERE b IS NOT NULL ORDER BY a) AS s"
+  }
+ },
+ "function.json:json_insert": {
+  "clickhouse": "none: ClickHouse has no function that edits a JSON document",
+  "duckdb": "none: DuckDB's json extension has no json_insert() (json_merge_patch and json_transform reshape documents instead)",
+  "postgres": {
+   "query": "SELECT ('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}'::jsonb || jsonb_build_object('e', 5))::text"
+  }
+ },
+ "function.json:json_object": {
+  "clickhouse": {
+   "query": "SELECT toJSONString(CAST(tuple(1, 'x'), 'Tuple(k UInt8, v String)'))"
+  }
+ },
+ "function.json:json_patch": {
+  "clickhouse": "none: ClickHouse has no function that edits a JSON document",
+  "duckdb": {
+   "query": "SELECT json_merge_patch('{\"a\":1,\"b\":2}', '{\"b\":null,\"c\":3}')"
+  },
+  "mysql": {
+   "query": "SELECT JSON_MERGE_PATCH('{\"a\":1,\"b\":2}', '{\"b\":null,\"c\":3}')"
+  },
+  "postgres": {
+   "query": "SELECT ('{\"a\":1,\"b\":2}'::jsonb || '{\"b\":null,\"c\":3}'::jsonb)::text"
+  }
+ },
+ "function.json:json_pretty": {
+  "clickhouse": "none: ClickHouse has no JSON pretty-printer",
+  "postgres": {
+   "query": "SELECT jsonb_pretty('{\"a\":[1,2]}'::jsonb)"
+  }
+ },
+ "function.json:json_quote": {
+  "clickhouse": {
+   "query": "SELECT toJSONString('a\"b'), toJSONString(3)"
+  },
+  "mysql": {
+   "query": "SELECT JSON_QUOTE('a\"b'), CAST(3 AS JSON)"
+  },
+  "postgres": {
+   "query": "SELECT to_json('a\"b'::text)::text, to_json(3)::text"
+  }
+ },
+ "function.json:json_remove": {
+  "clickhouse": "none: ClickHouse has no function that edits a JSON document",
+  "duckdb": "none: DuckDB's json extension has no json_remove() (json_merge_patch and json_transform reshape documents instead)",
+  "postgres": {
+   "query": "SELECT ('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}'::jsonb - 'b' - 'd')::text"
+  }
+ },
+ "function.json:json_replace": {
+  "clickhouse": "none: ClickHouse has no function that edits a JSON document",
+  "duckdb": "none: DuckDB's json extension has no json_replace() (json_merge_patch and json_transform reshape documents instead)",
+  "postgres": {
+   "query": "SELECT jsonb_set(jsonb_set('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}'::jsonb, '{a}', '7', false), '{zz}', '1', false)::text"
+  }
+ },
+ "function.json:json_set": {
+  "clickhouse": "none: ClickHouse has no function that edits a JSON document",
+  "duckdb": "none: DuckDB's json extension has no json_set() (json_merge_patch and json_transform reshape documents instead)",
+  "postgres": {
+   "query": "SELECT jsonb_set(jsonb_set('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}'::jsonb, '{a}', '8'), '{e}', '\"n\"')::text"
+  }
+ },
+ "function.json:json_tree": {
+  "clickhouse": "none: ClickHouse has no recursive JSON walk with SQLite's columns",
+  "duckdb": "none: DuckDB has no recursive JSON walk with SQLite's fullkey and type columns",
+  "mysql": "none: MySQL has no recursive JSON walk with SQLite's fullkey and type columns",
+  "postgres": "none: PostgreSQL has no recursive JSON walk with SQLite's fullkey and type columns (jsonb_path_query('$.**') walks values only)"
+ },
+ "function.json:json_type": {
+  "clickhouse": {
+   "query": "SELECT lower(toString(JSONType('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', 'b'))), lower(toString(JSONType('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', 'd')))"
+  },
+  "mysql": {
+   "query": "SELECT LOWER(JSON_TYPE(JSON_EXTRACT('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.b'))), LOWER(JSON_TYPE(JSON_EXTRACT('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.d')))"
+  },
+  "postgres": {
+   "query": "SELECT jsonb_typeof('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}'::jsonb -> 'b'), jsonb_typeof('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}'::jsonb -> 'd')"
+  }
+ },
+ "function.json:json_valid": {
+  "clickhouse": {
+   "query": "SELECT isValidJSON('{\"a\":1}'), isValidJSON('{a:1}'), isValidJSON('{a:1}')"
+  },
+  "duckdb": {
+   "query": "SELECT json_valid('{\"a\":1}'), json_valid('{a:1}'), json_valid('{a:1}')"
+  },
+  "mysql": {
+   "query": "SELECT JSON_VALID('{\"a\":1}'), JSON_VALID('{a:1}'), JSON_VALID('{a:1}')"
+  },
+  "postgres": {
+   "query": "SELECT '{\"a\":1}' IS JSON, '{a:1}' IS JSON, '{a:1}' IS JSON"
+  }
+ },
+ "function.json:jsonb": {
+  "clickhouse": "none: ClickHouse has no binary JSON functions (its JSON type keeps paths as columns)",
+  "duckdb": {
+   "query": "SELECT json('{\"a\":1}')"
+  },
+  "mysql": {
+   "query": "SELECT CAST('{\"a\":1}' AS JSON)"
+  },
+  "postgres": {
+   "query": "SELECT '{\"a\":1}'::jsonb::text"
+  }
+ },
+ "function.json:jsonb_array": {
+  "clickhouse": {
+   "query": "SELECT toJSONString(tuple(1, 2))"
+  },
+  "duckdb": {
+   "query": "SELECT json_array(1, 2)"
+  },
+  "mysql": {
+   "query": "SELECT JSON_ARRAY(1, 2)"
+  },
+  "postgres": {
+   "query": "SELECT jsonb_build_array(1, 2)::text"
+  }
+ },
+ "function.json:jsonb_array_insert": {
+  "clickhouse": "none: ClickHouse has no binary JSON functions (its JSON type keeps paths as columns)",
+  "duckdb": "none: DuckDB has no function that inserts into a JSON array",
+  "mysql": {
+   "query": "SELECT JSON_ARRAY_INSERT('[1,3]', '$[1]', 2)"
+  },
+  "postgres": {
+   "query": "SELECT jsonb_insert('[1,3]'::jsonb, '{1}', '2')::text"
+  }
+ },
+ "function.json:jsonb_each": {
+  "clickhouse": "none: ClickHouse has no binary JSON functions (its JSON type keeps paths as columns)",
+  "duckdb": {
+   "query": "SELECT key FROM json_each('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}') ORDER BY key"
+  },
+  "mysql": {
+   "query": "SELECT jt.k FROM JSON_TABLE(JSON_KEYS('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}'), '$[*]' COLUMNS (k VARCHAR(16) PATH '$')) AS jt ORDER BY jt.k"
+  },
+  "postgres": {
+   "query": "SELECT key FROM jsonb_each('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}'::jsonb) ORDER BY key"
+  }
+ },
+ "function.json:jsonb_extract": {
+  "clickhouse": {
+   "query": "SELECT JSONExtractRaw('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', 'b')"
+  },
+  "duckdb": {
+   "query": "SELECT json_extract('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.b')"
+  },
+  "mysql": {
+   "query": "SELECT JSON_EXTRACT('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.b')"
+  },
+  "postgres": {
+   "query": "SELECT ('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}'::jsonb -> 'b')::text"
+  }
+ },
+ "function.json:jsonb_group_array": {
+  "clickhouse": {
+   "query": "SELECT toJSONString(groupArray(a)) FROM (SELECT a FROM t ORDER BY a)"
+  },
+  "duckdb": {
+   "query": "SELECT json_group_array(a) FROM (SELECT a FROM t ORDER BY a)"
+  },
+  "mysql": {
+   "query": "SELECT JSON_ARRAYAGG(a) FROM (SELECT a FROM t ORDER BY a) AS s"
+  },
+  "postgres": {
+   "query": "SELECT jsonb_agg(a ORDER BY a)::text FROM t"
+  }
+ },
+ "function.json:jsonb_group_object": {
+  "clickhouse": {
+   "query": "SELECT toJSONString(CAST(groupArray(tuple(b, a)), 'Map(String, Int32)')) FROM (SELECT a, b FROM t WHERE b IS NOT NULL ORDER BY a)"
+  },
+  "duckdb": {
+   "query": "SELECT json_group_object(b, a) FROM (SELECT a, b FROM t WHERE b IS NOT NULL ORDER BY a)"
+  },
+  "mysql": {
+   "query": "SELECT JSON_OBJECTAGG(b, a) FROM (SELECT a, b FROM t WHERE b IS NOT NULL ORDER BY a) AS s"
+  },
+  "postgres": {
+   "query": "SELECT jsonb_object_agg(b, a)::text FROM t WHERE b IS NOT NULL"
+  }
+ },
+ "function.json:jsonb_insert": {
+  "clickhouse": "none: ClickHouse has no binary JSON functions (its JSON type keeps paths as columns)",
+  "duckdb": "none: DuckDB has no JSON insert function",
+  "mysql": {
+   "query": "SELECT JSON_INSERT('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.e', 5)"
+  },
+  "postgres": {
+   "query": "SELECT ('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}'::jsonb || jsonb_build_object('e', 5))::text"
+  }
+ },
+ "function.json:jsonb_object": {
+  "clickhouse": {
+   "query": "SELECT toJSONString(CAST(tuple(1), 'Tuple(k UInt8)'))"
+  },
+  "duckdb": {
+   "query": "SELECT json_object('k', 1)"
+  },
+  "mysql": {
+   "query": "SELECT JSON_OBJECT('k', 1)"
+  },
+  "postgres": {
+   "query": "SELECT jsonb_build_object('k', 1)::text"
+  }
+ },
+ "function.json:jsonb_patch": {
+  "clickhouse": "none: ClickHouse has no binary JSON functions (its JSON type keeps paths as columns)",
+  "duckdb": {
+   "query": "SELECT json_merge_patch('{\"a\":1}', '{\"b\":2}')"
+  },
+  "mysql": {
+   "query": "SELECT JSON_MERGE_PATCH('{\"a\":1}', '{\"b\":2}')"
+  },
+  "postgres": {
+   "query": "SELECT ('{\"a\":1}'::jsonb || '{\"b\":2}'::jsonb)::text"
+  }
+ },
+ "function.json:jsonb_remove": {
+  "clickhouse": "none: ClickHouse has no binary JSON functions (its JSON type keeps paths as columns)",
+  "duckdb": "none: DuckDB has no JSON remove function",
+  "mysql": {
+   "query": "SELECT JSON_REMOVE('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.b')"
+  },
+  "postgres": {
+   "query": "SELECT ('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}'::jsonb - 'b')::text"
+  }
+ },
+ "function.json:jsonb_replace": {
+  "clickhouse": "none: ClickHouse has no binary JSON functions (its JSON type keeps paths as columns)",
+  "duckdb": "none: DuckDB has no JSON replace function",
+  "mysql": {
+   "query": "SELECT JSON_REPLACE('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.a', 2)"
+  },
+  "postgres": {
+   "query": "SELECT jsonb_set('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}'::jsonb, '{a}', '2', false)::text"
+  }
+ },
+ "function.json:jsonb_set": {
+  "clickhouse": "none: ClickHouse has no binary JSON functions (its JSON type keeps paths as columns)",
+  "duckdb": "none: DuckDB has no JSON set function",
+  "mysql": {
+   "query": "SELECT JSON_SET('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.a', 3)"
+  },
+  "postgres": {
+   "query": "SELECT jsonb_set('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}'::jsonb, '{a}', '3')::text"
+  }
+ },
+ "function.json:jsonb_tree": {
+  "clickhouse": "none: ClickHouse has no binary JSON functions (its JSON type keeps paths as columns)",
+  "duckdb": "none: DuckDB has no recursive JSON walk with SQLite's columns",
+  "mysql": "none: MySQL has no recursive JSON walk with SQLite's columns",
+  "postgres": "none: PostgreSQL has no recursive JSON walk with SQLite's columns"
+ },
+ "function.math:acosh": {
+  "clickhouse": {
+   "query": "SELECT round(acosh(2), 6)"
+  },
+  "mysql": {
+   "query": "SELECT ROUND(LN(2 + SQRT(2 * 2 - 1)), 6)"
+  }
+ },
+ "function.math:asinh": {
+  "clickhouse": {
+   "query": "SELECT round(asinh(1), 6)"
+  },
+  "mysql": {
+   "query": "SELECT ROUND(LN(1 + SQRT(1 * 1 + 1)), 6)"
+  }
+ },
+ "function.math:atan2": {
+  "postgres": {
+   "query": "SELECT round(atan2(1, 2)::numeric, 6)"
+  }
+ },
+ "function.math:atanh": {
+  "clickhouse": {
+   "query": "SELECT round(atanh(0.5), 6)"
+  },
+  "mysql": {
+   "query": "SELECT ROUND(0.5 * LN((1 + 0.5) / (1 - 0.5)), 6)"
+  }
+ },
+ "function.math:cosh": {
+  "clickhouse": {
+   "query": "SELECT round(cosh(1), 6)"
+  },
+  "mysql": {
+   "query": "SELECT ROUND((EXP(1) + EXP(-1)) / 2, 6)"
+  }
+ },
+ "function.math:sinh": {
+  "clickhouse": {
+   "query": "SELECT round(sinh(1), 6)"
+  },
+  "mysql": {
+   "query": "SELECT ROUND((EXP(1) - EXP(-1)) / 2, 6)"
+  }
+ },
+ "function.math:tanh": {
+  "clickhouse": {
+   "query": "SELECT round(tanh(1), 6)"
+  },
+  "mysql": {
+   "query": "SELECT ROUND((EXP(1) - EXP(-1)) / (EXP(1) + EXP(-1)), 6)"
+  }
+ },
+ "function.window:cume_dist": {
+  "clickhouse": {
+   "query": "SELECT a, (count(*) OVER (ORDER BY a RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) / (count(*) OVER ()) FROM t ORDER BY a"
+  }
+ },
+ "keyword:ACTION": {
+  "clickhouse": "none: ClickHouse has no foreign keys"
+ },
+ "keyword:CONSTRAINT": {
+  "clickhouse": {
+   "query": "INSERT INTO kc VALUES (1); SELECT a FROM kc",
+   "setup": [
+    "CREATE TABLE kc(a Int32, CONSTRAINT pos CHECK a > 0) ENGINE = MergeTree ORDER BY a"
+   ]
+  }
+ },
+ "keyword:FAIL": {
+  "clickhouse": {
+   "query": "INSERT INTO kp VALUES (2); SELECT count(*) FROM kp"
+  },
+  "duckdb": {
+   "query": "INSERT INTO kp VALUES (2); SELECT count(*) FROM kp"
+  },
+  "mysql": {
+   "query": "INSERT INTO kp VALUES (2); SELECT count(*) FROM kp"
+  },
+  "postgres": {
+   "query": "INSERT INTO kp VALUES (2); SELECT count(*) FROM kp"
+  }
+ },
+ "keyword:NO": {
+  "clickhouse": "none: ClickHouse has no foreign keys"
+ },
+ "keyword:OTHERS": {
+  "clickhouse": {
+   "query": "SELECT a, sum(a) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY a"
+  },
+  "mysql": {
+   "query": "SELECT a, SUM(a) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY a"
+  }
+ },
+ "keyword:RESTRICT": {
+  "clickhouse": "none: ClickHouse has no foreign keys"
+ },
+ "operator:&": {
+  "clickhouse": {
+   "query": "SELECT bitAnd(6, 3)"
+  }
+ },
+ "operator:- (unary)": {
+  "clickhouse": {
+   "query": "SELECT -(3), -toInt32('4')"
+  },
+  "duckdb": {
+   "query": "SELECT -(3), -('4'::INTEGER)"
+  },
+  "postgres": {
+   "query": "SELECT -(3), -('4'::numeric)"
+  }
+ },
+ "operator:->>": {
+  "mysql": {
+   "query": "SELECT JSON_UNQUOTE(JSON_EXTRACT('{\"a\":{\"b\":2}}', '$.a.b'))"
+  }
+ },
+ "operator:<<": {
+  "clickhouse": {
+   "query": "SELECT bitShiftLeft(1, 4)"
+  }
+ },
+ "operator:>>": {
+  "clickhouse": {
+   "query": "SELECT bitShiftRight(256, 2)"
+  }
+ },
+ "operator:CAST#3": {
+  "duckdb": "none: DuckDB refuses text that isn't a whole number rather than reading its numeric prefix",
+  "postgres": "none: PostgreSQL refuses text that isn't a whole number rather than reading its numeric prefix"
+ },
+ "operator:COLLATE": {
+  "clickhouse": "none: ClickHouse compares strings by bytes: COLLATE orders an ORDER BY, it doesn't change a comparison",
+  "mysql": {
+   "query": "SELECT 'a' = 'A' COLLATE utf8mb4_0900_ai_ci",
+   "setup_tail": []
+  },
+  "postgres": {
+   "query": "SELECT 'a' = 'A' COLLATE nocase",
+   "setup_tail": [
+    "CREATE COLLATION nocase (provider = icu, locale = 'und-u-ks-level2', deterministic = false)"
+   ]
+  }
+ },
+ "operator:GLOB": {
+  "clickhouse": {
+   "query": "SELECT match('abc', '^a.c$')"
+  },
+  "mysql": {
+   "query": "SELECT REGEXP_LIKE('abc', '^a.c$', 'c')"
+  },
+  "postgres": {
+   "query": "SELECT 'abc' ~ '^a.c$'"
+  }
+ },
+ "operator:IS": {
+  "clickhouse": {
+   "query": "SELECT isNotDistinctFrom(NULL, NULL), isNotDistinctFrom(1, 1)"
+  },
+  "duckdb": {
+   "query": "SELECT NULL IS NOT DISTINCT FROM NULL, 1 IS NOT DISTINCT FROM 1"
+  },
+  "mysql": {
+   "query": "SELECT NULL <=> NULL, 1 <=> 1"
+  },
+  "postgres": {
+   "query": "SELECT NULL IS NOT DISTINCT FROM NULL, 1 IS NOT DISTINCT FROM 1"
+  }
+ },
+ "operator:MATCH": {
+  "clickhouse": {
+   "query": "SELECT body FROM ft WHERE hasToken(body, 'hello')",
+   "setup": [
+    "CREATE TABLE ft(body String) ENGINE = MergeTree ORDER BY tuple()",
+    "INSERT INTO ft VALUES ('hello world'), ('goodbye')"
+   ]
+  },
+  "duckdb": "none: DuckDB's full-text search is the fts extension (PRAGMA create_fts_index), installed apart",
+  "mysql": {
+   "query": "SELECT body FROM ft WHERE MATCH(body) AGAINST ('hello')",
+   "setup": [
+    "CREATE TABLE ft(body TEXT, FULLTEXT (body)) ENGINE = InnoDB",
+    "INSERT INTO ft VALUES ('hello world'), ('goodbye')"
+   ]
+  },
+  "postgres": {
+   "query": "SELECT body FROM ft WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'hello')",
+   "setup": [
+    "CREATE TABLE ft(body TEXT)",
+    "INSERT INTO ft VALUES ('hello world'), ('goodbye')"
+   ]
+  }
+ },
+ "operator:NOT GLOB": {
+  "clickhouse": {
+   "query": "SELECT NOT match('abc', '^A')"
+  },
+  "mysql": {
+   "query": "SELECT NOT REGEXP_LIKE('abc', '^A', 'c')"
+  },
+  "postgres": {
+   "query": "SELECT 'abc' !~ '^A'"
+  }
+ },
+ "operator:NOT MATCH": {
+  "clickhouse": "none: SQLite's NOT MATCH needs an application-defined match()",
+  "duckdb": "none: SQLite's NOT MATCH needs an application-defined match()",
+  "mysql": "none: SQLite's NOT MATCH needs an application-defined match(); MySQL negates NOT MATCH(...) AGAINST (...)",
+  "postgres": "none: SQLite's NOT MATCH needs an application-defined match(); PostgreSQL negates a text search with NOT (... @@ ...)"
+ },
+ "operator:NOT REGEXP": {
+  "clickhouse": {
+   "query": "SELECT NOT match('abc', 'z')"
+  },
+  "duckdb": {
+   "query": "SELECT NOT regexp_matches('abc', 'z')"
+  },
+  "postgres": {
+   "query": "SELECT 'abc' !~ 'z'"
+  }
+ },
+ "operator:REGEXP": {
+  "clickhouse": {
+   "query": "SELECT match('abc', 'b'), match('abc', '^b')"
+  },
+  "duckdb": {
+   "query": "SELECT regexp_matches('abc', 'b'), regexp_matches('abc', '^b')"
+  },
+  "postgres": {
+   "query": "SELECT 'abc' ~ 'b', 'abc' ~ '^b'"
+  }
+ },
+ "operator:|": {
+  "clickhouse": {
+   "query": "SELECT bitOr(6, 3)"
+  }
+ },
+ "operator:~": {
+  "clickhouse": {
+   "query": "SELECT bitNot(5)"
+  }
+ },
+ "parameter:?NNN": {
+  "duckdb": {
+   "query": "SELECT $1 + 1"
+  }
+ },
+ "pragma:analysis_limit": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA analysis_limit",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA analysis_limit",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA analysis_limit"
+ },
+ "pragma:application_id": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA application_id",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA application_id",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA application_id"
+ },
+ "pragma:auto_vacuum": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA auto_vacuum",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA auto_vacuum",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA auto_vacuum"
+ },
+ "pragma:automatic_index": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA automatic_index",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA automatic_index",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA automatic_index"
+ },
+ "pragma:busy_timeout": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA busy_timeout",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA busy_timeout",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA busy_timeout"
+ },
+ "pragma:cache_size": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA cache_size",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA cache_size",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA cache_size"
+ },
+ "pragma:cache_spill": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA cache_spill",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA cache_spill",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA cache_spill"
+ },
+ "pragma:case_sensitive_like": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA case_sensitive_like",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA case_sensitive_like",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA case_sensitive_like"
+ },
+ "pragma:cell_size_check": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA cell_size_check",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA cell_size_check",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA cell_size_check"
+ },
+ "pragma:checkpoint_fullfsync": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA checkpoint_fullfsync",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA checkpoint_fullfsync",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA checkpoint_fullfsync"
+ },
+ "pragma:collation_list": {
+  "clickhouse": {
+   "query": "SELECT name FROM system.collations LIMIT 0"
+  },
+  "duckdb": {
+   "query": "SELECT collname FROM pragma_collations() LIMIT 0"
+  },
+  "mysql": {
+   "query": "SELECT collation_name FROM information_schema.collations LIMIT 0"
+  },
+  "postgres": {
+   "query": "SELECT collname FROM pg_collation LIMIT 0"
+  }
+ },
+ "pragma:compile_options": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA compile_options",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA compile_options",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA compile_options"
+ },
+ "pragma:count_changes": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA count_changes",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA count_changes",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA count_changes"
+ },
+ "pragma:data_store_directory": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA data_store_directory",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA data_store_directory",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA data_store_directory"
+ },
+ "pragma:data_version": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA data_version",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA data_version",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA data_version"
+ },
+ "pragma:database_list": {
+  "clickhouse": {
+   "query": "SELECT 0, currentDatabase(), ''"
+  },
+  "duckdb": {
+   "query": "PRAGMA database_list"
+  },
+  "mysql": {
+   "query": "SELECT 0, database(), ''"
+  },
+  "postgres": {
+   "query": "SELECT 0, current_database(), ''"
+  }
+ },
+ "pragma:default_cache_size": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA default_cache_size",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA default_cache_size",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA default_cache_size"
+ },
+ "pragma:defer_foreign_keys": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA defer_foreign_keys",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA defer_foreign_keys",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA defer_foreign_keys"
+ },
+ "pragma:empty_result_callbacks": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA empty_result_callbacks",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA empty_result_callbacks",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA empty_result_callbacks"
+ },
+ "pragma:encoding": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA encoding",
+  "mysql": {
+   "query": "SELECT @@character_set_database"
+  },
+  "postgres": {
+   "query": "SHOW server_encoding"
+  }
+ },
+ "pragma:foreign_key_check": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA foreign_key_check",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA foreign_key_check",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA foreign_key_check"
+ },
+ "pragma:foreign_key_list": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA foreign_key_list",
+  "duckdb": {
+   "query": "SELECT constraint_text FROM duckdb_constraints() WHERE table_name = 't' AND constraint_type = 'FOREIGN KEY'"
+  },
+  "mysql": {
+   "query": "SELECT constraint_name FROM information_schema.table_constraints WHERE table_name = 't' AND constraint_type = 'FOREIGN KEY' AND table_schema = database()"
+  },
+  "postgres": {
+   "query": "SELECT constraint_name FROM information_schema.table_constraints WHERE table_name = 't' AND constraint_type = 'FOREIGN KEY'"
+  }
+ },
+ "pragma:foreign_keys": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA foreign_keys",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA foreign_keys",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA foreign_keys"
+ },
+ "pragma:freelist_count": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA freelist_count",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA freelist_count",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA freelist_count"
+ },
+ "pragma:full_column_names": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA full_column_names",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA full_column_names",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA full_column_names"
+ },
+ "pragma:fullfsync": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA fullfsync",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA fullfsync",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA fullfsync"
+ },
+ "pragma:function_list": {
+  "clickhouse": {
+   "query": "SELECT name FROM system.functions LIMIT 0"
+  },
+  "duckdb": {
+   "query": "SELECT function_name FROM duckdb_functions() LIMIT 0"
+  },
+  "mysql": {
+   "query": "SELECT routine_name FROM information_schema.routines LIMIT 0"
+  },
+  "postgres": {
+   "query": "SELECT DISTINCT proname FROM pg_proc LIMIT 0"
+  }
+ },
+ "pragma:hard_heap_limit": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA hard_heap_limit",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA hard_heap_limit",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA hard_heap_limit"
+ },
+ "pragma:ignore_check_constraints": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA ignore_check_constraints",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA ignore_check_constraints",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA ignore_check_constraints"
+ },
+ "pragma:incremental_vacuum": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA incremental_vacuum",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA incremental_vacuum",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA incremental_vacuum"
+ },
+ "pragma:index_info": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA index_info",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA index_info",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA index_info"
+ },
+ "pragma:index_list": {
+  "clickhouse": {
+   "query": "SELECT name FROM system.data_skipping_indices WHERE table = 't' AND database = currentDatabase()",
+   "setup_tail": [
+    "CREATE INDEX ti ON t(a) TYPE minmax GRANULARITY 1"
+   ]
+  },
+  "duckdb": {
+   "query": "SELECT index_name FROM duckdb_indexes() WHERE table_name = 't'"
+  },
+  "mysql": {
+   "query": "SELECT DISTINCT index_name FROM information_schema.statistics WHERE table_name = 't' AND table_schema = database()"
+  },
+  "postgres": {
+   "query": "SELECT indexname FROM pg_indexes WHERE tablename = 't' AND schemaname = current_schema()"
+  }
+ },
+ "pragma:index_xinfo": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA index_xinfo",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA index_xinfo",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA index_xinfo"
+ },
+ "pragma:integrity_check": {
+  "clickhouse": {
+   "query": "CHECK TABLE t"
+  },
+  "mysql": {
+   "query": "CHECK TABLE t"
+  },
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA integrity_check"
+ },
+ "pragma:journal_mode": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA journal_mode",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA journal_mode",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA journal_mode"
+ },
+ "pragma:journal_size_limit": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA journal_size_limit",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA journal_size_limit",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA journal_size_limit"
+ },
+ "pragma:legacy_alter_table": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA legacy_alter_table",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA legacy_alter_table",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA legacy_alter_table"
+ },
+ "pragma:legacy_file_format": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA legacy_file_format",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA legacy_file_format",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA legacy_file_format"
+ },
+ "pragma:locking_mode": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA locking_mode",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA locking_mode",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA locking_mode"
+ },
+ "pragma:max_page_count": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA max_page_count",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA max_page_count",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA max_page_count"
+ },
+ "pragma:mmap_size": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA mmap_size",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA mmap_size",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA mmap_size"
+ },
+ "pragma:module_list": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA module_list",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA module_list",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA module_list"
+ },
+ "pragma:optimize": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA optimize",
+  "duckdb": {
+   "query": "ANALYZE"
+  },
+  "mysql": {
+   "query": "ANALYZE TABLE t"
+  },
+  "postgres": {
+   "query": "ANALYZE"
+  }
+ },
+ "pragma:page_count": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA page_count",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA page_count",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA page_count"
+ },
+ "pragma:page_size": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA page_size",
+  "duckdb": {
+   "query": "SELECT current_setting('default_block_size') IS NOT NULL"
+  },
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA page_size",
+  "postgres": {
+   "query": "SHOW block_size"
+  }
+ },
+ "pragma:parser_trace": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA parser_trace",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA parser_trace",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA parser_trace"
+ },
+ "pragma:pragma_list": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA pragma_list",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA pragma_list",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA pragma_list"
+ },
+ "pragma:query_only": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA query_only",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA query_only",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA query_only"
+ },
+ "pragma:quick_check": {
+  "clickhouse": {
+   "query": "CHECK TABLE t"
+  },
+  "mysql": {
+   "query": "CHECK TABLE t QUICK"
+  },
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA quick_check"
+ },
+ "pragma:read_uncommitted": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA read_uncommitted",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA read_uncommitted",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA read_uncommitted"
+ },
+ "pragma:recursive_triggers": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA recursive_triggers",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA recursive_triggers",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA recursive_triggers"
+ },
+ "pragma:reverse_unordered_selects": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA reverse_unordered_selects",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA reverse_unordered_selects",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA reverse_unordered_selects"
+ },
+ "pragma:schema_version": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA schema_version",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA schema_version",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA schema_version"
+ },
+ "pragma:secure_delete": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA secure_delete",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA secure_delete",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA secure_delete"
+ },
+ "pragma:short_column_names": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA short_column_names",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA short_column_names",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA short_column_names"
+ },
+ "pragma:shrink_memory": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA shrink_memory",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA shrink_memory",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA shrink_memory"
+ },
+ "pragma:soft_heap_limit": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA soft_heap_limit",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA soft_heap_limit",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA soft_heap_limit"
+ },
+ "pragma:stats": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA stats",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA stats",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA stats"
+ },
+ "pragma:synchronous": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA synchronous",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA synchronous",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA synchronous"
+ },
+ "pragma:table_info": {
+  "clickhouse": {
+   "query": "SELECT position - 1 AS cid, name, type, 0 AS notnull, default_expression AS dflt_value, is_in_primary_key AS pk FROM system.columns WHERE table = 't' AND database = currentDatabase()"
+  },
+  "duckdb": {
+   "query": "PRAGMA table_info('t')"
+  },
+  "mysql": {
+   "query": "SELECT ordinal_position - 1 AS cid, column_name AS name, upper(data_type) AS type, (is_nullable = 'NO') AS notnull, column_default AS dflt_value, 0 AS pk FROM information_schema.columns WHERE table_name = 't' AND table_schema = database()"
+  },
+  "postgres": {
+   "query": "SELECT ordinal_position - 1 AS cid, column_name AS name, upper(data_type) AS type, (is_nullable = 'NO')::int AS notnull, column_default AS dflt_value, 0 AS pk FROM information_schema.columns WHERE table_name = 't' AND table_schema = current_schema()"
+  }
+ },
+ "pragma:table_list": {
+  "clickhouse": {
+   "query": "SELECT database, name, engine FROM system.tables WHERE database = currentDatabase()"
+  },
+  "duckdb": {
+   "query": "SELECT schema_name, table_name, 'table' FROM duckdb_tables()"
+  },
+  "mysql": {
+   "query": "SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_schema = database()"
+  },
+  "postgres": {
+   "query": "SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_schema = current_schema()"
+  }
+ },
+ "pragma:table_xinfo": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA table_xinfo",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA table_xinfo",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA table_xinfo"
+ },
+ "pragma:temp_store": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA temp_store",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA temp_store",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA temp_store"
+ },
+ "pragma:temp_store_directory": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA temp_store_directory",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA temp_store_directory",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA temp_store_directory"
+ },
+ "pragma:threads": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA threads",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA threads",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA threads"
+ },
+ "pragma:trusted_schema": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA trusted_schema",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA trusted_schema",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA trusted_schema"
+ },
+ "pragma:user_version": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA user_version",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA user_version",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA user_version"
+ },
+ "pragma:vdbe_addoptrace": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA vdbe_addoptrace",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA vdbe_addoptrace",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA vdbe_addoptrace"
+ },
+ "pragma:vdbe_debug": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA vdbe_debug",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA vdbe_debug",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA vdbe_debug"
+ },
+ "pragma:vdbe_listing": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA vdbe_listing",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA vdbe_listing",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA vdbe_listing"
+ },
+ "pragma:vdbe_trace": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA vdbe_trace",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA vdbe_trace",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA vdbe_trace"
+ },
+ "pragma:wal_autocheckpoint": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA wal_autocheckpoint",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA wal_autocheckpoint",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA wal_autocheckpoint"
+ },
+ "pragma:wal_checkpoint": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA wal_checkpoint",
+  "duckdb": {
+   "query": "CHECKPOINT"
+  },
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA wal_checkpoint",
+  "postgres": {
+   "query": "CHECKPOINT"
+  }
+ },
+ "pragma:writable_schema": {
+  "clickhouse": "none: ClickHouse has no PRAGMA: settings are in system.settings and SET, the catalog in system tables; nothing there answers PRAGMA writable_schema",
+  "mysql": "none: MySQL has no PRAGMA: server settings are SHOW VARIABLES and SET, the catalog is information_schema; nothing there answers PRAGMA writable_schema",
+  "postgres": "none: PostgreSQL has no PRAGMA: server settings are SHOW and SET (postgresql.conf), the catalog is information_schema and pg_catalog; nothing there answers PRAGMA writable_schema"
+ },
+ "rule.affinity:the rules apply in order": {
+  "clickhouse": "none: ClickHouse takes only its own type names: SQLite's affinity from the letters of any declared type has no counterpart there",
+  "duckdb": "none: DuckDB takes only its own type names: SQLite's affinity from the letters of any declared type has no counterpart there",
+  "mysql": "none: MySQL takes only its own type names: SQLite's affinity from the letters of any declared type has no counterpart there",
+  "postgres": "none: PostgreSQL takes only its own type names: SQLite's affinity from the letters of any declared type has no counterpart there"
+ },
+ "rule.collation:IN uses the left operand's collation": {
+  "mysql": {
+   "query": "SELECT 'a' COLLATE utf8mb4_0900_ai_ci IN ('A'), 'a' IN ('A' COLLATE utf8mb4_0900_ai_ci)",
+   "setup_tail": []
+  },
+  "postgres": {
+   "query": "SELECT 'a' COLLATE nocase IN ('A'), 'a' IN ('A' COLLATE nocase)",
+   "setup_tail": [
+    "CREATE COLLATION nocase (provider = icu, locale = 'und-u-ks-level2', deterministic = false)"
+   ]
+  }
+ },
+ "rule.collation:ORDER BY uses COLLATE, then the column's#1": {
+  "mysql": {
+   "query": "SELECT t FROM r ORDER BY t COLLATE utf8mb4_bin",
+   "setup_tail": [
+    "CREATE TABLE r (t TEXT COLLATE utf8mb4_0900_ai_ci)",
+    "INSERT INTO r VALUES ('b'), ('A'), ('a'), ('B')"
+   ]
+  },
+  "postgres": {
+   "query": "SELECT t FROM r ORDER BY t COLLATE \"C\" NULLS FIRST",
+   "setup_tail": [
+    "CREATE COLLATION nocase (provider = icu, locale = 'und-u-ks-level2', deterministic = false)",
+    "CREATE TABLE r (t TEXT COLLATE nocase)",
+    "INSERT INTO r VALUES ('b'), ('A'), ('a'), ('B')"
+   ]
+  }
+ },
+ "rule.collation:ORDER BY uses COLLATE, then the column's#2": {
+  "mysql": {
+   "query": "SELECT t FROM r ORDER BY t, t COLLATE utf8mb4_bin",
+   "setup_tail": [
+    "CREATE TABLE r (t TEXT COLLATE utf8mb4_0900_ai_ci)",
+    "INSERT INTO r VALUES ('b'), ('A'), ('a'), ('B')"
+   ]
+  },
+  "postgres": {
+   "query": "SELECT t FROM r ORDER BY t NULLS FIRST, t COLLATE \"C\" NULLS FIRST",
+   "setup_tail": [
+    "CREATE COLLATION nocase (provider = icu, locale = 'und-u-ks-level2', deterministic = false)",
+    "CREATE TABLE r (t TEXT COLLATE nocase)",
+    "INSERT INTO r VALUES ('b'), ('A'), ('a'), ('B')"
+   ]
+  }
+ },
+ "rule.collation:an explicit COLLATE wins, left first": {
+  "mysql": {
+   "query": "SELECT t = 'A' COLLATE utf8mb4_bin, 'A' COLLATE utf8mb4_0900_ai_ci = t COLLATE utf8mb4_bin FROM r",
+   "setup_tail": [
+    "CREATE TABLE r (t TEXT COLLATE utf8mb4_0900_ai_ci)",
+    "INSERT INTO r VALUES ('a')"
+   ]
+  },
+  "postgres": {
+   "query": "SELECT t = 'A' COLLATE \"C\", 'A' COLLATE nocase = t COLLATE \"C\" FROM r",
+   "setup_tail": [
+    "CREATE COLLATION nocase (provider = icu, locale = 'und-u-ks-level2', deterministic = false)",
+    "CREATE TABLE r (t TEXT COLLATE nocase)",
+    "INSERT INTO r VALUES ('a')"
+   ]
+  }
+ },
+ "rule.collation:the leftmost COLLATE anywhere wins": {
+  "mysql": {
+   "query": "SELECT 'a' COLLATE utf8mb4_0900_ai_ci = ('A' COLLATE utf8mb4_bin), 'x' = CONCAT('X' COLLATE utf8mb4_0900_ai_ci, '')",
+   "setup_tail": []
+  },
+  "postgres": {
+   "query": "SELECT 'a' COLLATE nocase = ('A' COLLATE \"C\"), 'x' = ('X' COLLATE nocase) || ''",
+   "setup_tail": [
+    "CREATE COLLATION nocase (provider = icu, locale = 'und-u-ks-level2', deterministic = false)"
+   ]
+  }
+ },
+ "rule.collation:then a column's collation, left first": {
+  "mysql": {
+   "query": "SELECT x = y, y = x FROM r",
+   "setup_tail": [
+    "CREATE TABLE r (x TEXT COLLATE utf8mb4_0900_ai_ci, y TEXT COLLATE `BINARY`)",
+    "INSERT INTO r VALUES ('a', 'A')"
+   ]
+  },
+  "postgres": {
+   "query": "SELECT x = y, y = x FROM r",
+   "setup_tail": [
+    "CREATE COLLATION nocase (provider = icu, locale = 'und-u-ks-level2', deterministic = false)",
+    "CREATE TABLE r (x TEXT COLLATE nocase, y TEXT COLLATE \"C\")",
+    "INSERT INTO r VALUES ('a', 'A')"
+   ]
+  }
+ },
+ "rule.comparison:blobs compare by memcmp": {
+  "clickhouse": {
+   "query": "SELECT unhex('0102') < unhex('0201'), unhex('01') < unhex('0100')"
+  }
+ },
+ "rule.comparison:numbers before text and blobs": {
+  "clickhouse": "none: ClickHouse compares and stores values of one type at a time: a number against text is an error, not an ordering"
+ },
+ "rule.comparison:otherwise compared as is": {
+  "clickhouse": {
+   "query": "SELECT '10' = 10, unhex('31') = '1'"
+  }
+ },
+ "rule.comparison:text before blobs": {
+  "clickhouse": {
+   "query": "SELECT 'zzz' < unhex('00')"
+  }
+ },
+ "rule.comparison:text compares by collation": {
+  "mysql": {
+   "query": "SELECT 'a' < 'B', 'a' < 'B' COLLATE utf8mb4_0900_ai_ci",
+   "setup_tail": []
+  },
+  "postgres": {
+   "query": "SELECT 'a' < 'B', 'a' < 'B' COLLATE nocase",
+   "setup_tail": [
+    "CREATE COLLATION nocase (provider = icu, locale = 'und-u-ks-level2', deterministic = false)"
+   ]
+  }
+ },
+ "rule.expression-affinity:COLLATE keeps its operand's affinity": {
+  "mysql": {
+   "query": "SELECT (n COLLATE utf8mb4_0900_ai_ci) = '5' FROM r",
+   "setup_tail": [
+    "CREATE TABLE r (n INT)",
+    "INSERT INTO r VALUES (5)"
+   ]
+  },
+  "postgres": {
+   "query": "SELECT (n COLLATE nocase) = '5' FROM r",
+   "setup_tail": [
+    "CREATE COLLATION nocase (provider = icu, locale = 'und-u-ks-level2', deterministic = false)",
+    "CREATE TABLE r (n INT)",
+    "INSERT INTO r VALUES (5)"
+   ]
+  }
+ },
+ "rule.sort:ORDER BY orders by storage class": {
+  "clickhouse": "none: ClickHouse compares and stores values of one type at a time: values of different classes can't share a column"
+ },
+ "storage_class:BLOB": {
+  "clickhouse": {
+   "query": "SELECT toTypeName(unhex('01'))"
+  },
+  "mysql": "none: MySQL has no function that names a value's type",
+  "postgres": {
+   "query": "SELECT pg_typeof('\\x01'::bytea)::text"
+  }
+ },
+ "syntax:aggregate-function-invocation#2": {
+  "clickhouse": {
+   "query": "SELECT arrayStringConcat(arrayMap(x -> x.2, arrayReverseSort(x -> x.1, groupArray(tuple(a, b)))), ',') FROM t WHERE b IS NOT NULL"
+  }
+ },
+ "syntax:alter-table-stmt#1": {
+  "clickhouse": {
+   "query": "RENAME TABLE t TO t9"
+  }
+ },
+ "syntax:alter-table-stmt#3": {
+  "mysql": {
+   "query": "ALTER TABLE t ADD COLUMN e VARCHAR(255) DEFAULT 'e'"
+  }
+ },
+ "syntax:analyze-stmt#1": {
+  "clickhouse": "none: ClickHouse gathers no planner statistics on request",
+  "mysql": {
+   "query": "ANALYZE TABLE t, u"
+  }
+ },
+ "syntax:analyze-stmt#2": {
+  "clickhouse": "none: ClickHouse gathers no planner statistics on request",
+  "mysql": {
+   "query": "ANALYZE TABLE t"
+  }
+ },
+ "syntax:attach-stmt": {
+  "clickhouse": "none: ClickHouse reaches other databases another way (databases are the server's; ATTACH there re-registers a detached table)",
+  "mysql": "none: MySQL reaches other databases another way (every database of the server is open to a session)",
+  "postgres": "none: PostgreSQL reaches other databases another way (dblink or postgres_fdw)"
+ },
+ "syntax:begin-stmt#1": {
+  "clickhouse": "none: ClickHouse's transactions are experimental and off by default",
+  "duckdb": {
+   "query": "BEGIN TRANSACTION"
+  },
+  "mysql": {
+   "query": "START TRANSACTION"
+  },
+  "postgres": {
+   "query": "BEGIN"
+  }
+ },
+ "syntax:begin-stmt#2": {
+  "clickhouse": "none: ClickHouse's transactions are experimental and off by default",
+  "duckdb": {
+   "query": "BEGIN TRANSACTION"
+  },
+  "mysql": {
+   "query": "START TRANSACTION"
+  },
+  "postgres": {
+   "query": "BEGIN ISOLATION LEVEL SERIALIZABLE"
+  }
+ },
+ "syntax:begin-stmt#3": {
+  "clickhouse": "none: ClickHouse's transactions are experimental and off by default",
+  "duckdb": {
+   "query": "BEGIN TRANSACTION"
+  },
+  "mysql": {
+   "query": "START TRANSACTION"
+  },
+  "postgres": {
+   "query": "BEGIN ISOLATION LEVEL SERIALIZABLE"
+  }
+ },
+ "syntax:column-constraint#1": {
+  "clickhouse": "none: ClickHouse keeps no unique or primary-key constraint to resolve: its sorting key accepts duplicates",
+  "duckdb": "none: DuckDB resolves conflicts per statement (INSERT OR REPLACE, ON CONFLICT), not per constraint",
+  "mysql": "none: MySQL resolves conflicts per statement (REPLACE, INSERT ... ON DUPLICATE KEY UPDATE), not per constraint",
+  "postgres": "none: PostgreSQL resolves conflicts per statement (INSERT ... ON CONFLICT), not per constraint, and a primary key has no direction"
+ },
+ "syntax:column-constraint#2": {
+  "clickhouse": "none: ClickHouse has no UNIQUE constraint"
+ },
+ "syntax:column-constraint#3": {
+  "clickhouse": "none: ClickHouse has no foreign keys"
+ },
+ "syntax:column-def#1": {
+  "clickhouse": "none: ClickHouse has no auto-incrementing column (generateSerialID is a separate function)",
+  "duckdb": {
+   "query": "CREATE SEQUENCE cd_a; CREATE TABLE cd(a INTEGER PRIMARY KEY DEFAULT nextval('cd_a'), v TEXT); INSERT INTO cd(v) VALUES ('x'), ('y'); SELECT a, v FROM cd ORDER BY a",
+   "setup_tail": []
+  }
+ },
+ "syntax:column-def#2": {
+  "clickhouse": "none: ClickHouse compares strings by bytes; lower() is its case-insensitive comparison",
+  "mysql": {
+   "query": "CREATE TABLE cd(b VARCHAR(10) COLLATE utf8mb4_0900_ai_ci); INSERT INTO cd VALUES ('Abc'); SELECT count(*) FROM cd WHERE b = 'aBC'"
+  },
+  "postgres": "none: PostgreSQL has no case-insensitive collation built in (a nondeterministic ICU collation is created by hand, or citext)"
+ },
+ "syntax:column-def#4": {
+  "clickhouse": {
+   "query": "CREATE TABLE cd(a Int32, d Int32 ALIAS a + 1) ENGINE = MergeTree ORDER BY a; INSERT INTO cd(a) VALUES (4); SELECT d FROM cd"
+  },
+  "postgres": "none: PostgreSQL 17 stores generated columns only (VIRTUAL arrived in 18)"
+ },
+ "syntax:column-name-list": {
+  "clickhouse": {
+   "query": "ALTER TABLE t UPDATE a = 1, b = 'z' WHERE a = 4 SETTINGS mutations_sync = 1"
+  },
+  "duckdb": {
+   "query": "UPDATE t SET a = 1, b = 'z' WHERE a = 4"
+  },
+  "mysql": {
+   "query": "UPDATE t SET a = 1, b = 'z' WHERE a = 4"
+  }
+ },
+ "syntax:commit-stmt#1": {
+  "clickhouse": "none: ClickHouse's transactions are experimental and off by default"
+ },
+ "syntax:commit-stmt#2": {
+  "clickhouse": "none: ClickHouse's transactions are experimental and off by default",
+  "duckdb": {
+   "query": "END TRANSACTION",
+   "setup_tail": [
+    "BEGIN TRANSACTION"
+   ]
+  },
+  "mysql": {
+   "query": "COMMIT",
+   "setup_tail": [
+    "START TRANSACTION"
+   ]
+  },
+  "postgres": {
+   "query": "END TRANSACTION",
+   "setup_tail": [
+    "BEGIN"
+   ]
+  }
+ },
+ "syntax:common-table-expression#1": {
+  "mysql": "none: MySQL takes no materialization hint on a CTE: its optimizer decides"
+ },
+ "syntax:common-table-expression#2": {
+  "clickhouse": "none: ClickHouse takes no materialization hint on a CTE: its optimizer decides",
+  "mysql": "none: MySQL takes no materialization hint on a CTE: its optimizer decides"
+ },
+ "syntax:conflict-clause": {
+  "clickhouse": "none: ClickHouse keeps no unique constraint to resolve",
+  "duckdb": "none: DuckDB resolves conflicts per statement (INSERT OR IGNORE), not per constraint",
+  "mysql": "none: MySQL resolves conflicts per statement (INSERT IGNORE), not per constraint",
+  "postgres": "none: PostgreSQL resolves conflicts per statement (INSERT ... ON CONFLICT DO NOTHING), not per constraint"
+ },
+ "syntax:create-index-stmt#1": {
+  "clickhouse": "none: ClickHouse has no unique indexes: its indexes skip data, they don't constrain it",
+  "mysql": {
+   "query": "CREATE UNIQUE INDEX ix ON t(a DESC)"
+  }
+ },
+ "syntax:create-index-stmt#2": {
+  "clickhouse": "none: ClickHouse has no partial indexes",
+  "duckdb": "none: DuckDB has no partial indexes",
+  "mysql": "none: MySQL has no partial indexes"
+ },
+ "syntax:create-index-stmt#3": {
+  "clickhouse": {
+   "query": "CREATE INDEX ex ON t(lower(b)) TYPE bloom_filter GRANULARITY 1"
+  },
+  "mysql": {
+   "query": "CREATE INDEX ex ON t((LOWER(b)))"
+  }
+ },
+ "syntax:create-index-stmt#4": {
+  "clickhouse": "none: ClickHouse's indexes take no collation",
+  "mysql": "none: MySQL takes a column's collation from the column's definition, not from an index",
+  "postgres": {
+   "query": "CREATE INDEX cx ON t(b COLLATE nocase NULLS FIRST)",
+   "setup_tail": [
+    "CREATE COLLATION nocase (provider = icu, locale = 'und-u-ks-level2', deterministic = false)"
+   ]
+  }
+ },
+ "syntax:create-table-stmt#1": {
+  "clickhouse": {
+   "query": "CREATE TABLE IF NOT EXISTS ct (a Int32, b String DEFAULT 'x', c Float64, CONSTRAINT c_nonneg CHECK c >= 0) ENGINE = MergeTree ORDER BY a"
+  },
+  "mysql": {
+   "query": "CREATE TABLE IF NOT EXISTS ct (a INT PRIMARY KEY, b VARCHAR(255) NOT NULL DEFAULT 'x', c DOUBLE CHECK (c >= 0), UNIQUE (b))"
+  }
+ },
+ "syntax:create-trigger-stmt#1": {
+  "clickhouse": "none: ClickHouse has no triggers (a materialized view acts on inserts)",
+  "duckdb": "none: DuckDB has no triggers",
+  "mysql": {
+   "query": "CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW BEGIN IF NEW.a > 100 THEN INSERT INTO u VALUES (NEW.a, 'trig'); END IF; END",
+   "setup_tail": [
+    "CREATE VIEW v1 AS SELECT a, b FROM t"
+   ]
+  },
+  "postgres": {
+   "query": "CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION tr_f()",
+   "setup_tail": [
+    "CREATE VIEW v1 AS SELECT a, b FROM t",
+    "CREATE FUNCTION tr_f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.a > 100 THEN INSERT INTO u VALUES (NEW.a, 'trig'); END IF; RETURN NEW; END $$"
+   ]
+  }
+ },
+ "syntax:create-trigger-stmt#2": {
+  "clickhouse": "none: ClickHouse has no triggers (a materialized view acts on inserts)",
+  "duckdb": "none: DuckDB has no triggers",
+  "mysql": "none: MySQL can't skip a row from a trigger (SQLite's RAISE(IGNORE))",
+  "postgres": "none: PostgreSQL's triggers run a function written apart (CREATE FUNCTION ... RETURNS trigger, then CREATE TRIGGER ... EXECUTE FUNCTION); this form's RAISE/OF/INSTEAD OF clauses are spelled inside that function"
+ },
+ "syntax:create-trigger-stmt#3": {
+  "clickhouse": "none: ClickHouse has no triggers (a materialized view acts on inserts)",
+  "duckdb": "none: DuckDB has no triggers",
+  "mysql": {
+   "query": "CREATE TRIGGER tu AFTER UPDATE ON t FOR EACH ROW UPDATE u SET d = NEW.b WHERE a = NEW.a"
+  },
+  "postgres": "none: PostgreSQL's triggers run a function written apart (CREATE FUNCTION ... RETURNS trigger, then CREATE TRIGGER ... EXECUTE FUNCTION); this form's RAISE/OF/INSTEAD OF clauses are spelled inside that function"
+ },
+ "syntax:create-trigger-stmt#4": {
+  "clickhouse": "none: ClickHouse has no triggers (a materialized view acts on inserts)",
+  "duckdb": "none: DuckDB has no triggers",
+  "mysql": "none: MySQL has no INSTEAD OF triggers (no trigger on a view)",
+  "postgres": "none: PostgreSQL's triggers run a function written apart (CREATE FUNCTION ... RETURNS trigger, then CREATE TRIGGER ... EXECUTE FUNCTION); this form's RAISE/OF/INSTEAD OF clauses are spelled inside that function"
+ },
+ "syntax:create-view-stmt#1": {
+  "mysql": {
+   "query": "CREATE OR REPLACE VIEW v1 (x, y) AS SELECT a, b FROM t"
+  },
+  "postgres": {
+   "query": "CREATE OR REPLACE VIEW v1(x, y) AS SELECT a, b FROM t"
+  }
+ },
+ "syntax:create-view-stmt#2": {
+  "mysql": "none: MySQL has no temporary views"
+ },
+ "syntax:create-virtual-table-stmt#1": {
+  "clickhouse": "none: SQLite's virtual-table modules (FTS5, R-Tree) are its own; a full-text (inverted) index is the counterpart, with its own syntax",
+  "duckdb": "none: SQLite's virtual-table modules (FTS5, R-Tree) are its own; the fts extension's PRAGMA create_fts_index is the counterpart, with its own syntax",
+  "mysql": "none: SQLite's virtual-table modules (FTS5, R-Tree) are its own; a FULLTEXT index is the counterpart, with its own syntax",
+  "postgres": "none: SQLite's virtual-table modules (FTS5, R-Tree) are its own; text search over tsvector with a GIN index is the counterpart, with its own syntax"
+ },
+ "syntax:create-virtual-table-stmt#2": {
+  "clickhouse": "none: SQLite's virtual-table modules (FTS5, R-Tree) are its own; nothing built in is the counterpart, with its own syntax",
+  "duckdb": "none: SQLite's virtual-table modules (FTS5, R-Tree) are its own; the spatial extension's R-tree index is the counterpart, with its own syntax",
+  "mysql": "none: SQLite's virtual-table modules (FTS5, R-Tree) are its own; a SPATIAL index is the counterpart, with its own syntax",
+  "postgres": "none: SQLite's virtual-table modules (FTS5, R-Tree) are its own; a GiST index on geometric types is the counterpart, with its own syntax"
+ },
+ "syntax:delete-stmt-limited": {
+  "clickhouse": "none: ClickHouse's DELETE takes no ORDER BY or LIMIT",
+  "duckdb": {
+   "query": "DELETE FROM t WHERE rowid IN (SELECT rowid FROM t WHERE a > 0 ORDER BY a DESC LIMIT 1)"
+  },
+  "postgres": {
+   "query": "DELETE FROM t WHERE ctid IN (SELECT ctid FROM t WHERE a > 0 ORDER BY a DESC LIMIT 1)"
+  }
+ },
+ "syntax:detach-stmt": {
+  "clickhouse": "none: ClickHouse reaches other databases another way (databases are the server's; DETACH there unregisters a table)",
+  "mysql": "none: MySQL reaches other databases another way (every database of the server is open to a session)",
+  "postgres": "none: PostgreSQL reaches other databases another way (dblink or postgres_fdw)"
+ },
+ "syntax:drop-index-stmt": {
+  "clickhouse": {
+   "query": "DROP INDEX IF EXISTS ti ON t",
+   "setup_tail": [
+    "CREATE INDEX ti ON t(a) TYPE minmax GRANULARITY 1"
+   ]
+  },
+  "mysql": {
+   "query": "DROP INDEX ti ON t"
+  }
+ },
+ "syntax:drop-trigger-stmt": {
+  "clickhouse": "none: ClickHouse has no triggers",
+  "duckdb": "none: DuckDB has no triggers",
+  "postgres": {
+   "query": "DROP TRIGGER IF EXISTS nope ON t"
+  }
+ },
+ "syntax:filter-clause#1": {
+  "mysql": {
+   "query": "SELECT SUM(CASE WHEN b IS NULL THEN 1 ELSE 0 END) FROM t"
+  }
+ },
+ "syntax:filter-clause#2": {
+  "mysql": {
+   "query": "SELECT SUM(CASE WHEN a > 2 THEN 1 ELSE 0 END), SUM(CASE WHEN b IS NOT NULL THEN a END) FROM t"
+  }
+ },
+ "syntax:foreign-key-clause": {
+  "clickhouse": "none: ClickHouse has no foreign keys",
+  "duckdb": "none: DuckDB's foreign keys take no ON UPDATE or ON DELETE actions",
+  "mysql": {
+   "query": "CREATE TABLE fk(a INT, FOREIGN KEY (a) REFERENCES pk(k) ON UPDATE SET NULL ON DELETE SET DEFAULT)"
+  },
+  "postgres": {
+   "query": "CREATE TABLE fk(a INT REFERENCES pk(k) MATCH SIMPLE ON UPDATE SET NULL ON DELETE SET DEFAULT)"
+  }
+ },
+ "syntax:frame-spec#aggregate-filter": {
+  "mysql": {
+   "query": "SELECT a, SUM(CASE WHEN a > 2 THEN 1 ELSE 0 END) OVER (ORDER BY a) FROM t ORDER BY a"
+  }
+ },
+ "syntax:frame-spec#exclude-current-row": {
+  "clickhouse": "none: ClickHouse has no EXCLUDE clause in a window frame",
+  "mysql": "none: MySQL has no EXCLUDE clause in a window frame"
+ },
+ "syntax:frame-spec#exclude-group": {
+  "clickhouse": "none: ClickHouse has no EXCLUDE clause in a window frame",
+  "mysql": "none: MySQL has no EXCLUDE clause in a window frame"
+ },
+ "syntax:frame-spec#exclude-ties": {
+  "clickhouse": "none: ClickHouse has no EXCLUDE clause in a window frame",
+  "mysql": "none: MySQL has no EXCLUDE clause in a window frame"
+ },
+ "syntax:frame-spec#groups": {
+  "mysql": "none: MySQL has no GROUPS frames"
+ },
+ "syntax:indexed-column": {
+  "clickhouse": "none: ClickHouse's indexes take no collation",
+  "mysql": "none: MySQL takes a column's collation from the column's definition, not from an index",
+  "postgres": {
+   "query": "CREATE INDEX ic ON t(b COLLATE nocase ASC NULLS FIRST)",
+   "setup_tail": [
+    "CREATE COLLATION nocase (provider = icu, locale = 'und-u-ks-level2', deterministic = false)"
+   ]
+  }
+ },
+ "syntax:insert-stmt#1": {
+  "clickhouse": "none: ClickHouse returns no rows from a change (RETURNING is not in its grammar)",
+  "mysql": "none: MySQL returns no rows from a change (RETURNING is not in its grammar)"
+ },
+ "syntax:insert-stmt#2": {
+  "clickhouse": "none: ClickHouse keeps no unique constraint, so nothing conflicts",
+  "mysql": {
+   "query": "INSERT IGNORE INTO pk VALUES (1, 'dup')"
+  },
+  "postgres": {
+   "query": "INSERT INTO pk VALUES (1, 'dup') ON CONFLICT DO NOTHING"
+  }
+ },
+ "syntax:insert-stmt#3": {
+  "clickhouse": "none: ClickHouse keeps no unique constraint; a ReplacingMergeTree merges duplicates later, not at the insert",
+  "mysql": {
+   "query": "REPLACE INTO pk VALUES (1, 'new')"
+  },
+  "postgres": {
+   "query": "INSERT INTO pk VALUES (1, 'new') ON CONFLICT (k) DO UPDATE SET v = excluded.v"
+  }
+ },
+ "syntax:insert-stmt#5": {
+  "clickhouse": {
+   "query": "INSERT INTO t SELECT NULL, NULL, NULL"
+  },
+  "mysql": {
+   "query": "INSERT INTO t () VALUES ()"
+  }
+ },
+ "syntax:insert-stmt#6": {
+  "clickhouse": "none: ClickHouse keeps no unique constraint; a ReplacingMergeTree merges duplicates later, not at the insert",
+  "duckdb": {
+   "query": "INSERT OR REPLACE INTO pk VALUES (2, 'two')"
+  },
+  "postgres": {
+   "query": "INSERT INTO pk VALUES (2, 'two') ON CONFLICT (k) DO UPDATE SET v = excluded.v"
+  }
+ },
+ "syntax:join-clause#4": {
+  "mysql": {
+   "query": "SELECT a, d FROM (SELECT t.a AS a, u.d AS d, COALESCE(t.a, u.a) AS k FROM t LEFT JOIN u ON t.a = u.a UNION ALL SELECT t.a, u.d, u.a FROM t RIGHT JOIN u ON t.a = u.a WHERE t.a IS NULL) AS f ORDER BY k, d"
+  }
+ },
+ "syntax:literal-value": {
+  "clickhouse": {
+   "query": "SELECT 1, 1.5, 'txt', unhex('0F'), NULL, true, false, toTypeName(today()), toTypeName(now()), toTypeName(now())"
+  },
+  "mysql": {
+   "query": "SELECT 1, 1.5, 'txt', x'0F', NULL, TRUE, FALSE, CURRENT_DATE IS NOT NULL, CURRENT_TIME IS NOT NULL, CURRENT_TIMESTAMP IS NOT NULL"
+  },
+  "postgres": {
+   "query": "SELECT 1, 1.5, 'txt', '\\x0f'::bytea, NULL, TRUE, FALSE, pg_typeof(CURRENT_DATE)::text, pg_typeof(CURRENT_TIME)::text, pg_typeof(CURRENT_TIMESTAMP)::text"
+  }
+ },
+ "syntax:numeric-literal": {
+  "clickhouse": {
+   "query": "SELECT 0x1F, 1e3, .5, 1000000, 2.5E-1"
+  }
+ },
+ "syntax:ordering-term#1": {
+  "clickhouse": {
+   "query": "SELECT b FROM t ORDER BY lower(b) DESC NULLS FIRST"
+  },
+  "mysql": {
+   "query": "SELECT b FROM t ORDER BY CASE WHEN b COLLATE utf8mb4_0900_ai_ci IS NULL THEN 1 ELSE 0 END DESC, b COLLATE utf8mb4_0900_ai_ci DESC",
+   "setup_tail": []
+  },
+  "postgres": {
+   "query": "SELECT b FROM t ORDER BY b COLLATE nocase DESC",
+   "setup_tail": [
+    "CREATE COLLATION nocase (provider = icu, locale = 'und-u-ks-level2', deterministic = false)"
+   ]
+  }
+ },
+ "syntax:pragma-stmt#1": {
+  "duckdb": {
+   "query": "PRAGMA table_info('t')"
+  },
+  "mysql": {
+   "query": "SELECT ordinal_position - 1 AS cid, column_name AS name, upper(data_type) AS type, (is_nullable = 'NO') AS notnull, column_default AS dflt_value, 0 AS pk FROM information_schema.columns WHERE table_name = 't' AND table_schema = database()"
+  },
+  "postgres": {
+   "query": "SELECT ordinal_position - 1 AS cid, column_name AS name, upper(data_type) AS type, (is_nullable = 'NO')::int AS notnull, column_default AS dflt_value, 0 AS pk FROM information_schema.columns WHERE table_name = 't' AND table_schema = current_schema()"
+  }
+ },
+ "syntax:pragma-stmt#2": {
+  "clickhouse": "none: ClickHouse keeps no user version number in a database",
+  "duckdb": "none: DuckDB keeps no user version number in a database",
+  "mysql": "none: MySQL keeps no user version number in a database",
+  "postgres": "none: PostgreSQL keeps no user version number in a database"
+ },
+ "syntax:pragma-value": {
+  "clickhouse": "none: ClickHouse sizes its caches in the server's configuration",
+  "duckdb": {
+   "query": "SET memory_limit = '2GB'"
+  },
+  "mysql": "none: MySQL sizes its cache in the server's configuration (innodb_buffer_pool_size)",
+  "postgres": "none: PostgreSQL sizes its cache in the server's configuration (shared_buffers)"
+ },
+ "syntax:qualified-table-name": {
+  "clickhouse": "none: ClickHouse takes no index hints; its primary key and skipping indexes are used by the planner",
+  "duckdb": "none: DuckDB takes no index hints",
+  "mysql": {
+   "query": "SELECT a FROM t FORCE INDEX (ti) WHERE a > 3 ORDER BY a"
+  },
+  "postgres": "none: PostgreSQL takes no index hints: its planner alone chooses (pg_hint_plan is an extension)"
+ },
+ "syntax:raise-function": {
+  "clickhouse": "none: ClickHouse has no triggers",
+  "duckdb": "none: DuckDB has no triggers",
+  "mysql": "none: MySQL signals errors with SIGNAL SQLSTATE in a trigger body",
+  "postgres": "none: PostgreSQL's triggers run a function written apart (CREATE FUNCTION ... RETURNS trigger, then CREATE TRIGGER ... EXECUTE FUNCTION); RAISE(ABORT, ...) is RAISE EXCEPTION there"
+ },
+ "syntax:reindex-stmt#1": {
+  "clickhouse": "none: ClickHouse rebuilds a skipping index with ALTER TABLE ... MATERIALIZE INDEX, per index",
+  "duckdb": "none: DuckDB has no REINDEX",
+  "mysql": "none: MySQL rebuilds indexes with ALTER TABLE ... FORCE or OPTIMIZE TABLE, per table",
+  "postgres": {
+   "query": "REINDEX DATABASE postgres"
+  }
+ },
+ "syntax:reindex-stmt#2": {
+  "clickhouse": "none: ClickHouse rebuilds a skipping index with ALTER TABLE ... MATERIALIZE INDEX, per index",
+  "duckdb": "none: DuckDB has no REINDEX",
+  "mysql": {
+   "query": "ALTER TABLE t FORCE"
+  },
+  "postgres": {
+   "query": "REINDEX TABLE t"
+  }
+ },
+ "syntax:release-stmt": {
+  "clickhouse": "none: ClickHouse's transactions are experimental and off by default",
+  "duckdb": "none: DuckDB has no savepoints",
+  "mysql": {
+   "query": "RELEASE SAVEPOINT sp1",
+   "setup_tail": [
+    "BEGIN",
+    "SAVEPOINT sp1"
+   ]
+  },
+  "postgres": {
+   "query": "RELEASE SAVEPOINT sp1",
+   "setup_tail": [
+    "BEGIN",
+    "SAVEPOINT sp1"
+   ]
+  }
+ },
+ "syntax:returning-clause#1": {
+  "clickhouse": "none: ClickHouse returns no rows from a change (RETURNING is not in its grammar)",
+  "mysql": "none: MySQL returns no rows from a change (RETURNING is not in its grammar)"
+ },
+ "syntax:returning-clause#2": {
+  "clickhouse": "none: ClickHouse returns no rows from a change (RETURNING is not in its grammar)",
+  "mysql": "none: MySQL returns no rows from a change (RETURNING is not in its grammar)"
+ },
+ "syntax:rollback-stmt": {
+  "clickhouse": "none: ClickHouse's transactions are experimental and off by default",
+  "duckdb": "none: DuckDB has no savepoints",
+  "mysql": {
+   "query": "ROLLBACK TO SAVEPOINT sp1",
+   "setup_tail": [
+    "BEGIN",
+    "SAVEPOINT sp1"
+   ]
+  },
+  "postgres": {
+   "query": "ROLLBACK TO SAVEPOINT sp1",
+   "setup_tail": [
+    "BEGIN",
+    "SAVEPOINT sp1"
+   ]
+  }
+ },
+ "syntax:savepoint-stmt": {
+  "clickhouse": "none: ClickHouse's transactions are experimental and off by default",
+  "duckdb": "none: DuckDB has no savepoints",
+  "mysql": {
+   "query": "SAVEPOINT sp1",
+   "setup_tail": [
+    "BEGIN"
+   ]
+  },
+  "postgres": {
+   "query": "SAVEPOINT sp1",
+   "setup_tail": [
+    "BEGIN"
+   ]
+  }
+ },
+ "syntax:select-core#2": {
+  "clickhouse": {
+   "query": "SELECT 1, 'a' UNION ALL SELECT 2, 'b'"
+  },
+  "mysql": {
+   "query": "VALUES ROW(1, 'a'), ROW(2, 'b')"
+  }
+ },
+ "syntax:sql-stmt#1": {
+  "clickhouse": {
+   "query": "EXPLAIN SELECT 1"
+  }
+ },
+ "syntax:sql-stmt#2": {
+  "clickhouse": {
+   "query": "EXPLAIN PLAN SELECT a FROM t WHERE a = 1"
+  },
+  "duckdb": {
+   "query": "EXPLAIN SELECT a FROM t WHERE a = 1"
+  },
+  "mysql": {
+   "query": "EXPLAIN FORMAT=TREE SELECT a FROM t WHERE a = 1"
+  },
+  "postgres": {
+   "query": "EXPLAIN SELECT a FROM t WHERE a = 1"
+  }
+ },
+ "syntax:table-constraint#1": {
+  "clickhouse": {
+   "query": "CREATE TABLE tc(a Int32, b Int32, CONSTRAINT ab CHECK a < b) ENGINE = MergeTree PRIMARY KEY (a, b) ORDER BY (a, b); INSERT INTO tc VALUES (1, 2); SELECT count(*) FROM tc"
+  }
+ },
+ "syntax:table-constraint#2": {
+  "clickhouse": "none: ClickHouse has no foreign keys",
+  "duckdb": "none: DuckDB checks constraints at once: it has no deferrable constraints",
+  "mysql": "none: MySQL checks foreign keys at once: it has no deferrable constraints"
+ },
+ "syntax:table-options#1": {
+  "clickhouse": "none: ClickHouse's tables there have no rowid: a primary key table is already clustered by it (InnoDB) or keeps rows apart from its indexes",
+  "duckdb": "none: DuckDB's tables there have no rowid: a primary key table is already clustered by it (InnoDB) or keeps rows apart from its indexes",
+  "mysql": "none: MySQL's tables there have no rowid: a primary key table is already clustered by it (InnoDB) or keeps rows apart from its indexes",
+  "postgres": "none: PostgreSQL's tables there have no rowid: a primary key table is already clustered by it (InnoDB) or keeps rows apart from its indexes"
+ },
+ "syntax:table-options#2": {
+  "clickhouse": "none: ClickHouse's column types are always enforced there; it has no ANY type and no rowid to leave out",
+  "duckdb": "none: DuckDB's column types are always enforced there; it has no ANY type and no rowid to leave out",
+  "mysql": "none: MySQL's column types are always enforced there; it has no ANY type and no rowid to leave out",
+  "postgres": "none: PostgreSQL's column types are always enforced there; it has no ANY type and no rowid to leave out"
+ },
+ "syntax:table-options#3": {
+  "clickhouse": "none: ClickHouse's column types are always enforced there; it has no ANY type and no rowid to leave out",
+  "duckdb": "none: DuckDB's column types are always enforced there; it has no ANY type and no rowid to leave out",
+  "mysql": "none: MySQL's column types are always enforced there; it has no ANY type and no rowid to leave out",
+  "postgres": "none: PostgreSQL's column types are always enforced there; it has no ANY type and no rowid to leave out"
+ },
+ "syntax:table-or-subquery#2": {
+  "clickhouse": {
+   "query": "SELECT arrayJoin(JSONExtract('[3,1,2]', 'Array(Int64)')) AS value ORDER BY value"
+  },
+  "mysql": {
+   "query": "SELECT value FROM JSON_TABLE('[3,1,2]', '$[*]' COLUMNS (value INT PATH '$')) AS j ORDER BY value"
+  },
+  "postgres": {
+   "query": "SELECT value FROM jsonb_array_elements('[3,1,2]'::jsonb) AS e(value) ORDER BY value::int"
+  }
+ },
+ "syntax:type-name#1": {
+  "clickhouse": {
+   "query": "CREATE TABLE tn(a String, b Decimal(10, 2), c Float64) ENGINE = MergeTree ORDER BY tuple(); INSERT INTO tn VALUES ('x', 1.25, 2.5); SELECT a, b, c FROM tn"
+  }
+ },
+ "syntax:type-name#2": {
+  "clickhouse": {
+   "query": "CREATE TABLE tn(d UInt64) ENGINE = MergeTree ORDER BY d; INSERT INTO tn VALUES (7); SELECT d FROM tn"
+  },
+  "duckdb": {
+   "query": "CREATE TABLE tn(d UBIGINT); INSERT INTO tn VALUES (7); SELECT d FROM tn"
+  },
+  "mysql": {
+   "query": "CREATE TABLE tn(d BIGINT UNSIGNED); INSERT INTO tn VALUES (7); SELECT d FROM tn"
+  },
+  "postgres": {
+   "query": "CREATE TABLE tn(d NUMERIC(20, 0)); INSERT INTO tn VALUES (7); SELECT d FROM tn"
+  }
+ },
+ "syntax:update-stmt#1": {
+  "clickhouse": {
+   "query": "ALTER TABLE t UPDATE b = upper(b), c = c + 1 WHERE a < 3 SETTINGS mutations_sync = 1"
+  }
+ },
+ "syntax:update-stmt#2": {
+  "clickhouse": "none: ClickHouse changes rows with ALTER TABLE ... UPDATE mutations, which have no conflict resolution",
+  "duckdb": "none: DuckDB's UPDATE has no conflict resolution",
+  "mysql": {
+   "query": "UPDATE IGNORE t SET a = a WHERE a = 1"
+  },
+  "postgres": "none: PostgreSQL's UPDATE has no conflict resolution: a violated constraint fails the statement"
+ },
+ "syntax:update-stmt#3": {
+  "clickhouse": {
+   "query": "ALTER TABLE t UPDATE b = 'p', c = 9.5 WHERE a = 2 SETTINGS mutations_sync = 1"
+  },
+  "mysql": {
+   "query": "UPDATE t SET b = 'p', c = 9.5 WHERE a = 2"
+  }
+ },
+ "syntax:update-stmt#4": {
+  "clickhouse": "none: ClickHouse's ALTER TABLE ... UPDATE can't join another table"
+ },
+ "syntax:update-stmt-limited": {
+  "clickhouse": "none: ClickHouse's ALTER TABLE ... UPDATE takes no ORDER BY or LIMIT",
+  "duckdb": {
+   "query": "UPDATE t SET b = 'lim' WHERE rowid IN (SELECT rowid FROM t WHERE a > 0 ORDER BY a LIMIT 2)"
+  },
+  "postgres": {
+   "query": "UPDATE t SET b = 'lim' WHERE ctid IN (SELECT ctid FROM t WHERE a > 0 ORDER BY a LIMIT 2)"
+  }
+ },
+ "syntax:upsert-clause#1": {
+  "clickhouse": "none: ClickHouse keeps no unique constraint to resolve a conflict on",
+  "duckdb": {
+   "query": "INSERT INTO pk VALUES (1, 'up') ON CONFLICT (k) DO UPDATE SET v = excluded.v || '!' RETURNING k, v"
+  },
+  "mysql": {
+   "query": "INSERT INTO pk VALUES (1, 'up') ON DUPLICATE KEY UPDATE v = CONCAT(VALUES(v), '!'); SELECT k, v FROM pk WHERE k = 1"
+  },
+  "postgres": {
+   "query": "INSERT INTO pk VALUES (1, 'up') ON CONFLICT (k) DO UPDATE SET v = excluded.v || '!' RETURNING k, v"
+  }
+ },
+ "syntax:upsert-clause#2": {
+  "clickhouse": "none: ClickHouse keeps no unique constraint to resolve a conflict on",
+  "mysql": {
+   "query": "INSERT IGNORE INTO pk VALUES (1, 'no')"
+  }
+ },
+ "syntax:vacuum-stmt": {
+  "clickhouse": {
+   "query": "OPTIMIZE TABLE t FINAL"
+  },
+  "mysql": {
+   "query": "OPTIMIZE TABLE t"
+  }
+ },
+ "syntax:window-function-invocation": {
+  "mysql": {
+   "query": "SELECT a, SUM(CASE WHEN a > 1 THEN a END) OVER (ORDER BY a) FROM t ORDER BY a"
+  }
+ },
+ "word:EXPRESSIONS": {
+  "clickhouse": "none: ClickHouse has no REINDEX",
+  "duckdb": "none: DuckDB has no REINDEX",
+  "mysql": "none: MySQL has no REINDEX",
+  "postgres": "none: PostgreSQL reindexes by index, table, schema or database, not by kind"
+ },
+ "word:ROWID": {
+  "clickhouse": "none: ClickHouse's tables there have no rowid: a primary key table is already clustered by it (InnoDB) or keeps rows apart from its indexes",
+  "duckdb": "none: DuckDB's tables there have no rowid: a primary key table is already clustered by it (InnoDB) or keeps rows apart from its indexes",
+  "mysql": "none: MySQL's tables there have no rowid: a primary key table is already clustered by it (InnoDB) or keeps rows apart from its indexes",
+  "postgres": "none: PostgreSQL's tables there have no rowid: a primary key table is already clustered by it (InnoDB) or keeps rows apart from its indexes"
+ },
+ "word:STORED": {
+  "duckdb": "none: DuckDB's generated columns are virtual only"
+ },
+ "word:STRICT#1": {
+  "clickhouse": "none: ClickHouse's column types are always enforced there; it has no ANY type and no rowid to leave out",
+  "duckdb": "none: DuckDB's column types are always enforced there; it has no ANY type and no rowid to leave out",
+  "mysql": "none: MySQL's column types are always enforced there; it has no ANY type and no rowid to leave out",
+  "postgres": "none: PostgreSQL's column types are always enforced there; it has no ANY type and no rowid to leave out"
+ },
+ "word:STRICT#2": {
+  "clickhouse": "none: ClickHouse's column types are always enforced there; it has no ANY type and no rowid to leave out",
+  "duckdb": "none: DuckDB's column types are always enforced there; it has no ANY type and no rowid to leave out",
+  "mysql": "none: MySQL's column types are always enforced there; it has no ANY type and no rowid to leave out",
+  "postgres": "none: PostgreSQL's column types are always enforced there; it has no ANY type and no rowid to leave out"
+ },
+ "word:TRUE": {
+  "duckdb": {
+   "query": "SELECT TRUE, TRUE::INTEGER + 1"
+  },
+  "postgres": {
+   "query": "SELECT TRUE, TRUE::int + 1"
+  }
+ }
+}
