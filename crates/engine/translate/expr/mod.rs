@@ -106,7 +106,8 @@ pub use translator::{
     resolve_expr, translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
 };
 pub use utils::{
-    as_binary_components, maybe_apply_affinity, sanitize_string, truth_test_rhs, unwrap_parens,
+    as_binary_components, fold_false_ands, folded_false_ands, has_subquery, literal_truth,
+    maybe_apply_affinity, sanitize_string, simplified_and_or, truth_test_rhs, unwrap_parens,
     unwrap_parens_owned,
 };
 pub use vectors::expr_vector_size;

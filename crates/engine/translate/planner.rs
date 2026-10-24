@@ -17,8 +17,8 @@ use crate::translate::plan::BitSet;
 use crate::translate::{
     emitter::Resolver,
     expr::{
-        expr_contains_nondeterministic_scalar_function, expr_vector_size, unwrap_parens,
-        BindingBehavior, WalkControl,
+        expr_contains_nondeterministic_scalar_function, expr_vector_size, folded_false_ands,
+        unwrap_parens, BindingBehavior, WalkControl,
     },
     plan::{NonFromClauseSubquery, SubqueryState},
     subquery::outer_query_refs_for_correlated_subquery,
@@ -2565,6 +2565,9 @@ pub fn parse_where(
     resolver: &Resolver,
 ) -> Result<()> {
     if let Some(where_expr) = where_clause {
+        // Split as SQLite's parser leaves it (fold_false_ands): a term it drops is never bound.
+        let folded = folded_false_ands(where_expr)?;
+        let where_expr = folded.as_ref().unwrap_or(where_expr);
         let start_idx = out_where_clause.len();
         break_predicate_at_and_boundaries(where_expr, out_where_clause);
         for expr in out_where_clause[start_idx..].iter_mut() {
@@ -3041,7 +3044,9 @@ fn parse_join(
 
     if let Some(constraint) = constraint {
         match constraint {
-            ast::JoinConstraint::On(ref expr) => {
+            ast::JoinConstraint::On(ref on) => {
+                let folded = folded_false_ands(on)?;
+                let expr = folded.as_ref().unwrap_or(on);
                 let start_idx = out_where_clause.len();
                 break_predicate_at_and_boundaries(expr, out_where_clause);
                 for predicate in out_where_clause[start_idx..].iter_mut() {

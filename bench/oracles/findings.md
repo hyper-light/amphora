@@ -12,8 +12,10 @@ finding that is no fault of Amphora's is filed with why. The runs, their summari
 queries answers as SQLite's does (for a CERT finding, the more restrictive query's estimate is no more
 than the other's). Every finding of the five runs below was rerun so on the build that closed G2
 step 3: all answer as SQLite does but for the CERT findings of AG (87), which the planner's goal
-holds (kiln goal 01a16e788f3e735fbadbbdaa30d38d29, "the oracles' CERT clean"), one that has a goal
-of its own (BE), and the ones that are not Amphora's (Q, AH, AN, BD).
+holds (kiln goal 01a16e788f3e735fbadbbdaa30d38d29, "the oracles' CERT clean"), and the ones that
+are not Amphora's (Q, AH, AN). BE and BD answer as SQLite does since the fix that followed: an AND
+a literal 0 settles is folded before names are resolved, and a subquery a settled branch drops
+never runs.
 
 ## Campaign 1: seed 11, 607 s, 2026-10-24
 
@@ -130,7 +132,7 @@ findings (2 more of the same), 12 of them not CERT (campaign 3: 37).
 | BC. A function's value kept what its last argument left of the collation, where SQLite takes the first explicit COLLATE among its arguments | 1 | `expr/translator.rs` `set_explicit_collation` | `a_functions_value_takes_its_arguments_first_collate` |
 | V (campaign 2's): a NULL test of a parenthesized constant, or of another such test, not folded (`(- 1.5) NOTNULL`, `(2.0 NOTNULL) NOTNULL`), so the AND or OR it settles read a call that raised an error | 3 | `expr/utils.rs` `literal_truth` | `a_parenthesized_null_test_folds_like_a_literal` |
 | AP. The oracles': -0.0 and 0 as one group's value, either shown (1); a REAL sum's partitions, summed again, rounding apart from it (1) | 2 | `engines.rs`, `checks.rs` | — |
-| BD. Not Amphora's to match: SQLite resolves no name in `0 AND x`, which its parser folds first; a case cut down past a table its predicate reads runs there and fails here (the oracles skip such cases) | 1 | — | — |
-| BE. Open, a goal of its own (kiln goal 01a16f23f567754ab32edfe5c2abc36d): a subquery held only in an AND or OR branch a literal settles still runs before the loop | 1 | — | — |
+| BD. SQLite resolves no name in `0 AND x`, which its parser makes the 0 first when neither side calls a function (sqlite3ExprAnd): a case cut down past a table its predicate reads ran there and failed here. Amphora folds it so before resolving names | 1 | `expr/utils.rs` `fold_false_ands`; `select.rs`, `planner.rs`, `expr/binding.rs` | `a_subquery_a_settled_branch_drops_never_runs` |
+| BE. A subquery held only in an AND or OR branch a literal settles ran before the loop, raising its error: SQLite codes no side sqlite3ExprSimplifiedAndOr drops, and no WHERE term past a literal 0 it tests before its loops | 1 | `subquery.rs` `drop_settled_subqueries`, `null_beside_false_where_term` | `a_subquery_a_settled_branch_drops_never_runs` |
 | Q. Not Amphora's: evaluation order (SQLite's min() over an index stops at the first row its WHERE passes; json_valid's flags error in a subquery) | 2 | — | — |
 | AG. CERT, the planner goal's | 58 | — | — |

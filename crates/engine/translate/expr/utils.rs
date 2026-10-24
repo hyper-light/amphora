@@ -237,6 +237,102 @@ pub fn has_subquery(expr: &ast::Expr) -> bool {
     found
 }
 
+/// Makes each AND that SQLite's parser makes the integer 0 that 0 (sqlite3ExprAnd), from the
+/// innermost out: one with a side that is that 0 already, neither side calling a function. The
+/// parser does it before anything reads the statement, so a name on the side it drops is never
+/// resolved, nor a subquery there planned; and an ORDER BY term it makes 0 is a column number.
+pub fn fold_false_ands(expr: &mut ast::Expr) -> Result<()> {
+    walk_expr_mut(expr, &mut |node: &mut ast::Expr| -> Result<WalkControl> {
+        if !matches!(node, ast::Expr::Binary(_, ast::Operator::And, _)) || !folds_to_zero(node) {
+            return Ok(WalkControl::Continue);
+        }
+        *node = ast::Expr::Literal(ast::Literal::Numeric("0".to_owned()));
+        Ok(WalkControl::SkipChildren)
+    })?;
+    Ok(())
+}
+
+/// `expr` with its ANDs folded ([fold_false_ands]) if any folds, for a caller that only reads it.
+pub fn folded_false_ands(expr: &ast::Expr) -> Result<Option<ast::Expr>> {
+    let mut folds = false;
+    walk_expr(expr, &mut |node: &ast::Expr| -> Result<WalkControl> {
+        if matches!(node, ast::Expr::Binary(_, ast::Operator::And, _)) && folds_to_zero(node) {
+            folds = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    if !folds {
+        return Ok(None);
+    }
+    let mut folded = expr.clone();
+    fold_false_ands(&mut folded)?;
+    Ok(Some(folded))
+}
+
+/// Whether SQLite's parser makes `expr` the integer 0 (sqlite3ExprAnd): an AND, inside any
+/// parentheses, with a side that is that 0 (a literal 0 or a NULL test the parser folds,
+/// [literal_truth], or such an AND itself) and no function called on either side (EP_HasFunc,
+/// which a subquery's own calls don't give). FALSE isn't that 0: SQLite reads it as a name until
+/// names are resolved. Children go before parents on a stack of its own (CLAUDE.md section 11).
+fn folds_to_zero(expr: &ast::Expr) -> bool {
+    let mut todo: Vec<(&ast::Expr, bool)> = vec![(expr, false)];
+    let mut zero: Vec<bool> = Vec::new();
+    while let Some((node, children_done)) = todo.pop() {
+        let mut inner = node;
+        while let ast::Expr::Parenthesized(exprs) = inner {
+            let [only] = exprs.as_slice() else {
+                break;
+            };
+            inner = only;
+        }
+        let ast::Expr::Binary(lhs, ast::Operator::And, rhs) = inner else {
+            zero.push(
+                literal_truth(inner) == Some(false)
+                    && !matches!(inner, ast::Expr::Literal(ast::Literal::False)),
+            );
+            continue;
+        };
+        if !children_done {
+            todo.push((node, true));
+            todo.push((rhs, false));
+            todo.push((lhs, false));
+            continue;
+        }
+        let (Some(rhs_zero), Some(lhs_zero)) = (zero.pop(), zero.pop()) else {
+            return false;
+        };
+        zero.push((lhs_zero || rhs_zero) && !calls_function(lhs) && !calls_function(rhs));
+    }
+    zero.pop().unwrap_or(false)
+}
+
+/// Whether `expr` calls a function outside its subqueries, as SQLite's parser sees it: LIKE,
+/// GLOB, REGEXP, MATCH, -> and ->> and CURRENT_DATE, CURRENT_TIME and CURRENT_TIMESTAMP are calls
+/// there.
+fn calls_function(expr: &ast::Expr) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        match e {
+            ast::Expr::FunctionCall { .. }
+            | ast::Expr::FunctionCallStar { .. }
+            | ast::Expr::Like { .. }
+            | ast::Expr::Binary(_, ast::Operator::ArrowRight | ast::Operator::ArrowRightShift, _)
+            | ast::Expr::Literal(
+                ast::Literal::CurrentDate
+                | ast::Literal::CurrentTime
+                | ast::Literal::CurrentTimestamp,
+            ) => {
+                found = true;
+                Ok(WalkControl::SkipChildren)
+            }
+            ast::Expr::Exists(_) | ast::Expr::Subquery(_) => Ok(WalkControl::SkipChildren),
+            _ => Ok(WalkControl::Continue),
+        }
+    });
+    found
+}
+
 /// Recursively unwrap parentheses from an owned Expr.
 /// Returns how many pairs of parentheses were removed.
 pub fn unwrap_parens_owned(expr: ast::Expr) -> Result<(ast::Expr, usize)> {

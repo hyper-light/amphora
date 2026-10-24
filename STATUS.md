@@ -291,8 +291,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   fixed (the oracles' cause E); left, from a failing test, `index_xinfo`'s NULL; then the missing
   features by how often users reach them (ORDER BY in aggregates, median and percentiles, the JSON
   functions, the PRAGMAs), each against the probe that found it.
-- **What the oracles left open** (`bench/oracles/findings.md`): a subquery a folded AND or OR still
-  runs (goal 01a16f23f567754ab32edfe5c2abc36d); CERT's estimates, with the planner researched and audited (goal
+- **What the oracles left open** (`bench/oracles/findings.md`): an uncorrelated subquery runs before
+  the loops whether it is read or not, where SQLite runs it where read (goal
+  01a16fcff30576398869ef792267f2eb); CERT's estimates, with the planner researched and audited (goal
   01a16e788f3e735fbadbbdaa30d38d29, plan 01a16eab7f457673b4cf9933adacfc4d).
 - **One thread making everything durable**: on btrfs every flush is a commit of the filesystem's
   log, one at a time, so the checkpointer's flushes of the file hold up the flusher's, and with it

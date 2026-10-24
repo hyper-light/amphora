@@ -28,14 +28,17 @@ use crate::{
             eqp_detail_for_rowid_search, eqp_detail_for_table_op, eqp_details_for_right_join,
             EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec,
         },
-        expr::{get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut, WalkControl},
+        expr::{
+            expr_contains_nondeterministic_scalar_function, get_expr_affinity, has_subquery,
+            literal_truth, simplified_and_or, unwrap_parens, walk_expr, walk_expr_mut, WalkControl,
+        },
         optimizer::optimize_select_plan,
         plan::{
             outer_columns_read, plan_has_outer_scope_dependency, plan_is_correlated,
             select_plan_has_outer_scope_dependency, ColumnUsedMask, EvalAt, JoinInfo,
             JoinOrderMember, JoinedTable, NonFromClauseSubquery, OuterQueryReference, Plan,
             SubqueryEvalPhase, SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences,
-            WhereTerm,
+            WhereTerm, WhereTermOrigin,
         },
         select::prepare_select_plan,
     },
@@ -401,6 +404,33 @@ pub fn plan_subqueries_from_select_plan(
         }
     }
 
+    {
+        let mut dropped = Vec::new();
+        null_beside_false_where_term(&mut plan.where_clause, resolver, &mut dropped)?;
+        let mut exprs: Vec<&mut ast::Expr> =
+            plan.where_clause.iter_mut().map(|t| &mut t.expr).collect();
+        if let Some(group_by) = &mut plan.group_by {
+            exprs.extend(group_by.exprs.iter_mut());
+            if let Some(having) = &mut group_by.having {
+                exprs.extend(having.iter_mut());
+            }
+        }
+        exprs.extend(plan.result_columns.iter_mut().map(|c| &mut c.expr));
+        exprs.extend(plan.order_by.iter_mut().map(|(expr, _, _)| &mut **expr));
+        if let Some(limit) = &mut plan.limit {
+            exprs.push(limit);
+        }
+        if let Some(offset) = &mut plan.offset {
+            exprs.push(offset);
+        }
+        drop_settled_subqueries(
+            exprs,
+            dropped,
+            &mut plan.non_from_clause_subqueries,
+            resolver,
+        )?;
+    }
+
     // Recollect aggregates after all subquery planning.
     // This is necessary because:
     // 1. Aggregates are collected with cloned expressions before subquery planning modifies them
@@ -453,6 +483,14 @@ pub fn plan_subqueries_from_where_clause(
         &mut Vec::new(),
         &[],
     )?;
+    let mut dropped = Vec::new();
+    null_beside_false_where_term(where_clause, resolver, &mut dropped)?;
+    drop_settled_subqueries(
+        where_clause.iter_mut().map(|term| &mut term.expr),
+        dropped,
+        non_from_clause_subqueries,
+        resolver,
+    )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
     Ok(())
@@ -484,6 +522,12 @@ pub fn plan_subqueries_from_values(
         &mut Vec::new(),
         &[],
     )?;
+    drop_settled_subqueries(
+        values.iter_mut().flatten().map(|e| e.as_mut()),
+        Vec::new(),
+        non_from_clause_subqueries,
+        resolver,
+    )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
     Ok(())
@@ -513,6 +557,12 @@ pub fn plan_subqueries_from_update_sets(
         &mut Vec::new(),
         &mut Vec::new(),
         &[],
+    )?;
+    drop_settled_subqueries(
+        sets.iter_mut().map(|set| set.expr.as_mut()),
+        Vec::new(),
+        non_from_clause_subqueries,
+        resolver,
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
@@ -551,6 +601,15 @@ pub fn plan_subqueries_from_returning(
         &mut Vec::new(),
         &[],
     )?;
+    drop_settled_subqueries(
+        returning.iter_mut().filter_map(|rc| match rc {
+            ast::ResultColumn::Expr(expr, _) => Some(expr.as_mut()),
+            ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => None,
+        }),
+        Vec::new(),
+        non_from_clause_subqueries,
+        resolver,
+    )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
     Ok(())
@@ -573,7 +632,7 @@ pub fn plan_subqueries_from_trigger_when_clause(
         non_from_clause_subqueries,
         &mut table_references,
         resolver,
-        std::iter::once(expr),
+        std::iter::once(&mut *expr),
         connection,
         SubqueryPosition::Where,
         SubqueryOrigin::TriggerWhen,
@@ -581,6 +640,12 @@ pub fn plan_subqueries_from_trigger_when_clause(
         &mut Vec::new(),
         &mut Vec::new(),
         &[],
+    )?;
+    drop_settled_subqueries(
+        std::iter::once(expr),
+        Vec::new(),
+        non_from_clause_subqueries,
+        resolver,
     )
 }
 
@@ -1095,6 +1160,178 @@ fn get_subquery_parser<'a>(
             _ => Ok(WalkControl::Continue),
         }
     }
+}
+
+/// Drops what a settled AND or OR never reads. SQLite codes only what sqlite3ExprSimplifiedAndOr
+/// keeps of an AND or an OR an operand settles ([simplified_and_or]), so a subquery on the side it
+/// leaves out never runs; here each became a subquery to run before the loops. Each such subquery
+/// becomes NULL (an IN subquery, the NOT of its left operand, which may hold an aggregate) and
+/// leaves `subqueries` unless an expression still reads it (one GROUP BY shares with the select
+/// list). Neither a NULL nor a NOT has a literal's truth, as a subquery hasn't, so every AND and
+/// OR settles as before. A subquery in an aggregate's or a window function's arguments stays:
+/// SQLite steps every aggregate, whatever the expression around it settles to. The subqueries were
+/// planned first, so a name one misses is still an error, as in SQLite. `dropped` holds those
+/// made NULL already ([null_beside_false_where_term]).
+fn drop_settled_subqueries<'a>(
+    exprs: impl IntoIterator<Item = &'a mut ast::Expr>,
+    mut dropped: Vec<TableInternalId>,
+    subqueries: &mut Vec<NonFromClauseSubquery>,
+    resolver: &Resolver,
+) -> Result<()> {
+    let mut exprs: Vec<&mut ast::Expr> = exprs.into_iter().collect();
+    for expr in exprs.iter_mut() {
+        walk_expr_mut(expr, &mut |node: &mut ast::Expr| -> Result<WalkControl> {
+            let ast::Expr::Binary(lhs, op @ (ast::Operator::And | ast::Operator::Or), rhs) = node
+            else {
+                return Ok(WalkControl::Continue);
+            };
+            let and = matches!(op, ast::Operator::And);
+            let lhs_truth = literal_truth(simplified_and_or(lhs));
+            let rhs_truth = literal_truth(simplified_and_or(rhs));
+            // The side simplified_and_or leaves out. One settled itself holds nothing that runs
+            // once its own ANDs and ORs are settled, as this walk does next.
+            let (left_out, truth) = if lhs_truth == Some(true) || rhs_truth == Some(false) {
+                if and {
+                    (lhs, lhs_truth)
+                } else {
+                    (rhs, rhs_truth)
+                }
+            } else if rhs_truth == Some(true) || lhs_truth == Some(false) {
+                if and {
+                    (rhs, rhs_truth)
+                } else {
+                    (lhs, lhs_truth)
+                }
+            } else {
+                return Ok(WalkControl::Continue);
+            };
+            if truth.is_none() {
+                null_subqueries(left_out, resolver, &mut dropped)?;
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    if dropped.is_empty() {
+        return Ok(());
+    }
+    let mut read: Vec<TableInternalId> = Vec::new();
+    for expr in &exprs {
+        walk_expr(expr, &mut |node: &ast::Expr| -> Result<WalkControl> {
+            if let ast::Expr::SubqueryResult { subquery_id, .. } = node {
+                read.push(*subquery_id);
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    subqueries.retain(|s| !dropped.contains(&s.internal_id) || read.contains(&s.internal_id));
+    Ok(())
+}
+
+/// Makes NULL ([null_subqueries]) the subqueries of the WHERE terms beside one a literal settles to
+/// false, which SQLite tests before its loops: a WHERE term that reads no row, holds no subquery
+/// and calls nothing nondeterministic (sqlite3WhereBegin's constant terms). It codes every term
+/// with a subquery inside the loops, which then never run. A term from an ON clause doesn't
+/// settle the WHERE. The ids made NULL go to `dropped`.
+fn null_beside_false_where_term(
+    where_clause: &mut [WhereTerm],
+    resolver: &Resolver,
+    dropped: &mut Vec<TableInternalId>,
+) -> Result<()> {
+    let mut settled = None;
+    for (i, term) in where_clause.iter().enumerate() {
+        if matches!(term.origin, WhereTermOrigin::Where)
+            && literal_truth(simplified_and_or(&term.expr)) == Some(false)
+            && !has_subquery(&term.expr)
+            && !reads_a_row(&term.expr)?
+            && !expr_contains_nondeterministic_scalar_function(&term.expr, resolver)?
+        {
+            settled = Some(i);
+            break;
+        }
+    }
+    let Some(settled) = settled else {
+        return Ok(());
+    };
+    for (i, term) in where_clause.iter_mut().enumerate() {
+        if i != settled {
+            null_subqueries(&mut term.expr, resolver, dropped)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `expr` reads a column or a rowid of a table.
+fn reads_a_row(expr: &ast::Expr) -> Result<bool> {
+    let mut reads = false;
+    walk_expr(expr, &mut |node: &ast::Expr| -> Result<WalkControl> {
+        if matches!(node, ast::Expr::Column { .. } | ast::Expr::RowId { .. }) {
+            reads = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(reads)
+}
+
+/// Makes each subquery in `side` NULL ([drop_settled_subqueries]), but not in an aggregate's or a
+/// window function's call; the ids made NULL go to `dropped`.
+fn null_subqueries(
+    side: &mut ast::Expr,
+    resolver: &Resolver,
+    dropped: &mut Vec<TableInternalId>,
+) -> Result<()> {
+    walk_expr_mut(side, &mut |node: &mut ast::Expr| -> Result<WalkControl> {
+        if accumulates(node, resolver)? {
+            return Ok(WalkControl::SkipChildren);
+        }
+        let replacement = match node {
+            ast::Expr::SubqueryResult {
+                subquery_id, lhs, ..
+            } => {
+                dropped.push(*subquery_id);
+                Some(match lhs.take() {
+                    Some(lhs) => ast::Expr::Unary(ast::UnaryOperator::Not, lhs),
+                    None => ast::Expr::Literal(ast::Literal::Null),
+                })
+            }
+            _ => None,
+        };
+        if let Some(replacement) = replacement {
+            *node = replacement;
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+/// Whether `expr` calls an aggregate or a window function, which SQLite steps whatever the
+/// expression around it settles to.
+fn accumulates(expr: &ast::Expr, resolver: &Resolver) -> Result<bool> {
+    let (name, arg_count) = match expr {
+        ast::Expr::FunctionCall {
+            name,
+            args,
+            within_group,
+            ..
+        } => {
+            if !within_group.is_empty() {
+                return Ok(true);
+            }
+            (name, args.len())
+        }
+        ast::Expr::FunctionCallStar { name, .. } => (name, 0),
+        _ => return Ok(false),
+    };
+    Ok(
+        match crate::function::Func::resolve_function(name.as_str(), arg_count)? {
+            Some(crate::function::Func::Agg(_) | crate::function::Func::Window(_)) => true,
+            Some(_) => false,
+            None => resolver
+                .symbol_table
+                .resolve_function(name.as_str(), arg_count)
+                .is_some_and(|f| f.func.is_aggregate()),
+        },
+    )
 }
 
 /// Recollect all aggregates after subquery planning.

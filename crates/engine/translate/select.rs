@@ -10,7 +10,8 @@ use crate::sync::Arc;
 use crate::translate::collate::{resolve_comparison_collseq_with_symbols, CollationSeq};
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
-    bind_and_rewrite_expr, expr_vector_size, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
+    bind_and_rewrite_expr, expr_vector_size, fold_false_ands, walk_expr, walk_expr_mut,
+    BindingBehavior, WalkControl,
 };
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::{optimize_plan, Optimizable};
@@ -182,6 +183,38 @@ pub fn prepare_select_plan(
     )
 }
 
+/// Folds the ANDs SQLite's parser makes 0 ([fold_false_ands]) in a SELECT arm's result columns,
+/// ON clauses, WHERE, GROUP BY and HAVING before anything reads them.
+fn fold_arm_ands(
+    columns: &mut [ResultColumn],
+    from: Option<&mut ast::FromClause>,
+    where_clause: Option<&mut ast::Expr>,
+    group_by: Option<&mut ast::GroupBy>,
+) -> Result<()> {
+    for column in columns.iter_mut() {
+        if let ResultColumn::Expr(expr, _) = column {
+            fold_false_ands(expr)?;
+        }
+    }
+    for join in from.into_iter().flat_map(|from| from.joins.iter_mut()) {
+        if let Some(ast::JoinConstraint::On(expr)) = join.constraint.as_mut() {
+            fold_false_ands(expr)?;
+        }
+    }
+    if let Some(expr) = where_clause {
+        fold_false_ands(expr)?;
+    }
+    if let Some(group_by) = group_by {
+        for expr in group_by.exprs.iter_mut() {
+            fold_false_ands(expr)?;
+        }
+        if let Some(having) = group_by.having.as_mut() {
+            fold_false_ands(having)?;
+        }
+    }
+    Ok(())
+}
+
 /// Plans a first SELECT arm followed by zero or more compound arms.
 ///
 /// Accepting the arms directly lets recursive CTE planning divide a stored
@@ -192,14 +225,25 @@ pub(crate) fn prepare_select_plan_from_arms(
     first_arm: ast::OneSelect,
     compound_arms: impl IntoIterator<Item = CompoundSelect>,
     with: Option<ast::With>,
-    order_by: Vec<ast::SortedColumn>,
-    limit: Option<ast::Limit>,
+    mut order_by: Vec<ast::SortedColumn>,
+    mut limit: Option<ast::Limit>,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
+    // As SQLite's parser does, before anything reads them: an ORDER BY term made 0 is a column
+    // number.
+    for term in order_by.iter_mut() {
+        fold_false_ands(&mut term.expr)?;
+    }
+    if let Some(limit) = limit.as_mut() {
+        fold_false_ands(&mut limit.expr)?;
+        if let Some(offset) = limit.offset.as_mut() {
+            fold_false_ands(offset)?;
+        }
+    }
     let mut compound_arms = compound_arms.into_iter().peekable();
     if compound_arms.peek().is_none() {
         return Ok(Plan::Select(Box::new(prepare_one_select_plan(
@@ -292,13 +336,19 @@ fn prepare_one_select_plan(
 ) -> Result<SelectPlan> {
     match select {
         ast::OneSelect::Select {
-            columns,
-            from,
-            where_clause,
-            group_by,
+            mut columns,
+            mut from,
+            mut where_clause,
+            mut group_by,
             distinctness,
             window_clause,
         } => {
+            fold_arm_ands(
+                &mut columns,
+                from.as_mut(),
+                where_clause.as_deref_mut(),
+                group_by.as_mut(),
+            )?;
             let col_count = columns.len();
             if col_count == 0 {
                 crate::bail_parse_error!("SELECT without columns is not allowed");
@@ -835,6 +885,9 @@ fn prepare_one_select_plan(
             Ok(plan)
         }
         ast::OneSelect::Values(mut values) => {
+            for expr in values.iter_mut().flatten() {
+                fold_false_ands(expr)?;
+            }
             if !order_by.is_empty() {
                 crate::bail_parse_error!("ORDER BY clause is not allowed with VALUES clause");
             }

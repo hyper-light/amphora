@@ -118,6 +118,7 @@ pub fn bind_and_rewrite_expr<'a>(
     resolver: &Resolver<'_>,
     binding_behavior: BindingBehavior,
 ) -> Result<()> {
+    fold_false_ands(top_level_expr)?;
     walk_expr_mut(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {

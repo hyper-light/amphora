@@ -1412,3 +1412,92 @@ fn a_functions_value_takes_its_arguments_first_collate() {
         ["1|1|1|1|1"]
     );
 }
+
+/// Do: settle an AND or OR with a literal (`1 OR`, `0 AND`, on either side) beside a subquery that
+/// raises an error (sum's integer overflow): in WHERE, in the select list, under EXISTS and IN,
+/// beside an aggregate, shared by GROUP BY and the select list, in INSERT VALUES, UPDATE SET, its
+/// WHERE and RETURNING, and DELETE's WHERE; and with a WHERE term a literal 0 settles beside it.
+/// Expect: SQLite's answers. Its parser makes an AND with a literal 0 and no function on either side
+/// the 0 (sqlite3ExprAnd), so names there are never resolved and an ORDER BY term so made is a
+/// column number; its code leaves out what sqlite3ExprSimplifiedAndOr drops, so a subquery there
+/// never runs, though an aggregate beside it still makes one row and a name it misses is still an
+/// error; and a WHERE term that is a literal 0 jumps past the loops before any other term runs, but
+/// not one from an ON clause. Amphora ran every uncorrelated subquery before the loops, read or
+/// not, and resolved every name (finding error-99fb1658e34f78cb of seed 14).
+#[test]
+fn a_subquery_a_settled_branch_drops_never_runs() {
+    let (io, conn) = open();
+    let error = |sql: &str| match conn.prepare(sql).and_then(|mut stmt| loop {
+        match stmt.step()? {
+            StepResult::IO => io.step()?,
+            StepResult::Done => break Ok(()),
+            _ => {}
+        }
+    }) {
+        Ok(()) => "no error".to_owned(),
+        Err(e) => e.to_string(),
+    };
+    conn.execute("CREATE TABLE t0(c0 INT)").unwrap();
+    conn.execute("INSERT INTO t0 VALUES (10), (9223372036854775807), (7)")
+        .unwrap();
+    let overflow = "(SELECT sum(c0) FROM t0 WHERE c0)";
+    let exists = "EXISTS (SELECT sum(c0) FROM t0 WHERE c0 HAVING sum(c0))";
+    assert!(error(&format!("SELECT 1 AND {overflow}")).contains("integer overflow"));
+    for (sql, want) in [
+        (format!("SELECT a0.rowid FROM t0 AS a0 WHERE (1 OR {overflow})"), vec!["1", "2", "3"]),
+        (format!("SELECT (1 OR {overflow}) IS TRUE, (1 OR {overflow}) IS FALSE FROM t0 WHERE rowid = 3"), vec!["1|0"]),
+        (format!("SELECT 0 AND {overflow}, {overflow} AND 0, {overflow} OR 1, NOT (0 AND {overflow})"), vec!["0|0|1|1"]),
+        (format!("SELECT count(*) FROM t0 WHERE 0 AND {exists}"), vec!["0"]),
+        (format!("SELECT 1 OR c0 IN {overflow} FROM t0"), vec!["1", "1", "1"]),
+        (format!("SELECT 1 OR max(c0) IN {overflow} FROM t0"), vec!["1"]),
+        ("SELECT 1 OR (SELECT count(*) FROM t0), (SELECT count(*) FROM t0) FROM t0 GROUP BY (SELECT count(*) FROM t0)".to_owned(), vec!["1|3"]),
+        (format!("SELECT c0 FROM t0 WHERE rowid = 1 AND (0 AND {overflow}) IS NOT NULL"), vec!["10"]),
+        ("SELECT 0 AND nosuch, (0) AND nosuch, (5 ISNULL) AND nosuch, 0 AND (SELECT nosuch FROM t0), 0 AND nosuch AND abs(1), (0 AND nosuch) OR 1".to_owned(), vec!["0|0|0|0|0|1"]),
+        ("SELECT count(*) FROM t0 WHERE nosuch AND 0".to_owned(), vec!["0"]),
+        ("SELECT count(*) FROM t0 JOIN t0 AS b ON 0 AND nosuch".to_owned(), vec!["0"]),
+        ("SELECT count(*) FROM t0 GROUP BY c0 HAVING 0 AND nosuch".to_owned(), vec![]),
+        (format!("SELECT count(*) FROM t0 WHERE 0 AND abs(c0) AND {exists}"), vec!["0"]),
+        (format!("SELECT count(*) FROM t0 WHERE abs(c0) AND {exists} AND 0"), vec!["0"]),
+        (format!("SELECT count(*) FROM t0 WHERE {exists} AND 0 AND random()"), vec!["0"]),
+        (format!("SELECT c0 FROM t0 WHERE {exists} AND (0 AND abs(c0))"), vec![]),
+    ] {
+        assert_eq!(rows(&io, &conn, &sql), want, "{sql}");
+    }
+    for (sql, want) in [
+        (
+            "SELECT 1 OR (SELECT nosuch FROM t0)".to_owned(),
+            "no such column",
+        ),
+        ("SELECT FALSE AND nosuch".to_owned(), "no such column"),
+        ("SELECT 0.0 AND nosuch".to_owned(), "no such column"),
+        ("SELECT -0 AND nosuch".to_owned(), "no such column"),
+        (
+            "SELECT 0 AND (nosuch LIKE 'a')".to_owned(),
+            "no such column",
+        ),
+        ("SELECT 0 AND abs(nosuch)".to_owned(), "no such column"),
+        (
+            "SELECT c0 FROM t0 ORDER BY 0 AND nosuch".to_owned(),
+            "ORDER BY term out of range",
+        ),
+        (
+            format!("SELECT count(*) FROM t0 LEFT JOIN t0 AS b ON 0 WHERE {exists}"),
+            "integer overflow",
+        ),
+    ] {
+        assert!(error(&sql).contains(want), "{sql}: {}", error(&sql));
+    }
+    conn.execute("CREATE TABLE t1(a INT)").unwrap();
+    conn.execute(format!(
+        "INSERT INTO t1 VALUES (0 AND {overflow}), (1 OR {overflow})"
+    ))
+    .unwrap();
+    assert_eq!(rows(&io, &conn, "SELECT a FROM t1"), ["0", "1"]);
+    assert_eq!(
+        rows(&io, &conn, &format!("UPDATE t1 SET a = a + (0 AND {overflow}) WHERE (1 OR {overflow}) RETURNING a, 1 OR {overflow}")),
+        ["0|1", "1|1"]
+    );
+    conn.execute(format!("DELETE FROM t1 WHERE 0 AND {overflow}"))
+        .unwrap();
+    assert_eq!(rows(&io, &conn, "SELECT count(*) FROM t1"), ["2"]);
+}
