@@ -1640,3 +1640,97 @@ fn a_triggers_subqueries_run_afresh_at_each_firing() {
         ["1|60", "2|10", "3|20"]
     );
 }
+
+/// Do: put a correlated subquery that raises an error (sum's integer overflow) in a CASE branch no
+/// row takes where Amphora ran it at every row of its loop: an ungrouped aggregate's output, a
+/// GROUP BY's select list, a window query's select list, a RIGHT JOIN query's select list and an
+/// UPDATE's SET; then let a row take the branch. Expect: SQLite's rows where no row reads it, as
+/// SQLite runs a correlated subquery where its expression is coded (an aggregate's from the values
+/// kept for its output), and SQLite's error where one does. HAVING, a DELETE's WHERE behind a
+/// failing term and a SELECT whose rows go straight out already answered so, and still do.
+#[test]
+fn a_correlated_subquery_no_row_reads_never_runs() {
+    let (io, conn) = open();
+    let error = |sql: &str| match conn.prepare(sql).and_then(|mut stmt| loop {
+        match stmt.step()? {
+            StepResult::IO => io.step()?,
+            StepResult::Done => break Ok(()),
+            _ => {}
+        }
+    }) {
+        Ok(()) => "no error".to_owned(),
+        Err(e) => e.to_string(),
+    };
+    conn.execute("CREATE TABLE t0(c0 INT, c1 INT)").unwrap();
+    conn.execute("INSERT INTO t0 VALUES (10, 0), (9223372036854775807, 0), (7, 0)")
+        .unwrap();
+    conn.execute("CREATE TABLE t1(x INT)").unwrap();
+    conn.execute("INSERT INTO t1 VALUES (1)").unwrap();
+    let s = "(SELECT sum(b.c0) FROM t0 AS b WHERE b.c0 >= a.c0 - a.c0)";
+    let u = "(SELECT sum(b.c0) FROM t0 AS b WHERE b.c0 >= t0.c0 - t0.c0)";
+    // Each place: a query no row of which reads the subquery, its answer, and one a row reads it in.
+    for (place, unread, want, read) in [
+        (
+            "an ungrouped aggregate's output",
+            format!("SELECT count(*), CASE WHEN max(a.c0) = 99 THEN {s} END FROM t0 AS a"),
+            vec!["3|NULL"],
+            format!("SELECT count(*), CASE WHEN max(a.c0) > 0 THEN {s} END FROM t0 AS a"),
+        ),
+        (
+            "a GROUP BY's select list",
+            format!("SELECT a.c0, CASE WHEN a.c0 = 99 THEN {s} END FROM t0 AS a GROUP BY a.c0 ORDER BY a.c0"),
+            vec!["7|NULL", "10|NULL", "9223372036854775807|NULL"],
+            format!("SELECT a.c0, CASE WHEN a.c0 = 7 THEN {s} END FROM t0 AS a GROUP BY a.c0 ORDER BY a.c0"),
+        ),
+        (
+            "HAVING",
+            format!("SELECT a.c0 FROM t0 AS a GROUP BY a.c0 HAVING a.c0 = 99 AND {s} > 0"),
+            vec![],
+            format!("SELECT a.c0 FROM t0 AS a GROUP BY a.c0 HAVING a.c0 = 7 AND {s} > 0"),
+        ),
+        (
+            "a window query's select list",
+            format!("SELECT CASE WHEN a.c0 = 99 THEN {s} END, row_number() OVER () FROM t0 AS a"),
+            vec!["NULL|1", "NULL|2", "NULL|3"],
+            format!("SELECT CASE WHEN a.c0 = 7 THEN {s} END, row_number() OVER () FROM t0 AS a"),
+        ),
+        (
+            "a window query a LIMIT cuts short of the row that reads it",
+            format!("SELECT CASE WHEN a.c0 = 7 THEN {s} END, row_number() OVER () FROM t0 AS a LIMIT 1"),
+            vec!["NULL|1"],
+            format!("SELECT CASE WHEN a.c0 = 7 THEN {s} END, row_number() OVER () FROM t0 AS a LIMIT 3"),
+        ),
+        (
+            "a RIGHT JOIN query's select list",
+            format!("SELECT CASE WHEN a.c0 = 99 THEN {s} END FROM t1 RIGHT JOIN t0 AS a ON t1.x = a.c0"),
+            vec!["NULL", "NULL", "NULL"],
+            format!("SELECT CASE WHEN a.c0 = 7 THEN {s} END FROM t1 RIGHT JOIN t0 AS a ON t1.x = a.c0"),
+        ),
+        (
+            "a SELECT whose rows go straight out",
+            format!("SELECT CASE WHEN a.c0 = 99 THEN {s} END FROM t0 AS a ORDER BY a.c1"),
+            vec!["NULL", "NULL", "NULL"],
+            format!("SELECT CASE WHEN a.c0 = 7 THEN {s} END FROM t0 AS a ORDER BY a.c1"),
+        ),
+        (
+            "an UPDATE's SET",
+            format!("UPDATE t0 SET c1 = CASE WHEN c0 = 99 THEN {u} END RETURNING c1"),
+            vec!["NULL", "NULL", "NULL"],
+            format!("UPDATE t0 SET c1 = CASE WHEN c0 = 7 THEN {u} END RETURNING c1"),
+        ),
+        (
+            "a DELETE's WHERE",
+            format!("DELETE FROM t0 WHERE c0 = 99 AND {u} > 0 RETURNING c0"),
+            vec![],
+            format!("DELETE FROM t0 WHERE c0 = 7 AND {u} > 0 RETURNING c0"),
+        ),
+    ] {
+        assert_eq!(error(&unread), "no error", "{place}: {unread}");
+        assert_eq!(rows(&io, &conn, &unread), want, "{place}: {unread}");
+        assert!(
+            error(&read).contains("integer overflow"),
+            "{place}: {read}: {}",
+            error(&read)
+        );
+    }
+}

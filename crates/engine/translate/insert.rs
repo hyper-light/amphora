@@ -1167,8 +1167,9 @@ pub fn translate_insert(
                     subquery.internal_id,
                     *subquery_plan,
                     &subquery.query_type,
+                    // Run at its read in RETURNING, for the row written, as SQLite codes it.
                     if subquery.correlated || rerun_for_target_scan {
-                        crate::translate::plan::SubqueryRun::EveryRow
+                        crate::translate::plan::SubqueryRun::EveryRead
                     } else {
                         crate::translate::plan::SubqueryRun::Once
                     },

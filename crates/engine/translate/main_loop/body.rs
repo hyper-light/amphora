@@ -519,6 +519,41 @@ fn emit_loop_source<'a>(
                 })?;
             }
 
+            // A subquery run after AggFinal reads this query's columns as its bare columns are
+            // read: from the row read here, kept in registers, not from the exhausted cursor.
+            for subquery in &plan.non_from_clause_subqueries {
+                let crate::translate::plan::SubqueryState::Unevaluated {
+                    plan: Some(subplan),
+                } = &subquery.state
+                else {
+                    continue;
+                };
+                if !matches!(
+                    subquery.eval_phase,
+                    crate::translate::plan::SubqueryEvalPhase::UngroupedAggregateOutput
+                ) {
+                    continue;
+                }
+                for expr in
+                    crate::translate::plan::outer_columns_read(subplan, &plan.table_references)
+                {
+                    let reg = program.alloc_register();
+                    translate_expr(
+                        program,
+                        Some(&plan.table_references),
+                        &expr,
+                        reg,
+                        &t_ctx.resolver,
+                    )?;
+                    t_ctx.resolver.cache_scalar_expr_reg(
+                        Cow::Owned(expr),
+                        reg,
+                        false,
+                        &plan.table_references,
+                    )?;
+                }
+            }
+
             if let Some(label) = label_emit_nonagg_only_once {
                 program.preassign_label_to_next_insn(label);
                 let flag = t_ctx.reg_nonagg_emit_once_flag.unwrap();

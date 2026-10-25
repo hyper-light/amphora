@@ -318,6 +318,14 @@ fn rewrite_terminal_expr(
     walk_expr_mut(
         top_level_expr,
         &mut |expr: &mut Expr| -> crate::Result<WalkControl> {
+            // An expression holding a subquery, and no window function or aggregate, goes down
+            // whole: the source subquery's rows go straight out, so the subquery runs where it is
+            // read there, under its CASE or AND. Pushed down alone, the source would run it for
+            // every row. A window keeps a row for each input row, so each runs as often.
+            if holds_subquery_alone(expr, aggregates)? {
+                rewrite_expr_as_subquery_column(expr, ctx, false);
+                return Ok(WalkControl::SkipChildren);
+            }
             match expr {
                 Expr::FunctionCall { filter_over, .. }
                 | Expr::FunctionCallStar { filter_over, .. } => {
@@ -375,6 +383,35 @@ fn rewrite_terminal_expr(
             Ok(WalkControl::Continue)
         },
     )
+}
+
+/// Whether `expr` holds a subquery and neither a window function nor one of `aggregates`.
+fn holds_subquery_alone(expr: &Expr, aggregates: &[Aggregate]) -> crate::Result<bool> {
+    let mut subquery = false;
+    let mut other = false;
+    walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
+        match e {
+            Expr::SubqueryResult { .. }
+            | Expr::Exists(..)
+            | Expr::InSelect { .. }
+            | Expr::Subquery(..) => {
+                subquery = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+            Expr::FunctionCall { filter_over, .. } | Expr::FunctionCallStar { filter_over, .. }
+                if filter_over.over_clause.is_some()
+                    || aggregates
+                        .iter()
+                        .any(|a| exprs_are_equivalent(&a.original_expr, e)) =>
+            {
+                other = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(subquery && !other)
 }
 
 /// Find the `WindowFunction` entry that this expression corresponds to.

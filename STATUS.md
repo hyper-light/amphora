@@ -192,10 +192,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   `crates/engine/tests/oracle_findings.rs`): a subquery outside FROM is a subroutine each read
   calls, an uncorrelated one's body behind its own Once, so one that no row reaches never runs
   (over an empty table, past a WHERE term no row passes, in a CASE branch none takes), as in
-  SQLite. A correlated one in WHERE, the select list or ORDER BY of a query whose rows go straight
-  out runs at each read, for the row in hand, and a WHERE term holding a subquery is tested in the
-  first loop, not before the loops. Correlated ones elsewhere still run at every row (goal
-  01a1704d3be97309b55a5863391f3182). The suite's `subquery_in` and `exists_subquery` are no slower:
+  SQLite. A correlated one runs at each read too, wherever what it reads of the outer row is: a
+  direct-output SELECT's loop, an aggregate's or a GROUP BY's output (from the values kept for it),
+  a window query's source, a RIGHT or FULL JOIN's row body, a write statement's SET, WHERE and
+  RETURNING; only one in an aggregate's arguments, a GROUP BY key or a RIGHT or FULL JOIN's WHERE
+  still runs at every row (`a_correlated_subquery_no_row_reads_never_runs`). A WHERE term holding a
+  subquery is tested in the first loop, not before the loops. The suite's `subquery_in` and
+  `exists_subquery` are no slower:
   time per statement within 1% at 1 and 32 clients, best of 3 in turns on adas-mac-studio
   (`bench/records/2026-10-25-adas-mac-studio-lazy-subqueries.md`).
 
@@ -225,10 +228,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   subqueries run after the read that needs them; the oracles' own artifacts, fixed; five not Amphora's
   (SQLite's own bugs, evaluation order, the BLOB LIKE option, ill-formed UTF-8 per
   `docs/design/semantics.md`, SQLite's names in a folded AND). Open: CERT's estimates (87 findings,
-  cause AG, the planner's goal), and a correlated subquery outside a direct-output SELECT, which
-  still runs at every row, read or not (goal 01a1704d3be97309b55a5863391f3182). **The
-  test:** a wrong-result bug injected into the optimizer (`x IS NULL` taken as rejecting NULLs) was
-  caught by one nightly run: 125 findings, the first at 0.47 s of the 1,800 s (`bench/oracles/injected.sh`).
+  cause AG, the planner's goal). **The test:** a wrong-result bug injected into the optimizer (`x IS
+  NULL` taken as rejecting NULLs) was caught by one nightly run: 125 findings, the first at 0.47 s
+  of the 1,800 s (`bench/oracles/injected.sh`).
 - **The SQLite language against every engine** (G2 step 1, `bench/corpus/run.sh`; published in
   `bench/corpus/matrix.md`, every cell in `matrix.json`, the probes' answers in
   `bench/records/2026-10-24-adacachy-corpus-probes/`): SQLite's documentation (3.54.1) inventoried into
@@ -307,11 +309,8 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   fixed (the oracles' cause E); left, from a failing test, `index_xinfo`'s NULL; then the missing
   features by how often users reach them (ORDER BY in aggregates, median and percentiles, the JSON
   functions, the PRAGMAs), each against the probe that found it.
-- **What the oracles left open** (`bench/oracles/findings.md`): a correlated subquery outside a
-  direct-output SELECT (an aggregate's, a GROUP BY's, a window's, a RIGHT or FULL JOIN's unmatched
-  rows', a write statement's) runs at every row, read or not, where SQLite runs it where read (goal
-  01a1704d3be97309b55a5863391f3182); CERT's estimates, with the planner researched and audited (goal
-  01a16e788f3e735fbadbbdaa30d38d29, plan 01a16eab7f457673b4cf9933adacfc4d).
+- **What the oracles left open** (`bench/oracles/findings.md`): CERT's estimates, with the planner
+  researched and audited (goal 01a16e788f3e735fbadbbdaa30d38d29, plan 01a16eab7f457673b4cf9933adacfc4d).
 - **One thread making everything durable**: on btrfs every flush is a commit of the filesystem's
   log, one at a time, so the checkpointer's flushes of the file hold up the flusher's, and with it
   every write (docs/design/store.md, decision 4: commits stalled up to 97 ms, writes at 512 writers

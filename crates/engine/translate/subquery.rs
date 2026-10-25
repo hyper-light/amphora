@@ -849,7 +849,7 @@ fn get_subquery_parser<'a>(
                     origin,
                     eval_phase: origin.phase_floor(),
                     preferred_eval_after_table: None,
-                    runs_where_read: false,
+                    runs_where_read: runs_where_read_from_the_start(correlated, origin),
                 });
                 Ok(WalkControl::Continue)
             }
@@ -995,7 +995,7 @@ fn get_subquery_parser<'a>(
                     origin: effective_origin,
                     eval_phase: effective_origin.phase_floor(),
                     preferred_eval_after_table: None,
-                    runs_where_read: false,
+                    runs_where_read: runs_where_read_from_the_start(correlated, effective_origin),
                 });
                 if let Some(key) = cse_key {
                     cse_map.push((key, expr.clone()));
@@ -1156,7 +1156,7 @@ fn get_subquery_parser<'a>(
                     origin,
                     eval_phase: origin.phase_floor(),
                     preferred_eval_after_table: None,
-                    runs_where_read: false,
+                    runs_where_read: runs_where_read_from_the_start(correlated, origin),
                 });
                 Ok(WalkControl::Continue)
             }
@@ -2325,6 +2325,13 @@ fn emit_materialized_subquery_table(
     Ok((result_columns_start_reg, cursor_id, shared_table))
 }
 
+/// Whether a subquery runs at each read from the start: a correlated one in a write statement's
+/// WHERE, read in its loop for the row in hand. A SELECT's are set with its phases
+/// (`assign_select_subquery_eval_phases`); SET and RETURNING choose where they are emitted.
+fn runs_where_read_from_the_start(correlated: bool, origin: SubqueryOrigin) -> bool {
+    correlated && matches!(origin, SubqueryOrigin::DmlWhere)
+}
+
 /// What a read of a subquery's result reads first: an EXISTS's register, a row value's first, or
 /// an IN's ephemeral cursor (ProgramBuilder::emit_lazy_subquery_call finds the subquery by it).
 pub(crate) fn subquery_result(query_type: &SubqueryType) -> usize {
@@ -2608,6 +2615,12 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
         .is_some_and(|group_by| !group_by.exprs.is_empty());
     let has_direct_row_output =
         !has_grouped_output && plan.aggregates.is_empty() && plan.window.is_none();
+    let has_aggregate_output = !has_direct_row_output && plan.window.is_none();
+    let output_phase = if has_grouped_output {
+        SubqueryEvalPhase::GroupedOutput
+    } else {
+        SubqueryEvalPhase::UngroupedAggregateOutput
+    };
     let has_unmatched_right_rows = plan.table_references.has_right_or_full_join();
 
     // Subqueries inside an aggregate's arguments or FILTER clause are evaluated
@@ -2628,19 +2641,37 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
         }
     }
 
-    let mut outer_aggregate_subquery_ids: Vec<ast::TableInternalId> = Vec::new();
+    let mut output_subquery_ids: Vec<ast::TableInternalId> = Vec::new();
     for subquery in plan.non_from_clause_subqueries.iter_mut() {
         // A subquery that reads an aggregate the outer query computes must run
         // in the outer query's aggregate-output phase, after that aggregate has
         // been finalized into a register; run earlier, the aggregate expression
         // inside the subquery has no register to read.
         if subquery_reads_outer_aggregate(subquery) {
-            subquery.eval_phase = if has_grouped_output {
-                SubqueryEvalPhase::GroupedOutput
-            } else {
-                SubqueryEvalPhase::UngroupedAggregateOutput
-            };
-            outer_aggregate_subquery_ids.push(subquery.internal_id);
+            subquery.eval_phase = output_phase;
+            subquery.runs_where_read = subquery.correlated;
+            output_subquery_ids.push(subquery.internal_id);
+            continue;
+        }
+        // A correlated subquery of an aggregate or grouped query that only its output reads (the
+        // select list, HAVING, ORDER BY: not an aggregate's arguments) runs in the output phase,
+        // at each read, as SQLite runs one in an aggregate's output: its outer columns come from
+        // what the output keeps of the rows (a group's carried columns; an ungrouped query's
+        // first row, as its bare columns). A RIGHT or FULL JOIN keeps its rule below.
+        if subquery.correlated
+            && has_aggregate_output
+            && !has_unmatched_right_rows
+            && matches!(
+                subquery.origin,
+                SubqueryOrigin::SelectList
+                    | SubqueryOrigin::SelectHaving
+                    | SubqueryOrigin::SelectOrderBy
+            )
+            && !aggregate_subquery_ids.contains(&subquery.internal_id)
+        {
+            subquery.eval_phase = output_phase;
+            subquery.runs_where_read = true;
+            output_subquery_ids.push(subquery.internal_id);
             continue;
         }
         // These subqueries run once per input row: in output columns and
@@ -2653,19 +2684,18 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
         } || aggregate_subquery_ids.contains(&subquery.internal_id);
         // A correlated subquery from WHERE, the select list or ORDER BY of a query whose rows go
         // straight out is read only while its loop's row is current, so it runs at each read, as
-        // SQLite's does. Elsewhere it still runs at every row of its loop: an aggregate, a GROUP
-        // BY or a window reads its value after the loops, from what each row stored then, and a
-        // RIGHT or FULL JOIN's unmatched rows enter the row body past the loops that would call
-        // it. Write statements emit their own subqueries (update.rs, delete.rs, insert.rs).
+        // SQLite's does. With a RIGHT or FULL JOIN, one from the select list or ORDER BY runs in
+        // the row body (below), which the matched rows and the unmatched rows' pass both enter,
+        // and so does its read; one from WHERE runs at every row of its loop, as the unmatched
+        // rows' pass enters past it. Write statements emit their own subqueries (update.rs,
+        // delete.rs, insert.rs).
         subquery.runs_where_read = subquery.correlated
             && has_direct_row_output
-            && !has_unmatched_right_rows
-            && matches!(
-                subquery.origin,
-                SubqueryOrigin::SelectWhere
-                    | SubqueryOrigin::SelectList
-                    | SubqueryOrigin::SelectOrderBy
-            );
+            && match subquery.origin {
+                SubqueryOrigin::SelectWhere => !has_unmatched_right_rows,
+                SubqueryOrigin::SelectList | SubqueryOrigin::SelectOrderBy => true,
+                _ => false,
+            };
         subquery.eval_phase = match subquery.origin {
             // The unmatched-rows pass of a RIGHT or FULL JOIN enters the row
             // body directly, skipping the loops where a correlated subquery
@@ -2685,15 +2715,15 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
         };
     }
 
-    // A result column that reads one of these subqueries depends on an
-    // aggregate computed in the output phase, so it must be evaluated there
-    // rather than once per input row — the same treatment SQLite gives any
-    // result-column expression that references an aggregate result (select.c
-    // evaluates those after the aggregation loop, in the output step). Mark it
-    // so the emitter defers it, instead of taking an arbitrary row's NULL
+    // A result column that reads one of these subqueries reads an aggregate
+    // computed in the output phase, or a subquery run there, so it must be
+    // evaluated there rather than once per input row — the same treatment SQLite
+    // gives any result-column expression that references an aggregate result
+    // (select.c evaluates those after the aggregation loop, in the output step).
+    // Mark it so the emitter defers it, instead of taking an arbitrary row's NULL
     // during the scan.
     for rc in plan.result_columns.iter_mut() {
-        if !rc.contains_aggregates && expr_reads_subquery(&rc.expr, &outer_aggregate_subquery_ids) {
+        if !rc.contains_aggregates && expr_reads_subquery(&rc.expr, &output_subquery_ids) {
             rc.contains_aggregates = true;
         }
     }

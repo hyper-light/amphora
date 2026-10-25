@@ -1265,10 +1265,15 @@ fn emit_update_insns<'a>(
             subquery.internal_id,
             *subquery_plan,
             &subquery.query_type,
-            if subquery.correlated {
-                crate::translate::plan::SubqueryRun::EveryRow
-            } else {
-                crate::translate::plan::SubqueryRun::Once
+            // A correlated one runs at its read in the SET expressions, for the positioned row, as
+            // SQLite codes it; but a row value `SET (a, b) = (SELECT ...)`, read a register at a
+            // time, runs once a row.
+            match (subquery.correlated, &subquery.query_type) {
+                (true, ast::SubqueryType::RowValue { num_regs, .. }) if *num_regs > 1 => {
+                    crate::translate::plan::SubqueryRun::EveryRow
+                }
+                (true, _) => crate::translate::plan::SubqueryRun::EveryRead,
+                (false, _) => crate::translate::plan::SubqueryRun::Once,
             },
             false,
         )?;
@@ -2491,8 +2496,9 @@ fn emit_update_insns<'a>(
                             subquery.internal_id,
                             *subquery_plan,
                             &subquery.query_type,
+                            // Run at its read in RETURNING, for the row written.
                             if subquery.correlated || rerun_for_target_scan {
-                                crate::translate::plan::SubqueryRun::EveryRow
+                                crate::translate::plan::SubqueryRun::EveryRead
                             } else {
                                 crate::translate::plan::SubqueryRun::Once
                             },

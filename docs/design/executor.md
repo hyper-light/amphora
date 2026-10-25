@@ -186,10 +186,17 @@ subroutine (`subquery.rs`, `emit_non_from_clause_subquery`): an uncorrelated one
 its own `Once`, and a correlated one's runs for the row in hand. Each read calls it before using its
 result (`ProgramBuilder::emit_lazy_subquery_call`): a scalar's or a row value's registers, an
 EXISTS's, an IN's list, an IN that drives a seek, LIMIT and OFFSET. An uncorrelated subquery's call is
-a `Once` and a `Gosub`, so it runs at most once, where control first reads it. A correlated one in
-WHERE, the select list or ORDER BY of a query whose rows go straight out (no aggregate, GROUP BY,
-window, or RIGHT or FULL JOIN) is called at each read, while its loop's row is current; elsewhere it
-still runs at every row of its loop. A WHERE term holding a subquery is tested in the first loop,
+a `Once` and a `Gosub`, so it runs at most once, where control first reads it. A correlated one is
+called at each read wherever what it reads of the outer row is there at the read: in WHERE, the select
+list and ORDER BY of a query whose rows go straight out, for its loop's row; in an aggregate's or a
+GROUP BY's output (the select list, HAVING, ORDER BY), from what the output keeps of the rows (a
+group's carried columns; an ungrouped query's first row, as its bare columns); in a window query,
+inside the window's source query, which takes the whole expression holding it (`window.rs`); in a
+RIGHT or FULL JOIN's row body, which the unmatched rows' pass enters too; and in a write statement's
+SET, WHERE and RETURNING, for the row in hand (`update.rs`, `delete.rs`, `insert.rs`), but for a row
+value `SET (a, b) = (SELECT ...)`, read a register at a time, which runs once a row. Elsewhere (an
+aggregate's arguments, a GROUP BY key, a RIGHT or FULL JOIN's WHERE) it still runs at every row of
+its loop. A WHERE term holding a subquery is tested in the first loop,
 after the terms that hold none, rather than before the loops (`planner.rs`,
 `determine_where_to_eval_term`), but where a RIGHT or FULL JOIN's unmatched rows would skip that loop.
 
@@ -197,7 +204,10 @@ after the terms that hold none, rather than before the loops (`planner.rs`,
 at every row of its loop. One that no row reaches still ran and raised its error where SQLite answers:
 the oracles' finding error-99fb1658e34f78cb (sum's integer overflow under `WHERE 1 OR (SELECT
 sum(x) ...)`), and with it the same subquery over an empty table, past a WHERE term no row passes,
-in a CASE branch no row takes, or beside `WHERE 0`. Its work was spent for nothing too.
+in a CASE branch no row takes, or beside `WHERE 0`; and a correlated one in a CASE branch of an
+aggregate's output, a GROUP BY's, a window query's, a RIGHT JOIN query's or an UPDATE's SET ran at
+every row (`SELECT count(*), CASE WHEN max(a.c0) = 99 THEN (SELECT ... a.c0 ...) END`: SQLite
+3|NULL, Amphora integer overflow). Its work was spent for nothing too.
 
 **Sources.** SQLite 3.54.0's `sqlite3CodeSubselect` (`src/expr.c`) codes a subquery where it is first
 read, as a subroutine (`OP_BeginSubrtn` ... `OP_Return`) whose body sits behind `OP_Once` unless it
@@ -205,7 +215,11 @@ is correlated; a later read is an `OP_Gosub` to it. `sqlite3WhereBegin` (`src/wh
 term before its loops (its False-WHERE-Term-Bypass) only if it reads none of the loops' tables and
 `exprIsDeterministic` holds, which fails on any subquery (`sqlite3SelectWalkFail`);
 `sqlite3WhereCodeOneLoopStart` (`src/wherecode.c`) codes a term holding a correlated subquery
-(`TERM_VARSELECT`) after the loop's other terms.
+(`TERM_VARSELECT`) after the loop's other terms. In an aggregate query a reference to the query's own
+columns is an aggregate column (`TK_AGG_COLUMN`, `analyzeAggregate`), read from the values kept for
+the output, so the output's subqueries run there; a window query's select list is evaluated in the
+parent of the subquery `sqlite3WindowRewrite` makes; a RIGHT JOIN's unmatched rows run the row body
+in a loop of their own (`sqlite3WhereRightJoinLoop`).
 
 **Evidence.** `crates/engine/tests/oracle_findings.rs`: `an_unread_subquery_never_runs` and
 `an_unread_correlated_subquery_never_runs` failed before the change with the subquery's integer
@@ -214,7 +228,11 @@ something does (a seek key, an IN that drives a seek, LIMIT, an aggregate's outp
 error as SQLite does). `a_subquery_read_in_two_places_is_coded_once` (GROUP BY and the select list,
 an UPDATE's row value) finds the subquery listed once by EXPLAIN QUERY PLAN and its body coded once,
 and `a_triggers_subqueries_run_afresh_at_each_firing` finds a trigger's subqueries run afresh at each
-firing. Release binaries before and after, best of 3 in turns at load under 2 on adas-mac-studio
+firing. `a_correlated_subquery_no_row_reads_never_runs` failed before the correlated subqueries
+moved, in an ungrouped aggregate's output, and answers as SQLite with it in every place: the
+aggregate, a GROUP BY's select list and HAVING, a window query (one a LIMIT cuts short too), a RIGHT
+JOIN query, a SELECT whose rows go straight out, an UPDATE's SET and a DELETE's WHERE, unread and
+read. Release binaries before and after, best of 3 in turns at load under 2 on adas-mac-studio
 (Apple M4 Max, 14 cores; `bench/records/2026-10-25-adas-mac-studio-lazy-subqueries.md`): time per
 statement within 1% for the suite's `subquery_in` and `exists_subquery` at 1 and 32 clients, and
 their median alone unchanged; `exists_subquery`'s median at 32 clients, 1.061 in the best of 3, lay

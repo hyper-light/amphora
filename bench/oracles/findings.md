@@ -17,8 +17,8 @@ are not Amphora's (Q, AH, AN). BE and BD answer as SQLite does since the fix tha
 a literal 0 settles is folded before names are resolved, and a subquery a settled branch drops
 never runs. What BE left, a subquery run before the loops where SQLite runs it later or never,
 answers as SQLite since a subquery runs where it is read (`docs/design/executor.md`, decision 6;
-`an_unread_subquery_never_runs`), but for a correlated one outside a direct-output SELECT (kiln goal
-01a1704d3be97309b55a5863391f3182).
+`an_unread_subquery_never_runs`), a correlated one too: in an aggregate's or a GROUP BY's output, a
+window query, a RIGHT JOIN query and a write statement (`a_correlated_subquery_no_row_reads_never_runs`).
 
 ## Campaign 1: seed 11, 607 s, 2026-10-24
 
