@@ -200,7 +200,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   subquery is tested in the first loop, not before the loops. The suite's `subquery_in` and
   `exists_subquery` are no slower:
   time per statement within 1% at 1 and 32 clients, best of 3 in turns on adas-mac-studio
-  (`bench/records/2026-10-25-adas-mac-studio-lazy-subqueries.md`).
+  (`bench/records/2026-10-25-adas-mac-studio-lazy-subqueries.md`). A correlated subquery in a grouped
+  query's output runs once a group, not once an input row: `group_correlated_row` 15.8 times as fast
+  at 1 client and 11.4 at 32, the suite's subquery statements within 1%
+  (`bench/records/2026-10-25-adas-mac-studio-2-corr-subqueries.md`).
 
 - **The suite counts what it measures** (`bench/src/suite.rs`): a run counts if it ends within the
   window, whenever it began (one begun in the warmup that outlasted the window used to blank a

@@ -236,7 +236,13 @@ read. Release binaries before and after, best of 3 in turns at load under 2 on a
 (Apple M4 Max, 14 cores; `bench/records/2026-10-25-adas-mac-studio-lazy-subqueries.md`): time per
 statement within 1% for the suite's `subquery_in` and `exists_subquery` at 1 and 32 clients, and
 their median alone unchanged; `exists_subquery`'s median at 32 clients, 1.061 in the best of 3, lay
-within its own run-to-run spread in five more rounds (the median run 0.988 after over before).
+within its own run-to-run spread in five more rounds (the median run 0.988 after over before). With
+the correlated subqueries moved, on adas-mac-studio-2
+(`bench/records/2026-10-25-adas-mac-studio-2-corr-subqueries.md`): the suite's `subquery_in`,
+`exists_subquery` and `group_correlated` within 1% in time per statement, the same programs before
+and after (the last is unnested at the suite's size), and `group_correlated_row`, a correlated
+subquery in a grouped query's output, 15.8 times as fast at 1 client and 11.4 at 32, its subquery run
+once a group instead of once an input row.
 
 **Falsified by.** A subquery that runs where SQLite's doesn't (an error SQLite doesn't raise); an
 uncorrelated one run more than once in one run of the query that holds it, or a correlated one run
