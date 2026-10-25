@@ -214,7 +214,11 @@ something does (a seek key, an IN that drives a seek, LIMIT, an aggregate's outp
 error as SQLite does). `a_subquery_read_in_two_places_is_coded_once` (GROUP BY and the select list,
 an UPDATE's row value) finds the subquery listed once by EXPLAIN QUERY PLAN and its body coded once,
 and `a_triggers_subqueries_run_afresh_at_each_firing` finds a trigger's subqueries run afresh at each
-firing.
+firing. Release binaries before and after, best of 3 in turns at load under 2 on adas-mac-studio
+(Apple M4 Max, 14 cores; `bench/records/2026-10-25-adas-mac-studio-lazy-subqueries.md`): time per
+statement within 1% for the suite's `subquery_in` and `exists_subquery` at 1 and 32 clients, and
+their median alone unchanged; `exists_subquery`'s median at 32 clients, 1.061 in the best of 3, lay
+within its own run-to-run spread in five more rounds (the median run 0.988 after over before).
 
 **Falsified by.** A subquery that runs where SQLite's doesn't (an error SQLite doesn't raise); an
 uncorrelated one run more than once in one run of the query that holds it, or a correlated one run

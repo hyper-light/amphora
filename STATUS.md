@@ -190,7 +190,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   SQLite. A correlated one in WHERE, the select list or ORDER BY of a query whose rows go straight
   out runs at each read, for the row in hand, and a WHERE term holding a subquery is tested in the
   first loop, not before the loops. Correlated ones elsewhere still run at every row (goal
-  01a1704d3be97309b55a5863391f3182).
+  01a1704d3be97309b55a5863391f3182). The suite's `subquery_in` and `exists_subquery` are no slower:
+  time per statement within 1% at 1 and 32 clients, best of 3 in turns on adas-mac-studio
+  (`bench/records/2026-10-25-adas-mac-studio-lazy-subqueries.md`).
 
 - **The suite counts what it measures** (`bench/src/suite.rs`): a run counts if it ends within the
   window, whenever it began (one begun in the warmup that outlasted the window used to blank a
