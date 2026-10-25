@@ -88,6 +88,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   on an index's second column alone seeks it once for each value of its first, where ANALYZE
   counted at least 18 rows to a value, as SQLite does. `count_range` 165 → 2,476 statements a
   second at 1 client and 2,644 → 32,892 at 32 (fedora, best of 3 at load 2–7, not recorded runs).
+- **Plans without statistics** (docs/design/planner.md decision 8,
+  `crates/engine/tests/records_plans.rs`): a column of a composite primary key is costed as any
+  indexed column, a unique lookup being a rowid alias's or a one-column key's only. Without ANALYZE,
+  kiln's records reads (its versions table) are planned on the index each needs, as SQLite plans
+  them, where the newest version walked its family by revision and the change feed sorted it.
 - **Readers keep their pages across commits** (docs/design/store.md decision 18,
   `crates/engine/storage/changes.rs`): a connection starting a read transaction forgets only the
   pages written since its last one, where SQLite and Turso forget its whole cache; it forgets

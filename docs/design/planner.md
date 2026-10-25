@@ -264,3 +264,42 @@ table cached, as decision 5 has it. `cost.rs`,
 
 **Falsified by.** A GROUP BY this sends to a scan and a hash table that an index's order would have
 answered faster (groups ANALYZE undercounts, which overflow the table into the sorter).
+
+## 8. Without statistics, a primary key's column is unique only as the whole key
+
+**Decision.** An equality is costed as a unique lookup (one row in the table) only on a rowid alias
+or on the column of a primary key that has that one column (`constraints.rs`,
+`estimate_selectivity`). A column of a composite primary key is costed as any indexed column:
+ANALYZE's rows per value when it has counted them, the indexed-column selectivity when it hasn't.
+
+**Why.** Every column a table-level `PRIMARY KEY (a, b, c)` lists carries the primary-key flag
+(`schema.rs`), and the estimate took the flag alone as uniqueness. Without statistics, on kiln's
+versions table (`PRIMARY KEY (family, key, rev)`, an index `versions_by_rev (family, rev, n)`),
+`family = ?` alone came to one row in a million, `family = ? AND key = ?` to a millionth of a row,
+and every seek of either index floored to one row at the same cost: the choice fell to a tie-break.
+Kiln's newest-version read walked a family's every version by revision, and its change feed sorted
+a family's every version, where SQLite 3.54.0 seeks each on the index it needs (reported by Sends
+T3 for CP-T1.5, kiln plan 01a1713cc0137649b9409364d81404d7).
+
+**Sources.** Without `sqlite_stat1`, SQLite estimates an index by fixed defaults
+(`sqlite3DefaultRowEst`, `src/build.c`): ten rows a value of its first column, nine of its first
+two, then eight, seven, six and five, and one row only for a unique index's whole key, so an index
+that matches more equality columns always gives fewer rows; it divides a seek's estimate by four a
+range bound (`whereRangeAdjust`, `src/where.c`).
+
+**Evidence.** `crates/engine/tests/records_plans.rs`:
+`kilns_reads_are_planned_without_statistics_as_sqlite_plans_them`, twelve forms of kiln's ten reads
+(eight as kiln words them, four plainly), failed before the change (kiln's newest-version read
+planned on `versions_by_rev` with a sorter) and plans all twelve as SQLite does with it;
+`more_equality_columns_and_the_order_a_limit_reads_in_win_without_statistics` and
+`indexed_by_uses_the_named_index_or_refuses` give SQLite's plans and SQLite's refusal. With the
+whole key's rule the estimates no longer floor for these shapes, so SQLite's absolute defaults were
+not needed: two against three equality columns already chose the three-column index.
+CERT is unchanged: the oracles' 87 CERT findings of cause AG fail before and after alike, and a
+CERT run of one seed (20261025, 300 s) found the same 29 findings with each build over the 2,007
+databases both reached, every one failing with both. The suite's 50 statements are planned as
+before (`--suite --explain`): their tables are keyed by rowid aliases, unique lookups either way.
+
+**Falsified by.** A composite key's equality the planner now costs above its rows, so that it
+passes over the key's index for one that reads more (a key whose first column is nearly unique, on
+a table no ANALYZE has counted).

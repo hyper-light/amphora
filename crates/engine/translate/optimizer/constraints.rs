@@ -466,6 +466,7 @@ fn estimate_selectivity(
     op: ConstraintOperator,
     params: &CostModelParams,
     is_rowid: bool,
+    whole_key: bool,
 ) -> f64 {
     // Get ANALYZE stats for this table if available
     let table_stats = schema.analyze_stats.table_stats(table_name);
@@ -473,8 +474,10 @@ fn estimate_selectivity(
 
     match op {
         ConstraintOperator::AstNativeOperator(ast::Operator::Equals) => {
-            let is_pk_or_rowid_alias =
-                is_rowid || column.is_some_and(|c| c.is_rowid_alias() || c.primary_key());
+            // A primary key's column is a unique key only when it is the whole key: a column of a
+            // composite key is matched by as many rows as any indexed column.
+            let is_pk_or_rowid_alias = is_rowid
+                || column.is_some_and(|c| c.is_rowid_alias() || (c.primary_key() && whole_key));
 
             let selectivity_when_unique = if row_count > 0 {
                 1.0 / row_count as f64
@@ -558,6 +561,10 @@ fn estimate_constraint_selectivity(
         operator,
         params,
         is_rowid,
+        table_reference
+            .table
+            .btree()
+            .is_some_and(|table| table.primary_key_columns.len() == 1),
     )
 }
 
