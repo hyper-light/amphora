@@ -350,3 +350,39 @@ Release binaries before and after, best of 3 in turns at load under 2 on adas-ma
 **Falsified by.** A grouped query whose correlated form the planner now keeps where the unnested
 form reads less (many groups, each reading most of the inner table); a subquery in the output that
 runs more often than the output's rows.
+
+## 10. A loop that gives at most one row orders its table and keeps the order before it
+
+**Decision.** A loop that is a complete lookup on a unique key by `=` (every column of a unique
+index, or the rowid: `index_access_is_unique_point_lookup`) gives at most one row for each row of
+the loops before it (`access_method_is_one_row`). In `plan_satisfies_order_target` the ORDER BY or
+GROUP BY columns of its table that come next are taken as ordered, as are any on it that come after
+a later loop's, and it keeps the order of the loops before it, so a later loop may continue it. `IS`
+doesn't qualify: it can match many NULL keys.
+
+**Why.** The order check ended the order at any loop that supplied none of the next ORDER BY
+columns, so a one-row loop whose index doesn't list them sorted its one row: `SELECT v FROM q WHERE
+a = ? AND b = ? ORDER BY c LIMIT 10` on q's primary key (a, b), a rowid lookup ordered by another
+column, and a join's key lookup after an outer scan in rowid order (`ORDER BY p.id, q.c`), each
+with `USE SORTER FOR ORDER BY` where SQLite 3.54.0 has none (found writing decision 8's tests).
+
+**Sources.** SQLite's `wherePathSatisfiesOrderBy` (`where.c`): a one-row loop is "automatically
+order-distinct", a unique index whose key columns all match by `==` is order-distinct (`IS` and
+`ISNULL` terms can repeat NULL rows), and it marks off "any other ORDER BY terms that reference"
+an order-distinct loop, walking the loops only while each is order-distinct. Simmen, Shekita and
+Malkemus (SIGMOD 1996, section 5): a key "fully qualified by equality predicates" leaves at most one
+record in the stream, under which an order requirement reduces to nothing.
+
+**Evidence.** `crates/engine/tests/records_plans.rs`: `a_one_row_lookup_needs_no_sort_for_its_columns`,
+statements on q (`PRIMARY KEY (a, b)`) and p (a rowid table), failed before the change on four:
+q's key by `=`, p's rowid by `=`, the join after p's rowid lookup ordered by q.c, and the analyzed
+join `SCAN p` then q's key search ordered by p.id, q.c, each with a sorter SQLite doesn't add. With
+the change it plans all of them as SQLite does, the lookup first before a scan in rowid order with
+its column named before or after the rowid too, and still sorts for `IS` and for the lookup's
+column alone after a scan. The suite's 52 statements plan as before at 20,000 and at 200,000 items
+(`--suite --explain`, debug builds of 80ce9d7 and the change on adas-mac-studio-2): none orders
+after a one-row loop. CERT is unchanged: the 87 findings of cause AG fail before and after alike,
+and a CERT run of one seed (20261025, 300 s) found the same 78 findings with each build.
+
+**Falsified by.** A plan that skips a sort its rows need: a loop taken as one-row whose lookup can
+return more than one row, or an order carried past a loop whose rows repeat in the ORDER BY's terms.

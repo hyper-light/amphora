@@ -100,6 +100,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   was unnested into a scan of all 200,000 entries of `items_grp_created`: 227 → 26,895 statements a
   second at 1 client and 1,231 → 225,470 at 32, best of 3 in turns on adas-mac-studio-2, the controls
   within 2% (`bench/records/2026-10-25-adas-mac-studio-2-output-subquery-calls.md`).
+- **A one-row lookup orders its table** (docs/design/planner.md decision 10,
+  `crates/engine/tests/records_plans.rs`): a loop that gives at most one row for each row before it
+  (a unique key's whole lookup by `=`, or the rowid's) takes its table's ORDER BY columns as ordered
+  and keeps the order before it, as SQLite's one-row loop does: `SELECT v FROM q WHERE a = ? AND b
+  = ? ORDER BY c` on a key (a, b), a rowid lookup ordered by another column, and a join's key lookup
+  after an outer scan in rowid order no longer sort.
 - **Readers keep their pages across commits** (docs/design/store.md decision 18,
   `crates/engine/storage/changes.rs`): a connection starting a read transaction forgets only the
   pages written since its last one, where SQLite and Turso forget its whole cache; it forgets

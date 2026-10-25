@@ -18,6 +18,7 @@ use crate::{
     util::exprs_are_equivalent,
 };
 use amphora_engine_parser::ast::{self, SortOrder, TableInternalId};
+use smallvec::SmallVec;
 
 use super::{access_method::AccessMethod, cost::index_access_is_unique_point_lookup, join::JoinN};
 
@@ -290,6 +291,9 @@ pub fn plan_satisfies_order_target(
     let mut target_col_idx = 0;
     let mut prior_tables = TableMask::default();
     let num_cols_in_order_target = order_target.columns.len();
+    // Amphora: the tables of the loops that gave at most one row for each row before them, reached
+    // with the order kept: their columns are fixed by the rows before them (decision 10).
+    let mut one_row_tables: SmallVec<[TableInternalId; 4]> = SmallVec::new();
     for (loop_pos, (table_index, access_method_index)) in plan.data.iter().enumerate() {
         let access_method = &access_methods_arena[*access_method_index];
         let table_ref = &joined_tables[*table_index];
@@ -385,10 +389,19 @@ pub fn plan_satisfies_order_target(
             _ => return false,
         };
 
-        if consumed.consumed == 0 {
+        // Amphora: a loop that gives at most one row for each row before it orders the columns
+        // of its table and keeps the order of the loops before it, as SQLite's one-row,
+        // order-distinct loop does (`wherePathSatisfiesOrderBy`; decision 10).
+        let one_row = access_method_is_one_row(access_method);
+        if consumed.consumed == 0 && !one_row {
             return false;
         }
         target_col_idx += consumed.consumed;
+        if one_row {
+            one_row_tables.push(table_ref.internal_id);
+        }
+        target_col_idx =
+            first_column_off_tables(&order_target.columns, target_col_idx, &one_row_tables);
         if target_col_idx == num_cols_in_order_target {
             return true;
         }
@@ -426,9 +439,25 @@ fn access_method_emits_unique_order_prefix(
 ) -> bool {
     // Rows always differ in rowid, so a consumed prefix that includes the
     // rowid never repeats.
-    if order_consumption.includes_rowid {
-        return true;
-    }
+    order_consumption.includes_rowid || access_method_is_one_row(access_method)
+}
+
+/// Amphora: the first of `columns` from `from` on that is on none of `tables`, or their end.
+fn first_column_off_tables(
+    columns: &[ColumnOrder],
+    from: usize,
+    tables: &[TableInternalId],
+) -> usize {
+    columns
+        .iter()
+        .enumerate()
+        .skip(from)
+        .find(|(_, column)| !tables.contains(&column.table_id))
+        .map_or(columns.len(), |(position, _)| position)
+}
+
+/// Whether a loop gives at most one row for each row of the loops before it.
+fn access_method_is_one_row(access_method: &AccessMethod) -> bool {
     // A complete lookup on a UNIQUE index also returns at most one row.
     // Each key column must use `=`. `IS` can match many NULL entries.
     match &access_method.params {

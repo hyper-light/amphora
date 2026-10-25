@@ -154,3 +154,87 @@ fn more_equality_columns_and_the_order_a_limit_reads_in_win_without_statistics()
         assert_eq!(plan(&conn, sql), [want], "{sql}");
     }
 }
+
+/// Do: order by columns of a unique key's lookup: a table's whole primary key matched by `=` (and
+/// by `IS`, which can match many NULL keys), a rowid matched by `=`, and a join of that lookup
+/// after its outer table's rowid lookup, without statistics; then, the tables filled and analyzed
+/// (so the join seeks the key as SQLite's does), after its outer table read in rowid order and
+/// ordered by that rowid, or by the lookup's column alone; and the lookup first, before a scan in
+/// rowid order, with its column named before or after the rowid. Expect: SQLite 3.54.0's plans: no
+/// sort where a loop that gives at most one row for each row before it orders its table's columns
+/// and keeps the order of the loops before it, as `wherePathSatisfiesOrderBy` marks off the ORDER
+/// BY terms of a one-row or order-distinct loop; a sort for `IS`, and for the lookup's column after
+/// a scan (AC-T1.13.4: reads at their latency).
+#[test]
+fn a_one_row_lookup_needs_no_sort_for_its_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
+    let db = Database::open(io, dir.path().join("onerow.db").to_str().unwrap(), options).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE q (a, b, c, v, PRIMARY KEY (a, b))")
+        .unwrap();
+    conn.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, x, y, z)")
+        .unwrap();
+    let search_q = "SEARCH q USING INDEX sqlite_autoindex_q_1 (a=? AND b=?)";
+    let search_p = "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)";
+    let sort = "USE SORTER FOR ORDER BY";
+    let join = "SELECT p.id, q.v FROM p JOIN q ON q.a = p.x AND q.b = p.y";
+    let mut wrong = Vec::new();
+    let mut check = |conn: &Arc<Connection>, sql: &str, want: &[&str]| {
+        let got = plan(conn, sql);
+        if got != want {
+            wrong.push(format!("{sql}\n  got  {got:?}\n  want {want:?}"));
+        }
+    };
+    check(
+        &conn,
+        "SELECT v FROM q WHERE a = ? AND b = ? ORDER BY c LIMIT 10",
+        &[search_q],
+    );
+    check(
+        &conn,
+        "SELECT v FROM q WHERE a IS ? AND b IS ? ORDER BY c LIMIT 10",
+        &[search_q, sort],
+    );
+    check(
+        &conn,
+        "SELECT x FROM p WHERE id = ? ORDER BY z",
+        &[search_p],
+    );
+    check(
+        &conn,
+        &format!("{join} WHERE p.id = ? ORDER BY q.c"),
+        &[search_p, search_q],
+    );
+    for sql in [
+        "WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 2000) INSERT INTO q SELECT n % 50, n / 50, n, n FROM s",
+        "WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 2000) INSERT INTO p SELECT n, n % 50, n / 50, n FROM s",
+        "ANALYZE",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    check(
+        &conn,
+        &format!("{join} ORDER BY p.id, q.c"),
+        &["SCAN p", search_q],
+    );
+    check(
+        &conn,
+        &format!("{join} ORDER BY q.c"),
+        &["SCAN p", search_q, sort],
+    );
+    // The lookup first: its columns hold for the whole result, wherever the ORDER BY names them.
+    let after_lookup = "SELECT q.v, p.id FROM q, p WHERE q.a = ? AND q.b = ?";
+    check(
+        &conn,
+        &format!("{after_lookup} ORDER BY p.id, q.v"),
+        &[search_q, "SCAN p"],
+    );
+    check(
+        &conn,
+        &format!("{after_lookup} ORDER BY q.v, p.id"),
+        &[search_q, "SCAN p"],
+    );
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
