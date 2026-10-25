@@ -238,3 +238,53 @@ fn a_one_row_lookup_needs_no_sort_for_its_columns() {
     );
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// Do: join a table to another's whole primary key without statistics (no ANALYZE), with the tables
+/// empty and with 2,000 rows each; and, as a control, join on columns no index covers. Expect:
+/// SQLite 3.54.0's plan for the key join, the outer table scanned and the key searched once an
+/// outer row, not a hash join whose cost rests on the fallback's million rows; and the control
+/// still a hash join, as no unique key could be searched (AC-T1.5.4, AC-T1.13.4).
+#[test]
+fn a_join_on_a_whole_key_searches_it_without_statistics() {
+    let dir = tempfile::tempdir().unwrap();
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
+    let db = Database::open(io, dir.path().join("keyjoin.db").to_str().unwrap(), options).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE q (a, b, c, v, PRIMARY KEY (a, b))")
+        .unwrap();
+    conn.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, x, y, z)")
+        .unwrap();
+    conn.execute("CREATE TABLE r (k, w)").unwrap();
+    let join = "SELECT p.id, q.v FROM p JOIN q ON q.a = p.x AND q.b = p.y ORDER BY p.id, q.c";
+    let control = "SELECT p.id, r.w FROM p JOIN r ON r.k = p.z";
+    let want = [
+        "SCAN p",
+        "SEARCH q USING INDEX sqlite_autoindex_q_1 (a=? AND b=?)",
+    ];
+    let mut wrong = Vec::new();
+    for filled in [false, true] {
+        if filled {
+            for sql in [
+                "WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 2000) INSERT INTO q SELECT n % 50, n / 50, n, n FROM s",
+                "WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 2000) INSERT INTO p SELECT n, n % 50, n / 50, n FROM s",
+                "WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 2000) INSERT INTO r SELECT n, n FROM s",
+            ] {
+                conn.execute(sql).unwrap();
+            }
+        }
+        let got = plan(&conn, join);
+        if got != want {
+            wrong.push(format!(
+                "filled {filled}: {join}\n  got  {got:?}\n  want {want:?}"
+            ));
+        }
+        let got = plan(&conn, control);
+        if !got.iter().any(|step| step.starts_with("HASH JOIN")) {
+            wrong.push(format!(
+                "filled {filled}: {control}\n  got  {got:?}\n  want a hash join"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

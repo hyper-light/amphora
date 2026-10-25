@@ -386,3 +386,43 @@ and a CERT run of one seed (20261025, 300 s) found the same 78 findings with eac
 
 **Falsified by.** A plan that skips a sort its rows need: a loop taken as one-row whose lookup can
 return more than one row, or an order carried past a loop whose rows repeat in the ORDER BY's terms.
+
+## 11. Without statistics, a unique key is searched rather than hashed
+
+**Decision.** When a hash join's build table has no ANALYZE statistics (its rows are the
+fallback's million) and the join's equality terms would search that table by a unique key from the
+probe table (the other join order's index nested loop), the hash join isn't considered
+(`build_unique_key_search_without_statistics`, beside the gate that keeps a probe's selective seek).
+With statistics, the costs decide as before; a join no unique key can search keeps its hash join.
+
+**Why.** Without statistics every table is taken at 1,000,000 rows, 20,000 pages against a cache
+of 2,000, so decisions 5 and 6 charge each search of a key its tree pages and a table-page read: a
+million searches cost about 3 million against a hash join's 113,000, and the hash join won on the
+guessed size alone. On q (`PRIMARY KEY (a, b)`) and p (a rowid table), empty or 2,000 rows each,
+`SELECT p.id, q.v FROM p JOIN q ON q.a = p.x AND q.b = p.y` was `HASH JOIN p, SCAN q` where SQLite
+3.54.0 plans `SCAN p`, then a search of q's key for each p row; after ANALYZE Amphora planned it as
+SQLite does. A unique key's search reads one row for each outer row whatever the table holds; a
+hash join reads the whole build table, whose size without statistics isn't known.
+
+**Sources.** SQLite implements every join as nested loops, building an automatic index where no
+index helps, and has no hash join (`optoverview.html`, sections 7 and 14). Leis et al. (PVLDB
+9(3), 2015, section 4.1), with estimates often wrong: "Algorithms that seldom offer a large benefit
+over more robust algorithms should not be chosen"; they disabled nested-loop joins without an index
+but kept index nested-loop joins. Against it: a hash join reads each table once in order where key
+searches read pages at random, so for two large tables the cache can't hold it can be faster; the
+rule keeps that choice wherever statistics give the sizes.
+
+**Evidence.** `crates/engine/tests/records_plans.rs`:
+`a_join_on_a_whole_key_searches_it_without_statistics` failed before the change (`HASH JOIN p,
+SCAN q`, empty and filled) and plans SQLite's `SCAN p` and q's key search with it, while its
+control, a join on columns no index covers, keeps the hash join. In `join.rs`,
+`a_unique_key_join_is_searched_without_statistics` finds the key searched at the fallback's
+million rows and a hash join chosen at ANALYZE's million rows each. The suite's 52 statements, run
+with ANALYZE, plan as before at 20,000 and at 200,000 items. CERT, whose databases have no
+statistics, gains: of the 87 findings of cause AG one now passes (`cert-e749d7942a5b1c1d`) and none
+newly fails, and a CERT run of one seed (20261025, 300 s) found 77 findings, all among the parent's
+78; the one gone (`cert-3292765d4c2b555e`) estimated an inner join on a one-column key, hashed, at a
+million rows, above its own LEFT JOIN.
+
+**Falsified by.** A join without statistics that the key search makes slower than the hash join
+would have been (two large tables the cache can't hold, every row joined), measured, not estimated.

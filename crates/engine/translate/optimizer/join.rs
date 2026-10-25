@@ -922,10 +922,31 @@ fn join_lhs_and_rhs<'a>(
                         .is_some_and(JoinInfo::keeps_right_rows)
                 });
 
+            // Amphora: with no ANALYZE statistics for the build table, its rows are the fallback's
+            // guess, so a hash join that reads all of them isn't weighed against a search of that
+            // table by a unique key from the probe table, the other order's index nested loop: the
+            // search reads one row for each probe row whatever the table holds, as SQLite plans the
+            // join (`docs/design/planner.md`, decision 11).
+            let build_unique_key_search_without_statistics =
+                matches!(build_base_rows, RowCountEstimate::HardcodedFallback(_)) && {
+                    let mut probe_side_mask = prior_mask.try_clone()?;
+                    probe_side_mask.set(rhs_table_idx)?;
+                    build_constraints.candidates.iter().any(|candidate| {
+                        let usable = usable_constraints_for_lhs_mask(
+                            &build_constraints.constraints,
+                            &candidate.refs,
+                            &probe_side_mask,
+                            build_table_idx,
+                        );
+                        index_access_is_unique_point_lookup(candidate.index.as_deref(), &usable)
+                    })
+                };
+
             // Eligibility gate: prefer nested-loop when uses a selective probe seek.
             // Probe->build chaining is only allowed when the
             // build input is materialized from the join prefix.
             let allow_hash_join = !rhs_has_selective_seek
+                && !build_unique_key_search_without_statistics
                 && !probe_table_is_prior_build
                 && (!build_has_prior_constraints || build_has_rowid)
                 && !chaining_across_outer
@@ -936,6 +957,7 @@ fn join_lhs_and_rhs<'a>(
                 rhs_table = rhs_table_reference.table.get_name(),
                 allow_hash_join,
                 rhs_has_selective_seek,
+                build_unique_key_search_without_statistics,
                 rhs_builds_index,
                 hash_can_replace_build_index,
                 build_read_is_unique_seek,
@@ -4591,6 +4613,129 @@ mod tests {
             }
             _ => panic!("Unexpected access method for t2"),
         }
+    }
+
+    /// Do: join t1 to the whole composite unique key of t2 (t1.a = t2.a AND t1.b = t2.b), the
+    /// tables on root pages of their own, first without statistics (each at the fallback's million
+    /// rows), then with ANALYZE's million rows each. Expect: without statistics, t1 scanned and t2
+    /// searched by its unique key, not a hash join whose cost rests on the fallback (decision 11);
+    /// with statistics the costs decide, and a hash join of a million rows each beats a million
+    /// searches of pages the cache can't hold (AC-T1.5.4, AC-T1.13.4).
+    #[test]
+    fn a_unique_key_join_is_searched_without_statistics() {
+        fn best_plan(base_table_rows: &[RowCountEstimate]) -> (Vec<usize>, Vec<String>) {
+            let table = |name: &str, root_page: i64| {
+                Arc::new(BTreeTable::new(
+                    root_page,
+                    name.to_string(),
+                    crate::alloc::vec![],
+                    _create_column_list(&["a", "b", "c"], Type::Integer)
+                        .try_to_vec()
+                        .expect(crate::alloc::ALLOC_ERR_MSG),
+                    BTreeCharacteristics::HAS_ROWID,
+                    crate::alloc::vec![],
+                    crate::alloc::vec![],
+                    crate::alloc::vec![],
+                    None,
+                ))
+            };
+            let mut table_id_counter = TableRefIdCounter::new();
+            let joined_tables = vec![
+                _create_table_reference(table("t1", 2), None, table_id_counter.next()),
+                _create_table_reference(
+                    table("t2", 3),
+                    Some(JoinInfo {
+                        join_type: JoinType::Inner,
+                        using: vec![],
+                        no_reorder: false,
+                        lateral: false,
+                    }),
+                    table_id_counter.next(),
+                ),
+            ];
+            let mut available_indexes = AvailableIndexes::default();
+            let key = Arc::new(Index {
+                name: "t2_ab".to_string(),
+                table_name: "t2".to_string(),
+                where_clause: None,
+                columns: crate::alloc::vec![IndexColumn::new("a", 0), IndexColumn::new("b", 1)],
+                unique: true,
+                ephemeral: false,
+                root_page: 4,
+                has_rowid: true,
+                index_method: None,
+                on_conflict: None,
+            });
+            available_indexes.insert_for_table_name(&joined_tables, "t2", VecDeque::from([key]));
+            let equal = |column| {
+                _create_binary_expr(
+                    _create_column_expr(joined_tables[0].internal_id, column, false),
+                    ast::Operator::Equals,
+                    _create_column_expr(joined_tables[1].internal_id, column, false),
+                )
+            };
+            let mut where_clause = vec![equal(0), equal(1)];
+            let table_references = TableReferences::new(joined_tables, vec![]);
+            let mut access_methods_arena = Vec::new();
+            let table_constraints = constraints_from_where_clause(
+                &where_clause,
+                &table_references,
+                &available_indexes,
+                &[],
+                &empty_schema(),
+                &DEFAULT_PARAMS,
+            )
+            .unwrap();
+            let schema = empty_schema();
+            let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
+                table_references.joined_tables(),
+                1.0,
+                None,
+                &table_constraints,
+                base_table_rows,
+                &mut access_methods_arena,
+                &mut where_clause,
+                &[],
+                &[],
+                &DEFAULT_PARAMS,
+                &AnalyzeStats::default(),
+                &available_indexes,
+                &table_references,
+                &schema,
+            )
+            .unwrap()
+            .unwrap();
+            let loops = best_plan
+                .data
+                .iter()
+                .map(|(_, method)| match &access_methods_arena[*method].params {
+                    AccessMethodParams::HashJoin { .. } => "hash join".to_owned(),
+                    AccessMethodParams::BTreeTable {
+                        index: Some(index),
+                        constraint_refs,
+                        ..
+                    } if !constraint_refs.is_empty() => format!("search {}", index.name),
+                    AccessMethodParams::BTreeTable {
+                        constraint_refs, ..
+                    } if constraint_refs.is_empty() => "scan".to_owned(),
+                    other => format!("{other:?}"),
+                })
+                .collect();
+            (best_plan.table_numbers().collect(), loops)
+        }
+
+        assert_eq!(
+            best_plan(&default_base_rows(2)),
+            (
+                vec![0, 1],
+                vec!["scan".to_owned(), "search t2_ab".to_owned()]
+            )
+        );
+        let (_, loops) = best_plan(&[
+            RowCountEstimate::AnalyzeStats(1_000_000.0),
+            RowCountEstimate::AnalyzeStats(1_000_000.0),
+        ]);
+        assert!(loops.iter().any(|step| step == "hash join"), "{loops:?}");
     }
 
     #[test]

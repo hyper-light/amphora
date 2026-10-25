@@ -106,6 +106,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   and keeps the order before it, as SQLite's one-row loop does: `SELECT v FROM q WHERE a = ? AND b
   = ? ORDER BY c` on a key (a, b), a rowid lookup ordered by another column, and a join's key lookup
   after an outer scan in rowid order no longer sort.
+- **Without statistics, a unique key is searched, not hashed** (docs/design/planner.md decision 11,
+  `crates/engine/tests/records_plans.rs`): a hash join whose build table has no ANALYZE statistics
+  isn't weighed against a search of that table by a unique key from the other table, as SQLite
+  plans the join: `p JOIN q ON q.a = p.x AND q.b = p.y` on q's key (a, b) is `SCAN p` and a search
+  of q's key, not a hash join costed on the fallback's million rows. With statistics the costs
+  decide; CERT, run without statistics, lost a finding and gained none.
 - **Readers keep their pages across commits** (docs/design/store.md decision 18,
   `crates/engine/storage/changes.rs`): a connection starting a read transaction forgets only the
   pages written since its last one, where SQLite and Turso forget its whole cache; it forgets
