@@ -97,7 +97,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   `crates/engine/tests/planner.rs`): a correlated subquery that an aggregate's or a GROUP BY's
   output reads is costed at the output's rows, as it runs (once a group), not at its loop's. The
   suite's `group_correlated` keeps the correlated form, a search of its one group's items, where it
-  was unnested into a scan of all 200,000 entries of `items_grp_created`.
+  was unnested into a scan of all 200,000 entries of `items_grp_created`: 227 → 26,895 statements a
+  second at 1 client and 1,231 → 225,470 at 32, best of 3 in turns on adas-mac-studio-2, the controls
+  within 2% (`bench/records/2026-10-25-adas-mac-studio-2-output-subquery-calls.md`).
 - **Readers keep their pages across commits** (docs/design/store.md decision 18,
   `crates/engine/storage/changes.rs`): a connection starting a read transaction forgets only the
   pages written since its last one, where SQLite and Turso forget its whole cache; it forgets

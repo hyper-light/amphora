@@ -342,6 +342,10 @@ its 200,000 items only `group_correlated`'s plan changes, from the unnested scan
 search of `items_grp_created (grp=?)`; at 20,000 items none does, the correlated form winning
 either way. CERT is unchanged: the 87 findings of cause AG fail before and after alike, and a CERT
 run of one seed (20261025, 300 s) found the same 76 findings in 248,688 checks with each build.
+Release binaries before and after, best of 3 in turns at load under 2 on adas-mac-studio-2
+(`bench/records/2026-10-25-adas-mac-studio-2-output-subquery-calls.md`): `group_correlated` 227 →
+26,895 statements a second at 1 client (median 4.35 → 0.036 ms) and 1,231 → 225,470 at 32;
+`exists_subquery` and `group_correlated_row`, the same programs before and after, within 2%.
 
 **Falsified by.** A grouped query whose correlated form the planner now keeps where the unnested
 form reads less (many groups, each reading most of the inner table); a subquery in the output that
