@@ -1192,6 +1192,19 @@ fn find_select_plan_form(
             }
         }
         plan.estimated_output_rows = Some(rows);
+        for estimate in &mut subquery_calls {
+            if let Some(subquery) = plan
+                .non_from_clause_subqueries
+                .iter()
+                .find(|subquery| subquery.internal_id == estimate.subquery_id)
+            {
+                estimate.calls = subquery_calls_where_it_runs(
+                    subquery.eval_phase,
+                    estimate.calls,
+                    rows_before_limit,
+                );
+            }
+        }
     }
 
     plan_correlated_subqueries(plan, resolver, &subquery_calls, cache, save_subquery_plans)?;
@@ -2318,6 +2331,29 @@ fn group_count_from_analyze(plan: &SelectPlan, group_by: &GroupBy, schema: &Sche
         .fold(None, |best: Option<f64>, groups| {
             Some(best.map_or(groups, |best| best.max(groups)))
         })
+}
+
+/// Amphora: the calls of a correlated subquery that runs where `phase` says, `loop_calls` being
+/// the rows of the loop where its outer columns are read and `output_rows` the query's output rows.
+/// One that an aggregate's or a GROUP BY's output reads runs at each read there, once an output
+/// row, so at most that often however many rows its loop reads; any other runs once a row of its
+/// loop (`docs/design/planner.md`, decision 9).
+fn subquery_calls_where_it_runs(
+    phase: SubqueryEvalPhase,
+    loop_calls: f64,
+    output_rows: f64,
+) -> f64 {
+    match phase {
+        SubqueryEvalPhase::GroupedOutput | SubqueryEvalPhase::UngroupedAggregateOutput => {
+            loop_calls.min(output_rows)
+        }
+        SubqueryEvalPhase::BeforeLoop
+        | SubqueryEvalPhase::Loop(_)
+        | SubqueryEvalPhase::RowOutput
+        | SubqueryEvalPhase::WindowOutput
+        | SubqueryEvalPhase::PreWrite
+        | SubqueryEvalPhase::PostWriteReturning => loop_calls,
+    }
 }
 
 /// Estimate the rows returned by a SELECT after grouping or an aggregate.
@@ -5042,6 +5078,36 @@ fn build_seek_def(
 
 #[cfg(test)]
 mod tests {
+    /// Do: price a correlated subquery that a GROUP BY's output reads, its loop reading 200 rows
+    /// into one group, one that an ungrouped aggregate's output reads, and ones read in a loop and
+    /// in the row body. Expect: one call for each output's, as each runs once an output row
+    /// (decision 9), and its loop's 200 for the others; never more calls than its loop's rows
+    /// (AC-T1.13.1).
+    #[test]
+    fn a_subquery_an_output_reads_is_priced_once_an_output_row() {
+        use super::{subquery_calls_where_it_runs, SubqueryEvalPhase};
+        assert_eq!(
+            subquery_calls_where_it_runs(SubqueryEvalPhase::GroupedOutput, 200.0, 1.0),
+            1.0
+        );
+        assert_eq!(
+            subquery_calls_where_it_runs(SubqueryEvalPhase::UngroupedAggregateOutput, 200.0, 1.0),
+            1.0
+        );
+        assert_eq!(
+            subquery_calls_where_it_runs(SubqueryEvalPhase::Loop(0), 200.0, 1.0),
+            200.0
+        );
+        assert_eq!(
+            subquery_calls_where_it_runs(SubqueryEvalPhase::RowOutput, 200.0, 1.0),
+            200.0
+        );
+        assert_eq!(
+            subquery_calls_where_it_runs(SubqueryEvalPhase::GroupedOutput, 50.0, 80.0),
+            50.0
+        );
+    }
+
     use super::{where_term_rejects_null_row, Optimizable};
     use crate::translate::emitter::{DoubleQuotedDml, Resolver};
     use crate::{schema::Schema, DatabaseCatalog, RwLock, SymbolTable};

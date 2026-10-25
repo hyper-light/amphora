@@ -20,6 +20,11 @@ fn mix(id: i64) -> i64 {
 
 /// The suite's tables, indexes and statistics, with a fiftieth of its rows.
 fn tables(dir: &Path) -> Arc<Connection> {
+    suite_tables(dir, OWNERS)
+}
+
+/// The suite's tables, indexes and statistics, with `owners` owners and a fiftieth of its items.
+fn suite_tables(dir: &Path, owners: i64) -> Arc<Connection> {
     let io = Arc::new(PlatformIO::new().unwrap());
     let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
     let db = Database::open(io, dir.join("suite.db").to_str().unwrap(), options).unwrap();
@@ -34,10 +39,10 @@ fn tables(dir: &Path) -> Arc<Connection> {
         .collect();
     conn.execute(format!("INSERT INTO regions VALUES {}", regions.join(", ")))
         .unwrap();
-    let owners: Vec<String> = (1..=OWNERS)
+    let rows: Vec<String> = (1..=owners)
         .map(|id| format!("({id}, 'owner-{id}', {}, {}.5)", id % 20 + 1, id % 97))
         .collect();
-    conn.execute(format!("INSERT INTO owners VALUES {}", owners.join(", ")))
+    conn.execute(format!("INSERT INTO owners VALUES {}", rows.join(", ")))
         .unwrap();
     for first in (1..=ITEMS).step_by(500) {
         let rows: Vec<String> = (first..first + 500)
@@ -45,7 +50,7 @@ fn tables(dir: &Path) -> Arc<Connection> {
                 format!(
                     "({id}, {}, {}, {}.25, {}, 'name-{:08x}')",
                     mix(id) % 100,
-                    mix(id ^ 0x5555) % OWNERS + 1,
+                    mix(id ^ 0x5555) % owners + 1,
                     mix(id) % 10_000,
                     1_700_000_000 + id * 60,
                     mix(id)
@@ -212,5 +217,59 @@ fn a_grouped_cte_drives_lookups_of_the_owners_it_names() {
             .map(|row| format!("{} {}", row[0], row[1]))
             .collect();
         assert_eq!(got, want, "{sql}");
+    }
+}
+
+/// Do: count a region's owners beside a correlated count of its group's items, grouped by the
+/// region (the suite's group_correlated) and ungrouped, with the suite's 4,000 owners, 200 a
+/// region. Expect: the correlated form, its subquery a search of the group's items run once for
+/// the output (docs/design/planner.md), not the unnested form's scan of every item grouped by grp
+/// (the call priced once an input row, 200 times, cost more than the scan); and the counts read
+/// directly (AC-T1.8.6, AC-T1.13.1).
+#[test]
+fn a_correlated_subquery_a_grouped_output_reads_is_planned_once_a_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = suite_tables(dir.path(), 4_000);
+    let rows = |sql: &str| -> Vec<String> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.run_collect_rows()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    };
+    let owners = rows("SELECT count(*) FROM owners WHERE region = 5");
+    let items = rows("SELECT count(*) FROM items WHERE grp = 5");
+    assert_eq!(owners, ["200"]);
+    let subquery = "(SELECT count(*) FROM items i WHERE i.grp = o.region)";
+    for (sql, want) in [
+        (
+            format!(
+                "SELECT o.region, count(*), {subquery} FROM owners o WHERE o.region = 5 GROUP BY o.region"
+            ),
+            format!("5 {} {}", owners[0], items[0]),
+        ),
+        (
+            format!("SELECT count(*), {subquery} FROM owners o WHERE o.region = 5"),
+            format!("{} {}", owners[0], items[0]),
+        ),
+    ] {
+        let steps = plan(&conn, &sql);
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.starts_with("CORRELATED SCALAR SUBQUERY")),
+            "{sql}: {steps:?}"
+        );
+        assert!(
+            steps.iter().all(|s| !s.contains("scalar_subquery")),
+            "{sql}: {steps:?}"
+        );
+        assert_eq!(rows(&sql), [want], "{sql}");
     }
 }

@@ -93,6 +93,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   indexed column, a unique lookup being a rowid alias's or a one-column key's only. Without ANALYZE,
   kiln's records reads (its versions table) are planned on the index each needs, as SQLite plans
   them, where the newest version walked its family by revision and the change feed sorted it.
+- **A subquery the output reads is priced once an output row** (docs/design/planner.md decision 9,
+  `crates/engine/tests/planner.rs`): a correlated subquery that an aggregate's or a GROUP BY's
+  output reads is costed at the output's rows, as it runs (once a group), not at its loop's. The
+  suite's `group_correlated` keeps the correlated form, a search of its one group's items, where it
+  was unnested into a scan of all 200,000 entries of `items_grp_created`.
 - **Readers keep their pages across commits** (docs/design/store.md decision 18,
   `crates/engine/storage/changes.rs`): a connection starting a read transaction forgets only the
   pages written since its last one, where SQLite and Turso forget its whole cache; it forgets

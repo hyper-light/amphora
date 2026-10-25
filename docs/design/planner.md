@@ -303,3 +303,46 @@ before (`--suite --explain`): their tables are keyed by rowid aliases, unique lo
 **Falsified by.** A composite key's equality the planner now costs above its rows, so that it
 passes over the key's index for one that reads more (a key whose first column is nearly unique, on
 a table no ANALYZE has counted).
+
+## 9. A correlated subquery that runs in the output is priced at the output's rows
+
+**Decision.** A correlated subquery that an aggregate's or a GROUP BY's output reads (its phase
+`UngroupedAggregateOutput` or `GroupedOutput`) is planned for, and costed at, the query's estimated
+output rows when they are fewer than the rows of the loop where its outer columns are read
+(`find_select_plan_form`, `subquery_calls_where_it_runs`); any other correlated subquery keeps its
+loop's rows.
+
+**Why.** Since d4efe6b such a subquery runs at each read in the output (`executor.md`, decision 6):
+once a group, or once for an ungrouped aggregate. The planner still counted its calls as its loop's
+rows (`count_subquery_calls_for_plan`), so the correlated form cost a call for every row grouped,
+and the unnested group-first form (`unnest.rs`), which reads every key of the inner table, won the
+cost comparison (`optimize_select_plan_with_cache`). The suite's `group_correlated`, at 200,000
+items, scanned all 200,000 entries of `items_grp_created` (4.5 ms a statement at 1 client on
+adas-mac-studio-2) where its one group's 1,972 entries take 0.03 ms.
+
+**Sources.** SQLite reevaluates a correlated subquery each time its result is required
+(`lang_expr.html`, section 12) and evaluates an aggregate query's output from aggregate columns once
+an output row (`TK_AGG_COLUMN`, `analyzeAggregate`): once a group. Cost-based query transformation
+applies a rewrite only when the physical optimizer costs it below the original (Ahmed et al.,
+PVLDB 17(12), 2024, section 1), so a wrong cost for the original picks the wrong form. Neumann and
+Kemper (BTW 2015, sections 3.1 and 3.3) evaluate the dependent side once per distinct outer binding
+and leave dropping that restriction, which can make larger intermediate results, to the optimizer:
+the group-first form drops it.
+
+**Evidence.** `crates/engine/tests/planner.rs`:
+`a_correlated_subquery_a_grouped_output_reads_is_planned_once_a_group`, on the suite's tables with
+its 4,000 owners (200 a region) and a fiftieth of its items, failed before the change: the grouped
+form unnested into a scan of every item (`SEARCH scalar_subquery_t2 USING INDEX
+ephemeral_subquery_t2 (correlation_key_0=?) LEFT-JOIN`, `SCAN items AS i USING COVERING INDEX
+items_grp_created`). With the change it plans the grouped and the ungrouped form correlated, a
+search of the one group's items, and their counts are the ones read directly.
+`a_subquery_an_output_reads_is_priced_once_an_output_row` prices each phase. Of the suite's 52
+statements (`--suite --explain`, debug builds of d4f6671 and the change on adas-mac-studio-2), at
+its 200,000 items only `group_correlated`'s plan changes, from the unnested scan to the correlated
+search of `items_grp_created (grp=?)`; at 20,000 items none does, the correlated form winning
+either way. CERT is unchanged: the 87 findings of cause AG fail before and after alike, and a CERT
+run of one seed (20261025, 300 s) found the same 76 findings in 248,688 checks with each build.
+
+**Falsified by.** A grouped query whose correlated form the planner now keeps where the unnested
+form reads less (many groups, each reading most of the inner table); a subquery in the output that
+runs more often than the output's rows.
