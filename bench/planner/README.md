@@ -24,7 +24,7 @@ largest intermediate result, and every engine's times.
 ## The engines
 
 Each engine runs a query on one thread, class for class with the embedded engines (CLAUDE.md §7):
-DuckDB with `threads = 1` (`duckdb`; `duckdb-mt` is DuckDB with every core, recorded beside it),
+DuckDB with `threads = 1` (`duckdb`; `duckdb-mt` is DuckDB with every core on a copy of its own, recorded beside it),
 PostgreSQL with `max_parallel_workers_per_gather = 0`. Amphora and SQLite keep `--cache-mib` of
 pages (2 GiB unless given); DuckDB and PostgreSQL keep what they ship with (`about` in the record).
 PostgreSQL 17 runs in Docker (`postgres.sh`), its data on a Docker volume. Every query has a

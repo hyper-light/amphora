@@ -148,7 +148,7 @@ fn load_average() -> Option<f64> {
 
 /// Windows keeps no load average. Its nearest: the cores busy (`% Processor Time` of every
 /// core, as cores) and the threads waiting for one (`Processor Queue Length`), averaged over
-/// five one-second samples, the running and runnable threads Linux's load counts.
+/// three one-second samples, the running and runnable threads Linux's load counts.
 #[cfg(windows)]
 fn load_average() -> Option<f64> {
     let cores = std::thread::available_parallelism().map(usize::from).ok()? as f64;
@@ -231,7 +231,8 @@ fn open(o: &Opts, target: &str) -> anyhow::Result<Box<dyn Target>> {
         "amphora" => Box::new(Amphora::open(&dir, o.cache_kib)?),
         "sqlite" => Box::new(Sqlite::open(&dir, o.cache_kib)?),
         "duckdb" => Box::new(Duck::open(&dir, Some(1))?),
-        "duckdb-mt" => Box::new(Duck::open(&o.dir.join("duckdb"), None)?),
+        // A database of its own: DuckDB locks its file to one database a process.
+        "duckdb-mt" => Box::new(Duck::open(&dir, None)?),
         "postgres" => {
             // A database of the benchmark's own on the server, made the first time.
             let name = format!("{}_{}", o.bench, o.sf.to_string().replace('.', "_"));
