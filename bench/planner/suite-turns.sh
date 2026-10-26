@@ -4,7 +4,7 @@
 # the load before and after, and the suite's report. Runs on Linux and in Git for Windows' shell,
 # where Windows keeps no load average and its nearest stands in (bench/planner/README.md).
 #
-# usage: bench/planner/suite-turns.sh <out.jsonl> <turns> <name>=<checkout>:<binary>... -- <suite arguments>
+# usage: [FIRST_TURN=n] bench/planner/suite-turns.sh <out.jsonl> <turns> <name>=<checkout>:<binary>... -- <suite arguments>
 #   e.g. suite-turns.sh out.jsonl 3 before=~/src/before:~/t-before/release/amphora-bench \
 #          after=~/src/after:~/t-after/release/amphora-bench -- --target amphora --items 200000
 set -euo pipefail
@@ -58,7 +58,9 @@ quiet() {
   done
 }
 
-for ((turn = 1; turn <= turns; turn++)); do
+# FIRST_TURN: the number of the first turn, to go on with a record a stopped run began.
+first=${FIRST_TURN:-1}
+for ((turn = first; turn < first + turns; turn++)); do
   for build in "${builds[@]}"; do
     name=${build%%=*}
     rest=${build#*=}

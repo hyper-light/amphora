@@ -33,6 +33,7 @@ struct Opts {
     max_load: f64,
     load_wait: Duration,
     out: PathBuf,
+    resume: bool,
 }
 
 fn opts() -> anyhow::Result<Opts> {
@@ -52,6 +53,7 @@ fn opts() -> anyhow::Result<Opts> {
         max_load: 2.0,
         load_wait: Duration::from_secs(3600),
         out: PathBuf::new(),
+        resume: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -73,7 +75,8 @@ fn opts() -> anyhow::Result<Opts> {
             "--max-load" => o.max_load = v()?.parse()?,
             "--load-wait-s" => o.load_wait = Duration::from_secs(v()?.parse()?),
             "--out" => o.out = v()?.into(),
-            other => anyhow::bail!("unknown argument {other} (--planner takes --bench job|tpch, --data, --queries, --sf, --dir, --targets, --runs, --timeout-s, --count-timeout-s, --dsn, --cache-mib, --only, --max-load, --load-wait-s, --out)"),
+            "--resume" => o.resume = true,
+            other => anyhow::bail!("unknown argument {other} (--planner takes --bench job|tpch, --data, --queries, --sf, --dir, --targets, --runs, --timeout-s, --count-timeout-s, --dsn, --cache-mib, --only, --max-load, --load-wait-s, --out, --resume)"),
         }
     }
     anyhow::ensure!(matches!(o.bench.as_str(), "job" | "tpch"), "--bench is job or tpch");
@@ -264,6 +267,26 @@ fn counts_json(counts: &[Count]) -> serde_json::Value {
 pub fn main() -> anyhow::Result<()> {
     let o = opts()?;
     let b = bench(&o)?;
+    // --resume: the queries and engines `--out` already holds a record of, run on this commit.
+    let bench_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let git = |args: &[&str]| {
+        std::process::Command::new("git").arg("-C").arg(bench_dir).args(args).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned()).unwrap_or_default()
+    };
+    let commit = git(&["rev-parse", "HEAD"]);
+    let mut done = std::collections::HashSet::new();
+    if o.resume && o.out.exists() {
+        let mut same_commit = false;
+        for line in std::fs::read_to_string(&o.out)?.lines() {
+            let r: serde_json::Value = serde_json::from_str(line)?;
+            match r["record"].as_str() {
+                Some("run") => same_commit = r["commit"].as_str() == Some(commit.as_str()),
+                Some("query") if same_commit => {
+                    done.insert((r["query"].as_str().unwrap_or_default().to_owned(), r["target"].as_str().unwrap_or_default().to_owned()));
+                }
+                _ => {}
+            }
+        }
+    }
     let mut out = std::fs::OpenOptions::new().create(true).append(true).open(&o.out)?;
     let mut write = |v: serde_json::Value| -> anyhow::Result<()> {
         writeln!(out, "{v}")?;
@@ -295,10 +318,6 @@ pub fn main() -> anyhow::Result<()> {
         }
         targets.push(target);
     }
-    let bench_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let git = |args: &[&str]| {
-        std::process::Command::new("git").arg("-C").arg(bench_dir).args(args).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned()).unwrap_or_default()
-    };
     let mut engines = Vec::new();
     for t in &mut targets {
         engines.push(t.about()?);
@@ -308,7 +327,7 @@ pub fn main() -> anyhow::Result<()> {
         "date": utc_now(),
         "host": host(&o.dir),
         "cores": std::thread::available_parallelism().map(usize::from).unwrap_or(0),
-        "commit": git(&["rev-parse", "HEAD"]),
+        "commit": commit,
         "dirty_files": git(&["status", "--porcelain"]).lines().count(),
         "args": std::env::args().skip(1).collect::<Vec<_>>().join(" "),
         "bench": o.bench, "sf": if o.bench == "tpch" { Some(o.sf) } else { None },
@@ -323,6 +342,9 @@ pub fn main() -> anyhow::Result<()> {
             continue;
         }
         for target in &mut targets {
+            if done.contains(&(name.clone(), target.name())) {
+                continue;
+            }
             let sql = for_dialect(sql.trim().trim_end_matches(';'), target.dialect());
             let mut record = serde_json::json!({ "record": "query", "bench": o.bench, "query": name, "target": target.name() });
             if let Some(amphora) = target.amphora() {
