@@ -49,7 +49,7 @@ A database is loaded the first time and kept: a load that finished leaves a `ben
 and one without it is dropped and loaded again. Each timed run starts once the load is under
 `--max-load` (2 unless given), waiting at most `--load-wait-s`; the load each began at is in its
 record. On Linux that is the one-minute load average; Windows keeps none, so there it is the cores
-busy plus the processor queue, averaged over five seconds, which the record names.
+busy plus the processor queue, averaged over three seconds, which the record names.
 
 ## What is measured
 

@@ -152,7 +152,7 @@ fn load_average() -> Option<f64> {
 #[cfg(windows)]
 fn load_average() -> Option<f64> {
     let cores = std::thread::available_parallelism().map(usize::from).ok()? as f64;
-    let out = powershell("$s = Get-Counter '\\Processor(_Total)\\% Processor Time','\\System\\Processor Queue Length' -SampleInterval 1 -MaxSamples 5; $busy = ($s | ForEach-Object { $_.CounterSamples[0].CookedValue } | Measure-Object -Average).Average; $queue = ($s | ForEach-Object { $_.CounterSamples[1].CookedValue } | Measure-Object -Average).Average; \"$busy $queue\"");
+    let out = powershell("$s = Get-Counter '\\Processor(_Total)\\% Processor Time','\\System\\Processor Queue Length' -SampleInterval 1 -MaxSamples 3; $busy = ($s | ForEach-Object { $_.CounterSamples[0].CookedValue } | Measure-Object -Average).Average; $queue = ($s | ForEach-Object { $_.CounterSamples[1].CookedValue } | Measure-Object -Average).Average; \"$busy $queue\"");
     let mut parts = out.split_whitespace().filter_map(|v| v.parse::<f64>().ok());
     let (busy, queue) = (parts.next()?, parts.next()?);
     Some(busy / 100.0 * cores + queue)
@@ -200,7 +200,7 @@ fn host(dir: &Path) -> serde_json::Value {
         "disk": powershell(&format!("(Get-Partition -DriveLetter {drive} | Get-Disk).FriendlyName")),
         "fs": powershell(&format!("(Get-Volume -DriveLetter {drive}).FileSystemType")),
         "kernel": powershell("$v = Get-CimInstance Win32_OperatingSystem; \"$($v.Caption) $($v.Version)\""),
-        "load_kind": "Windows: busy cores plus the processor queue, averaged over 5 s (it keeps no load average)",
+        "load_kind": "Windows: busy cores plus the processor queue, averaged over 3 s (it keeps no load average)",
     })
 }
 
