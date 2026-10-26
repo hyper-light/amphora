@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The bench suite (`amphora-bench --suite`) on two builds in turns, each run begun once the machine
 # is quiet, each recorded as bench/run.sh records one (CLAUDE.md §7): when, where, which commit,
-# the load before and after, and the suite's report. Runs on Linux and in Git for Windows' shell,
+# the load before and after, and the suite's report. Runs on Linux, macOS and in Git for Windows' shell,
 # where Windows keeps no load average and its nearest stands in (bench/planner/README.md).
 #
 # usage: [FIRST_TURN=n] bench/planner/suite-turns.sh <out.jsonl> <turns> <name>=<checkout>:<binary>... -- <suite arguments>
@@ -31,6 +31,15 @@ if [[ -r /proc/loadavg && "$(uname -s)" == Linux ]]; then
   fs=$(findmnt -no FSTYPE -T "$DATA")
   dev=$(findmnt -no SOURCE -T "$DATA" | sed 's/\[.*//; s#/dev/##; s/p[0-9]*$//')
   disk=$(xargs <"/sys/block/$dev/device/model" 2>/dev/null || echo unknown)
+elif [[ "$(uname -s)" == Darwin ]]; then
+  load() { sysctl -n vm.loadavg | awk '{ print $2 }'; }
+  load_kind="macOS's one-minute load average"
+  host=$(hostname -s)
+  cpu=$(sysctl -n machdep.cpu.brand_string)
+  kernel="macOS $(sw_vers -productVersion) (Darwin $(uname -r))"
+  mkdir -p "$DATA"
+  fs=$(diskutil info "$(df "$DATA" | awk 'NR == 2 { print $1 }')" | sed -n 's/^ *Type (Bundle): *//p')
+  disk=$(diskutil info disk0 | sed -n 's/^ *Device \/ Media Name: *//p')
 else
   # Busy cores plus the processor queue, averaged over five seconds (the harness's own measure).
   load() {
@@ -44,7 +53,7 @@ else
   disk=$(powershell -NoProfile -Command "(Get-Partition -DriveLetter $drive | Get-Disk).FriendlyName" | tr -d '\r' | xargs)
   fs=$(powershell -NoProfile -Command "(Get-Volume -DriveLetter $drive).FileSystemType" | tr -d '\r')
 fi
-cores=$(nproc)
+cores=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 
 # Waits for a quiet machine, at most LOAD_WAIT_S: the load it began at.
 quiet() {
