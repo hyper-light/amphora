@@ -29,7 +29,9 @@ PostgreSQL with `max_parallel_workers_per_gather = 0`. Amphora and SQLite keep `
 pages (2 GiB unless given); DuckDB and PostgreSQL keep what they ship with (`about` in the record).
 PostgreSQL 17 runs in Docker (`postgres.sh`), its data on a Docker volume. Every query has a
 deadline (`--timeout-s`, `--count-timeout-s` for Amphora's counted run): one that passes it is
-stopped and recorded as timed out, and one an engine refuses is recorded with its words.
+stopped and recorded as timed out, and one an engine refuses is recorded with its words. DuckDB's
+parser keeps `at` for itself, the alias JOB's 15a to 15d give aka_title, and refuses them as
+written; it is given them with the alias quoted (`"at"`), the same query.
 
 ## Running it
 

@@ -512,6 +512,7 @@ impl Target for Duck {
     }
 
     fn run(&mut self, sql: &str, deadline: Duration) -> Outcome {
+        let sql = &quote_at(sql);
         let handle = self.conn.interrupt_handle();
         let (stop, stopped) = std::sync::mpsc::channel::<()>();
         let watchdog = std::thread::spawn(move || {
@@ -542,6 +543,47 @@ impl Target for Duck {
             Err(_) if late => Outcome::TimedOut,
             Err(e) => Outcome::Failed(e.to_string()),
         }
+    }
+}
+
+/// DuckDB's parser keeps `at` for itself (`AT TIME ZONE`), which JOB's 15a to 15d name aka_title
+/// by: the name quoted wherever it stands alone outside a string, so DuckDB runs the query it refuses as written
+/// (its refusal is recorded too, from the run before this rewrite).
+fn quote_at(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let word = |b: Option<&u8>| b.is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'"' || *b == b'\'');
+    let mut i = 0;
+    let mut literal = false;
+    while i < bytes.len() {
+        let here = &sql[i..];
+        // A string literal is copied as it is (`''` within it closes and opens it again).
+        if bytes.get(i) == Some(&b'\'') {
+            literal = !literal;
+        }
+        if !literal && here.len() >= 2 && here[..2].eq_ignore_ascii_case("at") && !word(i.checked_sub(1).and_then(|p| bytes.get(p))) && !word(bytes.get(i + 2)) {
+            out.push_str("\"at\"");
+            i += 2;
+            continue;
+        }
+        let c = here.chars().next().unwrap_or_default();
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Do: quote JOB 15a's alias for DuckDB. Expect: `at` alone quoted, words holding it kept.
+    #[test]
+    fn quote_at_quotes_the_alias_alone() {
+        assert_eq!(
+            quote_at("SELECT MIN(at.title) FROM aka_title AS at WHERE at.movie_id = t.id AND t.note LIKE '%at%' AND rating > 2"),
+            "SELECT MIN(\"at\".title) FROM aka_title AS \"at\" WHERE \"at\".movie_id = t.id AND t.note LIKE '%at%' AND rating > 2"
+        );
     }
 }
 
