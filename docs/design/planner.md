@@ -484,18 +484,21 @@ returns per outer row stay the cost model's (`estimate_rows_per_seek`: a unique 
 ANALYZE's rows per key prefix, a GLOB's implied range) and no longer reach any output estimate.
 Each WHERE term counts once, on its home table (its most selective constraint's, ties to the first
 table by name, not by place in FROM), through the same `constraints_selectivity` the filters of one
-table use, so a closed range is one range wherever its bounds are counted. Outer joins by their
+table use, so a closed range is one range wherever its bounds are counted; a term with its table on
+both sides, which gives a constraint for each side, counts once there too. Outer joins by their
 semantics, each by the Poisson model the planner already took for a match count: a LEFT JOIN keeps
 each left row's matches or the row once (`m + e^-m` with `m` the right table's rows its ON terms
 keep); a RIGHT JOIN keeps the matches and the right rows no left row matches; a FULL JOIN keeps
 both sides' unmatched rows. So LEFT and RIGHT are never below the inner join and FULL never below
 either. A RIGHT or FULL JOIN is a reordering barrier both ways, so the rows before it are a set of
 their own, combined with it. Semi and anti joins keep or drop left rows and never add any: their
-tables and the terms that read them (their unnested EXISTS conditions) multiply by 1. A LEFT JOIN to
-a derived table grouped by exactly the columns its ON terms equate (a scalar subquery unnested,
-`unnest.rs`) gives one row for each left row, as the correlated form does, and a term on its value
-counts for nothing in either form. A whole WHERE or inner-ON term no row passes (`NULL`, a NULL test
-of a literal SQLite's parser folds to 0) leaves no rows in any set, and a plan made impossible by a
+tables and the terms that read them (their unnested EXISTS conditions) multiply by 1. A derived table
+grouped by exactly the columns `=` terms equate to other tables' values (a scalar subquery
+unnested, `unnest.rs`, by a LEFT JOIN or, once a null-rejecting term has made it one, an inner
+join) gives one row for each binding of them, as the correlated form it replaced does, and a term on
+its value counts by its operator, as the same term on the correlated subquery's value does. A whole
+WHERE or inner-ON term no row passes (`NULL`, or one that settles to false as SQLite settles an AND
+or OR of literals, `simplified_and_or` then `literal_truth`) leaves no rows in any set, and a plan made impossible by a
 constant-false WHERE estimates each table access at 0 rows. An ON term's BETWEEN is rewritten to its
 two comparisons as a WHERE term's is (`planner.rs`, `split_rewritten_ands`). Loops run over a
 set's tables and its RIGHT or FULL JOINs, bounded by the mask; nothing recurses.

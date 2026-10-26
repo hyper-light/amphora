@@ -18,7 +18,7 @@ use super::{
 };
 use crate::schema::Table as SchemaTable;
 use crate::translate::{
-    expr::literal_truth,
+    expr::{literal_truth, simplified_and_or},
     plan::{JoinType, JoinedTable, Plan, WhereTerm},
     planner::TableMask,
 };
@@ -126,9 +126,26 @@ impl<'a> JoinedSetRows<'a> {
                     continue;
                 };
                 if term.consumed
+                    || constraint.implied
                     || kind == Kind::SemiOrAnti
                     || key_terms.contains(&constraint.where_clause_pos.0)
                 {
+                    continue;
+                }
+                // A term with this table on both sides gives a constraint for each side, one
+                // predicate: it counts once, by its most selective constraint.
+                let same_term = |slot: &&mut (usize, Class)| {
+                    table_constraints
+                        .get(slot.0)
+                        .is_some_and(|c| c.where_clause_pos.0 == constraint.where_clause_pos.0)
+                };
+                if let Some(slot) = counted.iter_mut().find(same_term) {
+                    if table_constraints
+                        .get(slot.0)
+                        .is_some_and(|c| constraint.selectivity < c.selectivity)
+                    {
+                        slot.0 = constraint_idx;
+                    }
                     continue;
                 }
                 let class = if term.origin.is_outer_join() {
@@ -221,10 +238,11 @@ impl<'a> JoinedSetRows<'a> {
         let Some(t) = self.tables.get(table) else {
             return 1.0;
         };
-        // An unnested subquery's value has no statistics, and its correlated form counts a term
-        // on it for nothing: so does this form, one estimate for the two.
+        // One row for each binding of its keys, as the correlated subquery it was unnested from
+        // gives; a term on its value counts as the same term on the correlated subquery's value
+        // does, by its operator.
         if !t.keys.is_empty() && self.keys_ready(table, ready) {
-            return 1.0;
+            return self.selectivity(table, Class::Filter, ready);
         }
         match t.kind {
             Kind::SemiOrAnti => 1.0,
@@ -370,10 +388,11 @@ fn selects_unmatched_rows(
     })
 }
 
-/// Whether a whole term is a NULL, or a NULL test of a literal that SQLite's parser folds to 0
-/// ([literal_truth]): no row passes it. Only as a whole term: `NOT NULL` is NULL.
+/// Whether a whole term is a NULL, or settles to false as SQLite settles an AND or OR of literals
+/// ([simplified_and_or], [literal_truth]): no row passes it. Only as a whole term: `NOT NULL` is
+/// NULL.
 fn never_true(expr: &ast::Expr) -> bool {
-    let mut inner = expr;
+    let mut inner = simplified_and_or(expr);
     while let ast::Expr::Parenthesized(exprs) = inner {
         let [only] = exprs.as_slice() else {
             return false;

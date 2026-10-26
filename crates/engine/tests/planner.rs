@@ -509,7 +509,8 @@ fn a_constraint_seeks_or_filters_to_one_estimate() {
 /// Do: an inner join with its condition in ON, the same condition in WHERE, and the tables listed
 /// the other way round: a BETWEEN, an EXISTS and a NOT EXISTS correlated with the right table, two
 /// scalar subqueries (planned correlated in some orders and unnested to a grouped table in others), a
-/// NULL, and a NULL test of a literal that SQLite's parser folds to 0, alone and ANDed with NULL.
+/// NULL, and a NULL test of a literal that SQLite's parser folds to 0, alone, ANDed with NULL and
+/// ORed with 0.
 /// Expect: one estimate for each condition's forms, and 0 rows where no row can pass (decision 13:
 /// the oracles' order check found each of these estimated apart; AC-T1.1.2).
 #[test]
@@ -529,6 +530,12 @@ fn an_on_term_and_a_where_term_give_one_estimate() {
             None,
         ),
         ("NOT (SELECT min(s.c) FROM t2 AS s WHERE s.b = x.a)", None),
+        (
+            "(SELECT max(s.c) FROM t2 AS s WHERE s.b = x.a) IS NOT ('-1' <= x.c)",
+            None,
+        ),
+        ("(SELECT count(s.c) FROM t2 AS s WHERE s.b = y.a) = 2", None),
+        ("0 OR (255 ISNULL)", Some(0.0)),
         ("NULL", Some(0.0)),
         ("x'' ISNULL", Some(0.0)),
         ("(x'' ISNULL) AND NULL", Some(0.0)),
