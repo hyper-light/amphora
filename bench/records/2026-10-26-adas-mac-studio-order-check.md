@@ -27,6 +27,29 @@ estimate (a compound select, no table); a form Amphora refuses where SQLite answ
 failure (`derived`), and none was. The summaries (`summary.json`) and findings are on adas-mac-studio
 under `~/.cache/order-runs/final-s11` and `final-s12`.
 
+## The same campaigns again, with their summaries here
+
+adas-mac-studio went offline before its summaries could be copied, so both campaigns were run again
+on adas-mac-studio-2 (Apple M4 Max, 14 cores, 36 GiB, macOS 26.2) with a release build of the same
+clean export of d762dc2 and the same reference SQLite, 2026-10-26: their `summary.json` files are
+`2026-10-26-adas-mac-studio-2-order-check/seed11/summary.json` and `seed12/summary.json`, byte for
+byte as the runs wrote them (SHA-256 b5b2400c…f2f4 and a421ce5f…b8c2).
+
+| seed | databases | checks | order checks | order failures | order skips: no estimate | CERT failures |
+|---:|---:|---:|---:|---:|---:|---:|
+| 11 | 100,528 | 4,074,293 | 502,632 | **0** | 46,131 | 1 |
+| 12 | 106,159 | 4,302,451 | 530,789 | **0** | 48,610 | 1 |
+
+## The campaigns' other findings, replayed on both builds
+
+Every finding of the two adas-mac-studio-2 campaigns, replayed with `--replay-check` (each of its
+queries on Amphora against the reference SQLite) by release binaries of dbef789 and of d762dc2 on the
+same machine (`2026-10-26-adas-mac-studio-2-order-check/replay.jsonl`, SHA-256 58f89c9a…9a6c): of
+43 findings, 36 fail on both (the two CERT findings, step 5's, and 34 others: wrong answers, errors
+where SQLite answers, and three panics, "cursor id N is None"), 7 pass on both (their replay doesn't
+reproduce what the campaign saw), and none fails on d762dc2 alone. The change brings none of them:
+they predate it, and wait for fixes of their own.
+
 ## Before the change, and on the way
 
 | build | run | order checks | order failures |

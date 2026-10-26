@@ -554,10 +554,14 @@ join NOT INDEXED 1e11; a LEFT JOIN 2,500 under its inner join's 3,000) and pass,
 oracles found later added where it first failed. The oracles' order check
 (`bench/src/oracle/checks.rs`, `Case::Order`), which plans an inner join of two to four tables with
 its FROM list in every order and each order forced by CROSS JOIN, failed 33 of its 435 checks on
-dbef789 and none of 375,206 and 385,255 in two campaigns of every oracle on d762dc2, seeds 11 and
-12, 1,800 s each (`bench/records/2026-10-26-adas-mac-studio-order-check.md`; its causes in
-`bench/oracles/findings.md`). CERT, the check that found cause AG: all 71 findings of dbef789's run
-(seed 20261025, 300 s) pass on d762dc2, and d762dc2's own run found 6, each failing on dbef789 too.
+dbef789 and none of 502,632 and 530,789 in two campaigns of every oracle on d762dc2, seeds 11 and
+12, 1,800 s each (`bench/records/2026-10-26-adas-mac-studio-2-order-check/seed11/summary.json` and
+`seed12/summary.json`; an earlier pair of the same campaigns, 375,206 and 385,255, none failed, in
+`2026-10-26-adas-mac-studio-order-check.md`; the causes in `bench/oracles/findings.md`). CERT, the
+check that found cause AG: all 71 findings of dbef789's run (seed 20261025, 300 s) pass on d762dc2,
+and d762dc2's own run found 6, each failing on dbef789 too. The campaigns' other 41 findings
+replay alike on both builds (34 fail on both, 7 pass on both: `replay.jsonl` beside the summaries):
+the change brings none.
 The suite's 52 statements plan as before at 200,000 and at 20,000 items (`--suite --explain`, release
 builds of dbef789 and d762dc2), and every statement checked compiles to the same bytecode. Release
 binaries of both on adas-mac-studio-2, the whole suite, four rounds in ABBA order, each run started

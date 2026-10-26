@@ -172,3 +172,7 @@ dbef789's binary): none new. What is left of AG is step 5's (kiln plan 01a16eab7
 
 The campaigns on the change's last commit, d762dc2 (`bench/records/2026-10-26-adas-mac-studio-order-check.md`):
 seed 11, 1,800 s, 375,206 order checks, none failed; seed 12, 1,800 s, 385,255, none failed.
+Run again with their summaries kept (`bench/records/2026-10-26-adas-mac-studio-2-order-check/`):
+seed 11, 502,632 order checks, none failed; seed 12, 530,789, none failed. Their 43 other findings
+replay alike on dbef789 and d762dc2 (36 fail on both, 7 pass on both: `replay.jsonl` there): none
+is the change's.
