@@ -4,7 +4,7 @@
 # (`--resume`, so a pass stopped part way goes on where it stopped). The second passes are the
 # repeat the plan's test asks for: the same estimates, and median run times within 5%.
 #
-# usage: bench/planner/record.sh <amphora-bench> <out dir> <data dir> <JOB queries dir> [pass...]
+# usage: [TARGETS=a,b] bench/planner/record.sh <amphora-bench> <out dir> <data dir> <JOB queries dir> [pass...]
 #   <data dir> holds tpch-sf1, tpch-sf10 and imdb; the passes default to all five:
 #   tpch-sf1-a tpch-sf1-b tpch-sf10-a job-a job-b
 set -euo pipefail
@@ -21,8 +21,11 @@ here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 mkdir -p "$out"
 # Native Windows programs take Windows paths; elsewhere a path is itself.
 native() { if command -v cygpath >/dev/null; then cygpath -w "$1"; else echo "$1"; fi; }
-targets=amphora,sqlite,duckdb,duckdb-mt,postgres
-bash "$here/postgres.sh" start
+# TARGETS: the engines, all five unless given (PostgreSQL only when its server is there to start).
+targets=${TARGETS:-amphora,sqlite,duckdb,duckdb-mt,postgres}
+if [[ ",$targets," == *,postgres,* ]]; then
+  bash "$here/postgres.sh" start
+fi
 for pass in "${passes[@]}"; do
   case "$pass" in
     tpch-sf1-*) args=(--bench tpch --sf 1 --data "$(native "$data/tpch-sf1")" --queries "$(native "$here/tpch/queries")" --dir "$(native "$data/db-tpch-sf1")") ;;
