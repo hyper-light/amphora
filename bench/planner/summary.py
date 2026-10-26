@@ -112,13 +112,16 @@ def main(argv):
     runs, queries = [], {}
     for path in paths:
         with open(path) as f:
+            label = None
             for line in f:
                 r = json.loads(line)
                 if r["record"] == "run":
                     runs.append(r)
+                    # TPC-H's scale factor is the run's: its queries are named by it.
+                    label = r["bench"] + (f" SF {r['sf']:g}" if r.get("sf") else "")
                 elif r["record"] == "query":
                     # The last record of a query and engine is its record.
-                    queries[(r["bench"], r["query"], r["target"])] = r
+                    queries[(label or r["bench"], r["query"], r["target"])] = r
     benches = sorted({k[0] for k in queries})
     targets = sorted({k[2] for k in queries}, key=lambda t: ["amphora", "sqlite", "duckdb", "duckdb-mt", "postgres"].index(t) if t in ["amphora", "sqlite", "duckdb", "duckdb-mt", "postgres"] else 9)
     summary = {"runs": runs, "benches": {}}
@@ -208,6 +211,19 @@ def main(argv):
         totals = {t: sum(l["ms"][t] for l in rows if l["ms"].get(t) is not None) for t in targets}
         done = {t: sum(1 for l in rows if l["ms"].get(t) is not None) for t in targets}
         print("| all (sum of those run) | | | | | " + " | ".join(f"{totals[t]:.0f} ({done[t]} run)" for t in targets) + " |")
+        # Each engine against Amphora, on the queries both ran to the end: the geometric mean of
+        # its time over Amphora's, and on how many it was the faster.
+        versus = {}
+        for t in targets:
+            pairs = [(l["ms"]["amphora"], l["ms"][t]) for l in rows if l["ms"].get("amphora") and l["ms"].get(t)]
+            if t == "amphora" or not pairs:
+                continue
+            versus[t] = {"queries": len(pairs), "geomean_over_amphora": math.exp(sum(math.log(b / a) for a, b in pairs) / len(pairs)),
+                         "faster_than_amphora": sum(1 for a, b in pairs if b < a)}
+        summary["benches"][bench]["versus_amphora"] = versus
+        print("\n| engine | queries both ran | its time over Amphora's (geometric mean) | queries it was faster on |\n|---|---:|---:|---:|")
+        for t, v in versus.items():
+            print(f"| {t} | {v['queries']} | {v['geomean_over_amphora']:.3f} | {v['faster_than_amphora']} |")
     if json_out:
         with open(json_out, "w") as f:
             json.dump(summary, f, indent=1)
