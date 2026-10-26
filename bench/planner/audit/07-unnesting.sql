@@ -19,8 +19,10 @@ EXPLAIN QUERY PLAN SELECT count(*) FROM customer WHERE EXISTS (SELECT * FROM ord
 -- Kept: Q16's NOT IN, a list built once; correlated, a list built for every outer row.
 EXPLAIN QUERY PLAN SELECT p_brand, count(DISTINCT ps_suppkey) FROM partsupp JOIN part ON p_partkey = ps_partkey WHERE p_size IN (49, 14) AND ps_suppkey NOT IN (SELECT s_suppkey FROM supplier WHERE s_comment LIKE '%Customer%Complaints%') GROUP BY p_brand;
 EXPLAIN QUERY PLAN SELECT count(*) FROM customer WHERE c_custkey NOT IN (SELECT o_custkey FROM orders WHERE o_orderdate > c_phone);
--- Unnested, for contrast: Q21's EXISTS and NOT EXISTS (correlated by = and <>), Q17's correlated
--- avg and Q2's correlated min over four tables (grouped first), and a count in the SELECT list.
+-- Unnested, for contrast: Q21's EXISTS and NOT EXISTS (correlated by = and <>) over two of its
+-- tables (over all four, 13-tpch-subqueries.out keeps both, the written form estimated cheaper),
+-- Q17's correlated avg and Q2's correlated min over four tables (grouped first), and a count in
+-- the SELECT list.
 EXPLAIN QUERY PLAN SELECT count(*) FROM lineitem l1 JOIN orders ON o_orderkey = l1.l_orderkey WHERE EXISTS (SELECT * FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey AND l2.l_suppkey <> l1.l_suppkey) AND NOT EXISTS (SELECT * FROM lineitem l3 WHERE l3.l_orderkey = l1.l_orderkey AND l3.l_suppkey <> l1.l_suppkey AND l3.l_receiptdate > l3.l_commitdate);
 EXPLAIN QUERY PLAN SELECT sum(l_quantity) FROM lineitem JOIN part ON p_partkey = l_partkey WHERE p_brand = 'Brand#23' AND l_quantity < (SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey);
 EXPLAIN QUERY PLAN SELECT s_name FROM part, supplier, partsupp, nation, region WHERE p_partkey = ps_partkey AND s_suppkey = ps_suppkey AND p_size = 15 AND s_nationkey = n_nationkey AND n_regionkey = r_regionkey AND r_name = 'EUROPE' AND ps_supplycost = (SELECT min(ps_supplycost) FROM partsupp, supplier, nation, region WHERE p_partkey = ps_partkey AND s_suppkey = ps_suppkey AND s_nationkey = n_nationkey AND n_regionkey = r_regionkey AND r_name = 'EUROPE');

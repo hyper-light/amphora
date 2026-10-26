@@ -48,41 +48,41 @@
 
 > -- time
 > EXPLAIN QUERY PLAN SELECT count(*) FROM c1 JOIN c2 ON c2.id = c1.nxt JOIN c3 ON c3.id = c2.nxt JOIN c4 ON c4.id = c3.nxt JOIN c5 ON c5.id = c4.nxt JOIN c6 ON c6.id = c5.nxt JOIN c7 ON c7.id = c6.nxt JOIN c8 ON c8.id = c7.nxt;
-prepare: 0.077 ms
+prepare: 0.097 ms
 
 > -- time
 > EXPLAIN QUERY PLAN SELECT count(*) FROM c1 JOIN c2 ON c2.id = c1.nxt JOIN c3 ON c3.id = c2.nxt JOIN c4 ON c4.id = c3.nxt JOIN c5 ON c5.id = c4.nxt JOIN c6 ON c6.id = c5.nxt JOIN c7 ON c7.id = c6.nxt JOIN c8 ON c8.id = c7.nxt JOIN c9 ON c9.id = c8.nxt;
-prepare: 0.116 ms
+prepare: 0.146 ms
 
 > -- time
 > EXPLAIN QUERY PLAN SELECT count(*) FROM c1 JOIN c2 ON c2.id = c1.nxt JOIN c3 ON c3.id = c2.nxt JOIN c4 ON c4.id = c3.nxt JOIN c5 ON c5.id = c4.nxt JOIN c6 ON c6.id = c5.nxt JOIN c7 ON c7.id = c6.nxt JOIN c8 ON c8.id = c7.nxt JOIN c9 ON c9.id = c8.nxt JOIN c10 ON c10.id = c9.nxt;
-prepare: 0.191 ms
+prepare: 0.247 ms
 
 > -- time
 > EXPLAIN QUERY PLAN SELECT count(*) FROM c1 JOIN c2 ON c2.id = c1.nxt JOIN c3 ON c3.id = c2.nxt JOIN c4 ON c4.id = c3.nxt JOIN c5 ON c5.id = c4.nxt JOIN c6 ON c6.id = c5.nxt JOIN c7 ON c7.id = c6.nxt JOIN c8 ON c8.id = c7.nxt JOIN c9 ON c9.id = c8.nxt JOIN c10 ON c10.id = c9.nxt JOIN c11 ON c11.id = c10.nxt;
-prepare: 0.333 ms
+prepare: 0.383 ms
 
 > -- time
 > EXPLAIN QUERY PLAN SELECT count(*) FROM c1 JOIN c2 ON c2.id = c1.nxt JOIN c3 ON c3.id = c2.nxt JOIN c4 ON c4.id = c3.nxt JOIN c5 ON c5.id = c4.nxt JOIN c6 ON c6.id = c5.nxt JOIN c7 ON c7.id = c6.nxt JOIN c8 ON c8.id = c7.nxt JOIN c9 ON c9.id = c8.nxt JOIN c10 ON c10.id = c9.nxt JOIN c11 ON c11.id = c10.nxt JOIN c12 ON c12.id = c11.nxt;
-prepare: 0.621 ms
+prepare: 0.682 ms
 
 > -- time
 > EXPLAIN QUERY PLAN SELECT count(*) FROM hub JOIN s1 ON s1.id = hub.k1 JOIN s2 ON s2.id = hub.k2 JOIN s3 ON s3.id = hub.k3 JOIN s4 ON s4.id = hub.k4 JOIN s5 ON s5.id = hub.k5 JOIN s6 ON s6.id = hub.k6 JOIN s7 ON s7.id = hub.k7;
-prepare: 0.835 ms
+prepare: 0.802 ms
 
 > -- time
 > EXPLAIN QUERY PLAN SELECT count(*) FROM hub JOIN s1 ON s1.id = hub.k1 JOIN s2 ON s2.id = hub.k2 JOIN s3 ON s3.id = hub.k3 JOIN s4 ON s4.id = hub.k4 JOIN s5 ON s5.id = hub.k5 JOIN s6 ON s6.id = hub.k6 JOIN s7 ON s7.id = hub.k7 JOIN s8 ON s8.id = hub.k8;
-prepare: 2.190 ms
+prepare: 2.019 ms
 
 > -- time
 > EXPLAIN QUERY PLAN SELECT count(*) FROM hub JOIN s1 ON s1.id = hub.k1 JOIN s2 ON s2.id = hub.k2 JOIN s3 ON s3.id = hub.k3 JOIN s4 ON s4.id = hub.k4 JOIN s5 ON s5.id = hub.k5 JOIN s6 ON s6.id = hub.k6 JOIN s7 ON s7.id = hub.k7 JOIN s8 ON s8.id = hub.k8 JOIN s9 ON s9.id = hub.k9;
-prepare: 5.590 ms
+prepare: 5.875 ms
 
 > -- time
 > EXPLAIN QUERY PLAN SELECT count(*) FROM hub JOIN s1 ON s1.id = hub.k1 JOIN s2 ON s2.id = hub.k2 JOIN s3 ON s3.id = hub.k3 JOIN s4 ON s4.id = hub.k4 JOIN s5 ON s5.id = hub.k5 JOIN s6 ON s6.id = hub.k6 JOIN s7 ON s7.id = hub.k7 JOIN s8 ON s8.id = hub.k8 JOIN s9 ON s9.id = hub.k9 JOIN s10 ON s10.id = hub.k10;
-prepare: 13.822 ms
+prepare: 15.342 ms
 
 > -- time
 > EXPLAIN QUERY PLAN SELECT count(*) FROM hub JOIN s1 ON s1.id = hub.k1 JOIN s2 ON s2.id = hub.k2 JOIN s3 ON s3.id = hub.k3 JOIN s4 ON s4.id = hub.k4 JOIN s5 ON s5.id = hub.k5 JOIN s6 ON s6.id = hub.k6 JOIN s7 ON s7.id = hub.k7 JOIN s8 ON s8.id = hub.k8 JOIN s9 ON s9.id = hub.k9 JOIN s10 ON s10.id = hub.k10 JOIN s11 ON s11.id = hub.k11;
-prepare: 34.385 ms
+prepare: 38.508 ms
 
