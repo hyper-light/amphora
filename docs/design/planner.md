@@ -545,7 +545,27 @@ RIGHT JOIN does the same for the right side's rows and a FULL JOIN for both. The
 follows CERT's idea (Ba and Rigger, ICSE 2024, f21): a property of the estimator two forms of one
 query must share, checked without knowing true sizes.
 
-**Evidence.** EVIDENCE
+**Evidence.** `crates/engine/tests/planner.rs`: `every_order_of_an_inner_join_gets_one_estimate`
+(random inner joins of two to six tables, filters and join terms, with statistics and without, each
+in up to 24 FROM orders and each order forced by CROSS JOIN), `an_outer_join_is_estimated_at_least_its_inner_join`,
+`a_constraint_seeks_or_filters_to_one_estimate` and `an_on_term_and_a_where_term_give_one_estimate`
+failed on dbef789 (one join estimated 1e11 in one order and 1e6 as written; a seek 1e9 and the same
+join NOT INDEXED 1e11; a LEFT JOIN 2,500 under its inner join's 3,000) and pass, each shape the
+oracles found later added where it first failed. The oracles' order check
+(`bench/src/oracle/checks.rs`, `Case::Order`), which plans an inner join of two to four tables with
+its FROM list in every order and each order forced by CROSS JOIN, failed 33 of its 435 checks on
+dbef789 and none of 375,206 and 385,255 in two campaigns of every oracle on d762dc2, seeds 11 and
+12, 1,800 s each (`bench/records/2026-10-26-adas-mac-studio-order-check.md`; its causes in
+`bench/oracles/findings.md`). CERT, the check that found cause AG: all 71 findings of dbef789's run
+(seed 20261025, 300 s) pass on d762dc2, and d762dc2's own run found 6, each failing on dbef789 too.
+The suite's 52 statements plan as before at 200,000 and at 20,000 items (`--suite --explain`, release
+builds of dbef789 and d762dc2), and every statement checked compiles to the same bytecode. Release
+binaries of both on adas-mac-studio-2, the whole suite, four rounds in ABBA order, each run started
+at load under 2 (`bench/records/2026-10-26-adas-mac-studio-2-joined-set-rows.md`): 94 of the 104
+statement and client pairs within 3% or faster by best of 4; the ten below run unchanged programs
+and lie within their own binary's spread there (`table_count` at 32 clients 1,691 to 28,585 a
+second across the before binary's four runs), and the point reads, alternated tightly, measure 0.984
+to 1.004 by median.
 
 **Falsified by.** Two orders or two access paths of one inner join whose estimates differ (the order
 check, run nightly); an outer join estimated below its inner join, or a semi or anti join above its

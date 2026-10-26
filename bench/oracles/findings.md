@@ -139,3 +139,36 @@ findings (2 more of the same), 12 of them not CERT (campaign 3: 37).
 | BE. A subquery held only in an AND or OR branch a literal settles ran before the loop, raising its error: SQLite codes no side sqlite3ExprSimplifiedAndOr drops, and no WHERE term past a literal 0 it tests before its loops | 1 | `subquery.rs` `drop_settled_subqueries`, `null_beside_false_where_term` | `a_subquery_a_settled_branch_drops_never_runs` |
 | Q. Not Amphora's: evaluation order (SQLite's min() over an index stops at the first row its WHERE passes; json_valid's flags error in a subquery) | 2 | — | — |
 | AG. CERT, the planner goal's | 58 | — | — |
+
+## The order check: one estimate whatever the join order (planner.md decision 13), 2026-10-26
+
+The order check (`checks.rs`, `Case::Order`) plans an inner join of two to four tables with its
+FROM list in every order, its ON terms moved to WHERE, and each order forced by CROSS JOIN, and
+holds every form to the estimate of the query as written within 1e-9 relative. On dbef789 a run of
+it alone (seed 11, 180 s, adas-mac-studio-3) failed 33 of 435 checks. Each cause below was found
+by it, cut down by the reducer, and fixed with a test in `crates/engine/tests/planner.rs` that fails
+before its fix and passes after.
+
+| cause | fix | test |
+|---|---|---|
+| BF. A join's estimate was the access path's: a seek's rows per outer row times the filters it didn't consume, each term's share moved by the order its tables came in. A seek keyed by one bound of a range took the bounds as two (0.4 × 0.4) where the filter form took a closed range (0.005); a seek and NOT INDEXED estimated one join 100 times apart; a LEFT JOIN came below its inner join | `optimizer/cardinality.rs` (`JoinedSetRows`: one estimate per set of tables), `optimizer/join.rs` (homes tied by name) | `every_order_of_an_inner_join_gets_one_estimate`, `a_constraint_seeks_or_filters_to_one_estimate`, `an_outer_join_is_estimated_at_least_its_inner_join` |
+| BG. An ON term kept its BETWEEN where a WHERE term has it split into two comparisons, so the ON form constrained nothing | `planner.rs` `split_rewritten_ands` | `an_on_term_and_a_where_term_give_one_estimate` |
+| BH. An EXISTS unnested to a semi or anti join left its condition homed on the outer table, a filter of it, where the correlated form counts nothing | `optimizer/join.rs` (`build_where_term_info`: a term reading a semi or anti join's table has no home) | `an_on_term_and_a_where_term_give_one_estimate` |
+| BI. A term no row passes: `WHERE (x'' ISNULL) AND NULL`, folded by the parser, planned impossible with no estimate at all, while `ON NULL`, `x'' ISNULL` alone and (campaign on a2f7ca6, seed 11) `ON (0 OR (255 ISNULL))` planned every row | `optimizer/mod.rs` (an impossible plan estimates 0 rows at each access), `cardinality.rs` `never_true` | `an_on_term_and_a_where_term_give_one_estimate` |
+| BJ. A scalar subquery unnested to a table grouped by its correlation key was estimated at that table's rows times the key's selectivity for each outer row (100,000) where it gives one, and the correlated form one | `cardinality.rs` `grouped_by_keys` | `an_on_term_and_a_where_term_give_one_estimate` |
+| BK. A term reading one table on both sides (`(SELECT max(...) WHERE s.c2 = a0.c1) IS NOT ('-1' <= a0.c2)`) gave a constraint for each side and counted twice there, 0.81 for 0.9 (campaign on a2f7ca6, seed 12) | `cardinality.rs` (a term counts once per table) | `an_on_term_and_a_where_term_give_one_estimate` |
+| BL. CERT, of BG's split: with an ON term's BETWEEN split, a bound by the other table's column (`a1.c1 BETWEEN 0 AND a0.c2`) made a closed range on the right table in the outer form but was counted on the left table in the inner form, so an outer join came below its inner join (CERT on a2f7ca6 and 878db51, seed 20261025: 83 of 84 findings new). Only bounds by a pseudo-constant make a range now, as PostgreSQL's `clauselist_selectivity` pairs them; a right table's WHERE filters count what they add to its ON terms | `cardinality.rs` (`selectivity_of`, `filters_given_on`) | `an_outer_join_is_estimated_at_least_its_inner_join` |
+| BM. CERT: a comparison with a NULL literal (`a0.c0 >= NULL`, from `BETWEEN NULL AND x`), an AND holding one, or a never-true term the settled-AND handling had consumed, estimated as if it passed rows; and `WHERE NULL AND (SELECT ...)` reported its uncorrelated subquery's rows as the query's `output_rows` | `cardinality.rs` `never_true`, `matches_none`; `emitter/select.rs`, `eqp.rs` (`join_output_rows`) | `an_on_term_and_a_where_term_give_one_estimate` |
+
+A form of the query Amphora refuses is a finding only where SQLite answers it, as for every derived
+query (`derived`): `ON 0 WHERE min()` is planned impossible and never checks min()'s arguments, so
+it runs where the forms with the WHERE folded, and SQLite, refuse it ("wrong number of arguments").
+That is not an estimate, and SQLite refuses it too; it is left to the refusal checks.
+
+CERT beside it (cause AG, the planner goal's: `--oracles cert`, seed 20261025, 300 s, against the
+oracles' SQLite, adas-mac-studio-2): dbef789 found 71 findings; on d762dc2 every one of them passes
+`--replay-check`, and a run of d762dc2 found 6, each failing on dbef789 too (`--replay-check` with
+dbef789's binary): none new. What is left of AG is step 5's (kiln plan 01a16eab7f457673b4cf9933adacfc4d).
+
+The campaigns on the change's last commit, d762dc2 (`bench/records/2026-10-26-adas-mac-studio-order-check.md`):
+seed 11, 1,800 s, 375,206 order checks, none failed; seed 12, 1,800 s, 385,255, none failed.
