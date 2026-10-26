@@ -948,15 +948,19 @@ pub fn program_plan_json(program: &Program) -> String {
         .collect();
     top.str_array("result_columns", &column_names);
     // The rows the join is estimated to give: the last access's in the join order, which the
-    // nodes' order (a hash join's build listed after its probe) does not tell.
-    if let Some(estimate) = program
-        .table_references
-        .joined_tables()
-        .iter()
-        .filter_map(|table| table.plan_estimate.as_ref())
-        .max_by_key(|estimate| estimate.position)
-    {
-        top.float("output_rows", estimate.output_rows);
+    // nodes' order (a hash join's build listed after its probe) does not tell. The top-level
+    // query's own, not an uncorrelated subquery's whose tables the program holds too (decision 13
+    // of docs/design/planner.md: `WHERE NULL AND (SELECT ...)` reported its subquery's rows).
+    if let Some(rows) = program.join_output_rows.or_else(|| {
+        program
+            .table_references
+            .joined_tables()
+            .iter()
+            .filter_map(|table| table.plan_estimate.as_ref())
+            .max_by_key(|estimate| estimate.position)
+            .map(|estimate| estimate.output_rows)
+    }) {
+        top.float("output_rows", rows);
     }
 
     let nodes = top.key("nodes");

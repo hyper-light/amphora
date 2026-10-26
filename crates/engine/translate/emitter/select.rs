@@ -73,6 +73,13 @@ fn emit_program_for_select_with_inputs(
     })?;
 
     program.result_columns = plan.result_columns;
+    program.join_output_rows = plan
+        .table_references
+        .joined_tables()
+        .iter()
+        .filter_map(|table| table.plan_estimate.as_ref())
+        .max_by_key(|estimate| estimate.position)
+        .map(|estimate| estimate.output_rows);
     program.table_references.extend(plan.table_references);
     program.reg_result_cols_start = Some(result_cols_start);
     Ok(())

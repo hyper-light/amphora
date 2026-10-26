@@ -482,26 +482,37 @@ computed again, to the same number), and given to every order and every access p
 tries for the set. An access method changes only what reading the set costs; the rows a seek
 returns per outer row stay the cost model's (`estimate_rows_per_seek`: a unique key's one row,
 ANALYZE's rows per key prefix, a GLOB's implied range) and no longer reach any output estimate.
-Each WHERE term counts once, on its home table (its most selective constraint's, ties to the first
-table by name, not by place in FROM), through the same `constraints_selectivity` the filters of one
-table use, so a closed range is one range wherever its bounds are counted; a term with its table on
-both sides, which gives a constraint for each side, counts once there too. Outer joins by their
-semantics, each by the Poisson model the planner already took for a match count: a LEFT JOIN keeps
-each left row's matches or the row once (`m + e^-m` with `m` the right table's rows its ON terms
-keep); a RIGHT JOIN keeps the matches and the right rows no left row matches; a FULL JOIN keeps
-both sides' unmatched rows. So LEFT and RIGHT are never below the inner join and FULL never below
-either. A RIGHT or FULL JOIN is a reordering barrier both ways, so the rows before it are a set of
-their own, combined with it. Semi and anti joins keep or drop left rows and never add any: their
-tables and the terms that read them (their unnested EXISTS conditions) multiply by 1. A derived table
-grouped by exactly the columns `=` terms equate to other tables' values (a scalar subquery
-unnested, `unnest.rs`, by a LEFT JOIN or, once a null-rejecting term has made it one, an inner
-join) gives one row for each binding of them, as the correlated form it replaced does, and a term on
-its value counts by its operator, as the same term on the correlated subquery's value does. A whole
-WHERE or inner-ON term no row passes (`NULL`, or one that settles to false as SQLite settles an AND
-or OR of literals, `simplified_and_or` then `literal_truth`) leaves no rows in any set, and a plan made impossible by a
-constant-false WHERE estimates each table access at 0 rows. An ON term's BETWEEN is rewritten to its
-two comparisons as a WHERE term's is (`planner.rs`, `split_rewritten_ands`). Loops run over a
-set's tables and its RIGHT or FULL JOINs, bounded by the mask; nothing recurses.
+
+Each WHERE term counts once, on its home table: its most selective constraint's, ties to the first
+table by name, not by place in FROM, and never by the other terms, so adding a term moves no other.
+A term with its table on both sides, which gives a constraint for each side, counts once there.
+Selectivities combine through the same `constraints_selectivity` one table's filters use, with one
+change: only bounds by a constant (a literal, a parameter, an uncorrelated subquery) make a closed
+range together; a bound by a column, of the same row or another table (`x.c <= y.d`), is a join
+predicate and stands alone, so it counts the same on whichever table it is counted.
+
+Outer joins by their semantics, each by the Poisson model the planner already took for a match
+count: a LEFT JOIN keeps each left row's matches or the row once (`m + e^-m`, `m` the right table's
+rows its ON terms keep); a RIGHT JOIN keeps the matches and the right rows no left row matches; a
+FULL JOIN keeps both sides' unmatched rows. A WHERE filter on the right table counts what it
+restricts beyond the ON terms (`sel(ON and filter) / sel(ON)`), so the matches are never more than
+the inner join's rows: LEFT and RIGHT are never below the inner join and FULL never below either. A
+RIGHT or FULL JOIN is a reordering barrier both ways, so the rows before it are a set of their own,
+combined with it. Semi and anti joins keep or drop left rows and never add any: their tables and
+the terms that read them (their unnested EXISTS conditions) multiply by 1. A derived table grouped by
+exactly the columns `=` terms equate to other tables' values (a scalar subquery unnested,
+`unnest.rs`, by a LEFT JOIN or, once a null-rejecting term has made it one, an inner join) gives one
+row for each binding of them, as the correlated form it replaced does.
+
+A term no row passes leaves none: a NULL, one that settles to false as SQLite settles an AND or OR
+of literals (`simplified_and_or`, `literal_truth`), a comparison with a NULL literal by `=`, `<>`,
+`<`, `<=`, `>` or `>=`, or an AND with such a side. In WHERE it leaves no rows in any set; in a
+join's ON it makes that join's right table match nothing. A plan made impossible by a
+constant-false WHERE estimates each table access at 0 rows, and EXPLAIN QUERY PLAN FORMAT=JSON's
+`output_rows` is the top-level query's join, not an uncorrelated subquery's whose tables the program
+holds too (`ProgramBuilder::join_output_rows`). An ON term's BETWEEN is rewritten to its two
+comparisons as a WHERE term's is (`planner.rs`, `split_rewritten_ands`). Loops run over a set's
+tables and its RIGHT or FULL JOINs, bounded by the mask; nothing recurses.
 
 **Why.** The estimate was the chosen access path's: rows per outer row from the seek or scan
 picked, times the filters it didn't consume, with each term's share moved around by the order its
@@ -522,12 +533,17 @@ them (`statistics_builder.go`). DuckDB caches the cardinality of each relation s
 `reference_map_t<JoinRelationSet, CardinalityHelper> relation_set_2_cardinality;`,
 `EstimateCardinalityWithSet` at line 907 reading it before computing), after Ebergen's thesis: "the
 cardinality is also represented as a set of relations" (docs/research/planner.md, findings f15, f16
-and f39, kiln grade A). The outer-join bounds are the operators' definitions, SQLite's in its
+and f39, kiln grade A). Only a bound by a pseudo-constant joins a range: PostgreSQL's
+`clauselist_selectivity` (`src/backend/optimizer/path/clausesel.c` lines 205 to 231 at 126976a8)
+looks for "a restriction clause with a pseudoconstant on one side" of one relation before it pairs
+`<` and `>` clauses into a range (`addRangeClause`), and merges any other clause's selectivity
+"generically" (f16, f17, A). The outer-join bounds are the operators' definitions, SQLite's in its
 requirement R-24610-05866 (`test/e_select.test` line 622): for a LEFT JOIN, "after the ON or
 USING filtering clauses have been applied, an extra row is added to the output for each row in
 the original left-hand input dataset that does not match any row in the right-hand dataset"; a
-RIGHT JOIN does the same for the right side's rows and a FULL JOIN for both. The order check follows CERT's idea (Ba and Rigger, ICSE 2024, f21): a
-property of the estimator two forms of one query must share, checked without knowing true sizes.
+RIGHT JOIN does the same for the right side's rows and a FULL JOIN for both. The order check
+follows CERT's idea (Ba and Rigger, ICSE 2024, f21): a property of the estimator two forms of one
+query must share, checked without knowing true sizes.
 
 **Evidence.** EVIDENCE
 

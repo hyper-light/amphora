@@ -65,6 +65,8 @@ struct Table {
     /// columns: once all are ready, one row for each row of the rest, as the correlated subquery
     /// it replaced gives; else empty.
     keys: SmallVec<[usize; 2]>,
+    /// A join's right table with an ON term no row passes: it matches no row.
+    matches_none: bool,
 }
 
 pub(super) struct JoinedSetRows<'a> {
@@ -162,29 +164,26 @@ impl<'a> JoinedSetRows<'a> {
                 };
                 counted.push((constraint_idx, class));
             }
+            let matches_none = where_clause.iter().any(|term| {
+                term.origin
+                    .join_origin()
+                    .is_some_and(|origin| origin.right_table() == joined.internal_id)
+                    && never_true(&term.expr)
+            });
             tables.push(Table {
                 kind,
                 rows: *rows,
                 counted,
                 keys,
+                matches_none,
             });
         }
-        // A term no row passes (`WHERE NULL`, `ON x'' ISNULL` of an inner join) leaves no rows
-        // in any set, whether or not the parser folded it into a constant-false WHERE, which
-        // plans no table at all.
-        let right_or_full = joined_tables.iter().any(|t| {
-            t.join_info
-                .as_ref()
-                .is_some_and(|info| info.keeps_right_rows())
-        });
-        let none_pass = where_clause.iter().any(|term| {
-            !term.consumed
-                && match term.origin.join_origin() {
-                    None => true,
-                    Some(origin) => !origin.is_outer() && !right_or_full,
-                }
-                && never_true(&term.expr)
-        });
+        // A WHERE term no row passes (`WHERE NULL`) leaves no rows in any set, whether or not
+        // the parser folded it into a constant-false WHERE, which plans no table at all; an ON
+        // term so makes its join's right table match nothing (`matches_none`).
+        let none_pass = where_clause
+            .iter()
+            .any(|term| term.origin.join_origin().is_none() && never_true(&term.expr));
         Self {
             tables,
             constraints,
@@ -212,24 +211,54 @@ impl<'a> JoinedSetRows<'a> {
     /// tables of `ready`: the same function the filters of a single table use, so a closed range
     /// is one range wherever its bounds are counted.
     fn selectivity(&self, table: usize, class: Class, ready: &TableMask) -> f64 {
+        self.selectivity_of(table, &[class], ready)
+    }
+
+    /// [Self::selectivity] of the constraints of any of `classes` together. Only bounds by a
+    /// constant (a literal, a parameter, an uncorrelated subquery: no table read) make a range
+    /// with each other; a bound by a column of this row or another table's (`x.c <= x.d`,
+    /// `x.c <= y.d`) is a join predicate and stands alone, as PostgreSQL's
+    /// `clauselist_selectivity` pairs only "a restriction clause with a pseudoconstant on one
+    /// side". So a bound counts the same on whichever table it is counted.
+    fn selectivity_of(&self, table: usize, classes: &[Class], ready: &TableMask) -> f64 {
         let (Some(t), Some(table_constraints)) =
             (self.tables.get(table), self.constraints.get(table))
         else {
             return 1.0;
         };
-        constraints_selectivity(
-            t.counted
-                .iter()
-                .filter(|(_, c)| *c == class)
-                .filter_map(|(idx, _)| table_constraints.constraints.get(*idx))
-                .filter(|constraint| {
-                    constraint
-                        .lhs_mask
-                        .iter()
-                        .all(|other| other == table || ready.get(other))
-                }),
-            self.params,
-        )
+        if classes.contains(&Class::On) && t.matches_none {
+            return 0.0;
+        }
+        let counted = t
+            .counted
+            .iter()
+            .filter(|(_, c)| classes.contains(c))
+            .filter_map(|(idx, _)| table_constraints.constraints.get(*idx))
+            .filter(|constraint| {
+                constraint
+                    .lhs_mask
+                    .iter()
+                    .all(|other| other == table || ready.get(other))
+            });
+        let reads_a_table = |c: &&Constraint| !c.lhs_mask.is_empty();
+        let alone: f64 = counted
+            .clone()
+            .filter(reads_a_table)
+            .map(|c| c.selectivity)
+            .product();
+        alone * constraints_selectivity(counted.filter(|c| !reads_a_table(c)), self.params)
+    }
+
+    /// The share of an outer join's matches its other filters keep: what they restrict beyond its
+    /// ON terms, `sel(ON and filters) / sel(ON)`, so a filter bounding a column its ON terms bound
+    /// makes one range with them, and the matches are never more than the inner join's rows.
+    fn filters_given_on(&self, table: usize, ready: &TableMask) -> f64 {
+        let on = self.selectivity(table, Class::On, ready);
+        if on > 0.0 {
+            (self.selectivity_of(table, &[Class::On, Class::Filter], ready) / on).clamp(0.0, 1.0)
+        } else {
+            self.selectivity(table, Class::Filter, ready)
+        }
     }
 
     /// What `table` multiplies a set's rows by, its terms ready in `ready`; a RIGHT or FULL JOIN's
@@ -246,6 +275,7 @@ impl<'a> JoinedSetRows<'a> {
         }
         match t.kind {
             Kind::SemiOrAnti => 1.0,
+            Kind::Inner if t.matches_none => 0.0,
             Kind::Inner | Kind::Right | Kind::Full => {
                 t.rows * self.selectivity(table, Class::Filter, ready)
             }
@@ -263,7 +293,7 @@ impl<'a> JoinedSetRows<'a> {
                 } else {
                     matches + unmatched
                 };
-                per_row * self.selectivity(table, Class::Filter, ready)
+                per_row * self.filters_given_on(table, ready)
             }
         }
     }
@@ -304,7 +334,7 @@ impl<'a> JoinedSetRows<'a> {
         } else {
             0.0
         };
-        (matched + unmatched_right + unmatched_left) * self.selectivity(table, Class::Filter, ready)
+        (matched + unmatched_right + unmatched_left) * self.filters_given_on(table, ready)
     }
 
     /// The set's rows, in its tables' FROM order, which no join order changes. Without a RIGHT or
@@ -388,18 +418,51 @@ fn selects_unmatched_rows(
     })
 }
 
-/// Whether a whole term is a NULL, or settles to false as SQLite settles an AND or OR of literals
-/// ([simplified_and_or], [literal_truth]): no row passes it. Only as a whole term: `NOT NULL` is
-/// NULL.
+/// Whether no row passes a whole term: a NULL; one that settles to false as SQLite settles an AND
+/// or OR of literals ([simplified_and_or], [literal_truth]); a comparison with a NULL literal by
+/// `=`, `<>`, `<`, `<=`, `>` or `>=` (always NULL; `IS` is not one); or an AND with such a side.
+/// Only as a whole term: `NOT NULL` is NULL. Flat, on a stack of its own (CLAUDE.md section 11).
 fn never_true(expr: &ast::Expr) -> bool {
-    let mut inner = simplified_and_or(expr);
-    while let ast::Expr::Parenthesized(exprs) = inner {
-        let [only] = exprs.as_slice() else {
-            return false;
-        };
-        inner = only;
+    fn unwrap(mut e: &ast::Expr) -> &ast::Expr {
+        while let ast::Expr::Parenthesized(exprs) = e {
+            let [only] = exprs.as_slice() else {
+                break;
+            };
+            e = only;
+        }
+        e
     }
-    matches!(inner, ast::Expr::Literal(ast::Literal::Null)) || literal_truth(inner) == Some(false)
+    let is_null = |e: &ast::Expr| matches!(unwrap(e), ast::Expr::Literal(ast::Literal::Null));
+    let mut todo: SmallVec<[&ast::Expr; 4]> = SmallVec::new();
+    todo.push(expr);
+    // An AND's sides, each a term of its own: at most as many as the expression has nodes.
+    while let Some(e) = todo.pop() {
+        let inner = unwrap(simplified_and_or(e));
+        if is_null(inner) || literal_truth(inner) == Some(false) {
+            return true;
+        }
+        match inner {
+            ast::Expr::Binary(lhs, Operator::And, rhs) => {
+                todo.push(lhs);
+                todo.push(rhs);
+            }
+            ast::Expr::Binary(lhs, op, rhs)
+                if matches!(
+                    op,
+                    Operator::Equals
+                        | Operator::NotEquals
+                        | Operator::Less
+                        | Operator::LessEquals
+                        | Operator::Greater
+                        | Operator::GreaterEquals
+                ) && (is_null(lhs) || is_null(rhs)) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// For a derived table grouped by columns, one plain `=` constraint (not a NULL-matching `IS`)

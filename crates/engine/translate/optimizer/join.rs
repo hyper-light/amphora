@@ -2162,8 +2162,9 @@ fn build_where_term_info(
 ) -> Result<Vec<WhereTermInfo>> {
     // A term's home is its most selective constraint's table, ties broken by the tables' names in
     // the query, not their places in FROM: the same query with its FROM list in another order
-    // counts each term on the same table (decision 13). A semi or anti join's table is no home:
-    // it adds no rows to count a filter on.
+    // counts each term on the same table, and a term's home never depends on the other terms, so
+    // adding one never moves another (decision 13). A semi or anti join's table is no home: it adds
+    // no rows to count a filter on.
     let joined_tables = table_references.joined_tables();
     let mut homes: Vec<Option<(usize, f64)>> = vec![None; where_clause.len()];
     for (table_idx, table) in constraints.iter().enumerate() {

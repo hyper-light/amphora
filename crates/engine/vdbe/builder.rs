@@ -321,6 +321,10 @@ pub struct ProgramBuilder {
     init_label: BranchOffset,
     start_offset: BranchOffset,
     pub(crate) reg_result_cols_start: Option<usize>,
+    /// The rows the top-level query's join is estimated to give (its last table access's), which
+    /// EXPLAIN QUERY PLAN FORMAT=JSON reports as `output_rows`: set as each SELECT's plan is
+    /// emitted, so the top-level query, emitted after the subqueries it holds, sets it last.
+    pub(crate) join_output_rows: Option<f64>,
     pub resolve_type: ResolveType,
     /// When set, all triggers fired from this program should use this conflict resolution.
     /// This is used in UPSERT DO UPDATE context to ensure nested trigger's OR IGNORE/REPLACE
@@ -758,6 +762,7 @@ impl ProgramBuilder {
             read_database_cookies: HashMap::default(),
             mode: BuilderQueryMode::new(query_mode),
             reg_result_cols_start: None,
+            join_output_rows: None,
             flags: ProgramBuilderFlags::new(is_subprogram),
             emitted_function_call: false,
             trigger,
@@ -2496,6 +2501,7 @@ impl ProgramBuilder {
             readonly: self.flags.readonly(),
             result_columns: self.result_columns,
             table_references: self.table_references,
+            join_output_rows: self.join_output_rows,
             sql: sql.to_string(),
             refreshes_analyze_stats: sql
                 .trim_start()

@@ -425,8 +425,9 @@ fn every_order_of_an_inner_join_gets_one_estimate() {
     }
 }
 
-/// Do: the same two tables and ON terms joined INNER, LEFT, RIGHT and FULL, with statistics and
-/// without, and EXISTS and NOT EXISTS over the right table. Expect: LEFT and RIGHT never below
+/// Do: the same two tables and ON terms joined INNER, LEFT, RIGHT and FULL (a BETWEEN of the right
+/// table's column among them, its bounds a constant and the left table's column), with statistics
+/// and without, and EXISTS and NOT EXISTS over the right table. Expect: LEFT and RIGHT never below
 /// INNER, FULL never below LEFT or RIGHT (it keeps the unmatched rows of both sides), and a semi or
 /// anti join never above the rows of its left side (decision 13; AC-T1.1.2).
 #[test]
@@ -441,6 +442,12 @@ fn an_outer_join_is_estimated_at_least_its_inner_join() {
             "x.c = y.a AND x.b > 3",
             "x.b < y.b",
             "y.c = 3",
+            "y.b BETWEEN 2 AND x.c",
+            "y.b BETWEEN NULL AND x.b",
+            "y.a BETWEEN x.c AND 9",
+            "y.b BETWEEN NULL AND x.c",
+            "(x.c <= x.c) AND (y.b BETWEEN x.c AND 3)",
+            "(x.b <= y.b) AND (y.b ISNULL)",
             "1",
         ] {
             for (left, right) in [("t0", "t1"), ("t1", "t2"), ("t3", "t0"), ("t2", "t5")] {
@@ -509,8 +516,8 @@ fn a_constraint_seeks_or_filters_to_one_estimate() {
 /// Do: an inner join with its condition in ON, the same condition in WHERE, and the tables listed
 /// the other way round: a BETWEEN, an EXISTS and a NOT EXISTS correlated with the right table, two
 /// scalar subqueries (planned correlated in some orders and unnested to a grouped table in others), a
-/// NULL, and a NULL test of a literal that SQLite's parser folds to 0, alone, ANDed with NULL and
-/// ORed with 0.
+/// NULL, a NULL test of a literal that SQLite's parser folds to 0, alone, ANDed with NULL and
+/// ORed with 0, a bound by a NULL literal, and NULL ANDed with an EXISTS.
 /// Expect: one estimate for each condition's forms, and 0 rows where no row can pass (decision 13:
 /// the oracles' order check found each of these estimated apart; AC-T1.1.2).
 #[test]
@@ -536,6 +543,15 @@ fn an_on_term_and_a_where_term_give_one_estimate() {
         ),
         ("(SELECT count(s.c) FROM t2 AS s WHERE s.b = y.a) = 2", None),
         ("0 OR (255 ISNULL)", Some(0.0)),
+        ("x.b BETWEEN NULL AND y.c", Some(0.0)),
+        (
+            "NULL AND EXISTS (SELECT 1 FROM t2 AS s WHERE s.c = y.b)",
+            Some(0.0),
+        ),
+        (
+            "NULL AND NOT EXISTS (SELECT 1 FROM t2 AS s WHERE EXISTS (SELECT 1 FROM t4 AS u WHERE u.b IS s.c))",
+            Some(0.0),
+        ),
         ("NULL", Some(0.0)),
         ("x'' ISNULL", Some(0.0)),
         ("(x'' ISNULL) AND NULL", Some(0.0)),
