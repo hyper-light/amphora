@@ -17,6 +17,7 @@ mod clickhouse;
 mod mysql;
 mod oracle;
 mod pg;
+mod planner;
 mod pool;
 mod probe;
 mod query;
@@ -488,6 +489,11 @@ fn main() -> anyhow::Result<()> {
     if std::env::args().any(|a| a == "--oracle") {
         return oracle::main();
     }
+    // JOB and TPC-H on Amphora, its estimates beside its counts, and on SQLite, DuckDB and
+    // PostgreSQL (`planner/`).
+    if std::env::args().any(|a| a == "--planner") {
+        return planner::main();
+    }
     // The versioned storage's B-link tree on its own (`blink.rs`).
     if std::env::args().any(|a| a == "--blink") {
         return blink::main();
@@ -547,7 +553,7 @@ fn main() -> anyhow::Result<()> {
     // <prefix>.svg (a flamegraph) and <prefix>.txt (the frames most samples were in).
     let profile = std::env::var("AMPHORA_PROFILE").ok();
     let profiler = match &profile {
-        Some(_) => Some(pprof::ProfilerGuardBuilder::default().frequency(997).blocklist(&["libc", "libgcc", "pthread", "vdso"]).build()?),
+        Some(_) => Some(crate::profile_start()?),
         None => None,
     };
 
@@ -719,9 +725,32 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A sampling profiler (pprof's: a timer signal and backtraces), on Unix only.
+#[cfg(unix)]
+pub type Profiler = pprof::ProfilerGuard<'static>;
+#[cfg(not(unix))]
+pub struct Profiler;
+
+/// Samples every thread 997 times a second until the profiler is dropped.
+#[cfg(unix)]
+pub fn profile_start() -> anyhow::Result<Profiler> {
+    Ok(pprof::ProfilerGuardBuilder::default().frequency(997).blocklist(&["libc", "libgcc", "pthread", "vdso"]).build()?)
+}
+
+#[cfg(not(unix))]
+pub fn profile_start() -> anyhow::Result<Profiler> {
+    anyhow::bail!("AMPHORA_PROFILE samples with a timer signal: Unix only")
+}
+
+#[cfg(not(unix))]
+pub fn write_profile(_prefix: &str, _guard: &Profiler) -> anyhow::Result<()> {
+    anyhow::bail!("AMPHORA_PROFILE samples with a timer signal: Unix only")
+}
+
 /// Writes what `guard` sampled: `<prefix>.svg` (a flamegraph), `<prefix>.txt` (the frames most
 /// samples were in) and `<prefix>.folded` (every stack, for any tally after the run).
-pub fn write_profile(prefix: &str, guard: &pprof::ProfilerGuard) -> anyhow::Result<()> {
+#[cfg(unix)]
+pub fn write_profile(prefix: &str, guard: &Profiler) -> anyhow::Result<()> {
     let report = guard.report().build()?;
     report.flamegraph(std::fs::File::create(format!("{prefix}.svg"))?)?;
     // The frames most samples were in, by leaf and by any frame on the stack: every thread's,

@@ -1,0 +1,69 @@
+# The planner bench: JOB and TPC-H, Amphora's estimates against the rows that ran
+
+`amphora-bench --planner` (`bench/src/planner/`) loads a benchmark into Amphora, SQLite, DuckDB and
+PostgreSQL, takes each one's statistics, and runs every query on each. On Amphora each query runs
+once more on a connection that counts rows (`Connection::set_row_counters`, docs/design/planner.md
+decision 12), and the record keeps, for every table access and join of every query and subquery,
+the planner's estimate and the rows counted, beside the query's EXPLAIN QUERY PLAN FORMAT=JSON.
+`summary.py` turns the records into the q-error at every join prefix, the q-error of each query's
+largest intermediate result, and every engine's times.
+
+## The benchmarks
+
+- **JOB** (Leis et al., PVLDB 9(3), 2015): the IMDb tables of 2013 (`https://event.cwi.nl/da/job/imdb.tgz`,
+  CSV as PostgreSQL's COPY writes them) and the 113 queries of gregrahn/join-order-benchmark, its
+  `schema.sql` (primary keys) and `fkindexes.sql` (an index on each foreign key). `--queries` is a
+  clone of that repository; the record names its commit.
+- **TPC-H** (TPC-H 3.0.1): dbgen's tables at a scale factor (`tpch/dbgen.sh`, electrum/tpch-dbgen at
+  a fixed commit) and its 22 queries with the specification's validation parameters (`tpch/queries/`,
+  each date arithmetic done; Q15's view written as a WITH). The schema (`tpch/schema.sql`) gives each
+  table its primary key; `tpch/indexes.sql` an index on each foreign key, the same on every engine.
+  Amphora and SQLite keep TPC-H's decimals as REAL and its dates as ISO text, DuckDB and PostgreSQL
+  as DECIMAL(15,2) and DATE; `YEAR(x)` in a query is each one's year of a date.
+
+## The engines
+
+Each engine runs a query on one thread, class for class with the embedded engines (CLAUDE.md §7):
+DuckDB with `threads = 1` (`duckdb`; `duckdb-mt` is DuckDB with every core, recorded beside it),
+PostgreSQL with `max_parallel_workers_per_gather = 0`. Amphora and SQLite keep `--cache-mib` of
+pages (2 GiB unless given); DuckDB and PostgreSQL keep what they ship with (`about` in the record).
+PostgreSQL 17 runs in Docker (`postgres.sh`), its data on a Docker volume. Every query has a
+deadline (`--timeout-s`, `--count-timeout-s` for Amphora's counted run): one that passes it is
+stopped and recorded as timed out, and one an engine refuses is recorded with its words.
+
+## Running it
+
+```
+bench/planner/tpch/dbgen.sh 1 ~/.cache/planner-bench/tpch-sf1
+bench/planner/postgres.sh start
+amphora-bench --planner --bench tpch --sf 1 --data ~/.cache/planner-bench/tpch-sf1 \
+  --queries bench/planner/tpch/queries --dir ~/.cache/planner-bench/db-tpch-sf1 \
+  --targets amphora,sqlite,duckdb,duckdb-mt,postgres --runs 3 --out tpch-sf1.jsonl
+amphora-bench --planner --bench job --data ~/.cache/planner-bench/imdb \
+  --queries ~/.cache/research-src/join-order-benchmark --dir ~/.cache/planner-bench/db-job \
+  --targets amphora,sqlite,duckdb,duckdb-mt,postgres --runs 3 --out job.jsonl
+python3 bench/planner/summary.py job.jsonl tpch-sf1.jsonl --json summary.json
+```
+
+A database is loaded the first time and kept: a load that finished leaves a `bench_loaded` table,
+and one without it is dropped and loaded again. Each timed run starts once the load is under
+`--max-load` (2 unless given), waiting at most `--load-wait-s`; the load each began at is in its
+record. On Linux that is the one-minute load average; Windows keeps none, so there it is the cores
+busy plus the processor queue, averaged over five seconds, which the record names.
+
+## What is measured
+
+- **A join prefix's rows**: the rows that left a table access into the next level of the join, or
+  into the query's body after the last, having passed every term the plan evaluates there; for a
+  correlated subquery, its rows over its calls, as its estimate is a call's (PostgreSQL's EXPLAIN
+  ANALYZE does the same). A hash join's build table first in the order has its rows in the hash table
+  as its prefix's. Any prefix without a count (a later hash build, a query that never ran, a counter
+  with no estimate) is listed with why.
+- **q-error**: max(est/act, act/est), each taken as at least one row (Moerkotte et al., PVLDB 2(1),
+  2009), by the number of joins in the prefix (its position in the join order): median, 90th and 95th
+  percentile (nearest rank), and maximum. Beside it, each query's largest intermediate result's
+  q-error, since the q-error over every sub-plan misleads (Han et al., PVLDB 15(4), 2021).
+- **Planning time**: Amphora's prepare (parse, plan and code), best of the runs. **Run time**:
+  prepare and run to the last row, best of the runs; PostgreSQL's through its simple protocol, which
+  plans and runs in one round trip.
+- **Agreement**: each engine's row count for each query; any query on which they differ is listed.

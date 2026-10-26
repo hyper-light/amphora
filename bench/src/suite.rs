@@ -876,7 +876,7 @@ pub fn main() -> anyhow::Result<()> {
             // <prefix>-<target>-<statement>-<clients>.{svg,txt,folded} (main.rs, write_profile).
             let profile = std::env::var("AMPHORA_PROFILE").ok();
             let profiler = match &profile {
-                Some(_) => Some(pprof::ProfilerGuardBuilder::default().frequency(997).blocklist(&["libc", "libgcc", "pthread", "vdso"]).build()?),
+                Some(_) => Some(crate::profile_start()?),
                 None => None,
             };
             let out = run_op(&target, op, &stmts, &shape, clients, o.warmup, o.seconds);

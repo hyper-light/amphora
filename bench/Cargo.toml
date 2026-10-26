@@ -24,10 +24,15 @@ mysql = { version = "26", default-features = false, features = ["minimal"] }
 postgres = "0.19"
 # ClickHouse's HTTP interface: a small blocking client, no async runtime, no TLS.
 ureq = { version = "3", default-features = false }
+# The planner bench's DuckDB (`--planner`), compiled in as SQLite is.
+duckdb = { version = "1", features = ["bundled"] }
 anyhow = "1"
-serde_json = "1"
-# AMPHORA_PROFILE: a sampling profile of the mixed phase (a timer signal and backtraces: no root, no
+# float_roundtrip: the planner bench keeps estimates exactly as EXPLAIN QUERY PLAN FORMAT=JSON gives them.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+
+# AMPHORA_PROFILE (Unix only): a sampling profile of the mixed phase (a timer signal and backtraces: no root, no
 # perf), written as a flamegraph and the hottest frames.
+[target.'cfg(unix)'.dependencies]
 pprof = { version = "0.14", default-features = false, features = ["flamegraph"] }
 
 [profile.release]
