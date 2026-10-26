@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The bench suite (`amphora-bench --suite`) on two builds in turns, each run begun once the machine
+# The bench suite (`amphora-bench --suite`) on two builds in turns (ABBA), each run begun once the machine
 # is quiet, each recorded as bench/run.sh records one (CLAUDE.md §7): when, where, which commit,
 # the load before and after, and the suite's report. Runs on Linux, macOS and in Git for Windows' shell,
 # where Windows keeps no load average and its nearest stands in (bench/planner/README.md).
@@ -67,10 +67,19 @@ quiet() {
   done
 }
 
-# FIRST_TURN: the number of the first turn, to go on with a record a stopped run began.
+# FIRST_TURN: the number of the first turn, to go on with a record a stopped run began. Even turns
+# run the builds in reverse order (before, after, after, before, ...), so a drift in the machine's
+# speed across the turns falls on each build alike.
 first=${FIRST_TURN:-1}
 for ((turn = first; turn < first + turns; turn++)); do
-  for build in "${builds[@]}"; do
+  order=("${builds[@]}")
+  if ((turn % 2 == 0)); then
+    order=()
+    for ((i = ${#builds[@]} - 1; i >= 0; i--)); do
+      order+=("${builds[i]}")
+    done
+  fi
+  for build in "${order[@]}"; do
     name=${build%%=*}
     rest=${build#*=}
     checkout=${rest%%:*}
