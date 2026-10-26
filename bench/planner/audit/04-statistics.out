@@ -1,0 +1,119 @@
+> CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT, flag INT, skew INT, u INT);
+
+> INSERT INTO t(a, b, flag, skew, u) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10000) SELECT i % 100, i % 100, i % 2, CASE WHEN i <= 9900 THEN 0 ELSE i END, i FROM n;
+
+> CREATE INDEX t_a ON t(a);
+
+> CREATE INDEX t_b ON t(b);
+
+> CREATE INDEX t_skew ON t(skew);
+
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM t;
+{
+  "nodes": [
+    {
+      "detail": "SCAN t",
+      "id": 1,
+      "op": {
+        "estimate": {
+          "access_cost": 23000,
+          "input_rows": 1,
+          "output_rows": 1000000,
+          "rows_per_input": 1000000,
+          "total_cost": 23000
+        },
+        "source": "table",
+        "table": "t",
+        "type": "scan"
+      },
+      "parent": null
+    }
+  ],
+  "output_rows": 1000000,
+  "result_columns": [
+    "id",
+    "a",
+    "b",
+    "flag",
+    "skew",
+    "u"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM t",
+  "version": 1
+}
+
+> ANALYZE;
+
+> SELECT tbl, idx, stat FROM sqlite_stat1 ORDER BY tbl, idx;
+t | t_a | 10000 100
+t | t_b | 10000 100
+t | t_skew | 10000 100
+
+> -- counted
+> SELECT * FROM t WHERE a = 1 AND b = 1;
+rows: 100
+plan 0 loops : no estimate, counted 1
+plan 0 prefix t position 0: estimated 1 rows, counted 100
+
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM t WHERE a = 1 AND b = 1;
+{
+  "nodes": [
+    {
+      "detail": "MULTI-INDEX AND t (t_a, t_b)",
+      "id": 1,
+      "op": {
+        "estimate": {
+          "access_cost": 8.54,
+          "input_rows": 1,
+          "output_rows": 1,
+          "rows_per_input": 1,
+          "total_cost": 8.54
+        },
+        "indexes": [
+          "t_a",
+          "t_b"
+        ],
+        "set_op": "and",
+        "table": "t",
+        "type": "multi_index"
+      },
+      "parent": null
+    }
+  ],
+  "output_rows": 1,
+  "result_columns": [
+    "id",
+    "a",
+    "b",
+    "flag",
+    "skew",
+    "u"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM t WHERE a = 1 AND b = 1",
+  "version": 1
+}
+
+> -- counted
+> SELECT * FROM t WHERE flag = 1;
+rows: 5000
+plan 0 loops : no estimate, counted 1
+plan 0 prefix t position 0: estimated 1000 rows, counted 5000
+
+> -- counted
+> SELECT * FROM t WHERE skew = 0;
+rows: 9900
+plan 0 loops : no estimate, counted 1
+plan 0 prefix t position 0: estimated 100 rows, counted 9900
+
+> -- counted
+> SELECT * FROM t WHERE skew = 9950;
+rows: 1
+plan 0 loops : no estimate, counted 1
+plan 0 prefix t position 0: estimated 100 rows, counted 1
+
+> -- counted
+> SELECT * FROM t WHERE u > 20000;
+rows: 0
+plan 0 loops : no estimate, counted 1
+plan 0 prefix t position 0: estimated 4000 rows, counted 0
+

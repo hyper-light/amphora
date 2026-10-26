@@ -1,0 +1,68 @@
+> CREATE TABLE p(id INTEGER PRIMARY KEY, k INT);
+
+> CREATE TABLE q(id INTEGER PRIMARY KEY, k INT);
+
+> INSERT INTO p(k) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10) SELECT i FROM n;
+
+> INSERT INTO q(k) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10) SELECT i FROM n;
+
+> ANALYZE;
+
+> INSERT INTO p(k) WITH RECURSIVE n(i) AS (SELECT 11 UNION ALL SELECT i + 1 FROM n WHERE i < 3000) SELECT i FROM n;
+
+> INSERT INTO q(k) WITH RECURSIVE n(i) AS (SELECT 11 UNION ALL SELECT i + 1 FROM n WHERE i < 3000) SELECT i FROM n;
+
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT count(*) FROM p JOIN q ON q.k = p.k;
+{
+  "nodes": [
+    {
+      "detail": "SCAN p",
+      "id": 1,
+      "op": {
+        "estimate": {
+          "access_cost": 1.03,
+          "input_rows": 1,
+          "output_rows": 10,
+          "rows_per_input": 10,
+          "total_cost": 1.03
+        },
+        "source": "table",
+        "table": "p",
+        "type": "scan"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SCAN q",
+      "id": 2,
+      "op": {
+        "estimate": {
+          "access_cost": 0.8999999999999999,
+          "input_rows": 10,
+          "output_rows": 10,
+          "rows_per_input": 1,
+          "total_cost": 1.93
+        },
+        "join": "inner",
+        "source": "table",
+        "table": "q",
+        "type": "scan"
+      },
+      "parent": null
+    }
+  ],
+  "output_rows": 10,
+  "result_columns": [
+    "count(*)"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT count(*) FROM p JOIN q ON q.k = p.k",
+  "version": 1
+}
+
+> -- counted
+> SELECT count(*) FROM p JOIN q ON q.k = p.k;
+rows: 1
+plan 0 loops : no estimate, counted 1
+plan 0 prefix p position 0: estimated 10 rows, counted 3000
+plan 0 prefix q position 1: estimated 10 rows, counted 3000
+

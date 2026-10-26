@@ -1,0 +1,247 @@
+> CREATE TABLE big(id INTEGER PRIMARY KEY, k INT);
+
+> CREATE TABLE mid(id INTEGER PRIMARY KEY, k INT);
+
+> CREATE TABLE tiny(id INTEGER PRIMARY KEY, k INT);
+
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT count(*) FROM big JOIN mid ON mid.k = big.k JOIN tiny ON tiny.id = mid.id WHERE tiny.id = 5;
+{
+  "nodes": [
+    {
+      "detail": "SEARCH tiny USING INTEGER PRIMARY KEY (rowid=?)",
+      "id": 1,
+      "op": {
+        "constraints": [
+          "rowid=?"
+        ],
+        "estimate": {
+          "access_cost": 3.513,
+          "input_rows": 1,
+          "output_rows": 1,
+          "rows_per_input": 1,
+          "total_cost": 3.513
+        },
+        "integer_primary_key": true,
+        "join": "inner",
+        "search_kind": "rowid_eq",
+        "table": "tiny",
+        "type": "search"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SEARCH mid USING INTEGER PRIMARY KEY (rowid=?)",
+      "id": 2,
+      "op": {
+        "constraints": [
+          "rowid=?"
+        ],
+        "estimate": {
+          "access_cost": 3.513,
+          "input_rows": 1,
+          "output_rows": 1,
+          "rows_per_input": 1,
+          "total_cost": 7.026
+        },
+        "integer_primary_key": true,
+        "join": "inner",
+        "search_kind": "rowid_eq",
+        "table": "mid",
+        "type": "search"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SCAN big",
+      "id": 3,
+      "op": {
+        "estimate": {
+          "access_cost": 23000,
+          "input_rows": 1,
+          "output_rows": 100000,
+          "rows_per_input": 100000,
+          "total_cost": 23007.026
+        },
+        "source": "table",
+        "table": "big",
+        "type": "scan"
+      },
+      "parent": null
+    }
+  ],
+  "output_rows": 100000,
+  "result_columns": [
+    "count(*)"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT count(*) FROM big JOIN mid ON mid.k = big.k JOIN tiny ON tiny.id = mid.id WHERE tiny.id = 5",
+  "version": 1
+}
+
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT count(*) FROM big RIGHT JOIN mid ON mid.k = big.k JOIN tiny ON tiny.id = mid.id WHERE tiny.id = 5;
+{
+  "nodes": [
+    {
+      "detail": "SCAN big",
+      "id": 1,
+      "op": {
+        "estimate": {
+          "access_cost": 23000,
+          "input_rows": 1,
+          "output_rows": 1000000,
+          "rows_per_input": 1000000,
+          "total_cost": 23000
+        },
+        "source": "table",
+        "table": "big",
+        "type": "scan"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SCAN mid",
+      "id": 2,
+      "op": {
+        "estimate": {
+          "access_cost": 7000016000,
+          "input_rows": 1000000,
+          "output_rows": 100000000000,
+          "rows_per_input": 100000,
+          "total_cost": 7000039000
+        },
+        "join": "inner",
+        "source": "table",
+        "table": "mid",
+        "type": "scan"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SEARCH tiny USING INTEGER PRIMARY KEY (rowid=?)",
+      "id": 3,
+      "op": {
+        "constraints": [
+          "rowid=?"
+        ],
+        "estimate": {
+          "access_cost": 321300000000.3,
+          "input_rows": 100000000000,
+          "output_rows": 100000,
+          "rows_per_input": 1e-6,
+          "total_cost": 328300039000.3
+        },
+        "integer_primary_key": true,
+        "join": "inner",
+        "search_kind": "rowid_eq",
+        "table": "tiny",
+        "type": "search"
+      },
+      "parent": null
+    },
+    {
+      "detail": "RIGHT-JOIN mid",
+      "id": 4,
+      "op": {
+        "table": "mid",
+        "type": "right_join"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SCAN mid",
+      "id": 5,
+      "op": {
+        "estimate": {
+          "access_cost": 7000016000,
+          "input_rows": 1000000,
+          "output_rows": 100000000000,
+          "rows_per_input": 100000,
+          "total_cost": 7000039000
+        },
+        "source": "table",
+        "table": "mid",
+        "type": "scan"
+      },
+      "parent": 4
+    }
+  ],
+  "output_rows": 100000,
+  "result_columns": [
+    "count(*)"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT count(*) FROM big RIGHT JOIN mid ON mid.k = big.k JOIN tiny ON tiny.id = mid.id WHERE tiny.id = 5",
+  "version": 1
+}
+
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT count(*) FROM mid JOIN tiny ON tiny.id = mid.id LEFT JOIN big ON mid.k = big.k WHERE tiny.id = 5;
+{
+  "nodes": [
+    {
+      "detail": "SEARCH tiny USING INTEGER PRIMARY KEY (rowid=?)",
+      "id": 1,
+      "op": {
+        "constraints": [
+          "rowid=?"
+        ],
+        "estimate": {
+          "access_cost": 3.513,
+          "input_rows": 1,
+          "output_rows": 1,
+          "rows_per_input": 1,
+          "total_cost": 3.513
+        },
+        "integer_primary_key": true,
+        "join": "inner",
+        "search_kind": "rowid_eq",
+        "table": "tiny",
+        "type": "search"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SEARCH mid USING INTEGER PRIMARY KEY (rowid=?)",
+      "id": 2,
+      "op": {
+        "constraints": [
+          "rowid=?"
+        ],
+        "estimate": {
+          "access_cost": 3.513,
+          "input_rows": 1,
+          "output_rows": 1,
+          "rows_per_input": 1,
+          "total_cost": 7.026
+        },
+        "integer_primary_key": true,
+        "search_kind": "rowid_eq",
+        "table": "mid",
+        "type": "search"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SCAN big LEFT-JOIN",
+      "id": 3,
+      "op": {
+        "estimate": {
+          "access_cost": 23000,
+          "input_rows": 1,
+          "output_rows": 100000,
+          "rows_per_input": 100000,
+          "total_cost": 23007.026
+        },
+        "join": "left",
+        "source": "table",
+        "table": "big",
+        "type": "scan"
+      },
+      "parent": null
+    }
+  ],
+  "output_rows": 100000,
+  "result_columns": [
+    "count(*)"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT count(*) FROM mid JOIN tiny ON tiny.id = mid.id LEFT JOIN big ON mid.k = big.k WHERE tiny.id = 5",
+  "version": 1
+}
+

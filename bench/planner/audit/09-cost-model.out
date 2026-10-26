@@ -1,0 +1,74 @@
+> CREATE TABLE narrow(id INTEGER PRIMARY KEY, v INT);
+
+> CREATE TABLE wide(id INTEGER PRIMARY KEY, v INT, pad TEXT);
+
+> INSERT INTO narrow(v) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) SELECT i FROM n;
+
+> PRAGMA page_count;
+8
+
+> INSERT INTO wide(v, pad) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) SELECT i, printf('%2000s', i) FROM n;
+
+> ANALYZE;
+
+> PRAGMA page_count;
+1011
+
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT sum(v) FROM narrow;
+{
+  "nodes": [
+    {
+      "detail": "SCAN narrow",
+      "id": 1,
+      "op": {
+        "estimate": {
+          "access_cost": 46,
+          "input_rows": 1,
+          "output_rows": 2000,
+          "rows_per_input": 2000,
+          "total_cost": 46
+        },
+        "source": "table",
+        "table": "narrow",
+        "type": "scan"
+      },
+      "parent": null
+    }
+  ],
+  "output_rows": 2000,
+  "result_columns": [
+    "sum(v)"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT sum(v) FROM narrow",
+  "version": 1
+}
+
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT sum(v) FROM wide;
+{
+  "nodes": [
+    {
+      "detail": "SCAN wide",
+      "id": 1,
+      "op": {
+        "estimate": {
+          "access_cost": 46,
+          "input_rows": 1,
+          "output_rows": 2000,
+          "rows_per_input": 2000,
+          "total_cost": 46
+        },
+        "source": "table",
+        "table": "wide",
+        "type": "scan"
+      },
+      "parent": null
+    }
+  ],
+  "output_rows": 2000,
+  "result_columns": [
+    "sum(v)"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT sum(v) FROM wide",
+  "version": 1
+}
+

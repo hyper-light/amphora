@@ -14,6 +14,7 @@
 
 mod blink;
 mod clickhouse;
+mod eqp;
 mod mysql;
 mod oracle;
 mod pg;
@@ -493,6 +494,10 @@ fn main() -> anyhow::Result<()> {
     // PostgreSQL (`planner/`).
     if std::env::args().any(|a| a == "--planner") {
         return planner::main();
+    }
+    // A SQL script's plans: the planner audit's demonstrations (`eqp.rs`).
+    if std::env::args().any(|a| a == "--eqp") {
+        return eqp::main();
     }
     // The versioned storage's B-link tree on its own (`blink.rs`).
     if std::env::args().any(|a| a == "--blink") {

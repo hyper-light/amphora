@@ -1,0 +1,234 @@
+> CREATE TABLE part(p_partkey INTEGER PRIMARY KEY, p_brand TEXT, p_type TEXT, p_size INT, p_name TEXT);
+
+> CREATE TABLE supplier(s_suppkey INTEGER PRIMARY KEY, s_name TEXT, s_comment TEXT, s_nationkey INT);
+
+> CREATE TABLE partsupp(ps_partkey INT, ps_suppkey INT, ps_availqty INT, ps_supplycost REAL, PRIMARY KEY (ps_partkey, ps_suppkey));
+
+> CREATE TABLE orders(o_orderkey INTEGER PRIMARY KEY, o_custkey INT, o_orderdate TEXT);
+
+> CREATE TABLE lineitem(l_orderkey INT, l_linenumber INT, l_partkey INT, l_suppkey INT, l_quantity REAL, l_commitdate TEXT, l_receiptdate TEXT, PRIMARY KEY (l_orderkey, l_linenumber));
+
+> CREATE TABLE customer(c_custkey INTEGER PRIMARY KEY, c_phone TEXT, c_acctbal REAL);
+
+> CREATE TABLE nation(n_nationkey INTEGER PRIMARY KEY, n_name TEXT, n_regionkey INT);
+
+> CREATE TABLE region(r_regionkey INTEGER PRIMARY KEY, r_name TEXT);
+
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT count(*) FROM orders WHERE EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey AND l_commitdate < l_receiptdate);
+{
+  "nodes": [
+    {
+      "detail": "SCAN orders",
+      "id": 1,
+      "op": {
+        "estimate": {
+          "access_cost": 23000,
+          "input_rows": 1,
+          "output_rows": 1000000,
+          "rows_per_input": 1000000,
+          "total_cost": 23000
+        },
+        "source": "table",
+        "table": "orders",
+        "type": "scan"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)",
+      "id": 2,
+      "op": {
+        "constraints": [
+          "l_orderkey=?"
+        ],
+        "estimate": {
+          "access_cost": 916710112.5631579,
+          "input_rows": 1000000,
+          "output_rows": 1000000,
+          "rows_per_input": 1,
+          "total_cost": 916733112.5631579
+        },
+        "index": {
+          "covering": false,
+          "ephemeral": false,
+          "name": "sqlite_autoindex_lineitem_1"
+        },
+        "join": "semi",
+        "search_kind": "seek",
+        "table": "lineitem",
+        "type": "search"
+      },
+      "parent": null
+    }
+  ],
+  "output_rows": 1000000,
+  "result_columns": [
+    "count(*)"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT count(*) FROM orders WHERE EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey AND l_commitdate < l_receiptdate)",
+  "version": 1
+}
+
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT count(*) FROM orders RIGHT JOIN customer ON c_custkey = o_custkey WHERE EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey AND l_commitdate < l_receiptdate);
+{
+  "nodes": [
+    {
+      "detail": "SCAN orders",
+      "id": 1,
+      "op": {
+        "estimate": {
+          "access_cost": 23000,
+          "input_rows": 1,
+          "output_rows": 1000000,
+          "rows_per_input": 1000000,
+          "total_cost": 23000
+        },
+        "source": "table",
+        "table": "orders",
+        "type": "scan"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SEARCH customer USING INTEGER PRIMARY KEY (rowid=?)",
+      "id": 2,
+      "op": {
+        "constraints": [
+          "rowid=?"
+        ],
+        "estimate": {
+          "access_cost": 3213000.3000000003,
+          "input_rows": 1000000,
+          "output_rows": 1367879.4411714424,
+          "rows_per_input": 1.3678794411714423,
+          "total_cost": 3236000.3000000003
+        },
+        "integer_primary_key": true,
+        "join": "inner",
+        "search_kind": "rowid_eq",
+        "table": "customer",
+        "type": "search"
+      },
+      "parent": null
+    },
+    {
+      "detail": "RIGHT-JOIN customer",
+      "id": 3,
+      "op": {
+        "table": "customer",
+        "type": "right_join"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SCAN customer",
+      "id": 4,
+      "op": {
+        "estimate": {
+          "access_cost": 3213000.3000000003,
+          "input_rows": 1000000,
+          "output_rows": 1367879.4411714424,
+          "rows_per_input": 1.3678794411714423,
+          "total_cost": 3236000.3000000003
+        },
+        "source": "table",
+        "table": "customer",
+        "type": "scan"
+      },
+      "parent": 3
+    },
+    {
+      "detail": "SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)",
+      "id": 21,
+      "op": {
+        "constraints": [
+          "l_orderkey=?"
+        ],
+        "estimate": {
+          "access_cost": 916710112.5631579,
+          "input_rows": 1000000,
+          "output_rows": 160000000.00000003,
+          "rows_per_input": 160.00000000000003,
+          "total_cost": 916710112.5631579
+        },
+        "index": {
+          "covering": false,
+          "ephemeral": false,
+          "name": "sqlite_autoindex_lineitem_1"
+        },
+        "search_kind": "seek",
+        "table": "lineitem",
+        "type": "search"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SCAN lineitem",
+      "id": 47,
+      "op": {
+        "source": "table",
+        "table": "lineitem",
+        "type": "scan"
+      },
+      "parent": null
+    }
+  ],
+  "output_rows": 1367879.4411714424,
+  "result_columns": [
+    "count(*)"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT count(*) FROM orders RIGHT JOIN customer ON c_custkey = o_custkey WHERE EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey AND l_commitdate < l_receiptdate)",
+  "version": 1
+}
+
+> EXPLAIN QUERY PLAN SELECT count(*) FROM customer WHERE EXISTS (SELECT * FROM orders WHERE o_custkey = c_custkey AND o_orderdate > '1995') OR EXISTS (SELECT * FROM lineitem JOIN orders ON o_orderkey = l_orderkey WHERE o_custkey = c_custkey);
+1 | 0 | 0 | SCAN customer
+7 | 0 | 0 | SCAN orders
+23 | 0 | 0 | SCAN lineitem
+24 | 0 | 0 | SEARCH orders USING INTEGER PRIMARY KEY (rowid=?)
+
+> EXPLAIN QUERY PLAN SELECT p_brand, count(DISTINCT ps_suppkey) FROM partsupp JOIN part ON p_partkey = ps_partkey WHERE p_size IN (49, 14) AND ps_suppkey NOT IN (SELECT s_suppkey FROM supplier WHERE s_comment LIKE '%Customer%Complaints%') GROUP BY p_brand;
+1 | 0 | 0 | LIST SUBQUERY 1
+5 | 1 | 0 | SCAN supplier
+16 | 0 | 0 | SCAN part
+17 | 0 | 0 | SEARCH partsupp USING COVERING INDEX sqlite_autoindex_partsupp_1 (ps_partkey=?)
+20 | 0 | 0 | USE SORTER FOR GROUP BY
+25 | 0 | 0 | USE HASH TABLE FOR count(DISTINCT)
+
+> EXPLAIN QUERY PLAN SELECT count(*) FROM customer WHERE c_custkey NOT IN (SELECT o_custkey FROM orders WHERE o_orderdate > c_phone);
+1 | 0 | 0 | SCAN customer
+5 | 0 | 0 | CORRELATED LIST SUBQUERY 1
+7 | 5 | 0 | SCAN orders
+
+> EXPLAIN QUERY PLAN SELECT count(*) FROM lineitem l1 JOIN orders ON o_orderkey = l1.l_orderkey WHERE EXISTS (SELECT * FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey AND l2.l_suppkey <> l1.l_suppkey) AND NOT EXISTS (SELECT * FROM lineitem l3 WHERE l3.l_orderkey = l1.l_orderkey AND l3.l_suppkey <> l1.l_suppkey AND l3.l_receiptdate > l3.l_commitdate);
+1 | 0 | 0 | SCAN lineitem AS l1
+2 | 0 | 0 | SEARCH orders USING INTEGER PRIMARY KEY (rowid=?)
+3 | 0 | 0 | SEARCH l2 USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)
+4 | 0 | 0 | SEARCH l3 USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)
+
+> EXPLAIN QUERY PLAN SELECT sum(l_quantity) FROM lineitem JOIN part ON p_partkey = l_partkey WHERE p_brand = 'Brand#23' AND l_quantity < (SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey);
+1 | 0 | 0 | SCAN lineitem
+2 | 0 | 0 | SEARCH part USING INTEGER PRIMARY KEY (rowid=?)
+3 | 0 | 0 | SEARCH scalar_subquery_t3 USING INDEX ephemeral_subquery_t3 (correlation_key_0=?)
+6 | 3 | 0 | SCAN lineitem
+10 | 3 | 0 | USE HASH TABLE FOR GROUP BY
+
+> EXPLAIN QUERY PLAN SELECT s_name FROM part, supplier, partsupp, nation, region WHERE p_partkey = ps_partkey AND s_suppkey = ps_suppkey AND p_size = 15 AND s_nationkey = n_nationkey AND n_regionkey = r_regionkey AND r_name = 'EUROPE' AND ps_supplycost = (SELECT min(ps_supplycost) FROM partsupp, supplier, nation, region WHERE p_partkey = ps_partkey AND s_suppkey = ps_suppkey AND s_nationkey = n_nationkey AND n_regionkey = r_regionkey AND r_name = 'EUROPE');
+1 | 0 | 0 | SCAN partsupp
+2 | 0 | 0 | SEARCH part USING INTEGER PRIMARY KEY (rowid=?)
+3 | 0 | 0 | SEARCH scalar_subquery_t6 USING INDEX ephemeral_subquery_t6 (correlation_key_0=?)
+6 | 3 | 0 | SCAN partsupp
+7 | 3 | 0 | SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
+8 | 3 | 0 | SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
+9 | 3 | 0 | SEARCH region USING INTEGER PRIMARY KEY (rowid=?)
+13 | 3 | 0 | USE HASH TABLE FOR GROUP BY
+85 | 0 | 0 | SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
+86 | 0 | 0 | SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
+87 | 0 | 0 | SEARCH region USING INTEGER PRIMARY KEY (rowid=?)
+
+> EXPLAIN QUERY PLAN SELECT c_custkey, (SELECT count(*) FROM orders WHERE o_custkey = c_custkey) FROM customer;
+1 | 0 | 0 | SCAN customer
+2 | 0 | 0 | SEARCH scalar_subquery_t2 USING INDEX ephemeral_subquery_t2 (correlation_key_0=?) LEFT-JOIN
+5 | 2 | 0 | SCAN orders
+9 | 2 | 0 | USE HASH TABLE FOR GROUP BY
+

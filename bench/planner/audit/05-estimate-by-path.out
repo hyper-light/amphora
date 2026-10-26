@@ -1,0 +1,355 @@
+> CREATE TABLE r(id INTEGER PRIMARY KEY, k INT, v INT);
+
+> CREATE TABLE s(id INTEGER PRIMARY KEY, k INT, v INT);
+
+> INSERT INTO r(k, v) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) SELECT i % 200, i % 7 FROM n;
+
+> INSERT INTO s(k, v) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) SELECT i % 200, i % 7 FROM n;
+
+> CREATE INDEX s_k ON s(k);
+
+> ANALYZE;
+
+> -- counted
+> SELECT * FROM r JOIN s ON s.k = r.k;
+rows: 20000
+plan 0 loops : no estimate, counted 1
+plan 0 prefix r position 0: estimated 2000 rows, counted 2000
+plan 0 prefix s position 1: estimated 20000 rows, counted 20000
+
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM r JOIN s ON s.k = r.k;
+{
+  "nodes": [
+    {
+      "detail": "SCAN r",
+      "id": 1,
+      "op": {
+        "estimate": {
+          "access_cost": 46,
+          "input_rows": 1,
+          "output_rows": 2000,
+          "rows_per_input": 2000,
+          "total_cost": 46
+        },
+        "source": "table",
+        "table": "r",
+        "type": "scan"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SEARCH s USING INDEX s_k (k=?)",
+      "id": 2,
+      "op": {
+        "constraints": [
+          "k=?"
+        ],
+        "estimate": {
+          "access_cost": 347.1666666666667,
+          "input_rows": 2000,
+          "output_rows": 20000,
+          "rows_per_input": 10,
+          "total_cost": 393.1666666666667
+        },
+        "index": {
+          "covering": false,
+          "ephemeral": false,
+          "name": "s_k"
+        },
+        "join": "inner",
+        "search_kind": "seek",
+        "table": "s",
+        "type": "search"
+      },
+      "parent": null
+    }
+  ],
+  "output_rows": 20000,
+  "result_columns": [
+    "id",
+    "k",
+    "v",
+    "id",
+    "k",
+    "v"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM r JOIN s ON s.k = r.k",
+  "version": 1
+}
+
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM r JOIN s NOT INDEXED ON s.k = r.k;
+{
+  "nodes": [
+    {
+      "detail": "SCAN s",
+      "id": 1,
+      "op": {
+        "estimate": {
+          "access_cost": 46,
+          "input_rows": 1,
+          "output_rows": 2000,
+          "rows_per_input": 2000,
+          "total_cost": 46
+        },
+        "join": "inner",
+        "source": "table",
+        "table": "s",
+        "type": "scan"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SEARCH r USING COVERING INDEX ephemeral_r_t1 (k=?)",
+      "id": 2,
+      "op": {
+        "constraints": [
+          "k=?"
+        ],
+        "estimate": {
+          "access_cost": 1485.315685693242,
+          "input_rows": 2000,
+          "output_rows": 400000,
+          "rows_per_input": 200,
+          "total_cost": 1531.315685693242
+        },
+        "index": {
+          "covering": true,
+          "ephemeral": true,
+          "name": "ephemeral_r_t1"
+        },
+        "search_kind": "seek",
+        "table": "r",
+        "type": "search"
+      },
+      "parent": null
+    }
+  ],
+  "output_rows": 400000,
+  "result_columns": [
+    "id",
+    "k",
+    "v",
+    "id",
+    "k",
+    "v"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM r JOIN s NOT INDEXED ON s.k = r.k",
+  "version": 1
+}
+
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM s CROSS JOIN r WHERE s.k = r.k;
+{
+  "nodes": [
+    {
+      "detail": "HASH JOIN r",
+      "id": 1,
+      "op": {
+        "estimate": {
+          "access_cost": 1260,
+          "input_rows": 2000,
+          "output_rows": 400000,
+          "rows_per_input": 200,
+          "total_cost": 1306
+        },
+        "join": "cross",
+        "table": "r",
+        "type": "hash_join"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SCAN s",
+      "id": 2,
+      "op": {
+        "estimate": {
+          "access_cost": 46,
+          "input_rows": 1,
+          "output_rows": 2000,
+          "rows_per_input": 2000,
+          "total_cost": 46
+        },
+        "source": "table",
+        "table": "s",
+        "type": "scan"
+      },
+      "parent": null
+    }
+  ],
+  "output_rows": 400000,
+  "result_columns": [
+    "id",
+    "k",
+    "v",
+    "id",
+    "k",
+    "v"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM s CROSS JOIN r WHERE s.k = r.k",
+  "version": 1
+}
+
+> CREATE TABLE t0(c0 REAL PRIMARY KEY NOT NULL);
+
+> CREATE TABLE t1(c0 VARCHAR(10), c1 TEXT PRIMARY KEY);
+
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT NULL FROM t1 AS a0 FULL JOIN t0 AS a1 ON ((a1.c0 > 1000000000000000.0) AND (a0.c1 >= a1.c0)) WHERE (a1.c0 IN (NULL, 1.5));
+{
+  "nodes": [
+    {
+      "detail": "SCAN t1 AS a0 USING COVERING INDEX sqlite_autoindex_t1_1",
+      "id": 1,
+      "op": {
+        "alias": "a0",
+        "estimate": {
+          "access_cost": 16336.843333333334,
+          "input_rows": 1,
+          "output_rows": 1000000,
+          "rows_per_input": 1000000,
+          "total_cost": 16336.843333333334
+        },
+        "index": {
+          "covering": true,
+          "ephemeral": false,
+          "name": "sqlite_autoindex_t1_1"
+        },
+        "source": "table",
+        "table": "t1",
+        "type": "scan"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SEARCH a1 USING INDEX sqlite_autoindex_t0_1 (c0>? AND c0<=?)",
+      "id": 2,
+      "op": {
+        "alias": "a1",
+        "constraints": [
+          "c0>?",
+          "c0<=?"
+        ],
+        "estimate": {
+          "access_cost": 52210081.3,
+          "input_rows": 1000000,
+          "output_rows": 10000,
+          "rows_per_input": 0.01,
+          "total_cost": 52226418.14333333
+        },
+        "index": {
+          "covering": false,
+          "ephemeral": false,
+          "name": "sqlite_autoindex_t0_1"
+        },
+        "join": "inner",
+        "search_kind": "seek",
+        "table": "t0",
+        "type": "search"
+      },
+      "parent": null
+    },
+    {
+      "detail": "RIGHT-JOIN a1",
+      "id": 3,
+      "op": {
+        "alias": "a1",
+        "table": "t0",
+        "type": "right_join"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SEARCH a1 USING INDEX sqlite_autoindex_t0_1 (c0=?)",
+      "id": 4,
+      "op": {
+        "alias": "a1",
+        "constraints": [
+          "c0=?"
+        ],
+        "estimate": {
+          "access_cost": 52210081.3,
+          "input_rows": 1000000,
+          "output_rows": 10000,
+          "rows_per_input": 0.01,
+          "total_cost": 52226418.14333333
+        },
+        "index": {
+          "covering": false,
+          "ephemeral": false,
+          "name": "sqlite_autoindex_t0_1"
+        },
+        "search_kind": "in_seek",
+        "table": "t0",
+        "type": "search"
+      },
+      "parent": 3
+    }
+  ],
+  "output_rows": 10000,
+  "result_columns": [
+    "NULL"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT NULL FROM t1 AS a0 FULL JOIN t0 AS a1 ON ((a1.c0 > 1000000000000000.0) AND (a0.c1 >= a1.c0)) WHERE (a1.c0 IN (NULL, 1.5))",
+  "version": 1
+}
+
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT NULL FROM t1 AS a0 FULL JOIN t0 AS a1 ON ((a1.c0 > 1000000000000000.0) AND (a0.c1 >= a1.c0)) WHERE ((a1.c0 IN (NULL, 1.5)) AND a0.c1);
+{
+  "nodes": [
+    {
+      "detail": "SEARCH a1 USING COVERING INDEX sqlite_autoindex_t0_1 (c0=?)",
+      "id": 1,
+      "op": {
+        "alias": "a1",
+        "constraints": [
+          "c0=?"
+        ],
+        "estimate": {
+          "access_cost": 6.732,
+          "input_rows": 1,
+          "output_rows": 0.8,
+          "rows_per_input": 0.8,
+          "total_cost": 6.732
+        },
+        "index": {
+          "covering": true,
+          "ephemeral": false,
+          "name": "sqlite_autoindex_t0_1"
+        },
+        "join": "inner",
+        "search_kind": "in_seek",
+        "table": "t0",
+        "type": "search"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SCAN t1 AS a0 USING COVERING INDEX sqlite_autoindex_t1_1",
+      "id": 2,
+      "op": {
+        "alias": "a0",
+        "estimate": {
+          "access_cost": 15736.841333333334,
+          "input_rows": 0.8,
+          "output_rows": 320000,
+          "rows_per_input": 400000,
+          "total_cost": 15743.573333333334
+        },
+        "index": {
+          "covering": true,
+          "ephemeral": false,
+          "name": "sqlite_autoindex_t1_1"
+        },
+        "source": "table",
+        "table": "t1",
+        "type": "scan"
+      },
+      "parent": null
+    }
+  ],
+  "output_rows": 320000,
+  "result_columns": [
+    "NULL"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT NULL FROM t1 AS a0 FULL JOIN t0 AS a1 ON ((a1.c0 > 1000000000000000.0) AND (a0.c1 >= a1.c0)) WHERE ((a1.c0 IN (NULL, 1.5)) AND a0.c1)",
+  "version": 1
+}
+
