@@ -2580,35 +2580,40 @@ pub fn parse_where(
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
         }
-        // BETWEEN in WHERE is rewritten to binary terms here so each side can be
-        // considered independently by constraint extraction and range planning.
-        // Re-break any ANDs that were created so they become separate WhereTerms for
-        // constraint extraction.
-        let mut i = start_idx;
-        while i < out_where_clause.len() {
-            if matches!(
-                &out_where_clause[i].expr,
-                Expr::Binary(_, ast::Operator::And, _)
-            ) {
-                let term = out_where_clause.remove(i);
-                let mut new_terms: Vec<WhereTerm> = Vec::new();
-                break_predicate_at_and_boundaries(&term.expr, &mut new_terms);
-                // Preserve the source from the original term.
-                for new_term in new_terms.iter_mut() {
-                    new_term.origin = term.origin;
-                }
-                let count = new_terms.len();
-                for (j, new_term) in new_terms.into_iter().enumerate() {
-                    out_where_clause.insert(i + j, new_term);
-                }
-                i += count;
-            } else {
-                i += 1;
-            }
-        }
+        split_rewritten_ands(out_where_clause, start_idx);
         Ok(())
     } else {
         Ok(())
+    }
+}
+
+/// BETWEEN, in WHERE and in ON alike, is rewritten to binary terms so each side can be considered
+/// independently by constraint extraction and range planning: an ON term that kept its BETWEEN
+/// constrained nothing, so the same inner join was estimated apart with its condition in ON and in
+/// WHERE (docs/design/planner.md, decision 13). Re-break the ANDs the rewrite made so they become
+/// separate terms, each keeping its source.
+fn split_rewritten_ands(out_where_clause: &mut Vec<WhereTerm>, start_idx: usize) {
+    let mut i = start_idx;
+    while i < out_where_clause.len() {
+        let Some(term) = out_where_clause.get(i) else {
+            break;
+        };
+        let expr = unwrap_parens(&term.expr).unwrap_or(&term.expr);
+        if matches!(expr, Expr::Binary(_, ast::Operator::And, _)) {
+            let term = out_where_clause.remove(i);
+            let mut new_terms: Vec<WhereTerm> = Vec::new();
+            break_predicate_at_and_boundaries(&term.expr, &mut new_terms);
+            for new_term in new_terms.iter_mut() {
+                new_term.origin = term.origin;
+            }
+            let count = new_terms.len();
+            for (j, new_term) in new_terms.into_iter().enumerate() {
+                out_where_clause.insert(i.saturating_add(j), new_term);
+            }
+            i = i.saturating_add(count);
+        } else {
+            i = i.saturating_add(1);
+        }
     }
 }
 
@@ -3063,6 +3068,7 @@ fn parse_join(
                 break_predicate_at_and_boundaries(expr, out_where_clause);
                 for predicate in out_where_clause[start_idx..].iter_mut() {
                     predicate.origin = WhereTermOrigin::Join(join_origin);
+                    rewrite_between_exprs(&mut predicate.expr)?;
                     bind_and_rewrite_expr(
                         &mut predicate.expr,
                         Some(table_references),
@@ -3071,6 +3077,7 @@ fn parse_join(
                         BindingBehavior::TryResultColumnsFirst,
                     )?;
                 }
+                split_rewritten_ands(out_where_clause, start_idx);
             }
             ast::JoinConstraint::Using(distinct_names) => {
                 // USING join is replaced with a list of equality predicates

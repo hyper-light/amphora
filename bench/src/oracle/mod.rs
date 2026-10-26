@@ -1,9 +1,9 @@
 //! The oracles (`--oracle`, G2 step 3; docs/research/oracles.md): random databases and queries over
-//! the SQLite language's inventory, each query checked by TLP, NoREC, PQS, DQP, EET and CERT on
-//! Amphora, and against SQLite's own answer. A failure is cut down to its smallest form (reduce.rs)
+//! the SQLite language's inventory, each query checked by TLP, NoREC, PQS, DQP, EET, CERT and the
+//! order check on Amphora, and against SQLite's own answer. A failure is cut down to its smallest form (reduce.rs)
 //! and written as a finding; a panic in Amphora is one too.
 //!
-//! `amphora-bench --oracle [--oracles diff,tlp,norec,pqs,dqp,eet,cert] [--seconds N] [--seed S]
+//! `amphora-bench --oracle [--oracles diff,tlp,norec,pqs,dqp,eet,cert,order] [--seconds N] [--seed S]
 //!  [--per-state N] [--reduce-seconds N] [--features bench/corpus/features.json] [--out DIR] [--label L]
 //!  [--sqlite LIBRARY]`: `--sqlite` loads the reference from LIBRARY (bench/oracles/sqlite.sh builds
 //! it), in place of the system's libsqlite3.so.0, here and with `--replay` and `--replay-check`.
@@ -201,6 +201,21 @@ fn replay_check(path: &str) -> anyhow::Result<()> {
             };
             if !checks::no_more(er, eq) {
                 println!("estimates {er} rows for the more restrictive query, {eq} for the query: {more}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+    }
+    // An order finding's two queries: the same join written in two orders, estimated alike.
+    if std::path::Path::new(path).file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("order-")) {
+        if let [q, other] = queries.as_slice() {
+            let strip = |s: &str| s.trim_start_matches("EXPLAIN QUERY PLAN FORMAT=JSON ").to_owned();
+            let (Some(eq), Some(eo)) = (checks::estimate_any(&mut a, &strip(q)), checks::estimate_any(&mut a, &strip(other))) else {
+                println!("no estimate: {other}");
+                std::process::exit(1);
+            };
+            if !checks::same_estimate(eq, eo) {
+                println!("estimates {eo} rows for one order, {eq} for the query as written: {other}");
                 std::process::exit(1);
             }
             return Ok(());

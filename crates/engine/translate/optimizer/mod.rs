@@ -85,6 +85,7 @@ use std::{
 };
 
 pub(crate) mod access_method;
+mod cardinality;
 pub(crate) mod constraints;
 pub(crate) mod cost;
 mod cost_params;
@@ -1112,6 +1113,23 @@ fn find_select_plan_form(
         plan.contains_constant_false_condition = true;
         plan.estimated_output_rows = Some(0.0);
         plan.estimated_cost = Some(0.0);
+        // The plan reads no table: each access is estimated at no rows, so EXPLAIN gives the join
+        // its estimate, 0, as it does any other plan's (decision 13).
+        for (position, table) in plan
+            .table_references
+            .joined_tables_mut()
+            .iter_mut()
+            .enumerate()
+        {
+            table.plan_estimate = Some(TablePlanEstimate {
+                input_rows: 0.0,
+                rows_per_input: 0.0,
+                output_rows: 0.0,
+                access_cost: 0.0,
+                total_cost: 0.0,
+                position,
+            });
+        }
         plan_correlated_subqueries(plan, resolver, &[], cache, save_subquery_plans)?;
         return Ok(None);
     }

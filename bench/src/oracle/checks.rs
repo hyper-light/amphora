@@ -18,11 +18,13 @@ pub enum Oracle {
     Dqp,
     Eet,
     Cert,
+    /// An inner join estimated at the same rows whatever order its tables are written or read in.
+    Order,
 }
 
 impl Oracle {
     /// The oracles a run rotates through (`Same` runs once a database, after its statements).
-    pub const ALL: [Oracle; 7] = [Oracle::Diff, Oracle::Tlp, Oracle::Norec, Oracle::Pqs, Oracle::Dqp, Oracle::Eet, Oracle::Cert];
+    pub const ALL: [Oracle; 8] = [Oracle::Diff, Oracle::Tlp, Oracle::Norec, Oracle::Pqs, Oracle::Dqp, Oracle::Eet, Oracle::Cert, Oracle::Order];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -34,6 +36,7 @@ impl Oracle {
             Oracle::Dqp => "dqp",
             Oracle::Eet => "eet",
             Oracle::Cert => "cert",
+            Oracle::Order => "order",
         }
     }
 
@@ -102,6 +105,8 @@ pub enum Case {
     Dqp(Sel, Variant),
     Eet(Sel, Sel),
     Cert(Sel, More),
+    /// An inner join of two to four tables.
+    Order(Sel),
 }
 
 impl Case {
@@ -115,6 +120,7 @@ impl Case {
             Case::Dqp(..) => Oracle::Dqp,
             Case::Eet(..) => Oracle::Eet,
             Case::Cert(..) => Oracle::Cert,
+            Case::Order(_) => Oracle::Order,
         }
     }
 
@@ -122,7 +128,7 @@ impl Case {
     pub fn parts_mut(&mut self) -> (Vec<&mut Sel>, Vec<&mut E>) {
         match self {
             Case::Same(_) => (vec![], vec![]),
-            Case::Diff(q) | Case::Dqp(q, _) => (vec![q], vec![]),
+            Case::Diff(q) | Case::Dqp(q, _) | Case::Order(q) => (vec![q], vec![]),
             Case::TlpWhere(q, p) | Case::TlpDistinct(q, p) | Case::TlpGroup(q, p) | Case::TlpHaving(q, p) | Case::TlpAgg(q, p, _) | Case::Norec(q, p) | Case::Pqs(q, _, p) => (vec![q], vec![p]),
             Case::Eet(q, t) => (vec![q, t], vec![]),
             Case::Cert(q, More::Conjunct(p)) => (vec![q], vec![p]),
@@ -139,7 +145,8 @@ pub enum Kind {
     Error,
     /// Amphora panicked: production code never does.
     Panic,
-    /// A more restrictive query estimated to return more rows (CERT).
+    /// A more restrictive query estimated to return more rows (CERT), or one join order estimated
+    /// apart from another (Order).
     Estimate,
 }
 
@@ -246,6 +253,7 @@ pub fn sqls(case: &Case) -> Vec<String> {
         })).collect(),
         Case::Eet(q, t) => vec![q.sql(), t.sql()],
         Case::Cert(q, more) => vec![format!("EXPLAIN QUERY PLAN FORMAT=JSON {}", q.sql()), format!("EXPLAIN QUERY PLAN FORMAT=JSON {}", more.apply(q).sql())],
+        Case::Order(q) => std::iter::once(q.clone()).chain(orders(q)).map(|o| format!("EXPLAIN QUERY PLAN FORMAT=JSON {}", o.sql())).collect(),
     }
 }
 
@@ -452,7 +460,87 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
                 fail(Kind::Estimate, format!("the more restrictive query is estimated at {er} rows, the query at {eq}"), vec![qs, rs])
             }
         }
+        Case::Order(q) => {
+            if q.from.len() < 2 || !q.from.iter().all(|f| matches!(f.join, Join::First | Join::Inner | Join::Comma | Join::Cross)) {
+                return Outcome::Skip("no longer an inner join of two tables or more");
+            }
+            let aliases: Vec<String> = q.from.iter().map(|f| f.alias.clone()).collect();
+            let base = q.sql();
+            let Some(want) = estimate(a, &base, &aliases) else { return Outcome::Skip("no estimate") };
+            for o in orders(q) {
+                let sql = o.sql();
+                // A form Amphora refuses is a finding only where SQLite answers it, as for every
+                // derived query: the estimate is this check's, the refusal the others'.
+                if let Err(e) = a.run(&format!("EXPLAIN QUERY PLAN {sql}")) {
+                    return derived(s, &sql, "another join order", &e, vec![base, sql.clone()]);
+                }
+                match estimate(a, &sql, &aliases) {
+                    Some(got) if same_estimate(got, want) => {}
+                    Some(got) => return fail(Kind::Estimate, format!("one join order is estimated at {got} rows, the query as written at {want}"), vec![base, sql]),
+                    None => return fail(Kind::Estimate, format!("one join order has no estimate, the query as written {want} rows"), vec![base, sql]),
+                }
+            }
+            Outcome::Pass { plan_changed: false }
+        }
     }
+}
+
+/// Whether two estimates of the same rows agree to within 1e-9 of the larger, floating point's
+/// rounding over a product of a few factors taken in another order.
+pub fn same_estimate(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-9 * a.abs().max(b.abs())
+}
+
+/// Every order of an inner join's tables, each written two ways: its tables listed in that order
+/// with every ON term moved to WHERE (an inner join's ON filters as WHERE does), and the same order
+/// forced by CROSS JOIN, which the planner never reorders (SQLite's `jointype` rule, which Amphora
+/// keeps). The estimate of the set of tables joined is one number in every one of them.
+pub fn orders(q: &Sel) -> Vec<Sel> {
+    let mut flat = q.clone();
+    let mut wh = q.wh.clone();
+    for f in flat.from.iter_mut() {
+        if let Some(on) = f.on.take() {
+            wh = Some(match wh {
+                Some(w) => E::Bin("AND", Box::new(w), Box::new(on)),
+                None => on,
+            });
+        }
+    }
+    flat.wh = wh;
+    let n = flat.from.len();
+    // Heap's algorithm, iterative: every permutation of 0..n, n at most 4 here (24 orders).
+    let mut perm: Vec<usize> = (0..n).collect();
+    let mut c = vec![0usize; n];
+    let mut perms = vec![perm.clone()];
+    let mut i = 1;
+    while i < n {
+        if c[i] < i {
+            if i % 2 == 0 {
+                perm.swap(0, i);
+            } else {
+                perm.swap(c[i], i);
+            }
+            perms.push(perm.clone());
+            c[i] += 1;
+            i = 1;
+        } else {
+            c[i] = 0;
+            i += 1;
+        }
+    }
+    let mut out = Vec::with_capacity(perms.len() * 2);
+    for p in perms {
+        for cross in [false, true] {
+            let mut o = flat.clone();
+            o.from = p.iter().enumerate().map(|(k, &j)| {
+                let mut f = flat.from[j].clone();
+                f.join = if k == 0 { Join::First } else if cross { Join::Cross } else { Join::Comma };
+                f
+            }).collect();
+            out.push(o);
+        }
+    }
+    out
 }
 
 /// The optimizer's estimate of a query's rows: the output of the last top-level access to one of
@@ -630,6 +718,7 @@ pub fn build(o: Oracle, r: &mut Rng, schema: &Schema, funcs: &[Func], s: &mut Sq
                 }
             }
         }
+        Oracle::Order => Case::Order(synth::inner_join(r, schema, funcs)),
     })
 }
 

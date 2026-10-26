@@ -472,3 +472,64 @@ counted estimate back in the EXPLAIN plan of the same query.
 **Falsified by.** A counter whose rows differ from the true size of its prefix (a query whose
 prefix, run on its own as a COUNT(*), gives another number), or a statement on a connection that
 didn't ask that runs slower than before the change (the bench suite's 50 statements, best of 3).
+
+## 13. One estimate per joined set
+
+**Decision.** A join's row estimate is a property of the set of tables it joins
+(`optimizer/cardinality.rs`, `JoinedSetRows`): computed from the predicates over that set, once per
+`TableMask` and memoized for the search (at most its own subsets: 8,192 sets, past which a set is
+computed again, to the same number), and given to every order and every access path the search
+tries for the set. An access method changes only what reading the set costs; the rows a seek
+returns per outer row stay the cost model's (`estimate_rows_per_seek`: a unique key's one row,
+ANALYZE's rows per key prefix, a GLOB's implied range) and no longer reach any output estimate.
+Each WHERE term counts once, on its home table (its most selective constraint's, ties to the first
+table by name, not by place in FROM), through the same `constraints_selectivity` the filters of one
+table use, so a closed range is one range wherever its bounds are counted. Outer joins by their
+semantics, each by the Poisson model the planner already took for a match count: a LEFT JOIN keeps
+each left row's matches or the row once (`m + e^-m` with `m` the right table's rows its ON terms
+keep); a RIGHT JOIN keeps the matches and the right rows no left row matches; a FULL JOIN keeps
+both sides' unmatched rows. So LEFT and RIGHT are never below the inner join and FULL never below
+either. A RIGHT or FULL JOIN is a reordering barrier both ways, so the rows before it are a set of
+their own, combined with it. Semi and anti joins keep or drop left rows and never add any: their
+tables and the terms that read them (their unnested EXISTS conditions) multiply by 1. A LEFT JOIN to
+a derived table grouped by exactly the columns its ON terms equate (a scalar subquery unnested,
+`unnest.rs`) gives one row for each left row, as the correlated form does, and a term on its value
+counts for nothing in either form. A whole WHERE or inner-ON term no row passes (`NULL`, a NULL test
+of a literal SQLite's parser folds to 0) leaves no rows in any set, and a plan made impossible by a
+constant-false WHERE estimates each table access at 0 rows. An ON term's BETWEEN is rewritten to its
+two comparisons as a WHERE term's is (`planner.rs`, `split_rewritten_ands`). Loops run over a
+set's tables and its RIGHT or FULL JOINs, bounded by the mask; nothing recurses.
+
+**Why.** The estimate was the chosen access path's: rows per outer row from the seek or scan
+picked, times the filters it didn't consume, with each term's share moved around by the order its
+tables came in (`rows_after_join`, `completed_terms_selectivity`). So the same join got other
+estimates in other orders and with other access paths, and the search compared plans of one set by
+numbers that differed only in how they were reached. The oracles' CERT check found the symptoms
+(cause AG: a FULL JOIN estimated below its inner join; an index seek's estimate against two
+filters'); the order check this decision adds found them at their cause.
+
+**Sources.** PostgreSQL computes a join relation's rows once and keeps them for all its paths
+(`set_joinrel_size_estimates`, `src/backend/optimizer/path/costsize.c` lines 5671 to 5680 at
+126976a8: "In theory we should get the same answers no matter which pair is provided; ... and
+anyway we must keep the rowcount estimate the same for all paths for the joinrel"). CockroachDB's
+memo: "Because memo groups contain logically equivalent expressions, all the memo expressions in a
+group share the same logical properties" (`pkg/sql/opt/memo/memo.go` line 62), the row count among
+them (`statistics_builder.go`). DuckDB caches the cardinality of each relation set
+(`src/optimizer/join_order/cardinality_estimator.cpp` at 1641475, line 188:
+`reference_map_t<JoinRelationSet, CardinalityHelper> relation_set_2_cardinality;`,
+`EstimateCardinalityWithSet` at line 907 reading it before computing), after Ebergen's thesis: "the
+cardinality is also represented as a set of relations" (docs/research/planner.md, findings f15, f16
+and f39, kiln grade A). The outer-join bounds are the operators' definitions, SQLite's in its
+requirement R-24610-05866 (`test/e_select.test` line 622): for a LEFT JOIN, "after the ON or
+USING filtering clauses have been applied, an extra row is added to the output for each row in
+the original left-hand input dataset that does not match any row in the right-hand dataset"; a
+RIGHT JOIN does the same for the right side's rows and a FULL JOIN for both. The order check follows CERT's idea (Ba and Rigger, ICSE 2024, f21): a
+property of the estimator two forms of one query must share, checked without knowing true sizes.
+
+**Evidence.** EVIDENCE
+
+**Falsified by.** Two orders or two access paths of one inner join whose estimates differ (the order
+check, run nightly); an outer join estimated below its inner join, or a semi or anti join above its
+left side; a query the new estimates send to a slower plan than the old ones chose, measured (the
+estimate of a set no longer favours the path that happens to estimate fewer rows for it, so a choice
+that rested on that difference may move).

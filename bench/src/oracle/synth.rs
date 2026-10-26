@@ -593,6 +593,25 @@ pub fn plain(r: &mut Rng, schema: &Schema, funcs: &[Func]) -> Sel {
     Sel { distinct: r.chance(0.1), cols, from, wh, group: vec![], having: None, order: vec![], limit: None }
 }
 
+/// An inner join of two to four tables (a table may come twice), each joined by JOIN with an ON
+/// or by a comma, with a WHERE most of the time: what the order check permutes.
+pub fn inner_join(r: &mut Rng, schema: &Schema, funcs: &[Func]) -> Sel {
+    let mut from = Vec::new();
+    let mut tables: Vec<(String, String)> = Vec::new();
+    for i in 0..2 + r.below(3) {
+        let t = r.pick(&schema.tables).name.clone();
+        let alias = format!("a{i}");
+        tables.push((alias.clone(), t.clone()));
+        let join = if i == 0 { Join::First } else if r.chance(0.7) { Join::Inner } else { Join::Comma };
+        let on = (join == Join::Inner && r.chance(0.9)).then(|| Scope { schema, tables: tables.clone(), funcs, aggs: false }.pred(r, 2));
+        from.push(From { table: t, alias, join, on, hint: Hint::None });
+    }
+    let s = scope(schema, &from, funcs, false);
+    let cols = (0..1 + r.below(3)).map(|_| s.expr(r, 2)).collect();
+    let wh = if r.chance(0.8) { Some(s.pred(r, 3)) } else { None };
+    Sel { distinct: false, cols, from, wh, group: vec![], having: None, order: vec![], limit: None }
+}
+
 /// A query of any shape the generator makes: grouped and aggregated, ordered and limited.
 pub fn query(r: &mut Rng, schema: &Schema, funcs: &[Func]) -> Sel {
     let mut q = plain(r, schema, funcs);
