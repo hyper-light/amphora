@@ -37,6 +37,7 @@ pub mod insn;
 pub mod metrics;
 #[cfg(test)]
 mod native_extension_tests;
+pub mod row_counts;
 pub mod rowset;
 pub mod sorter;
 #[cfg(test)]
@@ -952,6 +953,9 @@ pub struct ProgramState {
     seek_state: OpSeekState,
     /// Metrics collected for the lifetime of this prepared statement.
     pub metrics: StatementMetrics,
+    /// Amphora: the rows each of the program's counters counted this run, by its slot
+    /// (`row_counts.rs`); empty unless the program has counters.
+    pub(crate) row_counts: Vec<u64>,
     op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
@@ -1097,6 +1101,7 @@ impl ProgramState {
             active_op_state: ActiveOpStateSlot::default(),
             seek_state: OpSeekState::Start,
             metrics: StatementMetrics::new(),
+            row_counts: Vec::new(),
             distinct_key_values: Vec::new(),
             op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
@@ -1252,6 +1257,12 @@ impl ProgramState {
             }
         }
         self.last_compare = None;
+        // Amphora: a run counts from nothing; a program prepared again may have other counters.
+        if max_cursors.is_some() {
+            self.row_counts.clear();
+        } else {
+            self.row_counts.fill(0);
+        }
         self.deferred_seeks.iter_mut().for_each(|s| *s = None);
         self.ended_coroutine.clear();
         self.once.clear();
@@ -1927,6 +1938,9 @@ pub struct PreparedProgram {
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
     pub read_databases: BitSet,
+    /// Amphora: the program's row counters, by slot (`row_counts.rs`); empty unless the
+    /// connection asked for them when it prepared the program.
+    pub row_count_sites: Vec<row_counts::RowCountSite>,
 }
 
 #[derive(Clone)]

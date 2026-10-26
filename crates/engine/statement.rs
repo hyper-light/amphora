@@ -489,6 +489,21 @@ impl Statement {
         self.state.reset_metrics();
     }
 
+    /// Amphora: the rows each counter of this run counted, beside the planner's estimate where
+    /// it counts (`vdbe/row_counts.rs`); empty unless the connection asked for row counts when
+    /// it prepared the statement. A counter its run never reached counted nothing.
+    pub fn row_counts(&self) -> Vec<vdbe::row_counts::RowCount> {
+        self.program
+            .row_count_sites
+            .iter()
+            .enumerate()
+            .map(|(slot, site)| vdbe::row_counts::RowCount {
+                site: site.clone(),
+                rows: self.state.row_counts.get(slot).copied().unwrap_or(0),
+            })
+            .collect()
+    }
+
     pub fn stmt_status(&self, counter: StatementStatusCounter) -> u64 {
         let metrics = self.metrics();
         match counter {

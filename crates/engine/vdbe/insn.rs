@@ -1877,6 +1877,11 @@ pub enum Insn {
     Once {
         target_pc_when_reentered: BranchOffset,
     },
+    /// Amphora: adds one to the row counter in `slot` (`vdbe/row_counts.rs`); emitted only when
+    /// the connection asked for row counts.
+    CountRows {
+        slot: usize,
+    },
     /// Forget that any [Insn::Once] between this instruction and `region_end`
     /// has already run. Trigger bodies are inlined and re-executed once per
     /// affected row, so their run-once blocks (uncorrelated subqueries,
@@ -2417,6 +2422,7 @@ impl InsnVariants {
             InsnVariants::OpenEphemeral | InsnVariants::OpenAutoindex => execute::op_open_ephemeral,
             InsnVariants::Once => execute::op_once,
             InsnVariants::ResetOnce => execute::op_reset_once,
+            InsnVariants::CountRows => execute::op_count_rows,
             InsnVariants::Found | InsnVariants::NotFound => execute::op_found,
             InsnVariants::Affinity => execute::op_affinity,
             InsnVariants::IdxDelete => execute::op_idx_delete,

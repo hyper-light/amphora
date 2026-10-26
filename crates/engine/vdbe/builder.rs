@@ -14,6 +14,7 @@ use crate::{
         emitter::{MaterializedColumnRef, TransactionMode},
         plan::{ResultSetColumn, TableReferences},
     },
+    vdbe::row_counts::RowCountSite,
     Arc, CaptureDataChangesInfo, Connection, VirtualTable,
 };
 
@@ -227,6 +228,13 @@ impl BuilderQueryMode {
     }
 }
 
+/// Amphora: the row counters a program is given as it is built (`vdbe/row_counts.rs`).
+#[derive(Debug, Default)]
+struct RowCounters {
+    sites: Vec<RowCountSite>,
+    next_plan: usize,
+}
+
 pub struct ProgramBuilder {
     /// A span of instructions from (offset_start_inclusive, offset_end_exclusive),
     /// that are deemed to be compile-time constant and can be hoisted out of loops
@@ -323,6 +331,9 @@ pub struct ProgramBuilder {
     next_cte_id: usize,
     /// Counter for subquery numbering in EXPLAIN QUERY PLAN output.
     next_subquery_eqp_id: usize,
+    /// Amphora: the program's row counters when the connection asked for them
+    /// (`vdbe/row_counts.rs`), `None` when it did not.
+    row_counters: Option<RowCounters>,
     /// Write-context for union-typed columns: tells `union_value('tag', val)`
     /// which union TypeDef to resolve the tag against.
     ///
@@ -763,8 +774,37 @@ impl ProgramBuilder {
             ctes_being_defined: Vec::new(),
             views_being_expanded: Vec::new(),
             next_subquery_eqp_id: 1,
+            row_counters: None,
             target_union_type: None,
         }
+    }
+
+    /// Amphora: count the rows of each table access and join this program runs
+    /// (`vdbe/row_counts.rs`).
+    pub fn count_rows(&mut self) {
+        self.row_counters = Some(RowCounters::default());
+    }
+
+    /// Amphora: the number of the next query to open its loops, if rows are counted.
+    pub fn row_count_plan(&mut self) -> Result<Option<usize>> {
+        let Some(counters) = self.row_counters.as_mut() else {
+            return Ok(None);
+        };
+        let plan = counters.next_plan;
+        counters.next_plan = plan
+            .checked_add(1)
+            .ok_or(crate::LimboError::IntegerOverflow)?;
+        Ok(Some(plan))
+    }
+
+    /// Amphora: count each pass of the next instruction at `site`, if rows are counted.
+    pub fn emit_row_count(&mut self, site: RowCountSite) {
+        let Some(counters) = self.row_counters.as_mut() else {
+            return;
+        };
+        let slot = counters.sites.len();
+        counters.sites.push(site);
+        self.emit_insn(Insn::CountRows { slot });
     }
 
     pub const fn next_subquery_eqp_id(&mut self) -> usize {
@@ -2440,7 +2480,13 @@ impl ProgramBuilder {
             && self.flags.is_multi_write()
             && self.may_abort();
 
+        let row_count_sites = self
+            .row_counters
+            .take()
+            .map(|counters| counters.sites)
+            .unwrap_or_default();
         let prepared = PreparedProgram {
+            row_count_sites,
             max_registers: self.next_free_register,
             insns: self.insns,
             cursor_ref: self.cursor_ref,

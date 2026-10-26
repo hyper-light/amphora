@@ -426,3 +426,49 @@ million rows, above its own LEFT JOIN.
 
 **Falsified by.** A join without statistics that the key search makes slower than the hash join
 would have been (two large tables the cache can't hold, every row joined), measured, not estimated.
+
+## 12. A statement counts its rows at each table access and join when asked, beside the estimates
+
+**Decision.** A connection that asks (`Connection::set_row_counters(true)`) prepares its
+statements with a counter at each plan node of every query they hold: one where a query's loops are
+entered (its calls), one where each table access's rows enter the next level of the join, or the
+query's body after the last (the rows of that join prefix, after every term evaluated there), and
+one where a hash join's build puts a row in its table (`vdbe/row_counts.rs`; the counting points in
+`translate/main_loop/open.rs`, `body.rs` and `hash.rs`). Each counter is one `CountRows`
+instruction adding one to its slot; the slots are a vector the statement sizes at its first count
+and zeroes at each reset, so a count allocates nothing and checks its arithmetic. Each counter keeps
+the table, the join position and the estimate the planner gave that access, the same
+`TablePlanEstimate` that EXPLAIN QUERY PLAN FORMAT=JSON prints, and `Statement::row_counts` reads
+them back with the rows counted. A connection that doesn't ask emits no counting instruction.
+
+**Why.** The planner's estimates can't be judged without the rows they estimate: Amphora's join
+search ranks orders by each prefix's estimated rows (`prefix_cardinalities`), and the plan's next
+steps (docs/research/planner.md) change those estimates; their measure is the q-error at each join
+prefix against the rows that ran. Counting where a row enters the next level counts what the
+estimate estimates: the rows that passed every term of the prefix, a row an anti-join kept or a
+LEFT JOIN null-extended as well as one that matched. Off unless asked, so no statement pays for it.
+
+**Sources.** PostgreSQL's EXPLAIN ANALYZE gives each node its rows and loops (PostgreSQL 17,
+`using-explain.html`, section 14.1.2): "In such cases, the loops value reports the total number
+of executions of the node, and the actual time and rows values shown are averages per-execution.
+This is done to make the numbers comparable with the way that the cost estimates are shown." The
+bench divides a prefix's rows by its query's loops for the same reason. SQLite counts each loop of
+a statement compiled with them (`c3ref/c_scanstat_est.html`): SQLITE_SCANSTAT_NLOOP is "the total
+number of times that the X-th loop has run", SQLITE_SCANSTAT_EST "the query planner's estimate
+for the average number of rows output from each iteration of the X-th loop", and the interface "is
+only available if SQLite is compiled using the SQLITE_ENABLE_STMT_SCANSTATUS compile-time option"
+(`c3ref/stmt_scanstatus.html`). Amphora asks at prepare rather than at compile, so the same binary
+measures and serves. The q-error, max(est/act, act/est), is Moerkotte, Neumann and Steidl's (PVLDB
+2(1), 2009).
+
+**Evidence.** `crates/engine/tests/row_counts.rs`: on a(100), b(3 a row of a), c(2 a row of b),
+analyzed, the three-table join's prefixes count 100, 300 and 600, each estimate exact and its
+q-error 1; a filter keeping a tenth counts 10, 30, 60; a correlated subquery counts its 100 calls
+and their 300 rows; a hash join counts its build; a second run counts from nothing; a connection
+that didn't ask has no `CountRows` in its program; and every counter's estimate is EXPLAIN QUERY
+PLAN FORMAT=JSON's for the same table. The bench's JOB and TPC-H runs (`bench/planner/`) read every
+counted estimate back in the EXPLAIN plan of the same query.
+
+**Falsified by.** A counter whose rows differ from the true size of its prefix (a query whose
+prefix, run on its own as a COUNT(*), gives another number), or a statement on a connection that
+didn't ask that runs slower than before the change (the bench suite's 50 statements, best of 3).

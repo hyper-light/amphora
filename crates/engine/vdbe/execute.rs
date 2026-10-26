@@ -16494,6 +16494,27 @@ pub fn op_once(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Amphora: [Insn::CountRows]. The counters are sized at the first count of a run of the
+/// program, so a count allocates nothing after it.
+pub fn op_count_rows(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(CountRows { slot }, insn);
+    let sites = program.row_count_sites.len();
+    if state.row_counts.len() != sites {
+        state.row_counts.resize(sites, 0);
+    }
+    let count = state.row_counts.get_mut(*slot).ok_or_else(|| {
+        LimboError::InternalError(format!("row counter {slot} of {sites} out of range"))
+    })?;
+    *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+    state.pc = state.pc.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 /// Execute the [Insn::ResetOnce] instruction.
 ///
 /// Forgets that any [Insn::Once] between this instruction and `region_end` has

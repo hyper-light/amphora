@@ -448,6 +448,14 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                 .clear_table_cursor_override(build_table.internal_id);
         }
 
+        if let Some(plan) = planner.t_ctx.row_count_plan {
+            planner.program.emit_row_count(RowCountSite {
+                plan,
+                kind: RowCountKind::HashBuild,
+                table: Some(build_table.identifier.clone()),
+                estimate: build_table.plan_estimate,
+            });
+        }
         planner.program.emit_insn(Insn::HashBuild {
             data: Box::new(HashBuildData {
                 cursor_id: hash_build_rowid_cursor_id,

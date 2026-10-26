@@ -63,6 +63,14 @@ impl OpenLoop {
         subqueries: &mut [NonFromClauseSubquery],
     ) -> Result<()> {
         let live_table_ids: HashSet<_> = join_order.iter().map(|member| member.table_id).collect();
+        // Amphora: a query's counters (`vdbe/row_counts.rs`): its loops' entries, then the rows
+        // each level gives the next, counted where the next begins, so a row an anti-join kept
+        // or a LEFT JOIN null-extended is counted as one that matched.
+        t_ctx.row_count_plan = if matches!(mode, OperationMode::SELECT) {
+            program.row_count_plan()?
+        } else {
+            None
+        };
         for (join_index, join) in join_order.iter().enumerate() {
             let joined_table_index = join.original_idx;
             let table = &table_references.joined_tables()[joined_table_index];
@@ -91,6 +99,26 @@ impl OpenLoop {
                         program.preassign_label_to_next_insn(prev_sa_meta.label_body);
                     }
                 }
+            }
+            if let Some(plan) = t_ctx.row_count_plan {
+                let previous = join_index
+                    .checked_sub(1)
+                    .and_then(|previous| join_order.get(previous))
+                    .and_then(|member| table_references.joined_tables().get(member.original_idx));
+                program.emit_row_count(match previous {
+                    None => RowCountSite {
+                        plan,
+                        kind: RowCountKind::Loops,
+                        table: None,
+                        estimate: None,
+                    },
+                    Some(previous) => RowCountSite {
+                        plan,
+                        kind: RowCountKind::Prefix,
+                        table: Some(previous.identifier.clone()),
+                        estimate: previous.plan_estimate,
+                    },
+                });
             }
 
             // Each OUTER JOIN has a "match flag" that is initially set to false,

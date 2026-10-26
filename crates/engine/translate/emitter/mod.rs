@@ -1156,6 +1156,9 @@ pub struct TranslateCtx<'a> {
     /// Metadata stored during `open_loop` for `Search::InSeek`, consumed by `close_loop`.
     pub meta_in_seeks: Vec<Option<InSeekMetadata>>,
     pub unsafe_testing: bool,
+    /// Amphora: the number of the query whose loops are open, when rows are counted
+    /// (`vdbe/row_counts.rs`).
+    pub row_count_plan: Option<usize>,
 }
 
 /// Metadata for the two-level loop emitted by `Search::InSeek`.
@@ -1196,6 +1199,7 @@ impl<'a> TranslateCtx<'a> {
             meta_window: None,
             meta_in_seeks: (0..table_count).map(|_| None).collect(),
             unsafe_testing,
+            row_count_plan: None,
         }
     }
 }

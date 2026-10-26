@@ -450,6 +450,9 @@ pub struct Connection {
     /// can skip the catalog locks while no such pager can exist.
     pub(super) has_non_main_pagers: AtomicBool,
     pub(super) query_only: AtomicBool,
+    /// Amphora: statements prepared from now on count the rows of their table accesses and
+    /// joins (`vdbe/row_counts.rs`).
+    pub(super) row_counters: AtomicBool,
     pub(super) vdbe_trace: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
     pub(super) dml_require_where: AtomicBool,
@@ -3959,6 +3962,17 @@ impl Connection {
     pub fn set_query_only(&self, value: bool) {
         self.query_only.store(value, Ordering::SeqCst);
         self.bump_prepare_context_generation();
+    }
+
+    /// Amphora: count the rows each table access and join of a statement prepared from now on
+    /// gives, read back with `Statement::row_counts` (`vdbe/row_counts.rs`). Off by default.
+    pub fn set_row_counters(&self, value: bool) {
+        self.row_counters.store(value, Ordering::SeqCst);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn row_counters(&self) -> bool {
+        self.row_counters.load(Ordering::SeqCst)
     }
 
     pub fn set_vdbe_trace(&self, value: bool) {

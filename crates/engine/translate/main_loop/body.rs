@@ -120,6 +120,22 @@ impl<'prog, 'ctx, 'plan> LoopBody<'prog, 'ctx, 'plan> {
     /// Emit the loop body once all required entry labels are fixed.
     fn emit(mut self) -> Result<()> {
         self.resolve_anti_join_entry();
+        // Amphora: the last level's rows, counted as they enter the body (`vdbe/row_counts.rs`).
+        if let Some(plan) = self.t_ctx.row_count_plan {
+            if let Some(last) = self.plan.join_order.last().and_then(|member| {
+                self.plan
+                    .table_references
+                    .joined_tables()
+                    .get(member.original_idx)
+            }) {
+                self.program.emit_row_count(RowCountSite {
+                    plan,
+                    kind: RowCountKind::Prefix,
+                    table: Some(last.identifier.clone()),
+                    estimate: last.plan_estimate,
+                });
+            }
+        }
         emit_loop_source(
             self.program,
             self.t_ctx,

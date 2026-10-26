@@ -2307,6 +2307,15 @@ pub fn insn_to_row(
                 0,
                 format!("goto {}", target_pc_when_reentered.as_debug_int()),
             ),
+            Insn::CountRows { slot } => (
+                "CountRows",
+                i64::try_from(*slot).unwrap_or(i64::MAX),
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                format!("row_counts[{slot}] += 1"),
+            ),
             Insn::ResetOnce { region_end } => (
                 "ResetOnce",
                 region_end.as_debug_int() as i64,

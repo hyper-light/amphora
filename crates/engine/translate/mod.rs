@@ -106,6 +106,9 @@ pub fn translate(
         ProgramBuilderOpts::new(1, 32, 2),
     ));
     program.set_mvcc_enabled(connection.mvcc_enabled());
+    if connection.row_counters() && matches!(query_mode, QueryMode::Normal) {
+        program.count_rows();
+    }
 
     program.prologue();
     let mut resolver = Resolver::new(
