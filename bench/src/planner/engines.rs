@@ -637,7 +637,11 @@ impl Target for Postgres {
                 Outcome::Done(Run { rows: n, first, prepare_ms: 0.0, exec_ms: ms(took) })
             }
             Err(e) if e.code() == Some(&postgres::error::SqlState::QUERY_CANCELED) => Outcome::TimedOut,
-            Err(e) => Outcome::Failed(e.to_string()),
+            // The client's own words are "db error" for whatever the server said: its message too.
+            Err(e) => Outcome::Failed(match e.as_db_error() {
+                Some(db) => format!("{e}: {} ({})", db.message(), db.code().code()),
+                None => format!("{e:?}"),
+            }),
         }
     }
 }
