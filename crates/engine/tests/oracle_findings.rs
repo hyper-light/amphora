@@ -2161,3 +2161,77 @@ fn an_unnested_in_compares_as_in_does() {
         assert_eq!(rows(&io, &conn, sql), [want], "{sql}");
     }
 }
+
+/// Do: sum(), total() and avg() over integers past 2^52 with text and BLOBs among them, where sum()'s
+/// exact integer total turns floating-point at a REAL, a BLOB or text that is no integer. Expect:
+/// SQLite 3.54's answers: the floating-point total starts from the integer one split at 2^14
+/// (kahanBabuskaNeumaierInit), so a large total keeps its low bits, and a BLOB or text that is no
+/// integer adds its REAL (sumStep, func.c). Amphora turned the integer total into a REAL whole when
+/// text or a BLOB came, losing its low bits: 9223372036854775807, '1.5' and -9223372036854775808
+/// summed to 1.5 where SQLite sums 0.5 (findings diff-6e3bfa5d3e0906f5, diff-6708219ff6f6337e,
+/// diff-31fe0233802a6ff0, diff-93b25a1abd23f665, pqs-7a3d84a82e07dc63 and pqs-05f1e48d4354286b).
+/// total() and avg() sum in floating point from the first value and kept SQLite's answers. A sum
+/// that is TRUE keeps every row of the PQS findings' pivot query, a FALSE one none.
+#[test]
+fn sum_keeps_a_large_integer_totals_low_bits_where_it_turns_real() {
+    let (io, conn) = open();
+    for (n, (column, values, want, kept)) in [
+        (
+            "VARCHAR(10)",
+            "(9223372036854775807), ('1.5'), (-9223372036854775808)",
+            "0.5|0.5|0.16666666666666666",
+            3,
+        ),
+        (
+            "BOOLEAN",
+            "(9223372036854775807), (x''), (-9223372036854775808)",
+            "-1.0|-1.0|-0.33333333333333332",
+            3,
+        ),
+        (
+            "TEXT",
+            "(10), (-9223372036854775808), ('a'), (9223372036854775807)",
+            "9.0|9.0|2.25",
+            4,
+        ),
+        (
+            "TEXT",
+            "(9223372036854775807), (-2.5), (1), ('1.5'), (-9223372036854775808)",
+            "-1.0|-1.0|-0.2",
+            5,
+        ),
+        (
+            "BLOB",
+            "(9223372036854775807), (x'41'), (-9223372036854775808), (2), (-1)",
+            "0.0|0.0|0.0",
+            0,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        conn.execute(format!("CREATE TABLE t{n}(c0 {column})"))
+            .unwrap();
+        conn.execute(format!("INSERT INTO t{n} VALUES {values}"))
+            .unwrap();
+        assert_eq!(
+            rows(
+                &io,
+                &conn,
+                &format!("SELECT sum(c0), total(c0), avg(c0) FROM t{n}")
+            ),
+            [want],
+            "{values}"
+        );
+        assert_eq!(
+            rows(
+                &io,
+                &conn,
+                &format!("SELECT rowid FROM t{n} WHERE (SELECT sum(c0) FROM t{n})")
+            )
+            .len(),
+            kept,
+            "{values}"
+        );
+    }
+}

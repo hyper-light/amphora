@@ -7488,70 +7488,50 @@ fn update_agg_payload(
                 approx: *approx_i != 0,
                 ovrfl: *ovrfl_i != 0,
             };
-            if !matches!(arg, Value::Null) {
+            let arg = classify_numeric_arg(arg);
+            if !matches!(arg, NumericArg::Null) {
                 *count = count.checked_add(1).or_overflow()?;
             }
             if matches!(*acc, Value::Null) && sum_state.approx {
                 return Ok(());
             }
+            // SQLite's sumStep (func.c): an exact integer total while every value is an integer,
+            // then the floating-point total from the first value that is none (a REAL, a BLOB,
+            // text that is no integer) or the first integer that overflows it. Text and BLOBs
+            // take the same path as numbers, so the floating-point total always starts from the
+            // integer one split as kahanBabuskaNeumaierInit splits it, keeping a large total's
+            // low bits.
             match arg {
-                Value::Null => {}
-                Value::Numeric(Numeric::Integer(i)) => match acc {
-                    Value::Null => {
-                        *acc = Value::from_i64(*i);
-                    }
-                    Value::Numeric(Numeric::Integer(acc_i)) => match acc_i.checked_add(*i) {
-                        Some(sum) => *acc_i = sum,
+                NumericArg::Null => {}
+                NumericArg::Integer(i) => match acc {
+                    Value::Null => *acc = Value::from_i64(i),
+                    Value::Numeric(Numeric::Integer(total)) => match total.checked_add(i) {
+                        Some(sum) => *total = sum,
                         None => {
-                            // The integer total overflowed i64. Switch to
-                            // the floating-point total and remember the
-                            // overflow: sum() reports it at the end unless
-                            // a later float clears it, and total() never
-                            // reports it. Mirrors sumStep (func.c:1838-1846).
-                            let prev = *acc_i;
+                            // sum() reports the overflow at the end unless a value that is no
+                            // integer clears it; total() never reports it.
+                            let prev = *total;
                             sum_state.approx = true;
                             sum_state.ovrfl = true;
                             kbn_init_from_int(acc, prev, &mut sum_state);
-                            apply_kbn_step_int(acc, *i, &mut sum_state);
+                            apply_kbn_step_int(acc, i, &mut sum_state);
                         }
                     },
-                    Value::Numeric(Numeric::Float(_)) => {
-                        apply_kbn_step_int(acc, *i, &mut sum_state);
-                    }
-                    _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
+                    _ => apply_kbn_step_int(acc, i, &mut sum_state),
                 },
-                Value::Numeric(Numeric::Float(f)) => match acc {
-                    Value::Null => {
-                        *acc = Value::Numeric(Numeric::Float(*f));
-                        sum_state.approx = true;
+                NumericArg::Float(r) => {
+                    match acc {
+                        Value::Null => kbn_init_from_int(acc, 0, &mut sum_state),
+                        Value::Numeric(Numeric::Integer(total)) => {
+                            let prev = *total;
+                            kbn_init_from_int(acc, prev, &mut sum_state);
+                        }
+                        // Already the floating-point total, which now stands: an earlier
+                        // overflow is no longer reported.
+                        _ => sum_state.ovrfl = false,
                     }
-                    Value::Numeric(Numeric::Integer(i)) => {
-                        // First float, after an all-integer run. Switch to
-                        // the floating-point total, seeding it from the
-                        // exact integer sum so far (func.c:1834-1836).
-                        let prev = *i;
-                        sum_state.approx = true;
-                        kbn_init_from_int(acc, prev, &mut sum_state);
-                        apply_kbn_step(acc, f64::from(*f), &mut sum_state);
-                    }
-                    Value::Numeric(Numeric::Float(_)) => {
-                        // Already a floating-point total. A float input
-                        // clears any earlier integer-overflow flag: the
-                        // result is a float approximation regardless, so
-                        // there's nothing to report (func.c:1852).
-                        sum_state.approx = true;
-                        sum_state.ovrfl = false;
-                        apply_kbn_step(acc, f64::from(*f), &mut sum_state);
-                    }
-                    _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
-                },
-                Value::Text(t) => {
-                    let (parse_result, parsed_number) = try_for_float(t.as_str().as_bytes());
-                    handle_text_sum(acc, &mut sum_state, parsed_number, parse_result, false);
-                }
-                Value::Blob(b) => {
-                    let (parse_result, parsed_number) = try_for_float(b);
-                    handle_text_sum(acc, &mut sum_state, parsed_number, parse_result, true);
+                    sum_state.approx = true;
+                    apply_kbn_step(acc, r, &mut sum_state);
                 }
             }
             *r_err_val = Value::from_f64(sum_state.r_err);
@@ -17735,85 +17715,6 @@ pub fn op_if_neg(
     }
 
     Ok(InsnFunctionStepResult::Step)
-}
-
-fn handle_text_sum(
-    acc: &mut Value,
-    sum_state: &mut SumAggState,
-    parsed_number: ParsedNumber,
-    parse_result: NumericParseResult,
-    force_approx: bool,
-) {
-    // SQLite treats text that only partially parses as numeric (ValidPrefixOnly)
-    // as approximate, so SUM returns real instead of integer. Non-integer inputs
-    // (e.g. BLOB) should also force approximate results.
-    let is_approx = force_approx || matches!(parse_result, NumericParseResult::ValidPrefixOnly);
-    // A value that is no integer clears an earlier integer overflow, as in SQLite's sumStep:
-    // the floating-point total then stands, without the error.
-    if is_approx || !matches!(parsed_number, ParsedNumber::Integer(_)) {
-        sum_state.ovrfl = false;
-    }
-    match parsed_number {
-        ParsedNumber::Integer(i) => {
-            if is_approx {
-                sum_state.approx = true;
-                match acc {
-                    Value::Null => {
-                        *acc = Value::from_f64(i as f64);
-                    }
-                    Value::Numeric(Numeric::Integer(acc_i)) => {
-                        *acc = Value::from_f64(*acc_i as f64);
-                        apply_kbn_step_int(acc, i, sum_state);
-                    }
-                    Value::Numeric(Numeric::Float(_)) => {
-                        apply_kbn_step_int(acc, i, sum_state);
-                    }
-                    _ => unreachable!(),
-                }
-            } else {
-                match acc {
-                    Value::Null => {
-                        *acc = Value::from_i64(i);
-                    }
-                    Value::Numeric(Numeric::Integer(acc_i)) => match acc_i.checked_add(i) {
-                        Some(sum) => *acc = Value::from_i64(sum),
-                        None => {
-                            let acc_f = *acc_i as f64;
-                            *acc = Value::from_f64(acc_f);
-                            sum_state.approx = true;
-                            sum_state.ovrfl = true;
-                            apply_kbn_step_int(acc, i, sum_state);
-                        }
-                    },
-                    Value::Numeric(Numeric::Float(_)) => {
-                        apply_kbn_step_int(acc, i, sum_state);
-                    }
-                    _ => unreachable!(),
-                }
-            }
-        }
-        ParsedNumber::Float(f) => {
-            if !sum_state.approx {
-                if let Value::Numeric(Numeric::Integer(current_sum)) = *acc {
-                    *acc = Value::from_f64(current_sum as f64);
-                } else if matches!(*acc, Value::Null) {
-                    *acc = Value::from_f64(0.0);
-                }
-                sum_state.approx = true;
-            }
-            apply_kbn_step(acc, f, sum_state);
-        }
-        ParsedNumber::None => {
-            if !sum_state.approx {
-                if let Value::Numeric(Numeric::Integer(current_sum)) = *acc {
-                    *acc = Value::from_f64(current_sum as f64);
-                } else if matches!(*acc, Value::Null) {
-                    *acc = Value::from_f64(0.0);
-                }
-                sum_state.approx = true;
-            }
-        }
-    }
 }
 
 pub fn op_fk_counter(
