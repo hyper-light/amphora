@@ -2010,3 +2010,58 @@ fn a_multi_index_or_still_filters_a_globs_range() {
         assert_eq!(rows(&io, &conn, sql), [want], "{sql}");
     }
 }
+
+/// Do: compare a numeric column with text holding a NUL after a decimal number (`'1.5' || x'00'`)
+/// where the comparison's affinity is applied to a seek key or an IN subquery's probe (an index
+/// seek, a join's seek, a range scan, `x IN (SELECT n ...)`). Expect: SQLite's rows: SQLite 3.54
+/// reads the number before the NUL as the text's, here the REAL 1.5. A comparison answered so
+/// already (AR); the Affinity instruction, which seeks and probes take, converted only text whose
+/// number was a whole integer, leaving `'1.5\0'` text, so nothing numeric matched (findings
+/// diff-b72da64068c12b5e, diff-ecbb9d89531a62f7, diff-a51fd77b72b31d7a, norec-7490c5b68dd496e1,
+/// diff-66a81e6f5988230c and diff-ba2d9989f045f65f, step 5's first runs).
+#[test]
+fn a_seek_or_probe_reads_the_number_before_a_nul() {
+    for (tables, sql, want) in [
+        (
+            &["CREATE TABLE t0(c0 BOOLEAN PRIMARY KEY, c1 REAL)", "INSERT INTO t0 VALUES ('1.5', -9223372036854775808)"][..],
+            "SELECT 'a' FROM t0 AS a0 JOIN t0 AS a1 ON (a0.c0 IS NOT DISTINCT FROM (a1.c0 || x'00'))",
+            1,
+        ),
+        (
+            &["CREATE TABLE t0(c0 BOOLEAN PRIMARY KEY, c1 REAL)", "INSERT INTO t0 VALUES ('1.5', 0)"][..],
+            "SELECT c0 FROM t0 WHERE c0 = ('1.5' || x'00')",
+            1,
+        ),
+        (
+            &["CREATE TABLE t0(c0 DECIMAL(10,2) PRIMARY KEY)", "INSERT INTO t0 VALUES (0.5)", "CREATE TABLE t1(c0 VARCHAR(10), c1 INT, c2 BOOLEAN PRIMARY KEY NOT NULL)", "INSERT INTO t1 VALUES (1000000000000000.0, x'00', 'x')"][..],
+            "SELECT NULL FROM t1 AS a0 JOIN t0 AS a2 ON ((a2.c0 || a0.c1) IN (SELECT s96.c0 FROM t0 AS s96))",
+            1,
+        ),
+        (
+            &["CREATE TABLE t0(c0 VARCHAR(10), c1 NUMERIC COLLATE RTRIM, c2 NUMERIC)", "INSERT OR IGNORE INTO t0 VALUES (2.0, NULL, -2.5)", "CREATE TABLE t1(c0 DOUBLE PRIMARY KEY, c1 DOUBLE)", "INSERT OR IGNORE INTO t1 VALUES ('é', 1), (9223372036854775807, x'41')", "CREATE TABLE t2(c0 TEXT, c1 VARCHAR(10))", "INSERT INTO t2 VALUES (-2.5, x'00')"][..],
+            "SELECT 'true' FROM t1 AS a0 RIGHT JOIN t2 AS a1 ON ((a1.c0 || a1.c1) IN (SELECT s32.c2 FROM t0 AS s32))",
+            2,
+        ),
+        (
+            &["CREATE TABLE t0(c0 BOOLEAN, c1 NUMERIC COLLATE NOCASE PRIMARY KEY, c2 BOOLEAN)", "INSERT OR IGNORE INTO t0 VALUES ('-1', -2.5, x'00')"][..],
+            "SELECT 1 FROM t0 AS a0, t0 AS a1 WHERE (a1.c1 >= (a0.c1 || substr(a0.c2, x'')))",
+            1,
+        ),
+        (
+            &["CREATE TABLE t0(c0 DECIMAL(10,2) UNIQUE, c1 TEXT)", "INSERT INTO t0 VALUES (x'00', -9223372036854775808), (255, 9223372036854775807)", "INSERT OR IGNORE INTO t0 VALUES (0.5, '1e3')"][..],
+            "SELECT (a1.c1 COLLATE RTRIM) FROM t0 AS a0, t0 AS a1 JOIN t0 AS a2 ON ((a0.c0 || a2.c0) < a1.c0)",
+            11,
+        ),
+        (
+            &["CREATE TABLE t1(c0 REAL, c1 TEXT, c2 INT PRIMARY KEY)", "INSERT INTO t1 VALUES (x'00', x'0102', ' a')", "CREATE TABLE t2(c0 BOOLEAN COLLATE NOCASE, c1  COLLATE RTRIM, c2 BOOLEAN COLLATE BINARY, c3 DECIMAL(10,2))", "INSERT OR IGNORE INTO t2 VALUES (3.0, 1.5, 10, NULL), (-9223372036854775808, NULL, 1.5, 255)"][..],
+            "SELECT json_extract('\"x\"', '$[0]') FROM t2 AS a0, t2 AS a1 JOIN t1 AS a2 ON (a1.c0 <= (a0.c2 || a2.c0))",
+            3,
+        ),
+    ] {
+        let (io, conn) = open();
+        for table in tables {
+            conn.execute(table).unwrap();
+        }
+        assert_eq!(rows(&io, &conn, sql).len(), want, "{sql}");
+    }
+}
