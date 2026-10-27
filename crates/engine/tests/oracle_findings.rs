@@ -1905,3 +1905,37 @@ fn every_top_level_plan_shape_has_an_estimate() {
         assert_eq!(estimate(&io, &conn, sql), want, "{sql}");
     }
 }
+
+/// Do: concat_ws with BLOB separators (empty, a NUL, bytes), BLOB, empty and NULL arguments, and
+/// numbers. Expect: SQLite 3.54's text: the separator and each argument as text, a BLOB its bytes,
+/// every argument but a NULL one written, an empty one too, with the separator between; a NULL
+/// separator NULL (`concatFuncCore` and `concatwsFunc`, release 3.54.0's func.c). Amphora gave NULL
+/// for a BLOB separator and left BLOB arguments out (findings diff-218e78aa0f42cff2,
+/// diff-24fa95590277913e, diff-3b05e239bef86a20, diff-6337522718bb9cef, diff-86205179ecc78c03,
+/// diff-a0400a5512b948ae, diff-a128a508204fbdd4, diff-c448c8dc357e58ba, diff-e518f9fb47a71f6c and
+/// diff-f0b1746622d11f4b, step 5's first run once the oracles called concat_ws at an arity SQLite
+/// takes).
+#[test]
+fn concat_ws_writes_every_argument_but_null_a_blob_as_its_text() {
+    let (io, conn) = open();
+    for (sql, want) in [
+        (
+            "SELECT concat_ws(x'', 0, 3, 9007199254740993)",
+            "'039007199254740993'",
+        ),
+        ("SELECT concat_ws(x'0102', NULL)", "''"),
+        ("SELECT concat_ws(x'00', 1)", "'1'"),
+        ("SELECT concat_ws('1e3', x'c3bf')", "'ÿ'"),
+        ("SELECT concat_ws(0, 2, 100, x'c3bf')", "'201000ÿ'"),
+        ("SELECT concat_ws(',', 'a', '', NULL, x'', 'b')", "'a,,,b'"),
+        ("SELECT concat_ws(NULL, 'a')", "NULL"),
+        (
+            "SELECT concat_ws('-', 1.5, -2.0, 1e15)",
+            "'1.5--2.0-1000000000000000.0'",
+        ),
+        ("SELECT typeof(concat_ws(',', NULL, NULL))", "'text'"),
+        ("SELECT hex(concat_ws(x'00', 'a', 'b'))", "'610062'"),
+    ] {
+        assert_eq!(rows(&io, &conn, sql), [want], "{sql}");
+    }
+}

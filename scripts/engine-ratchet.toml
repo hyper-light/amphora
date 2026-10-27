@@ -5,7 +5,7 @@
 [left.x86_64-unknown-linux-gnu]
 "clippy::panic" = 201
 "clippy::unwrap_used" = 452
-"clippy::expect_used" = 874
+"clippy::expect_used" = 873
 "clippy::unreachable" = 469
 "clippy::todo" = 11
 "clippy::unimplemented" = 0

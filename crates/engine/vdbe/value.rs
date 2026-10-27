@@ -1509,25 +1509,23 @@ impl Value {
         Value::build_text(result)
     }
 
+    /// SQLite's `concatwsFunc` and `concatFuncCore` (func.c): the separator and each argument as
+    /// text, a BLOB its bytes; every argument but a NULL one written, an empty one too, with the
+    /// separator between; a NULL separator makes the result NULL.
     pub fn exec_concat_ws<'a, T: ExactSizeIterator<Item = &'a Self>>(mut registers: T) -> Self {
-        if registers.len() == 0 {
-            return Value::Null;
-        }
-
-        let separator = match registers
-            .next()
-            .expect("registers should have at least one element after length check")
-        {
-            Value::Null | Value::Blob(_) => return Value::Null,
-            v => format!("{v}"),
+        let separator = match registers.next() {
+            None | Some(Value::Null) => return Value::Null,
+            Some(separator) => separator.to_string(),
         };
-
-        let parts = registers.filter_map(|val| match val {
-            Value::Text(_) | Value::Numeric(_) => Some(format!("{val}")),
-            _ => None,
-        });
-
-        let result = parts.collect::<Vec<_>>().join(&separator);
+        let mut result = String::new();
+        let mut written = false;
+        for val in registers.filter(|val| !matches!(val, Value::Null)) {
+            if written {
+                result.push_str(&separator);
+            }
+            result.push_str(&val.to_string());
+            written = true;
+        }
         Value::build_text(result)
     }
 
