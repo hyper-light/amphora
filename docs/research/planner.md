@@ -6,7 +6,8 @@ Source notes for Amphora's planner (CLAUDE.md §5), from kiln research
 adaptive execution, and plan caching. For each, this note says what the papers found, what DuckDB,
 Umbra/CedarDB, PostgreSQL, SQL Server, CockroachDB, ClickHouse and Calcite do, and where Amphora
 stands. The planner's decisions are in `docs/design/planner.md`. This note is what they cite.
-Section 7 audits Amphora's planner against these sources, each gap shown on a release build.
+Section 7 audits Amphora's planner against these sources, each gap shown on a release build;
+section 8 is the baseline of its estimates against the rows counted on JOB and TPC-H.
 
 Every claim ends with its evidence in parentheses: the source, where in it, the words quoted, then
 the research finding (`f11` to `f43`) and the grade kiln gave it (A to F, from the sources' kinds,
@@ -433,7 +434,7 @@ JOINs in 11 queries and FULL JOINs in Q51 and Q97; SSB's at most 5; CH-benCHmark
 | 12 | a page-based cost model whose pages are rows over 50 | cost.rs 121-134, 187; cost_params.rs 107 | f9 A, f12 D | 09-cost-model |
 | 13 | no adaptive or robust execution | join.rs 70, 1024; statement.rs 1040 | f32 A, f33 A, f34 A, f11 A | 10-no-adaptive |
 | 14 | no upper bound on an estimate | join.rs 259-264; cost.rs 408-458 | f19 A, f40 C, f11 A | 04-statistics, 10-no-adaptive |
-| 15 | estimation error measured per operator, but no q-error or P-error baseline yet | statement.rs 495; connection.rs 3969 | f36 B, f20 A, f37 A | the `-- counted` lines of 04, 05, 06, 08, 10, 11 |
+| 15 | estimation error measured per operator; its q-error baseline over JOB and TPC-H is section 8's, P-error not yet measured | statement.rs 495; connection.rs 3969 | f36 B, f20 A, f37 A | the `-- counted` lines of 04, 05, 06, 08, 10, 11; section 8 |
 | 16 | the greedy search, and the planner around it, hold unwrap, expect and panics | join.rs 1967, 2020, 2114; panics.out | f10 A | panics.out, 01-left-deep-greedy |
 
 ### Row 1. Left-deep trees only
@@ -709,16 +710,17 @@ JOINs in 11 queries and FULL JOINs in Q51 and Q97; SSB's at most 5; CH-benCHmark
 - **Benchmarks touched.** JOB (multi-join underestimates, f11); TPC-H, TPC-DS and SSB's
   multi-predicate dimension filters.
 
-### Row 15. Estimation error: counted per operator, no baseline yet
+### Row 15. Estimation error: counted per operator, its baseline in section 8
 
 - **Amphora.** Since 016d245 a statement counts the rows at each table access and join when asked
   (statement.rs line 495: "pub fn row_counts(&self)"; connection.rs line 3969: "pub fn
-  set_row_counters"), closing what f36 found missing; q-error and P-error over JOB and TPC-H are
-  step 3's baseline, not yet recorded.
+  set_row_counters"), closing what f36 found missing. Step 3 recorded the q-error at every join
+  prefix of JOB and TPC-H (section 8); P-error is not measured yet.
 - **The leading engines and sources.** q-error bounds a plan's cost; P-error tracks end-to-end
   time better (f20, A); the workloads are at hand (f37, A).
 - **The gap.** Every `-- counted` line of the demonstrations is an estimate beside its count
-  (04, 05, 06, 08, 10, 11); the benchmark-wide distribution waits on step 3.
+  (04, 05, 06, 08, 10, 11), and section 8 has the benchmark-wide distribution; what it measures is
+  rows 5, 6, 8 and 14's error, and no plan's cost yet (P-error).
 - **Benchmarks touched.** JOB's 113 and TPC-H's 22 (step 3); the others once they are loaded.
 
 ### Row 16. Panicking calls in the greedy search and the planner
@@ -748,6 +750,98 @@ JOINs in 11 queries and FULL JOINs in Q51 and Q97; SSB's at most 5; CH-benCHmark
 - **The rules on how a change is built** (f10, A): no recursion, counted budgets; they bind rows
   1 to 3 and 10 (DPhyp and both unnesting papers are stated recursively).
 
+## 8. The baseline: Amphora's estimates against the rows counted, JOB and TPC-H
+
+Step 3's measurement (`bench/records/2026-10-26-jupiter-planner-baseline.md`, its records beside it;
+`bench/planner/README.md` says how it is made): amphora-bench in release from 26657fd, whose engine
+is section 7's (f734df4's `crates/`), on jupiter (AMD Ryzen AI Max+ 395, 32 threads, 123.6 GiB,
+NTFS, Windows 11 Pro 10.0.26200), 2026-10-26 and 27. Each benchmark was loaded after ANALYZE, and
+every query run three times on each engine and once more with Amphora's row counters, each run begun
+at a load under 2. Every one of JOB's 113 queries and TPC-H's 22, at scale factors 1 and 10, has
+Amphora's estimate and the rows it counted at every join prefix (977 prefixes on JOB, 94 at each
+scale factor of TPC-H, subqueries' plans included); none was refused, and every pass recorded the
+same estimates and counts.
+
+**q-error by the joins in the prefix** (max(est/act, act/est), both at least one row, Moerkotte et
+al.; nearest-rank percentiles; a prefix with n joins is the (n+1)th table of its plan's join order):
+
+| joins in the prefix | prefixes | median q-error | p90 | p95 | max |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 113 | 1 | 1.342e+04 | 1.342e+04 | 1.924e+04 |
+| 1 | 113 | 10.9 | 365 | 1.380e+04 | 1.866e+05 |
+| 2 | 113 | 37.9 | 3.45e+03 | 1.237e+05 | 5.031e+05 |
+| 3 | 113 | 1.07e+03 | 5.638e+05 | 7.855e+05 | 9.048e+06 |
+| 4 | 110 | 1.14e+03 | 2.684e+05 | 1.302e+06 | 7.797e+06 |
+| 5 | 90 | 4.69e+03 | 9.783e+05 | 4.961e+06 | 7.797e+06 |
+| 6 | 88 | 3.44e+03 | 2.216e+05 | 8.815e+05 | 2.833e+06 |
+| 7 | 72 | 2.97e+03 | 3.199e+05 | 8.372e+05 | 4.317e+06 |
+| 8 | 51 | 2.5e+03 | 5.328e+05 | 9.339e+05 | 4.112e+07 |
+| 9 | 37 | 1.56e+03 | 9.339e+05 | 1.268e+07 | 4.112e+07 |
+| 10 | 30 | 743 | 4.502e+04 | 5.895e+04 | 1.897e+05 |
+| 11 | 20 | 477 | 8.65e+03 | 1.146e+04 | 1.501e+04 |
+| 12 | 9 | 6.14e+03 | 1.151e+06 | 1.151e+06 | 1.151e+06 |
+| 13 | 9 | 1.62e+03 | 7.676e+05 | 7.676e+05 | 7.676e+05 |
+| 14 | 3 | 30 | 803 | 803 | 803 |
+| 15 | 3 | 4.89e+03 | 9.044e+04 | 9.044e+04 | 9.044e+04 |
+| 16 | 3 | 1.62e+03 | 2.240e+04 | 2.240e+04 | 2.240e+04 |
+| all | 977 | 273 | 1.651e+05 | 7.384e+05 | 4.112e+07 |
+
+| joins in the prefix | prefixes | SF 1 median | p90 | p95 | max | SF 10 median | p90 | p95 | max |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 41 | 9.4 | 2.5e+03 | 2.054e+04 | 4.991e+04 | 8.08 | 1e+04 | 1.999e+05 | 3.108e+05 |
+| 1 | 22 | 9.4 | 2.5e+03 | 3.099e+04 | 1.183e+05 | 19.1 | 1e+04 | 3.108e+05 | 1.187e+06 |
+| 2 | 12 | 15.3 | 2.5e+03 | 4.991e+04 | 4.991e+04 | 3.68 | 60.9 | 2.5e+03 | 2.5e+03 |
+| 3 | 8 | 60.6 | 4.991e+04 | 4.991e+04 | 4.991e+04 | 38.2 | 1e+03 | 1e+03 | 1e+03 |
+| 4 | 5 | 60.6 | 4.991e+04 | 4.991e+04 | 4.991e+04 | 60.9 | 121 | 121 | 121 |
+| 5 | 4 | 30.8 | 4.991e+04 | 4.991e+04 | 4.991e+04 | 8.08 | 1.52e+03 | 1.52e+03 | 1.52e+03 |
+| 6 | 1 | 6.94 | 6.94 | 6.94 | 6.94 | 8.08 | 8.08 | 8.08 | 8.08 |
+| 7 | 1 | 6.94 | 6.94 | 6.94 | 6.94 | 8.08 | 8.08 | 8.08 | 8.08 |
+| all | 94 | 18.8 | 2.004e+04 | 4.991e+04 | 1.183e+05 | 9.39 | 2.5e+03 | 1.999e+05 | 1.187e+06 |
+
+**The largest intermediate result** (each query's largest counted result, the one Han et al. find
+matters; f20):
+
+| benchmark | queries | median | p90 | p95 | max |
+|---|---:|---:|---:|---:|---:|
+| JOB | 113 | 322 | 2.833e+06 | 7.797e+06 | 4.112e+07 |
+| TPC-H SF 1 | 22 | 30.3 | 3.099e+04 | 4.991e+04 | 1.183e+05 |
+| TPC-H SF 10 | 22 | 7.65 | 1.999e+05 | 3.108e+05 | 1.187e+06 |
+
+**What it shows.** On one table JOB's estimates are mostly right (median 1), but 16 of the 113 are
+off by 13,417 or more, 15 of them an equality on `keyword.keyword`, which no index covers: row 5's
+fixed selectivity of 0.1 (cost_params.rs line 110) holds whatever ANALYZE found, and 1 row counted
+is estimated at 13,417, a tenth of keyword's 134,170. Each join then multiplies the error on (rows
+5, 6, 8 and 14): the median passes 1,000 by the third join, and down the long chains the estimate
+falls below one row while the counts grow, so the q-error there is the count itself (26c's ninth
+table: 3.4e-33 rows estimated, 41,119,579 counted). TPC-H's joins follow keys and its error stays
+nearer (median 18.8 over every prefix at SF 1, 9.39 at SF 10); its largest come from filters' fixed
+selectivities (at SF 10, q16's three filters on part leave 1.44 rows estimated against 296,824
+counted, and its join to partsupp 0.0576 against 1,186,602). Amphora's planning time is a median 1.9
+ms on JOB (92.1 ms at most, 27c's 12 tables) and 0.5 to 0.6 ms on TPC-H.
+
+**Run times** (best of 3; each engine's time over Amphora's, geometric mean over the queries both
+finished, under 1 when the engine was faster; and on how many it was the faster):
+
+| benchmark | SQLite | DuckDB, one thread | DuckDB, 32 threads | PostgreSQL |
+|---|---:|---:|---:|---:|
+| JOB (113) | 1.101, 63 faster | 1.013, 64 faster | 0.435, 75 faster | not run |
+| TPC-H SF 1 (22) | 1.417, 12 faster | 0.481, 16 faster | 0.126, 20 faster | 0.535, 19 faster |
+| TPC-H SF 10 (22) | 1.028 (20 of 22), 12 faster | 0.297, 14 faster | 0.032, 21 faster | 0.740 (5 of 22), 4 faster |
+
+The times are the passes timed by fresh processes on loaded data: the first passes, timed by the
+process that had just loaded them, ran slower (DuckDB on all 32 threads throughout, the others over
+JOB's first hour and a half), and `record.sh` now loads in a process of its own (c652376). SF 10 has
+only its first pass. PostgreSQL ran in Docker Desktop, which stopped during SF 10's q06 and could
+not be started again, so it has TPC-H SF 1 and SF 10's first five queries; SQLite passed the 600 s
+deadline on SF 10's q07 and q14. The record says what each left out and why.
+
+**The repeat** (the plan's test: two passes of one build on one machine, the same estimates and
+median run times within 5%): on TPC-H SF 1, passes b and c record the same estimates and counts (0
+of 135 counters differ), and the median run times of Amphora (1.017), DuckDB (1.001) and DuckDB on
+all 32 threads (1.038) are within 5%; SQLite's (0.937) is not, its median moved by one query whose
+runs began at loads of 1.87 to 1.89 in one pass and 0.39 to 0.65 in the other. JOB's pass c was
+running when this was written.
+
 ## What would falsify these notes
 
 - A finding's quote missing from its source at the stated location. Kiln re-checks each quote. The
@@ -762,3 +856,6 @@ JOINs in 11 queries and FULL JOINs in Q51 and Q97; SSB's at most 5; CH-benCHmark
   one kept, on f734df4; a file and line it cites at f734df4 not showing what its row says; or a
   benchmark query its rows name whose text lacks the shape named (`benchmarks.tsv` is a scan of
   the text, checked by hand where cited).
+- For the baseline (section 8): `bench/planner/summary.py` over its records giving other numbers
+  than the record's; a pass of `record.sh` on 26657fd recording another estimate at any prefix; or,
+  at a load under 2 on jupiter, run times outside the repeat's spread.
