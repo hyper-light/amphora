@@ -569,7 +569,11 @@ at load under 2 (`bench/records/2026-10-26-adas-mac-studio-2-joined-set-rows.md`
 statement and client pairs within 3% or faster by best of 4; the ten below run unchanged programs
 and lie within their own binary's spread there (`table_count` at 32 clients 1,691 to 28,585 a
 second across the before binary's four runs), and the point reads, alternated tightly, measure 0.984
-to 1.004 by median.
+to 1.004 by median. Measured again (the same record), each of the ten is within 3% too: eight in a
+run of the ten alone (best of 4), and `insert_batch_100` and `table_count` at 32 clients, whose
+ratio moves both ways from run to run (0.895 to 1.074 and 0.640 to 1.110 by best in four runs), in
+eight rounds of their own (1.074 and 1.110, medians 1.002 and 1.013); both compile to the same
+bytecode on either binary.
 
 **Falsified by.** Two orders or two access paths of one inner join whose estimates differ (the order
 check, run nightly); an outer join estimated below its inner join, or a semi or anti join above its
