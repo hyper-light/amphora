@@ -2300,3 +2300,33 @@ fn a_negative_zero_keeps_its_sign_through_abs_and_text_arithmetic() {
         ["0.0|-0.0", "-0.0|0.0"]
     );
 }
+
+/// Do: unicode() of BLOBs that aren't well-formed UTF-8: a continuation byte first (unhex() and
+/// JSONB headers make them), a lead byte followed by more continuation bytes than it calls for,
+/// overlong and surrogate forms, a NUL first; and of text and numbers. Expect: SQLite 3.54's
+/// integers: unicodeFunc reads the first character with sqlite3Utf8Read, which takes a byte below
+/// 0xC0 as its own value (0x90 is 144), lets a lead byte take in every continuation byte after it in
+/// a u32 that wraps (x'C3BFBFBFBFBF' is -1 as a C int) and gives U+FFFD only for a value below 0x80
+/// or a surrogate; an empty BLOB or one starting with a NUL is NULL. Amphora read the BLOB as lossy
+/// UTF-8 text and gave 65533 for every ill-formed start (findings diff-ec071f3026c035f9,
+/// diff-d94be5be23c74a1a, diff-fe8301cf10f64b0b and diff-7bf9cd99a17e6672).
+#[test]
+fn unicode_reads_a_blobs_first_character_as_sqlite_does() {
+    let (io, conn) = open();
+    assert_eq!(
+        rows(&io, &conn, "SELECT unicode(unhex('9007199254740993')), unicode(jsonb_set('1.0e+308')), unicode(jsonb_array(-1e-308))"),
+        ["144|133|171"]
+    );
+    assert_eq!(
+        rows(&io, &conn, "SELECT unicode(x'90'), unicode(x'C3BF'), unicode(x'C3BFBF'), unicode(x'C3BFBFBFBFBF'), unicode(x'F8BFBFBFBFBF'), unicode(x'FF'), unicode(x'C080'), unicode(x'EDA080'), unicode(x'E0828041'), unicode(x''), unicode(x'00'), unicode(x'0041'), unicode(x'41')"),
+        ["144|255|16383|-1|1073741823|65533|65533|65533|128|NULL|NULL|NULL|65"]
+    );
+    assert_eq!(
+        rows(
+            &io,
+            &conn,
+            "SELECT unicode('é'), unicode(char(65534)), unicode(12), unicode(-1.5)"
+        ),
+        ["233|65534|49|45"]
+    );
+}

@@ -797,21 +797,52 @@ impl Value {
         Ok(result)
     }
 
+    /// unicode(): the first character of the value's text as SQLite's unicodeFunc reads it with
+    /// sqlite3Utf8Read (func.c, utf.c), NULL for an empty value or one starting with a NUL. A BLOB's
+    /// bytes are read as they are: a byte below 0xC0 is its own value, a lead byte takes in every
+    /// continuation byte after it in a u32 that wraps, returned as a C int, and a value below 0x80
+    /// or a surrogate is U+FFFD. Text is well-formed UTF-8, so its first character reads as itself.
     pub fn exec_unicode(&self) -> Value {
-        match self {
-            Value::Text(_) | Value::Numeric(_) | Value::Blob(_) => {
-                let text = self.to_string();
-                if let Some(first_char) = text.chars().next() {
-                    if first_char == '\0' {
-                        return Value::Null;
-                    }
-                    Value::from_i64(first_char as u32 as i64)
-                } else {
-                    Value::Null
-                }
+        let number;
+        let bytes = match self {
+            Value::Null => return Value::Null,
+            Value::Text(text) => text.as_str().as_bytes(),
+            Value::Blob(blob) => blob.as_slice(),
+            Value::Numeric(_) => {
+                number = self.to_string();
+                number.as_bytes()
             }
-            _ => Value::Null,
+        };
+        let Some((&lead, rest)) = bytes.split_first() else {
+            return Value::Null;
+        };
+        if lead == 0 {
+            return Value::Null;
         }
+        if lead < 0xC0 {
+            return Value::from_i64(i64::from(lead));
+        }
+        // sqlite3Utf8Trans1: the bits a lead byte keeps.
+        let bits = match lead {
+            0xC0..=0xDF => lead & 0x1F,
+            0xE0..=0xEF => lead & 0x0F,
+            0xF0..=0xF7 => lead & 0x07,
+            0xF8..=0xFB => lead & 0x03,
+            0xFC..=0xFD => lead & 0x01,
+            _ => 0,
+        };
+        let c = rest
+            .iter()
+            .take_while(|byte| *byte & 0xC0 == 0x80)
+            .fold(u32::from(bits), |c, byte| {
+                c.wrapping_shl(6).wrapping_add(u32::from(byte & 0x3F))
+            });
+        let c = if c < 0x80 || c & 0xFFFF_F800 == 0xD800 {
+            0xFFFD
+        } else {
+            c
+        };
+        Value::from_i64(i64::from(c.cast_signed()))
     }
 
     pub fn exec_unistr(&self) -> Result<Value> {
