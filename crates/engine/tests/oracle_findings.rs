@@ -2356,3 +2356,30 @@ fn timediff_of_a_date_before_julian_day_zero_is_null() {
         ["'+0000-00-00 00:00:00.000'|'+14712-01-07 11:59:59.999'|'-4712-01-06 12:00:00.000'"]
     );
 }
+
+/// Do: atanh() of the REAL the finding multiplies out, `-1e-308 * '1.0e+308'` (-0.99999999999999989,
+/// the same double in both), of its opposite, and of opposite pairs. Expect: SQLite 3.54's answers,
+/// which are its C library's atanh: computed on |x| and given x's sign, so it is odd and keeps its
+/// digits near -1. Amphora used Rust's f64::atanh, ln_1p(2x / (1 - x)) / 2 of x signed, which near
+/// -1 rounds 2x / (1 - x) and lost half the digits: -18.36840028483855 where SQLite gives
+/// -18.714973875118524 (finding diff-827d8a2d59c98538); atanh(-0.75) wasn't -atanh(0.75) either.
+#[test]
+fn atanh_is_odd_and_keeps_its_digits_near_minus_one() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t1(c0 REAL COLLATE BINARY, c1 TEXT PRIMARY KEY, c2 )")
+        .unwrap();
+    conn.execute("INSERT INTO t1 VALUES (0.5, 1e308, ' ')")
+        .unwrap();
+    assert_eq!(
+        rows(
+            &io,
+            &conn,
+            "SELECT atanh((-1e-308 * a0.c1)), -1e-308 * a0.c1 FROM t1 AS a0"
+        ),
+        ["-18.714973875118524|-0.99999999999999989"]
+    );
+    assert_eq!(
+        rows(&io, &conn, "SELECT atanh(0.9999999999999999), atanh(-0.75) = -atanh(0.75), atanh(-0.5) = -atanh(0.5), atanh(-0.25) = -atanh(0.25), atanh(-1e-10) = -atanh(1e-10), atanh(2), atanh(-2)"),
+        ["18.714973875118524|1|1|1|1|NULL|NULL"]
+    );
+}

@@ -63,8 +63,12 @@ mod cmath {
     pub fn atan(x: f64) -> f64 {
         x.atan()
     }
+    // The libm crate's atanh (musl's, after fdlibm's) works on |x| and gives the result x's sign,
+    // as the C libraries SQLite calls do. std's is ln_1p(2x / (1 - x)) / 2 of x signed, which near
+    // -1 rounds 2x / (1 - x) to about -1 and loses half the digits: atanh(-0.9999999999999999)
+    // came out -18.368 where SQLite gives -18.714973875118524.
     pub fn atanh(x: f64) -> f64 {
-        x.atanh()
+        libm::atanh(x)
     }
     pub fn atan2(x: f64, y: f64) -> f64 {
         x.atan2(y)
