@@ -2468,3 +2468,72 @@ fn json_error_position_reports_a_signed_leading_zero_at_the_zero() {
         ["2|2|2|2|3|3|3|7|2|0|0|0"]
     );
 }
+
+/// Do: a WHERE ANDing a NULL test SQLite's parser folds to 0 (`1e308 ISNULL`) with
+/// likelihood(NULL, NULL), which SQLite refuses wherever it resolves it: the call under a COLLATE,
+/// under NOT, IS NULL, + 1, BETWEEN or IN over that COLLATE; and bare, under unary plus, inside
+/// abs() or LIKE, or with the COLLATE on the NULL test instead. Expect: SQLite 3.54's answers. Its
+/// parser makes such an AND the integer 0 unless a side carries EP_HasFunc (sqlite3ExprAnd,
+/// sqlite3.c line 113984), and a COLLATE node takes no flag from its operand
+/// (sqlite3ExprAddCollateToken, line 112995, sets only EP_Collate and EP_Skip): with the call under
+/// a COLLATE the AND folds and the call is never resolved, so the query runs; in the other forms the
+/// call shows, or the NULL test's 0 doesn't, and SQLite refuses it. Amphora looked through the
+/// COLLATE for a call, kept the AND, and refused the folded forms too (finding
+/// error-a2539ea61c26b70f, whose TLP partitions are the last query here).
+#[test]
+fn a_call_under_a_collate_folds_away_with_a_false_and() {
+    let (io, conn) = open();
+    let error = |sql: &str| match conn.prepare(sql).and_then(|mut stmt| loop {
+        match stmt.step()? {
+            StepResult::IO => io.step()?,
+            StepResult::Done => break Ok(()),
+            _ => {}
+        }
+    }) {
+        Ok(()) => "no error".to_owned(),
+        Err(e) => e.to_string(),
+    };
+    conn.execute(
+        "CREATE TABLE t1(c0 REAL PRIMARY KEY, c1 INT, c2 VARCHAR(10), c3 NUMERIC NOT NULL)",
+    )
+    .unwrap();
+    let call = "likelihood(NULL, NULL)";
+    for folded in [
+        format!("(1e308 ISNULL) AND ({call} COLLATE RTRIM)"),
+        format!("({call} COLLATE RTRIM) AND (1e308 ISNULL)"),
+        format!("(1e308 ISNULL) AND (NOT ({call} COLLATE RTRIM))"),
+        format!("(1e308 ISNULL) AND (({call} COLLATE RTRIM) ISNULL)"),
+        format!("(1e308 ISNULL) AND (({call} COLLATE RTRIM) + 1)"),
+        format!("(1e308 ISNULL) AND (({call} COLLATE RTRIM) BETWEEN 1 AND 2)"),
+        format!("(1e308 ISNULL) AND (({call} COLLATE RTRIM) IN (1, 2))"),
+        format!("(1e308 ISNULL) AND (CAST({call} AS INT) COLLATE RTRIM)"),
+    ] {
+        assert_eq!(
+            error(&format!("SELECT * FROM t1 WHERE {folded}")),
+            "no error",
+            "{folded}"
+        );
+    }
+    for refused in [
+        format!("(1e308 ISNULL) AND {call}"),
+        format!("(1e308 ISNULL) AND (+{call})"),
+        format!("(1e308 ISNULL) AND (abs({call} COLLATE RTRIM))"),
+        format!("(1e308 ISNULL) AND (({call} COLLATE RTRIM) LIKE 'a')"),
+        format!("(1e308 ISNULL) AND (({call} COLLATE RTRIM) IN (1, abs(2)))"),
+        format!("((1e308 ISNULL) COLLATE RTRIM) AND ({call} COLLATE RTRIM)"),
+    ] {
+        assert!(
+            error(&format!("SELECT * FROM t1 WHERE {refused}"))
+                .contains("second argument to likelihood() must be a constant"),
+            "{refused}"
+        );
+    }
+    assert_eq!(
+        rows(
+            &io,
+            &conn,
+            "SELECT min(m COLLATE BINARY) FROM (SELECT NULL AS m WHERE 0 UNION ALL SELECT min((NULL COLLATE BINARY)) FROM t1 AS a0 WHERE ((1e308 ISNULL) AND (likelihood(NULL, NULL) COLLATE RTRIM)) UNION ALL SELECT min((NULL COLLATE BINARY)) FROM t1 AS a0 WHERE ((1e308 ISNULL) AND (NOT (likelihood(NULL, NULL) COLLATE RTRIM))) UNION ALL SELECT min((NULL COLLATE BINARY)) FROM t1 AS a0 WHERE ((1e308 ISNULL) AND ((likelihood(NULL, NULL) COLLATE RTRIM) ISNULL)))"
+        ),
+        ["NULL"]
+    );
+}
