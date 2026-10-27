@@ -214,12 +214,14 @@ fn value_error(e: &str) -> bool {
     ["too big", "malformed JSON", "JSON path", "bad JSON path", "JSON cannot hold", "overflow", "Unexpected character", "must be TEXT", "number of arguments", "argument count", "must be between", "not an array element", "single character", "Unexpected end of input"].iter().any(|m| e.contains(m))
 }
 
-/// Whether SQLite raises an error evaluating one of `p`'s function calls on some row the call can
-/// read: the query's rows (`from`), or a subquery's beside its outer query's. Then an error Amphora
-/// meets evaluating `p` is a value's, met where SQLite's plan read the rows in another order or
-/// stopped sooner (an EXISTS at its first match, min() over an index at its first row: cause Q),
-/// not an error SQLite never raises. Flat, on a stack of its own.
-fn sqlite_errors_on_a_call(s: &mut Sqlite, from: &[synth::From], p: &E) -> bool {
+/// Whether SQLite meets an error `counts` evaluating one of `p`'s function calls on some row the
+/// call can read: the query's rows (`from`), or a subquery's beside its outer query's. An error
+/// SQLite raises there makes one Amphora meets evaluating `p` a value's, met where SQLite's plan
+/// read the rows in another order or stopped sooner (an EXISTS at its first match, min() over an
+/// index at its first row: cause Q), not an error SQLite never raises; text SQLite gives that isn't
+/// well-formed UTF-8 makes `p` one SQLite promises no answer for (cause AN). Flat, on a stack of
+/// its own.
+fn sqlite_call_meets(s: &mut Sqlite, from: &[synth::From], p: &E, counts: impl Fn(&str) -> bool) -> bool {
     // A subquery's expressions, each with the rows it reads: its own tables and its outer query's.
     fn subquery<'a>(todo: &mut Vec<(&'a E, Vec<synth::From>)>, q: &'a Sel, outer: &[synth::From]) {
         let mut inner = q.from.clone();
@@ -233,7 +235,7 @@ fn sqlite_errors_on_a_call(s: &mut Sqlite, from: &[synth::From], p: &E) -> bool 
         if let E::Fn(..) = e {
             let tables: Vec<String> = scope.iter().map(|f| format!("{} AS {}", f.table, f.alias)).collect();
             let sql = if tables.is_empty() { format!("SELECT {}", e.sql()) } else { format!("SELECT {} FROM {}", e.sql(), tables.join(", ")) };
-            if s.run(&sql).is_err() {
+            if s.run(&sql).is_err_and(|e| counts(&e)) {
                 return true;
             }
         }
@@ -247,6 +249,23 @@ fn sqlite_errors_on_a_call(s: &mut Sqlite, from: &[synth::From], p: &E) -> bool 
         }
     }
     false
+}
+
+/// Whether SQLite's own answers break the relation a TLP case holds Amphora to: `base`'s rows
+/// against the rows of `parts` together. TLP assumes a query is its partitions; where SQLite's
+/// answers aren't (a GROUP BY that keeps the integer 0 and the REAL 0.0 apart under a HAVING, one
+/// group without it), the relation isn't one this query keeps, and Amphora answering as SQLite does
+/// is no fault.
+fn relation_fails_on_sqlite(s: &mut Sqlite, base: &str, parts: &[String], loose: bool) -> bool {
+    let Ok(all) = s.run(base) else { return false };
+    let mut together = Vec::new();
+    for part in parts {
+        match s.run(part) {
+            Ok(rows) => together.extend(rows),
+            Err(_) => return false,
+        }
+    }
+    !same_rows_by(&all, &together, loose)
 }
 
 /// Whether a LIMIT still keeps certain rows: its query ordered by each column it returns (by
@@ -395,6 +414,8 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
             }
             if same_rows_by(&all, &union, loose(q)) {
                 Outcome::Pass { plan_changed: false }
+            } else if relation_fails_on_sqlite(s, &sqls[0], &sqls[1..], loose(q)) {
+                Outcome::Skip("the relation fails on SQLite too")
             } else {
                 wrong("the query's rows aren't its three partitions' (p, NOT p, p IS NULL)", &Ok(union), &Ok(all), sqls)
             }
@@ -421,6 +442,7 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
             match a.run(&union) {
                 Err(e) => derived(s, &union, "the partitions' UNION", &e, vec![base, union.clone()]),
                 Ok(rows) if same_rows_by(&all, &rows, true) => Outcome::Pass { plan_changed: false },
+                Ok(_) if relation_fails_on_sqlite(s, &base, std::slice::from_ref(&union), true) => Outcome::Skip("the relation fails on SQLite too"),
                 Ok(rows) => wrong("the query's rows aren't the UNION of its partitions'", &Ok(rows), &Ok(all), vec![base, union]),
             }
         }
@@ -456,6 +478,7 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
                 Ok(rows) if matches!(f, Agg::Sum) && rows.iter().flatten().any(|v| matches!(v, V::Real(_))) => Outcome::Skip("a REAL sum's partitions round apart from it"),
                 Err(e) => derived(s, &combined, "the partitions' aggregate", &e, vec![base, combined.clone()]),
                 Ok(rows) if same_rows_by(&all, &rows, true) => Outcome::Pass { plan_changed: false },
+                Ok(_) if relation_fails_on_sqlite(s, &base, std::slice::from_ref(&combined), true) => Outcome::Skip("the relation fails on SQLite too"),
                 Ok(rows) => wrong("the query's aggregate isn't its partitions' combined", &Ok(rows), &Ok(all), vec![base, combined]),
             }
         }
@@ -505,9 +528,10 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
                 _ => return Outcome::Skip("sqlite misses its own pivot"),
             }
             match a.run(&sql) {
-                Err(e) if value_error(&e) && sqlite_errors_on_a_call(s, &q.from, p) => Outcome::Skip("a derived query meets a value's error (evaluation order)"),
+                Err(e) if value_error(&e) && sqlite_call_meets(s, &q.from, p, |e| e != ILL_FORMED) => Outcome::Skip("a derived query meets a value's error (evaluation order)"),
                 Err(e) => error(format!("Amphora errors where SQLite finds the pivot: {e}"), &e, vec![eval, sql]),
                 Ok(rows) if has(&rows) => Outcome::Pass { plan_changed: false },
+                Ok(_) if sqlite_call_meets(s, &q.from, p, |e| e == ILL_FORMED) => Outcome::Skip("SQLite's answer holds ill-formed UTF-8 (garbage in, garbage out)"),
                 Ok(rows) => fail(Kind::Wrong, format!("the pivot (rowid {pivot}), whose predicate SQLite rectified to TRUE, is missing\n  Amphora: {}", show(&Ok(rows))), vec![eval, sql]),
             }
         }
