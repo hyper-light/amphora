@@ -145,3 +145,9 @@ bench on Windows and nothing else, on local branches `t1/rowcounts-before` and
 `t1/rowcounts-after-suite`, not for merge). A build's own runs there differed by a median of 15% and up
 to 19 times (`table_count` at 32 clients), so it can't tell 2%; it is kept as what was run, not as
 evidence. A turn lost when the runner's connection closed was run again as turn 3.
+
+## Measured again
+
+The 56 pairs outside 2% above, each statement alone in ABBA turns on jupiter, 2026-10-27:
+`2026-10-27-jupiter-row-counters-off-pairs.md` (35 of them within 2%; the 7 of the rest that are
+slower with the counters off within their builds' own run-to-run variation).
