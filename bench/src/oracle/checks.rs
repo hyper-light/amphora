@@ -285,15 +285,21 @@ fn relation_fails_on_sqlite(s: &mut Sqlite, base: &str, parts: &[String], loose:
 }
 
 /// Whether a LIMIT still keeps certain rows: its query ordered by each column it returns (by
-/// BINARY, then by storage class) as the generator made it, but for a literal, the same in every
+/// BINARY, then by storage class) as the generator made it, but for a constant, the same in every
 /// row. A cut that lets two rows tie leaves which of them the LIMIT keeps to the plan.
 fn limit_certain(q: &Sel) -> bool {
     let order: Vec<String> = q.order.iter().map(|(e, _)| e.sql()).collect();
     q.limit.is_none()
         || q.cols.iter().all(|c| {
-            matches!(c, E::Lit(_))
-                || (order.contains(&E::Collate(Box::new(c.clone()), "BINARY").sql()) && order.contains(&E::Fn("typeof".into(), vec![c.clone()]).sql()))
+            constant(c) || (order.contains(&E::Collate(Box::new(c.clone()), "BINARY").sql()) && order.contains(&E::Fn("typeof".into(), vec![c.clone()]).sql()))
         })
+}
+
+/// Whether `e` is the same in every row: it reads no column, no subquery and no aggregate.
+fn constant(e: &E) -> bool {
+    let mut reads = false;
+    e.walk(&mut |x| reads |= matches!(x, E::Col(..) | E::Exists(..) | E::Scalar(_) | E::InSel(..) | E::Agg(..)));
+    !reads
 }
 
 /// Whether a TLP aggregate case's columns are still the one aggregate its partitions combine to:
@@ -378,7 +384,8 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
     if !matches!(case, Case::Cert(..)) && c.parts_mut().0.iter().any(|q| !q.certain()) {
         return Outcome::Skip("a bare column: its row is any of its group's");
     }
-    if !matches!(case, Case::Cert(..)) && c.parts_mut().0.iter().any(|q| !limit_certain(q)) {
+    // (The case's own query: EET's equivalent form rewrites its columns, not its ORDER BY.)
+    if !matches!(case, Case::Cert(..)) && c.parts_mut().0.first().is_some_and(|q| !limit_certain(q)) {
         return Outcome::Skip("a LIMIT no longer keeps certain rows");
     }
     match case {
