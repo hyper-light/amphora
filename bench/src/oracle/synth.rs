@@ -633,12 +633,25 @@ pub fn inner_join(r: &mut Rng, schema: &Schema, funcs: &[Func]) -> Sel {
     Sel { distinct: false, cols, from, wh, group: vec![], having: None, order: vec![], limit: None }
 }
 
+/// Whether SQLite reads `e` as a result column's number in GROUP BY or ORDER BY: an integer
+/// literal, behind any COLLATE or unary + or - (resolveOrderGroupBy's sqlite3ExprIsInteger).
+fn column_number(e: &E) -> bool {
+    match e {
+        E::Lit(V::Int(_)) => true,
+        E::Un("+" | "-", a) | E::Collate(a, _) => column_number(a),
+        _ => false,
+    }
+}
+
 /// A query of any shape the generator makes: grouped and aggregated, ordered and limited.
 pub fn query(r: &mut Rng, schema: &Schema, funcs: &[Func]) -> Sel {
     let mut q = plain(r, schema, funcs);
     if r.chance(0.3) {
         let s = scope(schema, &q.from, funcs, true);
-        q.group = (0..1 + r.below(2)).map(|_| s.expr(r, 1)).collect();
+        // GROUP BY's terms read rows, not aggregates, and an integer there is a column's number
+        // to SQLite, so one is cast: the same value, read as a value
+        let rows = scope(schema, &q.from, funcs, false);
+        q.group = (0..1 + r.below(2)).map(|_| rows.expr(r, 1)).map(|e| if column_number(&e) { E::Cast(Box::new(e), "INTEGER") } else { e }).collect();
         q.cols = q.group.clone();
         q.cols.push(s.aggregate(r, 1));
         if r.chance(0.4) {
@@ -652,8 +665,10 @@ pub fn query(r: &mut Rng, schema: &Schema, funcs: &[Func]) -> Sel {
         // ordered by every column it returns, exactly (BINARY, then the storage class, since 'a'
         // and 'A' tie under NOCASE and 1 and 1.0 tie as numbers), so the rows a LIMIT keeps are
         // certain
+        // (an integer column, the same in every row, orders nothing, and SQLite would read it as
+        // a column's number)
         let desc = r.chance(0.5);
-        q.order = q.cols.iter().flat_map(|c| [(E::Collate(Box::new(c.clone()), "BINARY"), desc), (E::Fn("typeof".into(), vec![c.clone()]), desc)]).collect();
+        q.order = q.cols.iter().filter(|c| !column_number(c)).flat_map(|c| [(E::Collate(Box::new(c.clone()), "BINARY"), desc), (E::Fn("typeof".into(), vec![c.clone()]), desc)]).collect();
         q.limit = Some((r.below(5) as i64, r.below(3) as i64));
     }
     q
