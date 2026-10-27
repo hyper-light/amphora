@@ -239,6 +239,21 @@ fn sqlite_call_meets(s: &mut Sqlite, from: &[synth::From], p: &E, counts: impl F
                 return true;
             }
         }
+        // A subquery whole, its tables read in rowid order (NOT INDEXED): an error its rows' values
+        // raise in that order, which the plan's order skipped (an aggregate's overflow), counts too.
+        if matches!(e, E::Exists(..) | E::Scalar(_) | E::InSel(..)) {
+            let mut plain = e.clone();
+            if let E::Exists(q, _) | E::Scalar(q) | E::InSel(_, q, _) = &mut plain {
+                for f in q.from.iter_mut() {
+                    f.hint = Hint::NotIndexed;
+                }
+            }
+            let tables: Vec<String> = scope.iter().map(|f| format!("{} AS {}", f.table, f.alias)).collect();
+            let sql = if tables.is_empty() { format!("SELECT {}", plain.sql()) } else { format!("SELECT {} FROM {}", plain.sql(), tables.join(", ")) };
+            if s.run(&sql).is_err_and(|e| counts(&e)) {
+                return true;
+            }
+        }
         match e {
             E::Exists(q, _) | E::Scalar(q) => subquery(&mut todo, q, &scope),
             E::InSel(x, q, _) => {
@@ -251,11 +266,12 @@ fn sqlite_call_meets(s: &mut Sqlite, from: &[synth::From], p: &E, counts: impl F
     false
 }
 
-/// Whether SQLite's own answers break the relation a TLP case holds Amphora to: `base`'s rows
-/// against the rows of `parts` together. TLP assumes a query is its partitions; where SQLite's
-/// answers aren't (a GROUP BY that keeps the integer 0 and the REAL 0.0 apart under a HAVING, one
-/// group without it), the relation isn't one this query keeps, and Amphora answering as SQLite does
-/// is no fault.
+/// Whether SQLite's own answers break the relation a TLP, EET or DQP case holds Amphora to:
+/// `base`'s rows against the rows of `parts` together (a TLP query's partitions, an equivalent
+/// form, another plan). Where SQLite's answers don't keep it (a GROUP BY that keeps the integer 0
+/// and the REAL 0.0 apart under a HAVING and together without one; `- 0.0` against
+/// `-(CASE .. 0.0 END)`), the relation isn't one this query keeps, and Amphora answering as SQLite
+/// does is no fault.
 fn relation_fails_on_sqlite(s: &mut Sqlite, base: &str, parts: &[String], loose: bool) -> bool {
     let Ok(all) = s.run(base) else { return false };
     let mut together = Vec::new();
@@ -548,6 +564,7 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
                 Err(_) if matches!(v, Variant::IndexedBy(..)) => Outcome::Skip("the index can't serve the query"),
                 Err(e) => derived(s, &sql, "another plan", &e, vec![base, sql.clone()]),
                 Ok(rows) if same_rows_by(&rows, &want, loose(q)) => Outcome::Pass { plan_changed: before != after },
+                Ok(_) if relation_fails_on_sqlite(s, &base, std::slice::from_ref(&sql), loose(q)) => Outcome::Skip("the relation fails on SQLite too"),
                 Ok(rows) => wrong("another plan gives other rows", &Ok(rows), &Ok(want), vec![base, sql]),
             }
         }
@@ -557,6 +574,9 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
             match a.run(&ts) {
                 Err(e) => derived(s, &ts, "the equivalent form", &e, vec![qs.clone(), ts.clone()]),
                 Ok(got) if same_rows_by(&got, &want, loose(q)) => Outcome::Pass { plan_changed: false },
+                // SQLite's two forms apart as well: the transformation isn't equivalent for this query
+                // (`- 0.0` and `-(CASE .. 0.0 END)`, a negative zero and 0 - x)
+                Ok(_) if relation_fails_on_sqlite(s, &qs, std::slice::from_ref(&ts), loose(q)) => Outcome::Skip("the relation fails on SQLite too"),
                 Ok(got) => wrong("an equivalent form gives other rows", &Ok(got), &Ok(want), vec![qs, ts]),
             }
         }
