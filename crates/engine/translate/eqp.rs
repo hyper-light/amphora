@@ -947,11 +947,13 @@ pub fn program_plan_json(program: &Program) -> String {
         })
         .collect();
     top.str_array("result_columns", &column_names);
-    // The rows the join is estimated to give: the last access's in the join order, which the
-    // nodes' order (a hash join's build listed after its probe) does not tell. The top-level
-    // query's own, not an uncorrelated subquery's whose tables the program holds too (decision 13
-    // of docs/design/planner.md: `WHERE NULL AND (SELECT ...)` reported its subquery's rows).
-    if let Some(rows) = program.join_output_rows.or_else(|| {
+    // The rows the statement is estimated to return: a SELECT's join (the last access's in the
+    // join order, which the nodes' order, a hash join's build listed after its probe, does not
+    // tell) after grouping, aggregation and a literal LIMIT; a compound SELECT's arms combined.
+    // The top-level statement's own, not an uncorrelated subquery's whose tables the program
+    // holds too (decision 13 of docs/design/planner.md: `WHERE NULL AND (SELECT ...)` reported
+    // its subquery's rows).
+    if let Some(rows) = program.output_rows.or_else(|| {
         program
             .table_references
             .joined_tables()

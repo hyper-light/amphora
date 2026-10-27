@@ -8,6 +8,7 @@ use crate::translate::emitter::{
 };
 use crate::translate::eqp::{EqpCompoundOp, EqpDetail, EqpSortMethod};
 use crate::translate::expr::translate_expr;
+use crate::translate::optimizer::compound_output_rows;
 use crate::translate::order_by::{custom_type_comparator, sorter_insert};
 use crate::translate::plan::{CompoundOrderByKey, Plan, QueryDestination, SelectPlan};
 use crate::translate::result_row::emit_columns_to_destination;
@@ -200,6 +201,9 @@ pub fn emit_program_for_compound_select(
     else {
         unreachable!()
     };
+    // Its arms' estimates, read before emission takes the arms apart; set once they're emitted,
+    // after any subquery of theirs set its own.
+    let output_rows = compound_output_rows(left, right_most, limit_owned.as_deref());
 
     program.with_scoped_result_cols_start(|program| {
         emit_compound_select(
@@ -216,6 +220,7 @@ pub fn emit_program_for_compound_select(
         )
     })?;
     program.pop_current_parent_explain();
+    program.output_rows = output_rows;
 
     // Install the compound query's result columns. Emission of nested subqueries above may
     // have overwritten `program.result_columns` (each `emit_program_for_select` call sets

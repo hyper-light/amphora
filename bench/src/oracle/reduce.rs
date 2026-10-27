@@ -72,6 +72,23 @@ fn cuts(r: &Repro) -> Vec<Repro> {
             }
         }
     }
+    // a CERT compound's arms, each but the restricted one, with the operator before it (the first
+    // arm's after it), so long as the restricted arm is still no EXCEPT's right side
+    if let Case::Cert(q, _) = &r.case {
+        for j in (0..q.arms.len()).rev().filter(|&j| j != q.arm) {
+            let mut c = r.clone();
+            if let Case::Cert(q, _) = &mut c.case {
+                q.arms.remove(j);
+                q.ops.remove(j.saturating_sub(1));
+                if j < q.arm {
+                    q.arm -= 1;
+                }
+                if q.arm == 0 || q.ops[q.arm - 1] != "EXCEPT" {
+                    out.push(c);
+                }
+            }
+        }
+    }
     // clauses: the same cut to every query of the case (EET's two forms stay equivalent)
     let clause_cuts: Vec<Box<dyn Fn(&mut Sel) -> bool>> = vec![
         Box::new(|q: &mut Sel| q.wh.take().is_some()),

@@ -1178,34 +1178,14 @@ fn find_select_plan_form(
         let rows_before_limit =
             estimate_select_output_rows(plan, table_plan.join.output_cardinality, schema);
         let mut rows = rows_before_limit;
-        // Clamp to LIMIT when it's a literal non-negative number.
-        // Negative LIMIT means "no limit" in SQLite, so we skip those.
-        if let Some(limit) = &plan.limit {
-            if let Ok(value) = crate::util::parse_signed_number(limit) {
-                let limit_rows = match value {
-                    crate::types::Value::Numeric(Numeric::Integer(value)) if value >= 0 => {
-                        Some(value as f64)
-                    }
-                    crate::types::Value::Numeric(Numeric::Float(value)) => {
-                        let value: f64 = value.into();
-                        if value >= 0.0 {
-                            Some(value)
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                };
-                if let Some(limit_rows) = limit_rows {
-                    rows = rows.min(limit_rows);
-                    if rows_before_limit > 0.0 {
-                        // These call counts cover the full result. LIMIT only
-                        // needs the same share of those calls.
-                        let call_scale = (rows / rows_before_limit).min(1.0);
-                        for estimate in &mut subquery_calls {
-                            estimate.calls *= call_scale;
-                        }
-                    }
+        if let Some(limit_rows) = plan.limit.as_deref().and_then(literal_limit_rows) {
+            rows = rows.min(limit_rows);
+            if rows_before_limit > 0.0 {
+                // These call counts cover the full result. LIMIT only
+                // needs the same share of those calls.
+                let call_scale = (rows / rows_before_limit).min(1.0);
+                for estimate in &mut subquery_calls {
+                    estimate.calls *= call_scale;
                 }
             }
         }
@@ -2260,31 +2240,11 @@ fn base_row_estimate(
             Plan::CompoundSelect {
                 left, right_most, ..
             } => {
-                // Combine estimates from all branches according to set operation semantics.
-                // left = [(A, op1), (B, op2)], right_most = C
-                // represents: (A op1 B) op2 C
-                // We fold left-to-right: seed with A, then apply op_i with plan_{i+1}.
                 let fallback = *RowCountEstimate::hardcoded_fallback(params);
-                let est = |p: &SelectPlan| p.estimated_output_rows.unwrap_or(fallback);
-                let mut combined = left.first().map_or_else(
-                    || right_most.estimated_output_rows.unwrap_or(fallback),
-                    |(p, _)| est(p),
-                );
-                // The estimates to the right of each operator: left[1..].est, then right_most.est
-                let rhs_estimates = left
-                    .iter()
-                    .skip(1)
-                    .map(|(p, _)| est(p))
-                    .chain(std::iter::once(est(right_most)));
-                for ((_, op), rhs) in left.iter().zip(rhs_estimates) {
-                    combined = match op {
-                        ast::CompoundOperator::UnionAll | ast::CompoundOperator::Union => {
-                            combined + rhs
-                        }
-                        ast::CompoundOperator::Intersect => combined.min(rhs),
-                        ast::CompoundOperator::Except => combined,
-                    };
-                }
+                let combined = compound_arms_rows(left, right_most, |p| {
+                    Some(p.estimated_output_rows.unwrap_or(fallback))
+                })
+                .unwrap_or(fallback);
                 RowCountEstimate::AnalyzeStats(combined.max(1.0))
             }
             _ => RowCountEstimate::hardcoded_fallback(params),
@@ -2427,6 +2387,88 @@ fn estimate_select_output_rows(plan: &SelectPlan, input_rows: f64, schema: &Sche
         Some(rows * *base_row_estimate(schema, table, params))
     });
     rows_per_call.map_or(input_rows, |rows| input_rows.min(calls * rows))
+}
+
+/// The rows a LIMIT keeps when it is a literal number: a negative LIMIT is no limit in SQLite, and
+/// any other expression is known only as the statement runs.
+fn literal_limit_rows(limit: &Expr) -> Option<f64> {
+    match crate::util::parse_signed_number(limit).ok()? {
+        crate::types::Value::Numeric(Numeric::Integer(value)) if value >= 0 => Some(value as f64),
+        crate::types::Value::Numeric(Numeric::Float(value)) => {
+            let value: f64 = value.into();
+            if value >= 0.0 {
+                Some(value)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The rows a planned SELECT is estimated to return, as EXPLAIN QUERY PLAN FORMAT=JSON gives them
+/// (`output_rows`): a VALUES its rows; otherwise the optimizer's estimate, its join's rows after
+/// grouping and aggregation, cut to a literal LIMIT; a SELECT reading no table one row, or none
+/// when its WHERE is never true, cut to a literal LIMIT. None only for a plan the optimizer gave
+/// no estimate.
+pub(crate) fn select_output_rows(plan: &SelectPlan) -> Option<f64> {
+    if !plan.values.is_empty() {
+        return Some(plan.values.len() as f64);
+    }
+    if let Some(rows) = plan.estimated_output_rows {
+        return Some(rows);
+    }
+    if !plan.table_references.joined_tables().is_empty() {
+        return None;
+    }
+    let rows: f64 = if plan.contains_constant_false_condition {
+        0.0
+    } else {
+        1.0
+    };
+    Some(match plan.limit.as_deref().and_then(literal_limit_rows) {
+        Some(limit) => rows.min(limit),
+        None => rows,
+    })
+}
+
+/// A compound SELECT's rows from its arms' (`left`, then `right_most`), folded left to right as
+/// `(A op1 B) op2 C` reads: UNION ALL and UNION add the next arm's, INTERSECT keeps the smaller,
+/// EXCEPT keeps its left side's. Each grows or stays as an arm's rows grow, but for EXCEPT's right
+/// arm, which it never reads. None when an arm has no estimate.
+pub(crate) fn compound_arms_rows(
+    left: &[(SelectPlan, ast::CompoundOperator)],
+    right_most: &SelectPlan,
+    rows: impl Fn(&SelectPlan) -> Option<f64>,
+) -> Option<f64> {
+    let mut arms = left
+        .iter()
+        .map(|(plan, _)| plan)
+        .chain(std::iter::once(right_most));
+    let mut combined = rows(arms.next()?)?;
+    for ((_, op), arm) in left.iter().zip(arms) {
+        let arm = rows(arm)?;
+        combined = match op {
+            ast::CompoundOperator::UnionAll | ast::CompoundOperator::Union => combined + arm,
+            ast::CompoundOperator::Intersect => combined.min(arm),
+            ast::CompoundOperator::Except => combined,
+        };
+    }
+    Some(combined)
+}
+
+/// The rows a compound SELECT is estimated to return (`output_rows`): its arms'
+/// ([select_output_rows]) combined ([compound_arms_rows]), cut to a literal LIMIT.
+pub(crate) fn compound_output_rows(
+    left: &[(SelectPlan, ast::CompoundOperator)],
+    right_most: &SelectPlan,
+    limit: Option<&Expr>,
+) -> Option<f64> {
+    let rows = compound_arms_rows(left, right_most, select_output_rows)?;
+    Some(match limit.and_then(literal_limit_rows) {
+        Some(limit) => rows.min(limit),
+        None => rows,
+    })
 }
 
 /// Returns true if a WHERE-term predicate is null-rejecting for a table: the

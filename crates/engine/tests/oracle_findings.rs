@@ -1734,3 +1734,174 @@ fn a_correlated_subquery_no_row_reads_never_runs() {
         );
     }
 }
+
+/// Do: estimate a FULL JOIN filtered on its right table's column, then the same with a conjunct on
+/// its left table's, which makes it an inner join. Expect: no more rows estimated for the inner
+/// join (CERT; finding cert-70d3e0baf8df5914 in the second campaign, cause AG: 320,000 rows against
+/// the FULL JOIN's 10,000, as the FULL JOIN's estimate came from its access path and left out the
+/// rows its inner join counted).
+#[test]
+fn a_full_join_is_estimated_at_least_its_inner_join() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t0(c0 REAL PRIMARY KEY NOT NULL)")
+        .unwrap();
+    conn.execute("CREATE TABLE t1(c0 VARCHAR(10), c1 TEXT PRIMARY KEY)")
+        .unwrap();
+    let from = "SELECT NULL FROM t1 AS a0 FULL JOIN t0 AS a1 ON ((a1.c0 > 1000000000000000.0) AND (a0.c1 >= a1.c0)) WHERE ";
+    let term = "(a1.c0 IN (NULL, 1.5))";
+    let base = estimate(&io, &conn, &format!("{from}{term}"));
+    let more = estimate(&io, &conn, &format!("{from}({term} AND a0.c1)"));
+    assert!(
+        no_more(more, base),
+        "{more} rows estimated for the more restrictive query, {base} for the query"
+    );
+}
+
+/// Do: estimate a join whose WHERE bounds a column by a value of its own table and one of the other
+/// table's, then the same with a conjunct that is always true (`1 NOTNULL OR ...`), which moves the
+/// join's order. Expect: no more rows estimated (CERT; finding cert-bae9c4dcf94932e8 in the second
+/// campaign, cause AG: 6.4e10 rows against 2e9, as an index seek's estimate counted the two bounds
+/// as one closed range in one order and two filters counted them apart in the other).
+#[test]
+fn an_always_true_conjunct_raises_no_estimate() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t0(c0 TEXT PRIMARY KEY, c1 INTEGER UNIQUE)")
+        .unwrap();
+    let from = "SELECT ((x'41' = 9007199254740993) AND (a1.c1 NOT BETWEEN 'x' AND a0.c1)) FROM t0 AS a0, t0 AS a1 WHERE ";
+    let term = "(a0.c0 BETWEEN (a0.c1 >= a0.c1) AND ('1.5' IS DISTINCT FROM a1.c1))";
+    let base = estimate(&io, &conn, &format!("{from}{term}"));
+    let more = estimate(
+        &io,
+        &conn,
+        &format!("{from}({term} AND ((1 NOTNULL) OR (a1.c1 BETWEEN -1 AND -2.5)))"),
+    );
+    assert!(
+        no_more(more, base),
+        "{more} rows estimated for the more restrictive query, {base} for the query"
+    );
+}
+
+/// Do: estimate a LEFT JOIN whose WHERE, or a later join's ON, tests a column of its right table
+/// that no row of it holds NULL in (a NOT NULL column, an INTEGER PRIMARY KEY) with IS NULL, written
+/// each way SQLite reads it (`NULL IS c`, `c IS NOT DISTINCT FROM NULL`), then the same with the
+/// join made inner, by INNER JOIN or by a conjunct that rejects the rows it null-extends. Expect: no
+/// more rows estimated for the inner join. The term is true only of a row the LEFT JOIN
+/// null-extended, so the LEFT JOIN keeps about none and a table no join null-extends keeps none
+/// (CERT; findings cert-e21949a38a9b16d7, cert-2732f12b21087328, cert-2c3a9d2455aef93d and
+/// cert-d03ea211f1fab06d on step 4's d762dc2, cause AG: 1e10 to 1e17 rows against 0, the term
+/// counted on the inner table as IS NULL's tenth of its rows).
+#[test]
+fn an_is_null_of_a_column_never_null_keeps_no_inner_row() {
+    for (tables, base, more) in [
+        (
+            &["CREATE TABLE t0(c0 BLOB PRIMARY KEY)", "CREATE TABLE t2(c0 BOOLEAN, c1 DOUBLE PRIMARY KEY NOT NULL, c2 TEXT NOT NULL)"][..],
+            "SELECT NULL FROM t0 AS a0 LEFT JOIN t2 AS a1 ON 255 WHERE (NULL IS a1.c1)",
+            "SELECT NULL FROM t0 AS a0 JOIN t2 AS a1 ON 255 WHERE (NULL IS a1.c1)",
+        ),
+        (
+            &["CREATE TABLE t0(c0 INT, c1 BLOB NOT NULL, c2 DOUBLE COLLATE BINARY PRIMARY KEY NOT NULL)"][..],
+            "SELECT x'00' FROM t0 AS a0 LEFT JOIN t0 AS a1 ON '[1,2,3]' WHERE (a1.c2 IS NOT DISTINCT FROM NULL)",
+            "SELECT x'00' FROM t0 AS a0 LEFT JOIN t0 AS a1 ON '[1,2,3]' WHERE ((a1.c2 IS NOT DISTINCT FROM NULL) AND a1.c2)",
+        ),
+        (
+            &["CREATE TABLE t0(c0 DOUBLE PRIMARY KEY)", "CREATE TABLE t1(c0 REAL, c1 INTEGER PRIMARY KEY, c2 VARCHAR(10))"][..],
+            "SELECT NULL FROM t0 AS a0 LEFT JOIN t1 AS a1 ON 1 JOIN t1 AS a2 ON (NULL IS NOT DISTINCT FROM a1.c1)",
+            "SELECT NULL FROM t0 AS a0 JOIN t1 AS a1 ON 1 JOIN t1 AS a2 ON (NULL IS NOT DISTINCT FROM a1.c1)",
+        ),
+        (
+            &["CREATE TABLE t1(c0 TEXT, c1  COLLATE NOCASE PRIMARY KEY NOT NULL, c2  COLLATE BINARY)", "CREATE TABLE t2(c0 BLOB NOT NULL, c1 INT PRIMARY KEY, c2 REAL COLLATE RTRIM, c3 BOOLEAN)"][..],
+            "SELECT (a0.c3 <= a0.c3) FROM t2 AS a0 LEFT JOIN t1 AS a1 ON ((a1.c1 NOT GLOB 'abc') OR (a0.c3 AND (100 NOTNULL))), t2 AS a2 WHERE (((NULL IS NOT DISTINCT FROM a1.c1) AND (-9223372036854775808 = a0.c3)) AND (a2.c1 == 1000000000000000.0))",
+            "SELECT (a0.c3 <= a0.c3) FROM t2 AS a0 JOIN t1 AS a1 ON ((a1.c1 NOT GLOB 'abc') OR (a0.c3 AND (100 NOTNULL))), t2 AS a2 WHERE (((NULL IS NOT DISTINCT FROM a1.c1) AND (-9223372036854775808 = a0.c3)) AND (a2.c1 == 1000000000000000.0))",
+        ),
+    ] {
+        let (io, conn) = open();
+        for table in tables {
+            conn.execute(table).unwrap();
+        }
+        let (b, m) = (estimate(&io, &conn, base), estimate(&io, &conn, more));
+        assert!(
+            no_more(m, b),
+            "{m} rows estimated for the more restrictive query, {b} for the query: {more}"
+        );
+    }
+}
+
+/// Do: EXPLAIN QUERY PLAN FORMAT=JSON a query of every top-level shape: a table read, a join,
+/// grouped, aggregated, DISTINCT, cut by LIMIT, VALUES, a SELECT of no table, a compound select of
+/// each operator (of VALUES and of tables, with a LIMIT of its own), a FROM-clause subquery and a
+/// CTE. Expect: `output_rows` for each, the rows the statement returns: VALUES its rows, a SELECT
+/// of no table one (none under a WHERE never true or LIMIT 0), an aggregate without GROUP BY one,
+/// a literal LIMIT at most its rows, UNION ALL and UNION its arms' sum, INTERSECT the smaller arm,
+/// EXCEPT its left arm; so CERT has an estimate for every query it checks (campaign 2 skipped 2,049
+/// of its checks as "no estimate", every one a query Amphora refused, not one planned without an
+/// estimate; bench/oracles/findings.md, cause AG).
+#[test]
+fn every_top_level_plan_shape_has_an_estimate() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE u(c, d)").unwrap();
+    let table = estimate(&io, &conn, "SELECT * FROM t");
+    assert!(table >= 1.0, "a table read: {table}");
+    for (sql, want) in [
+        ("SELECT count(*) FROM t", Some(1.0)),
+        (
+            "SELECT count(*) FROM t JOIN u ON t.b = u.c WHERE u.d > 3",
+            Some(1.0),
+        ),
+        ("SELECT * FROM t LIMIT 5", Some(5.0)),
+        (
+            "SELECT * FROM t JOIN u ON t.b = u.c LIMIT 7 OFFSET 2",
+            Some(7.0),
+        ),
+        ("SELECT * FROM t LIMIT 0", Some(0.0)),
+        ("VALUES (1), (2), (3)", Some(3.0)),
+        ("SELECT 1", Some(1.0)),
+        ("SELECT 1 WHERE 0", Some(0.0)),
+        ("SELECT 1 LIMIT 0", Some(0.0)),
+        ("SELECT 1 UNION ALL VALUES (2), (3)", Some(3.0)),
+        ("VALUES (1), (2), (3) UNION VALUES (4)", Some(4.0)),
+        ("VALUES (1), (2), (3) INTERSECT VALUES (1)", Some(1.0)),
+        ("VALUES (1), (2), (3) EXCEPT VALUES (1)", Some(3.0)),
+        (
+            "VALUES (1), (2), (3) EXCEPT VALUES (1) UNION ALL SELECT 4",
+            Some(4.0),
+        ),
+        ("SELECT a FROM t UNION SELECT c FROM u LIMIT 9", Some(9.0)),
+        ("SELECT * FROM (SELECT * FROM t LIMIT 4)", Some(4.0)),
+        (
+            "WITH c AS (SELECT * FROM t LIMIT 4) SELECT * FROM c",
+            Some(4.0),
+        ),
+        ("SELECT b, count(*) FROM t GROUP BY b", None),
+        ("SELECT DISTINCT b FROM t", None),
+        ("SELECT * FROM t JOIN u ON t.b = u.c", None),
+        ("SELECT a FROM t UNION ALL SELECT c FROM u", None),
+        ("SELECT a FROM t INTERSECT SELECT c FROM u", None),
+        ("SELECT a FROM t EXCEPT SELECT c FROM u", None),
+        ("SELECT * FROM t WHERE a IN (SELECT c FROM u)", None),
+        (
+            "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.c = t.b)",
+            None,
+        ),
+    ] {
+        let got = estimate(&io, &conn, sql);
+        match want {
+            Some(want) => assert_eq!(got, want, "{sql}"),
+            None => assert!(got >= 0.0, "{sql}: {got}"),
+        }
+    }
+    // A compound's arms combine as their operator reads them.
+    let (a, c) = (
+        estimate(&io, &conn, "SELECT a FROM t"),
+        estimate(&io, &conn, "SELECT c FROM u"),
+    );
+    for (sql, want) in [
+        ("SELECT a FROM t UNION ALL SELECT c FROM u", a + c),
+        ("SELECT a FROM t UNION SELECT c FROM u", a + c),
+        ("SELECT a FROM t INTERSECT SELECT c FROM u", a.min(c)),
+        ("SELECT a FROM t EXCEPT SELECT c FROM u", a),
+    ] {
+        assert_eq!(estimate(&io, &conn, sql), want, "{sql}");
+    }
+}

@@ -507,12 +507,24 @@ row for each binding of them, as the correlated form it replaced does.
 A term no row passes leaves none: a NULL, one that settles to false as SQLite settles an AND or OR
 of literals (`simplified_and_or`, `literal_truth`), a comparison with a NULL literal by `=`, `<>`,
 `<`, `<=`, `>` or `>=`, or an AND with such a side. In WHERE it leaves no rows in any set; in a
-join's ON it makes that join's right table match nothing. A plan made impossible by a
-constant-false WHERE estimates each table access at 0 rows, and EXPLAIN QUERY PLAN FORMAT=JSON's
-`output_rows` is the top-level query's join, not an uncorrelated subquery's whose tables the program
-holds too (`ProgramBuilder::join_output_rows`). An ON term's BETWEEN is rewritten to its two
-comparisons as a WHERE term's is (`planner.rs`, `split_rewritten_ands`). Loops run over a set's
-tables and its RIGHT or FULL JOINs, bounded by the mask; nothing recurses.
+join's ON it makes that join's right table match nothing. So does `c IS NULL`, however written
+(`NULL IS c`, `c IS NOT DISTINCT FROM NULL`), of a column no row of its table holds NULL in (the
+rowid, a NOT NULL column), which is true only of a row a join null-extended: on a LEFT JOIN's right
+table it keeps the left rows that matched nothing; on a table no join null-extends (not a LEFT or
+FULL JOIN's right table, nor before a RIGHT or FULL JOIN) it keeps none; as an ON term of the
+table's own outer join it matches none. A plan made impossible by a constant-false WHERE estimates
+each table access at 0 rows.
+
+EXPLAIN QUERY PLAN FORMAT=JSON's `output_rows` is the rows the top-level statement is estimated to
+return (`ProgramBuilder::output_rows`), never an uncorrelated subquery's whose tables the program
+holds too: a SELECT's join after grouping and aggregation, cut to a literal LIMIT
+(`estimated_output_rows`); VALUES its rows; a SELECT of no table one row, none under a WHERE never
+true; a compound SELECT its arms', UNION ALL and UNION adding, INTERSECT taking the smaller, EXCEPT
+its left arm's, cut to a literal LIMIT (`optimizer::select_output_rows`, `compound_output_rows`, the
+same fold a FROM-clause subquery's rows take). Each grows or stays as its join's rows grow, so a
+more restrictive query is never estimated at more rows for its shape alone. An ON term's BETWEEN is
+rewritten to its two comparisons as a WHERE term's is (`planner.rs`, `split_rewritten_ands`). Loops
+run over a set's tables and its RIGHT or FULL JOINs, bounded by the mask; nothing recurses.
 
 **Why.** The estimate was the chosen access path's: rows per outer row from the seek or scan
 picked, times the filters it didn't consume, with each term's share moved around by the order its
@@ -543,7 +555,12 @@ USING filtering clauses have been applied, an extra row is added to the output f
 the original left-hand input dataset that does not match any row in the right-hand dataset"; a
 RIGHT JOIN does the same for the right side's rows and a FULL JOIN for both. The order check
 follows CERT's idea (Ba and Rigger, ICSE 2024, f21): a property of the estimator two forms of one
-query must share, checked without knowing true sizes.
+query must share, checked without knowing true sizes. An IS NULL of a never-NULL column is SQLite's
+"NOT NULL strength reduction optimization" (`resolveExprStep`, release 3.54.0's `sqlite3.c` as
+`bench/oracles/sqlite.sh` downloads it, lines 111487 to 111490: `"expr IS NULL" --> "FALSE"` "if we can
+prove that "expr" is never NULL", in a WHERE clause), whose proof `sqlite3ExprCanBeNull` (line 115849) takes
+from a column's `notNull` and the `EP_CanBeNull` mark a column of an outer join's right side carries;
+its WHERE loop builder likewise ignores "IS [NOT] NULL constraints on NOT NULL columns" (line 172939).
 
 **Evidence.** `crates/engine/tests/planner.rs`: `every_order_of_an_inner_join_gets_one_estimate`
 (random inner joins of two to six tables, filters and join terms, with statistics and without, each

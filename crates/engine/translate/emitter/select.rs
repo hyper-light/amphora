@@ -12,7 +12,10 @@ use crate::{
         },
         group_by::{group_by_agg_phase, group_by_emit_row_phase, EmitGroupBy, GroupByRowSource},
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
-        optimizer::{constraints::partial_index, mark_partial_index_predicate_terms_consumed},
+        optimizer::{
+            constraints::partial_index, mark_partial_index_predicate_terms_consumed,
+            select_output_rows,
+        },
         order_by::EmitOrderBy,
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember,
@@ -72,14 +75,15 @@ fn emit_program_for_select_with_inputs(
         emit_query(program, &mut plan, &mut t_ctx)
     })?;
 
+    program.output_rows = select_output_rows(&plan).or_else(|| {
+        plan.table_references
+            .joined_tables()
+            .iter()
+            .filter_map(|table| table.plan_estimate.as_ref())
+            .max_by_key(|estimate| estimate.position)
+            .map(|estimate| estimate.output_rows)
+    });
     program.result_columns = plan.result_columns;
-    program.join_output_rows = plan
-        .table_references
-        .joined_tables()
-        .iter()
-        .filter_map(|table| table.plan_estimate.as_ref())
-        .max_by_key(|estimate| estimate.position)
-        .map(|estimate| estimate.output_rows);
     program.table_references.extend(plan.table_references);
     program.reg_result_cols_start = Some(result_cols_start);
     Ok(())

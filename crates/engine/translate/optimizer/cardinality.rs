@@ -53,6 +53,8 @@ enum Class {
     /// `col IS NULL` on a LEFT JOIN's right table, of a column never NULL in a row of it: it keeps
     /// only the left rows that matched nothing.
     Unmatched,
+    /// The same test on a table no join null-extends: no row passes it. A filter, of no rows.
+    Never,
 }
 
 struct Table {
@@ -119,6 +121,17 @@ impl<'a> JoinedSetRows<'a> {
                 .get(table_idx)
                 .copied()
                 .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
+            // A LEFT or FULL JOIN null-extends its right table, and a RIGHT or FULL JOIN every
+            // table before it.
+            let null_extended = matches!(kind, Kind::Left | Kind::Full)
+                || joined_tables.iter().skip(table_idx).skip(1).any(|later| {
+                    matches!(
+                        later.join_info.as_ref().map(|info| info.join_type),
+                        Some(JoinType::RightOuter | JoinType::FullOuter)
+                    )
+                });
+            // An ON term of the table's own outer join that no row of it passes.
+            let mut on_never_true = false;
             let mut counted = SmallVec::new();
             let table_constraints = constraints
                 .get(table_idx)
@@ -151,25 +164,30 @@ impl<'a> JoinedSetRows<'a> {
                     continue;
                 }
                 let class = if term.origin.is_outer_join() {
-                    // Constraints from an outer join's ON terms exist only on its right table.
+                    // Constraints from an outer join's ON terms exist only on its right table,
+                    // whose rows the ON terms see before any is null-extended.
+                    on_never_true |= null_test_of_never_null(constraint, where_clause, joined);
                     Class::On
                 } else if homes(constraint.where_clause_pos.0) != Some(table_idx) {
                     continue;
-                } else if kind == Kind::Left
-                    && selects_unmatched_rows(constraint, term, where_clause, joined)
-                {
-                    Class::Unmatched
-                } else {
+                } else if !null_test_of_never_null(constraint, where_clause, joined) {
                     Class::Filter
+                } else if kind == Kind::Left {
+                    Class::Unmatched
+                } else if null_extended {
+                    Class::Filter
+                } else {
+                    Class::Never
                 };
                 counted.push((constraint_idx, class));
             }
-            let matches_none = where_clause.iter().any(|term| {
-                term.origin
-                    .join_origin()
-                    .is_some_and(|origin| origin.right_table() == joined.internal_id)
-                    && never_true(&term.expr)
-            });
+            let matches_none = on_never_true
+                || where_clause.iter().any(|term| {
+                    term.origin
+                        .join_origin()
+                        .is_some_and(|origin| origin.right_table() == joined.internal_id)
+                        && never_true(&term.expr)
+                });
             tables.push(Table {
                 kind,
                 rows: *rows,
@@ -229,17 +247,29 @@ impl<'a> JoinedSetRows<'a> {
         if classes.contains(&Class::On) && t.matches_none {
             return 0.0;
         }
+        let ready_in = |constraint: &Constraint| {
+            constraint
+                .lhs_mask
+                .iter()
+                .all(|other| other == table || ready.get(other))
+        };
+        if classes.contains(&Class::Filter)
+            && t.counted.iter().any(|(idx, c)| {
+                *c == Class::Never
+                    && table_constraints
+                        .constraints
+                        .get(*idx)
+                        .is_some_and(ready_in)
+            })
+        {
+            return 0.0;
+        }
         let counted = t
             .counted
             .iter()
             .filter(|(_, c)| classes.contains(c))
             .filter_map(|(idx, _)| table_constraints.constraints.get(*idx))
-            .filter(|constraint| {
-                constraint
-                    .lhs_mask
-                    .iter()
-                    .all(|other| other == table || ready.get(other))
-            });
+            .filter(|constraint| ready_in(constraint));
         let reads_a_table = |c: &&Constraint| !c.lhs_mask.is_empty();
         let alone: f64 = counted
             .clone()
@@ -394,17 +424,15 @@ impl<'a> JoinedSetRows<'a> {
     }
 }
 
-/// `col IS NULL` on a LEFT JOIN's right table, where `col` is never NULL in a row of it (the rowid
-/// or a NOT NULL column): it holds only in the rows the join null-extended.
-fn selects_unmatched_rows(
+/// `col IS NULL`, however written (`NULL IS col`, `col IS NOT DISTINCT FROM NULL`), where `col` is
+/// never NULL in a row of the table (the rowid or a NOT NULL column): it holds only in a row a join
+/// null-extended.
+fn null_test_of_never_null(
     constraint: &Constraint,
-    term: &WhereTerm,
     where_clause: &[WhereTerm],
     table: &JoinedTable,
 ) -> bool {
-    if term.origin.is_outer_join()
-        || !matches!(constraint.operator.as_ast_operator(), Some(Operator::Is))
-    {
+    if !matches!(constraint.operator.as_ast_operator(), Some(Operator::Is)) {
         return false;
     }
     matches!(
