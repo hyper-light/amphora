@@ -218,7 +218,9 @@ fn value_error(e: &str) -> bool {
 /// call can read: the query's rows (`from`), or a subquery's beside its outer query's. An error
 /// SQLite raises there makes one Amphora meets evaluating `p` a value's, met where SQLite's plan
 /// read the rows in another order or stopped sooner (an EXISTS at its first match, min() over an
-/// index at its first row: cause Q), not an error SQLite never raises; text SQLite gives that isn't
+/// index at its first row: cause Q), not an error SQLite never raises. A call reading no column is
+/// the same on every row, so it's evaluated on none: Amphora computes it once ahead of the rows,
+/// SQLite on each, and over an empty table never (cause Q too). Text SQLite gives that isn't
 /// well-formed UTF-8 makes `p` one SQLite promises no answer for (cause AN). Flat, on a stack of
 /// its own.
 fn sqlite_call_meets(s: &mut Sqlite, from: &[synth::From], p: &E, counts: impl Fn(&str) -> bool) -> bool {
@@ -233,7 +235,7 @@ fn sqlite_call_meets(s: &mut Sqlite, from: &[synth::From], p: &E, counts: impl F
     let mut todo: Vec<(&E, Vec<synth::From>)> = vec![(p, from.to_vec())];
     while let Some((e, scope)) = todo.pop() {
         if let E::Fn(..) = e {
-            let tables: Vec<String> = scope.iter().map(|f| format!("{} AS {}", f.table, f.alias)).collect();
+            let tables: Vec<String> = if constant(e) { Vec::new() } else { scope.iter().map(|f| format!("{} AS {}", f.table, f.alias)).collect() };
             let sql = if tables.is_empty() { format!("SELECT {}", e.sql()) } else { format!("SELECT {} FROM {}", e.sql(), tables.join(", ")) };
             if s.run(&sql).is_err_and(|e| counts(&e)) {
                 return true;
@@ -286,13 +288,18 @@ fn relation_fails_on_sqlite(s: &mut Sqlite, base: &str, parts: &[String], loose:
 
 /// Whether a LIMIT still keeps certain rows: its query ordered by each column it returns (by
 /// BINARY, then by storage class) as the generator made it, but for a constant, the same in every
-/// row. A cut that lets two rows tie leaves which of them the LIMIT keeps to the plan.
+/// row. A cut that lets two rows tie leaves which of them the LIMIT keeps to the plan. DISTINCT and
+/// GROUP BY keep one row of those they take as one (0 and 0.0, 'a' and 'A' under NOCASE), whichever
+/// the plan met first, which the ORDER BY then tells apart by its storage class or its bytes: their
+/// LIMIT keeps rows by the plan too.
 fn limit_certain(q: &Sel) -> bool {
     let order: Vec<String> = q.order.iter().map(|(e, _)| e.sql()).collect();
     q.limit.is_none()
-        || q.cols.iter().all(|c| {
-            constant(c) || (order.contains(&E::Collate(Box::new(c.clone()), "BINARY").sql()) && order.contains(&E::Fn("typeof".into(), vec![c.clone()]).sql()))
-        })
+        || (!q.distinct
+            && q.group.is_empty()
+            && q.cols.iter().all(|c| {
+                constant(c) || (order.contains(&E::Collate(Box::new(c.clone()), "BINARY").sql()) && order.contains(&E::Fn("typeof".into(), vec![c.clone()]).sql()))
+            }))
 }
 
 /// Whether `e` is the same in every row: it reads no column, no subquery and no aggregate.
