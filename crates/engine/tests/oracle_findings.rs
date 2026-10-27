@@ -2538,6 +2538,67 @@ fn a_call_under_a_collate_folds_away_with_a_false_and() {
     );
 }
 
+/// Do: jsonb_array(), jsonb_object(), jsonb_group_array() and jsonb_group_object() of a JSONB
+/// argument whose header is wider than it needs (jsonb_patch('1e3', 0) is x'D3000130', SQLite's
+/// jsonBlobOverwrite widening the shorter 0 into the place of 1e3), of one nested in an array, and
+/// of one holding JSON5 forms (.5, 0x1F, a \u escape in single quotes); and jsonb_set(),
+/// jsonb_insert(), jsonb_replace() and jsonb_array_insert() of the same. Expect: SQLite 3.54's
+/// bytes. Its jsonb_array, jsonb_object and their aggregates write every argument as JSON text, a
+/// JSONB BLOB as jsonTranslateBlobToText renders it (jsonAppendSqlValue), and make the whole text
+/// JSONB again (jsonReturnStringAsBlob), so the argument comes back with each header at its
+/// smallest and its JSON5 forms as JSON (13 30 for 0, 0.5, 31); the edits put the argument's bytes
+/// in as they are. Amphora copied a JSONB argument's bytes into the array or object (finding
+/// diff-0d96c0783d6fbbce: x'5b00d3000130' for SQLite's x'3b001330').
+#[test]
+fn jsonb_containers_write_a_jsonb_argument_as_its_text_would() {
+    let (io, conn) = open();
+    let patch = "jsonb_patch('1e3', 0)";
+    assert_eq!(
+        rows(&io, &conn, &format!("SELECT {patch}")),
+        ["x'd3000130'"]
+    );
+    assert_eq!(
+        rows(
+            &io,
+            &conn,
+            &format!("SELECT jsonb_array(NULL, {patch}), jsonb_array({patch}), jsonb_array(x'D3000130', x'D3000130'), jsonb_object('a', {patch}), jsonb_array(jsonb_set('[1]', '$[0]', {patch}))")
+        ),
+        ["x'3b001330'|x'2b1330'|x'4b13301330'|x'4c17611330'|x'3b2b1330'"]
+    );
+    assert_eq!(
+        rows(
+            &io,
+            &conn,
+            &format!("SELECT jsonb_group_array(x), jsonb_group_object('k', x) FROM (SELECT {patch} AS x)")
+        ),
+        ["x'2b1330'|x'4c176b1330'"]
+    );
+    assert_eq!(
+        rows(
+            &io,
+            &conn,
+            "SELECT jsonb_array(jsonb('[.5, 0x1F, ''\\u0041'']'))"
+        ),
+        ["x'cb10cb0e35302e35233331685c7530303431'"]
+    );
+    assert_eq!(
+        rows(
+            &io,
+            &conn,
+            &format!("SELECT jsonb_set('[1]', '$[0]', {patch}), jsonb_insert('[]', '$[#]', {patch}), jsonb_replace('[1]', '$[0]', {patch}), jsonb_array_insert('[1]', '$[0]', {patch})")
+        ),
+        ["x'4bd3000130'|x'4bd3000130'|x'4bd3000130'|x'6bd30001301331'"]
+    );
+    assert_eq!(
+        rows(
+            &io,
+            &conn,
+            &format!("SELECT json_array({patch}), json_object('a', {patch})")
+        ),
+        ["'[0]'|'{\"a\":0}'"]
+    );
+}
+
 /// Do: jsonb_insert() and jsonb_set() appending to an array, by '$[#]' and by the index one past
 /// its end, values of one, two and four bytes (NULL, 0, 'abc', and x'D3000130', a 0 behind a
 /// header wider than it needs), into the root array ('[]', '[1]'), an object's array ('$.a[#]')
