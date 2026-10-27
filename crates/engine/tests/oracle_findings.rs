@@ -2330,3 +2330,29 @@ fn unicode_reads_a_blobs_first_character_as_sqlite_does() {
         ["233|65534|49|45"]
     );
 }
+
+/// Do: timediff() with a date before Julian day 0 on either side, as date(0)'s '-4713-11-24' is (its
+/// midnight, half a day before), and with dates at the range's two ends. Expect: SQLite 3.54's
+/// answers: each argument is held to isDate's rule, no error and a Julian day from 0 to
+/// 9999-12-31 23:59:59.999 (validJulianDay, date.c), so a date before -4713-11-24 12:00:00 makes
+/// timediff NULL, as it makes date() and julianday() NULL. Amphora's timediff checked only for an
+/// error and answered '-0000-00-00 12:00:00.000' (finding diff-1ac238359d74b8a1).
+#[test]
+fn timediff_of_a_date_before_julian_day_zero_is_null() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t0(c0 DECIMAL(10,2), c1 BLOB NOT NULL)")
+        .unwrap();
+    conn.execute("INSERT INTO t0 VALUES (0.5, x'00')").unwrap();
+    assert_eq!(
+        rows(&io, &conn, "SELECT timediff(date(0), (c0 = c1)) FROM t0"),
+        ["NULL"]
+    );
+    assert_eq!(
+        rows(&io, &conn, "SELECT date(0), timediff(date(0), 0), timediff(0, date(0)), timediff('-4713-11-24 11:59:59', 0), timediff('-4713-11-24 12:00', '-4713-11-24 11:00'), julianday('-4713-11-24')"),
+        ["'-4713-11-24'|NULL|NULL|NULL|NULL|NULL"]
+    );
+    assert_eq!(
+        rows(&io, &conn, "SELECT timediff('-4713-11-24 12:00:00', 0), timediff('9999-12-31 23:59:59.999', '-4713-11-24 12:00:00'), timediff('-4713-11-24 12:00:00', '0000-01-01')"),
+        ["'+0000-00-00 00:00:00.000'|'+14712-01-07 11:59:59.999'|'-4712-01-06 12:00:00.000'"]
+    );
+}
