@@ -2136,3 +2136,28 @@ fn a_multi_index_and_seeks_only_indexes_its_comparisons_fit() {
         assert_eq!(rows(&io, &conn, sql), [want], "{sql}");
     }
 }
+
+/// Do: a correlated `x IN (SELECT y ...)` where y is a lone REAL column and x an integer with no
+/// affinity of its own, which the planner unnests to a semi-join on `x = y`. Expect: SQLite's rows:
+/// IN gives the probe y's REAL affinity, so -9223372036854775807 finds the REAL -2^63 (cause AV),
+/// where `=` compares the integer with the REAL exactly and finds nothing. The semi-join's term
+/// compared as `=` does (finding diff-6a0a824a042f7356, step 5's first runs: 0 rows for 1).
+#[test]
+fn an_unnested_in_compares_as_in_does() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t0(c0 REAL COLLATE NOCASE, c1 NUMERIC COLLATE BINARY PRIMARY KEY, c2 NUMERIC, c3 DECIMAL(10,2) NOT NULL)").unwrap();
+    conn.execute("INSERT OR IGNORE INTO t0 VALUES (-9223372036854775808, 10, 'A', ' ')")
+        .unwrap();
+    conn.execute("CREATE TABLE t1(c0 BOOLEAN, c1 BLOB PRIMARY KEY, c2 BLOB COLLATE RTRIM)")
+        .unwrap();
+    conn.execute("INSERT INTO t1 VALUES (9223372036854775807, 2, 0)")
+        .unwrap();
+    for (sql, want) in [
+        ("SELECT count(*) FROM t1 AS a0 WHERE ((- a0.c0) IN (SELECT s593.c0 FROM t0 AS s593 WHERE ((s593.c2 == -2.5) != (100 + a0.c0))))", "1"),
+        ("SELECT count(*) FROM t1 AS a0 WHERE ((- a0.c0) IN (SELECT s.c0 FROM t0 AS s WHERE s.c1 > a0.c0 - a0.c0))", "1"),
+        ("SELECT count(*) FROM t1 AS a0 WHERE ((- a0.c0) IN (SELECT s.c0 FROM t0 AS s))", "1"),
+        ("SELECT count(*) FROM t1 AS a0 WHERE ((- a0.c0) = (SELECT s.c0 FROM t0 AS s WHERE s.c1 > a0.c0 - a0.c0))", "0"),
+    ] {
+        assert_eq!(rows(&io, &conn, sql), [want], "{sql}");
+    }
+}
