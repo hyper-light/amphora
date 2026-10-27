@@ -1789,7 +1789,9 @@ fn an_always_true_conjunct_raises_no_estimate() {
 /// null-extended, so the LEFT JOIN keeps about none and a table no join null-extends keeps none
 /// (CERT; findings cert-e21949a38a9b16d7, cert-2732f12b21087328, cert-2c3a9d2455aef93d and
 /// cert-d03ea211f1fab06d on step 4's d762dc2, cause AG: 1e10 to 1e17 rows against 0, the term
-/// counted on the inner table as IS NULL's tenth of its rows).
+/// counted on the inner table as IS NULL's tenth of its rows). An inner join's ON term reads its
+/// tables before a RIGHT JOIN after it null-extends them, so there too it keeps none
+/// (cert-60e65956aed5c593: 1e17 rows against the LEFT JOIN form's 1e12).
 #[test]
 fn an_is_null_of_a_column_never_null_keeps_no_inner_row() {
     for (tables, base, more) in [
@@ -1812,6 +1814,11 @@ fn an_is_null_of_a_column_never_null_keeps_no_inner_row() {
             &["CREATE TABLE t1(c0 TEXT, c1  COLLATE NOCASE PRIMARY KEY NOT NULL, c2  COLLATE BINARY)", "CREATE TABLE t2(c0 BLOB NOT NULL, c1 INT PRIMARY KEY, c2 REAL COLLATE RTRIM, c3 BOOLEAN)"][..],
             "SELECT (a0.c3 <= a0.c3) FROM t2 AS a0 LEFT JOIN t1 AS a1 ON ((a1.c1 NOT GLOB 'abc') OR (a0.c3 AND (100 NOTNULL))), t2 AS a2 WHERE (((NULL IS NOT DISTINCT FROM a1.c1) AND (-9223372036854775808 = a0.c3)) AND (a2.c1 == 1000000000000000.0))",
             "SELECT (a0.c3 <= a0.c3) FROM t2 AS a0 JOIN t1 AS a1 ON ((a1.c1 NOT GLOB 'abc') OR (a0.c3 AND (100 NOTNULL))), t2 AS a2 WHERE (((NULL IS NOT DISTINCT FROM a1.c1) AND (-9223372036854775808 = a0.c3)) AND (a2.c1 == 1000000000000000.0))",
+        ),
+        (
+            &["CREATE TABLE t0(c0 TEXT COLLATE RTRIM NOT NULL, c1 BOOLEAN)", "CREATE TABLE t1(c0 REAL COLLATE RTRIM, c1 BLOB PRIMARY KEY, c2 BLOB COLLATE RTRIM UNIQUE NOT NULL, c3 INT)"][..],
+            "SELECT '\"x\"' FROM t1 AS a0 LEFT JOIN t1 AS a1 ON (a1.c2 IS NOT DISTINCT FROM NULL) RIGHT JOIN t0 AS a2 ON 1",
+            "SELECT '\"x\"' FROM t1 AS a0 JOIN t1 AS a1 ON (a1.c2 IS NOT DISTINCT FROM NULL) RIGHT JOIN t0 AS a2 ON 1",
         ),
     ] {
         let (io, conn) = open();

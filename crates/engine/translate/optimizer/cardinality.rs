@@ -121,15 +121,25 @@ impl<'a> JoinedSetRows<'a> {
                 .get(table_idx)
                 .copied()
                 .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
-            // A LEFT or FULL JOIN null-extends its right table, and a RIGHT or FULL JOIN every
-            // table before it.
-            let null_extended = matches!(kind, Kind::Left | Kind::Full)
-                || joined_tables.iter().skip(table_idx).skip(1).any(|later| {
-                    matches!(
-                        later.join_info.as_ref().map(|info| info.join_type),
-                        Some(JoinType::RightOuter | JoinType::FullOuter)
-                    )
-                });
+            // Whether a join has null-extended the table by the time a term evaluated after the
+            // join at place `point` reads it: its own LEFT or FULL JOIN, or a RIGHT or FULL JOIN
+            // after it up to `point`. A WHERE term is evaluated after every join; an inner join's
+            // ON term at its own join, before any join after it null-extends anything.
+            let null_extended_by = |point: usize| {
+                matches!(kind, Kind::Left | Kind::Full)
+                    || joined_tables
+                        .iter()
+                        .enumerate()
+                        .skip(table_idx)
+                        .skip(1)
+                        .take_while(|(later_idx, _)| *later_idx <= point)
+                        .any(|(_, later)| {
+                            matches!(
+                                later.join_info.as_ref().map(|info| info.join_type),
+                                Some(JoinType::RightOuter | JoinType::FullOuter)
+                            )
+                        })
+            };
             // An ON term of the table's own outer join that no row of it passes.
             let mut on_never_true = false;
             let mut counted = SmallVec::new();
@@ -174,7 +184,16 @@ impl<'a> JoinedSetRows<'a> {
                     Class::Filter
                 } else if kind == Kind::Left {
                     Class::Unmatched
-                } else if null_extended {
+                } else if null_extended_by(
+                    term.origin
+                        .join_origin()
+                        .and_then(|origin| {
+                            joined_tables
+                                .iter()
+                                .position(|t| t.internal_id == origin.right_table())
+                        })
+                        .unwrap_or(joined_tables.len()),
+                ) {
                     Class::Filter
                 } else {
                     Class::Never
