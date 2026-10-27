@@ -214,6 +214,53 @@ fn value_error(e: &str) -> bool {
     ["too big", "malformed JSON", "JSON path", "bad JSON path", "JSON cannot hold", "overflow", "Unexpected character", "must be TEXT", "number of arguments", "argument count", "must be between", "not an array element", "single character", "Unexpected end of input"].iter().any(|m| e.contains(m))
 }
 
+/// Whether SQLite raises an error evaluating one of `p`'s function calls on some row the call can
+/// read: the query's rows (`from`), or a subquery's beside its outer query's. Then an error Amphora
+/// meets evaluating `p` is a value's, met where SQLite's plan read the rows in another order or
+/// stopped sooner (an EXISTS at its first match, min() over an index at its first row: cause Q),
+/// not an error SQLite never raises. Flat, on a stack of its own.
+fn sqlite_errors_on_a_call(s: &mut Sqlite, from: &[synth::From], p: &E) -> bool {
+    // A subquery's expressions, each with the rows it reads: its own tables and its outer query's.
+    fn subquery<'a>(todo: &mut Vec<(&'a E, Vec<synth::From>)>, q: &'a Sel, outer: &[synth::From]) {
+        let mut inner = q.from.clone();
+        inner.extend(outer.iter().cloned());
+        for x in q.cols.iter().chain(q.wh.iter()).chain(q.from.iter().filter_map(|f| f.on.as_ref())) {
+            todo.push((x, inner.clone()));
+        }
+    }
+    let mut todo: Vec<(&E, Vec<synth::From>)> = vec![(p, from.to_vec())];
+    while let Some((e, scope)) = todo.pop() {
+        if let E::Fn(..) = e {
+            let tables: Vec<String> = scope.iter().map(|f| format!("{} AS {}", f.table, f.alias)).collect();
+            let sql = if tables.is_empty() { format!("SELECT {}", e.sql()) } else { format!("SELECT {} FROM {}", e.sql(), tables.join(", ")) };
+            if s.run(&sql).is_err() {
+                return true;
+            }
+        }
+        match e {
+            E::Exists(q, _) | E::Scalar(q) => subquery(&mut todo, q, &scope),
+            E::InSel(x, q, _) => {
+                todo.push((x, scope.clone()));
+                subquery(&mut todo, q, &scope);
+            }
+            _ => todo.extend(e.children().into_iter().map(|c| (c, scope.clone()))),
+        }
+    }
+    false
+}
+
+/// Whether a LIMIT still keeps certain rows: its query ordered by each column it returns (by
+/// BINARY, then by storage class) as the generator made it, but for a literal, the same in every
+/// row. A cut that lets two rows tie leaves which of them the LIMIT keeps to the plan.
+fn limit_certain(q: &Sel) -> bool {
+    let order: Vec<String> = q.order.iter().map(|(e, _)| e.sql()).collect();
+    q.limit.is_none()
+        || q.cols.iter().all(|c| {
+            matches!(c, E::Lit(_))
+                || (order.contains(&E::Collate(Box::new(c.clone()), "BINARY").sql()) && order.contains(&E::Fn("typeof".into(), vec![c.clone()]).sql()))
+        })
+}
+
 /// Whether a TLP aggregate case's columns are still the one aggregate its partitions combine to:
 /// count or sum of a value, min or max of one under BINARY (what the combined query applies).
 fn is_partitioned_aggregate(cols: &[E], f: Agg) -> bool {
@@ -291,9 +338,13 @@ pub fn sqls(case: &Case) -> Vec<String> {
 /// failure; a base form Amphora refuses is a skip (or, against SQLite, a refusal counted).
 pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
     let mut c = case.clone();
-    // CERT reads estimates, not answers: which row of its group a bare column reads is no matter.
+    // CERT reads estimates, not answers: which row of its group a bare column reads is no matter,
+    // nor which rows a LIMIT keeps.
     if !matches!(case, Case::Cert(..)) && c.parts_mut().0.iter().any(|q| !q.certain()) {
         return Outcome::Skip("a bare column: its row is any of its group's");
+    }
+    if !matches!(case, Case::Cert(..)) && c.parts_mut().0.iter().any(|q| !limit_certain(q)) {
+        return Outcome::Skip("a LIMIT no longer keeps certain rows");
     }
     match case {
         Case::Same(tables) => {
@@ -400,6 +451,9 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
             let combined = format!("SELECT {outer} FROM (SELECT NULL AS m WHERE 0 UNION ALL {})", parts.join(" UNION ALL "));
             match a.run(&combined) {
                 Err(e) if e.contains("overflow") => Outcome::Skip("a partition's sum overflows"),
+                // ... and so may theirs where the query's is NULL: infinities of both signs make a
+                // NaN, which is NULL, in one grouping of the rows and not in another.
+                Ok(rows) if matches!(f, Agg::Sum) && rows.iter().flatten().any(|v| matches!(v, V::Real(_))) => Outcome::Skip("a REAL sum's partitions round apart from it"),
                 Err(e) => derived(s, &combined, "the partitions' aggregate", &e, vec![base, combined.clone()]),
                 Ok(rows) if same_rows_by(&all, &rows, true) => Outcome::Pass { plan_changed: false },
                 Ok(rows) => wrong("the query's aggregate isn't its partitions' combined", &Ok(rows), &Ok(all), vec![base, combined]),
@@ -451,6 +505,7 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
                 _ => return Outcome::Skip("sqlite misses its own pivot"),
             }
             match a.run(&sql) {
+                Err(e) if value_error(&e) && sqlite_errors_on_a_call(s, &q.from, p) => Outcome::Skip("a derived query meets a value's error (evaluation order)"),
                 Err(e) => error(format!("Amphora errors where SQLite finds the pivot: {e}"), &e, vec![eval, sql]),
                 Ok(rows) if has(&rows) => Outcome::Pass { plan_changed: false },
                 Ok(rows) => fail(Kind::Wrong, format!("the pivot (rowid {pivot}), whose predicate SQLite rectified to TRUE, is missing\n  Amphora: {}", show(&Ok(rows))), vec![eval, sql]),
