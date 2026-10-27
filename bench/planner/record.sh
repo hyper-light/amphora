@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # The planner bench's baseline (bench/planner/README.md): TPC-H at scale factor 1 twice, at 10
 # once, and JOB twice, every engine, best of 3, each pass to a record of its own in <out dir>
-# (`--resume`, so a pass stopped part way goes on where it stopped). The second passes are the
-# repeat the plan's test asks for: the same estimates, and median run times within 5%.
+# (`--resume`, so a pass stopped part way goes on where it stopped), each benchmark loaded first
+# (`load-<benchmark>.jsonl`). The second passes are the repeat the plan's test asks for: the same
+# estimates, and median run times within 5%.
 #
 # usage: [TARGETS=a,b] bench/planner/record.sh <amphora-bench> <out dir> <data dir> <JOB queries dir> [pass...]
 #   <data dir> holds tpch-sf1, tpch-sf10 and imdb; the passes default to all five:
@@ -28,12 +29,16 @@ if [[ ",$targets," == *,postgres,* ]]; then
 fi
 for pass in "${passes[@]}"; do
   case "$pass" in
-    tpch-sf1-*) args=(--bench tpch --sf 1 --data "$(native "$data/tpch-sf1")" --queries "$(native "$here/tpch/queries")" --dir "$(native "$data/db-tpch-sf1")") ;;
-    tpch-sf10-*) args=(--bench tpch --sf 10 --data "$(native "$data/tpch-sf10")" --queries "$(native "$here/tpch/queries")" --dir "$(native "$data/db-tpch-sf10")") ;;
-    job-*) args=(--bench job --data "$(native "$data/imdb")" --queries "$(native "$job")" --dir "$(native "$data/db-job")") ;;
+    tpch-sf1-*) bench=tpch-sf1; args=(--bench tpch --sf 1 --data "$(native "$data/tpch-sf1")" --queries "$(native "$here/tpch/queries")" --dir "$(native "$data/db-tpch-sf1")") ;;
+    tpch-sf10-*) bench=tpch-sf10; args=(--bench tpch --sf 10 --data "$(native "$data/tpch-sf10")" --queries "$(native "$here/tpch/queries")" --dir "$(native "$data/db-tpch-sf10")") ;;
+    job-*) bench=job; args=(--bench job --data "$(native "$data/imdb")" --queries "$(native "$job")" --dir "$(native "$data/db-job")") ;;
     *) echo "no pass $pass" >&2; exit 2 ;;
   esac
   echo "== $pass $(date -u +%Y-%m-%dT%H:%M:%SZ)" >&2
+  # The benchmark is loaded by a process of its own (`--only -` names no query), and the pass is
+  # timed by another: the 2026-10-26 baseline's first passes, timed by the process that had just
+  # loaded their data, ran slower (bench/records/2026-10-26-jupiter-planner-baseline.md).
+  "$bin" --planner "${args[@]}" --targets "$targets" --only - --out "$(native "$out/load-$bench.jsonl")" 2>>"$out/load-$bench.log"
   "$bin" --planner "${args[@]}" --targets "$targets" --runs 3 --timeout-s 600 --count-timeout-s 1800 \
     --max-load 2 --load-wait-s 3600 --out "$(native "$out/$pass.jsonl")" --resume 2>>"$out/$pass.log"
 done

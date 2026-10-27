@@ -48,10 +48,13 @@ python3 bench/planner/summary.py job.jsonl tpch-sf1.jsonl --json summary.json
 ```
 
 A database is loaded the first time and kept: a load that finished leaves a `bench_loaded` table,
-and one without it is dropped and loaded again. Each timed run starts once the load is under
-`--max-load` (2 unless given), waiting at most `--load-wait-s`; the load each began at is in its
-record. On Linux that is the one-minute load average; Windows keeps none, so there it is the cores
-busy plus the processor queue, averaged over three seconds, which the record names.
+and one without it is dropped and loaded again. `record.sh` loads a benchmark in a process of its
+own (`--only -`, which names no query) and times it in another: a pass timed by the process that had
+just loaded its data ran slower (bench/records/2026-10-26-jupiter-planner-baseline.md). Each timed
+run starts once the load is under `--max-load` (2 unless given), waiting at most `--load-wait-s`;
+the load each began at is in its record. On Linux that is the one-minute load average; Windows keeps
+none, so there it is the cores busy plus the processor queue, averaged over three seconds, which the
+record names.
 
 ## What is measured
 
