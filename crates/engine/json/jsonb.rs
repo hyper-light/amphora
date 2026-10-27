@@ -2254,10 +2254,12 @@ impl Jsonb {
                     })?;
                 return Ok(pos);
             } else if pos < input.len() && input[pos].is_ascii_digit() {
-                // Leading zero followed by digit is not allowed in standard JSON
+                // Leading zero followed by digit is not allowed in standard JSON. SQLite reports it
+                // one past the number's start (jsonTranslateTextToBlob): at the digit after an
+                // unsigned zero, at the zero after a sign.
                 return Err(PError::Message {
                     msg: "Leading zero is not allowed".to_string(),
-                    location: Some(pos),
+                    location: text_start.checked_add(1),
                 });
             }
         }

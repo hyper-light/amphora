@@ -2453,3 +2453,18 @@ fn atanh_has_its_platforms_c_library_digits() {
         [format!("{quarter}|{quarter}")]
     );
 }
+
+/// Do: json_error_position() of numbers whose leading zero a digit follows, signed and not, alone
+/// and inside an array or object, and of timediff(0, 0), '+0000-00-00 00:00:00.000'. Expect: SQLite
+/// 3.54's positions: one past the number's start (jsonTranslateTextToBlob), the digit after an
+/// unsigned zero but the zero after a sign. Amphora reported the digit after the zero after a sign
+/// too, 3 for timediff(0, 0) where SQLite gives 2 (finding diff-9bcd332bd8ccd930, step 5's
+/// nightly run of 2026-10-27).
+#[test]
+fn json_error_position_reports_a_signed_leading_zero_at_the_zero() {
+    let (io, conn) = open();
+    assert_eq!(
+        rows(&io, &conn, "SELECT json_error_position('+00'), json_error_position('-00'), json_error_position('00'), json_error_position('-01'), json_error_position('[01]'), json_error_position('[-01]'), json_error_position('[+012]'), json_error_position('{\"a\":-00}'), json_error_position(timediff(0, 0)), json_error_position('-0x1'), json_error_position('-0.5'), json_error_position('-0')"),
+        ["2|2|2|2|3|3|3|7|2|0|0|0"]
+    );
+}
