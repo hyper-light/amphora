@@ -1946,3 +1946,27 @@ fn concat_ws_writes_every_argument_but_null_a_blob_as_its_text() {
         assert_eq!(rows(&io, &conn, sql), [want], "{sql}");
     }
 }
+
+/// Do: a RIGHT JOIN whose ON no row passes, so every right row comes from its unmatched-row pass,
+/// with a WHERE reading an IN subquery whose own WHERE is an OR of two index seeks (a multi-index
+/// OR); the pass runs a copy of the subquery. Expect: SQLite's rows. Amphora panicked ("cursor id 2
+/// is None"): the copy opened cursors of its own for the OR's index branches but sought on the
+/// original's, which never ran, the main loop matching no row (finding norec-db0d4a055d27c23c,
+/// step 5's nightly run of 2026-10-28; and the panics of its other runs).
+#[test]
+fn an_unmatched_row_pass_seeks_its_own_subquerys_cursors() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t0(c0 REAL, c1 DOUBLE PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT OR IGNORE INTO t0 VALUES (255, '%')")
+        .unwrap();
+    let sub = "(SELECT s.c1 FROM t0 AS s WHERE ((s.c1 < -1) OR (-2.5 BETWEEN s.c1 AND s.c1)))";
+    for (wh, want) in [
+        (format!("(a0.c1 IN {sub})"), 0),
+        (format!("(NOT (a0.c1 IN {sub}))"), 1),
+        (format!("((a0.c1 IN {sub}) ISNULL)"), 0),
+    ] {
+        let sql = format!("SELECT NULL FROM t0 AS a0 RIGHT JOIN t0 AS a1 ON NULL WHERE {wh}");
+        assert_eq!(rows(&io, &conn, &sql).len(), want, "{sql}");
+    }
+}
