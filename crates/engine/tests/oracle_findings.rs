@@ -2107,3 +2107,32 @@ fn a_rowid_seek_finds_the_smallest_rowid_by_a_real() {
         assert_eq!(rows(&io, &conn, sql), [want], "{sql}");
     }
 }
+
+/// Do: AND two comparisons, each on a column with an index of its own, which the planner may answer
+/// with a multi-index AND (an intersection of the two seeks): one comparison whose affinity the
+/// index's column can't serve (`CAST(1e15 AS INTEGER) <= c0`, NUMERIC against a TEXT column: index
+/// order is no numeric order of text), another whose collation isn't the index's (`a = 'abc'
+/// COLLATE NOCASE` against a BINARY index). Expect: SQLite's rows: such an index can't serve such a
+/// comparison (sqlite3IndexAffinityOk; a seek's collation is its index's), as Amphora's single-index
+/// seeks already held; the intersection used them anyway (finding norec-bb8e0c1b5a66c950, step 5's
+/// first runs: 1 row for SQLite's 0).
+#[test]
+fn a_multi_index_and_seeks_only_indexes_its_comparisons_fit() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t1(c0 VARCHAR(10) UNIQUE, c1 INT UNIQUE, c2 DOUBLE COLLATE BINARY PRIMARY KEY NOT NULL, c3 VARCHAR(10) COLLATE RTRIM NOT NULL)").unwrap();
+    conn.execute("INSERT OR IGNORE INTO t1 VALUES (0.0, 3, 1e308, 3)")
+        .unwrap();
+    conn.execute("CREATE TABLE t(a TEXT, b INT)").unwrap();
+    conn.execute("CREATE INDEX ia ON t(a)").unwrap();
+    conn.execute("CREATE INDEX ib ON t(b)").unwrap();
+    conn.execute("INSERT INTO t VALUES ('ABC', 1), ('abd', 2)")
+        .unwrap();
+    for (sql, want) in [
+        ("SELECT count(*) FROM t1 AS a0 WHERE (CAST(1000000000000000.0 AS INTEGER) BETWEEN a0.c1 AND a0.c0)", "0"),
+        ("SELECT count(*) FROM t WHERE a = 'abc' COLLATE NOCASE AND b = 1", "1"),
+        ("SELECT count(*) FROM t WHERE a > 'abc' COLLATE NOCASE AND b >= 1", "1"),
+        ("SELECT count(*) FROM t WHERE a = 5 AND b = 1", "0"),
+    ] {
+        assert_eq!(rows(&io, &conn, sql), [want], "{sql}");
+    }
+}
