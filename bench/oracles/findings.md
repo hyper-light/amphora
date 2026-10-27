@@ -254,3 +254,21 @@ rather than Amphora answering otherwise.
 too, a run) and none Amphora refused. The other oracles made 13 findings, each the differential
 check's and each AH's, the same 13 as the second runs': no cause campaign 2 did not find
 (`third-runs/*/causes.tsv` in the record).
+
+## The order-check campaigns' other findings, on step 5's build, 2026-10-27
+
+The 43 findings of the order check's two campaigns on d762dc2
+(`bench/records/2026-10-26-adas-mac-studio-2-order-check/`), replayed with `--replay-check` by a
+release build of 5f16a6f's bench (`replay-5f16a6f.tsv` there, a row a finding with its cause): 13
+that failed on d762dc2 pass, each by a cause above (AR, BN, BP, BQ, BS, BT, BV, BW); 7 passed on
+d762dc2 already, their files reproducing nothing; 21 fail and are not Amphora's (AH 5, Q 15, AN 1);
+and 2 failed as Amphora's. Those two are fixed here, each by a test that fails before its fix and
+holds its finding's query:
+
+| cause | findings | fix | test |
+|---|---:|---|---|
+| CB. jsonb_array(), jsonb_object(), jsonb_group_array() and jsonb_group_object() copied a JSONB argument's bytes, where SQLite writes each argument as JSON text and makes the whole text JSONB again (jsonAppendSqlValue, jsonReturnStringAsBlob): jsonb_array(NULL, jsonb_patch('1e3', 0)) kept jsonb_patch's widened header, x'5b00d3000130' for SQLite's x'3b001330' | 1 (diff-0d96c0783d6fbbce) | `json/mod.rs` (`convert_dbtype_to_element_jsonb`; the aggregates at their end, `json_from_raw_bytes_agg`) | `jsonb_containers_write_a_jsonb_argument_as_its_text_would` |
+| CC. A call under a COLLATE kept a false AND from folding: SQLite's COLLATE node takes no flag from its operand (sqlite3ExprAddCollateToken sets only EP_Collate and EP_Skip), so `(1e308 ISNULL) AND (likelihood(NULL, NULL) COLLATE RTRIM)` is 0 there and the call is never resolved, where Amphora saw the call, kept the AND and refused the query ("second argument to likelihood() must be a constant") | 1 (error-a2539ea61c26b70f) | `translate/expr/utils.rs` (`calls_function` stops at a COLLATE) | `a_call_under_a_collate_folds_away_with_a_false_and` |
+| CD. Found by CB's test's controls, not by a campaign: an element appended to the root array (jsonb_insert() or jsonb_set(), by '$[#]' or the index past its end) left the array's header one byte short of what it holds, the placeholder the path's traversal puts in first left uncounted where an object's array counts it: jsonb_insert('[]', '$[#]', 0) was x'1b1330', SQLite's x'2b1330' | — | `json/jsonb.rs` (`count_placeholder`) | `an_element_appended_to_the_root_array_counts_in_its_header` |
+
+None of the 43 is left failing as Amphora's.

@@ -1,0 +1,44 @@
+seed	finding	d762dc2	step5	cause and fixing commit
+11	cert-d03ea211f1fab06d	fail	pass	BN (CERT: IS NULL of a never-NULL column) - 7dbb9c5
+11	diff-3c7732c812d80f94	fail	fail	AH, not Amphora's (SQLite's LIKE optimization on an outer join)
+11	diff-5277e86e68467733	fail	fail	AH, not Amphora's
+11	diff-7bf9cd99a17e6672	fail	pass	BV (unicode() of a BLOB) - 11b7a8b
+11	diff-b12f3332dd917ede	fail	pass	AR (number before a NUL, Affinity) - 474c208
+11	diff-b16f13ce4b1e0b0e	fail	fail	AH, not Amphora's
+11	diff-e608f6356f25b344	fail	fail	AN, not Amphora's (substr of a BLOB cuts a character: Amphora's U+FFFD sorts above SQLite's kept bytes; semantics.md decision 1)
+11	error-15c526dd5edf1a96	fail	fail	Q, not Amphora's (evaluation order: a value's error SQLite meets too where its plan reads otherwise); PQS skips it since 3df9ebc, 090dbe4, 10f2461
+11	error-2ca8ffc19f3a6362	fail	fail	Q, not Amphora's (evaluation order: a value's error SQLite meets too where its plan reads otherwise); PQS skips it since 3df9ebc, 090dbe4, 10f2461
+11	error-30d4c79dd110f070	fail	fail	Q, not Amphora's (evaluation order: a value's error SQLite meets too where its plan reads otherwise); PQS skips it since 3df9ebc, 090dbe4, 10f2461
+11	error-493c667725cb13ff	fail	fail	Q, not Amphora's (evaluation order: a value's error SQLite meets too where its plan reads otherwise); PQS skips it since 3df9ebc, 090dbe4, 10f2461
+11	error-6879b552c9cd2cf7	fail	fail	Q, not Amphora's (evaluation order: a value's error SQLite meets too where its plan reads otherwise); PQS skips it since 3df9ebc, 090dbe4, 10f2461
+11	error-99fb1658e34f78cb	fail	fail	Q, not Amphora's (evaluation order: a value's error SQLite meets too where its plan reads otherwise); PQS skips it since 3df9ebc, 090dbe4, 10f2461
+11	error-d1da6bb77b9dc20d	fail	fail	Q, not Amphora's (evaluation order: a value's error SQLite meets too where its plan reads otherwise); PQS skips it since 3df9ebc, 090dbe4, 10f2461
+11	tlp-1651eaa5a5137485	pass	pass	passed on d762dc2 already (not reproduced from its file)
+11	tlp-49cf2c158d4cee7d	pass	pass	passed on d762dc2 already (not reproduced from its file)
+11	tlp-56524ff1ded7c159	fail	pass	BS (multi-index AND seeks an index its comparison can't use: COLLATE NOCASE bound on a BINARY index) - 7c199cb
+11	tlp-989cf37149c91432	fail	pass	BP (panic 'cursor id N is None', unmatched-row pass) - 5efa45f
+11	tlp-a207431db5037ad3	fail	pass	BP (panic 'cursor id N is None', unmatched-row pass) - 5efa45f
+11	tlp-f328f36eeb460535	pass	pass	passed on d762dc2 already (not reproduced from its file)
+12	cert-2c3a9d2455aef93d	fail	pass	BN (CERT: IS NULL of a never-NULL column) - 7dbb9c5
+12	diff-0d96c0783d6fbbce	fail	fail	OPEN, Amphora's (AI's family): jsonb_patch('1e3', 0) writes 0 with a 2-byte size header (d3 00 01 30) where SQLite writes 13 30
+12	diff-0e0ce2388c892785	fail	fail	AH, not Amphora's
+12	diff-1ac238359d74b8a1	fail	pass	BW (timediff before Julian day 0) - 90a30d0
+12	diff-62a00bdd3d770397	fail	pass	AR (number before a NUL, Affinity) - 474c208
+12	diff-95213aa9c033e685	fail	pass	BT (sum's integer/REAL split) - 9ef2b28
+12	diff-a3a4beb0bbce2fa8	pass	pass	passed on d762dc2 already (not reproduced from its file)
+12	diff-a93ca7d94a4ebb8d	pass	pass	passed on d762dc2 already (not reproduced from its file)
+12	diff-b16f13ce4b1e0b0e	fail	fail	AH, not Amphora's
+12	diff-e6099a1e340808ad	fail	pass	BQ (GLOB in a multi-index OR) - a5f959f
+12	diff-f93f0363c5e4f173	pass	pass	passed on d762dc2 already (not reproduced from its file)
+12	eet-c841de815cf85036	fail	pass	BP (panic 'cursor id N is None', unmatched-row pass) - 5efa45f
+12	error-05d7b3eda026e716	fail	fail	Q, not Amphora's (evaluation order: a value's error SQLite meets too where its plan reads otherwise); PQS skips it since 3df9ebc, 090dbe4, 10f2461
+12	error-15c526dd5edf1a96	fail	fail	Q, not Amphora's (evaluation order: a value's error SQLite meets too where its plan reads otherwise); PQS skips it since 3df9ebc, 090dbe4, 10f2461
+12	error-2b8c6518bc1e5f28	fail	fail	Q, not Amphora's (evaluation order: a value's error SQLite meets too where its plan reads otherwise); PQS skips it since 3df9ebc, 090dbe4, 10f2461
+12	error-2ca8ffc19f3a6362	fail	fail	Q, not Amphora's (evaluation order: a value's error SQLite meets too where its plan reads otherwise); PQS skips it since 3df9ebc, 090dbe4, 10f2461
+12	error-30d4c79dd110f070	fail	fail	Q, not Amphora's (evaluation order: a value's error SQLite meets too where its plan reads otherwise); PQS skips it since 3df9ebc, 090dbe4, 10f2461
+12	error-493c667725cb13ff	fail	fail	Q, not Amphora's (evaluation order: a value's error SQLite meets too where its plan reads otherwise); PQS skips it since 3df9ebc, 090dbe4, 10f2461
+12	error-95a30b3d763ff2ad	fail	fail	Q, not Amphora's (evaluation order: a value's error SQLite meets too where its plan reads otherwise); PQS skips it since 3df9ebc, 090dbe4, 10f2461
+12	error-9c5ff875d92402a3	fail	fail	Q, not Amphora's (evaluation order: a value's error SQLite meets too where its plan reads otherwise); PQS skips it since 3df9ebc, 090dbe4, 10f2461
+12	error-a2539ea61c26b70f	fail	fail	OPEN, Amphora's (M/V/BD family): Amphora rejects likelihood(NULL, NULL) inside (1e308 ISNULL) AND ..., which SQLite's parser folds away unresolved; the generator no longer makes such calls (7dbb9c5)
+12	pqs-bb7cb8fbced15dfd	fail	pass	BT (sum's integer/REAL split) - 9ef2b28
+12	tlp-54d4cfd64539e9b3	pass	pass	passed on d762dc2 already (not reproduced from its file)
