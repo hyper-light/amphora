@@ -6262,6 +6262,34 @@ pub fn op_idx_row_id(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// The rowid a SeekRowid key names, as SQLite's OP_SeekRowid reads one: an integer; text as the
+/// number it reads as (applyNumericAffinity); then a REAL that is an integer exactly, within the
+/// rowid range, -2^63 among them (ticket #3922's exclusion of the smallest integer is
+/// sqlite3VdbeIntegerAffinity's, a column's, not the seek's). Anything else, NULL too, names none.
+fn seek_rowid_key(key: &Value) -> Option<i64> {
+    let mut numeric = Register::Value(key.clone());
+    if matches!(key, Value::Text(_)) {
+        apply_affinity_char(&mut numeric, Affinity::Numeric);
+    }
+    match numeric.get_value() {
+        Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
+        Value::Numeric(Numeric::Float(f)) => {
+            let real = f64::from(*f);
+            let rowid = real_to_i64(real);
+            // The range's top is the largest double below 2^63; every double from
+            // 9223372036854774263.0 to 9223372036854775295.0 is it (vdbe.c).
+            if (-9_223_372_036_854_775_808.0..=9_223_372_036_854_774_784.0).contains(&real)
+                && rowid as f64 == real
+            {
+                Some(rowid)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 pub fn op_seek_rowid(
     _program: &Program,
     state: &mut ProgramState,
@@ -6286,11 +6314,7 @@ pub fn op_seek_rowid(
         // Handle MaterializedView cursor
         let (pc, did_seek) = match cursor {
             Cursor::MaterializedView(mv_cursor) => {
-                let rowid = match state.registers[*src_reg].get_value() {
-                    Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
-                    Value::Null => None,
-                    _ => None,
-                };
+                let rowid = seek_rowid_key(state.registers[*src_reg].get_value());
 
                 match rowid {
                     Some(rowid) => {
@@ -6311,24 +6335,7 @@ pub fn op_seek_rowid(
             }
             Cursor::BTree(..) | Cursor::Dyn(..) => {
                 let btree_cursor = cursor.as_btree_mut();
-                let rowid = match state.registers[*src_reg].get_value() {
-                    Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
-                    Value::Null => None,
-                    // For non-integer values try to apply affinity and convert them to integer.
-                    other => {
-                        let mut temp_reg = Register::Value(other.clone());
-                        let converted = apply_affinity_char(&mut temp_reg, Affinity::Numeric);
-                        if converted {
-                            match temp_reg.get_value() {
-                                Value::Numeric(Numeric::Integer(i)) => Some(*i),
-                                Value::Numeric(Numeric::Float(f)) => Some(f64::from(*f) as i64),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        }
-                    }
-                };
+                let rowid = seek_rowid_key(state.registers[*src_reg].get_value());
 
                 match rowid {
                     Some(rowid) => {

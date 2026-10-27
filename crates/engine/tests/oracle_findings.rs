@@ -2065,3 +2065,45 @@ fn a_seek_or_probe_reads_the_number_before_a_nul() {
         assert_eq!(rows(&io, &conn, sql).len(), want, "{sql}");
     }
 }
+
+/// Do: seek the smallest rowid, -9223372036854775808, by a REAL that is exactly it (a literal, a
+/// REAL column, an IN list's value, a join's key) and by text that reads as it. Expect: SQLite's
+/// row: its SeekRowid takes a REAL that is an integer exactly within the rowid range, the smallest
+/// among them (the exclusion of ticket #3922 is its column affinity's, not the seek's). Amphora's
+/// seek converted the key by NUMERIC affinity, which keeps -2^63 a REAL, and found no row (findings
+/// diff-f254967d5150ea85 and eet-56b728bcbf4c5a59, step 5's first runs).
+#[test]
+fn a_rowid_seek_finds_the_smallest_rowid_by_a_real() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (-9223372036854775808, 1)")
+        .unwrap();
+    conn.execute("CREATE TABLE r(x REAL)").unwrap();
+    conn.execute("INSERT INTO r VALUES (-9223372036854775808)")
+        .unwrap();
+    for sql in [
+        "SELECT count(*) FROM t WHERE a = -9223372036854775808.0",
+        "SELECT count(*) FROM t WHERE a IN (-9223372036854775808.0, 5)",
+        "SELECT count(*) FROM t, r WHERE t.a = r.x",
+        "SELECT count(*) FROM t, r WHERE t.a IN (r.x, 5)",
+        "SELECT count(*) FROM t WHERE a = '-9.2233720368547758e+18'",
+        "SELECT count(*) FROM t AS a0 CROSS JOIN t AS a1, t AS a2 WHERE (CAST(CAST(a0.a AS REAL) AS TEXT) = a2.a)",
+    ] {
+        assert_eq!(rows(&io, &conn, sql), ["1"], "{sql}");
+    }
+    // Beyond the range, or not exactly an integer, a REAL names no rowid.
+    conn.execute("CREATE TABLE u(a INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO u VALUES (1)").unwrap();
+    for (sql, want) in [
+        (
+            "SELECT count(*) FROM t WHERE a = -9223372036854777856.0",
+            "0",
+        ),
+        ("SELECT count(*) FROM u WHERE a = 1.5", "0"),
+        ("SELECT count(*) FROM u WHERE a = 1.0", "1"),
+    ] {
+        assert_eq!(rows(&io, &conn, sql), [want], "{sql}");
+    }
+}
