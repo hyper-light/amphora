@@ -10,7 +10,11 @@ q-error is max(est / act, act / est) with both taken as at least 1 row (Moerkott
 Steidl, PVLDB 2(1), 2009). A prefix's actual rows are its counter's rows over its query's loops
 (a correlated subquery's calls), as its estimate is a call's.
 
-usage: bench/planner/summary.py <records.jsonl>... [--json out.json]
+A query and engine's record is the last of the files given; with --best, the one whose best run is
+the fastest of every pass given (their estimates and counts are the same), so passes a, b and c
+give the best of their three bests.
+
+usage: bench/planner/summary.py <records.jsonl>... [--best] [--json out.json]
 """
 
 import json
@@ -120,8 +124,13 @@ def main(argv):
                     # TPC-H's scale factor is the run's: its queries are named by it.
                     label = r["bench"] + (f" SF {r['sf']:g}" if r.get("sf") else "")
                 elif r["record"] == "query":
-                    # The last record of a query and engine is its record.
-                    queries[(label or r["bench"], r["query"], r["target"])] = r
+                    # The last record of a query and engine is its record; with --best, the one
+                    # with the lowest best time over the passes given (one with no time loses).
+                    key = (label or r["bench"], r["query"], r["target"])
+                    old = queries.get(key)
+                    if "--best" in argv and old is not None and best(old) is not None and (best(r) is None or best(old) <= best(r)):
+                        continue
+                    queries[key] = r
     benches = sorted({k[0] for k in queries})
     targets = sorted({k[2] for k in queries}, key=lambda t: ["amphora", "sqlite", "duckdb", "duckdb-mt", "postgres"].index(t) if t in ["amphora", "sqlite", "duckdb", "duckdb-mt", "postgres"] else 9)
     summary = {"runs": runs, "benches": {}}
