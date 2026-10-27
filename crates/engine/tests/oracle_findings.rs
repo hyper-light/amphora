@@ -4,7 +4,7 @@
 //! (G2 step 3; AC-T1.1.1: reads as committed; AC-T1.8.6: the differential suite).
 
 use amphora_engine::{
-    ConnectOpts, Connection, Database, DatabaseOpts, MemoryIO, OpenOptions, SqliteDialect,
+    ConnectOpts, Connection, Database, DatabaseOpts, MemoryIO, Numeric, OpenOptions, SqliteDialect,
     StepResult, Value, IO,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,6 +23,16 @@ fn open() -> (Arc<MemoryIO>, Arc<Connection>) {
 /// The rows of `sql`, columns joined by `|`, each value as SQL writes it: NULL, an integer, a real,
 /// 'text' or x'blob'.
 fn rows(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> Vec<String> {
+    written_rows(io, conn, sql, false)
+}
+
+/// The rows of `sql` as rows() writes them, but each REAL as Rust writes an f64, which keeps the sign
+/// of a negative zero that SQL's text of a REAL leaves off: -0.0 is "-0.0" here and 0.0 to CAST.
+fn signed_rows(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> Vec<String> {
+    written_rows(io, conn, sql, true)
+}
+
+fn written_rows(io: &MemoryIO, conn: &Arc<Connection>, sql: &str, signed: bool) -> Vec<String> {
     let mut stmt = conn.prepare(sql).unwrap();
     let mut out = Vec::new();
     loop {
@@ -33,6 +43,9 @@ fn rows(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> Vec<String> {
                     .get_values()
                     .map(|v| match v {
                         Value::Null => "NULL".to_owned(),
+                        Value::Numeric(Numeric::Float(f)) if signed => {
+                            format!("{:?}", f64::from(*f))
+                        }
                         Value::Text(t) => format!("'{}'", t.as_str()),
                         Value::Blob(b) => format!(
                             "x'{}'",
@@ -2234,4 +2247,56 @@ fn sum_keeps_a_large_integer_totals_low_bits_where_it_turns_real() {
             "{values}"
         );
     }
+}
+
+/// Do: abs() of -0.0, of a negative zero as text and as a BLOB, and of 0 divided by a negative REAL;
+/// arithmetic between a REAL and text spelling a negative zero ('-0', timediff's '-0000-08-10 ...');
+/// `(- 0.0) * x` beside `-(CASE ... ELSE 0.0 END) * x`. Expect: SQLite 3.54's signs. abs negates
+/// only a value below zero (absFunc), so -0.0 stays -0.0. Text whose numeric type is the integer 0
+/// is that integer in integer arithmetic, but floating-point arithmetic reads each operand's REAL
+/// afresh (fp_math's sqlite3VdbeRealValue), -0.0 for '-0'. `- 0.0` is the literal -0.0, while the
+/// minus of any other expression is 0 - x, 0.0 for 0.0 (TK_UMINUS in sqlite3ExprCodeTarget).
+/// Amphora's abs dropped the sign (findings diff-d6a7bedd446e5469, diff-5113ce99737b9e06 and
+/// diff-f93f0363c5e4f173), and it multiplied a REAL by the integer a text read as
+/// (diff-cfa8b811932383e5). The two minus forms give opposite signs in SQLite too, as Amphora gave
+/// them: eet-49998c30035cd4e6 compared forms that aren't equivalent.
+#[test]
+fn a_negative_zero_keeps_its_sign_through_abs_and_text_arithmetic() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t0(c0 INT, c1 BOOLEAN, c2 VARCHAR(10))")
+        .unwrap();
+    conn.execute("INSERT INTO t0 VALUES (3.0, 2, 9223372036854775807), (-1e-308, -1e-308, -2.5)")
+        .unwrap();
+    assert_eq!(
+        signed_rows(
+            &io,
+            &conn,
+            "SELECT abs(0 / c0), abs('%' / c1), abs('%' / c2) FROM t0"
+        ),
+        ["0|0|0", "-0.0|-0.0|-0.0"]
+    );
+    assert_eq!(
+        signed_rows(&io, &conn, "SELECT abs(-0.0), abs('-0.0'), abs('-0'), abs(x'2d30'), abs(-2.5), abs('-2.5x'), abs(-3), abs(0.0)"),
+        ["-0.0|-0.0|-0.0|-0.0|2.5|2.5|3|0.0"]
+    );
+    assert_eq!(
+        signed_rows(&io, &conn, "SELECT '-0' * 0.1, 0.1 * '-0', '-0' / 1.0, '-0' - 0.0, '-0' * '0.5', x'2d30' * 0.5, '-0' * 1, typeof('-0' * 1), '-0' + 0.0, '-0.0' * 1"),
+        ["-0.0|-0.0|-0.0|-0.0|-0.0|-0.0|0|'integer'|0.0|-0.0"]
+    );
+    assert_eq!(
+        signed_rows(
+            &io,
+            &conn,
+            "SELECT timediff(1, 255), timediff(1, 255) * 0.1, timediff(1, 255) * 255"
+        ),
+        ["'-0000-08-10 00:00:00.000'|-0.0|0"]
+    );
+    conn.execute("CREATE TABLE t1(c0 DOUBLE PRIMARY KEY NOT NULL, c1 REAL)")
+        .unwrap();
+    conn.execute("INSERT INTO t1 VALUES (100, 'abc'), (3, -9223372036854775808)")
+        .unwrap();
+    assert_eq!(
+        signed_rows(&io, &conn, "SELECT (- 0.0) * c1, -(CASE WHEN c0 > 1000 THEN '1' ELSE 0.0 END) * c1 FROM t1 ORDER BY c0"),
+        ["0.0|-0.0", "-0.0|0.0"]
+    );
 }

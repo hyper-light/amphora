@@ -2,7 +2,7 @@
 use crate::types::TextSubtype;
 use crate::{
     function::MathFunc,
-    numeric::{format_float, format_float_for_quote, NullableInteger, Numeric},
+    numeric::{format_float, format_float_for_quote, nonnan::NonNan, NullableInteger, Numeric},
     translate::collate::CollationSeq,
     types::{compare_immutable_single, AsValueRef, SeekOp},
     vdbe::affinity::{real_to_i64, Affinity},
@@ -304,29 +304,39 @@ impl Value {
         Value::build_text(result)
     }
 
+    /// abs() as SQLite's absFunc (func.c): an integer's magnitude, NULL for NULL, and anything else
+    /// as its REAL, negated only below zero, so -0.0 stays -0.0.
     #[expect(
         clippy::unnecessary_lazy_evaluations,
         reason = "ok_or skips the drop glue that otherwise bloats the happy path"
     )]
     pub fn exec_abs(&self) -> Result<Self> {
-        Ok(match self {
-            Value::Null => Value::Null,
+        let real = match self {
+            Value::Null => return Ok(Value::Null),
             Value::Numeric(Numeric::Integer(v)) => {
-                Value::from_i64(v.checked_abs().ok_or_else(|| LimboError::IntegerOverflow)?)
+                return Ok(Value::from_i64(
+                    v.checked_abs().ok_or_else(|| LimboError::IntegerOverflow)?,
+                ));
             }
-            Value::Numeric(Numeric::Float(non_nan)) => Value::from_f64(f64::from(*non_nan).abs()),
-            _ => {
-                let s = match self {
-                    Value::Text(text) => std::borrow::Cow::Borrowed(text.as_str()),
-                    Value::Blob(blob) => String::from_utf8_lossy(blob),
-                    _ => unreachable!(),
-                };
+            Value::Numeric(Numeric::Float(_)) | Value::Text(_) | Value::Blob(_) => {
+                self.real_value()
+            }
+        };
+        Ok(Value::from_f64(if real < 0.0 { -real } else { real }))
+    }
 
-                crate::numeric::str_to_f64(s)
-                    .map(|v| Value::from_f64(f64::from(v).abs()))
-                    .unwrap_or_else(|| Value::from_f64(0.0))
+    /// The value as a REAL, as SQLite's sqlite3VdbeRealValue reads it: a number's own value, the
+    /// number a text or BLOB spells read afresh (0.0 for none), and 0.0 for NULL. Text spelling a
+    /// negative zero ('-0') is -0.0 here, though its numeric type is the integer 0.
+    fn real_value(&self) -> f64 {
+        match self {
+            Value::Null => 0.0,
+            Value::Numeric(numeric) => numeric.to_f64(),
+            Value::Text(text) => crate::numeric::str_to_f64(text.as_str()).map_or(0.0, f64::from),
+            Value::Blob(blob) => {
+                crate::numeric::str_to_f64(String::from_utf8_lossy(blob)).map_or(0.0, f64::from)
             }
-        })
+        }
     }
 
     pub fn exec_random<F>(generate_random_number: F) -> Self
@@ -1221,19 +1231,37 @@ impl Value {
     }
 
     pub fn exec_add(&self, rhs: &Value) -> Value {
-        (|| Numeric::from_value(self)?.checked_add(Numeric::from_value(rhs)?))().into()
+        self.exec_arithmetic(rhs, Numeric::checked_add)
     }
 
     pub fn exec_subtract(&self, rhs: &Value) -> Value {
-        (|| Numeric::from_value(self)?.checked_sub(Numeric::from_value(rhs)?))().into()
+        self.exec_arithmetic(rhs, Numeric::checked_sub)
     }
 
     pub fn exec_multiply(&self, rhs: &Value) -> Value {
-        (|| Numeric::from_value(self)?.checked_mul(Numeric::from_value(rhs)?))().into()
+        self.exec_arithmetic(rhs, Numeric::checked_mul)
     }
 
     pub fn exec_divide(&self, rhs: &Value) -> Value {
-        (|| Numeric::from_value(self)?.checked_div(Numeric::from_value(rhs)?))().into()
+        self.exec_arithmetic(rhs, Numeric::checked_div)
+    }
+
+    /// SQLite's arithmetic (OP_Add to OP_Divide, vdbe.c): integer math when both operands' numeric
+    /// types are integers (`op` turns to REALs itself on overflow), else floating-point math on each
+    /// operand's REAL, which fp_math reads afresh (sqlite3VdbeRealValue) rather than from the
+    /// integer a text's numeric type gave: '-0' * 0.1 is -0.0, where '-0' * 1 is the integer 0.
+    fn exec_arithmetic(&self, rhs: &Value, op: fn(Numeric, Numeric) -> Option<Numeric>) -> Value {
+        (|| {
+            let (lhs_num, rhs_num) = (Numeric::from_value(self)?, Numeric::from_value(rhs)?);
+            match (lhs_num, rhs_num) {
+                (Numeric::Integer(_), Numeric::Integer(_)) => op(lhs_num, rhs_num),
+                _ => op(
+                    Numeric::Float(NonNan::new(self.real_value())?),
+                    Numeric::Float(NonNan::new(rhs.real_value())?),
+                ),
+            }
+        })()
+        .into()
     }
 
     pub fn exec_bit_and(&self, rhs: &Value) -> Value {

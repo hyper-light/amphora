@@ -6,7 +6,7 @@
 "clippy::panic" = 201
 "clippy::unwrap_used" = 452
 "clippy::expect_used" = 873
-"clippy::unreachable" = 465
+"clippy::unreachable" = 464
 "clippy::todo" = 11
 "clippy::unimplemented" = 0
 "clippy::indexing_slicing" = 3221
