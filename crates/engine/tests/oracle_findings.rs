@@ -1970,3 +1970,43 @@ fn an_unmatched_row_pass_seeks_its_own_subquerys_cursors() {
         assert_eq!(rows(&io, &conn, &sql).len(), want, "{sql}");
     }
 }
+
+/// Do: an OR of a comparison with NULL and a GLOB whose pattern begins with a character class
+/// (`[a-z]*`), on an indexed text column, which the planner answers with a multi-index OR: the GLOB's
+/// branch seeks the range its pattern implies. Expect: SQLite's rows. The range holds every match but
+/// not only matches (' a', '10' and 'b' lie within the bounds `[a-z]*` gives), so the GLOB must
+/// still filter what the seek finds, as it does after a seek of its own (decision 3 of
+/// docs/design/planner.md); the branch took its range as the GLOB itself and kept every row in it
+/// (findings dqp-720239a34e22196d, eet-614fea129bc7ea47 and eet-ce1e661cf06a6492, step 5's first
+/// runs).
+#[test]
+fn a_multi_index_or_still_filters_a_globs_range() {
+    for (tables, sql, want) in [
+        (
+            &["CREATE TABLE t1(c0 TEXT)", "INSERT INTO t1 VALUES (' a'), ('b'), (NULL), ('10')", "CREATE INDEX i0 ON t1(c0)"][..],
+            "SELECT count(*) FROM t1 WHERE (NULL < c0) OR (c0 GLOB '[a-z]*')",
+            "1",
+        ),
+        (
+            &["CREATE TABLE t1(c0 TEXT COLLATE BINARY)", "INSERT INTO t1 VALUES (' a')", "CREATE INDEX i0 ON t1(c0 DESC)"][..],
+            "SELECT count(*) FROM t1 AS a0 WHERE ((NULL < a0.c0) OR (a0.c0 GLOB '[a-z]*'))",
+            "0",
+        ),
+        (
+            &["CREATE TABLE t0(c0 DECIMAL(10,2))", "INSERT OR IGNORE INTO t0 VALUES ('1e3')", "CREATE TABLE t2(c0 DECIMAL(10,2) PRIMARY KEY, c1 VARCHAR(10) NOT NULL, c2 REAL COLLATE BINARY UNIQUE)", "INSERT INTO t2 VALUES (-2.5, 10, -1)", "CREATE INDEX i0 ON t2(c1)"][..],
+            "SELECT count(*) FROM t2 AS a0 JOIN t0 AS a1 ON ((a0.c2 == NULL) OR (a0.c1 GLOB '[a-z]*'))",
+            "0",
+        ),
+        (
+            &["CREATE TABLE t0(c0 VARCHAR(10) PRIMARY KEY)", "INSERT OR IGNORE INTO t0 VALUES (2.0)", "CREATE TABLE t2(c0 INTEGER COLLATE BINARY NOT NULL)", "INSERT INTO t2 VALUES ('1')"][..],
+            "SELECT count(*) FROM t2 AS a0 JOIN t0 AS a1 ON ((a1.c0 <= NULL) OR (a1.c0 GLOB '[a-z]*'))",
+            "0",
+        ),
+    ] {
+        let (io, conn) = open();
+        for table in tables {
+            conn.execute(table).unwrap();
+        }
+        assert_eq!(rows(&io, &conn, sql), [want], "{sql}");
+    }
+}
