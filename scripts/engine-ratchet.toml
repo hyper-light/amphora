@@ -14,7 +14,7 @@
 "clippy::string_slice" = 101
 "clippy::cast_possible_truncation" = 562
 "clippy::cast_sign_loss" = 254
-"clippy::cast_possible_wrap" = 690
+"clippy::cast_possible_wrap" = 688
 "clippy::disallowed_macros" = 786
 "clippy::disallowed_methods" = 40
 "clippy::disallowed_types" = 0

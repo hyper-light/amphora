@@ -2492,6 +2492,35 @@ impl Jsonb {
         })
     }
 
+    /// Counts a placeholder just put at `at` in the root array at `pos` (`size` payload bytes
+    /// behind a `header_size`-byte header before it) in that array's header, as the traversal
+    /// counts one in an object's array: SetOperation and InsertOperation resize a root or object
+    /// array from its header, so a header left short of the placeholder came out one byte short of
+    /// what it holds. Says how much the document grew and where the placeholder is now, since a
+    /// rewritten header can move the contents either way.
+    fn count_placeholder(
+        &mut self,
+        pos: usize,
+        size: usize,
+        header_size: usize,
+        placeholder: usize,
+        at: usize,
+    ) -> Result<(isize, usize)> {
+        let malformed = || LimboError::ParseError("malformed JSON".to_string());
+        let grown = size.checked_add(placeholder).ok_or_else(malformed)?;
+        let new_header_size = self.write_element_header(pos, ElementType::ARRAY, grown, true)?;
+        let header_delta = isize::try_from(new_header_size)
+            .map_err(|_| malformed())?
+            .checked_sub(isize::try_from(header_size).map_err(|_| malformed())?)
+            .ok_or_else(malformed)?;
+        let delta = isize::try_from(placeholder)
+            .map_err(|_| malformed())?
+            .checked_add(header_delta)
+            .ok_or_else(malformed)?;
+        let at = at.checked_add_signed(header_delta).ok_or_else(malformed)?;
+        Ok((delta, at))
+    }
+
     fn write_element_header(
         &mut self,
         cursor: usize,
@@ -3058,11 +3087,18 @@ impl Jsonb {
 
                                 self.data
                                     .splice(arr_pos..arr_pos, placeholder_bytes.iter().copied());
+                                let (delta, arr_pos) = self.count_placeholder(
+                                    pos,
+                                    root_size,
+                                    root_header_size,
+                                    placeholder_bytes.len(),
+                                    arr_pos,
+                                )?;
 
                                 return Ok(JsonTraversalResult::with_array_index(
                                     pos,
                                     JsonLocationKind::DocumentRoot,
-                                    placeholder_bytes.len() as isize,
+                                    delta,
                                     arr_pos,
                                 ));
                             }
@@ -3114,11 +3150,18 @@ impl Jsonb {
 
                             self.data
                                 .splice(end_pos..end_pos, placeholder_bytes.iter().copied());
+                            let (delta, end_pos) = self.count_placeholder(
+                                pos,
+                                root_size,
+                                root_header_size,
+                                placeholder_bytes.len(),
+                                end_pos,
+                            )?;
 
                             return Ok(JsonTraversalResult::with_array_index(
                                 pos,
                                 JsonLocationKind::DocumentRoot,
-                                placeholder_bytes.len() as isize,
+                                delta,
                                 end_pos,
                             ));
                         }

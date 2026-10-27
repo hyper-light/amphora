@@ -2537,3 +2537,61 @@ fn a_call_under_a_collate_folds_away_with_a_false_and() {
         ["NULL"]
     );
 }
+
+/// Do: jsonb_insert() and jsonb_set() appending to an array, by '$[#]' and by the index one past
+/// its end, values of one, two and four bytes (NULL, 0, 'abc', and x'D3000130', a 0 behind a
+/// header wider than it needs), into the root array ('[]', '[1]'), an object's array ('$.a[#]')
+/// and a nested one ('$[0][#]'). Expect: SQLite 3.54's bytes, each array's header counting every
+/// byte it holds. Amphora's root array header left out the one-byte placeholder its path
+/// traversal puts in first, which an object's array counts there, so jsonb_insert('[]', '$[#]', 0)
+/// was x'1b1330', a header one byte short of what it holds (found by the controls of
+/// jsonb_containers_write_a_jsonb_argument_as_its_text_would).
+#[test]
+fn an_element_appended_to_the_root_array_counts_in_its_header() {
+    let (io, conn) = open();
+    let values = ["NULL", "0", "x'D3000130'", "'abc'"];
+    for (doc, path, want) in [
+        (
+            "[]",
+            "$[#]",
+            "x'1b00'|x'2b1330'|x'4bd3000130'|x'4b3a616263'",
+        ),
+        (
+            "[]",
+            "$[0]",
+            "x'1b00'|x'2b1330'|x'4bd3000130'|x'4b3a616263'",
+        ),
+        (
+            "[1]",
+            "$[1]",
+            "x'3b133100'|x'4b13311330'|x'6b1331d3000130'|x'6b13313a616263'",
+        ),
+        (
+            "[1]",
+            "$[#]",
+            "x'3b133100'|x'4b13311330'|x'6b1331d3000130'|x'6b13313a616263'",
+        ),
+        (
+            "{\"a\":[]}",
+            "$.a[#]",
+            "x'4c17611b00'|x'5c17612b1330'|x'7c17614bd3000130'|x'7c17614b3a616263'",
+        ),
+        (
+            "[[]]",
+            "$[0][#]",
+            "x'2b1b00'|x'3b2b1330'|x'5b4bd3000130'|x'5b4b3a616263'",
+        ),
+    ] {
+        for function in ["jsonb_insert", "jsonb_set"] {
+            let columns: Vec<String> = values
+                .iter()
+                .map(|value| format!("{function}('{doc}', '{path}', {value})"))
+                .collect();
+            assert_eq!(
+                rows(&io, &conn, &format!("SELECT {}", columns.join(", "))),
+                [want],
+                "{function} {doc} {path}"
+            );
+        }
+    }
+}
