@@ -824,23 +824,26 @@ finished, under 1 when the engine was faster; and on how many it was the faster)
 
 | benchmark | SQLite | DuckDB, one thread | DuckDB, 32 threads | PostgreSQL |
 |---|---:|---:|---:|---:|
-| JOB (113) | 1.101, 63 faster | 1.013, 64 faster | 0.435, 75 faster | not run |
+| JOB (113) | 1.101, 63 faster | 1.013, 64 faster | 0.435, 75 faster | 0.354, 83 faster |
 | TPC-H SF 1 (22) | 1.417, 12 faster | 0.481, 16 faster | 0.126, 20 faster | 0.535, 19 faster |
-| TPC-H SF 10 (22) | 1.028 (20 of 22), 12 faster | 0.297, 14 faster | 0.032, 21 faster | 0.740 (5 of 22), 4 faster |
+| TPC-H SF 10 (22) | 1.028 (20 of 22), 12 faster | 0.297, 14 faster | 0.032, 21 faster | 0.292, 20 faster |
 
 The times are the passes timed by fresh processes on loaded data: the first passes, timed by the
 process that had just loaded them, ran slower (DuckDB on all 32 threads throughout, the others over
 JOB's first hour and a half), and `record.sh` now loads in a process of its own (c652376). SF 10 has
-only its first pass. PostgreSQL ran in Docker Desktop, which stopped during SF 10's q06 and could
-not be started again, so it has TPC-H SF 1 and SF 10's first five queries; SQLite passed the 600 s
-deadline on SF 10's q07 and q14. The record says what each left out and why.
+only its first pass. PostgreSQL ran in Docker Desktop, which stopped during SF 10's first pass and
+answered again a day later; its SF 10 and JOB times are passes of its own (JOB's right after loading
+it). Every engine counted the same rows for every query; SQLite passed the 600 s deadline on SF 10's
+q07 and q14. The record says what each left out and why.
 
-**The repeat** (the plan's test: two passes of one build on one machine, the same estimates and
-median run times within 5%): on TPC-H SF 1, passes b and c record the same estimates and counts (0
-of 135 counters differ), and the median run times of Amphora (1.017), DuckDB (1.001) and DuckDB on
-all 32 threads (1.038) are within 5%; SQLite's (0.937) is not, its median moved by one query whose
-runs began at loads of 1.87 to 1.89 in one pass and 0.39 to 0.65 in the other. JOB's pass c was
-running when this was written.
+**The repeat** (the plan's test: two passes of one build on one machine record the same estimates,
+and median run times within 5%): every pair of passes recorded the same estimates and counts (0 of
+JOB's 1,090 counters and 0 of TPC-H SF 1's 135 differ). The run times are not repeatable to 5% on
+jupiter while other agents use it: TPC-H SF 1's passes b and c are within 5% for Amphora (1.017) and
+DuckDB (1.001; 1.038 on all 32 threads) but not for SQLite (0.937), and JOB's for SQLite (1.036)
+alone, with Amphora at 1.144 and DuckDB at 1.102 (1.473 on all 32 threads), slowed where other work
+ran during pass c's runs. Each run begins at a load under 2; nothing keeps the machine quiet through
+it.
 
 ## What would falsify these notes
 
