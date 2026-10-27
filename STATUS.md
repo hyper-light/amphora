@@ -249,8 +249,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   holding a NUL, NULL routing under NOT, comparisons that kept their conversions, and two panics of
   subqueries run after the read that needs them; the oracles' own artifacts, fixed; five not Amphora's
   (SQLite's own bugs, evaluation order, the BLOB LIKE option, ill-formed UTF-8 per
-  `docs/design/semantics.md`, SQLite's names in a folded AND). Open: CERT's estimates (87 findings,
-  cause AG, the planner's goal). **The test:** a wrong-result bug injected into the optimizer (`x IS
+  `docs/design/semantics.md`, SQLite's names in a folded AND). CERT's estimates (cause AG, 87
+  findings) are clean since the planner's goal (step 5, 2026-10-27,
+  `bench/records/2026-10-27-adas-mac-studio-2-cert-clean/`): every CERT finding of the campaigns
+  replays clean, CERT checks every shape the generator makes (grouped, aggregated, DISTINCT, ordered,
+  limited, compound), and six runs of every oracle on its last tree (seeds 11 to 13 and three nights',
+  1,800 s each) fail none of 2,607,858 CERT checks and find only SQLite's own LIKE bug (cause AH);
+  the step fixed 14 more causes in Amphora from failing tests (`oracle_findings.rs`, 79 tests), among
+  them a RIGHT JOIN's OFFSET, atanh's last digit (`docs/design/semantics.md`, decision 2) and a
+  panic of a RIGHT JOIN's unmatched-row pass. **The test:** a wrong-result bug injected into the optimizer (`x IS
   NULL` taken as rejecting NULLs) was caught by one nightly run: 125 findings, the first at 0.47 s
   of the 1,800 s (`bench/oracles/injected.sh`).
 - **The SQLite language against every engine** (G2 step 1, `bench/corpus/run.sh`; published in
@@ -331,8 +338,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   fixed (the oracles' cause E); left, from a failing test, `index_xinfo`'s NULL; then the missing
   features by how often users reach them (ORDER BY in aggregates, median and percentiles, the JSON
   functions, the PRAGMAs), each against the probe that found it.
-- **What the oracles left open** (`bench/oracles/findings.md`): CERT's estimates, with the planner
-  researched and audited (goal 01a16e788f3e735fbadbbdaa30d38d29, plan 01a16eab7f457673b4cf9933adacfc4d).
+- **What the oracles left open** (`bench/oracles/findings.md`): no cause of Amphora's. Their last
+  runs (step 5 of plan 01a16eab7f457673b4cf9933adacfc4d) find only SQLite 3.54's LIKE optimization
+  dropping an outer join's rows under SQLITE_LIKE_DOESNT_MATCH_BLOBS (cause AH), where the system's
+  SQLite answers as Amphora does.
 - **One thread making everything durable**: on btrfs every flush is a commit of the filesystem's
   log, one at a time, so the checkpointer's flushes of the file hold up the flusher's, and with it
   every write (docs/design/store.md, decision 4: commits stalled up to 97 ms, writes at 512 writers

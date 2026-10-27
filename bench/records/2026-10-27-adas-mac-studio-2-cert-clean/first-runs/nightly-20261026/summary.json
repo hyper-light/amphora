@@ -1,0 +1,319 @@
+{
+  "duplicates": 6,
+  "findings": {
+    "cert-60e65956aed5c593": {
+      "at_seconds": 1342.754598875,
+      "detail": "the more restrictive query is estimated at 100000000000000000 rows, the query at 1000000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "diff-6a0a824a042f7356": {
+      "at_seconds": 622.478526584,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-6e3bfa5d3e0906f5": {
+      "at_seconds": 863.761985292,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-ec071f3026c035f9": {
+      "at_seconds": 944.645705709,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-ecbb9d89531a62f7": {
+      "at_seconds": 1316.000617042,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "dqp-a8e9aa5690b72c52": {
+      "at_seconds": 617.737057625,
+      "detail": "cursor id 4 is None",
+      "kind": "Panic",
+      "oracle": "dqp",
+      "statements": 2
+    },
+    "eet-ce1e661cf06a6492": {
+      "at_seconds": 644.49433275,
+      "detail": "an equivalent form gives other rows",
+      "kind": "Wrong",
+      "oracle": "eet",
+      "statements": 4
+    },
+    "error-2ca8ffc19f3a6362": {
+      "at_seconds": 684.244612,
+      "detail": "Amphora errors where SQLite finds the pivot: Parse error: Unexpected character",
+      "kind": "Error",
+      "oracle": "pqs",
+      "statements": 5
+    },
+    "error-493c667725cb13ff": {
+      "at_seconds": 196.347246917,
+      "detail": "Amphora errors where SQLite finds the pivot: Parse error: malformed JSON",
+      "kind": "Error",
+      "oracle": "pqs",
+      "statements": 3
+    },
+    "error-95a30b3d763ff2ad": {
+      "at_seconds": 1752.537807,
+      "detail": "Amphora errors where SQLite finds the pivot: Parse error: Unexpected end of input",
+      "kind": "Error",
+      "oracle": "pqs",
+      "statements": 2
+    },
+    "error-dfd3551986fdeacf": {
+      "at_seconds": 568.257913709,
+      "detail": "Amphora errors where SQLite finds the pivot: json_object() requires an even number of arguments",
+      "kind": "Error",
+      "oracle": "pqs",
+      "statements": 3
+    },
+    "tlp-0b5892f5ea286d51": {
+      "at_seconds": 904.219096167,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 7
+    },
+    "tlp-98b8974395ae8411": {
+      "at_seconds": 761.66655425,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-f1c4df55c2b69eb4": {
+      "at_seconds": 429.896249584,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 5
+    }
+  },
+  "functions": 101,
+  "label": "",
+  "oracles": {
+    "cert": {
+      "checks": 421712,
+      "failed": 1,
+      "passed": 399635,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "sqlite refused": 22076
+      }
+    },
+    "diff": {
+      "checks": 421714,
+      "failed": 4,
+      "passed": 338405,
+      "plans_changed": 0,
+      "refused": {
+        "ESCAPE expression must be a single character": 15,
+        "FLAGS parameter to json_valid() must be between # and ##": 13,
+        "JSON cannot hold BLOB values": 48,
+        "JSON path error near: \"#\"": 19,
+        "JSON path error near: \"##\"": 5,
+        "JSON path error near: \"###\"": 4,
+        "JSON path error near: \"####\"": 1,
+        "JSON path error near: \"################\"": 4,
+        "JSON path error near: \"###################\"": 2,
+        "JSON path error near: \"################.#\"": 2,
+        "JSON path error near: \"#.#\"": 15,
+        "JSON path error near: \"#.#e+###\"": 3,
+        "JSON path error near: \"-#\"": 2,
+        "JSON path error near: \"-###\"": 9,
+        "JSON path error near: \"-###################\"": 3,
+        "JSON path error near: \"-#.#\"": 3,
+        "JSON path error near: \"-#.#e-###\"": 1,
+        "JSON path error near: \"Inf\"": 1,
+        "Parse error: Unexpected character": 58,
+        "Parse error: Unexpected end of input": 18,
+        "Parse error: bad JSON path: '\u0001\u0002'": 1,
+        "Parse error: bad JSON path: ' '": 1,
+        "Parse error: bad JSON path: ' a'": 1,
+        "Parse error: bad JSON path: '###'": 1,
+        "Parse error: bad JSON path: '##'": 3,
+        "Parse error: bad JSON path: '#'": 1,
+        "Parse error: bad JSON path: '#.#'": 4,
+        "Parse error: bad JSON path: '#.#e+###'": 1,
+        "Parse error: bad JSON path: '%'": 1,
+        "Parse error: bad JSON path: ''": 8,
+        "Parse error: bad JSON path: '-#'": 2,
+        "Parse error: bad JSON path: 'A'": 5,
+        "Parse error: bad JSON path: 'ABC'": 1,
+        "Parse error: bad JSON path: '[#,#,#]'": 1,
+        "Parse error: bad JSON path: 'a'": 3,
+        "Parse error: bad JSON path: 'abc'": 1,
+        "Parse error: bad JSON path: 'true'": 4,
+        "Parse error: bad JSON path: 'x'": 2,
+        "Parse error: bad JSON path: 'xÿ'": 1,
+        "Parse error: bad JSON path: '{\"a\":null}'": 1,
+        "Parse error: bad JSON path: 'ÿ'": 3,
+        "Parse error: malformed JSON": 188,
+        "integer overflow": 5,
+        "json_array_insert() needs an odd number of arguments": 18,
+        "json_insert() needs an odd number of arguments": 28,
+        "json_object() labels must be TEXT": 20,
+        "json_object() requires an even number of arguments": 51,
+        "json_replace() needs an odd number of arguments": 24,
+        "json_set() needs an odd number of arguments": 12,
+        "string or blob too big": 8
+      },
+      "skipped": {
+        "SQLite's answer holds ill-formed UTF-8 (garbage in, garbage out)": 23,
+        "a bare column: its row is any of its group's": 38459,
+        "sqlite refused": 44197
+      }
+    },
+    "dqp": {
+      "checks": 421713,
+      "failed": 1,
+      "passed": 314912,
+      "plans_changed": 110966,
+      "refused": {},
+      "skipped": {
+        "a bare column: its row is any of its group's": 38660,
+        "a derived query meets a value's error (evaluation order)": 542,
+        "amphora refused the base": 43665,
+        "the index can't serve the query": 23933
+      }
+    },
+    "eet": {
+      "checks": 421712,
+      "failed": 1,
+      "passed": 333659,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a bare column: its row is any of its group's": 44292,
+        "a derived query errors on SQLite too": 351,
+        "a derived query meets a value's error (evaluation order)": 458,
+        "amphora refused the base": 42951
+      }
+    },
+    "norec": {
+      "checks": 421713,
+      "failed": 0,
+      "passed": 388356,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a derived query meets a value's error (evaluation order)": 4110,
+        "amphora refused both": 29247
+      }
+    },
+    "order": {
+      "checks": 421712,
+      "failed": 0,
+      "passed": 421712,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {}
+    },
+    "pqs": {
+      "checks": 382131,
+      "failed": 10,
+      "passed": 353537,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "sqlite can't evaluate it": 21544,
+        "sqlite misses its own pivot": 7040
+      }
+    },
+    "same": {
+      "checks": 84344,
+      "failed": 0,
+      "passed": 84344,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {}
+    },
+    "tlp": {
+      "checks": 421714,
+      "failed": 3,
+      "passed": 362905,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a REAL sum's partitions round apart from it": 3953,
+        "a derived query meets a value's error (evaluation order)": 12606,
+        "a partition's sum overflows": 17,
+        "amphora refused the base": 42230
+      }
+    }
+  },
+  "seconds": 1800.000235625,
+  "seed": 20261026,
+  "setup_refused": {},
+  "sqlite": "3.54.0",
+  "sqlite_options": [
+    "ATOMIC_INTRINSICS=1",
+    "COMPILER=clang-17.0.0",
+    "DEFAULT_AUTOVACUUM",
+    "DEFAULT_CACHE_SIZE=-2000",
+    "DEFAULT_FILE_FORMAT=4",
+    "DEFAULT_JOURNAL_SIZE_LIMIT=-1",
+    "DEFAULT_MMAP_SIZE=0",
+    "DEFAULT_PAGE_SIZE=4096",
+    "DEFAULT_PCACHE_INITSZ=20",
+    "DEFAULT_RECURSIVE_TRIGGERS",
+    "DEFAULT_SECTOR_SIZE=4096",
+    "DEFAULT_SYNCHRONOUS=2",
+    "DEFAULT_WAL_AUTOCHECKPOINT=1000",
+    "DEFAULT_WAL_SYNCHRONOUS=2",
+    "DEFAULT_WORKER_THREADS=0",
+    "DIRECT_OVERFLOW_READ",
+    "ENABLE_COLUMN_METADATA",
+    "ENABLE_DBSTAT_VTAB",
+    "ENABLE_FTS3",
+    "ENABLE_FTS3_PARENTHESIS",
+    "ENABLE_FTS4",
+    "ENABLE_FTS5",
+    "ENABLE_MATH_FUNCTIONS",
+    "ENABLE_PERCENTILE",
+    "ENABLE_PREUPDATE_HOOK",
+    "ENABLE_RTREE",
+    "ENABLE_SESSION",
+    "ENABLE_STAT4",
+    "ENABLE_STMTVTAB",
+    "ENABLE_UNLOCK_NOTIFY",
+    "HAVE_ISNAN",
+    "LIKE_DOESNT_MATCH_BLOBS",
+    "MALLOC_SOFT_LIMIT=1024",
+    "MAX_ATTACHED=10",
+    "MAX_COLUMN=2000",
+    "MAX_COMPOUND_SELECT=500",
+    "MAX_DEFAULT_PAGE_SIZE=8192",
+    "MAX_EXPR_DEPTH=10000",
+    "MAX_FUNCTION_ARG=1000",
+    "MAX_LENGTH=1000000000",
+    "MAX_LIKE_PATTERN_LENGTH=50000",
+    "MAX_MMAP_SIZE=0x7fff0000",
+    "MAX_PAGE_COUNT=0xfffffffe",
+    "MAX_PAGE_SIZE=65536",
+    "MAX_SCHEMA=10000000",
+    "MAX_SQL_LENGTH=1000000000",
+    "MAX_TRIGGER_DEPTH=1000",
+    "MAX_VARIABLE_NUMBER=250000",
+    "MAX_VDBE_OP=250000000",
+    "MAX_WORKER_THREADS=8",
+    "MUTEX_PTHREADS",
+    "SECURE_DELETE",
+    "SYSTEM_MALLOC",
+    "TEMP_STORE=1",
+    "THREADSAFE=1"
+  ],
+  "states": 84344
+}

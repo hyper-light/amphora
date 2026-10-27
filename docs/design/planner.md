@@ -592,6 +592,19 @@ ratio moves both ways from run to run (0.895 to 1.074 and 0.640 to 1.110 by best
 eight rounds of their own (1.074 and 1.110, medians 1.002 and 1.013); both compile to the same
 bytecode on either binary.
 
+Step 5 of the planner's plan (2026-10-27) made the statement's own `output_rows`, the estimate CERT
+reads, the rows of every shape, and added the IS NULL rule above. Every CERT finding of the oracles'
+campaigns 1 to 4 and the injected run (126) and of step 5's own runs (5) passes `--replay-check` on
+10f2461, and six runs of every oracle there (seeds 11, 12 and 13 and three nights' seeds, 1,800 s
+each, on adas-mac-studio-2) fail none of 2,607,858 CERT checks, none of them a query planned without
+an estimate (`bench/records/2026-10-27-adas-mac-studio-2-cert-clean/`, `third-runs/*/summary.json`
+and `replay-cert.tsv`). `crates/engine/tests/oracle_findings.rs` holds a test for each cause CERT
+found, each failing before its fix: `a_hash_joins_estimate_is_the_joins` (AF),
+`a_full_join_is_estimated_at_least_its_inner_join` and `an_always_true_conjunct_raises_no_estimate`
+(AG), `an_is_null_of_a_column_never_null_keeps_no_inner_row` (BN),
+`a_multi_index_or_keeps_the_other_terms_selectivity` (P1), `a_term_counts_where_the_join_completes_it`
+(P2) and `bounds_read_apart_make_the_same_range` (P3).
+
 **Falsified by.** Two orders or two access paths of one inner join whose estimates differ (the order
 check, run nightly); an outer join estimated below its inner join, or a semi or anti join above its
 left side; a query the new estimates send to a slower plan than the old ones chose, measured (the
