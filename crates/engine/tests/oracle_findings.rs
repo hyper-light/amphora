@@ -2383,3 +2383,48 @@ fn atanh_is_odd_and_keeps_its_digits_near_minus_one() {
         ["18.714973875118524|1|1|1|1|NULL|NULL"]
     );
 }
+
+/// Do: RIGHT and FULL JOINs whose rows come from the main loop, from the unmatched-row pass or from
+/// both, LIMIT 2 at every OFFSET from 0 to past the last row. Expect: SQLite's rows: the OFFSET
+/// skips rows across both passes and the LIMIT counts the rest. The pass enters the main loop's
+/// body as a subroutine; a row the OFFSET skipped jumped to the right table's next row in the main
+/// loop, past the subroutine's Return (SQLite resolves that level's continue label at the Return,
+/// sqlite3WhereEnd), so the pass ran on as the main loop and kept or lost rows by the tables' sizes
+/// (findings diff-60e05c03077b9681, diff-0cdfabdc3c24bfc3, diff-149f30f47877187c,
+/// diff-ce9dc54f20fa07db, eet-010828432e21524e and four more of step 5's second runs).
+#[test]
+fn an_offset_skips_a_right_joins_rows_in_either_pass() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
+        .unwrap();
+    conn.execute("CREATE TABLE s(a INTEGER)").unwrap();
+    conn.execute("INSERT INTO s VALUES (2), (4)").unwrap();
+    for offset in 0..=7usize {
+        for (from, all) in [
+            ("s RIGHT JOIN t ON NULL", 5),
+            ("s RIGHT JOIN t ON s.a = t.a", 5),
+            ("s RIGHT JOIN t ON NULL WHERE t.a <> 3", 4),
+            ("s FULL JOIN t ON s.a = t.a", 5),
+            ("s FULL JOIN t ON NULL", 7),
+            ("s FULL JOIN t ON NULL WHERE s.a IS NULL", 5),
+        ] {
+            let sql = format!("SELECT 1 FROM {from} LIMIT 2 OFFSET {offset}");
+            let want = 2usize.min(all - offset.min(all));
+            assert_eq!(rows(&io, &conn, &sql).len(), want, "{sql}");
+        }
+    }
+    conn.execute("CREATE TABLE t0(c0 INTEGER UNIQUE)").unwrap();
+    conn.execute("INSERT INTO t0 VALUES (2.0), ('x')").unwrap();
+    conn.execute("CREATE TABLE t1(c0 TEXT COLLATE BINARY, c1 DECIMAL(10,2))")
+        .unwrap();
+    assert_eq!(
+        rows(
+            &io,
+            &conn,
+            "SELECT -100 FROM t1 AS a0 RIGHT JOIN t0 AS a1 ON 10 LIMIT 4 OFFSET 1"
+        ),
+        ["-100"]
+    );
+}
