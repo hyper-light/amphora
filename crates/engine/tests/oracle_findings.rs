@@ -2428,3 +2428,28 @@ fn an_offset_skips_a_right_joins_rows_in_either_pass() {
         ["-100"]
     );
 }
+
+/// Do: atanh() of REALs the generator makes, and of 0.25, which the platforms' C libraries round
+/// apart. Expect: SQLite 3.54's answers, which are its C library's atanh (math1Func, func.c):
+/// glibc 2.44 rounds atanh correctly, and macOS 26's libm is x below 2^-27 and
+/// ln_1p(2|x| / (1 - |x|)) / 2 given x's sign above, an ulp below the correctly rounded value at
+/// 0.25 (each the platform's answer for 3,000,019 arguments). The libm crate's atanh gave
+/// 0.54930614433405478 for 0.5, where both give 0.54930614433405489 (finding diff-2074283afc468d4a
+/// and sixteen more of step 5's second runs, on macOS).
+#[test]
+fn atanh_has_its_platforms_c_library_digits() {
+    let (io, conn) = open();
+    assert_eq!(
+        rows(&io, &conn, "SELECT atanh(0.5), atanh(-0.5), atanh(0.1), atanh(0.75), atanh(0.9999999999999999)"),
+        ["0.54930614433405489|-0.54930614433405489|0.10033534773107558|0.97295507452765662|18.714973875118524"]
+    );
+    let quarter = if cfg!(target_vendor = "apple") {
+        "0.25541281188299531"
+    } else {
+        "0.25541281188299536"
+    };
+    assert_eq!(
+        rows(&io, &conn, "SELECT atanh(0.25), -atanh(-0.25)"),
+        [format!("{quarter}|{quarter}")]
+    );
+}
