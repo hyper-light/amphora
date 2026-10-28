@@ -132,3 +132,10 @@ Every pair, best of 3 (`suite_compare.py`):
 | upsert | 1 | 63.0 | 63.1 | 1.0016 |
 | upsert | 32 | 2139.0 | 2129.7 | 0.9957 |
 | window_row_number | 32 | 3386.6 | 3383.9 | 0.9992 |
+
+## Measured again
+
+The 19 statements behind the 21 pairs outside 2% here, each at both client counts in six ABBA rounds
+on adas-mac-studio-2, 2026-10-27: `2026-10-27-adas-mac-studio-2-row-counters-off-19.md`. On neither
+machine is a pair slower with the counters off by more than its builds' own runs vary; Ada judged
+the criterion met on that evidence (2026-10-27).

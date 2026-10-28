@@ -845,6 +845,18 @@ alone, with Amphora at 1.144 and DuckDB at 1.102 (1.473 on all 32 threads), slow
 ran during pass c's runs. Each run begins at a load under 2; nothing keeps the machine quiet through
 it.
 
+**The counters off** (the step's fourth criterion: the bench suite's statements with the row
+counters off within 2% of the change's parent, best of 3): 9cfc8b9's record left 56 of its 104
+statement and client-count pairs outside 2%. Measured again, each statement alone in ABBA turns, 35
+of the 56 were within 2% on jupiter (`bench/records/2026-10-27-jupiter-row-counters-off-pairs.md`),
+and the 19 statements behind the other 21 were measured again on adas-mac-studio-2
+(`bench/records/2026-10-27-adas-mac-studio-2-row-counters-off-19.md`). On neither machine is a pair
+slower with the counters off by more than its builds' own runs vary; five pairs are faster with them
+off in every round on Studio 2 (`date_bucket`, `like_substring` and `string_functions` at 1 client,
+`point_pk_one_column` and `range_secondary_100` at 32), the two binaries' other differences, since a
+connection that asks for no counts runs no counting instruction. Ada judged the criterion met on
+that evidence (2026-10-27).
+
 ## What would falsify these notes
 
 - A finding's quote missing from its source at the stated location. Kiln re-checks each quote. The
