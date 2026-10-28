@@ -56,6 +56,13 @@ the load each began at is in its record. On Linux that is the one-minute load av
 none, so there it is the cores busy plus the processor queue, averaged over three seconds, which the
 record names.
 
+On a machine others use, a monitor beside the passes (every process's CPU each 10 s) and the passes'
+log lines with their times let `disturbed.py` name the records that ran beside other work; those are
+run again by a process of their own with the same binary (`--only`, `--targets`) once the machine is
+quiet, into a record of their own, and a query's last record is its rerun
+(bench/records/2026-10-26-jupiter-planner-baseline.md). `summary.py --best` takes each query's
+fastest of the passes given.
+
 ## What is measured
 
 - **A join prefix's rows**: the rows that left a table access into the next level of the join, or
