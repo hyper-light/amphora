@@ -2,10 +2,10 @@ Subject: CP-T2.2 frame connection provenance and exact TLS exporter
 Why: Authenticate queued control frames by their actual transport epoch rather than a certificate-stable peer replacement, retaining the existing connection owner and wire protocol
 
 diff --git a/crates/hyper-transport/src/endpoint.rs b/crates/hyper-transport/src/endpoint.rs
-index cdc35329f4de7580ec708dde96ab4aa477e73247..567a1f5fbebd213dac526b8e2acc8f6d55fcfb07 100644
+index cdc35329f4de7580ec708dde96ab4aa477e73247..9e1af1da12ba139c4e8a2c0fde7c059210c1f601 100644
 --- a/crates/hyper-transport/src/endpoint.rs
 +++ b/crates/hyper-transport/src/endpoint.rs
-@@ -1734,12 +1734,34 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C,
+@@ -1734,14 +1734,36 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C,
          Ok(conn.epoch)
      }
  
@@ -39,8 +39,11 @@ index cdc35329f4de7580ec708dde96ab4aa477e73247..567a1f5fbebd213dac526b8e2acc8f6d
 +    fn connection_at(&self, peer: PeerId, epoch: Epoch) -> Option<&Conn<C::Role>> {
 +        self.conns.iter().flatten().find(|conn| {
              !conn.lost && conn.epoch == epoch && conn.peer.is_some_and(|(of, _)| of == peer)
-         })
+-        })
++        }).map(Box::as_ref)
      }
+
+     /// What the path to `peer` measures now.
 @@ -4882,6 +4904,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                  self.events.push_back(Waiting {
                      event: Event::Frame {

@@ -1763,7 +1763,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     fn connection_at(&self, peer: PeerId, epoch: Epoch) -> Option<&Conn<C::Role>> {
         self.conns.iter().flatten().find(|conn| {
             !conn.lost && conn.epoch == epoch && conn.peer.is_some_and(|(of, _)| of == peer)
-        })
+        }).map(Box::as_ref)
     }
 
     /// What the path to `peer` measures now.
