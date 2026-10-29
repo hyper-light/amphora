@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::Db;
 
-pub use crate::database::replicated::ReplicaHandle;
+pub use crate::database::replicated::{ReceiveReceipt, ReplicaHandle};
 pub mod bootstrap;
 
 const BASELINE_DELTA: &[u8] = b"amphora.delta.v1\0";

@@ -38,6 +38,45 @@ pub struct ReplicaHandle {
     sender: mpsc::SyncSender<Envelope>,
     shared: Arc<Control>,
 }
+
+/// Completion of a bounded queued wire record. Admission transfers byte ownership only;
+/// processing, application and durability are not acknowledged until their own protocol steps.
+#[must_use = "poll the receipt to observe later processing errors"]
+pub struct ReceiveReceipt {
+    // Mutex makes receipts Sync for host carrier shells; exclusive polling uses get_mut and
+    // never locks or waits for the actor. The actor holds only the channel's sending end.
+    receiver: Mutex<mpsc::Receiver<Result<(), Refusal>>>,
+    until: Instant,
+    completed: bool,
+}
+impl ReceiveReceipt {
+    /// None is pending; Some(()) means the actor accepted the record through step. Typed errors
+    /// report rejection, deadline expiry or owner loss. A completed receipt cannot be polled again.
+    /// Expiry stops observation; it does not undo processing that already began.
+    pub fn try_result(&mut self) -> Result<Option<()>, Refusal> {
+        if self.completed {
+            return Err(api::invalid("replica receive receipt", "already completed"));
+        }
+        let result = match self.receiver.get_mut() {
+            Ok(receiver) => match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) if Instant::now() < self.until => None,
+                Err(mpsc::TryRecvError::Empty) => Some(Err(Refusal::Timeout)),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(fenced("replica owner ended"))),
+            },
+            Err(_) => Some(Err(unavailable(
+                "replica receive receipt lock was poisoned",
+            ))),
+        };
+        match result {
+            None => Ok(None),
+            Some(result) => {
+                self.completed = true;
+                result.map(|()| Some(()))
+            }
+        }
+    }
+}
 #[derive(Clone)]
 pub(super) struct Client {
     handle: ReplicaHandle,
@@ -220,8 +259,12 @@ impl ReplicaHandle {
             })?
     }
 
-    /// `from` must be the identity authenticated by the host's transport, not a wire claim.
-    pub fn receive(&self, from: u64, bytes: Vec<u8>, until: Instant) -> Result<(), Refusal> {
+    fn enqueue_receive(
+        &self,
+        from: u64,
+        bytes: Vec<u8>,
+        until: Instant,
+    ) -> Result<mpsc::Receiver<Result<(), Refusal>>, Refusal> {
         if Instant::now() >= until {
             return Err(Refusal::Timeout);
         }
@@ -237,12 +280,37 @@ impl ReplicaHandle {
             },
             charge,
         )?;
+        Ok(receiver)
+    }
+
+    /// `from` must be the identity authenticated by the host's transport, not a wire claim.
+    /// Success waits until the actor processes the record; it does not acknowledge a commit.
+    pub fn receive(&self, from: u64, bytes: Vec<u8>, until: Instant) -> Result<(), Refusal> {
+        let receiver = self.enqueue_receive(from, bytes, until)?;
         receiver
             .recv_timeout(until.saturating_duration_since(Instant::now()))
             .map_err(|error| match error {
                 mpsc::RecvTimeoutError::Timeout => Refusal::Timeout,
                 mpsc::RecvTimeoutError::Disconnected => fenced("replica owner ended"),
             })?
+    }
+
+    /// Transfers a wire record to the existing bounded actor queue without waiting for step.
+    /// `from` is the host-authenticated identity. The host must reap the returned receipt to
+    /// observe later validation, expiry and fencing; successful admission is not a durability ACK.
+    /// Dropping the receipt abandons observation; it does not cancel or replay the queued record.
+    /// Hosts must bound their retained receipts as well as handling the queue's admission limit.
+    pub fn admit_receive(
+        &self,
+        from: u64,
+        bytes: Vec<u8>,
+        until: Instant,
+    ) -> Result<ReceiveReceipt, Refusal> {
+        Ok(ReceiveReceipt {
+            receiver: Mutex::new(self.enqueue_receive(from, bytes, until)?),
+            until,
+            completed: false,
+        })
     }
 
     /// Takes at most `limit` messages. An undrained host eventually fences explicitly at the
@@ -1266,26 +1334,19 @@ mod tests {
         );
         assert_eq!(evaluated.load(Ordering::Relaxed), 1);
 
-        // Force both follower closures to prepare from the same committed base, while the
-        // leader keeps driving. Exactly one page set may apply; the stale one's answer is refused.
-        let ready = Arc::new(AtomicUsize::new(0));
+        // Hold both forwarded proposals outside the owners so both captures use the same
+        // committed base. Blocking a closure here would also block the serial pump's receive.
+        // Exactly one page set may apply; the stale one's answer is refused.
+        let captures = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
         let (sender, receiver) = mpsc::sync_channel(2);
         let mut workers = Vec::new();
         for offset in 1..=2 {
             let client = clients.get((leader + offset) % 3).unwrap().clone();
-            let ready = Arc::clone(&ready);
+            let captures = Arc::clone(&captures);
             let sender = sender.clone();
             workers.push(std::thread::spawn(move || {
                 let result = call(&client, move |db| {
-                    ready.fetch_add(1, Ordering::AcqRel);
-                    let until = deadline();
-                    while ready.load(Ordering::Acquire) < 2 {
-                        assert!(
-                            Instant::now() < until,
-                            "concurrent captures did not rendezvous"
-                        );
-                        std::thread::park_timeout(POLL);
-                    }
+                    captures[offset - 1].fetch_add(1, Ordering::Relaxed);
                     db.exec("INSERT INTO actor_items(value) VALUES(x'01')")?;
                     Ok(vec![1])
                 });
@@ -1295,6 +1356,8 @@ mod tests {
         drop(sender);
         let until = deadline();
         let mut outcomes = Vec::new();
+        let mut held: [Option<(u64, Outbound)>; 2] = [None, None];
+        let mut released = false;
         while outcomes.len() < 2 {
             if let Ok(outcome) = receiver.try_recv() {
                 outcomes.push(outcome);
@@ -1303,13 +1366,70 @@ mod tests {
                 Instant::now() < until,
                 "concurrent proposals did not settle"
             );
-            pump(&clients);
+            for (index, client) in clients.iter().enumerate() {
+                let from = u64::try_from(index + 1).unwrap();
+                for message in client.handle().drain(OUTGOING_MESSAGES).unwrap() {
+                    let record = Message::decode(&message.bytes).unwrap();
+                    if !released && record.msg_type == hyper_raft::proto::MessageType::MsgPropose {
+                        assert_ne!(index, leader);
+                        assert_eq!(message.to, u64::try_from(leader + 1).unwrap());
+                        assert!(held.iter().flatten().all(|(origin, _)| *origin != from));
+                        let slot = held.iter_mut().find(|slot| slot.is_none()).unwrap();
+                        *slot = Some((from, message));
+                    } else {
+                        clients
+                            .get(usize::try_from(message.to - 1).unwrap())
+                            .unwrap()
+                            .handle()
+                            .receive(from, message.bytes, deadline())
+                            .unwrap();
+                    }
+                }
+            }
+            if !released && held.iter().all(Option::is_some) {
+                let first = clients
+                    .get((leader + 1) % 3)
+                    .unwrap()
+                    .handle()
+                    .status()
+                    .unwrap();
+                let second = clients
+                    .get((leader + 2) % 3)
+                    .unwrap()
+                    .handle()
+                    .status()
+                    .unwrap();
+                assert_eq!(first.applied, second.applied);
+                assert_eq!(first.term, second.term);
+                assert_eq!(first.leader, u64::try_from(leader + 1).unwrap());
+                assert_eq!(second.leader, first.leader);
+                assert!(
+                    captures
+                        .iter()
+                        .all(|count| count.load(Ordering::Relaxed) == 1)
+                );
+                for slot in &mut held {
+                    let (from, message) = slot.take().unwrap();
+                    clients
+                        .get(leader)
+                        .unwrap()
+                        .handle()
+                        .receive(from, message.bytes, deadline())
+                        .unwrap();
+                }
+                released = true;
+            }
             std::thread::park_timeout(POLL);
         }
         for worker in workers {
             worker.join().unwrap();
         }
-        assert_eq!(ready.load(Ordering::Acquire), 2);
+        assert!(released);
+        assert!(
+            captures
+                .iter()
+                .all(|count| count.load(Ordering::Relaxed) == 1)
+        );
         assert_eq!(
             outcomes.iter().filter(|r| r.is_ok()).count(),
             1,
@@ -1483,6 +1603,142 @@ mod tests {
                 vec![3]
             );
             assert_eq!(pumped_call(&reopened, origin, unchanged).unwrap(), original);
+        }
+    }
+
+    mod receive_receipts {
+        use super::*;
+
+        fn finish(receipt: &mut ReceiveReceipt) -> Result<(), Refusal> {
+            let until = deadline();
+            loop {
+                match receipt.try_result() {
+                    Ok(None) => {}
+                    Ok(Some(())) => return Ok(()),
+                    Err(error) => return Err(error),
+                }
+                assert!(Instant::now() < until, "receive receipt did not complete");
+                std::thread::park_timeout(POLL);
+            }
+        }
+
+        /// CP-T1.8: admission must not wait behind a SQL capture or acknowledge validation.
+        #[test]
+        fn admission_is_bounded_while_processed_receive_waits_and_errors_remain_observable() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = open(dir.path(), vec![1]);
+            leader(&client);
+            let (entered, entering) = mpsc::sync_channel(1);
+            let (release, released) = mpsc::sync_channel(1);
+            let caller = client.clone();
+            let capture = std::thread::spawn(move || {
+                call(&caller, move |_| {
+                    entered.send(())?;
+                    released.recv_timeout(Duration::from_secs(5))?;
+                    Ok(Vec::new())
+                })
+            });
+            entering.recv_timeout(Duration::from_secs(5)).unwrap();
+
+            let handle = client.handle();
+            let mut receipts = Vec::new();
+            for _ in 0..COMMANDS - 1 {
+                receipts.push(handle.admit_receive(2, vec![0xff], deadline()).unwrap());
+            }
+            assert!(
+                receipts
+                    .iter_mut()
+                    .all(|r| matches!(r.try_result(), Ok(None)))
+            );
+            let legacy = handle.clone();
+            let (finished, finishing) = mpsc::sync_channel(1);
+            let processed = std::thread::spawn(move || {
+                finished
+                    .send(legacy.receive(2, vec![0xff], deadline()))
+                    .unwrap();
+            });
+            let until = deadline();
+            // Wait for the legacy record's actual queue reservation, not thread scheduling.
+            while handle.shared.admitted.load(Ordering::Acquire) != api::REQUEST_MAX + COMMANDS {
+                assert!(Instant::now() < until, "processed receive was not admitted");
+                std::thread::park_timeout(POLL);
+            }
+            assert!(matches!(
+                finishing.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            assert!(matches!(
+                handle.admit_receive(2, vec![0xff], deadline()),
+                Err(Refusal::Full { limit: COMMANDS })
+            ));
+
+            release.send(()).unwrap();
+            assert!(capture.join().unwrap().is_ok());
+            for receipt in &mut receipts {
+                assert!(matches!(finish(receipt), Err(Refusal::Invalid { .. })));
+                assert!(matches!(receipt.try_result(), Err(Refusal::Invalid { .. })));
+            }
+            assert!(matches!(
+                finishing.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Err(Refusal::Invalid { .. })
+            ));
+            processed.join().unwrap();
+        }
+
+        /// CP-T1.8: only processing a valid authenticated record completes a success receipt.
+        #[test]
+        fn authenticated_heartbeat_completes_through_the_existing_actor_step() {
+            fn send_sync<T: Send + Sync>() {}
+            send_sync::<ReceiveReceipt>();
+            let dir = tempfile::tempdir().unwrap();
+            let client = open(dir.path(), vec![1, 2, 3]);
+            let mut bytes = Vec::new();
+            Message {
+                msg_type: hyper_raft::proto::MessageType::MsgHeartbeat,
+                from: 2,
+                to: 1,
+                term: 1,
+                ..Message::default()
+            }
+            .encode(&mut bytes);
+            let mut receipt = client.handle().admit_receive(2, bytes, deadline()).unwrap();
+            assert!(finish(&mut receipt).is_ok());
+            assert!(matches!(receipt.try_result(), Err(Refusal::Invalid { .. })));
+            assert!(matches!(
+                client.handle().admit_receive(2, Vec::new(), Instant::now()),
+                Err(Refusal::Timeout)
+            ));
+        }
+
+        /// CP-T1.8: queued completion wins over expiry; missing replies expire or fence explicitly.
+        #[test]
+        fn receipt_poll_preserves_ready_result_and_typed_terminal_errors() {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            sender.send(Ok(())).unwrap();
+            let mut receipt = ReceiveReceipt {
+                receiver: Mutex::new(receiver),
+                until: Instant::now(),
+                completed: false,
+            };
+            assert!(matches!(receipt.try_result(), Ok(Some(()))));
+
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let mut receipt = ReceiveReceipt {
+                receiver: Mutex::new(receiver),
+                until: Instant::now(),
+                completed: false,
+            };
+            assert!(matches!(receipt.try_result(), Err(Refusal::Timeout)));
+            drop(sender);
+
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let mut receipt = ReceiveReceipt {
+                receiver: Mutex::new(receiver),
+                until: deadline(),
+                completed: false,
+            };
+            drop(sender);
+            assert!(matches!(receipt.try_result(), Err(Refusal::Fenced(_))));
         }
     }
 }
