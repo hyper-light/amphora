@@ -671,7 +671,7 @@ fn one_seed(seed: u64) -> Result<Seen, String> {
             .map_or_else(String::new, |w| wal_account(w));
         format!("\n{told}\ndatabase file: {db_file} bytes\n{wal}")
     };
-    let mut db = Db::open_with(path, Disk::new(seed, image.clone()))
+    let db = Db::open_with(path, Disk::new(seed, image.clone()))
         .map_err(|e| format!("reopen: {e:#}{}", account()))?;
     let mut check = String::new();
     db.query("PRAGMA integrity_check", [], |r| {

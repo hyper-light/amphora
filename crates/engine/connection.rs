@@ -1350,6 +1350,20 @@ impl Connection {
         self.force_reparse_schema_inner(false)
     }
 
+    /// Amphora: rebuild this writer's schema after importing unresolved-commit page images.
+    /// The caller owns an explicit write transaction. Unlike an external committed restore,
+    /// this must keep that transaction and its private WAL suffix, without publishing a schema
+    /// to other connections until the transaction commits.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn reparse_unpublished_schema(self: &Arc<Connection>) -> Result<()> {
+        if !matches!(self.get_tx_state(), TransactionState::Write { .. }) {
+            return Err(LimboError::InvalidArgument(
+                "unpublished schema refresh requires a writer transaction".into(),
+            ));
+        }
+        self.reparse_schema()
+    }
+
     fn force_reparse_schema_inner(self: &Arc<Connection>, publish: bool) -> Result<()> {
         if self.get_tx_state() != TransactionState::None {
             return Err(LimboError::Busy);

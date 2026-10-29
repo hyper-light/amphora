@@ -89,3 +89,9 @@ debug = "line-tables-only"
 
 [profile.bench]
 inherits = "release"
+
+[patch.crates-io]
+hyper-durable = { path = "vendor/hyper-raft/crates/hyper-durable" }
+hyper-raft = { path = "vendor/hyper-raft/crates/hyper-raft" }
+hyper-log = { path = "vendor/hyper-raft/crates/hyper-log" }
+hyper-block = { path = "vendor/hyper-raft/crates/hyper-block" }

@@ -107,7 +107,7 @@ fn a_page_corrupted_on_disk_is_refused_not_read() {
     file.sync_all().unwrap();
     drop(file);
 
-    let mut db = Db::open(&path).unwrap();
+    let db = Db::open(&path).unwrap();
     let mut sum = 0i64;
     let read = db.query("SELECT n FROM t", [], |r| {
         sum += r.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?;

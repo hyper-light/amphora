@@ -1,0 +1,734 @@
+use super::{
+    Error, auth,
+    endpoint::{self, Stream},
+    wire::*,
+};
+use amphora_api::{
+    self as api, Records, Refusal,
+    sql::{self, Session},
+};
+use serde::{Serialize, de::DeserializeOwned};
+use std::{
+    cell::{Cell, RefCell},
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+pub(super) fn unavailable(e: impl std::fmt::Display) -> Refusal {
+    Refusal::Unavailable(e.to_string())
+}
+fn sql_error(e: impl std::fmt::Display) -> sql::Error {
+    sql::Error::Database(e.to_string())
+}
+pub(super) fn remaining(until: Instant) -> Result<Duration, Refusal> {
+    let left = until.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        Err(Refusal::Timeout)
+    } else {
+        Ok(left)
+    }
+}
+fn transfer(stream: &mut Stream, bytes: &mut [u8], until: Instant) -> Result<(), Refusal> {
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        stream
+            .set_read_timeout(Some(remaining(until)?))
+            .map_err(unavailable)?;
+        let rest = bytes
+            .get_mut(offset..)
+            .ok_or_else(|| unavailable("frame offset"))?;
+        let n = stream.read(rest).map_err(unavailable)?;
+        if n == 0 {
+            return Err(unavailable("owner connection closed"));
+        }
+        offset = offset
+            .checked_add(n)
+            .ok_or_else(|| unavailable("frame overflow"))?;
+    }
+    Ok(())
+}
+fn read<T: DeserializeOwned>(stream: &mut Stream, until: Instant) -> Result<T, Refusal> {
+    read_limit(stream, until, FRAME_MAX)
+}
+fn read_limit<T: DeserializeOwned>(
+    stream: &mut Stream,
+    until: Instant,
+    max: usize,
+) -> Result<T, Refusal> {
+    let mut size = [0u8; 4];
+    transfer(stream, &mut size, until)?;
+    let size = usize::try_from(u32::from_be_bytes(size)).map_err(unavailable)?;
+    api::bound("transport frame", size, max)?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(size).map_err(unavailable)?;
+    bytes.resize(size, 0);
+    transfer(stream, &mut bytes, until)?;
+    postcard::from_bytes(&bytes).map_err(unavailable)
+}
+struct FrameBuffer<'a> {
+    bytes: Vec<u8>,
+    max: usize,
+    failure: &'a mut Option<Refusal>,
+}
+impl FrameBuffer<'_> {
+    fn fail(&mut self, error: Refusal) -> postcard::Error {
+        *self.failure = Some(error);
+        postcard::Error::SerializeBufferFull
+    }
+}
+impl postcard::ser_flavors::Flavor for FrameBuffer<'_> {
+    type Output = Vec<u8>;
+    fn try_push(&mut self, data: u8) -> postcard::Result<()> {
+        self.try_extend(std::slice::from_ref(&data))
+    }
+    fn try_extend(&mut self, data: &[u8]) -> postcard::Result<()> {
+        let wanted = match self.bytes.len().checked_add(data.len()) {
+            Some(n) => n,
+            None => return Err(self.fail(api::invalid("transport frame", "size overflow"))),
+        };
+        if wanted > self.max {
+            return Err(self.fail(Refusal::TooLarge {
+                what: "transport frame".into(),
+                size: wanted,
+                limit: self.max,
+            }));
+        }
+        if wanted > self.bytes.capacity() {
+            let doubled = self.bytes.capacity().checked_mul(2).unwrap_or(self.max);
+            let target = doubled.max(wanted).max(128).min(self.max);
+            let extra = target
+                .checked_sub(self.bytes.len())
+                .ok_or(postcard::Error::SerializeBufferFull)?;
+            if let Err(error) = self.bytes.try_reserve_exact(extra) {
+                return Err(self.fail(unavailable(error)));
+            }
+        }
+        self.bytes.extend_from_slice(data);
+        Ok(())
+    }
+    fn finalize(self) -> postcard::Result<Self::Output> {
+        Ok(self.bytes)
+    }
+}
+fn encode<T: Serialize>(value: &T, max: usize) -> Result<Vec<u8>, Refusal> {
+    let mut failure = None;
+    postcard::serialize_with_flavor(
+        value,
+        FrameBuffer {
+            bytes: Vec::new(),
+            max,
+            failure: &mut failure,
+        },
+    )
+    .map_err(|error| failure.unwrap_or_else(|| unavailable(error)))
+}
+fn send(stream: &mut Stream, encoded: &[u8], until: Instant) -> Result<(), Refusal> {
+    let size = u32::try_from(encoded.len())
+        .map_err(unavailable)?
+        .to_be_bytes();
+    for mut part in [size.as_slice(), encoded] {
+        while !part.is_empty() {
+            stream
+                .set_write_timeout(Some(remaining(until)?))
+                .map_err(unavailable)?;
+            let n = stream.write(part).map_err(unavailable)?;
+            if n == 0 {
+                return Err(unavailable("owner connection closed"));
+            }
+            part = part.get(n..).ok_or_else(|| unavailable("frame offset"))?;
+        }
+    }
+    Ok(())
+}
+fn write<T: Serialize>(stream: &mut Stream, value: &T, until: Instant) -> Result<(), Refusal> {
+    send(stream, &encode(value, FRAME_MAX)?, until)
+}
+fn write_auth<T: Serialize>(stream: &mut Stream, value: &T, until: Instant) -> Result<(), Refusal> {
+    send(stream, &encode(value, 256)?, until)
+}
+struct Permit(Arc<AtomicUsize>);
+impl Permit {
+    fn take(count: &Arc<AtomicUsize>, max: usize) -> Result<Self, Refusal> {
+        count
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                if n < max { n.checked_add(1) } else { None }
+            })
+            .map_err(|_| Refusal::Full { limit: max })?;
+        Ok(Self(Arc::clone(count)))
+    }
+}
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Stored once in the database's shared owner, never on individual clone handles.
+pub struct Owner {
+    stop: Arc<AtomicBool>,
+    listener: Option<thread::JoinHandle<()>>,
+}
+impl Owner {
+    /// `acquire` must upgrade a weak database reference, avoiding an owner/database cycle.
+    /// The caller must hold the database's OS ownership lock before invoking this method.
+    pub fn start(
+        path: &Path,
+        acquire: impl Fn() -> Option<crate::database::Database> + Send + Sync + 'static,
+    ) -> Result<Self, Refusal> {
+        let endpoint::Bound {
+            listener,
+            token,
+            guard,
+        } = endpoint::bind(path)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let acquire = Arc::new(acquire);
+        let count = Arc::new(AtomicUsize::new(0));
+        let waits = Arc::new(AtomicUsize::new(0));
+        let handle = thread::Builder::new()
+            .name("amphora.owner".into())
+            .spawn(move || {
+                let _guard = guard;
+                while !stopping.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            if let Err(error)=stream.set_nonblocking(false) {
+                                tracing::warn!(target:"amphora.transport",event="stream_configuration_failed",%error);
+                                continue;
+                            }
+                            if let Err(error)=stream.set_nodelay(true) {
+                                tracing::warn!(target:"amphora.transport",event="stream_configuration_failed",%error);
+                                continue;
+                            }
+                            let Ok(permit) = Permit::take(&count, CONNECTION_MAX) else {
+                                tracing::debug!(target: "amphora.transport", event = "connection_refused", reason = "connection_limit");
+                                drop(stream);
+                                continue;
+                            };
+                            let acquire = Arc::clone(&acquire);
+                            let waits = Arc::clone(&waits);
+                            // Detached workers are bounded by permits and the absolute session deadline.
+                            let spawned = thread::Builder::new()
+                                .name("amphora.client".into())
+                                .spawn(move || {
+                                    let _permit = permit;
+                                    if let Err(error) = serve(stream, token, &*acquire, &waits) {
+                                        tracing::debug!(target: "amphora.transport", event = "connection_finished", %error);
+                                    }
+                                });
+                            if let Err(error) = spawned {
+                                tracing::warn!(target: "amphora.transport", event = "worker_start_failed", %error);
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(error) => {
+                            tracing::error!(target: "amphora.transport", event = "listener_failed", %error);
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(unavailable)?;
+        Ok(Self {
+            stop,
+            listener: Some(handle),
+        })
+    }
+}
+impl Drop for Owner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.listener.take() {
+            let _joined = handle.join();
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Client {
+    path: PathBuf,
+}
+impl Client {
+    pub fn connect(path: &Path, until: Instant) -> Result<Self, Refusal> {
+        remaining(until)?;
+        let client = Self {
+            path: path.canonicalize().map_err(unavailable)?,
+        };
+        // Authenticate now, without creating a writer session or replaying any command.
+        let mut stream = client.stream(until)?;
+        write(&mut stream, &Request::Probe, until)?;
+        let response: Response = read(&mut stream, until)?;
+        response?;
+        Ok(client)
+    }
+    fn stream(&self, until: Instant) -> Result<Stream, Refusal> {
+        remaining(until)?;
+        let (mut stream, token) = endpoint::connect(&self.path, until)?;
+        let millis =
+            u64::try_from(remaining(until)?.min(SESSION_MAX).as_millis()).map_err(unavailable)?;
+        let hello = Hello {
+            version: 2,
+            nonce: auth::nonce()?,
+            millis,
+        };
+        let auth_until = until.min(
+            Instant::now()
+                .checked_add(Duration::from_secs(2))
+                .ok_or(Refusal::Timeout)?,
+        );
+        write_auth(&mut stream, &hello, auth_until)?;
+        let challenge: Challenge = read_limit(&mut stream, auth_until, 256)?;
+        auth::verify(&token, true, &hello, &challenge.nonce, &challenge.proof)?;
+        let proof = auth::proof(&token, false, &hello, &challenge.nonce)?;
+        write_auth(&mut stream, &proof, auth_until)?;
+        match read_limit::<Response>(&mut stream, auth_until, 256)?? {
+            Answer::Ready => Ok(stream),
+            _ => Err(unavailable("unexpected owner greeting")),
+        }
+    }
+    fn request(&self, request: Request, until: Instant) -> Result<Answer, Error> {
+        let encoded = encode(&request, FRAME_MAX)?;
+        let mut stream = self.stream(until)?;
+        send(&mut stream, &encoded, until).map_err(|_| Error::UnknownOutcome)?;
+        read::<Response>(&mut stream, until)
+            .map_err(|_| Error::UnknownOutcome)?
+            .map_err(Error::from)
+    }
+    pub fn execute(
+        &self,
+        statements: Vec<api::Statement>,
+        until: Instant,
+    ) -> Result<Vec<api::SqlResult>, Error> {
+        match self.request(Request::Execute(statements), until)? {
+            Answer::Sql(rows) => Ok(rows),
+            _ => Err(unavailable("unexpected SQL response").into()),
+        }
+    }
+    pub fn migrate(&self, migration: api::Migration, until: Instant) -> Result<bool, Error> {
+        match self.request(Request::Migrate(migration), until)? {
+            Answer::Migrated(done) => Ok(done),
+            _ => Err(unavailable("unexpected migration response").into()),
+        }
+    }
+    pub fn namespace(&self, name: &str) -> Result<Namespace, Refusal> {
+        api::family(name)?;
+        Ok(Namespace {
+            client: self.clone(),
+            name: name.to_owned(),
+        })
+    }
+    pub fn call<R, F>(&self, until: Instant, f: F) -> Result<R, Error>
+    where
+        F: FnOnce(&mut sql::Connection<'_>) -> anyhow::Result<R>,
+    {
+        let mut stream = self.stream(until)?;
+        write(&mut stream, &Request::Session, until)?;
+        match read::<Response>(&mut stream, until)?? {
+            Answer::Ready => (),
+            _ => return Err(unavailable("session not ready").into()),
+        }
+        let session = Remote {
+            stream: RefCell::new(stream),
+            until,
+            count: Cell::new(0),
+            changes: Cell::new(0),
+            rowid: Cell::new(0),
+            failed: Cell::new(false),
+        };
+        let mut connection = sql::Connection::new(&session);
+        let value = match f(&mut connection).and_then(|v| {
+            connection.finish()?;
+            Ok(v)
+        }) {
+            Ok(value) if !session.failed.get() => value,
+            result => {
+                let _abort = session.exchange(Command::Abort);
+                return Err(unavailable(
+                    result
+                        .err()
+                        .map_or_else(|| "SQL session transport failed".into(), |e| e.to_string()),
+                )
+                .into());
+            }
+        };
+        match session.exchange(Command::Commit) {
+            Ok(Answer::Done) => Ok(value),
+            Err(error) => Err(error),
+            _ => Err(Error::UnknownOutcome),
+        }
+    }
+}
+struct Remote {
+    stream: RefCell<Stream>,
+    until: Instant,
+    count: Cell<usize>,
+    changes: Cell<i64>,
+    rowid: Cell<i64>,
+    failed: Cell<bool>,
+}
+impl Remote {
+    fn exchange(&self, command: Command) -> Result<Answer, Error> {
+        let n = self
+            .count
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| unavailable("session budget overflow"))?;
+        api::bound("session commands", n, COMMAND_MAX)?;
+        self.count.set(n);
+        let mut stream = self.stream.try_borrow_mut().map_err(unavailable)?;
+        let result = (|| {
+            let encoded = encode(&command, FRAME_MAX)?;
+            send(&mut stream, &encoded, self.until).map_err(|_| Error::UnknownOutcome)?;
+            read::<Response>(&mut stream, self.until)
+                .map_err(|_| Error::UnknownOutcome)?
+                .map_err(Error::from)
+        })();
+        if matches!(result, Err(Error::UnknownOutcome)) {
+            self.failed.set(true)
+        }
+        result
+    }
+}
+impl Session for Remote {
+    fn execute_batch(&self, sql: &str) -> sql::Result<()> {
+        api::bound("SQL bytes", sql.len(), api::SQL_MAX).map_err(sql_error)?;
+        match self
+            .exchange(Command::Batch(sql.to_owned()))
+            .map_err(sql_error)?
+        {
+            Answer::Rows { changes, rowid, .. } => {
+                self.changes.set(changes);
+                self.rowid.set(rowid);
+                Ok(())
+            }
+            _ => Err(sql_error("unexpected batch response")),
+        }
+    }
+    fn query(
+        &self,
+        sql: &str,
+        params: Vec<api::Value>,
+        first: bool,
+    ) -> sql::Result<Vec<Vec<api::Value>>> {
+        api::bound("SQL bytes", sql.len(), api::SQL_MAX).map_err(sql_error)?;
+        match self
+            .exchange(Command::Query(sql.to_owned(), params, first))
+            .map_err(sql_error)?
+        {
+            Answer::Rows {
+                rows,
+                changes,
+                rowid,
+            } => {
+                self.changes.set(changes);
+                self.rowid.set(rowid);
+                Ok(rows)
+            }
+            _ => Err(sql_error("unexpected query response")),
+        }
+    }
+    fn column_count(&self, sql: &str) -> sql::Result<usize> {
+        api::bound("SQL bytes", sql.len(), api::SQL_MAX).map_err(sql_error)?;
+        match self
+            .exchange(Command::Columns(sql.to_owned()))
+            .map_err(sql_error)?
+        {
+            Answer::Columns(n) => Ok(n),
+            _ => Err(sql_error("unexpected columns response")),
+        }
+    }
+    fn changes(&self) -> i64 {
+        self.changes.get()
+    }
+    fn last_insert_rowid(&self) -> i64 {
+        self.rowid.get()
+    }
+}
+
+fn serve(
+    mut stream: Stream,
+    token: [u8; 32],
+    acquire: &dyn Fn() -> Option<crate::database::Database>,
+    waits: &Arc<AtomicUsize>,
+) -> Result<(), Refusal> {
+    let started = Instant::now();
+    let greeting_until = started
+        .checked_add(Duration::from_secs(2))
+        .ok_or(Refusal::Timeout)?;
+    let hello: Hello = read_limit(&mut stream, greeting_until, 256)?;
+    if hello.version != 2 || hello.millis == 0 || Duration::from_millis(hello.millis) > SESSION_MAX
+    {
+        return Err(api::invalid("owner greeting", "version or deadline"));
+    }
+    let nonce = auth::nonce()?;
+    write_auth(
+        &mut stream,
+        &Challenge {
+            nonce,
+            proof: auth::proof(&token, true, &hello, &nonce)?,
+        },
+        greeting_until,
+    )?;
+    let proof: [u8; 32] = read_limit(&mut stream, greeting_until, 256)?;
+    auth::verify(&token, false, &hello, &nonce, &proof)?;
+    let until = started
+        .checked_add(Duration::from_millis(hello.millis))
+        .ok_or(Refusal::Timeout)?;
+    write(&mut stream, &Ok::<_, Refusal>(Answer::Ready), until)?;
+    let request: Request = read(&mut stream, until)?;
+    if matches!(request, Request::Probe) {
+        return write(&mut stream, &Ok::<_, Refusal>(Answer::Done), until);
+    }
+    let database = acquire().ok_or_else(|| unavailable("owner is draining"))?;
+    if matches!(request, Request::Session) {
+        let mut final_stream = stream.try_clone().map_err(unavailable)?;
+        let result = database
+            .call(until, move |connection| {
+                write(&mut stream, &Ok::<_, Refusal>(Answer::Ready), until)?;
+                for _ in 0..COMMAND_MAX {
+                    let command: Command = read(&mut stream, until)?;
+                    let response = match command {
+                        Command::Commit => {
+                            remaining(until)?;
+                            return Ok(());
+                        }
+                        Command::Abort => {
+                            return Err(anyhow::anyhow!("client aborted SQL session"));
+                        }
+                        Command::Batch(sql) => connection.execute_batch(&sql).and_then(|()| {
+                            Ok(Answer::Rows {
+                                rows: Vec::new(),
+                                changes: i64::try_from(connection.changes()).map_err(sql_error)?,
+                                rowid: connection.last_insert_rowid(),
+                            })
+                        }),
+                        Command::Columns(sql) => connection
+                            .prepare(&sql)
+                            .map(|s| Answer::Columns(s.column_count())),
+                        Command::Query(sql, params, first) => {
+                            query(connection, &sql, params, first)
+                        }
+                    }
+                    .map_err(unavailable);
+                    write(&mut stream, &response, until)?;
+                    // SQL errors can be handled by application savepoints; transport failures abort.
+                }
+                Err(anyhow::anyhow!("SQL session command budget exhausted"))
+            })
+            .map(|()| Answer::Done);
+        return write(&mut final_stream, &result, until);
+    }
+    let result = match request {
+        Request::Execute(statements) => database.execute(statements, until).map(Answer::Sql),
+        Request::Migrate(migration) => database.migrate(migration, until).map(Answer::Migrated),
+        Request::Records { namespace, op } => (|| {
+            let ns = database.namespace(&namespace)?;
+            Ok(match op {
+                Record::Get(f, k, at) => Answer::Row(ns.get(&f, &k, at, until)?),
+                Record::Scan(f, s) => Answer::Page(ns.scan(&f, s, until)?),
+                Record::Commit(tx) => Answer::Rev(ns.commit(tx, until)?),
+                Record::Changes(f, r, n) => Answer::Changes(ns.changes(&f, r, n, until)?),
+                Record::Wait(f, r) => {
+                    let _permit = Permit::take(waits, WAIT_MAX)?;
+                    Answer::Rev(ns.wait(&f, r, until)?)
+                }
+                Record::Head => Answer::Rev(ns.head(until)?),
+                Record::Compact(r) => {
+                    ns.compact(r, until)?;
+                    Answer::Done
+                }
+            })
+        })(),
+        Request::Session | Request::Probe => Err(unavailable("unexpected session")),
+    };
+    write(&mut stream, &result, until)
+}
+fn query(
+    connection: &sql::Connection<'_>,
+    sql: &str,
+    params: Vec<api::Value>,
+    first: bool,
+) -> sql::Result<Answer> {
+    let rows = if first {
+        match connection.query_row(sql, params, |row| {
+            let mut values = Vec::new();
+            for column in 0..row.column_count() {
+                values.push(row.get::<_, api::Value>(column)?);
+            }
+            Ok(values)
+        }) {
+            Ok(values) => vec![values],
+            Err(sql::Error::QueryReturnedNoRows) => Vec::new(),
+            Err(error) => return Err(error),
+        }
+    } else {
+        let mut statement = connection.prepare(sql)?;
+        let columns = statement.column_count();
+        let mut cursor = statement.query(params)?;
+        let mut rows = Vec::new();
+        while let Some(row) = cursor.next()? {
+            let mut values = Vec::new();
+            for column in 0..columns {
+                values.push(row.get::<_, api::Value>(column)?);
+            }
+            rows.push(values);
+        }
+        rows
+    };
+    Ok(Answer::Rows {
+        rows,
+        changes: i64::try_from(connection.changes()).map_err(sql_error)?,
+        rowid: connection.last_insert_rowid(),
+    })
+}
+
+#[derive(Clone)]
+pub struct Namespace {
+    client: Client,
+    name: String,
+}
+impl Namespace {
+    fn request(&self, op: Record, until: Instant) -> Result<Answer, Refusal> {
+        self.client
+            .request(
+                Request::Records {
+                    namespace: self.name.clone(),
+                    op,
+                },
+                until,
+            )
+            .map_err(Refusal::from)
+    }
+}
+impl Records for Namespace {
+    fn get(
+        &self,
+        f: &str,
+        k: &[u8],
+        at: api::Consistency,
+        u: Instant,
+    ) -> Result<Option<api::Row>, Refusal> {
+        api::family(f)?;
+        api::key(k)?;
+        match self.request(Record::Get(f.into(), k.into(), at), u)? {
+            Answer::Row(v) => Ok(v),
+            _ => Err(unavailable("unexpected row response")),
+        }
+    }
+    fn scan(&self, f: &str, s: api::Scan, u: Instant) -> Result<api::Page, Refusal> {
+        api::family(f)?;
+        match self.request(Record::Scan(f.into(), s), u)? {
+            Answer::Page(v) => Ok(v),
+            _ => Err(unavailable("unexpected scan response")),
+        }
+    }
+    fn commit(&self, t: api::Tx, u: Instant) -> Result<api::Rev, Refusal> {
+        api::transaction(&t)?;
+        match self.request(Record::Commit(t), u)? {
+            Answer::Rev(v) => Ok(v),
+            _ => Err(unavailable("unexpected commit response")),
+        }
+    }
+    fn changes(&self, f: &str, r: api::Rev, n: usize, u: Instant) -> Result<api::Changes, Refusal> {
+        api::family(f)?;
+        match self.request(Record::Changes(f.into(), r, n), u)? {
+            Answer::Changes(v) => Ok(v),
+            _ => Err(unavailable("unexpected changes response")),
+        }
+    }
+    fn wait(&self, f: &str, r: api::Rev, u: Instant) -> Result<api::Rev, Refusal> {
+        api::family(f)?;
+        match self.request(Record::Wait(f.into(), r), u)? {
+            Answer::Rev(v) => Ok(v),
+            _ => Err(unavailable("unexpected wait response")),
+        }
+    }
+    fn head(&self, u: Instant) -> Result<api::Rev, Refusal> {
+        match self.request(Record::Head, u)? {
+            Answer::Rev(v) => Ok(v),
+            _ => Err(unavailable("unexpected head response")),
+        }
+    }
+    fn compact(&self, r: api::Rev, u: Instant) -> Result<(), Refusal> {
+        match self.request(Record::Compact(r), u)? {
+            Answer::Done => Ok(()),
+            _ => Err(unavailable("unexpected compact response")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn pair() -> (Stream, Stream) {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = std::net::TcpStream::connect_timeout(
+            &listener.local_addr().unwrap(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+    fn until() -> Instant {
+        Instant::now() + Duration::from_secs(5)
+    }
+
+    #[test]
+    fn frame_length_is_refused_before_reading_payload() {
+        // CP-T1.5: hostile framing cannot cause an allocation beyond the admission budget.
+        let (mut sender, mut receiver) = pair();
+        sender.write_all(&u32::MAX.to_be_bytes()).unwrap();
+        assert!(matches!(
+            read::<Request>(&mut receiver, until()),
+            Err(Refusal::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn wrong_capability_never_acquires_database() {
+        // U05/U06: authentication precedes writer/Records access.
+        let (mut client, server) = pair();
+        let accessed = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&accessed);
+        let task = thread::spawn(move || {
+            serve(
+                server,
+                [1; 32],
+                &|| {
+                    observed.fetch_add(1, Ordering::AcqRel);
+                    None
+                },
+                &Arc::new(AtomicUsize::new(0)),
+            )
+        });
+        write(
+            &mut client,
+            &Hello {
+                version: 2,
+                nonce: [2; 32],
+                millis: 1000,
+            },
+            until(),
+        )
+        .unwrap();
+        let challenge: Challenge = read(&mut client, until()).unwrap();
+        let hello = Hello {
+            version: 2,
+            nonce: [2; 32],
+            millis: 1000,
+        };
+        let proof = auth::proof(&[9; 32], false, &hello, &challenge.nonce).unwrap();
+        write(&mut client, &proof, until()).unwrap();
+        assert!(matches!(task.join().unwrap(), Err(Refusal::Invalid { .. })));
+        assert_eq!(accessed.load(Ordering::Acquire), 0);
+    }
+}

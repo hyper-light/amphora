@@ -24,11 +24,15 @@
 //!
 //! The `amphora` binary says what it is ([`reply`]).
 
+pub mod database;
 pub mod db;
 pub mod groups;
 pub mod memory;
 pub mod meter;
+pub mod replication;
+pub mod sql;
 pub mod store;
+pub mod transport;
 
 /// What `amphora` prints for its arguments, where, and the exit status.
 #[derive(Debug, PartialEq, Eq)]

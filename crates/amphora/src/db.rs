@@ -3,7 +3,6 @@
 //! writer do with it ([`Db::flusher`], [`Db::checkpoint`], [`Db::restart_log`]). An engine on Turso
 //! keeps a [`Db`] for its writer and gives readers their own.
 
-use std::collections::HashMap;
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -12,11 +11,13 @@ use std::time::{Duration, Instant};
 use amphora_engine::io::FileSyncType;
 use amphora_engine::{
     CheckpointMode, Completion, CompletionError, ConnectOpts, Connection, Database, DatabaseOpts,
-    IO, LimboError, OpenFlags, OpenOptions, PlatformIO, Row, SqliteDialect, Statement, StepResult,
-    Value,
+    IO, IOExt, LimboError, OpenFlags, OpenOptions, PlatformIO, Row, SqliteDialect, Statement,
+    StepResult, Value,
 };
 
 use crate::store::{Checkpointed, Flush, Opener};
+
+mod cache;
 
 /// The pages a process's databases share (docs/design/store.md, decision 20).
 pub use amphora_engine::storage::shared_pages::SharedPages;
@@ -135,12 +136,15 @@ fn in_place(path: &Path) {
 fn in_place(_path: &Path) {}
 
 /// A connection on a Turso database, with the statements it prepared kept.
+pub(crate) type Pages = Vec<(u32, Vec<u8>)>;
+
 pub struct Db {
     io: Arc<dyn IO>,
     db: Arc<Database>,
     conn: Arc<Connection>,
     path: PathBuf,
-    statements: HashMap<&'static str, Statement>,
+    statements: cache::Cache,
+    owner: Option<Arc<std::fs::File>>,
 }
 
 impl Db {
@@ -187,7 +191,8 @@ impl Db {
             match Database::open(
                 io.clone(),
                 name,
-                OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new()),
+                OpenOptions::new(Arc::new(SqliteDialect))
+                    .db_opts(DatabaseOpts::new().with_without_rowid(true)),
             ) {
                 Err(LimboError::LockingError(_)) if Instant::now() < until => {
                     pause(Duration::from_millis(100));
@@ -204,9 +209,11 @@ impl Db {
             db,
             conn,
             path: path.to_path_buf(),
-            statements: HashMap::new(),
+            statements: cache::Cache::default(),
+            owner: None,
         };
         d.exec("PRAGMA synchronous = NORMAL")?;
+        d.exec("PRAGMA foreign_keys = ON")?;
         d.exec("PRAGMA wal_autocheckpoint = 0")?;
         d.exec(&format!("PRAGMA cache_size = {WRITER_PAGES}"))?;
         match sharing {
@@ -234,7 +241,8 @@ impl Db {
             db: self.db.clone(),
             conn: self.db.connect(ConnectOpts::new()).map_err(fail)?,
             path: self.path.clone(),
-            statements: HashMap::new(),
+            statements: cache::Cache::default(),
+            owner: self.owner.clone(),
         };
         r.keep_pages(READER_PAGES)?;
         Ok(r)
@@ -244,13 +252,15 @@ impl Db {
     #[must_use]
     pub fn opener(&self) -> Opener<Self> {
         let (io, db, path) = (self.io.clone(), self.db.clone(), self.path.clone());
+        let owner = self.owner.clone();
         Arc::new(move || {
             let r = Self {
                 io: io.clone(),
                 db: db.clone(),
                 conn: db.connect(ConnectOpts::new()).map_err(fail)?,
                 path: path.clone(),
-                statements: HashMap::new(),
+                statements: cache::Cache::default(),
+                owner: owner.clone(),
             };
             r.keep_pages(READER_PAGES)?;
             Ok(r)
@@ -264,7 +274,9 @@ impl Db {
     pub fn flusher(&self) -> Flush {
         let wal = format!("{}-wal", self.path.display());
         let (io, db) = (self.io.clone(), self.db.clone());
+        let owner = self.owner.clone();
         Box::new(move || {
+            let _lease = &owner;
             // Where the log ends before the flush begins: every frame up to it is durable once
             // the flush ends, and the checkpointer copies those without a flush of its own.
             let (generation, frame) = db.wal_end();
@@ -323,6 +335,10 @@ impl Db {
         &self.path
     }
 
+    pub(crate) fn hold_owner(&mut self, owner: Arc<std::fs::File>) {
+        self.owner = Some(owner);
+    }
+
     /// Whether the log's generations from the next one written are packed (docs/design/store.md,
     /// decisions 16 and 17): not unless this asks, while the bench weighs them (`AMPHORA_PACK_LOG`).
     /// A generation keeps the format it began with. A packed log's pages aren't shared: a database
@@ -353,29 +369,194 @@ impl Db {
 
     /// Statements that answer nothing, one after another.
     pub fn exec(&self, sql: &str) -> anyhow::Result<()> {
-        for one in sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-            self.conn.execute(one).map_err(|e| {
-                anyhow::anyhow!("{e} (in: {})", one.lines().next().unwrap_or_default())
-            })?;
+        // The engine's parser knows where a statement ends, including trigger bodies and quoted
+        // semicolons. U05: splitting text on ';' corrupts valid migration scripts.
+        self.conn.prepare_execute_batch(sql).map_err(fail)
+    }
+
+    /// Owned/dynamic SQL without an unbounded statement cache (U05). The caller bounds results.
+    pub fn query_owned(
+        &self,
+        sql: &str,
+        params: impl IntoIterator<Item = Value>,
+        each: impl FnMut(&Row) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<()> {
+        let mut stmt = match self.statements.take(sql)? {
+            Some(stmt) => stmt,
+            None => self.conn.prepare(sql).map_err(fail)?,
+        };
+        step(self.io.as_ref(), &mut stmt, params, each)?;
+        self.statements.put(sql, stmt)?;
+        Ok(())
+    }
+
+    pub fn changes(&self) -> i64 {
+        self.conn.changes()
+    }
+
+    pub fn column_count(&self, sql: &str) -> anyhow::Result<usize> {
+        let stmt = match self.statements.take(sql)? {
+            Some(stmt) => stmt,
+            None => self.conn.prepare(sql).map_err(fail)?,
+        };
+        let columns = stmt.num_columns();
+        self.statements.put(sql, stmt)?;
+        Ok(columns)
+    }
+
+    pub fn last_insert_rowid(&self) -> i64 {
+        self.conn.last_insert_rowid()
+    }
+
+    /// Validates imported rows using the engine's resolved FK metadata. The engine currently
+    /// implements foreign_key_list and enforcement, but not PRAGMA foreign_key_check; an unknown
+    /// PRAGMA returns no rows and therefore cannot prove a restored database consistent.
+    pub(crate) fn validate_foreign_keys(&self) -> anyhow::Result<()> {
+        let schema = self.conn.current_schema();
+        let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+        for table in schema.tables.values() {
+            let Some(table) = table.btree() else { continue };
+            for fk in schema.resolved_fks_for_child(&table.name).map_err(fail)? {
+                let mut present = Vec::new();
+                let mut equal = Vec::new();
+                for (child, parent) in fk.fk.child_columns.iter().zip(fk.parent_cols.iter()) {
+                    present.push(format!("c.{} IS NOT NULL", quote(child)));
+                    // Parent on the left gives its declared affinity and collation, as FK
+                    // enforcement requires; a NULL in any child column exempts that row.
+                    equal.push(format!("p.{} = c.{}", quote(parent), quote(child)));
+                }
+                let sql = format!(
+                    "SELECT 1 FROM {} AS c WHERE {} AND NOT EXISTS (SELECT 1 FROM {} AS p WHERE {}) LIMIT 1",
+                    quote(&table.name),
+                    present.join(" AND "),
+                    quote(&fk.fk.parent_table),
+                    equal.join(" AND ")
+                );
+                let mut invalid = false;
+                self.query_owned(&sql, [], |_| {
+                    invalid = true;
+                    Ok(false)
+                })?;
+                if invalid {
+                    anyhow::bail!(
+                        "foreign key validation failed: {} referencing {}",
+                        table.name,
+                        fk.fk.parent_table
+                    );
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Captures a speculative writer transaction without publishing a commit. The engine's
+    /// image includes spilled dirty pages; no random/default/trigger expression is replayed.
+    pub(crate) fn prepare_pages<R>(
+        &mut self,
+        max_bytes: usize,
+        f: impl FnOnce(&mut Self) -> anyhow::Result<R>,
+    ) -> anyhow::Result<(R, Pages)> {
+        self.exec("BEGIN IMMEDIATE")?;
+        let result = f(self).and_then(|answer| {
+            let pages = self
+                .conn
+                .get_pager()
+                .transaction_image(max_bytes)
+                .map_err(fail)?;
+            Ok((answer, pages))
+        });
+        // A prepared transaction never leaves an engine commit marker, even when capture fails.
+        self.exec("ROLLBACK")?;
+        result
+    }
+
+    pub(crate) fn image_pages(&mut self, max_bytes: usize) -> anyhow::Result<Pages> {
+        self.exec("BEGIN")?;
+        let result = (|| {
+            let pager = self.conn.get_pager();
+            let count = self
+                .io
+                .block(|| pager.with_header(|h| h.database_size.get()))?;
+            let page_size = usize::try_from(self.conn.get_page_size().get())?;
+            let size = usize::try_from(count)?
+                .checked_mul(page_size)
+                .ok_or_else(|| anyhow::anyhow!("snapshot size overflow"))?;
+            if size > max_bytes {
+                anyhow::bail!("snapshot exceeds its byte budget");
+            }
+            let mut pages = Vec::with_capacity(usize::try_from(count)?);
+            for id in 1..=count {
+                let (page, completion) = self.io.block(|| pager.read_page(i64::from(id)))?;
+                if let Some(completion) = completion {
+                    self.io.wait_for_completion(completion).map_err(fail)?;
+                }
+                if !page.is_loaded() {
+                    anyhow::bail!("snapshot page was not loaded");
+                }
+                pages.push((id, page.get_contents().as_ptr().to_vec()));
+            }
+            Ok(pages)
+        })();
+        self.exec("ROLLBACK")?;
+        result
+    }
+
+    /// Applies resolved pages and the caller's applied-index update in one WAL transaction.
+    /// Raw pages have no commit marker; only the final SQL marker update publishes the batch.
+    pub(crate) fn apply_pages<R>(
+        &mut self,
+        pages: &[(u32, Vec<u8>)],
+        finish: impl FnOnce(&mut Self) -> anyhow::Result<R>,
+    ) -> anyhow::Result<R> {
+        self.statements.clear()?;
+        self.conn.wal_insert_begin().map_err(fail)?;
+        let result = (|| {
+            let mut frame_no = self.conn.wal_state().map_err(fail)?.max_frame;
+            for (page, bytes) in pages {
+                if *page == 0 || bytes.len() != usize::try_from(self.conn.get_page_size().get())? {
+                    anyhow::bail!("invalid replicated page");
+                }
+                frame_no = frame_no
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("frame number overflow"))?;
+                let mut frame = Vec::with_capacity(
+                    bytes
+                        .len()
+                        .checked_add(24)
+                        .ok_or_else(|| anyhow::anyhow!("frame size overflow"))?,
+                );
+                frame.extend_from_slice(&page.to_be_bytes());
+                frame.extend_from_slice(&[0; 20]);
+                frame.extend_from_slice(bytes);
+                self.conn.wal_insert_frame(frame_no, &frame).map_err(fail)?;
+            }
+            self.conn.reparse_unpublished_schema().map_err(fail)?;
+            finish(self)
+        })();
+        match result {
+            Ok(answer) => {
+                self.conn.wal_insert_end(true).map_err(fail)?;
+                self.statements.clear()?;
+                Ok(answer)
+            }
+            Err(error) => {
+                self.conn.wal_insert_end(false).map_err(fail)?;
+                self.conn.force_reparse_schema().map_err(fail)?;
+                self.statements.clear()?;
+                Err(error)
+            }
+        }
     }
 
     /// Runs `sql` with `params`, its statement prepared the first time and kept, handing each row
     /// to `each` until it says stop (false).
     pub fn query(
-        &mut self,
+        &self,
         sql: &'static str,
         params: impl IntoIterator<Item = Value>,
         each: impl FnMut(&Row) -> anyhow::Result<bool>,
     ) -> anyhow::Result<()> {
-        let stmt = match self.statements.entry(sql) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(self.conn.prepare(sql).map_err(fail)?)
-            }
-        };
-        step(self.io.as_ref(), stmt, params, each)
+        self.query_owned(sql, params, each)
     }
 
     /// `f` in one transaction: committed if it returns Ok and the commit goes through, rolled back
@@ -385,7 +566,10 @@ impl Db {
         &mut self,
         f: impl FnOnce(&mut Self) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        self.query("BEGIN", [], |_| Ok(true))?;
+        // A session can read before it writes. Reserve this owner's writer at the start so
+        // checkpoint/coordinator changes cannot invalidate a deferred snapshot mid-closure;
+        // an FnOnce session cannot be replayed after an upgrade fails.
+        self.query("BEGIN IMMEDIATE", [], |_| Ok(true))?;
         let done = f(self).and_then(|v| self.query("COMMIT", [], |_| Ok(true)).map(|()| v));
         if done.is_err() && !self.conn.get_auto_commit() {
             // What the failure already says is what the caller hears; a rollback that fails too
