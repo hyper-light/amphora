@@ -62,7 +62,7 @@ number	format	records	in_record	how	what
 1.585e+05	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q09 ms amphora	q09, Amphora, best ms, SF 10
 2.380e+04	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q09 ms postgres	q09, PostgreSQL, best ms, SF 10
 1.634e+04	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q05 ms amphora	q05, Amphora, best ms, SF 10
-8.15e+03	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q05 ms postgres	q05, PostgreSQL, best ms, SF 10
+8.05e+03	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q05 ms postgres	q05, PostgreSQL, best ms, SF 10
 3.112e+04	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q08 ms amphora	q08, Amphora, best ms, SF 10
 2.19e+03	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q08 ms postgres	q08, PostgreSQL, best ms, SF 10
 30	,.0f	job-b,job-at,job-pg	no	job inner_scans count	JOB plans whose loop after the first scans a table whole

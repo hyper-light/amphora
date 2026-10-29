@@ -1128,7 +1128,7 @@ value (rank 12).
   (f33). A filter only drops rows no join would keep; its false positives go on to the search.
 - **From step 3.** At SF 10 q09 reads lineitem first and searches part for each of its 59,986,052
   rows, of which 3,261,613 pass part's filter: 1.585e+05 ms where PostgreSQL takes 2.380e+04. q05
-  takes 1.634e+04 against 8.15e+03, q08 3.112e+04 against 2.19e+03.
+  takes 1.634e+04 against 8.05e+03, q08 3.112e+04 against 2.19e+03.
 - **Findings.** f33 (A): LIP, predicate transfer (3.3 times over Bloom join on TPC-H, its join phase
   robust to the order), POLAR and diamond-hardened joins; f32 (A).
 - **Audit rows.** 13, the Bloom filters.
