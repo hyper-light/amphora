@@ -31,4 +31,7 @@ pub struct ReplicaStatus {
     pub voters: Vec<u64>,
     pub learners: Vec<u64>,
     pub fenced: Option<String>,
+    /// Initial data is not exposed until its declared image is committed and applied.
+    #[serde(default)]
+    pub bootstrapping: bool,
 }

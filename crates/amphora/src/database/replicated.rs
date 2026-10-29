@@ -448,6 +448,7 @@ fn status(replica: &Durable) -> ReplicaStatus {
         term: replica.term(),
         applied: replica.applied().index,
         durable_commit: replica.durable_commit(),
+        bootstrapping: replica.machine().bootstrap_pending(),
         voters: replica.configuration().voters.clone(),
         learners: replica.configuration().learners.clone(),
         fenced: replica.fenced().map(ToString::to_string),
@@ -1466,6 +1467,7 @@ mod tests {
             assert_eq!(status.voters, vec![1, 2, 3]);
             assert!(status.learners.is_empty());
             assert!(status.fenced.is_none());
+            assert!(!status.bootstrapping);
         }
         for origin in 0..3 {
             assert_eq!(
