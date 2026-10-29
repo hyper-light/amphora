@@ -61,7 +61,14 @@ log lines with their times let `disturbed.py` name the records that ran beside o
 run again by a process of their own with the same binary (`--only`, `--targets`) once the machine is
 quiet, into a record of their own, and a query's last record is its rerun
 (bench/records/2026-10-26-jupiter-planner-baseline.md). `summary.py --best` takes each query's
-fastest of the passes given.
+fastest of the passes given. `test_disturbed.py` checks `disturbed.py` on logs as the passes write
+them.
+
+A pass's queries are timed by one process, and DuckDB on all its threads runs slower the older that
+process is: on jupiter, JOB's 16a, 16c, 17a and 32b took 2.4 to 4.9 times as long late in a pass
+as in a process started for them. `repeat.py` compares passes timed alike, each by one process from start to
+end, and such a pass stopped part way starts again from its beginning rather than resuming
+(bench/records/2026-10-26-jupiter-planner-baseline.md).
 
 ## What is measured
 
