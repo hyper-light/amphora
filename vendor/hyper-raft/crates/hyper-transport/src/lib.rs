@@ -257,6 +257,8 @@ pub enum Event<C: Classes> {
     Frame {
         /// The peer.
         peer: PeerId,
+        /// The connection the frame arrived on, even if another is current when it is polled.
+        epoch: Epoch,
         /// The lane.
         lane: LaneId,
         /// The frame's kind.
@@ -363,12 +365,13 @@ impl<C: Classes> Debug for Event<C> {
             }
             Self::Frame {
                 peer,
+                epoch,
                 lane,
                 kind,
                 frame,
             } => write!(
                 formatter,
-                "Frame {{ peer: {peer}, lane: {lane}, kind: {kind:?}, bytes: {} }}",
+                "Frame {{ peer: {peer}, epoch: {epoch}, lane: {lane}, kind: {kind:?}, bytes: {} }}",
                 frame.bytes().len()
             ),
             Self::Refused {

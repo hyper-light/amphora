@@ -24,6 +24,8 @@ Each change is recorded in `vendor/patches/hyper-raft/`, applied in this order o
 
 | `crates/hyper-rt/src/kqueue.rs` | macOS FIFO readiness shares the existing reactor wait through Rustix unlimited select over its kqueue descriptor and bounded FIFO registrations; critical timers, kicks, one-shot ownership and typed invalid-FD refusals remain intact | CP-M1: native Darwin probes show quiet writer-close EOF is readable but neither kqueue nor poll signals it; native r57 validates backend fixtures, original two-second coalition/recovery, terminal and process lifecycle tests without threads or timeout polling | `0003-cp-m1-darwin-named-fifo-eof-in-the-existing-reactor.patch` |
 
+| `crates/hyper-transport/src/{lib,endpoint}.rs`, `tests/exchange.rs` | Frames retain their actual connection epoch; an exporter lookup accepts exactly that peer/epoch, sharing the existing live-connection lookup | Authenticate delayed control capabilities and readiness against their true TLS origin without selecting a replacement connection, changing transport wire bytes, or adding another connection owner | `0004-cp-t2-2-frame-connection-provenance-and-exact-tls-exporter.patch` |
+
 The first change is Quiver's and kiln's policy, not hyper-raft's, so it isn't offered upstream: hyper-durable
 calls `RamStore` slates' case (each write complete as it's submitted), and gating it in hyper-raft
 would reach slates. Focal's agent agrees (2026-10-22), and notes that Focal names `RamStore` only in a

@@ -1734,12 +1734,34 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         Ok(conn.epoch)
     }
 
+    /// Keying material from exactly the live connection named by `peer` and `epoch`.
+    /// Unlike [`Self::export_keying_material`], this never selects the peer's current connection:
+    /// an owner authenticating a queued [`Event::Frame`] must use that frame's origin.
+    pub fn export_keying_material_at(
+        &self,
+        peer: PeerId,
+        epoch: Epoch,
+        label: &[u8],
+        context: &[u8],
+        out: &mut [u8],
+    ) -> Result<(), Refusal> {
+        let conn = self.connection_at(peer, epoch).ok_or(Refusal::NotConnected)?;
+        conn.quic
+            .crypto_session()
+            .export_keying_material(out, label, context)
+            .map_err(|_| Refusal::Configuration)
+    }
+
     /// Whether the connection of `epoch` to `peer` is up. A peer may hold several connections at
     /// once (its identity's, up to its admission bound), and only its current one's lifecycle is
     /// an event ([`Event::Connected`], [`Event::Closed`]): an owner that keeps something for each
     /// connection a request came on ([`Event::Request`]'s epoch) lets an older one's go by this.
     pub fn connection_live(&self, peer: PeerId, epoch: Epoch) -> bool {
-        self.conns.iter().flatten().any(|conn| {
+        self.connection_at(peer, epoch).is_some()
+    }
+
+    fn connection_at(&self, peer: PeerId, epoch: Epoch) -> Option<&Conn<C::Role>> {
+        self.conns.iter().flatten().find(|conn| {
             !conn.lost && conn.epoch == epoch && conn.peer.is_some_and(|(of, _)| of == peer)
         })
     }
@@ -4882,6 +4904,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 self.events.push_back(Waiting {
                     event: Event::Frame {
                         peer,
+                        epoch: conn.epoch,
                         lane: lane_id,
                         kind,
                         frame,

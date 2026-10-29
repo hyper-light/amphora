@@ -2559,16 +2559,19 @@ fn a_peer_is_held_to_its_lanes_windows_across_its_connections() {
     net.exchange();
     // The old connection's frames and the peer's one lifecycle event, its new connection.
     assert_eq!(frames_waiting(&net), seats + 1, "the new lane is not read");
-    let Event::Frame { lane: 0, frame, .. } = net.b.poll_event().unwrap() else {
+    let Event::Frame { epoch, lane: 0, frame, .. } = net.b.poll_event().unwrap() else {
         panic!("the first to wait is the old connection's first frame")
     };
+    assert_eq!(epoch, 1, "queued frames retain their origin after reconnect");
     net.b.release(frame);
     assert_eq!(frames_waiting(&net), seats + 1, "one seat, one frame read");
     let mut order = Vec::new();
     while let Some(event) = net.b.poll_event() {
         match event {
-            Event::Frame { frame, .. } => {
-                order.push(u32::from_be_bytes(frame.bytes().try_into().unwrap()));
+            Event::Frame { epoch, frame, .. } => {
+                let index = u32::from_be_bytes(frame.bytes().try_into().unwrap());
+                assert_eq!(epoch, if index < 8 { 1 } else { 2 });
+                order.push(index);
                 net.b.release(frame);
             }
             Event::Connected { peer: 1, epoch, .. } => assert_eq!(epoch, 2),
@@ -2625,6 +2628,13 @@ fn a_request_names_the_connection_it_came_on() {
     assert!(!net.b.connection_live(1, 1), "the first connection went");
     assert!(net.b.connection_live(1, 2), "the second is up");
     assert!(!net.b.connection_live(1, 3), "no third");
+    let mut material = [0; 32];
+    assert!(net.b.export_keying_material_at(1, 1, b"origin", b"", &mut material).is_err());
+    assert!(net.b.export_keying_material_at(1, 3, b"origin", b"", &mut material).is_err());
+    net.b.export_keying_material_at(1, 2, b"origin", b"", &mut material).unwrap();
+    let mut current = [0; 32];
+    assert_eq!(net.b.export_keying_material(1, b"origin", b"", &mut current).unwrap(), 2);
+    assert!(material == current, "exact origin and current select the same live TLS session");
 }
 
 /// An owner that polls nothing holds each exchange's slot with its events: the peer's exchanges
