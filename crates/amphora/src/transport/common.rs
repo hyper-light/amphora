@@ -65,7 +65,7 @@ fn transfer(stream: &mut Stream, bytes: &mut [u8], until: Instant) -> Result<(),
 pub(super) fn read<T: DeserializeOwned>(stream: &mut Stream, until: Instant) -> Result<T, Refusal> {
     read_limit(stream, until, FRAME_MAX)
 }
-fn read_limit<T: DeserializeOwned>(
+pub(super) fn read_limit<T: DeserializeOwned>(
     stream: &mut Stream,
     until: Instant,
     max: usize,
@@ -236,7 +236,7 @@ impl Owner {
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(10))
+                            thread::park_timeout(Duration::from_millis(10))
                         }
                         Err(error) => {
                             tracing::error!(target: "amphora.transport", event = "listener_failed", %error);
@@ -256,6 +256,7 @@ impl Drop for Owner {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(handle) = self.listener.take() {
+            handle.thread().unpark();
             let _joined = handle.join();
         }
     }
@@ -263,7 +264,7 @@ impl Drop for Owner {
 
 #[derive(Clone)]
 pub struct Client {
-    path: PathBuf,
+    pub(super) path: PathBuf,
 }
 impl Client {
     pub fn connect(path: &Path, until: Instant) -> Result<Self, Refusal> {
@@ -275,7 +276,10 @@ impl Client {
         let mut stream = client.stream(until)?;
         write(&mut stream, &Request::Probe, until)?;
         let response: Response = read(&mut stream, until)?;
-        response?;
+        match response? {
+            Answer::Done => (),
+            _ => return Err(unavailable("unexpected owner probe response")),
+        }
         Ok(client)
     }
     pub(super) fn stream(&self, until: Instant) -> Result<Stream, Refusal> {
@@ -303,7 +307,7 @@ impl Client {
             _ => Err(unavailable("unexpected owner greeting")),
         }
     }
-    fn request(&self, request: Request, until: Instant) -> Result<Answer, Error> {
+    pub(super) fn request(&self, request: Request, until: Instant) -> Result<Answer, Error> {
         let encoded = encode(&request, FRAME_MAX)?;
         let mut stream = self.stream(until)?;
         send(&mut stream, &encoded, until).map_err(|_| Error::UnknownOutcome)?;
@@ -325,6 +329,33 @@ impl Client {
         match self.request(Request::Migrate(migration), until)? {
             Answer::Migrated(done) => Ok(done),
             _ => Err(Error::UnknownOutcome),
+        }
+    }
+    pub(crate) fn identity(
+        &self,
+        until: Instant,
+    ) -> Result<crate::database::remote::Identity, Error> {
+        match self.request(Request::Identity, until)? {
+            Answer::Identity(identity) => Ok(identity),
+            _ => Err(unavailable("unexpected owner identity response").into()),
+        }
+    }
+    pub(crate) fn replica_status(
+        &self,
+        until: Instant,
+    ) -> Result<Option<api::replication::ReplicaStatus>, Error> {
+        match self.request(Request::ReplicaStatus, until)? {
+            Answer::ReplicaStatus(status) => Ok(status),
+            _ => Err(unavailable("unexpected owner replication status response").into()),
+        }
+    }
+    pub fn restore_progress(
+        &self,
+        until: Instant,
+    ) -> Result<Option<api::import::ImportProgress>, Error> {
+        match self.request(Request::RestoreProgress, until)? {
+            Answer::ImportState(progress) => Ok(progress),
+            _ => Err(unavailable("unexpected restore progress response").into()),
         }
     }
     pub fn namespace(&self, name: &str) -> Result<Namespace, Refusal> {
@@ -606,9 +637,26 @@ fn serve(
             .map(|()| Answer::Done);
         return write(&mut final_stream, &result, until);
     }
+    let watch_batch = matches!(&request, Request::WatchBatch(_));
     let result = match request {
         Request::Execute(statements) => database.execute(statements, until).map(Answer::Sql),
         Request::Migrate(migration) => database.migrate(migration, until).map(Answer::Migrated),
+        Request::Identity => database.transport_identity().map(Answer::Identity),
+        Request::ReplicaStatus => database.replica_status(until).map(Answer::ReplicaStatus),
+        Request::RestoreProgress => database.restore_progress(until).map(Answer::ImportState),
+        Request::WatchBatch(requests) => {
+            api::bound("watch batch", requests.len(), WATCH_BATCH_MAX)?;
+            Ok(Answer::WatchBatch(
+                requests
+                    .into_iter()
+                    .map(|(namespace, family, after)| {
+                        database
+                            .namespace(&namespace)?
+                            .try_wait_selected(&family, after, until)
+                    })
+                    .collect(),
+            ))
+        }
         Request::Records { namespace, op } => (|| {
             let ns = database.namespace(&namespace)?;
             Ok(match op {
@@ -635,7 +683,15 @@ fn serve(
         })(),
         Request::Session | Request::Probe => Err(unavailable("unexpected session")),
     };
-    write(&mut stream, &result, until)
+    if watch_batch {
+        let encoded = match encode(&result, WATCH_REPLY_MAX) {
+            Ok(encoded) => encoded,
+            Err(error) => encode(&Err::<Answer, _>(error), WATCH_REPLY_MAX)?,
+        };
+        send(&mut stream, &encoded, until)
+    } else {
+        write(&mut stream, &result, until)
+    }
 }
 struct WaitingThread(std::thread::Thread);
 impl std::task::Wake for WaitingThread {

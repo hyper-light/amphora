@@ -44,11 +44,35 @@ fn unavailable(error: impl std::fmt::Display) -> Refusal {
     Refusal::Unavailable(error.to_string())
 }
 
-fn directory(path: &Path) -> Result<PathBuf, Refusal> {
-    let canonical = path.canonicalize().map_err(unavailable)?;
+fn database_path(path: &Path) -> Result<PathBuf, Refusal> {
+    let canonical = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => path.canonicalize().map_err(|error| {
+            if metadata.file_type().is_symlink() && error.kind() == std::io::ErrorKind::NotFound {
+                api::invalid("database path", "dangling symlink")
+            } else {
+                unavailable(error)
+            }
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let name = path
+                .file_name()
+                .ok_or_else(|| api::invalid("database path", "missing file name"))?;
+            parent.canonicalize().map_err(unavailable)?.join(name)
+        }
+        Err(error) => return Err(unavailable(error)),
+    };
     for (depth, _) in canonical.components().enumerate() {
         api::bound("database directory depth", depth, 256)?;
     }
+    Ok(canonical)
+}
+
+fn directory(path: &Path) -> Result<PathBuf, Refusal> {
+    let canonical = database_path(path)?;
     let mut sidecar = canonical.into_os_string();
     sidecar.push(".client");
     Ok(PathBuf::from(sidecar))
@@ -77,6 +101,64 @@ fn clone_lock(file: &PrivateFile) -> Result<File, Refusal> {
         .try_clone_to_owned()
         .map(File::from)
         .map_err(unavailable)
+}
+
+fn single_database_link(path: &Path) -> Result<(), Refusal> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(api::invalid("database path", "must be a regular file"));
+        }
+        Ok(_) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(unavailable(error)),
+    }
+    // Check the opened object too. The first check avoids opening known special files such
+    // as FIFOs, whose open could block before a metadata check can reject them.
+    let file = File::open(path).map_err(unavailable)?;
+    let metadata = file.metadata().map_err(unavailable)?;
+    if !metadata.is_file() {
+        return Err(api::invalid("database path", "must be a regular file"));
+    }
+    #[cfg(unix)]
+    let links = {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink()
+    };
+    #[cfg(windows)]
+    let links = winapi_util::file::information(&file)
+        .map_err(unavailable)?
+        .number_of_links();
+    if links != 1 {
+        return Err(api::invalid(
+            "database path",
+            "hard-linked database files cannot select a unique canonical owner",
+        ));
+    }
+    Ok(())
+}
+
+/// Acquire the protected database owner lock before opening an engine or creating SQL state.
+/// A busy lease selects a client; malformed filesystem state is refused before bootstrap.
+pub(crate) fn try_lease(path: &Path) -> Result<Option<File>, Refusal> {
+    let canonical = database_path(path)?;
+    let directory = PrivateDir::ensure(directory(&canonical)?).map_err(unavailable)?;
+    single_database_link(&canonical)?;
+    let private_lock = directory
+        .open_file_with(
+            "database-owner",
+            OpenOptions {
+                access: FileAccess::ReadWrite,
+                creation: FileCreation::OpenOrCreate,
+                ..OpenOptions::default()
+            },
+        )
+        .map_err(unavailable)?;
+    let lock = clone_lock(&private_lock)?;
+    match lock.try_lock() {
+        Ok(()) => Ok(Some(lock)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(unavailable(error)),
+    }
 }
 
 pub(super) fn bind(path: &Path) -> Result<Bound, Refusal> {
@@ -188,6 +270,56 @@ mod tests {
         (temporary, database)
     }
 
+    #[test]
+    fn protected_lease_precedes_database_creation_and_refuses_a_second_owner() {
+        // CP-T1.5/U16: owner selection precedes engine/bootstrap changes, even for a new DB.
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("new-database");
+        let lease = try_lease(&database).unwrap().unwrap();
+        assert!(!database.exists());
+        assert!(try_lease(&database).unwrap().is_none());
+        let protected = PrivateDir::open(directory(&database).unwrap()).unwrap();
+        protected
+            .open_file("database-owner")
+            .unwrap()
+            .verify()
+            .unwrap();
+        drop(lease);
+        assert!(try_lease(&database).unwrap().is_some());
+        assert!(!database.exists());
+    }
+
+    #[test]
+    fn hard_linked_database_aliases_are_refused_before_bootstrap() {
+        // CP-T1.5/U16: a filesystem alias cannot select another controller for the same file.
+        let (temporary, database) = database();
+        let alias = temporary.path().join("database-alias");
+        assert!(try_lease(&database).unwrap().is_some());
+        std::fs::hard_link(&database, &alias).unwrap();
+        assert!(matches!(try_lease(&database), Err(Refusal::Invalid { .. })));
+        assert!(matches!(try_lease(&alias), Err(Refusal::Invalid { .. })));
+        assert_eq!(std::fs::metadata(&database).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn directory_database_target_is_refused_before_bootstrap() {
+        // CP-T1.5/U17: filesystem objects that are not regular files cannot reach the engine.
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("database-directory");
+        std::fs::create_dir(&database).unwrap();
+        assert!(matches!(try_lease(&database), Err(Refusal::Invalid { .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_database_symlink_is_refused_before_owner_selection() {
+        // CP-T1.5/U17: resolving a missing database cannot adopt a dangling alias as a new DB.
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("database-link");
+        std::os::unix::fs::symlink(temporary.path().join("missing"), &database).unwrap();
+        assert!(matches!(try_lease(&database), Err(Refusal::Invalid { .. })));
+    }
+
     #[cfg(windows)]
     fn grant_world_read(path: &Path) {
         // Use the vendor ACL tool through an absolute path, without a shell or token output.
@@ -224,7 +356,21 @@ mod tests {
         let (mut client, token) =
             connect(&database, Instant::now() + Duration::from_secs(5)).unwrap();
         assert!(token == owner.token);
-        let (mut server, address) = owner.listener.accept().unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let (mut server, address) = loop {
+            match owner.listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    let left = until.saturating_duration_since(Instant::now());
+                    assert!(
+                        !left.is_zero(),
+                        "client did not reach the listener before its deadline"
+                    );
+                    std::thread::park_timeout(left.min(Duration::from_millis(1)));
+                }
+                Err(error) => panic!("owner accept failed: {error}"),
+            }
+        };
         assert!(address.ip().is_loopback());
         server.set_nonblocking(false).unwrap();
         server

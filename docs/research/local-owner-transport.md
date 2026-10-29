@@ -10,11 +10,13 @@
   the nonblocking exclusive lock refuses contention and releases when its file handles close.
   Therefore endpoint publication retains the lock for the listener lifetime and never unlinks the
   lock file during ordinary shutdown. This supplements rather than replaces canonical database
-  ownership locking.
+  ownership locking. The SDK now retains a separate private database-owner lease before opening
+  an engine, while publication retains its own lock.
 
 These sources support endpoint and lock semantics; admission constants are explicit resource
 policy and are not performance measurements. Portability is only claimed for compiled/tested
-shells. Windows remains a typed refusal until its ACL-protected endpoint is supplied.
+shells. Linux, macOS and Windows share the protected-loopback implementation; native validation
+is recorded separately from cross-compilation.
 
 - Microsoft Winsock socket security,
   https://learn.microsoft.com/en-us/windows/win32/winsock/using-so-reuseaddr-and-so-exclusiveaddruse:
@@ -24,7 +26,9 @@ shells. Windows remains a typed refusal until its ACL-protected endpoint is supp
   PrivateDir creates and verifies current-token-user-only DACLs; operations remain relative to
   retained validated directory handles. PrivateFile exposes AsHandle, allowing a safe standard
   owned-handle duplicate for File::try_lock. Separate record publication avoids LockFileEx's
-  exclusive byte-range read denial.
+  exclusive byte-range read denial. Source inspection also establishes a boundary: Windows
+  ancestor traversal rejects reparse points but does not validate ancestor DELETE_CHILD grants.
+  The embedding host must protect the database's directory namespace.
 - RFC 2104, https://www.rfc-editor.org/rfc/rfc2104.html: HMAC combines a secret key with a hash to
   authenticate messages. This protocol uses HMAC-SHA256 with distinct direction labels and
   fresh client/server nonces; capability bytes are never a wire field.

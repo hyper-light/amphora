@@ -40,6 +40,18 @@ where
 pub(super) fn params<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Value>, D::Error> {
     vector::<D, Value, { api::TX_MAX }>(d)
 }
+
+pub(super) fn watch_requests<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<(String, String, api::Rev)>, D::Error> {
+    vector::<D, _, { super::wire::WATCH_BATCH_MAX }>(d)
+}
+
+pub(super) fn watch_answers<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<Result<Option<api::Rev>, api::Refusal>>, D::Error> {
+    vector::<D, _, { super::wire::WATCH_BATCH_MAX }>(d)
+}
 #[derive(Deserialize)]
 struct Statement {
     sql: String,

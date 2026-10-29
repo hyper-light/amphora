@@ -483,11 +483,11 @@ mod tests {
             let imported = db.transaction(|db| apply_page(db, "host", &first()))?;
             assert!(!imported.done);
             assert!(imported.publication.is_none());
-            assert!(incomplete(&mut db, "host")?);
-            assert_eq!(progress(&mut db, "host")?.map(|p| p.cursor), Some(vec![1]));
+            assert!(incomplete(&db, "host")?);
+            assert_eq!(progress(&db, "host")?.map(|p| p.cursor), Some(vec![1]));
         }
         let mut db = open(&path)?;
-        assert!(incomplete(&mut db, "host")?);
+        assert!(incomplete(&db, "host")?);
         let imported = db.transaction(|db| apply_page(db, "host", &last()))?;
         assert!(imported.done);
         let published = imported
@@ -495,16 +495,16 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("missing final publication"))?;
         assert_eq!((published.head, published.feed), (5, 1));
         assert_eq!(published.newest.get("compacted"), Some(&4));
-        assert!(!incomplete(&mut db, "host")?);
+        assert!(!incomplete(&db, "host")?);
         assert_eq!(
-            get(&mut db, "host", "items", b"a", 2)?.map(|r| (r.rev, r.value)),
+            get(&db, "host", "items", b"a", 2)?.map(|r| (r.rev, r.value)),
             Some((1, b"old".to_vec()))
         );
         assert_eq!(
-            get(&mut db, "host", "items", b"a", 5)?.map(|r| (r.rev, r.value)),
+            get(&db, "host", "items", b"a", 5)?.map(|r| (r.rev, r.value)),
             Some((3, b"new".to_vec()))
         );
-        assert!(get(&mut db, "host", "items", b"b", 5)?.is_none());
+        assert!(get(&db, "host", "items", b"b", 5)?.is_none());
         let mut deletes = Vec::new();
         db.query("SELECT seq,value FROM __amphora_versions WHERE namespace='host' AND rev=3 ORDER BY seq",[],|r| {deletes.push((rev(r,0)?,bytes(r,1)?));Ok(true)})?;
         assert_eq!(deletes, vec![(0, Some(b"new".to_vec())), (1, None)]);
@@ -560,9 +560,9 @@ mod tests {
             },
         ] {
             assert!(db.transaction(|db| apply_page(db, "host", &bad)).is_err());
-            assert_eq!(progress(&mut db, "host")?.map(|p| p.cursor), Some(vec![1]));
-            assert!(get(&mut db, "host", "items", b"a", 3)?.is_some_and(|r| r.rev == 1));
-            assert!(incomplete(&mut db, "host")?);
+            assert_eq!(progress(&db, "host")?.map(|p| p.cursor), Some(vec![1]));
+            assert!(get(&db, "host", "items", b"a", 3)?.is_some_and(|r| r.rev == 1));
+            assert!(incomplete(&db, "host")?);
         }
         db.transaction(|db| apply_page(db, "host", &last()))?;
         let outcome = db.transaction(|db| {
@@ -632,13 +632,13 @@ mod tests {
             },
         )?;
         assert_eq!(live, 1);
-        assert!(get(&mut db, "host", "items", b"b", 5)?.is_none());
+        assert!(get(&db, "host", "items", b"b", 5)?.is_none());
         assert_eq!(
-            get(&mut db, "host", "items", b"b", 2)?.map(|r| r.value),
+            get(&db, "host", "items", b"b", 2)?.map(|r| r.value),
             Some(b"before delete".to_vec())
         );
         assert_eq!(
-            get(&mut db, "host", "items", b"a", 5)?.map(|r| r.value),
+            get(&db, "host", "items", b"a", 5)?.map(|r| r.value),
             Some(b"new".to_vec())
         );
         Ok(())

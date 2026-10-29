@@ -1,8 +1,8 @@
 # Embedded local owner transport (CP-T1.5, U05/U06)
 
 The canonical database owns one engine, controller and durability pipeline. A second process
-uses a product-owned local client; it never opens another engine. The embedding Database must
-select owner or client during startup and retain the listener in shared ownership. The listener
+uses a product-owned local client; it never opens another engine. Database startup selects the
+owner or client automatically and retains the listener in shared ownership. The listener
 holds a weak-upgrade factory, not a strong Database reference, so individual clone drops cannot
 stop it and the last handle can release ownership. Connections retain the database only for their
 bounded lifetime. This module is not an installed daemon.
@@ -15,6 +15,14 @@ points. It also verifies macOS extended ACLs, which ordinary mode checks cannot 
 The record is atomically replaced under the lock and retained after shutdown as one bounded
 stale record. It contains no remotely routable address. The lockfile is separate because a
 Windows exclusive byte-range lock also denies other processes' reads.
+
+An additional private `database-owner` lease is acquired before opening the engine or creating
+SQL state. The engine, flusher and readers retain the lease until their actual drain. Existing
+hard-linked database files and dangling symlinks are refused; an OS-file-identity registry also
+reuses an existing same-process owner for aliases. The embedding host must protect its database
+directory namespace. In particular, private-fs validates the final Windows sidecar DACL and
+reparse traversal, but does not validate ancestor DELETE_CHILD grants; this protocol does not
+make an attacker-writable database directory safe.
 
 Windows binds SO_EXCLUSIVEADDRUSE before bind through socket2's safe API; Linux/macOS do not
 request reuse of an already bound listening endpoint. The exact upstream socket2 revision is
@@ -34,6 +42,15 @@ grows a buffer only up to that fixed cap; small control messages keep small allo
 writes reset their kernel timeout to the remaining absolute deadline after every partial transfer.
 All platforms use TcpStream::connect_timeout. Backlog saturation refuses before submission.
 No retry loop replays writes or closures.
+
+Before a new application operation, a client checks owner identity. If the old process has
+exited, the client acquires the same exclusive lease, reopens the existing durable data through
+its original local or replicated factory, and publishes the replacement endpoint. All clones
+see that promoted owner. Authenticated identity includes the complete replication reopening
+configuration; an explicitly configured attachment must match it. Identity probes may retry;
+an application request that loses its response returns `Refusal::UnknownOutcome` and is never
+replayed. `attach_replicated` lets a host attach before attempting exclusive bootstrap inspection;
+`ensure_owner` lets its carrier coordinator discover local takeover before advertising a carrier.
 
 Resource limits are admission policy, not measured tuning claims: 32 connections, at most eight
 Records waits, 30 seconds total per authenticated connection, two seconds to authenticate,
@@ -55,24 +72,32 @@ CAS, SQL batches and migrations route directly to existing Database/Namespace me
 
 SQL-session Records get/CAS commands also run inside the same Database.call, with provisional
 revisions and typed refusals. Namespace import pages, progress and readiness route existing owner
-methods. Remote async watches use at most eight deadline-bound workers; polling only inspects a
-local result/waker. Dropping a watch shuts down its socket. The owner waits on the existing local
-Namespace watch, which wakes on durable publication, and checks disconnected peers at most every
-10 ms so cancelled waits release server capacity. No async executor polls a synchronous RPC.
+methods. Remote async watches use one process-wide reactor with at most 4096 registrations,
+64 metadata checks per request, and a 64 KiB reply limit before decoding. Each registration has
+a thirty-second deadline and a 4096-probe limit. A metadata batch uses at most one connection,
+does not enter the SQL writer, and consumes no synchronous-wait slot. Ten milliseconds between
+checks is explicit notification policy, not a throughput claim. Polling only inspects a local
+result/waker. Dropping a registration releases admission immediately; dropping the last
+subscriber of an active batch interrupts that socket. Read-only metadata probes may retry
+transient connection failures within those bounds. Synchronous Records waits remain limited
+to eight; their owner-side watches check cancellation at most every 10 ms.
 
-The embedded SQL implementation must also enforce execution cancellation/deadlines: socket
-timeouts cannot interrupt an engine instruction already running. Producer result accounting must
-charge the same owned-value overhead as the wire decoder before commit. These shared SQL seams
-and SDK automatic owner selection are part of completion; merely compiling this module does
-not establish blue/green continuity.
+The local writer checks admission deadlines before invoking an application closure and installs
+the existing SQL progress guard during application evaluation, with a check every 1024 VM
+instructions. It drops the guard before transaction cleanup and durability work. The replicated
+actor owns its corresponding evaluation guard. A trusted closure's arbitrary blocking host code
+cannot be preempted; expiration after submission therefore remains an unknown outcome. Producer
+result accounting charges owned-value overhead as well as payload before commit.
 
 Falsification: a second independent engine acquiring the same canonical database; a successful
 response before durable publication; a disconnected adaptive session leaving rows; one clone's
 drop stopping another; an unauthenticated client reaching SQL; a Records wait preventing a SQL
 client's admission; or any attacker-controlled allocation beyond the frame/API budgets.
 `tests/transport.rs` exercises independent-process ownership, CAS, adaptive SQL, application rollback
-and disconnect rollback on both platform shells. Endpoint tests also check private record
-reading under the separate lock and competing owner refusal. Builds and behavior tests must run
+and disconnect rollback. It also exercises an existing client becoming the next standalone and
+single-node replicated owner after a predecessor process exits, retaining SQL rows and ledger
+revisions. Endpoint tests check private record reading, competing owner refusal, protected
+pre-bootstrap leases and hard-link refusal. Builds and behavior tests must run
 on each supported target before claiming validation.
 
 Primary evidence: [Rust File locking](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock)

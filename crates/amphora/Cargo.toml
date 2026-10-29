@@ -41,6 +41,10 @@ hyper-block = "0.1.0"
 # Safe filesystem identity and process access (also used by private filesystem validation).
 rustix = { version = "1.1", features = ["fs", "process"] }
 
+[target.'cfg(windows)'.dependencies]
+# Safe stable handle metadata, including hard-link count before engine bootstrap.
+winapi-util = "0.1"
+
 [dev-dependencies]
 tempfile = "3"
 tracing-subscriber.workspace = true

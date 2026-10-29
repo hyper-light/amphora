@@ -32,7 +32,11 @@ fn progress(db: &Db) -> anyhow::Result<Option<ImportProgress>> {
 
 impl Database {
     pub fn restore_progress(&self, until: Instant) -> Result<Option<ImportProgress>, Refusal> {
-        self.call_db(until, |db| progress(db))
+        let database = self.resolve(until)?;
+        if let Some(client) = database.remote_client() {
+            return client.restore_progress(until).map_err(Refusal::from);
+        }
+        database.call_db(until, |db| progress(db))
     }
 }
 pub(super) fn incomplete(db: &Db) -> anyhow::Result<bool> {
@@ -163,6 +167,9 @@ impl Restore {
             .shared
             .restoring
             .store(false, Ordering::Release);
+        if let Some(path) = self.database.shared.path.get() {
+            remote::publish(&self.database, path)?;
+        }
         Ok(self.database)
     }
 }

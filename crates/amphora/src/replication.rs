@@ -1,11 +1,12 @@
 //! Amphora's resolved-page state machine for hyper-durable (U15, CP-T1.8).
 //!
-//! A leader evaluates SQL once inside a speculative transaction and rolls it back after capture.
-//! Only resolved page images enter Raft: defaults, random functions and adaptive reads never run
-//! again on followers. Applied index, term and membership share the pages' atomic WAL commit and
-//! actual disk flush. hyper-durable owns quorum decisions, commit fencing, recovery and snapshots;
-//! its GroupStore uses hyper-log. A host drives networking and quorum ReadIndex before reads.
-//! The local Database API is not switched to this owner until that driver is wired in.
+//! The designated local owner evaluates SQL once after a quorum read fence, including for
+//! follower-origin requests, then rolls back its speculative transaction after capture. Only
+//! resolved page deltas enter Raft: defaults, random functions and adaptive reads never run again
+//! during application. Applied index, term and membership share the deltas' atomic WAL commit and
+//! actual disk flush. The product Database actor drives ReadIndex, elections and durability through
+//! hyper-durable, which owns quorum decisions, commit fencing, recovery and snapshots; its
+//! GroupStore uses hyper-log. The host only carries authenticated replication messages.
 
 use std::path::Path;
 

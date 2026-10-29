@@ -8,6 +8,8 @@ pub(super) const FRAME_MAX: usize = amphora_api::RESULT_MAX + (1 << 20);
 pub(super) const COMMAND_MAX: usize = 4096;
 pub(super) const CONNECTION_MAX: usize = 32;
 pub(super) const WAIT_MAX: usize = 8;
+pub(super) const WATCH_BATCH_MAX: usize = 64;
+pub(super) const WATCH_REPLY_MAX: usize = 64 << 10;
 pub(super) const SESSION_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Serialize, Deserialize)]
@@ -26,8 +28,17 @@ pub(super) enum Request {
     Session,
     Execute(#[serde(deserialize_with = "super::bounded::statements")] Vec<Statement>),
     Migrate(Migration),
-    Records { namespace: String, op: Record },
+    Records {
+        namespace: String,
+        op: Record,
+    },
     Probe,
+    Identity,
+    RestoreProgress,
+    WatchBatch(
+        #[serde(deserialize_with = "super::bounded::watch_requests")] Vec<(String, String, Rev)>,
+    ),
+    ReplicaStatus,
 }
 #[derive(Serialize, Deserialize)]
 pub(super) enum Record {
@@ -90,5 +101,11 @@ pub(super) enum Answer {
         changes: i64,
         rowid: i64,
     },
+    Identity(crate::database::remote::Identity),
+    WatchBatch(
+        #[serde(deserialize_with = "super::bounded::watch_answers")]
+        Vec<Result<Option<Rev>, Refusal>>,
+    ),
+    ReplicaStatus(Option<amphora_api::replication::ReplicaStatus>),
 }
 pub(super) type Response = Result<Answer, Refusal>;

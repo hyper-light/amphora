@@ -1,8 +1,7 @@
-//! One local Amphora database for SQL and namespaced Records (CP-T1.5, U05/U06).
-//! All answers go through the existing commit pipeline and its durable callback. In this first
-//! integration, reads are serialized too: they cannot acknowledge a value whose write isn't durable.
-//! This is local durability only. U15 must put these owned commands through Amphora's hyper-durable
-//! state machine before quorum durability or follower reads are exposed to a host.
+//! One product owner for SQL and namespaced Records (CP-T1.5, U05/U06/U15).
+//! `open` uses the standalone durable commit pipeline; `open_replicated` uses the product's
+//! hyper-durable actor, quorum commits and read fences. Other processes attach to that same owner
+//! through authenticated local transport, without opening another engine or Raft controller.
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -27,6 +26,7 @@ use crate::db::Db;
 use crate::store::{self, Checkpointed, Engine, Flush, Opener, Store};
 
 mod import;
+pub(crate) mod remote;
 pub(crate) mod replicated;
 mod restore;
 pub(crate) mod session;
@@ -68,6 +68,9 @@ pub struct Database {
 }
 
 struct Shared {
+    // Stop accepting before dropping the writer and its asynchronous engine lease.
+    transport: Mutex<Option<crate::transport::Owner>>,
+    path: OnceLock<PathBuf>,
     writer: Writer,
     changed: Arc<Changed>,
     restoring: AtomicBool,
@@ -78,15 +81,18 @@ struct Shared {
 
 enum Writer {
     Local(Store<Local>),
+    Client(remote::Backend),
     Replicated {
         client: replicated::Client,
         log_path: PathBuf,
         node_id: u64,
+        config: api::replication::ReplicaConfig,
     },
 }
 struct Owner {
     shared: Weak<Shared>,
     lease: Weak<File>,
+    identity: Option<amphora_engine::io::FileId>,
 }
 static OWNERS: OnceLock<Mutex<BTreeMap<PathBuf, Owner>>> = OnceLock::new();
 
@@ -134,6 +140,7 @@ enum Operation {
 type Call = Box<dyn FnOnce(&mut Db) -> anyhow::Result<Box<dyn Any + Send>> + Send>;
 
 enum Answer {
+    Done,
     Sql(Vec<SqlResult>),
     Migrated(bool),
     Row(Option<Row>),
@@ -151,6 +158,7 @@ struct Command {
     operation: Operation,
     answer: Reply,
     publication: Arc<Mutex<Option<BTreeMap<String, Published>>>>,
+    until: Instant,
 }
 struct Local {
     db: Db,
@@ -161,8 +169,24 @@ fn unavailable(e: impl std::fmt::Display) -> Refusal {
     Refusal::Unavailable(e.to_string())
 }
 
+fn admission_refusal(error: store::Refused) -> Refusal {
+    match error {
+        store::Refused::Full => Refusal::Full {
+            limit: QUEUED_BYTES,
+        },
+        store::Refused::Timeout => Refusal::Timeout,
+        store::Refused::Disk => Refusal::Fenced("writer disk failed; reopen after recovery".into()),
+        store::Refused::Stopped => unavailable("database writer stopped"),
+        store::Refused::Failed => unavailable("transaction could not be committed"),
+        store::Refused::Groups => api::invalid("database batch", "cross-group submission"),
+    }
+}
+
 fn canonical_path(path: &Path) -> Result<PathBuf, Refusal> {
-    if path.exists() {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) && !path.exists() {
+        return Err(api::invalid("database path", "dangling symlink"));
+    }
+    if path.try_exists().map_err(unavailable)? {
         return path.canonicalize().map_err(unavailable);
     }
     let parent = path
@@ -176,19 +200,25 @@ fn canonical_path(path: &Path) -> Result<PathBuf, Refusal> {
     Ok(parent.canonicalize().map_err(unavailable)?.join(name))
 }
 
-pub(crate) fn exclusive_file(path: &Path) -> Result<File, Refusal> {
+fn file_identity(path: &Path) -> Result<Option<amphora_engine::io::FileId>, Refusal> {
+    if !path.try_exists().map_err(unavailable)? {
+        return Ok(None);
+    }
+    let path = path
+        .to_str()
+        .ok_or_else(|| api::invalid("database path", "not UTF-8"))?;
+    amphora_engine::io::get_file_id(path)
+        .map(Some)
+        .map_err(unavailable)
+}
+
+fn try_exclusive_file(path: &Path) -> Result<Option<File>, Refusal> {
     let path = canonical_path(path)?;
-    let mut owner_path = path.into_os_string();
-    owner_path.push(".owner");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(PathBuf::from(owner_path))
-        .map_err(unavailable)?;
-    file.try_lock().map_err(|e| unavailable(format!("database ownership is held or unavailable; drain the previous owner before handoff: {e}")))?;
-    Ok(file)
+    crate::transport::try_lease(&path)
+}
+pub(crate) fn exclusive_file(path: &Path) -> Result<File, Refusal> {
+    try_exclusive_file(path)?
+        .ok_or_else(|| unavailable("database ownership is held by another owner"))
 }
 pub(crate) fn refused(error: &anyhow::Error) -> Refusal {
     if let Some(refusal) = error.downcast_ref::<Refusal>() {
@@ -202,6 +232,24 @@ pub(crate) fn refused(error: &anyhow::Error) -> Refusal {
 fn locked<T>(m: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, Refusal> {
     m.lock()
         .map_err(|_| unavailable("a database response lock was poisoned"))
+}
+fn locked_until<T>(m: &Mutex<T>, until: Instant) -> Result<std::sync::MutexGuard<'_, T>, Refusal> {
+    loop {
+        if Instant::now() >= until {
+            return Err(Refusal::Timeout);
+        }
+        match m.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(unavailable("database selection lock was poisoned"));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => std::thread::park_timeout(
+                until
+                    .saturating_duration_since(Instant::now())
+                    .min(std::time::Duration::from_millis(1)),
+            ),
+        }
+    }
 }
 fn integer(n: u64) -> anyhow::Result<EValue> {
     Ok(EValue::from_i64(i64::try_from(n)?))
@@ -322,7 +370,7 @@ impl Database {
         path: &Path,
         until: Instant,
         restoring: bool,
-        replica: Option<(&Path, u64)>,
+        replica: Option<(&Path, &api::replication::ReplicaConfig)>,
         create: impl FnOnce(&Path, Arc<File>) -> Result<Self, Refusal>,
     ) -> Result<Self, Refusal> {
         let path = canonical_path(path)?;
@@ -330,11 +378,14 @@ impl Database {
             if Instant::now() >= until {
                 return Err(Refusal::Timeout);
             }
-            let mut owners = locked(OWNERS.get_or_init(Mutex::default))?;
+            let mut owners = locked_until(OWNERS.get_or_init(Mutex::default), until)?;
             owners.retain(|_, owner| {
                 owner.shared.strong_count() > 0 || owner.lease.strong_count() > 0
             });
-            if let Some(owner) = owners.get(&path) {
+            let identity = file_identity(&path)?;
+            if let Some(owner) = owners.get(&path).or_else(|| {
+                identity.and_then(|id| owners.values().find(|owner| owner.identity == Some(id)))
+            }) {
                 if let Some(shared) = owner.shared.upgrade() {
                     if restoring || shared.restoring.load(Ordering::Acquire) {
                         return Err(api::invalid(
@@ -342,13 +393,31 @@ impl Database {
                             "a live owner must drain before restore",
                         ));
                     }
-                    if let Some((log_path, node_id)) = replica {
+                    if let Writer::Client(backend) = &shared.writer {
+                        match remote::validate(&backend.client, replica, until) {
+                            Ok(_) => {
+                                backend.configure(replica)?;
+                                return Ok(Self { shared });
+                            }
+                            // Identity probes cannot submit application work. Only a successful
+                            // OS lease below permits starting the predecessor's replacement.
+                            Err(
+                                Refusal::Unavailable(_)
+                                | Refusal::Timeout
+                                | Refusal::UnknownOutcome,
+                            ) => (),
+                            Err(error) => return Err(error),
+                        }
+                    } else if let Some((log_path, config)) = replica {
                         match &shared.writer {
                             Writer::Replicated {
                                 log_path: existing,
                                 node_id: id,
+                                config: current,
                                 ..
-                            } if existing == log_path && *id == node_id => {}
+                            } if existing == log_path
+                                && *id == config.node_id
+                                && current == config => {}
                             _ => {
                                 return Err(api::invalid(
                                     "replica ownership",
@@ -356,8 +425,10 @@ impl Database {
                                 ));
                             }
                         }
+                        return Ok(Self { shared });
+                    } else {
+                        return Ok(Self { shared });
                     }
-                    return Ok(Self { shared });
                 }
                 // Store shutdown is asynchronous. Its engine/readers/flusher still retain the
                 // lease, so wait for their actual drain instead of starting a second writer.
@@ -372,13 +443,47 @@ impl Database {
                 }
             }
             api::bound("open database owners", owners.len().saturating_add(1), 4096)?;
-            let owner = Arc::new(exclusive_file(&path)?);
+            let Some(lease) = try_exclusive_file(&path)? else {
+                if restoring {
+                    return Err(api::invalid(
+                        "restore",
+                        "another process owns the destination",
+                    ));
+                }
+                match remote::attach(&path, replica, until) {
+                    Ok(database) => {
+                        owners.insert(
+                            path,
+                            Owner {
+                                shared: Arc::downgrade(&database.shared),
+                                lease: Weak::new(),
+                                identity,
+                            },
+                        );
+                        return Ok(database);
+                    }
+                    Err(Refusal::Unavailable(_)) => {
+                        drop(owners);
+                        std::thread::park_timeout(
+                            until
+                                .saturating_duration_since(Instant::now())
+                                .min(std::time::Duration::from_millis(1)),
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            let owner = Arc::new(lease);
             let database = create(&path, Arc::clone(&owner))?;
+            remote::publish(&database, &path)?;
+            let identity = file_identity(&path)?;
             owners.insert(
                 path,
                 Owner {
                     shared: Arc::downgrade(&database.shared),
                     lease: Arc::downgrade(&owner),
+                    identity,
                 },
             );
             return Ok(database);
@@ -398,28 +503,34 @@ impl Database {
         until: Instant,
     ) -> Result<Self, Refusal> {
         let log_path = canonical_path(log_path)?;
+        log_path
+            .to_str()
+            .ok_or_else(|| api::invalid("replica path", "not UTF-8"))?;
         let node_id = config.node_id;
         Self::owner(
             path,
             until,
             false,
-            Some((&log_path, node_id)),
+            Some((&log_path, &config)),
             |path, owner| {
                 let changed = Arc::new(Changed::default());
                 let client = replicated::start(
                     path,
                     &log_path,
-                    config,
+                    config.clone(),
                     Arc::clone(&changed),
                     Arc::clone(&owner),
                     until,
                 )?;
                 Ok(Self {
                     shared: Arc::new(Shared {
+                        transport: Mutex::new(None),
+                        path: OnceLock::new(),
                         writer: Writer::Replicated {
                             client,
                             log_path: log_path.clone(),
                             node_id,
+                            config: config.clone(),
                         },
                         changed,
                         restoring: AtomicBool::new(false),
@@ -434,6 +545,7 @@ impl Database {
     pub fn replica(&self) -> Option<crate::replication::ReplicaHandle> {
         match &self.shared.writer {
             Writer::Replicated { client, .. } => Some(client.handle()),
+            Writer::Client(backend) => backend.replica(),
             Writer::Local(_) => None,
         }
     }
@@ -452,12 +564,12 @@ impl Database {
     }
 
     fn from_db_mode(
-        mut db: Db,
+        db: Db,
         until: Instant,
         restoring: bool,
         owner: Option<Arc<File>>,
     ) -> Result<Self, Refusal> {
-        bootstrap_db(&mut db)?;
+        bootstrap_db(&db)?;
         let mut replicated = false;
         db.query(
             "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '__amphora_replica'",
@@ -474,16 +586,18 @@ impl Database {
                 "replicated data must reopen through its replicated owner",
             ));
         }
-        if !restoring && restore::incomplete(&mut db).map_err(unavailable)? {
+        if !restoring && restore::incomplete(&db).map_err(unavailable)? {
             return Err(api::invalid(
                 "database",
                 "an incomplete restore must be resumed before ordinary access",
             ));
         }
         let changed = Changed::default();
-        *locked(&changed.published)? = read_published(&mut db)?;
+        *locked(&changed.published)? = read_published(&db)?;
         let database = Self {
             shared: Arc::new(Shared {
+                transport: Mutex::new(None),
+                path: OnceLock::new(),
                 writer: Writer::Local(
                     Store::start(Local { db, restoring }, store::Config::default())
                         .map_err(unavailable)?,
@@ -495,7 +609,7 @@ impl Database {
             }),
         };
         // Bootstrap DDL used the same WAL; the barrier makes it durable before open succeeds.
-        database.submit("", Operation::Mutation(Mutation::Sql(Vec::new())), until)?;
+        database.submit_selected("", Operation::Mutation(Mutation::Sql(Vec::new())), until)?;
         Ok(database)
     }
 
@@ -515,7 +629,11 @@ impl Database {
         R: Send + 'static,
         F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
     {
-        self.call_db(until, move |db| {
+        let database = self.resolve(until)?;
+        if let Some(client) = database.remote_client() {
+            return client.call(until, f).map_err(Refusal::from);
+        }
+        database.call_db(until, move |db| {
             let mut connection = crate::sql::Connection::new(db);
             let value = f(&mut connection)?;
             connection.finish()?;
@@ -581,6 +699,16 @@ impl Database {
         operation: Operation,
         until: Instant,
     ) -> Result<Answer, Refusal> {
+        self.resolve(until)?
+            .submit_selected(namespace, operation, until)
+    }
+
+    fn submit_selected(
+        &self,
+        namespace: &str,
+        operation: Operation,
+        until: Instant,
+    ) -> Result<Answer, Refusal> {
         if Instant::now() >= until {
             return Err(Refusal::Timeout);
         }
@@ -589,6 +717,9 @@ impl Database {
                 return client.submit(namespace.to_owned(), operation, until);
             }
             Writer::Local(store) => store,
+            Writer::Client(backend) => {
+                return remote::submit(&backend.client, namespace, operation, until);
+            }
         };
         let admission = Admission::reserve(&self.shared.admitted)?;
         let wake = matches!(&operation, Operation::Mutation(Mutation::Records { tx, .. }) if !tx.writes.is_empty())
@@ -624,6 +755,7 @@ impl Database {
                     operation,
                     answer: Arc::clone(&answer),
                     publication: Arc::clone(&publication),
+                    until,
                 }],
                 until,
                 move |done| {
@@ -640,7 +772,10 @@ impl Database {
                             .and_then(|mut r| r.take())
                             .and_then(Result::err)
                             .map_or_else(|| Err(unavailable("the transaction failed")), Err),
-                        Err(e) => Err(unavailable(e)),
+                        Err(store::Refused::Groups) => {
+                            Err(admission_refusal(store::Refused::Groups))
+                        }
+                        Err(_) => Err(Refusal::UnknownOutcome),
                     };
                     if let Some(publish) = publish
                         && result.is_ok()
@@ -725,7 +860,7 @@ impl Database {
                     let _ = tx.send(result);
                 },
             )
-            .map_err(unavailable)?;
+            .map_err(admission_refusal)?;
         rx.recv_timeout(until.saturating_duration_since(Instant::now()))
             .map_err(|e| match e {
                 mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected => {
@@ -746,7 +881,7 @@ impl Namespace {
             .database
             .submit(&self.name, Operation::Import(page), until)?
         {
-            Answer::Imported(_) => Ok(()),
+            Answer::Imported(_) | Answer::Done => Ok(()),
             _ => Err(unavailable("wrong import answer")),
         }
     }
@@ -763,10 +898,33 @@ impl Namespace {
         }
     }
 
-    /// Checks only metadata published by successful durable callbacks. No disk/queue wait and
-    /// no speculative writer state is observed; a changed family is ready on the first poll.
+    /// Checks metadata published by successful durable callbacks. Local owners do not wait for
+    /// disk or the writer queue; clients have a bounded two-second owner/metadata exchange.
     pub fn try_wait(&self, family: &str, after: Rev) -> Result<Option<Rev>, Refusal> {
+        let until = Instant::now()
+            .checked_add(std::time::Duration::from_secs(2))
+            .ok_or(Refusal::Timeout)?;
+        self.resolved(until)?
+            .try_wait_selected(family, after, until)
+    }
+
+    pub(super) fn resolved(&self, until: Instant) -> Result<Namespace, Refusal> {
+        Ok(Namespace {
+            database: self.database.resolve(until)?,
+            name: self.name.clone(),
+        })
+    }
+
+    pub(super) fn try_wait_selected(
+        &self,
+        family: &str,
+        after: Rev,
+        until: Instant,
+    ) -> Result<Option<Rev>, Refusal> {
         api::family(family)?;
+        if let Some(remote) = self.remote()? {
+            return remote.try_wait(family, after, until);
+        }
         let published = locked(&self.database.shared.changed.published)?;
         let Some(namespace) = published.get(&self.name) else {
             return Ok(None);
@@ -869,16 +1027,20 @@ impl Records for Namespace {
             }),
             until,
         )? {
-            Answer::Compacted { .. } => Ok(()),
+            Answer::Compacted { .. } | Answer::Done => Ok(()),
             _ => Err(unavailable("wrong compact answer")),
         }
     }
     fn wait(&self, family: &str, after: Rev, until: Instant) -> Result<Rev, Refusal> {
         api::family(family)?;
+        let namespace = self.resolved(until)?;
+        if let Some(remote) = namespace.remote()? {
+            return remote.wait(family, after, until);
+        }
         loop {
-            let changed = &self.database.shared.changed;
+            let changed = &namespace.database.shared.changed;
             let before = *locked(&changed.generation)?;
-            if let Some(at) = self.try_wait(family, after)? {
+            if let Some(at) = namespace.try_wait_selected(family, after, until)? {
                 return Ok(at);
             }
             let guard = locked(&changed.generation)?;
@@ -921,10 +1083,14 @@ impl Engine for Local {
                 let result = self
                     .db
                     .transaction(|db| {
+                        if Instant::now() >= row.until {
+                            return Err(Refusal::Timeout.into());
+                        }
+                        let _deadline = db.deadline(row.until);
                         if !restoring && restore::incomplete(db)? {
                             return Err(api::invalid("database", "restore is incomplete").into());
                         }
-                        match &row.operation {
+                        let result = (|| match &row.operation {
                             Operation::Call(call) => {
                                 let f = locked(call)?.take().ok_or_else(|| {
                                     anyhow::anyhow!("SQL session was already executed")
@@ -934,7 +1100,11 @@ impl Engine for Local {
                                 Ok(Ok(Answer::Called(value)))
                             }
                             other => apply(db, &row.namespace, other),
+                        })();
+                        if result.is_err() && Instant::now() >= row.until {
+                            return Err(Refusal::Timeout.into());
                         }
+                        result
                     })
                     .unwrap_or_else(|e| Err(refused(&e)));
                 *locked(&row.answer)? = Some(result);
@@ -946,7 +1116,17 @@ impl Engine for Local {
                 return Err(api::invalid("database", "restore is incomplete").into());
             }
             rows.iter()
-                .map(|r| apply(db, &r.namespace, &r.operation))
+                .map(|r| {
+                    if Instant::now() >= r.until {
+                        return Err(Refusal::Timeout.into());
+                    }
+                    let _deadline = db.deadline(r.until);
+                    let result = apply(db, &r.namespace, &r.operation);
+                    if result.is_err() && Instant::now() >= r.until {
+                        return Err(Refusal::Timeout.into());
+                    }
+                    result
+                })
                 .collect::<anyhow::Result<Vec<_>>>()
         });
         match done {

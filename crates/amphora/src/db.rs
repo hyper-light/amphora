@@ -786,6 +786,30 @@ mod tests {
         );
     }
 
+    /// U05/U15: an expired SQL VM is interrupted and the guard clears before rollback,
+    /// leaving the same writer usable for the next transaction.
+    #[test]
+    fn deadline_interrupts_sql_and_cleanup_remains_usable() {
+        let mut db = Db::open_with(
+            Path::new(":memory:deadline"),
+            Arc::new(amphora_engine::MemoryIO::new()),
+        )
+        .unwrap();
+        db.exec("CREATE TABLE retained(n)").unwrap();
+        let result = db.transaction(|db| {
+            let _deadline = db.deadline(Instant::now());
+            db.query_owned("WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n < 10000000) SELECT sum(n) FROM numbers", [], |_| Ok(true))
+        });
+        assert!(result.unwrap_err().to_string().contains("interrupt"));
+        db.transaction(|db| db.exec("INSERT INTO retained VALUES (42)"))
+            .unwrap();
+        db.query("SELECT n FROM retained", [], |row| {
+            assert_eq!(row.get::<i64>(0).unwrap(), 42);
+            Ok(false)
+        })
+        .unwrap();
+    }
+
     /// Do: size the process's pool for 32 GiB, for 16 MiB, for none said and for more than a
     /// `usize` holds. Expect: a quarter in 4 KiB pages, the floor, the fallback, and no overflow
     /// (decision 26; AC-T1.13.4: reads at their latency).

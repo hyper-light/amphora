@@ -160,3 +160,47 @@ fn unknown_outcome_keeps_the_owner_lease_until_the_writer_actually_drains() {
         42
     );
 }
+
+/// U05/CP-T1.5: distinct live memory databases must not share the native file registry.
+#[test]
+fn independent_memory_databases_keep_sql_and_records_isolated() {
+    use amphora_api::{Consistency, Records, Tx, Write};
+    let first = Database::in_memory(until()).unwrap();
+    let second = Database::in_memory(until()).unwrap();
+    first
+        .call(until(), |connection| {
+            connection
+                .execute_batch("CREATE TABLE private_row(n); INSERT INTO private_row VALUES (7)")?;
+            connection.records_commit(
+                "tenant",
+                Tx {
+                    conds: vec![],
+                    writes: vec![Write::Put {
+                        family: "items".into(),
+                        key: b"private".to_vec(),
+                        value: b"first".to_vec(),
+                    }],
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        second
+            .call(until(), |connection| Ok(connection.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'private_row'",
+                [],
+                |row| row.get::<_, i64>(0usize)
+            )?))
+            .unwrap(),
+        0
+    );
+    let namespace = second.namespace("tenant").unwrap();
+    assert_eq!(namespace.head(until()).unwrap(), 0);
+    assert!(
+        namespace
+            .get("items", b"private", Consistency::Linearizable, until())
+            .unwrap()
+            .is_none()
+    );
+}
