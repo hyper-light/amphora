@@ -1,0 +1,25 @@
+# norec Panic: cursor id 2 is None
+
+seed 20261028, state 64953
+
+## Statements
+
+```sql
+CREATE TABLE t0(c0 REAL, c1 DOUBLE PRIMARY KEY);
+INSERT OR IGNORE INTO t0 VALUES (255, '%');
+```
+
+## Queries
+
+```sql
+SELECT NULL FROM t0 AS a0 RIGHT JOIN t0 AS a1 ON NULL;
+SELECT NULL FROM t0 AS a0 RIGHT JOIN t0 AS a1 ON NULL WHERE (a0.c1 IN (SELECT s594.c1 FROM t0 AS s594 WHERE ((s594.c1 < -1) OR (-2.5 BETWEEN s594.c1 AND s594.c1))));
+SELECT NULL FROM t0 AS a0 RIGHT JOIN t0 AS a1 ON NULL WHERE (NOT (a0.c1 IN (SELECT s594.c1 FROM t0 AS s594 WHERE ((s594.c1 < -1) OR (-2.5 BETWEEN s594.c1 AND s594.c1)))));
+SELECT NULL FROM t0 AS a0 RIGHT JOIN t0 AS a1 ON NULL WHERE ((a0.c1 IN (SELECT s594.c1 FROM t0 AS s594 WHERE ((s594.c1 < -1) OR (-2.5 BETWEEN s594.c1 AND s594.c1)))) ISNULL);
+```
+
+## What differed
+
+```
+cursor id 2 is None
+```

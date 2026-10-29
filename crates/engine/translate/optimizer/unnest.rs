@@ -134,8 +134,8 @@ use crate::translate::{
     emitter::Resolver,
     expr::{
         expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
-        expr_references_subquery_id, expression_can_fail_on_input, get_expr_affinity, walk_expr,
-        walk_expr_mut, WalkControl,
+        expr_references_subquery_id, expression_can_fail_on_input, get_expr_affinity,
+        in_compares_as_equality, walk_expr, walk_expr_mut, WalkControl,
     },
     plan::{
         plan_is_correlated, Distinctness, GroupBy, JoinInfo, JoinOrigin, JoinType, JoinedTable,
@@ -310,6 +310,14 @@ fn try_rewrite_in(
         || expression_can_fail_on_input(&left)
         || expression_can_fail_on_input(&right)
     {
+        return Ok(false);
+    }
+    // Amphora: the semi-join compares by `=`, which may convert otherwise than IN: an integer probe
+    // of a lone REAL column IN makes a REAL, `=` compares exactly. Where they differ, IN stays.
+    if !in_compares_as_equality(
+        get_expr_affinity(&left, Some(&plan.table_references), None),
+        get_expr_affinity(&right, Some(&inner_plan.table_references), None),
+    ) {
         return Ok(false);
     }
 

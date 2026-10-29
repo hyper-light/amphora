@@ -273,3 +273,302 @@ fn a_correlated_subquery_a_grouped_output_reads_is_planned_once_a_group() {
         assert_eq!(rows(&sql), [want], "{sql}");
     }
 }
+
+/// The rows the plan of `sql` estimates it returns: the plan's own `output_rows` (the join's), as
+/// the oracles' CERT and order checks read them.
+fn estimate(conn: &Arc<Connection>, sql: &str) -> f64 {
+    let mut stmt = conn
+        .prepare(format!("EXPLAIN QUERY PLAN FORMAT=JSON {sql}"))
+        .unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    let text = rows[0][0].to_string();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    json["output_rows"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("{sql}: no output_rows in {text}"))
+}
+
+/// Whether two estimates agree to within 1e-9 of the larger (the oracles' order check).
+fn same_estimate(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-9 * a.abs().max(b.abs())
+}
+
+/// A small generator of its own (xorshift64*), so a failing case is the same on every run.
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: usize) -> usize {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 33) as usize % n
+    }
+}
+
+/// Six tables of three integer columns, some indexed, a few hundred rows each.
+fn order_tables(dir: &Path, analyze: bool) -> Arc<Connection> {
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
+    let db = Database::open(io, dir.join("order.db").to_str().unwrap(), options).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    for t in 0..6 {
+        let key = if t % 2 == 0 {
+            "INTEGER PRIMARY KEY"
+        } else {
+            "INTEGER"
+        };
+        conn.execute(format!("CREATE TABLE t{t} (a {key}, b INTEGER, c INTEGER)"))
+            .unwrap();
+        let rows: Vec<String> = (1..=100 * (t + 1))
+            .map(|i| format!("({i}, {}, {})", i % (7 + t), i % 13))
+            .collect();
+        conn.execute(format!("INSERT INTO t{t} VALUES {}", rows.join(", ")))
+            .unwrap();
+        if t % 3 != 2 {
+            conn.execute(format!("CREATE INDEX t{t}_b ON t{t} (b)"))
+                .unwrap();
+        }
+        if t == 1 {
+            conn.execute("CREATE INDEX t1_bc ON t1 (b, c)").unwrap();
+        }
+    }
+    if analyze {
+        conn.execute("ANALYZE").unwrap();
+    }
+    conn
+}
+
+/// Every order of `from`'s tables, the identity first.
+fn permutations(n: usize) -> Vec<Vec<usize>> {
+    let mut perm: Vec<usize> = (0..n).collect();
+    let mut c = vec![0usize; n];
+    let mut all = vec![perm.clone()];
+    let mut i = 1;
+    while i < n {
+        if c[i] < i {
+            if i % 2 == 0 {
+                perm.swap(0, i);
+            } else {
+                perm.swap(c[i], i);
+            }
+            all.push(perm.clone());
+            c[i] += 1;
+            i = 1;
+        } else {
+            c[i] = 0;
+            i += 1;
+        }
+    }
+    all
+}
+
+/// Do: random inner joins of two to six tables (a table may come twice) with random join terms and
+/// filters (equalities and ranges between tables, constants compared by `=`, `<`, `>`, BETWEEN, IS
+/// NULL and IN), with statistics and without, each planned with its FROM list in every order (up to
+/// 24 orders of the six-table ones) and each order forced by CROSS JOIN. Expect: one estimate for
+/// all of them, within 1e-9 of the larger (decision 13; AC-T1.1.2: the planner's estimates, which
+/// the reads' plans rest on).
+#[test]
+fn every_order_of_an_inner_join_gets_one_estimate() {
+    for analyze in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = order_tables(dir.path(), analyze);
+        let mut r = Rng(0x9E37_79B9_7F4A_7C15 ^ u64::from(analyze));
+        let mut checked = 0;
+        for _ in 0..60 {
+            let n = 2 + r.below(5);
+            let from: Vec<String> = (0..n).map(|i| format!("t{} AS x{i}", r.below(6))).collect();
+            let col = |r: &mut Rng, i: usize| format!("x{i}.{}", ["a", "b", "c"][r.below(3)]);
+            let mut terms = Vec::new();
+            for i in 1..n {
+                let j = r.below(i);
+                let op = ["=", "=", "=", "<", ">="][r.below(5)];
+                terms.push(format!("{} {op} {}", col(&mut r, i), col(&mut r, j)));
+            }
+            for _ in 0..r.below(4) {
+                let i = r.below(n);
+                let c = col(&mut r, i);
+                terms.push(match r.below(6) {
+                    0 => format!("{c} = {}", r.below(20)),
+                    1 => format!("{c} < {}", r.below(20)),
+                    2 => format!("{c} > {} AND {c} < {}", r.below(10), 10 + r.below(10)),
+                    3 => format!("{c} BETWEEN {} AND {}", r.below(10), 10 + r.below(10)),
+                    4 => format!("{c} IS NULL"),
+                    _ => format!("{c} IN ({}, {})", r.below(20), r.below(20)),
+                });
+            }
+            let wh = terms.join(" AND ");
+            let base = format!("SELECT x0.a FROM {} WHERE {wh}", from.join(", "));
+            let want = estimate(&conn, &base);
+            let mut orders = permutations(n);
+            // 720 orders of six tables: every fourth of five's 120 and every 30th of six's
+            let step = match n {
+                5 => 4,
+                6 => 30,
+                _ => 1,
+            };
+            orders = orders.into_iter().step_by(step).collect();
+            for order in orders {
+                let listed: Vec<&str> = order.iter().map(|&k| from[k].as_str()).collect();
+                for join in [", ", " CROSS JOIN "] {
+                    let sql = format!("SELECT x0.a FROM {} WHERE {wh}", listed.join(join));
+                    let got = estimate(&conn, &sql);
+                    assert!(
+                        same_estimate(got, want),
+                        "analyze {analyze}: {sql}\n  estimated {got}, as written {want}: {base}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 600, "{checked} orders checked");
+    }
+}
+
+/// Do: the same two tables and ON terms joined INNER, LEFT, RIGHT and FULL (a BETWEEN of the right
+/// table's column among them, its bounds a constant and the left table's column), with statistics
+/// and without, and EXISTS and NOT EXISTS over the right table. Expect: LEFT and RIGHT never below
+/// INNER, FULL never below LEFT or RIGHT (it keeps the unmatched rows of both sides), and a semi or
+/// anti join never above the rows of its left side (decision 13; AC-T1.1.2).
+#[test]
+fn an_outer_join_is_estimated_at_least_its_inner_join() {
+    for analyze in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = order_tables(dir.path(), analyze);
+        for on in [
+            "x.b = y.b",
+            "x.a = y.a",
+            "x.b = y.b AND y.c < 5",
+            "x.c = y.a AND x.b > 3",
+            "x.b < y.b",
+            "y.c = 3",
+            "y.b BETWEEN 2 AND x.c",
+            "y.b BETWEEN NULL AND x.b",
+            "y.a BETWEEN x.c AND 9",
+            "y.b BETWEEN NULL AND x.c",
+            "(x.c <= x.c) AND (y.b BETWEEN x.c AND 3)",
+            "(x.b <= y.b) AND (y.b ISNULL)",
+            "1",
+        ] {
+            for (left, right) in [("t0", "t1"), ("t1", "t2"), ("t3", "t0"), ("t2", "t5")] {
+                let join = |kind: &str| {
+                    estimate(
+                        &conn,
+                        &format!(
+                            "SELECT x.a, y.a FROM {left} AS x {kind} JOIN {right} AS y ON {on}"
+                        ),
+                    )
+                };
+                let (inner, l, r, full) = (join(""), join("LEFT"), join("RIGHT"), join("FULL"));
+                let what = format!("analyze {analyze}, {left} and {right} ON {on}: inner {inner}, left {l}, right {r}, full {full}");
+                assert!(l >= inner * (1.0 - 1e-9), "LEFT below INNER: {what}");
+                assert!(r >= inner * (1.0 - 1e-9), "RIGHT below INNER: {what}");
+                assert!(full >= l * (1.0 - 1e-9), "FULL below LEFT: {what}");
+                assert!(full >= r * (1.0 - 1e-9), "FULL below RIGHT: {what}");
+                let all = estimate(&conn, &format!("SELECT x.a FROM {left} AS x"));
+                for not in ["", "NOT "] {
+                    let sql = format!("SELECT x.a FROM {left} AS x WHERE {not}EXISTS (SELECT 1 FROM {right} AS y WHERE {on})");
+                    let semi = estimate(&conn, &sql);
+                    assert!(
+                        semi <= all * (1.0 + 1e-9),
+                        "analyze {analyze}: {sql} estimated {semi}, its table {all}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Do: the same constraints used by an index seek, and with NOT INDEXED as filters: equalities,
+/// a closed range, a range one bound of which can't key the seek, and a join's equality on the
+/// searched table's indexed column. Expect: the same output_rows each way (decision 13: an access
+/// method changes only the cost; AC-T1.1.2).
+#[test]
+fn a_constraint_seeks_or_filters_to_one_estimate() {
+    for analyze in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = order_tables(dir.path(), analyze);
+        for (from, wh) in [
+            ("t0 AS y{h}", "y.b = 3"),
+            ("t0 AS y{h}", "y.b > 2 AND y.b < 5"),
+            ("t1 AS y{h}", "y.b = 3 AND y.c > 4"),
+            ("t1 AS y{h}", "y.b BETWEEN 2 AND 5"),
+            (
+                "t3 AS x, t0 AS y{h}",
+                "y.b >= x.c AND y.b <= length(y.c + x.a)",
+            ),
+            ("t3 AS x, t0 AS y{h}", "y.b = x.c"),
+            ("t3 AS x, t1 AS y{h}", "y.b = x.c AND y.c = x.b"),
+            ("t3 AS x, t0 AS y{h}", "y.a = x.b AND y.c < 9"),
+        ] {
+            let sql =
+                |hint: &str| format!("SELECT y.a FROM {} WHERE {wh}", from.replace("{h}", hint));
+            let (seek, filter) = (sql(""), sql(" NOT INDEXED"));
+            let (s, f) = (estimate(&conn, &seek), estimate(&conn, &filter));
+            assert!(
+                same_estimate(s, f),
+                "analyze {analyze}: {seek} estimated {s}, {filter} {f}"
+            );
+        }
+    }
+}
+
+/// Do: an inner join with its condition in ON, the same condition in WHERE, and the tables listed
+/// the other way round: a BETWEEN, an EXISTS and a NOT EXISTS correlated with the right table, two
+/// scalar subqueries (planned correlated in some orders and unnested to a grouped table in others), a
+/// NULL, a NULL test of a literal that SQLite's parser folds to 0, alone, ANDed with NULL and
+/// ORed with 0, a bound by a NULL literal, and NULL ANDed with an EXISTS.
+/// Expect: one estimate for each condition's forms, and 0 rows where no row can pass (decision 13:
+/// the oracles' order check found each of these estimated apart; AC-T1.1.2).
+#[test]
+fn an_on_term_and_a_where_term_give_one_estimate() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = order_tables(dir.path(), false);
+    for (cond, rows) in [
+        ("x.b BETWEEN 2 AND y.c", None),
+        ("0.1 BETWEEN x.c AND NULL", None),
+        ("EXISTS (SELECT 1 FROM t2 AS s WHERE s.c != y.b)", None),
+        (
+            "NOT EXISTS (SELECT 1 FROM t2 AS s WHERE s.c IS NOT DISTINCT FROM y.a)",
+            None,
+        ),
+        (
+            "(SELECT count(s.c) FROM t2 AS s WHERE s.b = y.c) NOT BETWEEN x.b AND 3",
+            None,
+        ),
+        ("NOT (SELECT min(s.c) FROM t2 AS s WHERE s.b = x.a)", None),
+        (
+            "(SELECT max(s.c) FROM t2 AS s WHERE s.b = x.a) IS NOT ('-1' <= x.c)",
+            None,
+        ),
+        ("(SELECT count(s.c) FROM t2 AS s WHERE s.b = y.a) = 2", None),
+        ("0 OR (255 ISNULL)", Some(0.0)),
+        ("x.b BETWEEN NULL AND y.c", Some(0.0)),
+        (
+            "NULL AND EXISTS (SELECT 1 FROM t2 AS s WHERE s.c = y.b)",
+            Some(0.0),
+        ),
+        (
+            "NULL AND NOT EXISTS (SELECT 1 FROM t2 AS s WHERE EXISTS (SELECT 1 FROM t4 AS u WHERE u.b IS s.c))",
+            Some(0.0),
+        ),
+        ("NULL", Some(0.0)),
+        ("x'' ISNULL", Some(0.0)),
+        ("(x'' ISNULL) AND NULL", Some(0.0)),
+    ] {
+        let forms = [
+            format!("SELECT x.a FROM t1 AS x JOIN t3 AS y ON {cond}"),
+            format!("SELECT x.a FROM t1 AS x, t3 AS y WHERE {cond}"),
+            format!("SELECT x.a FROM t3 AS y, t1 AS x WHERE {cond}"),
+            format!("SELECT x.a FROM t3 AS y CROSS JOIN t1 AS x WHERE {cond}"),
+        ];
+        let want = rows.unwrap_or_else(|| estimate(&conn, &forms[0]));
+        for sql in &forms {
+            let got = estimate(&conn, sql);
+            assert!(
+                same_estimate(got, want),
+                "{sql}: estimated {got}, {want} wanted"
+            );
+        }
+    }
+}

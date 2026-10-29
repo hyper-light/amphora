@@ -637,6 +637,16 @@ fn offset_continue_label(t_ctx: &TranslateCtx<'_>, plan: &SelectPlan) -> Option<
             .as_ref()
             .map(|meta| meta.label_next_outer);
     }
+    // A RIGHT or FULL JOIN's unmatched-row pass enters the body as a subroutine, so its next row
+    // is the subroutine's Return, which the main loop falls through to its own next row; SQLite
+    // resolves that level's continue label at the Return too (sqlite3WhereEnd).
+    if let Some(right_join) = t_ctx
+        .meta_right_joins
+        .get(join.original_idx)
+        .and_then(Option::as_ref)
+    {
+        return Some(right_join.return_label);
+    }
     t_ctx
         .labels_main_loop
         .get(join.original_idx)

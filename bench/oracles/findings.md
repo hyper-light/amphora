@@ -139,3 +139,136 @@ findings (2 more of the same), 12 of them not CERT (campaign 3: 37).
 | BE. A subquery held only in an AND or OR branch a literal settles ran before the loop, raising its error: SQLite codes no side sqlite3ExprSimplifiedAndOr drops, and no WHERE term past a literal 0 it tests before its loops | 1 | `subquery.rs` `drop_settled_subqueries`, `null_beside_false_where_term` | `a_subquery_a_settled_branch_drops_never_runs` |
 | Q. Not Amphora's: evaluation order (SQLite's min() over an index stops at the first row its WHERE passes; json_valid's flags error in a subquery) | 2 | — | — |
 | AG. CERT, the planner goal's | 58 | — | — |
+
+## The order check: one estimate whatever the join order (planner.md decision 13), 2026-10-26
+
+The order check (`checks.rs`, `Case::Order`) plans an inner join of two to four tables with its
+FROM list in every order, its ON terms moved to WHERE, and each order forced by CROSS JOIN, and
+holds every form to the estimate of the query as written within 1e-9 relative. On dbef789 a run of
+it alone (seed 11, 180 s, adas-mac-studio-3) failed 33 of 435 checks. Each cause below was found
+by it, cut down by the reducer, and fixed with a test in `crates/engine/tests/planner.rs` that fails
+before its fix and passes after.
+
+| cause | fix | test |
+|---|---|---|
+| BF. A join's estimate was the access path's: a seek's rows per outer row times the filters it didn't consume, each term's share moved by the order its tables came in. A seek keyed by one bound of a range took the bounds as two (0.4 × 0.4) where the filter form took a closed range (0.005); a seek and NOT INDEXED estimated one join 100 times apart; a LEFT JOIN came below its inner join | `optimizer/cardinality.rs` (`JoinedSetRows`: one estimate per set of tables), `optimizer/join.rs` (homes tied by name) | `every_order_of_an_inner_join_gets_one_estimate`, `a_constraint_seeks_or_filters_to_one_estimate`, `an_outer_join_is_estimated_at_least_its_inner_join` |
+| BG. An ON term kept its BETWEEN where a WHERE term has it split into two comparisons, so the ON form constrained nothing | `planner.rs` `split_rewritten_ands` | `an_on_term_and_a_where_term_give_one_estimate` |
+| BH. An EXISTS unnested to a semi or anti join left its condition homed on the outer table, a filter of it, where the correlated form counts nothing | `optimizer/join.rs` (`build_where_term_info`: a term reading a semi or anti join's table has no home) | `an_on_term_and_a_where_term_give_one_estimate` |
+| BI. A term no row passes: `WHERE (x'' ISNULL) AND NULL`, folded by the parser, planned impossible with no estimate at all, while `ON NULL`, `x'' ISNULL` alone and (campaign on a2f7ca6, seed 11) `ON (0 OR (255 ISNULL))` planned every row | `optimizer/mod.rs` (an impossible plan estimates 0 rows at each access), `cardinality.rs` `never_true` | `an_on_term_and_a_where_term_give_one_estimate` |
+| BJ. A scalar subquery unnested to a table grouped by its correlation key was estimated at that table's rows times the key's selectivity for each outer row (100,000) where it gives one, and the correlated form one | `cardinality.rs` `grouped_by_keys` | `an_on_term_and_a_where_term_give_one_estimate` |
+| BK. A term reading one table on both sides (`(SELECT max(...) WHERE s.c2 = a0.c1) IS NOT ('-1' <= a0.c2)`) gave a constraint for each side and counted twice there, 0.81 for 0.9 (campaign on a2f7ca6, seed 12) | `cardinality.rs` (a term counts once per table) | `an_on_term_and_a_where_term_give_one_estimate` |
+| BL. CERT, of BG's split: with an ON term's BETWEEN split, a bound by the other table's column (`a1.c1 BETWEEN 0 AND a0.c2`) made a closed range on the right table in the outer form but was counted on the left table in the inner form, so an outer join came below its inner join (CERT on a2f7ca6 and 878db51, seed 20261025: 83 of 84 findings new). Only bounds by a pseudo-constant make a range now, as PostgreSQL's `clauselist_selectivity` pairs them; a right table's WHERE filters count what they add to its ON terms | `cardinality.rs` (`selectivity_of`, `filters_given_on`) | `an_outer_join_is_estimated_at_least_its_inner_join` |
+| BM. CERT: a comparison with a NULL literal (`a0.c0 >= NULL`, from `BETWEEN NULL AND x`), an AND holding one, or a never-true term the settled-AND handling had consumed, estimated as if it passed rows; and `WHERE NULL AND (SELECT ...)` reported its uncorrelated subquery's rows as the query's `output_rows` | `cardinality.rs` `never_true`, `matches_none`; `emitter/select.rs`, `eqp.rs` (`join_output_rows`) | `an_on_term_and_a_where_term_give_one_estimate` |
+
+A form of the query Amphora refuses is a finding only where SQLite answers it, as for every derived
+query (`derived`): `ON 0 WHERE min()` is planned impossible and never checks min()'s arguments, so
+it runs where the forms with the WHERE folded, and SQLite, refuse it ("wrong number of arguments").
+That is not an estimate, and SQLite refuses it too; it is left to the refusal checks.
+
+CERT beside it (cause AG, the planner goal's: `--oracles cert`, seed 20261025, 300 s, against the
+oracles' SQLite, adas-mac-studio-2): dbef789 found 71 findings; on d762dc2 every one of them passes
+`--replay-check`, and a run of d762dc2 found 6, each failing on dbef789 too (`--replay-check` with
+dbef789's binary): none new. What is left of AG is step 5's (kiln plan 01a16eab7f457673b4cf9933adacfc4d).
+
+The campaigns on the change's last commit, d762dc2 (`bench/records/2026-10-26-adas-mac-studio-order-check.md`):
+seed 11, 1,800 s, 375,206 order checks, none failed; seed 12, 1,800 s, 385,255, none failed.
+Run again with their summaries kept (`bench/records/2026-10-26-adas-mac-studio-2-order-check/`):
+seed 11, 502,632 order checks, none failed; seed 12, 530,789, none failed. Their 43 other findings
+replay alike on dbef789 and d762dc2 (36 fail on both, 7 pass on both: `replay.jsonl` there): none
+is the change's.
+
+## CERT clean: step 5 of the planner's plan, 2026-10-27
+
+Kiln plan 01a16eab7f457673b4cf9933adacfc4d, step 5: AG's open causes reproduced and fixed, CERT made
+to cover every shape the generator makes, and the oracles run with seeds 11, 12 and 13 and
+`nightly.sh` for three nights' seeds, against the oracles' SQLite (`sqlite.sh`), on
+adas-mac-studio-2 (`bench/records/2026-10-27-adas-mac-studio-2-cert-clean/`).
+
+**CERT's estimates.** Every CERT finding of campaigns 1 to 4 and the injected run (126) passes
+`--replay-check` on step 5's last tree (10f2461), and so do the five of step 5's own runs
+(`replay-cert.tsv` in the record). Campaign 2's two AG findings pass since decision 13's joined-set rows (d762dc2); what AG
+left was one cause (BN). EXPLAIN QUERY PLAN FORMAT=JSON's top-level `output_rows` is now the
+statement's rows for every shape (decision 13 of `docs/design/planner.md`), and CERT checks grouped,
+aggregated, DISTINCT, ordered, limited and compound queries as well as plain ones.
+
+**CERT's "no estimate".** Campaign 2's 2,049 were no query planned without an estimate: a CERT run of
+d762dc2 logging each of them (120 s, 105,989) found every one a query Amphora refused, nearly all
+refused by SQLite too. The generator read SQLite's `narg` of -(k + 2), "at least k arguments", as
+none (`iif()`, `coalesce()`, `concat()`, `concat_ws()`), called min and max with the one argument
+that makes them aggregates, gave likelihood a probability that isn't a REAL literal, and made GROUP
+BY and ORDER BY terms SQLite refuses (an aggregate in a GROUP BY; an integer, which is a column's
+number). It now makes queries SQLite takes; a query Amphora can't plan counts as SQLite refusing it
+or as a refusal, and "no estimate" is only a query planned without one.
+
+| cause | findings | fix | test |
+|---|---:|---|---|
+| AG (campaign 2's): a FULL JOIN estimated below the inner join a conjunct makes it (cert-70d3e0baf8df5914) | 1 | decision 13's joined-set rows (d762dc2) | `a_full_join_is_estimated_at_least_its_inner_join` |
+| AG (campaign 2's): an always-true conjunct moved the join order, and with it a seek's closed range against two filters' (cert-bae9c4dcf94932e8) | 1 | the same | `an_always_true_conjunct_raises_no_estimate` |
+| AG (campaigns 3 and 4, the injected run) | 85 | the same: each passes `--replay-check` | decision 13's tests in `planner.rs` |
+| BN. CERT: an IS NULL of a column no row holds NULL in (`NULL IS c`, `c IS NOT DISTINCT FROM NULL`) counted as IS NULL's tenth of the rows on a table no join null-extends, where its LEFT JOIN form keeps only the unmatched rows (cert-e21949a38a9b16d7, cert-2732f12b21087328, cert-2c3a9d2455aef93d, cert-d03ea211f1fab06d on d762dc2); then an inner join's ON term on a table a later RIGHT JOIN null-extends (cert-60e65956aed5c593, step 5's first nightly run) | 5 | `optimizer/cardinality.rs`: `Class::Never`, an ON term of the table's own outer join matching none, a table null-extended only by the joins up to the term's own (SQLite's NOT NULL strength reduction) | `an_is_null_of_a_column_never_null_keeps_no_inner_row` |
+| AP. The oracles': CERT's "no estimate", queries Amphora refused, and the generator's calls and terms SQLite refuses (above) | — | `synth.rs`, `checks.rs` | `every_top_level_plan_shape_has_an_estimate` |
+
+**The other oracles.** With calls at arities SQLite takes, the generator reached functions it had
+never called validly, and the first runs (a 120 s run of every oracle, seed 1012, then the six of the
+step's seeds, 1,800 s each) found causes campaign 2 had not:
+
+| cause | findings | fix | test |
+|---|---:|---|---|
+| BO. concat_ws gave NULL for a BLOB separator and left BLOB arguments out | 10 | `vdbe/value.rs` (SQLite's `concatFuncCore`) | `concat_ws_writes_every_argument_but_null_a_blob_as_its_text` |
+| BP. Panic ("cursor id N is None"): a RIGHT or FULL JOIN's unmatched-row pass ran a copy of a subquery whose multi-index OR opened cursors of its own and sought on the original's, never opened where the main loop matched nothing | 9 | `main_loop/init.rs` (a branch's cursor is the one its key names) | `an_unmatched_row_pass_seeks_its_own_subquerys_cursors` |
+| BQ. A multi-index OR's branch took the range a GLOB implies for the GLOB, keeping every row in it (`(NULL < c0) OR (c0 GLOB '[a-z]*')`) | 3 | `optimizer/multi_index.rs` (an implied constraint consumes no term) | `a_multi_index_or_still_filters_a_globs_range` |
+| AR (campaign 3's), the Affinity instruction: a decimal number before a NUL stayed text where a seek's key or an IN probe takes affinity | 8 | `vdbe/affinity.rs` | `a_seek_or_probe_reads_the_number_before_a_nul` |
+| BR. A rowid seek refused a REAL that is exactly -2^63 | 2 | `vdbe/execute.rs` (`seek_rowid_key`, SQLite's OP_SeekRowid) | `a_rowid_seek_finds_the_smallest_rowid_by_a_real` |
+| BS. A multi-index AND sought indexes its comparisons' affinity or collation can't use (`CAST(1e15 AS INTEGER) BETWEEN c1 AND c0` by c0's TEXT index) | 1 | `optimizer/constraints.rs` (`comparison_fits_column`) | `a_multi_index_and_seeks_only_indexes_its_comparisons_fit` |
+| AV (campaign 3's), unnested: a correlated IN unnested to a semi-join on `=`, which compares an integer with a lone REAL column exactly where IN makes the probe a REAL | 1 | `optimizer/unnest.rs` (`in_compares_as_equality`) | `an_unnested_in_compares_as_in_does` |
+| BT. sum() turned its integer total into a REAL whole when text or a BLOB came, losing the low bits SQLite's split keeps (kahanBabuskaNeumaierInit) | 6 | `vdbe/execute.rs` | `sum_keeps_a_large_integer_totals_low_bits_where_it_turns_real` |
+| BU. abs() dropped a negative zero's sign, and REAL arithmetic read text by the integer it parsed to | 4 | `vdbe/value.rs`, `numeric/mod.rs` | `a_negative_zero_keeps_its_sign_through_abs_and_text_arithmetic` |
+| BV. unicode() of a BLOB read it as lossy text (65533) where SQLite reads its first character as `sqlite3Utf8Read` does | 4 | `vdbe/value.rs` | `unicode_reads_a_blobs_first_character_as_sqlite_does` |
+| BW. timediff() took dates before Julian day 0, which SQLite's date functions refuse (`validJulianDay`) | 1 | `functions/datetime.rs` | `timediff_of_a_date_before_julian_day_zero_is_null` |
+| BX. atanh() near -1 lost half its digits (std's, not computed on \|x\|) | 1 | the libm crate's `atanh`, then BY's | `atanh_is_odd_and_keeps_its_digits_near_minus_one` |
+| The pager's "dirty pages should be empty for read txn" (eet-abd78b596ec27e54) and a pivot missing in the same database (pqs-263b8b1d13a60214): neither reproduces from its file, both from their database (seed 11, state 50178) on 564bd15, neither on step 5's build | 2 | among this table's fixes | — |
+| AH. Not Amphora's: SQLite's LIKE optimization, built with SQLITE_LIKE_DOESNT_MATCH_BLOBS, drops an outer join's rows for a LIKE ON term on a NOCASE or indexed column (`t2 LEFT JOIN t0 ON t0.c0 LIKE 'a%'` with t0 empty: no rows); the system's SQLite, without the option, answers as Amphora | 11 | — (SQLite's) | — |
+| Q. Not Amphora's: evaluation order. PQS met a JSON function's error SQLite raises too on a value the query reads, where SQLite's plan stopped sooner (an EXISTS at its first match, min() over an index at its first row; 32 across 16 messages), and sum()'s overflow, which SQLite meets too reading the rows in rowid order (2) | 34 | the oracles: PQS now skips such an error as the other checks do | — |
+| AN. Not Amphora's: `lower()` of a JSONB value, text that isn't well-formed UTF-8 | 1 | the oracles: PQS skips it | — |
+| AP. The oracles': TLP held a REAL sum's partitions to the query's where infinities make a NaN in one order of the rows and not in another (5); a LIMIT the reducer left without its ORDER BY (2); relations SQLite's own answers break, a GROUP BY that keeps 0 and 0.0 apart under a HAVING (TLP) and EET's `- 0.0` against `-(CASE .. 0.0 END)` (2) | 9 | `checks.rs`: such cases skipped | — |
+
+**The second runs.** The six runs again on 19a78a5 (2026-10-27, 07:02 to 07:32Z): CERT failed none
+of its 418,760 to 432,615 checks a run, with no "no estimate" (40 to 50 queries SQLite refuses too, a
+run); the other oracles made 46 findings (45 distinct):
+
+| cause | findings | fix | test |
+|---|---:|---|---|
+| BY. atanh()'s last digit: the libm crate's (BX's fix) is an ulp below SQLite's C library at 0.5, 0.54930614433405478 where macOS's and glibc 2.44's give 0.54930614433405489; and the platforms' C libraries differ from each other (0.25) | 18 | `vdbe/value.rs`: macOS's computation on Apple platforms, the correctly rounded value elsewhere (decision 2 of `docs/design/semantics.md`) | `atanh_has_its_platforms_c_library_digits` |
+| BZ. A RIGHT or FULL JOIN's unmatched-row pass under an OFFSET: a row the OFFSET skipped jumped past the Return of the subroutine the pass enters the body by, and the pass ran on as the main loop, keeping or losing rows | 9 | `main_loop/body.rs` (`offset_continue_label`: the Return, as SQLite's sqlite3WhereEnd) | `an_offset_skips_a_right_joins_rows_in_either_pass` |
+| CA. json_error_position put a signed number's leading zero error at the digit after the zero, where SQLite puts it at the zero: timediff(0, 0), '+0000-00-00 00:00:00.000', gave 3, not 2 | 1 | `json/jsonb.rs` (one past the number's start, as jsonTranslateTextToBlob) | `json_error_position_reports_a_signed_leading_zero_at_the_zero` |
+| AH. Not Amphora's (above) | 13 | — (SQLite's) | — |
+| Q. Not Amphora's: evaluation order. A JSON call reading no column, in an EXISTS over an empty table, which Amphora computes once ahead of the rows and SQLite on each (campaign 2's zeroblob) | 4 | the oracles: PQS evaluates such a call on no rows | — |
+| AP. The oracles': a DISTINCT query's LIMIT, where DISTINCT keeps 0 or 0.0, whichever the plan meets first, and the ORDER BY tells them apart | 1 | `checks.rs`: a DISTINCT or grouped query's LIMIT keeps no certain rows | — |
+
+Each of BY's, BZ's and CA's findings passes `--replay-check` on 10f2461, and none of the others does
+(`replay-round2.tsv` in the record): AH's are SQLite's, and the oracles now skip Q's and AP's states
+rather than Amphora answering otherwise.
+
+**The third runs.** The six runs on 10f2461 (2026-10-27, 08:15 to 08:45Z): CERT failed none of its
+2,607,858 checks (431,435 to 438,746 a run), with no "no estimate" (41 to 52 queries SQLite refuses
+too, a run) and none Amphora refused. The other oracles made 13 findings, each the differential
+check's and each AH's, the same 13 as the second runs': no cause campaign 2 did not find
+(`third-runs/*/causes.tsv` in the record).
+
+## The order-check campaigns' other findings, on step 5's build, 2026-10-27
+
+The 43 findings of the order check's two campaigns on d762dc2
+(`bench/records/2026-10-26-adas-mac-studio-2-order-check/`), replayed with `--replay-check` by a
+release build of 5f16a6f's bench (`replay-5f16a6f.tsv` there, a row a finding with its cause): 13
+that failed on d762dc2 pass, each by a cause above (AR, BN, BP, BQ, BS, BT, BV, BW); 7 passed on
+d762dc2 already, their files reproducing nothing; 21 fail and are not Amphora's (AH 5, Q 15, AN 1);
+and 2 failed as Amphora's. Those two are fixed here, each by a test that fails before its fix and
+holds its finding's query:
+
+| cause | findings | fix | test |
+|---|---:|---|---|
+| CB. jsonb_array(), jsonb_object(), jsonb_group_array() and jsonb_group_object() copied a JSONB argument's bytes, where SQLite writes each argument as JSON text and makes the whole text JSONB again (jsonAppendSqlValue, jsonReturnStringAsBlob): jsonb_array(NULL, jsonb_patch('1e3', 0)) kept jsonb_patch's widened header, x'5b00d3000130' for SQLite's x'3b001330' | 1 (diff-0d96c0783d6fbbce) | `json/mod.rs` (`convert_dbtype_to_element_jsonb`; the aggregates at their end, `json_from_raw_bytes_agg`) | `jsonb_containers_write_a_jsonb_argument_as_its_text_would` |
+| CC. A call under a COLLATE kept a false AND from folding: SQLite's COLLATE node takes no flag from its operand (sqlite3ExprAddCollateToken sets only EP_Collate and EP_Skip), so `(1e308 ISNULL) AND (likelihood(NULL, NULL) COLLATE RTRIM)` is 0 there and the call is never resolved, where Amphora saw the call, kept the AND and refused the query ("second argument to likelihood() must be a constant") | 1 (error-a2539ea61c26b70f) | `translate/expr/utils.rs` (`calls_function` stops at a COLLATE) | `a_call_under_a_collate_folds_away_with_a_false_and` |
+| CD. Found by CB's test's controls, not by a campaign: an element appended to the root array (jsonb_insert() or jsonb_set(), by '$[#]' or the index past its end) left the array's header one byte short of what it holds, the placeholder the path's traversal puts in first left uncounted where an object's array counts it: jsonb_insert('[]', '$[#]', 0) was x'1b1330', SQLite's x'2b1330' | — | `json/jsonb.rs` (`count_placeholder`) | `an_element_appended_to_the_root_array_counts_in_its_header` |
+
+None of the 43 is left failing as Amphora's.

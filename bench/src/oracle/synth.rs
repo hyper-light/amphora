@@ -302,12 +302,16 @@ pub struct Schema {
     pub indexes: Vec<(String, String)>,
 }
 
-/// A function the expressions may call: its arities (-1 for any), and whether it aggregates.
+/// A function the expressions may call: its arities as `pragma_function_list` gives them (-1 for
+/// any number, -(k + 2) for at least k), and whether it aggregates.
 #[derive(Clone, Debug)]
 pub struct Func {
     pub name: String,
     pub nargs: Vec<i32>,
     pub aggregate: bool,
+    /// The arities at which the name calls an aggregate or window function instead (`min(x)`,
+    /// `max(x)`), which a scalar call never takes.
+    pub agg_nargs: Vec<i32>,
 }
 
 /// Functions whose answer isn't the same each call, reads the connection's state, or depends on the
@@ -323,16 +327,24 @@ pub fn functions(features: &serde_json::Value, sqlite: &mut super::engines::Sqli
         .filter(|f| f["kind"].as_str().is_some_and(|k| k.starts_with("function.") && k != "function.window"))
         .filter_map(|f| f["name"].as_str().map(str::to_owned)).collect();
     let mut by: std::collections::BTreeMap<String, Func> = std::collections::BTreeMap::new();
+    let mut windows: std::collections::BTreeMap<String, Vec<i32>> = std::collections::BTreeMap::new();
     for row in sqlite.run("SELECT name, type, narg FROM pragma_function_list").map_err(|e| anyhow::anyhow!(e))? {
         let (Some(V::Text(name)), Some(V::Text(kind)), Some(V::Int(narg))) = (row.first(), row.get(1), row.get(2)) else { continue };
-        if !names.contains(name) || UNSTABLE.contains(&name.as_str()) || kind == "w" {
+        if !names.contains(name) || UNSTABLE.contains(&name.as_str()) {
             continue;
         }
-        let f = by.entry(name.clone()).or_insert(Func { name: name.clone(), nargs: vec![], aggregate: kind == "a" });
         let narg = *narg as i32;
+        if kind == "w" {
+            windows.entry(name.clone()).or_default().push(narg);
+            continue;
+        }
+        let f = by.entry(name.clone()).or_insert(Func { name: name.clone(), nargs: vec![], aggregate: kind == "a", agg_nargs: vec![] });
         if !f.nargs.contains(&narg) {
             f.nargs.push(narg);
         }
+    }
+    for f in by.values_mut().filter(|f| !f.aggregate) {
+        f.agg_nargs = windows.remove(&f.name).unwrap_or_default();
     }
     Ok(by.into_values().collect())
 }
@@ -487,9 +499,18 @@ impl Scope<'_> {
         let f = *r.pick(&scalars);
         let n = match *r.pick(&f.nargs) {
             -1 => 1 + r.below(3),
+            n if n < -1 => (n.unsigned_abs() - 2) as usize + r.below(3),
             n => n.max(0) as usize,
         };
-        E::Fn(f.name.clone(), (0..n).map(|_| self.expr(r, d)).collect())
+        let n = if f.agg_nargs.contains(&(n as i32)) { n + 1 } else { n };
+        let mut args: Vec<E> = (0..n).map(|_| self.expr(r, d)).collect();
+        // likelihood's second argument is a REAL literal from 0.0 to 1.0, or SQLite refuses the call
+        if f.name == "likelihood" {
+            if let Some(p) = args.get_mut(1) {
+                *p = E::Lit(V::Real(*r.pick(&[0.0, 0.0625, 0.5, 0.9375, 1.0])));
+            }
+        }
+        E::Fn(f.name.clone(), args)
     }
 
     /// An aggregate call, for a select list or HAVING.
@@ -593,12 +614,44 @@ pub fn plain(r: &mut Rng, schema: &Schema, funcs: &[Func]) -> Sel {
     Sel { distinct: r.chance(0.1), cols, from, wh, group: vec![], having: None, order: vec![], limit: None }
 }
 
+/// An inner join of two to four tables (a table may come twice), each joined by JOIN with an ON
+/// or by a comma, with a WHERE most of the time: what the order check permutes.
+pub fn inner_join(r: &mut Rng, schema: &Schema, funcs: &[Func]) -> Sel {
+    let mut from = Vec::new();
+    let mut tables: Vec<(String, String)> = Vec::new();
+    for i in 0..2 + r.below(3) {
+        let t = r.pick(&schema.tables).name.clone();
+        let alias = format!("a{i}");
+        tables.push((alias.clone(), t.clone()));
+        let join = if i == 0 { Join::First } else if r.chance(0.7) { Join::Inner } else { Join::Comma };
+        let on = (join == Join::Inner && r.chance(0.9)).then(|| Scope { schema, tables: tables.clone(), funcs, aggs: false }.pred(r, 2));
+        from.push(From { table: t, alias, join, on, hint: Hint::None });
+    }
+    let s = scope(schema, &from, funcs, false);
+    let cols = (0..1 + r.below(3)).map(|_| s.expr(r, 2)).collect();
+    let wh = if r.chance(0.8) { Some(s.pred(r, 3)) } else { None };
+    Sel { distinct: false, cols, from, wh, group: vec![], having: None, order: vec![], limit: None }
+}
+
+/// Whether SQLite reads `e` as a result column's number in GROUP BY or ORDER BY: an integer
+/// literal, behind any COLLATE or unary + or - (resolveOrderGroupBy's sqlite3ExprIsInteger).
+fn column_number(e: &E) -> bool {
+    match e {
+        E::Lit(V::Int(_)) => true,
+        E::Un("+" | "-", a) | E::Collate(a, _) => column_number(a),
+        _ => false,
+    }
+}
+
 /// A query of any shape the generator makes: grouped and aggregated, ordered and limited.
 pub fn query(r: &mut Rng, schema: &Schema, funcs: &[Func]) -> Sel {
     let mut q = plain(r, schema, funcs);
     if r.chance(0.3) {
         let s = scope(schema, &q.from, funcs, true);
-        q.group = (0..1 + r.below(2)).map(|_| s.expr(r, 1)).collect();
+        // GROUP BY's terms read rows, not aggregates, and an integer there is a column's number
+        // to SQLite, so one is cast: the same value, read as a value
+        let rows = scope(schema, &q.from, funcs, false);
+        q.group = (0..1 + r.below(2)).map(|_| rows.expr(r, 1)).map(|e| if column_number(&e) { E::Cast(Box::new(e), "INTEGER") } else { e }).collect();
         q.cols = q.group.clone();
         q.cols.push(s.aggregate(r, 1));
         if r.chance(0.4) {
@@ -612,8 +665,10 @@ pub fn query(r: &mut Rng, schema: &Schema, funcs: &[Func]) -> Sel {
         // ordered by every column it returns, exactly (BINARY, then the storage class, since 'a'
         // and 'A' tie under NOCASE and 1 and 1.0 tie as numbers), so the rows a LIMIT keeps are
         // certain
+        // (an integer column, the same in every row, orders nothing, and SQLite would read it as
+        // a column's number)
         let desc = r.chance(0.5);
-        q.order = q.cols.iter().flat_map(|c| [(E::Collate(Box::new(c.clone()), "BINARY"), desc), (E::Fn("typeof".into(), vec![c.clone()]), desc)]).collect();
+        q.order = q.cols.iter().filter(|c| !column_number(c)).flat_map(|c| [(E::Collate(Box::new(c.clone()), "BINARY"), desc), (E::Fn("typeof".into(), vec![c.clone()]), desc)]).collect();
         q.limit = Some((r.below(5) as i64, r.below(3) as i64));
     }
     q

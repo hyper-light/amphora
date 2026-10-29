@@ -58,7 +58,14 @@ to WHERE, an outer join made inner, a LIMIT lowered), the optimizer's estimate f
 its estimate for Q. A violation is an estimation error, which is how slow plans are chosen. 13 unique
 issues in MySQL, TiDB and CockroachDB. SQLancer: `common/oracle/CERTOracle.java` (reads EXPLAIN's
 estimated rows). Amphora's estimates: `EXPLAIN QUERY PLAN FORMAT=JSON` gives each table access's
-`input_rows`, `rows_per_input` and `output_rows` (crates/engine/translate/eqp.rs).
+`input_rows`, `rows_per_input` and `output_rows` (crates/engine/translate/eqp.rs), and at its top
+the statement's own `output_rows` for every shape: a join after grouping, aggregation and a literal
+LIMIT, VALUES, a SELECT of no table, a compound's arms combined (docs/design/planner.md, decision
+13). CERT checks every shape the generator makes, grouped, aggregated, DISTINCT, ordered and
+limited queries and compound selects (restricting an arm no EXCEPT has on its right), with no
+HAVING, where fewer rows in a group can pass more groups. A query Amphora can't plan has no
+estimate to check: one SQLite refuses too is skipped as such, one only Amphora refuses is counted as
+a refusal, and "no estimate" is a query planned without one.
 
 ## On Amphora
 

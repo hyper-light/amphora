@@ -1,0 +1,46 @@
+nightly-20261026	diff-2074283afc468d4a	0	
+nightly-20261026	diff-2a9657e41b9b078c	0	
+nightly-20261026	diff-ee071e9f9562fc2c	0	
+nightly-20261027	diff-0823e68bcdacb7a4	1	differs: SELECT '' FROM t0 AS a0 RIGHT JOIN t1 AS a1 ON (a1.c0 LIKE 'A%')
+nightly-20261027	diff-150b98f89e832a9a	1	differs: SELECT NULL FROM t2 AS a0 LEFT JOIN t0 AS a1 ON (a1.c0 LIKE 'a%')
+nightly-20261027	diff-33d11be2491422d4	1	differs: SELECT NULL FROM t0 AS a0 FULL JOIN t1 AS a1 ON (a1.c2 LIKE 'A%')
+nightly-20261027	diff-42927b9e7bb80879	1	differs: SELECT '%', '1', NULL FROM t0 AS a0 FULL JOIN t0 AS a2 ON (a2.c3 LIKE 'a%') GROUP BY '%', '1'
+nightly-20261027	diff-5b29336a29569219	0	
+nightly-20261027	diff-8373092867d012f3	0	
+nightly-20261027	diff-950f9b530b2f3293	1	differs: SELECT ((255 <= a1.c1) COLLATE NOCASE) FROM t0 AS a0, t1 AS a1 RIGHT JOIN t0 AS a2 ON (a2.c0 LIKE 'A%')
+nightly-20261027	diff-9bcd332bd8ccd930	0	
+nightly-20261027	diff-c20280b2b3f064ad	1	differs: SELECT NULL FROM t2 AS a0 RIGHT JOIN t2 AS a1 ON (a1.c0 LIKE 'a%')
+nightly-20261027	eet-010828432e21524e	0	
+nightly-20261028	diff-0cdfabdc3c24bfc3	0	
+nightly-20261028	diff-19d1a2705d9df571	0	
+nightly-20261028	diff-454f4dbd54786dfa	0	
+nightly-20261028	diff-60e05c03077b9681	0	
+nightly-20261028	diff-ce9dc54f20fa07db	0	
+nightly-20261028	diff-d39f91995565f793	0	
+nightly-20261028	diff-e493d4806442ee92	1	differs: SELECT strftime('ABC', (- a2.c1), json_extract('{"a":null}', '$.b[1]')) FROM t0 AS a0 LEFT JOIN t0 AS a1 ON ((a1.c2 COLLATE RTRIM) LIKE 'A%'), t0 AS a2
+nightly-20261028	error-11a8a8d692ba2cd6	1	differs: SELECT ((EXISTS (SELECT 1 FROM t1 AS s487 WHERE (jsonb_extract(1e308, 'A', -100) BETWEEN (CASE WHEN ('A' > s487.c0) THEN s487.c0 END) AND 0.5)))) IS TRUE, ((EXISTS (SELECT 1 FROM t1 AS s487 WHERE (jsonb_extract(1e308, 'A', -100) BETWEEN (CASE WHEN ('A' > s487.c0) THEN s487.c0 END) AND 0.5)))) IS FALSE FROM t0 AS a0 WHERE a0.rowid = 1
+nightly-20261028	error-c1d490f4d6fdfe5a	1	differs: SELECT ((NOT EXISTS (SELECT 1 FROM t0 AS s15 WHERE (date(a0.c2) BETWEEN substr(x'', s15.c0) AND json_object(255, 'a'))))) IS TRUE, ((NOT EXISTS (SELECT 1 FROM t0 AS s15 WHERE (date(a0.c2) BETWEEN substr(x'', s15.c0) AND json_object(255, 'a'))))) IS FALSE FROM t1 AS a0 WHERE a0.rowid = 3
+seed11	diff-243487fcb9e98d38	1	differs: SELECT 255 FROM t0 AS a0 RIGHT JOIN t0 AS a1 ON (a1.c0 LIKE 'a%')
+seed11	diff-2ae0cd601c4f2139	0	
+seed11	diff-3064c68395dc9aac	0	
+seed11	diff-662a693d7e38c916	0	
+seed11	diff-a4ba99214e344a9f	0	
+seed11	diff-a6a081a46ecf71c6	0	
+seed11	diff-eaaf0bdfbf9d6c13	1	differs: SELECT NULL FROM t0 AS a0 FULL JOIN t2 AS a1 ON (a1.c0 LIKE 'A%')
+seed12	diff-149f30f47877187c	0	
+seed12	diff-1d3fcb1b071f8388	1	differs: SELECT 'x' FROM t0 AS a0 FULL JOIN t2 AS a1 ON (a1.c0 LIKE 'a%')
+seed12	diff-5c0a409a56f70bdb	0	
+seed12	diff-85f5b02fea5a3407	0	
+seed12	diff-a2771e993158ae0e	0	
+seed12	diff-a8691c482ce6afd7	0	
+seed12	diff-cc01fb2d9a75a773	1	differs: SELECT ((a0.c0 COLLATE BINARY) & (9007199254740993 COLLATE BINARY)) FROM t0 AS a0, t1 AS a1 LEFT JOIN t2 AS a2 ON ((a2.c0 LIKE 'a%') AND ((a1.c1 IS DISTINCT FROM NULL) AND (0.1 <= a0.c0)))
+seed12	diff-ceb9310eaf9ea735	0	
+seed12	diff-d2eb16b50bbc007a	0	
+seed12	diff-ee30a4550927b5f1	1	differs: SELECT DISTINCT CAST((a1.c1 COLLATE NOCASE) AS TEXT) FROM t0 AS a0, t2 AS a1 WHERE (a0.c2 >= a1.c0) ORDER BY ((('A' % a0.c0) COLLATE BINARY) COLLATE BINARY) DESC, typeof((('A' % a0.c0) COLLATE BINARY)) DESC, ((a1.c0 OR (10 < a1.c0)) COLLATE BINARY) DESC, typeof((a1.c0 OR (10 < a1.c0))) DESC, (CAST((a1.c1 COLLATE NOCASE) AS TEXT) COLLATE BINARY) DESC, typeof(CAST((a1.c1 COLLATE NOCASE) AS TEXT)) DESC LIMIT 2 OFFSET 1
+seed13	diff-003c47db69864d3f	1	differs: SELECT NULL FROM t1 AS a0 LEFT JOIN t0 AS a1 ON (a1.c0 LIKE 'A%')
+seed13	diff-222a9b6828a31762	0	
+seed13	diff-855571d692b1fdc8	0	
+seed13	diff-87cad54fcabe3814	1	differs: SELECT 0.0 FROM t1 AS a0 LEFT JOIN t2 AS a1 ON (a1.c0 LIKE 'a%')
+seed13	diff-a2771e993158ae0e	0	
+seed13	error-327aa6bdaaacbc20	1	differs: SELECT ((EXISTS (SELECT 1 FROM t2 AS s84 WHERE (json_remove(-1e-308, 3) BETWEEN (+ s84.c0) AND 'é')))) IS TRUE, ((EXISTS (SELECT 1 FROM t2 AS s84 WHERE (json_remove(-1e-308, 3) BETWEEN (+ s84.c0) AND 'é')))) IS FALSE FROM t1 AS a0 WHERE a0.rowid = 1
+seed13	error-493c667725cb13ff	1	differs: SELECT ((EXISTS (SELECT 1 FROM t1 AS s764 WHERE (json_patch(' ', '_') BETWEEN format(-1, s764.c2) AND (9223372036854775807 LIKE 'a*'))))) IS TRUE, ((EXISTS (SELECT 1 FROM t1 AS s764 WHERE (json_patch(' ', '_') BETWEEN format(-1, s764.c2) AND (9223372036854775807 LIKE 'a*'))))) IS FALSE FROM t0 AS a0 WHERE a0.rowid = 1000000000000000

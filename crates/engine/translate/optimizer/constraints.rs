@@ -2265,6 +2265,29 @@ struct BinaryTermIndexInfo<'a> {
     is_rowid: bool,
 }
 
+/// Amphora: whether an index on the term's column can answer `lhs op rhs`, as a single-index seek
+/// requires ([Constraint::satisfies_index_affinity] and the collation check of
+/// [constraints_from_where_clause]): the comparison's affinity one the column's affinity serves
+/// (SQLite's sqlite3IndexAffinityOk: index order is no numeric order of text), and its collation
+/// the column's. An implicit rowid's comparison is numeric, and its collation is no matter.
+fn comparison_fits_column(
+    lhs: &ast::Expr,
+    rhs: &ast::Expr,
+    table_col_pos: Option<usize>,
+    table_reference: &JoinedTable,
+    table_references: &TableReferences,
+) -> bool {
+    let Some(column) = table_col_pos.and_then(|pos| table_reference.table.columns().get(pos))
+    else {
+        return true;
+    };
+    column
+        .affinity()
+        .index_affinity_ok(comparison_affinity(lhs, rhs, Some(table_references), None))
+        && resolve_comparison_collseq(lhs, rhs, table_references)
+            .is_ok_and(|collation| collation == column.collation())
+}
+
 fn analyze_binary_term_index_info<'a>(
     expr: &'a ast::Expr,
     table_id: TableInternalId,
@@ -2338,12 +2361,17 @@ pub(crate) fn summarize_binary_term_for_index(
     subqueries: &[NonFromClauseSubquery],
 ) -> Option<IndexableTermSummary> {
     let BinaryTermIndexInfo {
+        lhs,
+        rhs,
         operator,
         table_col_pos,
         constraining_expr,
         is_rowid,
         ..
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
+    if !comparison_fits_column(lhs, rhs, table_col_pos, table_reference, table_references) {
+        return None;
+    }
 
     let (best_index, constraint_refs) = find_best_index_for_constraint(
         table_col_pos,
@@ -2405,6 +2433,9 @@ pub(crate) fn analyze_binary_term_for_index(
         side,
         is_rowid,
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
+    if !comparison_fits_column(lhs, rhs, table_col_pos, table_reference, table_references) {
+        return None;
+    }
 
     // Find the best index for this constraint
     let (best_index, constraint_refs) = find_best_index_for_constraint(
@@ -2572,9 +2603,18 @@ fn find_best_index_for_constraint(
                 continue;
             }
             if let Some(idx_col_pos) = index.column_table_pos_to_index_pos(col_pos) {
+                // Amphora: an index whose column collates otherwise than the table's can't serve
+                // the comparison (comparison_fits_column held it to the table column's).
+                let collates_alike = index
+                    .columns
+                    .get(idx_col_pos)
+                    .zip(table_reference.table.columns().get(col_pos))
+                    .is_some_and(|(index_column, column)| {
+                        index_column.collation.unwrap_or_default() == column.collation()
+                    });
                 // For multi-index OR, we prefer indexes where the constraint column
                 // is the first column (leftmost prefix)
-                if idx_col_pos == 0 {
+                if idx_col_pos == 0 && collates_alike {
                     let constraint_ref = RangeConstraintRef {
                         table_col_pos: Some(col_pos),
                         index_col_pos: 0,

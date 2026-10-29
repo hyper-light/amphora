@@ -321,6 +321,12 @@ pub struct ProgramBuilder {
     init_label: BranchOffset,
     start_offset: BranchOffset,
     pub(crate) reg_result_cols_start: Option<usize>,
+    /// The rows the top-level statement is estimated to return, which EXPLAIN QUERY PLAN
+    /// FORMAT=JSON reports as `output_rows`: a SELECT's join after grouping, aggregation and a
+    /// literal LIMIT, a compound SELECT's arms combined (`optimizer::select_output_rows`,
+    /// `compound_output_rows`). Set as each SELECT's plan is emitted, so the top-level statement,
+    /// emitted after the subqueries it holds, sets it last.
+    pub(crate) output_rows: Option<f64>,
     pub resolve_type: ResolveType,
     /// When set, all triggers fired from this program should use this conflict resolution.
     /// This is used in UPSERT DO UPDATE context to ensure nested trigger's OR IGNORE/REPLACE
@@ -758,6 +764,7 @@ impl ProgramBuilder {
             read_database_cookies: HashMap::default(),
             mode: BuilderQueryMode::new(query_mode),
             reg_result_cols_start: None,
+            output_rows: None,
             flags: ProgramBuilderFlags::new(is_subprogram),
             emitted_function_call: false,
             trigger,
@@ -2496,6 +2503,7 @@ impl ProgramBuilder {
             readonly: self.flags.readonly(),
             result_columns: self.result_columns,
             table_references: self.table_references,
+            output_rows: self.output_rows,
             sql: sql.to_string(),
             refreshes_analyze_stats: sql
                 .trim_start()

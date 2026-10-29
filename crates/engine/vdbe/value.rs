@@ -2,7 +2,7 @@
 use crate::types::TextSubtype;
 use crate::{
     function::MathFunc,
-    numeric::{format_float, format_float_for_quote, NullableInteger, Numeric},
+    numeric::{format_float, format_float_for_quote, nonnan::NonNan, NullableInteger, Numeric},
     translate::collate::CollationSeq,
     types::{compare_immutable_single, AsValueRef, SeekOp},
     vdbe::affinity::{real_to_i64, Affinity},
@@ -63,8 +63,24 @@ mod cmath {
     pub fn atan(x: f64) -> f64 {
         x.atan()
     }
+    // SQLite's atanh is its C library's (math1Func, func.c), so its last digit is the platform's.
+    // macOS's libm is x below 2^-27 and ln_1p(2|x| / (1 - |x|)) / 2 given x's sign above: this
+    // gave its answer for each of 3,000,019 arguments on macOS 26.2, where the correctly rounded
+    // value is an ulp off for 15% of them (0.25 among them). glibc 2.44 rounds correctly, as
+    // atanh_correctly_rounded does for the same arguments. std's f64::atanh isn't computed on |x|
+    // and near -1 loses half the digits; the libm crate's (fdlibm's) is an ulp off at 0.5.
+    #[cfg(target_vendor = "apple")]
     pub fn atanh(x: f64) -> f64 {
-        x.atanh()
+        const TWO_POW_M27: f64 = 7.450580596923828e-9;
+        let a = x.abs();
+        if a < TWO_POW_M27 {
+            return x;
+        }
+        (0.5 * ((a + a) / (1.0 - a)).ln_1p()).copysign(x)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    pub fn atanh(x: f64) -> f64 {
+        double_double::atanh_correctly_rounded(x)
     }
     pub fn atan2(x: f64, y: f64) -> f64 {
         x.atan2(y)
@@ -74,6 +90,113 @@ mod cmath {
     }
     pub fn radians(x: f64) -> f64 {
         x.to_radians()
+    }
+
+    /// Arithmetic on pairs (hi, lo) of doubles whose sum holds about 106 bits (Dekker 1971; Knuth,
+    /// TAOCP vol. 2, 4.2.2), enough that rounding the sum once gives the correctly rounded result.
+    #[cfg(not(target_vendor = "apple"))]
+    mod double_double {
+        type Dd = (f64, f64);
+
+        // Below 2^-28, x³/3 is under half an ulp of x: atanh(x) rounds to x.
+        const TWO_POW_M28: f64 = 3.725290298461914e-9;
+        // 3 - 2√2: where (1 + a) / (1 - a) reaches √2, so atanh(a) is its own series.
+        const Z_MAX: f64 = 0.1715728752538099;
+        // ln(2) / 2 as the double nearest it and the double nearest the rest.
+        const LN2_HALF: Dd = (0.34657359027997264, 1.1595234069231498e-17);
+        // For |z| ≤ 3 - 2√2 the first term left out, z^47 / 47, is under 2^-116 of z.
+        const SERIES_TERMS: usize = 22;
+        // (1 + a) / (1 - a) is under 2^54 for a double a below 1: 54 halvings bring it under √2.
+        const HALVINGS: usize = 64;
+
+        /// atanh(x) = ln((1 + a) / (1 - a)) / 2 given x's sign, a = |x|. With (1 + a) / (1 - a) =
+        /// 2^e m, m within [√2 / 2, √2], that is e ln(2) / 2 + atanh(z) for z = (m - 1) / (m + 1),
+        /// and atanh(z) = z + z³/3 + z⁵/5 + ... converges fast for |z| ≤ 3 - 2√2.
+        pub fn atanh_correctly_rounded(x: f64) -> f64 {
+            let a = x.abs();
+            if a >= 1.0 || a.is_nan() {
+                return if a == 1.0 {
+                    f64::INFINITY.copysign(x)
+                } else {
+                    f64::NAN
+                };
+            }
+            if a < TWO_POW_M28 {
+                return x;
+            }
+            let (z, e) = if a <= Z_MAX {
+                ((a, 0.0), 0.0)
+            } else {
+                let mut m = div(two_sum(1.0, a), two_sum(1.0, -a));
+                let mut e = 0.0;
+                for _ in 0..HALVINGS {
+                    if m.0 <= std::f64::consts::SQRT_2 {
+                        break;
+                    }
+                    m = (m.0 * 0.5, m.1 * 0.5);
+                    e += 1.0;
+                }
+                (div(add(m, (-1.0, 0.0)), add(m, (1.0, 0.0))), e)
+            };
+            let z2 = mul(z, z);
+            let mut power = z;
+            let mut series = z;
+            let mut odd = 1.0;
+            for _ in 0..SERIES_TERMS {
+                power = mul(power, z2);
+                odd += 2.0;
+                series = add(series, div_by(power, odd));
+            }
+            let (p, q) = two_prod(e, LN2_HALF.0);
+            add(add((p, q), (e * LN2_HALF.1, 0.0)), series)
+                .0
+                .copysign(x)
+        }
+
+        /// a + b exactly: the rounded sum and its rounding error (Knuth's TwoSum).
+        fn two_sum(a: f64, b: f64) -> Dd {
+            let s = a + b;
+            let v = s - a;
+            (s, (a - (s - v)) + (b - v))
+        }
+
+        /// a + b exactly where |a| ≥ |b| (Dekker's FastTwoSum).
+        fn fast_two_sum(a: f64, b: f64) -> Dd {
+            let s = a + b;
+            (s, b - (s - a))
+        }
+
+        /// a × b exactly: the rounded product and its rounding error, from one fused multiply-add.
+        fn two_prod(a: f64, b: f64) -> Dd {
+            let p = a * b;
+            (p, a.mul_add(b, -p))
+        }
+
+        fn add(a: Dd, b: Dd) -> Dd {
+            let (s, e) = two_sum(a.0, b.0);
+            let (t, f) = two_sum(a.1, b.1);
+            let (s, e) = fast_two_sum(s, e + t);
+            fast_two_sum(s, e + f)
+        }
+
+        fn mul(a: Dd, b: Dd) -> Dd {
+            let (p, e) = two_prod(a.0, b.0);
+            fast_two_sum(p, e + (a.0 * b.1 + a.1 * b.0))
+        }
+
+        /// a / b: the quotient of the high parts, corrected by the remainder's.
+        fn div(a: Dd, b: Dd) -> Dd {
+            let q = a.0 / b.0;
+            let (p, e) = two_prod(b.0, q);
+            let r = add(a, (-p, -(e + b.1 * q)));
+            fast_two_sum(q, r.0 / b.0)
+        }
+
+        fn div_by(a: Dd, c: f64) -> Dd {
+            let q = a.0 / c;
+            let (p, e) = two_prod(q, c);
+            fast_two_sum(q, (((a.0 - p) - e) + a.1) / c)
+        }
     }
 }
 
@@ -304,29 +427,39 @@ impl Value {
         Value::build_text(result)
     }
 
+    /// abs() as SQLite's absFunc (func.c): an integer's magnitude, NULL for NULL, and anything else
+    /// as its REAL, negated only below zero, so -0.0 stays -0.0.
     #[expect(
         clippy::unnecessary_lazy_evaluations,
         reason = "ok_or skips the drop glue that otherwise bloats the happy path"
     )]
     pub fn exec_abs(&self) -> Result<Self> {
-        Ok(match self {
-            Value::Null => Value::Null,
+        let real = match self {
+            Value::Null => return Ok(Value::Null),
             Value::Numeric(Numeric::Integer(v)) => {
-                Value::from_i64(v.checked_abs().ok_or_else(|| LimboError::IntegerOverflow)?)
+                return Ok(Value::from_i64(
+                    v.checked_abs().ok_or_else(|| LimboError::IntegerOverflow)?,
+                ));
             }
-            Value::Numeric(Numeric::Float(non_nan)) => Value::from_f64(f64::from(*non_nan).abs()),
-            _ => {
-                let s = match self {
-                    Value::Text(text) => std::borrow::Cow::Borrowed(text.as_str()),
-                    Value::Blob(blob) => String::from_utf8_lossy(blob),
-                    _ => unreachable!(),
-                };
+            Value::Numeric(Numeric::Float(_)) | Value::Text(_) | Value::Blob(_) => {
+                self.real_value()
+            }
+        };
+        Ok(Value::from_f64(if real < 0.0 { -real } else { real }))
+    }
 
-                crate::numeric::str_to_f64(s)
-                    .map(|v| Value::from_f64(f64::from(v).abs()))
-                    .unwrap_or_else(|| Value::from_f64(0.0))
+    /// The value as a REAL, as SQLite's sqlite3VdbeRealValue reads it: a number's own value, the
+    /// number a text or BLOB spells read afresh (0.0 for none), and 0.0 for NULL. Text spelling a
+    /// negative zero ('-0') is -0.0 here, though its numeric type is the integer 0.
+    fn real_value(&self) -> f64 {
+        match self {
+            Value::Null => 0.0,
+            Value::Numeric(numeric) => numeric.to_f64(),
+            Value::Text(text) => crate::numeric::str_to_f64(text.as_str()).map_or(0.0, f64::from),
+            Value::Blob(blob) => {
+                crate::numeric::str_to_f64(String::from_utf8_lossy(blob)).map_or(0.0, f64::from)
             }
-        })
+        }
     }
 
     pub fn exec_random<F>(generate_random_number: F) -> Self
@@ -787,21 +920,52 @@ impl Value {
         Ok(result)
     }
 
+    /// unicode(): the first character of the value's text as SQLite's unicodeFunc reads it with
+    /// sqlite3Utf8Read (func.c, utf.c), NULL for an empty value or one starting with a NUL. A BLOB's
+    /// bytes are read as they are: a byte below 0xC0 is its own value, a lead byte takes in every
+    /// continuation byte after it in a u32 that wraps, returned as a C int, and a value below 0x80
+    /// or a surrogate is U+FFFD. Text is well-formed UTF-8, so its first character reads as itself.
     pub fn exec_unicode(&self) -> Value {
-        match self {
-            Value::Text(_) | Value::Numeric(_) | Value::Blob(_) => {
-                let text = self.to_string();
-                if let Some(first_char) = text.chars().next() {
-                    if first_char == '\0' {
-                        return Value::Null;
-                    }
-                    Value::from_i64(first_char as u32 as i64)
-                } else {
-                    Value::Null
-                }
+        let number;
+        let bytes = match self {
+            Value::Null => return Value::Null,
+            Value::Text(text) => text.as_str().as_bytes(),
+            Value::Blob(blob) => blob.as_slice(),
+            Value::Numeric(_) => {
+                number = self.to_string();
+                number.as_bytes()
             }
-            _ => Value::Null,
+        };
+        let Some((&lead, rest)) = bytes.split_first() else {
+            return Value::Null;
+        };
+        if lead == 0 {
+            return Value::Null;
         }
+        if lead < 0xC0 {
+            return Value::from_i64(i64::from(lead));
+        }
+        // sqlite3Utf8Trans1: the bits a lead byte keeps.
+        let bits = match lead {
+            0xC0..=0xDF => lead & 0x1F,
+            0xE0..=0xEF => lead & 0x0F,
+            0xF0..=0xF7 => lead & 0x07,
+            0xF8..=0xFB => lead & 0x03,
+            0xFC..=0xFD => lead & 0x01,
+            _ => 0,
+        };
+        let c = rest
+            .iter()
+            .take_while(|byte| *byte & 0xC0 == 0x80)
+            .fold(u32::from(bits), |c, byte| {
+                c.wrapping_shl(6).wrapping_add(u32::from(byte & 0x3F))
+            });
+        let c = if c < 0x80 || c & 0xFFFF_F800 == 0xD800 {
+            0xFFFD
+        } else {
+            c
+        };
+        Value::from_i64(i64::from(c.cast_signed()))
     }
 
     pub fn exec_unistr(&self) -> Result<Value> {
@@ -1221,19 +1385,37 @@ impl Value {
     }
 
     pub fn exec_add(&self, rhs: &Value) -> Value {
-        (|| Numeric::from_value(self)?.checked_add(Numeric::from_value(rhs)?))().into()
+        self.exec_arithmetic(rhs, Numeric::checked_add)
     }
 
     pub fn exec_subtract(&self, rhs: &Value) -> Value {
-        (|| Numeric::from_value(self)?.checked_sub(Numeric::from_value(rhs)?))().into()
+        self.exec_arithmetic(rhs, Numeric::checked_sub)
     }
 
     pub fn exec_multiply(&self, rhs: &Value) -> Value {
-        (|| Numeric::from_value(self)?.checked_mul(Numeric::from_value(rhs)?))().into()
+        self.exec_arithmetic(rhs, Numeric::checked_mul)
     }
 
     pub fn exec_divide(&self, rhs: &Value) -> Value {
-        (|| Numeric::from_value(self)?.checked_div(Numeric::from_value(rhs)?))().into()
+        self.exec_arithmetic(rhs, Numeric::checked_div)
+    }
+
+    /// SQLite's arithmetic (OP_Add to OP_Divide, vdbe.c): integer math when both operands' numeric
+    /// types are integers (`op` turns to REALs itself on overflow), else floating-point math on each
+    /// operand's REAL, which fp_math reads afresh (sqlite3VdbeRealValue) rather than from the
+    /// integer a text's numeric type gave: '-0' * 0.1 is -0.0, where '-0' * 1 is the integer 0.
+    fn exec_arithmetic(&self, rhs: &Value, op: fn(Numeric, Numeric) -> Option<Numeric>) -> Value {
+        (|| {
+            let (lhs_num, rhs_num) = (Numeric::from_value(self)?, Numeric::from_value(rhs)?);
+            match (lhs_num, rhs_num) {
+                (Numeric::Integer(_), Numeric::Integer(_)) => op(lhs_num, rhs_num),
+                _ => op(
+                    Numeric::Float(NonNan::new(self.real_value())?),
+                    Numeric::Float(NonNan::new(rhs.real_value())?),
+                ),
+            }
+        })()
+        .into()
     }
 
     pub fn exec_bit_and(&self, rhs: &Value) -> Value {
@@ -1509,25 +1691,23 @@ impl Value {
         Value::build_text(result)
     }
 
+    /// SQLite's `concatwsFunc` and `concatFuncCore` (func.c): the separator and each argument as
+    /// text, a BLOB its bytes; every argument but a NULL one written, an empty one too, with the
+    /// separator between; a NULL separator makes the result NULL.
     pub fn exec_concat_ws<'a, T: ExactSizeIterator<Item = &'a Self>>(mut registers: T) -> Self {
-        if registers.len() == 0 {
-            return Value::Null;
-        }
-
-        let separator = match registers
-            .next()
-            .expect("registers should have at least one element after length check")
-        {
-            Value::Null | Value::Blob(_) => return Value::Null,
-            v => format!("{v}"),
+        let separator = match registers.next() {
+            None | Some(Value::Null) => return Value::Null,
+            Some(separator) => separator.to_string(),
         };
-
-        let parts = registers.filter_map(|val| match val {
-            Value::Text(_) | Value::Numeric(_) => Some(format!("{val}")),
-            _ => None,
-        });
-
-        let result = parts.collect::<Vec<_>>().join(&separator);
+        let mut result = String::new();
+        let mut written = false;
+        for val in registers.filter(|val| !matches!(val, Value::Null)) {
+            if written {
+                result.push_str(&separator);
+            }
+            result.push_str(&val.to_string());
+            written = true;
+        }
         Value::build_text(result)
     }
 

@@ -309,7 +309,7 @@ fn folds_to_zero(expr: &ast::Expr) -> bool {
 
 /// Whether `expr` calls a function outside its subqueries, as SQLite's parser sees it: LIKE,
 /// GLOB, REGEXP, MATCH, -> and ->> and CURRENT_DATE, CURRENT_TIME and CURRENT_TIMESTAMP are calls
-/// there.
+/// there, and a call under a COLLATE isn't.
 fn calls_function(expr: &ast::Expr) -> bool {
     let mut found = false;
     let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
@@ -327,6 +327,10 @@ fn calls_function(expr: &ast::Expr) -> bool {
                 Ok(WalkControl::SkipChildren)
             }
             ast::Expr::Exists(_) | ast::Expr::Subquery(_) => Ok(WalkControl::SkipChildren),
+            // SQLite's COLLATE node takes no flag from its operand: sqlite3ExprAddCollateToken sets
+            // only EP_Collate and EP_Skip (sqlite3.c 3.54.0, line 112995), so a call under a
+            // COLLATE gives the AND no EP_HasFunc and it still folds.
+            ast::Expr::Collate(..) => Ok(WalkControl::SkipChildren),
             _ => Ok(WalkControl::Continue),
         }
     });

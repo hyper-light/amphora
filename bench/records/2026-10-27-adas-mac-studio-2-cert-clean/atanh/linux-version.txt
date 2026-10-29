@@ -1,0 +1,2 @@
+ldd (GNU libc) 2.44
+Linux 7.2.9-2-cachyos x86_64

@@ -225,13 +225,24 @@ pub(crate) fn in_subquery_affinity(
     lhs: Affinity,
     referenced_tables: Option<&TableReferences>,
 ) -> Affinity {
-    let rhs = get_expr_affinity(rhs, referenced_tables, None);
+    in_affinity(lhs, get_expr_affinity(rhs, referenced_tables, None))
+}
+
+/// [in_subquery_affinity] of the probe's affinity and the subquery column's.
+fn in_affinity(lhs: Affinity, rhs: Affinity) -> Affinity {
     match (lhs != Affinity::None, rhs != Affinity::None) {
         (true, true) if lhs.is_numeric() || rhs.is_numeric() => Affinity::Numeric,
         (true, true) | (false, false) => Affinity::Blob,
         (_, true) => rhs,
         (true, false) => lhs,
     }
+}
+
+/// Amphora: whether `x IN (SELECT y)` compares x and y as `x = y` does, by the same affinity. Not
+/// where y is a lone REAL column: IN makes an integer probe a REAL (`-9223372036854775807` finds
+/// -2^63), `=` compares the integer with the REAL exactly.
+pub(crate) fn in_compares_as_equality(lhs: Affinity, rhs: Affinity) -> bool {
+    in_affinity(lhs, rhs) == do_comparison_affinity(lhs, rhs)
 }
 
 pub(crate) trait HasComparableAffinity {

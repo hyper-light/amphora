@@ -89,6 +89,22 @@ pub fn convert_dbtype_to_raw_jsonb(data: &Value, strict: Conv) -> crate::Result<
     Ok(json.data())
 }
 
+/// A value's JSONB as an element of what SQLite's jsonb_array(), jsonb_object() and their
+/// aggregates make: they write each argument as JSON text, a JSONB BLOB as jsonTranslateBlobToText
+/// renders it (jsonAppendSqlValue), and make the whole text JSONB again (jsonReturnStringAsBlob,
+/// json.c), so a JSONB argument comes back in the encoding parsing its text gives: every header at
+/// its smallest and JSON5 forms as JSON (`.5` is 0.5, `0x1F` is 31). jsonb_set() and the other
+/// edits put an argument's bytes in as they are (jsonBlobEdit), and keep convert_dbtype_to_jsonb;
+/// the aggregates re-encode at the end ([json_from_raw_bytes_agg]).
+pub fn convert_dbtype_to_element_jsonb(val: impl AsValueRef, strict: Conv) -> crate::Result<Jsonb> {
+    let val = val.as_value_ref();
+    let json = convert_ref_dbtype_to_jsonb(val, strict)?;
+    if !matches!(val, ValueRef::Blob(_)) {
+        return Ok(json);
+    }
+    Jsonb::from_str_with_mode(&json.to_string()?, Conv::Strict).map_err(Into::into)
+}
+
 /// Return the encoded length of the raw JSONB element beginning at `cursor`.
 ///
 /// Aggregate JSON payloads keep an unfinalized one-byte array/object header
@@ -113,6 +129,10 @@ pub fn json_from_raw_bytes_agg(data: &[u8], raw: bool) -> crate::Result<Value> {
     let el_type = json.element_type()?;
     json.finalize_unsafe(el_type)?;
     if raw {
+        // jsonb_group_array() and jsonb_group_object() build JSON text and make it JSONB at the end
+        // (jsonReturnStringAsBlob, json.c), so each element comes out in the encoding its text
+        // gives, as jsonb_array()'s do (convert_dbtype_to_element_jsonb), whatever bytes it came in.
+        let json = Jsonb::from_str_with_mode(&json.to_string()?, Conv::Strict)?;
         json_string_to_db_type(json, el_type, OutputVariant::Binary)
     } else {
         json_string_to_db_type(json, el_type, OutputVariant::ElementType)
@@ -370,7 +390,7 @@ where
     for value in values {
         let value = value.as_value_ref();
         ensure_blob_arg_is_jsonb(value)?;
-        let value = convert_dbtype_to_jsonb(value, Conv::NotStrict)?;
+        let value = convert_dbtype_to_element_jsonb(value, Conv::NotStrict)?;
         json.append_jsonb_to_end(value.data());
     }
     json.finalize_unsafe(ElementType::ARRAY)?;
@@ -1024,7 +1044,7 @@ where
             )
         })?;
         ensure_blob_arg_is_jsonb(second.as_value_ref())?;
-        let value = convert_dbtype_to_jsonb(second, Conv::NotStrict)?;
+        let value = convert_dbtype_to_element_jsonb(second, Conv::NotStrict)?;
         json.append_jsonb_to_end(value.data());
     }
 

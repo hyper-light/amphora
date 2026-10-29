@@ -472,3 +472,141 @@ counted estimate back in the EXPLAIN plan of the same query.
 **Falsified by.** A counter whose rows differ from the true size of its prefix (a query whose
 prefix, run on its own as a COUNT(*), gives another number), or a statement on a connection that
 didn't ask that runs slower than before the change (the bench suite's 50 statements, best of 3).
+
+## 13. One estimate per joined set
+
+**Decision.** A join's row estimate is a property of the set of tables it joins
+(`optimizer/cardinality.rs`, `JoinedSetRows`): computed from the predicates over that set, once per
+`TableMask` and memoized for the search (at most its own subsets: 8,192 sets, past which a set is
+computed again, to the same number), and given to every order and every access path the search
+tries for the set. An access method changes only what reading the set costs; the rows a seek
+returns per outer row stay the cost model's (`estimate_rows_per_seek`: a unique key's one row,
+ANALYZE's rows per key prefix, a GLOB's implied range) and no longer reach any output estimate.
+
+Each WHERE term counts once, on its home table: its most selective constraint's, ties to the first
+table by name, not by place in FROM, and never by the other terms, so adding a term moves no other.
+A term with its table on both sides, which gives a constraint for each side, counts once there.
+Selectivities combine through the same `constraints_selectivity` one table's filters use, with one
+change: only bounds by a constant (a literal, a parameter, an uncorrelated subquery) make a closed
+range together; a bound by a column, of the same row or another table (`x.c <= y.d`), is a join
+predicate and stands alone, so it counts the same on whichever table it is counted.
+
+Outer joins by their semantics, each by the Poisson model the planner already took for a match
+count: a LEFT JOIN keeps each left row's matches or the row once (`m + e^-m`, `m` the right table's
+rows its ON terms keep); a RIGHT JOIN keeps the matches and the right rows no left row matches; a
+FULL JOIN keeps both sides' unmatched rows. A WHERE filter on the right table counts what it
+restricts beyond the ON terms (`sel(ON and filter) / sel(ON)`), so the matches are never more than
+the inner join's rows: LEFT and RIGHT are never below the inner join and FULL never below either. A
+RIGHT or FULL JOIN is a reordering barrier both ways, so the rows before it are a set of their own,
+combined with it. Semi and anti joins keep or drop left rows and never add any: their tables and
+the terms that read them (their unnested EXISTS conditions) multiply by 1. A derived table grouped by
+exactly the columns `=` terms equate to other tables' values (a scalar subquery unnested,
+`unnest.rs`, by a LEFT JOIN or, once a null-rejecting term has made it one, an inner join) gives one
+row for each binding of them, as the correlated form it replaced does.
+
+A term no row passes leaves none: a NULL, one that settles to false as SQLite settles an AND or OR
+of literals (`simplified_and_or`, `literal_truth`), a comparison with a NULL literal by `=`, `<>`,
+`<`, `<=`, `>` or `>=`, or an AND with such a side. In WHERE it leaves no rows in any set; in a
+join's ON it makes that join's right table match nothing. So does `c IS NULL`, however written
+(`NULL IS c`, `c IS NOT DISTINCT FROM NULL`), of a column no row of its table holds NULL in (the
+rowid, a NOT NULL column), which is true only of a row a join null-extended: on a LEFT JOIN's right
+table it keeps the left rows that matched nothing; on a table no join null-extends (not a LEFT or
+FULL JOIN's right table, nor before a RIGHT or FULL JOIN) it keeps none; as an ON term of the
+table's own outer join it matches none. A plan made impossible by a constant-false WHERE estimates
+each table access at 0 rows.
+
+EXPLAIN QUERY PLAN FORMAT=JSON's `output_rows` is the rows the top-level statement is estimated to
+return (`ProgramBuilder::output_rows`), never an uncorrelated subquery's whose tables the program
+holds too: a SELECT's join after grouping and aggregation, cut to a literal LIMIT
+(`estimated_output_rows`); VALUES its rows; a SELECT of no table one row, none under a WHERE never
+true; a compound SELECT its arms', UNION ALL and UNION adding, INTERSECT taking the smaller, EXCEPT
+its left arm's, cut to a literal LIMIT (`optimizer::select_output_rows`, `compound_output_rows`, the
+same fold a FROM-clause subquery's rows take). Each grows or stays as its join's rows grow, so a
+more restrictive query is never estimated at more rows for its shape alone. An ON term's BETWEEN is
+rewritten to its two comparisons as a WHERE term's is (`planner.rs`, `split_rewritten_ands`). Loops
+run over a set's tables and its RIGHT or FULL JOINs, bounded by the mask; nothing recurses.
+
+**Why.** The estimate was the chosen access path's: rows per outer row from the seek or scan
+picked, times the filters it didn't consume, with each term's share moved around by the order its
+tables came in (`rows_after_join`, `completed_terms_selectivity`). So the same join got other
+estimates in other orders and with other access paths, and the search compared plans of one set by
+numbers that differed only in how they were reached. The oracles' CERT check found the symptoms
+(cause AG: a FULL JOIN estimated below its inner join; an index seek's estimate against two
+filters'); the order check this decision adds found them at their cause.
+
+**Sources.** PostgreSQL computes a join relation's rows once and keeps them for all its paths
+(`set_joinrel_size_estimates`, `src/backend/optimizer/path/costsize.c` lines 5671 to 5680 at
+126976a8: "In theory we should get the same answers no matter which pair is provided; ... and
+anyway we must keep the rowcount estimate the same for all paths for the joinrel"). CockroachDB's
+memo: "Because memo groups contain logically equivalent expressions, all the memo expressions in a
+group share the same logical properties" (`pkg/sql/opt/memo/memo.go` line 62), the row count among
+them (`statistics_builder.go`). DuckDB caches the cardinality of each relation set
+(`src/optimizer/join_order/cardinality_estimator.cpp` at 1641475, line 188:
+`reference_map_t<JoinRelationSet, CardinalityHelper> relation_set_2_cardinality;`,
+`EstimateCardinalityWithSet` at line 907 reading it before computing), after Ebergen's thesis: "the
+cardinality is also represented as a set of relations" (docs/research/planner.md, findings f15, f16
+and f39, kiln grade A). Only a bound by a pseudo-constant joins a range: PostgreSQL's
+`clauselist_selectivity` (`src/backend/optimizer/path/clausesel.c` lines 205 to 231 at 126976a8)
+looks for "a restriction clause with a pseudoconstant on one side" of one relation before it pairs
+`<` and `>` clauses into a range (`addRangeClause`), and merges any other clause's selectivity
+"generically" (f16, f17, A). The outer-join bounds are the operators' definitions, SQLite's in its
+requirement R-24610-05866 (`test/e_select.test` line 622): for a LEFT JOIN, "after the ON or
+USING filtering clauses have been applied, an extra row is added to the output for each row in
+the original left-hand input dataset that does not match any row in the right-hand dataset"; a
+RIGHT JOIN does the same for the right side's rows and a FULL JOIN for both. The order check
+follows CERT's idea (Ba and Rigger, ICSE 2024, f21): a property of the estimator two forms of one
+query must share, checked without knowing true sizes. An IS NULL of a never-NULL column is SQLite's
+"NOT NULL strength reduction optimization" (`resolveExprStep`, release 3.54.0's `sqlite3.c` as
+`bench/oracles/sqlite.sh` downloads it, lines 111487 to 111490: `"expr IS NULL" --> "FALSE"` "if we can
+prove that "expr" is never NULL", in a WHERE clause), whose proof `sqlite3ExprCanBeNull` (line 115849) takes
+from a column's `notNull` and the `EP_CanBeNull` mark a column of an outer join's right side carries;
+its WHERE loop builder likewise ignores "IS [NOT] NULL constraints on NOT NULL columns" (line 172939).
+
+**Evidence.** `crates/engine/tests/planner.rs`: `every_order_of_an_inner_join_gets_one_estimate`
+(random inner joins of two to six tables, filters and join terms, with statistics and without, each
+in up to 24 FROM orders and each order forced by CROSS JOIN), `an_outer_join_is_estimated_at_least_its_inner_join`,
+`a_constraint_seeks_or_filters_to_one_estimate` and `an_on_term_and_a_where_term_give_one_estimate`
+failed on dbef789 (one join estimated 1e11 in one order and 1e6 as written; a seek 1e9 and the same
+join NOT INDEXED 1e11; a LEFT JOIN 2,500 under its inner join's 3,000) and pass, each shape the
+oracles found later added where it first failed. The oracles' order check
+(`bench/src/oracle/checks.rs`, `Case::Order`), which plans an inner join of two to four tables with
+its FROM list in every order and each order forced by CROSS JOIN, failed 33 of its 435 checks on
+dbef789 and none of 502,632 and 530,789 in two campaigns of every oracle on d762dc2, seeds 11 and
+12, 1,800 s each (`bench/records/2026-10-26-adas-mac-studio-2-order-check/seed11/summary.json` and
+`seed12/summary.json`; an earlier pair of the same campaigns, 375,206 and 385,255, none failed, in
+`2026-10-26-adas-mac-studio-order-check.md`; the causes in `bench/oracles/findings.md`). CERT, the
+check that found cause AG: all 71 findings of dbef789's run (seed 20261025, 300 s) pass on d762dc2,
+and d762dc2's own run found 6, each failing on dbef789 too. The campaigns' other 41 findings
+replay alike on both builds (34 fail on both, 7 pass on both: `replay.jsonl` beside the summaries):
+the change brings none.
+The suite's 52 statements plan as before at 200,000 and at 20,000 items (`--suite --explain`, release
+builds of dbef789 and d762dc2), and every statement checked compiles to the same bytecode. Release
+binaries of both on adas-mac-studio-2, the whole suite, four rounds in ABBA order, each run started
+at load under 2 (`bench/records/2026-10-26-adas-mac-studio-2-joined-set-rows.md`): 94 of the 104
+statement and client pairs within 3% or faster by best of 4; the ten below run unchanged programs
+and lie within their own binary's spread there (`table_count` at 32 clients 1,691 to 28,585 a
+second across the before binary's four runs), and the point reads, alternated tightly, measure 0.984
+to 1.004 by median. Measured again (the same record), each of the ten is within 3% too: eight in a
+run of the ten alone (best of 4), and `insert_batch_100` and `table_count` at 32 clients, whose
+ratio moves both ways from run to run (0.895 to 1.074 and 0.640 to 1.110 by best in four runs), in
+eight rounds of their own (1.074 and 1.110, medians 1.002 and 1.013); both compile to the same
+bytecode on either binary.
+
+Step 5 of the planner's plan (2026-10-27) made the statement's own `output_rows`, the estimate CERT
+reads, the rows of every shape, and added the IS NULL rule above. Every CERT finding of the oracles'
+campaigns 1 to 4 and the injected run (126) and of step 5's own runs (5) passes `--replay-check` on
+10f2461, and six runs of every oracle there (seeds 11, 12 and 13 and three nights' seeds, 1,800 s
+each, on adas-mac-studio-2) fail none of 2,607,858 CERT checks, none of them a query planned without
+an estimate (`bench/records/2026-10-27-adas-mac-studio-2-cert-clean/`, `third-runs/*/summary.json`
+and `replay-cert.tsv`). `crates/engine/tests/oracle_findings.rs` holds a test for each cause CERT
+found, each failing before its fix: `a_hash_joins_estimate_is_the_joins` (AF),
+`a_full_join_is_estimated_at_least_its_inner_join` and `an_always_true_conjunct_raises_no_estimate`
+(AG), `an_is_null_of_a_column_never_null_keeps_no_inner_row` (BN),
+`a_multi_index_or_keeps_the_other_terms_selectivity` (P1), `a_term_counts_where_the_join_completes_it`
+(P2) and `bounds_read_apart_make_the_same_range` (P3).
+
+**Falsified by.** Two orders or two access paths of one inner join whose estimates differ (the order
+check, run nightly); an outer join estimated below its inner join, or a semi or anti join above its
+left side; a query the new estimates send to a slower plan than the old ones chose, measured (the
+estimate of a set no longer favours the path that happens to estimate fewer rows for it, so a choice
+that rested on that difference may move).

@@ -11,8 +11,9 @@
 set -uo pipefail
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 BENCH=$1
-OUT=$(realpath -m -- "$2")
-mkdir -p "$OUT"
+# made first, then named whole: macOS has no `realpath -m`
+mkdir -p -- "$2" || exit 2
+OUT=$(cd -- "$2" && pwd) || exit 2
 SQLITE=${ORACLE_SQLITE:-$("$HERE/sqlite.sh")} || exit 2
 "$BENCH" --oracle --seconds "${ORACLE_SECONDS:-1800}" --seed "${ORACLE_SEED:-$(date +%Y%m%d)}" --reduce-seconds 20 \
   --features "$HERE/../corpus/features.json" --sqlite "$SQLITE" --out "$OUT" || exit 2

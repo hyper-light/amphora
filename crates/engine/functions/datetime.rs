@@ -14,6 +14,12 @@ use std::fmt::Write;
 const JD_TO_MS: i64 = 86_400_000;
 const MAX_JD: i64 = 464269060799999; // 9999-12-31 23:59:59.999
 
+/// SQLite's validJulianDay (date.c): a Julian day, in milliseconds, from Julian day 0
+/// (-4713-11-24 12:00:00) to 9999-12-31 23:59:59.999.
+fn valid_julian_day(i_jd: i64) -> bool {
+    (0..=MAX_JD).contains(&i_jd)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DateTime {
     i_jd: i64, // The julian day number times 86400000
@@ -63,6 +69,13 @@ impl DateTime {
     fn set_error(&mut self) {
         *self = DateTime::default();
         self.is_error = true;
+    }
+
+    /// The rule SQLite's isDate holds each date function's argument to once it is read (date.c):
+    /// no error, and a Julian day in range, so a date before Julian day 0 is none: date(0)'s
+    /// '-4713-11-24' is its midnight, half a day before.
+    fn is_valid(&self) -> bool {
+        !self.is_error && valid_julian_day(self.i_jd)
     }
 
     fn compute_jd(&mut self) {
@@ -118,7 +131,7 @@ impl DateTime {
             self.y = 2000;
             self.m = 1;
             self.d = 1;
-        } else if self.i_jd < 0 || self.i_jd > MAX_JD {
+        } else if !valid_julian_day(self.i_jd) {
             self.set_error();
             return;
         } else {
@@ -914,7 +927,7 @@ where
     }
 
     p.compute_jd();
-    if p.is_error || p.i_jd < 0 || p.i_jd > MAX_JD {
+    if !p.is_valid() {
         return Value::Null;
     }
 
@@ -1150,8 +1163,8 @@ where
     d1.compute_jd();
     d2.compute_jd();
 
-    // Validate inputs after computation
-    if d1.is_error || d2.is_error {
+    // Each argument is held to isDate's rule, as every date function's is.
+    if !d1.is_valid() || !d2.is_valid() {
         return Value::Null;
     }
 
@@ -1334,7 +1347,7 @@ where
     }
 
     p.compute_jd();
-    if p.is_error || p.i_jd < 0 || p.i_jd > MAX_JD {
+    if !p.is_valid() {
         return Value::Null;
     }
 

@@ -4,7 +4,7 @@
 //! (G2 step 3; AC-T1.1.1: reads as committed; AC-T1.8.6: the differential suite).
 
 use amphora_engine::{
-    ConnectOpts, Connection, Database, DatabaseOpts, MemoryIO, OpenOptions, SqliteDialect,
+    ConnectOpts, Connection, Database, DatabaseOpts, MemoryIO, Numeric, OpenOptions, SqliteDialect,
     StepResult, Value, IO,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,6 +23,16 @@ fn open() -> (Arc<MemoryIO>, Arc<Connection>) {
 /// The rows of `sql`, columns joined by `|`, each value as SQL writes it: NULL, an integer, a real,
 /// 'text' or x'blob'.
 fn rows(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> Vec<String> {
+    written_rows(io, conn, sql, false)
+}
+
+/// The rows of `sql` as rows() writes them, but each REAL as Rust writes an f64, which keeps the sign
+/// of a negative zero that SQL's text of a REAL leaves off: -0.0 is "-0.0" here and 0.0 to CAST.
+fn signed_rows(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> Vec<String> {
+    written_rows(io, conn, sql, true)
+}
+
+fn written_rows(io: &MemoryIO, conn: &Arc<Connection>, sql: &str, signed: bool) -> Vec<String> {
     let mut stmt = conn.prepare(sql).unwrap();
     let mut out = Vec::new();
     loop {
@@ -33,6 +43,9 @@ fn rows(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> Vec<String> {
                     .get_values()
                     .map(|v| match v {
                         Value::Null => "NULL".to_owned(),
+                        Value::Numeric(Numeric::Float(f)) if signed => {
+                            format!("{:?}", f64::from(*f))
+                        }
                         Value::Text(t) => format!("'{}'", t.as_str()),
                         Value::Blob(b) => format!(
                             "x'{}'",
@@ -1732,5 +1745,914 @@ fn a_correlated_subquery_no_row_reads_never_runs() {
             "{place}: {read}: {}",
             error(&read)
         );
+    }
+}
+
+/// Do: estimate a FULL JOIN filtered on its right table's column, then the same with a conjunct on
+/// its left table's, which makes it an inner join. Expect: no more rows estimated for the inner
+/// join (CERT; finding cert-70d3e0baf8df5914 in the second campaign, cause AG: 320,000 rows against
+/// the FULL JOIN's 10,000, as the FULL JOIN's estimate came from its access path and left out the
+/// rows its inner join counted).
+#[test]
+fn a_full_join_is_estimated_at_least_its_inner_join() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t0(c0 REAL PRIMARY KEY NOT NULL)")
+        .unwrap();
+    conn.execute("CREATE TABLE t1(c0 VARCHAR(10), c1 TEXT PRIMARY KEY)")
+        .unwrap();
+    let from = "SELECT NULL FROM t1 AS a0 FULL JOIN t0 AS a1 ON ((a1.c0 > 1000000000000000.0) AND (a0.c1 >= a1.c0)) WHERE ";
+    let term = "(a1.c0 IN (NULL, 1.5))";
+    let base = estimate(&io, &conn, &format!("{from}{term}"));
+    let more = estimate(&io, &conn, &format!("{from}({term} AND a0.c1)"));
+    assert!(
+        no_more(more, base),
+        "{more} rows estimated for the more restrictive query, {base} for the query"
+    );
+}
+
+/// Do: estimate a join whose WHERE bounds a column by a value of its own table and one of the other
+/// table's, then the same with a conjunct that is always true (`1 NOTNULL OR ...`), which moves the
+/// join's order. Expect: no more rows estimated (CERT; finding cert-bae9c4dcf94932e8 in the second
+/// campaign, cause AG: 6.4e10 rows against 2e9, as an index seek's estimate counted the two bounds
+/// as one closed range in one order and two filters counted them apart in the other).
+#[test]
+fn an_always_true_conjunct_raises_no_estimate() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t0(c0 TEXT PRIMARY KEY, c1 INTEGER UNIQUE)")
+        .unwrap();
+    let from = "SELECT ((x'41' = 9007199254740993) AND (a1.c1 NOT BETWEEN 'x' AND a0.c1)) FROM t0 AS a0, t0 AS a1 WHERE ";
+    let term = "(a0.c0 BETWEEN (a0.c1 >= a0.c1) AND ('1.5' IS DISTINCT FROM a1.c1))";
+    let base = estimate(&io, &conn, &format!("{from}{term}"));
+    let more = estimate(
+        &io,
+        &conn,
+        &format!("{from}({term} AND ((1 NOTNULL) OR (a1.c1 BETWEEN -1 AND -2.5)))"),
+    );
+    assert!(
+        no_more(more, base),
+        "{more} rows estimated for the more restrictive query, {base} for the query"
+    );
+}
+
+/// Do: estimate a LEFT JOIN whose WHERE, or a later join's ON, tests a column of its right table
+/// that no row of it holds NULL in (a NOT NULL column, an INTEGER PRIMARY KEY) with IS NULL, written
+/// each way SQLite reads it (`NULL IS c`, `c IS NOT DISTINCT FROM NULL`), then the same with the
+/// join made inner, by INNER JOIN or by a conjunct that rejects the rows it null-extends. Expect: no
+/// more rows estimated for the inner join. The term is true only of a row the LEFT JOIN
+/// null-extended, so the LEFT JOIN keeps about none and a table no join null-extends keeps none
+/// (CERT; findings cert-e21949a38a9b16d7, cert-2732f12b21087328, cert-2c3a9d2455aef93d and
+/// cert-d03ea211f1fab06d on step 4's d762dc2, cause AG: 1e10 to 1e17 rows against 0, the term
+/// counted on the inner table as IS NULL's tenth of its rows). An inner join's ON term reads its
+/// tables before a RIGHT JOIN after it null-extends them, so there too it keeps none
+/// (cert-60e65956aed5c593: 1e17 rows against the LEFT JOIN form's 1e12).
+#[test]
+fn an_is_null_of_a_column_never_null_keeps_no_inner_row() {
+    for (tables, base, more) in [
+        (
+            &["CREATE TABLE t0(c0 BLOB PRIMARY KEY)", "CREATE TABLE t2(c0 BOOLEAN, c1 DOUBLE PRIMARY KEY NOT NULL, c2 TEXT NOT NULL)"][..],
+            "SELECT NULL FROM t0 AS a0 LEFT JOIN t2 AS a1 ON 255 WHERE (NULL IS a1.c1)",
+            "SELECT NULL FROM t0 AS a0 JOIN t2 AS a1 ON 255 WHERE (NULL IS a1.c1)",
+        ),
+        (
+            &["CREATE TABLE t0(c0 INT, c1 BLOB NOT NULL, c2 DOUBLE COLLATE BINARY PRIMARY KEY NOT NULL)"][..],
+            "SELECT x'00' FROM t0 AS a0 LEFT JOIN t0 AS a1 ON '[1,2,3]' WHERE (a1.c2 IS NOT DISTINCT FROM NULL)",
+            "SELECT x'00' FROM t0 AS a0 LEFT JOIN t0 AS a1 ON '[1,2,3]' WHERE ((a1.c2 IS NOT DISTINCT FROM NULL) AND a1.c2)",
+        ),
+        (
+            &["CREATE TABLE t0(c0 DOUBLE PRIMARY KEY)", "CREATE TABLE t1(c0 REAL, c1 INTEGER PRIMARY KEY, c2 VARCHAR(10))"][..],
+            "SELECT NULL FROM t0 AS a0 LEFT JOIN t1 AS a1 ON 1 JOIN t1 AS a2 ON (NULL IS NOT DISTINCT FROM a1.c1)",
+            "SELECT NULL FROM t0 AS a0 JOIN t1 AS a1 ON 1 JOIN t1 AS a2 ON (NULL IS NOT DISTINCT FROM a1.c1)",
+        ),
+        (
+            &["CREATE TABLE t1(c0 TEXT, c1  COLLATE NOCASE PRIMARY KEY NOT NULL, c2  COLLATE BINARY)", "CREATE TABLE t2(c0 BLOB NOT NULL, c1 INT PRIMARY KEY, c2 REAL COLLATE RTRIM, c3 BOOLEAN)"][..],
+            "SELECT (a0.c3 <= a0.c3) FROM t2 AS a0 LEFT JOIN t1 AS a1 ON ((a1.c1 NOT GLOB 'abc') OR (a0.c3 AND (100 NOTNULL))), t2 AS a2 WHERE (((NULL IS NOT DISTINCT FROM a1.c1) AND (-9223372036854775808 = a0.c3)) AND (a2.c1 == 1000000000000000.0))",
+            "SELECT (a0.c3 <= a0.c3) FROM t2 AS a0 JOIN t1 AS a1 ON ((a1.c1 NOT GLOB 'abc') OR (a0.c3 AND (100 NOTNULL))), t2 AS a2 WHERE (((NULL IS NOT DISTINCT FROM a1.c1) AND (-9223372036854775808 = a0.c3)) AND (a2.c1 == 1000000000000000.0))",
+        ),
+        (
+            &["CREATE TABLE t0(c0 TEXT COLLATE RTRIM NOT NULL, c1 BOOLEAN)", "CREATE TABLE t1(c0 REAL COLLATE RTRIM, c1 BLOB PRIMARY KEY, c2 BLOB COLLATE RTRIM UNIQUE NOT NULL, c3 INT)"][..],
+            "SELECT '\"x\"' FROM t1 AS a0 LEFT JOIN t1 AS a1 ON (a1.c2 IS NOT DISTINCT FROM NULL) RIGHT JOIN t0 AS a2 ON 1",
+            "SELECT '\"x\"' FROM t1 AS a0 JOIN t1 AS a1 ON (a1.c2 IS NOT DISTINCT FROM NULL) RIGHT JOIN t0 AS a2 ON 1",
+        ),
+    ] {
+        let (io, conn) = open();
+        for table in tables {
+            conn.execute(table).unwrap();
+        }
+        let (b, m) = (estimate(&io, &conn, base), estimate(&io, &conn, more));
+        assert!(
+            no_more(m, b),
+            "{m} rows estimated for the more restrictive query, {b} for the query: {more}"
+        );
+    }
+}
+
+/// Do: EXPLAIN QUERY PLAN FORMAT=JSON a query of every top-level shape: a table read, a join,
+/// grouped, aggregated, DISTINCT, cut by LIMIT, VALUES, a SELECT of no table, a compound select of
+/// each operator (of VALUES and of tables, with a LIMIT of its own), a FROM-clause subquery and a
+/// CTE. Expect: `output_rows` for each, the rows the statement returns: VALUES its rows, a SELECT
+/// of no table one (none under a WHERE never true or LIMIT 0), an aggregate without GROUP BY one,
+/// a literal LIMIT at most its rows, UNION ALL and UNION its arms' sum, INTERSECT the smaller arm,
+/// EXCEPT its left arm; so CERT has an estimate for every query it checks (campaign 2 skipped 2,049
+/// of its checks as "no estimate", every one a query Amphora refused, not one planned without an
+/// estimate; bench/oracles/findings.md, cause AG).
+#[test]
+fn every_top_level_plan_shape_has_an_estimate() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE u(c, d)").unwrap();
+    let table = estimate(&io, &conn, "SELECT * FROM t");
+    assert!(table >= 1.0, "a table read: {table}");
+    for (sql, want) in [
+        ("SELECT count(*) FROM t", Some(1.0)),
+        (
+            "SELECT count(*) FROM t JOIN u ON t.b = u.c WHERE u.d > 3",
+            Some(1.0),
+        ),
+        ("SELECT * FROM t LIMIT 5", Some(5.0)),
+        (
+            "SELECT * FROM t JOIN u ON t.b = u.c LIMIT 7 OFFSET 2",
+            Some(7.0),
+        ),
+        ("SELECT * FROM t LIMIT 0", Some(0.0)),
+        ("VALUES (1), (2), (3)", Some(3.0)),
+        ("SELECT 1", Some(1.0)),
+        ("SELECT 1 WHERE 0", Some(0.0)),
+        ("SELECT 1 LIMIT 0", Some(0.0)),
+        ("SELECT 1 UNION ALL VALUES (2), (3)", Some(3.0)),
+        ("VALUES (1), (2), (3) UNION VALUES (4)", Some(4.0)),
+        ("VALUES (1), (2), (3) INTERSECT VALUES (1)", Some(1.0)),
+        ("VALUES (1), (2), (3) EXCEPT VALUES (1)", Some(3.0)),
+        (
+            "VALUES (1), (2), (3) EXCEPT VALUES (1) UNION ALL SELECT 4",
+            Some(4.0),
+        ),
+        ("SELECT a FROM t UNION SELECT c FROM u LIMIT 9", Some(9.0)),
+        ("SELECT * FROM (SELECT * FROM t LIMIT 4)", Some(4.0)),
+        (
+            "WITH c AS (SELECT * FROM t LIMIT 4) SELECT * FROM c",
+            Some(4.0),
+        ),
+        ("SELECT b, count(*) FROM t GROUP BY b", None),
+        ("SELECT DISTINCT b FROM t", None),
+        ("SELECT * FROM t JOIN u ON t.b = u.c", None),
+        ("SELECT a FROM t UNION ALL SELECT c FROM u", None),
+        ("SELECT a FROM t INTERSECT SELECT c FROM u", None),
+        ("SELECT a FROM t EXCEPT SELECT c FROM u", None),
+        ("SELECT * FROM t WHERE a IN (SELECT c FROM u)", None),
+        (
+            "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.c = t.b)",
+            None,
+        ),
+    ] {
+        let got = estimate(&io, &conn, sql);
+        match want {
+            Some(want) => assert_eq!(got, want, "{sql}"),
+            None => assert!(got >= 0.0, "{sql}: {got}"),
+        }
+    }
+    // A compound's arms combine as their operator reads them.
+    let (a, c) = (
+        estimate(&io, &conn, "SELECT a FROM t"),
+        estimate(&io, &conn, "SELECT c FROM u"),
+    );
+    for (sql, want) in [
+        ("SELECT a FROM t UNION ALL SELECT c FROM u", a + c),
+        ("SELECT a FROM t UNION SELECT c FROM u", a + c),
+        ("SELECT a FROM t INTERSECT SELECT c FROM u", a.min(c)),
+        ("SELECT a FROM t EXCEPT SELECT c FROM u", a),
+    ] {
+        assert_eq!(estimate(&io, &conn, sql), want, "{sql}");
+    }
+}
+
+/// Do: concat_ws with BLOB separators (empty, a NUL, bytes), BLOB, empty and NULL arguments, and
+/// numbers. Expect: SQLite 3.54's text: the separator and each argument as text, a BLOB its bytes,
+/// every argument but a NULL one written, an empty one too, with the separator between; a NULL
+/// separator NULL (`concatFuncCore` and `concatwsFunc`, release 3.54.0's func.c). Amphora gave NULL
+/// for a BLOB separator and left BLOB arguments out (findings diff-218e78aa0f42cff2,
+/// diff-24fa95590277913e, diff-3b05e239bef86a20, diff-6337522718bb9cef, diff-86205179ecc78c03,
+/// diff-a0400a5512b948ae, diff-a128a508204fbdd4, diff-c448c8dc357e58ba, diff-e518f9fb47a71f6c and
+/// diff-f0b1746622d11f4b, step 5's first run once the oracles called concat_ws at an arity SQLite
+/// takes).
+#[test]
+fn concat_ws_writes_every_argument_but_null_a_blob_as_its_text() {
+    let (io, conn) = open();
+    for (sql, want) in [
+        (
+            "SELECT concat_ws(x'', 0, 3, 9007199254740993)",
+            "'039007199254740993'",
+        ),
+        ("SELECT concat_ws(x'0102', NULL)", "''"),
+        ("SELECT concat_ws(x'00', 1)", "'1'"),
+        ("SELECT concat_ws('1e3', x'c3bf')", "'ÿ'"),
+        ("SELECT concat_ws(0, 2, 100, x'c3bf')", "'201000ÿ'"),
+        ("SELECT concat_ws(',', 'a', '', NULL, x'', 'b')", "'a,,,b'"),
+        ("SELECT concat_ws(NULL, 'a')", "NULL"),
+        (
+            "SELECT concat_ws('-', 1.5, -2.0, 1e15)",
+            "'1.5--2.0-1000000000000000.0'",
+        ),
+        ("SELECT typeof(concat_ws(',', NULL, NULL))", "'text'"),
+        ("SELECT hex(concat_ws(x'00', 'a', 'b'))", "'610062'"),
+    ] {
+        assert_eq!(rows(&io, &conn, sql), [want], "{sql}");
+    }
+}
+
+/// Do: a RIGHT JOIN whose ON no row passes, so every right row comes from its unmatched-row pass,
+/// with a WHERE reading an IN subquery whose own WHERE is an OR of two index seeks (a multi-index
+/// OR); the pass runs a copy of the subquery. Expect: SQLite's rows. Amphora panicked ("cursor id 2
+/// is None"): the copy opened cursors of its own for the OR's index branches but sought on the
+/// original's, which never ran, the main loop matching no row (finding norec-db0d4a055d27c23c,
+/// step 5's nightly run of 2026-10-28; and the panics of its other runs).
+#[test]
+fn an_unmatched_row_pass_seeks_its_own_subquerys_cursors() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t0(c0 REAL, c1 DOUBLE PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT OR IGNORE INTO t0 VALUES (255, '%')")
+        .unwrap();
+    let sub = "(SELECT s.c1 FROM t0 AS s WHERE ((s.c1 < -1) OR (-2.5 BETWEEN s.c1 AND s.c1)))";
+    for (wh, want) in [
+        (format!("(a0.c1 IN {sub})"), 0),
+        (format!("(NOT (a0.c1 IN {sub}))"), 1),
+        (format!("((a0.c1 IN {sub}) ISNULL)"), 0),
+    ] {
+        let sql = format!("SELECT NULL FROM t0 AS a0 RIGHT JOIN t0 AS a1 ON NULL WHERE {wh}");
+        assert_eq!(rows(&io, &conn, &sql).len(), want, "{sql}");
+    }
+}
+
+/// Do: an OR of a comparison with NULL and a GLOB whose pattern begins with a character class
+/// (`[a-z]*`), on an indexed text column, which the planner answers with a multi-index OR: the GLOB's
+/// branch seeks the range its pattern implies. Expect: SQLite's rows. The range holds every match but
+/// not only matches (' a', '10' and 'b' lie within the bounds `[a-z]*` gives), so the GLOB must
+/// still filter what the seek finds, as it does after a seek of its own (decision 3 of
+/// docs/design/planner.md); the branch took its range as the GLOB itself and kept every row in it
+/// (findings dqp-720239a34e22196d, eet-614fea129bc7ea47 and eet-ce1e661cf06a6492, step 5's first
+/// runs).
+#[test]
+fn a_multi_index_or_still_filters_a_globs_range() {
+    for (tables, sql, want) in [
+        (
+            &["CREATE TABLE t1(c0 TEXT)", "INSERT INTO t1 VALUES (' a'), ('b'), (NULL), ('10')", "CREATE INDEX i0 ON t1(c0)"][..],
+            "SELECT count(*) FROM t1 WHERE (NULL < c0) OR (c0 GLOB '[a-z]*')",
+            "1",
+        ),
+        (
+            &["CREATE TABLE t1(c0 TEXT COLLATE BINARY)", "INSERT INTO t1 VALUES (' a')", "CREATE INDEX i0 ON t1(c0 DESC)"][..],
+            "SELECT count(*) FROM t1 AS a0 WHERE ((NULL < a0.c0) OR (a0.c0 GLOB '[a-z]*'))",
+            "0",
+        ),
+        (
+            &["CREATE TABLE t0(c0 DECIMAL(10,2))", "INSERT OR IGNORE INTO t0 VALUES ('1e3')", "CREATE TABLE t2(c0 DECIMAL(10,2) PRIMARY KEY, c1 VARCHAR(10) NOT NULL, c2 REAL COLLATE BINARY UNIQUE)", "INSERT INTO t2 VALUES (-2.5, 10, -1)", "CREATE INDEX i0 ON t2(c1)"][..],
+            "SELECT count(*) FROM t2 AS a0 JOIN t0 AS a1 ON ((a0.c2 == NULL) OR (a0.c1 GLOB '[a-z]*'))",
+            "0",
+        ),
+        (
+            &["CREATE TABLE t0(c0 VARCHAR(10) PRIMARY KEY)", "INSERT OR IGNORE INTO t0 VALUES (2.0)", "CREATE TABLE t2(c0 INTEGER COLLATE BINARY NOT NULL)", "INSERT INTO t2 VALUES ('1')"][..],
+            "SELECT count(*) FROM t2 AS a0 JOIN t0 AS a1 ON ((a1.c0 <= NULL) OR (a1.c0 GLOB '[a-z]*'))",
+            "0",
+        ),
+    ] {
+        let (io, conn) = open();
+        for table in tables {
+            conn.execute(table).unwrap();
+        }
+        assert_eq!(rows(&io, &conn, sql), [want], "{sql}");
+    }
+}
+
+/// Do: compare a numeric column with text holding a NUL after a decimal number (`'1.5' || x'00'`)
+/// where the comparison's affinity is applied to a seek key or an IN subquery's probe (an index
+/// seek, a join's seek, a range scan, `x IN (SELECT n ...)`). Expect: SQLite's rows: SQLite 3.54
+/// reads the number before the NUL as the text's, here the REAL 1.5. A comparison answered so
+/// already (AR); the Affinity instruction, which seeks and probes take, converted only text whose
+/// number was a whole integer, leaving `'1.5\0'` text, so nothing numeric matched (findings
+/// diff-b72da64068c12b5e, diff-ecbb9d89531a62f7, diff-a51fd77b72b31d7a, norec-7490c5b68dd496e1,
+/// diff-66a81e6f5988230c and diff-ba2d9989f045f65f, step 5's first runs).
+#[test]
+fn a_seek_or_probe_reads_the_number_before_a_nul() {
+    for (tables, sql, want) in [
+        (
+            &["CREATE TABLE t0(c0 BOOLEAN PRIMARY KEY, c1 REAL)", "INSERT INTO t0 VALUES ('1.5', -9223372036854775808)"][..],
+            "SELECT 'a' FROM t0 AS a0 JOIN t0 AS a1 ON (a0.c0 IS NOT DISTINCT FROM (a1.c0 || x'00'))",
+            1,
+        ),
+        (
+            &["CREATE TABLE t0(c0 BOOLEAN PRIMARY KEY, c1 REAL)", "INSERT INTO t0 VALUES ('1.5', 0)"][..],
+            "SELECT c0 FROM t0 WHERE c0 = ('1.5' || x'00')",
+            1,
+        ),
+        (
+            &["CREATE TABLE t0(c0 DECIMAL(10,2) PRIMARY KEY)", "INSERT INTO t0 VALUES (0.5)", "CREATE TABLE t1(c0 VARCHAR(10), c1 INT, c2 BOOLEAN PRIMARY KEY NOT NULL)", "INSERT INTO t1 VALUES (1000000000000000.0, x'00', 'x')"][..],
+            "SELECT NULL FROM t1 AS a0 JOIN t0 AS a2 ON ((a2.c0 || a0.c1) IN (SELECT s96.c0 FROM t0 AS s96))",
+            1,
+        ),
+        (
+            &["CREATE TABLE t0(c0 VARCHAR(10), c1 NUMERIC COLLATE RTRIM, c2 NUMERIC)", "INSERT OR IGNORE INTO t0 VALUES (2.0, NULL, -2.5)", "CREATE TABLE t1(c0 DOUBLE PRIMARY KEY, c1 DOUBLE)", "INSERT OR IGNORE INTO t1 VALUES ('é', 1), (9223372036854775807, x'41')", "CREATE TABLE t2(c0 TEXT, c1 VARCHAR(10))", "INSERT INTO t2 VALUES (-2.5, x'00')"][..],
+            "SELECT 'true' FROM t1 AS a0 RIGHT JOIN t2 AS a1 ON ((a1.c0 || a1.c1) IN (SELECT s32.c2 FROM t0 AS s32))",
+            2,
+        ),
+        (
+            &["CREATE TABLE t0(c0 BOOLEAN, c1 NUMERIC COLLATE NOCASE PRIMARY KEY, c2 BOOLEAN)", "INSERT OR IGNORE INTO t0 VALUES ('-1', -2.5, x'00')"][..],
+            "SELECT 1 FROM t0 AS a0, t0 AS a1 WHERE (a1.c1 >= (a0.c1 || substr(a0.c2, x'')))",
+            1,
+        ),
+        (
+            &["CREATE TABLE t0(c0 DECIMAL(10,2) UNIQUE, c1 TEXT)", "INSERT INTO t0 VALUES (x'00', -9223372036854775808), (255, 9223372036854775807)", "INSERT OR IGNORE INTO t0 VALUES (0.5, '1e3')"][..],
+            "SELECT (a1.c1 COLLATE RTRIM) FROM t0 AS a0, t0 AS a1 JOIN t0 AS a2 ON ((a0.c0 || a2.c0) < a1.c0)",
+            11,
+        ),
+        (
+            &["CREATE TABLE t1(c0 REAL, c1 TEXT, c2 INT PRIMARY KEY)", "INSERT INTO t1 VALUES (x'00', x'0102', ' a')", "CREATE TABLE t2(c0 BOOLEAN COLLATE NOCASE, c1  COLLATE RTRIM, c2 BOOLEAN COLLATE BINARY, c3 DECIMAL(10,2))", "INSERT OR IGNORE INTO t2 VALUES (3.0, 1.5, 10, NULL), (-9223372036854775808, NULL, 1.5, 255)"][..],
+            "SELECT json_extract('\"x\"', '$[0]') FROM t2 AS a0, t2 AS a1 JOIN t1 AS a2 ON (a1.c0 <= (a0.c2 || a2.c0))",
+            3,
+        ),
+    ] {
+        let (io, conn) = open();
+        for table in tables {
+            conn.execute(table).unwrap();
+        }
+        assert_eq!(rows(&io, &conn, sql).len(), want, "{sql}");
+    }
+}
+
+/// Do: seek the smallest rowid, -9223372036854775808, by a REAL that is exactly it (a literal, a
+/// REAL column, an IN list's value, a join's key) and by text that reads as it. Expect: SQLite's
+/// row: its SeekRowid takes a REAL that is an integer exactly within the rowid range, the smallest
+/// among them (the exclusion of ticket #3922 is its column affinity's, not the seek's). Amphora's
+/// seek converted the key by NUMERIC affinity, which keeps -2^63 a REAL, and found no row (findings
+/// diff-f254967d5150ea85 and eet-56b728bcbf4c5a59, step 5's first runs).
+#[test]
+fn a_rowid_seek_finds_the_smallest_rowid_by_a_real() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (-9223372036854775808, 1)")
+        .unwrap();
+    conn.execute("CREATE TABLE r(x REAL)").unwrap();
+    conn.execute("INSERT INTO r VALUES (-9223372036854775808)")
+        .unwrap();
+    for sql in [
+        "SELECT count(*) FROM t WHERE a = -9223372036854775808.0",
+        "SELECT count(*) FROM t WHERE a IN (-9223372036854775808.0, 5)",
+        "SELECT count(*) FROM t, r WHERE t.a = r.x",
+        "SELECT count(*) FROM t, r WHERE t.a IN (r.x, 5)",
+        "SELECT count(*) FROM t WHERE a = '-9.2233720368547758e+18'",
+        "SELECT count(*) FROM t AS a0 CROSS JOIN t AS a1, t AS a2 WHERE (CAST(CAST(a0.a AS REAL) AS TEXT) = a2.a)",
+    ] {
+        assert_eq!(rows(&io, &conn, sql), ["1"], "{sql}");
+    }
+    // Beyond the range, or not exactly an integer, a REAL names no rowid.
+    conn.execute("CREATE TABLE u(a INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO u VALUES (1)").unwrap();
+    for (sql, want) in [
+        (
+            "SELECT count(*) FROM t WHERE a = -9223372036854777856.0",
+            "0",
+        ),
+        ("SELECT count(*) FROM u WHERE a = 1.5", "0"),
+        ("SELECT count(*) FROM u WHERE a = 1.0", "1"),
+    ] {
+        assert_eq!(rows(&io, &conn, sql), [want], "{sql}");
+    }
+}
+
+/// Do: AND two comparisons, each on a column with an index of its own, which the planner may answer
+/// with a multi-index AND (an intersection of the two seeks): one comparison whose affinity the
+/// index's column can't serve (`CAST(1e15 AS INTEGER) <= c0`, NUMERIC against a TEXT column: index
+/// order is no numeric order of text), another whose collation isn't the index's (`a = 'abc'
+/// COLLATE NOCASE` against a BINARY index). Expect: SQLite's rows: such an index can't serve such a
+/// comparison (sqlite3IndexAffinityOk; a seek's collation is its index's), as Amphora's single-index
+/// seeks already held; the intersection used them anyway (finding norec-bb8e0c1b5a66c950, step 5's
+/// first runs: 1 row for SQLite's 0).
+#[test]
+fn a_multi_index_and_seeks_only_indexes_its_comparisons_fit() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t1(c0 VARCHAR(10) UNIQUE, c1 INT UNIQUE, c2 DOUBLE COLLATE BINARY PRIMARY KEY NOT NULL, c3 VARCHAR(10) COLLATE RTRIM NOT NULL)").unwrap();
+    conn.execute("INSERT OR IGNORE INTO t1 VALUES (0.0, 3, 1e308, 3)")
+        .unwrap();
+    conn.execute("CREATE TABLE t(a TEXT, b INT)").unwrap();
+    conn.execute("CREATE INDEX ia ON t(a)").unwrap();
+    conn.execute("CREATE INDEX ib ON t(b)").unwrap();
+    conn.execute("INSERT INTO t VALUES ('ABC', 1), ('abd', 2)")
+        .unwrap();
+    for (sql, want) in [
+        ("SELECT count(*) FROM t1 AS a0 WHERE (CAST(1000000000000000.0 AS INTEGER) BETWEEN a0.c1 AND a0.c0)", "0"),
+        ("SELECT count(*) FROM t WHERE a = 'abc' COLLATE NOCASE AND b = 1", "1"),
+        ("SELECT count(*) FROM t WHERE a > 'abc' COLLATE NOCASE AND b >= 1", "1"),
+        ("SELECT count(*) FROM t WHERE a = 5 AND b = 1", "0"),
+    ] {
+        assert_eq!(rows(&io, &conn, sql), [want], "{sql}");
+    }
+}
+
+/// Do: a correlated `x IN (SELECT y ...)` where y is a lone REAL column and x an integer with no
+/// affinity of its own, which the planner unnests to a semi-join on `x = y`. Expect: SQLite's rows:
+/// IN gives the probe y's REAL affinity, so -9223372036854775807 finds the REAL -2^63 (cause AV),
+/// where `=` compares the integer with the REAL exactly and finds nothing. The semi-join's term
+/// compared as `=` does (finding diff-6a0a824a042f7356, step 5's first runs: 0 rows for 1).
+#[test]
+fn an_unnested_in_compares_as_in_does() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t0(c0 REAL COLLATE NOCASE, c1 NUMERIC COLLATE BINARY PRIMARY KEY, c2 NUMERIC, c3 DECIMAL(10,2) NOT NULL)").unwrap();
+    conn.execute("INSERT OR IGNORE INTO t0 VALUES (-9223372036854775808, 10, 'A', ' ')")
+        .unwrap();
+    conn.execute("CREATE TABLE t1(c0 BOOLEAN, c1 BLOB PRIMARY KEY, c2 BLOB COLLATE RTRIM)")
+        .unwrap();
+    conn.execute("INSERT INTO t1 VALUES (9223372036854775807, 2, 0)")
+        .unwrap();
+    for (sql, want) in [
+        ("SELECT count(*) FROM t1 AS a0 WHERE ((- a0.c0) IN (SELECT s593.c0 FROM t0 AS s593 WHERE ((s593.c2 == -2.5) != (100 + a0.c0))))", "1"),
+        ("SELECT count(*) FROM t1 AS a0 WHERE ((- a0.c0) IN (SELECT s.c0 FROM t0 AS s WHERE s.c1 > a0.c0 - a0.c0))", "1"),
+        ("SELECT count(*) FROM t1 AS a0 WHERE ((- a0.c0) IN (SELECT s.c0 FROM t0 AS s))", "1"),
+        ("SELECT count(*) FROM t1 AS a0 WHERE ((- a0.c0) = (SELECT s.c0 FROM t0 AS s WHERE s.c1 > a0.c0 - a0.c0))", "0"),
+    ] {
+        assert_eq!(rows(&io, &conn, sql), [want], "{sql}");
+    }
+}
+
+/// Do: sum(), total() and avg() over integers past 2^52 with text and BLOBs among them, where sum()'s
+/// exact integer total turns floating-point at a REAL, a BLOB or text that is no integer. Expect:
+/// SQLite 3.54's answers: the floating-point total starts from the integer one split at 2^14
+/// (kahanBabuskaNeumaierInit), so a large total keeps its low bits, and a BLOB or text that is no
+/// integer adds its REAL (sumStep, func.c). Amphora turned the integer total into a REAL whole when
+/// text or a BLOB came, losing its low bits: 9223372036854775807, '1.5' and -9223372036854775808
+/// summed to 1.5 where SQLite sums 0.5 (findings diff-6e3bfa5d3e0906f5, diff-6708219ff6f6337e,
+/// diff-31fe0233802a6ff0, diff-93b25a1abd23f665, pqs-7a3d84a82e07dc63 and pqs-05f1e48d4354286b).
+/// total() and avg() sum in floating point from the first value and kept SQLite's answers. A sum
+/// that is TRUE keeps every row of the PQS findings' pivot query, a FALSE one none.
+#[test]
+fn sum_keeps_a_large_integer_totals_low_bits_where_it_turns_real() {
+    let (io, conn) = open();
+    for (n, (column, values, want, kept)) in [
+        (
+            "VARCHAR(10)",
+            "(9223372036854775807), ('1.5'), (-9223372036854775808)",
+            "0.5|0.5|0.16666666666666666",
+            3,
+        ),
+        (
+            "BOOLEAN",
+            "(9223372036854775807), (x''), (-9223372036854775808)",
+            "-1.0|-1.0|-0.33333333333333332",
+            3,
+        ),
+        (
+            "TEXT",
+            "(10), (-9223372036854775808), ('a'), (9223372036854775807)",
+            "9.0|9.0|2.25",
+            4,
+        ),
+        (
+            "TEXT",
+            "(9223372036854775807), (-2.5), (1), ('1.5'), (-9223372036854775808)",
+            "-1.0|-1.0|-0.2",
+            5,
+        ),
+        (
+            "BLOB",
+            "(9223372036854775807), (x'41'), (-9223372036854775808), (2), (-1)",
+            "0.0|0.0|0.0",
+            0,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        conn.execute(format!("CREATE TABLE t{n}(c0 {column})"))
+            .unwrap();
+        conn.execute(format!("INSERT INTO t{n} VALUES {values}"))
+            .unwrap();
+        assert_eq!(
+            rows(
+                &io,
+                &conn,
+                &format!("SELECT sum(c0), total(c0), avg(c0) FROM t{n}")
+            ),
+            [want],
+            "{values}"
+        );
+        assert_eq!(
+            rows(
+                &io,
+                &conn,
+                &format!("SELECT rowid FROM t{n} WHERE (SELECT sum(c0) FROM t{n})")
+            )
+            .len(),
+            kept,
+            "{values}"
+        );
+    }
+}
+
+/// Do: abs() of -0.0, of a negative zero as text and as a BLOB, and of 0 divided by a negative REAL;
+/// arithmetic between a REAL and text spelling a negative zero ('-0', timediff's '-0000-08-10 ...');
+/// `(- 0.0) * x` beside `-(CASE ... ELSE 0.0 END) * x`. Expect: SQLite 3.54's signs. abs negates
+/// only a value below zero (absFunc), so -0.0 stays -0.0. Text whose numeric type is the integer 0
+/// is that integer in integer arithmetic, but floating-point arithmetic reads each operand's REAL
+/// afresh (fp_math's sqlite3VdbeRealValue), -0.0 for '-0'. `- 0.0` is the literal -0.0, while the
+/// minus of any other expression is 0 - x, 0.0 for 0.0 (TK_UMINUS in sqlite3ExprCodeTarget).
+/// Amphora's abs dropped the sign (findings diff-d6a7bedd446e5469, diff-5113ce99737b9e06 and
+/// diff-f93f0363c5e4f173), and it multiplied a REAL by the integer a text read as
+/// (diff-cfa8b811932383e5). The two minus forms give opposite signs in SQLite too, as Amphora gave
+/// them: eet-49998c30035cd4e6 compared forms that aren't equivalent.
+#[test]
+fn a_negative_zero_keeps_its_sign_through_abs_and_text_arithmetic() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t0(c0 INT, c1 BOOLEAN, c2 VARCHAR(10))")
+        .unwrap();
+    conn.execute("INSERT INTO t0 VALUES (3.0, 2, 9223372036854775807), (-1e-308, -1e-308, -2.5)")
+        .unwrap();
+    assert_eq!(
+        signed_rows(
+            &io,
+            &conn,
+            "SELECT abs(0 / c0), abs('%' / c1), abs('%' / c2) FROM t0"
+        ),
+        ["0|0|0", "-0.0|-0.0|-0.0"]
+    );
+    assert_eq!(
+        signed_rows(&io, &conn, "SELECT abs(-0.0), abs('-0.0'), abs('-0'), abs(x'2d30'), abs(-2.5), abs('-2.5x'), abs(-3), abs(0.0)"),
+        ["-0.0|-0.0|-0.0|-0.0|2.5|2.5|3|0.0"]
+    );
+    assert_eq!(
+        signed_rows(&io, &conn, "SELECT '-0' * 0.1, 0.1 * '-0', '-0' / 1.0, '-0' - 0.0, '-0' * '0.5', x'2d30' * 0.5, '-0' * 1, typeof('-0' * 1), '-0' + 0.0, '-0.0' * 1"),
+        ["-0.0|-0.0|-0.0|-0.0|-0.0|-0.0|0|'integer'|0.0|-0.0"]
+    );
+    assert_eq!(
+        signed_rows(
+            &io,
+            &conn,
+            "SELECT timediff(1, 255), timediff(1, 255) * 0.1, timediff(1, 255) * 255"
+        ),
+        ["'-0000-08-10 00:00:00.000'|-0.0|0"]
+    );
+    conn.execute("CREATE TABLE t1(c0 DOUBLE PRIMARY KEY NOT NULL, c1 REAL)")
+        .unwrap();
+    conn.execute("INSERT INTO t1 VALUES (100, 'abc'), (3, -9223372036854775808)")
+        .unwrap();
+    assert_eq!(
+        signed_rows(&io, &conn, "SELECT (- 0.0) * c1, -(CASE WHEN c0 > 1000 THEN '1' ELSE 0.0 END) * c1 FROM t1 ORDER BY c0"),
+        ["0.0|-0.0", "-0.0|0.0"]
+    );
+}
+
+/// Do: unicode() of BLOBs that aren't well-formed UTF-8: a continuation byte first (unhex() and
+/// JSONB headers make them), a lead byte followed by more continuation bytes than it calls for,
+/// overlong and surrogate forms, a NUL first; and of text and numbers. Expect: SQLite 3.54's
+/// integers: unicodeFunc reads the first character with sqlite3Utf8Read, which takes a byte below
+/// 0xC0 as its own value (0x90 is 144), lets a lead byte take in every continuation byte after it in
+/// a u32 that wraps (x'C3BFBFBFBFBF' is -1 as a C int) and gives U+FFFD only for a value below 0x80
+/// or a surrogate; an empty BLOB or one starting with a NUL is NULL. Amphora read the BLOB as lossy
+/// UTF-8 text and gave 65533 for every ill-formed start (findings diff-ec071f3026c035f9,
+/// diff-d94be5be23c74a1a, diff-fe8301cf10f64b0b and diff-7bf9cd99a17e6672).
+#[test]
+fn unicode_reads_a_blobs_first_character_as_sqlite_does() {
+    let (io, conn) = open();
+    assert_eq!(
+        rows(&io, &conn, "SELECT unicode(unhex('9007199254740993')), unicode(jsonb_set('1.0e+308')), unicode(jsonb_array(-1e-308))"),
+        ["144|133|171"]
+    );
+    assert_eq!(
+        rows(&io, &conn, "SELECT unicode(x'90'), unicode(x'C3BF'), unicode(x'C3BFBF'), unicode(x'C3BFBFBFBFBF'), unicode(x'F8BFBFBFBFBF'), unicode(x'FF'), unicode(x'C080'), unicode(x'EDA080'), unicode(x'E0828041'), unicode(x''), unicode(x'00'), unicode(x'0041'), unicode(x'41')"),
+        ["144|255|16383|-1|1073741823|65533|65533|65533|128|NULL|NULL|NULL|65"]
+    );
+    assert_eq!(
+        rows(
+            &io,
+            &conn,
+            "SELECT unicode('é'), unicode(char(65534)), unicode(12), unicode(-1.5)"
+        ),
+        ["233|65534|49|45"]
+    );
+}
+
+/// Do: timediff() with a date before Julian day 0 on either side, as date(0)'s '-4713-11-24' is (its
+/// midnight, half a day before), and with dates at the range's two ends. Expect: SQLite 3.54's
+/// answers: each argument is held to isDate's rule, no error and a Julian day from 0 to
+/// 9999-12-31 23:59:59.999 (validJulianDay, date.c), so a date before -4713-11-24 12:00:00 makes
+/// timediff NULL, as it makes date() and julianday() NULL. Amphora's timediff checked only for an
+/// error and answered '-0000-00-00 12:00:00.000' (finding diff-1ac238359d74b8a1).
+#[test]
+fn timediff_of_a_date_before_julian_day_zero_is_null() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t0(c0 DECIMAL(10,2), c1 BLOB NOT NULL)")
+        .unwrap();
+    conn.execute("INSERT INTO t0 VALUES (0.5, x'00')").unwrap();
+    assert_eq!(
+        rows(&io, &conn, "SELECT timediff(date(0), (c0 = c1)) FROM t0"),
+        ["NULL"]
+    );
+    assert_eq!(
+        rows(&io, &conn, "SELECT date(0), timediff(date(0), 0), timediff(0, date(0)), timediff('-4713-11-24 11:59:59', 0), timediff('-4713-11-24 12:00', '-4713-11-24 11:00'), julianday('-4713-11-24')"),
+        ["'-4713-11-24'|NULL|NULL|NULL|NULL|NULL"]
+    );
+    assert_eq!(
+        rows(&io, &conn, "SELECT timediff('-4713-11-24 12:00:00', 0), timediff('9999-12-31 23:59:59.999', '-4713-11-24 12:00:00'), timediff('-4713-11-24 12:00:00', '0000-01-01')"),
+        ["'+0000-00-00 00:00:00.000'|'+14712-01-07 11:59:59.999'|'-4712-01-06 12:00:00.000'"]
+    );
+}
+
+/// Do: atanh() of the REAL the finding multiplies out, `-1e-308 * '1.0e+308'` (-0.99999999999999989,
+/// the same double in both), of its opposite, and of opposite pairs. Expect: SQLite 3.54's answers,
+/// which are its C library's atanh: computed on |x| and given x's sign, so it is odd and keeps its
+/// digits near -1. Amphora used Rust's f64::atanh, ln_1p(2x / (1 - x)) / 2 of x signed, which near
+/// -1 rounds 2x / (1 - x) and lost half the digits: -18.36840028483855 where SQLite gives
+/// -18.714973875118524 (finding diff-827d8a2d59c98538); atanh(-0.75) wasn't -atanh(0.75) either.
+#[test]
+fn atanh_is_odd_and_keeps_its_digits_near_minus_one() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t1(c0 REAL COLLATE BINARY, c1 TEXT PRIMARY KEY, c2 )")
+        .unwrap();
+    conn.execute("INSERT INTO t1 VALUES (0.5, 1e308, ' ')")
+        .unwrap();
+    assert_eq!(
+        rows(
+            &io,
+            &conn,
+            "SELECT atanh((-1e-308 * a0.c1)), -1e-308 * a0.c1 FROM t1 AS a0"
+        ),
+        ["-18.714973875118524|-0.99999999999999989"]
+    );
+    assert_eq!(
+        rows(&io, &conn, "SELECT atanh(0.9999999999999999), atanh(-0.75) = -atanh(0.75), atanh(-0.5) = -atanh(0.5), atanh(-0.25) = -atanh(0.25), atanh(-1e-10) = -atanh(1e-10), atanh(2), atanh(-2)"),
+        ["18.714973875118524|1|1|1|1|NULL|NULL"]
+    );
+}
+
+/// Do: RIGHT and FULL JOINs whose rows come from the main loop, from the unmatched-row pass or from
+/// both, LIMIT 2 at every OFFSET from 0 to past the last row. Expect: SQLite's rows: the OFFSET
+/// skips rows across both passes and the LIMIT counts the rest. The pass enters the main loop's
+/// body as a subroutine; a row the OFFSET skipped jumped to the right table's next row in the main
+/// loop, past the subroutine's Return (SQLite resolves that level's continue label at the Return,
+/// sqlite3WhereEnd), so the pass ran on as the main loop and kept or lost rows by the tables' sizes
+/// (findings diff-60e05c03077b9681, diff-0cdfabdc3c24bfc3, diff-149f30f47877187c,
+/// diff-ce9dc54f20fa07db, eet-010828432e21524e and four more of step 5's second runs).
+#[test]
+fn an_offset_skips_a_right_joins_rows_in_either_pass() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
+        .unwrap();
+    conn.execute("CREATE TABLE s(a INTEGER)").unwrap();
+    conn.execute("INSERT INTO s VALUES (2), (4)").unwrap();
+    for offset in 0..=7usize {
+        for (from, all) in [
+            ("s RIGHT JOIN t ON NULL", 5),
+            ("s RIGHT JOIN t ON s.a = t.a", 5),
+            ("s RIGHT JOIN t ON NULL WHERE t.a <> 3", 4),
+            ("s FULL JOIN t ON s.a = t.a", 5),
+            ("s FULL JOIN t ON NULL", 7),
+            ("s FULL JOIN t ON NULL WHERE s.a IS NULL", 5),
+        ] {
+            let sql = format!("SELECT 1 FROM {from} LIMIT 2 OFFSET {offset}");
+            let want = 2usize.min(all - offset.min(all));
+            assert_eq!(rows(&io, &conn, &sql).len(), want, "{sql}");
+        }
+    }
+    conn.execute("CREATE TABLE t0(c0 INTEGER UNIQUE)").unwrap();
+    conn.execute("INSERT INTO t0 VALUES (2.0), ('x')").unwrap();
+    conn.execute("CREATE TABLE t1(c0 TEXT COLLATE BINARY, c1 DECIMAL(10,2))")
+        .unwrap();
+    assert_eq!(
+        rows(
+            &io,
+            &conn,
+            "SELECT -100 FROM t1 AS a0 RIGHT JOIN t0 AS a1 ON 10 LIMIT 4 OFFSET 1"
+        ),
+        ["-100"]
+    );
+}
+
+/// Do: atanh() of REALs the generator makes, and of 0.25, which the platforms' C libraries round
+/// apart. Expect: SQLite 3.54's answers, which are its C library's atanh (math1Func, func.c):
+/// glibc 2.44 rounds atanh correctly, and macOS 26's libm is x below 2^-27 and
+/// ln_1p(2|x| / (1 - |x|)) / 2 given x's sign above, an ulp below the correctly rounded value at
+/// 0.25 (each the platform's answer for 3,000,019 arguments). The libm crate's atanh gave
+/// 0.54930614433405478 for 0.5, where both give 0.54930614433405489 (finding diff-2074283afc468d4a
+/// and sixteen more of step 5's second runs, on macOS).
+#[test]
+fn atanh_has_its_platforms_c_library_digits() {
+    let (io, conn) = open();
+    assert_eq!(
+        rows(&io, &conn, "SELECT atanh(0.5), atanh(-0.5), atanh(0.1), atanh(0.75), atanh(0.9999999999999999)"),
+        ["0.54930614433405489|-0.54930614433405489|0.10033534773107558|0.97295507452765662|18.714973875118524"]
+    );
+    let quarter = if cfg!(target_vendor = "apple") {
+        "0.25541281188299531"
+    } else {
+        "0.25541281188299536"
+    };
+    assert_eq!(
+        rows(&io, &conn, "SELECT atanh(0.25), -atanh(-0.25)"),
+        [format!("{quarter}|{quarter}")]
+    );
+}
+
+/// Do: json_error_position() of numbers whose leading zero a digit follows, signed and not, alone
+/// and inside an array or object, and of timediff(0, 0), '+0000-00-00 00:00:00.000'. Expect: SQLite
+/// 3.54's positions: one past the number's start (jsonTranslateTextToBlob), the digit after an
+/// unsigned zero but the zero after a sign. Amphora reported the digit after the zero after a sign
+/// too, 3 for timediff(0, 0) where SQLite gives 2 (finding diff-9bcd332bd8ccd930, step 5's
+/// nightly run of 2026-10-27).
+#[test]
+fn json_error_position_reports_a_signed_leading_zero_at_the_zero() {
+    let (io, conn) = open();
+    assert_eq!(
+        rows(&io, &conn, "SELECT json_error_position('+00'), json_error_position('-00'), json_error_position('00'), json_error_position('-01'), json_error_position('[01]'), json_error_position('[-01]'), json_error_position('[+012]'), json_error_position('{\"a\":-00}'), json_error_position(timediff(0, 0)), json_error_position('-0x1'), json_error_position('-0.5'), json_error_position('-0')"),
+        ["2|2|2|2|3|3|3|7|2|0|0|0"]
+    );
+}
+
+/// Do: a WHERE ANDing a NULL test SQLite's parser folds to 0 (`1e308 ISNULL`) with
+/// likelihood(NULL, NULL), which SQLite refuses wherever it resolves it: the call under a COLLATE,
+/// under NOT, IS NULL, + 1, BETWEEN or IN over that COLLATE; and bare, under unary plus, inside
+/// abs() or LIKE, or with the COLLATE on the NULL test instead. Expect: SQLite 3.54's answers. Its
+/// parser makes such an AND the integer 0 unless a side carries EP_HasFunc (sqlite3ExprAnd,
+/// sqlite3.c line 113984), and a COLLATE node takes no flag from its operand
+/// (sqlite3ExprAddCollateToken, line 112995, sets only EP_Collate and EP_Skip): with the call under
+/// a COLLATE the AND folds and the call is never resolved, so the query runs; in the other forms the
+/// call shows, or the NULL test's 0 doesn't, and SQLite refuses it. Amphora looked through the
+/// COLLATE for a call, kept the AND, and refused the folded forms too (finding
+/// error-a2539ea61c26b70f, whose TLP partitions are the last query here).
+#[test]
+fn a_call_under_a_collate_folds_away_with_a_false_and() {
+    let (io, conn) = open();
+    let error = |sql: &str| match conn.prepare(sql).and_then(|mut stmt| loop {
+        match stmt.step()? {
+            StepResult::IO => io.step()?,
+            StepResult::Done => break Ok(()),
+            _ => {}
+        }
+    }) {
+        Ok(()) => "no error".to_owned(),
+        Err(e) => e.to_string(),
+    };
+    conn.execute(
+        "CREATE TABLE t1(c0 REAL PRIMARY KEY, c1 INT, c2 VARCHAR(10), c3 NUMERIC NOT NULL)",
+    )
+    .unwrap();
+    let call = "likelihood(NULL, NULL)";
+    for folded in [
+        format!("(1e308 ISNULL) AND ({call} COLLATE RTRIM)"),
+        format!("({call} COLLATE RTRIM) AND (1e308 ISNULL)"),
+        format!("(1e308 ISNULL) AND (NOT ({call} COLLATE RTRIM))"),
+        format!("(1e308 ISNULL) AND (({call} COLLATE RTRIM) ISNULL)"),
+        format!("(1e308 ISNULL) AND (({call} COLLATE RTRIM) + 1)"),
+        format!("(1e308 ISNULL) AND (({call} COLLATE RTRIM) BETWEEN 1 AND 2)"),
+        format!("(1e308 ISNULL) AND (({call} COLLATE RTRIM) IN (1, 2))"),
+        format!("(1e308 ISNULL) AND (CAST({call} AS INT) COLLATE RTRIM)"),
+    ] {
+        assert_eq!(
+            error(&format!("SELECT * FROM t1 WHERE {folded}")),
+            "no error",
+            "{folded}"
+        );
+    }
+    for refused in [
+        format!("(1e308 ISNULL) AND {call}"),
+        format!("(1e308 ISNULL) AND (+{call})"),
+        format!("(1e308 ISNULL) AND (abs({call} COLLATE RTRIM))"),
+        format!("(1e308 ISNULL) AND (({call} COLLATE RTRIM) LIKE 'a')"),
+        format!("(1e308 ISNULL) AND (({call} COLLATE RTRIM) IN (1, abs(2)))"),
+        format!("((1e308 ISNULL) COLLATE RTRIM) AND ({call} COLLATE RTRIM)"),
+    ] {
+        assert!(
+            error(&format!("SELECT * FROM t1 WHERE {refused}"))
+                .contains("second argument to likelihood() must be a constant"),
+            "{refused}"
+        );
+    }
+    assert_eq!(
+        rows(
+            &io,
+            &conn,
+            "SELECT min(m COLLATE BINARY) FROM (SELECT NULL AS m WHERE 0 UNION ALL SELECT min((NULL COLLATE BINARY)) FROM t1 AS a0 WHERE ((1e308 ISNULL) AND (likelihood(NULL, NULL) COLLATE RTRIM)) UNION ALL SELECT min((NULL COLLATE BINARY)) FROM t1 AS a0 WHERE ((1e308 ISNULL) AND (NOT (likelihood(NULL, NULL) COLLATE RTRIM))) UNION ALL SELECT min((NULL COLLATE BINARY)) FROM t1 AS a0 WHERE ((1e308 ISNULL) AND ((likelihood(NULL, NULL) COLLATE RTRIM) ISNULL)))"
+        ),
+        ["NULL"]
+    );
+}
+
+/// Do: jsonb_array(), jsonb_object(), jsonb_group_array() and jsonb_group_object() of a JSONB
+/// argument whose header is wider than it needs (jsonb_patch('1e3', 0) is x'D3000130', SQLite's
+/// jsonBlobOverwrite widening the shorter 0 into the place of 1e3), of one nested in an array, and
+/// of one holding JSON5 forms (.5, 0x1F, a \u escape in single quotes); and jsonb_set(),
+/// jsonb_insert(), jsonb_replace() and jsonb_array_insert() of the same. Expect: SQLite 3.54's
+/// bytes. Its jsonb_array, jsonb_object and their aggregates write every argument as JSON text, a
+/// JSONB BLOB as jsonTranslateBlobToText renders it (jsonAppendSqlValue), and make the whole text
+/// JSONB again (jsonReturnStringAsBlob), so the argument comes back with each header at its
+/// smallest and its JSON5 forms as JSON (13 30 for 0, 0.5, 31); the edits put the argument's bytes
+/// in as they are. Amphora copied a JSONB argument's bytes into the array or object (finding
+/// diff-0d96c0783d6fbbce: x'5b00d3000130' for SQLite's x'3b001330').
+#[test]
+fn jsonb_containers_write_a_jsonb_argument_as_its_text_would() {
+    let (io, conn) = open();
+    let patch = "jsonb_patch('1e3', 0)";
+    assert_eq!(
+        rows(&io, &conn, &format!("SELECT {patch}")),
+        ["x'd3000130'"]
+    );
+    assert_eq!(
+        rows(
+            &io,
+            &conn,
+            &format!("SELECT jsonb_array(NULL, {patch}), jsonb_array({patch}), jsonb_array(x'D3000130', x'D3000130'), jsonb_object('a', {patch}), jsonb_array(jsonb_set('[1]', '$[0]', {patch}))")
+        ),
+        ["x'3b001330'|x'2b1330'|x'4b13301330'|x'4c17611330'|x'3b2b1330'"]
+    );
+    assert_eq!(
+        rows(
+            &io,
+            &conn,
+            &format!("SELECT jsonb_group_array(x), jsonb_group_object('k', x) FROM (SELECT {patch} AS x)")
+        ),
+        ["x'2b1330'|x'4c176b1330'"]
+    );
+    assert_eq!(
+        rows(
+            &io,
+            &conn,
+            "SELECT jsonb_array(jsonb('[.5, 0x1F, ''\\u0041'']'))"
+        ),
+        ["x'cb10cb0e35302e35233331685c7530303431'"]
+    );
+    assert_eq!(
+        rows(
+            &io,
+            &conn,
+            &format!("SELECT jsonb_set('[1]', '$[0]', {patch}), jsonb_insert('[]', '$[#]', {patch}), jsonb_replace('[1]', '$[0]', {patch}), jsonb_array_insert('[1]', '$[0]', {patch})")
+        ),
+        ["x'4bd3000130'|x'4bd3000130'|x'4bd3000130'|x'6bd30001301331'"]
+    );
+    assert_eq!(
+        rows(
+            &io,
+            &conn,
+            &format!("SELECT json_array({patch}), json_object('a', {patch})")
+        ),
+        ["'[0]'|'{\"a\":0}'"]
+    );
+}
+
+/// Do: jsonb_insert() and jsonb_set() appending to an array, by '$[#]' and by the index one past
+/// its end, values of one, two and four bytes (NULL, 0, 'abc', and x'D3000130', a 0 behind a
+/// header wider than it needs), into the root array ('[]', '[1]'), an object's array ('$.a[#]')
+/// and a nested one ('$[0][#]'). Expect: SQLite 3.54's bytes, each array's header counting every
+/// byte it holds. Amphora's root array header left out the one-byte placeholder its path
+/// traversal puts in first, which an object's array counts there, so jsonb_insert('[]', '$[#]', 0)
+/// was x'1b1330', a header one byte short of what it holds (found by the controls of
+/// jsonb_containers_write_a_jsonb_argument_as_its_text_would).
+#[test]
+fn an_element_appended_to_the_root_array_counts_in_its_header() {
+    let (io, conn) = open();
+    let values = ["NULL", "0", "x'D3000130'", "'abc'"];
+    for (doc, path, want) in [
+        (
+            "[]",
+            "$[#]",
+            "x'1b00'|x'2b1330'|x'4bd3000130'|x'4b3a616263'",
+        ),
+        (
+            "[]",
+            "$[0]",
+            "x'1b00'|x'2b1330'|x'4bd3000130'|x'4b3a616263'",
+        ),
+        (
+            "[1]",
+            "$[1]",
+            "x'3b133100'|x'4b13311330'|x'6b1331d3000130'|x'6b13313a616263'",
+        ),
+        (
+            "[1]",
+            "$[#]",
+            "x'3b133100'|x'4b13311330'|x'6b1331d3000130'|x'6b13313a616263'",
+        ),
+        (
+            "{\"a\":[]}",
+            "$.a[#]",
+            "x'4c17611b00'|x'5c17612b1330'|x'7c17614bd3000130'|x'7c17614b3a616263'",
+        ),
+        (
+            "[[]]",
+            "$[0][#]",
+            "x'2b1b00'|x'3b2b1330'|x'5b4bd3000130'|x'5b4b3a616263'",
+        ),
+    ] {
+        for function in ["jsonb_insert", "jsonb_set"] {
+            let columns: Vec<String> = values
+                .iter()
+                .map(|value| format!("{function}('{doc}', '{path}', {value})"))
+                .collect();
+            assert_eq!(
+                rows(&io, &conn, &format!("SELECT {}", columns.join(", "))),
+                [want],
+                "{function} {doc} {path}"
+            );
+        }
     }
 }

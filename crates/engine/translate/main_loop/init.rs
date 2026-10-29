@@ -512,13 +512,16 @@ impl InitLoop {
                                     db: table.database_id,
                                 });
                             }
-                            // Open cursors for each index branch
+                            // Open a cursor for each index branch: the one its seek resolves by the
+                            // branch's key (multi_index.rs), shared as the table's is with a copy of
+                            // this query the unmatched-row pass of a RIGHT or FULL JOIN runs.
                             for branch in &multi_idx_op.branches {
                                 if let Some(index) = &branch.index {
-                                    let branch_cursor_id = program.alloc_cursor_index(
-                                        Some(CursorKey::index(table.internal_id, index.clone())),
-                                        index,
-                                    )?;
+                                    let branch_cursor_id = program
+                                        .alloc_cursor_index_if_not_exists(
+                                            CursorKey::index(table.internal_id, index.clone()),
+                                            index,
+                                        )?;
                                     program.emit_insn(Insn::OpenRead {
                                         cursor_id: branch_cursor_id,
                                         root_page: index.root_page,

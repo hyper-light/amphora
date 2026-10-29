@@ -690,7 +690,7 @@ pub fn apply_numeric_affinity(val: ValueRef, try_for_int: bool) -> Option<ValueR
             } else if let Some(float_val) = parsed_value.as_float() {
                 let res = ValueRef::from_f64(float_val);
                 if try_for_int {
-                    apply_integer_affinity(res)
+                    apply_integer_affinity(res).or(Some(res))
                 } else {
                     Some(res)
                 }
@@ -708,9 +708,10 @@ pub fn apply_numeric_affinity(val: ValueRef, try_for_int: bool) -> Option<ValueR
                 }
 
                 let res = ValueRef::from_f64(float_val);
-                // If try_for_int is true, try to convert float to int if exact
+                // If try_for_int is true, an exact float becomes an integer; any other stays the
+                // REAL (SQLite's applyNumericAffinity with bTryForInt), not the text.
                 if try_for_int {
-                    apply_integer_affinity(res)
+                    apply_integer_affinity(res).or(Some(res))
                 } else {
                     Some(res)
                 }

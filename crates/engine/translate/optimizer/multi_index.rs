@@ -483,7 +483,13 @@ fn partition_residual_multi_or_exprs(
                 .into_iter()
                 .flatten()
                 {
-                    consumed[constraints[idx].where_clause_pos.0] = true;
+                    // Amphora: an implied constraint (a GLOB's bounds) narrows the seek, but its term
+                    // still filters what the seek finds (decision 3 of docs/design/planner.md).
+                    if let Some(constraint) = constraints.get(idx).filter(|c| !c.implied) {
+                        if let Some(slot) = consumed.get_mut(constraint.where_clause_pos.0) {
+                            *slot = true;
+                        }
+                    }
                 }
             }
         }

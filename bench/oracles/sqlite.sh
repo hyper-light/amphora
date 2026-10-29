@@ -9,7 +9,9 @@
 #
 # usage: bench/oracles/sqlite.sh [dir]   (default ~/.cache/sqlite-oracle; reuses a library built there)
 set -euo pipefail
-DIR=$(realpath -m -- "${1:-$HOME/.cache/sqlite-oracle}")
+# made first, then named whole: macOS has no `realpath -m`
+mkdir -p -- "${1:-$HOME/.cache/sqlite-oracle}"
+DIR=$(cd -- "${1:-$HOME/.cache/sqlite-oracle}" && pwd)
 NAME=sqlite-amalgamation-3540000
 URL=https://sqlite.org/2026/$NAME.zip
 # As downloaded on 2026-10-24: its SQLITE_SOURCE_ID is check-in be8d059e9a49 of 2026-10-09, the one

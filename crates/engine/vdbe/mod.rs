@@ -1919,6 +1919,8 @@ pub struct PreparedProgram {
     pub readonly: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
+    /// The top-level statement's estimated rows (`ProgramBuilder::output_rows`).
+    pub output_rows: Option<f64>,
     pub sql: String,
     /// The statement is ANALYZE, so its completion refreshes the in-memory
     /// planner statistics. Decided once here instead of by scanning the SQL

@@ -18,11 +18,13 @@ pub enum Oracle {
     Dqp,
     Eet,
     Cert,
+    /// An inner join estimated at the same rows whatever order its tables are written or read in.
+    Order,
 }
 
 impl Oracle {
     /// The oracles a run rotates through (`Same` runs once a database, after its statements).
-    pub const ALL: [Oracle; 7] = [Oracle::Diff, Oracle::Tlp, Oracle::Norec, Oracle::Pqs, Oracle::Dqp, Oracle::Eet, Oracle::Cert];
+    pub const ALL: [Oracle; 8] = [Oracle::Diff, Oracle::Tlp, Oracle::Norec, Oracle::Pqs, Oracle::Dqp, Oracle::Eet, Oracle::Cert, Oracle::Order];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -34,6 +36,7 @@ impl Oracle {
             Oracle::Dqp => "dqp",
             Oracle::Eet => "eet",
             Oracle::Cert => "cert",
+            Oracle::Order => "order",
         }
     }
 
@@ -87,6 +90,36 @@ impl More {
     }
 }
 
+/// What CERT estimates: a SELECT, or a compound of SELECTs (`ops[i]` between arm i and arm i + 1,
+/// read left to right), and the arm its restriction applies to. Never the right arm of an EXCEPT:
+/// fewer rows there leave more in the answer.
+#[derive(Clone, Debug)]
+pub struct CertQuery {
+    pub arms: Vec<Sel>,
+    pub ops: Vec<&'static str>,
+    pub arm: usize,
+}
+
+impl CertQuery {
+    fn sql_of(arms: &[Sel], ops: &[&str]) -> String {
+        let mut s = arms.first().map(Sel::sql).unwrap_or_default();
+        for (op, arm) in ops.iter().zip(arms.iter().skip(1)) {
+            s.push_str(&format!(" {op} {}", arm.sql()));
+        }
+        s
+    }
+
+    pub fn sql(&self) -> String {
+        Self::sql_of(&self.arms, &self.ops)
+    }
+
+    /// The same query with `more` applied to its restricted arm.
+    pub fn restricted(&self, more: &More) -> String {
+        let arms: Vec<Sel> = self.arms.iter().enumerate().map(|(i, q)| if i == self.arm { more.apply(q) } else { q.clone() }).collect();
+        Self::sql_of(&arms, &self.ops)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Case {
     /// The tables whose rows both engines must hold alike.
@@ -101,7 +134,9 @@ pub enum Case {
     Pqs(Sel, i64, E),
     Dqp(Sel, Variant),
     Eet(Sel, Sel),
-    Cert(Sel, More),
+    Cert(CertQuery, More),
+    /// An inner join of two to four tables.
+    Order(Sel),
 }
 
 impl Case {
@@ -115,6 +150,7 @@ impl Case {
             Case::Dqp(..) => Oracle::Dqp,
             Case::Eet(..) => Oracle::Eet,
             Case::Cert(..) => Oracle::Cert,
+            Case::Order(_) => Oracle::Order,
         }
     }
 
@@ -122,11 +158,11 @@ impl Case {
     pub fn parts_mut(&mut self) -> (Vec<&mut Sel>, Vec<&mut E>) {
         match self {
             Case::Same(_) => (vec![], vec![]),
-            Case::Diff(q) | Case::Dqp(q, _) => (vec![q], vec![]),
+            Case::Diff(q) | Case::Dqp(q, _) | Case::Order(q) => (vec![q], vec![]),
             Case::TlpWhere(q, p) | Case::TlpDistinct(q, p) | Case::TlpGroup(q, p) | Case::TlpHaving(q, p) | Case::TlpAgg(q, p, _) | Case::Norec(q, p) | Case::Pqs(q, _, p) => (vec![q], vec![p]),
             Case::Eet(q, t) => (vec![q, t], vec![]),
-            Case::Cert(q, More::Conjunct(p)) => (vec![q], vec![p]),
-            Case::Cert(q, More::Inner(_)) => (vec![q], vec![]),
+            Case::Cert(q, More::Conjunct(p)) => (q.arms.iter_mut().collect(), vec![p]),
+            Case::Cert(q, More::Inner(_)) => (q.arms.iter_mut().collect(), vec![]),
         }
     }
 }
@@ -139,7 +175,8 @@ pub enum Kind {
     Error,
     /// Amphora panicked: production code never does.
     Panic,
-    /// A more restrictive query estimated to return more rows (CERT).
+    /// A more restrictive query estimated to return more rows (CERT), or one join order estimated
+    /// apart from another (Order).
     Estimate,
 }
 
@@ -175,6 +212,101 @@ fn error(detail: String, cause: &str, queries: Vec<String>) -> Outcome {
 /// didn't, in SQLite as in Amphora.
 fn value_error(e: &str) -> bool {
     ["too big", "malformed JSON", "JSON path", "bad JSON path", "JSON cannot hold", "overflow", "Unexpected character", "must be TEXT", "number of arguments", "argument count", "must be between", "not an array element", "single character", "Unexpected end of input"].iter().any(|m| e.contains(m))
+}
+
+/// Whether SQLite meets an error `counts` evaluating one of `p`'s function calls on some row the
+/// call can read: the query's rows (`from`), or a subquery's beside its outer query's. An error
+/// SQLite raises there makes one Amphora meets evaluating `p` a value's, met where SQLite's plan
+/// read the rows in another order or stopped sooner (an EXISTS at its first match, min() over an
+/// index at its first row: cause Q), not an error SQLite never raises. A call reading no column is
+/// the same on every row, so it's evaluated on none: Amphora computes it once ahead of the rows,
+/// SQLite on each, and over an empty table never (cause Q too). Text SQLite gives that isn't
+/// well-formed UTF-8 makes `p` one SQLite promises no answer for (cause AN). Flat, on a stack of
+/// its own.
+fn sqlite_call_meets(s: &mut Sqlite, from: &[synth::From], p: &E, counts: impl Fn(&str) -> bool) -> bool {
+    // A subquery's expressions, each with the rows it reads: its own tables and its outer query's.
+    fn subquery<'a>(todo: &mut Vec<(&'a E, Vec<synth::From>)>, q: &'a Sel, outer: &[synth::From]) {
+        let mut inner = q.from.clone();
+        inner.extend(outer.iter().cloned());
+        for x in q.cols.iter().chain(q.wh.iter()).chain(q.from.iter().filter_map(|f| f.on.as_ref())) {
+            todo.push((x, inner.clone()));
+        }
+    }
+    let mut todo: Vec<(&E, Vec<synth::From>)> = vec![(p, from.to_vec())];
+    while let Some((e, scope)) = todo.pop() {
+        if let E::Fn(..) = e {
+            let tables: Vec<String> = if constant(e) { Vec::new() } else { scope.iter().map(|f| format!("{} AS {}", f.table, f.alias)).collect() };
+            let sql = if tables.is_empty() { format!("SELECT {}", e.sql()) } else { format!("SELECT {} FROM {}", e.sql(), tables.join(", ")) };
+            if s.run(&sql).is_err_and(|e| counts(&e)) {
+                return true;
+            }
+        }
+        // A subquery whole, its tables read in rowid order (NOT INDEXED): an error its rows' values
+        // raise in that order, which the plan's order skipped (an aggregate's overflow), counts too.
+        if matches!(e, E::Exists(..) | E::Scalar(_) | E::InSel(..)) {
+            let mut plain = e.clone();
+            if let E::Exists(q, _) | E::Scalar(q) | E::InSel(_, q, _) = &mut plain {
+                for f in q.from.iter_mut() {
+                    f.hint = Hint::NotIndexed;
+                }
+            }
+            let tables: Vec<String> = scope.iter().map(|f| format!("{} AS {}", f.table, f.alias)).collect();
+            let sql = if tables.is_empty() { format!("SELECT {}", plain.sql()) } else { format!("SELECT {} FROM {}", plain.sql(), tables.join(", ")) };
+            if s.run(&sql).is_err_and(|e| counts(&e)) {
+                return true;
+            }
+        }
+        match e {
+            E::Exists(q, _) | E::Scalar(q) => subquery(&mut todo, q, &scope),
+            E::InSel(x, q, _) => {
+                todo.push((x, scope.clone()));
+                subquery(&mut todo, q, &scope);
+            }
+            _ => todo.extend(e.children().into_iter().map(|c| (c, scope.clone()))),
+        }
+    }
+    false
+}
+
+/// Whether SQLite's own answers break the relation a TLP, EET or DQP case holds Amphora to:
+/// `base`'s rows against the rows of `parts` together (a TLP query's partitions, an equivalent
+/// form, another plan). Where SQLite's answers don't keep it (a GROUP BY that keeps the integer 0
+/// and the REAL 0.0 apart under a HAVING and together without one; `- 0.0` against
+/// `-(CASE .. 0.0 END)`), the relation isn't one this query keeps, and Amphora answering as SQLite
+/// does is no fault.
+fn relation_fails_on_sqlite(s: &mut Sqlite, base: &str, parts: &[String], loose: bool) -> bool {
+    let Ok(all) = s.run(base) else { return false };
+    let mut together = Vec::new();
+    for part in parts {
+        match s.run(part) {
+            Ok(rows) => together.extend(rows),
+            Err(_) => return false,
+        }
+    }
+    !same_rows_by(&all, &together, loose)
+}
+
+/// Whether a LIMIT still keeps certain rows: its query ordered by each column it returns (by
+/// BINARY, then by storage class) as the generator made it, but for a constant, the same in every
+/// row. A cut that lets two rows tie leaves which of them the LIMIT keeps to the plan. DISTINCT and
+/// GROUP BY keep one row of those they take as one (0 and 0.0, 'a' and 'A' under NOCASE), whichever
+/// the plan met first, which the ORDER BY then tells apart by its storage class or its bytes: their
+/// LIMIT keeps rows by the plan too.
+fn limit_certain(q: &Sel) -> bool {
+    let order: Vec<String> = q.order.iter().map(|(e, _)| e.sql()).collect();
+    q.limit.is_none()
+        || (!q.distinct
+            && q.group.is_empty()
+            && q.cols.iter().all(|c| {
+                constant(c) || (order.contains(&E::Collate(Box::new(c.clone()), "BINARY").sql()) && order.contains(&E::Fn("typeof".into(), vec![c.clone()]).sql()))
+            }))
+}
+
+/// Whether `e` is the same in every row: it reads no column, no subquery and no aggregate.
+fn constant(e: &E) -> bool {
+    let mut reads = false;
+    e.walk(&mut |x| reads |= matches!(x, E::Col(..) | E::Exists(..) | E::Scalar(_) | E::InSel(..) | E::Agg(..)));
+    !reads
 }
 
 /// Whether a TLP aggregate case's columns are still the one aggregate its partitions combine to:
@@ -245,7 +377,8 @@ pub fn sqls(case: &Case) -> Vec<String> {
             qp.sql()
         })).collect(),
         Case::Eet(q, t) => vec![q.sql(), t.sql()],
-        Case::Cert(q, more) => vec![format!("EXPLAIN QUERY PLAN FORMAT=JSON {}", q.sql()), format!("EXPLAIN QUERY PLAN FORMAT=JSON {}", more.apply(q).sql())],
+        Case::Cert(q, more) => vec![format!("EXPLAIN QUERY PLAN FORMAT=JSON {}", q.sql()), format!("EXPLAIN QUERY PLAN FORMAT=JSON {}", q.restricted(more))],
+        Case::Order(q) => std::iter::once(q.clone()).chain(orders(q)).map(|o| format!("EXPLAIN QUERY PLAN FORMAT=JSON {}", o.sql())).collect(),
     }
 }
 
@@ -253,8 +386,14 @@ pub fn sqls(case: &Case) -> Vec<String> {
 /// failure; a base form Amphora refuses is a skip (or, against SQLite, a refusal counted).
 pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
     let mut c = case.clone();
-    if c.parts_mut().0.iter().any(|q| !q.certain()) {
+    // CERT reads estimates, not answers: which row of its group a bare column reads is no matter,
+    // nor which rows a LIMIT keeps.
+    if !matches!(case, Case::Cert(..)) && c.parts_mut().0.iter().any(|q| !q.certain()) {
         return Outcome::Skip("a bare column: its row is any of its group's");
+    }
+    // (The case's own query: EET's equivalent form rewrites its columns, not its ORDER BY.)
+    if !matches!(case, Case::Cert(..)) && c.parts_mut().0.first().is_some_and(|q| !limit_certain(q)) {
+        return Outcome::Skip("a LIMIT no longer keeps certain rows");
     }
     match case {
         Case::Same(tables) => {
@@ -305,6 +444,8 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
             }
             if same_rows_by(&all, &union, loose(q)) {
                 Outcome::Pass { plan_changed: false }
+            } else if relation_fails_on_sqlite(s, &sqls[0], &sqls[1..], loose(q)) {
+                Outcome::Skip("the relation fails on SQLite too")
             } else {
                 wrong("the query's rows aren't its three partitions' (p, NOT p, p IS NULL)", &Ok(union), &Ok(all), sqls)
             }
@@ -331,6 +472,7 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
             match a.run(&union) {
                 Err(e) => derived(s, &union, "the partitions' UNION", &e, vec![base, union.clone()]),
                 Ok(rows) if same_rows_by(&all, &rows, true) => Outcome::Pass { plan_changed: false },
+                Ok(_) if relation_fails_on_sqlite(s, &base, std::slice::from_ref(&union), true) => Outcome::Skip("the relation fails on SQLite too"),
                 Ok(rows) => wrong("the query's rows aren't the UNION of its partitions'", &Ok(rows), &Ok(all), vec![base, union]),
             }
         }
@@ -361,8 +503,12 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
             let combined = format!("SELECT {outer} FROM (SELECT NULL AS m WHERE 0 UNION ALL {})", parts.join(" UNION ALL "));
             match a.run(&combined) {
                 Err(e) if e.contains("overflow") => Outcome::Skip("a partition's sum overflows"),
+                // ... and so may theirs where the query's is NULL: infinities of both signs make a
+                // NaN, which is NULL, in one grouping of the rows and not in another.
+                Ok(rows) if matches!(f, Agg::Sum) && rows.iter().flatten().any(|v| matches!(v, V::Real(_))) => Outcome::Skip("a REAL sum's partitions round apart from it"),
                 Err(e) => derived(s, &combined, "the partitions' aggregate", &e, vec![base, combined.clone()]),
                 Ok(rows) if same_rows_by(&all, &rows, true) => Outcome::Pass { plan_changed: false },
+                Ok(_) if relation_fails_on_sqlite(s, &base, std::slice::from_ref(&combined), true) => Outcome::Skip("the relation fails on SQLite too"),
                 Ok(rows) => wrong("the query's aggregate isn't its partitions' combined", &Ok(rows), &Ok(all), vec![base, combined]),
             }
         }
@@ -412,8 +558,10 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
                 _ => return Outcome::Skip("sqlite misses its own pivot"),
             }
             match a.run(&sql) {
+                Err(e) if value_error(&e) && sqlite_call_meets(s, &q.from, p, |e| e != ILL_FORMED) => Outcome::Skip("a derived query meets a value's error (evaluation order)"),
                 Err(e) => error(format!("Amphora errors where SQLite finds the pivot: {e}"), &e, vec![eval, sql]),
                 Ok(rows) if has(&rows) => Outcome::Pass { plan_changed: false },
+                Ok(_) if sqlite_call_meets(s, &q.from, p, |e| e == ILL_FORMED) => Outcome::Skip("SQLite's answer holds ill-formed UTF-8 (garbage in, garbage out)"),
                 Ok(rows) => fail(Kind::Wrong, format!("the pivot (rowid {pivot}), whose predicate SQLite rectified to TRUE, is missing\n  Amphora: {}", show(&Ok(rows))), vec![eval, sql]),
             }
         }
@@ -430,6 +578,7 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
                 Err(_) if matches!(v, Variant::IndexedBy(..)) => Outcome::Skip("the index can't serve the query"),
                 Err(e) => derived(s, &sql, "another plan", &e, vec![base, sql.clone()]),
                 Ok(rows) if same_rows_by(&rows, &want, loose(q)) => Outcome::Pass { plan_changed: before != after },
+                Ok(_) if relation_fails_on_sqlite(s, &base, std::slice::from_ref(&sql), loose(q)) => Outcome::Skip("the relation fails on SQLite too"),
                 Ok(rows) => wrong("another plan gives other rows", &Ok(rows), &Ok(want), vec![base, sql]),
             }
         }
@@ -439,20 +588,118 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
             match a.run(&ts) {
                 Err(e) => derived(s, &ts, "the equivalent form", &e, vec![qs.clone(), ts.clone()]),
                 Ok(got) if same_rows_by(&got, &want, loose(q)) => Outcome::Pass { plan_changed: false },
+                // SQLite's two forms apart as well: the transformation isn't equivalent for this query
+                // (`- 0.0` and `-(CASE .. 0.0 END)`, a negative zero and 0 - x)
+                Ok(_) if relation_fails_on_sqlite(s, &qs, std::slice::from_ref(&ts), loose(q)) => Outcome::Skip("the relation fails on SQLite too"),
                 Ok(got) => wrong("an equivalent form gives other rows", &Ok(got), &Ok(want), vec![qs, ts]),
             }
         }
         Case::Cert(q, more) => {
-            let (qs, rs) = (q.sql(), more.apply(q).sql());
-            let aliases: Vec<String> = q.from.iter().map(|f| f.alias.clone()).collect();
-            let (Some(eq), Some(er)) = (estimate(a, &qs, &aliases), estimate(a, &rs, &aliases)) else { return Outcome::Skip("no estimate") };
+            let (qs, rs) = (q.sql(), q.restricted(more));
+            let aliases: Vec<String> = q.arms.iter().flat_map(|arm| arm.from.iter().map(|f| f.alias.clone())).collect();
+            // A query Amphora can't plan has no estimate to check: SQLite refuses it too (a call
+            // to a function at an arity it hasn't), or it's a refusal counted as the differential
+            // check counts one. Only a query planned without an estimate is "no estimate".
+            let mut got = [None, None];
+            for (slot, sql) in got.iter_mut().zip([&qs, &rs]) {
+                match estimate(a, sql, &aliases) {
+                    Ok(e) => *slot = e,
+                    Err(_) if s.run(&format!("EXPLAIN QUERY PLAN {sql}")).is_err() => return Outcome::Skip("sqlite refused"),
+                    Err(e) => return Outcome::Refused(e),
+                }
+            }
+            let [Some(eq), Some(er)] = got else { return Outcome::Skip("no estimate") };
             if no_more(er, eq) {
                 Outcome::Pass { plan_changed: false }
             } else {
                 fail(Kind::Estimate, format!("the more restrictive query is estimated at {er} rows, the query at {eq}"), vec![qs, rs])
             }
         }
+        Case::Order(q) => {
+            if q.from.len() < 2 || !q.from.iter().all(|f| matches!(f.join, Join::First | Join::Inner | Join::Comma | Join::Cross)) {
+                return Outcome::Skip("no longer an inner join of two tables or more");
+            }
+            let aliases: Vec<String> = q.from.iter().map(|f| f.alias.clone()).collect();
+            let base = q.sql();
+            let want = match estimate(a, &base, &aliases) {
+                Ok(Some(want)) => want,
+                Ok(None) => return Outcome::Skip("no estimate"),
+                Err(_) => return Outcome::Skip("amphora refused the base"),
+            };
+            for o in orders(q) {
+                let sql = o.sql();
+                // A form Amphora refuses is a finding only where SQLite answers it, as for every
+                // derived query: the estimate is this check's, the refusal the others'.
+                if let Err(e) = a.run(&format!("EXPLAIN QUERY PLAN {sql}")) {
+                    return derived(s, &sql, "another join order", &e, vec![base, sql.clone()]);
+                }
+                match estimate(a, &sql, &aliases) {
+                    Ok(Some(got)) if same_estimate(got, want) => {}
+                    Ok(Some(got)) => return fail(Kind::Estimate, format!("one join order is estimated at {got} rows, the query as written at {want}"), vec![base, sql]),
+                    Ok(None) | Err(_) => return fail(Kind::Estimate, format!("one join order has no estimate, the query as written {want} rows"), vec![base, sql]),
+                }
+            }
+            Outcome::Pass { plan_changed: false }
+        }
     }
+}
+
+/// Whether two estimates of the same rows agree to within 1e-9 of the larger, floating point's
+/// rounding over a product of a few factors taken in another order.
+pub fn same_estimate(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-9 * a.abs().max(b.abs())
+}
+
+/// Every order of an inner join's tables, each written two ways: its tables listed in that order
+/// with every ON term moved to WHERE (an inner join's ON filters as WHERE does), and the same order
+/// forced by CROSS JOIN, which the planner never reorders (SQLite's `jointype` rule, which Amphora
+/// keeps). The estimate of the set of tables joined is one number in every one of them.
+pub fn orders(q: &Sel) -> Vec<Sel> {
+    let mut flat = q.clone();
+    let mut wh = q.wh.clone();
+    for f in flat.from.iter_mut() {
+        if let Some(on) = f.on.take() {
+            wh = Some(match wh {
+                Some(w) => E::Bin("AND", Box::new(w), Box::new(on)),
+                None => on,
+            });
+        }
+    }
+    flat.wh = wh;
+    let n = flat.from.len();
+    // Heap's algorithm, iterative: every permutation of 0..n, n at most 4 here (24 orders).
+    let mut perm: Vec<usize> = (0..n).collect();
+    let mut c = vec![0usize; n];
+    let mut perms = vec![perm.clone()];
+    let mut i = 1;
+    while i < n {
+        if c[i] < i {
+            if i % 2 == 0 {
+                perm.swap(0, i);
+            } else {
+                perm.swap(c[i], i);
+            }
+            perms.push(perm.clone());
+            c[i] += 1;
+            i = 1;
+        } else {
+            c[i] = 0;
+            i += 1;
+        }
+    }
+    let mut out = Vec::with_capacity(perms.len() * 2);
+    for p in perms {
+        for cross in [false, true] {
+            let mut o = flat.clone();
+            o.from = p.iter().enumerate().map(|(k, &j)| {
+                let mut f = flat.from[j].clone();
+                f.join = if k == 0 { Join::First } else if cross { Join::Cross } else { Join::Comma };
+                f
+            }).collect();
+            out.push(o);
+        }
+    }
+    out
 }
 
 /// The optimizer's estimate of a query's rows: the output of the last top-level access to one of
@@ -481,20 +728,18 @@ pub fn estimate_any(a: &mut Amphora, sql: &str) -> Option<f64> {
     })
 }
 
-fn estimate(a: &mut Amphora, sql: &str, aliases: &[String]) -> Option<f64> {
-    let rows = a.run(&format!("EXPLAIN QUERY PLAN FORMAT=JSON {sql}")).ok()?;
-    let text = match rows.first()?.first()? {
-        V::Text(t) => t.clone(),
-        _ => return None,
-    };
-    let j: serde_json::Value = serde_json::from_str(&text).ok()?;
+/// The plan's estimate of `sql`'s rows, or Amphora's refusal to plan it.
+fn estimate(a: &mut Amphora, sql: &str, aliases: &[String]) -> Result<Option<f64>, String> {
+    let rows = a.run(&format!("EXPLAIN QUERY PLAN FORMAT=JSON {sql}"))?;
+    let Some(V::Text(text)) = rows.first().and_then(|r| r.first()) else { return Ok(None) };
+    let Ok(j) = serde_json::from_str::<serde_json::Value>(text) else { return Ok(None) };
     // The join's own estimate where the plan gives it; else the last table read at the top.
-    j["output_rows"].as_f64().or_else(|| {
+    Ok(j["output_rows"].as_f64().or_else(|| {
         j["nodes"].as_array()?.iter()
             .filter(|n| n["parent"].is_null() && n["op"]["alias"].as_str().is_some_and(|al| aliases.iter().any(|x| x == al)))
             .filter_map(|n| n["op"]["estimate"]["output_rows"].as_f64())
             .last()
-    })
+    }))
 }
 
 fn variant(q: &Sel, v: &Variant) -> Sel {
@@ -619,17 +864,45 @@ pub fn build(o: Oracle, r: &mut Rng, schema: &Schema, funcs: &[Func], s: &mut Sq
             Case::Eet(q, t)
         }
         Oracle::Cert => {
-            let mut q = synth::plain(r, schema, funcs);
-            q.distinct = false;
-            let outer = q.from.iter().enumerate().skip(1).find(|(_, f)| matches!(f.join, Join::Left | Join::Right | Join::Full)).map(|(i, _)| i);
-            match outer {
-                Some(i) if r.chance(0.5) => Case::Cert(q, More::Inner(i)),
-                _ => {
-                    let p = synth::scope(schema, &q.from, funcs, false).pred(r, 2);
-                    Case::Cert(q, More::Conjunct(p))
+            // Any shape the generator makes, grouped, aggregated, DISTINCT, ordered and limited,
+            // but with no HAVING: fewer rows in a group can pass a HAVING more rows fail
+            // (`count(*) < 2`), so a restriction there is none.
+            let arm = |r: &mut Rng| {
+                let mut q = synth::query(r, schema, funcs);
+                q.having = None;
+                q
+            };
+            let mut arms = vec![arm(r)];
+            let mut ops = Vec::new();
+            // A compound select a quarter of the time: two or three arms of the first's width, no
+            // ORDER BY or LIMIT in any (SQLite takes them only at the compound's end).
+            if r.chance(0.25) {
+                for _ in 0..1 + r.below(2) {
+                    let mut next = arm(r);
+                    let width = arms[0].cols.len();
+                    next.cols.truncate(width);
+                    while next.cols.len() < width {
+                        next.cols.push(E::Lit(synth::literal(r)));
+                    }
+                    ops.push(*r.pick(&["UNION ALL", "UNION", "INTERSECT", "EXCEPT"]));
+                    arms.push(next);
+                }
+                for a in arms.iter_mut() {
+                    a.order.clear();
+                    a.limit = None;
                 }
             }
+            let places: Vec<usize> = (0..arms.len()).filter(|&k| k == 0 || ops[k - 1] != "EXCEPT").collect();
+            let k = *r.pick(&places);
+            let q = &arms[k];
+            let outer = q.from.iter().enumerate().skip(1).find(|(_, f)| matches!(f.join, Join::Left | Join::Right | Join::Full)).map(|(i, _)| i);
+            let more = match outer {
+                Some(i) if r.chance(0.5) => More::Inner(i),
+                _ => More::Conjunct(synth::scope(schema, &q.from, funcs, false).pred(r, 2)),
+            };
+            Case::Cert(CertQuery { arms, ops, arm: k }, more)
         }
+        Oracle::Order => Case::Order(synth::inner_join(r, schema, funcs)),
     })
 }
 
