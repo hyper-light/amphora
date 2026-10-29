@@ -4118,14 +4118,24 @@ impl Pager {
     /// The caller owns the writer transaction and must not write while this image is collected.
     pub fn transaction_image(&self, max_bytes: usize) -> Result<Vec<(u32, Vec<u8>)>> {
         self.io.block(|| self.wait_for_spill_completions())?;
-        let ids: Vec<u32> = self.dirty_pages.read().iter().collect();
         let page_size = usize::try_from(self.get_page_size_unchecked().get())
             .map_err(|_| LimboError::InvalidArgument("page size does not fit usize".into()))?;
-        let bytes = ids.len().checked_mul(page_size)
-            .ok_or_else(|| LimboError::InvalidArgument("transaction image size overflow".into()))?;
-        if bytes > max_bytes {
-            return Err(LimboError::InvalidArgument("transaction image exceeds its byte budget".into()));
-        }
+        let ids: Vec<u32> = {
+            let dirty = self.dirty_pages.read();
+            let count = usize::try_from(dirty.len()).map_err(|_| {
+                LimboError::InvalidArgument("transaction page count overflow".into())
+            })?;
+            let bytes = count.checked_mul(page_size).ok_or_else(|| {
+                LimboError::InvalidArgument("transaction image size overflow".into())
+            })?;
+            if bytes > max_bytes {
+                return Err(LimboError::InvalidArgument(
+                    "transaction image exceeds its byte budget".into(),
+                ));
+            }
+            // Refuse before allocating even the page-ID list for an oversized transaction.
+            dirty.iter().collect()
+        };
         let mut pages = Vec::with_capacity(ids.len());
         for id in ids {
             let (page, completion) = self.io.block(|| self.read_page(i64::from(id)))?;
@@ -4134,7 +4144,9 @@ impl Pager {
             }
             let contents = page.get_contents();
             if !page.is_loaded() || contents.buffer().is_none() {
-                return Err(LimboError::InternalError("transaction image page was not loaded".into()));
+                return Err(LimboError::InternalError(
+                    "transaction image page was not loaded".into(),
+                ));
             }
             pages.push((id, contents.as_ptr().to_vec()));
         }

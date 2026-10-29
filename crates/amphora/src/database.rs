@@ -8,7 +8,7 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::sync::{OnceLock, Weak};
 use std::time::Instant;
@@ -41,6 +41,26 @@ CREATE INDEX IF NOT EXISTS __amphora_feed ON __amphora_versions(namespace, famil
 CREATE TABLE IF NOT EXISTS __amphora_families (namespace TEXT NOT NULL, family TEXT NOT NULL, newest INTEGER NOT NULL, PRIMARY KEY(namespace, family));
 CREATE TABLE IF NOT EXISTS __amphora_migrations (name TEXT PRIMARY KEY, sql TEXT NOT NULL);";
 const LIVE_MAX: u64 = 10_000_000;
+const QUEUED_BYTES: usize = 512 << 20;
+struct Admission(Arc<AtomicUsize>);
+impl Admission {
+    fn reserve(bytes: &Arc<AtomicUsize>) -> Result<Self, Refusal> {
+        bytes
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                held.checked_add(api::REQUEST_MAX)
+                    .filter(|next| *next <= QUEUED_BYTES)
+            })
+            .map_err(|_| Refusal::Full {
+                limit: QUEUED_BYTES,
+            })?;
+        Ok(Self(Arc::clone(bytes)))
+    }
+}
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.0.fetch_sub(api::REQUEST_MAX, Ordering::AcqRel);
+    }
+}
 
 #[derive(Clone)]
 pub struct Database {
@@ -51,6 +71,7 @@ struct Shared {
     writer: Writer,
     changed: Arc<Changed>,
     restoring: AtomicBool,
+    admitted: Arc<AtomicUsize>,
     // The engine, readers and flusher retain the same lease until asynchronous drain ends.
     _owner: Option<Arc<File>>,
 }
@@ -169,7 +190,7 @@ pub(crate) fn exclusive_file(path: &Path) -> Result<File, Refusal> {
     file.try_lock().map_err(|e| unavailable(format!("database ownership is held or unavailable; drain the previous owner before handoff: {e}")))?;
     Ok(file)
 }
-fn refused(error: &anyhow::Error) -> Refusal {
+pub(crate) fn refused(error: &anyhow::Error) -> Refusal {
     if let Some(refusal) = error.downcast_ref::<Refusal>() {
         return refusal.clone();
     }
@@ -402,6 +423,7 @@ impl Database {
                         },
                         changed,
                         restoring: AtomicBool::new(false),
+                        admitted: Arc::new(AtomicUsize::new(0)),
                         _owner: Some(owner),
                     }),
                 })
@@ -420,7 +442,7 @@ impl Database {
     pub fn in_memory(until: Instant) -> Result<Self, Refusal> {
         let io = Arc::new(amphora_engine::MemoryIO::new());
         Self::from_db(
-            Db::open_with(Path::new("amphora.db"), io).map_err(unavailable)?,
+            Db::open_with(Path::new(":memory:amphora"), io).map_err(unavailable)?,
             until,
         )
     }
@@ -468,6 +490,7 @@ impl Database {
                 ),
                 changed: Arc::new(changed),
                 restoring: AtomicBool::new(restoring),
+                admitted: Arc::new(AtomicUsize::new(0)),
                 _owner: owner,
             }),
         };
@@ -567,6 +590,7 @@ impl Database {
             }
             Writer::Local(store) => store,
         };
+        let admission = Admission::reserve(&self.shared.admitted)?;
         let wake = matches!(&operation, Operation::Mutation(Mutation::Records { tx, .. }) if !tx.writes.is_empty())
             || matches!(&operation, Operation::Mutation(Mutation::Compact { .. }));
         let wake = wake || matches!(&operation, Operation::Import(_) | Operation::Call(_));
@@ -603,6 +627,7 @@ impl Database {
                 }],
                 until,
                 move |done| {
+                    let _admission = admission;
                     let mut result = match done {
                         Ok(()) => locked(&answer)
                             .and_then(|mut r| {
@@ -703,8 +728,9 @@ impl Database {
             .map_err(unavailable)?;
         rx.recv_timeout(until.saturating_duration_since(Instant::now()))
             .map_err(|e| match e {
-                mpsc::RecvTimeoutError::Timeout => Refusal::Timeout,
-                mpsc::RecvTimeoutError::Disconnected => unavailable("the notifier stopped"),
+                mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected => {
+                    Refusal::UnknownOutcome
+                }
             })?
     }
 }
@@ -953,6 +979,7 @@ impl Engine for Local {
 }
 
 fn validate_sql(sql: &str, script: bool) -> Result<(), Refusal> {
+    crate::sql::validate_reserved_sql(sql)?;
     api::bound("SQL", sql.len(), api::SQL_MAX)?;
     let mut parser = Parser::new(sql.as_bytes());
     let mut count = 0usize;

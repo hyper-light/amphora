@@ -6,8 +6,10 @@ use amphora_api::Value;
 pub use amphora_api::sql::*;
 use amphora_engine::{Numeric, Value as Native};
 use amphora_engine_parser::{
+    ast::fmt::{BlankContext, ToTokens, TokenStream},
     ast::{Cmd, Stmt},
     parser::Parser,
+    token::TokenType,
 };
 
 fn failed(e: impl std::fmt::Display) -> Error {
@@ -32,11 +34,75 @@ fn owned(value: &Native) -> Value {
         Native::Blob(value) => Value::Blob(value.to_vec()),
     }
 }
+
+/// Reserve product metadata names at the public SQL boundary. Using the parsed token
+/// stream distinguishes single-quoted names from string values, including inside triggers.
+/// Private Db SQL deliberately does not pass through this check.
+pub(crate) fn validate_reserved_sql(sql: &str) -> std::result::Result<(), amphora_api::Refusal> {
+    amphora_api::bound("SQL bytes", sql.len(), amphora_api::SQL_MAX)?;
+    let mut parser = Parser::new(sql.as_bytes());
+    let mut count = 0usize;
+    while let Some(command) = parser
+        .next_cmd()
+        .map_err(|e| amphora_api::invalid("SQL", &e.to_string()))?
+    {
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| amphora_api::invalid("SQL", "statement count overflow"))?;
+        amphora_api::bound("SQL statements", count, amphora_api::TX_MAX)?;
+        validate_reserved_command(&command)?;
+    }
+    Ok(())
+}
+
+fn validate_reserved_command(command: &Cmd) -> std::result::Result<(), amphora_api::Refusal> {
+    struct Identifiers {
+        tokens: usize,
+    }
+    impl TokenStream for Identifiers {
+        type Error = amphora_api::Refusal;
+        fn append(
+            &mut self,
+            kind: TokenType,
+            value: Option<&str>,
+        ) -> std::result::Result<(), Self::Error> {
+            self.tokens = self
+                .tokens
+                .checked_add(1)
+                .ok_or_else(|| amphora_api::invalid("SQL", "token count overflow"))?;
+            // Formatting can add punctuation, but output is never retained. This fixed
+            // budget bounds traversal independently of the statement's SQL byte bound.
+            amphora_api::bound("SQL validation tokens", self.tokens, amphora_api::SQL_MAX)?;
+            if kind == TokenType::TK_ID
+                && let Some(name) = value
+            {
+                let name = match name.as_bytes().first() {
+                    Some(b'\'' | b'"' | b'`' | b'[') => name.get(1..).unwrap_or(""),
+                    _ => name,
+                };
+                const RESERVED: &str = "__amphora_";
+                if name
+                    .get(..RESERVED.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED))
+                {
+                    return Err(amphora_api::invalid(
+                        "SQL identifier",
+                        "__amphora_* names are reserved for product metadata",
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+    command.to_tokens(&mut Identifiers { tokens: 0 }, &BlankContext)
+}
+
 fn validate(sql: &str, batch: bool) -> Result<()> {
     amphora_api::bound("SQL bytes", sql.len(), amphora_api::SQL_MAX).map_err(failed)?;
     let mut parser = Parser::new(sql.as_bytes());
     let mut count = 0usize;
     while let Some(command) = parser.next_cmd().map_err(failed)? {
+        validate_reserved_command(&command)?;
         count = count
             .checked_add(1)
             .ok_or_else(|| failed("SQL statement count overflow"))?;
@@ -166,6 +232,72 @@ mod tests {
                 value: value.to_vec(),
             }],
         }
+    }
+
+    // U05/U06: public SQL cannot alter the metadata that enforces Records and commit fences.
+    #[test]
+    fn public_sql_reserves_metadata_names_but_allows_literal_and_comment_text() {
+        use super::validate_reserved_sql;
+        for sql in [
+            "UPDATE __amphora_replica SET applied = 0",
+            "DROP TABLE main.\"__AMPHORA_restore\"",
+            "DELETE FROM `__AmPhOrA_versions`",
+            "SELECT * FROM [__amphora_versions]",
+            "DROP TABLE '__amphora_versions'",
+            "ALTER TABLE ordinary RENAME TO '__amphora_versions'",
+            "CREATE TABLE ordinary('__amphora_hidden' INTEGER)",
+            "CREATE VIEW ordinary AS SELECT * FROM __amphora_versions",
+            "CREATE TRIGGER hidden AFTER INSERT ON ordinary BEGIN DELETE FROM '__amphora_versions'; END",
+            "CREATE TRIGGER hidden AFTER INSERT ON ordinary BEGIN UPDATE [__amphora_replica] SET applied = 0; END",
+            "SELECT 1; DROP TABLE __amphora_versions",
+        ] {
+            assert!(
+                matches!(validate_reserved_sql(sql), Err(Refusal::Invalid { what, .. }) if what == "SQL identifier"),
+                "{sql}"
+            );
+        }
+        for sql in [
+            "SELECT '__amphora_versions', 'DROP TABLE __amphora_restore'",
+            "SELECT 1 /* __amphora_replica */ -- __amphora_versions\n",
+            "CREATE TABLE ordinary(value TEXT DEFAULT '__amphora_versions')",
+            "CREATE TABLE user__amphora_versions(value TEXT)",
+            "CREATE TRIGGER ordinary_trigger AFTER INSERT ON ordinary BEGIN SELECT '__amphora_versions'; END",
+            "SELECT ':__amphora_versions'",
+        ] {
+            validate_reserved_sql(sql).unwrap();
+        }
+
+        let db = crate::database::Database::in_memory(until()).unwrap();
+        db.call(until(), |c| {
+            c.execute_batch("CREATE TABLE ordinary(value TEXT)")?;
+            c.execute("INSERT INTO ordinary VALUES (?1)", ["__amphora_versions"])?;
+            assert!(matches!(c.execute("DELETE FROM __amphora_versions", []), Err(super::Error::Refusal(Refusal::Invalid { .. }))));
+            assert!(c.prepare("SELECT * FROM [__AMPHORA_versions]").is_err());
+            assert!(c.execute_batch("CREATE TRIGGER hidden AFTER INSERT ON ordinary BEGIN DELETE FROM '__amphora_versions'; END").is_err());
+            let literal: String = c.query_row("SELECT value FROM ordinary", [], |r| r.get(0))?;
+            assert_eq!(literal, "__amphora_versions");
+            c.records_commit("tenant", policy(None, b"private path remains available"))?;
+            Ok(())
+        }).unwrap();
+        assert!(
+            db.execute(
+                vec![amphora_api::Statement {
+                    sql: "DROP TABLE '__amphora_versions'".into(),
+                    params: vec![]
+                }],
+                until()
+            )
+            .is_err()
+        );
+        assert_eq!(
+            db.namespace("tenant")
+                .unwrap()
+                .get("policy", b"active", Consistency::Linearizable, until())
+                .unwrap()
+                .unwrap()
+                .value,
+            b"private path remains available"
+        );
     }
 
     // U05/U06, CP-T1.5: a policy CAS and its SQL reservation have one durable outcome.

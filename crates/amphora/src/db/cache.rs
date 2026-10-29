@@ -3,7 +3,7 @@
 //! never hold the cache mutex. Returning a statement makes it most recently used; eviction takes
 //! the least recently used. Oversized entries execute normally and are simply not retained.
 
-use amphora_engine::Statement;
+use amphora_engine::{Statement, schema::Schema};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -39,6 +39,7 @@ struct State {
     statements: HashMap<Arc<str>, Statement>,
     order: VecDeque<Arc<str>>,
     sql_bytes: usize,
+    schema: Option<(Arc<Schema>, u32)>,
 }
 impl State {
     fn remove(&mut self, sql: &str) -> Result<Option<Statement>> {
@@ -59,21 +60,33 @@ impl State {
     }
 }
 
+#[derive(Default)]
 pub(super) struct Cache {
     state: Mutex<State>,
     limits: Limits,
 }
-impl Default for Cache {
-    fn default() -> Self {
-        Self {
-            state: Mutex::default(),
-            limits: Limits::default(),
-        }
-    }
-}
 impl Cache {
     fn locked(&self) -> Result<MutexGuard<'_, State>> {
         self.state.lock().map_err(|_| Error::Poisoned)
+    }
+
+    /// Keep the schema Arc, rather than its address alone, so allocator reuse cannot make a
+    /// stale schema look current. The cookie also fences any in-place metadata update.
+    pub(super) fn schema(&self, current: Arc<Schema>) -> Result<()> {
+        let previous = {
+            let mut state = self.locked()?;
+            if state.schema.as_ref().is_some_and(|(held, version)| {
+                Arc::ptr_eq(held, &current) && *version == current.schema_version
+            }) {
+                return Ok(());
+            }
+            let previous = std::mem::take(&mut *state);
+            let version = current.schema_version;
+            state.schema = Some((current, version));
+            previous
+        };
+        drop(previous);
+        Ok(())
     }
 
     pub(super) fn take(&self, sql: &str) -> Result<Option<Statement>> {

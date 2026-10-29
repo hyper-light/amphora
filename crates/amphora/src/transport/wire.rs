@@ -38,6 +38,11 @@ pub(super) enum Record {
     Wait(String, Rev),
     Head,
     Compact(Rev),
+    TryWait(String, Rev),
+    ImportPage(
+        #[serde(deserialize_with = "super::bounded::import_page")] amphora_api::import::ImportPage,
+    ),
+    ImportState,
 }
 #[derive(Serialize, Deserialize)]
 pub(super) enum Command {
@@ -50,6 +55,11 @@ pub(super) enum Command {
     Columns(String),
     Commit,
     Abort,
+    RecordsGet(String, String, Vec<u8>),
+    RecordsCommit(
+        String,
+        #[serde(deserialize_with = "super::bounded::transaction")] Tx,
+    ),
 }
 #[derive(Serialize, Deserialize)]
 pub(super) enum Answer {
@@ -68,5 +78,17 @@ pub(super) enum Answer {
     Page(#[serde(deserialize_with = "super::bounded::page")] Page),
     Rev(Rev),
     Changes(#[serde(deserialize_with = "super::bounded::changes")] Changes),
+    OptionalRev(Option<Rev>),
+    ImportState(Option<amphora_api::import::ImportProgress>),
+    SessionRow {
+        row: Option<Row>,
+        changes: i64,
+        rowid: i64,
+    },
+    SessionRev {
+        rev: Rev,
+        changes: i64,
+        rowid: i64,
+    },
 }
 pub(super) type Response = Result<Answer, Refusal>;

@@ -97,6 +97,7 @@ enum Input {
 struct Pending {
     context: Vec<u8>,
     term: u64,
+    leader: u64,
     until: Instant,
     namespace: String,
     response: Option<Response<Answer>>,
@@ -105,8 +106,9 @@ struct Pending {
     _reservation: Reservation,
 }
 enum Phase {
-    Barrier(Operation),
+    Barrier(Option<Operation>),
     Proposed(Answer),
+    Bootstrap(Option<Operation>),
 }
 struct Actor {
     replica: Durable,
@@ -124,6 +126,7 @@ struct Actor {
     started: Instant,
     ticked: Instant,
     published: u64,
+    transferred: Option<(u64, Instant)>,
 }
 
 fn nonleader(replica: &Durable) -> Refusal {
@@ -247,6 +250,11 @@ impl ReplicaHandle {
     pub fn drain(&self, limit: usize) -> Result<Vec<Outbound>, Refusal> {
         api::bound("replica drain count", limit, OUTGOING_MESSAGES)?;
         let mut outgoing = locked(&self.shared.outgoing)?;
+        if outgoing.messages.is_empty()
+            && let Err(error) = &*locked(&self.shared.status)?
+        {
+            return Err(error.clone());
+        }
         let mut messages = Vec::with_capacity(limit.min(outgoing.messages.len()));
         for _ in 0..limit {
             let Some(message) = outgoing.messages.pop_front() else {
@@ -287,6 +295,8 @@ pub(super) fn start(
             ..ConfState::default()
         },
         Arc::clone(&lease),
+        config.node_id,
+        config.bootstrap.clone(),
     )?;
     let file = DeviceFile::open(
         log_path,
@@ -301,7 +311,11 @@ pub(super) fn start(
         max_segments: 16,
         max_groups: 1,
         group_entries: 65_536,
-        group_bytes: 256 << 20,
+        // A 256 MiB seed needs its chunk envelopes and election/configuration entries too.
+        // 512 MiB payload admission stays below the 16 x 64 MiB segment ring (plus fixed
+        // persist metadata). Even one 32 MiB chunk per segment uses at most nine segments;
+        // seven remain, including hyper-log's final segment reserved for making room.
+        group_bytes: 512 << 20,
         group_cache: 64 << 20,
         queue_submissions: 16,
         waits: hyper_log::Waits::Never,
@@ -340,6 +354,7 @@ pub(super) fn start(
         pending: None,
         waiting: VecDeque::new(),
         serial: 0,
+        transferred: None,
         started,
         ticked: started,
     };
@@ -380,6 +395,14 @@ fn validate(config: &ReplicaConfig) -> Result<(), Refusal> {
                 "members must be nonzero, unique and disjoint",
             ));
         }
+    }
+    if let Some(bootstrap) = &config.bootstrap
+        && !config.voters.contains(&bootstrap.source_node)
+    {
+        return Err(api::invalid(
+            "bootstrap source",
+            "source must be an initial voter",
+        ));
     }
     if !unique.contains(&config.node_id) {
         return Err(api::invalid(
@@ -436,6 +459,10 @@ impl Actor {
         u64::try_from(self.started.elapsed().as_nanos()).map_err(unavailable)
     }
     fn refresh(&mut self) -> Result<(), Refusal> {
+        if self.replica.machine().bootstrap_pending() {
+            self.published = self.replica.applied().index;
+            return Ok(());
+        }
         self.replica
             .machine_mut()
             .read_db(|db| reload_changed(db, &self.changed).map_err(Into::into))?;
@@ -503,12 +530,21 @@ impl Actor {
                 self.refresh()?;
             }
             self.expire();
-            if self.pending.is_none()
+            self.bootstrap()?;
+            if !self.replica.machine().bootstrap_pending()
+                && self.pending.is_none()
                 && let Some(envelope) = self.waiting.pop_front()
             {
                 self.receive(envelope)?;
             }
-            if self.replica.compactable_bytes() >= 128 << 20 || self.replica.is_stalled() {
+            if self.replica.machine().bootstrap_pending() && self.replica.is_stalled() {
+                return Err(fenced(
+                    "bootstrap exhausted replication log admission before publication",
+                ));
+            }
+            if !self.replica.machine().bootstrap_pending()
+                && (self.replica.compactable_bytes() >= 128 << 20 || self.replica.is_stalled())
+            {
                 let nanos = self.now()?;
                 self.replica
                     .compact(0, nanos, std::task::Waker::noop())
@@ -523,17 +559,34 @@ impl Actor {
         }
     }
     fn expire(&mut self) {
-        let changed_term = self
-            .pending
-            .as_ref()
-            .is_some_and(|p| p.term != self.replica.term() || !self.replica.is_leader());
+        // Expired callers relinquish queued operations even while a seed or proposal is held.
+        // Rotate the bounded queue once; surviving requests retain their FIFO order.
+        let queued = self.waiting.len().min(COMMANDS);
+        for _ in 0..queued {
+            let Some(envelope) = self.waiting.pop_front() else {
+                break;
+            };
+            let expired = matches!(&envelope.command, Input::Submit { until, .. } if Instant::now() >= *until);
+            if expired {
+                if let Input::Submit { response, .. } = envelope.command {
+                    answer(response, Err(Refusal::Timeout));
+                }
+            } else {
+                self.waiting.push_back(envelope);
+            }
+        }
+        let changed_term = self.pending.as_ref().is_some_and(|p| {
+            p.term != self.replica.term()
+                || p.leader != self.replica.leader()
+                || self.replica.leader() == 0
+        });
         if changed_term {
             if let Some(mut pending) = self.pending.take()
                 && let Some(response) = pending.response.take()
             {
                 let refusal = match pending.phase {
                     Phase::Barrier(_) => nonleader(&self.replica),
-                    Phase::Proposed(_) => unknown(),
+                    Phase::Proposed(_) | Phase::Bootstrap(_) => unknown(),
                 };
                 answer(response, Err(refusal));
             }
@@ -544,7 +597,7 @@ impl Actor {
             .as_ref()
             .is_some_and(|p| Instant::now() >= p.until);
         if expired && let Some(mut pending) = self.pending.take() {
-            let proposed = matches!(pending.phase, Phase::Proposed(_));
+            let proposed = matches!(pending.phase, Phase::Proposed(_) | Phase::Bootstrap(_));
             if let Some(response) = pending.response.take() {
                 answer(
                     response,
@@ -594,9 +647,9 @@ impl Actor {
             } => {
                 if Instant::now() >= until {
                     answer(response, Err(Refusal::Timeout));
-                } else if !self.replica.is_leader() {
+                } else if self.replica.leader() == 0 {
                     answer(response, Err(nonleader(&self.replica)));
-                } else if self.pending.is_some() {
+                } else if self.pending.is_some() || self.replica.machine().bootstrap_pending() {
                     if self.waiting.len() >= COMMANDS {
                         answer(response, Err(Refusal::Full { limit: COMMANDS }));
                     } else {
@@ -611,25 +664,17 @@ impl Actor {
                         });
                     }
                 } else {
-                    self.serial = self
-                        .serial
-                        .checked_add(1)
-                        .ok_or_else(|| fenced("request identity exhausted"))?;
-                    // A restart must not confuse an old log entry with a new local request.
-                    // Leadership requires a new election term after reopen; the serial is unique
-                    // within that term, including read-only commands.
-                    let mut context = self.replica.id().to_le_bytes().to_vec();
-                    context.extend_from_slice(&self.replica.term().to_le_bytes());
-                    context.extend_from_slice(&self.serial.to_le_bytes());
+                    let context = self.context()?;
                     match self.replica.read(context.clone()) {
                         Ok(()) => {
                             self.pending = Some(Pending {
                                 context,
                                 term: self.replica.term(),
+                                leader: self.replica.leader(),
                                 until,
                                 namespace,
                                 response: Some(response),
-                                phase: Phase::Barrier(operation),
+                                phase: Phase::Barrier(Some(operation)),
                                 _reservation,
                             })
                         }
@@ -682,6 +727,19 @@ impl Actor {
                     Phase::Barrier(_) => {
                         Err(fenced("a read barrier matched an unapplied proposal"))
                     }
+                    Phase::Bootstrap(operation) => match applied.result {
+                        Ok(()) => {
+                            pending.phase = Phase::Barrier(operation);
+                            match self.replica.read(pending.context.clone()) {
+                                Ok(()) => {
+                                    self.pending = Some(pending);
+                                    continue;
+                                }
+                                Err(error) => Err(raft_error(error)),
+                            }
+                        }
+                        Err(error) => Err(error),
+                    },
                 };
                 if let Some(response) = pending.response.take() {
                     answer(response, result);
@@ -726,15 +784,82 @@ impl Actor {
         }
         Ok(())
     }
-    fn propose(&mut self, context: &[u8], bytes: Vec<u8>) -> Result<(), Refusal> {
-        let room = self
-            ._log
+    fn context(&mut self) -> Result<Vec<u8>, Refusal> {
+        self.serial = self
+            .serial
+            .checked_add(1)
+            .ok_or_else(|| fenced("request identity exhausted"))?;
+        // Followers can reopen within a term; the durable shell's fresh incarnation disambiguates
+        // an old log entry from a new request at the same origin.
+        let mut context = self.replica.id().to_le_bytes().to_vec();
+        context.extend_from_slice(&self.replica.term().to_le_bytes());
+        context.extend_from_slice(&self.replica.core().raft.config().incarnation.to_le_bytes());
+        context.extend_from_slice(&self.serial.to_le_bytes());
+        Ok(context)
+    }
+    fn bootstrap(&mut self) -> Result<(), Refusal> {
+        if !self.replica.machine().bootstrap_pending() || self.pending.is_some() {
+            return Ok(());
+        }
+        let source = self
+            .replica
+            .machine()
+            .bootstrap_source()
+            .ok_or_else(|| fenced("pending bootstrap has no designated source"))?;
+        if source != self.replica.id() || !self.replica.is_leader() {
+            // A failed transfer can be requested again after the core's twenty-tick election
+            // period. At most one such request is made per period, never a host election.
+            let period = TICK
+                .checked_mul(20)
+                .ok_or_else(|| fenced("tick period overflow"))?;
+            let due = self
+                .transferred
+                .is_none_or(|(term, at)| term != self.replica.term() || at.elapsed() >= period);
+            if due
+                && self.replica.leader() != 0
+                && (self.replica.is_leader() || source == self.replica.id())
+            {
+                self.replica.transfer(source).map_err(raft_error)?;
+                self.transferred = Some((self.replica.term(), Instant::now()));
+            }
+            return Ok(());
+        }
+        let context = self.context()?;
+        self.replica.read(context.clone()).map_err(raft_error)?;
+        // One internal attempt has a finite lease; committed chunk progress survives its expiry.
+        // User requests retain their own deadlines in the bounded waiting queue throughout.
+        let until = Instant::now()
+            .checked_add(Duration::from_secs(60))
+            .ok_or_else(|| fenced("bootstrap deadline overflow"))?;
+        self.pending = Some(Pending {
+            context,
+            term: self.replica.term(),
+            leader: self.replica.leader(),
+            until,
+            namespace: String::new(),
+            response: None,
+            phase: Phase::Barrier(None),
+            _reservation: Reservation {
+                control: Arc::clone(&self.control),
+                bytes: 0,
+            },
+        });
+        Ok(())
+    }
+    fn entry_room(&self, context: usize) -> Result<usize, Refusal> {
+        self._log
             .entry_room()
             .map_err(unavailable)?
             .checked_sub(hyper_durable::ENTRY_OVERHEAD)
-            .and_then(|room| room.checked_sub(context.len()))
-            .ok_or_else(|| fenced("replication log cannot hold the proposal envelope"))?;
-        api::bound("replication log entry", bytes.len(), room)?;
+            .and_then(|room| room.checked_sub(context))
+            .ok_or_else(|| fenced("replication log cannot hold the proposal envelope"))
+    }
+    fn propose(&mut self, context: &[u8], bytes: Vec<u8>) -> Result<(), Refusal> {
+        api::bound(
+            "replication log entry",
+            bytes.len(),
+            self.entry_room(context.len())?,
+        )?;
         self.replica
             .propose(context.to_vec(), bytes)
             .map_err(raft_error)
@@ -743,7 +868,10 @@ impl Actor {
         let Some(mut pending) = self.pending.take() else {
             return Ok(());
         };
-        if pending.term != self.replica.term() || !self.replica.is_leader() {
+        if pending.term != self.replica.term()
+            || pending.leader != self.replica.leader()
+            || self.replica.leader() == 0
+        {
             if let Some(response) = pending.response.take() {
                 answer(response, Err(nonleader(&self.replica)));
             }
@@ -759,7 +887,57 @@ impl Actor {
             self.pending = Some(pending);
             return Ok(());
         };
+        if self.replica.machine().bootstrap_pending() {
+            let source = self
+                .replica
+                .machine()
+                .bootstrap_source()
+                .ok_or_else(|| fenced("pending bootstrap has no designated source"))?;
+            if source != self.replica.id() || !self.replica.is_leader() {
+                // The core's transfer request names its target in `from`. Only the source can
+                // forward that request authenticated as itself; a leader executes it locally.
+                if self.replica.is_leader() || source == self.replica.id() {
+                    self.replica.transfer(source).map_err(raft_error)?;
+                }
+                if let Some(response) = pending.response.take() {
+                    answer(
+                        response,
+                        Err(Refusal::NotLeader {
+                            leader: Some(source),
+                        }),
+                    );
+                }
+                return Ok(());
+            }
+            let room = self
+                .entry_room(pending.context.len())?
+                .min(crate::replication::COMMAND_BYTES);
+            let seed = self.replica.machine_mut().prepare_bootstrap(room);
+            let result = match seed {
+                Ok(Some(bytes)) => self.propose(&pending.context, bytes),
+                Ok(None) => Err(fenced("pending bootstrap produced no seed chunk")),
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(()) => {
+                    pending.phase = Phase::Bootstrap(operation);
+                    self.pending = Some(pending);
+                }
+                Err(error) => {
+                    if let Some(response) = pending.response.take() {
+                        answer(response, Err(error));
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let Some(operation) = operation else {
+            return Ok(());
+        };
         let prepared = self.replica.machine_mut().prepare_db(|db| {
+            // The guard ends with application evaluation, before prepare_pages rolls back its
+            // speculative transaction. Cleanup must run even after the SQL deadline elapsed.
+            let _deadline = db.deadline(pending.until);
             if restore::incomplete(db)? {
                 return Err(api::invalid("database", "restore is incomplete").into());
             }
@@ -793,7 +971,11 @@ impl Actor {
                     }
                 }
             }
-            Err(error) => Err(error),
+            Err(error) => Err(if Instant::now() >= pending.until {
+                Refusal::Timeout
+            } else {
+                error
+            }),
         };
         if let Some(response) = pending.response.take() {
             answer(response, result);
@@ -829,6 +1011,7 @@ mod tests {
                 node_id: 1,
                 voters,
                 learners: Vec::new(),
+                bootstrap: None,
             },
             Arc::new(Changed::default()),
             lease,
@@ -899,6 +1082,17 @@ mod tests {
             client.handle().receive(3, bytes, deadline()),
             Err(Refusal::Invalid { .. })
         ));
+        let mut foreign = Vec::new();
+        Message {
+            from: 4,
+            to: 1,
+            ..Message::default()
+        }
+        .encode(&mut foreign);
+        assert!(matches!(
+            client.handle().receive(4, foreign, deadline()),
+            Err(Refusal::Invalid { .. })
+        ));
         assert!(matches!(
             client.handle().drain(OUTGOING_MESSAGES + 1),
             Err(Refusal::TooLarge { .. })
@@ -927,5 +1121,366 @@ mod tests {
         assert!(reopened.handle().status().unwrap().applied >= applied);
         assert_eq!(call(&reopened, value).unwrap(), chosen);
         assert_eq!(evaluated.load(Ordering::Relaxed), 1);
+    }
+    /// U15/CP-T1.8: a SQL deadline interrupts execution, rolls back capture and frees the driver.
+    #[test]
+    fn expired_sql_rolls_back_before_actor_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = open(dir.path(), vec![1]);
+        leader(&client);
+        let ran = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&ran);
+        let operation = Operation::Call(Mutex::new(Some(Box::new(move |db| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            db.exec("CREATE TABLE cancelled_actor_write(value); WITH RECURSIVE n(x) AS(VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000000) SELECT sum(x) FROM n")?;
+            Ok(Box::new(Vec::<u8>::new()) as Box<dyn Any + Send>)
+        }))));
+        let result = client.submit(
+            String::new(),
+            operation,
+            Instant::now() + Duration::from_millis(200),
+        );
+        assert!(matches!(
+            result,
+            Err(Refusal::Timeout | Refusal::UnknownOutcome)
+        ));
+        assert_eq!(ran.load(Ordering::Relaxed), 1);
+        let retained = call(&client, |db| {
+            let mut count = 0;
+            db.query(
+                "SELECT count(*) FROM sqlite_schema WHERE name='cancelled_actor_write'",
+                [],
+                |row| {
+                    count = row.get::<i64>(0).map_err(unavailable)?;
+                    Ok(false)
+                },
+            )?;
+            Ok(vec![u8::try_from(count)?])
+        })
+        .unwrap();
+        assert_eq!(retained, vec![0]);
+    }
+    fn pump(clients: &[Client]) -> usize {
+        let mut delivered = 0;
+        for (index, client) in clients.iter().enumerate() {
+            let from = u64::try_from(index + 1).unwrap();
+            for message in client.handle().drain(OUTGOING_MESSAGES).unwrap() {
+                let peer = clients
+                    .get(usize::try_from(message.to - 1).unwrap())
+                    .unwrap();
+                peer.handle()
+                    .receive(from, message.bytes, deadline())
+                    .unwrap();
+                delivered += 1;
+            }
+        }
+        delivered
+    }
+    fn pumped_call(
+        clients: &[Client],
+        origin: usize,
+        f: impl FnOnce(&mut Db) -> anyhow::Result<Vec<u8>> + Send + 'static,
+    ) -> Result<Vec<u8>, Refusal> {
+        let client = clients.get(origin).unwrap().clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || sender.send(call(&client, f)).unwrap());
+        let until = deadline();
+        let result = loop {
+            match receiver.try_recv() {
+                Ok(result) => break result,
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(error) => panic!("actor caller ended: {error}"),
+            }
+            assert!(
+                Instant::now() < until,
+                "follower-origin command did not settle"
+            );
+            pump(clients);
+            std::thread::park_timeout(POLL);
+        };
+        worker.join().unwrap();
+        result
+    }
+
+    /// U15/CP-T1.8: follower calls use the real leader's ReadIndex and proposal forwarding.
+    #[test]
+    fn follower_origin_captures_once_and_reads_after_local_durable_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut clients = Vec::new();
+        for node_id in 1..=3 {
+            let path = dir.path().join(format!("state-{node_id}.db"));
+            let lease = Arc::new(exclusive_file(&path).unwrap());
+            clients.push(
+                start(
+                    &path,
+                    &dir.path().join(format!("raft-{node_id}.log")),
+                    ReplicaConfig {
+                        node_id,
+                        voters: vec![1, 2, 3],
+                        learners: Vec::new(),
+                        bootstrap: None,
+                    },
+                    Arc::new(Changed::default()),
+                    lease,
+                    deadline(),
+                )
+                .unwrap(),
+            );
+        }
+        let until = deadline();
+        let mut delivered = 0;
+        let leader = loop {
+            delivered += pump(&clients);
+            let states: Vec<_> = clients
+                .iter()
+                .map(|c| c.handle().status().unwrap())
+                .collect();
+            let candidate = states.first().unwrap().leader;
+            if candidate != 0
+                && states
+                    .iter()
+                    .all(|s| s.leader == candidate && s.applied > 0)
+            {
+                break usize::try_from(candidate - 1).unwrap();
+            }
+            assert!(
+                Instant::now() < until,
+                "three product actors did not elect: {states:?}"
+            );
+            std::thread::park_timeout(POLL);
+        };
+        assert!(delivered > 0);
+        let origin = (leader + 1) % 3;
+        let evaluated = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&evaluated);
+        let chosen = pumped_call(&clients, origin, move |db| {
+            count.fetch_add(1, Ordering::Relaxed);
+            db.exec("CREATE TABLE actor_items(value BLOB DEFAULT(randomblob(32))); INSERT INTO actor_items DEFAULT VALUES")?;
+            value(db)
+        }).unwrap();
+        assert_eq!(evaluated.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            pumped_call(&clients, (origin + 1) % 3, value).unwrap(),
+            chosen
+        );
+        assert_eq!(evaluated.load(Ordering::Relaxed), 1);
+
+        // Force both follower closures to prepare from the same committed base, while the
+        // leader keeps driving. Exactly one page set may apply; the stale one's answer is refused.
+        let ready = Arc::new(AtomicUsize::new(0));
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let mut workers = Vec::new();
+        for offset in 1..=2 {
+            let client = clients.get((leader + offset) % 3).unwrap().clone();
+            let ready = Arc::clone(&ready);
+            let sender = sender.clone();
+            workers.push(std::thread::spawn(move || {
+                let result = call(&client, move |db| {
+                    ready.fetch_add(1, Ordering::AcqRel);
+                    let until = deadline();
+                    while ready.load(Ordering::Acquire) < 2 {
+                        assert!(
+                            Instant::now() < until,
+                            "concurrent captures did not rendezvous"
+                        );
+                        std::thread::park_timeout(POLL);
+                    }
+                    db.exec("INSERT INTO actor_items(value) VALUES(x'01')")?;
+                    Ok(vec![1])
+                });
+                sender.send(result).unwrap();
+            }));
+        }
+        drop(sender);
+        let until = deadline();
+        let mut outcomes = Vec::new();
+        while outcomes.len() < 2 {
+            if let Ok(outcome) = receiver.try_recv() {
+                outcomes.push(outcome);
+            }
+            assert!(
+                Instant::now() < until,
+                "concurrent proposals did not settle"
+            );
+            pump(&clients);
+            std::thread::park_timeout(POLL);
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(ready.load(Ordering::Acquire), 2);
+        assert_eq!(
+            outcomes.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "{outcomes:?}"
+        );
+        assert_eq!(outcomes.iter().filter(|r| matches!(r, Err(Refusal::Invalid { what, .. }) if what == "prepared transaction")).count(), 1, "{outcomes:?}");
+        assert!(clients.iter().all(|c| c.handle().status().is_ok()));
+        let count = pumped_call(&clients, origin, |db| {
+            db.exec("INSERT INTO actor_items(value) VALUES(x'03')")?;
+            let mut count = 0;
+            db.query("SELECT count(*) FROM actor_items", [], |row| {
+                count = row.get::<i64>(0).map_err(unavailable)?;
+                Ok(false)
+            })?;
+            Ok(vec![u8::try_from(count)?])
+        })
+        .unwrap();
+        assert_eq!(count, vec![3]);
+    }
+    /// U15/CP-T1.8: malformed membership and a source that cannot lead are refused at admission.
+    #[test]
+    fn malformed_initial_membership_is_refused() {
+        let valid = ReplicaConfig {
+            node_id: 1,
+            voters: vec![1, 2, 3],
+            learners: Vec::new(),
+            bootstrap: None,
+        };
+        assert!(validate(&valid).is_ok());
+        for config in [
+            ReplicaConfig {
+                node_id: 0,
+                ..valid.clone()
+            },
+            ReplicaConfig {
+                voters: Vec::new(),
+                ..valid.clone()
+            },
+            ReplicaConfig {
+                voters: vec![1, 1],
+                ..valid.clone()
+            },
+            ReplicaConfig {
+                learners: vec![2],
+                ..valid.clone()
+            },
+            ReplicaConfig {
+                node_id: 9,
+                ..valid.clone()
+            },
+            ReplicaConfig {
+                learners: vec![4],
+                bootstrap: Some(api::replication::Bootstrap {
+                    source_node: 4,
+                    source_id: [0; 32],
+                }),
+                ..valid.clone()
+            },
+        ] {
+            assert!(matches!(validate(&config), Err(Refusal::Invalid { .. })));
+        }
+    }
+    fn seeded_nodes(dir: &Path, bootstrap: &api::replication::Bootstrap) -> Vec<Client> {
+        let mut clients = Vec::new();
+        for node_id in 1..=3 {
+            let path = dir.join(format!("state-{node_id}.db"));
+            let until = deadline();
+            let lease = loop {
+                match exclusive_file(&path) {
+                    Ok(lease) => break Arc::new(lease),
+                    Err(error) => {
+                        assert!(Instant::now() < until, "seed owner did not drain: {error}");
+                        std::thread::park_timeout(POLL);
+                    }
+                }
+            };
+            clients.push(
+                start(
+                    &path,
+                    &dir.join(format!("raft-{node_id}.log")),
+                    ReplicaConfig {
+                        node_id,
+                        voters: vec![1, 2, 3],
+                        learners: Vec::new(),
+                        bootstrap: Some(bootstrap.clone()),
+                    },
+                    Arc::new(Changed::default()),
+                    lease,
+                    until,
+                )
+                .unwrap(),
+            );
+        }
+        clients
+    }
+    fn known_leader(clients: &[Client]) {
+        let until = deadline();
+        loop {
+            pump(clients);
+            if clients
+                .iter()
+                .all(|c| c.handle().status().unwrap().leader != 0)
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < until,
+                "seed actors did not discover a leader"
+            );
+            std::thread::park_timeout(POLL);
+        }
+    }
+    fn unchanged(db: &mut Db) -> anyhow::Result<Vec<u8>> {
+        let mut value = Vec::new();
+        db.query("SELECT value FROM baseline_items WHERE id = 1", [], |row| {
+            value = row
+                .get_value(0)
+                .to_blob()
+                .ok_or_else(|| anyhow::anyhow!("expected blob"))?
+                .to_vec();
+            Ok(false)
+        })?;
+        Ok(value)
+    }
+    /// U15/CP-T1.8: a complete original image precedes every delta, including untouched pages.
+    #[test]
+    fn autonomous_quorum_seed_preserves_unchanged_pages_then_delta_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("state-3.db");
+        let original = {
+            let mut db = Db::open(&source).unwrap();
+            db.exec("CREATE TABLE baseline_items(id INTEGER PRIMARY KEY,value BLOB); INSERT INTO baseline_items VALUES(1,randomblob(9000)); INSERT INTO baseline_items VALUES(2,x'02')").unwrap();
+            db.flusher()().unwrap();
+            unchanged(&mut db).unwrap()
+        };
+        let bootstrap = crate::replication::bootstrap::inspect_source(&source, 3).unwrap();
+        let clients = seeded_nodes(dir.path(), &bootstrap);
+        known_leader(&clients);
+        // This can be admitted before the last seed chunk commits. The closure must wait in the
+        // product queue, while autonomous source transfer and seed application keep driving.
+        assert_eq!(pumped_call(&clients, 0, unchanged).unwrap(), original);
+        pumped_call(&clients, 1, |db| {
+            db.exec("UPDATE baseline_items SET value=x'03' WHERE id=2")?;
+            Ok(Vec::new())
+        })
+        .unwrap();
+        for origin in 0..3 {
+            assert_eq!(pumped_call(&clients, origin, unchanged).unwrap(), original);
+        }
+        drop(clients);
+        let reopened = seeded_nodes(dir.path(), &bootstrap);
+        known_leader(&reopened);
+        for client in &reopened {
+            let status = client.handle().status().unwrap();
+            assert_eq!(status.voters, vec![1, 2, 3]);
+            assert!(status.learners.is_empty());
+            assert!(status.fenced.is_none());
+        }
+        for origin in 0..3 {
+            assert_eq!(
+                pumped_call(&reopened, origin, |db| {
+                    let mut value = Vec::new();
+                    db.query("SELECT value FROM baseline_items WHERE id=2", [], |row| {
+                        value = row.get_value(0).to_blob().unwrap().to_vec();
+                        Ok(false)
+                    })?;
+                    Ok(value)
+                })
+                .unwrap(),
+                vec![3]
+            );
+            assert_eq!(pumped_call(&reopened, origin, unchanged).unwrap(), original);
+        }
     }
 }

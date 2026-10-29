@@ -147,7 +147,56 @@ pub struct Db {
     owner: Option<Arc<std::fs::File>>,
 }
 
+pub(crate) struct Deadline {
+    connection: Arc<Connection>,
+}
+impl Drop for Deadline {
+    fn drop(&mut self) {
+        self.connection.set_progress_handler(0, None);
+    }
+}
+
 impl Db {
+    /// Read-only source inspection. This opens no directories, creates no database, and executes
+    /// no writable connection PRAGMAs. The caller owns the product's external lease.
+    pub(crate) fn open_readonly(path: &Path) -> anyhow::Result<Self> {
+        let name = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("the database path is not UTF-8"))?;
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(fail)?);
+        // Do not let a registry hit substitute a writable engine for this inspection handle.
+        let db = Database::do_open(
+            Arc::clone(&io),
+            name,
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .flags(OpenFlags::ReadOnly)
+                .db_opts(DatabaseOpts::new().with_without_rowid(true)),
+        )
+        .map_err(fail)?;
+        let conn = db.connect(ConnectOpts::new()).map_err(fail)?;
+        conn.set_statement_journals(false);
+        Ok(Self {
+            io,
+            db,
+            conn,
+            path: path.to_path_buf(),
+            statements: cache::Cache::default(),
+            owner: None,
+        })
+    }
+
+    /// Bound SQL VM work by the request's absolute deadline. The owning caller drops this guard
+    /// before COMMIT/ROLLBACK cleanup, so cancellation cannot interrupt recovery of its session.
+    pub(crate) fn deadline(&self, until: Instant) -> Deadline {
+        // An administrative cancellation quantum, not a throughput tuning claim. A SQL VM can
+        // execute at most 1024 further instructions between deadline checks.
+        self.conn
+            .set_progress_handler(1024, Some(Box::new(move || Instant::now() >= until)));
+        Deadline {
+            connection: Arc::clone(&self.conn),
+        }
+    }
+
     /// The database at `path`, made as needed, for a store's writer: a commit writes the log and
     /// doesn't flush it (the store's flusher does, [`Db::flusher`]), and no checkpoint runs in a
     /// commit (the store's checkpointer copies the log, [`Db::checkpoint`]). A checkpoint still
@@ -371,7 +420,11 @@ impl Db {
     pub fn exec(&self, sql: &str) -> anyhow::Result<()> {
         // The engine's parser knows where a statement ends, including trigger bodies and quoted
         // semicolons. U05: splitting text on ';' corrupts valid migration scripts.
-        self.conn.prepare_execute_batch(sql).map_err(fail)
+        let result = self.conn.prepare_execute_batch(sql).map_err(fail);
+        // A failed script may have executed DDL before refusing. Invalidate on its actual schema,
+        // including rollback and raw-image reparses, without flushing every BEGIN/COMMIT.
+        self.statements.schema(self.conn.current_schema())?;
+        result
     }
 
     /// Owned/dynamic SQL without an unbounded statement cache (U05). The caller bounds results.
@@ -381,12 +434,20 @@ impl Db {
         params: impl IntoIterator<Item = Value>,
         each: impl FnMut(&Row) -> anyhow::Result<bool>,
     ) -> anyhow::Result<()> {
+        let schema = self.conn.current_schema();
+        self.statements.schema(Arc::clone(&schema))?;
         let mut stmt = match self.statements.take(sql)? {
             Some(stmt) => stmt,
             None => self.conn.prepare(sql).map_err(fail)?,
         };
         step(self.io.as_ref(), &mut stmt, params, each)?;
-        self.statements.put(sql, stmt)?;
+        let current = self.conn.current_schema();
+        self.statements.schema(Arc::clone(&current))?;
+        // A callback can change schema and run another query. Never return this checked-out
+        // statement under that later schema's cache identity.
+        if Arc::ptr_eq(&schema, &current) && schema.schema_version == current.schema_version {
+            self.statements.put(sql, stmt)?;
+        }
         Ok(())
     }
 
@@ -395,6 +456,7 @@ impl Db {
     }
 
     pub fn column_count(&self, sql: &str) -> anyhow::Result<usize> {
+        self.statements.schema(self.conn.current_schema())?;
         let stmt = match self.statements.take(sql)? {
             Some(stmt) => stmt,
             None => self.conn.prepare(sql).map_err(fail)?,
@@ -536,6 +598,11 @@ impl Db {
         match result {
             Ok(answer) => {
                 self.conn.wal_insert_end(true).map_err(fail)?;
+                // An installed image can replace a catalog at an equal or older schema cookie.
+                // Publish that exact committed schema so readers cannot re-adopt the old one.
+                self.conn
+                    .publish_schema_after_external_restore()
+                    .map_err(fail)?;
                 self.statements.clear()?;
                 Ok(answer)
             }
@@ -652,6 +719,72 @@ pub fn step(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// U15/CP-T1.8: failure after raw pages and schema refresh must expose neither the imported
+    /// catalog nor its rows. A later successful apply persists both through the real flusher.
+    #[test]
+    fn raw_page_failure_restores_catalog_and_success_persists_the_same_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = Db::open(&dir.path().join("source.db")).unwrap();
+        source
+            .exec("CREATE TABLE replacement(value TEXT); INSERT INTO replacement VALUES ('seed')")
+            .unwrap();
+        let image = source.image_pages(1 << 20).unwrap();
+        let target_path = dir.path().join("target.db");
+        let mut target = Db::open(&target_path).unwrap();
+        target
+            .exec("CREATE TABLE original(value TEXT); INSERT INTO original VALUES ('retained'); CREATE TABLE discarded_one(n); CREATE TABLE discarded_two(n)")
+            .unwrap();
+        target.flusher()().unwrap();
+        let failed: anyhow::Result<()> = target.apply_pages(&image, |db| {
+            db.query("SELECT value FROM replacement", [], |row| {
+                assert_eq!(row.get::<String>(0).unwrap(), "seed");
+                Ok(false)
+            })?;
+            anyhow::bail!("refuse before imported pages receive their commit marker")
+        });
+        assert!(failed.is_err());
+        target
+            .query("SELECT value FROM original", [], |row| {
+                assert_eq!(row.get::<String>(0).unwrap(), "retained");
+                Ok(false)
+            })
+            .unwrap();
+        assert!(
+            target
+                .query("SELECT value FROM replacement", [], |_| Ok(false))
+                .is_err()
+        );
+        target
+            .apply_pages(&image, |db| {
+                db.exec("INSERT INTO replacement VALUES ('committed')")
+            })
+            .unwrap();
+        target.flusher()().unwrap();
+        let reader = target.reader().unwrap();
+        reader
+            .query("SELECT value FROM replacement WHERE rowid = 1", [], |row| {
+                assert_eq!(row.get::<String>(0).unwrap(), "seed");
+                Ok(false)
+            })
+            .unwrap();
+        drop(reader);
+        drop(target);
+        let target = Db::open(&target_path).unwrap();
+        let mut rows = Vec::new();
+        target
+            .query("SELECT value FROM replacement ORDER BY rowid", [], |row| {
+                rows.push(row.get::<String>(0).unwrap());
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(rows, ["seed", "committed"]);
+        assert!(
+            target
+                .query("SELECT value FROM original", [], |_| Ok(false))
+                .is_err()
+        );
+    }
 
     /// Do: size the process's pool for 32 GiB, for 16 MiB, for none said and for more than a
     /// `usize` holds. Expect: a quarter in 4 KiB pages, the floor, the fallback, and no overflow

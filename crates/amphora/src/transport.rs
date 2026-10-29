@@ -5,8 +5,10 @@ mod auth;
 mod bounded;
 mod common;
 mod endpoint;
+mod watch;
 mod wire;
 pub use common::{Client, Namespace, Owner};
+pub use watch::Watch;
 
 /// The peer disappeared after submission: durability may already have completed.
 #[derive(Debug, thiserror::Error)]

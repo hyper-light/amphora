@@ -19,6 +19,15 @@ use serde::{Deserialize, Serialize};
 use crate::db::Db;
 
 pub use crate::database::replicated::ReplicaHandle;
+pub mod bootstrap;
+
+const BASELINE_DELTA: &[u8] = b"amphora.delta.v1\0";
+const BASELINE_SNAPSHOT: &[u8] = b"amphora.snapshot.v1\0";
+#[derive(Serialize, Deserialize)]
+struct BaselineSnapshot {
+    declaration: api::replication::Bootstrap,
+    pages: Vec<(u32, Vec<u8>)>,
+}
 
 const META: &str = "CREATE TABLE IF NOT EXISTS __amphora_replica (id INTEGER PRIMARY KEY CHECK(id = 1), applied TEXT NOT NULL, term TEXT NOT NULL, configuration BLOB NOT NULL)";
 /// One resolved transaction's page budget. Oversize transactions are refused before proposal.
@@ -32,6 +41,8 @@ pub struct Prepared {
     base_index: u64,
     base_term: u64,
     pages: Vec<(u32, Vec<u8>)>,
+    #[serde(skip)]
+    baseline: Option<api::replication::Bootstrap>,
 }
 
 impl Prepared {
@@ -40,7 +51,13 @@ impl Prepared {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, Refusal> {
-        let bytes = postcard::to_allocvec(self).map_err(unavailable)?;
+        let bytes = if let Some(declaration) = &self.baseline {
+            let mut bytes = BASELINE_DELTA.to_vec();
+            bytes.extend(postcard::to_allocvec(&(declaration, self)).map_err(unavailable)?);
+            bytes
+        } else {
+            postcard::to_allocvec(self).map_err(unavailable)?
+        };
         api::bound(
             "replicated command",
             bytes.len(),
@@ -55,7 +72,14 @@ impl Prepared {
             bytes.len(),
             COMMAND_BYTES.saturating_add(ENVELOPE_BYTES),
         )?;
-        let prepared: Self = postcard::from_bytes(bytes).map_err(unavailable)?;
+        let prepared: Self = if let Some(payload) = bytes.strip_prefix(BASELINE_DELTA) {
+            let (declaration, mut prepared): (api::replication::Bootstrap, Self) =
+                postcard::from_bytes(payload).map_err(unavailable)?;
+            prepared.baseline = Some(declaration);
+            prepared
+        } else {
+            postcard::from_bytes(bytes).map_err(unavailable)?
+        };
         validate_pages(&prepared.pages, COMMAND_BYTES)?;
         Ok(prepared)
     }
@@ -74,6 +98,7 @@ pub struct Machine {
     db: Db,
     point: Point,
     configuration: ConfState,
+    baseline: bootstrap::Baseline,
     _owner: std::sync::Arc<std::fs::File>,
 }
 
@@ -119,14 +144,24 @@ fn marker(db: &mut Db, point: Point, configuration: &ConfState) -> anyhow::Resul
 impl Machine {
     pub fn open(path: &Path, initial: ConfState) -> Result<Self, Refusal> {
         let owner = std::sync::Arc::new(crate::database::exclusive_file(path)?);
-        Self::open_with_owner(path, initial, owner)
+        Self::open_with_owner(path, initial, owner, 0, None)
     }
 
     pub(crate) fn open_with_owner(
         path: &Path,
         initial: ConfState,
         owner: std::sync::Arc<std::fs::File>,
+        node_id: u64,
+        bootstrap: Option<api::replication::Bootstrap>,
     ) -> Result<Self, Refusal> {
+        if let Some(declaration) = &bootstrap
+            && (node_id == 0 || !initial.voters.contains(&declaration.source_node))
+        {
+            return Err(api::invalid(
+                "replica baseline",
+                "the declared source must be an initial voter and the local node ID must be positive",
+            ));
+        }
         let mut db = Db::open(path).map_err(unavailable)?;
         db.hold_owner(std::sync::Arc::clone(&owner));
         let mut marked = false;
@@ -139,34 +174,37 @@ impl Machine {
             },
         )
         .map_err(unavailable)?;
-        if !marked {
-            let mut occupied = false;
-            db.query("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB '__amphora_*' AND name NOT GLOB 'sqlite_*' LIMIT 1", [], |_| { occupied = true; Ok(false) }).map_err(unavailable)?;
-            let mut records = false;
+        // Check unfinished legacy adoption before retaining any image or creating a marker.
+        let mut restore_table = false;
+        db.query(
+            "SELECT 1 FROM sqlite_schema WHERE name = '__amphora_restore'",
+            [],
+            |_| {
+                restore_table = true;
+                Ok(false)
+            },
+        )
+        .map_err(unavailable)?;
+        if restore_table {
+            let mut incomplete = false;
             db.query(
-                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '__amphora_versions'",
+                "SELECT 1 FROM __amphora_restore WHERE done = 0 LIMIT 1",
                 [],
                 |_| {
-                    records = true;
+                    incomplete = true;
                     Ok(false)
                 },
             )
             .map_err(unavailable)?;
-            if records {
-                db.query("SELECT 1 FROM __amphora_versions LIMIT 1", [], |_| {
-                    occupied = true;
-                    Ok(false)
-                })
-                .map_err(unavailable)?;
-            }
-            if occupied {
+            if incomplete {
                 return Err(api::invalid(
                     "replica baseline",
-                    "existing local data requires a product-owned committed seed before replicated startup",
+                    "complete the pinned restore before replicated startup",
                 ));
             }
         }
-        crate::database::bootstrap_db(&mut db)?;
+        let baseline = bootstrap::Baseline::open(&mut db, node_id, bootstrap, marked)?;
+        crate::database::bootstrap_db(&db)?;
         let mut incomplete = false;
         db.query("SELECT 1 FROM __amphora_restore WHERE done = 0", [], |_| {
             incomplete = true;
@@ -196,6 +234,11 @@ impl Machine {
             },
         )
         .map_err(unavailable)?;
+        if marked && state.is_none() {
+            return Err(Refusal::Fenced(
+                "replica table lacks its durable applied marker".into(),
+            ));
+        }
         let (point, configuration) = state.unwrap_or((Point::default(), initial));
         db.transaction(|db| marker(db, point, &configuration))
             .map_err(unavailable)?;
@@ -204,14 +247,35 @@ impl Machine {
             db,
             point,
             configuration,
+            baseline,
             _owner: owner,
         })
+    }
+
+    pub(crate) fn bootstrap_pending(&self) -> bool {
+        self.baseline.pending()
+    }
+    pub(crate) fn bootstrap_source(&self) -> Option<u64> {
+        self.baseline.source()
+    }
+    pub(crate) fn prepare_bootstrap(&self, entry_room: usize) -> Result<Option<Vec<u8>>, Refusal> {
+        self.baseline.proposal(entry_room)
+    }
+    fn require_baseline(&self) -> Result<(), Refusal> {
+        if self.baseline.pending() {
+            return Err(api::invalid(
+                "replica baseline",
+                "initial image has not committed; canonical operations are withheld",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn prepare_db<R>(
         &mut self,
         f: impl FnOnce(&mut Db) -> anyhow::Result<R>,
     ) -> Result<(Prepared, R), Refusal> {
+        self.require_baseline()?;
         let (answer, pages) = self
             .db
             .prepare_pages(COMMAND_BYTES, f)
@@ -222,6 +286,7 @@ impl Machine {
                 base_index: self.point.index,
                 base_term: self.point.term,
                 pages,
+                baseline: self.baseline.declaration().cloned(),
             },
             answer,
         ))
@@ -247,6 +312,7 @@ impl Machine {
         &mut self,
         f: impl FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R>,
     ) -> Result<(Prepared, R), Refusal> {
+        self.require_baseline()?;
         let (answer, pages) = self
             .db
             .prepare_pages(COMMAND_BYTES, |db| {
@@ -262,6 +328,7 @@ impl Machine {
                 base_index: self.point.index,
                 base_term: self.point.term,
                 pages,
+                baseline: self.baseline.declaration().cloned(),
             },
             answer,
         ))
@@ -272,6 +339,7 @@ impl Machine {
         &mut self,
         f: impl FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R>,
     ) -> Result<R, Refusal> {
+        self.require_baseline()?;
         let (answer, pages) = self
             .db
             .prepare_pages(COMMAND_BYTES, |db| {
@@ -317,10 +385,32 @@ impl StateMachine for Machine {
             index: entry.index,
             term: entry.term,
         };
+        if !entry.data.is_empty()
+            && self
+                .baseline
+                .apply_seed(&mut self.db, entry.data, |db| {
+                    crate::database::bootstrap_db(db)?;
+                    db.exec(META)?;
+                    marker(db, at, &self.configuration)
+                })
+                .map_err(failed)?
+        {
+            self.point = at;
+            answers.push(Applied {
+                index: entry.index,
+                context: entry.context.to_vec(),
+                result: Ok(()),
+            });
+            return Ok(());
+        }
         let mut result = Ok(());
         let mut pages = Vec::new();
         if !entry.data.is_empty() {
+            self.require_baseline().map_err(failed)?;
             let prepared = Prepared::decode(entry.data).map_err(failed)?;
+            if prepared.baseline.as_ref() != self.baseline.declaration() {
+                return Err(failed("resolved delta baseline identity differs"));
+            }
             if prepared.base_index == self.point.index && prepared.base_term == self.point.term {
                 pages = prepared.pages;
             } else {
@@ -360,8 +450,21 @@ impl StateMachine for Machine {
     }
 
     fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
+        self.require_baseline().map_err(failed)?;
         let pages = self.db.image_pages(SNAPSHOT_BYTES).map_err(failed)?;
-        let bytes = postcard::to_allocvec(&pages).map_err(failed)?;
+        let bytes = if let Some(declaration) = self.baseline.declaration() {
+            let mut bytes = BASELINE_SNAPSHOT.to_vec();
+            bytes.extend(
+                postcard::to_allocvec(&BaselineSnapshot {
+                    declaration: declaration.clone(),
+                    pages,
+                })
+                .map_err(failed)?,
+            );
+            bytes
+        } else {
+            postcard::to_allocvec(&pages).map_err(failed)?
+        };
         api::bound(
             "snapshot",
             bytes.len(),
@@ -381,12 +484,35 @@ impl StateMachine for Machine {
             SNAPSHOT_BYTES.saturating_add(ENVELOPE_BYTES),
         )
         .map_err(failed)?;
-        let pages: Vec<(u32, Vec<u8>)> = postcard::from_bytes(image).map_err(failed)?;
+        let pages: Vec<(u32, Vec<u8>)> =
+            if let Some(payload) = image.strip_prefix(BASELINE_SNAPSHOT) {
+                let snapshot: BaselineSnapshot = postcard::from_bytes(payload).map_err(failed)?;
+                if self.baseline.declaration() != Some(&snapshot.declaration) {
+                    return Err(failed("snapshot baseline declaration differs"));
+                }
+                snapshot.pages
+            } else {
+                if self.baseline.declaration().is_some() {
+                    return Err(failed("snapshot lacks declared baseline identity"));
+                }
+                postcard::from_bytes(image).map_err(failed)?
+            };
         validate_pages(&pages, SNAPSHOT_BYTES).map_err(failed)?;
         if pages.first().map(|p| p.0) != Some(1) {
             return Err(failed("snapshot lacks its database header"));
         }
-        self.advance(at, &pages, configuration)
+        self.db
+            .apply_pages(&pages, |db| {
+                db.exec(META)?;
+                marker(db, at, configuration)?;
+                self.baseline.completed_marker(db)
+            })
+            .map_err(failed)?;
+        self.db.flusher()().map_err(failed)?;
+        self.point = at;
+        self.configuration = configuration.clone();
+        self.baseline.completed();
+        Ok(())
     }
     fn persist(&mut self) -> Result<(), Fatal> {
         self.db.flusher()().map_err(failed)

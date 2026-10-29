@@ -206,6 +206,43 @@ pub(super) fn changes<'de, D: Deserializer<'de>>(d: D) -> Result<api::Changes, D
     })
 }
 
+#[derive(Deserialize)]
+struct ImportState {
+    head: api::Rev,
+    horizon: api::Rev,
+    feed: api::Rev,
+    #[serde(deserialize_with = "tx_vector")]
+    newest: Vec<(String, api::Rev)>,
+}
+#[derive(Deserialize)]
+struct ImportPage {
+    source: String,
+    expected_cursor: Vec<u8>,
+    next_cursor: Vec<u8>,
+    #[serde(deserialize_with = "tx_vector")]
+    versions: Vec<api::import::ImportVersion>,
+    state: ImportState,
+    done: bool,
+}
+pub(super) fn import_page<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<api::import::ImportPage, D::Error> {
+    let p = ImportPage::deserialize(d)?;
+    Ok(api::import::ImportPage {
+        source: p.source,
+        expected_cursor: p.expected_cursor,
+        next_cursor: p.next_cursor,
+        versions: p.versions,
+        state: api::import::ImportState {
+            head: p.state.head,
+            horizon: p.state.horizon,
+            feed: p.state.feed,
+            newest: p.state.newest,
+        },
+        done: p.done,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

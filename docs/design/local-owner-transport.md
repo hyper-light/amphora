@@ -21,7 +21,7 @@ request reuse of an already bound listening endpoint. The exact upstream socket2
 pinned because the safe Windows exclusivity setter merged after its latest published release.
 There are no product unsafe blocks or production subprocesses.
 
-Both peers authenticate the owner before revealing a client proof: random client/server nonces
+The client authenticates the owner before revealing a client proof: random client/server nonces
 and direction-separated HMAC-SHA256 proofs bind protocol version, nonces and requested lifetime.
 The capability never crosses the socket. Thus a stale record whose port was reused by another
 process cannot authenticate that process or expose the capability. Windows exclusive binding
@@ -30,8 +30,10 @@ stream isolation protects subsequent SQL/Records frames; this is not a network t
 
 The wire is a four-byte big-endian length followed by a postcard envelope. Variant order is
 append-only. Frames are limited to RESULT_MAX plus 1 MiB of serialization overhead. Serialization
-grows a buffer only up to that fixed cap; small control messages keep small allocations. Reads and writes reset their kernel timeout to the remaining
-absolute deadline after every partial transfer. All platforms use TcpStream::connect_timeout. Backlog saturation refuses before submission. No retry loop replays writes or closures.
+grows a buffer only up to that fixed cap; small control messages keep small allocations. Reads and
+writes reset their kernel timeout to the remaining absolute deadline after every partial transfer.
+All platforms use TcpStream::connect_timeout. Backlog saturation refuses before submission.
+No retry loop replays writes or closures.
 
 Resource limits are admission policy, not measured tuning claims: 32 connections, at most eight
 Records waits, 30 seconds total per authenticated connection, two seconds to authenticate,
@@ -41,8 +43,8 @@ and charge SQL result collection overhead as well as value payload. Overload clo
 connection; the client returns a typed connection refusal before submission. The persistent
 accept loop checks shutdown every 10 ms (bounded idle shutdown latency); each admitted worker
 releases its permit on every exit. Waits use existing Namespace waiting outside the SQL writer;
-they cannot consume all connection slots. Frame allocation caps bound per-process transport memory at 32 connections times bounded wire
-and decoded values. Authentication frames have a separate 256-byte cap.
+they cannot consume all connection slots. Frame allocation caps bound per-process transport
+memory at 32 connections times bounded wire and decoded values. Authentication frames have a separate 256-byte cap.
 
 Adaptive SQL is executed inside existing Database.call. The client closure runs once. Intermediate
 query responses are provisional; Commit ends the closure and the final Done waits until the
@@ -50,6 +52,19 @@ real durable callback. Socket loss, deadline expiry, exhausted command budget or
 Abort before Commit causes the closure to fail and the existing pipeline to roll back. Loss of
 the final response after Commit is an unknown outcome; callers must not replay FnOnce. Records
 CAS, SQL batches and migrations route directly to existing Database/Namespace methods.
+
+SQL-session Records get/CAS commands also run inside the same Database.call, with provisional
+revisions and typed refusals. Namespace import pages, progress and readiness route existing owner
+methods. Remote async watches use at most eight deadline-bound workers; polling only inspects a
+local result/waker. Dropping a watch shuts down its socket. The owner waits on the existing local
+Namespace watch, which wakes on durable publication, and checks disconnected peers at most every
+10 ms so cancelled waits release server capacity. No async executor polls a synchronous RPC.
+
+The embedded SQL implementation must also enforce execution cancellation/deadlines: socket
+timeouts cannot interrupt an engine instruction already running. Producer result accounting must
+charge the same owned-value overhead as the wire decoder before commit. These shared SQL seams
+and SDK automatic owner selection are part of completion; merely compiling this module does
+not establish blue/green continuity.
 
 Falsification: a second independent engine acquiring the same canonical database; a successful
 response before durable publication; a disconnected adaptive session leaving rows; one clone's

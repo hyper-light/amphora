@@ -26,6 +26,15 @@ pub(super) fn unavailable(e: impl std::fmt::Display) -> Refusal {
 fn sql_error(e: impl std::fmt::Display) -> sql::Error {
     sql::Error::Database(e.to_string())
 }
+fn session_error(error: Error) -> sql::Error {
+    sql::Error::Refusal(Refusal::from(error))
+}
+fn sql_refusal(error: sql::Error) -> Refusal {
+    match error {
+        sql::Error::Refusal(refusal) => refusal,
+        other => unavailable(other),
+    }
+}
 pub(super) fn remaining(until: Instant) -> Result<Duration, Refusal> {
     let left = until.saturating_duration_since(Instant::now());
     if left.is_zero() {
@@ -53,7 +62,7 @@ fn transfer(stream: &mut Stream, bytes: &mut [u8], until: Instant) -> Result<(),
     }
     Ok(())
 }
-fn read<T: DeserializeOwned>(stream: &mut Stream, until: Instant) -> Result<T, Refusal> {
+pub(super) fn read<T: DeserializeOwned>(stream: &mut Stream, until: Instant) -> Result<T, Refusal> {
     read_limit(stream, until, FRAME_MAX)
 }
 fn read_limit<T: DeserializeOwned>(
@@ -116,7 +125,7 @@ impl postcard::ser_flavors::Flavor for FrameBuffer<'_> {
         Ok(self.bytes)
     }
 }
-fn encode<T: Serialize>(value: &T, max: usize) -> Result<Vec<u8>, Refusal> {
+pub(super) fn encode<T: Serialize>(value: &T, max: usize) -> Result<Vec<u8>, Refusal> {
     let mut failure = None;
     postcard::serialize_with_flavor(
         value,
@@ -128,7 +137,7 @@ fn encode<T: Serialize>(value: &T, max: usize) -> Result<Vec<u8>, Refusal> {
     )
     .map_err(|error| failure.unwrap_or_else(|| unavailable(error)))
 }
-fn send(stream: &mut Stream, encoded: &[u8], until: Instant) -> Result<(), Refusal> {
+pub(super) fn send(stream: &mut Stream, encoded: &[u8], until: Instant) -> Result<(), Refusal> {
     let size = u32::try_from(encoded.len())
         .map_err(unavailable)?
         .to_be_bytes();
@@ -269,9 +278,14 @@ impl Client {
         response?;
         Ok(client)
     }
-    fn stream(&self, until: Instant) -> Result<Stream, Refusal> {
+    pub(super) fn stream(&self, until: Instant) -> Result<Stream, Refusal> {
         remaining(until)?;
-        let (mut stream, token) = endpoint::connect(&self.path, until)?;
+        let auth_until = until.min(
+            Instant::now()
+                .checked_add(Duration::from_secs(2))
+                .ok_or(Refusal::Timeout)?,
+        );
+        let (mut stream, token) = endpoint::connect(&self.path, auth_until)?;
         let millis =
             u64::try_from(remaining(until)?.min(SESSION_MAX).as_millis()).map_err(unavailable)?;
         let hello = Hello {
@@ -279,11 +293,6 @@ impl Client {
             nonce: auth::nonce()?,
             millis,
         };
-        let auth_until = until.min(
-            Instant::now()
-                .checked_add(Duration::from_secs(2))
-                .ok_or(Refusal::Timeout)?,
-        );
         write_auth(&mut stream, &hello, auth_until)?;
         let challenge: Challenge = read_limit(&mut stream, auth_until, 256)?;
         auth::verify(&token, true, &hello, &challenge.nonce, &challenge.proof)?;
@@ -309,13 +318,13 @@ impl Client {
     ) -> Result<Vec<api::SqlResult>, Error> {
         match self.request(Request::Execute(statements), until)? {
             Answer::Sql(rows) => Ok(rows),
-            _ => Err(unavailable("unexpected SQL response").into()),
+            _ => Err(Error::UnknownOutcome),
         }
     }
     pub fn migrate(&self, migration: api::Migration, until: Instant) -> Result<bool, Error> {
         match self.request(Request::Migrate(migration), until)? {
             Answer::Migrated(done) => Ok(done),
-            _ => Err(unavailable("unexpected migration response").into()),
+            _ => Err(Error::UnknownOutcome),
         }
     }
     pub fn namespace(&self, name: &str) -> Result<Namespace, Refusal> {
@@ -351,12 +360,10 @@ impl Client {
             Ok(value) if !session.failed.get() => value,
             result => {
                 let _abort = session.exchange(Command::Abort);
-                return Err(unavailable(
-                    result
-                        .err()
-                        .map_or_else(|| "SQL session transport failed".into(), |e| e.to_string()),
-                )
-                .into());
+                return Err(match result {
+                    Err(error) => Error::Refused(crate::database::refused(&error)),
+                    Ok(_) => Error::UnknownOutcome,
+                });
             }
         };
         match session.exchange(Command::Commit) {
@@ -375,6 +382,10 @@ struct Remote {
     failed: Cell<bool>,
 }
 impl Remote {
+    fn unexpected(&self) -> sql::Error {
+        self.failed.set(true);
+        sql::Error::Refusal(Refusal::UnknownOutcome)
+    }
     fn exchange(&self, command: Command) -> Result<Answer, Error> {
         let n = self
             .count
@@ -398,20 +409,69 @@ impl Remote {
     }
 }
 impl Session for Remote {
+    fn records_get(
+        &self,
+        namespace: &str,
+        family: &str,
+        key: &[u8],
+    ) -> sql::Result<Option<api::Row>> {
+        api::family(namespace)?;
+        api::family(family)?;
+        api::key(key)?;
+        match self
+            .exchange(Command::RecordsGet(
+                namespace.into(),
+                family.into(),
+                key.into(),
+            ))
+            .map_err(session_error)?
+        {
+            Answer::SessionRow {
+                row,
+                changes,
+                rowid,
+            } => {
+                self.changes.set(changes);
+                self.rowid.set(rowid);
+                Ok(row)
+            }
+            _ => Err(self.unexpected()),
+        }
+    }
+    fn records_commit(&self, namespace: &str, tx: api::Tx) -> sql::Result<api::Rev> {
+        api::family(namespace)?;
+        api::transaction(&tx)?;
+        match self
+            .exchange(Command::RecordsCommit(namespace.into(), tx))
+            .map_err(session_error)?
+        {
+            Answer::SessionRev {
+                rev,
+                changes,
+                rowid,
+            } => {
+                self.changes.set(changes);
+                self.rowid.set(rowid);
+                Ok(rev)
+            }
+            _ => Err(self.unexpected()),
+        }
+    }
     fn execute_batch(&self, sql: &str) -> sql::Result<()> {
         api::bound("SQL bytes", sql.len(), api::SQL_MAX).map_err(sql_error)?;
         match self
             .exchange(Command::Batch(sql.to_owned()))
-            .map_err(sql_error)?
+            .map_err(session_error)?
         {
             Answer::Rows { changes, rowid, .. } => {
                 self.changes.set(changes);
                 self.rowid.set(rowid);
                 Ok(())
             }
-            _ => Err(sql_error("unexpected batch response")),
+            _ => Err(self.unexpected()),
         }
     }
+
     fn query(
         &self,
         sql: &str,
@@ -421,7 +481,7 @@ impl Session for Remote {
         api::bound("SQL bytes", sql.len(), api::SQL_MAX).map_err(sql_error)?;
         match self
             .exchange(Command::Query(sql.to_owned(), params, first))
-            .map_err(sql_error)?
+            .map_err(session_error)?
         {
             Answer::Rows {
                 rows,
@@ -432,17 +492,17 @@ impl Session for Remote {
                 self.rowid.set(rowid);
                 Ok(rows)
             }
-            _ => Err(sql_error("unexpected query response")),
+            _ => Err(self.unexpected()),
         }
     }
     fn column_count(&self, sql: &str) -> sql::Result<usize> {
         api::bound("SQL bytes", sql.len(), api::SQL_MAX).map_err(sql_error)?;
         match self
             .exchange(Command::Columns(sql.to_owned()))
-            .map_err(sql_error)?
+            .map_err(session_error)?
         {
             Answer::Columns(n) => Ok(n),
-            _ => Err(sql_error("unexpected columns response")),
+            _ => Err(self.unexpected()),
         }
     }
     fn changes(&self) -> i64 {
@@ -516,8 +576,28 @@ fn serve(
                         Command::Query(sql, params, first) => {
                             query(connection, &sql, params, first)
                         }
+                        Command::RecordsGet(namespace, family, key) => connection
+                            .records_get(&namespace, &family, &key)
+                            .and_then(|row| {
+                                Ok(Answer::SessionRow {
+                                    row,
+                                    changes: i64::try_from(connection.changes())
+                                        .map_err(sql_error)?,
+                                    rowid: connection.last_insert_rowid(),
+                                })
+                            }),
+                        Command::RecordsCommit(namespace, tx) => {
+                            connection.records_commit(&namespace, tx).and_then(|rev| {
+                                Ok(Answer::SessionRev {
+                                    rev,
+                                    changes: i64::try_from(connection.changes())
+                                        .map_err(sql_error)?,
+                                    rowid: connection.last_insert_rowid(),
+                                })
+                            })
+                        }
                     }
-                    .map_err(unavailable);
+                    .map_err(sql_refusal);
                     write(&mut stream, &response, until)?;
                     // SQL errors can be handled by application savepoints; transport failures abort.
                 }
@@ -538,19 +618,70 @@ fn serve(
                 Record::Changes(f, r, n) => Answer::Changes(ns.changes(&f, r, n, until)?),
                 Record::Wait(f, r) => {
                     let _permit = Permit::take(waits, WAIT_MAX)?;
-                    Answer::Rev(ns.wait(&f, r, until)?)
+                    Answer::Rev(wait_remote(&ns, &f, r, &mut stream, until)?)
                 }
                 Record::Head => Answer::Rev(ns.head(until)?),
                 Record::Compact(r) => {
                     ns.compact(r, until)?;
                     Answer::Done
                 }
+                Record::TryWait(f, r) => Answer::OptionalRev(ns.try_wait(&f, r)?),
+                Record::ImportPage(page) => {
+                    ns.import_page(page, until)?;
+                    Answer::Done
+                }
+                Record::ImportState => Answer::ImportState(ns.import_state(until)?),
             })
         })(),
         Request::Session | Request::Probe => Err(unavailable("unexpected session")),
     };
     write(&mut stream, &result, until)
 }
+struct WaitingThread(std::thread::Thread);
+impl std::task::Wake for WaitingThread {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark()
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark()
+    }
+}
+fn wait_remote(
+    namespace: &crate::database::Namespace,
+    family: &str,
+    after: api::Rev,
+    stream: &mut Stream,
+    until: Instant,
+) -> Result<api::Rev, Refusal> {
+    use std::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+    let waker = Waker::from(Arc::new(WaitingThread(thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut watch = Box::pin(namespace.watch(family, after)?);
+    stream.set_nonblocking(true).map_err(unavailable)?;
+    let result = (|| {
+        loop {
+            remaining(until)?;
+            if let Poll::Ready(result) = watch.as_mut().poll(&mut cx) {
+                return result;
+            }
+            match stream.peek(&mut [0u8; 1]) {
+                Ok(0) => return Err(unavailable("client cancelled Records wait")),
+                Ok(_) => return Err(api::invalid("Records wait", "unexpected pipelined bytes")),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (),
+                Err(error) => return Err(unavailable(error)),
+            }
+            // Commit notifications unpark immediately. This administrative 10ms bound only
+            // limits how long a disconnected peer can retain one of the eight wait slots.
+            thread::park_timeout(remaining(until)?.min(Duration::from_millis(10)));
+        }
+    })();
+    stream.set_nonblocking(false).map_err(unavailable)?;
+    result
+}
+
 fn query(
     connection: &sql::Connection<'_>,
     sql: &str,
@@ -592,10 +723,43 @@ fn query(
 
 #[derive(Clone)]
 pub struct Namespace {
-    client: Client,
-    name: String,
+    pub(super) client: Client,
+    pub(super) name: String,
 }
 impl Namespace {
+    pub fn try_wait(
+        &self,
+        family: &str,
+        after: api::Rev,
+        until: Instant,
+    ) -> Result<Option<api::Rev>, Refusal> {
+        api::family(family)?;
+        match self.request(Record::TryWait(family.into(), after), until)? {
+            Answer::OptionalRev(rev) => Ok(rev),
+            _ => Err(unavailable("unexpected wait readiness response")),
+        }
+    }
+    pub fn import_page(
+        &self,
+        page: api::import::ImportPage,
+        until: Instant,
+    ) -> Result<(), Refusal> {
+        api::bound("import versions", page.versions.len(), api::TX_MAX)?;
+        api::bound("import families", page.state.newest.len(), api::TX_MAX)?;
+        match self.request(Record::ImportPage(page), until)? {
+            Answer::Done => Ok(()),
+            _ => Err(Refusal::UnknownOutcome),
+        }
+    }
+    pub fn import_state(
+        &self,
+        until: Instant,
+    ) -> Result<Option<api::import::ImportProgress>, Refusal> {
+        match self.request(Record::ImportState, until)? {
+            Answer::ImportState(progress) => Ok(progress),
+            _ => Err(unavailable("unexpected import progress response")),
+        }
+    }
     fn request(&self, op: Record, until: Instant) -> Result<Answer, Refusal> {
         self.client
             .request(
@@ -634,7 +798,7 @@ impl Records for Namespace {
         api::transaction(&t)?;
         match self.request(Record::Commit(t), u)? {
             Answer::Rev(v) => Ok(v),
-            _ => Err(unavailable("unexpected commit response")),
+            _ => Err(Refusal::UnknownOutcome),
         }
     }
     fn changes(&self, f: &str, r: api::Rev, n: usize, u: Instant) -> Result<api::Changes, Refusal> {
@@ -660,7 +824,7 @@ impl Records for Namespace {
     fn compact(&self, r: api::Rev, u: Instant) -> Result<(), Refusal> {
         match self.request(Record::Compact(r), u)? {
             Answer::Done => Ok(()),
-            _ => Err(unavailable("unexpected compact response")),
+            _ => Err(Refusal::UnknownOutcome),
         }
     }
 }
@@ -691,6 +855,38 @@ mod tests {
             read::<Request>(&mut receiver, until()),
             Err(Refusal::TooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn stale_record_cannot_authenticate_a_reused_port() {
+        // CP-T1.5/U17: another loopback listener cannot impersonate a dead owner or elicit
+        // a client proof merely because its port matches a protected stale record.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("db");
+        std::fs::File::create(&path).unwrap();
+        let owner = endpoint::bind(&path).unwrap();
+        let address = owner.listener.local_addr().unwrap();
+        drop(owner);
+        let listener = std::net::TcpListener::bind(address).unwrap();
+        let fake = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _hello: Hello = read_limit(&mut stream, until(), 256).unwrap();
+            write_auth(
+                &mut stream,
+                &Challenge {
+                    nonce: [8; 32],
+                    proof: [0; 32],
+                },
+                until(),
+            )
+            .unwrap();
+            assert!(read_limit::<[u8; 32]>(&mut stream, until(), 256).is_err());
+        });
+        assert!(matches!(
+            Client::connect(&path, until()),
+            Err(Refusal::Invalid { .. })
+        ));
+        fake.join().unwrap();
     }
 
     #[test]

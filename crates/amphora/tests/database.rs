@@ -107,6 +107,29 @@ fn adaptive_sql_runs_once_rolls_back_errors_and_returns_after_persistence() {
             })
             .unwrap();
         assert_eq!(value, 42);
+        db.call(until(), |connection| {
+            assert_eq!(
+                connection
+                    .prepare_cached("SELECT * FROM decisions")?
+                    .column_count(),
+                1
+            );
+            connection
+                .execute_batch("ALTER TABLE decisions ADD COLUMN label TEXT DEFAULT 'ready'")?;
+            assert_eq!(
+                connection
+                    .prepare_cached("SELECT * FROM decisions")?
+                    .column_count(),
+                2
+            );
+            assert_eq!(
+                connection.query_row("SELECT * FROM decisions", [], |row| row
+                    .get::<_, String>(1usize))?,
+                "ready"
+            );
+            Ok(())
+        })
+        .unwrap();
     }
     let db = Database::open(&path, until()).unwrap();
     assert_eq!(

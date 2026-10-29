@@ -140,11 +140,14 @@ fn unknown_outcome_keeps_the_owner_lease_until_the_writer_actually_drains() {
     begun.recv_timeout(Duration::from_secs(10)).unwrap();
     assert!(matches!(
         caller.join().unwrap(),
-        Err(amphora_api::Refusal::Timeout)
+        Err(amphora_api::Refusal::UnknownOutcome)
     ));
     assert!(Database::open(&path, Instant::now() + Duration::from_millis(5)).is_err());
     release.send(()).unwrap();
-    outcome.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+    outcome
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
     let reopened = Database::open(&path, until()).unwrap();
     assert_eq!(
         reopened
