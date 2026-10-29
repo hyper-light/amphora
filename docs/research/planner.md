@@ -879,7 +879,7 @@ measurement. Each number taken from step 3 is as
 `bench/planner/cited.tsv` lists every one with its records and how it is computed;
 `bench/planner/cited.py` recomputes each by `summary.py`'s definitions, and with `--job` the counts
 this section takes from JOB's text (gregrahn/join-order-benchmark at a396036):
-`python3 -I bench/planner/cited.py --job DIR` ends "cited.py: 84 numbers from step 3's records, 0
+`python3 -I bench/planner/cited.py --job DIR` ends "cited.py: 91 numbers from step 3's records, 0
 differ; 5 from JOB's text, 0 differ".
 
 Step 3 measured f734df4's estimator. Decision 13 (step 4, d762dc2) and step 5 (10f2461) have changed
@@ -887,6 +887,19 @@ the estimates since, so a change is measured by `record.sh` on the change and on
 machine, each run begun at a load under 2 (CLAUDE.md §7): step 3's numbers set the targets, and the
 parent's pass says what the change itself moved. The first such pass is of this branch, before rank
 1.
+
+Ada's ask of 2026-10-29 sets the bar above these targets: JOB's median best query time from 784.2 ms
+to 78.4 ms or less and TPC-H SF 10's from 23,287.8 ms to 2,328.8 ms or less, every answer unchanged
+(the goal that follows this plan). The changes ranked here are the planner's share of it, and step
+3's records say the planner can't carry it alone. PostgreSQL, on one thread with hash joins, runs
+JOB's median query in 259.1 ms, and DuckDB on all 32 threads in 332.8 ms, 3.3 and 4.2 times the
+target; at SF 10 PostgreSQL's median is 5,218 ms. SF 10's median queries read lineitem or orders
+whole whatever the join order (Amphora's q06 2.215e+04 ms, q12 2.440e+04), so a better plan barely
+moves that median. The rest is execution, which this list doesn't rank: no hash join is weighed where
+the table joined has any seek (`rhs_has_selective_seek`, `optimizer/join.rs` lines 457 to 467 and
+706), so none ran on JOB's or TPC-H's indexed keys; each `Column` decodes its record from the first
+column (`vdbe/execute.rs` line 2188); a scan reads one page at a time; and a query runs on one
+thread. The goal that follows plans those, with these ranks inside it.
 
 Step 3's records say where the gain is. Of JOB's 113 queries, the 52 whose largest intermediate
 result is misestimated by 1,000 times or more (the factor every estimator routinely erred by, f11)
