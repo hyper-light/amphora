@@ -48,6 +48,7 @@ impl EqpTable {
 /// The index used by a scan or search step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EqpIndex {
+    pub primary_key: bool,
     pub name: String,
     pub covering: bool,
     pub ephemeral: bool,
@@ -325,7 +326,9 @@ impl Display for EqpDetail {
             } => {
                 write!(f, "SCAN {}", table.name_with_alias())?;
                 if let Some(index) = index {
-                    if index.covering {
+                    if index.primary_key {
+                        write!(f, " USING PRIMARY KEY")?;
+                    } else if index.covering {
                         write!(f, " USING COVERING INDEX {}", index.name)?;
                     } else {
                         write!(f, " USING INDEX {}", index.name)?;
@@ -345,6 +348,7 @@ impl Display for EqpDetail {
             } => {
                 write!(f, "SEARCH {}", table.identifier())?;
                 match index {
+                    Some(index) if index.primary_key => write!(f, " USING PRIMARY KEY")?,
                     Some(index) if index.covering => {
                         write!(f, " USING COVERING INDEX {}", index.name)?
                     }
@@ -480,10 +484,13 @@ fn key_constraint_parts<'a>(
     parts
 }
 
-fn eqp_index(index: &Index, covering: bool) -> EqpIndex {
+fn eqp_index(index: &Index, table: &JoinedTable) -> EqpIndex {
     EqpIndex {
+        primary_key: table
+            .btree()
+            .is_some_and(|btree| index.is_without_rowid_primary_key(&btree)),
         name: index.name.clone(),
-        covering,
+        covering: table.utilizes_covering_index(),
         ephemeral: index.ephemeral,
     }
 }
@@ -499,9 +506,7 @@ pub(crate) fn eqp_detail_for_table_op(
         Operation::Scan(scan) => {
             let (index, source, backwards) = match scan {
                 Scan::BTreeTable { iter_dir, index } => (
-                    index
-                        .as_ref()
-                        .map(|index| eqp_index(index, table.utilizes_covering_index())),
+                    index.as_ref().map(|index| eqp_index(index, table)),
                     EqpRowSource::BTreeTable,
                     *iter_dir == IterationDirection::Backwards,
                 ),
@@ -526,13 +531,11 @@ pub(crate) fn eqp_detail_for_table_op(
         Operation::Search(search) => {
             let (kind, index, constraints, backwards) = match search {
                 Search::RowidEq { .. } => {
-                    return eqp_detail_for_rowid_search(table, join, subquery)
+                    return eqp_detail_for_rowid_search(table, join, subquery);
                 }
                 Search::Seek { index, seek_def } => (
                     EqpSearchKind::Seek,
-                    index
-                        .as_ref()
-                        .map(|index| eqp_index(index, table.utilizes_covering_index())),
+                    index.as_ref().map(|index| eqp_index(index, table)),
                     match index {
                         Some(index) => seek_constraint_parts(index, seek_def),
                         None => rowid_constraint_parts(seek_def),
@@ -541,9 +544,7 @@ pub(crate) fn eqp_detail_for_table_op(
                 ),
                 Search::InSeek { index, .. } => (
                     EqpSearchKind::InSeek,
-                    index
-                        .as_ref()
-                        .map(|index| eqp_index(index, table.utilizes_covering_index())),
+                    index.as_ref().map(|index| eqp_index(index, table)),
                     match index {
                         Some(index) => index
                             .columns
@@ -748,6 +749,9 @@ impl EqpDetail {
             let mut idx = JsonBuilder::new(obj.key("index"));
             idx.str("name", &index.name);
             idx.bool("covering", index.covering);
+            if index.primary_key {
+                idx.bool("primary_key", true);
+            }
             idx.bool("ephemeral", index.ephemeral);
             idx.finish();
         }

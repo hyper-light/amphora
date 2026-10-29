@@ -2617,41 +2617,21 @@ impl Schema {
                     .zip(&parent_cols)
                     .all(|((name, _), parent)| name.eq_ignore_ascii_case(parent))
             {
-                let mut columns = Vec::new();
-                for (name, order) in &parent_tbl.primary_key_columns {
-                    let (pos_in_table, column) = parent_tbl
+                // FK eligibility is narrower than query access: a referenced key's
+                // collation must agree with its declared column collation.
+                for (name, _) in &parent_tbl.primary_key_columns {
+                    let (_, column) = parent_tbl
                         .get_column(name)
                         .ok_or_else(|| fk_mismatch_err(&child.name, &parent_tbl.name))?;
-                    let collation = parent_tbl
+                    if parent_tbl
                         .primary_key_constraint_collation(name)
-                        .unwrap_or_else(|| column.collation());
-                    if collation != column.collation() {
+                        .unwrap_or_else(|| column.collation())
+                        != column.collation()
+                    {
                         return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
                     }
-                    columns.try_push(IndexColumn {
-                        name: name.clone(),
-                        order: *order,
-                        nulls_order: None,
-                        pos_in_table,
-                        collation: parent_tbl
-                            .primary_key_constraint_collation(name)
-                            .or_else(|| column.collation_opt()),
-                        default: column.default.clone(),
-                        expr: None,
-                    })?;
                 }
-                found = Some(Arc::new(Index {
-                    name: parent_tbl.name.clone(),
-                    table_name: parent_tbl.name.clone(),
-                    root_page: parent_tbl.root_page,
-                    columns,
-                    unique: true,
-                    ephemeral: false,
-                    has_rowid: false,
-                    where_clause: None,
-                    index_method: None,
-                    on_conflict: None,
-                }));
+                found = Some(Arc::new(Index::without_rowid_primary_key(parent_tbl)?));
             }
             if require_unique && found.is_none() {
                 return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
@@ -6067,6 +6047,53 @@ impl IndexColumn {
 }
 
 impl Index {
+    /// The existing table root, described by its comparison key only. Payload
+    /// columns remain table data, not extra UNIQUE or ordering terms.
+    pub(crate) fn without_rowid_primary_key(table: &BTreeTable) -> Result<Self> {
+        if table.has_rowid || table.primary_key_columns.is_empty() {
+            return Err(crate::LimboError::InternalError(
+                "primary-root descriptor requires a WITHOUT ROWID primary key".into(),
+            ));
+        }
+        let mut columns = Vec::new();
+        for (name, order) in &table.primary_key_columns {
+            let (pos_in_table, column) = table.get_column(name).ok_or_else(|| {
+                crate::LimboError::InternalError("primary key column missing".into())
+            })?;
+            columns.try_push(IndexColumn {
+                name: name.clone(),
+                order: *order,
+                nulls_order: None,
+                pos_in_table,
+                collation: table
+                    .primary_key_constraint_collation(name)
+                    .or_else(|| column.collation_opt()),
+                default: column.default.clone(),
+                expr: None,
+            })?;
+        }
+        Ok(Self {
+            name: table.name.clone(),
+            table_name: table.name.clone(),
+            root_page: table.root_page,
+            columns,
+            unique: true,
+            ephemeral: false,
+            has_rowid: false,
+            where_clause: None,
+            index_method: None,
+            on_conflict: None,
+        })
+    }
+
+    pub(crate) fn is_without_rowid_primary_key(&self, table: &BTreeTable) -> bool {
+        !table.has_rowid
+            && !self.ephemeral
+            && self.index_method.is_none()
+            && self.root_page == table.root_page
+            && self.table_name == table.name
+    }
+
     /// Physical secondary-index fields: declared terms followed by the missing
     /// WITHOUT ROWID primary-key terms. A term with another collation cannot
     /// identify the corresponding primary-key value and must not suppress it.
@@ -6635,15 +6662,22 @@ mod tests {
                 assert_eq!(actual.primary_key(), expected.primary_key(), "{sql}");
                 assert_eq!(actual.is_rowid_alias(), expected.is_rowid_alias(), "{sql}");
                 assert_eq!(actual.notnull(), expected.notnull(), "{sql}");
-                assert_eq!(actual.explicit_notnull(), expected.explicit_notnull(), "{sql}");
+                assert_eq!(
+                    actual.explicit_notnull(),
+                    expected.explicit_notnull(),
+                    "{sql}"
+                );
                 assert_eq!(actual.unique(), expected.unique(), "{sql}");
                 assert_eq!(actual.hidden(), expected.hidden(), "{sql}");
                 assert_eq!(
-                    actual.notnull_conflict_clause,
-                    expected.notnull_conflict_clause,
+                    actual.notnull_conflict_clause, expected.notnull_conflict_clause,
                     "{sql}"
                 );
-                assert_eq!(actual.array_dimensions(), expected.array_dimensions(), "{sql}");
+                assert_eq!(
+                    actual.array_dimensions(),
+                    expected.array_dimensions(),
+                    "{sql}"
+                );
                 match (actual.generated_type(), expected.generated_type()) {
                     (
                         GeneratedType::Virtual {
@@ -8138,7 +8172,9 @@ mod without_rowid_index_tests {
     #[test]
     fn without_rowid_secondary_locator_preserves_collation_and_unique_prefix() -> Result<()> {
         let table = BTreeTable::from_sql(
-            "CREATE TABLE t(a TEXT,b INTEGER,v TEXT,PRIMARY KEY(a COLLATE NOCASE DESC,b)) WITHOUT ROWID", 2)?;
+            "CREATE TABLE t(a TEXT,b INTEGER,v TEXT,PRIMARY KEY(a COLLATE NOCASE DESC,b)) WITHOUT ROWID",
+            2,
+        )?;
         let index = Index::automatic_from_unique(
             &table,
             ("u".into(), 3),

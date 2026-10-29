@@ -54,3 +54,9 @@ Before that, kiln's changes (the first five) and Amphora's, on Turso's tree:
 | `core/io/mod.rs`, `core/io/unix.rs` | `FileSyncType::DataSync`: `fdatasync` on Unix systems but Apple's, `F_FULLFSYNC` on Apple's (as `FullFsync`), what `Fsync` does elsewhere | Amphora's flusher flushes the log's data only, as SQLite and PostgreSQL do (Amphora's `docs/design/store.md`, decision 13) |
 | `core/storage/wal.rs` | A new log header cuts the log's file back to it only under the multi-process authority (`WalCoordination::truncates_orphans`); in one process the frames from before the restart stay, to be overwritten in place, as SQLite's are | a log cut back at every restart grows by appending again, so its flushes write metadata; the new header is still synced before any frame follows it, which is what makes the frames left behind safe (decision 13; crash injection, 10,000 power cuts) |
 | `core/database.rs`, `core/storage/wal.rs`, `core/storage/sqlite3_ondisk.rs` | The log known durable (`WalSharedRuntime::durable`: a generation, the header's `checkpoint_seq`, and a frame), set by `Database::wal_durable` after a flush begun when `Database::wal_end` answered, read by `Database::wal_durable_frame`; a checkpoint flushes no log of its own for frames within it in the current generation (`WalCoordination::durable_through`, never under the multi-process authority) | Amphora's flusher already made those frames durable: its checkpointer copies only what a flush covered and skips one flush of the log a pass (Amphora's `docs/design/store.md`, decision 15) |
+
+The query planner also offers the existing WITHOUT ROWID primary root for
+leading-key seeks. Its descriptor is shared with FK resolution, contains only
+PK comparison terms, and remains absent from schema index mutation lists.
+Payload reads keep the existing composite-key table lookup and column mapping;
+see `docs/design/without-rowid.md` for bounded-access regressions.

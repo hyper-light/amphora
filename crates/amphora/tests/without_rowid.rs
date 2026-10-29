@@ -638,3 +638,45 @@ fn without_rowid_upsert_update_aborts_statement_despite_outer_fail_policy() {
     );
     assert_eq!(rows(&db, "SELECT value FROM survived"), vec![vec![int(0)]]);
 }
+
+#[test]
+fn native_primary_root_payload_and_mutations_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("native-pk.db");
+    {
+        let db = Database::open(&path, until()).unwrap();
+        exec(&db,"CREATE TABLE native_payload(value TEXT,b INTEGER,a TEXT COLLATE NOCASE,PRIMARY KEY(a DESC,b ASC)) WITHOUT ROWID;
+            INSERT INTO native_payload VALUES('one',1,'Alpha'),('two',2,'alpha'),('three',1,'Beta');
+            CREATE INDEX native_value ON native_payload(value);
+            INSERT INTO native_payload VALUES('replace',1,'ALPHA') ON CONFLICT(a,b) DO UPDATE SET value=excluded.value;
+            UPDATE native_payload SET value='updated' WHERE a='ALPHA' AND b=2;
+            DELETE FROM native_payload WHERE a='BETA' AND b=1");
+        refused(&db, "INSERT INTO native_payload VALUES('bad',1,NULL)");
+    }
+    let db = Database::open(&path, until()).unwrap();
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT value FROM native_payload WHERE a='alpha' AND b=1"
+        ),
+        vec![vec![text("replace")]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT value FROM native_payload WHERE a='alpha' AND b>=1 AND b<3 ORDER BY b DESC"
+        ),
+        vec![vec![text("updated")], vec![text("replace")]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT a,b FROM native_payload INDEXED BY native_value WHERE value='updated'"
+        ),
+        vec![vec![text("alpha"), int(2)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM native_payload"),
+        vec![vec![int(2)]]
+    );
+}

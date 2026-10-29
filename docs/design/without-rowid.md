@@ -45,3 +45,30 @@ The focused suite includes those cases. Unsupported mutation combinations
 (generated columns, user triggers, UPDATE FROM, CDC, and custom-type or array
 mutations/indexes) retain explicit refusals;
 this change does not claim support for those combinations.
+
+## Native primary-root query access
+
+The planner offers the existing table root as a candidate using the same
+primary-key descriptor as foreign-key resolution. Its terms contain only the
+primary key: payload fields cannot become uniqueness or ordering terms. The
+descriptor is not registered as a schema index and never enters index mutation
+maintenance. FK-specific eligibility checks stay at their original boundary.
+
+Payload projections retain the existing two-cursor path: the query seeks the
+primary-root index cursor, reconstructs its composite key, and positions the
+table cursor with `Found`. Table column emission uses the established logical
+to physical mapping. This adds a bounded same-root lookup per matched row,
+rather than introducing cursor aliases or integer rowid locators. Existing
+secondary-index coverage and range/ordering rules remain unchanged. Comparisons
+whose collation cannot use the descriptor retain their existing scan fallback.
+
+Evidence: `native_primary_root_bounds_work_ledger_point_and_prefix_reads`
+checks EXPLAIN and public statement counters on 20,000 work-ledger rows, with
+four rows per weak key; `native_primary_root_preserves_collation_payload_and_join_fallbacks`
+checks reordered keys, collations, direction, affinity, joins and fallback;
+`native_primary_root_payload_and_mutations_survive_reopen` checks the durable
+public boundary. These falsify the decision if an unrelated-row scan is required
+for a supported leading-key lookup, payload/ordering changes, or secondary index
+and mutation results disagree after reopen. Counter ceilings distinguish a
+bounded lookup of at most four rows from visiting 20,000 unrelated rows; they
+are correctness/access-shape checks, not latency claims.

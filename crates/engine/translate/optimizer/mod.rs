@@ -119,6 +119,25 @@ impl AvailableIndexes {
         }
     }
 
+    /// Add at most one existing primary root per joined table. It is a query
+    /// candidate only: schema index iterators still describe secondary storage.
+    fn with_primary_roots(mut self, tables: &TableReferences) -> Result<Self> {
+        for table in tables.joined_tables() {
+            let Some(btree) = table.btree().filter(|btree| !btree.has_rowid) else {
+                continue;
+            };
+            let primary = Arc::new(Index::without_rowid_primary_key(&btree)?);
+            self.indexes_by_table_id.try_reserve(1)?;
+            let indexes = self
+                .indexes_by_table_id
+                .entry(table.internal_id)
+                .or_default();
+            indexes.try_reserve(1)?;
+            indexes.push_back(primary);
+        }
+        Ok(self)
+    }
+
     pub(crate) fn indexes_for_table(
         &self,
         table_id: TableInternalId,
@@ -141,15 +160,15 @@ impl AvailableIndexes {
             .map(Arc::as_ref)
     }
 
-    fn btree_index_by_name(
-        &self,
-        table_id: TableInternalId,
-        index_name: &str,
-    ) -> Option<Arc<Index>> {
-        self.indexes_for_table(table_id)?
+    fn btree_index_by_name(&self, table: &JoinedTable, index_name: &str) -> Option<Arc<Index>> {
+        self.indexes_for_table(table.internal_id)?
             .iter()
             .find(|index| {
-                index.name.eq_ignore_ascii_case(index_name) && index.index_method.is_none()
+                index.name.eq_ignore_ascii_case(index_name)
+                    && index.index_method.is_none()
+                    && !table
+                        .btree()
+                        .is_some_and(|btree| index.is_without_rowid_primary_key(&btree))
             })
             .cloned()
     }
@@ -1103,7 +1122,8 @@ fn find_select_plan_form(
     }
     optimize_subqueries(plan, resolver, cache, save_subquery_plans)?;
     let available_indexes =
-        AvailableIndexes::for_table_references(resolver, &plan.table_references);
+        AvailableIndexes::for_table_references(resolver, &plan.table_references)
+            .with_primary_roots(&plan.table_references)?;
     rewrite_or_terms(&mut plan.where_clause, &available_indexes)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition = eliminate_constant_conditions(
         &mut plan.where_clause,
@@ -1357,7 +1377,8 @@ fn apply_select_table_plan(
 fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()> {
     let schema = resolver.schema();
     let available_indexes =
-        AvailableIndexes::for_table_references(resolver, &plan.table_references);
+        AvailableIndexes::for_table_references(resolver, &plan.table_references)
+            .with_primary_roots(&plan.table_references)?;
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &plan.table_references)?;
 
@@ -1409,7 +1430,8 @@ fn optimize_update_plan(
     );
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &target_tables)?;
-    let available_indexes = AvailableIndexes::for_table_references(resolver, &target_tables);
+    let available_indexes = AvailableIndexes::for_table_references(resolver, &target_tables)
+        .with_primary_roots(&target_tables)?;
     rewrite_or_terms(&mut plan.where_clause, &available_indexes)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition = eliminate_constant_conditions(
         &mut plan.where_clause,
@@ -2578,8 +2600,7 @@ fn enforce_indexed_by_hints(
             ast::Indexed::IndexedBy(name) => {
                 let idx_name = name.as_str();
                 // Verify the index exists and belongs to this table.
-                let forced_index =
-                    available_indexes.btree_index_by_name(table_ref.internal_id, idx_name);
+                let forced_index = available_indexes.btree_index_by_name(table_ref, idx_name);
                 let Some(forced_index) = forced_index else {
                     crate::bail_parse_error!("no such index: {}", idx_name);
                 };
@@ -3099,7 +3120,7 @@ fn plan_unmatched_right_rows(
             let forced_index = match indexed {
                 ast::Indexed::IndexedBy(name) => Some(
                     available_indexes
-                        .btree_index_by_name(table.internal_id, name.as_str())
+                        .btree_index_by_name(table, name.as_str())
                         .expect("the main plan checked that the INDEXED BY index exists"),
                 ),
                 ast::Indexed::NotIndexed => None,
