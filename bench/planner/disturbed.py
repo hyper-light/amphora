@@ -11,7 +11,10 @@ sample in that span shows other processes (all but amphora-bench, and Docker's V
 records) using more than LIMIT cores, or the span overlaps a window of other work the monitor can't
 see (`--windows`, such as a disk-heavy delete).
 
-usage: bench/planner/disturbed.py <monitor.log> <passes-ts.log> <pass> [<limit cores, 2>] [--windows a/b,...] [--json out.json]
+A pass stopped part way and started again from its beginning under its name (a pass timed by one
+process) keeps the stopped run's lines too: `--since` counts only the records after the restart.
+
+usage: bench/planner/disturbed.py <monitor.log> <passes-ts.log> <pass> [<limit cores, 2>] [--windows a/b,...] [--since utc] [--json out.json]
 """
 
 import json
@@ -33,6 +36,7 @@ def main(argv):
     mon_path, ts_path, name = argv[0], argv[1], argv[2]
     limit = float(argv[3]) if len(argv) > 3 and not argv[3].startswith("--") else 2.0
     json_out = argv[argv.index("--json") + 1] if "--json" in argv else None
+    since = t(argv[argv.index("--since") + 1]) if "--since" in argv else None
     windows = []
     if "--windows" in argv:
         for w in argv[argv.index("--windows") + 1].split(","):
@@ -59,7 +63,9 @@ def main(argv):
         if rest.startswith("==> "):
             current = rest[4:].rstrip(" <=").rsplit("/", 1)[-1].removesuffix(".log")
         elif rest.startswith("== "):
-            if rest[3:].split()[:1] == [name]:
+            # A start names its pass too: tail following one log writes no `==>` header.
+            current = (rest[3:].split() or [current])[0]
+            if current == name:
                 events.append((t(stamp), None, None, None))
         else:
             m = re.match(r"(\S+) (\S+): (.+)$", rest)
@@ -82,8 +88,9 @@ def main(argv):
         overlaps = [f"{a:%H:%M}-{b:%H:%M}" for a, b in windows if a < when and b > lo]
         if overlaps:
             who = who + [("window " + " ".join(overlaps), 0.0)]
-        out.append({"query": query, "target": target, "result": result, "from": lo.isoformat() + "Z", "to": when.isoformat() + "Z",
-                    "worst_other_cores": round(worst, 2), "who": who, "disturbed": worst > limit or bool(overlaps)})
+        if since is None or when >= since:
+            out.append({"query": query, "target": target, "result": result, "from": lo.isoformat() + "Z", "to": when.isoformat() + "Z",
+                        "worst_other_cores": round(worst, 2), "who": who, "disturbed": worst > limit or bool(overlaps)})
         prev = when
     bad = [r for r in out if r["disturbed"]]
     print(f"{name}: {len(out)} records, {len(bad)} with other work above {limit} cores or in a window")

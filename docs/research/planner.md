@@ -826,27 +826,29 @@ finished, under 1 when the engine was faster; and on how many it was the faster)
 |---|---:|---:|---:|---:|
 | JOB (113) | 1.101, 63 faster | 1.013, 64 faster | 0.435, 75 faster | 0.354, 83 faster |
 | TPC-H SF 1 (22) | 1.417, 12 faster | 0.481, 16 faster | 0.126, 20 faster | 0.535, 19 faster |
-| TPC-H SF 10 (22) | 1.198 (21 of 22), 13 faster | 0.289, 16 faster | 0.021, 22 faster | 0.329, 20 faster |
+| TPC-H SF 10 (22) | 1.198 (21 of 22), 13 faster | 0.289, 16 faster | 0.021, 22 faster | 0.328, 20 faster |
 
 JOB's and SF 1's times are their second passes', timed by fresh processes on loaded data: the first
 passes, timed by the process that had just loaded them, ran slower (DuckDB on all 32 threads
 throughout, the others over JOB's first hour and a half), and `record.sh` now loads in a process of
 its own (c652376). SF 10's are the best of its passes a, b and c, each query's fastest. PostgreSQL
-ran in Docker Desktop, which stopped twice; its SF 10 and JOB times are passes of its own (JOB's
-right after loading it), and it has no time in SF 10's passes b and c. Every engine counted the same
+ran in Docker Desktop, which stopped three times; its JOB times are a pass of its own, right after
+loading it, and its SF 10 times the best of a pass of its own and its shares of passes b and c. Every engine counted the same
 rows for every query; SQLite passed the 600 s deadline on SF 10's q07 in every pass. The record says
 what each left out and why.
 
 **The repeat** (the plan's test: two passes of one build on one machine record the same estimates,
 and median run times within 5%): every pair of passes recorded the same estimates and counts (0 of
-JOB's 1,090 counters and 0 of TPC-H's 135 differ, at SF 1 and at SF 10). Timed alike by fresh
-processes, with the records that ran beside other work on jupiter run again (a monitor's samples and
-`bench/planner/disturbed.py` name them), TPC-H SF 10's passes b and c are within 5% for every engine
-(Amphora 1.006, SQLite 0.990, DuckDB 1.037, on all 32 threads 1.001), and JOB's passes b and d for
-Amphora (0.973), SQLite (0.982) and DuckDB (0.959) but not DuckDB on all 32 threads (1.155 by the
-median of its best times, 1.033 by the median of its queries' ratios). PostgreSQL's 51 undisturbed
-queries of the 54 it ran in JOB's pass d are within 5% of its own earlier pass (0.967); Docker
-Desktop stopped before its other 59 and before SF 10's passes b and c.
+JOB's 1,090 counters and 0 of TPC-H's 135 differ, at SF 1 and at SF 10). Timed alike on a quiet
+machine, with the records that ran beside other work on jupiter left out or run again (a monitor's
+samples and `bench/planner/disturbed.py` name them), every engine is within 5%: TPC-H SF 10's passes
+b and c (Amphora 1.006, SQLite 0.990, DuckDB 1.037, on all 32 threads 1.001, PostgreSQL's shares
+1.013), SF 1's passes d and e (0.983, 0.982, 0.986 and 1.002), and JOB's passes e and f (0.992,
+0.977, 1.000 and 0.994; PostgreSQL's own pass against its share of pass d 0.984). DuckDB on all 32
+threads runs slower the older the process timing it: JOB's 16a, 16c, 17a and 32b took 2.4 to 4.9
+times as long late in a pass as in a process started for them, so JOB's passes are compared only
+when each was timed by one process from start to end, and b against d, resumed part way, set it at
+1.155.
 
 **The counters off** (the step's fourth criterion: the bench suite's statements with the row
 counters off within 2% of the change's parent, best of 3): 9cfc8b9's record left 56 of its 104

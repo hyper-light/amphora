@@ -47,6 +47,14 @@ SQLite, DuckDB and PostgreSQL on the same machine (`bench/planner/README.md` say
 | JOB, c | `2026-10-26-jupiter-planner-job-c.jsonl` | 2026-10-27 07:33 to 13:13 | all but PostgreSQL | the repeat |
 | JOB, PostgreSQL | `2026-10-26-jupiter-planner-job-pg.jsonl` | 2026-10-27 13:37 to 14:10 (its load 13:31 to 13:37, `2026-10-26-jupiter-planner-load-job.jsonl`) | PostgreSQL | run times |
 | JOB, d | `2026-10-26-jupiter-planner-job-d.jsonl` and its reruns' `2026-10-26-jupiter-planner-job-d-again.jsonl` | 2026-10-27 15:36 to 20:17; reruns 2026-10-28 03:42 to 04:00 | all five (PostgreSQL to 15c) | the repeat |
+| JOB, e | `2026-10-26-jupiter-planner-job-e.jsonl` | 2026-10-28 13:31 to 17:09 | all but PostgreSQL, one process, Docker Desktop stopped | the repeat |
+| JOB, f | `2026-10-26-jupiter-planner-job-f.jsonl` | 2026-10-29 04:29 to 07:43 | all but PostgreSQL, one process, Docker Desktop stopped | the repeat, against e |
+| JOB, f's two stopped starts | `-job-f-stopped-0256.jsonl` (to 9c), `-job-f-stopped-0320.jsonl` (to 2d) | 2026-10-29 01:23 to 02:56, 03:03 to 03:20 | as f | kept, not compared: jupiter's runner restarted under the first, and the second was stopped when another session's lab took eight cores |
+| DuckDB on 32 threads, six JOB queries | `2026-10-29-jupiter-planner-duckdb-mt-probe.jsonl` | 2026-10-29 00:34 | DuckDB, 32 threads | a process of their own (the next section) |
+| TPC-H SF 1, d | `2026-10-26-jupiter-planner-tpch-sf1-d.jsonl` | 2026-10-29 07:58 to 08:24 | all but PostgreSQL, one process, Docker Desktop stopped | the repeat |
+| TPC-H SF 1, e | `2026-10-26-jupiter-planner-tpch-sf1-e.jsonl` | 2026-10-29 12:17 to 14:49 | as d | the repeat, against d |
+| JOB d, PostgreSQL's share from 15d | `-job-d.jsonl` (its run from 00:58), its 31a to 33c again in `-job-d-again.jsonl` | 2026-10-29 00:58 to 01:21; again 08:47 to 08:49 | PostgreSQL | the repeat, against `job-pg` |
+| TPC-H SF 10, b and c, PostgreSQL's share | `-tpch-sf10-b.jsonl`, `-tpch-sf10-c.jsonl` | 2026-10-29 08:49 to 09:13, 09:13 to 09:28 | PostgreSQL | the repeat |
 
 ## Estimates and counts at every join prefix
 
@@ -121,15 +129,16 @@ Best of 3; each engine's time over Amphora's, the geometric mean over the querie
 (under 1, the engine was faster), and on how many queries it was the faster. JOB's from its pass b,
 with DuckDB's 15a to 15d from `job-at`, and TPC-H SF 1's from its pass b, both timed by processes
 that had not loaded the data (the next section says why); SF 10's are the best of its passes a, b
-and c, each query's fastest pass (`summary.py --best`). PostgreSQL's SF 10 and JOB times are passes
-of its own on 2026-10-27, and its SF 1 times pass b's. Every engine counted the same rows for every
+and c, each query's fastest pass (`summary.py --best`). PostgreSQL's JOB times are its own pass's of
+2026-10-27, its SF 10 times the best of its own pass and its shares of passes b and c (2026-10-29),
+and its SF 1 times pass b's. Every engine counted the same rows for every
 query.
 
 | benchmark | SQLite | DuckDB, one thread | DuckDB, 32 threads | PostgreSQL |
 |---|---:|---:|---:|---:|
 | JOB (113) | 1.101, 63 faster | 1.013, 64 faster | 0.435, 75 faster | 0.354, 83 faster |
 | TPC-H SF 1 (22) | 1.417, 12 faster | 0.481, 16 faster | 0.126, 20 faster | 0.535, 19 faster |
-| TPC-H SF 10 (22) | 1.198 (21 of 22), 13 faster | 0.289, 16 faster | 0.021, 22 faster | 0.329, 20 faster |
+| TPC-H SF 10 (22) | 1.198 (21 of 22), 13 faster | 0.289, 16 faster | 0.021, 22 faster | 0.328, 20 faster |
 
 Amphora's planning time (its prepare, best of 3) is a median 1.9 ms (92.1 ms at most, 27c's 12
 tables) on JOB and 0.5 to 0.6 ms (1.4 ms at most) on TPC-H.
@@ -169,11 +178,12 @@ process of its own since c652376. SF 10's best of 3 is each query's fastest of p
 with c's reruns: b gave 42 of the 87 four-engine records with a time, c 35, c's reruns 5 and a 5;
 SQLite's q07 passed the deadline in all three.
 
-## Quiet runs: what ran beside the passes of 2026-10-27 and 28
+## Quiet runs: what ran beside the passes of 2026-10-27 to 29
 
-TPC-H SF 10's passes b and c and JOB's pass d ran beside a monitor: every process's CPU over each 10
-s (PowerShell's `Get-Process` totals, differenced; those using a fifth of a core or more) and C:'s
-free space (`2026-10-26-jupiter-planner-monitor.log`, 2026-10-27 15:36Z to 2026-10-28 06:07Z), and
+TPC-H SF 10's passes b and c, JOB's passes d, e and f and the passes after them ran beside a monitor:
+every process's CPU over each 10 s (PowerShell's `Get-Process` totals, differenced; those using a
+fifth of a core or more) and C:'s free space (`2026-10-26-jupiter-planner-monitor.log`, from
+2026-10-27 15:36Z, while a pass ran), and
 each pass's log lines with the time they appeared (`2026-10-26-jupiter-planner-passes-ts.log`). A
 record's runs happen between the log line before it and its own: `bench/planner/disturbed.py` finds
 the records during whose span other processes (all but amphora-bench, and Docker's VM for
@@ -184,6 +194,11 @@ again, by a process of their own with the same binary, once the machine was quie
 `-again.jsonl`, every run kept; a query's last record is its rerun). The windows, as given:
 `--windows
 2026-10-27T15:40:00Z/2026-10-27T15:48:00Z,2026-10-28T00:24:00Z/2026-10-28T01:18:00Z,2026-10-28T01:23:00Z/2026-10-28T01:26:00Z`.
+A pass's start line names it too, as a pass whose log alone is followed gets no `==>` header, and a
+pass started again from its beginning keeps its stopped starts' lines, which `--since` leaves out
+(`bench/planner/test_disturbed.py`).
+Each pass from 2026-10-29 on began only once no build and no container but PostgreSQL's ran and the
+load had stayed under 1.5 for five minutes (its waits and steps in `2026-10-26-jupiter-planner-chain.log`).
 
 - JOB d: 45 of 506 records disturbed, by Shards' Windows builds and tests (15:56 to 16:57Z and 19:12
   to 20:03Z) and the temp sweep; the 41 of the four engines ran again, all quiet. PostgreSQL's 3
@@ -191,6 +206,20 @@ again, by a process of their own with the same binary, once the machine was quie
 - TPC-H SF 10 b: 0 of 88.
 - TPC-H SF 10 c: 24 of 88 (q09 to q14 in the deletes, SQLite's q07 and DuckDB's q18 beside other
   work); all 24 ran again, and 6 of the reruns were disturbed in turn.
+- JOB e: 18 of 452, all from 13:40 to 14:38Z beside other agents' builds (rustc on up to 16 cores).
+- JOB f: 15 of 452 since it began at 04:28:56Z (`--since 2026-10-29T04:28:56Z`), from 05:52 to
+  06:33Z beside other agents' builds. The records disturbed in e or f are left out of their
+  comparison rather than run again: a run by a process of its own isn't timed alike for DuckDB on
+  32 threads (the repeat's section on it).
+- TPC-H SF 1 d: 0 of 88. TPC-H SF 1 e: 21 of 88, from 12:30 to 14:13Z beside other agents' builds on
+  up to 25 cores, the runs waiting at times for the load to fall (e took 2 h 32 min, d 26 min).
+- PostgreSQL's share of JOB d from 15d (`--since 2026-10-29T00:58:10Z`): 3 of 59 (16b, 16c and 17b,
+  beside Docker Desktop's own processes and kiln), and none of the 8 run again at 08:47Z.
+- PostgreSQL's share of TPC-H SF 10 b: 3 of 22 (q07; q08 beside other agents' builds on 22 cores; q09
+  beside their VMs); of c, 5 of 22 (q01, q09, q10 beside Windows Defender and the indexer; q02 and
+  q04 beside builds). For PostgreSQL the monitor counts Docker's VM as the bench's own, so every
+  other container's CPU each 10 s went in `2026-10-26-jupiter-planner-docker-stats.log`: none ran
+  beside these shares but another session's lab at 00:58 to 01:21Z, at 1.7 cores at most.
 
 ## The repeat: two passes of one build on one machine
 
@@ -244,11 +273,122 @@ share, and over those the one-thread engines were 0.99 to 1.04 against b, over 1
 stopped in both) 0.92 to 0.95. PostgreSQL's 51 undisturbed queries of the 54 it ran in pass d,
 against its own pass of 2026-10-27: 0.967 (by query 0.997).
 
-So the test is met for the estimates, in every pair of passes; for the run times on TPC-H at SF 10
-for all four engines; and on JOB for Amphora, SQLite and DuckDB on one thread, not DuckDB on all 32
-threads. Before this re-measure, TPC-H SF 1's passes b and c (2026-10-27 06:07 to 07:33) were within
-5% but for SQLite (0.937), and JOB's pass c (07:33 to 13:13), run beside other agents' work without
-a monitor, was 1.04 to 1.47 against b; both are kept in their records.
+### DuckDB on all 32 threads, and the age of the process timing it
+
+A pass's queries are timed by one process, and DuckDB on all 32 threads runs slower the older that
+process is, the more of the pass it has run; the one-thread engines don't. Passes c and e were each
+timed by one process from start to end (c beside other agents' work, e on a quiet machine with
+Docker Desktop stopped). Passes b and d went on where a stopped process left them (`--resume`): b in
+five processes, begun at its 1a, 9d, 12a, 13b and 30b (2026-10-26 21:41, 22:21 and 23:38, 2026-10-27
+01:06 and 03:26), and d in two, begun at 1a and 15d (2026-10-27 15:36 and 18:17). Six of JOB's
+queries on DuckDB with 32 threads, best of 3 in ms, in each pass and in a process started for them
+alone on 2026-10-29 at 00:34 (`2026-10-29-jupiter-planner-duckdb-mt-probe.jsonl`; the processors
+at 103 to 158% of their 3,000 MHz base while it ran, `-probe-perf.txt`):
+
+| query | probe | b | c | d | e |
+|---|---:|---:|---:|---:|---:|
+| 1a | 61.3 | 57.1 | 54.7 | 58.8 | 57.9 |
+| 2b | 68.7 | 63.5 | 68.5 | 67.3 | 65.2 |
+| 16a | 98.7 | 132.4 | 265.6 | 105.5 | 257.5 |
+| 16c | 207.9 | 330.5 | 498.0 | 227.3 | 501.5 |
+| 17a | 192.4 | 309.5 | 490.1 | 239.3 | 492.2 |
+| 32b | 64.1 | 103.4 | 311.6 | 232.7 | 314.8 |
+
+A pass's first queries ran alike in all. 16a to 32b ran slowest in c and e, one process each, and
+there c and e agree within 2%; d's second process began two queries before 16a, b's fourth at 13b
+and its fifth at 30b, and the probe's process was new. In pass e, DuckDB on 32 threads was within 3%
+of b through the pass's first two hours (the median of its queries' e/b 1.027 at 13Z and 1.026 at
+14Z), beside other agents' builds (other processes 1.84 cores on average), and 1.17 to 1.58 from
+15Z on, when other processes used 0.43 of a core on average and 1.72 at most: not the machine's
+other work. Over the 109 queries, e against c is 0.981 by the median of best times (0.945 by query),
+where e against b is 1.445. So b against d sets DuckDB's later queries in younger processes against
+older ones, and its repeat is between passes timed alike, each by one process from start to end:
+e against f.
+
+**JOB, pass e against pass f**, each timed by one process from start to end with Docker Desktop
+stopped (the same estimates and counts at all 1,090 of Amphora's counters), as run:
+
+| engine | queries | median best ms, pass e | pass f | f/e | median of f/e by query |
+|---|---:|---:|---:|---:|---:|
+| amphora | 113 | 828.2 | 776.4 | 0.9375 | 1.0041 |
+| duckdb | 109 | 798.7 | 800.0 | 1.0017 | 1.0062 |
+| duckdb-mt | 109 | 481.0 | 484.8 | 1.0078 | 1.0266 |
+| sqlite | 113 | 814.5 | 750.5 | 0.9214 | 0.9839 |
+
+and with the 33 records disturbed in either pass (18 in e, 15 in f) left out:
+
+| engine | queries | median best ms, pass e | pass f | f/e | median of f/e by query |
+|---|---:|---:|---:|---:|---:|
+| amphora | 100 | 811.6 | 805.5 | 0.9924 | 1.0051 |
+| duckdb | 102 | 813.7 | 813.6 | 0.9999 | 1.0064 |
+| duckdb-mt | 105 | 492.2 | 489.2 | 0.9940 | 1.0254 |
+| sqlite | 104 | 1137.2 | 1111.1 | 0.9770 | 0.9836 |
+
+Within 5% for every engine by both measures once the disturbed records are left out: Amphora 0.992,
+DuckDB on one thread 1.000, DuckDB on all 32 threads 0.994 and SQLite 0.977 (by query 1.005, 1.006,
+1.025 and 0.984). As run, Amphora (0.938) and SQLite (0.921) are not: e's disturbed records, beside
+other agents' builds, were 8 of Amphora's and 4 of SQLite's, and SQLite's best times have a gap at
+their median in every pass (774.5 to 1,128.7 ms in b).
+
+**TPC-H, SF 1, pass d against pass e**, each timed by one process from start to end with Docker
+Desktop stopped (the same estimates and counts at all 135 counters), as run:
+
+| engine | queries | median best ms, pass d | pass e | e/d | median of e/d by query |
+|---|---:|---:|---:|---:|---:|
+| amphora | 22 | 767.0 | 782.0 | 1.0196 | 1.0195 |
+| duckdb | 22 | 208.6 | 206.5 | 0.9901 | 0.9975 |
+| duckdb-mt | 22 | 101.1 | 99.4 | 0.9836 | 1.0111 |
+| sqlite | 22 | 935.4 | 952.9 | 1.0187 | 1.0145 |
+
+and with the 21 records disturbed in e left out:
+
+| engine | queries | median best ms, pass d | pass e | e/d | median of e/d by query |
+|---|---:|---:|---:|---:|---:|
+| amphora | 17 | 764.8 | 751.5 | 0.9826 | 1.0119 |
+| duckdb | 17 | 192.9 | 190.2 | 0.9860 | 0.9970 |
+| duckdb-mt | 16 | 96.3 | 96.5 | 1.0016 | 1.0105 |
+| sqlite | 17 | 1002.0 | 984.4 | 0.9824 | 1.0122 |
+
+Within 5% for every engine either way. SF 1's earlier passes b and c, against d, were 0.86 to 0.94
+for the one-thread engines (by query 0.90 to 0.97): b began at loads up to 1.75 and c ran beside other
+agents' work without a monitor, so d and e, both quiet, are the pair.
+
+**PostgreSQL, TPC-H SF 10, its share of pass b against its share of pass c**, each by a process of
+its own on 2026-10-29, as run:
+
+| engine | queries | median best ms, pass b | pass c | c/b | median of c/b by query |
+|---|---:|---:|---:|---:|---:|
+| postgres | 22 | 5627.8 | 5766.3 | 1.0246 | 1.0015 |
+
+and with the 7 queries disturbed in either share left out (q01, q02, q04, q07, q08, q09, q10):
+
+| engine | queries | median best ms, pass b | pass c | c/b | median of c/b by query |
+|---|---:|---:|---:|---:|---:|
+| postgres | 15 | 5256.8 | 5323.6 | 1.0127 | 0.9974 |
+
+Within 5% either way. Against its own pass of 2026-10-27 (`tpch-sf10-pg`, the first after Docker
+Desktop came back), the share of b is 1.079 by the median of best times (1.035 by query).
+
+**PostgreSQL, JOB, its own pass (`job-pg`, 2026-10-27) against its share of pass d** (1a to 15c with
+pass d on 2026-10-27, 15d on from 2026-10-29, 31a to 33c from their rerun), as run:
+
+| engine | queries | median best ms, pass pg | pass d | d/pg | median of d/pg by query |
+|---|---:|---:|---:|---:|---:|
+| postgres | 113 | 259.1 | 254.3 | 0.9818 | 1.0078 |
+
+and with the 6 records disturbed in pass d left out (1a, 6c, 6d, 16b, 16c, 17b):
+
+| engine | queries | median best ms, pass pg | pass d | d/pg | median of d/pg by query |
+|---|---:|---:|---:|---:|---:|
+| postgres | 107 | 249.5 | 245.6 | 0.9843 | 1.0065 |
+
+So the test is met: the estimates are the same in every pair of passes, and the median run times are
+within 5% for every engine between passes timed alike on a quiet machine, with the records other work
+disturbed left out or run again: TPC-H at SF 10 (b against c, PostgreSQL's shares of them too), TPC-H
+at SF 1 (d against e; PostgreSQL's a against b, 1.030), and JOB (e against f, each timed by one process
+from start to end; PostgreSQL's own pass against its share of d). Every earlier pair is kept in its
+records: JOB's b against d (DuckDB on all 32 threads 1.155, the age of its process), JOB's pass c,
+run beside other agents' work without a monitor (1.04 to 1.47 against b), and SF 1's b and c.
 
 ## Refusals, deadlines and PostgreSQL's passes
 
@@ -262,10 +402,14 @@ a monitor, was 1.04 to 1.47 against b; both are kept in their records.
   of their own (`tpch-sf10-pg`, `job-pg`), the same image on the same volume, and its times above
   are those. JOB was loaded into PostgreSQL by a process of its own just before its pass, on the
   same server: that pass ran right after the load, as the other engines' first passes did. Docker
-  Desktop stopped again at about 18:16Z on 2026-10-27, during JOB's pass d, and had not started by
-  2026-10-28 06:08Z: PostgreSQL has 54 of pass d's 113 (to 15c) and no time in SF 10's passes b and
-  c, so its SF 10 times are its one pass's (with pass a's q01 to q05) and its JOB repeat covers the
-  51 of those 54 that ran undisturbed.
+  Desktop stopped again at about 18:16Z on 2026-10-27, during JOB's pass d, with PostgreSQL's share
+  at 15c. Another session's lab on jupiter held Docker Desktop up from 2026-10-29 00:50Z, and
+  PostgreSQL's share of pass d from 15d ran then, by `record.sh` with `TARGETS=postgres`, from 00:58
+  to 01:21Z, until Docker Desktop stopped once more: 31a to 33c got no time and ran again, by a
+  process of their own into `job-d-again.jsonl`, at 08:47 to 08:49Z. Docker Desktop was started for
+  them at 08:24Z (Ada's word, 2026-10-28), and PostgreSQL's share of SF 10's passes b and c ran next,
+  08:49 to 09:13Z and 09:13 to 09:28Z, each by a process of its own. Its SF 10 and JOB times in the
+  table above stay those of its own passes of 2026-10-27; the later ones are its repeat.
 - **SQLite at SF 10:** q07 passed the 600 s deadline in every pass. In pass a, q14 passed it on its
   first run and q15 on its third; in passes b and c both finished all three runs (q14's best 485.9
   s, q15's 474.4 s), so SF 10's best of 3 has SQLite's time for 21 of the 22.
@@ -501,32 +645,32 @@ The largest intermediate result's q-error, a query each (22): median 7.65, p90 1
 | query | tables | max q-error | largest result's q-error | Amphora plan ms | amphora ms | sqlite ms | duckdb ms | duckdb-mt ms | postgres ms |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | q01 | 1 | 2.46 | 2.46 | 0.476 | 5.230e+04 | 6.516e+04 | 2.85e+03 | 240 | 2.164e+04 |
-| q02 | 5 | 2.5e+03 | 2.5e+03 | 1.05 | 343 | 3.46e+03 | 247 | 161 | 2.51e+03 |
+| q02 | 5 | 2.5e+03 | 2.5e+03 | 1.05 | 343 | 3.46e+03 | 247 | 161 | 2.47e+03 |
 | q03 | 3 | 6.4 | 1.35 | 0.587 | 2.830e+04 | 4.017e+04 | 1.7e+03 | 201 | 8.52e+03 |
 | q04 | 2 | 7.65 | 7.65 | 0.547 | 9.88e+03 | 6.38e+03 | 1.36e+03 | 187 | 6.52e+03 |
-| q05 | 6 | 1.52e+03 | 30.3 | 1.08 | 1.634e+04 | 1.739e+05 | 1.77e+03 | 282 | 8.15e+03 |
-| q06 | 1 | 1.9e+03 | 1.9e+03 | 0.374 | 2.215e+04 | 1.210e+04 | 702 | 73.7 | 2.43e+03 |
+| q05 | 6 | 1.52e+03 | 30.3 | 1.08 | 1.634e+04 | 1.739e+05 | 1.77e+03 | 282 | 8.05e+03 |
+| q06 | 1 | 1.9e+03 | 1.9e+03 | 0.374 | 2.215e+04 | 1.210e+04 | 702 | 73.7 | 2.41e+03 |
 | q07 | 6 | 60.9 | 60.8 | 1.36 | 4.334e+04 | timed_out | 1.65e+03 | 255 | 5.02e+03 |
 | q08 | 8 | 121 | 60.8 | 1.06 | 3.112e+04 | 4.989e+04 | 1.56e+03 | 301 | 2.19e+03 |
 | q09 | 6 | 3.68 | 1 | 0.85 | 1.585e+05 | 9.159e+04 | 6.09e+03 | 428 | 2.380e+04 |
 | q10 | 4 | 38.2 | 38.2 | 0.617 | 1.368e+04 | 4.412e+04 | 7.2e+03 | 468 | 6.15e+03 |
 | q11 | 3 | 2.5 | 2.47 | 0.552 | 1.74e+03 | 966 | 8.68e+03 | 91.8 | 1.06e+03 |
 | q12 | 2 | 3.108e+05 | 3.108e+05 | 0.583 | 2.440e+04 | 2.397e+04 | 1.43e+03 | 181 | 5.42e+03 |
-| q13 | 2 | 3.16 | 3.16 | 0.473 | 3.716e+04 | 3.054e+04 | 1.620e+05 | 682 | 6.46e+03 |
+| q13 | 2 | 3.16 | 3.16 | 0.473 | 3.716e+04 | 3.054e+04 | 1.620e+05 | 682 | 6.41e+03 |
 | q14 | 2 | 2.5 | 2.5 | 0.47 | 2.500e+04 | 4.859e+05 | 1.17e+03 | 150 | 2.66e+03 |
 | q15 | 2 | 1e+04 | 7.55 | 1.3 | 4.600e+04 | 4.744e+05 | 4.444e+04 | 342 | 3.1e+03 |
-| q16 | 2 | 1.187e+06 | 1.187e+06 | 0.478 | 2.96e+03 | 1.66e+03 | 6.309e+04 | 502 | 2.62e+03 |
+| q16 | 2 | 1.187e+06 | 1.187e+06 | 0.478 | 2.96e+03 | 1.66e+03 | 6.309e+04 | 502 | 2.6e+03 |
 | q17 | 2 | 1.934e+04 | 1.934e+04 | 0.532 | 1.35e+03 | 1.07e+03 | 1.81e+03 | 303 | 5.55e+03 |
 | q18 | 3 | 6.21 | 1 | 0.575 | 3.948e+04 | 1.643e+04 | 4.097e+05 | 1.51e+03 | 3.075e+04 |
 | q19 | 2 | 1.999e+05 | 1.999e+05 | 0.716 | 1.011e+04 | 612 | 1.17e+03 | 171 | 448 |
 | q20 | 2 | 141 | 99.4 | 0.797 | 7.93e+03 | 6.1e+03 | 1.32e+03 | 419 | 4.69e+03 |
 | q21 | 4 | 360 | 3.95 | 0.869 | 5.309e+04 | 3.100e+04 | 3.54e+03 | 531 | 1.195e+04 |
 | q22 | 2 | 9.39 | 1.57 | 0.718 | 1.4e+03 | 696 | 1.98e+03 | 297 | 647 |
-| all (sum of those run) | | | | | 626567 (22 run) | 1560178 (21 run) | 725375 (22 run) | 7772 (22 run) | 162287 (22 run) |
+| all (sum of those run) | | | | | 626567 (22 run) | 1560178 (21 run) | 725375 (22 run) | 7772 (22 run) | 162058 (22 run) |
 
 | engine | queries both ran | its time over Amphora's (geometric mean) | queries it was faster on |
 |---|---:|---:|---:|
 | sqlite | 21 | 1.198 | 13 |
 | duckdb | 22 | 0.289 | 16 |
 | duckdb-mt | 22 | 0.021 | 22 |
-| postgres | 22 | 0.329 | 20 |
+| postgres | 22 | 0.328 | 20 |

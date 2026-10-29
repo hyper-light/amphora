@@ -1,0 +1,39 @@
+2026-10-29T02:57:33Z chain2 up
+2026-10-29T03:02:44Z quiet for job-f (load 0.80)
+quiet check: busy=0 load=0.70 ok=3 2026-10-29T03:03:47Z
+2026-10-29T03:21:42Z chain2 up
+2026-10-29T03:33:02Z waiting for quiet before job-f: busy=1 (containers 1) load=11.78
+2026-10-29T03:44:58Z waiting for quiet before job-f: busy=1 (containers 1) load=9.24
+2026-10-29T03:56:54Z waiting for quiet before job-f: busy=1 (containers 1) load=11.20
+2026-10-29T04:08:40Z waiting for quiet before job-f: busy=0 (containers 0) load=0.57
+2026-10-29T04:20:22Z waiting for quiet before job-f: busy=0 (containers 0) load=0.82
+2026-10-29T04:27:53Z quiet for job-f (load 1.04)
+quiet check: busy=0 load=0.76 ok=3 2026-10-29T04:28:56Z
+job-f exit 0 2026-10-29T07:43:43Z
+2026-10-29T07:43:43Z rest5 job-f exit 0
+2026-10-29T07:54:47Z waiting for quiet before tpch-sf1-d: busy=0 (containers 0) load=0.58
+2026-10-29T07:57:06Z quiet for tpch-sf1-d (load 0.70)
+quiet check: busy=0 load=0.71 ok=3 2026-10-29T07:58:09Z
+tpch-sf1-d exit 0 2026-10-29T08:24:11Z
+2026-10-29T08:24:11Z rest5 tpch-sf1-d exit 0
+2026-10-29T08:24:12Z docker does not answer: docker desktop start
+✓ Starting Docker Desktop
+2026-10-29T08:35:33Z waiting for quiet before postgres: busy=4 (containers 0) load=2.21
+2026-10-29T08:47:00Z quiet for postgres (load 0.57)
+job-d-again postgres exit 0 2026-10-29T08:49:02Z
+tpch-sf10-b postgres exit 0 2026-10-29T09:13:25Z
+tpch-sf10-c postgres exit 0 2026-10-29T09:28:18Z
+postgres stopped 0 2026-10-29T09:28:19Z
+rest7 done 2026-10-29T09:28:21Z
+2026-10-29T09:28:21Z rest7 exit 0
+2026-10-29T09:28:21Z chain2 done
+2026-10-29T11:25:03Z chain3 up
+2026-10-29T11:36:12Z waiting for quiet before tpch-sf1-e: busy=1 (containers 1) load=4.69
+2026-10-29T11:47:56Z waiting for quiet before tpch-sf1-e: busy=0 (containers 0) load=0.75
+2026-10-29T11:59:42Z waiting for quiet before tpch-sf1-e: busy=2 (containers 0) load=7.73
+2026-10-29T12:11:21Z waiting for quiet before tpch-sf1-e: busy=0 (containers 0) load=0.78
+2026-10-29T12:16:34Z quiet for tpch-sf1-e (load 1.07)
+quiet check: busy=0 load=0.64 ok=3 2026-10-29T12:17:37Z
+tpch-sf1-e exit 0 2026-10-29T14:49:21Z
+2026-10-29T14:49:21Z rest5 tpch-sf1-e exit 0
+2026-10-29T14:49:21Z chain3 done
