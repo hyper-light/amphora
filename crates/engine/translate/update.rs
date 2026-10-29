@@ -71,6 +71,16 @@ pub fn translate_update(
     };
     super::stmt_journal::set_update_stmt_journal_flags(program, update_plan, resolver, connection)?;
 
+    if update_plan
+        .target_table
+        .table
+        .btree()
+        .is_some_and(|bt| !bt.has_rowid)
+    {
+        if let Plan::Update(update) = plan {
+            return super::without_rowid::emit_update(connection, resolver, program, *update);
+        }
+    }
     let opts = ProgramBuilderOpts::new(1, 20, 4);
     program.extend(&opts);
     emit_program(connection, resolver, program, plan, |_| {})?;
@@ -198,7 +208,15 @@ fn prepare_and_optimize_update_plan(
     update_plan.target_table = read_scope_tables.joined_tables_mut().remove(0);
     update_plan.from_tables = read_scope_tables;
 
+    let without_rowid = update_plan
+        .target_table
+        .table
+        .btree()
+        .is_some_and(|bt| !bt.has_rowid);
     let mut plan = Plan::Update(Box::new(update_plan));
+    if without_rowid {
+        return Ok(plan);
+    }
     optimize_plan(program, &mut plan, resolver)?;
     Ok(plan)
 }
@@ -259,9 +277,6 @@ fn prepare_update_plan(
             "unsafe use of virtual table \"{}\"",
             body.tbl_name.name.as_str()
         );
-    }
-    if table.btree().is_some_and(|bt| !bt.has_rowid) {
-        bail_parse_error!("UPDATE of WITHOUT ROWID tables is not supported");
     }
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;

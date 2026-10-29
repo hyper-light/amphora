@@ -29,10 +29,11 @@ fn sql_error(e: impl std::fmt::Display) -> sql::Error {
 fn session_error(error: Error) -> sql::Error {
     sql::Error::Refusal(Refusal::from(error))
 }
-fn sql_refusal(error: sql::Error) -> Refusal {
-    match error {
-        sql::Error::Refusal(refusal) => refusal,
-        other => unavailable(other),
+fn sql_response(result: sql::Result<Answer>) -> Response {
+    match result {
+        Ok(answer) => Ok(answer),
+        Err(sql::Error::Refusal(refusal)) => Err(refusal),
+        Err(other) => Ok(Answer::SqlError(other.to_string())),
     }
 }
 pub(super) fn remaining(until: Instant) -> Result<Duration, Refusal> {
@@ -413,6 +414,12 @@ struct Remote {
     failed: Cell<bool>,
 }
 impl Remote {
+    fn command(&self, command: Command) -> sql::Result<Answer> {
+        match self.exchange(command).map_err(session_error)? {
+            Answer::SqlError(message) => Err(sql::Error::Database(message)),
+            answer => Ok(answer),
+        }
+    }
     fn unexpected(&self) -> sql::Error {
         self.failed.set(true);
         sql::Error::Refusal(Refusal::UnknownOutcome)
@@ -449,14 +456,11 @@ impl Session for Remote {
         api::family(namespace)?;
         api::family(family)?;
         api::key(key)?;
-        match self
-            .exchange(Command::RecordsGet(
-                namespace.into(),
-                family.into(),
-                key.into(),
-            ))
-            .map_err(session_error)?
-        {
+        match self.command(Command::RecordsGet(
+            namespace.into(),
+            family.into(),
+            key.into(),
+        ))? {
             Answer::SessionRow {
                 row,
                 changes,
@@ -472,10 +476,7 @@ impl Session for Remote {
     fn records_commit(&self, namespace: &str, tx: api::Tx) -> sql::Result<api::Rev> {
         api::family(namespace)?;
         api::transaction(&tx)?;
-        match self
-            .exchange(Command::RecordsCommit(namespace.into(), tx))
-            .map_err(session_error)?
-        {
+        match self.command(Command::RecordsCommit(namespace.into(), tx))? {
             Answer::SessionRev {
                 rev,
                 changes,
@@ -490,10 +491,7 @@ impl Session for Remote {
     }
     fn execute_batch(&self, sql: &str) -> sql::Result<()> {
         api::bound("SQL bytes", sql.len(), api::SQL_MAX).map_err(sql_error)?;
-        match self
-            .exchange(Command::Batch(sql.to_owned()))
-            .map_err(session_error)?
-        {
+        match self.command(Command::Batch(sql.to_owned()))? {
             Answer::Rows { changes, rowid, .. } => {
                 self.changes.set(changes);
                 self.rowid.set(rowid);
@@ -510,10 +508,7 @@ impl Session for Remote {
         first: bool,
     ) -> sql::Result<Vec<Vec<api::Value>>> {
         api::bound("SQL bytes", sql.len(), api::SQL_MAX).map_err(sql_error)?;
-        match self
-            .exchange(Command::Query(sql.to_owned(), params, first))
-            .map_err(session_error)?
-        {
+        match self.command(Command::Query(sql.to_owned(), params, first))? {
             Answer::Rows {
                 rows,
                 changes,
@@ -528,10 +523,7 @@ impl Session for Remote {
     }
     fn column_count(&self, sql: &str) -> sql::Result<usize> {
         api::bound("SQL bytes", sql.len(), api::SQL_MAX).map_err(sql_error)?;
-        match self
-            .exchange(Command::Columns(sql.to_owned()))
-            .map_err(session_error)?
-        {
+        match self.command(Command::Columns(sql.to_owned()))? {
             Answer::Columns(n) => Ok(n),
             _ => Err(self.unexpected()),
         }
@@ -627,8 +619,8 @@ fn serve(
                                 })
                             })
                         }
-                    }
-                    .map_err(sql_refusal);
+                    };
+                    let response = sql_response(response);
                     write(&mut stream, &response, until)?;
                     // SQL errors can be handled by application savepoints; transport failures abort.
                 }

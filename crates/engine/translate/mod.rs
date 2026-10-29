@@ -48,6 +48,7 @@ pub(crate) mod vacuum;
 mod values;
 pub(crate) mod view;
 mod window;
+pub(crate) mod without_rowid;
 
 use crate::connection::PrepareOptions;
 use crate::schema::Schema;

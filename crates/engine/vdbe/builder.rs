@@ -1323,25 +1323,73 @@ impl ProgramBuilder {
         self.insns.push((insn, self.insns.len()));
     }
 
-    /// Emit a deferred table seek when the index can identify a table row.
-    pub fn emit_deferred_seek(&mut self, index_cursor_id: CursorID, table_cursor_id: CursorID) {
-        let cursor_type = self.get_cursor_type(index_cursor_id);
-        // A rowid-free index cannot identify a base-table row. Such a plan must
-        // read all required values from the index. SQLite emits no DeferredSeek.
-        if matches!(cursor_type, Some(CursorType::BTreeIndex(index)) if !index.has_rowid) {
-            return;
+    /// Secondary indexes identify WITHOUT ROWID rows by their composite primary key.
+    /// Position that index-btree table explicitly; ordinary tables retain deferred rowid seeks.
+    pub fn emit_deferred_seek(
+        &mut self,
+        index_cursor_id: CursorID,
+        table_cursor_id: CursorID,
+    ) -> Result<()> {
+        let index_type = self.get_cursor_type(index_cursor_id).cloned();
+        let table_type = self.get_cursor_type(table_cursor_id).cloned();
+        if let (Some(CursorType::BTreeIndex(index)), Some(CursorType::BTreeTable(table))) =
+            (&index_type, &table_type)
+        {
+            if !table.has_rowid {
+                let count = table.primary_key_columns.len();
+                let start = self.alloc_registers(count);
+                for (key, (name, _)) in table.primary_key_columns.iter().enumerate() {
+                    let (logical, _) = table.get_column(name).ok_or_else(|| {
+                        crate::LimboError::InternalError(
+                            "WITHOUT ROWID primary key column missing".into(),
+                        )
+                    })?;
+                    let physical = index
+                        .columns
+                        .iter()
+                        .position(|column| column.expr.is_none() && column.pos_in_table == logical)
+                        .ok_or_else(|| {
+                            crate::LimboError::InternalError(
+                                "secondary index lacks primary key locator".into(),
+                            )
+                        })?;
+                    let dest = start.checked_add(key).ok_or_else(|| {
+                        crate::LimboError::InternalError("primary key register overflow".into())
+                    })?;
+                    self.emit_column_or_rowid(index_cursor_id, physical, dest);
+                }
+                let found = self.allocate_label();
+                self.emit_insn(Insn::Found {
+                    cursor_id: table_cursor_id,
+                    target_pc: found,
+                    record_reg: start,
+                    num_regs: count,
+                });
+                self.emit_halt_err(
+                    1,
+                    "secondary index references a missing WITHOUT ROWID row".into(),
+                );
+                self.preassign_label_to_next_insn(found);
+                return Ok(());
+            }
         }
-        turso_assert!(
-            matches!(
-                cursor_type,
-                Some(CursorType::BTreeIndex(_) | CursorType::IndexMethod(_))
-            ),
-            "a deferred seek requires an index cursor"
-        );
+        // Ephemeral rowid-free covering indexes have no base-table locator.
+        if matches!(&index_type, Some(CursorType::BTreeIndex(index)) if !index.has_rowid) {
+            return Ok(());
+        }
+        if !matches!(
+            index_type,
+            Some(CursorType::BTreeIndex(_) | CursorType::IndexMethod(_))
+        ) {
+            return Err(crate::LimboError::InternalError(
+                "a deferred seek requires an index cursor".into(),
+            ));
+        }
         self.emit_insn(Insn::DeferredSeek {
             index_cursor_id,
             table_cursor_id,
         });
+        Ok(())
     }
 
     /// Emits a `Column` or `ColumnRange` opcode, fusing it into an immediately preceding `Column`
@@ -1477,10 +1525,7 @@ impl ProgramBuilder {
         });
     }
 
-    // no users yet, but I want to avoid someone else in the future
-    // just adding parameters to emit_halt! If you use this, remove the
-    // clippy warning please.
-    #[allow(dead_code)]
+    /// Emit a runtime refusal for an inconsistent cursor locator.
     pub fn emit_halt_err(&mut self, err_code: usize, description: String) {
         self.emit_insn(Insn::Halt {
             err_code,

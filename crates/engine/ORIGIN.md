@@ -25,6 +25,12 @@ nothing is synced with Turso in either direction, and a change is an Amphora com
 
 ## What changed from Turso 3e09a82
 
+Amphora now supports persistent secondary indexes and ordinary mutations on
+WITHOUT ROWID tables using composite primary-key locators, including UNIQUE,
+UPSERT, REPLACE and foreign-key actions. The physical layout, compatibility
+evidence and remaining explicit refusals are recorded in
+[`docs/design/without-rowid.md`](../../docs/design/without-rowid.md).
+
 When Amphora's engine was taken (2026-10-20): the crates renamed (`amphora-engine`,
 `amphora-engine-parser`, `amphora-engine-macros`, `amphora-engine-ext`) and moved into Amphora's
 workspace, its dependencies named in Amphora's root `Cargo.toml`; Turso's microbenchmarks dropped

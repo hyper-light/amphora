@@ -49,9 +49,6 @@ fn validate_delete(
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name);
     }
-    if table.btree().is_some_and(|bt| !bt.has_rowid) {
-        crate::bail_parse_error!("DELETE from WITHOUT ROWID tables is not supported");
-    }
 
     // Check if this is a materialized view
     if resolver.schema().is_materialized_view(tbl_name) {
@@ -133,6 +130,19 @@ pub fn translate_delete(
         }
     }
 
+    if let Plan::Delete(delete) = &delete_plan {
+        if delete
+            .table_references
+            .joined_tables()
+            .first()
+            .and_then(|t| t.table.btree())
+            .is_some_and(|bt| !bt.has_rowid)
+        {
+            if let Plan::Delete(delete) = delete_plan {
+                return super::without_rowid::emit_delete(connection, resolver, program, *delete);
+            }
+        }
+    }
     optimize_plan(program, &mut delete_plan, resolver)?;
     if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
         // Re-check after optimization: chosen access paths can make "delete while scanning"

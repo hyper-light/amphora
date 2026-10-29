@@ -188,7 +188,7 @@ impl<'a> InsertEmitCtx<'a> {
             idx_cursors.push((
                 idx.name.clone(),
                 idx.root_page,
-                program.alloc_cursor_index(None, idx)?,
+                program.alloc_cursor_index(None, &Arc::new(idx.physical_index(table)?))?,
             ));
         }
         let loop_labels = InsertLoopLabels {
@@ -392,30 +392,27 @@ pub fn translate_insert(
                 s.any_resolved_fks_referencing(table_name.as_str())
             }));
     if !btree_table.has_rowid {
-        if has_fks {
-            crate::bail_parse_error!("foreign keys on WITHOUT ROWID tables are not supported");
-        }
-        if on_conflict == Some(ResolveType::Replace) || !upsert_actions.is_empty() {
+        if btree_table.has_virtual_columns {
             crate::bail_parse_error!(
-                "UPSERT and REPLACE on WITHOUT ROWID tables are not supported"
+                "generated-column mutations of WITHOUT ROWID tables are not supported"
+            );
+        }
+        if super::without_rowid::has_encoded_columns(&btree_table, resolver, database_id) {
+            crate::bail_parse_error!(
+                "custom-type and array mutations of WITHOUT ROWID tables are not supported"
             );
         }
         if cdc_table.is_some() {
             crate::bail_parse_error!("CDC on WITHOUT ROWID tables is not supported");
         }
-        if !resolver
-            .schema()
-            .get_dependent_materialized_views(table_name.as_str())
-            .is_empty()
-        {
+        if !resolver.with_schema(database_id, |schema| {
+            schema
+                .get_dependent_materialized_views(table_name.as_str())
+                .is_empty()
+        }) {
             crate::bail_parse_error!(
                 "materialized views on WITHOUT ROWID tables are not supported"
             );
-        }
-        if resolver.with_schema(database_id, |s| {
-            s.get_indices(table_name.as_str()).next().is_some()
-        }) {
-            crate::bail_parse_error!("secondary indexes on WITHOUT ROWID tables are not supported");
         }
     }
 
@@ -932,10 +929,12 @@ pub fn translate_insert(
         &mut preflight_ctx,
     )?;
 
-    // Create and insert the record
+    // Apply record affinities in the physical register order (PK-first for WITHOUT ROWID).
+    let mut record_columns: Vec<_> = insertion.col_mappings.iter().collect();
+    record_columns.sort_by_key(|mapping| mapping.register);
     emit_make_record(
         program,
-        insertion.col_mappings.iter().map(|m| m.column),
+        record_columns.into_iter().map(|m| m.column),
         insertion.base_reg,
         insertion.record_register(),
     );
@@ -970,7 +969,7 @@ pub fn translate_insert(
     // constraints, so we can't skip the commit phase.
     let statement_replace = matches!(ctx.on_conflict, ResolveType::Replace);
     let skip_replace_indexes = has_ddl_replace && !statement_replace;
-    if has_upsert || !statement_replace {
+    if !ctx.table.has_rowid || has_upsert || !statement_replace {
         emit_commit_phase(program, resolver, &insertion, &ctx, skip_replace_indexes)?;
     }
 
@@ -985,13 +984,22 @@ pub fn translate_insert(
     if matches!(ctx.on_conflict, ResolveType::Replace) || has_ddl_replace {
         insert_flags = insert_flags.require_seek();
     }
-    program.emit_insn(Insn::Insert {
-        cursor: ctx.cursor_id,
-        key_reg: insertion.key_register(),
-        record_reg: insertion.record_register(),
-        flag: insert_flags,
-        table_name: table_name.to_string(),
-    });
+    if ctx.table.has_rowid {
+        program.emit_insn(Insn::Insert {
+            cursor: ctx.cursor_id,
+            key_reg: insertion.key_register(),
+            record_reg: insertion.record_register(),
+            flag: insert_flags,
+            table_name: table_name.to_string(),
+        });
+    } else {
+        super::without_rowid::write_row(
+            program,
+            ctx.table,
+            ctx.cursor_id,
+            insertion.first_col_register(),
+        )?;
+    }
 
     // Fire AFTER INSERT triggers
     let relevant_after_triggers = get_triggers_including_temp(
@@ -1391,11 +1399,21 @@ fn emit_partial_index_check(
 // already guaranteed non-conflict.
 fn emit_commit_phase(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    resolver: &mut Resolver,
     insertion: &Insertion,
     ctx: &InsertEmitCtx,
     skip_replace_indexes: bool,
 ) -> Result<()> {
+    if !ctx.table.has_rowid {
+        let indexes = without_rowid_index_cursors(ctx, resolver)?;
+        return super::without_rowid::insert_indexes(
+            program,
+            resolver,
+            ctx.table,
+            insertion.first_col_register(),
+            &indexes,
+        );
+    }
     let indices: Vec<_> = resolver.with_schema(ctx.database_id, |s| {
         s.get_indices(ctx.table.name.as_str()).cloned().collect()
     });
@@ -3283,6 +3301,9 @@ fn emit_preflight_constraint_checks(
     constraints: &ConstraintsToCheck,
     preflight: &mut PreflightCtx,
 ) -> Result<()> {
+    if !ctx.table.has_rowid {
+        return without_rowid_preflight(program, ctx, resolver, insertion, constraints, preflight);
+    }
     let mut seen_replace = false;
     for (constraint, position) in &constraints.constraints_to_check {
         // Compute per-constraint effective conflict resolution:
@@ -4289,14 +4310,9 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
             s.get_indices(&child_tbl.name).cloned().collect()
         });
-        let idx = indices.iter().find(|ix| {
-            ix.columns.len() == child_cols.len()
-                && ix
-                    .columns
-                    .iter()
-                    .zip(child_cols.iter())
-                    .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
-        });
+        let idx = indices
+            .iter()
+            .find(|ix| super::fkeys::child_index_matches_fk(ix, &pref, parent_table));
 
         if let Some(ix) = idx {
             let icur = open_read_index(program, ix, database_id);
@@ -4325,58 +4341,22 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 Ok(())
             })?;
         } else {
-            // fallback scan :(
-            let ccur = open_read_table(program, child_tbl, database_id);
-            let done = program.allocate_label();
-            program.emit_insn(Insn::Rewind {
-                cursor_id: ccur,
-                pc_if_empty: done,
-            });
-            let loop_top = program.allocate_label();
-            let next_row = program.allocate_label();
-            program.preassign_label_to_next_insn(loop_top);
-
-            for (i, child_name) in child_cols.iter().enumerate() {
-                let (pos, _) = child_tbl.get_column(child_name).ok_or_else(|| {
-                    crate::LimboError::InternalError(format!("child col {child_name} missing"))
-                })?;
-                let tmp = program.alloc_register();
-                program.emit_insn(Insn::Column {
-                    cursor_id: ccur,
-                    column: pos,
-                    dest: tmp,
-                    default: None,
-                });
-
-                program.emit_insn(Insn::IsNull {
-                    reg: tmp,
-                    target_pc: next_row,
-                });
-
-                let cont = program.allocate_label();
-                program.emit_insn(Insn::Eq {
-                    lhs: tmp,
-                    rhs: new_pk_start + i,
-                    target_pc: cont,
-                    flags: CmpInsFlags::default().jump_if_null(),
-                    collation: Some(super::collate::CollationSeq::Binary),
-                });
-                program.emit_insn(Insn::Goto {
-                    target_pc: next_row,
-                });
-                program.preassign_label_to_next_insn(cont);
-            }
-            // Matched one child row: guarded decrement of counter
-            emit_guarded_fk_decrement(program, next_row, pref.fk.deferred);
-            program.preassign_label_to_next_insn(next_row);
-            program.emit_insn(Insn::Next {
-                cursor_id: ccur,
-                pc_if_next: loop_top,
-                fullscan: false,
-                is_index: false,
-            });
-            program.preassign_label_to_next_insn(done);
-            program.emit_insn(Insn::Close { cursor_id: ccur });
+            super::fkeys::table_scan_match_any(
+                program,
+                child_tbl,
+                child_cols,
+                parent_table,
+                &pref.parent_cols,
+                new_pk_start,
+                None,
+                database_id,
+                |program| {
+                    let next = program.allocate_label();
+                    emit_guarded_fk_decrement(program, next, pref.fk.deferred);
+                    program.preassign_label_to_next_insn(next);
+                    Ok(())
+                },
+            )?;
         }
         program.preassign_label_to_next_insn(skip_fk);
     }
@@ -4407,4 +4387,173 @@ fn emit_custom_type_encode(
         table_name,
         &layout,
     )
+}
+
+pub(crate) fn without_rowid_index_cursors(
+    ctx: &InsertEmitCtx,
+    resolver: &Resolver,
+) -> Result<Vec<super::without_rowid::IndexCursor>> {
+    let indices: Vec<_> = resolver.with_schema(ctx.database_id, |s| {
+        s.get_indices(&ctx.table.name).cloned().collect()
+    });
+    indices
+        .into_iter()
+        .map(|index| {
+            let cursor = ctx
+                .idx_cursors
+                .iter()
+                .find(|(name, _, _)| name == &index.name)
+                .map(|(_, _, cursor)| *cursor)
+                .ok_or_else(|| {
+                    crate::LimboError::InternalError("WITHOUT ROWID index cursor missing".into())
+                })?;
+            Ok(super::without_rowid::IndexCursor { index, cursor })
+        })
+        .collect()
+}
+
+fn without_rowid_preflight(
+    program: &mut ProgramBuilder,
+    ctx: &mut InsertEmitCtx,
+    resolver: &mut Resolver,
+    insertion: &Insertion,
+    constraints: &ConstraintsToCheck,
+    preflight: &mut PreflightCtx,
+) -> Result<()> {
+    use super::without_rowid as wr;
+    let indexes = without_rowid_index_cursors(ctx, resolver)?;
+    let mut replacements = Vec::new();
+    for (constraint, position) in &constraints.constraints_to_check {
+        let replace_flag = program.alloc_register();
+        program.emit_bool(false, replace_flag);
+        let ok = program.allocate_label();
+        let (cursor, key, count, index) = match constraint {
+            ResolvedUpsertTarget::PrimaryKey => (
+                ctx.cursor_id,
+                wr::pk_registers(program, ctx.table, insertion.first_col_register())?,
+                ctx.table.primary_key_columns.len(),
+                None,
+            ),
+            ResolvedUpsertTarget::Index(index) => {
+                if !index.unique {
+                    continue;
+                }
+                wr::partial_skip(
+                    program,
+                    resolver,
+                    ctx.table,
+                    insertion.first_col_register(),
+                    index,
+                    ok,
+                )?;
+                let cursor = indexes
+                    .iter()
+                    .find(|i| i.index.name == index.name)
+                    .map(|i| i.cursor)
+                    .ok_or_else(|| {
+                        crate::LimboError::InternalError("index cursor missing".into())
+                    })?;
+                let (key, _) = wr::index_key(
+                    program,
+                    resolver,
+                    ctx.table,
+                    insertion.first_col_register(),
+                    index,
+                )?;
+                (cursor, key, index.columns.len(), Some(index))
+            }
+            ResolvedUpsertTarget::CatchAll => {
+                return Err(crate::LimboError::InternalError(
+                    "catchall is not a physical constraint".into(),
+                ));
+            }
+        };
+        program.emit_insn(Insn::NoConflict {
+            cursor_id: cursor,
+            target_pc: ok,
+            record_reg: key,
+            num_regs: count,
+        });
+        if let Some(index) = index {
+            let physical = index.physical_columns(ctx.table)?;
+            let pk = program.alloc_registers(ctx.table.primary_key_columns.len());
+            for (i, (name, _)) in ctx.table.primary_key_columns.iter().enumerate() {
+                let (pos, col) = ctx.table.get_column(name).ok_or_else(|| {
+                    crate::LimboError::InternalError("primary key missing".into())
+                })?;
+                let slot = physical
+                    .iter()
+                    .position(|c| {
+                        c.expr.is_none()
+                            && c.pos_in_table == pos
+                            && c.collation.unwrap_or_else(|| col.collation())
+                                == ctx
+                                    .table
+                                    .primary_key_constraint_collation(name)
+                                    .unwrap_or_else(|| col.collation())
+                    })
+                    .ok_or_else(|| {
+                        crate::LimboError::InternalError("index PK suffix missing".into())
+                    })?;
+                let dest = pk
+                    .checked_add(i)
+                    .ok_or_else(|| crate::LimboError::InternalError("register overflow".into()))?;
+                program.emit_column_or_rowid(cursor, slot, dest);
+            }
+            program.emit_insn(Insn::NoConflict {
+                cursor_id: ctx.cursor_id,
+                target_pc: ok,
+                record_reg: pk,
+                num_regs: ctx.table.primary_key_columns.len(),
+            });
+        }
+        if let Some(position) = position.or(constraints.upsert_catch_all_position) {
+            let (_, label, _) = preflight
+                .upsert_actions
+                .get(position)
+                .ok_or_else(|| crate::LimboError::InternalError("upsert action missing".into()))?;
+            program.emit_insn(Insn::Goto { target_pc: *label });
+        } else {
+            let effective = if ctx.statement_on_conflict.is_some() {
+                ctx.on_conflict
+            } else {
+                index.map_or_else(
+                    || wr::primary_key_policy(ctx.table),
+                    |i| i.on_conflict.unwrap_or(ResolveType::Abort),
+                )
+            };
+            match effective {
+                ResolveType::Ignore => {
+                    program.emit_insn(Insn::Goto {
+                        target_pc: ctx.loop_labels.row_done,
+                    });
+                }
+                ResolveType::Replace => replacements.push(wr::queue_replace(
+                    program,
+                    ctx.table,
+                    ctx.cursor_id,
+                    replace_flag,
+                )?),
+                _ => wr::halt_constraint(
+                    program,
+                    ctx.table,
+                    index.map(|i| i.as_ref()),
+                    effective,
+                    false,
+                ),
+            }
+        }
+        program.preassign_label_to_next_insn(ok);
+    }
+    wr::apply_replacements(
+        program,
+        resolver,
+        preflight.connection,
+        ctx.table,
+        ctx.cursor_id,
+        &indexes,
+        ctx.database_id,
+        &replacements,
+    )?;
+    Ok(())
 }

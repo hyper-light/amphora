@@ -227,7 +227,7 @@ pub(crate) fn refused(error: &anyhow::Error) -> Refusal {
     if let Some(crate::sql::Error::Refusal(refusal)) = error.downcast_ref::<crate::sql::Error>() {
         return refusal.clone();
     }
-    unavailable(error)
+    unavailable(format!("{error:#}"))
 }
 fn locked<T>(m: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, Refusal> {
     m.lock()

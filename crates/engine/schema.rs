@@ -1873,6 +1873,11 @@ impl Schema {
             // we must process unique_sets in this exact order in order to emit automatic indices schema entries in the same order
             let mut pk_index_added = false;
             for unique_set in &table.unique_sets {
+                // WITHOUT ROWID stores its primary key in the table root, so
+                // sqlite_schema has no separate autoindex row to consume.
+                if unique_set.is_primary_key && !table.has_rowid {
+                    continue;
+                }
                 if unique_set.is_primary_key {
                     assert!(
                         table.primary_key_columns.len() == unique_set.columns.len(),
@@ -2586,19 +2591,68 @@ impl Schema {
         let parent_unique_index = if parent_uses_rowid {
             None
         } else {
-            let found = self
+            let mut found = self
                 .get_indices(&parent_tbl.name)
                 .find(|idx| {
                     idx.unique
                         && idx.where_clause.is_none()
                         && idx.columns.len() == parent_cols.len()
-                        && idx
-                            .columns
-                            .iter()
-                            .zip(parent_cols.iter())
-                            .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
+                        && idx.columns.iter().zip(parent_cols.iter()).all(|(ic, pc)| {
+                            ic.name.eq_ignore_ascii_case(pc)
+                                && parent_tbl.get_column(pc).is_some_and(|(_, column)| {
+                                    ic.collation.unwrap_or_default() == column.collation()
+                                })
+                        })
                 })
                 .cloned();
+            // A WITHOUT ROWID primary key lives in the table root, without
+            // a separate sqlite_schema index entry. Probe that root using its
+            // primary-key prefix, in storage order.
+            if found.is_none()
+                && !parent_tbl.has_rowid
+                && parent_tbl.primary_key_columns.len() == parent_cols.len()
+                && parent_tbl
+                    .primary_key_columns
+                    .iter()
+                    .zip(&parent_cols)
+                    .all(|((name, _), parent)| name.eq_ignore_ascii_case(parent))
+            {
+                let mut columns = Vec::new();
+                for (name, order) in &parent_tbl.primary_key_columns {
+                    let (pos_in_table, column) = parent_tbl
+                        .get_column(name)
+                        .ok_or_else(|| fk_mismatch_err(&child.name, &parent_tbl.name))?;
+                    let collation = parent_tbl
+                        .primary_key_constraint_collation(name)
+                        .unwrap_or_else(|| column.collation());
+                    if collation != column.collation() {
+                        return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                    }
+                    columns.try_push(IndexColumn {
+                        name: name.clone(),
+                        order: *order,
+                        nulls_order: None,
+                        pos_in_table,
+                        collation: parent_tbl
+                            .primary_key_constraint_collation(name)
+                            .or_else(|| column.collation_opt()),
+                        default: column.default.clone(),
+                        expr: None,
+                    })?;
+                }
+                found = Some(Arc::new(Index {
+                    name: parent_tbl.name.clone(),
+                    table_name: parent_tbl.name.clone(),
+                    root_page: parent_tbl.root_page,
+                    columns,
+                    unique: true,
+                    ephemeral: false,
+                    has_rowid: false,
+                    where_clause: None,
+                    index_method: None,
+                    on_conflict: None,
+                }));
+            }
             if require_unique && found.is_none() {
                 return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
             }
@@ -3857,7 +3911,10 @@ impl BTreeTable {
             })
     }
 
-    fn primary_key_constraint_collation(&self, column_name: &str) -> Option<CollationSeq> {
+    pub(crate) fn primary_key_constraint_collation(
+        &self,
+        column_name: &str,
+    ) -> Option<CollationSeq> {
         self.unique_sets
             .iter()
             .find(|unique_set| unique_set.is_primary_key)
@@ -6010,6 +6067,52 @@ impl IndexColumn {
 }
 
 impl Index {
+    /// Physical secondary-index fields: declared terms followed by the missing
+    /// WITHOUT ROWID primary-key terms. A term with another collation cannot
+    /// identify the corresponding primary-key value and must not suppress it.
+    pub fn physical_columns(&self, table: &BTreeTable) -> Result<Vec<IndexColumn>> {
+        let mut columns = self.columns.try_clone()?;
+        if self.has_rowid || self.ephemeral {
+            return Ok(columns);
+        }
+        for (name, order) in &table.primary_key_columns {
+            let Some((pos_in_table, column)) = table.get_column(name) else {
+                return Err(crate::LimboError::ParseError(format!(
+                    "Primary key column {name} not found in table {}",
+                    table.name
+                )));
+            };
+            let collation = table
+                .primary_key_constraint_collation(name)
+                .or_else(|| column.collation_opt());
+            if columns.iter().any(|term| {
+                term.expr.is_none()
+                    && term.pos_in_table == pos_in_table
+                    && term.collation.unwrap_or_default() == collation.unwrap_or_default()
+            }) {
+                continue;
+            }
+            columns.try_push(IndexColumn {
+                name: normalize_ident(name),
+                order: *order,
+                nulls_order: None,
+                pos_in_table,
+                collation,
+                default: column.default.clone(),
+                expr: None,
+            })?;
+        }
+        Ok(columns)
+    }
+
+    /// Cursor metadata includes the locator suffix; constraint metadata keeps
+    /// only the declared terms so uniqueness is checked on the correct prefix.
+    pub fn physical_index(&self, table: &BTreeTable) -> Result<Index> {
+        let mut index = self.try_clone()?;
+        index.columns = self.physical_columns(table)?;
+        Ok(index)
+    }
+
     pub fn from_sql(
         syms: &SymbolTable,
         sql: &str,
@@ -8022,5 +8125,49 @@ mod column_info {
             let v: u32 = affinity as u32;
             self.0 = (self.0 & !BASE_AFF_MASK) | ((v << BASE_AFF_SHIFT) & BASE_AFF_MASK);
         }
+    }
+}
+
+#[cfg(test)]
+mod without_rowid_index_tests {
+    use super::*;
+    use std::vec;
+
+    // AC-T1.1: persistent secondary indexes retain the complete row identity,
+    // including PK COLLATE/order, without extending the UNIQUE constraint.
+    #[test]
+    fn without_rowid_secondary_locator_preserves_collation_and_unique_prefix() -> Result<()> {
+        let table = BTreeTable::from_sql(
+            "CREATE TABLE t(a TEXT,b INTEGER,v TEXT,PRIMARY KEY(a COLLATE NOCASE DESC,b)) WITHOUT ROWID", 2)?;
+        let index = Index::automatic_from_unique(
+            &table,
+            ("u".into(), 3),
+            vec![(0, SortOrder::Asc)],
+            None,
+            &[],
+        )?;
+        let physical = index.physical_columns(&table)?;
+        assert_eq!(index.columns.len(), 1);
+        assert_eq!(physical.len(), 3);
+        assert_eq!(physical[1].pos_in_table, 0);
+        assert_eq!(physical[1].collation, Some(CollationSeq::NoCase));
+        assert_eq!(physical[1].order, SortOrder::Desc);
+        assert_eq!(physical[2].pos_in_table, 1);
+        let same_collation = Index::automatic_from_unique(
+            &table,
+            ("u2".into(), 4),
+            vec![(0, SortOrder::Asc)],
+            None,
+            &[UniqueSetColumn {
+                name: "a".into(),
+                sort_order: SortOrder::Asc,
+                collation: Some(CollationSeq::NoCase),
+                nulls_order: None,
+            }],
+        )?;
+        let compact = same_collation.physical_columns(&table)?;
+        assert_eq!(compact.len(), 2);
+        assert_eq!(compact[1].pos_in_table, 1);
+        Ok(())
     }
 }

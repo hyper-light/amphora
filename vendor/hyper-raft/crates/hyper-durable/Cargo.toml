@@ -15,7 +15,14 @@ hyper-raft = { path = "../hyper-raft" }
 hyper-timing = { path = "../hyper-timing" }
 thiserror.workspace = true
 
+[features]
+# `RamStore`, a store whose writes complete as they're submitted, for tests alone: a dev-dependency
+# asks for it (this crate's own tests, below). Quiver's and kiln's copies make it so, as the
+# write-ahead log is mandatory there (Quiver's docs/design/focal-bus.md, "GroupStore mandated").
+test-store = []
+
 [dev-dependencies]
+hyper-durable = { path = ".", features = ["test-store"] }
 hyper-block = { path = "../hyper-block", features = ["sim"] }
 # The oracles the simulated groups are held to, and their crash enumeration by fork (docs/sim.md
 # S-6, `tests/support/cluster.rs`).

@@ -106,7 +106,6 @@ impl AvailableIndexes {
             .joined_tables()
             .iter()
             .filter(|jt| matches!(jt.table, Table::BTree(_) | Table::Virtual(_))) // only b-tree tables can have indexes
-            .filter(|jt| jt.btree().is_none_or(|btree| btree.has_rowid))
             .filter_map(|jt| {
                 let indexes = resolver.with_schema(jt.database_id, |schema| {
                     schema.indexes.get(jt.table.get_name()).cloned()
@@ -2578,12 +2577,6 @@ fn enforce_indexed_by_hints(
         match indexed {
             ast::Indexed::IndexedBy(name) => {
                 let idx_name = name.as_str();
-                if table_ref.btree().is_some_and(|btree| !btree.has_rowid) {
-                    crate::bail_parse_error!(
-                        "INDEXED BY is not supported on WITHOUT ROWID tables: {}",
-                        idx_name
-                    );
-                }
                 // Verify the index exists and belongs to this table.
                 let forced_index =
                     available_indexes.btree_index_by_name(table_ref.internal_id, idx_name);
@@ -4577,7 +4570,7 @@ fn ephemeral_index_build(
             (None, None) => Ordering::Equal,
         }
     });
-    let ephemeral_index = Index {
+    let mut ephemeral_index = Index {
         name: format!(
             "ephemeral_{}_{}",
             table_reference.table.get_name(),
@@ -4604,6 +4597,14 @@ fn ephemeral_index_build(
         index_method: None,
         on_conflict: None,
     };
+
+    if let Some(table) = table_reference.btree().filter(|table| !table.has_rowid) {
+        // An automatic index still needs the full row identity: otherwise equal
+        // projected fields from distinct primary keys would collapse into one record.
+        let mut locator = ephemeral_index.clone();
+        locator.ephemeral = false;
+        ephemeral_index.columns = locator.physical_columns(&table)?;
+    }
 
     Ok(ephemeral_index)
 }

@@ -899,11 +899,6 @@ fn validate(
             if table.primary_key_columns.is_empty() {
                 bail_parse_error!("PRIMARY KEY missing on table {}", table_name);
             }
-            if table.unique_sets.iter().any(|us| !us.is_primary_key) {
-                bail_parse_error!(
-                    "secondary UNIQUE constraints on WITHOUT ROWID tables are not supported"
-                );
-            }
         }
     }
     Ok(())

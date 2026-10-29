@@ -439,6 +439,21 @@ pub fn resolve_upsert_target(
         return Ok(ResolvedUpsertTarget::PrimaryKey);
     }
 
+    if let Some(bt) = table.btree().filter(|bt| !bt.has_rowid) {
+        let constraint = bt.unique_sets.iter().find(|set| set.is_primary_key);
+        let columns = constraint.map_or(&[][..], |set| set.columns.as_slice());
+        let primary = Index::automatic_from_primary_key(
+            &bt,
+            (bt.name.clone(), bt.root_page),
+            bt.primary_key_columns.len(),
+            constraint.and_then(|set| set.conflict_clause),
+            columns,
+        )?;
+        if upsert_matches_index(upsert, &primary, table) {
+            return Ok(ResolvedUpsertTarget::PrimaryKey);
+        }
+    }
+
     // Otherwise match a UNIQUE index, also covering non-rowid PRIMARY KEYs
     for idx in schema.get_indices(table.get_name()) {
         if idx.unique && upsert_matches_index(upsert, idx, table) {
@@ -486,6 +501,21 @@ pub fn emit_upsert(
     table_references: &mut TableReferences,
     table_alias: Option<&str>,
 ) -> crate::Result<()> {
+    if !ctx.table.has_rowid {
+        return super::without_rowid::emit_upsert(
+            program,
+            table,
+            ctx,
+            insertion,
+            set_pairs,
+            where_clause,
+            resolver,
+            returning,
+            connection,
+            table_references,
+            table_alias,
+        );
+    }
     // Seek & snapshot CURRENT
     program.emit_insn(Insn::SeekRowid {
         cursor_id: ctx.cursor_id,
@@ -1724,7 +1754,7 @@ fn emit_upsert_expr_index_value(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn rewrite_expr_to_registers(
+pub(crate) fn rewrite_expr_to_registers(
     e: &mut ast::Expr,
     table: &Table,
     base_start: usize,

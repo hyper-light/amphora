@@ -39,6 +39,10 @@ mod compaction;
 mod held;
 mod hyperlog;
 mod machine;
+// A store whose writes complete as they're submitted: for tests alone where this copy is built
+// (Quiver's and kiln's: the write-ahead log is mandatory there), its feature asked for by a
+// dev-dependency.
+#[cfg(any(test, feature = "test-store"))]
 mod memory;
 mod owner;
 mod replica;
@@ -49,6 +53,7 @@ pub use compaction::Compaction;
 pub use held::Held;
 pub use hyperlog::{ClaimError, ENTRY_OVERHEAD, GroupStore, LogGroups, decode_entry, encode_entry};
 pub use machine::{Fatal, StateMachine};
+#[cfg(any(test, feature = "test-store"))]
 pub use memory::RamStore;
 pub use owner::{Full, Handle, Owner};
 pub use replica::{Cause, Driven, OpenError, Output, Replica, ReplicaError, Settings, Writes};

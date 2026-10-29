@@ -1290,7 +1290,10 @@ impl BTreeCursor {
                 .expect("WITHOUT ROWID primary key column should exist");
             crate::types::KeyInfo {
                 sort_order: *order,
-                collation: column.collation_opt().unwrap_or_default(),
+                collation: table
+                    .primary_key_constraint_collation(col_name)
+                    .or_else(|| column.collation_opt())
+                    .unwrap_or_default(),
                 nulls_order: None,
             }
         });

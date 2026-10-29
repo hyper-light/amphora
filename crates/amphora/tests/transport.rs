@@ -9,6 +9,7 @@
 //! CP-T1.5 / U05/U06: independent processes share the same writer and Records revisions.
 use amphora::{database::Database, transport::Client};
 use amphora_api::{self as api, Records};
+use anyhow::Context;
 use std::{
     io::{Read, Write},
     path::Path,
@@ -57,6 +58,49 @@ fn child(path: &Path, mode: &str) -> std::process::ExitStatus {
         .status()
         .unwrap()
 }
+fn migration_diagnostics(database: &Database) {
+    // U05/U16: caller migration context and the engine cause survive either SQL session path.
+    let failure = database
+        .call::<(), _>(until(), |db| {
+            db.execute_batch("CREATE INDEX diagnostic_index ON missing_diagnostic_table(value)")
+                .context("migration 20261023-1300_p6_records.sql")
+                .context("apply migrations")?;
+            Ok(())
+        })
+        .unwrap_err();
+    let api::Refusal::Unavailable(message) = failure else {
+        panic!("untyped SQL error changed refusal: {failure:?}");
+    };
+    for expected in [
+        "apply migrations",
+        "20261023-1300_p6_records.sql",
+        "missing_diagnostic_table",
+    ] {
+        assert!(
+            message.contains(expected),
+            "lost error context {expected}: {message}"
+        );
+    }
+    let refusal = database.call::<(), _>(until(), |_| {
+        Err(
+            anyhow::Error::new(api::Refusal::NotLeader { leader: Some(7) })
+                .context("apply migrations"),
+        )
+    });
+    assert!(matches!(
+        refusal,
+        Err(api::Refusal::NotLeader { leader: Some(7) })
+    ));
+    let refusal = database.call::<(), _>(until(), |_| {
+        Err(
+            anyhow::Error::new(api::sql::Error::Refusal(api::Refusal::Fenced(
+                "writer fenced".into(),
+            )))
+            .context("apply migrations"),
+        )
+    });
+    assert!(matches!(refusal, Err(api::Refusal::Fenced(reason)) if reason == "writer fenced"));
+}
 // The disconnect oracle must kill the isolated child before Commit or any Rust cleanup.
 // Returning from the closure would commit; unwinding would exercise explicit Abort instead.
 #[allow(clippy::exit)]
@@ -102,6 +146,7 @@ fn transport_child() {
         }
         "owner" => {
             let database = Database::open(path, until()).unwrap();
+            migration_diagnostics(&database);
             let n = database
                 .call(until(), |db| {
                     Ok(db.query_row("SELECT count(*) FROM items", [], |r| r.get::<_, i64>(0))?)
@@ -351,6 +396,7 @@ fn independent_processes_share_cas_and_adaptive_sql_and_abort_disconnect() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let database = Database::open(&path, until()).unwrap();
+    migration_diagnostics(&database);
     let client = Client::connect(&path, until()).unwrap();
     client
         .call(until(), |db| {

@@ -3405,6 +3405,7 @@ impl JoinedTable {
                 let index_is_ephemeral = index.is_some_and(|index| index.ephemeral);
                 let table_not_required = matches!(mode, OperationMode::SELECT)
                     && use_covering_index
+                    && btree.has_rowid
                     && !index_is_ephemeral
                     && !self.requires_table_cursor_for_unmatched_rows();
                 let table_cursor_id = if table_not_required {
@@ -3442,9 +3443,14 @@ impl JoinedTable {
 
                 let index_cursor_id = index
                     .map(|index| {
+                        let physical = if !btree.has_rowid && !index.ephemeral {
+                            Arc::new(index.physical_index(btree)?)
+                        } else {
+                            index.clone()
+                        };
                         program.alloc_cursor_index_if_not_exists(
                             CursorKey::index(self.internal_id, index.clone()),
-                            index,
+                            &physical,
                         )
                     })
                     .transpose()?;

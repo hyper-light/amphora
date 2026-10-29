@@ -154,8 +154,9 @@ pub fn translate_create_index(
     let Some(tbl) = table.btree() else {
         crate::bail_parse_error!("virtual tables may not be indexed");
     };
-    if !tbl.has_rowid {
-        bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
+    validate_without_rowid_index_types(resolver, database_id, &tbl)?;
+    if !tbl.has_rowid && using.is_some() {
+        bail_parse_error!("custom index methods require a rowid table");
     }
     let columns = resolve_sorted_columns_with_resolver(&tbl, &columns, Some(resolver))?;
 
@@ -243,7 +244,8 @@ pub fn translate_create_index(
 
     // Create a new B-Tree and store the root page index in a register
     let root_page_reg = program.alloc_register();
-    let index_cursor_id = program.alloc_cursor_index(None, &idx)?;
+    let physical_index = Arc::new(idx.physical_index(&tbl)?);
+    let index_cursor_id = program.alloc_cursor_index(None, &physical_index)?;
     if idx.index_method.is_some() && !idx.is_backing_btree_index() {
         program.emit_insn(Insn::IndexMethodCreate {
             db: database_id,
@@ -312,6 +314,30 @@ pub fn translate_create_index(
     Ok(())
 }
 
+/// The WITHOUT ROWID mutation image path currently handles SQLite scalar
+/// values only. Refuse indexes it cannot subsequently maintain correctly.
+fn validate_without_rowid_index_types(
+    resolver: &Resolver,
+    database_id: usize,
+    table: &BTreeTable,
+) -> crate::Result<()> {
+    if !table.has_rowid
+        && resolver.with_schema(database_id, |schema| {
+            table.columns().iter().any(|column| {
+                column.is_array()
+                    || schema
+                        .get_type_def(&column.ty_str, table.is_strict)
+                        .is_some()
+            })
+        })
+    {
+        bail_parse_error!(
+            "indexes on WITHOUT ROWID tables with custom types or arrays are not supported"
+        );
+    }
+    Ok(())
+}
+
 /// Emits the bytecode that rebuilds `idx` from a full scan of `tbl`.
 ///
 /// `CREATE INDEX` calls this with a newly allocated root page. `REINDEX` calls it with
@@ -329,6 +355,7 @@ pub(crate) fn emit_refill_index(
     index_root_page: RegisterOrLiteral<i64>,
     clear_existing_root: Option<i64>,
 ) -> crate::Result<()> {
+    validate_without_rowid_index_types(resolver, database_id, tbl)?;
     let table_ref = program.table_reference_counter.next();
     let table_cursor_id = program.alloc_cursor_id_keyed(
         CursorKey::table(table_ref),
@@ -338,7 +365,12 @@ pub(crate) fn emit_refill_index(
     let pseudo_cursor_id = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
         column_count: tbl.columns().len(),
     }));
-    let columns = &idx.columns;
+    let physical_columns = idx.physical_columns(tbl)?;
+    let columns = &physical_columns;
+    let record_count = columns
+        .len()
+        .checked_add(usize::from(tbl.has_rowid))
+        .ok_or_else(|| LimboError::ParseError("index field count overflow".to_string()))?;
     let tbl_name = normalize_ident(tbl.name.as_str());
 
     let mut table_references = TableReferences::new(
@@ -408,7 +440,7 @@ pub(crate) fn emit_refill_index(
             skip_row_label = Some(label);
         }
 
-        let start_reg = program.alloc_registers(columns.len() + 1);
+        let start_reg = program.alloc_registers(record_count);
         for (i, col) in columns.iter().enumerate() {
             emit_index_column_value_from_cursor(
                 program,
@@ -417,18 +449,24 @@ pub(crate) fn emit_refill_index(
                 table_cursor_id,
                 tbl,
                 col,
-                start_reg + i,
+                start_reg
+                    .checked_add(i)
+                    .ok_or_else(|| LimboError::ParseError("index register overflow".to_string()))?,
             )?;
         }
-        let rowid_reg = start_reg + columns.len();
-        program.emit_insn(Insn::RowId {
-            cursor_id: table_cursor_id,
-            dest: rowid_reg,
-        });
+        if tbl.has_rowid {
+            let rowid_reg = start_reg
+                .checked_add(columns.len())
+                .ok_or_else(|| LimboError::ParseError("index register overflow".to_string()))?;
+            program.emit_insn(Insn::RowId {
+                cursor_id: table_cursor_id,
+                dest: rowid_reg,
+            });
+        }
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
             start_reg: to_u32(start_reg),
-            count: to_u32(columns.len() + 1),
+            count: to_u32(record_count),
             dest_reg: to_u32(record_reg),
             index_name: Some(idx.name.clone()),
             affinity_str: None,
@@ -438,7 +476,7 @@ pub(crate) fn emit_refill_index(
             cursor_id: index_cursor_id,
             record_reg,
             unpacked_start: Some(start_reg),
-            unpacked_count: Some((columns.len() + 1) as u32),
+            unpacked_count: Some(to_u32(record_count)),
             flags: IdxInsertFlags::new().use_seek(false),
         });
 
@@ -453,8 +491,7 @@ pub(crate) fn emit_refill_index(
         });
         program.preassign_label_to_next_insn(loop_end_label);
     } else {
-        let order_collations_nulls = idx
-            .columns
+        let order_collations_nulls = physical_columns
             .iter()
             .map(|c| (c.order, c.collation, c.nulls_order))
             .try_collect()?;
@@ -472,7 +509,7 @@ pub(crate) fn emit_refill_index(
         program.emit_insn(Insn::OpenPseudo {
             cursor_id: pseudo_cursor_id,
             content_reg,
-            num_fields: columns.len() + 1,
+            num_fields: record_count,
         });
 
         program.emit_insn(Insn::OpenRead {
@@ -509,7 +546,7 @@ pub(crate) fn emit_refill_index(
             skip_row_label = Some(label);
         }
 
-        let start_reg = program.alloc_registers(columns.len() + 1);
+        let start_reg = program.alloc_registers(record_count);
         for (i, col) in columns.iter().enumerate() {
             emit_index_column_value_from_cursor(
                 program,
@@ -518,18 +555,24 @@ pub(crate) fn emit_refill_index(
                 table_cursor_id,
                 tbl,
                 col,
-                start_reg + i,
+                start_reg
+                    .checked_add(i)
+                    .ok_or_else(|| LimboError::ParseError("index register overflow".to_string()))?,
             )?;
         }
-        let rowid_reg = start_reg + columns.len();
-        program.emit_insn(Insn::RowId {
-            cursor_id: table_cursor_id,
-            dest: rowid_reg,
-        });
+        if tbl.has_rowid {
+            let rowid_reg = start_reg
+                .checked_add(columns.len())
+                .ok_or_else(|| LimboError::ParseError("index register overflow".to_string()))?;
+            program.emit_insn(Insn::RowId {
+                cursor_id: table_cursor_id,
+                dest: rowid_reg,
+            });
+        }
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
             start_reg: to_u32(start_reg),
-            count: to_u32(columns.len() + 1),
+            count: to_u32(record_count),
             dest_reg: to_u32(record_reg),
             index_name: Some(idx.name.clone()),
             affinity_str: None,
@@ -583,7 +626,7 @@ pub(crate) fn emit_refill_index(
             program.emit_insn(Insn::SorterCompare {
                 cursor_id: sorter_cursor_id,
                 sorted_record_reg: content_reg,
-                num_regs: columns.len(),
+                num_regs: idx.columns.len(),
                 pc_when_nonequal: goto_label,
             });
             program.emit_insn(Insn::Halt {
@@ -672,10 +715,8 @@ pub fn translate_reindex(
                 "REINDEX is not supported for custom index methods without a backing btree"
             );
         }
-        if !table.has_rowid {
-            bail_parse_error!("REINDEX on WITHOUT ROWID tables is not supported");
-        }
-        let index_cursor_id = program.alloc_cursor_index(None, &index)?;
+        let physical_index = Arc::new(index.physical_index(&table)?);
+        let index_cursor_id = program.alloc_cursor_index(None, &physical_index)?;
         emit_refill_index(
             program,
             resolver,

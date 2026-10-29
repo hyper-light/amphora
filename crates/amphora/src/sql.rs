@@ -13,7 +13,7 @@ use amphora_engine_parser::{
 };
 
 fn failed(e: impl std::fmt::Display) -> Error {
-    Error::Database(e.to_string())
+    Error::Database(format!("{e:#}"))
 }
 
 fn native(value: Value) -> Result<Native> {

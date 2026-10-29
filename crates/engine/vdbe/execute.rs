@@ -9545,7 +9545,9 @@ pub fn op_sorter_compare(
         && compare_immutable(
             previous_sorter_values,
             current_sorter_values,
-            &cursor.index_key_info,
+            cursor.index_key_info.get(..*num_regs).ok_or_else(|| {
+                LimboError::InternalError("sorter comparison prefix exceeds key metadata".into())
+            })?,
         )
         .is_eq();
     if is_equal {
@@ -13012,13 +13014,17 @@ pub fn op_idx_delete(
                 *state.active_op_state.idx_delete() = OpIdxDeleteState::Verifying;
             }
             OpIdxDeleteState::Verifying => {
-                let rowid = {
+                let positioned = {
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
-                    return_if_io!(state, cursor.rowid())
+                    if cursor.has_rowid() {
+                        return_if_io!(state, cursor.rowid()).is_some()
+                    } else {
+                        return_if_io!(state, cursor.record()).is_some()
+                    }
                 };
 
-                if rowid.is_none() && *raise_error_if_no_matching_entry {
+                if !positioned && *raise_error_if_no_matching_entry {
                     let reg_values = (*start_reg..*start_reg + *num_regs)
                         .map(|i| &state.registers[i])
                         .collect::<Vec<_>>();

@@ -8,7 +8,7 @@ use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef},
     sync::{Arc, OnceLock, Weak},
-    translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
+    translate::{emitter::Resolver, planner::ROWID_STRS},
     vdbe::{
         builder::{CursorType, DmlColumnContext, QueryMode},
         insn::{CmpInsFlags, Insn, Subprogram},
@@ -477,10 +477,13 @@ pub(super) fn emit_skip_if_any_null(
 /// Rows with any NULL FK column do not reference a parent and are ignored. For
 /// self-referential UPDATEs, `self_exclude_rowid` skips the current row when
 /// its old child key is being updated away by the same statement.
-fn table_scan_match_any<F>(
+#[expect(clippy::too_many_arguments)]
+pub(super) fn table_scan_match_any<F>(
     program: &mut ProgramBuilder,
     child_tbl: &Arc<BTreeTable>,
     child_cols: &[String],
+    parent_table: &BTreeTable,
+    parent_cols: &[String],
     parent_key_start: usize,
     self_exclude_rowid: Option<usize>,
     database_id: usize,
@@ -506,24 +509,26 @@ where
             .get_column(cname)
             .ok_or_else(|| LimboError::InternalError(format!("child col {cname} missing")))?;
         let tmp = program.alloc_register();
-        program.emit_insn(Insn::Column {
-            cursor_id: ccur,
-            column: pos,
-            dest: tmp,
-            default: None,
-        });
+        program.emit_column_or_rowid(ccur, pos, tmp);
         program.emit_insn(Insn::IsNull {
             reg: tmp,
             target_pc: next_row,
         });
 
+        let parent_name = parent_cols
+            .get(i)
+            .ok_or_else(|| LimboError::InternalError("foreign key column count mismatch".into()))?;
+        let (_, parent_column) = parent_table.get_column(parent_name).ok_or_else(|| {
+            LimboError::InternalError(format!("parent col {parent_name} missing"))
+        })?;
+        program.emit_column_affinity(tmp, parent_column.affinity());
         let cont = program.allocate_label();
         program.emit_insn(Insn::Eq {
             lhs: tmp,
             rhs: parent_key_start + i,
             target_pc: cont,
             flags: CmpInsFlags::default(),
-            collation: Some(CollationSeq::Binary),
+            collation: Some(parent_column.collation()),
         });
         program.emit_insn(Insn::Goto {
             target_pc: next_row,
@@ -534,21 +539,51 @@ where
     // The current row may match the OLD parent key only because it has not been
     // physically rewritten yet. If the caller knows this row's child key is
     // changing too, do not count that disappearing old self-reference.
-    if let Some(parent_rowid) = self_exclude_rowid {
-        let child_rowid = program.alloc_register();
+    if let Some(parent_identity) = self_exclude_rowid {
         let skip = program.allocate_label();
-        program.emit_insn(Insn::RowId {
-            cursor_id: ccur,
-            dest: child_rowid,
-        });
-        program.emit_insn(Insn::Eq {
-            lhs: child_rowid,
-            rhs: parent_rowid,
-            target_pc: skip,
-            flags: CmpInsFlags::default(),
-            collation: None,
-        });
-        on_match(program)?;
+        if child_tbl.has_rowid {
+            let child_rowid = program.alloc_register();
+            program.emit_insn(Insn::RowId {
+                cursor_id: ccur,
+                dest: child_rowid,
+            });
+            program.emit_insn(Insn::Eq {
+                lhs: child_rowid,
+                rhs: parent_identity,
+                target_pc: skip,
+                flags: CmpInsFlags::default(),
+                collation: None,
+            });
+            on_match(program)?;
+        } else {
+            // Rowidless DML passes the OLD primary-key register block, in
+            // declared primary-key order, as the current row identity.
+            let distinct = program.allocate_label();
+            for (offset, (name, _)) in child_tbl.primary_key_columns.iter().enumerate() {
+                let (position, column) = child_tbl.get_column(name).ok_or_else(|| {
+                    LimboError::InternalError(format!("primary key col {name} missing"))
+                })?;
+                let key = program.alloc_register();
+                program.emit_column_or_rowid(ccur, position, key);
+                let identity = parent_identity.checked_add(offset).ok_or_else(|| {
+                    LimboError::InternalError("primary key register overflow".into())
+                })?;
+                program.emit_insn(Insn::Ne {
+                    lhs: key,
+                    rhs: identity,
+                    target_pc: distinct,
+                    flags: CmpInsFlags::default(),
+                    collation: Some(
+                        child_tbl
+                            .primary_key_constraint_collation(name)
+                            .unwrap_or_else(|| column.collation()),
+                    ),
+                });
+            }
+            program.emit_insn(Insn::Goto { target_pc: skip });
+            program.preassign_label_to_next_insn(distinct);
+            on_match(program)?;
+        }
         program.preassign_label_to_next_insn(skip);
     } else {
         on_match(program)?;
@@ -891,6 +926,35 @@ enum ParentProbePass {
     New,
 }
 
+/// An index probe must use the same affinity and collation as the parent
+/// comparison; otherwise an exact scan remains the correctness path.
+pub(super) fn child_index_matches_fk(
+    index: &Index,
+    fk: &ResolvedFkRef,
+    parent: &BTreeTable,
+) -> bool {
+    index.where_clause.is_none()
+        && index.columns.len() == fk.fk.child_columns.len()
+        && index
+            .columns
+            .iter()
+            .zip(&fk.fk.child_columns)
+            .zip(&fk.parent_cols)
+            .all(|((term, child_name), parent_name)| {
+                let child_column = fk.child_table.get_column(child_name);
+                let parent_column = parent.get_column(parent_name);
+                match (child_column, parent_column) {
+                    (Some((_, child_column)), Some((_, parent_column))) => {
+                        term.expr.is_none()
+                            && term.name.eq_ignore_ascii_case(child_name)
+                            && child_column.affinity() == parent_column.affinity()
+                            && term.collation.unwrap_or_default() == parent_column.collation()
+                    }
+                    _ => false,
+                }
+            })
+}
+
 /// Probe the child side for a given parent key
 /// For RESTRICT on OLD pass: emits immediate HALT
 /// For NO ACTION on OLD pass: increments FK violation counter
@@ -940,18 +1004,16 @@ fn emit_fk_parent_key_probe(
         Ok(())
     };
 
-    // Prefer an exact child index on (child_cols...). If the current row must
-    // be excluded, scan only the matching index range so the rowid can be
-    // checked before counting the match.
+    let parent_table = resolver
+        .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
+        .ok_or_else(|| LimboError::InternalError("FK parent table missing".into()))?;
+    // Only a complete index with matching parent comparison semantics can
+    // replace the FK scan. Partial indexes cannot prove child absence.
     let idx = resolver.with_schema(database_id, |s| {
         s.get_indices(&child_tbl.name)
             .find(|ix| {
-                ix.columns.len() == child_cols.len()
-                    && ix
-                        .columns
-                        .iter()
-                        .zip(child_cols.iter())
-                        .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
+                (child_tbl.has_rowid || self_exclude_rowid.is_none())
+                    && child_index_matches_fk(ix, fk_ref, &parent_table)
             })
             .cloned()
     });
@@ -972,6 +1034,8 @@ fn emit_fk_parent_key_probe(
             program,
             child_tbl,
             child_cols,
+            &parent_table,
+            &fk_ref.parent_cols,
             parent_key_start,
             self_exclude_rowid,
             database_id,
@@ -1077,10 +1141,16 @@ pub fn emit_fk_child_update_counters(
         let null_skip_label = program.allocate_label();
 
         let old_rowid_reg = program.alloc_register();
-        program.emit_insn(Insn::RowId {
-            cursor_id: child_cursor_id,
-            dest: old_rowid_reg,
-        });
+        if child_tbl.has_rowid {
+            program.emit_insn(Insn::RowId {
+                cursor_id: child_cursor_id,
+                dest: old_rowid_reg,
+            });
+        } else {
+            // A rowidless row has no alias column; dependency materialization
+            // reads its logical columns directly from the table cursor.
+            program.emit_null(old_rowid_reg, None);
+        }
 
         let fk_col_positions: Vec<usize> = fk_cols
             .iter()
@@ -1235,13 +1305,23 @@ pub fn emit_fk_child_update_counters(
         if is_self_ref && !fk_ref.parent_uses_rowid {
             let self_mismatch = program.allocate_label();
             for (idx, &child_pos) in fk_ref.child_pos.iter().enumerate() {
-                let child_reg = if child_tbl.columns()[child_pos].is_rowid_alias() {
+                let child_column = child_tbl
+                    .columns()
+                    .get(child_pos)
+                    .ok_or_else(|| LimboError::InternalError("FK child column missing".into()))?;
+                let child_reg = if child_column.is_rowid_alias() {
                     new_rowid_reg
                 } else {
                     layout.to_register(new_start_reg, child_pos)
                 };
-                let parent_pos = fk_ref.parent_pos[idx];
-                let parent_reg = if child_tbl.columns()[parent_pos].is_rowid_alias() {
+                let parent_pos = *fk_ref.parent_pos.get(idx).ok_or_else(|| {
+                    LimboError::InternalError("FK parent position missing".into())
+                })?;
+                let parent_column = child_tbl
+                    .columns()
+                    .get(parent_pos)
+                    .ok_or_else(|| LimboError::InternalError("FK parent column missing".into()))?;
+                let parent_reg = if parent_column.is_rowid_alias() {
                     new_rowid_reg
                 } else {
                     layout.to_register(new_start_reg, parent_pos)
@@ -1251,7 +1331,7 @@ pub fn emit_fk_child_update_counters(
                     rhs: parent_reg,
                     target_pc: self_mismatch,
                     flags: CmpInsFlags::default().jump_if_null(),
-                    collation: Some(CollationSeq::Binary),
+                    collation: Some(super::collate::CollationSeq::Binary),
                 });
             }
             program.emit_insn(Insn::Goto { target_pc: fk_ok });
@@ -1414,14 +1494,9 @@ fn emit_fk_delete_parent_existence_check_single(
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
             s.get_indices(&fk_ref.child_table.name).cloned().collect()
         });
-        indices.into_iter().find(|idx| {
-            idx.columns.len() == child_cols.len()
-                && idx
-                    .columns
-                    .iter()
-                    .zip(child_cols.iter())
-                    .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
-        })
+        indices
+            .into_iter()
+            .find(|idx| child_index_matches_fk(idx, fk_ref, parent_bt))
     } else {
         None
     };
@@ -1455,6 +1530,8 @@ fn emit_fk_delete_parent_existence_check_single(
             program,
             &fk_ref.child_table,
             child_cols,
+            parent_bt,
+            &fk_ref.parent_cols,
             parent_key_start,
             if is_self_ref {
                 Some(parent_rowid_reg)
@@ -1530,7 +1607,36 @@ pub fn emit_fk_update_parent_actions(
         }
     }
 
+    // The rowidless PRIMARY KEY is the table root, so it is absent from
+    // schema secondary-index iterators but remains a referenced parent key.
+    if !table_btree.has_rowid {
+        if let Some(primary) = check_fks
+            .iter()
+            .filter_map(|fk| fk.parent_unique_index.as_ref())
+            .find(|index| index.root_page == table_btree.root_page)
+        {
+            if let Some(plan) = emit_parent_index_key_change_checks(
+                program,
+                cursor_id,
+                start,
+                old_rowid_reg,
+                rowid_new_reg,
+                &check_fks,
+                table_btree,
+                primary,
+                updated_positions,
+                new_key_probe_mode,
+                database_id,
+                resolver,
+            )? {
+                deferred_new_key_plans.push(plan);
+            }
+        }
+    }
     for index in indexes_to_update {
+        if !table_btree.has_rowid && index.as_ref().root_page == table_btree.root_page {
+            continue;
+        }
         if let Some(plan) = emit_parent_index_key_change_checks(
             program,
             cursor_id,
@@ -1724,12 +1830,13 @@ fn emit_fk_action_subprogram(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
     connection: &Arc<Connection>,
-    stmt: ast::Stmt,
+    mut stmt: ast::Stmt,
     ctx: &FkActionContext,
-    foreign_key: Arc<ForeignKey>,
+    fk_ref: &ResolvedFkRef,
     description: &'static str,
 ) -> Result<()> {
     let parent_change = ctx.parent_change();
+    let foreign_key = fk_ref.fk.clone();
     let compile_stack = resolver.fk_action_compile_stack.clone();
 
     let subprogram = if let Some(slot) = compile_stack.find(&foreign_key, parent_change) {
@@ -1746,9 +1853,31 @@ fn emit_fk_action_subprogram(
         );
         let entry = compile_stack.push(foreign_key, parent_change);
         subprogram_builder.prologue();
+        let mut local_resolver = resolver.fork();
+        let parent_table = resolver
+            .with_schema(
+                resolver.resolve_existing_table_database_id_qualified(&match &stmt {
+                    ast::Stmt::Delete { tbl_name, .. } => tbl_name.clone(),
+                    ast::Stmt::Update(update) => update.tbl_name.clone(),
+                    _ => return Err(LimboError::InternalError("FK action is not DML".into())),
+                })?,
+                |schema| schema.get_btree_table(&fk_ref.fk.parent_table),
+            )
+            .ok_or_else(|| LimboError::InternalError("FK parent table missing".into()))?;
+        let predicate = build_parent_comparison_predicate(
+            &mut subprogram_builder,
+            &mut local_resolver,
+            fk_ref,
+            &parent_table,
+        )?;
+        match &mut stmt {
+            ast::Stmt::Delete { where_clause, .. } => *where_clause = Some(Box::new(predicate)),
+            ast::Stmt::Update(update) => update.where_clause = Some(Box::new(predicate)),
+            _ => return Err(LimboError::InternalError("FK action is not DML".into())),
+        }
         translate_inner(
             stmt,
-            resolver,
+            &mut local_resolver,
             &mut subprogram_builder,
             connection,
             description,
@@ -1778,6 +1907,56 @@ fn emit_fk_action_subprogram(
     program.preassign_label_to_next_insn(ignore_jump_target);
 
     Ok(())
+}
+
+/// SQLite FK comparisons use the parent column's affinity and collation.
+/// A register retains that affinity without CAST changing nonnumeric values;
+/// unary plus strips the child's own affinity from the generated comparison.
+fn build_parent_comparison_predicate(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    fk: &ResolvedFkRef,
+    parent: &BTreeTable,
+) -> Result<Expr> {
+    let mut predicate = None;
+    for (offset, (child_name, parent_name)) in
+        fk.fk.child_columns.iter().zip(&fk.parent_cols).enumerate()
+    {
+        let (_, column) = parent.get_column(parent_name).ok_or_else(|| {
+            LimboError::InternalError(format!("FK parent column {parent_name} missing"))
+        })?;
+        let parameter = offset
+            .checked_add(1)
+            .and_then(|value| u32::try_from(value).ok())
+            .and_then(std::num::NonZeroU32::new)
+            .ok_or_else(|| LimboError::InternalError("FK parameter overflow".into()))?;
+        let variable = ast::Variable::indexed(parameter);
+        let index = program.register_variable(&variable);
+        let register = program.alloc_register();
+        program.emit_insn(Insn::Variable {
+            index,
+            dest: register,
+        });
+        resolver
+            .register_affinities
+            .insert(register, column.affinity());
+        let term = Expr::Binary(
+            Box::new(Expr::Collate(
+                Box::new(Expr::Register(register)),
+                Name::from_string(column.collation().name()),
+            )),
+            ast::Operator::Equals,
+            Box::new(Expr::Unary(
+                ast::UnaryOperator::Positive,
+                Box::new(Expr::Id(Name::from_string(child_name))),
+            )),
+        );
+        predicate = Some(match predicate {
+            None => term,
+            Some(previous) => Expr::Binary(Box::new(previous), ast::Operator::And, Box::new(term)),
+        });
+    }
+    predicate.ok_or_else(|| LimboError::InternalError("FK has no columns".into()))
 }
 
 /// Build a QualifiedName with db_name set for non-main databases.
@@ -1971,7 +2150,7 @@ fn fire_fk_cascade_delete(
         connection,
         stmt,
         ctx,
-        fk_ref.fk.clone(),
+        fk_ref,
         "fk cascade delete",
     )
 }
@@ -2005,7 +2184,7 @@ fn fire_fk_set_null(
         connection,
         stmt,
         ctx,
-        fk_ref.fk.clone(),
+        fk_ref,
         "fk set null",
     )
 }
@@ -2039,7 +2218,7 @@ fn fire_fk_set_default(
         connection,
         stmt,
         ctx,
-        fk_ref.fk.clone(),
+        fk_ref,
         "fk set default",
     )
 }
@@ -2074,7 +2253,7 @@ fn fire_fk_cascade_update(
         connection,
         stmt,
         ctx,
-        fk_ref.fk.clone(),
+        fk_ref,
         "fk cascade update",
     )
 }
@@ -2414,6 +2593,47 @@ pub fn emit_fk_drop_table_check(
         return Ok(());
     }
 
+    if !parent_tbl.has_rowid {
+        // DROP performs an implicit delete before destroying storage. Reuse
+        // the DML composite-key snapshot and FK actions rather than treating
+        // index-tree keys as integer RowSet identities.
+        let db_name = if database_id != crate::MAIN_DB_ID {
+            resolver.get_database_name_by_index(database_id)
+        } else {
+            None
+        };
+        let statement = ast::Stmt::Delete {
+            with: None,
+            tbl_name: qualified_table_name(parent_table_name, db_name.as_deref()),
+            indexed: None,
+            where_clause: None,
+            returning: vec![],
+        };
+        let mut builder = ProgramBuilder::new_for_subprogram(
+            QueryMode::Normal,
+            program.capture_data_changes_info().clone(),
+            FK_SUBPROGRAM_OPTS,
+        );
+        builder.prologue();
+        translate_inner(
+            statement,
+            resolver,
+            &mut builder,
+            connection,
+            "DROP implicit DELETE",
+        )?;
+        builder.epilogue(resolver.schema());
+        let built = builder.build(connection.clone(), true, "DROP implicit DELETE")?;
+        let join = program.allocate_label();
+        program.emit_insn(Insn::Program {
+            param_registers: vec![],
+            program: Subprogram::PreparedProgram(built.prepared().clone()),
+            ignore_jump_target: join,
+        });
+        program.preassign_label_to_next_insn(join);
+        return Ok(());
+    }
+
     // Separate FK refs by action type:
     // - action_fk_refs: CASCADE, SET NULL, SET DEFAULT - need to fire action subprograms
     // - check_fk_refs: RESTRICT, NO ACTION - need violation counting
@@ -2577,25 +2797,27 @@ pub fn emit_fk_drop_table_check(
                 .ok_or_else(|| LimboError::InternalError(format!("child col {cname} missing")))?;
 
             let child_val_reg = program.alloc_register();
-            program.emit_insn(Insn::Column {
-                cursor_id: child_cur,
-                column: pos,
-                dest: child_val_reg,
-                default: None,
-            });
+            program.emit_column_or_rowid(child_cur, pos, child_val_reg);
             // If child FK column is NULL, skip (no reference)
             program.emit_insn(Insn::IsNull {
                 reg: child_val_reg,
                 target_pc: child_next,
             });
 
-            // Compare child FK column to corresponding parent key column
+            let parent_name = parent_cols.get(i).ok_or_else(|| {
+                LimboError::InternalError("foreign key column count mismatch".into())
+            })?;
+            let (_, parent_column) = parent_tbl.get_column(parent_name).ok_or_else(|| {
+                LimboError::InternalError(format!("parent col {parent_name} missing"))
+            })?;
+            program.emit_column_affinity(child_val_reg, parent_column.affinity());
+            // Compare using the parent key's affinity and collation.
             program.emit_insn(Insn::Ne {
                 lhs: child_val_reg,
                 rhs: parent_key_start + i,
                 target_pc: child_next,
                 flags: CmpInsFlags::default().jump_if_null(),
-                collation: Some(CollationSeq::Binary),
+                collation: Some(parent_column.collation()),
             });
         }
 

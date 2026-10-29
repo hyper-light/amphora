@@ -107,5 +107,7 @@ pub(super) enum Answer {
         Vec<Result<Option<Rev>, Refusal>>,
     ),
     ReplicaStatus(Option<amphora_api::replication::ReplicaStatus>),
+    // Untyped SQL failures retain caller context; typed refusals use Response::Err.
+    SqlError(String),
 }
 pub(super) type Response = Result<Answer, Refusal>;
