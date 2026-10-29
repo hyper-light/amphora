@@ -40,7 +40,9 @@ findings (f1 to f10, f36, f37) cite its tree as of 2026-10-24.
   against two filters'"; f5, B). Without statistics, an estimate can jump by up to five orders of
   magnitude when a query is made more restrictive: a cross join with one added conjunct went from
   1,000,000 to 160,000,000,000 rows (cert-50d4acc3fb3a85cd.md line 1: "the more restrictive query
-  is estimated at 160000000000.00003 rows, the query at 1000000"; f6, B).
+  is estimated at 160000000000.00003 rows, the query at 1000000"; f6, B). Since then step 5 has
+  closed AG with the other causes its campaigns found, and CERT failed none of its 2,607,858 checks
+  on 10f2461 (bench/records/2026-10-27-adas-mac-studio-2-cert-clean/README.md).
 - Join order: left-deep only, by a dynamic program over table subsets each extended by one table up
   to 12 tables, then a greedy left-deep search (join.rs line 1576: "In this block, LHS is always
   (n-1) tables, and RHS is a single table."; line 1813: "pub const GREEDY_JOIN_THRESHOLD: usize =
