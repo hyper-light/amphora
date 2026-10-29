@@ -7,7 +7,8 @@ adaptive execution, and plan caching. For each, this note says what the papers f
 Umbra/CedarDB, PostgreSQL, SQL Server, CockroachDB, ClickHouse and Calcite do, and where Amphora
 stands. The planner's decisions are in `docs/design/planner.md`. This note is what they cite.
 Section 7 audits Amphora's planner against these sources, each gap shown on a release build;
-section 8 is the baseline of its estimates against the rows counted on JOB and TPC-H.
+section 8 is the baseline of its estimates against the rows counted on JOB and TPC-H; section 9
+ranks the changes they call for, each with the measurement that would show it.
 
 Every claim ends with its evidence in parentheses: the source, where in it, the words quoted, then
 the research finding (`f11` to `f43`) and the grade kiln gave it (A to F, from the sources' kinds,
@@ -859,6 +860,578 @@ off in every round on Studio 2 (`date_bucket`, `like_substring` and `string_func
 `point_pk_one_column` and `range_secondary_100` at 32), the two binaries' other differences, since a
 connection that asks for no counts runs no counting instruction. Ada judged the criterion met on
 that evidence (2026-10-27).
+
+## 9. The changes ranked
+
+Step 6 of the plan: the planner changes sections 1 to 8 call for, ranked by their expected gain on
+TPC-H, TPC-DS, JOB, ClickBench, SSB and CH-benCHmark for the work and the risk each takes, each with
+the measurement that would show it and what would falsify it. Step 3 measured JOB and TPC-H (section
+8). TPC-DS, ClickBench, SSB and CH-benCHmark are not loaded yet, so what a change would do to them
+comes from the sources and from their queries' text (section 7's benchmark notes), not from a
+measurement. Each number taken from step 3 is as
+`bench/records/2026-10-26-jupiter-planner-baseline.md` takes it: JOB's from its pass b (with
+`-job-at` for DuckDB's 15a to 15d and `-job-pg` for PostgreSQL), TPC-H SF 1's from its pass b, SF
+10's the best of its passes a, b and c, c's reruns and PostgreSQL's own pass.
+`bench/planner/cited.tsv` lists every one with its records and how it is computed;
+`bench/planner/cited.py` recomputes each by `summary.py`'s definitions, and with `--job` the counts
+this section takes from JOB's text (gregrahn/join-order-benchmark at a396036):
+`python3 -I bench/planner/cited.py --job DIR` ends "cited.py: 84 numbers from step 3's records, 0
+differ; 5 from JOB's text, 0 differ".
+
+Step 3 measured f734df4's estimator. Decision 13 (step 4, d762dc2) and step 5 (10f2461) have changed
+the estimates since, so a change is measured by `record.sh` on the change and on its parent, on one
+machine, each run begun at a load under 2 (CLAUDE.md §7): step 3's numbers set the targets, and the
+parent's pass says what the change itself moved. The first such pass is of this branch, before rank
+1.
+
+Step 3's records say where the gain is. Of JOB's 113 queries, the 52 whose largest intermediate
+result is misestimated by 1,000 times or more (the factor every estimator routinely erred by, f11)
+take 77% of Amphora's time on JOB. On them SQLite's time over Amphora's is 0.819 and DuckDB's on one
+thread 0.509; on the other 61 they are 1.416 and 1.823. At TPC-H's SF 10 the 6 such queries give
+SQLite 0.725, the other 15 it finished 1.465. PostgreSQL's lead is about the same on either side
+(0.344 and 0.362), so it does not rest on Amphora's estimates. By the tables joined, Amphora is the
+faster on JOB's 28 queries of 10 to 12 tables, which its dynamic program plans (SQLite's time over
+Amphora's 1.813), and the slower on the 9 above 12, which its greedy search plans (0.405). So
+estimation comes first, and the search above 12 tables soon after.
+
+| rank | change | audit rows | JOB | TPC-H | TPC-DS | SSB | CH-benCHmark | ClickBench | work | risk |
+|---:|---|---|---|---|---|---|---|---|---|---|
+| 1 | join sizes from equivalence classes, with key caps | 8, 14 | large | small | large | none to large | medium | none | small | moderate |
+| 2 | distinct counts and a sample per table, kept by ANALYZE | 5, 9, 11 | medium | medium | medium | medium | medium | medium | large | moderate |
+| 3 | connected subsets within a counted budget | 2, 3, 16 | medium | none | small | none | none | none | medium | moderate |
+| 4 | each table's filters estimated together on its sample | 5 | medium | medium | medium | medium | small | medium | medium | moderate |
+| 5 | Bloom filters passed to a star join's fact table | 13 | small | medium | medium | large | small | none | medium | low |
+| 6 | no unindexed nested loop beneath an unbounded outer | 13 | none | none | small | none | medium | none | small | low |
+| 7 | the cost model against measured time | 12, 15 | unknown | unknown | medium | small | small | medium | medium | low |
+| 8 | bushy plans over connected pairs, with CD-C | 1, 2, 4 | medium | small | medium | small | small | none | large | high |
+| 9 | statistics kept as rows change | 5, 11 | none | none | none | none | medium | none | medium | high |
+| 10 | general unnesting by dependent joins | 10 | none | small | medium | none | small | none | very large | high |
+| 11 | degree-sequence upper bounds as a guard | 14 | small | small | small | small | small | none | medium | low |
+| 12 | custom plans, then a generic one | 11 | none | small | small | none | medium | none | medium | moderate |
+| 13 | an adaptive join switch and mid-query re-optimization | 13 | medium | small | medium | small | medium | none | very large | high |
+
+The JOB and TPC-H columns rest on step 3's records, the other four on the sources and the queries'
+text; each change's subsection says why.
+
+Four of the step's candidates are split where their parts differ in gain, work or risk. The
+statistics kept by ANALYZE (rank 2) touch no write; kept as rows change (rank 9) they add work to
+every commit. The join search over connected subsets (rank 3) keeps plans left-deep and needs no
+change to execution; bushy plans and CD-C (rank 8) do. Robust execution is three changes of very
+different size: the nested-loop rule (rank 6), Bloom filters (rank 5), and adaptive joins with
+re-optimization (rank 13). Plan caching's re-planning on ANALYZE goes with rank 2, whose statistics
+it carries to statements already prepared; its custom plans need ranks 2 and 4's estimates of a
+value (rank 12).
+
+### Rank 1. Join sizes from equivalence classes, with key caps
+
+- **What changes.** `optimizer/cardinality.rs` (`JoinedSetRows`, decision 13's one estimate per
+  joined set). The `=` terms between two tables' columns put those columns in equivalence classes, a
+  union-find over the query's column references built once. A set's rows become its tables' rows
+  after their filters, divided for each class by the class's domain once for each table of the set
+  it joins past the first, however many terms state it; today every join term multiplies in its own
+  selectivity. A class's domain is its largest distinct count: a unique key's rows (the rowid, a
+  primary key of one column, a one-column unique index), else the distinct values `sqlite_stat1`
+  gives where an index leads the column, else rank 2's sketch; with none, the rows of the class's
+  smallest table, its column taken for a key (Ebergen's rule). A join that covers a unique key never
+  exceeds its other side's rows (the key cap). Join terms no longer take `sel_eq_unindexed`'s 0.1
+  (`constraints.rs`). A class that holds two columns of one table makes them equal in every row the
+  set keeps, a filter on that table, counted; so a term that merges two classes never lowers a set's
+  divisor, and no added term raises an estimate, as CERT requires (f21).
+- **From step 3.** JOB's queries state each class whole: 26c equates five movie_id columns by ten
+  terms where four connect them, and every one of the 113 has terms beyond those its classes need
+  (`cited.py --job`). Each such term divides again. 17a's estimate falls from 456,178 rows to 1.57
+  at mc, which joins title's key and has no filter, while its counted rows grow from 41,840 to
+  148,552: at mc two terms complete, t.id = mc.movie_id and the surplus mc.movie_id = mk.movie_id.
+  Down the longer plans the estimates fall below a row: 343 of JOB's 977 prefixes, in 88 queries,
+  are estimated below one row while counting 1,000 or more.
+- **Findings.** f39 (A): Ebergen's equivalence sets sharing one domain, which DuckDB's estimator
+  follows, with JOB's intermediate tuples down 66% and 95% and its run time 18% and 25%; f15 (A):
+  DuckDB divides by the classes' domains; f16 (A): a set's estimate is its own, as decision 13 has
+  it; f43 (A): SQL Server's containment assumption; f11 (A): estimates are what make plans bad.
+  Nothing in the research is against it.
+- **Audit rows.** 8; 14 for joins on a key (the key cap); and what row 6 left, a join term's
+  selectivity multiplied in once a term.
+- **Expected effect.** JOB: the fall below a row ends, carried by the 52 queries above. TPC-H:
+  little; each of its join terms connects a class, and its error stays near (median 18.8 at SF 1,
+  9.39 at SF 10). TPC-DS: large: turso's schema declares no key and no index, so each of its joins
+  takes 0.1 today (row 8), and its dimensions' rows become its star joins' domains. SSB: the same
+  where its keys go undeclared, none where they are declared. CH-benCHmark: key caps for its joins
+  on composite keys (warehouse, district, customer). ClickBench: none, one table.
+- **Measurement.** JOB and TPC-H at SF 1 and 10, on the change and its parent. JOB's prefixes
+  estimated below one row while counting 1,000 or more: 343 at step 3, target under 35. Its median
+  q-error at three joins: 1.07e+03, target under 100; its largest intermediate results' p95:
+  7.797e+06, target under 1e+05. JOB's run time over the parent's, geometric mean over the 113:
+  target 0.85 or less (the same estimator took 18% off JOB in DuckDB, f39). TPC-H at SF 10: median
+  q-error 9.39, not above the parent's.
+- **Falsified by.** The 343 not halving; JOB no faster where its estimates come near the counts (the
+  geometric mean over the parent at 1 or more); a failure the change brings to CERT or the order
+  check, which run nightly.
+- **Work and risk.** Small: one file, over statistics ANALYZE keeps today. Moderate risk: every join
+  estimate moves, and kiln's statements that join must keep their plans or be measured.
+- **Rules.** §11: the union-find and a set's divisors are loops over arrays, bounded by the query's
+  terms and the set's tables. §2: the classes bounded by the terms, the memo's 8,192 sets as now.
+  §1: checked arithmetic, a domain of at least one, typed errors. §5: decision 14 in
+  `docs/design/planner.md`, with Ebergen's thesis and DuckDB's estimator for sources and this
+  falsifier. §6: tests in `crates/engine/tests/planner.rs` citing AC-T1.1.2, as decision 13's do.
+
+### Rank 2. Distinct counts and a sample per table, kept by ANALYZE
+
+- **What changes.** ANALYZE (`translate/analyze.rs`, which writes `sqlite_stat1`'s rows per index
+  prefix) also keeps a HyperLogLog sketch of each column's values and a reservoir sample of each
+  table's rows, its size bounded and measured on the bench, in an internal table beside
+  `sqlite_stat1` (the engine's reserved prefix, `schema.rs`), loaded with it into `AnalyzeStats`
+  (`stats.rs`). Estimates read them (`constraints.rs`, `estimate_selectivity` and
+  `estimate_in_selectivity`): an equality, and each value of an IN list, takes the value's share of
+  the sample where the sample holds it often enough to count, else one over the column's distinct
+  count, where today an equality on a column no index leads takes 0.1 and an IN list one row a
+  value, as if each were unique. A GROUP BY's groups come from its columns' distinct counts capped
+  by its input (`estimate_select_output_rows`, which has them today only where an index leads them),
+  and rank 1 takes its domains from them where no index leads a join column. A statement prepared
+  before an ANALYZE that changed its tables' statistics plans again at its next run, as after a
+  schema change (`statement.rs`, `reprepare`). The sample is drawn by a seeded generator and the
+  sketches hash by a fixed function, so two passes of one build record the same estimates (step 3's
+  repeat test) on every platform.
+- **From step 3.** 16 of JOB's 113 first tables are off by 13,417 or more, 15 of them an equality on
+  keyword.keyword, which no index covers: 13,417 estimated, a tenth of the table, against 1 counted.
+  At SF 10, q16's part, whose IN list counts each of its eight sizes as one row, is estimated at
+  1.44 rows against 296,824 (q16's largest q-error 1.187e+06), and q12's lineitem, two shipping
+  modes, at 2e-05 against 310,803 (3.108e+05).
+- **Findings.** f14 (A): Umbra keeps HyperLogLog sketches on every column (about 2% in 1.5 KB) and a
+  sample of every relation, and gets near exact distinct counts and multi-column estimates from
+  them; f15 (A): DuckDB's HyperLogLog over sampled vectors; f42 (A): ClickHouse's per-column
+  statistics, built by default, HyperLogLog among them; f2 (A), f3 (A): Amphora's `sqlite_stat1` and
+  fixed selectivities; f8 (B), f35 (A): Amphora plans again only after a schema change, where the
+  engines' plan caches plan again for more. Against: f13 (D), Han et al.'s finding that sampling
+  over joins did worse than PostgreSQL's estimator; this sample is one table's, for its own filters,
+  which that finding didn't test.
+- **Audit rows.** 5; 9, where no index leads a GROUP BY's columns; 11, the half that is new
+  statistics.
+- **Expected effect.** JOB: the 15 keyword first tables exact, keyword's values being distinct; a
+  frequent value at its share of the sample, as cn.country_code = '[us]' at 9a's first table (23,500
+  estimated, 84,843 counted), which one over the column's distinct count would put further off.
+  TPC-H: q16's and q12's IN lists, and q19's part in part (an OR of three conjunctions, whole in
+  rank 4). TPC-DS, SSB and CH-benCHmark: their dimension filters (a year, a region, a category) and
+  rank 1's domains. ClickBench: the groups of its 29 GROUP BY queries, which decide hashing or
+  sorting (decision 7), and its equalities.
+- **Measurement.** JOB's q-error at its first tables: p90 1.342e+04 at step 3, target 11 or less,
+  what its other first tables give (10.5 with the 15 keyword prefixes exact), and the 15 within 1.1
+  of their counts. TPC-H at SF 10: q16's part within 10 of its count and q12's lineitem within 100
+  (their ranges and column comparisons keep fixed selectivities until rank 4). JOB and TPC-H no
+  slower than the parent beyond its passes' spread. The audit's `08-fixed-at-prepare`: the join
+  prepared before ANALYZE plans again after it.
+- **Falsified by.** A keyword prefix off by more than 1.1 after ANALYZE; q16's part off by more than
+  10; a plan the new estimates move that runs slower than the parent's.
+- **Work and risk.** Large: the statistics table, ANALYZE's sketches and sample in its bytecode, the
+  estimates that read them, the re-plan. Moderate risk: every equality and IN estimate moves, so the
+  bench suite's 52 statements and kiln's must keep their plans or be measured, and ANALYZE takes
+  longer (measured beside `sqlite_stat1`'s cost).
+- **Rules.** §2: a sketch's 1.5 KB a column and the sample's rows charged to a statistics budget; a
+  table past it keeps `sqlite_stat1` alone and says so. §5: the sample's size measured, the sketch's
+  precision cited, a decision record. §12: the hash and the generator the same on every platform.
+  §11: ANALYZE's loops in bytecode. §1. The previous release and SQLite open the file as before: the
+  new table is an internal one neither reads.
+
+### Rank 3. Connected subsets within a counted budget, the greedy search fixed
+
+- **What changes.** `optimizer/join.rs`. The dynamic program walks connected subsets only, as DPccp
+  enumerates them (f22), on an explicit stack, each extended by one table so plans stay left-deep,
+  and counts them against a budget measured on the bench (Neumann and Radke solve exactly up to
+  10,000 connected subgraphs, f23) in place of `GREEDY_JOIN_THRESHOLD`'s 12 tables; the walk of
+  every subset (`generate_join_bitmasks`, then `has_connected_legal_candidate`) goes. Past the
+  budget the greedy search adds at each step the table whose joined set has the fewest estimated
+  rows, one lookup in `JoinedSetRows`, where it now compares the plan's cost so far and counts a
+  table's filter for nothing at the step it adds it (row 2). It is no longer called GOO, which
+  merges pairs into bushy trees (f28) and comes with rank 8. Its `unwrap` and two `expect`s
+  (`compute_greedy_join_order`, `find_best_starting_table`) become typed errors.
+- **From step 3.** Amphora is the faster on JOB's queries of 10 to 12 tables (SQLite 1.813) and the
+  slower on the 9 above 12 (0.405): 33c takes 692 ms where SQLite takes 30.9, 29c 3.46e+03 where
+  SQLite takes 570. Row 2 shows the greedy's plan at 5.7 times the dynamic program's cost by
+  Amphora's own model. 28a to 28c have 2,032 connected subsets and 33a to 33c 1,517, inside a budget
+  of 10,000; 29a to 29c have 13,246 (`cited.py --job`).
+- **Findings.** f22 (A): DPccp meets the lower bound, while DPsize, which the search resembles, runs
+  far above it; f23 (A): exact within a budget of connected subgraphs, not a table count; f27 (A):
+  on JOB exhaustive search beat the heuristics even with estimation errors (GOO up to 21 times
+  costlier); f28 (A): GOO as published; f1 (A): the search today; f10 (A), f24 (A): DPhyp and
+  DuckDB's enumerator are recursive as published, which Amphora's rules forbid.
+- **Audit rows.** 2, 3, and row 16's three calls in the greedy search.
+- **Expected effect.** JOB: its 9 queries above 12 tables planned exactly or by a greedy that counts
+  filters; planning time where the dynamic program walks fewer subsets (27a to 27c: 905 connected of
+  the 4,095 subsets of 12 tables). TPC-DS: Q64's 18 tables. TPC-H, SSB and CH-benCHmark (9 tables at
+  most) and ClickBench: none but planning time.
+- **Measurement.** JOB: SQLite's time over Amphora's on the 9 above 12 tables, 0.405 at step 3,
+  target 1 or more. Planning time: at most 92.1 ms for every JOB query, step 3's most (27c, 12
+  tables), and a median not above step 3's 1.9 ms.
+- **Falsified by.** The 9 no faster than on the parent; a query past the budget slower than its
+  parent's plan; an order the walk of every subset finds and the connected walk misses (a test over
+  random join graphs runs both).
+- **Work and risk.** Medium: one file, the search's frame kept. Moderate risk: every join order
+  passes through it, which the order check and the planner tests watch.
+- **Rules.** §11: the explicit stack. §2: the budget, counted. §1: the three calls typed errors,
+  `scripts/engine-ratchet.toml` lowered with them. §5: the budget measured on the running hardware,
+  planning time against plan cost. §6.
+
+### Rank 4. Each table's filters estimated together on its sample
+
+- **What changes.** `optimizer/constraints.rs` and `cost.rs` (`constraints_selectivity`). Once per
+  table per prepare the planner runs the table's filter terms over its sample (rank 2's) as one
+  program bounded by the sample's rows, and takes the share that passes as their selectivity:
+  ranges, LIKE, functions and correlated columns at once (Oracle samples a table's blocks at parse
+  time for the same, f13). A conjunction no sample row passes takes half a row of the sample, never
+  above the same conjunction with a term fewer, whose rows include its rows (CERT, f21). A term that
+  raises an error on a sample row gives no share. Where no sample serves (a bound parameter's value,
+  a table without one, such a term), a table's terms combine by exponential backoff, the most
+  selective first with exponents 1, 1/2, 1/4 and 1/8 (SQL Server's CE 120, f17), in place of their
+  product; with the terms ordered so, an added term multiplies the result by at most 1, and CERT
+  holds there too. Equalities on an index's leading columns take the index's distinct prefixes from
+  `sqlite_stat1` as a multi-column distinct count, what PostgreSQL's extended statistics are made by
+  hand for (f17).
+- **From step 3.** At SF 10 q19's part, an OR of three conjunctions, is estimated at 1.2 rows and
+  counts 239,849 (q19's largest q-error 1.999e+05), and each of those rows searches lineitem:
+  1.011e+04 ms where SQLite takes 612 and PostgreSQL 448. q06's lineitem, three ranges, is off by
+  1.9e+03. With its 15 keyword prefixes taken as exact, JOB's first tables' q-errors have a p95 of
+  66.3, what the rest of their filters leave.
+- **Findings.** f17 (A): correlated columns break the independence assumption, with PostgreSQL's
+  extended statistics and SQL Server's exponential backoff the engines' answers; f13 (D): samples
+  catch correlations per-column statistics miss, while single-table samples miss join-crossing ones,
+  graded D for Han et al.'s counterclaim on sampling over joins, which this is not; f14 (A): Umbra's
+  sample gives multi-column estimates; f21 (A): CERT.
+- **Audit rows.** 5, the independence assumption.
+- **Expected effect.** JOB: its LIKE and range filters (on title, name, char_name) and the
+  correlations within a table; join-crossing correlations stay (f13). TPC-H: q19's plan; q12's
+  ranges and column comparisons; q06's estimate, though q06 stays a scan (no index leads
+  l_shipdate). SSB: Q1.1 to Q1.3's three ranges on lineorder and the date. ClickBench: the filters
+  most of its 43 queries have. TPC-DS: its dimensions' ranges. CH-benCHmark: its date ranges.
+- **Measurement.** TPC-H at SF 10: q19's part, 1.2 rows estimated against 239,849 at step 3, target
+  within 10 of its count, and q19's time, 1.011e+04 ms, target under twice SQLite's 612; q06's
+  lineitem, off by 1.9e+03, target within 2. JOB's first tables' p95, 1.342e+04 at step 3, target
+  under 20. Planning time: JOB's median, 1.9 ms at step 3, target at most twice that.
+- **Falsified by.** q06's estimate off by more than 2 at the sample's size; q19 no faster once its
+  part's estimate is near its count; planning time past the target; a CERT failure.
+- **Work and risk.** Medium once rank 2 is in: an evaluator over the sample at prepare, and backoff
+  in `constraints_selectivity`. Moderate risk: every prepare runs a program a table.
+- **Rules.** §2: the sample's run bounded by its rows and a counted budget of steps. §11. §1 and §3:
+  an error on a sample row ends that estimate, never the statement. §5: the exponents SQL Server's,
+  cited; the half row stated. §6: CERT's and the order check's shapes as tests.
+
+### Rank 5. Bloom filters passed to the fact table of a star join
+
+- **What changes.** `optimizer/join.rs` and `translate/main_loop` (`hash.rs`, `seek.rs`), with the
+  Bloom filters the VDBE has (`vdbe/bloom_filter.rs`, and the `Filter` instruction a hash join's
+  probe tests today, for its own build only). Where a plan reads a large table and then searches
+  filtered tables by key (a star), each such table's filtered keys go into a Bloom filter built
+  before the large table's loop, and each of its rows tests them all before any search (Lookahead
+  Information Passing, f33); predicate transfer passes them along the join graph for other shapes
+  (f33). A filter only drops rows no join would keep; its false positives go on to the search.
+- **From step 3.** At SF 10 q09 reads lineitem first and searches part for each of its 59,986,052
+  rows, of which 3,261,613 pass part's filter: 1.585e+05 ms where PostgreSQL takes 2.380e+04. q05
+  takes 1.634e+04 against 8.15e+03, q08 3.112e+04 against 2.19e+03.
+- **Findings.** f33 (A): LIP, predicate transfer (3.3 times over Bloom join on TPC-H, its join phase
+  robust to the order), POLAR and diamond-hardened joins; f32 (A).
+- **Audit rows.** 13, the Bloom filters.
+- **Expected effect.** SSB: every query a star of lineorder and one to four dimensions, LIP's shape.
+  TPC-H: q05, q08 and q09. TPC-DS: its store_sales and catalog_sales stars. JOB: little, its plans
+  starting at a filtered table already. CH-benCHmark: its order-line joins. ClickBench: none.
+- **Measurement.** TPC-H at SF 10: q09, 1.585e+05 ms at step 3, target twice as fast as its parent;
+  q05 and q08 faster than their parents. SSB, loaded and measured on the parent first.
+- **Falsified by.** q09 no faster though its filters drop the rows part's filter would (the row
+  counters show it); a query slower by more than its filters' building.
+- **Work and risk.** Medium: the filters and their instruction exist; building them ahead of the
+  large table's loop is new. Low risk: a filter never changes a result.
+- **Rules.** §2: each filter's bits charged to the statement's memory, sized from its keys'
+  estimate; one past its budget isn't built. §5: the false-positive rate
+  (`DEFAULT_FALSE_POSITIVE_RATE`, 1% today) measured or cited. §11. §6.
+
+### Rank 6. No nested loop without an index beneath an outer not bounded at one row
+
+- **What changes.** `optimizer/join.rs` and `access_method.rs`. A loop that scans a table whole for
+  each row before it is planned only when the rows before it are bounded at one: equalities on a
+  unique key (the rowid, a primary key, a unique index) or a LIMIT 1. Otherwise the two sides join
+  by hashing, the smaller side built, or through an automatic index, so the table is read once
+  whatever the outer counts (Leis et al. took such loops away and JOB's timeouts ended, f32).
+- **From step 3.** 30 of JOB's 113 plans hold such a loop, each beneath a first table estimated at
+  0.4 or 1.2 rows by a fixed selectivity. Each counted 1 row, so each scan ran once: on step 3's
+  data they cost nothing. TPC-H's plans hold none (0 at SF 1 and 0 at SF 10). The audit's row 13
+  shows the case that goes wrong: p and q analyzed at 10 rows and grown to 3,000, q scanned for
+  every row of p.
+- **Findings.** f32 (A); f11 (A).
+- **Audit rows.** 13, nested loops on uncertain estimates.
+- **Expected effect.** JOB and TPC-H: none measured, the 30 scans having run once (a one-row build
+  reads the same rows). CH-benCHmark: its tables grow past their statistics while it runs (rows 11
+  and 13). TPC-DS: joins with no index, where a misestimated outer would scan again and again. SSB
+  and ClickBench: none.
+- **Measurement.** JOB: plans with such a loop, 30 at step 3, target 0, their times within the
+  passes' spread of their parents'. TPC-H: none at step 3, none after. The audit's `10-no-adaptive`
+  at 3,000 rows a table: q read once.
+- **Falsified by.** A plan the rule changes that runs slower than its parent's on JOB, TPC-H or the
+  bench suite.
+- **Work and risk.** Small: one condition in the search. Low risk.
+- **Rules.** §5: a decision record citing f32. §6. §1.
+
+### Rank 7. The cost model against measured time
+
+- **What changes.** `optimizer/cost.rs` and `cost_params.rs`. A table's and an index's pages come
+  from the B-tree's page count, which ANALYZE records, where today they are rows over 50
+  (`rows_per_table_page`, row 12). The cost units (a page read, a seek, a row, a hash probe, a
+  sort's row) are fitted to times measured on the running hardware, where the inherited ones
+  (`cpu_cost_per_row`, `cpu_cost_per_seek`, the hash and sort costs) are neither measured nor cited,
+  as CLAUDE.md §5 requires a tuning constant to be. The planner bench adds P-error (f20): each
+  plan's cost under counted rows against the cost of the plan chosen with counted rows in place of
+  estimates, those rows given through `JoinedSetRows` for every set the search asks for, each set
+  counted once and kept beside the records.
+- **From step 3.** The cost each JOB plan is estimated at ranks the queries' measured times at a
+  Spearman correlation of 0.20, estimates and costs together; P-error is not measured (row 15).
+- **Findings.** f12 (D): on JOB cost-model errors were dwarfed by estimation errors, graded D for
+  Amphora's own counterclaim (decisions 2, 5 and 7); f20 (A): P-error tracks end-to-end time; f29
+  (A): Calcite's cost combines CPU, I/O and memory; f9 (A): Amphora's cost model.
+- **Audit rows.** 12, 15.
+- **Expected effect.** ClickBench (hits' wide rows), TPC-DS's fact tables and JOB's text tables
+  (movie_info, person_info): scans costed at their pages, no longer cheap against seeks. TPC-H, SSB
+  and CH-benCHmark: where costs decide between plans near in rows. Beyond that, P-error says which
+  plans ranks 1 to 4 moved.
+- **Measurement.** JOB and TPC-H: the rank correlation of estimated cost with time, 0.20 on JOB at
+  step 3, target 0.8 or more with counted rows in place of estimates; P-error for every query, none
+  at step 3. The audit's `09-cost-model`: its tables of 8 and 1,011 pages no longer both scan at a
+  cost of 46.
+- **Falsified by.** The correlation with counted rows no higher than with estimates.
+- **Work and risk.** Medium: page counts in ANALYZE, a fitting run, the P-error harness. Low to
+  moderate risk: each cost change moves plans, which the bench suite measures.
+- **Rules.** §5: each constant measured on the running hardware, its comment saying so. §7: the
+  fitting run recorded in `bench/`. §6.
+
+### Rank 8. Bushy plans over connected pairs, with the CD-C conflict detector
+
+- **What changes.** `optimizer/join.rs` and the emitter. The search enumerates connected complement
+  pairs (DPccp, or DPhyp for terms over more than two tables, f22) on rank 3's explicit stack and
+  budget, so a join can take two composite inputs; past the budget, linearized dynamic programming
+  or GOO as published, merging the pair of least cost (f23, f28). A join's result becomes a hash
+  join's build through the emitter's materialized build input, which already folds a join prefix
+  into a build (`MaterializedBuildInput` in `emitter/mod.rs`, made in `emitter/select.rs`). Outer,
+  semi and anti joins reorder by Moerkotte, Fender and Eich's CD-C conflict detector (f25) in place
+  of `required_lhs_by_table`'s barriers (row 4).
+- **From step 3.** PostgreSQL, which searches bushy trees (f26), is the faster on 83 of JOB's 113
+  (its time over Amphora's 0.354), by about as much where Amphora's estimates are near as where they
+  are off (0.362 and 0.344): its lead rests on something else, and its plans' shape is one
+  difference.
+- **Findings.** f27 (A): left-deep trees up to 4.5 times the best bushy plan on JOB, zig-zag 2.54;
+  f22 (A), f24 (A), f26 (A): DPhyp in DuckDB, bushy search in PostgreSQL; f25 (A): CD-C, correct and
+  complete, in ClickHouse and CockroachDB; f23 (A), f28 (A); f10 (A): DPhyp is recursive as
+  published.
+- **Audit rows.** 1, 4, and row 2's GOO.
+- **Expected effect.** JOB: the queries whose best plan joins two composite inputs. TPC-DS: its
+  queries over two fact tables (Q17, Q25, Q29) and Q64, and its LEFT JOINs (Q51's and Q97's FULL
+  JOINs need no reordering, row 4). TPC-H: little (8 tables at most), its unnested semi and anti
+  joins (Q4, Q22) free to move. SSB: little, stars of 5 tables. CH-benCHmark: Q13's LEFT JOIN and
+  its unnested EXISTS. ClickBench: none.
+- **Measurement.** JOB: PostgreSQL's time over Amphora's, 0.354 at step 3; target JOB's time over
+  its parent's at most 0.95 by geometric mean, and each query whose plan turns bushy faster than on
+  its parent. The audit's `03-right-full-barrier`: the RIGHT JOIN reads tiny first, total_cost
+  23,007.0 where it is 328,300,039,000.3.
+- **Falsified by.** No JOB or TPC-H plan turning bushy; those that do no faster; a wrong result in
+  the oracles (DQP compares one query's plans).
+- **Work and risk.** Large: the search, a composite build in the emitter, CD-C's rules. High risk:
+  new shapes of execution and outer joins reordered, which DQP, TLP and NoREC test.
+- **Rules.** §11: DPhyp's recursive enumeration as loops over an explicit stack. §2: rank 3's
+  budget, and a composite build charged to the hash table's budget. §1. §5. §6.
+
+### Rank 9. Statistics kept as rows change, and statements re-planned as they move
+
+- **What changes.** The write path (the inserts and deletes of `vdbe/execute.rs`, applied at
+  commit): a commit's inserted values join their columns' sketches, whose merge is a register-wise
+  maximum, so writers' additions merge in any order; its rows join the table's sample by online
+  reservoir sampling, a deleted sampled row replaced by an upcoming one (Birler, Radke and Neumann,
+  f41); the table's row count follows each commit. A table never analyzed has statistics from its
+  first rows (ClickHouse builds its statistics on insert, f42). Deletes leave the sketches
+  over-counting until the next ANALYZE; the rows changed since are counted with the statistics, and
+  a statement plans again when its tables' rows have moved by a stated share since it was planned.
+- **From step 3.** No step-3 number applies: each benchmark was analyzed after loading and each
+  query prepared after (section 8). A re-plan costs a prepare: a median of 1.9 ms on JOB and 0.5 to
+  0.6 ms on TPC-H at step 3.
+- **Findings.** f41 (A), f14 (A), f42 (A); f8 (B), f35 (A).
+- **Audit rows.** 5, the fallbacks without ANALYZE; 11, for tables that grow.
+- **Expected effect.** CH-benCHmark: its analytical queries over tables its transactions grow. The
+  other five load, analyze and run: none. kiln prepares its statements once a connection while its
+  tables grow, so for kiln this change matters more than its rank says.
+- **Measurement.** CH-benCHmark, loaded and run on the parent first (step 3 has none): its
+  analytical queries' times as its tables grow, target faster than the parent's with ANALYZE run on
+  the same schedule, each re-plan costing a prepare (a median 1.9 ms on JOB at step 3). The bench
+  suite's writes: target within 2% of the parent, with the write rate and p99 of AC-T1.1.3 and
+  AC-T1.1.4 held at K0's load.
+- **Falsified by.** A write statement slower beyond the 2%; CH-benCHmark's queries no faster than on
+  the parent with ANALYZE run on the same schedule.
+- **Work and risk.** Medium. High risk: it adds work to every commit, the path T1's acceptance
+  criteria measure.
+- **Rules.** §2: a commit's added work bounded. §8: deterministic in the log's order, so every
+  replica keeps the same statistics. §10: its metrics agreed with kiln's Observe owner. §5. §6:
+  deterministic simulation with writers and a nemesis.
+
+### Rank 10. General unnesting by dependent joins, top-down, on a worklist
+
+- **What changes.** `optimizer/unnest.rs`, which unnests by fixed patterns, gives way to Neumann and
+  Kemper's dependent joins, pushed down until no correlation is left (f30), in Neumann's top-down
+  form that visits each operator once (f38), each step taken from an explicit worklist where both
+  papers recurse (f10). NOT IN, subqueries beside a RIGHT or FULL JOIN and those that read several
+  tables unnest too; the comparison of the two forms' costs (`mod.rs`) stays.
+- **From step 3.** Of step 3's queries only TPC-H q21 keeps its subqueries (EXISTS and NOT EXISTS
+  over four outer tables, on cost): 5.309e+04 ms at SF 10 where PostgreSQL takes 1.195e+04 and
+  DuckDB 3.54e+03. Its plan's order counts too: it reads lineitem first and nation last.
+- **Findings.** f30 (B); f31 (A): DuckDB and CedarDB decorrelate every subquery; f38 (C): the 2025
+  top-down form, which made PostgreSQL's 26 minutes on its Figure 1 query 1.3 s; f7 (A): the
+  patterns today; f10 (A).
+- **Audit rows.** 10.
+- **Expected effect.** TPC-DS: ten of its queries keep correlated subqueries (Q1, Q6, Q10, Q16, Q30,
+  Q35, Q41, Q69, Q81, Q94, row 10). CH-benCHmark: Q16's NOT IN and its EXISTS forms. TPC-H: q21
+  where its unnested form is the cheaper. JOB, SSB and ClickBench: none, having no subqueries.
+- **Measurement.** TPC-H at SF 10: q21, 5.309e+04 ms at step 3, target under PostgreSQL's 1.195e+04
+  where it is unnested. TPC-DS, loaded and its ten queries measured on the parent first.
+- **Falsified by.** TPC-DS's ten queries no faster unnested; a finding of the oracles (TLP, NoREC,
+  DQP, the differential check) on an unnested form.
+- **Work and risk.** Very large: dependent joins in a plan that holds joined tables, terms and
+  subqueries, with no operator tree. High risk: NOT IN's and outer joins' NULLs, which the oracles
+  test.
+- **Rules.** §11: the worklist. §2: a counted bound on rewrites. §3: a form that can't be unnested
+  stays correlated, and EXPLAIN says so. §1. §5. §6.
+
+### Rank 11. Degree-sequence upper bounds as a guard
+
+- **What changes.** ANALYZE's ordered scan of each index, which counts its distinct prefixes for
+  `sqlite_stat1`, also keeps the most rows one value holds: the largest degree, the ℓ∞ norm of its
+  degree sequence (LpBound bounds joins from such norms, f19). A joined set's upper bound is one
+  table's rows times, along a spanning tree of its joins, each join's largest degree; an estimate
+  above its bound is cut to it, and a decision an estimate carries (rank 6's) can see how far above
+  it the bound lies.
+- **From step 3.** Step 3's errors are mostly underestimates, 791 of JOB's 977 prefixes, which an
+  upper bound leaves as they are; LpBound uses its bounds as the estimates, and SafeBound's authors
+  call theirs not ready for production (f40).
+- **Findings.** f19 (A), f40 (C), f11 (A).
+- **Audit rows.** 14.
+- **Expected effect.** Small on JOB, TPC-H, TPC-DS, SSB and CH-benCHmark: an estimate above a bound
+  is rare where statistics exist, and the bound caps the cross joins of tables without them (f6).
+  ClickBench: none, one table.
+- **Measurement.** JOB and TPC-H: prefixes estimated above their bound, target 0; step 3's 791
+  underestimates left as they are.
+- **Falsified by.** A prefix counted above its bound (a property test over random data).
+- **Work and risk.** Medium: the degrees in ANALYZE, a bound per set. Low risk.
+- **Rules.** §2, §5, §11.
+
+### Rank 12. Custom plans, then a generic one, for prepared statements
+
+- **What changes.** `statement.rs`: a statement with parameters is planned with its bound values for
+  its first five runs, then generically if the generic plan's estimated cost is not significantly
+  above those custom plans' average (PostgreSQL and CockroachDB, f35); ranks 2 and 4 give a value
+  its estimate. A statement keeps two plans at most, the generic one and its current run's.
+- **From step 3.** No step-3 number applies to the plans: JOB and TPC-H ran literal queries. The
+  audit's `08-fixed-at-prepare`: `WHERE k = ?` has one plan and one estimate, 1,000 rows, where k =
+  1 counts 1,000 and k = 9 none.
+- **Findings.** f35 (A): custom then generic plans in PostgreSQL and CockroachDB, several cached
+  variants by the parameters' cardinality in SQL Server (PSP), a recompile when a bound value could
+  change the plan in SQLite; the first keeps the fewest plans, two, which §2 favours. f8 (B):
+  Amphora plans once.
+- **Audit rows.** 11, a parameter's value.
+- **Expected effect.** TPC-H and TPC-DS run as prepared streams with substitution parameters, and
+  CH-benCHmark's transactions; JOB, SSB and ClickBench run literal queries: none.
+- **Measurement.** TPC-H's 22 prepared once and run with qgen's parameters, on the parent first
+  (step 3 has none), target no query slower than its generic plan; the planning paid on each custom
+  run, 0.5 to 0.6 ms a TPC-H query at step 3, target the bench suite's prepared statements within 2%
+  of the parent.
+- **Falsified by.** Custom plans no faster than the generic one; the bench suite's prepared
+  statements slower beyond 2% for their extra planning.
+- **Work and risk.** Medium. Moderate risk: five more plannings of every statement with parameters.
+- **Rules.** §2: the two plans. §5: the five runs PostgreSQL's, cited, or measured. §6.
+
+### Rank 13. An adaptive join switch and mid-query re-optimization
+
+- **What changes.** The emitter and the VDBE: a join emitted as a hash join and as an index nested
+  loop, chosen when its outer side's rows are counted against a threshold (SQL Server's batch-mode
+  adaptive join, f32); and where a plan materializes rows (a hash build, a sort), the rows counted
+  compared with the estimate and the rest of the plan made again when they differ by a stated factor
+  (Perron et al., f34). Decision 12's row counters are the counting points.
+- **From step 3.** JOB's 20 slowest queries take 414,668 ms of Amphora's 514,502 (PostgreSQL 103,893
+  ms on the same 20); Perron et al. took 27% off JOB's 20 longest-running (f34).
+- **Findings.** f32 (A); f33 (A): POLAR; f34 (A): re-optimization, and holistic adaptivity absent
+  from commercial systems because it complicates debugging and testing.
+- **Audit rows.** 13, adaptive execution.
+- **Expected effect.** JOB: its long tail. TPC-H, TPC-DS, SSB and CH-benCHmark: where estimates stay
+  off after ranks 1 to 4. ClickBench: none.
+- **Measurement.** JOB: the 20 slowest queries' time against the parent's, 414,668 ms of 514,502 at
+  step 3, target 27% less (f34).
+- **Falsified by.** Under 27% on JOB's 20 slowest once ranks 1 to 4 are in (they take the same
+  misestimates away); a result changed (the oracles).
+- **Work and risk.** Very large: a program compiled whole would need a second plan in mid-run. High
+  risk.
+- **Rules.** §2: what is materialized charged to a budget. §3. §11. §6: the oracles over both paths.
+
+### Not ranked: learned estimators
+
+f18 (D): learned estimators are more accurate than traditional ones on static data, costly to train
+and to run, unable to keep up with fast updates, and unpredictable; against it, Han et al. found ML
+data-driven estimators improving PostgreSQL's query times markedly where most traditional methods
+hardly did. Amphora's records change as kiln writes them, a model's training and memory need bounds
+(§2) its sources don't give, and nothing in them keeps CERT's property, which steps 4 and 5 made
+hold. They stay unranked until ranks 1 to 4 are in; a measurement on Amphora's workloads would
+reopen them if JOB's largest intermediate results' p95 then stays above 1e+03 (7.797e+06 at step 3).
+
+### Why this order
+
+Each reason names the gain on the six benchmarks, the work and the risk, so that one can be disputed
+alone.
+
+- **1 before 2.** Both are estimation, where step 3 puts the time (the 52 queries). Rank 1's cause
+  is in the records and in JOB's text (343 prefixes; surplus terms in all 113), and its fix is one
+  file over statistics ANALYZE keeps today; rank 2 needs new statistics, a table and a sample, for
+  errors that sit mostly at first tables (16 of JOB's 113) and in TPC-H's IN lists.
+- **2 before 3.** Rank 2's estimates reach all six benchmarks; rank 3 reaches JOB's 9 queries above
+  12 tables and TPC-DS Q64, with a gain step 3 measured (0.405 against 1.813) and less work. Whoever
+  weighs that measured gain above the breadth puts rank 3 second.
+- **3 before 4.** Rank 3's gain is measured and its work medium; rank 4 waits for rank 2's sample
+  and needs an evaluator at prepare, and of its step-3 targets q19 moves a plan while q06 can't (a
+  scan whatever its estimate).
+- **4 before 5.** Rank 4 is estimation on every benchmark; rank 5's measured target is TPC-H's three
+  star queries until SSB is loaded, though its risk is lower.
+- **5 before 6.** Rank 5 has a gain to measure (q09's 1.585e+05 ms); rank 6 changes no plan step 3
+  timed (its 30 loops each ran once), for less work. It is insurance: whoever wants the insurance
+  first swaps them.
+- **6 before 7.** Rank 6 is one condition at low risk; rank 7's gain on JOB and TPC-H is unknown
+  until P-error is measured, and its work is a fitting run and a harness.
+- **7 before 8.** Rank 7 says which plans the estimates moved, at low risk; rank 8 is large work at
+  high risk, for a gain the sources bound (left-deep within 4.5 times of bushy on JOB, f27) and step
+  3 can't place.
+- **8 before 9.** Rank 8 reaches JOB and TPC-DS; rank 9 reaches only CH-benCHmark of the six and
+  puts work on every commit. For kiln's own statements rank 9 would come first: this order is the
+  benchmarks'.
+- **9 before 10.** Both are high risk; rank 9 is medium work for one benchmark, rank 10 very large
+  work for TPC-DS's ten queries and CH-benCHmark's, none measured yet.
+- **10 before 11.** Rank 10 changes plans on TPC-DS and CH-benCHmark; rank 11 caps estimates where
+  step 3's errors are mostly underestimates (791 of 977), so it changes little, though at low risk.
+- **11 before 12.** Rank 11 is low risk; rank 12's gain is on runs step 3 didn't make (prepared
+  streams), and it plans every statement with parameters five more times.
+- **12 before 13.** Rank 13's gain (27% on JOB's slowest, f34) is the misestimates ranks 1 to 4 take
+  away, at the most work and risk of any.
+
+### The audit's gaps, each with a change or a reason
+
+| audit item | ranked change | reason, where none |
+|---|---|---|
+| 1. left-deep trees only | 8 | |
+| 2. above 12 tables a greedy left-deep search, called GOO | 3, 8 | |
+| 3. subsets enumerated by size, not as connected pairs | 3 | |
+| 4. no conflict detector | 8 | |
+| 5. statistics only `sqlite_stat1`; fallbacks without ANALYZE; filters multiplied | 2, 4, 9 | |
+| 6. a join's estimate from the access path chosen (AG) | — | closed since the audit by decision 13 (d762dc2) and step 5 (10f2461): the order check failed none of 502,632 and 530,789 checks, CERT none of 2,607,858; rank 1 changes how a set's rows are computed, not this |
+| 7. a FULL JOIN's estimate leaves out the right table's unmatched rows | — | closed by decision 13: a FULL JOIN keeps both sides' unmatched rows (`a_full_join_is_estimated_at_least_its_inner_join`) |
+| 8. a join on columns no index leads takes a fixed 0.1 | 1 | |
+| 9. a GROUP BY's groups are not estimated | 2 | |
+| 10. unnesting by fixed patterns | 10 | |
+| 11. plans fixed at prepare | 2, 9, 12 | |
+| 12. a page-based cost model whose pages are rows over 50 | 7 | |
+| 13. no adaptive or robust execution | 5, 6, 13 | |
+| 14. no upper bound on an estimate | 1, 11 | |
+| 15. P-error not yet measured | 7 | |
+| 16. unwrap, expect and panics in the greedy search and the planner | 3 | the calls elsewhere go with whichever change touches them (§1, `scripts/engine-ratchet.toml`) |
+| learned estimators (f18, D) | — | not ranked: the subsection above |
+| Calcite's rule engines (f29, A) | — | a framework's design, not a technique Amphora lacks for these benchmarks (section 7) |
+| the rules on how a change is built (f10, A) | — | not a gap: they bind every change, each in its rules |
+
+Of the 19 items, 14 have a ranked change and 5 a reason; 0 have neither.
 
 ## What would falsify these notes
 
