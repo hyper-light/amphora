@@ -5,9 +5,10 @@
 # (`load-<benchmark>.jsonl`). The second passes are the repeat the plan's test asks for: the same
 # estimates, and median run times within 5%.
 #
-# usage: [TARGETS=a,b] bench/planner/record.sh <amphora-bench> <out dir> <data dir> <JOB queries dir> [pass...]
+# usage: [TARGETS=a,b] [ANSWERS=dir] bench/planner/record.sh <amphora-bench> <out dir> <data dir> <JOB queries dir> [pass...]
 #   <data dir> holds tpch-sf1, tpch-sf10 and imdb; the passes default to all five:
 #   tpch-sf1-a tpch-sf1-b tpch-sf10-a job-a job-b
+#   ANSWERS: each pass's whole answers (--answers) in <dir>/<pass>, for answers.py.
 set -euo pipefail
 bin=${1:?amphora-bench}
 out=${2:?out dir}
@@ -39,7 +40,12 @@ for pass in "${passes[@]}"; do
   # timed by another: the 2026-10-26 baseline's first passes, timed by the process that had just
   # loaded their data, ran slower (bench/records/2026-10-26-jupiter-planner-baseline.md).
   "$bin" --planner "${args[@]}" --targets "$targets" --only - --out "$(native "$out/load-$bench.jsonl")" 2>>"$out/load-$bench.log"
+  answers=()
+  if [[ -n ${ANSWERS:-} ]]; then
+    answers=(--answers "$(native "$ANSWERS/$pass")")
+  fi
+  # ${answers[@]+...}: an empty array under `set -u` is an error in macOS's bash 3.2.
   "$bin" --planner "${args[@]}" --targets "$targets" --runs 3 --timeout-s 600 --count-timeout-s 1800 \
-    --max-load 2 --load-wait-s 3600 --out "$(native "$out/$pass.jsonl")" --resume 2>>"$out/$pass.log"
+    --max-load 2 --load-wait-s 3600 --out "$(native "$out/$pass.jsonl")" --resume ${answers[@]+"${answers[@]}"} 2>>"$out/$pass.log"
 done
 echo "== done $(date -u +%Y-%m-%dT%H:%M:%SZ)" >&2

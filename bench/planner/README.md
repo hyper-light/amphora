@@ -64,6 +64,19 @@ quiet, into a record of their own, and a query's last record is its rerun
 fastest of the passes given. `test_disturbed.py` checks `disturbed.py` on logs as the passes write
 them.
 
+With `--answers <dir>`, each query's first timed run on each engine also writes its whole answer,
+every row in the order the engine returned it, to `<dir>/<benchmark>/<query>/<engine>.tsv`
+(`tpch-sf1/q16/duckdb.tsv`) beside the query's text (`query.sql`); that run's record says
+`"captured": true`, as its time holds the writing, and the runs after it are timed as without. An
+answer past 2^20 rows or 32 MiB, or a run that didn't finish, leaves a refusal saying why in its
+place (`answers.rs`). `python3 -I answers.py <dir>` compares each query's answers between the
+engines, and `answers.py <dir> <parent's dir>` each engine's against the parent build's too: row by
+row where the query's outermost statement has ORDER BY (rows tied on its keys in any order), as
+multisets elsewhere, REALs within a relative 1e-9 and text without CHAR(n)'s trailing spaces (its
+docstring says why). It prints each difference with the first rows that differ, then `answers.py: N
+queries compared, M differ`, and exits 1 if any differ. `ANSWERS=<dir>` has `record.sh` write each
+pass's answers to `<dir>/<pass>`. `test_answers.py` checks `answers.py`.
+
 A pass's queries are timed by one process, and DuckDB on all its threads runs slower the older that
 process is: on jupiter, JOB's 16a, 16c, 17a and 32b took 2.4 to 4.9 times as long late in a pass
 as in a process started for them. `repeat.py` compares passes timed alike, each by one process from start to
@@ -86,3 +99,4 @@ end, and such a pass stopped part way starts again from its beginning rather tha
   prepare and run to the last row, best of the runs; PostgreSQL's through its simple protocol, which
   plans and runs in one round trip.
 - **Agreement**: each engine's row count for each query; any query on which they differ is listed.
+  With `--answers`, every row of every answer (`answers.py`).
