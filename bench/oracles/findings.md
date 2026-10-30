@@ -272,3 +272,18 @@ holds its finding's query:
 | CD. Found by CB's test's controls, not by a campaign: an element appended to the root array (jsonb_insert() or jsonb_set(), by '$[#]' or the index past its end) left the array's header one byte short of what it holds, the placeholder the path's traversal puts in first left uncounted where an object's array counts it: jsonb_insert('[]', '$[#]', 0) was x'1b1330', SQLite's x'2b1330' | — | `json/jsonb.rs` (`count_placeholder`) | `an_element_appended_to_the_root_array_counts_in_its_header` |
 
 None of the 43 is left failing as Amphora's.
+
+## The row-value seek's nightly run: seed 20261030, 1,800 s, 2026-10-30
+
+adacachy, `nightly.sh` against the reference SQLite 3.54.0 (LIKE_DOESNT_MATCH_BLOBS), on t1/keyset-seek's
+33599f1 (row values seek the index their columns lead: `docs/design/planner.md` decision 14), for its goal's
+"CERT and the order check clean": 68,800 databases, 2,787,918 checks. CERT failed none of its 343,997
+checks (32 queries SQLite refuses too) and the order check none of its 343,997. The other oracles made 4
+findings (`bench/records/2026-10-30-adacachy-keyset-oracles/`: the summary, the findings, and
+`replay.tsv`, each finding's `--replay-check` on c87e332's engine and on 33599f1, with its cause). Each
+fails on both builds alike, so none is the seek's:
+
+| cause | findings | fix | test |
+|---|---:|---|---|
+| AH. Not Amphora's (above): a LEFT, RIGHT or FULL JOIN's LIKE ON term on an INTEGER PRIMARY KEY, a NOCASE-indexed or a UNIQUE NOCASE column, where the reference SQLite answers no rows; the system's SQLite 3.54.0, built without the option, answers as Amphora | 3 | — (SQLite's) | — |
+| CE. An IN subquery's NULL check (a miss told from a NULL in the list) compared by the builder's current collation, what the expression translated last left there: a WHERE whose CASE ends on `c0 != ('a ' COLLATE RTRIM)`, or a vector's first column, so `'' IN (SELECT c0 FROM t2)` with t2 holding ' ' answered NULL for 0. SQLite compares each column as `x = y` does (`sqlite3ExprCodeIN`, step 6), the collation the list's index has | 1 (eet-5d073f0af8f98282) | `translate/expr/translator.rs` (the check reads the list index's collations) | `an_in_lists_null_check_compares_each_column_as_equality_does` |

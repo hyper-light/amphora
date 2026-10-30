@@ -1,0 +1,17 @@
+33599f1a3f5a446e229187c147adc7b9712c97e5
+68800 databases, 2787918 checks, 4 findings (0 more of the same), in 1800 s
+68800 databases, 2787918 checks in 1800 s; 4 findings (0 more of the same)
+  cert    343997 checks,  343965 passed,    0 failed
+  diff    343998 checks,  281876 passed,    3 failed
+  dqp     343997 checks,  262547 passed,    0 failed, another plan in 92370
+  eet     343997 checks,  277541 passed,    1 failed
+  norec   343998 checks,  316918 passed,    0 failed
+  order   343997 checks,  343997 passed,    0 failed
+  pqs     311136 checks,  287937 passed,    0 failed
+  same     68800 checks,   68800 passed,    0 failed
+  tlp     343998 checks,  296022 passed,    0 failed
+     21.5 s  diff-9694c3d5d048ba1f  Wrong: Amphora's answer isn't SQLite's
+     77.9 s  diff-f08e47b86b16bc48  Wrong: Amphora's answer isn't SQLite's
+    278.4 s  eet-5d073f0af8f98282  Wrong: an equivalent form gives other rows
+   1198.6 s  diff-8bb8b642344f1c0c  Wrong: Amphora's answer isn't SQLite's
+nightly exit 1

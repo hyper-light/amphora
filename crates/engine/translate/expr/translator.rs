@@ -537,6 +537,22 @@ fn translate_subquery_result_expr(
             });
             program.preassign_label_to_next_insn(label_null_checks_loop_start);
             let column_check_reg = program.alloc_register();
+            // Amphora: each column compared by the list's collation, its index's (`x = y`'s,
+            // resolve_comparison_collseq_across), as SQLite's `sqlite3ExprCodeIN` step 6 compares
+            // (sqlite3BinaryCompareCollSeq of each left field and the subquery's column): not by
+            // the builder's, which holds what the expression translated last left there, a
+            // WHERE's COLLATE or another column's.
+            let list_collations: Vec<Option<CollationSeq>> =
+                match program.get_cursor_type(*cursor_id) {
+                    Some(crate::vdbe::builder::CursorType::BTreeIndex(index)) => {
+                        index.columns.iter().map(|c| c.collation).collect()
+                    }
+                    _ => {
+                        return Err(LimboError::InternalError(
+                            "an IN subquery's list is not an index".to_string(),
+                        ))
+                    }
+                };
             for (i, affinity) in affinity_str.chars().map(Affinity::from_char).enumerate() {
                 program.emit_insn(Insn::Column {
                     cursor_id: *cursor_id,
@@ -550,7 +566,7 @@ fn translate_subquery_result_expr(
                     rhs: column_check_reg,
                     target_pc: label_row_differs,
                     flags: CmpInsFlags::default().with_affinity(affinity),
-                    collation: program.curr_collation(),
+                    collation: list_collations.get(i).copied().flatten(),
                 });
             }
             // All Ne comparisons fell through -> this row has all NULLs -> result is NULL

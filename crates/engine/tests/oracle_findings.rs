@@ -1315,6 +1315,42 @@ fn a_case_carries_no_columns_collation() {
     );
 }
 
+/// Do: `'' IN (SELECT c0 FROM t2)` and its NOT IN with t2 holding ' ', in a query whose WHERE is a
+/// CASE ending on a comparison under COLLATE RTRIM; `('x' COLLATE RTRIM, '') IN (SELECT 'x', c0
+/// FROM t2)`; `('', 1) IN (SELECT r, NULL FROM t3)` with r an RTRIM column holding ' ', under a
+/// WHERE ending on COLLATE NOCASE; and controls with the collation explicit. Expect: SQLite's
+/// answers: a miss is told from a NULL in the list by each column compared as `x = y` compares it
+/// (`sqlite3ExprCodeIN`, step 6: sqlite3BinaryCompareCollSeq of each left field and the
+/// subquery's column), the collation the list's index has: BINARY where neither side has one, so
+/// '' is not ' ' and IN is 0, NOT IN 1; RTRIM for r, so ('', 1) matches (' ', NULL) but for the
+/// NULL and IN is NULL. Amphora compared every column by the collation the builder held last, the
+/// WHERE's or the first column's: NULL where SQLite answers 0 or 1, and 0 and 1 where it answers
+/// NULL (finding eet-5d073f0af8f98282 of seed 20261030).
+#[test]
+fn an_in_lists_null_check_compares_each_column_as_equality_does() {
+    let (io, conn) = open();
+    conn.execute("CREATE TABLE t1(c0 NUMERIC)").unwrap();
+    conn.execute("INSERT INTO t1 VALUES (9007199254740993)")
+        .unwrap();
+    conn.execute("CREATE TABLE t2(c0 VARCHAR(10))").unwrap();
+    conn.execute("INSERT INTO t2 VALUES (' ')").unwrap();
+    conn.execute("CREATE TABLE t3(r TEXT COLLATE RTRIM)")
+        .unwrap();
+    conn.execute("INSERT INTO t3 VALUES (' ')").unwrap();
+    assert_eq!(
+        rows(&io, &conn, "SELECT '' IN (SELECT c0 FROM t2), '' NOT IN (SELECT c0 FROM t2) FROM t1 WHERE CASE WHEN 0 THEN 1 ELSE c0 != ('a ' COLLATE RTRIM) END"),
+        ["0|1"]
+    );
+    assert_eq!(
+        rows(&io, &conn, "SELECT ('x' COLLATE RTRIM, '') IN (SELECT 'x', c0 FROM t2), ('' COLLATE RTRIM) IN (SELECT c0 FROM t2), ('x', '' COLLATE RTRIM) IN (SELECT 'x', c0 FROM t2) FROM t1"),
+        ["0|1|1"]
+    );
+    assert_eq!(
+        rows(&io, &conn, "SELECT ('', 1) IN (SELECT r, NULL FROM t3), ('', 1) NOT IN (SELECT r, NULL FROM t3), ('x', 1) IN (SELECT r, NULL FROM t3) FROM t1 WHERE CASE WHEN 0 THEN 1 ELSE c0 != ('a ' COLLATE NOCASE) END"),
+        ["NULL|NULL|0"]
+    );
+}
+
 /// Do: count(DISTINCT x) and group_concat(DISTINCT x) of NOCASE and RTRIM columns, of text holding
 /// a NUL, and of expressions over them. Expect: SQLite's answers: the set is keyed by the
 /// argument's collation (KeyInfo over the aggregate's arguments), so 'a' and 'A' count once under
