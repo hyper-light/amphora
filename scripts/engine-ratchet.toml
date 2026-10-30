@@ -12,7 +12,7 @@
 "clippy::indexing_slicing" = 3214
 "clippy::arithmetic_side_effects" = 3406
 "clippy::string_slice" = 101
-"clippy::cast_possible_truncation" = 561
+"clippy::cast_possible_truncation" = 560
 "clippy::cast_sign_loss" = 254
 "clippy::cast_possible_wrap" = 688
 "clippy::disallowed_macros" = 783

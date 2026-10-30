@@ -255,7 +255,11 @@ pub(crate) fn step(
         }
         if next(db, ns, cutoff, cursor.as_ref())?.is_none() {
             completed = cutoff;
-            target = if completed < horizon { Some(horizon) } else { None };
+            target = if completed < horizon {
+                Some(horizon)
+            } else {
+                None
+            };
             cursor = None;
         }
     }

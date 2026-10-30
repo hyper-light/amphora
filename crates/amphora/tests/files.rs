@@ -108,7 +108,7 @@ fn a_restart_cuts_a_log_past_its_bound_to_nothing_and_keeps_one_within_it() {
             "a restart within the bound keeps the log's file"
         );
     }
-    let mut db = Db::open(&path).unwrap();
+    let db = Db::open(&path).unwrap();
     let mut rows = 0i64;
     db.query("SELECT count(*) FROM t", [], |r| {
         rows = r.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
