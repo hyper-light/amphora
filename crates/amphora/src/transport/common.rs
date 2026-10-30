@@ -62,7 +62,14 @@ fn transfer(stream: &mut Stream, bytes: &mut [u8], until: Instant) -> Result<(),
         let rest = bytes
             .get_mut(offset..)
             .ok_or_else(|| unavailable("frame offset"))?;
-        let n = stream.read(rest).map_err(transfer_error)?;
+        let n = match stream.read(rest) {
+            Ok(n) => n,
+            // A read with a timeout installed is never restarted after a signal's handler, nor
+            // after the process is stopped and continued: it ends EINTR having read nothing
+            // (signal(7)). It reads again, its wait still bounded by the deadline above.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(transfer_error(error)),
+        };
         if n == 0 {
             return Err(unavailable("owner connection closed"));
         }
@@ -156,7 +163,13 @@ pub(super) fn send(stream: &mut Stream, encoded: &[u8], until: Instant) -> Resul
             stream
                 .set_write_timeout(Some(remaining(until)?))
                 .map_err(unavailable)?;
-            let n = stream.write(part).map_err(transfer_error)?;
+            let n = match stream.write(part) {
+                Ok(n) => n,
+                // As `transfer` reads again: a write with a timeout installed ends EINTR, having
+                // written nothing, after a signal's handler or a stop (signal(7)).
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(transfer_error(error)),
+            };
             if n == 0 {
                 return Err(unavailable("owner connection closed"));
             }
@@ -988,6 +1001,138 @@ mod tests {
     }
     fn until() -> Instant {
         Instant::now() + Duration::from_secs(5)
+    }
+
+    /// Whether this is the child copy of the test binary that `test` runs alone, to be stopped
+    /// and continued without stopping the tests beside it; the parent runs it and checks it passed.
+    #[cfg(target_os = "linux")]
+    fn in_stopped_child(test: &str) -> bool {
+        if std::env::var_os("AMPHORA_TRANSPORT_STOPPED").is_some() {
+            return true;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("AMPHORA_TRANSPORT_STOPPED", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "{test} in a stopped child: {status}");
+        false
+    }
+
+    /// This thread's id within the process, from Linux's /proc/thread-self.
+    #[cfg(target_os = "linux")]
+    fn thread_id() -> u32 {
+        let link = std::fs::read_link("/proc/thread-self").unwrap();
+        link.file_name().unwrap().to_str().unwrap().parse().unwrap()
+    }
+
+    /// Waits until thread `id` of this process sleeps (state S): the threads here sleep only in
+    /// their socket call.
+    #[cfg(target_os = "linux")]
+    fn wait_asleep(id: u32) {
+        let deadline = until();
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/self/task/{id}/stat")).unwrap();
+            // The state follows the thread's name, which the stat's last ')' closes.
+            let state = stat
+                .rsplit_once(')')
+                .unwrap()
+                .1
+                .split_whitespace()
+                .next()
+                .unwrap();
+            if state == "S" {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "thread {id} never slept: {state}"
+            );
+            thread::park_timeout(Duration::from_millis(1));
+        }
+    }
+
+    /// Stops this process and continues it 200 ms later, from a shell outside it.
+    #[cfg(target_os = "linux")]
+    fn stop_and_continue() {
+        let pid = std::process::id().to_string();
+        let status = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "kill -STOP \"$0\"; sleep 0.2; kill -CONT \"$0\"",
+                &pid,
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    // Bug dc8ffe98: transport tests failed "Interrupted system call" in full runs. Do: wait in
+    // `transfer` for a frame's bytes while this process is stopped and continued; a read with a
+    // timeout ends EINTR after that (signal(7)). Expect: the bytes, not a refusal (CP-T1.5).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stop_and_continue_leaves_a_waiting_read_whole() {
+        if !in_stopped_child(
+            "transport::common::tests::a_stop_and_continue_leaves_a_waiting_read_whole",
+        ) {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut stream = Stream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let (send_id, id) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            send_id.send(thread_id()).unwrap();
+            let mut bytes = [0u8; 4];
+            transfer(&mut stream, &mut bytes, until()).map(|()| bytes)
+        });
+        wait_asleep(id.recv().unwrap());
+        stop_and_continue();
+        peer.write_all(b"ping").unwrap();
+        assert_eq!(reader.join().unwrap().unwrap(), *b"ping");
+    }
+
+    // Bug dc8ffe98. Do: `send` a frame larger than the sockets hold, so its write waits for
+    // room, while this process is stopped and continued. Expect: every byte arrives and `send`
+    // succeeds (CP-T1.5). Linux doesn't end a waiting write on a stop and continue, so this passed
+    // before `send` wrote again on EINTR too; a handled signal does end it (signal(7)), and
+    // aiming one at this thread alone would take unsafe code.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stop_and_continue_leaves_a_waiting_send_whole() {
+        if !in_stopped_child(
+            "transport::common::tests::a_stop_and_continue_leaves_a_waiting_send_whole",
+        ) {
+            return;
+        }
+        // Four times what the sockets of both ends may hold (the kernel's most for each), so the
+        // write waits for room until the peer reads.
+        let most = |path: &str| -> usize {
+            let limits = std::fs::read_to_string(path).unwrap();
+            limits.split_whitespace().last().unwrap().parse().unwrap()
+        };
+        let frame = 4 * (most("/proc/sys/net/ipv4/tcp_wmem") + most("/proc/sys/net/ipv4/tcp_rmem"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut stream = Stream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        // A send cut short leaves the rest of the frame unread: the read refuses, never hangs.
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (send_id, id) = std::sync::mpsc::channel();
+        let writer = thread::spawn(move || {
+            let bytes = vec![7u8; frame];
+            send_id.send(thread_id()).unwrap();
+            send(&mut stream, &bytes, until())
+        });
+        wait_asleep(id.recv().unwrap());
+        stop_and_continue();
+        let mut size = [0u8; 4];
+        peer.read_exact(&mut size).unwrap();
+        assert_eq!(u32::from_be_bytes(size), u32::try_from(frame).unwrap());
+        let mut bytes = vec![0u8; frame];
+        peer.read_exact(&mut bytes).unwrap();
+        assert!(bytes.iter().all(|byte| *byte == 7));
+        writer.join().unwrap().unwrap();
     }
 
     #[test]
