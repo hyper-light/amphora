@@ -1088,6 +1088,12 @@ pub trait Wal: Debug + Send + Sync {
     /// db_size is none -> non-last frame written in transaction
     fn append_frames_vectored(&self, pages: Vec<PageRef>, page_sz: PageSize) -> Result<Completion>;
 
+    /// Amphora: chains again the checksums of the frames this write transaction wrote a page back
+    /// over, and of every frame after them, read back from the log (Amphora's
+    /// `docs/design/store.md`, decision 30). A commit does this before it prepares its frames, which
+    /// chain on from them; done at once when it wrote over none.
+    fn rechain(&self) -> IOResultOr<()>;
+
     /// Complete append of frames by updating shared wal state. Before this
     /// all changes were stored locally.
     fn finish_append_frames_commit(&self) -> Result<()>;
@@ -3332,6 +3338,33 @@ pub struct WalFile {
     /// reported durable under synchronous=FULL.
     /// Shared with the fsync completion callback, hence the Arc.
     dirty: Arc<AtomicBool>,
+    /// Amphora: the first frame past the log's committed end that this write transaction wrote a
+    /// page back over (0: none). The frames' checksums no longer chain from it; the commit chains
+    /// them again before it appends (`Wal::rechain`; Amphora's `docs/design/store.md`, decision 30).
+    rewritten: AtomicU64,
+    /// Amphora: the commit's re-chaining under way.
+    rechaining: Mutex<Option<Rechain>>,
+}
+
+/// Amphora: a commit chaining again the checksums of the frames its transaction wrote over, and of
+/// every frame after them (`Wal::rechain`), read back and written back [`IOV_MAX`] frames at a time
+/// (as many as a spill writes at once, 4 MiB of 4 KiB pages: what it holds in memory at most).
+struct Rechain {
+    /// The first frame of the next batch.
+    next: u64,
+    /// The transaction's last frame.
+    last: u64,
+    /// What frame `next - 1` chains to. None until the first batch is read: that batch begins one
+    /// frame early, at a frame never written over, whose checksum seeds the chain.
+    checksum: Option<(u32, u32)>,
+    batch: Option<RechainBatch>,
+}
+
+/// Amphora: a batch of frames from [`Rechain::next`] in flight: how many, read into the buffer, then
+/// written back with their checksums chained again.
+enum RechainBatch {
+    Read(u64, Arc<Buffer>, Completion),
+    Written(u64, Completion),
 }
 
 impl fmt::Debug for WalFile {
@@ -4636,6 +4669,9 @@ impl Wal for WalFile {
                 "begin_write_tx called while write lock already held according to connection state"
             );
         }
+        // Amphora: nothing past the committed end is this transaction's yet (decision 30).
+        self.rewritten.store(0, Ordering::Release);
+        *self.rechaining.lock() = None;
 
         if !allowed_auto_actions.contains(WalAutoActions::Restart) {
             self.write_base
@@ -5113,6 +5149,14 @@ impl Wal for WalFile {
         };
         self.ensure_header_if_needed(page_size, sync_type)?;
         self.refuse_packed("write_frame_raw")?;
+        // Amphora: frames this write transaction wrote over don't chain until its commit chains
+        // them again (decision 30); a raw frame, which may commit them, can't follow them.
+        if self.rewritten.load(Ordering::Acquire) != 0 {
+            return Err(LimboError::TxError(
+                "a raw frame can't follow frames this transaction wrote over before its commit"
+                    .into(),
+            ));
+        }
         tracing::debug!("write_raw_frame({})", frame_id);
         // if page_size wasn't initialized before - we will initialize it during that raw write
         if self.page_size() != 0 && page.len() != self.page_size() as usize {
@@ -5393,6 +5437,12 @@ impl Wal for WalFile {
         self.coordination.rollback_cache(max_frame);
         self.set_last_checksum(last_checksum);
         self.max_frame.store(max_frame, Ordering::Release);
+        // Amphora: a frame written over past the position rolled back to goes with it, as SQLite's
+        // `sqlite3WalSavepointUndo` forgets `iReCksum` (decision 30).
+        if self.rewritten.load(Ordering::Acquire) > max_frame {
+            self.rewritten.store(0, Ordering::Release);
+        }
+        *self.rechaining.lock() = None;
         if !is_savepoint {
             self.reset_internal_states();
         }
@@ -5816,12 +5866,40 @@ impl Wal for WalFile {
         if Self::is_packed(&header) {
             return self.append_records(&pages, &header, epoch);
         }
+        let page_transform = self.io_ctx.read().page_transform().clone();
+        let file = self.coordination.wal_file()?;
+
+        // Amphora: a page this write transaction already wrote past the log's committed end is
+        // written back over that frame, as SQLite's `walFrames` does, not appended again: the log
+        // holds one frame for each page the transaction dirtied, however often its spills write the
+        // page (Amphora's docs/design/store.md, decision 30).
+        let committed = self.load_coordination_snapshot().max_frame;
+        let local = self.max_frame.load(Ordering::Acquire);
+        let mut group = CompletionGroup::new(|_| {});
+        let mut over = Vec::new();
+        let mut appended = Vec::with_capacity(pages.len());
+        for page in pages {
+            let page_id =
+                u64::try_from(page.get().id()).map_err(|_| LimboError::IntegerOverflow)?;
+            match self
+                .coordination
+                .latest_frame(page_id, local)
+                .filter(|&frame| frame > committed)
+            {
+                Some(frame) => over.push((frame, page)),
+                None => appended.push(page),
+            }
+        }
+        self.write_over(&file, &header, &page_transform, over, &mut group)?;
+        if appended.is_empty() {
+            return Ok(group.build());
+        }
+        let pages = appended;
 
         // Prepare write buffers and bookkeeping
         let mut iovecs: Vec<Arc<Buffer>> = Vec::with_capacity(pages.len());
         let mut page_frame_and_checksum: Vec<(PageRef, u64, (u32, u32))> =
             Vec::with_capacity(pages.len());
-        let page_transform = self.io_ctx.read().page_transform().clone();
 
         // Rolling checksum input to each frame build
         let first_frame_id = self.max_frame.load(Ordering::Acquire) + 1;
@@ -5887,9 +5965,8 @@ impl Wal for WalFile {
         };
 
         let c = Completion::new_write(on_complete);
-
-        let file = self.coordination.wal_file()?;
-        let c = file.pwritev(start_off, iovecs, c)?;
+        group.add(&c);
+        let _appended = file.pwritev(start_off, iovecs, c)?;
 
         // Advance the connection-private write cursor (max_frame / rolling
         // checksum / dirty) synchronously so a following batch in the same
@@ -5916,7 +5993,120 @@ impl Wal for WalFile {
             self.max_frame.store(*last_frame_id, Ordering::Release);
         }
 
-        Ok(c)
+        Ok(group.build())
+    }
+
+    fn rechain(&self) -> IOResultOr<()> {
+        let mut rechaining = self.rechaining.lock();
+        loop {
+            let Some(r) = rechaining.as_mut() else {
+                let from = self.rewritten.load(Ordering::Acquire);
+                if from == 0 {
+                    return Ok(IOResult::Done(()));
+                }
+                let before = from.checked_sub(1).ok_or(LimboError::IntegerOverflow)?;
+                let snapshot = self.load_coordination_snapshot();
+                let header = self.coordination.wal_header();
+                // Frame 1 chains from the log's header and the frame after the last commit from
+                // that commit; a frame between them holds its own checksum, read with the first
+                // batch (frames before `from` were never written over, so theirs still chain).
+                let (next, checksum) = if before == 0 {
+                    (from, Some((header.checksum_1, header.checksum_2)))
+                } else if before == snapshot.max_frame {
+                    (from, Some(snapshot.last_checksum))
+                } else {
+                    (before, None)
+                };
+                *rechaining = Some(Rechain {
+                    next,
+                    last: self.max_frame.load(Ordering::Acquire),
+                    checksum,
+                    batch: None,
+                });
+                continue;
+            };
+            let frame_len = usize::try_from(self.page_size())
+                .ok()
+                .and_then(|page| page.checked_add(WAL_FRAME_HEADER_SIZE))
+                .ok_or(LimboError::IntegerOverflow)?;
+            match r.batch.take() {
+                None if r.next > r.last => {
+                    let checksum = r.checksum.ok_or_else(|| {
+                        LimboError::InternalError("the log's frames were left unchained".into())
+                    })?;
+                    self.set_last_checksum(checksum);
+                    self.rewritten.store(0, Ordering::Release);
+                    *rechaining = None;
+                    return Ok(IOResult::Done(()));
+                }
+                None => {
+                    let frames = r
+                        .last
+                        .checked_sub(r.next)
+                        .and_then(|n| n.checked_add(1))
+                        .zip(u64::try_from(IOV_MAX).ok())
+                        .map(|(left, most)| left.min(most))
+                        .ok_or(LimboError::IntegerOverflow)?;
+                    let len = usize::try_from(frames)
+                        .ok()
+                        .and_then(|frames| frames.checked_mul(frame_len))
+                        .ok_or(LimboError::IntegerOverflow)?;
+                    let offset = self.frame_offset(r.next);
+                    let buf = Arc::new(Buffer::new_temporary(len));
+                    let read = Completion::new_read(buf.clone(), move |res| match res {
+                        Ok((_, n)) if usize::try_from(n).is_ok_and(|n| n == len) => None,
+                        Ok((_, n)) => Some(CompletionError::ShortReadWalFrame {
+                            offset,
+                            expected: len,
+                            actual: usize::try_from(n).unwrap_or(0),
+                        }),
+                        Err(_) => None,
+                    });
+                    let read = self.coordination.wal_file()?.pread(offset, read)?;
+                    r.batch = Some(RechainBatch::Read(frames, buf, read));
+                }
+                Some(RechainBatch::Read(frames, buf, c)) => {
+                    if !c.finished() {
+                        r.batch = Some(RechainBatch::Read(frames, buf, c.clone()));
+                        io_yield_one!(c);
+                    }
+                    if let Some(e) = c.get_error() {
+                        *rechaining = None;
+                        return Err(LimboError::CompletionError(e).into());
+                    }
+                    let header = self.coordination.wal_header();
+                    for frame in buf.as_mut_slice().chunks_exact_mut(frame_len) {
+                        r.checksum = Some(match r.checksum {
+                            Some(prev) => recompute_wal_frame_checksum(frame, &header, prev),
+                            None => {
+                                let (held, _) = sqlite3_ondisk::parse_wal_frame_header(frame);
+                                (held.checksum_1, held.checksum_2)
+                            }
+                        });
+                    }
+                    let write = self.coordination.wal_file()?.pwrite(
+                        self.frame_offset(r.next),
+                        buf,
+                        Completion::new_write(|_| {}),
+                    )?;
+                    r.batch = Some(RechainBatch::Written(frames, write));
+                }
+                Some(RechainBatch::Written(frames, c)) => {
+                    if !c.finished() {
+                        r.batch = Some(RechainBatch::Written(frames, c.clone()));
+                        io_yield_one!(c);
+                    }
+                    if let Some(e) = c.get_error() {
+                        *rechaining = None;
+                        return Err(LimboError::CompletionError(e).into());
+                    }
+                    r.next = r
+                        .next
+                        .checked_add(frames)
+                        .ok_or(LimboError::IntegerOverflow)?;
+                }
+            }
+        }
     }
 
     #[cfg(any(test, debug_assertions))]
@@ -6010,6 +6200,8 @@ impl WalFile {
             checkpoint_guard: RwLock::new(None),
             io_ctx: RwLock::new(IOContext::default()),
             dirty: Arc::new(AtomicBool::new(false)),
+            rewritten: AtomicU64::new(0),
+            rechaining: Mutex::new(None),
         }
     }
 
@@ -6067,6 +6259,73 @@ impl WalFile {
         self.set_last_checksum(checksums);
         self.max_frame.store(frame_id, Ordering::Release);
         self.coordination.cache_frame(page_id, frame_id);
+    }
+
+    /// Amphora: writes each page of `over` back over its frame, the frame this write transaction
+    /// last wrote it to past the log's committed end (Amphora's `docs/design/store.md`, decision
+    /// 30), frames next to each other in one write: a frame keeps its page, so the frame cache stays
+    /// as it is. Their checksums no longer chain until the commit chains the frames again
+    /// (`Wal::rechain`). The writes join `group`.
+    fn write_over(
+        &self,
+        file: &Arc<dyn File>,
+        header: &WalHeader,
+        page_transform: &PageTransform,
+        mut over: Vec<(u64, PageRef)>,
+        group: &mut CompletionGroup,
+    ) -> Result<()> {
+        over.sort_unstable_by_key(|&(frame, _)| frame);
+        let Some(&(first, _)) = over.first() else {
+            return Ok(());
+        };
+        let epoch = self.coordination.checkpoint_epoch();
+        let mut over = over.into_iter().peekable();
+        while let Some((start, page)) = over.next() {
+            let mut run = vec![(start, page)];
+            let mut end = start;
+            while let Some((frame, page)) =
+                over.next_if(|&(frame, _)| end.checked_add(1) == Some(frame))
+            {
+                run.push((frame, page));
+                end = frame;
+            }
+            let mut bufs = Vec::with_capacity(run.len());
+            let mut len = 0usize;
+            for (_, page) in &run {
+                let page_number =
+                    u32::try_from(page.get().id()).map_err(|_| LimboError::IntegerOverflow)?;
+                let (_, bytes) = Self::prepare_transformed_frame(
+                    &self.buffer_pool,
+                    header,
+                    self.last_checksum(),
+                    page_number,
+                    0,
+                    page.get_contents().as_ptr(),
+                    page_transform,
+                )?;
+                len = len
+                    .checked_add(bytes.len())
+                    .ok_or(LimboError::IntegerOverflow)?;
+                bufs.push(bytes);
+            }
+            // The pages are in the log again once their frames are written whole, as appended
+            // frames' are.
+            let c = Completion::new_write(move |res| {
+                if res.is_ok_and(|n| usize::try_from(n).is_ok_and(|n| n == len)) {
+                    for (frame, page) in &run {
+                        page.set_wal_tag(*frame, epoch);
+                    }
+                }
+            });
+            group.add(&c);
+            let _written = file.pwritev(self.frame_offset(start), bufs, c)?;
+        }
+        self.dirty.store(true, Ordering::Release);
+        let was = self.rewritten.load(Ordering::Acquire);
+        if was == 0 || first < was {
+            self.rewritten.store(first, Ordering::Release);
+        }
+        Ok(())
     }
 
     /// Reset connection-private WAL state.

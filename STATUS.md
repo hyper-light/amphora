@@ -20,11 +20,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   writer keeps no statement journal. Its meter keeps the longest commit, flush, checkpoint, wait to
   restart and restart. A flush that fails is the last: the store refuses what waits and what comes
   (`Refused::Disk`) until it is started again. The flusher flushes the log's data, and the log keeps
-  its length across restarts (decision 13); when the writer ran out of work during a flush, the next
-  waits for it to take in what that flush's senders send (decision 14): at 32 writers on fedora,
-  7,605 writes a second at p50 4.06 ms against 5,608 at 5.12 ms before, and PostgreSQL 17's 6,120 at
-  5.06 ms in the same windows (2026-10-20, load 4–12, not yet a quiet machine). Tested in
-  `crates/amphora/tests/store.rs`.
+  its length across restarts within twice its bound (decisions 13 and 31); when the writer ran out
+  of work during a flush, the next waits for it to take in what that flush's senders send (decision
+  14): at 32 writers on fedora, 7,605 writes a second at p50 4.06 ms against 5,608 at 5.12 ms
+  before, and PostgreSQL 17's 6,120 at 5.06 ms in the same windows (2026-10-20, load 4–12, not yet a
+  quiet machine). Tested in `crates/amphora/tests/store.rs`.
 - **Groups** (`crates/amphora/src/groups.rs`, docs/design/store.md decision 10): a store in groups
   on one node, keys spread by hash, each group a writer, a log and a flusher of its own; a batch is
   one group's. 16 groups wrote 320,451 rows a second at 1,000,000 writers on fedora, against one
@@ -112,6 +112,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   plans the join: `p JOIN q ON q.a = p.x AND q.b = p.y` on q's key (a, b) is `SCAN p` and a search
   of q's key, not a hash join costed on the fallback's million rows. With statistics the costs
   decide; CERT, run without statistics, lost a finding and gained none.
+- **A row value seeks the index its columns lead** (docs/design/planner.md decision 14,
+  `crates/engine/tests/row_value_seek.rs`): `(a, b, c) > (?, ?, ?)` bounds a, and a search of an
+  index on (a, b, c) takes the whole row, from the first key at or past it, the comparison filtering
+  every row as SQLite's does. So a keyset page, `WHERE (family, key, rev) > (?1, ?2, ?3) ORDER BY
+  family, key, rev LIMIT 8`, reads from the cursor and stops at its LIMIT, and a pass is linear in
+  its rows where it was quadratic. A page reading columns the index lacks seeks once ANALYZE has
+  counted the table; the OR chain spelling of a keyset stays a scan, as in SQLite.
 - **Readers keep their pages across commits** (docs/design/store.md decision 18,
   `crates/engine/storage/changes.rs`): a connection starting a read transaction forgets only the
   pages written since its last one, where SQLite and Turso forget its whole cache; it forgets
@@ -173,6 +180,17 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   decision 25): past its bound it had passed about 10,000 times a second copying nothing, each pass
   taking locks and lines the writer takes at every commit; a pass that copies nothing now waits for
   the next flush.
+- **A transaction's spills write over its own frames** (docs/design/store.md decision 30): a page
+  spilled again goes back over the frame its transaction wrote it to, and the commit chains the
+  frames' checksums again before its own, as SQLite's `walFrames` does; a transaction's log holds at
+  most a frame for each page it dirtied before its commit, and two after, where it took a frame for
+  each change after a spill (the unify audit's 8 MiB log-search transaction: a 7 GiB log beside a
+  120 MiB file; reproduced on its corpus, 7,041.7 MiB → 241.1 MiB for 30,689 dirtied pages). A
+  power cut anywhere in such a transaction keeps the last commit (crash injection, 10,000 seeds).
+- **A restart cuts a log past twice its bound to nothing** (docs/design/store.md decision 31):
+  `Db::restart_log` keeps the log's file while it holds room for no more than twice the store's
+  bound (`Db::keep_log`), and past it cuts the file to nothing once every frame is in the database
+  file; a log's high water had stayed on disk for good.
 - **Many writers, stage 1** (docs/design/engine.md, `crates/engine/storage/versioned`): B-link
   trees on one shared buffer pool, in memory: writers on different leaves at once, readers through
   copies of inner pages validated by version, a root split whole under the root's latch (decision

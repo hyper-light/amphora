@@ -226,6 +226,45 @@ fn native_primary_root_bounds_work_ledger_point_and_prefix_reads() {
             .any(|r| r[1] == "IdxRowId" || r[1] == "DeferredSeek"),
         "{bytecode:?}"
     );
+    // AC-T1.13.4: the same native primary root must seek a composite keyset cursor,
+    // including its non-key payload, rather than reread the preceding 16,000 rows.
+    // Reuse the point/prefix work bounds; both directions must return the exact next page.
+    for (op, key, direction, expected) in [
+        (
+            ">",
+            "04000|1",
+            "ASC",
+            (16002..16010).map(|n| format!("v{n}")).collect::<Vec<_>>(),
+        ),
+        (
+            "<",
+            "04000|2",
+            "DESC",
+            (15994..16002)
+                .rev()
+                .map(|n| format!("v{n}"))
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        let query = format!("SELECT value FROM work_records WHERE (family,key) {op} ('weak','{key}') ORDER BY family {direction},key {direction} LIMIT 8");
+        let mut statement = c.prepare(&query).unwrap();
+        let got: Vec<_> = statement
+            .run_collect_rows()
+            .unwrap()
+            .iter()
+            .map(|row| row[0].to_string())
+            .collect();
+        assert_eq!(got, expected, "{query}");
+        assert_eq!(statement.stmt_status(Counter::FullscanStep), 0, "{query}");
+        assert!(statement.stmt_status(Counter::RowsRead) <= 256, "{query}");
+        assert!(statement.stmt_status(Counter::VmStep) < 2000, "{query}");
+        let plan = sql(&io, &c, &format!("EXPLAIN QUERY PLAN {query}")).unwrap();
+        assert!(
+            plan.iter()
+                .any(|row| row[3].contains(&format!("USING PRIMARY KEY ((family,key){op}(?,?))"))),
+            "{query}: {plan:?}"
+        );
+    }
 }
 
 // AC-T1.1.1: adding a native query candidate must preserve SQL results in

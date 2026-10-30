@@ -3655,14 +3655,17 @@ impl<'a> Iterator for SeekDefKeyIterator<'a, SeekKeyComponent<&'a ast::Expr>> {
             Some(SeekKeyComponent::Expr(
                 &self.seek_def.prefix[self.pos].eq.as_ref().unwrap().1,
             ))
-        } else if self.pos == self.seek_def.prefix.len() {
-            match &self.seek_key.last_component {
-                SeekKeyComponent::Expr(expr) => Some(SeekKeyComponent::Expr(expr)),
-                SeekKeyComponent::Null => Some(SeekKeyComponent::Null),
-                SeekKeyComponent::None => None,
-            }
         } else {
-            None
+            // Amphora: a row value's elements one after another (`planner.md`, decision 14).
+            let element = self.pos.checked_sub(self.seek_def.prefix.len());
+            match (&self.seek_key.last_component, element) {
+                (SeekKeyComponent::Expr(expr), Some(0)) => Some(SeekKeyComponent::Expr(expr)),
+                (SeekKeyComponent::Null, Some(0)) => Some(SeekKeyComponent::Null),
+                (SeekKeyComponent::Row(row), Some(i)) => {
+                    row.get(i).map(|(expr, _)| SeekKeyComponent::Expr(expr))
+                }
+                _ => None,
+            }
         };
         self.pos += 1;
         result
@@ -3675,15 +3678,15 @@ impl<'a> Iterator for SeekDefKeyIterator<'a, Affinity> {
     fn next(&mut self) -> Option<Self::Item> {
         let result = if self.pos < self.seek_def.prefix.len() {
             Some(self.seek_def.prefix[self.pos].eq.as_ref().unwrap().2)
-        } else if self.pos == self.seek_def.prefix.len() {
-            match &self.seek_key.last_component {
-                SeekKeyComponent::Expr(..) => Some(self.seek_key.affinity),
-                // NULL sentinel does not require conversion; use NONE affinity so width matches.
-                SeekKeyComponent::Null => Some(Affinity::Blob),
-                SeekKeyComponent::None => None,
-            }
         } else {
-            None
+            let element = self.pos.checked_sub(self.seek_def.prefix.len());
+            match (&self.seek_key.last_component, element) {
+                (SeekKeyComponent::Expr(..), Some(0)) => Some(self.seek_key.affinity),
+                // NULL sentinel does not require conversion; use NONE affinity so width matches.
+                (SeekKeyComponent::Null, Some(0)) => Some(Affinity::Blob),
+                (SeekKeyComponent::Row(row), Some(i)) => row.get(i).map(|(_, affinity)| *affinity),
+                _ => None,
+            }
         };
         self.pos += 1;
         result
@@ -3697,6 +3700,7 @@ impl SeekDef {
         self.prefix.len()
             + match key.last_component {
                 SeekKeyComponent::Expr(_) => 1,
+                SeekKeyComponent::Row(ref row) => row.len(),
                 SeekKeyComponent::Null => 1,
                 SeekKeyComponent::None => 0,
             }
@@ -3797,6 +3801,10 @@ pub fn synthesized_seek_affinity_str(index: &Index, seek_def: &SeekDef) -> Optio
 #[derive(Debug, Clone)]
 pub enum SeekKeyComponent<E> {
     Expr(E),
+    /// Amphora: a row value's leading elements, each with the affinity its comparison converts it
+    /// by: one bound on as many index columns, from the range's on (`docs/design/planner.md`,
+    /// decision 14). The key iterators yield its elements one by one, as `Expr`s.
+    Row(Vec<(E, Affinity)>),
     Null,
     None,
 }

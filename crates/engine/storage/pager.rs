@@ -1373,6 +1373,9 @@ enum CommitState {
     PrepareWalSync,
     /// Get DB size (mostly from page cache - but in rare cases we can read it from disk)
     GetDbSize,
+    /// Amphora: chain again the checksums of the frames the transaction's spills wrote over
+    /// (`Wal::rechain`; Amphora's `docs/design/store.md`, decision 30), which its frames chain on from.
+    Rechain { db_size: u32 },
     /// Scan all dirty pages and issue concurrent reads for evicted (spilled) pages.
     ScanAndIssueReads { db_size: u32 },
     /// Wait for all batched reads of evicted pages to complete.
@@ -5006,9 +5009,13 @@ impl Pager {
                 }
                 CommitState::GetDbSize => {
                     let db_size = return_if_io!(self.with_header(|h| h.database_size));
-                    self.commit_info.write().state = CommitState::ScanAndIssueReads {
+                    self.commit_info.write().state = CommitState::Rechain {
                         db_size: db_size.get(),
                     };
+                }
+                CommitState::Rechain { db_size } => {
+                    return_if_io!(wal.rechain());
+                    self.commit_info.write().state = CommitState::ScanAndIssueReads { db_size };
                 }
                 CommitState::ScanAndIssueReads { db_size } => {
                     let mut commit_info = self.commit_info.write();

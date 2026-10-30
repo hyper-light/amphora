@@ -3,7 +3,9 @@
 //! durable what was written before it began; each change not made durable survives whole, torn or
 //! not at all, in any combination. After the restart, every batch acknowledged durable is there,
 //! every batch the engine refused isn't, every other batch is there whole or not at all, and the
-//! database passes Turso's integrity check.
+//! database passes Turso's integrity check. The same disk under one transaction too large for its
+//! cache, whose spills write frames over again (docs/design/store.md, decision 30): after the
+//! restart it is there whole or not at all, and there once its flush was told done.
 
 #![cfg_attr(
     test,
@@ -68,13 +70,16 @@ fn apply(bytes: &mut Vec<u8>, change: &Change) {
 }
 
 /// What a file holds: what its flushes made durable, the changes not yet durable (in order), how
-/// many changes were made durable in all, and what a reader sees (both).
+/// many changes were made durable in all, what a reader sees (both), and how many writes went over
+/// bytes it already held and how many times it was cut.
 #[derive(Default)]
 struct Held {
     durable: Vec<u8>,
     since: Vec<Change>,
     flushed: u64,
     seen: Vec<u8>,
+    rewrites: u64,
+    cuts: u64,
 }
 
 /// How long a flush takes. A change made while one runs isn't part of it, so a commit can land
@@ -136,9 +141,8 @@ impl Disk {
                         disk: me.clone(),
                         held: Mutex::new(Held {
                             durable: bytes.clone(),
-                            since: Vec::new(),
-                            flushed: 0,
                             seen: bytes,
+                            ..Held::default()
                         }),
                     });
                     (path, file)
@@ -289,6 +293,7 @@ impl SimFile {
     fn write(&self, pos: u64, data: Vec<u8>, c: Completion) -> amphora_engine::Result<Completion> {
         let n = i32::try_from(data.len()).unwrap();
         self.change(|held| {
+            held.rewrites += u64::from(pos + data.len() as u64 <= held.seen.len() as u64);
             let change = Change::Write(pos, data);
             apply(&mut held.seen, &change);
             held.since.push(change);
@@ -369,6 +374,7 @@ impl File for SimFile {
 
     fn truncate(&self, len: u64, c: Completion) -> amphora_engine::Result<Completion> {
         self.change(|held| {
+            held.cuts += 1;
             let change = Change::Truncate(len);
             apply(&mut held.seen, &change);
             held.since.push(change);
@@ -571,6 +577,8 @@ struct Seen {
     /// The checkpoints and restarts of the log the store made before the cut.
     checkpoints: u64,
     restarts: u64,
+    /// The times a restart cut the log's file to nothing before the cut (decision 31).
+    log_cuts: u64,
     acknowledged: usize,
     refused: usize,
 }
@@ -590,10 +598,16 @@ fn one_seed(seed: u64) -> Result<Seen, String> {
     } else {
         Sharing::Process
     };
-    let db =
+    let mut db =
         Db::open_with_sharing(path, disk.clone(), &sharing).map_err(|e| format!("open: {e:#}"))?;
     if packed {
         db.pack_log(true).map_err(|e| format!("pack: {e:#}"))?;
+    }
+    // Every third seed keeps no more log than its bound across a restart, so each restart, past
+    // the bound, cuts the log's file to nothing (docs/design/store.md, decision 31); the others keep
+    // their logs' files (decision 13).
+    if seed.is_multiple_of(3) {
+        db.keep_log(16);
     }
     db.exec("CREATE TABLE events (key TEXT, seq INTEGER CHECK (seq >= 0), batch INTEGER); CREATE INDEX by_key ON events (key, seq)")
         .map_err(|e| format!("schema: {e:#}"))?;
@@ -658,6 +672,12 @@ fn one_seed(seed: u64) -> Result<Seen, String> {
         changes: disk.changes.load(Ordering::SeqCst),
         checkpoints: counted.checkpoints,
         restarts: counted.restarts,
+        log_cuts: disk
+            .files
+            .lock()
+            .unwrap()
+            .get(&format!("{PATH}-wal"))
+            .map_or(0, |f| f.held.lock().unwrap().cuts),
         ..Seen::default()
     };
 
@@ -723,12 +743,12 @@ fn one_seed(seed: u64) -> Result<Seen, String> {
     Ok(seen)
 }
 
-/// `n` seeds from `from`: every one passes, and between them they cut the power midway in most,
-/// and acknowledged and refused batches to check.
-fn seeds(n: u64, from: u64) {
-    // Seeds side by side, each on a disk of its own (its files named apart in Turso's registry).
+/// `one` on seeds `from..from + n`, side by side, each on a disk of its own (its files named apart in
+/// Turso's registry): every seed passes (a seed that panics fails alone), and what each saw comes
+/// back in seed order.
+fn run_seeds<S: Send>(n: u64, from: u64, one: impl Fn(u64) -> Result<S, String> + Sync) -> Vec<S> {
     let next = AtomicU64::new(from);
-    let results: Mutex<Vec<(u64, Result<Seen, String>)>> = Mutex::new(Vec::new());
+    let results: Mutex<Vec<(u64, Result<S, String>)>> = Mutex::new(Vec::new());
     let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     std::thread::scope(|s| {
         for _ in 0..threads {
@@ -738,15 +758,16 @@ fn seeds(n: u64, from: u64) {
                     if seed >= from + n {
                         return;
                     }
-                    let seen = std::panic::catch_unwind(|| one_seed(seed)).unwrap_or_else(|p| {
-                        Err(format!(
-                            "panicked: {}",
-                            p.downcast_ref::<String>().map_or_else(
-                                || p.downcast_ref::<&str>().copied().unwrap_or("?").to_owned(),
-                                Clone::clone
-                            )
-                        ))
-                    });
+                    let seen = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| one(seed)))
+                        .unwrap_or_else(|p| {
+                            Err(format!(
+                                "panicked: {}",
+                                p.downcast_ref::<String>().map_or_else(
+                                    || p.downcast_ref::<&str>().copied().unwrap_or("?").to_owned(),
+                                    Clone::clone
+                                )
+                            ))
+                        });
                     results.lock().unwrap().push((seed, seen));
                 }
             });
@@ -754,23 +775,11 @@ fn seeds(n: u64, from: u64) {
     });
     let mut results = results.into_inner().unwrap();
     results.sort_by_key(|(seed, _)| *seed);
-    let (mut failed, mut midway, mut acknowledged, mut refused) =
-        (Vec::new(), 0u64, 0usize, 0usize);
-    let (mut checkpoints, mut restarts) = (0u64, 0u64);
-    // What whole workloads changed, to draw crash points from.
-    let mut whole: Vec<u64> = Vec::new();
+    let mut failed = Vec::new();
+    let mut passed = Vec::new();
     for (seed, seen) in results {
         match seen {
-            Ok(seen) => {
-                if !seen.cut_midway {
-                    whole.push(seen.changes);
-                }
-                midway += u64::from(seen.cut_midway);
-                acknowledged += seen.acknowledged;
-                refused += seen.refused;
-                checkpoints += seen.checkpoints;
-                restarts += seen.restarts;
-            }
+            Ok(seen) => passed.push(seen),
             Err(e) => failed.push((seed, e)),
         }
     }
@@ -784,6 +793,32 @@ fn seeds(n: u64, from: u64) {
         failed[0].0,
         failed[0].1
     );
+    passed
+}
+
+/// `n` seeds from `from`: every one passes, and between them they cut the power midway in most,
+/// and acknowledged and refused batches to check.
+fn seeds(n: u64, from: u64) {
+    let (mut midway, mut acknowledged, mut refused) = (0u64, 0usize, 0usize);
+    let (mut checkpoints, mut restarts, mut log_cuts) = (0u64, 0u64, 0u64);
+    // What whole workloads changed, to draw crash points from.
+    let mut whole: Vec<u64> = Vec::new();
+    for seen in run_seeds(n, from, one_seed) {
+        if !seen.cut_midway {
+            whole.push(seen.changes);
+        }
+        midway += u64::from(seen.cut_midway);
+        acknowledged += seen.acknowledged;
+        refused += seen.refused;
+        checkpoints += seen.checkpoints;
+        restarts += seen.restarts;
+        log_cuts += seen.log_cuts;
+    }
+    eprintln!(
+        "{n} seeds: cut midway in {midway}; {checkpoints} checkpoints, {restarts} restarts of the log \
+         and {log_cuts} cuts of its file before a cut; {acknowledged} batches acknowledged, \
+         {refused} refused"
+    );
     whole.sort_unstable();
     assert!(
         midway * 2 > n,
@@ -796,9 +831,276 @@ fn seeds(n: u64, from: u64) {
         "{acknowledged} acknowledged and {refused} refused batches checked"
     );
     assert!(
-        checkpoints > 0 && restarts > 0,
-        "{checkpoints} checkpoints and {restarts} restarts of the log before a cut"
+        checkpoints > 0 && restarts > 0 && log_cuts > 0,
+        "{checkpoints} checkpoints, {restarts} restarts of the log and {log_cuts} cuts of its file \
+         before a cut"
     );
+}
+
+/// The database the spilling transaction's seeds write.
+const SPILL_PATH: &str = "/crash/spill.db";
+const SPILL_SCHEMA: &str = "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT NOT NULL); \
+     CREATE TABLE postings (term INTEGER NOT NULL, doc INTEGER NOT NULL, PRIMARY KEY (term, doc)); \
+     CREATE INDEX postings_doc ON postings (doc, term); \
+     CREATE TABLE terms (term INTEGER PRIMARY KEY, docs INTEGER NOT NULL)";
+/// Documents committed and made durable before the transaction, each a page of text (a table leaf
+/// of its own): 600 pages, three times the transaction's cache of 200.
+const SPILL_DOCS: i64 = 600;
+/// The transaction's edits: each rewrites a document drawn at random, inserts a posting into a table
+/// with two indexes and upserts its term's count, so the pages it reads in outgrow its cache and
+/// spill, and are changed and spilled again over the frames they spilled to (docs/design/store.md,
+/// decision 30).
+const SPILL_EDITS: usize = 1200;
+/// The crash point is drawn up to here: a whole transaction, its commit and its flush make 319
+/// changes in every seed (measured by this test), so about four seeds in five lose the power midway
+/// and the rest check the transaction made durable.
+const SPILL_CHANGES: u64 = 400;
+
+/// A document's text at a version (0 as the baseline wrote it, else the edit that wrote it last).
+fn spill_body(doc: i64, version: i64) -> String {
+    format!("{doc:08}:{version:08}:{}", "x".repeat(3500))
+}
+
+/// The transaction's edits, (document, term), the same in every seed.
+fn spill_edits() -> Vec<(i64, i64)> {
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    (0..SPILL_EDITS)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let doc = i64::try_from(x % SPILL_DOCS.unsigned_abs()).unwrap();
+            (doc, i64::try_from((x >> 32) % 300).unwrap())
+        })
+        .collect()
+}
+
+/// The edits in one transaction, a savepoint for each inside one for each 20, as kiln's log search
+/// nests them.
+fn spill_transaction(db: &mut Db, edits: &[(i64, i64)]) -> anyhow::Result<()> {
+    db.transaction(|db| {
+        for (k, &(doc, term)) in (1i64..).zip(edits) {
+            if k % 20 == 1 {
+                if k > 1 {
+                    db.exec("RELEASE step")?;
+                }
+                db.exec("SAVEPOINT step")?;
+            }
+            db.exec("SAVEPOINT edit")?;
+            let body = [Value::from_i64(doc), Value::from_text(spill_body(doc, k))];
+            db.query("UPDATE docs SET body = ?2 WHERE id = ?1", body, |_| Ok(true))?;
+            let posting = [Value::from_i64(term), Value::from_i64(k)];
+            db.query("INSERT INTO postings (term, doc) VALUES (?1, ?2)", posting, |_| Ok(true))?;
+            db.query(
+                "INSERT INTO terms (term, docs) VALUES (?1, 1) ON CONFLICT (term) DO UPDATE SET docs = docs + 1",
+                [Value::from_i64(term)],
+                |_| Ok(true),
+            )?;
+            db.exec("RELEASE edit")?;
+        }
+        db.exec("RELEASE step")
+    })
+}
+
+fn count(db: &mut Db, sql: &'static str, params: Vec<Value>) -> Result<i64, String> {
+    let mut n = 0;
+    db.query(sql, params, |r| {
+        n = r.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(true)
+    })
+    .map_err(|e| format!("{sql}: {e:#}"))?;
+    Ok(n)
+}
+
+/// What a spilling transaction's seed exercised.
+struct SpillSeen {
+    cut_midway: bool,
+    changes: u64,
+    /// Writes over bytes the log already held before the cut: frames its spills wrote over, and
+    /// frames written back with their checksums chained again.
+    rewrites: u64,
+    acknowledged: bool,
+    kept: bool,
+}
+
+/// One seed: a durable baseline, then one transaction too large for its 200-page cache, committed
+/// and flushed, on a disk that loses its power at a change the seed draws; then the restart and its
+/// checks. The failure, if any, names what was wrong.
+fn spill_seed(seed: u64) -> Result<SpillSeen, String> {
+    let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+    let disk = Disk::new(seed, HashMap::new());
+    let path = std::path::Path::new(SPILL_PATH);
+    let mut db = Db::open_with(path, disk.clone()).map_err(|e| format!("open: {e:#}"))?;
+    db.exec(SPILL_SCHEMA)
+        .map_err(|e| format!("schema: {e:#}"))?;
+    db.transaction(|db| {
+        for doc in 0..SPILL_DOCS {
+            let body = [Value::from_i64(doc), Value::from_text(spill_body(doc, 0))];
+            db.query("INSERT INTO docs (id, body) VALUES (?1, ?2)", body, |_| {
+                Ok(true)
+            })?;
+        }
+        Ok(())
+    })
+    .map_err(|e| format!("baseline: {e:#}"))?;
+    db.flusher()().map_err(|e| format!("flush: {e}"))?;
+    db.keep_pages(200).map_err(|e| format!("cache: {e:#}"))?;
+    let edits = spill_edits();
+    disk.arm(1 + rng.below(SPILL_CHANGES));
+    let committed = spill_transaction(&mut db, &edits).is_ok();
+    let acknowledged = committed && db.flusher()().is_ok();
+    let rewrites = disk
+        .files
+        .lock()
+        .unwrap()
+        .get(&format!("{SPILL_PATH}-wal"))
+        .map_or(0, |f| f.held.lock().unwrap().rewrites);
+    drop(db);
+    let (cut_midway, changes) = (disk.crashed(), disk.changes.load(Ordering::SeqCst));
+
+    // The restart, on what survived.
+    let image = disk.image();
+    let account = || {
+        let told = disk.told.lock().unwrap().join("\n");
+        let wal = image
+            .get(&format!("{SPILL_PATH}-wal"))
+            .map_or_else(String::new, |w| wal_account(w));
+        format!("\n{told}\n{wal}")
+    };
+    let mut db = Db::open_with(path, Disk::new(seed, image.clone()))
+        .map_err(|e| format!("reopen: {e:#}{}", account()))?;
+    let mut check = String::new();
+    db.query("PRAGMA integrity_check", [], |r| {
+        check = r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(true)
+    })
+    .map_err(|e| format!("integrity_check: {e:#}{}", account()))?;
+    if check != "ok" {
+        return Err(format!("integrity_check: {check}{}", account()));
+    }
+    let postings = count(&mut db, "SELECT count(*) FROM postings", vec![])?;
+    let edited = i64::try_from(SPILL_EDITS).unwrap();
+    let kept = if postings == 0 {
+        false
+    } else if postings == edited {
+        true
+    } else {
+        return Err(format!(
+            "{postings} of the transaction's {SPILL_EDITS} postings survived{}",
+            account()
+        ));
+    };
+    // Each document's version is the edit that wrote it last, or 0: summed, one number for the
+    // baseline and one for the whole transaction.
+    let mut last = vec![0i64; SPILL_DOCS.unsigned_abs().try_into().unwrap()];
+    if kept {
+        for (k, &(doc, _)) in (1i64..).zip(&edits) {
+            last[usize::try_from(doc).unwrap()] = k;
+        }
+    }
+    let body = Value::from_i64(i64::try_from(spill_body(0, 0).len()).unwrap());
+    let whole = [
+        (
+            "SELECT count(*) FROM docs WHERE length(body) = ?1",
+            vec![body],
+            SPILL_DOCS,
+        ),
+        (
+            "SELECT coalesce(sum(CAST(substr(body, 10, 8) AS INTEGER)), 0) FROM docs",
+            vec![],
+            last.iter().sum(),
+        ),
+        ("SELECT coalesce(sum(docs), 0) FROM terms", vec![], postings),
+    ];
+    for (sql, params, want) in whole {
+        let n = count(&mut db, sql, params)?;
+        if n != want {
+            return Err(format!(
+                "{sql}: {n}, where {} makes {want}{}",
+                if kept {
+                    "the whole transaction"
+                } else {
+                    "the baseline"
+                },
+                account()
+            ));
+        }
+    }
+    if acknowledged && !kept {
+        return Err(format!(
+            "the transaction's commit was flushed, and is gone{}",
+            account()
+        ));
+    }
+    Ok(SpillSeen {
+        cut_midway,
+        changes,
+        rewrites,
+        acknowledged,
+        kept,
+    })
+}
+
+/// `n` spilling seeds from `from`: every one passes, and between them they cut the power midway in
+/// most, after writes over the log's own frames in most of those, and restart on the baseline alone
+/// and on the whole transaction.
+fn spill_seeds(n: u64, from: u64) {
+    let seen = run_seeds(n, from, spill_seed);
+    let midway = seen.iter().filter(|s| s.cut_midway).count();
+    let rewritten = seen
+        .iter()
+        .filter(|s| s.cut_midway && s.rewrites > 0)
+        .count();
+    let kept = seen.iter().filter(|s| s.kept).count();
+    let acknowledged = seen.iter().filter(|s| s.acknowledged).count();
+    let mut whole: Vec<u64> = seen
+        .iter()
+        .filter(|s| !s.cut_midway)
+        .map(|s| s.changes)
+        .collect();
+    whole.sort_unstable();
+    let percentiles = [whole.len() / 10, whole.len() / 2, whole.len() * 9 / 10]
+        .map(|i| whole.get(i).copied().unwrap_or(0));
+    eprintln!(
+        "{n} seeds: cut midway in {midway}, {rewritten} of them after writes over the log's own frames; \
+         {kept} kept the transaction, {acknowledged} acknowledged it; whole workloads changed the disk \
+         {percentiles:?} times (percentiles 10/50/90)"
+    );
+    assert!(
+        midway * 2 > seen.len(),
+        "the power went out midway in only {midway} of {n} seeds (whole workloads changed the disk \
+         {percentiles:?} times, by percentile 10/50/90)"
+    );
+    assert!(
+        rewritten * 2 > midway,
+        "the log's own frames were written over before the cut in only {rewritten} of the {midway} \
+         seeds cut midway"
+    );
+    assert!(
+        kept > 0 && kept < seen.len() && acknowledged > 0,
+        "{kept} of {n} seeds kept the transaction, {acknowledged} acknowledged it"
+    );
+}
+
+/// T-T1.1.1 and decision 30 of docs/design/store.md, a sample run in every gate: a power cut at a
+/// change drawn from a transaction whose spills write pages over frames it wrote before (and from
+/// its commit, which chains their checksums again, and its flush): the restart holds the last
+/// commit before it, whole, or the transaction too, whole, and that once its flush was told done.
+#[test]
+fn a_power_cut_in_a_transaction_that_wrote_its_frames_over_keeps_the_last_commit() {
+    spill_seeds(100, 1);
+}
+
+/// The same in full: 10,000 seeds (`cargo test --release --test crash -- --ignored spilled`; from
+/// another seed with AMPHORA_CRASH_FROM).
+#[test]
+#[ignore = "10,000 seeds: run on its own, in release"]
+fn ten_thousand_power_cuts_in_spilled_transactions() {
+    let from = std::env::var("AMPHORA_CRASH_FROM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    spill_seeds(10_000, from);
 }
 
 /// T-T1.1.1, the flusher's mark (docs/design/store.md, decision 15): a flush counts durable only

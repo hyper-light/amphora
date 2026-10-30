@@ -1136,6 +1136,20 @@ pub fn constraints_from_where_clause(
                 };
             }
 
+            // Amphora: a row-value range bounds its first column (`docs/design/planner.md`,
+            // decision 14).
+            if let Some(constraint) = super::row_value::constraint(
+                i,
+                term,
+                table_reference,
+                table_references,
+                subqueries,
+                can_use_before_null_extension(false),
+                params,
+            )? {
+                cs.constraints.push(constraint);
+            }
+
             // IN expressions are handled separately from binary expressions above because:
             // - as_binary_components returns (&Expr, ConstraintOperator, &Expr) - a single RHS
             // - InList has Vec<Expr> as RHS, SubqueryResult has a different structure entirely
@@ -1338,7 +1352,12 @@ pub fn constraints_from_where_clause(
             // comparison collation follows the left operand, so a plain BINARY
             // column on the left disqualifies an index on a NOCASE column even
             // though neither side declares a collation explicitly.
-            let comparison_collation = if constraint.constraining_expr.is_some() {
+            // Amphora: a row-value range compares its first elements (decision 14).
+            let row_collation =
+                super::row_value::first_collation(constraint, where_clause, table_references)?;
+            let comparison_collation = if row_collation.is_some() {
+                row_collation
+            } else if constraint.constraining_expr.is_some() {
                 get_collseq_from_expr(
                     constraint.get_constraining_expr_ref(where_clause),
                     table_references,

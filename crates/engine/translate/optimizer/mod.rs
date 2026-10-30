@@ -93,6 +93,7 @@ pub(crate) mod join;
 pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
 pub(crate) mod order;
+mod row_value;
 pub(crate) mod unnest;
 
 #[derive(Debug, Default)]
@@ -3899,17 +3900,29 @@ fn btree_search_operation(
     table_references: &TableReferences,
     resolver: &Resolver,
 ) -> Result<Operation> {
-    if index.is_some() {
+    if let Some(index) = index {
+        let mut seek_def = build_seek_def_from_constraints(
+            constraints,
+            constraint_refs,
+            iter_dir,
+            where_clause,
+            Some(table_references),
+            Some(resolver),
+        )?;
+        // Amphora: a row-value range seeks by as many of its elements as the index matches
+        // (`docs/design/planner.md`, decision 14).
+        row_value::extend_row_bounds(
+            &mut seek_def,
+            &index,
+            constraints,
+            constraint_refs,
+            where_clause,
+            table_references,
+            resolver,
+        )?;
         return Ok(Operation::Search(Search::Seek {
-            index,
-            seek_def: build_seek_def_from_constraints(
-                constraints,
-                constraint_refs,
-                iter_dir,
-                where_clause,
-                Some(table_references),
-                Some(resolver),
-            )?,
+            index: Some(index),
+            seek_def,
         }));
     }
     turso_assert_eq!(

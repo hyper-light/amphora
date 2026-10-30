@@ -610,3 +610,91 @@ check, run nightly); an outer join estimated below its inner join, or a semi or 
 left side; a query the new estimates send to a slower plan than the old ones chose, measured (the
 estimate of a set no longer favours the path that happens to estimate fewer rows for it, so a choice
 that rested on that difference may move).
+
+## 14. A row-value range seeks the index its columns lead
+
+**Decision.** A comparison of two row values by `<`, `<=`, `>` or `>=`, `(a, b, c) > (?1, ?2, ?3)`,
+the first element of one side a plain column of the table and the other side reading no subquery,
+bounds that column at or past the other side's first element, whatever the operator
+(`optimizer/row_value.rs`, `constraint`). The bound is implied by the term (`Constraint::implied`,
+decision 3): the comparison still filters every row, so a seek on the bound consumes nothing, and
+the estimates count the term as they did before, the bound for nothing. A search of an index whose
+range the bound is takes as many of the row's elements as the index's columns from the range's on
+match, one by one (`extend_row_bounds`): the element is the index's next column, sorted as the
+first, compared by the index column's collation and by the column's own affinity (SQLite's
+comparison affinity of the element and the column), and not of a custom type, whose index order is
+its encoding's. The search's key becomes that row (`SeekKeyComponent::Row`): the scan starts at the
+first key at or past it and, bounded on the other side, stops past it, so a keyset page reads from
+the row at the cursor and stops at its LIMIT. A NULL first element leaves no row, as a NULL scalar
+bound does; a NULL later one only positions the seek among rows the comparison makes NULL. EXPLAIN
+QUERY PLAN words it as SQLite does: `(family,key,rev)>(?,?,?)`.
+
+What it leaves to the cost model and the filter, unlike SQLite: an automatic index and a skip-scan
+keep the bound on the first column, and the rowid is not one of an index's columns here (SQLite's
+`nColumn` counts it). A page that reads columns the index lacks seeks once ANALYZE has counted the
+table (4,000 versions: SQLite's search), but without statistics it is a scan and a sort: the cost
+model takes the table at a million rows whose pages the cache can't hold, prices each lookup a page
+read (decisions 5 and 11) and has no notion of a LIMIT stopping an ordered scan (decision 2), where
+SQLite seeks. The lexicographic OR chain (`a > ?1 OR (a = ?1 AND b > ?2) OR ...`) stays a filter,
+as it does in SQLite: a keyset is written as the row value, its first page apart.
+
+**Why.** The unify audit's finding 3 (kiln goal 59833ddf373583f4ba3a6d9e4844f1a8): keyset
+pagination over a composite primary key, each page of 8 bounded by the last row's key and ordered by
+it, was a scan of the key's index from its first entry, every row before the page read and filtered
+again on every page, so a pass over the table took time quadratic in its rows: 0.02, 0.09, 0.34 and
+1.34 s at 2,000, 4,000, 8,000 and 16,000 rows on the rowid versions shape through turso_core, and
+0.06 to 3.20 s on a WITHOUT ROWID one at unify's 542f5a9 (the goal's measurements). The planner
+never took a row value for a constraint: `as_binary_components` leaves row values to the expression
+code, so no access path saw one.
+
+**Sources.** SQLite 3.54.0's `sqlite3.c` (as `bench/oracles/sqlite.sh` downloads it):
+`exprMightBeIndexed` (line 168736) takes a vector inequality for a term on its first element: "If
+this expression is a vector to the left or right of a inequality constraint (>, <, >= or <=),
+perform the processing on the first element of the vector"; `whereLoopAddBtreeIndex` gives the range
+`whereRangeVectorLen`'s count of elements (line 173074), which takes them while each passes its
+"Test if comparison i of pTerm is compatible with column (i+nEq) of the index" (line 172789): the
+column itself, "the sort order of the index column is the same as the sort order of the leftmost
+index column", `sqlite3CompareAffinity` of the element and the column equal to the column's
+affinity, and the index column's collation; `sqlite3WhereCodeOneLoopStart` loads the row
+(`codeExprOrVector(pParse, pRight, regBase+nEq, nBtm)`), tests its first register alone for NULL
+(`OP_IsNull, regBase+nEq`, lines 166666 and 166769) and keeps a vector's term, seeking at or past it:
+`if( sqlite3ExprIsVector(pRight)==0 ){ disableTerm(pLevel, pRangeStart); }else{ startEq = 1; }`
+(line 166675; `endEq = 1` at the other end, line 166782). The comparison, sqlite.org/rowvalue.html,
+section 2.1: "The overall result of comparison is NULL if it is possible to make the result either
+true or false by substituting alternative values in place of the constituent NULLs"; and its use,
+section 3.1, "Scrolling Window Queries": "A more efficient approach is to remember the last entry
+currently displayed", with `WHERE (lastname,firstname) > (?1,?2)`, "And, assuming there is an
+appropriate index, it does so very efficiently — much more efficiently than OFFSET."
+
+**Evidence.** `crates/engine/tests/row_value_seek.rs`, four of whose five tests failed on c87e332
+(the fifth, one estimate, held there as well) and all pass with the change:
+`a_row_value_bound_seeks_the_key_from_the_cursor`, ten forms of kiln's keyset page on its versions
+table (each operator, the row on either side, both directions, a prefix of the key, an equality then
+a row, both bounds, the value column through the named index and, after ANALYZE, unnamed), planned
+word for word as SQLite 3.54.0 plans them, each seeking the key's index by the whole row with no
+Rewind or Last (c87e332: `SCAN versions USING COVERING INDEX sqlite_autoindex_versions_1`);
+`a_keyset_pass_reads_each_row_once`, a pass over 4,000 versions in pages of 8, forwards and
+backwards, every row once in order within LIMIT + 2 cursor positionings a bounded page (c87e332:
+1,005,992 positionings forwards, against 5,000); `a_row_value_range_answers_as_sqlite_does`, 125
+bounds (NULL in each place) by each operator in five forms on four indexes, 10,000 reads through the
+index, each SQLite's row-value answer (a model that SQLite 3.54.0's shell answers alike for all 500
+bounds and operators) and the table's NOT INDEXED one, the row sought on three of the indexes and
+never past a column of the other direction on the fourth;
+`a_row_value_bound_converts_as_its_comparison_does`, SQLite 3.54.0's counts and rowid sums for eight
+bounds of other types or with NULLs by each operator, sought by all three columns as SQLite seeks
+them; `a_row_value_bound_seeks_or_filters_to_one_estimate`, one estimate sought or NOT INDEXED, and
+in a join in either FROM order, so neither CERT nor the order check can see the bound (no campaign
+was run: the cardinality code skips implied constraints). The planner's other tests (`planner.rs`,
+`records_plans.rs`, `glob_range.rs`, `skip_scan.rs`, `top_n.rs`, `row_counts.rs`, `in_subquery.rs`,
+and `oracle_findings.rs` with each CERT cause's test) pass unchanged. A full pass in the row form at
+2,000, 4,000, 8,000 and 16,000 versions (a scratch test of the debug build on adacachy, 2026-10-29,
+capped beside production, so the shape is the claim, not the times): on c87e332 252,992, 1,005,992,
+4,011,992 and 16,023,992 cursor positionings and 0.13, 0.50, 1.99 and 7.86 s, quadratic; with the
+change 2,242, 4,492, 8,992 and 17,992 positionings (nine a page of eight) and 0.013, 0.015, 0.026
+and 0.056 s, linear. The OR chain is the same scan on both (16,023,992 positionings at 16,000
+versions).
+
+**Falsified by.** A row a row-value seek misses or adds: an element whose type, NULL, collation or
+order the matching of elements misjudges (`a_row_value_range_answers_as_sqlite_does` and the
+oracles' differential check would show it); a keyset page the seek makes slower than the scan it
+replaced; a pass whose cursor positionings grow faster than its rows.

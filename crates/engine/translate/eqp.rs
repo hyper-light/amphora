@@ -5,6 +5,8 @@
 
 use std::fmt::{self, Display, Formatter, Write as _};
 
+use amphora_engine_parser::ast::SortOrder;
+
 use crate::{
     schema::Index,
     translate::plan::{
@@ -422,7 +424,12 @@ impl Display for EqpDetail {
 /// Build the human-readable key constraints for an index seek,
 /// e.g. `["label=?", "fromId>?"]`.
 pub(crate) fn seek_constraint_parts(index: &Index, seek_def: &SeekDef) -> Vec<String> {
-    key_constraint_parts(seek_def, |i| {
+    let range_desc = seek_def
+        .skip
+        .checked_add(seek_def.prefix.len())
+        .and_then(|i| index.columns.get(i))
+        .is_some_and(|col| col.order == SortOrder::Desc);
+    key_constraint_parts(seek_def, range_desc, |i| {
         index.columns.get(i).map(|col| col.name.as_str())
     })
 }
@@ -430,15 +437,17 @@ pub(crate) fn seek_constraint_parts(index: &Index, seek_def: &SeekDef) -> Vec<St
 /// The key constraints of a seek on the table's own B-tree: its key is the rowid alone, so a
 /// range reads `rowid>=? AND rowid<=?` rather than the `rowid=?` of a point lookup.
 fn rowid_constraint_parts(seek_def: &SeekDef) -> Vec<String> {
-    key_constraint_parts(seek_def, |i| match i {
+    key_constraint_parts(seek_def, false, |i| match i {
         0 => Some("rowid"),
         _ => None,
     })
 }
 
-/// A seek's key constraints, naming the key's columns by position with `name`.
+/// A seek's key constraints, naming the key's columns by position with `name`; `range_desc` when
+/// the range's column sorts descending.
 fn key_constraint_parts<'a>(
     seek_def: &SeekDef,
+    range_desc: bool,
     name: impl Fn(usize) -> Option<&'a str>,
 ) -> Vec<String> {
     let mut parts = Vec::new();
@@ -454,8 +463,13 @@ fn key_constraint_parts<'a>(
             parts.push(format!("{col}=?"));
         }
     }
-    // Range constraint from start key
+    // Range constraint from start key. Amphora: a forward scan of an ascending column starts at its
+    // lower bound, as a backward scan of a descending one does.
     let range_col_idx = seek_def.skip.checked_add(seek_def.prefix.len());
+    let lower_starts = (seek_def.iter_dir == IterationDirection::Forwards) != range_desc;
+    if let SeekKeyComponent::Row(row) = &seek_def.start.last_component {
+        parts.extend(row_part(&name, range_col_idx, row.len(), lower_starts));
+    }
     if let SeekKeyComponent::Expr(_) = &seek_def.start.last_component {
         if let Some(col) = range_col_idx.and_then(&name) {
             let op_str = match seek_def.start.op {
@@ -470,6 +484,9 @@ fn key_constraint_parts<'a>(
     // Range constraint from end key.
     // The end key's SeekOp is the B-tree termination condition (the negation of the
     // user-facing SQL operator), so we reverse it for display.
+    if let SeekKeyComponent::Row(row) = &seek_def.end.last_component {
+        parts.extend(row_part(&name, range_col_idx, row.len(), !lower_starts));
+    }
     if let SeekKeyComponent::Expr(_) = &seek_def.end.last_component {
         if let Some(col) = range_col_idx.and_then(&name) {
             let op_str = match seek_def.end.op {
@@ -482,6 +499,24 @@ fn key_constraint_parts<'a>(
         }
     }
     parts
+}
+
+/// Amphora: a row-value bound as SQLite words it, `(a,b)>(?,?)`: `>` for a lower bound and `<` for
+/// an upper one whatever its operator (`explainAppendTerm`; `planner.md`, decision 14), its columns
+/// named by position with `name` from `first` on.
+fn row_part<'a>(
+    name: impl Fn(usize) -> Option<&'a str>,
+    first: Option<usize>,
+    len: usize,
+    lower: bool,
+) -> Option<String> {
+    let first = first?;
+    let names: Option<Vec<&str>> = (0..len)
+        .map(|i| first.checked_add(i).and_then(&name))
+        .collect();
+    let op_str = if lower { ">" } else { "<" };
+    let marks = vec!["?"; len].join(",");
+    Some(format!("({}){op_str}({marks})", names?.join(",")))
 }
 
 fn eqp_index(index: &Index, table: &JoinedTable) -> EqpIndex {

@@ -16,7 +16,7 @@ use amphora_engine::{
     StepResult, Value,
 };
 
-use crate::store::{Checkpointed, Flush, Opener};
+use crate::store::{Checkpointed, Config, Flush, Opener};
 
 mod cache;
 
@@ -148,6 +148,8 @@ pub struct Db {
     owner: Option<Arc<std::fs::File>>,
     // Shared by this owner's readers: a failed rollback may never be reused as clean state.
     fenced: Arc<AtomicBool>,
+    /// The frames of log a restart keeps the log's file for ([`Db::keep_log`]).
+    log_kept: u64,
 }
 
 pub(crate) struct Deadline {
@@ -157,6 +159,18 @@ impl Drop for Deadline {
     fn drop(&mut self) {
         self.connection.set_progress_handler(0, None);
     }
+}
+
+/// SQLite's log format (sqlite.org/fileformat2.html, "The WAL File Format"): a 32-byte header, then
+/// frames of a 24-byte header and a page.
+const LOG_HEADER_BYTES: u64 = 32;
+const FRAME_HEADER_BYTES: u64 = 24;
+
+/// The frames of log a restart keeps the file for unless told otherwise (docs/design/store.md,
+/// decision 31): twice the store's default bound (`Config::log_frames`, decision 4), the most a log
+/// takes between restarts.
+fn log_kept() -> u64 {
+    Config::default().log_frames.saturating_mul(2)
 }
 
 impl Db {
@@ -186,6 +200,7 @@ impl Db {
             statements: cache::Cache::default(),
             owner: None,
             fenced: Arc::new(AtomicBool::new(false)),
+            log_kept: log_kept(),
         })
     }
 
@@ -265,6 +280,7 @@ impl Db {
             statements: cache::Cache::default(),
             owner: None,
             fenced: Arc::new(AtomicBool::new(false)),
+            log_kept: log_kept(),
         };
         d.exec("PRAGMA synchronous = NORMAL")?;
         d.exec("PRAGMA foreign_keys = ON")?;
@@ -299,6 +315,7 @@ impl Db {
             statements: cache::Cache::default(),
             owner: self.owner.clone(),
             fenced: Arc::clone(&self.fenced),
+            log_kept: self.log_kept,
         };
         r.keep_pages(READER_PAGES)?;
         Ok(r)
@@ -310,6 +327,7 @@ impl Db {
         let (io, db, path) = (self.io.clone(), self.db.clone(), self.path.clone());
         let owner = self.owner.clone();
         let fenced = Arc::clone(&self.fenced);
+        let log_kept = self.log_kept;
         Arc::new(move || {
             Self::check_fence(&fenced)?;
             let r = Self {
@@ -320,6 +338,7 @@ impl Db {
                 statements: cache::Cache::default(),
                 owner: owner.clone(),
                 fenced: Arc::clone(&fenced),
+                log_kept,
             };
             r.keep_pages(READER_PAGES)?;
             Ok(r)
@@ -328,8 +347,8 @@ impl Db {
 
     /// Flushes the log, through the database's own IO: what was committed before the flush began
     /// is durable once it ends. Its data only (`fdatasync`; on macOS `F_FULLFSYNC`, its `fsync`
-    /// leaving the disk's cache): the log keeps its length across restarts, so once it has been
-    /// as long as it gets, a flush writes no metadata.
+    /// leaving the disk's cache): the log keeps its length across restarts (within
+    /// [`Db::keep_log`]), so once it has been as long as it gets, a flush writes no metadata.
     pub fn flusher(&self) -> Flush {
         let wal = format!("{}-wal", self.path.display());
         let (io, db) = (self.io.clone(), self.db.clone());
@@ -383,14 +402,51 @@ impl Db {
     }
 
     /// With no reader reading (the store holds them back), copies what remains, flushes the file,
-    /// and starts the log from its beginning, its file kept: whether it did.
+    /// and starts the log from its beginning: whether it did. The log's file keeps its length
+    /// (decision 13), unless it holds room for more frames than [`Db::keep_log`] keeps: then it is
+    /// cut to nothing, once every frame is in the file (docs/design/store.md, decision 31).
     pub fn restart_log(&mut self) -> anyhow::Result<bool> {
         self.ensure_unfenced()?;
-        match self.conn.checkpoint(CheckpointMode::Restart) {
+        let mode = if self.log_frames()? > self.log_kept {
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            }
+        } else {
+            CheckpointMode::Restart
+        };
+        match self.conn.checkpoint(mode) {
             Ok(_) => Ok(true),
             Err(LimboError::Busy) => Ok(false),
             Err(e) => Err(fail(e)),
         }
+    }
+
+    /// The frames of log a restart keeps the log's file for: past them, it cuts the file to nothing
+    /// (decision 31). By default twice the store's default bound. A caller using a nondefault
+    /// `Config::log_frames` may pass twice that bound here; changing Config alone does not set it.
+    pub fn keep_log(&mut self, frames: u64) {
+        self.log_kept = frames;
+    }
+
+    /// The frames the log's file holds room for: none without a log.
+    fn log_frames(&self) -> anyhow::Result<u64> {
+        let wal = format!("{}-wal", self.path.display());
+        let bytes = match self.io.open_file(&wal, OpenFlags::NoLock, false) {
+            Ok(file) => file.size().map_err(fail)?,
+            Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::NotFound,
+                _,
+            ))) => 0,
+            Err(e) => return Err(fail(e)),
+        };
+        let frame = PAGE_BYTES
+            .checked_add(FRAME_HEADER_BYTES)
+            .ok_or_else(|| anyhow::anyhow!("a frame's bytes overflow"))?;
+        // A file shorter than its header holds no frame.
+        Ok(bytes
+            .saturating_sub(LOG_HEADER_BYTES)
+            .checked_div(frame)
+            .unwrap_or(0))
     }
 
     /// The file.

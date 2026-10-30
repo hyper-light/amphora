@@ -243,9 +243,11 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     // A NULL key can never satisfy `=`, so the loop is done as
                     // soon as one shows up. `IS` matches NULL instead: keep the
                     // NULL in the seek register and let the index comparison
-                    // find the rows whose key component is NULL.
+                    // find the rows whose key component is NULL. Amphora: a row
+                    // value's later elements only position the seek (decision 14).
                     if !expr.is_nonnull(self.tables)
                         && !self.seek_def.is_null_matching_key_component(i)
+                        && i <= self.seek_def.prefix.len()
                     {
                         self.program.emit_insn(Insn::IsNull {
                             reg,
@@ -254,8 +256,12 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     }
                 }
                 SeekKeyComponent::Null => self.program.emit_null(reg, None),
-                SeekKeyComponent::None => {
-                    unreachable!("None component is not possible in iterator")
+                // The key iterator yields a row value's elements one by one, and nothing for a
+                // key with no last component.
+                SeekKeyComponent::None | SeekKeyComponent::Row(_) => {
+                    return Err(crate::LimboError::InternalError(
+                        "a seek key component the key iterator never yields".to_string(),
+                    ));
                 }
             }
         }
@@ -431,6 +437,56 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     }
                 }
                 if !expr.is_nonnull(self.tables) {
+                    self.program.emit_insn(Insn::IsNull {
+                        reg: last_reg,
+                        target_pc: self.loop_end,
+                    });
+                }
+            }
+            // Amphora: a row value's elements in the registers from the range's on; only a NULL
+            // first element leaves no row, as a NULL scalar bound does (decision 14).
+            SeekKeyComponent::Row(row) => {
+                let too_long = || crate::LimboError::InternalError("seek key too long".to_string());
+                for (offset, (expr, _)) in row.iter().enumerate() {
+                    translate_expr_no_constant_opt(
+                        self.program,
+                        Some(self.tables),
+                        expr,
+                        last_reg.checked_add(offset).ok_or_else(too_long)?,
+                        &self.t_ctx.resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )?;
+                }
+                if let Some(idx) = self.seek_index {
+                    let first_col = self
+                        .seek_def
+                        .skip
+                        .checked_add(self.seek_def.prefix.len())
+                        .ok_or_else(too_long)?;
+                    encode_seek_keys_for_custom_types(
+                        self.program,
+                        self.tables,
+                        idx,
+                        last_reg,
+                        row.len(),
+                        first_col,
+                        &self.t_ctx.resolver,
+                    )?;
+                    let affinities = self.key_affinities(&self.seek_def.end);
+                    let converts = affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB);
+                    if let Some(count) = std::num::NonZeroUsize::new(num_regs).filter(|_| converts)
+                    {
+                        self.program.emit_insn(Insn::Affinity {
+                            start_reg: self.start_reg,
+                            count,
+                            affinities,
+                        });
+                    }
+                }
+                if row
+                    .first()
+                    .is_some_and(|(expr, _)| !expr.is_nonnull(self.tables))
+                {
                     self.program.emit_insn(Insn::IsNull {
                         reg: last_reg,
                         target_pc: self.loop_end,

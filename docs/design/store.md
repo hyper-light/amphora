@@ -1085,3 +1085,137 @@ Sources: Rust's [`Arc::ptr_eq`](https://doc.rust-lang.org/std/sync/struct.Arc.ht
 and [`Weak::ptr_eq`](https://doc.rust-lang.org/std/sync/struct.Weak.html#method.ptr_eq) specify
 allocation identity. Unlike value equality, these preserve separate scopes with equal payloads;
 the retained Arc and exact Weak owner keep those allocations alive until cleanup.
+
+## 30. A transaction's spills write over the frames it already wrote
+
+**Decision.** A page a write transaction already wrote into the log past its committed end is
+written back over that frame when it spills again, or a cache flush writes it again, not appended
+(`WalFile::append_frames_vectored`, `write_over`; frames next to each other in one write). The
+frame keeps its page, so the frame cache, the list of changed pages (decision 18) and readers, who
+see frames only up to the committed end, are untouched. The first frame written over is noted: its
+checksum, and every later frame's, no longer chain. Before a commit prepares its frames,
+`Wal::rechain` (the commit's `Rechain` step) reads the transaction's frames back from that frame to
+its last, 1,024 at a time (as many as a spill writes at once, 4 MiB: what it holds in memory),
+chains their checksums again from the frame before it (the log's header for frame 1, the last
+commit's checksum, or the checksum that frame holds, never written over) and writes them back; the
+commit's frames then chain on from them, as they always did. A savepoint rolled back past the first
+frame written over forgets it. A raw frame (`write_frame_raw`, the sync engine's) after frames
+written over is refused (`TxError`): it could commit them before they chain. A packed log (decision
+16, opt-in) keeps appending its records, whose lengths follow their contents.
+
+So the log a transaction writes holds at most a frame for each page it dirtied before its commit,
+and at most two after it, whatever its statement count: the engine keeps a spilled page dirty, and
+its commit writes every dirty page again, where SQLite's pager marks a spilled page clean and its
+commit writes only what changed since (left as it was here: one frame a page is that change).
+
+**Why.** The unify audit (kiln-unify, finding data-1, Amphora 542f5a9): one 8 MiB log-search
+transaction (for each trigram a row into a table with two indexes and an upsert of its term's
+count, in nested savepoints) left a 7,068.5 MiB log beside a 119.9 MiB file, and a 12 MiB one,
+rolled back, 9,010.7 MiB. Each page changed again after it spilled was appended again: 1.8 million
+4 KiB frames for 1,790,521 postings. A log that grows with a transaction's statements instead of its
+pages costs every byte written, the disk it keeps (decision 13) and the checkpoints that copy it.
+
+**Sources.** SQLite 3.54.0's `walFrames` (`src/wal.c`): "Check if this page has already been
+written into the wal file by the current transaction. If so, overwrite the existing frame";
+`iReCksum` ("On commit, recalculate checksums from here") and `walRewriteChecksums`, which reads the
+frames back from the earliest written over and writes their headers again;
+`sqlite3WalSavepointUndo` forgets `iReCksum` past the frame it rolls back to. Its pager's spill,
+`pagerStress` (`src/pager.c`): a single frame for the page, the page then clean.
+sqlite.org/fileformat2.html, "The Write-Ahead
+Log": a frame is valid only if its checksum matches the one "computed consecutively on the first 24
+bytes of the WAL header and the first 8 bytes and the content of all frames up to and including the
+current frame", and a read takes "the last valid instance of page P that is followed by a commit
+frame or is a commit frame itself"; sqlite.org/walformat.html: mxFrame "is set to the index of the
+last valid commit frame in WAL". So frames past the last commit stand for nothing until a commit
+frame follows them: a crash before the commit's frames, written over or chained again or not, keeps
+the last commit.
+
+**Evidence.** `crates/engine/tests/spilled_log.rs`,
+`a_transactions_log_is_bounded_by_the_pages_it_dirtied_not_its_statements`: 60,000 statements of
+kiln's log search on a 200-page cache, the log cut first, dirty 473 pages; on c87e332 the log held
+1,892 frames past its last commit before the commit and 2,365 after (the test failed); with this
+decision 462 and 935, every row read back on a fresh connection and after opening the database
+again (its recovery reads the commit's chain whole, from the log's header), the integrity check
+whole. The audit's legs, its corpus and SQL on a connection as Amphora's writer keeps one (1,024
+pages; `the_audits_log_search_legs_log_within_their_pages`, release builds without LTO as the audit
+built them, adacachy 2026-10-29 at load 46-64, sizes, not times): on c87e332 the 1, 2, 4 and 8 MiB
+transactions dirtied 3,405, 7,390, 15,162 and 30,689 pages and left 22,554, 207,360, 688,238 and
+1,792,166 frames past the last commit (88.6, 814.7, 2,704.2 and 7,041.7 MiB: the audit's 7,068.5
+MiB at 8 MiB, growing faster than the pages); with this decision 6,780, 14,758, 30,307 and 61,359
+(26.6, 58.0, 119.1 and 241.1 MiB), about two frames a page at every size. Crash injection
+(`crates/amphora/tests/crash.rs`,
+`a_power_cut_in_a_transaction_that_wrote_its_frames_over_keeps_the_last_commit`): 1,200 edits of 600
+one-page documents on a 200-page cache, a posting and an upsert each, in nested savepoints, the
+commit flushed, the power cut at a change drawn from the 319 the transaction makes: in every gate
+100 seeds, 79 cut midway, 78 of them after writes over the log's own frames, 21 restarted with the
+whole transaction, the rest with what was there before; in 10,000 seeds (release) 7,964 cut midway,
+7,913 of them after writes over the log's own frames, 2,044 restarted with the whole transaction
+(2,036 of them acknowledged), never one with a part of it. The engine's suites pass unchanged: the
+log's and pager's unit tests (116 in `storage::wal` and `storage::pager`, among them the contract
+that a commit chains after its transaction's spilled frames), the model that rolls savepoints back
+amid spills in both log formats (`packed_log.rs`), and the reader-cache and shared-pages models.
+What it costs, the four legs in turn with c87e332's (release binaries, adacachy 2026-10-29 at load
+17-90, best of 2; checks rather than recorded runs): on files written in place, as decision 12
+makes Amphora's, 50.3 s against c87e332's 76.9 s (frames written one at a time, not together: 64.4
+s); in a copy-on-write directory with compression, 59.6 s against 39.5 s, every frame written over
+there a new extent.
+
+**Falsified by.** A transaction whose log holds more frames past the last commit than the pages it
+dirtied before its commit, or more than twice them after (`spilled_log.rs`); a row read back other
+than as committed, on a fresh connection or after opening again (the models); a power cut that
+leaves part of a transaction whose frames were written over, or loses one whose commit was flushed
+(`tests/crash.rs`); on files written in place, a transaction that spills taking longer than it did
+when its spills appended.
+
+## 31. A restart cuts a log past twice its bound to nothing
+
+**Decision.** `Db::restart_log` starts the log again with its file kept (decision 13) while the
+file holds room for no more frames than `Db::keep_log` keeps: by default twice the store's default
+bound (decision 4), 262,144 frames, 1.0 GiB of 4 KiB pages, the most a log takes between restarts. A
+file past that is cut to nothing in the same step (the engine's TRUNCATE checkpoint). When: only at
+a restart, which the store already makes between commits with its readers and checkpointer held
+back, and only once every frame is in the file and the file flushed (the checkpoint copies what is
+left and flushes the file first, then cuts the log and flushes it). Not cut to the bound: until the
+next commit writes a new header the file holds the old generation's header and frames, all copied,
+and a file cut short among them would keep a valid prefix of old frames that a recovery would read
+over the newer pages the checkpoint wrote, which is why SQLite cuts a log to its limit only after
+the new header is synced, and to zero bytes on close. A log within the bound pays nothing new.
+
+**Why.** The unify audit (finding data-1): the restart kept the log's file at its high water for
+good: the 8 MiB transaction's 7 GiB log stayed, and the rolled-back 12 MiB one left 9 GiB. Decision
+30 bounds what one transaction writes by its pages, not by the store's bound: a transaction of a
+million pages still grows the log past it, and nothing gave the space back.
+
+**Sources.** sqlite.org/pragma.html, `journal_size_limit`: "in WAL mode, the write-ahead log file is
+not truncated following a checkpoint. Instead, SQLite reuses the existing file for subsequent WAL
+entries since overwriting is faster than appending", and "Each time a transaction is committed or a
+WAL file resets, SQLite compares the size of the rollback journal file or WAL file left in the
+file-system to the size limit set by this pragma and if the journal or WAL file is larger it is
+truncated to the limit"; its default is no limit. sqlite.org/c3ref/wal_checkpoint_v2.html:
+`SQLITE_CHECKPOINT_TRUNCATE` "works the same way as SQLITE_CHECKPOINT_RESTART with the addition that
+it also truncates the log file to zero bytes just prior to a successful return". SQLite 3.54.0's
+`src/wal.c`: the limit is applied at the first commit after a reset, once its header is written
+(`truncateOnCommit`), and `sqlite3WalClose` cuts "to zero bytes as truncating to the
+journal_size_limit might leave a corrupt WAL file on disk". sqlite.org/fileformat2.html:
+"Performance is usually a little better if the WAL is not truncated, since filesystems generally
+will overwrite an existing file faster than they will grow a file."
+
+**Evidence.** `crates/amphora/tests/files.rs`,
+`a_restart_cuts_a_log_past_its_bound_to_nothing_and_keeps_one_within_it`: with 64 frames kept, 500
+rows of a page grew the log to 2,076,512 bytes; on c87e332 (with the setter alone) the restart left
+the file at that length (the test failed); with this decision it cut it to 0 bytes, a row's commit
+grew it to a few frames, a restart within the bound kept that length, and all 501 rows read back
+after opening again. Crash injection (`tests/crash.rs`): every third seed keeps 16 frames, so each
+of its restarts cuts the log; in 10,000 seeds 4,365 cuts came before a power cut (40 in the gate's
+200), and nothing acknowledged was lost, nothing refused found, nothing torn. Its cost to writers
+(`what_cutting_the_log_costs_its_writer`, release without LTO, adacachy 2026-10-29 at load 66-100,
+files in place as decision 12 makes them; a check rather than a recorded run): on a 1 GiB log a
+restart keeping the file held the writer 42.4 ms (best of 6) and one cutting it 66.0 ms (best of 2),
+and the commit of 4 MiB and the flush after it took 36.0 ms after a restart that kept the file and
+79.7 ms after one that cut it (its writes extend the file again). A log is cut only once it has
+outgrown twice its bound, so that is paid once for each such log, not at every restart.
+
+**Falsified by.** A log's file longer than its bound after a restart that copied every frame
+(`files.rs`); an acknowledged write lost, or a database refused, after a power cut around a restart
+that cut the log (`tests/crash.rs`); a restart that cuts the log holding the writer much longer than
+one that keeps it, or the commits after it slower than after a restart that keeps the file.
