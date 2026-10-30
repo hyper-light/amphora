@@ -495,20 +495,35 @@ pub fn translate_insert(
     // trigger bodies see affinity-applied values. Affinity is idempotent, so
     // applying it here means we can skip the per-trigger Copy+Affinity in fire_trigger.
     if !ctx.table.is_strict {
-        let affinity = insertion
-            .col_mappings
-            .iter()
-            .filter(|cm| !cm.column.is_virtual_generated())
-            .map(|col_mapping| col_mapping.column.affinity());
-
-        // Only emit Affinity if there's meaningful affinity to apply
-        // (i.e., not all BLOB/NONE affinity)
-        if affinity.clone().any(|a| a != Affinity::Blob) {
-            if let Ok(count) = NonZeroUsize::try_from(insertion.num_non_virtual_cols) {
+        if let Ok(count) = NonZeroUsize::try_from(insertion.num_non_virtual_cols) {
+            // Amphora: each stored column's affinity goes at its own register. A WITHOUT ROWID
+            // table's columns take their registers in its key's order, not in declaration order,
+            // so an affinity string in declaration order gave a column its neighbour's affinity
+            // (the unify audit's E1 and E2: '1.0' in a TEXT column stored as '1').
+            let mut affinities = vec![Affinity::Blob; count.get()];
+            for col_mapping in insertion
+                .col_mappings
+                .iter()
+                .filter(|cm| !cm.column.is_virtual_generated())
+            {
+                let slot = col_mapping
+                    .register
+                    .checked_sub(insertion.first_col_register())
+                    .and_then(|offset| affinities.get_mut(offset))
+                    .ok_or_else(|| {
+                        crate::LimboError::InternalError(
+                            "a stored column's register lies outside its row's registers".into(),
+                        )
+                    })?;
+                *slot = col_mapping.column.affinity();
+            }
+            // Only emit Affinity if there's meaningful affinity to apply
+            // (i.e., not all BLOB/NONE affinity)
+            if affinities.iter().any(|a| *a != Affinity::Blob) {
                 program.emit_insn(Insn::Affinity {
                     start_reg: insertion.first_col_register(),
                     count,
-                    affinities: affinity.map(|a| a.aff_mask()).collect(),
+                    affinities: affinities.iter().map(|a| a.aff_mask()).collect(),
                 });
             }
         }
