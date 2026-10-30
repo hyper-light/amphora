@@ -12,6 +12,8 @@ description = "Amphora against vanilla Turso, SQLite and clustered MySQL (Vitess
 
 [dependencies]
 amphora = { path = "../crates/amphora" }
+# The public SQL API's values (`--sql-api`).
+amphora-api = { path = "../crates/api" }
 amphora-engine = { path = "../crates/engine", default-features = false, features = ["fs", "json", "pure-rust-crypto", "checksum"] }
 # Vanilla Turso: upstream at the revision Amphora's engine was taken from, none of Amphora's changes.
 turso_core = { git = "https://github.com/tursodatabase/turso", rev = "3e09a82750d8290ef96e3830896e7205b7c0b9e6", default-features = false, features = ["fs", "json", "pure-rust-crypto"] }
