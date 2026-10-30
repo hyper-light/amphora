@@ -1229,46 +1229,210 @@ mod tests {
         .unwrap();
         assert_eq!(retained, vec![0]);
     }
-    fn pump(clients: &[Client]) -> usize {
-        let mut delivered = 0;
-        for (index, client) in clients.iter().enumerate() {
-            let from = u64::try_from(index + 1).unwrap();
-            for message in client.handle().drain(OUTGOING_MESSAGES).unwrap() {
-                let peer = clients
-                    .get(usize::try_from(message.to - 1).unwrap())
-                    .unwrap();
-                peer.handle()
-                    .receive(from, message.bytes, deadline())
-                    .unwrap();
-                delivered += 1;
+    struct PumpPacket {
+        from: u64,
+        message: Outbound,
+        until: Instant,
+    }
+    struct PumpReceipt {
+        receipt: ReceiveReceipt,
+        bytes: usize,
+    }
+    enum PumpPhase {
+        Relay,
+        Captures {
+            leader: usize,
+            held: [Option<PumpPacket>; 2],
+        },
+    }
+    /// CP-T1.8: mirror the carrier's bounded admission and observe every processed receipt.
+    /// Admission never waits for another owner. All records, including retained proposals,
+    /// share COMMANDS/QUEUED_BYTES bounds; each keeps its first absolute receive deadline.
+    struct Pump<'a> {
+        clients: &'a [Client],
+        receipts: [Option<PumpReceipt>; COMMANDS],
+        phase: PumpPhase,
+        next_source: usize,
+        records: usize,
+        bytes: usize,
+    }
+    impl<'a> Pump<'a> {
+        fn new(clients: &'a [Client]) -> Self {
+            assert!(!clients.is_empty() && clients.len() <= MEMBERS);
+            Self {
+                clients,
+                receipts: std::array::from_fn(|_| None),
+                phase: PumpPhase::Relay,
+                next_source: 0,
+                records: 0,
+                bytes: 0,
             }
         }
-        delivered
-    }
-    fn pumped_call(
-        clients: &[Client],
-        origin: usize,
-        f: impl FnOnce(&mut Db) -> anyhow::Result<Vec<u8>> + Send + 'static,
-    ) -> Result<Vec<u8>, Refusal> {
-        let client = clients.get(origin).unwrap().clone();
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let worker = std::thread::spawn(move || sender.send(call(&client, f)).unwrap());
-        let until = deadline();
-        let result = loop {
-            match receiver.try_recv() {
-                Ok(result) => break result,
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(error) => panic!("actor caller ended: {error}"),
+        fn reap(&mut self) {
+            for slot in &mut self.receipts {
+                let Some(pending) = slot.as_mut() else {
+                    continue;
+                };
+                let result = pending.receipt.try_result();
+                if matches!(result, Ok(None)) {
+                    continue;
+                }
+                let pending = slot.take().unwrap();
+                self.records -= 1;
+                self.bytes -= pending.bytes;
+                // Admission was not an ACK: expiry, validation and fencing must fail the test.
+                assert_eq!(result.unwrap(), Some(()));
             }
+        }
+        fn admit(&mut self, packet: PumpPacket) {
+            let peer = self
+                .clients
+                .get(usize::try_from(packet.message.to - 1).unwrap())
+                .unwrap();
+            let bytes = packet.message.bytes.len();
+            let receipt = peer
+                .handle()
+                .admit_receive(packet.from, packet.message.bytes, packet.until)
+                .unwrap();
+            let slot = self
+                .receipts
+                .iter_mut()
+                .find(|slot| slot.is_none())
+                .unwrap();
+            *slot = Some(PumpReceipt { receipt, bytes });
+        }
+        fn drive(&mut self) -> usize {
+            self.reap();
+            let first = self.next_source;
+            self.next_source = (first + 1) % self.clients.len();
+            let mut admitted = 0;
+            // U15/CP-T1.8: match the host carrier's bounded 16-record quantum. One
+            // record per origin each round preserves fairness and the held-origin barrier;
+            // control traffic must not consume the entire relay service opportunity.
+            for _ in 0..16 {
+                let mut drained = false;
+                for offset in 0..self.clients.len() {
+                    // Reserve room for any legal wire record before draining ownership from a peer.
+                    // The conservative byte check needs no unbounded overflow/backpressure buffer.
+                    if self.records == COMMANDS || self.bytes + WIRE_BYTES > QUEUED_BYTES {
+                        break;
+                    }
+                    let index = (first + offset) % self.clients.len();
+                    let from = u64::try_from(index + 1).unwrap();
+                    // No later record from this origin may overtake its retained proposal.
+                    if let PumpPhase::Captures { held, .. } = &self.phase
+                        && held.iter().flatten().any(|packet| packet.from == from)
+                    {
+                        continue;
+                    }
+                    for message in self.clients.get(index).unwrap().handle().drain(1).unwrap() {
+                        drained = true;
+                        api::bound("fixture wire record", message.bytes.len(), WIRE_BYTES).unwrap();
+                        let packet = PumpPacket {
+                            from,
+                            message,
+                            until: deadline(),
+                        };
+                        self.records += 1;
+                        self.bytes += packet.message.bytes.len();
+                        if let PumpPhase::Captures { leader, held } = &mut self.phase {
+                            let record = Message::decode(&packet.message.bytes).unwrap();
+                            if record.msg_type == hyper_raft::proto::MessageType::MsgPropose {
+                                assert_ne!(index, *leader);
+                                assert_eq!(packet.message.to, u64::try_from(*leader + 1).unwrap());
+                                assert!(held.iter().flatten().all(|other| other.from != from));
+                                *held.iter_mut().find(|slot| slot.is_none()).unwrap() = Some(packet);
+                                continue;
+                            }
+                        }
+                        self.admit(packet);
+                        admitted += 1;
+                    }
+                }
+                if !drained {
+                    break;
+                }
+            }
+            self.reap();
+            admitted
+        }
+        fn begin_captures(&mut self, leader: usize) {
+            assert!(matches!(self.phase, PumpPhase::Relay));
+            self.phase = PumpPhase::Captures {
+                leader,
+                held: [None, None],
+            };
+        }
+        fn captures_ready(&self) -> bool {
+            matches!(&self.phase, PumpPhase::Captures { held, .. } if held.iter().all(Option::is_some))
+        }
+        fn release_captures(&mut self) {
+            assert!(self.captures_ready());
+            let PumpPhase::Captures { held, .. } =
+                std::mem::replace(&mut self.phase, PumpPhase::Relay)
+            else {
+                panic!("capture phase disappeared")
+            };
+            for packet in held {
+                self.admit(packet.unwrap());
+            }
+            self.reap();
+        }
+        fn call(
+            &mut self,
+            origin: usize,
+            f: impl FnOnce(&mut Db) -> anyhow::Result<Vec<u8>> + Send + 'static,
+        ) -> Result<Vec<u8>, Refusal> {
+            let client = self.clients.get(origin).unwrap().clone();
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || sender.send(call(&client, f)).unwrap());
+            let until = deadline();
+            let result = loop {
+                match receiver.try_recv() {
+                    Ok(result) => break result,
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(error) => panic!("actor caller ended: {error}"),
+                }
+                assert!(
+                    Instant::now() < until,
+                    "follower-origin command did not settle"
+                );
+                self.drive();
+                std::thread::park_timeout(POLL);
+            };
+            worker.join().unwrap();
+            self.reap();
+            result
+        }
+        fn finish(mut self) {
             assert!(
-                Instant::now() < until,
-                "follower-origin command did not settle"
+                matches!(self.phase, PumpPhase::Relay),
+                "retained proposals were not released"
             );
-            pump(clients);
-            std::thread::park_timeout(POLL);
-        };
-        worker.join().unwrap();
-        result
+            // No new records or grace deadline: try_result enforces each admitted until.
+            while self.records != 0 {
+                self.reap();
+                if self.records != 0 {
+                    std::thread::park_timeout(POLL);
+                }
+            }
+            assert_eq!(self.bytes, 0);
+            assert!(self.receipts.iter().all(Option::is_none));
+        }
+    }
+    impl Drop for Pump<'_> {
+        fn drop(&mut self) {
+            // Never wait in Drop, including failure unwinding. Success requires explicit finish.
+            if !std::thread::panicking() {
+                assert_eq!(
+                    self.records, 0,
+                    "fixture pump dropped with unsettled records"
+                );
+                assert_eq!(self.bytes, 0);
+                assert!(self.receipts.iter().all(Option::is_none));
+                assert!(matches!(self.phase, PumpPhase::Relay));
+            }
+        }
     }
 
     /// U15/CP-T1.8: follower calls use the real leader's ReadIndex and proposal forwarding.
@@ -1296,10 +1460,11 @@ mod tests {
                 .unwrap(),
             );
         }
+        let mut pump = Pump::new(&clients);
         let until = deadline();
         let mut delivered = 0;
         let leader = loop {
-            delivered += pump(&clients);
+            delivered += pump.drive();
             let states: Vec<_> = clients
                 .iter()
                 .map(|c| c.handle().status().unwrap())
@@ -1322,20 +1487,17 @@ mod tests {
         let origin = (leader + 1) % 3;
         let evaluated = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&evaluated);
-        let chosen = pumped_call(&clients, origin, move |db| {
+        let chosen = pump.call(origin, move |db| {
             count.fetch_add(1, Ordering::Relaxed);
             db.exec("CREATE TABLE actor_items(value BLOB DEFAULT(randomblob(32))); INSERT INTO actor_items DEFAULT VALUES")?;
             value(db)
         }).unwrap();
         assert_eq!(evaluated.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            pumped_call(&clients, (origin + 1) % 3, value).unwrap(),
-            chosen
-        );
+        assert_eq!(pump.call((origin + 1) % 3, value).unwrap(), chosen);
         assert_eq!(evaluated.load(Ordering::Relaxed), 1);
 
-        // Hold both forwarded proposals outside the owners so both captures use the same
-        // committed base. Blocking a closure here would also block the serial pump's receive.
+        // Hold both forwarded proposals in the pump so both captures use the same committed
+        // base. No owner waits for the other capture, and later records cannot overtake a hold.
         // Exactly one page set may apply; the stale one's answer is refused.
         let captures = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
         let (sender, receiver) = mpsc::sync_channel(2);
@@ -1356,8 +1518,7 @@ mod tests {
         drop(sender);
         let until = deadline();
         let mut outcomes = Vec::new();
-        let mut held: [Option<(u64, Outbound)>; 2] = [None, None];
-        let mut released = false;
+        pump.begin_captures(leader);
         while outcomes.len() < 2 {
             if let Ok(outcome) = receiver.try_recv() {
                 outcomes.push(outcome);
@@ -1366,27 +1527,8 @@ mod tests {
                 Instant::now() < until,
                 "concurrent proposals did not settle"
             );
-            for (index, client) in clients.iter().enumerate() {
-                let from = u64::try_from(index + 1).unwrap();
-                for message in client.handle().drain(OUTGOING_MESSAGES).unwrap() {
-                    let record = Message::decode(&message.bytes).unwrap();
-                    if !released && record.msg_type == hyper_raft::proto::MessageType::MsgPropose {
-                        assert_ne!(index, leader);
-                        assert_eq!(message.to, u64::try_from(leader + 1).unwrap());
-                        assert!(held.iter().flatten().all(|(origin, _)| *origin != from));
-                        let slot = held.iter_mut().find(|slot| slot.is_none()).unwrap();
-                        *slot = Some((from, message));
-                    } else {
-                        clients
-                            .get(usize::try_from(message.to - 1).unwrap())
-                            .unwrap()
-                            .handle()
-                            .receive(from, message.bytes, deadline())
-                            .unwrap();
-                    }
-                }
-            }
-            if !released && held.iter().all(Option::is_some) {
+            pump.drive();
+            if pump.captures_ready() {
                 let first = clients
                     .get((leader + 1) % 3)
                     .unwrap()
@@ -1408,23 +1550,14 @@ mod tests {
                         .iter()
                         .all(|count| count.load(Ordering::Relaxed) == 1)
                 );
-                for slot in &mut held {
-                    let (from, message) = slot.take().unwrap();
-                    clients
-                        .get(leader)
-                        .unwrap()
-                        .handle()
-                        .receive(from, message.bytes, deadline())
-                        .unwrap();
-                }
-                released = true;
+                pump.release_captures();
             }
             std::thread::park_timeout(POLL);
         }
         for worker in workers {
             worker.join().unwrap();
         }
-        assert!(released);
+        assert!(matches!(pump.phase, PumpPhase::Relay));
         assert!(
             captures
                 .iter()
@@ -1437,17 +1570,19 @@ mod tests {
         );
         assert_eq!(outcomes.iter().filter(|r| matches!(r, Err(Refusal::Invalid { what, .. }) if what == "prepared transaction")).count(), 1, "{outcomes:?}");
         assert!(clients.iter().all(|c| c.handle().status().is_ok()));
-        let count = pumped_call(&clients, origin, |db| {
-            db.exec("INSERT INTO actor_items(value) VALUES(x'03')")?;
-            let mut count = 0;
-            db.query("SELECT count(*) FROM actor_items", [], |row| {
-                count = row.get::<i64>(0).map_err(unavailable)?;
-                Ok(false)
-            })?;
-            Ok(vec![u8::try_from(count)?])
-        })
-        .unwrap();
+        let count = pump
+            .call(origin, |db| {
+                db.exec("INSERT INTO actor_items(value) VALUES(x'03')")?;
+                let mut count = 0;
+                db.query("SELECT count(*) FROM actor_items", [], |row| {
+                    count = row.get::<i64>(0).map_err(unavailable)?;
+                    Ok(false)
+                })?;
+                Ok(vec![u8::try_from(count)?])
+            })
+            .unwrap();
         assert_eq!(count, vec![3]);
+        pump.finish();
     }
     /// U15/CP-T1.8: malformed membership and a source that cannot lead are refused at admission.
     #[test]
@@ -1525,11 +1660,12 @@ mod tests {
         }
         clients
     }
-    fn known_leader(clients: &[Client]) {
+    fn known_leader(pump: &mut Pump<'_>) {
         let until = deadline();
         loop {
-            pump(clients);
-            if clients
+            pump.drive();
+            if pump
+                .clients
                 .iter()
                 .all(|c| c.handle().status().unwrap().leader != 0)
             {
@@ -1567,21 +1703,24 @@ mod tests {
         };
         let bootstrap = crate::replication::bootstrap::inspect_source(&source, 3).unwrap();
         let clients = seeded_nodes(dir.path(), &bootstrap);
-        known_leader(&clients);
+        let mut pump = Pump::new(&clients);
+        known_leader(&mut pump);
         // This can be admitted before the last seed chunk commits. The closure must wait in the
         // product queue, while autonomous source transfer and seed application keep driving.
-        assert_eq!(pumped_call(&clients, 0, unchanged).unwrap(), original);
-        pumped_call(&clients, 1, |db| {
+        assert_eq!(pump.call(0, unchanged).unwrap(), original);
+        pump.call(1, |db| {
             db.exec("UPDATE baseline_items SET value=x'03' WHERE id=2")?;
             Ok(Vec::new())
         })
         .unwrap();
         for origin in 0..3 {
-            assert_eq!(pumped_call(&clients, origin, unchanged).unwrap(), original);
+            assert_eq!(pump.call(origin, unchanged).unwrap(), original);
         }
+        pump.finish();
         drop(clients);
         let reopened = seeded_nodes(dir.path(), &bootstrap);
-        known_leader(&reopened);
+        let mut pump = Pump::new(&reopened);
+        known_leader(&mut pump);
         for client in &reopened {
             let status = client.handle().status().unwrap();
             assert_eq!(status.voters, vec![1, 2, 3]);
@@ -1591,7 +1730,7 @@ mod tests {
         }
         for origin in 0..3 {
             assert_eq!(
-                pumped_call(&reopened, origin, |db| {
+                pump.call(origin, |db| {
                     let mut value = Vec::new();
                     db.query("SELECT value FROM baseline_items WHERE id=2", [], |row| {
                         value = row.get_value(0).to_blob().unwrap().to_vec();
@@ -1602,8 +1741,9 @@ mod tests {
                 .unwrap(),
                 vec![3]
             );
-            assert_eq!(pumped_call(&reopened, origin, unchanged).unwrap(), original);
+            assert_eq!(pump.call(origin, unchanged).unwrap(), original);
         }
+        pump.finish();
     }
 
     mod receive_receipts {
