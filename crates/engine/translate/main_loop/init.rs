@@ -199,7 +199,11 @@ impl InitLoop {
                                 db: table.database_id,
                             });
                         }
-                        if let Some(index_cursor_id) = index_cursor_id {
+                        // Amphora: a WITHOUT ROWID primary key read through the table's cursor
+                        // is already open (JoinedTable::reads_primary_key_through_table).
+                        if let Some(index_cursor_id) =
+                            index_cursor_id.filter(|cursor| Some(*cursor) != table_cursor_id)
+                        {
                             program.emit_insn(Insn::OpenRead {
                                 cursor_id: index_cursor_id,
                                 root_page: index.as_ref().unwrap().root_page,
@@ -380,7 +384,9 @@ impl InitLoop {
                     };
                     if let Some(index) = search_index {
                         // Ephemeral index cursor are opened ad-hoc when needed.
-                        if !index.ephemeral {
+                        // Amphora: a WITHOUT ROWID primary key read through the table's own
+                        // cursor is that cursor, open already (reads_primary_key_through_table).
+                        if !index.ephemeral && index_cursor_id != table_cursor_id {
                             match mode {
                                 OperationMode::SELECT => {
                                     program.emit_insn(Insn::OpenRead {

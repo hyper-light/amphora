@@ -1330,6 +1330,11 @@ impl ProgramBuilder {
         index_cursor_id: CursorID,
         table_cursor_id: CursorID,
     ) -> Result<()> {
+        // Amphora: a WITHOUT ROWID primary key read through the table's own cursor is the row
+        // already (JoinedTable::reads_primary_key_through_table): nothing to find again.
+        if index_cursor_id == table_cursor_id {
+            return Ok(());
+        }
         let index_type = self.get_cursor_type(index_cursor_id).cloned();
         let table_type = self.get_cursor_type(table_cursor_id).cloned();
         if let (Some(CursorType::BTreeIndex(index)), Some(CursorType::BTreeTable(table))) =

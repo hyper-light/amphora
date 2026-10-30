@@ -362,7 +362,21 @@ pub(super) fn choose_best_btree_candidate(
         }
         has_valid_candidate = true;
 
+        // Amphora: a WITHOUT ROWID table's primary key is the table's own B-tree, every column in
+        // its records, so reading it costs no lookup behind it and its leaves hold the table's rows
+        // (SQLite marks it covering: convertToWithoutRowidTable, pPk->isCovering).
+        let table_primary_key = |index: &Index| {
+            rhs_table
+                .btree()
+                .is_some_and(|btree| index.is_without_rowid_primary_key(&btree))
+        };
         let index_info = match candidate.index.as_ref() {
+            Some(index) if table_primary_key(index) => IndexInfo {
+                unique: index.unique,
+                covering: true,
+                column_count: index.columns.len(),
+                rows_per_leaf_page: params.rows_per_table_page,
+            },
             Some(index) => IndexInfo {
                 unique: index.unique,
                 covering: rhs_table.index_is_covering(index),

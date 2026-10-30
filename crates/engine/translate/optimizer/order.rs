@@ -902,6 +902,19 @@ pub(super) fn btree_access_order_consumed(
         .iter()
         .position(|c| c.is_rowid_alias());
 
+    // Amphora: a WITHOUT ROWID table is its primary key's B-tree, so read whole it comes in the
+    // key's order, as SQLite's PRIMARY KEY index is the table (convertToWithoutRowidTable).
+    let primary_key = match index {
+        None => table_ref.btree().and_then(|btree| {
+            schema
+                .get_indices(&btree.name)
+                .find(|candidate| candidate.is_without_rowid_primary_key(&btree))
+                .cloned()
+        }),
+        Some(_) => None,
+    };
+    let index = index.or(primary_key.as_deref());
+
     match index {
         None => {
             // Without an index, only rowid order is available.

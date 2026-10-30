@@ -327,10 +327,10 @@ impl Display for EqpDetail {
                 table, index, join, ..
             } => {
                 write!(f, "SCAN {}", table.name_with_alias())?;
-                if let Some(index) = index {
-                    if index.primary_key {
-                        write!(f, " USING PRIMARY KEY")?;
-                    } else if index.covering {
+                // Amphora: a WITHOUT ROWID table's primary key is the table itself, and SQLite
+                // words a scan of it as the table's own scan (`SCAN t`).
+                if let Some(index) = index.as_ref().filter(|index| !index.primary_key) {
+                    if index.covering {
                         write!(f, " USING COVERING INDEX {}", index.name)?;
                     } else {
                         write!(f, " USING INDEX {}", index.name)?;

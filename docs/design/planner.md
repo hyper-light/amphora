@@ -698,3 +698,64 @@ versions).
 order the matching of elements misjudges (`a_row_value_range_answers_as_sqlite_does` and the
 oracles' differential check would show it); a keyset page the seek makes slower than the scan it
 replaced; a pass whose cursor positionings grow faster than its rows.
+
+## 15. A WITHOUT ROWID table's primary key is the table: ordered, covering, read through its cursor
+
+**Decision.** A WITHOUT ROWID table's primary key, the index on the table's own root page
+(`Index::is_without_rowid_primary_key`), is the table's B-tree: it orders the table, holds every
+column, and has no row behind it. So read whole, the table comes in its key's order, and an ORDER BY
+of the key, of its reverse or of a prefix of it needs no sort (`btree_access_order_consumed` takes
+the key's columns where no index is named). Its cost counts no lookup behind it, and its leaves hold
+the table's rows (`IndexInfo { covering: true, rows_per_leaf_page: the table's }`). A SELECT reads
+it through the table's own cursor, which is keyed by that key (`JoinedTable::
+reads_primary_key_through_table`): one descent finds the row and every column of it, where an index
+cursor beside the table's found the row and a `Found` on the table's cursor found it again. Every
+column is read from the table's cursor at the table's own position, so a key whose columns neither
+lead the table nor keep its order reads right. EXPLAIN QUERY PLAN words a scan of it as SQLite does,
+`SCAN t`, and a search `SEARCH t USING PRIMARY KEY (...)`.
+
+What it leaves: a write planned through the key (DELETE, UPDATE) keeps its index cursor beside the
+table's, and its `Found`; so do the unmatched-row pass of a RIGHT or FULL JOIN and a multi-index OR's
+branches, which open their own cursors. Each is right, finding the row twice.
+
+**Why.** Verifying the unify audit's finding 3 natively (kiln goal 3ba4c454cf268ce1a8993a51dfc46a54)
+on Codex's canonical engine e2e67247: kiln's records import on records_versions (WITHOUT ROWID, as
+kiln's p6_records migration makes it) planned its first page and every next page, `WHERE
+(family,key,rev) > (?1,?2,?3) ORDER BY family,key,rev LIMIT 8`, as SCAN + USE SORTER FOR ORDER BY,
+and `family > ?1` too: a pass over 2,000 versions made 500,000 cursor positionings, 250 a row, in
+519 ms. Equality-prefixed ranges sought the key. Three causes: the order check gave a table's own
+B-tree rowid order only ("Without an index, only rowid order is available."); the covering check
+counted the key's declared columns only, so the key looked to need a lookup per row and lost to a
+scan and a sort; and a search through the key read each row a second time.
+
+**Sources.** SQLite 3.54.0's `sqlite3.c`: `convertToWithoutRowidTable`, "(5) Add all table columns to
+the PRIMARY KEY Index object so that the PRIMARY KEY is a covering index", `pPk->isCovering = 1;` and
+"The root page of the PRIMARY KEY is the table root page" (lines 129128 to 129251);
+`whereLoopAddBtree` reads a covering index alone, `pNew->wsFlags = WHERE_IDX_ONLY | WHERE_INDEXED;`
+(line 173836). sqlite.org/withoutrowid.html: "A WITHOUT ROWID table is a table that uses a Clustered
+Index as the primary key", and querying a column "only involves a single binary search into the main
+B-Tree". SQLite 3.54.0 plans kiln's shapes on kiln's DDL as `SCAN records_versions`, `SEARCH
+records_versions USING PRIMARY KEY ((family,key,rev)>(?,?,?))` and `SEARCH records_versions USING
+PRIMARY KEY (family>?)`.
+
+**Evidence.** `crates/engine/tests/without_rowid_seek.rs`, two of whose tests failed on e2e67247 and
+all pass with the change: `a_without_rowid_tables_key_orders_and_seeks_its_pages`, eight plans on
+kiln's records_versions word for word as SQLite 3.54.0 plans them (e2e67247: `SCAN records_versions`,
+`USE SORTER FOR ORDER BY`); `a_keyset_pass_over_a_without_rowid_table_reads_each_row_once`, 4,000
+versions in pages of 8, forwards and backwards, every row once in order within LIMIT + 2 cursor
+positionings a page (e2e67247: 2,000,000 positionings forwards, against 5,000);
+`a_row_value_range_on_a_without_rowid_key_answers_as_sqlite_does`, keys ascending, descending and
+mixed, 125 bounds (NULL in each place) by each operator in both orders, written as the row and as
+`(+a, b, c)`, and an equality then a row: 7,500 reads, each SQLite's row-value answer;
+`a_without_rowid_key_seeks_or_filters_to_one_estimate_and_answer`, one estimate sought or NOT
+INDEXED, and six bounds of other types or with NULL answering alike sought and NOT INDEXED;
+`a_without_rowid_key_reads_every_column_where_its_columns_do_not_lead`, every column of `v, c, b, a`
+keyed on (a, b, c) through the key as NOT INDEXED reads it. `row_value_seek.rs` and
+`implicit_rowid_seek.rs` pass unchanged. kiln's import pass natively (a scratch test of the debug
+build on adacachy, 2026-10-30, capped beside production, so the shape is the claim, not the times):
+2,242, 4,492, 8,992 and 17,992 cursor positionings at 2,000, 4,000, 8,000 and 16,000 versions, 1.12
+a row, and 7.7, 13.9, 27.3 and 56.4 ms, linear, where e2e67247 made 500,000 at 2,000 in 519 ms.
+
+**Falsified by.** A row a scan or search of the key misses, adds or misorders (the differential
+test and the oracles' checks would show it); a column read wrong through the table's cursor; a
+write planned through the key that loses its row; a key access slower than the scan it replaced.

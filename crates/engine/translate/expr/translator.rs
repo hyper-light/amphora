@@ -2804,7 +2804,21 @@ fn translate_column_expr(
                     Some(program.resolve_cursor_id(&CursorKey::table(*table_ref_id)))
                 };
                 let index_cursor_id = index.map(|index| {
-                    program.resolve_cursor_id(&CursorKey::index(*table_ref_id, index.clone()))
+                    let key = CursorKey::index(*table_ref_id, index.clone());
+                    // Amphora: a SELECT reading a WITHOUT ROWID table's primary key reads it
+                    // through the table's own cursor and opens no index cursor
+                    // (JoinedTable::reads_primary_key_through_table).
+                    match (program.resolve_cursor_id_safe(&key), table_cursor_id) {
+                        (Some(cursor), _) => cursor,
+                        (None, Some(table_cursor))
+                            if table.btree().is_some_and(|btree| {
+                                index.is_without_rowid_primary_key(&btree)
+                            }) =>
+                        {
+                            table_cursor
+                        }
+                        (None, _) => program.resolve_cursor_id(&key),
+                    }
                 });
                 (table_cursor_id, index_cursor_id)
             };

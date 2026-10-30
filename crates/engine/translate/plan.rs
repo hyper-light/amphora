@@ -3441,19 +3441,23 @@ impl JoinedTable {
                     ))
                 };
 
-                let index_cursor_id = index
-                    .map(|index| {
-                        let physical = if !btree.has_rowid && !index.ephemeral {
-                            Arc::new(index.physical_index(btree)?)
-                        } else {
-                            index.clone()
-                        };
-                        program.alloc_cursor_index_if_not_exists(
-                            CursorKey::index(self.internal_id, index.clone()),
-                            &physical,
-                        )
-                    })
-                    .transpose()?;
+                let index_cursor_id = if self.reads_primary_key_through_table(&mode) {
+                    table_cursor_id
+                } else {
+                    index
+                        .map(|index| {
+                            let physical = if !btree.has_rowid && !index.ephemeral {
+                                Arc::new(index.physical_index(btree)?)
+                            } else {
+                                index.clone()
+                            };
+                            program.alloc_cursor_index_if_not_exists(
+                                CursorKey::index(self.internal_id, index.clone()),
+                                &physical,
+                            )
+                        })
+                        .transpose()?
+                };
                 Ok((table_cursor_id, index_cursor_id))
             }
             Table::Virtual(virtual_table) => {
@@ -3503,10 +3507,26 @@ impl JoinedTable {
         } else {
             program.resolve_cursor_id_safe(&CursorKey::table(self.internal_id))
         };
-        let index_cursor_id = index.map(|index| {
-            program.resolve_cursor_id(&CursorKey::index(self.internal_id, index.clone()))
-        });
+        let index_cursor_id = if self.reads_primary_key_through_table(&mode) {
+            table_cursor_id
+        } else {
+            index.map(|index| {
+                program.resolve_cursor_id(&CursorKey::index(self.internal_id, index.clone()))
+            })
+        };
         Ok((table_cursor_id, index_cursor_id))
+    }
+
+    /// Amphora: whether a SELECT reads this WITHOUT ROWID table's primary key through the table's
+    /// own cursor, which is keyed by that key: one descent finds the row and every column of it,
+    /// where an index cursor beside it found the row again, as SQLite reads its PRIMARY KEY index
+    /// (the table itself: convertToWithoutRowidTable). Writes keep their cursor beside the table's.
+    fn reads_primary_key_through_table(&self, mode: &OperationMode) -> bool {
+        matches!(mode, OperationMode::SELECT)
+            && self.op.index().is_some_and(|index| {
+                self.btree()
+                    .is_some_and(|btree| index.is_without_rowid_primary_key(&btree))
+            })
     }
 
     /// Returns true if a given index is a covering index for this [TableReference].
