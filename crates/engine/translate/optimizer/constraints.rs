@@ -1365,9 +1365,9 @@ pub fn constraints_from_where_clause(
                 _ => {}
             }
 
-            if constraint.is_rowid
-                || rowid_alias_column.is_some_and(|p| constraint.table_col_pos == Some(p))
-            {
+            let targets_rowid = constraint.is_rowid
+                || rowid_alias_column.is_some_and(|p| constraint.table_col_pos == Some(p));
+            if targets_rowid {
                 let rowid_candidate = cs
                     .candidates
                     .iter_mut()
@@ -1392,24 +1392,44 @@ pub fn constraints_from_where_clause(
                 .flat_map(|indexes| indexes.iter())
                 .filter(|idx| idx.index_method.is_none())
             {
-                if let Some(position_in_index) = match constraint.table_col_pos {
+                let declared_position = match constraint.table_col_pos {
                     Some(pos) => index.column_table_pos_to_index_pos(pos),
                     None => constraint.expr.as_ref().and_then(|e| {
                         let normalized =
                             normalize_expr_for_index_matching(e, table_reference, table_references);
                         index.expression_to_index_pos(&normalized)
                     }),
-                } {
-                    turso_assert!(
-                        constraint.usable,
-                        "constraint collation must match table column collation"
-                    );
-                    if let Some(table_col_pos) = constraint.table_col_pos {
-                        let constrained_column = &table_reference.table.columns()[table_col_pos];
+                };
+                // Rowid is physically the final ASC/BINARY field, but is not a
+                // declared column (and must not change uniqueness or encoding).
+                // Binding, rather than the spelling "rowid", identifies aliases
+                // and leaves real columns that shadow rowid on the normal path.
+                let suffix_position = (targets_rowid
+                    && index.has_rowid
+                    && !index.ephemeral
+                    && !index.is_backing_btree_index()
+                    && table_reference
+                        .table
+                        .btree()
+                        .is_some_and(|table| table.has_rowid)
+                    && constraint.satisfies_index_affinity(Affinity::Integer))
+                .then_some(index.columns.len());
+                if let Some(position_in_index) = declared_position.or(suffix_position) {
+                    let declared_column = index.columns.get(position_in_index);
+                    if let (Some(table_col_pos), Some(index_column)) =
+                        (constraint.table_col_pos, declared_column)
+                    {
+                        let constrained_column = table_reference
+                            .table
+                            .columns()
+                            .get(table_col_pos)
+                            .ok_or_else(|| {
+                                crate::LimboError::InternalError(
+                                    "index constraint column missing".into(),
+                                )
+                            })?;
                         let table_collation = constrained_column.collation();
-                        let index_collation = index.columns[position_in_index]
-                            .collation
-                            .unwrap_or_default();
+                        let index_collation = index_column.collation.unwrap_or_default();
                         if table_collation != index_collation {
                             continue;
                         }
@@ -1446,8 +1466,11 @@ pub fn constraints_from_where_clause(
                         index_candidate.refs.push(ConstraintRef {
                             constraint_vec_pos: i,
                             index_col_pos: position_in_index,
-                            sort_order: index.columns[position_in_index].order,
-                            nulls_order: index.columns[position_in_index].effective_nulls_order(),
+                            sort_order: declared_column
+                                .map_or(SortOrder::Asc, |column| column.order),
+                            nulls_order: declared_column.map_or(ast::NullsOrder::First, |column| {
+                                column.effective_nulls_order()
+                            }),
                         });
                     }
                 }
@@ -1687,6 +1710,7 @@ pub fn usable_constraints_for_lhs_mask(
         let operator = constraints[cref.constraint_vec_pos].operator;
         let table_col_pos = constraints[cref.constraint_vec_pos].table_col_pos;
         if is_equality_operator(operator)
+            && table_col_pos.is_some()
             && usable
                 .last()
                 .is_some_and(|x| x.table_col_pos == table_col_pos)
