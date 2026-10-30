@@ -1369,10 +1369,49 @@ fn apply(
                 Err(e) => return Ok(Err(e)),
             };
             let upper = successor(&scan.prefix);
+            // Four finite prepared-query shapes keep cursor/upper bounds outside OR guards.
+            // A cursor below the prefix is equivalent to the initial inclusive prefix seek.
+            let (lower, continued) = match scan.after.as_ref() {
+                Some(after) if after >= &scan.prefix => (after.as_slice(), true),
+                _ => (scan.prefix.as_slice(), false),
+            };
+            let query = match (continued, upper.is_some()) {
+                (false, false) => {
+                    "SELECT v.key, v.rev, v.value FROM __amphora_versions v WHERE v.namespace = ?1 AND v.family = ?2 AND v.key >= ?3 AND v.rev = (SELECT MAX(w.rev) FROM __amphora_versions w WHERE w.namespace = v.namespace AND w.family = v.family AND w.key = v.key AND w.rev <= ?4) AND v.value IS NOT NULL ORDER BY v.key LIMIT ?5"
+                }
+                (false, true) => {
+                    "SELECT v.key, v.rev, v.value FROM __amphora_versions v WHERE v.namespace = ?1 AND v.family = ?2 AND v.key >= ?3 AND v.key < ?6 AND v.rev = (SELECT MAX(w.rev) FROM __amphora_versions w WHERE w.namespace = v.namespace AND w.family = v.family AND w.key = v.key AND w.rev <= ?4) AND v.value IS NOT NULL ORDER BY v.key LIMIT ?5"
+                }
+                (true, false) => {
+                    "SELECT v.key, v.rev, v.value FROM __amphora_versions v WHERE v.namespace = ?1 AND v.family = ?2 AND v.key > ?3 AND v.rev = (SELECT MAX(w.rev) FROM __amphora_versions w WHERE w.namespace = v.namespace AND w.family = v.family AND w.key = v.key AND w.rev <= ?4) AND v.value IS NOT NULL ORDER BY v.key LIMIT ?5"
+                }
+                (true, true) => {
+                    "SELECT v.key, v.rev, v.value FROM __amphora_versions v WHERE v.namespace = ?1 AND v.family = ?2 AND v.key > ?3 AND v.key < ?6 AND v.rev = (SELECT MAX(w.rev) FROM __amphora_versions w WHERE w.namespace = v.namespace AND w.family = v.family AND w.key = v.key AND w.rev <= ?4) AND v.value IS NOT NULL ORDER BY v.key LIMIT ?5"
+                }
+            };
+            let mut params = vec![
+                text(namespace),
+                text(f),
+                blob(lower)?,
+                integer(at)?,
+                integer(
+                    u64::try_from(scan.limit)?
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("limit overflow"))?,
+                )?,
+            ];
+            if let Some(upper) = upper {
+                params.push(blob(&upper)?);
+            }
             let mut rows = Vec::new();
-            db.query("SELECT v.key, v.rev, v.value FROM __amphora_versions v WHERE namespace = ?1 AND family = ?2 AND key >= ?3 AND (?4 IS NULL OR key < ?4) AND (?5 IS NULL OR key > ?5) AND rev = (SELECT MAX(w.rev) FROM __amphora_versions w WHERE w.namespace = v.namespace AND w.family = v.family AND w.key = v.key AND w.rev <= ?6) AND value IS NOT NULL ORDER BY key LIMIT ?7",
-                [text(namespace), text(f), blob(&scan.prefix)?, upper.as_ref().map(|v| blob(v)).transpose()?.unwrap_or(EValue::Null), scan.after.as_ref().map(|v| blob(v)).transpose()?.unwrap_or(EValue::Null), integer(at)?, integer(u64::try_from(scan.limit)?.checked_add(1).ok_or_else(|| anyhow::anyhow!("limit overflow"))?)?],
-                |r| { rows.push(Row { key: bytes(r, 0)?.ok_or_else(|| anyhow::anyhow!("null key"))?, rev: rev(r, 1)?, value: bytes(r, 2)?.ok_or_else(|| anyhow::anyhow!("null value"))? }); Ok(true) })?;
+            db.query(query, params, |r| {
+                rows.push(Row {
+                    key: bytes(r, 0)?.ok_or_else(|| anyhow::anyhow!("null key"))?,
+                    rev: rev(r, 1)?,
+                    value: bytes(r, 2)?.ok_or_else(|| anyhow::anyhow!("null value"))?,
+                });
+                Ok(true)
+            })?;
             let more = rows.len() > scan.limit;
             rows.truncate(scan.limit);
             Ok(Ok(Answer::Page(Page { rows, more })))

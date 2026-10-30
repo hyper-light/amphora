@@ -351,6 +351,111 @@ fn records_cas_snapshots_feeds_compaction_and_namespaces_survive_reopen() {
                 .unwrap()
                 .is_none()
         );
+        // Initial and continued scans have distinct seeks, including a binary prefix whose
+        // upper bound does not exist. Cursors before/at/past the prefix retain their meaning.
+        let pages = db.namespace("scan_pages").unwrap();
+        pages
+            .commit(
+                Tx {
+                    conds: vec![],
+                    writes: [
+                        b"a".as_slice(),
+                        b"ab",
+                        b"ab\0",
+                        b"ab\xff",
+                        b"ac",
+                        b"b",
+                        &[254, 255],
+                        &[255],
+                        &[255, 0],
+                        &[255, 1],
+                    ]
+                    .into_iter()
+                    .map(|key| put(key, b"payload"))
+                    .collect(),
+                },
+                until(),
+            )
+            .unwrap();
+        for (prefix, after, expected) in [
+            (
+                b"ab".as_slice(),
+                None,
+                vec![b"ab".to_vec(), b"ab\0".to_vec(), b"ab\xff".to_vec()],
+            ),
+            (
+                b"ab".as_slice(),
+                Some(b"a".as_slice()),
+                vec![b"ab".to_vec(), b"ab\0".to_vec(), b"ab\xff".to_vec()],
+            ),
+            (
+                b"ab".as_slice(),
+                Some(b"ab".as_slice()),
+                vec![b"ab\0".to_vec(), b"ab\xff".to_vec()],
+            ),
+            (b"ab".as_slice(), Some(b"ac".as_slice()), vec![]),
+            (&[255], None, vec![vec![255], vec![255, 0], vec![255, 1]]),
+            (
+                &[255],
+                Some([254].as_slice()),
+                vec![vec![255], vec![255, 0], vec![255, 1]],
+            ),
+            (
+                &[255],
+                Some([255].as_slice()),
+                vec![vec![255, 0], vec![255, 1]],
+            ),
+            (&[255], Some([255, 1].as_slice()), vec![]),
+            (
+                b"".as_slice(),
+                None,
+                vec![
+                    b"a".to_vec(),
+                    b"ab".to_vec(),
+                    b"ab\0".to_vec(),
+                    b"ab\xff".to_vec(),
+                    b"ac".to_vec(),
+                    b"b".to_vec(),
+                    vec![254, 255],
+                    vec![255],
+                    vec![255, 0],
+                    vec![255, 1],
+                ],
+            ),
+        ] {
+            let mut cursor = after.map(Vec::from);
+            let mut actual = Vec::new();
+            for _ in 0..10 {
+                let page = pages
+                    .scan(
+                        "items",
+                        Scan {
+                            prefix: prefix.to_vec(),
+                            after: cursor.clone(),
+                            limit: 2,
+                            at: Consistency::Linearizable,
+                        },
+                        until(),
+                    )
+                    .unwrap();
+                assert!(page.rows.len() <= 2);
+                if let Some(last) = page.rows.last() {
+                    assert!(cursor.as_ref().is_none_or(|previous| previous < &last.key));
+                    cursor = Some(last.key.clone());
+                }
+                actual.extend(page.rows.into_iter().map(|row| row.key));
+                assert_eq!(
+                    page.more,
+                    actual.len() < expected.len(),
+                    "exact page continuation"
+                );
+                if !page.more {
+                    break;
+                }
+                assert!(!actual.is_empty(), "continued scan must advance");
+            }
+            assert_eq!(actual, expected, "prefix={prefix:?}, after={after:?}");
+        }
         // U06, CP-T1.5: one deletion falls below the horizon; one is its feed boundary.
         let deleted = records
             .commit(
