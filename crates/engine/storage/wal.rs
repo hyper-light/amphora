@@ -3533,6 +3533,10 @@ pub struct WalSharedRuntime {
     /// frame): every frame up to it was in the file when a flush of the file began, and that flush
     /// ended. A checkpoint of frames within it flushes no log of its own. None until a flush says.
     pub durable: SpinLock<Option<(u32, u64)>>,
+    /// Legacy generation/frame tuples cannot distinguish an external replacement or generation
+    /// wrap. Once either occurs, only identity-bearing prefixes can publish durability. Accessed
+    /// under the shared WAL guard; no additional admission-path synchronization is needed.
+    pub(crate) legacy_durable_allowed: bool,
     /// Amphora: new generations of the log are packed (`packed.rs`, decision 16).
     pub(crate) pack: AtomicBool,
     /// Amphora: the packed records of the log's generation, and those decoded (`packed::Records`).
@@ -7082,6 +7086,7 @@ impl WalFileShared {
                     OverflowFallbackCoverage::default(),
                 )),
                 durable: SpinLock::new(None),
+                legacy_durable_allowed: true,
                 pack: AtomicBool::new(false),
                 records: Arc::new(SpinLock::new(Records::default())),
                 changes: SpinLock::new(ChangeLog::default()),
@@ -7164,6 +7169,7 @@ impl WalFileShared {
                     OverflowFallbackCoverage::default(),
                 )),
                 durable: SpinLock::new(None),
+                legacy_durable_allowed: true,
                 pack: AtomicBool::new(false),
                 records: Arc::new(SpinLock::new(Records::default())),
                 changes: SpinLock::new(ChangeLog::default()),
@@ -7212,6 +7218,7 @@ impl WalFileShared {
                     OverflowFallbackCoverage::default(),
                 )),
                 durable: SpinLock::new(None),
+                legacy_durable_allowed: true,
                 pack: AtomicBool::new(false),
                 records: Arc::new(SpinLock::new(Records::default())),
                 changes: SpinLock::new(ChangeLog::default()),
@@ -7257,6 +7264,15 @@ impl WalFileShared {
             self.metadata.initialized.store(false, Ordering::Release);
         }
 
+        // Invalidate the preceding generation's proof, including when its u32 sequence wraps.
+        *self.runtime.durable.lock() = None;
+        if self.metadata.wal_header.checkpoint_seq() == 0 {
+            // Keep an old opaque prefix from matching again after sequence reuse. Only wrap
+            // needs a new header identity; ordinary restarts allocate nothing.
+            let header = *self.metadata.wal_header.lock();
+            self.metadata.wal_header = Arc::new(HeaderCell::new(header));
+            self.runtime.legacy_durable_allowed = false;
+        }
         self.runtime.frame_cache.lock().clear();
         self.runtime
             .frame_cache_high_water
@@ -7282,7 +7298,14 @@ impl WalFileShared {
     /// derived from storage.
     #[cfg(feature = "conn_raw_api")]
     pub fn replace_after_external_restore(&mut self, restored: WalFileShared) {
+        // The restored bytes can reuse both the generation and frame numbers. Old tuple proofs
+        // must never cover them, including a pre-restore sync publishing after this replacement.
+        *self.runtime.durable.lock() = None;
+        self.runtime.legacy_durable_allowed = false;
         self.metadata = restored.metadata;
+        // Also reject a caller-supplied restored state that happened to retain the old header Arc.
+        let header = *self.metadata.wal_header.lock();
+        self.metadata.wal_header = Arc::new(HeaderCell::new(header));
         self.runtime.frame_cache = restored.runtime.frame_cache;
         // Amphora: in place, as connections hold the registry's `Arc`.
         *self.runtime.records.lock() = std::mem::take(&mut *restored.runtime.records.lock());
@@ -7374,6 +7397,9 @@ pub mod test {
     struct DeferredReadFile {
         inner: Arc<dyn File>,
         pending_reads: Mutex<Vec<(u64, Completion)>>,
+        defer_reads: bool,
+        reject_sync: crate::sync::atomic::AtomicBool,
+        syncs: crate::sync::atomic::AtomicUsize,
     }
 
     impl DeferredReadFile {
@@ -7381,6 +7407,9 @@ pub mod test {
             Self {
                 inner,
                 pending_reads: Mutex::new(Vec::new()),
+                defer_reads: true,
+                reject_sync: crate::sync::atomic::AtomicBool::new(false),
+                syncs: crate::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -7402,6 +7431,9 @@ pub mod test {
         }
 
         fn pread(&self, pos: u64, c: Completion) -> crate::Result<Completion> {
+            if !self.defer_reads {
+                return self.inner.pread(pos, c);
+            }
             self.pending_reads.lock().push((pos, c.clone()));
             Ok(c)
         }
@@ -7420,6 +7452,10 @@ pub mod test {
             c: Completion,
             sync_type: crate::io::FileSyncType,
         ) -> crate::Result<Completion> {
+            self.syncs.fetch_add(1, Ordering::Relaxed);
+            if self.reject_sync.load(Ordering::Relaxed) {
+                return Err(LimboError::InternalError("test WAL sync refused".into()));
+            }
             self.inner.sync(c, sync_type)
         }
 
@@ -7473,6 +7509,113 @@ pub mod test {
         for (idx, lock) in shared.runtime.read_locks.iter().enumerate() {
             assert_eq!(std::ptr::from_ref(lock), read_lock_ptrs[idx]);
         }
+    }
+
+    /// AC-T1.4.4 / store.md decision 15: a restored WAL can reuse every numeric prefix field while
+    /// containing different bytes. An old/foreign proof must not remove checkpoint's barrier;
+    /// a fresh completed sync may.
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn restored_wal_requires_a_fresh_proof_before_checkpoint_can_omit_sync() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let io = shared_wal_test_io();
+        let path = temp_dir.path().join("restore-proof.db");
+        let donor_path = temp_dir.path().join("restore-donor.db");
+        let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(SqliteDialect))
+            .unwrap();
+        let donor = Database::open_file(
+            io.clone(),
+            donor_path.to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let donor_conn = donor.connect(ConnectOpts::new()).unwrap();
+        for (connection, value) in [(&conn, "old"), (&donor_conn, "new")] {
+            connection.execute("pragma synchronous=NORMAL").unwrap();
+            connection.execute("pragma wal_autocheckpoint=0").unwrap();
+            connection
+                .execute("create table test(id integer primary key, value text)")
+                .unwrap();
+            connection
+                .execute(format!("insert into test values(1, '{value}')"))
+                .unwrap();
+        }
+        let initial = db.wal_prefix();
+        let stale = db.wal_prefix();
+        let legacy = db.wal_end();
+        assert_eq!(
+            legacy,
+            donor.wal_end(),
+            "fixture must reuse the numeric prefix"
+        );
+        let file = db.shared_wal.read().runtime.file.as_ref().unwrap().clone();
+        io.wait_for_completion(
+            file.sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)
+                .unwrap(),
+        )
+        .unwrap();
+        db.wal_prefix_durable(initial);
+        assert!(db.wal_prefix().is_durable());
+
+        let restored = WalFileShared::open_shared_if_exists(
+            &io,
+            &format!("{}-wal", donor_path.display()),
+            OpenFlags::default(),
+        )
+        .unwrap();
+        let mut restored = match Arc::try_unwrap(restored) {
+            Ok(restored) => restored.into_inner(),
+            Err(_) => panic!("restored fixture should own its WAL view"),
+        };
+        let mut observed = DeferredReadFile::new(restored.runtime.file.take().unwrap());
+        observed.defer_reads = false;
+        observed.reject_sync.store(true, Ordering::Relaxed);
+        let observed = Arc::new(observed);
+        restored.runtime.file = Some(observed.clone());
+        db.shared_wal
+            .write()
+            .replace_after_external_restore(restored);
+        db.wal_prefix_durable(stale);
+        db.wal_prefix_durable(donor.wal_prefix());
+        db.wal_durable(legacy.0, legacy.1);
+        assert!(!db.wal_prefix().is_durable());
+        assert_eq!(db.wal_durable_frame(), None);
+
+        let pager = conn.pager.load();
+        pager.clear_page_cache(false);
+        let wal = pager.wal.as_ref().unwrap();
+        let failed = io.block(|| wal.checkpoint(&pager, CheckpointMode::Full, SyncMode::Full));
+        assert!(failed
+            .unwrap_err()
+            .to_string()
+            .contains("test WAL sync refused"));
+        assert_eq!(observed.syncs.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            db.shared_wal
+                .read()
+                .metadata
+                .nbackfills
+                .load(Ordering::Acquire),
+            0
+        );
+
+        observed.reject_sync.store(false, Ordering::Relaxed);
+        let fresh = db.wal_prefix();
+        io.wait_for_completion(
+            observed
+                .sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)
+                .unwrap(),
+        )
+        .unwrap();
+        db.wal_prefix_durable(fresh);
+        assert!(db.wal_prefix().is_durable());
+        observed.reject_sync.store(true, Ordering::Relaxed);
+        observed.syncs.store(0, Ordering::Relaxed);
+        let result = run_wal_checkpoint_until_done(&db, &pager, CheckpointMode::Full);
+        assert!(result.wal_total_backfilled > 0);
+        assert_eq!(observed.syncs.load(Ordering::Relaxed), 0);
+        observed.reject_sync.store(false, Ordering::Relaxed);
     }
 
     #[test]

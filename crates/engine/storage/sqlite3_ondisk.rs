@@ -1599,6 +1599,7 @@ impl BuildSharedWal {
                     OverflowFallbackCoverage::default(),
                 )),
                 durable: SpinLock::new(None),
+                legacy_durable_allowed: true,
                 pack: AtomicBool::new(false),
                 records: Arc::new(SpinLock::new(Records::default())),
                 changes: SpinLock::new(ChangeLog::default()),

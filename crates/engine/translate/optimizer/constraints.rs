@@ -1413,7 +1413,7 @@ pub fn constraints_from_where_clause(
                         .btree()
                         .is_some_and(|table| table.has_rowid)
                     && constraint.satisfies_index_affinity(Affinity::Integer))
-                .then_some(index.columns.len());
+                .then(|| index.columns.len());
                 if let Some(position_in_index) = declared_position.or(suffix_position) {
                     let declared_column = index.columns.get(position_in_index);
                     if let (Some(table_col_pos), Some(index_column)) =

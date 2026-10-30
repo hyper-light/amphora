@@ -6,10 +6,10 @@
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
-pub mod sql;
-pub mod restore;
-pub mod replication;
 pub mod import;
+pub mod replication;
+pub mod restore;
+pub mod sql;
 
 pub type Rev = u64;
 pub const FAMILY_MAX: usize = 64;

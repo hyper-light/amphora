@@ -168,12 +168,6 @@ struct Actor {
     transferred: Option<(u64, Instant)>,
 }
 
-fn nonleader(replica: &Durable) -> Refusal {
-    let leader = replica.leader();
-    Refusal::NotLeader {
-        leader: if leader == 0 { None } else { Some(leader) },
-    }
-}
 fn fenced(reason: impl std::fmt::Display) -> Refusal {
     Refusal::Fenced(reason.to_string())
 }
@@ -194,12 +188,22 @@ fn answer<T>(response: Response<T>, result: Result<T, Refusal>) {
 
 impl ReplicaHandle {
     fn enqueue(&self, command: Input, bytes: usize) -> Result<(), Refusal> {
+        // Untouched application calls can wait for leadership. Keep room for one maximum wire
+        // record against application pressure so that waiting calls cannot block that discovery.
+        let application_limit = QUEUED_BYTES
+            .checked_sub(WIRE_BYTES)
+            .ok_or_else(|| fenced("replica wire reservation exceeds command queue budget"))?;
         let mut charged = self.shared.admitted.load(Ordering::Acquire);
         let mut reserved = false;
         for _ in 0..COMMANDS {
             let next = charged.checked_add(bytes).ok_or(Refusal::Full {
                 limit: QUEUED_BYTES,
             })?;
+            if matches!(&command, Input::Submit { .. }) && next > application_limit {
+                return Err(Refusal::Full {
+                    limit: application_limit,
+                });
+            }
             api::bound("replica command queue bytes", next, QUEUED_BYTES)?;
             match self.shared.admitted.compare_exchange_weak(
                 charged,
@@ -602,6 +606,7 @@ impl Actor {
             self.bootstrap()?;
             if !self.replica.machine().bootstrap_pending()
                 && self.pending.is_none()
+                && self.replica.leader() != 0
                 && let Some(envelope) = self.waiting.pop_front()
             {
                 self.receive(envelope)?;
@@ -644,44 +649,64 @@ impl Actor {
                 self.waiting.push_back(envelope);
             }
         }
-        let changed_term = self.pending.as_ref().is_some_and(|p| {
-            p.term != self.replica.term()
-                || p.leader != self.replica.leader()
-                || self.replica.leader() == 0
-        });
-        if changed_term {
-            if let Some(mut pending) = self.pending.take()
-                && let Some(response) = pending.response.take()
-            {
-                let refusal = match pending.phase {
-                    Phase::Barrier(_) => nonleader(&self.replica),
-                    Phase::Proposed(_) | Phase::Bootstrap(_) => unknown(),
-                };
-                answer(response, Err(refusal));
-            }
+        let Some(pending) = self.pending.as_ref() else {
+            return;
+        };
+        let expired = Instant::now() >= pending.until;
+        let changed_term = pending.term != self.replica.term()
+            || pending.leader != self.replica.leader()
+            || self.replica.leader() == 0;
+        if !expired && !changed_term {
             return;
         }
-        let expired = self
-            .pending
-            .as_ref()
-            .is_some_and(|p| Instant::now() >= p.until);
-        if expired && let Some(mut pending) = self.pending.take() {
-            let proposed = matches!(pending.phase, Phase::Proposed(_) | Phase::Bootstrap(_));
-            if let Some(response) = pending.response.take() {
-                answer(
+        let Some(mut pending) = self.pending.take() else {
+            return;
+        };
+        match &pending.phase {
+            Phase::Barrier(_) => {
+                if expired {
+                    if let Some(response) = pending.response.take() {
+                        answer(response, Err(Refusal::Timeout));
+                    }
+                } else {
+                    self.requeue(pending);
+                }
+            }
+            Phase::Proposed(_) | Phase::Bootstrap(_) => {
+                if let Some(response) = pending.response.take() {
+                    answer(response, Err(unknown()));
+                }
+                // The captured base cannot be used by another write until this one applies. A
+                // caller timing out relinquishes its response, never an unresolved proposal.
+                if !changed_term {
+                    self.pending = Some(pending);
+                }
+            }
+        }
+    }
+    fn requeue(&mut self, mut pending: Pending) {
+        // Only an untouched application operation may move back. A fresh dispatch assigns a new
+        // context and ReadIndex; its old read completion cannot release the renewed barrier.
+        let Phase::Barrier(Some(operation)) = pending.phase else {
+            return;
+        };
+        let Some(response) = pending.response.take() else {
+            return;
+        };
+        if Instant::now() >= pending.until {
+            answer(response, Err(Refusal::Timeout));
+        } else if self.waiting.len() >= COMMANDS {
+            answer(response, Err(Refusal::Full { limit: COMMANDS }));
+        } else {
+            self.waiting.push_front(Envelope {
+                command: Input::Submit {
+                    namespace: pending.namespace,
+                    operation,
+                    until: pending.until,
                     response,
-                    Err(if proposed {
-                        unknown()
-                    } else {
-                        Refusal::Timeout
-                    }),
-                );
-            }
-            // The captured base cannot be used by another write until this one applies. A caller
-            // timing out relinquishes its response, never the unresolved proposal reservation.
-            if proposed {
-                self.pending = Some(pending);
-            }
+                },
+                _reservation: pending._reservation,
+            });
         }
     }
     fn receive(&mut self, envelope: Envelope) -> Result<(), Refusal> {
@@ -716,9 +741,10 @@ impl Actor {
             } => {
                 if Instant::now() >= until {
                     answer(response, Err(Refusal::Timeout));
-                } else if self.replica.leader() == 0 {
-                    answer(response, Err(nonleader(&self.replica)));
-                } else if self.pending.is_some() || self.replica.machine().bootstrap_pending() {
+                } else if self.replica.leader() == 0
+                    || self.pending.is_some()
+                    || self.replica.machine().bootstrap_pending()
+                {
                     if self.waiting.len() >= COMMANDS {
                         answer(response, Err(Refusal::Full { limit: COMMANDS }));
                     } else {
@@ -937,19 +963,22 @@ impl Actor {
         let Some(mut pending) = self.pending.take() else {
             return Ok(());
         };
-        if pending.term != self.replica.term()
-            || pending.leader != self.replica.leader()
-            || self.replica.leader() == 0
-        {
-            if let Some(response) = pending.response.take() {
-                answer(response, Err(nonleader(&self.replica)));
-            }
+        // A delayed read completion must not refuse or replay an already proposed operation.
+        if !matches!(pending.phase, Phase::Barrier(_)) {
+            self.pending = Some(pending);
             return Ok(());
         }
         if Instant::now() >= pending.until {
             if let Some(response) = pending.response.take() {
                 answer(response, Err(Refusal::Timeout));
             }
+            return Ok(());
+        }
+        if pending.term != self.replica.term()
+            || pending.leader != self.replica.leader()
+            || self.replica.leader() == 0
+        {
+            self.requeue(pending);
             return Ok(());
         }
         let Phase::Barrier(operation) = pending.phase else {
@@ -1129,16 +1158,23 @@ mod tests {
 
     /// U15/CP-T1.8: the product owner must not run a closure before leadership and ReadIndex.
     #[test]
-    fn nonleader_refuses_without_evaluating_and_authentication_binds_wire_sender() {
+    fn unknown_leader_waits_to_deadline_without_evaluating_and_authentication_binds_wire_sender() {
         let dir = tempfile::tempdir().unwrap();
         let client = open(dir.path(), vec![1, 2, 3]);
         let evaluated = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&evaluated);
+        let started = Instant::now();
         let result = call(&client, move |_| {
             count.fetch_add(1, Ordering::Relaxed);
             Ok(Vec::new())
         });
-        assert!(matches!(result, Err(Refusal::NotLeader { .. })));
+        // The owner and synchronous receiver share the original five-second deadline. Either
+        // expiry observer may win; neither permits this isolated member to evaluate the closure.
+        assert!(matches!(
+            result,
+            Err(Refusal::Timeout | Refusal::UnknownOutcome)
+        ));
+        assert!(started.elapsed() >= Duration::from_secs(5));
         assert_eq!(evaluated.load(Ordering::Relaxed), 0);
         let mut bytes = Vec::new();
         Message {
@@ -1166,6 +1202,62 @@ mod tests {
             client.handle().drain(OUTGOING_MESSAGES + 1),
             Err(Refusal::TooLarge { .. })
         ));
+    }
+
+    /// CP-T1.8: admitted application calls cannot consume replication's reserved byte capacity.
+    #[test]
+    fn unknown_leader_application_pressure_keeps_wire_admission_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = open(dir.path(), vec![1, 2, 3]);
+        let handle = client.handle();
+        let until = deadline();
+        let evaluated = Arc::new(AtomicUsize::new(0));
+        let mut replies = Vec::new();
+        let mut refusal = None;
+        for _ in 0..COMMANDS {
+            let counted = Arc::clone(&evaluated);
+            let operation = Operation::Call(Mutex::new(Some(Box::new(move |_| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                Ok(Box::new(Vec::<u8>::new()) as Box<dyn Any + Send>)
+            }))));
+            let (response, receiver) = mpsc::sync_channel(1);
+            match handle.enqueue(
+                Input::Submit {
+                    namespace: String::new(),
+                    operation,
+                    until,
+                    response,
+                },
+                api::REQUEST_MAX,
+            ) {
+                Ok(()) => replies.push(receiver),
+                Err(error) => {
+                    refusal = Some(error);
+                    break;
+                }
+            }
+        }
+        assert_eq!(evaluated.load(Ordering::Relaxed), 0);
+        let mut bytes = Vec::new();
+        Message {
+            msg_type: hyper_raft::proto::MessageType::MsgHeartbeat,
+            from: 2,
+            to: 1,
+            term: 1,
+            ..Message::default()
+        }
+        .encode(&mut bytes);
+        handle.receive(2, bytes, until).unwrap();
+        assert!(matches!(
+            refusal,
+            Some(Refusal::Full { limit }) if limit == QUEUED_BYTES - WIRE_BYTES
+        ));
+        assert_eq!(
+            replies.len(),
+            (QUEUED_BYTES - WIRE_BYTES) / api::REQUEST_MAX
+        );
+        assert!(!replies.is_empty());
+        assert_eq!(evaluated.load(Ordering::Relaxed), 0);
     }
 
     /// U15/CP-T1.8: real DeviceFile log, product-driven election, once-only capture and reopen.
@@ -1341,7 +1433,8 @@ mod tests {
                                 assert_ne!(index, *leader);
                                 assert_eq!(packet.message.to, u64::try_from(*leader + 1).unwrap());
                                 assert!(held.iter().flatten().all(|other| other.from != from));
-                                *held.iter_mut().find(|slot| slot.is_none()).unwrap() = Some(packet);
+                                *held.iter_mut().find(|slot| slot.is_none()).unwrap() =
+                                    Some(packet);
                                 continue;
                             }
                         }

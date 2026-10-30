@@ -21,6 +21,22 @@ them. The Raft log is hyper-log through hyper-durable GroupStore; no Raft algori
 in Amphora. A speculative preparation never publishes a local commit, so a leader that loses its
 term cannot leave that preparation visible after restart.
 
+The replicated owner admits an application request with an unknown leader into its existing
+bounded waiting queue, retaining its original absolute deadline and admission charge. It dispatches
+only after discovering a leader. If the term or leader changes before application evaluation,
+the same untouched operation returns to the front of that queue and must pass a new context and
+ReadIndex. This deliberately replaces immediate unknown-leader refusal with bounded waiting;
+expiry returns Timeout, or UnknownOutcome if the client's existing receive deadline wins.
+
+The retry boundary ends before `prepare_db` begins and before a SQL session's `FnOnce` is taken.
+An evaluated session is never replayed, including one that fails, captures no pages or cannot
+propose. Proposed changes and bootstrap seeds retain their UnknownOutcome semantics on leadership
+loss, displacement or deadline. A stale read completion cannot turn a proposal into a new operation.
+Queue/core-read admission can still refuse work at its existing bounds; no deadline is extended.
+Application admission keeps one maximum wire record's bytes free within the existing shared byte
+budget, so waiting calls alone cannot prevent replication traffic from entering the same actor.
+Already admitted wire traffic can still fill that bounded budget and cause an honest refusal.
+
 The implementation currently retains the engine WAL for atomic application of committed Raft
 pages. It does not yet eliminate that apply journal in favor of the Raft log alone. Transactions
 are limited to 32 MiB of resolved pages, snapshots to 256 MiB. Larger snapshots are explicitly

@@ -1,13 +1,10 @@
-use super::memory::MemStore;
+use super::memory::{MemStore, MemoryFiles};
 use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::FileSyncType;
 use crate::sync::Mutex;
 use crate::Result;
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-};
+use std::{collections::VecDeque, sync::Arc};
 use tracing::debug;
 
 /// A memory-backed [`IO`] backend that defers every completion until the next
@@ -20,7 +17,8 @@ use tracing::debug;
 /// so the engine must return `StepResult::IO`, yield, and re-enter — exercising
 /// the resume path behind each yield point.
 pub struct MemoryYieldIO {
-    files: Arc<Mutex<HashMap<String, Arc<MemoryYieldFile>>>>,
+    registry_scope: super::RegistryScope,
+    files: Arc<Mutex<MemoryFiles<MemoryYieldFile>>>,
     /// Completions submitted but not yet signalled, drained FIFO by `step()`.
     pending: Arc<Mutex<VecDeque<Deferred>>>,
 }
@@ -38,7 +36,8 @@ impl MemoryYieldIO {
     pub fn new() -> Self {
         debug!("Using IO backend 'memory_yield'");
         Self {
-            files: Arc::new(Mutex::new(HashMap::default())),
+            registry_scope: super::RegistryScope::default(),
+            files: Arc::new(Mutex::new(MemoryFiles::default())),
             pending: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
@@ -63,17 +62,19 @@ impl Clock for MemoryYieldIO {
 impl IO for MemoryYieldIO {
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         let mut files = self.files.lock();
-        if !files.contains_key(path) && !flags.contains(OpenFlags::Create) {
+        if !files.files.contains_key(path) && !flags.contains(OpenFlags::Create) {
             return Err(crate::error::CompletionError::IOError(
                 std::io::ErrorKind::NotFound,
                 "open",
             )
             .into());
         }
-        if !files.contains_key(path) {
-            files.insert(
+        if !files.files.contains_key(path) {
+            let file_id = files.allocate_id()?;
+            files.files.insert(
                 path.to_string(),
                 Arc::new(MemoryYieldFile {
+                    file_id,
                     path: path.to_string(),
                     store: MemStore::new(),
                     pending: self.pending.clone(),
@@ -81,6 +82,7 @@ impl IO for MemoryYieldIO {
             );
         }
         Ok(files
+            .files
             .get(path)
             .ok_or_else(|| {
                 crate::LimboError::InternalError("file should exist after insert".to_string())
@@ -90,12 +92,24 @@ impl IO for MemoryYieldIO {
 
     fn remove_file(&self, path: &str) -> Result<()> {
         let mut files = self.files.lock();
-        files.remove(path);
+        files.files.remove(path);
         Ok(())
     }
 
+    fn registry_scope(&self) -> Option<super::RegistryScope> {
+        Some(self.registry_scope.clone())
+    }
+
     fn file_id(&self, path: &str) -> Result<super::FileId> {
-        Ok(super::FileId::from_path_hash(path))
+        self.files
+            .lock()
+            .files
+            .get(path)
+            .map(|file| file.file_id)
+            .ok_or_else(|| {
+                crate::error::CompletionError::IOError(std::io::ErrorKind::NotFound, "file_id")
+                    .into()
+            })
     }
 
     fn supports_shared_wal_coordination(&self) -> bool {
@@ -122,6 +136,7 @@ impl IO for MemoryYieldIO {
 }
 
 pub struct MemoryYieldFile {
+    file_id: super::FileId,
     path: String,
     store: MemStore,
     pending: Arc<Mutex<VecDeque<Deferred>>>,
@@ -250,6 +265,10 @@ mod tests {
 
         fn remove_file(&self, path: &str) -> Result<()> {
             self.inner.remove_file(path)
+        }
+
+        fn registry_scope(&self) -> Option<super::super::RegistryScope> {
+            self.inner.registry_scope()
         }
 
         fn file_id(&self, path: &str) -> Result<super::super::FileId> {

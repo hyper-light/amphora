@@ -2503,6 +2503,10 @@ mod tests {
             self.inner.cancel(completions)
         }
 
+        fn registry_scope(&self) -> Option<crate::io::RegistryScope> {
+            self.inner.registry_scope()
+        }
+
         fn file_id(&self, path: &str) -> Result<FileId> {
             self.inner.file_id(path)
         }

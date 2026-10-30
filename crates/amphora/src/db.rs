@@ -328,7 +328,10 @@ impl Db {
             let _lease = &owner;
             // Where the log ends before the flush begins: every frame up to it is durable once
             // the flush ends, and the checkpointer copies those without a flush of its own.
-            let (generation, frame) = db.wal_end();
+            let prefix = db.wal_prefix();
+            if prefix.is_durable() {
+                return Ok(());
+            }
             // Opened each time: a flush is a disk's round trip, an open a few microseconds, and the
             // log may have been made again. No log: everything is in the file, which the checkpoint
             // that emptied the log flushed.
@@ -343,7 +346,7 @@ impl Db {
             file.sync(Completion::new_sync(|_| {}), FileSyncType::DataSync)
                 .and_then(|c| io.wait_for_completion(c))
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
-            db.wal_durable(generation, frame);
+            db.wal_prefix_durable(prefix);
             Ok(())
         })
     }

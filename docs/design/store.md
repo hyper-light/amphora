@@ -393,15 +393,24 @@ flushes stop following one another.
 
 ## 15. The checkpoint copies what the flusher made durable
 
-**Decision.** The flusher notes where the log ends before each flush begins, as the log's
-generation (its header's `checkpoint_seq`, which a restart changes in the same step that starts
-the frames again) and its last committed frame, and once the flush ends tells Turso every frame up
-to it is durable (`Database::wal_end`, `Database::wal_durable`, added to Turso). The checkpointer
-copies only up to that frame (`Database::wal_durable_frame`, a passive checkpoint's upper bound),
-and Turso's checkpoint flushes no log of its own for frames the mark covers in the log's current
-generation (`WalCoordination::durable_through`; never under the multi-process authority, whose
-log other processes write). With no mark yet (no flush through `Db::flusher`), a checkpoint copies
-everything and flushes the log first, as before.
+**Decision.** Before a flush the flusher captures the log's header-object identity, generation
+(its header's `checkpoint_seq`) and last committed frame together with any completed-flush proof,
+under one shared-log guard (`Database::wal_prefix`). If that exact prefix is already known durable,
+it owes no additional log sync. Otherwise it syncs the log and publishes the captured prefix only
+after success (`Database::wal_prefix_durable`); a stale or foreign token is ignored. The checkpointer
+copies only up to the proved frame (`Database::wal_durable_frame`, a passive checkpoint's upper
+bound), and its own flush is omitted only for a covered prefix (`WalCoordination::durable_through`).
+With no mark yet, a checkpoint copies everything and flushes the log first, as before. No local
+proof is accepted or reused under the multi-process authority, whose log other processes write.
+
+A normal log restart clears its proof. Reusing the 32-bit generation after wrap also renews header
+identity. External replacement always renews header identity and clears proof, even if restored
+bytes reuse the same generation and frame numbers; a pre-replacement sync cannot then publish a
+proof for the replacement. The old `wal_end`/`wal_durable` tuple API has no object identity: after
+external replacement or generation wrap, its proof publications are conservatively ignored for
+that database instance, so legacy callers may incur extra checkpoint syncs. Typed publication
+continues to work. External file replacement itself requires writers, flushers and checkpoints to
+remain quiescent until reload completes; proof invalidation does not make file replacement atomic.
 
 **Sources.** Turso's checkpoint (`CheckpointState::SyncWal`): a frame copied into the file must
 be durable in the log first, or a crash could keep the copy and lose the frame, leaving a file that
@@ -419,8 +428,17 @@ fails with the flusher noting the log's end after its flush instead of before, a
 claiming the whole log durable, which also fails crash injection (integrity check and checksum
 failures in 10,000 seeds); the real flusher passes both.
 
-**Falsified by.** A checkpoint that copies a frame no flush made durable (the test above), or an
-acknowledged batch lost or torn by a power cut during checkpoints (`tests/crash.rs`).
+**Candidate validation (UNRUN).** AC-T1.4.4:
+`restored_wal_requires_a_fresh_proof_before_checkpoint_can_omit_sync` replaces a WAL with different
+contents at the same numeric prefix, attempts stale, foreign and legacy proof publications, and
+requires a refused WAL sync to stop checkpoint before backfill. A fresh successful sync and typed
+publication must then permit backfill without another WAL sync. This proposed regression and the
+candidate changes have not been compiled or run; the historical measurements above establish no
+latency claim for this optimization.
+
+**Falsified by.** A required WAL sync omitted without a matching completed-flush proof, a checkpoint
+that copies a frame no flush made durable (the tests above), or an acknowledged batch lost or torn
+by a power cut during checkpoints (`tests/crash.rs`).
 
 ## 16. The log packed: a commit's pages compressed into records
 
@@ -1036,3 +1054,34 @@ against 75,565).
 
 **Falsified by.** Scans many readers make of the same pages at once still slower with the pool than
 without, or single readers slower (a 4 KiB copy a hit costing more than the count it saves).
+
+## Virtual filesystem registry ownership (AC-T1.1.1)
+
+A synthetic file identity belongs to its virtual filesystem. Independent MemoryIO and MemoryYieldIO
+instances can contain different bytes under the same path; their registry keys therefore combine
+FileId with an opaque, retained Arc identity. Reopening through the same backend or a transparent
+wrapper retains that scope and shares the existing Database. Native files keep the unscoped OS
+identity, including hard-link sharing. FileId's public dev/ino representation is unchanged.
+Within each memory backend, file creation assigns a monotonically increasing checked file ID
+under the existing files mutex. Removing and recreating a path gets a fresh ID while old handles
+retain the old bytes. Exhausting the counter returns a typed refusal; IDs never wrap or repeat.
+A missing path has no file identity and returns NotFound.
+
+A scoped registration is owned by its Database and removed in one key lookup when its final alias
+closes. The cleanup compares the exact weak Database identity, so an old destructor cannot remove a
+successor or an Opening reservation. Failed and cancelled opens keep the existing state-owned
+reservation cleanup. Registry locks are released before validating or dropping an upgraded Database.
+This prevents both an unbounded accumulation of dead virtual scopes and destructor lock reentrancy.
+
+Evidence: the engine's implicit_rowid_seek suite opens independent MemoryIO backends at the same
+path; the previous path-only keys reused one Database and three parallel cases returned Busy. The
+parameterized ownership regression is a sequential witness: independent backends keep different
+rows, aliases share writes, unlink/recreate keeps old readers separate from new bytes, and the
+final alias releases its scoped entry. It covers both memory backends and their mixed use when
+io_memory_yield is enabled. These behaviors, and the unchanged implicit-rowid suite, would falsify
+this ownership model if they fail.
+
+Sources: Rust's [`Arc::ptr_eq`](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.ptr_eq)
+and [`Weak::ptr_eq`](https://doc.rust-lang.org/std/sync/struct.Weak.html#method.ptr_eq) specify
+allocation identity. Unlike value equality, these preserve separate scopes with equal payloads;
+the retained Arc and exact Weak owner keep those allocations alive until cleanup.

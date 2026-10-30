@@ -9,13 +9,13 @@
 "clippy::unreachable" = 464
 "clippy::todo" = 11
 "clippy::unimplemented" = 0
-"clippy::indexing_slicing" = 3218
+"clippy::indexing_slicing" = 3214
 "clippy::arithmetic_side_effects" = 3406
 "clippy::string_slice" = 101
 "clippy::cast_possible_truncation" = 561
 "clippy::cast_sign_loss" = 254
 "clippy::cast_possible_wrap" = 688
-"clippy::disallowed_macros" = 784
+"clippy::disallowed_macros" = 783
 "clippy::disallowed_methods" = 40
 "clippy::disallowed_types" = 0
 "clippy::dbg_macro" = 0

@@ -1,6 +1,6 @@
 //! Revision-preserving, restartable import of one Records namespace from a fixed snapshot.
-use serde::{Deserialize, Serialize};
 use crate::Rev;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportVersion {

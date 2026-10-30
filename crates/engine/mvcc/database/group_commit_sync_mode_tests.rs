@@ -91,6 +91,10 @@ impl IO for SyncCountingIo {
     fn remove_file(&self, path: &str) -> Result<()> {
         self.inner.remove_file(path)
     }
+    fn registry_scope(&self) -> Option<crate::io::RegistryScope> {
+        self.inner.registry_scope()
+    }
+
     fn file_id(&self, path: &str) -> Result<FileId> {
         self.inner.file_id(path)
     }

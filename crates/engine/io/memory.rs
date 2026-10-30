@@ -11,7 +11,36 @@ use std::{
 use tracing::debug;
 
 pub struct MemoryIO {
-    files: Arc<Mutex<HashMap<String, Arc<MemoryFile>>>>,
+    registry_scope: super::RegistryScope,
+    files: Arc<Mutex<MemoryFiles<MemoryFile>>>,
+}
+
+/// Per-backend file incarnations, assigned under its existing files mutex. IDs never
+/// repeat: exhausting u64 refuses creation without changing any existing file.
+pub(super) struct MemoryFiles<F> {
+    pub(super) files: HashMap<String, Arc<F>>,
+    next_file_id: u64,
+}
+
+impl<F> Default for MemoryFiles<F> {
+    fn default() -> Self {
+        Self {
+            files: HashMap::default(),
+            next_file_id: 0,
+        }
+    }
+}
+
+impl<F> MemoryFiles<F> {
+    pub(super) fn allocate_id(&mut self) -> Result<super::FileId> {
+        let ino = self.next_file_id.checked_add(1).ok_or_else(|| {
+            crate::LimboError::InvalidArgument(
+                "virtual file identity capacity exhausted".to_string(),
+            )
+        })?;
+        self.next_file_id = ino;
+        Ok(super::FileId { dev: 0, ino })
+    }
 }
 
 // TODO: page size flag
@@ -34,7 +63,8 @@ impl MemoryIO {
     pub fn new() -> Self {
         debug!("Using IO backend 'memory'");
         Self {
-            files: Arc::new(Mutex::new(HashMap::default())),
+            registry_scope: super::RegistryScope::default(),
+            files: Arc::new(Mutex::new(MemoryFiles::default())),
         }
     }
 }
@@ -58,23 +88,26 @@ impl Clock for MemoryIO {
 impl IO for MemoryIO {
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         let mut files = self.files.lock();
-        if !files.contains_key(path) && !flags.contains(OpenFlags::Create) {
+        if !files.files.contains_key(path) && !flags.contains(OpenFlags::Create) {
             return Err(crate::error::CompletionError::IOError(
                 std::io::ErrorKind::NotFound,
                 "open",
             )
             .into());
         }
-        if !files.contains_key(path) {
-            files.insert(
+        if !files.files.contains_key(path) {
+            let file_id = files.allocate_id()?;
+            files.files.insert(
                 path.to_string(),
                 Arc::new(MemoryFile {
+                    file_id,
                     path: path.to_string(),
                     store: MemStore::new(),
                 }),
             );
         }
         Ok(files
+            .files
             .get(path)
             .ok_or_else(|| {
                 crate::LimboError::InternalError("file should exist after insert".to_string())
@@ -83,12 +116,24 @@ impl IO for MemoryIO {
     }
     fn remove_file(&self, path: &str) -> Result<()> {
         let mut files = self.files.lock();
-        files.remove(path);
+        files.files.remove(path);
         Ok(())
     }
 
+    fn registry_scope(&self) -> Option<super::RegistryScope> {
+        Some(self.registry_scope.clone())
+    }
+
     fn file_id(&self, path: &str) -> Result<super::FileId> {
-        Ok(super::FileId::from_path_hash(path))
+        self.files
+            .lock()
+            .files
+            .get(path)
+            .map(|file| file.file_id)
+            .ok_or_else(|| {
+                crate::error::CompletionError::IOError(std::io::ErrorKind::NotFound, "file_id")
+                    .into()
+            })
     }
 
     fn supports_shared_wal_coordination(&self) -> bool {
@@ -266,6 +311,7 @@ impl MemStore {
 }
 
 pub struct MemoryFile {
+    file_id: super::FileId,
     path: String,
     store: MemStore,
 }

@@ -276,7 +276,7 @@ impl NoPumpInsideStepIo {
     }
 }
 
-#[cfg(feature = "fts")]
+#[cfg(any(feature = "fts", feature = "io_memory_yield"))]
 impl crate::Clock for NoPumpInsideStepIo {
     fn current_time_monotonic(&self) -> crate::MonotonicInstant {
         self.inner.current_time_monotonic()
@@ -322,6 +322,14 @@ impl crate::IO for NoPumpInsideStepIo {
 
     fn get_memory_io(&self) -> Arc<MemoryIO> {
         self.inner.get_memory_io()
+    }
+
+    fn file_id(&self, path: &str) -> crate::Result<crate::io::FileId> {
+        self.inner.file_id(path)
+    }
+
+    fn registry_scope(&self) -> Option<crate::io::RegistryScope> {
+        self.inner.registry_scope()
     }
 }
 

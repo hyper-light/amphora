@@ -66,9 +66,30 @@ mod completions;
 pub use clock::Clock;
 pub use completions::*;
 
+/// AC-T1.1.1: an opaque ownership domain for a virtual filesystem's registry keys.
+/// Create one per independent backend and clone it for aliases and transparent wrappers.
+/// Equality and hashing use allocation identity; retaining the token keeps that identity alive.
+/// This metadata uses std Arc, like the process-wide registry, across shuttle executions.
+#[derive(Clone, Debug, Default)]
+pub struct RegistryScope(std::sync::Arc<()>);
+
+impl PartialEq for RegistryScope {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for RegistryScope {}
+
+impl std::hash::Hash for RegistryScope {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&std::sync::Arc::as_ptr(&self.0), state);
+    }
+}
+
 /// Platform-independent file identity, analogous to SQLite's `struct unixFileId`.
 /// On Unix: (st_dev, st_ino). On Windows: (dwVolumeSerialNumber, nFileIndex).
-/// On non-filesystem backends: synthetic hash-based identity.
+/// On non-filesystem backends: a backend-provided synthetic identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileId {
     pub dev: u64,
@@ -77,7 +98,7 @@ pub struct FileId {
 
 impl FileId {
     /// Synthetic identity from a path hash, for backends without real inodes
-    /// (MemoryIO, OPFS, simulators).
+    /// (OPFS, simulators). MemoryIO uses per-backend file incarnations instead.
     pub fn from_path_hash(path: &str) -> Self {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -509,6 +530,13 @@ pub trait IO: Clock + Send + Sync {
     /// Used for progressive backoff in contended lock acquisition.
     fn sleep(&self, duration: std::time::Duration) {
         crate::thread::sleep(duration);
+    }
+
+    /// AC-T1.1.1: ownership domain of synthetic file identities. Native backends use
+    /// None so separate handles and hard links retain their shared OS identity. Independent
+    /// virtual backends retain one token; wrappers forward the wrapped backend's token.
+    fn registry_scope(&self) -> Option<RegistryScope> {
+        None
     }
 
     /// Return the file identity for the given path.

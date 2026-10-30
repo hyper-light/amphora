@@ -627,7 +627,7 @@ pub(crate) enum RegistryEntry {
 /// can never resume the coroutine that owns the lock.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum DatabaseKey {
-    File(io::FileId),
+    File(io::FileId, Option<io::RegistryScope>),
     SharedMemory(String),
 }
 
@@ -644,7 +644,46 @@ pub fn clear_database_registry() {
 #[cfg(test)]
 pub(crate) fn remove_file_from_database_registry(path: &str) {
     let file_id = io::get_file_id(path).unwrap();
-    DATABASE_MANAGER.lock().remove(&DatabaseKey::File(file_id));
+    DATABASE_MANAGER
+        .lock()
+        .remove(&DatabaseKey::File(file_id, None));
+}
+
+/// AC-T1.1.1: scoped entries live exactly as long as their registered Database. A
+/// dead weak entry must not retain a new virtual filesystem identity forever. Removal is
+/// one key lookup, and an old Database cannot remove an Opening sentinel or a successor.
+struct ScopedRegistration {
+    key: DatabaseKey,
+    owner: Weak<Database>,
+}
+
+impl Drop for ScopedRegistration {
+    fn drop(&mut self) {
+        let mut registry = DATABASE_MANAGER.lock();
+        let owned = matches!(registry.get(&self.key), Some(RegistryEntry::Ready(owner)) if Weak::ptr_eq(owner, &self.owner));
+        if owned {
+            registry.remove(&self.key);
+        }
+    }
+}
+
+/// A committed WAL prefix captured by [`Database::wal_prefix`]. Its identity is opaque: an
+/// external restore or generation restart can make an old prefix inapplicable to the current log.
+#[derive(Debug)]
+pub struct WalPrefix {
+    header: Arc<storage::wal::HeaderCell>,
+    generation: u32,
+    frame: u64,
+    already_durable: bool,
+}
+
+impl WalPrefix {
+    /// This captured prefix was already covered by a completed successful flush. Later writes are
+    /// not covered. A prefix of a shared multi-process WAL is conservatively never reported so.
+    #[must_use]
+    pub fn is_durable(&self) -> bool {
+        self.already_durable
+    }
 }
 
 /// The `Database` object contains per database file state that is shared
@@ -697,6 +736,8 @@ pub struct Database<
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
     page_codec_id: Option<PageCodecId>,
+    // Last: release this Database's I/O fields before its scoped registry entry.
+    registry_registration: std::sync::OnceLock<ScopedRegistration>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -850,6 +891,7 @@ impl Database {
             page_codec_id,
 
             durable_storage: None,
+            registry_registration: std::sync::OnceLock::new(),
         };
 
         db.register_global_builtin_extensions()
@@ -1080,6 +1122,7 @@ impl Database {
     /// This avoids opening a file (and acquiring a file lock) when the
     /// database is already open in this process.
     fn lookup_in_registry(
+        io: &dyn IO,
         path: &str,
         encryption_opts: &Option<EncryptionOpts>,
         dialect: &dyn Dialect,
@@ -1088,19 +1131,23 @@ impl Database {
         if is_memory_like(path) {
             return Ok(None);
         }
-        let file_id = match io::get_file_id(path) {
+        let file_id = match io.file_id(path) {
             Ok(id) => id,
             Err(_) => return Ok(None), // file doesn't exist yet
         };
-        let key = DatabaseKey::File(file_id);
-        let registry = DATABASE_MANAGER.lock();
-        let db = match registry.get(&key) {
-            Some(RegistryEntry::Ready(weak)) => match weak.upgrade() {
-                Some(db) => db,
-                None => return Ok(None),
-            },
-            _ => return Ok(None),
+        let key = DatabaseKey::File(file_id, io.registry_scope());
+        let db = {
+            let registry = DATABASE_MANAGER.lock();
+            match registry.get(&key) {
+                Some(RegistryEntry::Ready(weak)) => weak.upgrade(),
+                _ => None,
+            }
         };
+        let Some(db) = db else {
+            return Ok(None);
+        };
+        // The upgraded Arc may be the final owner; validation errors must drop it
+        // after releasing the registry lock, because scoped cleanup takes that lock.
 
         // Validate encryption compatibility (key is not stored for security,
         // so we can only check cipher mode)
@@ -1175,6 +1222,7 @@ impl Database {
         // lock that would conflict with an already-open Database in this process.
         if use_registry {
             if let Some(db) = Self::lookup_in_registry(
+                io.as_ref(),
                 path,
                 &options.encryption,
                 options.dialect.as_ref(),
@@ -1324,45 +1372,39 @@ impl Database {
         // in this case we need to bypass registry (as this is MemoryIO DB) but also preserve original distinction in names (e.g. :memory:-draft and :memory:-synced)
         // so, we bypass registry for all in memory dbs (i.e. db paths which starts with ":memory:")
         if matches!(state.phase, OpenDbAsyncPhase::Init) && !is_memory_like(path) {
-            // Briefly lock the registry to check/reserve — never hold across I/O yields.
-            let mut registry = DATABASE_MANAGER.lock();
-
-            // Look up by file identity (dev, ino). If file doesn't exist
-            // yet (CREATE mode), skip lookup — no cached entry is possible.
+            // Reserve one backend-scoped identity atomically, but never validate or
+            // drop a possibly last upgraded Database while holding the registry lock.
             if let Ok(file_id) = io.file_id(path) {
-                let key = DatabaseKey::File(file_id);
-                match registry.get(&key) {
-                    Some(RegistryEntry::Ready(weak)) => {
-                        if let Some(db) = weak.upgrade() {
-                            tracing::debug!("took database {path:?} from the registry");
-
-                            let db_is_encrypted =
-                                !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
-                            if db_is_encrypted && options.encryption.is_none() {
-                                return Err(LimboError::InvalidArgument(
-                                    "Database is encrypted but no encryption options provided"
-                                        .to_string(),
-                                )
-                                .into());
-                            }
-                            db.validate_page_codec(options.page_codec.as_deref())?;
-                            Self::check_registry_dialect(&db, options.dialect.as_ref())?;
-                            return Ok(IOResult::Done(db));
+                let key = DatabaseKey::File(file_id, io.registry_scope());
+                let cached = {
+                    let mut registry = DATABASE_MANAGER.lock();
+                    let cached = match registry.get(&key) {
+                        Some(RegistryEntry::Ready(weak)) => weak.upgrade(),
+                        Some(RegistryEntry::Opening) => {
+                            return Ok(IOResult::IO(types::IOCompletions(
+                                io::Completion::new_yield(),
+                            )));
                         }
-                        // Weak ref expired — treat as absent, fall through to insert Opening.
+                        None => None,
+                    };
+                    if cached.is_none() {
                         registry.insert(key.clone(), RegistryEntry::Opening);
                     }
-                    Some(RegistryEntry::Opening) => {
-                        // Another caller is already opening this path. Yield so the
-                        // event loop can make progress and we retry later.
-                        return Ok(IOResult::IO(types::IOCompletions(
-                            io::Completion::new_yield(),
-                        )));
+                    cached
+                };
+                if let Some(db) = cached {
+                    tracing::debug!("took database {path:?} from the registry");
+                    let db_is_encrypted =
+                        !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
+                    if db_is_encrypted && options.encryption.is_none() {
+                        return Err(LimboError::InvalidArgument(
+                            "Database is encrypted but no encryption options provided".to_string(),
+                        )
+                        .into());
                     }
-                    None => {
-                        // Not in registry — mark as Opening and proceed.
-                        registry.insert(key.clone(), RegistryEntry::Opening);
-                    }
+                    db.validate_page_codec(options.page_codec.as_deref())?;
+                    Self::check_registry_dialect(&db, options.dialect.as_ref())?;
+                    return Ok(IOResult::Done(db));
                 }
                 state.registry_key = Some(key);
             }
@@ -1603,6 +1645,18 @@ impl Database {
 
                     // Wrap db in Arc before connecting
                     let db = Arc::new(db);
+                    if let Some(key @ DatabaseKey::File(_, Some(_))) = &state.registry_key {
+                        let registration = ScopedRegistration {
+                            key: key.clone(),
+                            owner: Arc::downgrade(&db),
+                        };
+                        if db.registry_registration.set(registration).is_err() {
+                            return Err(LimboError::InternalError(
+                                "database registry ownership was already installed".to_string(),
+                            )
+                            .into());
+                        }
+                    }
 
                     // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
                     let conn = db._connect(
@@ -2348,6 +2402,10 @@ impl Database {
     #[cfg(feature = "conn_raw_api")]
     /// Rebuild the process-local shared WAL view after a caller restores the
     /// database and WAL files outside the pager.
+    ///
+    /// The caller must keep writers, flushers and checkpoints quiescent while replacing the files
+    /// and rebuilding this view. Invalidating old durability proofs does not make concurrent
+    /// external file replacement atomic with running operations.
     pub fn reload_wal_after_external_restore(self: &Arc<Self>) -> Result<()> {
         if self.page_codec_id.is_some() {
             return Err(LimboError::InvalidArgument(
@@ -3025,6 +3083,43 @@ impl Database {
         ))
     }
 
+    /// Capture the committed WAL prefix and its existing durability proof in one generation.
+    /// No I/O is performed. The shared log guard excludes restart, restore and commit publication
+    /// while its header identity, committed end and completed-flush proof are read together.
+    pub fn wal_prefix(&self) -> WalPrefix {
+        let shared = self.shared_wal.read();
+        let generation = shared.metadata.wal_header.lock().checkpoint_seq;
+        let frame = shared.metadata.max_frame.load(Ordering::Acquire);
+        let durable = *shared.runtime.durable.lock();
+        WalPrefix {
+            header: Arc::clone(&shared.metadata.wal_header),
+            generation,
+            frame,
+            already_durable: !self.opts.enable_multiprocess_wal
+                && durable.is_some_and(|(g, f)| g == generation && f >= frame),
+        }
+    }
+
+    /// A successful file sync begun after `prefix` was captured covers that prefix. Stale or
+    /// foreign prefixes are ignored, including a same-generation external restore. Multi-process
+    /// WALs have an external authority and do not accept process-local durability proofs.
+    pub fn wal_prefix_durable(&self, prefix: WalPrefix) {
+        if self.opts.enable_multiprocess_wal {
+            return;
+        }
+        let shared = self.shared_wal.read();
+        if !Arc::ptr_eq(&shared.metadata.wal_header, &prefix.header)
+            || shared.metadata.wal_header.lock().checkpoint_seq != prefix.generation
+        {
+            return;
+        }
+        let mut durable = shared.runtime.durable.lock();
+        match *durable {
+            Some((g, f)) if g == prefix.generation && f >= prefix.frame => {}
+            _ => *durable = Some((prefix.generation, prefix.frame)),
+        }
+    }
+
     /// Amphora: where the log ends, as (its generation, the header's `checkpoint_seq`; its last
     /// committed frame). A flush of the log's file begun after this makes every frame up to it
     /// durable ([`Database::wal_durable`]).
@@ -3041,9 +3136,18 @@ impl Database {
     /// begun after [`Database::wal_end`] answered them has ended. A checkpoint of frames within it
     /// flushes no log of its own. A generation the log has since left is ignored (a restart holds
     /// the shared log's write lock, so none happens between the check and the update).
+    ///
+    /// This legacy tuple cannot identify a replaced WAL. After the first external reload (or a
+    /// generation-counter wrap), publications through this method are conservatively ignored for
+    /// this database instance; checkpoints then perform their own required sync. Multi-process WAL
+    /// publications are also ignored. Use [`Database::wal_prefix`] and
+    /// [`Database::wal_prefix_durable`] for identity-safe proof publication after reload.
     pub fn wal_durable(&self, generation: u32, frame: u64) {
         let shared = self.shared_wal.read();
-        if shared.metadata.wal_header.lock().checkpoint_seq != generation {
+        if self.opts.enable_multiprocess_wal
+            || !shared.runtime.legacy_durable_allowed
+            || shared.metadata.wal_header.lock().checkpoint_seq != generation
+        {
             return;
         }
         let mut durable = shared.runtime.durable.lock();
@@ -3131,6 +3235,8 @@ impl Database {
     }
 
     /// Amphora: the last frame of the log known durable in its current generation.
+    /// After external reload or generation wrap, only identity-bearing prefix publications advance
+    /// this hint; legacy tuple publications are ignored and checkpoints supply any missing sync.
     pub fn wal_durable_frame(&self) -> Option<u64> {
         let shared = self.shared_wal.read();
         let generation = shared.metadata.wal_header.lock().checkpoint_seq;
@@ -3780,6 +3886,117 @@ mod database_tests {
         OpenOptions, PlatformIO, SqliteDialect, IO,
     };
 
+    /// AC-T1.1.1: virtual files share within their backend, never across independent
+    /// backends, and their registry ownership ends with the final Database alias.
+    #[cfg(feature = "fs")]
+    #[test]
+    fn virtual_filesystems_isolate_same_paths_and_release_registry_ownership() {
+        fn check(left: Arc<dyn IO>, right: Arc<dyn IO>) {
+            let path = "registry-scope-behavior.db";
+            let open = |io: Arc<dyn IO>| {
+                Database::open(io, path, OpenOptions::new(Arc::new(SqliteDialect))).unwrap()
+            };
+            let first = open(left.clone());
+            let first_conn = first.connect(ConnectOpts::new()).unwrap();
+            first_conn
+                .execute("CREATE TABLE probe(value TEXT)")
+                .unwrap();
+            first_conn
+                .execute("INSERT INTO probe VALUES ('left')")
+                .unwrap();
+            let second = open(right);
+            let second_conn = second.connect(ConnectOpts::new()).unwrap();
+            second_conn
+                .execute("CREATE TABLE probe(value TEXT)")
+                .unwrap();
+            second_conn
+                .execute("INSERT INTO probe VALUES ('right')")
+                .unwrap();
+            let alias = open(left.clone());
+            let alias_conn = alias.connect(ConnectOpts::new()).unwrap();
+            let value = |connection: &Arc<Connection>| {
+                connection
+                    .prepare("SELECT value FROM probe ORDER BY rowid")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(value(&alias_conn), vec![vec!["left"]]);
+            assert_eq!(value(&second_conn), vec![vec!["right"]]);
+            let old_key =
+                super::DatabaseKey::File(left.file_id(path).unwrap(), left.registry_scope());
+            alias_conn
+                .execute("INSERT INTO probe VALUES ('shared')")
+                .unwrap();
+            assert_eq!(value(&first_conn), vec![vec!["left"], vec!["shared"]]);
+            // Unlinking replaces a virtual file's incarnation while existing handles still
+            // own the preceding bytes, like unlink plus recreate on a native filesystem.
+            left.remove_file(path).unwrap();
+            left.remove_file(&format!("{path}-wal")).unwrap();
+            assert!(left.file_id(path).is_err());
+            let replacement = open(left.clone());
+            let replacement_conn = replacement.connect(ConnectOpts::new()).unwrap();
+            replacement_conn
+                .execute("CREATE TABLE probe(value TEXT)")
+                .unwrap();
+            replacement_conn
+                .execute("INSERT INTO probe VALUES ('new')")
+                .unwrap();
+            let replacement_alias = open(left.clone());
+            let replacement_alias_conn = replacement_alias.connect(ConnectOpts::new()).unwrap();
+            assert_eq!(value(&replacement_alias_conn), vec![vec!["new"]]);
+            assert_eq!(value(&first_conn), vec![vec!["left"], vec!["shared"]]);
+            let new_key =
+                super::DatabaseKey::File(left.file_id(path).unwrap(), left.registry_scope());
+            drop(first_conn);
+            drop(first);
+            assert!(
+                super::DATABASE_MANAGER.lock().contains_key(&old_key),
+                "an alias still owns the registry entry"
+            );
+            drop(alias_conn);
+            drop(alias);
+            assert!(
+                !super::DATABASE_MANAGER.lock().contains_key(&old_key),
+                "closed virtual files cannot retain registry entries"
+            );
+            assert!(
+                super::DATABASE_MANAGER.lock().contains_key(&new_key),
+                "old cleanup cannot remove the replacement"
+            );
+            drop(replacement_conn);
+            drop(replacement);
+            assert!(
+                super::DATABASE_MANAGER.lock().contains_key(&new_key),
+                "the replacement alias still owns its entry"
+            );
+            drop(replacement_alias_conn);
+            drop(replacement_alias);
+            assert!(
+                !super::DATABASE_MANAGER.lock().contains_key(&new_key),
+                "the final alias releases its entry"
+            );
+        }
+        check(
+            Arc::new(crate::MemoryIO::new()),
+            Arc::new(crate::MemoryIO::new()),
+        );
+        #[cfg(feature = "io_memory_yield")]
+        {
+            check(
+                Arc::new(crate::MemoryYieldIO::new()),
+                Arc::new(crate::MemoryYieldIO::new()),
+            );
+            check(
+                Arc::new(crate::MemoryIO::new()),
+                Arc::new(crate::MemoryYieldIO::new()),
+            );
+        }
+    }
+
     #[test]
     fn memory_path_classifies_named_memory_databases() {
         assert!(is_memory_like(":memory:"));
@@ -3798,6 +4015,7 @@ mod database_tests {
 
         let io = Database::io_for_path(&path).unwrap();
 
+        io.open_file(&path, OpenFlags::Create, false).unwrap();
         assert!(io.file_id(&path).is_ok());
         assert!(std::fs::metadata(&path).is_err());
     }

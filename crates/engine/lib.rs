@@ -140,7 +140,7 @@ pub(crate) use database::{is_memory_like, DatabaseCatalog, InitState};
 pub use database::{
     ConnectAsyncState, ConnectOpts, Database, DatabaseAllocators, DatabaseOpts, EncryptionOpts,
     OpenDbAsyncPhase, OpenDbAsyncState, OpenOptions, SharedWalCoordinationOpenTelemetryMode,
-    SharedWalOpenTelemetry,
+    SharedWalOpenTelemetry, WalPrefix,
 };
 #[cfg(all(
     test,
