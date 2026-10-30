@@ -508,6 +508,53 @@ mod tests {
         let mut deletes = Vec::new();
         db.query("SELECT seq,value FROM __amphora_versions WHERE namespace='host' AND rev=3 ORDER BY seq",[],|r| {deletes.push((rev(r,0)?,bytes(r,1)?));Ok(true)})?;
         assert_eq!(deletes, vec![(0, Some(b"new".to_vec())), (1, None)]);
+        // U06: the boundary deletion stays observable, then obsolete history is reclaimed.
+        for before in [3, 4] {
+            db.transaction(|db| {
+                super::super::apply(
+                    db,
+                    "host",
+                    &Operation::Mutation(Mutation::Compact {
+                        namespace: "host".into(),
+                        before,
+                    }),
+                )??;
+                Ok(())
+            })?;
+            if before == 3 {
+                let answer =
+                    super::super::apply(&db, "host", &Operation::Changes("items".into(), 2, 10))??;
+                let Answer::Changes(page) = answer else {
+                    anyhow::bail!("missing boundary changes")
+                };
+                assert_eq!(page.changes.len(), 2);
+                assert!(
+                    page.changes
+                        .iter()
+                        .any(|change| change.key == b"b" && change.value.is_none())
+                );
+            }
+        }
+        let mut retained = 0;
+        db.query(
+            "SELECT COUNT(*) FROM __amphora_versions WHERE namespace = 'host'",
+            [],
+            |row| {
+                retained = rev(row, 0)?;
+                Ok(false)
+            },
+        )?;
+        assert_eq!(
+            retained, 1,
+            "compaction retains one live baseline, not deleted-key history"
+        );
+        drop(db);
+        let db = open(&path)?;
+        assert!(get(&db, "host", "items", b"b", 5)?.is_none());
+        assert_eq!(
+            get(&db, "host", "items", b"a", 5)?.map(|row| row.rev),
+            Some(3)
+        );
         Ok(())
     }
     #[test]

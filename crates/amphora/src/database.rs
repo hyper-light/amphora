@@ -1384,6 +1384,13 @@ fn apply(
         Operation::Mutation(Mutation::Compact { before, .. }) => {
             let before = (*before).min(head).max(horizon);
             db.query("DELETE FROM __amphora_versions WHERE namespace = ?1 AND rev < (SELECT MAX(w.rev) FROM __amphora_versions w WHERE w.namespace = __amphora_versions.namespace AND w.family = __amphora_versions.family AND w.key = __amphora_versions.key AND w.rev <= ?2)", [text(namespace), integer(before)?], |_| Ok(true))?;
+            // U06, CP-T1.5: older values are gone, so an obsolete deletion can no longer
+            // resurrect a key. Keep the boundary event for changes(after = before - 1).
+            db.query(
+                "DELETE FROM __amphora_versions WHERE namespace = ?1 AND value IS NULL AND rev < ?2",
+                [text(namespace), integer(before)?],
+                |_| Ok(true),
+            )?;
             db.query(
                 "UPDATE __amphora_namespaces SET horizon = ?2, feed = ?3 WHERE name = ?1",
                 [

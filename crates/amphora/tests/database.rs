@@ -277,6 +277,7 @@ fn records_cas_snapshots_feeds_compaction_and_namespaces_survive_reopen() {
     let path = dir.path().join("records.db");
     let first;
     let second;
+    let compacted;
     {
         let db = Database::open(&path, until()).unwrap();
         let records = db.namespace("server").unwrap();
@@ -284,7 +285,12 @@ fn records_cas_snapshots_feeds_compaction_and_namespaces_survive_reopen() {
             .commit(
                 Tx {
                     conds: vec![absent(b"a")],
-                    writes: vec![put(b"a", b"one"), put(&[255, 1], b"binary")],
+                    writes: vec![
+                        put(b"a", b"one"),
+                        put(&[255, 1], b"binary"),
+                        put(b"retired", b"old value"),
+                        put(b"boundary", b"old value"),
+                    ],
                 },
                 until(),
             )
@@ -345,7 +351,85 @@ fn records_cas_snapshots_feeds_compaction_and_namespaces_survive_reopen() {
                 .unwrap()
                 .is_none()
         );
-        records.compact(second, until()).unwrap();
+        // U06, CP-T1.5: one deletion falls below the horizon; one is its feed boundary.
+        let deleted = records
+            .commit(
+                Tx {
+                    conds: vec![],
+                    writes: vec![Write::Delete {
+                        family: "items".into(),
+                        key: b"retired".into(),
+                    }],
+                },
+                until(),
+            )
+            .unwrap();
+        compacted = records
+            .commit(
+                Tx {
+                    conds: vec![],
+                    writes: vec![Write::Delete {
+                        family: "items".into(),
+                        key: b"boundary".into(),
+                    }],
+                },
+                until(),
+            )
+            .unwrap();
+        records.compact(compacted, until()).unwrap();
+        records.compact(compacted, until()).unwrap();
+        let boundary = records.changes("items", deleted, 100, until()).unwrap();
+        assert_eq!(boundary.head, compacted);
+        assert_eq!(boundary.changes.len(), 1);
+        assert_eq!(boundary.changes[0].rev, compacted);
+        assert_eq!(boundary.changes[0].key, b"boundary");
+        assert_eq!(boundary.changes[0].value, None);
+        assert!(matches!(
+            records.changes("items", second, 100, until()),
+            Err(Refusal::Compacted { .. })
+        ));
+        assert_eq!(
+            records
+                .commit(
+                    Tx {
+                        conds: vec![Cond::At {
+                            family: "items".into(),
+                            key: b"a".into(),
+                            rev: second,
+                        }],
+                        writes: vec![],
+                    },
+                    until(),
+                )
+                .unwrap(),
+            compacted,
+            "a current live revision remains a valid CAS even below the snapshot horizon"
+        );
+        let scan = Scan {
+            prefix: vec![],
+            after: None,
+            limit: 10,
+            at: Consistency::Snapshot(compacted),
+        };
+        let visible = records.scan("items", scan.clone(), until()).unwrap();
+        assert_eq!(visible.rows.len(), 2);
+        assert!(
+            visible
+                .rows
+                .iter()
+                .all(|row| row.key == b"a" || row.key == [255, 1])
+        );
+        assert!(matches!(
+            records.scan(
+                "items",
+                Scan {
+                    at: Consistency::Snapshot(first),
+                    ..scan
+                },
+                until()
+            ),
+            Err(Refusal::Compacted { .. })
+        ));
         assert!(matches!(
             records.get("items", b"a", Consistency::Snapshot(first), until()),
             Err(Refusal::Compacted { .. })
@@ -353,7 +437,7 @@ fn records_cas_snapshots_feeds_compaction_and_namespaces_survive_reopen() {
     }
     let db = Database::open(&path, until()).unwrap();
     let records = db.namespace("server").unwrap();
-    assert_eq!(records.head(until()).unwrap(), second);
+    assert_eq!(records.head(until()).unwrap(), compacted);
     assert_eq!(
         records
             .get("items", b"a", Consistency::Linearizable, until())
@@ -366,7 +450,44 @@ fn records_cas_snapshots_feeds_compaction_and_namespaces_survive_reopen() {
         records.get("items", b"a", Consistency::Snapshot(first), until()),
         Err(Refusal::Compacted { .. })
     ));
-    assert_eq!(records.wait("items", first, until()).unwrap(), second);
+    for key in [b"retired".as_slice(), b"boundary".as_slice()] {
+        assert!(
+            records
+                .get("items", key, Consistency::Linearizable, until())
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert_eq!(
+        records
+            .commit(
+                Tx {
+                    conds: vec![absent(b"retired")],
+                    writes: vec![]
+                },
+                until()
+            )
+            .unwrap(),
+        compacted
+    );
+    assert!(matches!(
+        records.commit(
+            Tx {
+                conds: vec![Cond::At {
+                    family: "items".into(),
+                    key: b"retired".into(),
+                    rev: first
+                }],
+                writes: vec![]
+            },
+            until()
+        ),
+        Err(Refusal::Conflict { at: None, .. })
+    ));
+    assert_eq!(
+        records.wait("items", compacted - 1, until()).unwrap(),
+        compacted
+    );
 }
 
 #[test]
