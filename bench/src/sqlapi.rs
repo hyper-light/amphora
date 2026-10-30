@@ -6,19 +6,29 @@
 //! - `logsearch`: ci/logsearch.rs's search page, its cursor stepping down the documents, every
 //!   page's rows folded into a checksum, so two builds' answers can be compared;
 //! - `insert`: ci/logsearch.rs's posting INSERT.
+//! - `parse`: what the session's `validate` does to each of those statements on every execute at e2e67247 (a whole
+//!   parse, then a walk of its tokens for reserved names), timed alone, so a shape's time a statement can be
+//!   set against it.
 //!
 //! Each run reports, per execute, the time inside the calls' closures (the statements alone) and
-//! the calls' whole time (their commits too): one JSON line a run, then the best of each.
+//! the calls' whole time (their commits too): one JSON line a run, then the best of each. Where Linux
+//! keeps it, the closures' own CPU time too (the writer thread's, /proc/thread-self/schedstat): on a
+//! loaded machine a capped run's wall clock counts the time it waits for a CPU, its CPU time doesn't.
 //!
 //! usage: amphora-bench --sql-api --dir <dir> [--shapes reapi,logsearch,insert] [--runs 3]
 //!        [--digests 100000] [--pages 10000] [--rows 100000] [--per-call 1000]
-//!        [--pages-per-call 100] [--label <commit>]
+//!        [--pages-per-call 100] [--parses 20000] [--label <commit>]
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use amphora::database::Database;
 use amphora_api::Value;
+use amphora_engine_parser::{
+    ast::fmt::{BlankContext, ToTokens, TokenStream},
+    parser::Parser,
+    token::TokenType,
+};
 
 const EXISTS: &str = "SELECT EXISTS(SELECT 1 FROM work_records WHERE family = ?1 AND key = ?2 AND at >= ?3) AND EXISTS(SELECT 1 FROM cas_index WHERE digest = ?4)";
 const SIZE: &str = "SELECT size FROM cas_index WHERE digest = ?1";
@@ -62,19 +72,31 @@ struct Opts {
     rows: u64,
     per_call: u64,
     pages_per_call: u64,
+    parses: u64,
     label: String,
 }
 
-/// What a run measured: its executes, the time inside its closures and the calls' whole time.
-#[derive(Default)]
+/// What a run measured: its executes, the time inside its closures (and their CPU time, where it's
+/// known), and the calls' whole time.
 struct Timed {
     executes: u64,
     inside: Duration,
+    cpu: Option<u64>,
     whole: Duration,
     checksum: u64,
 }
 
 impl Timed {
+    fn new() -> Self {
+        Timed { executes: 0, inside: Duration::ZERO, cpu: Some(0), whole: Duration::ZERO, checksum: 0 }
+    }
+    /// One call's figures added in.
+    fn add(&mut self, executes: u64, inside: Duration, cpu: Option<u64>, whole: Duration) {
+        self.executes += executes;
+        self.inside += inside;
+        self.cpu = self.cpu.zip(cpu).map(|(a, b)| a + b);
+        self.whole += whole;
+    }
     fn per_execute(d: Duration, executes: u64) -> f64 {
         d.as_nanos() as f64 / executes.max(1) as f64
     }
@@ -86,6 +108,16 @@ fn mix(mut x: u64) -> u64 {
     x ^= x >> 33;
     x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
     x ^ (x >> 33)
+}
+
+/// The calling thread's time on a CPU so far, in nanoseconds: Linux's schedstat, elsewhere unknown.
+fn cpu_ns() -> Option<u64> {
+    std::fs::read_to_string("/proc/thread-self/schedstat").ok()?.split_whitespace().next()?.parse().ok()
+}
+
+/// The CPU time since `from` (a `cpu_ns` reading on this thread).
+fn cpu_since(from: Option<u64>) -> Option<u64> {
+    from.zip(cpu_ns()).map(|(a, b)| b.saturating_sub(a))
 }
 
 fn until() -> Instant {
@@ -161,13 +193,13 @@ fn reapi_setup(db: &Database, digests: &[String]) -> anyhow::Result<()> {
 }
 
 fn reapi_run(db: &Database, digests: &[String], per_call: u64) -> anyhow::Result<Timed> {
-    let mut t = Timed::default();
+    let mut t = Timed::new();
     for chunk in digests.chunks(usize::try_from(per_call.max(1))?) {
         let chunk = chunk.to_vec();
         let began = Instant::now();
-        let (executes, inside) = db
+        let (executes, inside, cpu) = db
             .call(until(), move |c| {
-                let started = Instant::now();
+                let (started, cpu) = (Instant::now(), cpu_ns());
                 let mut held = c.prepare_cached(EXISTS)?;
                 let mut size = c.prepare_cached(SIZE)?;
                 let mut touch = c.prepare_cached(TOUCH)?;
@@ -177,12 +209,10 @@ fn reapi_run(db: &Database, digests: &[String], per_call: u64) -> anyhow::Result
                     let _: i64 = size.query_row(vec![Value::Text(d.clone())], |r| r.get(0))?;
                     anyhow::ensure!(touch.execute(vec![Value::Text(d.clone()), Value::Integer(NOW + 1)])? == 1, "digest {d} wasn't touched");
                 }
-                Ok((chunk.len() as u64 * 3, started.elapsed()))
+                Ok((chunk.len() as u64 * 3, started.elapsed(), cpu_since(cpu)))
             })
             .map_err(refused)?;
-        t.whole += began.elapsed();
-        t.inside += inside;
-        t.executes += executes;
+        t.add(executes, inside, cpu, began.elapsed());
     }
     Ok(t)
 }
@@ -227,15 +257,15 @@ fn logsearch_setup(db: &Database, docs: u64) -> anyhow::Result<()> {
 }
 
 fn logsearch_run(db: &Database, pages: u64, per_call: u64) -> anyhow::Result<Timed> {
-    let mut t = Timed { checksum: 0xcbf29ce484222325, ..Timed::default() };
+    let mut t = Timed { checksum: 0xcbf29ce484222325, ..Timed::new() };
     let (mut cursor, mut left) = (i64::MAX, pages);
     while left > 0 {
         let n = left.min(per_call.max(1));
         let (h, start) = (t.checksum, cursor);
         let began = Instant::now();
-        let (h, next, inside) = db
+        let (h, next, inside, cpu) = db
             .call(until(), move |c| {
-                let started = Instant::now();
+                let (started, cpu) = (Instant::now(), cpu_ns());
                 let (mut h, mut cursor) = (h, start);
                 let mut page = c.prepare_cached(PAGE)?;
                 for _ in 0..n {
@@ -261,29 +291,78 @@ fn logsearch_run(db: &Database, pages: u64, per_call: u64) -> anyhow::Result<Tim
                     let Some(id) = last else { anyhow::bail!("a page below {cursor} came back empty: --pages is past the documents") };
                     cursor = id - 1;
                 }
-                Ok((h, cursor, started.elapsed()))
+                Ok((h, cursor, started.elapsed(), cpu_since(cpu)))
             })
             .map_err(refused)?;
-        t.whole += began.elapsed();
-        t.inside += inside;
-        t.executes += n;
+        t.add(n, inside, cpu, began.elapsed());
         (t.checksum, cursor) = (h, next);
         left -= n;
     }
     Ok(t)
 }
 
+/// The reserved-name walk of crates/amphora/src/sql.rs's `validate_reserved_command`, its checks made the same
+/// way: that function is private to the session.
+struct Reserved {
+    tokens: usize,
+}
+
+impl TokenStream for Reserved {
+    type Error = anyhow::Error;
+    fn append(&mut self, kind: TokenType, value: Option<&str>) -> anyhow::Result<()> {
+        self.tokens += 1;
+        if kind == TokenType::TK_ID
+            && let Some(name) = value
+        {
+            let name = match name.as_bytes().first() {
+                Some(b'\'' | b'"' | b'`' | b'[') => name.get(1..).unwrap_or(""),
+                _ => name,
+            };
+            anyhow::ensure!(!name.get(..10).is_some_and(|p| p.eq_ignore_ascii_case("__amphora_")), "{name} is reserved");
+        }
+        Ok(())
+    }
+}
+
+/// `validate`'s work on one statement: parse it whole, then walk its tokens.
+fn validate_like(sql: &str) -> anyhow::Result<usize> {
+    let mut parser = Parser::new(sql.as_bytes());
+    let mut tokens = 0;
+    while let Some(command) = parser.next_cmd().map_err(refused)? {
+        let mut walk = Reserved { tokens: 0 };
+        command.to_tokens(&mut walk, &BlankContext)?;
+        tokens += walk.tokens;
+    }
+    Ok(tokens)
+}
+
+/// Nanoseconds a validation of each statement, over `parses` of each: wall clock, and CPU time where known.
+fn parse_run(parses: u64) -> anyhow::Result<Vec<(&'static str, f64, Option<f64>)>> {
+    let mut each = Vec::new();
+    for (name, sql) in [("exists", EXISTS), ("size", SIZE), ("touch", TOUCH), ("page", PAGE), ("posting", POSTING)] {
+        let (began, cpu) = (Instant::now(), cpu_ns());
+        let mut tokens = 0usize;
+        for _ in 0..parses {
+            tokens = tokens.wrapping_add(validate_like(std::hint::black_box(sql))?);
+        }
+        std::hint::black_box(tokens);
+        let wall = Timed::per_execute(began.elapsed(), parses);
+        each.push((name, wall, cpu_since(cpu).map(|ns| ns as f64 / parses.max(1) as f64)));
+    }
+    Ok(each)
+}
+
 fn insert_run(db: &Database, rows: u64, per_call: u64) -> anyhow::Result<Timed> {
     db.call(until(), |c| Ok(c.execute_batch("CREATE TABLE ci_log_grams (gram INTEGER NOT NULL, doc INTEGER NOT NULL, PRIMARY KEY (gram, doc)); CREATE INDEX ci_log_grams_doc ON ci_log_grams (doc, gram);")?))
         .map_err(refused)?;
-    let mut t = Timed::default();
+    let mut t = Timed::new();
     let (mut next, step) = (0u64, per_call.max(1));
     while next < rows {
         let (from, to) = (next, rows.min(next + step));
         let began = Instant::now();
-        let inside = db
+        let (inside, cpu) = db
             .call(until(), move |c| {
-                let started = Instant::now();
+                let (started, cpu) = (Instant::now(), cpu_ns());
                 let mut posting = c.prepare_cached(POSTING)?;
                 for i in from..to {
                     // A hundred postings a document, each its own gram: (gram, doc) never repeats.
@@ -291,12 +370,10 @@ fn insert_run(db: &Database, rows: u64, per_call: u64) -> anyhow::Result<Timed> 
                     let gram = (i % 100) * 100_000 + mix(doc) % 100_000;
                     posting.execute(vec![Value::Integer(gram as i64), Value::Integer(doc as i64)])?;
                 }
-                Ok(started.elapsed())
+                Ok((started.elapsed(), cpu_since(cpu)))
             })
             .map_err(refused)?;
-        t.whole += began.elapsed();
-        t.inside += inside;
-        t.executes += to - from;
+        t.add(to - from, inside, cpu, began.elapsed());
         next = to;
     }
     Ok(t)
@@ -312,6 +389,7 @@ fn opts() -> anyhow::Result<Opts> {
         rows: 100_000,
         per_call: 1_000,
         pages_per_call: 100,
+        parses: 20_000,
         label: String::new(),
     };
     let mut args = std::env::args().skip(1);
@@ -327,6 +405,7 @@ fn opts() -> anyhow::Result<Opts> {
             "--rows" => o.rows = v()?.parse()?,
             "--per-call" => o.per_call = v()?.parse()?,
             "--pages-per-call" => o.pages_per_call = v()?.parse()?,
+            "--parses" => o.parses = v()?.parse()?,
             "--label" => o.label = v()?,
             other => anyhow::bail!("unknown argument {other}"),
         }
@@ -339,7 +418,35 @@ fn opts() -> anyhow::Result<Opts> {
 pub fn main() -> anyhow::Result<()> {
     let o = opts()?;
     for shape in &o.shapes {
-        let mut best: Option<(f64, f64)> = None;
+        if shape == "parse" {
+            let mut best: Vec<(&str, f64, Option<f64>)> = Vec::new();
+            for run in 1..=o.runs {
+                let load = crate::planner::load_average();
+                for (statement, ns, cpu) in parse_run(o.parses)? {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "record": "sql_api", "label": o.label, "shape": "parse", "run": run, "statement": statement,
+                            "parses": o.parses, "ns_per_parse": ns, "cpu_ns_per_parse": cpu, "load": load })
+                    );
+                    match best.iter_mut().find(|(s, _, _)| *s == statement) {
+                        Some((_, b, c)) => {
+                            *b = b.min(ns);
+                            *c = c.zip(cpu).map(|(c, cpu)| c.min(cpu));
+                        }
+                        None => best.push((statement, ns, cpu)),
+                    }
+                }
+            }
+            for (statement, ns, cpu) in best {
+                println!(
+                    "{}",
+                    serde_json::json!({ "record": "best", "label": o.label, "shape": "parse", "runs": o.runs, "statement": statement,
+                        "ns_per_parse": ns, "cpu_ns_per_parse": cpu })
+                );
+            }
+            continue;
+        }
+        let mut best: Option<(f64, f64, Option<f64>)> = None;
         let mut checksums = Vec::new();
         let reapi = (shape == "reapi").then(|| (0..o.digests).map(digest).collect::<Vec<_>>());
         let db = match shape.as_str() {
@@ -354,7 +461,7 @@ pub fn main() -> anyhow::Result<()> {
                 Some(db)
             }
             "insert" => None,
-            other => anyhow::bail!("no shape {other}: reapi, logsearch or insert"),
+            other => anyhow::bail!("no shape {other}: reapi, logsearch, insert or parse"),
         };
         for run in 1..=o.runs {
             let load = crate::planner::load_average();
@@ -364,23 +471,24 @@ pub fn main() -> anyhow::Result<()> {
                 _ => insert_run(&fresh(&o.dir, &format!("insert-{run}.db"))?, o.rows, o.per_call)?,
             };
             let (inside, whole) = (Timed::per_execute(t.inside, t.executes), Timed::per_execute(t.whole, t.executes));
-            best = Some(best.map_or((inside, whole), |(i, w)| (i.min(inside), w.min(whole))));
+            let cpu = t.cpu.map(|ns| ns as f64 / t.executes.max(1) as f64);
+            best = Some(best.map_or((inside, whole, cpu), |(i, w, c)| (i.min(inside), w.min(whole), c.zip(cpu).map(|(c, cpu)| c.min(cpu)))));
             if shape == "logsearch" {
                 checksums.push(t.checksum);
             }
             println!(
                 "{}",
                 serde_json::json!({ "record": "sql_api", "label": o.label, "shape": shape, "run": run, "executes": t.executes,
-                    "inside_ns_per_execute": inside, "whole_ns_per_execute": whole, "load": load,
+                    "inside_ns_per_execute": inside, "inside_cpu_ns_per_execute": cpu, "whole_ns_per_execute": whole, "load": load,
                     "checksum": (shape == "logsearch").then(|| format!("{:016x}", t.checksum)) })
             );
         }
         anyhow::ensure!(checksums.windows(2).all(|w| w.first() == w.last()), "the {shape} runs answered differently: {checksums:x?}");
-        if let Some((inside, whole)) = best {
+        if let Some((inside, whole, cpu)) = best {
             println!(
                 "{}",
                 serde_json::json!({ "record": "best", "label": o.label, "shape": shape, "runs": o.runs,
-                    "inside_ns_per_execute": inside, "whole_ns_per_execute": whole })
+                    "inside_ns_per_execute": inside, "inside_cpu_ns_per_execute": cpu, "whole_ns_per_execute": whole })
             );
         }
     }
