@@ -368,6 +368,17 @@ pub trait Session {
     }
     fn execute_batch(&self, sql: &str) -> Result<()>;
     fn query(&self, sql: &str, params: Vec<Value>, first: bool) -> Result<Vec<Vec<Value>>>;
+    /// `query` for a prepared statement's text, which this session's `column_count` accepted when
+    /// the statement was prepared and which never changes after: a session may run it without
+    /// validating it again. Unless a session says otherwise, it validates as `query` does.
+    fn query_prepared(
+        &self,
+        sql: &str,
+        params: Vec<Value>,
+        first: bool,
+    ) -> Result<Vec<Vec<Value>>> {
+        self.query(sql, params, first)
+    }
     fn column_count(&self, sql: &str) -> Result<usize>;
     fn changes(&self) -> i64;
     fn last_insert_rowid(&self) -> i64;
@@ -476,6 +487,23 @@ impl<'db> Connection<'db> {
     }
 
     fn rows(&self, sql: &str, params: impl Params, first: bool) -> Result<Vec<Row<'static>>> {
+        let params = self.request(sql, params)?;
+        Ok(owned(self.db.query(sql, params, first)?))
+    }
+
+    /// A prepared statement's rows: its text was validated when it was prepared.
+    fn prepared_rows(
+        &self,
+        sql: &str,
+        params: impl Params,
+        first: bool,
+    ) -> Result<Vec<Row<'static>>> {
+        let params = self.request(sql, params)?;
+        Ok(owned(self.db.query_prepared(sql, params, first)?))
+    }
+
+    /// A request's parameters, checked against its bounds.
+    fn request(&self, sql: &str, params: impl Params) -> Result<Vec<Value>> {
         self.finish()?;
         let params = params.values()?;
         crate::bound("SQL parameters", params.len(), crate::TX_MAX).map_err(failed)?;
@@ -486,17 +514,17 @@ impl<'db> Connection<'db> {
                 .ok_or_else(|| failed("SQL request size overflow"))?;
         }
         crate::bound("SQL request bytes", bytes, crate::RESULT_MAX).map_err(failed)?;
-        let rows = self
-            .db
-            .query(sql, params, first)?
-            .into_iter()
-            .map(|values| Row {
-                values,
-                lifetime: PhantomData,
-            })
-            .collect();
-        Ok(rows)
+        Ok(params)
     }
+}
+
+fn owned(rows: Vec<Vec<Value>>) -> Vec<Row<'static>> {
+    rows.into_iter()
+        .map(|values| Row {
+            values,
+            lifetime: PhantomData,
+        })
+        .collect()
 }
 
 pub struct Statement<'c, 'db> {
@@ -506,34 +534,44 @@ pub struct Statement<'c, 'db> {
 }
 impl Statement<'_, '_> {
     pub fn exists(&mut self, params: impl Params) -> Result<bool> {
-        Ok(!self.connection.rows(&self.sql, params, true)?.is_empty())
+        Ok(!self
+            .connection
+            .prepared_rows(&self.sql, params, true)?
+            .is_empty())
     }
     pub fn column_count(&self) -> usize {
         self.columns
     }
     pub fn execute(&mut self, params: impl Params) -> Result<usize> {
-        self.connection.execute(&self.sql, params)
+        self.connection.prepared_rows(&self.sql, params, false)?;
+        usize::try_from(self.connection.db.changes()).map_err(failed)
     }
     pub fn query_row<T>(
         &mut self,
         params: impl Params,
-        map: impl FnMut(&Row<'_>) -> Result<T>,
+        mut map: impl FnMut(&Row<'_>) -> Result<T>,
     ) -> Result<T> {
-        self.connection.query_row(&self.sql, params, map)
+        let rows = self.connection.prepared_rows(&self.sql, params, true)?;
+        rows.first()
+            .ok_or(Error::QueryReturnedNoRows)
+            .and_then(&mut map)
     }
     pub fn query_map<T>(
         &mut self,
         params: impl Params,
         mut map: impl FnMut(&Row<'_>) -> Result<T>,
     ) -> Result<MappedRows<T>> {
-        let rows = self.connection.rows(&self.sql, params, false)?;
+        let rows = self.connection.prepared_rows(&self.sql, params, false)?;
         Ok(MappedRows {
             rows: rows.iter().map(&mut map).collect::<Vec<_>>().into_iter(),
         })
     }
     pub fn query(&mut self, params: impl Params) -> Result<Rows> {
         Ok(Rows {
-            rows: self.connection.rows(&self.sql, params, false)?.into_iter(),
+            rows: self
+                .connection
+                .prepared_rows(&self.sql, params, false)?
+                .into_iter(),
             current: None,
         })
     }

@@ -1290,3 +1290,41 @@ refused, and the table stayed at 2 (adas-mac-studio-3, 2026-11-01).
 
 **Falsified by.** A query that waits behind the writer or a flush (the test above), one that writes,
 or one that sees a commit made after it began.
+
+## 34. A prepared statement is validated once, when it's prepared
+
+**Decision.** The public SQL API's `Statement` (`crates/api/src/sql.rs`) runs through
+`Session::query_prepared`, for text the session's `column_count` validated when
+`Connection::prepare` made the statement; the text is the statement's own and never changes after.
+The local session (`crates/amphora/src/sql.rs`, `Db`) runs it without validating it again:
+validation reads the text alone (the whole statement parsed, its tokens walked for reserved names,
+transaction and connection control refused), so its answer can't change between executes. A call
+given text (`Connection::execute`, `query_row`, `execute_batch`) validates every time, as before,
+and a session that says nothing (`Session::query_prepared`'s default, the remote client's, whose
+owner validates what it receives) validates a prepared statement's text on every execute too. What
+this leaves to kiln plan `01a18d12142c7789a40e959ccdf52bd1`, step 2: `prepare_cached` still prepares
+anew, and the engine's plan is still found by its text in Db's statement cache.
+
+**Why.** The unify audit's finding 4: every execute of a prepared statement parsed its SQL again to
+validate it, 1,001 parses for 1,000 executes, though Db's statement cache spared the engine's own
+prepare. On kiln's hot statements at e2e67247 that validation was 27% of a REAPI digest's CPU time
+(2,891 of 10,729 ns: memo.rs `missing`'s EXISTS, cas.rs `object`'s SELECT and UPDATE), 35% of a log
+search page's (15,269 of 43,175 ns) and 17% of a posting INSERT's (649 of 3,756 ns), by
+`amphora-bench --sql-api --shapes parse` beside each shape, the writer thread's CPU time, best of 3,
+on adacachy at load 15 to 22: an estimate beside production, not a recorded run.
+
+**Sources.** sqlite.org/c3ref/stmt.html: "The original SQL text is source code. A prepared statement
+object is the compiled object code", and its life-cycle prepares once, then binds, steps and resets
+it again and again ("Reset the prepared statement using sqlite3_reset() then go back to step 2. Do
+this zero or more times"). The plan's research `01a18d12143072d5992fe36a5f3b2ccb` keeps the notes.
+
+**Evidence.** `crates/amphora/src/sql.rs`, `a_prepared_statement_is_parsed_once_however_often_it_runs`:
+1,000 executes of one `prepare_cached` INSERT and 1,000 runs of log search's next page (kiln's
+`ci/logsearch.rs` at r80, three correlated subqueries) through one `prepare_cached` statement. At
+e2e67247 the INSERT parsed 1,001 times (the test failed there, its pages already right); with this
+decision each text parsed once, every page's rows the same as e2e67247's (blocks 2 and 1 of leg l1,
+then 7 of l0), and the same INSERT given as text parsed again.
+
+**Falsified by.** A prepared statement that runs what validation refuses (its text can't change, so
+this would be a fault in `prepare`); a text call that runs without validation; or, at plan step 3,
+the parser above 1% of a prepared statement's hot loop.

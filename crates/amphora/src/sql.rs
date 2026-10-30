@@ -97,7 +97,33 @@ fn validate_reserved_command(command: &Cmd) -> std::result::Result<(), amphora_a
     command.to_tokens(&mut Identifiers { tokens: 0 }, &BlankContext)
 }
 
+/// Each SQL text's parses by `validate`, counted in tests only (the unify audit's finding 4: a
+/// prepared statement is parsed once, not again on every execute).
+#[cfg(test)]
+static PARSED: std::sync::Mutex<Option<std::collections::HashMap<String, usize>>> =
+    std::sync::Mutex::new(None);
+
+/// How many times `validate` has parsed `sql` in this test process.
+#[cfg(test)]
+fn parses(sql: &str) -> usize {
+    PARSED
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|parsed| parsed.get(sql).copied())
+        .unwrap_or(0)
+}
+
 fn validate(sql: &str, batch: bool) -> Result<()> {
+    #[cfg(test)]
+    {
+        *PARSED
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Default::default)
+            .entry(sql.to_owned())
+            .or_default() += 1;
+    }
     amphora_api::bound("SQL bytes", sql.len(), amphora_api::SQL_MAX).map_err(failed)?;
     let mut parser = Parser::new(sql.as_bytes());
     let mut count = 0usize;
@@ -157,40 +183,18 @@ impl Session for Db {
     }
     fn query(&self, sql: &str, params: Vec<Value>, first: bool) -> Result<Vec<Vec<Value>>> {
         validate(sql, false)?;
-        let params = params.into_iter().map(native).collect::<Result<Vec<_>>>()?;
-        let mut rows = Vec::new();
-        let mut bytes = 0usize;
-        self.query_owned(sql, params, |row| {
-            // Match the transport decoder's owned-allocation budget before acknowledging
-            // a write with RETURNING: a locally accepted result must fit remotely too.
-            bytes = bytes
-                .checked_add(std::mem::size_of::<Vec<Value>>())
-                .ok_or_else(|| anyhow::anyhow!("SQL result size overflow"))?;
-            let mut values = Vec::new();
-            for value in row.get_values() {
-                let payload = match value {
-                    Native::Text(s) => s.as_str().len(),
-                    Native::Blob(b) => b.len(),
-                    _ => 0,
-                };
-                bytes = bytes
-                    .checked_add(std::mem::size_of::<Value>())
-                    .and_then(|n| n.checked_add(payload))
-                    .ok_or_else(|| anyhow::anyhow!("SQL result size overflow"))?;
-                amphora_api::bound("SQL result bytes", bytes, amphora_api::RESULT_MAX)?;
-                values.push(owned(value));
-            }
-            amphora_api::bound("SQL result bytes", bytes, amphora_api::RESULT_MAX)?;
-            let count = rows
-                .len()
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("SQL result row count overflow"))?;
-            amphora_api::bound("SQL result rows", count, amphora_api::RESULT_MAX / 32)?;
-            rows.push(values);
-            Ok(!first)
-        })
-        .map_err(failed)?;
-        Ok(rows)
+        rows(self, sql, params, first)
+    }
+    // `column_count` validated this text when its statement was prepared, and validation reads
+    // the text alone: parsing it again on every execute cost a sixth to a third of kiln's hot
+    // statements (docs/design/store.md, decision 34).
+    fn query_prepared(
+        &self,
+        sql: &str,
+        params: Vec<Value>,
+        first: bool,
+    ) -> Result<Vec<Vec<Value>>> {
+        rows(self, sql, params, first)
     }
     fn column_count(&self, sql: &str) -> Result<usize> {
         validate(sql, false)?;
@@ -202,6 +206,44 @@ impl Session for Db {
     fn last_insert_rowid(&self) -> i64 {
         Db::last_insert_rowid(self)
     }
+}
+
+/// A validated statement's rows, each value owned, within the transport's result bounds.
+fn rows(db: &Db, sql: &str, params: Vec<Value>, first: bool) -> Result<Vec<Vec<Value>>> {
+    let params = params.into_iter().map(native).collect::<Result<Vec<_>>>()?;
+    let mut rows = Vec::new();
+    let mut bytes = 0usize;
+    db.query_owned(sql, params, |row| {
+        // Match the transport decoder's owned-allocation budget before acknowledging
+        // a write with RETURNING: a locally accepted result must fit remotely too.
+        bytes = bytes
+            .checked_add(std::mem::size_of::<Vec<Value>>())
+            .ok_or_else(|| anyhow::anyhow!("SQL result size overflow"))?;
+        let mut values = Vec::new();
+        for value in row.get_values() {
+            let payload = match value {
+                Native::Text(s) => s.as_str().len(),
+                Native::Blob(b) => b.len(),
+                _ => 0,
+            };
+            bytes = bytes
+                .checked_add(std::mem::size_of::<Value>())
+                .and_then(|n| n.checked_add(payload))
+                .ok_or_else(|| anyhow::anyhow!("SQL result size overflow"))?;
+            amphora_api::bound("SQL result bytes", bytes, amphora_api::RESULT_MAX)?;
+            values.push(owned(value));
+        }
+        amphora_api::bound("SQL result bytes", bytes, amphora_api::RESULT_MAX)?;
+        let count = rows
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("SQL result row count overflow"))?;
+        amphora_api::bound("SQL result rows", count, amphora_api::RESULT_MAX / 32)?;
+        rows.push(values);
+        Ok(!first)
+    })
+    .map_err(failed)?;
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -391,5 +433,74 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    // The unify audit's finding 4. Do: 1,000 executes of one prepare_cached INSERT, and 1,000 runs
+    // of one prepare_cached query, log search's next page as kiln's ci/logsearch.rs writes it.
+    // Expect: each SQL text parsed once, at prepare, and every run of the query answering alike;
+    // the same INSERT given as text parses again. The session's validate parsed the text again on
+    // every execute: 1,001 parses each (AC-T1.1.1; docs/design/store.md, decision 34).
+    #[test]
+    fn a_prepared_statement_is_parsed_once_however_often_it_runs() {
+        use amphora_api::Value;
+        const INSERT: &str = "INSERT INTO parsed_once(a, b) VALUES (?1, ?2)";
+        const PAGE: &str = "SELECT p.finished,p.leg_order,p.leg,p.block,p.bits,
+        (SELECT bits FROM ci_log_grams g WHERE g.gram=?2 AND g.finished=p.finished AND g.leg_order=p.leg_order AND g.leg=p.leg AND g.block=p.block),
+        (SELECT bits FROM ci_log_grams g WHERE g.gram=?3 AND g.finished=p.finished AND g.leg_order=p.leg_order AND g.leg=p.leg AND g.block=p.block),
+        (SELECT bits FROM ci_log_grams g WHERE g.gram=?4 AND g.finished=p.finished AND g.leg_order=p.leg_order AND g.leg=p.leg AND g.block=p.block)
+        FROM ci_log_grams p WHERE p.gram=?1 AND (p.finished,p.leg_order,p.leg,p.block)<(?5,?6,?7,?8) ORDER BY p.finished DESC,p.leg_order DESC,p.leg DESC,p.block DESC LIMIT 8";
+        let db = crate::database::Database::in_memory(until()).unwrap();
+        let (pages, prepared, text) = db
+            .call(until(), |c| {
+                c.execute_batch(
+                    "CREATE TABLE parsed_once(a INTEGER, b TEXT);
+                     CREATE TABLE ci_log_grams(gram TEXT, finished INTEGER, leg_order INTEGER, leg TEXT, block INTEGER, bits BLOB);
+                     INSERT INTO ci_log_grams VALUES ('abc', 3, 1, 'l1', 1, x'01'), ('bcd', 3, 1, 'l1', 1, x'02'),
+                       ('abc', 3, 1, 'l1', 2, x'03'), ('cde', 3, 1, 'l1', 2, x'04'), ('abc', 2, 1, 'l0', 7, x'05')",
+                )?;
+                let mut insert = c.prepare_cached(INSERT)?;
+                for i in 0..1000i64 {
+                    insert.execute(vec![Value::Integer(i), Value::Text("x".into())])?;
+                }
+                let prepared = super::parses(INSERT);
+                c.execute(INSERT, vec![Value::Integer(1000), Value::Text("x".into())])?;
+                let text = super::parses(INSERT);
+                let mut page = c.prepare_cached(PAGE)?;
+                let cursor = || {
+                    vec![
+                        Value::Text("abc".into()),
+                        Value::Text("bcd".into()),
+                        Value::Text("cde".into()),
+                        Value::Text("def".into()),
+                        Value::Integer(9),
+                        Value::Integer(9),
+                        Value::Text("zz".into()),
+                        Value::Integer(9),
+                    ]
+                };
+                let mut pages = Vec::new();
+                for _ in 0..1000 {
+                    let blocks: Vec<i64> = page.query_map(cursor(), |r| r.get::<_, i64>(3))?.collect::<Result<_, _>>()?;
+                    pages.push(blocks);
+                }
+                Ok((pages, prepared, text))
+            })
+            .unwrap();
+        assert_eq!(
+            pages[0],
+            [2, 1, 7],
+            "the next page: blocks 2 and 1 of leg l1, then block 7 of l0"
+        );
+        assert!(
+            pages.iter().all(|blocks| *blocks == pages[0]),
+            "every run answers alike"
+        );
+        assert_eq!(prepared, 1, "parses of the INSERT for 1,000 executes");
+        assert_eq!(text, 2, "the same INSERT given as text parses again");
+        assert_eq!(
+            super::parses(PAGE),
+            1,
+            "parses of the page query for 1,000 runs"
+        );
     }
 }
