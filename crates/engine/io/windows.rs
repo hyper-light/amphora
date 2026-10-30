@@ -1,29 +1,38 @@
+use super::windows_lock::{
+    ProcessFileLockGuard, SharedWalLockState, acquire_process_file_lock,
+    release_shared_wal_locks_on_drop, shared_wal_lock_byte, shared_wal_map,
+    shared_wal_probe_exclusive_byte, shared_wal_set_len, shared_wal_try_lock_byte,
+    shared_wal_unlock_byte, stable_lock_path_for_handle,
+};
 use crate::error::io_error;
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::common;
-use crate::io::FileSyncType;
-use super::windows_lock::{acquire_process_file_lock, ProcessFileLockGuard};
-use crate::sync::Arc;
-use crate::{Clock, Completion, CompletionError, File, LimboError, OpenFlags, Result, IO};
+use crate::io::{FileSyncType, SharedWalLockKind, SharedWalMappedRegion};
+use crate::sync::{Arc, Mutex};
+use crate::{Clock, Completion, CompletionError, File, IO, LimboError, OpenFlags, Result};
 use std::cell::Cell;
 use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::ptr;
 #[cfg(feature = "fs")]
 use tracing::debug;
-use tracing::{instrument, trace, Level};
+use tracing::{Level, instrument, trace};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_HANDLE_EOF, ERROR_IO_PENDING, FALSE, GENERIC_READ,
-    GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0,
+    CloseHandle, ERROR_HANDLE_EOF, ERROR_IO_PENDING, FALSE, GENERIC_READ, GENERIC_WRITE,
+    GetLastError, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FileEndOfFileInfo, FlushFileBuffers, GetFileSizeEx, LockFileEx, ReadFile,
-    SetFileInformationByHandle, UnlockFileEx, WriteFile, FILE_ATTRIBUTE_NORMAL,
-    FILE_END_OF_FILE_INFO, FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, OPEN_ALWAYS,
-    OPEN_EXISTING,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_END_OF_FILE_INFO, FILE_FLAG_OVERLAPPED,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileEndOfFileInfo, FlushFileBuffers,
+    GetFileSizeEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, OPEN_ALWAYS,
+    OPEN_EXISTING, ReadFile, SetFileInformationByHandle, UnlockFileEx, WriteFile,
 };
-use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject, INFINITE};
-use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
+use windows_sys::Win32::System::IO::{
+    GetOverlappedResult, OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0,
+};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, INFINITE, ResetEvent, WaitForSingleObject,
+};
 
 // Per-thread event handle used to synchronously wait for completion of an
 // overlapped ReadFile/WriteFile. Created lazily on first use and reused for
@@ -84,8 +93,7 @@ fn write_chunk(handle: HANDLE, event: HANDLE, pos: u64, data: &[u8]) -> Result<u
         if wait != WAIT_OBJECT_0 {
             return Err(last_os_error("pwrite WaitForSingleObject"));
         }
-        let ok =
-            unsafe { GetOverlappedResult(handle, &overlapped, &mut bytes_written, FALSE) };
+        let ok = unsafe { GetOverlappedResult(handle, &overlapped, &mut bytes_written, FALSE) };
         if ok == FALSE {
             return Err(last_os_error("pwrite GetOverlappedResult"));
         }
@@ -128,6 +136,10 @@ impl WindowsIO {
 }
 
 impl IO for WindowsIO {
+    fn supports_shared_wal_coordination(&self) -> bool {
+        true
+    }
+
     #[instrument(skip_all, level = Level::TRACE)]
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);
@@ -190,6 +202,8 @@ impl IO for WindowsIO {
 
         Ok(Arc::new(WindowsFile {
             handle: file_handle,
+            path: stable_lock_path_for_handle(file_handle, Path::new(path)),
+            shared_wal_locks: Mutex::new(SharedWalLockState::default()),
             _process_lock: process_lock,
         }))
     }
@@ -219,6 +233,8 @@ impl Clock for WindowsIO {
 
 pub struct WindowsFile {
     handle: HANDLE,
+    path: PathBuf,
+    shared_wal_locks: Mutex<SharedWalLockState>,
     /// Process-wide advisory lock held while this file is open. The lock lives
     /// in a dedicated handle managed by `ProcessFileLockEntry`; this field
     /// just keeps the registry refcount up. Dropped automatically with `self`.
@@ -340,7 +356,8 @@ impl File for WindowsFile {
 
         while total_written < total_size {
             let remaining = &buf_slice[total_written..];
-            let written = with_io_event(|event| write_chunk(self.handle, event, current_pos, remaining))?;
+            let written =
+                with_io_event(|event| write_chunk(self.handle, event, current_pos, remaining))?;
             if written == 0 {
                 return Err(LimboError::CompletionError(CompletionError::IOError(
                     ErrorKind::UnexpectedEof,
@@ -382,9 +399,8 @@ impl File for WindowsFile {
 
             while buf_written < slice.len() {
                 let remaining = &slice[buf_written..];
-                let written = with_io_event(|event| {
-                    write_chunk(self.handle, event, current_pos, remaining)
-                })?;
+                let written =
+                    with_io_event(|event| write_chunk(self.handle, event, current_pos, remaining))?;
                 if written == 0 {
                     return Err(LimboError::CompletionError(CompletionError::IOError(
                         ErrorKind::UnexpectedEof,
@@ -442,10 +458,56 @@ impl File for WindowsFile {
         }
         Ok(file_size as u64)
     }
+    fn shared_wal_lock_byte(
+        &self,
+        offset: u64,
+        exclusive: bool,
+        _kind: SharedWalLockKind,
+    ) -> Result<()> {
+        shared_wal_lock_byte(self.handle, &self.shared_wal_locks, offset, exclusive)
+    }
+
+    fn shared_wal_try_lock_byte(
+        &self,
+        offset: u64,
+        exclusive: bool,
+        _kind: SharedWalLockKind,
+    ) -> Result<bool> {
+        shared_wal_try_lock_byte(self.handle, &self.shared_wal_locks, offset, exclusive)
+    }
+
+    fn shared_wal_probe_exclusive_byte(
+        &self,
+        offset: u64,
+        _kind: SharedWalLockKind,
+    ) -> Result<bool> {
+        shared_wal_probe_exclusive_byte(self.handle, &self.shared_wal_locks, offset)
+    }
+
+    fn shared_wal_probe_exclusive_while_shared_byte(
+        &self,
+        offset: u64,
+        _kind: SharedWalLockKind,
+    ) -> Result<bool> {
+        shared_wal_probe_exclusive_byte(self.handle, &self.shared_wal_locks, offset)
+    }
+
+    fn shared_wal_unlock_byte(&self, offset: u64, _kind: SharedWalLockKind) -> Result<()> {
+        shared_wal_unlock_byte(&self.shared_wal_locks, offset)
+    }
+
+    fn shared_wal_set_len(&self, len: u64) -> Result<()> {
+        shared_wal_set_len(self.handle, len)
+    }
+
+    fn shared_wal_map(&self, offset: u64, len: usize) -> Result<Box<dyn SharedWalMappedRegion>> {
+        shared_wal_map(self.handle, offset, len)
+    }
 }
 
 impl Drop for WindowsFile {
     fn drop(&mut self) {
+        release_shared_wal_locks_on_drop(&self.path, &self.shared_wal_locks);
         unsafe {
             CloseHandle(self.handle);
         }

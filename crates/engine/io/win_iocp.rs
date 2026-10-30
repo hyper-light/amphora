@@ -38,16 +38,17 @@
 //  `process_packet_from_iocp`
 
 use super::windows_lock::{
-    acquire_process_file_lock, release_shared_wal_locks_on_drop, shared_wal_lock_byte,
-    shared_wal_probe_exclusive_byte, shared_wal_try_lock_byte, shared_wal_unlock_byte,
-    stable_lock_path_for_handle, ProcessFileLockGuard, SharedWalLockState,
+    ProcessFileLockGuard, SharedWalLockState, acquire_process_file_lock,
+    release_shared_wal_locks_on_drop, shared_wal_lock_byte, shared_wal_map,
+    shared_wal_probe_exclusive_byte, shared_wal_set_len, shared_wal_try_lock_byte,
+    shared_wal_unlock_byte, stable_lock_path_for_handle,
 };
 use crate::error::io_error;
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::common;
 use crate::sync::Arc;
 use crate::sync::Mutex;
-use crate::{Clock, Completion, CompletionError, File, LimboError, OpenFlags, Result, IO};
+use crate::{Clock, Completion, CompletionError, File, IO, LimboError, OpenFlags, Result};
 
 use smallvec::SmallVec;
 use std::collections::{HashMap, VecDeque};
@@ -56,40 +57,35 @@ use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use windows_sys::core::BOOL;
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    FormatMessageW, FORMAT_MESSAGE_ALLOCATE_BUFFER, FORMAT_MESSAGE_FROM_SYSTEM,
-    FORMAT_MESSAGE_IGNORE_INSERTS,
+    FORMAT_MESSAGE_ALLOCATE_BUFFER, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
+    FormatMessageW,
 };
+use windows_sys::core::BOOL;
 
 use std::{io, mem, ptr};
-use tracing::{debug, instrument, trace, warn, Level};
+use tracing::{Level, debug, instrument, trace, warn};
 
 use super::FileSyncType;
 use crate::io::completions::CompletionInner;
 use crate::io::{SharedWalLockKind, SharedWalMappedRegion};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_LOCK_VIOLATION,
-    ERROR_NOT_LOCKED, ERROR_OPERATION_ABORTED, FALSE, GENERIC_READ, GENERIC_WRITE, HANDLE,
-    INVALID_HANDLE_VALUE, TRUE, WAIT_TIMEOUT,
+    CloseHandle, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_LOCK_VIOLATION, ERROR_NOT_LOCKED,
+    ERROR_OPERATION_ABORTED, FALSE, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
+    INVALID_HANDLE_VALUE, LocalFree, TRUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FileEndOfFileInfo, FlushFileBuffers, GetFileSizeEx, LockFileEx, ReadFile,
-    SetFileInformationByHandle, UnlockFileEx, WriteFile, FILE_END_OF_FILE_INFO,
-    FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
-    OPEN_ALWAYS, OPEN_EXISTING,
+    CreateFileW, FILE_END_OF_FILE_INFO, FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED,
+    FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FileEndOfFileInfo, FlushFileBuffers, GetFileSizeEx, LOCKFILE_EXCLUSIVE_LOCK,
+    LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, OPEN_ALWAYS, OPEN_EXISTING, ReadFile,
+    SetFileInformationByHandle, UnlockFileEx, WriteFile,
 };
-use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_READ, FILE_MAP_WRITE,
-    PAGE_READWRITE,
-};
-use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
-use windows_sys::Win32::System::Threading::CreateEventW;
 use windows_sys::Win32::System::IO::{
     CancelIoEx, CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatus, OVERLAPPED,
     OVERLAPPED_0, OVERLAPPED_0_0,
 };
+use windows_sys::Win32::System::Threading::CreateEventW;
 
 // Constants
 
@@ -222,50 +218,6 @@ fn get_limboerror_from_std_error(err: impl Error) -> LimboError {
 
 pub struct WindowsIOCP {
     instance: Arc<InnerWindowsIOCP>,
-}
-
-struct WindowsSharedWalMapping {
-    mapping_handle: HANDLE,
-    view_ptr: NonNull<u8>,
-    ptr: NonNull<u8>,
-    len: usize,
-}
-
-unsafe impl Send for WindowsSharedWalMapping {}
-unsafe impl Sync for WindowsSharedWalMapping {}
-
-impl SharedWalMappedRegion for WindowsSharedWalMapping {
-    fn ptr(&self) -> NonNull<u8> {
-        self.ptr
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-}
-
-impl Drop for WindowsSharedWalMapping {
-    fn drop(&mut self) {
-        unsafe {
-            if UnmapViewOfFile(
-                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: self.view_ptr.as_ptr().cast(),
-                },
-            ) == FALSE
-            {
-                tracing::error!(
-                    "UnmapViewOfFile failed for shared WAL coordination region: {}",
-                    io::Error::last_os_error()
-                );
-            }
-            if CloseHandle(self.mapping_handle) == FALSE {
-                tracing::error!(
-                    "CloseHandle failed for shared WAL mapping: {}",
-                    io::Error::last_os_error()
-                );
-            }
-        }
-    }
 }
 
 impl WindowsIOCP {
@@ -1048,7 +1000,7 @@ impl File for WindowsFile {
         exclusive: bool,
         _kind: SharedWalLockKind,
     ) -> Result<()> {
-        shared_wal_lock_byte(&self.path, &self.shared_wal_locks, offset, exclusive)
+        shared_wal_lock_byte(self.file_handle, &self.shared_wal_locks, offset, exclusive)
     }
 
     fn shared_wal_try_lock_byte(
@@ -1057,7 +1009,7 @@ impl File for WindowsFile {
         exclusive: bool,
         _kind: SharedWalLockKind,
     ) -> Result<bool> {
-        shared_wal_try_lock_byte(&self.path, &self.shared_wal_locks, offset, exclusive)
+        shared_wal_try_lock_byte(self.file_handle, &self.shared_wal_locks, offset, exclusive)
     }
 
     fn shared_wal_probe_exclusive_byte(
@@ -1065,7 +1017,7 @@ impl File for WindowsFile {
         offset: u64,
         _kind: SharedWalLockKind,
     ) -> Result<bool> {
-        shared_wal_probe_exclusive_byte(&self.path, &self.shared_wal_locks, offset)
+        shared_wal_probe_exclusive_byte(self.file_handle, &self.shared_wal_locks, offset)
     }
 
     fn shared_wal_probe_exclusive_while_shared_byte(
@@ -1073,109 +1025,19 @@ impl File for WindowsFile {
         offset: u64,
         _kind: SharedWalLockKind,
     ) -> Result<bool> {
-        shared_wal_probe_exclusive_byte(&self.path, &self.shared_wal_locks, offset)
+        shared_wal_probe_exclusive_byte(self.file_handle, &self.shared_wal_locks, offset)
     }
 
     fn shared_wal_unlock_byte(&self, offset: u64, _kind: SharedWalLockKind) -> Result<()> {
-        shared_wal_unlock_byte(&self.path, &self.shared_wal_locks, offset)
+        shared_wal_unlock_byte(&self.shared_wal_locks, offset)
     }
 
     fn shared_wal_set_len(&self, len: u64) -> Result<()> {
-        unsafe {
-            let file_info = FILE_END_OF_FILE_INFO {
-                EndOfFile: len.try_into().map_err(get_limboerror_from_std_error)?,
-            };
-
-            if SetFileInformationByHandle(
-                self.file_handle,
-                FileEndOfFileInfo,
-                (&raw const file_info).cast(),
-                size_of_val(&file_info)
-                    .try_into()
-                    .map_err(get_limboerror_from_std_error)?,
-            ) == FALSE
-            {
-                return Err(io_error(
-                    io::Error::last_os_error(),
-                    "resize shared WAL coordination file",
-                ));
-            }
-        }
-
-        Ok(())
+        shared_wal_set_len(self.file_handle, len)
     }
 
     fn shared_wal_map(&self, offset: u64, len: usize) -> Result<Box<dyn SharedWalMappedRegion>> {
-        if len == 0 {
-            return Err(LimboError::InternalError(
-                "cannot map shared WAL coordination region with zero length".into(),
-            ));
-        }
-
-        let mut system_info = unsafe { mem::zeroed::<SYSTEM_INFO>() };
-        unsafe { GetSystemInfo(&raw mut system_info) };
-        let granularity = u64::from(system_info.dwAllocationGranularity);
-        if granularity == 0 {
-            return Err(LimboError::LockingError(
-                "failed to determine shared WAL mapping allocation granularity".into(),
-            ));
-        }
-
-        let aligned_offset = offset / granularity * granularity;
-        let prefix_len = (offset - aligned_offset) as usize;
-        let view_len = prefix_len
-            .checked_add(len)
-            .ok_or_else(|| LimboError::InternalError("shared WAL map length overflow".into()))?;
-
-        let mapping_handle = unsafe {
-            CreateFileMappingW(
-                self.file_handle,
-                ptr::null(),
-                PAGE_READWRITE,
-                0,
-                0,
-                ptr::null(),
-            )
-        };
-        if mapping_handle.is_null() {
-            return Err(io_error(
-                io::Error::last_os_error(),
-                "create shared WAL file mapping",
-            ));
-        }
-
-        let offset_high = (aligned_offset >> 32) as u32;
-        let offset_low = aligned_offset as u32;
-        let mapped_ptr = unsafe {
-            MapViewOfFile(
-                mapping_handle,
-                FILE_MAP_READ | FILE_MAP_WRITE,
-                offset_high,
-                offset_low,
-                view_len,
-            )
-        };
-        if mapped_ptr.Value.is_null() {
-            unsafe {
-                CloseHandle(mapping_handle);
-            }
-            return Err(io_error(
-                io::Error::last_os_error(),
-                "map shared WAL coordination file",
-            ));
-        }
-
-        let view_ptr = NonNull::new(mapped_ptr.Value.cast::<u8>())
-            .expect("MapViewOfFile returned null for shared WAL map");
-        let ptr = NonNull::new(unsafe { view_ptr.as_ptr().add(prefix_len) })
-            .expect("mapped base plus prefix_len returned null");
-
-        Ok(Box::new(WindowsSharedWalMapping {
-            mapping_handle,
-            view_ptr,
-            ptr,
-            len,
-        }))
+        shared_wal_map(self.file_handle, offset, len)
     }
 }
 
@@ -1194,14 +1056,14 @@ impl Drop for WindowsFile {
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     };
     use std::task::{Wake, Waker};
 
     use crate::{
-        io::{common, win_iocp::get_generic_limboerror_from_os_err, OpenFlags, TempFile},
         Buffer, Completion, IO,
+        io::{OpenFlags, TempFile, common, win_iocp::get_generic_limboerror_from_os_err},
     };
 
     use super::WindowsIOCP;

@@ -7359,9 +7359,8 @@ pub mod test {
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     /// Returns an IO backend that supports shared WAL coordination on the host.
-    /// On Windows the default `PlatformIO` (`WindowsIO`) lacks the byte-locking
-    /// and mapping primitives, so the experimental IOCP backend is used when
-    /// the `experimental_win_iocp` feature is enabled.
+    /// Both Windows backends support coordination; enabling `experimental_win_iocp`
+    /// exercises IOCP while the default configuration exercises `PlatformIO`.
     fn shared_wal_test_io() -> Arc<dyn IO> {
         #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
         {
@@ -7679,10 +7678,6 @@ pub mod test {
     }
 
     #[test]
-    #[cfg_attr(
-        all(target_os = "windows", not(feature = "experimental_win_iocp")),
-        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
-    )]
     fn test_shutdown_checkpoint_truncates_after_restart() {
         let (db, path) = get_database();
         let walpath = path.path().join("test.db-wal");
@@ -9479,10 +9474,6 @@ pub mod test {
 
     #[cfg(host_shared_wal)]
     #[test]
-    #[cfg_attr(
-        all(target_os = "windows", not(feature = "experimental_win_iocp")),
-        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
-    )]
     fn shm_reader_does_not_wait_for_a_checkpoint_that_holds_read_mark_0() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-shm-read-mark-0-fallback.db-wal");
@@ -9530,10 +9521,6 @@ pub mod test {
 
     #[cfg(host_shared_wal)]
     #[test]
-    #[cfg_attr(
-        all(target_os = "windows", not(feature = "experimental_win_iocp")),
-        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
-    )]
     fn shm_readers_share_a_mark_pinned_at_frame_zero() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-shm-share-mark-zero.db-wal");
@@ -9590,10 +9577,6 @@ pub mod test {
 
     #[cfg(host_shared_wal)]
     #[test]
-    #[cfg_attr(
-        all(target_os = "windows", not(feature = "experimental_win_iocp")),
-        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
-    )]
     fn test_shm_coordination_uses_shared_authority() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.db-wal");
@@ -9824,10 +9807,6 @@ pub mod test {
 
     #[cfg(host_shared_wal)]
     #[test]
-    #[cfg_attr(
-        all(target_os = "windows", not(feature = "experimental_win_iocp")),
-        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
-    )]
     fn test_shm_coordination_shared_index_grows_past_old_fixed_limit() {
         const OLD_FIXED_LIMIT: u64 = 65_536;
 
@@ -10790,10 +10769,6 @@ pub mod test {
 
     #[cfg(host_shared_wal)]
     #[test]
-    #[cfg_attr(
-        all(target_os = "windows", not(feature = "experimental_win_iocp")),
-        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
-    )]
     fn test_shm_coordination_secondary_disk_scan_does_not_reseed_authority_while_writer_active() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.db-wal");
@@ -10867,10 +10842,6 @@ pub mod test {
 
     #[cfg(host_shared_wal)]
     #[test]
-    #[cfg_attr(
-        all(target_os = "windows", not(feature = "experimental_win_iocp")),
-        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
-    )]
     fn test_shm_coordination_disk_scan_matching_authority_keeps_frame_index() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.db-wal");
@@ -10945,10 +10916,6 @@ pub mod test {
 
     #[cfg(host_shared_wal)]
     #[test]
-    #[cfg_attr(
-        all(target_os = "windows", not(feature = "experimental_win_iocp")),
-        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
-    )]
     fn test_shm_coordination_disk_scan_matching_snapshot_rebuilds_stale_frame_index() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.db-wal");
@@ -11076,10 +11043,6 @@ pub mod test {
 
     #[cfg(host_shared_wal)]
     #[test]
-    #[cfg_attr(
-        all(target_os = "windows", not(feature = "experimental_win_iocp")),
-        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
-    )]
     fn test_shm_coordination_empty_disk_scan_does_not_clobber_positive_authority() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.db-wal");
@@ -11261,10 +11224,6 @@ pub mod test {
 
     #[cfg(host_shared_wal)]
     #[test]
-    #[cfg_attr(
-        all(target_os = "windows", not(feature = "experimental_win_iocp")),
-        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
-    )]
     fn test_shm_prepare_wal_header_does_not_clobber_zero_frame_authority_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.db-wal");
