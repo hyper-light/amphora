@@ -23,6 +23,15 @@ use std::{
 pub(super) fn unavailable(e: impl std::fmt::Display) -> Refusal {
     Refusal::Unavailable(e.to_string())
 }
+fn transfer_error(error: std::io::Error) -> Refusal {
+    // These transfers use blocking streams with the remaining absolute deadline installed.
+    // Preserve kernel timeout identity for the read-only capability phase; mutation callers
+    // still map any transfer failure to UnknownOutcome after transmission begins.
+    match error.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => Refusal::Timeout,
+        _ => unavailable(error),
+    }
+}
 fn sql_error(e: impl std::fmt::Display) -> sql::Error {
     sql::Error::Database(e.to_string())
 }
@@ -53,7 +62,7 @@ fn transfer(stream: &mut Stream, bytes: &mut [u8], until: Instant) -> Result<(),
         let rest = bytes
             .get_mut(offset..)
             .ok_or_else(|| unavailable("frame offset"))?;
-        let n = stream.read(rest).map_err(unavailable)?;
+        let n = stream.read(rest).map_err(transfer_error)?;
         if n == 0 {
             return Err(unavailable("owner connection closed"));
         }
@@ -147,7 +156,7 @@ pub(super) fn send(stream: &mut Stream, encoded: &[u8], until: Instant) -> Resul
             stream
                 .set_write_timeout(Some(remaining(until)?))
                 .map_err(unavailable)?;
-            let n = stream.write(part).map_err(unavailable)?;
+            let n = stream.write(part).map_err(transfer_error)?;
             if n == 0 {
                 return Err(unavailable("owner connection closed"));
             }
@@ -315,6 +324,15 @@ impl Client {
         read::<Response>(&mut stream, until)
             .map_err(|_| Error::UnknownOutcome)?
             .map_err(Error::from)
+    }
+    fn compact_step(
+        &self,
+        namespace: &str,
+        before: api::Rev,
+        until: Instant,
+    ) -> Result<api::CompactionProgress, Refusal> {
+        let mut stream = self.stream(until)?;
+        compact_step_on(&mut stream, namespace, before, until)
     }
     pub fn execute(
         &self,
@@ -536,6 +554,56 @@ impl Session for Remote {
     }
 }
 
+fn capability_unverified(error: Refusal) -> Refusal {
+    match error {
+        Refusal::Timeout => Refusal::Timeout,
+        _ => api::invalid(
+            "bounded compaction capability",
+            "support not verified; no mutation sent",
+        ),
+    }
+}
+
+fn compact_step_on(
+    stream: &mut Stream,
+    namespace: &str,
+    before: api::Rev,
+    until: Instant,
+) -> Result<api::CompactionProgress, Refusal> {
+    // Probe and mutation share one authenticated stream: an owner replacement cannot invalidate
+    // a cached affirmative capability between connections. This probe acquires no writer.
+    let probe = encode(&Request::Capabilities, 256)?;
+    send(stream, &probe, until).map_err(|error| {
+        if Instant::now() >= until {
+            Refusal::Timeout
+        } else {
+            capability_unverified(error)
+        }
+    })?;
+    let response: Response = read_limit(stream, until, 256).map_err(|error| {
+        if Instant::now() >= until {
+            Refusal::Timeout
+        } else {
+            capability_unverified(error)
+        }
+    })?;
+    match response? {
+        Answer::Capabilities(bits) if bits & CAP_BOUNDED_COMPACTION != 0 => (),
+        _ => return Err(capability_unverified(unavailable("unsupported capability"))),
+    }
+    let request = Request::Records {
+        namespace: namespace.into(),
+        op: Record::CompactStep(before),
+    };
+    let encoded = encode(&request, 256)?;
+    // Once mutation transmission begins, loss/decode failure is conservatively unknown outcome.
+    send(stream, &encoded, until).map_err(|_| Refusal::UnknownOutcome)?;
+    match read::<Response>(stream, until).map_err(|_| Refusal::UnknownOutcome)?? {
+        Answer::Compaction(progress) => Ok(progress),
+        _ => Err(Refusal::UnknownOutcome),
+    }
+}
+
 fn serve(
     mut stream: Stream,
     token: [u8; 32],
@@ -566,7 +634,28 @@ fn serve(
         .checked_add(Duration::from_millis(hello.millis))
         .ok_or(Refusal::Timeout)?;
     write(&mut stream, &Ok::<_, Refusal>(Answer::Ready), until)?;
-    let request: Request = read(&mut stream, until)?;
+    let mut request: Request = read(&mut stream, until)?;
+    if matches!(request, Request::Capabilities) {
+        write(
+            &mut stream,
+            &Ok::<_, Refusal>(Answer::Capabilities(CAP_BOUNDED_COMPACTION)),
+            until,
+        )?;
+        // One small, restricted continuation; EOF is harmless and still acquires no database.
+        request = read_limit(&mut stream, until, 256)?;
+        if !matches!(
+            request,
+            Request::Records {
+                op: Record::CompactStep(_),
+                ..
+            }
+        ) {
+            return Err(api::invalid(
+                "capability continuation",
+                "expected one bounded compaction step",
+            ));
+        }
+    }
     if matches!(request, Request::Probe) {
         return write(&mut stream, &Ok::<_, Refusal>(Answer::Done), until);
     }
@@ -661,6 +750,7 @@ fn serve(
                     Answer::Rev(wait_remote(&ns, &f, r, &mut stream, until)?)
                 }
                 Record::Head => Answer::Rev(ns.head(until)?),
+                Record::CompactStep(before) => Answer::Compaction(ns.compact_step(before, until)?),
                 Record::Compact(r) => {
                     ns.compact(r, until)?;
                     Answer::Done
@@ -673,7 +763,9 @@ fn serve(
                 Record::ImportState => Answer::ImportState(ns.import_state(until)?),
             })
         })(),
-        Request::Session | Request::Probe => Err(unavailable("unexpected session")),
+        Request::Session | Request::Probe | Request::Capabilities => {
+            Err(unavailable("unexpected session"))
+        }
     };
     if watch_batch {
         let encoded = match encode(&result, WATCH_REPLY_MAX) {
@@ -870,10 +962,14 @@ impl Records for Namespace {
         }
     }
     fn compact(&self, r: api::Rev, u: Instant) -> Result<(), Refusal> {
-        match self.request(Record::Compact(r), u)? {
-            Answer::Done => Ok(()),
-            _ => Err(Refusal::UnknownOutcome),
-        }
+        api::compact(self, r, u)
+    }
+    fn compact_step(
+        &self,
+        before: api::Rev,
+        until: Instant,
+    ) -> Result<api::CompactionProgress, Refusal> {
+        self.client.compact_step(&self.name, before, until)
     }
 }
 
@@ -903,6 +999,60 @@ mod tests {
             read::<Request>(&mut receiver, until()),
             Err(Refusal::TooLarge { .. })
         ));
+
+        // Existing indexes stay fixed; additive capability negotiation does not renumber v2.
+        assert_eq!(
+            postcard::to_allocvec(&Request::ReplicaStatus).unwrap(),
+            vec![8]
+        );
+        assert_eq!(
+            postcard::to_allocvec(&Record::ImportState).unwrap(),
+            vec![9]
+        );
+        assert_eq!(
+            postcard::to_allocvec(&Answer::SqlError(String::new())).unwrap(),
+            vec![17, 0]
+        );
+
+        // A legacy-shaped owner closes on the appended probe. No mutation is sent; losing the
+        // connection after an affirmative probe and a submitted step is instead unknown outcome.
+        for supported in [false, true] {
+            let (mut client, mut server) = pair();
+            let fake = thread::spawn(move || {
+                assert!(matches!(
+                    read::<Request>(&mut server, until()).unwrap(),
+                    Request::Capabilities
+                ));
+                if supported {
+                    write(
+                        &mut server,
+                        &Ok::<_, Refusal>(Answer::Capabilities(CAP_BOUNDED_COMPACTION)),
+                        until(),
+                    )
+                    .unwrap();
+                    assert!(matches!(
+                        read::<Request>(&mut server, until()).unwrap(),
+                        Request::Records {
+                            op: Record::CompactStep(3),
+                            ..
+                        }
+                    ));
+                } else {
+                    server.shutdown(std::net::Shutdown::Write).unwrap();
+                    let mut trailing = [0; 1];
+                    // Client exits the read-only phase and closes without sending a mutation.
+                    assert_eq!(server.read(&mut trailing).unwrap(), 0);
+                }
+            });
+            let result = compact_step_on(&mut client, "items", 3, until());
+            if supported {
+                assert_eq!(result, Err(Refusal::UnknownOutcome));
+            } else {
+                assert!(matches!(result, Err(Refusal::Invalid { .. })));
+            }
+            drop(client);
+            fake.join().unwrap();
+        }
     }
 
     #[test]
@@ -974,5 +1124,55 @@ mod tests {
         write(&mut client, &proof, until()).unwrap();
         assert!(matches!(task.join().unwrap(), Err(Refusal::Invalid { .. })));
         assert_eq!(accessed.load(Ordering::Acquire), 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            crate::database::Database::open(&dir.path().join("compaction.db"), until()).unwrap();
+        for probe_only in [true, false] {
+            let (mut client, server) = pair();
+            let accessed = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&accessed);
+            let db = db.clone();
+            let task = thread::spawn(move || {
+                serve(
+                    server,
+                    [1; 32],
+                    &|| {
+                        observed.fetch_add(1, Ordering::AcqRel);
+                        Some(db.clone())
+                    },
+                    &Arc::new(AtomicUsize::new(0)),
+                )
+            });
+            let hello = Hello {
+                version: 2,
+                nonce: [2; 32],
+                millis: 1000,
+            };
+            write(&mut client, &hello, until()).unwrap();
+            let challenge: Challenge = read(&mut client, until()).unwrap();
+            let proof = auth::proof(&[1; 32], false, &hello, &challenge.nonce).unwrap();
+            write(&mut client, &proof, until()).unwrap();
+            assert!(matches!(
+                read::<Response>(&mut client, until()).unwrap().unwrap(),
+                Answer::Ready
+            ));
+            if probe_only {
+                write(&mut client, &Request::Capabilities, until()).unwrap();
+                assert!(matches!(
+                    read::<Response>(&mut client, until()).unwrap().unwrap(),
+                    Answer::Capabilities(CAP_BOUNDED_COMPACTION)
+                ));
+                drop(client);
+                assert!(task.join().unwrap().is_err());
+                assert_eq!(accessed.load(Ordering::Acquire), 0);
+            } else {
+                let progress = compact_step_on(&mut client, "records", 0, until()).unwrap();
+                assert_eq!(progress.completed, 0);
+                assert!(!progress.more);
+                assert!(task.join().unwrap().is_ok());
+                assert_eq!(accessed.load(Ordering::Acquire), 1);
+            }
+        }
     }
 }

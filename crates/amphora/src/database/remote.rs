@@ -355,6 +355,9 @@ pub(super) fn submit(
             records.compact(before, until)?;
             Ok(Answer::Done)
         }
+        Operation::Mutation(Mutation::CompactStep { before, .. }) => {
+            records.compact_step(before, until).map(Answer::Compacted)
+        }
         Operation::Get(family, key, at) => records.get(&family, &key, at, until).map(Answer::Row),
         Operation::Scan(family, scan) => records.scan(&family, scan, until).map(Answer::Page),
         Operation::Changes(family, after, limit) => records

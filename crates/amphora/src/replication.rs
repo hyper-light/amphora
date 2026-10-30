@@ -293,6 +293,38 @@ impl Machine {
         ))
     }
 
+    pub(crate) fn prepare_compaction(
+        &mut self,
+        namespace: &str,
+        before: api::Rev,
+        until: std::time::Instant,
+        room: usize,
+    ) -> Result<(Prepared, api::CompactionProgress), Refusal> {
+        use crate::database::compaction;
+        self.require_baseline()?;
+        let room = room.min(COMMAND_BYTES);
+        let pages = compaction::page_limit(room)?;
+        let (answer, image) = compaction::retry(|visits| {
+            let result = self.db.compaction_attempt(pages, true, |db| {
+                let _deadline = db.deadline(until);
+                compaction::ready(db, namespace, until, false)?;
+                compaction::step(db, namespace, before, visits)
+            });
+            compaction::deadline_result(result, until)
+        })?;
+        validate_pages(&image, COMMAND_BYTES)?;
+        let prepared = Prepared {
+            base_index: self.point.index,
+            base_term: self.point.term,
+            pages: image,
+            baseline: self.baseline.declaration().cloned(),
+        };
+        // The hard page fence proves the worst-case bound; retain the exact serialization check
+        // before proposal as a format-change and arithmetic guard.
+        api::bound("bounded compaction command", prepared.encode()?.len(), room)?;
+        Ok((prepared, answer))
+    }
+
     pub(crate) fn read_db<R>(
         &mut self,
         f: impl FnOnce(&mut Db) -> anyhow::Result<R>,

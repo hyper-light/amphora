@@ -59,6 +59,7 @@ pub enum Mutation {
     Migrate(Migration),
     Records { namespace: String, tx: Tx },
     Compact { namespace: String, before: Rev },
+    CompactStep { namespace: String, before: Rev },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +126,20 @@ pub struct Changes {
     pub head: Rev,
 }
 
+/// Durable progress of one bounded physical compaction transaction. Logical horizons can
+/// advance before cleanup completes; a later timeout does not roll those horizons back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionProgress {
+    pub head: Rev,
+    pub horizon: Rev,
+    pub feed: Rev,
+    pub completed: Rev,
+    pub target: Option<Rev>,
+    pub visited: usize,
+    pub deleted: usize,
+    pub more: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum Refusal {
     #[error("condition failed for {family}: row is at {at:?}")]
@@ -179,6 +194,32 @@ pub trait Records: Send + Sync {
     fn wait(&self, family: &str, after: Rev, until: Instant) -> Result<Rev, Refusal>;
     fn head(&self, until: Instant) -> Result<Rev, Refusal>;
     fn compact(&self, before: Rev, until: Instant) -> Result<(), Refusal>;
+    /// One recoverable step through the existing writer. Unsupported owners must refuse before
+    /// submitting a mutation; callers must not fall back to an unbounded compaction.
+    fn compact_step(&self, _before: Rev, _until: Instant) -> Result<CompactionProgress, Refusal> {
+        Err(invalid(
+            "bounded compaction",
+            "this implementation does not support it",
+        ))
+    }
+}
+
+/// Completes the first step's accepted cutoff under one absolute deadline. Concurrent requests
+/// may raise the logical horizon, but do not make this call chase a moving target indefinitely.
+pub fn compact(
+    records: &(impl Records + ?Sized),
+    before: Rev,
+    until: Instant,
+) -> Result<(), Refusal> {
+    let mut progress = records.compact_step(before, until)?;
+    let cutoff = progress.horizon;
+    while progress.completed < cutoff {
+        if Instant::now() >= until {
+            return Err(Refusal::Timeout);
+        }
+        progress = records.compact_step(cutoff, until)?;
+    }
+    Ok(())
 }
 
 pub fn invalid(what: &str, why: &str) -> Refusal {

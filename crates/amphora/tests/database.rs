@@ -376,7 +376,9 @@ fn records_cas_snapshots_feeds_compaction_and_namespaces_survive_reopen() {
                 until(),
             )
             .unwrap();
-        records.compact(compacted, until()).unwrap();
+        let progress = records.compact_step(compacted, until()).unwrap();
+        assert_eq!(progress.horizon, compacted);
+        assert_eq!(progress.feed, compacted - 1);
         records.compact(compacted, until()).unwrap();
         let boundary = records.changes("items", deleted, 100, until()).unwrap();
         assert_eq!(boundary.head, compacted);
@@ -434,9 +436,45 @@ fn records_cas_snapshots_feeds_compaction_and_namespaces_survive_reopen() {
             records.get("items", b"a", Consistency::Snapshot(first), until()),
             Err(Refusal::Compacted { .. })
         ));
+        // A fixed-domain step stops after TX_MAX visits and resumes after owner recovery.
+        let gc = db.namespace("gc_progress").unwrap();
+        gc.commit(
+            Tx {
+                conds: vec![],
+                writes: (0..1000u32)
+                    .map(|n| put(&n.to_be_bytes(), b"baseline"))
+                    .collect(),
+            },
+            until(),
+        )
+        .unwrap();
+        let cutoff = gc
+            .commit(
+                Tx {
+                    conds: vec![],
+                    writes: vec![put(b"last", b"boundary")],
+                },
+                until(),
+            )
+            .unwrap();
+        let progress = gc.compact_step(cutoff, until()).unwrap();
+        assert_eq!(progress.visited, 1000);
+        assert!(progress.more);
+        assert_eq!(progress.completed, 0);
     }
     let db = Database::open(&path, until()).unwrap();
     let records = db.namespace("server").unwrap();
+    let resumed = db
+        .namespace("gc_progress")
+        .unwrap()
+        .compact_step(2, until())
+        .unwrap();
+    assert_eq!(
+        resumed.visited, 1,
+        "recovery resumes after the committed cursor"
+    );
+    assert_eq!(resumed.completed, 2);
+    assert!(!resumed.more);
     assert_eq!(records.head(until()).unwrap(), compacted);
     assert_eq!(
         records

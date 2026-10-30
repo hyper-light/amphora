@@ -71,6 +71,8 @@ pub enum LimboError {
     IntegerOverflow,
     #[error("string or blob too big")]
     TooBig,
+    #[error("transaction needs {attempted} dirty pages, over its limit of {limit}")]
+    TransactionPageLimit { limit: usize, attempted: usize },
     #[error("database table is locked")]
     TableLocked,
     #[error("attempt to write a readonly database")]
@@ -177,7 +179,7 @@ impl LimboError {
             Self::Corrupt(_) => 11,
             Self::DatabaseFull | Self::SequenceExhausted { .. } => 13,
             Self::SchemaUpdated | Self::SchemaConflict => 17,
-            Self::TooBig => 18,
+            Self::TooBig | Self::TransactionPageLimit { .. } => 18,
             Self::NotADB => 26,
             Self::BlobHandleExpired => 4,
             _ => 1,

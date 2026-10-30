@@ -25,6 +25,7 @@ use amphora_engine_parser::{
 use crate::db::Db;
 use crate::store::{self, Checkpointed, Engine, Flush, Opener, Store};
 
+pub(crate) mod compaction;
 mod import;
 pub(crate) mod remote;
 pub(crate) mod replicated;
@@ -147,7 +148,7 @@ enum Answer {
     Page(Page),
     Rev(Rev),
     Changes(Changes),
-    Compacted { head: Rev, feed: Rev },
+    Compacted(api::CompactionProgress),
     Called(Box<dyn Any + Send>),
     Imported(import::Imported),
     ImportProgress(Option<amphora_api::import::ImportProgress>),
@@ -712,6 +713,10 @@ impl Database {
         if Instant::now() >= until {
             return Err(Refusal::Timeout);
         }
+        if let Operation::Mutation(Mutation::Compact { before, .. }) = &operation {
+            self.namespace(namespace)?.compact(*before, until)?;
+            return Ok(Answer::Done);
+        }
         let store = match &self.shared.writer {
             Writer::Replicated { client, .. } => {
                 return client.submit(namespace.to_owned(), operation, until);
@@ -723,7 +728,10 @@ impl Database {
         };
         let admission = Admission::reserve(&self.shared.admitted)?;
         let wake = matches!(&operation, Operation::Mutation(Mutation::Records { tx, .. }) if !tx.writes.is_empty())
-            || matches!(&operation, Operation::Mutation(Mutation::Compact { .. }));
+            || matches!(
+                &operation,
+                Operation::Mutation(Mutation::Compact { .. } | Mutation::CompactStep { .. })
+            );
         let wake = wake || matches!(&operation, Operation::Import(_) | Operation::Call(_));
         let publish = match &operation {
             Operation::Mutation(Mutation::Records { namespace, tx }) if !tx.writes.is_empty() => {
@@ -737,9 +745,9 @@ impl Database {
                     families.into_keys().collect(),
                 ))
             }
-            Operation::Mutation(Mutation::Compact { namespace, .. }) => {
-                Some(Publish::Compact(namespace.clone()))
-            }
+            Operation::Mutation(
+                Mutation::Compact { namespace, .. } | Mutation::CompactStep { namespace, .. },
+            ) => Some(Publish::Compact(namespace.clone())),
             Operation::Import(_) => Some(Publish::Imported(namespace.into())),
             Operation::Call(_) => Some(Publish::Call),
             _ => None,
@@ -791,13 +799,10 @@ impl Database {
                                         *newest = (*newest).max(*at);
                                     }
                                 }
-                                (
-                                    Publish::Compact(namespace),
-                                    Ok(Answer::Compacted { head, feed }),
-                                ) => {
+                                (Publish::Compact(namespace), Ok(Answer::Compacted(progress))) => {
                                     let state = published.entry(namespace).or_default();
-                                    state.head = state.head.max(*head);
-                                    state.feed = state.feed.max(*feed);
+                                    state.head = state.head.max(progress.head);
+                                    state.feed = state.feed.max(progress.feed);
                                 }
                                 (Publish::Imported(namespace), Ok(Answer::Imported(imported))) => {
                                     let state = published.entry(namespace).or_default();
@@ -1019,16 +1024,23 @@ impl Records for Namespace {
         }
     }
     fn compact(&self, before: Rev, until: Instant) -> Result<(), Refusal> {
+        api::compact(self, before, until)
+    }
+    fn compact_step(
+        &self,
+        before: Rev,
+        until: Instant,
+    ) -> Result<api::CompactionProgress, Refusal> {
         match self.database.submit(
             &self.name,
-            Operation::Mutation(Mutation::Compact {
+            Operation::Mutation(Mutation::CompactStep {
                 namespace: self.name.clone(),
                 before,
             }),
             until,
         )? {
-            Answer::Compacted { .. } | Answer::Done => Ok(()),
-            _ => Err(unavailable("wrong compact answer")),
+            Answer::Compacted(progress) => Ok(progress),
+            _ => Err(Refusal::UnknownOutcome),
         }
     }
     fn wait(&self, family: &str, after: Rev, until: Instant) -> Result<Rev, Refusal> {
@@ -1075,11 +1087,25 @@ impl Engine for Local {
         let restoring = self.restoring;
         // An adaptive session contains an FnOnce: the pipeline must never retry it. Its own
         // transaction captures the application result before the pipeline's durable barrier.
-        if rows
-            .iter()
-            .any(|r| matches!(r.operation, Operation::Call(_)))
-        {
+        if rows.iter().any(|r| {
+            matches!(
+                r.operation,
+                Operation::Call(_) | Operation::Mutation(Mutation::CompactStep { .. })
+            )
+        }) {
             for row in rows {
+                if let Operation::Mutation(Mutation::CompactStep { before, .. }) = &row.operation {
+                    let result = compaction::local(
+                        &mut self.db,
+                        &row.namespace,
+                        *before,
+                        row.until,
+                        restoring,
+                    )
+                    .map(Answer::Compacted);
+                    *locked(&row.answer)? = Some(result);
+                    continue;
+                }
                 let result = self
                     .db
                     .transaction(|db| {
@@ -1311,7 +1337,9 @@ fn apply(
     }
     if matches!(
         operation,
-        Operation::Mutation(Mutation::Records { .. } | Mutation::Compact { .. })
+        Operation::Mutation(
+            Mutation::Records { .. } | Mutation::Compact { .. } | Mutation::CompactStep { .. }
+        )
     ) {
         db.query("INSERT OR IGNORE INTO __amphora_namespaces(name, head, horizon, feed, live) VALUES (?1, 0, 0, 0, 0)", [text(namespace)], |_| Ok(true))?;
     }
@@ -1381,29 +1409,8 @@ fn apply(
             }
             Ok(Ok(Answer::Changes(Changes { changes, head })))
         }
-        Operation::Mutation(Mutation::Compact { before, .. }) => {
-            let before = (*before).min(head).max(horizon);
-            db.query("DELETE FROM __amphora_versions WHERE namespace = ?1 AND rev < (SELECT MAX(w.rev) FROM __amphora_versions w WHERE w.namespace = __amphora_versions.namespace AND w.family = __amphora_versions.family AND w.key = __amphora_versions.key AND w.rev <= ?2)", [text(namespace), integer(before)?], |_| Ok(true))?;
-            // U06, CP-T1.5: older values are gone, so an obsolete deletion can no longer
-            // resurrect a key. Keep the boundary event for changes(after = before - 1).
-            db.query(
-                "DELETE FROM __amphora_versions WHERE namespace = ?1 AND value IS NULL AND rev < ?2",
-                [text(namespace), integer(before)?],
-                |_| Ok(true),
-            )?;
-            db.query(
-                "UPDATE __amphora_namespaces SET horizon = ?2, feed = ?3 WHERE name = ?1",
-                [
-                    text(namespace),
-                    integer(before)?,
-                    integer(feed.max(before.saturating_sub(1)))?,
-                ],
-                |_| Ok(true),
-            )?;
-            Ok(Ok(Answer::Compacted {
-                head,
-                feed: feed.max(before.saturating_sub(1)),
-            }))
+        Operation::Mutation(Mutation::Compact { .. } | Mutation::CompactStep { .. }) => {
+            Err(api::invalid("compaction", "requires the bounded writer transaction").into())
         }
         Operation::Import(_)
         | Operation::ImportProgress

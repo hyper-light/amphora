@@ -1034,23 +1034,41 @@ impl Actor {
         let Some(operation) = operation else {
             return Ok(());
         };
-        let prepared = self.replica.machine_mut().prepare_db(|db| {
-            // The guard ends with application evaluation, before prepare_pages rolls back its
-            // speculative transaction. Cleanup must run even after the SQL deadline elapsed.
-            let _deadline = db.deadline(pending.until);
-            if restore::incomplete(db)? {
-                return Err(api::invalid("database", "restore is incomplete").into());
-            }
-            match &operation {
-                Operation::Call(call) => {
-                    let call = locked(call)?
-                        .take()
-                        .ok_or_else(|| unavailable("SQL session already executed"))?;
-                    call(db).map(Answer::Called)
+        let bounded = matches!(
+            &operation,
+            Operation::Mutation(Mutation::CompactStep { .. })
+        );
+        let prepared = if let Operation::Mutation(Mutation::CompactStep { before, .. }) = &operation
+        {
+            let room = self.entry_room(pending.context.len())?;
+            self.replica
+                .machine_mut()
+                .prepare_compaction(&pending.namespace, *before, pending.until, room)
+                .map(|(prepared, progress)| (prepared, Answer::Compacted(progress)))
+        } else {
+            self.replica.machine_mut().prepare_db(|db| {
+                // The guard ends with application evaluation, before prepare_pages rolls back its
+                // speculative transaction. Cleanup must run even after the SQL deadline elapsed.
+                let _deadline = db.deadline(pending.until);
+                if restore::incomplete(db)? {
+                    return Err(api::invalid("database", "restore is incomplete").into());
                 }
-                other => apply(db, &pending.namespace, other)?.map_err(Into::into),
-            }
-        });
+                match &operation {
+                    Operation::Call(call) => {
+                        let call = locked(call)?
+                            .take()
+                            .ok_or_else(|| unavailable("SQL session already executed"))?;
+                        call(db).map(Answer::Called)
+                    }
+                    other => apply(db, &pending.namespace, other)?.map_err(Into::into),
+                }
+            })
+        };
+        // A failed whole rollback poisons this machine. Stop its existing owner instead of
+        // accepting another request against an unverified speculative base.
+        if bounded && let Err(Refusal::Fenced(reason)) = &prepared {
+            return Err(fenced(reason));
+        }
         let result = match prepared {
             Ok((prepared, value)) => {
                 if Instant::now() >= pending.until {
@@ -1277,12 +1295,80 @@ mod tests {
         }).unwrap();
         assert_eq!(evaluated.load(Ordering::Relaxed), 1);
         assert_eq!(call(&client, value).unwrap(), chosen);
+        // Bounded GC is captured by this same owner and survives its durable restart.
+        for writes in [
+            vec![Write::Put {
+                family: "items".into(),
+                key: b"retired".to_vec(),
+                value: b"old".to_vec(),
+            }],
+            vec![Write::Delete {
+                family: "items".into(),
+                key: b"retired".to_vec(),
+            }],
+        ] {
+            client
+                .submit(
+                    "gc".into(),
+                    Operation::Mutation(Mutation::Records {
+                        namespace: "gc".into(),
+                        tx: Tx {
+                            conds: vec![],
+                            writes,
+                        },
+                    }),
+                    deadline(),
+                )
+                .unwrap();
+        }
+        let progress = client
+            .submit(
+                "gc".into(),
+                Operation::Mutation(Mutation::CompactStep {
+                    namespace: "gc".into(),
+                    before: 2,
+                }),
+                deadline(),
+            )
+            .unwrap();
+        let Answer::Compacted(progress) = progress else {
+            panic!("wrong compaction answer")
+        };
+        assert_eq!(progress.completed, 2);
+        assert_eq!(progress.feed, 1);
         let applied = client.handle().status().unwrap().applied;
         drop(client);
         let reopened = open(dir.path(), vec![1]);
         leader(&reopened);
         assert!(reopened.handle().status().unwrap().applied >= applied);
         assert_eq!(call(&reopened, value).unwrap(), chosen);
+        let changes = reopened
+            .submit(
+                "gc".into(),
+                Operation::Changes("items".into(), 1, 10),
+                deadline(),
+            )
+            .unwrap();
+        let Answer::Changes(changes) = changes else {
+            panic!("wrong changes answer")
+        };
+        assert_eq!(changes.changes.len(), 1);
+        assert_eq!(changes.changes[0].value, None);
+        let progress = reopened
+            .submit(
+                "gc".into(),
+                Operation::Mutation(Mutation::CompactStep {
+                    namespace: "gc".into(),
+                    before: 2,
+                }),
+                deadline(),
+            )
+            .unwrap();
+        let Answer::Compacted(progress) = progress else {
+            panic!("wrong recovered compaction answer")
+        };
+        assert_eq!(progress.completed, 2);
+        assert_eq!(progress.visited, 0);
         assert_eq!(evaluated.load(Ordering::Relaxed), 1);
     }
     /// U15/CP-T1.8: a SQL deadline interrupts execution, rolls back capture and frees the driver.

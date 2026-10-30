@@ -5,6 +5,7 @@
 
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -89,8 +90,8 @@ pub fn default_pages(memory: Option<u64>) -> usize {
         .max(MIN_PROCESS_PAGES)
 }
 
-fn fail(e: impl std::fmt::Display) -> anyhow::Error {
-    anyhow::anyhow!("{e}")
+fn fail(e: impl std::error::Error + Send + Sync + 'static) -> anyhow::Error {
+    anyhow::Error::new(e)
 }
 
 /// Parks this thread for `d` (a park ends early for no reason sometimes: the rest is parked again).
@@ -145,6 +146,8 @@ pub struct Db {
     path: PathBuf,
     statements: cache::Cache,
     owner: Option<Arc<std::fs::File>>,
+    // Shared by this owner's readers: a failed rollback may never be reused as clean state.
+    fenced: Arc<AtomicBool>,
 }
 
 pub(crate) struct Deadline {
@@ -182,6 +185,7 @@ impl Db {
             path: path.to_path_buf(),
             statements: cache::Cache::default(),
             owner: None,
+            fenced: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -260,6 +264,7 @@ impl Db {
             path: path.to_path_buf(),
             statements: cache::Cache::default(),
             owner: None,
+            fenced: Arc::new(AtomicBool::new(false)),
         };
         d.exec("PRAGMA synchronous = NORMAL")?;
         d.exec("PRAGMA foreign_keys = ON")?;
@@ -285,6 +290,7 @@ impl Db {
     /// Another connection on the same database, for reading or checkpointing: each read sees what
     /// was committed before it; its checkpoints flush.
     pub fn reader(&self) -> anyhow::Result<Self> {
+        self.ensure_unfenced()?;
         let r = Self {
             io: self.io.clone(),
             db: self.db.clone(),
@@ -292,6 +298,7 @@ impl Db {
             path: self.path.clone(),
             statements: cache::Cache::default(),
             owner: self.owner.clone(),
+            fenced: Arc::clone(&self.fenced),
         };
         r.keep_pages(READER_PAGES)?;
         Ok(r)
@@ -302,7 +309,9 @@ impl Db {
     pub fn opener(&self) -> Opener<Self> {
         let (io, db, path) = (self.io.clone(), self.db.clone(), self.path.clone());
         let owner = self.owner.clone();
+        let fenced = Arc::clone(&self.fenced);
         Arc::new(move || {
+            Self::check_fence(&fenced)?;
             let r = Self {
                 io: io.clone(),
                 db: db.clone(),
@@ -310,6 +319,7 @@ impl Db {
                 path: path.clone(),
                 statements: cache::Cache::default(),
                 owner: owner.clone(),
+                fenced: Arc::clone(&fenced),
             };
             r.keep_pages(READER_PAGES)?;
             Ok(r)
@@ -357,6 +367,7 @@ impl Db {
     /// made some of the log durable ([`Db::flusher`]), only that is copied, and the log isn't
     /// flushed again for it.
     pub fn checkpoint(&mut self) -> anyhow::Result<Checkpointed> {
+        self.ensure_unfenced()?;
         match self.conn.checkpoint(CheckpointMode::Passive {
             upper_bound_inclusive: self.db.wal_durable_frame(),
         }) {
@@ -374,6 +385,7 @@ impl Db {
     /// With no reader reading (the store holds them back), copies what remains, flushes the file,
     /// and starts the log from its beginning, its file kept: whether it did.
     pub fn restart_log(&mut self) -> anyhow::Result<bool> {
+        self.ensure_unfenced()?;
         match self.conn.checkpoint(CheckpointMode::Restart) {
             Ok(_) => Ok(true),
             Err(LimboError::Busy) => Ok(false),
@@ -421,6 +433,7 @@ impl Db {
 
     /// Statements that answer nothing, one after another.
     pub fn exec(&self, sql: &str) -> anyhow::Result<()> {
+        self.ensure_unfenced()?;
         // The engine's parser knows where a statement ends, including trigger bodies and quoted
         // semicolons. U05: splitting text on ';' corrupts valid migration scripts.
         let result = self.conn.prepare_execute_batch(sql).map_err(fail);
@@ -437,6 +450,7 @@ impl Db {
         params: impl IntoIterator<Item = Value>,
         each: impl FnMut(&Row) -> anyhow::Result<bool>,
     ) -> anyhow::Result<()> {
+        self.ensure_unfenced()?;
         let schema = self.conn.current_schema();
         self.statements.schema(Arc::clone(&schema))?;
         let mut stmt = match self.statements.take(sql)? {
@@ -459,6 +473,7 @@ impl Db {
     }
 
     pub fn column_count(&self, sql: &str) -> anyhow::Result<usize> {
+        self.ensure_unfenced()?;
         self.statements.schema(self.conn.current_schema())?;
         let stmt = match self.statements.take(sql)? {
             Some(stmt) => stmt,
@@ -477,6 +492,7 @@ impl Db {
     /// implements foreign_key_list and enforcement, but not PRAGMA foreign_key_check; an unknown
     /// PRAGMA returns no rows and therefore cannot prove a restored database consistent.
     pub(crate) fn validate_foreign_keys(&self) -> anyhow::Result<()> {
+        self.ensure_unfenced()?;
         let schema = self.conn.current_schema();
         let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
         for table in schema.tables.values() {
@@ -512,6 +528,81 @@ impl Db {
             }
         }
         Ok(())
+    }
+
+    fn check_fence(fenced: &AtomicBool) -> anyhow::Result<()> {
+        if fenced.load(Ordering::Acquire) {
+            return Err(amphora_api::Refusal::Fenced(
+                "compaction rollback did not reset the writer; reopen after recovery".into(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn ensure_unfenced(&self) -> anyhow::Result<()> {
+        Self::check_fence(&self.fenced)
+    }
+
+    fn verify_compaction_reset(&self) -> anyhow::Result<()> {
+        if !self.conn.get_auto_commit() || self.conn.get_pager().dirty_page_count() != 0 {
+            self.fenced.store(true, Ordering::Release);
+        }
+        self.ensure_unfenced()
+    }
+
+    /// The page fence applies to all modifications, including catalogs, indexes and durable GC
+    /// progress. Only deterministic compaction work is retried, and only after a whole rollback.
+    pub(crate) fn compaction_attempt<R>(
+        &mut self,
+        pages: usize,
+        prepare: bool,
+        f: impl FnOnce(&mut Self) -> anyhow::Result<R>,
+    ) -> anyhow::Result<(R, Pages)> {
+        self.ensure_unfenced()?;
+        self.verify_compaction_reset()?;
+        if pages == 0 {
+            return Err(amphora_api::invalid("compaction page limit", "must be nonzero").into());
+        }
+        if self.conn.get_page_size().get() != 4096 {
+            return Err(
+                amphora_api::invalid("bounded compaction", "requires 4096-byte pages").into(),
+            );
+        }
+        let pager = self.conn.get_pager();
+        pager.set_transaction_page_limit(pages).map_err(fail)?;
+        // Always release the admission fence before rollback restoration, including BEGIN errors.
+        let result = (|| {
+            self.exec("BEGIN IMMEDIATE")?;
+            let answer = f(self)?;
+            let image = if prepare {
+                pager
+                    .transaction_image(
+                        pages
+                            .checked_mul(4096)
+                            .ok_or_else(|| anyhow::anyhow!("compaction image size overflow"))?,
+                    )
+                    .map_err(fail)?
+            } else {
+                Vec::new()
+            };
+            if !prepare {
+                self.exec("COMMIT")?;
+            }
+            Ok((answer, image))
+        })();
+        pager.set_transaction_page_limit(0).map_err(fail)?;
+        if !self.conn.get_auto_commit()
+            && let Err(error) = self.exec("ROLLBACK")
+        {
+            self.fenced.store(true, Ordering::Release);
+            return Err(amphora_api::Refusal::Fenced(format!(
+                "compaction rollback failed: {error:#}; reopen after recovery"
+            ))
+            .into());
+        }
+        self.verify_compaction_reset()?;
+        result
     }
 
     /// Captures a speculative writer transaction without publishing a commit. The engine's
@@ -574,6 +665,7 @@ impl Db {
         finish: impl FnOnce(&mut Self) -> anyhow::Result<R>,
     ) -> anyhow::Result<R> {
         self.statements.clear()?;
+        self.ensure_unfenced()?;
         self.conn.wal_insert_begin().map_err(fail)?;
         let result = (|| {
             let mut frame_no = self.conn.wal_state().map_err(fail)?.max_frame;
@@ -811,6 +903,48 @@ mod tests {
             Ok(false)
         })
         .unwrap();
+
+        // A hard page refusal rolls the entire attempt back before the writer is reused.
+        let refused = db.compaction_attempt(1, false, |db| {
+            db.exec("CREATE TABLE oversized(payload BLOB); INSERT INTO oversized VALUES (zeroblob(65536))")
+        }).unwrap_err();
+        assert!(matches!(
+            refused.downcast_ref::<LimboError>(),
+            Some(LimboError::TransactionPageLimit { .. })
+        ));
+        assert!(
+            db.query("SELECT * FROM oversized", [], |_| Ok(false))
+                .is_err()
+        );
+        db.transaction(|db| db.exec("INSERT INTO retained VALUES (43)"))
+            .unwrap();
+
+        // An actual cleanup interruption fences every later SQL route, including a reader
+        // created before the failure. Clearing the interrupt cannot clear owner fencing.
+        let reader = db.reader().unwrap();
+        let failed: anyhow::Result<((), Pages)> = db.compaction_attempt(100, false, |db| {
+            db.exec("INSERT INTO retained VALUES (44)")?;
+            db.conn.set_progress_handler(1, Some(Box::new(|| true)));
+            anyhow::bail!("force rollback after the application error")
+        });
+        assert!(matches!(
+            failed.unwrap_err().downcast_ref::<amphora_api::Refusal>(),
+            Some(amphora_api::Refusal::Fenced(_))
+        ));
+        db.conn.set_progress_handler(0, None);
+        assert!(db.exec("INSERT INTO retained VALUES (45)").is_err());
+        assert!(
+            db.query_owned("SELECT n FROM retained", [], |_| Ok(false))
+                .is_err()
+        );
+        assert!(db.column_count("SELECT n FROM retained").is_err());
+        assert!(db.reader().is_err());
+        assert!(
+            reader
+                .query("SELECT n FROM retained", [], |_| Ok(false))
+                .is_err()
+        );
+        assert!(db.apply_pages(&[], |_| Ok(())).is_err());
     }
 
     /// Do: size the process's pool for 32 GiB, for 16 MiB, for none said and for more than a

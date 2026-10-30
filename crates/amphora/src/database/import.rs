@@ -510,17 +510,20 @@ mod tests {
         assert_eq!(deletes, vec![(0, Some(b"new".to_vec())), (1, None)]);
         // U06: the boundary deletion stays observable, then obsolete history is reclaimed.
         for before in [3, 4] {
-            db.transaction(|db| {
-                super::super::apply(
-                    db,
-                    "host",
-                    &Operation::Mutation(Mutation::Compact {
-                        namespace: "host".into(),
-                        before,
-                    }),
-                )??;
-                Ok(())
-            })?;
+            // Force one visited version per physical transaction. A tombstone becomes
+            // eligible only after its older value is gone; reopening must retain that cursor.
+            loop {
+                let (progress, _) = db.compaction_attempt(100, false, |db| {
+                    super::super::compaction::step(db, "host", before, 1)
+                })?;
+                assert!(progress.visited <= 1);
+                assert!(get(&db, "host", "items", b"b", 5)?.is_none());
+                if !progress.more {
+                    break;
+                }
+                drop(db);
+                db = open(&path)?;
+            }
             if before == 3 {
                 let answer =
                     super::super::apply(&db, "host", &Operation::Changes("items".into(), 2, 10))??;
@@ -548,6 +551,107 @@ mod tests {
             retained, 1,
             "compaction retains one live baseline, not deleted-key history"
         );
+
+        // U06/U15: actual prepared-page pressure must shrink the GC prefix, commit progress,
+        // and resume it after recovery. Derive the small allowance from a real one-visit image;
+        // the full image must exceed it, so this cannot pass without adaptive page admission.
+        use hyper_durable::{EntryRef, StateMachine};
+        use hyper_raft::proto::{ConfState, EntryType};
+        let config = ConfState {
+            voters: vec![1],
+            ..ConfState::default()
+        };
+        let bounded_path = dir.path().join("bounded.db");
+        let mut machine = crate::replication::Machine::open(&bounded_path, config.clone())?;
+        let (prepared, cutoff) = machine.prepare(|connection| {
+            for value in [vec![7; 16384], b"current".to_vec()] {
+                connection.records_commit(
+                    "bounded",
+                    Tx {
+                        conds: vec![],
+                        writes: (0..64u32)
+                            .map(|key| Write::Put {
+                                family: "items".into(),
+                                key: key.to_be_bytes().to_vec(),
+                                value: value.clone(),
+                            })
+                            .collect(),
+                    },
+                )?;
+            }
+            Ok(2)
+        })?;
+        let apply = |machine: &mut crate::replication::Machine,
+                     index: u64,
+                     bytes: &[u8]|
+         -> anyhow::Result<()> {
+            let mut answers = Vec::new();
+            machine.apply(
+                &EntryRef {
+                    index,
+                    term: 1,
+                    kind: EntryType::EntryNormal,
+                    context: b"bounded-compaction",
+                    data: bytes,
+                },
+                &mut answers,
+            )?;
+            assert_eq!(answers.len(), 1);
+            assert!(answers[0].result.is_ok());
+            Ok(())
+        };
+        apply(&mut machine, 1, &prepared.encode()?)?;
+        let (one, _) =
+            machine.prepare_db(|db| super::super::compaction::step(db, "bounded", cutoff, 1))?;
+        let one_encoded = one.encode()?.len();
+        let pages = one_encoded.div_ceil(4096);
+        let room = 81 + pages * 4103;
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let (full, whole) =
+            machine.prepare_compaction("bounded", cutoff, until, api::REQUEST_MAX)?;
+        assert!(
+            full.encode()?.len() > room,
+            "fixture must exceed the actual small entry allowance"
+        );
+        let (prefix, progress) = machine.prepare_compaction("bounded", cutoff, until, room)?;
+        assert!(progress.visited > 0 && progress.visited < whole.visited);
+        assert!(progress.deleted > 0 && progress.more);
+        assert!(prefix.encode()?.len() <= room);
+        let mut visited = progress.visited;
+        let mut deleted = progress.deleted;
+        apply(&mut machine, 2, &prefix.encode()?)?;
+        drop(machine);
+        let mut machine = crate::replication::Machine::open(&bounded_path, config)?;
+        let mut completed = progress.completed;
+        for index in 3..131 {
+            let (prefix, progress) = machine.prepare_compaction("bounded", cutoff, until, room)?;
+            assert!(prefix.encode()?.len() <= room);
+            visited += progress.visited;
+            deleted += progress.deleted;
+            apply(&mut machine, index, &prefix.encode()?)?;
+            completed = progress.completed;
+            if !progress.more {
+                break;
+            }
+        }
+        assert_eq!(completed, cutoff);
+        assert_eq!(
+            visited, whole.visited,
+            "recovery must not revisit the committed cursor prefix"
+        );
+        assert_eq!(deleted, 64);
+        machine.read(|connection| {
+            for key in 0..64u32 {
+                assert_eq!(
+                    connection
+                        .records_get("bounded", "items", &key.to_be_bytes())?
+                        .map(|row| row.value),
+                    Some(b"current".to_vec())
+                );
+            }
+            Ok(())
+        })?;
+
         drop(db);
         let db = open(&path)?;
         assert!(get(&db, "host", "items", b"b", 5)?.is_none());

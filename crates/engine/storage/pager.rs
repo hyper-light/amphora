@@ -1778,6 +1778,8 @@ pub struct Pager {
     insert_yield: SpillYieldHook,
     /// Dirty pages as a bitmap, naturally sorted by page number.
     dirty_pages: Arc<RwLock<RoaringBitmap>>,
+    /// An owned transaction's hard dirty-page admission limit; zero disables the fence.
+    transaction_page_limit: AtomicUsize,
     subjournal: RwLock<Option<Subjournal>>,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
@@ -2088,6 +2090,7 @@ impl Pager {
             #[cfg(test)]
             insert_yield: SpillYieldHook::new(),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
+            transaction_page_limit: AtomicUsize::new(0),
             subjournal: RwLock::new(None),
             savepoints: Arc::new(RwLock::new(Vec::new())),
             commit_info: RwLock::new(CommitInfo {
@@ -4112,6 +4115,21 @@ impl Pager {
         usize::try_from(self.dirty_pages.read().len()).unwrap_or(usize::MAX)
     }
 
+    /// Installs a hard limit only on a clean, exclusively owned transaction. Disabling it must
+    /// precede whole-transaction rollback, whose restoration work must always be allowed.
+    pub fn set_transaction_page_limit(&self, limit: usize) -> Result<()> {
+        if limit != 0
+            && (self.transaction_page_limit.load(Ordering::Acquire) != 0
+                || self.dirty_page_count() != 0)
+        {
+            return Err(LimboError::InvalidArgument(
+                "transaction page limit requires a clean, unguarded pager".into(),
+            ));
+        }
+        self.transaction_page_limit.store(limit, Ordering::Release);
+        Ok(())
+    }
+
     /// Resolved pages of the current write transaction, before its commit is published.
     /// Amphora proposes these bytes to Raft and rolls the speculative transaction back. Dirty
     /// pages spilled from the cache are read from this transaction's unpublished WAL suffix.
@@ -4207,6 +4225,21 @@ impl Pager {
             "page must be loaded in add_dirty() so its contents can be subjournaled",
             { "page_id": page.get().id() }
         );
+        let page_id = u32::try_from(page.get().id())
+            .map_err(|_| LimboError::InvalidArgument("dirty page ID does not fit u32".into()))?;
+        let limit = self.transaction_page_limit.load(Ordering::Acquire);
+        if limit != 0 {
+            let dirty = self.dirty_pages.read();
+            if !dirty.contains(page_id) && dirty.len() >= u64::try_from(limit).unwrap_or(u64::MAX) {
+                // Refuse before unsharing, subjournaling or changing this page's contents.
+                return Err(LimboError::TransactionPageLimit {
+                    limit,
+                    attempted: limit.checked_add(1).ok_or_else(|| {
+                        LimboError::InvalidArgument("transaction page limit overflow".into())
+                    })?,
+                });
+            }
+        }
         // Amphora: a buffer the shared pages hold is every connection's: written only as this
         // connection's own copy (decision 20).
         if page.is_shared() {
@@ -4214,7 +4247,7 @@ impl Pager {
         }
         self.subjournal_page_if_required(page)?;
         let mut dirty_pages = self.dirty_pages.write();
-        dirty_pages.insert(page.get().id() as u32);
+        dirty_pages.insert(page_id);
         // Notify cache before marking dirty (page was evictable, now it won't be)
         // Only notify if page wasn't already dirty, or if it was spilled
         // State before set_dirty():

@@ -11,6 +11,7 @@ pub(super) const WAIT_MAX: usize = 8;
 pub(super) const WATCH_BATCH_MAX: usize = 64;
 pub(super) const WATCH_REPLY_MAX: usize = 64 << 10;
 pub(super) const SESSION_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+pub(super) const CAP_BOUNDED_COMPACTION: u64 = 1;
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Hello {
@@ -39,6 +40,7 @@ pub(super) enum Request {
         #[serde(deserialize_with = "super::bounded::watch_requests")] Vec<(String, String, Rev)>,
     ),
     ReplicaStatus,
+    Capabilities,
 }
 #[derive(Serialize, Deserialize)]
 pub(super) enum Record {
@@ -54,6 +56,7 @@ pub(super) enum Record {
         #[serde(deserialize_with = "super::bounded::import_page")] amphora_api::import::ImportPage,
     ),
     ImportState,
+    CompactStep(Rev),
 }
 #[derive(Serialize, Deserialize)]
 pub(super) enum Command {
@@ -109,5 +112,7 @@ pub(super) enum Answer {
     ReplicaStatus(Option<amphora_api::replication::ReplicaStatus>),
     // Untyped SQL failures retain caller context; typed refusals use Response::Err.
     SqlError(String),
+    Capabilities(u64),
+    Compaction(amphora_api::CompactionProgress),
 }
 pub(super) type Response = Result<Answer, Refusal>;
