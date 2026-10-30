@@ -142,6 +142,8 @@ fn settings(id: u64) -> hyper_durable::Settings {
             pre_vote: true,
             ..hyper_raft::Config::new(id, limits)
         },
+        // CP-T2.2: preserve flush-proved group durability during API reconciliation.
+        disk: hyper_durable::Disk::Flushed,
         elections: hyper_raft::Elections::Suspicion,
         quiet: std::time::Duration::from_millis(50),
     }

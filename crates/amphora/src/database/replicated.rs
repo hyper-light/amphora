@@ -509,6 +509,8 @@ fn settings(id: u64) -> Result<hyper_durable::Settings, Refusal> {
             seed: id,
             ..hyper_raft::Config::new(id, limits)
         },
+        // CP-T2.2: preserve flush-proved group durability during API reconciliation.
+        disk: hyper_durable::Disk::Flushed,
         elections: hyper_raft::Elections::Ticks,
         quiet: Duration::from_millis(50),
     })

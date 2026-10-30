@@ -52,7 +52,7 @@ or infer quorum durability from a local flush. Missing owner/transport integrati
 optional degraded mode and is not U15 completion.
 
 Evidence: the existing hyper-durable contract states the durable commit fence, configuration and
-snapshot ordering in its [StateMachine and Replica implementations](https://github.com/hyper-light/hyper-raft/tree/25cf88924895ee55976caa061a48789355fb3354/crates/hyper-durable/src).
+snapshot ordering in its [StateMachine and Replica implementations](https://github.com/hyper-light/hyper-raft/tree/4d72e19b9533851e19602eee57053a5a7337b2cd/crates/hyper-durable/src).
 Raft's state-machine safety and log compaction rules are described in
 [Ongaro's dissertation, chapters 3 and 5](https://raft.github.io/raft.pdf).
 The engine's current transaction dirty-page set, spill completion and raw WAL insertion form the
