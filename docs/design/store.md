@@ -1291,19 +1291,26 @@ refused, and the table stayed at 2 (adas-mac-studio-3, 2026-11-01).
 **Falsified by.** A query that waits behind the writer or a flush (the test above), one that writes,
 or one that sees a commit made after it began.
 
-## 34. A prepared statement is validated once, when it's prepared
+## 34. A prepared statement is validated once and held between executes
 
-**Decision.** The public SQL API's `Statement` (`crates/api/src/sql.rs`) runs through
-`Session::query_prepared`, for text the session's `column_count` validated when
-`Connection::prepare` made the statement; the text is the statement's own and never changes after.
-The local session (`crates/amphora/src/sql.rs`, `Db`) runs it without validating it again:
-validation reads the text alone (the whole statement parsed, its tokens walked for reserved names,
-transaction and connection control refused), so its answer can't change between executes. A call
-given text (`Connection::execute`, `query_row`, `execute_batch`) validates every time, as before,
-and a session that says nothing (`Session::query_prepared`'s default, the remote client's, whose
-owner validates what it receives) validates a prepared statement's text on every execute too. What
-this leaves to kiln plan `01a18d12142c7789a40e959ccdf52bd1`, step 2: `prepare_cached` still prepares
-anew, and the engine's plan is still found by its text in Db's statement cache.
+**Decision.** The public SQL API's `Statement` (`crates/api/src/sql.rs`) holds what
+`Session::prepare` gave it, and each execute runs that. The local session (`crates/amphora/src/sql.rs`,
+`Db`) validates the text once there and holds its engine statement, taken out of Db's statement
+cache or prepared (`Db::hold`): an execute neither parses the text nor looks it up. Validation
+reads the text alone (the whole statement parsed, its tokens walked for reserved names, transaction
+and connection control refused), so its answer can't change between executes. A held statement is
+prepared again only when the schema changed since it was (`Db::run_held`, by the cache's own test of
+the schema), and dropped, it goes back to the cache, kept while that schema stands
+(`Db::give_back`), reset with its bindings cleared. While it's held, the same text is prepared anew
+for anyone else: a statement in use is never handed out twice. A call given text
+(`Connection::execute`, `query_row`, `execute_batch`) validates every time, as before, and a
+session that says nothing (`Session::prepare`'s default, the remote client's, whose owner validates
+what it receives) keeps the text and validates it on every execute; no wire format changes.
+
+The cache (`db/cache.rs`) keeps at most `TX_MAX` (1,000) statements and `SQL_MAX` (1 MiB) of their
+text, and evicts the least recently used until both hold. Its recency order is a list linked
+through its map by the statements' text, so taking, returning and evicting a statement each cost a
+few map operations; the order was a queue searched end to end on every take and every return.
 
 **Why.** The unify audit's finding 4: every execute of a prepared statement parsed its SQL again to
 validate it, 1,001 parses for 1,000 executes, though Db's statement cache spared the engine's own
@@ -1324,6 +1331,12 @@ this zero or more times"). The plan's research `01a18d12143072d5992fe36a5f3b2ccb
 e2e67247 the INSERT parsed 1,001 times (the test failed there, its pages already right); with this
 decision each text parsed once, every page's rows the same as e2e67247's (blocks 2 and 1 of leg l1,
 then 7 of l0), and the same INSERT given as text parsed again.
+`a_held_statement_follows_the_schema_and_is_never_handed_out_twice`: a held `SELECT * FROM held`
+read one column, then two after `ALTER TABLE held ADD COLUMN c`, as a new one did; one INSERT
+prepared twice gave two statements, which wrote ten rows in turn. `db/cache.rs`,
+`a_full_cache_evicts_its_least_recently_used_statement`: a cache at its own bounds given `TX_MAX` + 1
+statements, the first taken and returned before the last, evicted the second-oldest, kept the first
+and held `TX_MAX`.
 
 **Falsified by.** A prepared statement that runs what validation refuses (its text can't change, so
 this would be a fault in `prepare`); a text call that runs without validation; or, at plan step 3,

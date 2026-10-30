@@ -1,10 +1,10 @@
 //! U05: Amphora's implementation of its public SQL session API. The database owns the
 //! transaction and durable acknowledgement; the session cannot commit it independently.
 
-use crate::db::Db;
+use crate::db::{Db, Held};
 use amphora_api::Value;
 pub use amphora_api::sql::*;
-use amphora_engine::{Numeric, Value as Native};
+use amphora_engine::{Numeric, Row as NativeRow, Value as Native};
 use amphora_engine_parser::{
     ast::fmt::{BlankContext, ToTokens, TokenStream},
     ast::{Cmd, Stmt},
@@ -183,18 +183,24 @@ impl Session for Db {
     }
     fn query(&self, sql: &str, params: Vec<Value>, first: bool) -> Result<Vec<Vec<Value>>> {
         validate(sql, false)?;
-        rows(self, sql, params, first)
+        rows(params, first, |params, each| {
+            self.query_owned(sql, params, each)
+        })
     }
-    // `column_count` validated this text when its statement was prepared, and validation reads
-    // the text alone: parsing it again on every execute cost a sixth to a third of kiln's hot
-    // statements (docs/design/store.md, decision 34).
-    fn query_prepared(
-        &self,
-        sql: &str,
-        params: Vec<Value>,
-        first: bool,
-    ) -> Result<Vec<Vec<Value>>> {
-        rows(self, sql, params, first)
+    // Validation reads the text alone, so the statement validated and held here runs again and
+    // again without a parse or a lookup by its text: parsing on every execute cost a sixth to a
+    // third of kiln's hot statements (docs/design/store.md, decision 34).
+    fn prepare<'s>(&'s self, sql: &str) -> Result<(Box<dyn Prepared + 's>, usize)> {
+        validate(sql, false)?;
+        let held = self.hold(sql).map_err(failed)?;
+        let columns = held.columns();
+        Ok((
+            Box::new(Kept {
+                db: self,
+                held: Some(held),
+            }),
+            columns,
+        ))
     }
     fn column_count(&self, sql: &str) -> Result<usize> {
         validate(sql, false)?;
@@ -208,12 +214,48 @@ impl Session for Db {
     }
 }
 
-/// A validated statement's rows, each value owned, within the transport's result bounds.
-fn rows(db: &Db, sql: &str, params: Vec<Value>, first: bool) -> Result<Vec<Vec<Value>>> {
+/// A statement the session prepared, held until its `Statement` is dropped.
+struct Kept<'s> {
+    db: &'s Db,
+    held: Option<Held>,
+}
+impl Prepared for Kept<'_> {
+    fn query(&mut self, params: Vec<Value>, first: bool) -> Result<Vec<Vec<Value>>> {
+        let db = self.db;
+        let held = self
+            .held
+            .as_mut()
+            .ok_or_else(|| failed("a prepared statement ran after it was given back"))?;
+        rows(params, first, |params, each| {
+            db.run_held(held, params, each)
+        })
+    }
+}
+impl Drop for Kept<'_> {
+    fn drop(&mut self) {
+        if let Some(held) = self.held.take() {
+            // The cache only spares preparing the statement again. One it can't take back (its
+            // reset failed, or its lock is poisoned, which refuses the next caller) is
+            // finalized here instead.
+            let _ = self.db.give_back(held);
+        }
+    }
+}
+
+/// A validated statement's rows, each value owned, within the transport's result bounds: `run`
+/// steps the statement with its parameters, handing each row on.
+fn rows(
+    params: Vec<Value>,
+    first: bool,
+    run: impl FnOnce(
+        Vec<Native>,
+        &mut dyn FnMut(&NativeRow) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<()>,
+) -> Result<Vec<Vec<Value>>> {
     let params = params.into_iter().map(native).collect::<Result<Vec<_>>>()?;
     let mut rows = Vec::new();
     let mut bytes = 0usize;
-    db.query_owned(sql, params, |row| {
+    run(params, &mut |row| {
         // Match the transport decoder's owned-allocation budget before acknowledging
         // a write with RETURNING: a locally accepted result must fit remotely too.
         bytes = bytes
@@ -433,6 +475,46 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    // Kiln plan 01a18d12142c7789a40e959ccdf52bd1, step 2. Do: run one prepare_cached
+    // `SELECT * FROM held`, add a column, run it again and prepare it again; then prepare one
+    // INSERT twice and run the two in turn. Expect: the held statement and the new one both read
+    // the added column, and the INSERT's two statements each write their rows (AC-T1.1.1;
+    // docs/design/store.md, decision 34).
+    #[test]
+    fn a_held_statement_follows_the_schema_and_is_never_handed_out_twice() {
+        use amphora_api::Value;
+        let db = crate::database::Database::in_memory(until()).unwrap();
+        let (columns, rows) = db
+            .call(until(), |c| {
+                c.execute_batch("CREATE TABLE held(a INTEGER); INSERT INTO held VALUES (1)")?;
+                let mut all = c.prepare_cached("SELECT * FROM held")?;
+                let before = all.query_row([], |r| Ok(r.column_count()))?;
+                c.execute_batch("ALTER TABLE held ADD COLUMN c TEXT")?;
+                let after = all.query_row([], |r| Ok(r.column_count()))?;
+                let again = c
+                    .prepare_cached("SELECT * FROM held")?
+                    .query_row([], |r| Ok(r.column_count()))?;
+                let mut one = c.prepare_cached("INSERT INTO held(a) VALUES (?1)")?;
+                let mut two = c.prepare_cached("INSERT INTO held(a) VALUES (?1)")?;
+                for n in 2..12i64 {
+                    let statement = if n % 2 == 0 { &mut one } else { &mut two };
+                    assert_eq!(statement.execute(vec![Value::Integer(n)])?, 1);
+                }
+                let rows: i64 = c.query_row("SELECT count(*) FROM held", [], |r| r.get(0))?;
+                Ok(([before, after, again], rows))
+            })
+            .unwrap();
+        assert_eq!(
+            columns,
+            [1, 2, 2],
+            "one column, then the added one through the held statement and a new one"
+        );
+        assert_eq!(
+            rows, 11,
+            "the first row and ten from the two INSERT statements"
+        );
     }
 
     // The unify audit's finding 4. Do: 1,000 executes of one prepare_cached INSERT, and 1,000 runs

@@ -550,6 +550,53 @@ impl Db {
         Ok(columns)
     }
 
+    /// Takes `sql`'s statement out of the cache, or prepares it, for a caller that runs it again
+    /// and again with [`Db::run_held`] until [`Db::give_back`] returns it (docs/design/store.md,
+    /// decision 34). While it's held, the same text is prepared anew for anyone else.
+    pub(crate) fn hold(&self, sql: &str) -> anyhow::Result<Held> {
+        self.ensure_unfenced()?;
+        let schema = self.conn.current_schema();
+        self.statements.schema(Arc::clone(&schema))?;
+        let statement = match self.statements.take(sql)? {
+            Some(statement) => statement,
+            None => self.conn.prepare(sql).map_err(fail)?,
+        };
+        Ok(Held {
+            sql: sql.to_owned(),
+            statement,
+            schema,
+        })
+    }
+
+    /// Runs a held statement as [`Db::query_owned`] runs one, preparing it again first if the
+    /// schema changed since it was prepared.
+    pub(crate) fn run_held(
+        &self,
+        held: &mut Held,
+        params: impl IntoIterator<Item = Value>,
+        each: impl FnMut(&Row) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<()> {
+        self.ensure_unfenced()?;
+        let schema = self.conn.current_schema();
+        self.statements.schema(Arc::clone(&schema))?;
+        if !same_schema(&held.schema, &schema) {
+            held.statement = self.conn.prepare(&held.sql).map_err(fail)?;
+            held.schema = schema;
+        }
+        step(self.io.as_ref(), &mut held.statement, params, each)
+    }
+
+    /// Returns a held statement to the cache, kept for the next caller while the schema is the
+    /// one it was prepared under.
+    pub(crate) fn give_back(&self, held: Held) -> anyhow::Result<()> {
+        let current = self.conn.current_schema();
+        self.statements.schema(Arc::clone(&current))?;
+        if same_schema(&held.schema, &current) {
+            self.statements.put(&held.sql, held.statement)?;
+        }
+        Ok(())
+    }
+
     pub fn last_insert_rowid(&self) -> i64 {
         self.conn.last_insert_rowid()
     }
@@ -856,6 +903,27 @@ impl Db {
             Ok(done)
         })
     }
+}
+
+/// A statement held by its caller between executes: its text and the schema it was prepared under.
+pub(crate) struct Held {
+    sql: String,
+    statement: Statement,
+    schema: Arc<amphora_engine::schema::Schema>,
+}
+
+impl Held {
+    pub(crate) fn columns(&self) -> usize {
+        self.statement.num_columns()
+    }
+}
+
+/// The same schema, not another at the same address: the cache's own test (`cache::Cache::schema`).
+fn same_schema(
+    held: &Arc<amphora_engine::schema::Schema>,
+    current: &Arc<amphora_engine::schema::Schema>,
+) -> bool {
+    Arc::ptr_eq(held, current) && held.schema_version == current.schema_version
 }
 
 /// Runs `stmt` with `params` to its end, handing each row to `each` until it says stop (false).
