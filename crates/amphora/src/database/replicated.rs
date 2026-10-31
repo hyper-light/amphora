@@ -1160,63 +1160,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
 
-    fn deadline() -> Instant {
-        Instant::now() + Duration::from_secs(5)
-    }
-    fn open(dir: &Path, voters: Vec<u64>) -> Client {
-        let path = dir.join("state.db");
-        let until = deadline();
-        // Wait for actual lease release, including the actor's log/machine destruction.
-        let lease = loop {
-            match exclusive_file(&path) {
-                Ok(lease) => break Arc::new(lease),
-                Err(error) => {
-                    assert!(Instant::now() < until, "owner did not drain: {error}");
-                    std::thread::park_timeout(POLL);
-                }
-            }
-        };
-        start(
-            &path,
-            &dir.join("raft.log"),
-            ReplicaConfig {
-                node_id: 1,
-                voters,
-                learners: Vec::new(),
-                bootstrap: None,
-            },
-            Arc::new(Changed::default()),
-            lease,
-            until,
-        )
-        .unwrap()
-    }
-    fn leader(client: &Client) {
-        let until = deadline();
-        loop {
-            let status = client.handle().status().unwrap();
-            if status.leader == status.node_id && status.applied > 0 {
-                return;
-            }
-            assert!(
-                Instant::now() < until,
-                "single voter did not elect: {status:?}"
-            );
-            std::thread::park_timeout(POLL);
-        }
-    }
-    fn call(
-        client: &Client,
-        f: impl FnOnce(&mut Db) -> anyhow::Result<Vec<u8>> + Send + 'static,
-    ) -> Result<Vec<u8>, Refusal> {
-        let operation = Operation::Call(Mutex::new(Some(Box::new(move |db| {
-            Ok(Box::new(f(db)?) as Box<dyn Any + Send>)
-        }))));
-        match client.submit(String::new(), operation, deadline())? {
-            Answer::Called(value) => Ok(*value.downcast::<Vec<u8>>().unwrap()),
-            _ => panic!("wrong actor reply"),
-        }
-    }
     fn value(db: &mut Db) -> anyhow::Result<Vec<u8>> {
         let mut value = Vec::new();
         db.query("SELECT value FROM actor_items", [], |row| {
@@ -1230,37 +1173,39 @@ mod tests {
         Ok(value)
     }
 
-    /// U15/CP-T1.8: the product owner must not run a closure before leadership and ReadIndex.
+    /// U15/CP-T1.8 on driven time: the product owner must not run a closure before leadership and
+    /// ReadIndex, and authentication binds a wire record to its sender. Do: call a lone member of
+    /// three, which has no leader, and step it with its clock a nanosecond before the call's
+    /// deadline, then at it. Expect: no answer before the deadline, Timeout at it, the closure never
+    /// run; then records whose claimed sender isn't the authenticated one, or isn't a member,
+    /// refused, and a drain past the outgoing bound refused too.
     #[test]
     fn unknown_leader_waits_to_deadline_without_evaluating_and_authentication_binds_wire_sender() {
         let dir = tempfile::tempdir().unwrap();
-        let client = open(dir.path(), vec![1, 2, 3]);
+        let mut driven = Driven::new();
+        let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
         let evaluated = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&evaluated);
-        let started = Instant::now();
-        let result = call(&client, move |_| {
+        let until = driven.until();
+        let answer = submit(&client, until, move |_| {
             count.fetch_add(1, Ordering::Relaxed);
             Ok(Vec::new())
         });
-        // The owner and synchronous receiver share the original five-second deadline. Either
-        // expiry observer may win; neither permits this isolated member to evaluate the closure.
-        assert!(matches!(
-            result,
-            Err(Refusal::Timeout | Refusal::UnknownOutcome)
-        ));
-        assert!(started.elapsed() >= Duration::from_secs(5));
+        let clock = driven.clock(0);
+        set(&clock, driven.base, until - Duration::from_nanos(1));
+        driven.step();
+        assert!(matches!(answer.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        set(&clock, driven.base, until);
+        driven.step();
+        assert!(matches!(answer.try_recv(), Ok(Err(Refusal::Timeout))));
         assert_eq!(evaluated.load(Ordering::Relaxed), 0);
-        let mut bytes = Vec::new();
+        let mut forged = Vec::new();
         Message {
             from: 2,
             to: 1,
             ..Message::default()
         }
-        .encode(&mut bytes);
-        assert!(matches!(
-            client.handle().receive(3, bytes, deadline()),
-            Err(Refusal::Invalid { .. })
-        ));
+        .encode(&mut forged);
         let mut foreign = Vec::new();
         Message {
             from: 4,
@@ -1268,23 +1213,37 @@ mod tests {
             ..Message::default()
         }
         .encode(&mut foreign);
-        assert!(matches!(
-            client.handle().receive(4, foreign, deadline()),
-            Err(Refusal::Invalid { .. })
-        ));
+        let mut receipts = [
+            client
+                .handle()
+                .admit_receive(3, forged, driven.until())
+                .unwrap(),
+            client
+                .handle()
+                .admit_receive(4, foreign, driven.until())
+                .unwrap(),
+        ];
+        driven.step();
+        for receipt in &mut receipts {
+            assert!(matches!(receipt.try_result(), Err(Refusal::Invalid { .. })));
+        }
         assert!(matches!(
             client.handle().drain(OUTGOING_MESSAGES + 1),
             Err(Refusal::TooLarge { .. })
         ));
     }
 
-    /// CP-T1.8: admitted application calls cannot consume replication's reserved byte capacity.
+    /// CP-T1.8 on driven time: admitted application calls cannot consume replication's reserved
+    /// byte capacity. Do: fill a leaderless member's queue with calls until it refuses one, then
+    /// admit a member's heartbeat and step the member. Expect: the refusal is the application
+    /// bound, the heartbeat processed, and no call run.
     #[test]
     fn unknown_leader_application_pressure_keeps_wire_admission_available() {
         let dir = tempfile::tempdir().unwrap();
-        let client = open(dir.path(), vec![1, 2, 3]);
+        let mut driven = Driven::new();
+        let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
         let handle = client.handle();
-        let until = deadline();
+        let until = driven.until();
         let evaluated = Arc::new(AtomicUsize::new(0));
         let mut replies = Vec::new();
         let mut refusal = None;
@@ -1321,7 +1280,9 @@ mod tests {
             ..Message::default()
         }
         .encode(&mut bytes);
-        handle.receive(2, bytes, until).unwrap();
+        let mut heartbeat = handle.admit_receive(2, bytes, until).unwrap();
+        driven.step();
+        assert!(matches!(heartbeat.try_result(), Ok(Some(()))));
         assert!(matches!(
             refusal,
             Some(Refusal::Full { limit }) if limit == QUEUED_BYTES - WIRE_BYTES
@@ -1334,21 +1295,28 @@ mod tests {
         assert_eq!(evaluated.load(Ordering::Relaxed), 0);
     }
 
-    /// U15/CP-T1.8: real DeviceFile log, product-driven election, once-only capture and reopen.
+    /// U15/CP-T1.8 on driven time: a real DeviceFile log, a product-driven election, a once-only
+    /// capture and bounded GC by the same owner, all kept through a durable restart. Do: a single
+    /// voter captures a random value, puts and deletes a record, compacts, then restarts. Expect:
+    /// the closure run once, the value and the deletion's change back after the restart, and a
+    /// second compaction with nothing left to visit.
     #[test]
     fn single_voter_actor_captures_once_and_reopens_durable_random_value() {
         let dir = tempfile::tempdir().unwrap();
-        let client = open(dir.path(), vec![1]);
-        leader(&client);
+        let mut driven = Driven::new();
+        let clients = vec![driven.open(dir.path(), 1, vec![1], None)];
+        let mut pump = Pump::new(&clients);
+        driven.elect(&mut pump, &clients, 0, 1);
+        let client = clients.first().unwrap();
         let evaluated = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&evaluated);
-        let chosen = call(&client, move |db| {
+        let chosen = driven.call(&mut pump, client, move |db| {
             count.fetch_add(1, Ordering::Relaxed);
             db.exec("CREATE TABLE actor_items(value BLOB DEFAULT(randomblob(32))); INSERT INTO actor_items DEFAULT VALUES")?;
             value(db)
         }).unwrap();
         assert_eq!(evaluated.load(Ordering::Relaxed), 1);
-        assert_eq!(call(&client, value).unwrap(), chosen);
+        assert_eq!(driven.call(&mut pump, client, value).unwrap(), chosen);
         // Bounded GC is captured by this same owner and survives its durable restart.
         for writes in [
             vec![Write::Put {
@@ -1361,69 +1329,68 @@ mod tests {
                 key: b"retired".to_vec(),
             }],
         ] {
-            client
-                .submit(
-                    "gc".into(),
-                    Operation::Mutation(Mutation::Records {
-                        namespace: "gc".into(),
-                        tx: Tx {
-                            conds: vec![],
-                            writes,
-                        },
-                    }),
-                    deadline(),
-                )
-                .unwrap();
+            let records = Operation::Mutation(Mutation::Records {
+                namespace: "gc".into(),
+                tx: Tx {
+                    conds: vec![],
+                    writes,
+                },
+            });
+            let answer = enqueue(client, driven.until(), "gc", records);
+            driven.answer(&mut pump, &answer).unwrap();
         }
-        let progress = client
-            .submit(
-                "gc".into(),
-                Operation::Mutation(Mutation::CompactStep {
-                    namespace: "gc".into(),
-                    before: 2,
-                }),
-                deadline(),
-            )
-            .unwrap();
-        let Answer::Compacted(progress) = progress else {
+        let step = Operation::Mutation(Mutation::CompactStep {
+            namespace: "gc".into(),
+            before: 2,
+        });
+        let answer = enqueue(client, driven.until(), "gc", step);
+        let Answer::Compacted(progress) = driven.answer(&mut pump, &answer).unwrap() else {
             panic!("wrong compaction answer")
         };
         assert_eq!(progress.completed, 2);
         assert_eq!(progress.feed, 1);
         let applied = client.handle().status().unwrap().applied;
-        drop(client);
-        let reopened = open(dir.path(), vec![1]);
-        leader(&reopened);
-        assert!(reopened.handle().status().unwrap().applied >= applied);
-        assert_eq!(call(&reopened, value).unwrap(), chosen);
-        let changes = reopened
-            .submit(
-                "gc".into(),
-                Operation::Changes("items".into(), 1, 10),
-                deadline(),
-            )
-            .unwrap();
-        let Answer::Changes(changes) = changes else {
+        // Past hyper-durable's quiet period, so the owner states its durable commit before it stops.
+        driven.advance(0, Duration::from_millis(60));
+        for _ in 0..8 {
+            driven.round(&mut pump);
+        }
+        driven.drain(&mut pump);
+        pump.finish();
+        drop(clients);
+        drop(driven);
+
+        let mut driven = Driven::new();
+        let reopened = vec![driven.open(dir.path(), 1, vec![1], None)];
+        let mut pump = Pump::new(&reopened);
+        driven.elect(&mut pump, &reopened, 0, applied);
+        let client = reopened.first().unwrap();
+        assert!(client.handle().status().unwrap().applied >= applied);
+        assert_eq!(driven.call(&mut pump, client, value).unwrap(), chosen);
+        let changes = enqueue(
+            client,
+            driven.until(),
+            "gc",
+            Operation::Changes("items".into(), 1, 10),
+        );
+        let Answer::Changes(changes) = driven.answer(&mut pump, &changes).unwrap() else {
             panic!("wrong changes answer")
         };
         assert_eq!(changes.changes.len(), 1);
         assert_eq!(changes.changes[0].value, None);
-        let progress = reopened
-            .submit(
-                "gc".into(),
-                Operation::Mutation(Mutation::CompactStep {
-                    namespace: "gc".into(),
-                    before: 2,
-                }),
-                deadline(),
-            )
-            .unwrap();
-        let Answer::Compacted(progress) = progress else {
+        let step = Operation::Mutation(Mutation::CompactStep {
+            namespace: "gc".into(),
+            before: 2,
+        });
+        let answer = enqueue(client, driven.until(), "gc", step);
+        let Answer::Compacted(progress) = driven.answer(&mut pump, &answer).unwrap() else {
             panic!("wrong recovered compaction answer")
         };
         assert_eq!(progress.completed, 2);
         assert_eq!(progress.visited, 0);
         assert_eq!(evaluated.load(Ordering::Relaxed), 1);
+        driven.drain(&mut pump);
+        pump.finish();
     }
     struct PumpPacket {
         from: u64,
@@ -1796,19 +1763,27 @@ mod tests {
             panic!("the lead did not move to {id} in {ROUNDS} driven rounds");
         }
         /// Rounds, time standing still, until `answer` comes.
+        fn answer(
+            &mut self,
+            pump: &mut Pump<'_>,
+            answer: &mpsc::Receiver<Result<Answer, Refusal>>,
+        ) -> Result<Answer, Refusal> {
+            for _ in 0..ROUNDS {
+                match answer.try_recv() {
+                    Ok(result) => return result,
+                    Err(mpsc::TryRecvError::Empty) => self.round(pump),
+                    Err(error) => panic!("owner ended: {error}"),
+                }
+            }
+            panic!("a driven operation was unanswered after {ROUNDS} rounds");
+        }
+        /// Rounds, time standing still, until the call's `answer` comes.
         fn settle(
             &mut self,
             pump: &mut Pump<'_>,
             answer: &mpsc::Receiver<Result<Answer, Refusal>>,
         ) -> Result<Vec<u8>, Refusal> {
-            for _ in 0..ROUNDS {
-                match answer.try_recv() {
-                    Ok(result) => return result.map(called),
-                    Err(mpsc::TryRecvError::Empty) => self.round(pump),
-                    Err(error) => panic!("owner ended: {error}"),
-                }
-            }
-            panic!("a driven call was unanswered after {ROUNDS} rounds");
+            self.answer(pump, answer).map(called)
         }
         fn call(
             &mut self,
@@ -1831,21 +1806,19 @@ mod tests {
             panic!("admitted records still untaken after {ROUNDS} rounds");
         }
     }
-    /// Enqueues `f` at `client` without waiting: its answer comes on the returned receiver.
-    fn submit(
+    /// Enqueues `operation` at `client` without waiting: its answer comes on the returned receiver.
+    fn enqueue(
         client: &Client,
         until: Instant,
-        f: impl FnOnce(&mut Db) -> anyhow::Result<Vec<u8>> + Send + 'static,
+        namespace: &str,
+        operation: Operation,
     ) -> mpsc::Receiver<Result<Answer, Refusal>> {
-        let operation = Operation::Call(Mutex::new(Some(Box::new(move |db| {
-            Ok(Box::new(f(db)?) as Box<dyn Any + Send>)
-        }))));
         let (response, receiver) = mpsc::sync_channel(1);
         client
             .handle
             .enqueue(
                 Input::Submit {
-                    namespace: String::new(),
+                    namespace: namespace.into(),
                     operation,
                     until,
                     response,
@@ -1854,6 +1827,17 @@ mod tests {
             )
             .unwrap();
         receiver
+    }
+    /// Enqueues the call `f` at `client` without waiting.
+    fn submit(
+        client: &Client,
+        until: Instant,
+        f: impl FnOnce(&mut Db) -> anyhow::Result<Vec<u8>> + Send + 'static,
+    ) -> mpsc::Receiver<Result<Answer, Refusal>> {
+        let operation = Operation::Call(Mutex::new(Some(Box::new(move |db| {
+            Ok(Box::new(f(db)?) as Box<dyn Any + Send>)
+        }))));
+        enqueue(client, until, "", operation)
     }
     fn called(answer: Answer) -> Vec<u8> {
         match answer {
@@ -2521,89 +2505,103 @@ mod tests {
     mod receive_receipts {
         use super::*;
 
-        fn finish(receipt: &mut ReceiveReceipt) -> Result<(), Refusal> {
-            let until = deadline();
-            loop {
+        /// Steps `driven` until `receipt` completes.
+        fn finish(driven: &mut Driven, receipt: &mut ReceiveReceipt) -> Result<(), Refusal> {
+            for _ in 0..ROUNDS {
                 match receipt.try_result() {
-                    Ok(None) => {}
+                    Ok(None) => driven.step(),
                     Ok(Some(())) => return Ok(()),
                     Err(error) => return Err(error),
                 }
-                assert!(Instant::now() < until, "receive receipt did not complete");
-                std::thread::park_timeout(POLL);
             }
+            panic!("a receive receipt was unanswered after {ROUNDS} rounds");
         }
 
-        /// CP-T1.8: admission must not wait behind a SQL capture or acknowledge validation.
+        /// CP-T1.8 on driven time: admission must not wait behind a SQL capture or acknowledge
+        /// validation. Do: from inside a call's work, while a single voter runs it, admit records
+        /// up to the queue's bound, one of them through the waiting `receive`. Expect: each
+        /// admission answered at once, the bound's refusal, the waiting `receive` still waiting;
+        /// then, once the owner runs again, each record's own refusal.
         #[test]
         fn admission_is_bounded_while_processed_receive_waits_and_errors_remain_observable() {
             let dir = tempfile::tempdir().unwrap();
-            let client = open(dir.path(), vec![1]);
-            leader(&client);
-            let (entered, entering) = mpsc::sync_channel(1);
-            let (release, released) = mpsc::sync_channel(1);
-            let caller = client.clone();
-            let capture = std::thread::spawn(move || {
-                call(&caller, move |_| {
-                    entered.send(())?;
-                    released.recv_timeout(Duration::from_secs(5))?;
-                    Ok(Vec::new())
-                })
+            let mut driven = Driven::new();
+            let clients = vec![driven.open(dir.path(), 1, vec![1], None)];
+            let mut pump = Pump::new(&clients);
+            driven.elect(&mut pump, &clients, 0, 1);
+            let handle = clients.first().unwrap().handle().clone();
+            let until = driven.until();
+            let (kept, taken) = mpsc::sync_channel(1);
+            let capture = submit(clients.first().unwrap(), until, move |_| {
+                // The owner is inside this capture: nothing admitted now can be processed yet.
+                let mut receipts = Vec::new();
+                for _ in 0..COMMANDS - 1 {
+                    receipts.push(handle.admit_receive(2, vec![0xff], until).unwrap());
+                }
+                assert!(
+                    receipts
+                        .iter_mut()
+                        .all(|r| matches!(r.try_result(), Ok(None)))
+                );
+                let legacy = handle.clone();
+                let (finished, finishing) = mpsc::sync_channel(1);
+                let processed = std::thread::spawn(move || {
+                    finished.send(legacy.receive(2, vec![0xff], until)).unwrap();
+                });
+                // Wait for the legacy record's actual queue reservation, not thread scheduling.
+                for _ in 0..ROUNDS {
+                    if handle.shared.admitted.load(Ordering::Acquire) == api::REQUEST_MAX + COMMANDS
+                    {
+                        break;
+                    }
+                    std::thread::park_timeout(POLL);
+                }
+                assert_eq!(
+                    handle.shared.admitted.load(Ordering::Acquire),
+                    api::REQUEST_MAX + COMMANDS
+                );
+                assert!(matches!(
+                    finishing.try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+                assert!(matches!(
+                    handle.admit_receive(2, vec![0xff], until),
+                    Err(Refusal::Full { limit: COMMANDS })
+                ));
+                kept.send((receipts, finishing, processed)).unwrap();
+                Ok(Vec::new())
             });
-            entering.recv_timeout(Duration::from_secs(5)).unwrap();
-
-            let handle = client.handle();
-            let mut receipts = Vec::new();
-            for _ in 0..COMMANDS - 1 {
-                receipts.push(handle.admit_receive(2, vec![0xff], deadline()).unwrap());
-            }
-            assert!(
-                receipts
-                    .iter_mut()
-                    .all(|r| matches!(r.try_result(), Ok(None)))
-            );
-            let legacy = handle.clone();
-            let (finished, finishing) = mpsc::sync_channel(1);
-            let processed = std::thread::spawn(move || {
-                finished
-                    .send(legacy.receive(2, vec![0xff], deadline()))
-                    .unwrap();
-            });
-            let until = deadline();
-            // Wait for the legacy record's actual queue reservation, not thread scheduling.
-            while handle.shared.admitted.load(Ordering::Acquire) != api::REQUEST_MAX + COMMANDS {
-                assert!(Instant::now() < until, "processed receive was not admitted");
-                std::thread::park_timeout(POLL);
-            }
-            assert!(matches!(
-                finishing.try_recv(),
-                Err(mpsc::TryRecvError::Empty)
-            ));
-            assert!(matches!(
-                handle.admit_receive(2, vec![0xff], deadline()),
-                Err(Refusal::Full { limit: COMMANDS })
-            ));
-
-            release.send(()).unwrap();
-            assert!(capture.join().unwrap().is_ok());
+            assert_eq!(driven.settle(&mut pump, &capture), Ok(Vec::new()));
+            let (mut receipts, finishing, processed) = taken.try_recv().unwrap();
             for receipt in &mut receipts {
-                assert!(matches!(finish(receipt), Err(Refusal::Invalid { .. })));
+                assert!(matches!(
+                    finish(&mut driven, receipt),
+                    Err(Refusal::Invalid { .. })
+                ));
                 assert!(matches!(receipt.try_result(), Err(Refusal::Invalid { .. })));
             }
+            // The owner answered the legacy record with the others; its thread passes it on.
+            processed.join().unwrap();
             assert!(matches!(
-                finishing.recv_timeout(Duration::from_secs(5)).unwrap(),
+                finishing.try_recv().unwrap(),
                 Err(Refusal::Invalid { .. })
             ));
-            processed.join().unwrap();
+            driven.drain(&mut pump);
+            pump.finish();
         }
 
-        /// CP-T1.8: only processing a valid authenticated record completes a success receipt.
+        /// CP-T1.8 on driven time: only processing a valid authenticated record completes a
+        /// success receipt. Do: admit a member's heartbeat to a lone member of three, and poll its
+        /// receipt before and after stepping the member. Expect: pending before, done after, a
+        /// second poll of the completed receipt refused, and a record whose deadline has already
+        /// passed refused at admission.
         #[test]
         fn authenticated_heartbeat_completes_through_the_existing_actor_step() {
             fn send_sync<T: Send + Sync>() {}
             send_sync::<ReceiveReceipt>();
             let dir = tempfile::tempdir().unwrap();
-            let client = open(dir.path(), vec![1, 2, 3]);
+            let mut driven = Driven::new();
+            let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
             let mut bytes = Vec::new();
             Message {
                 msg_type: hyper_raft::proto::MessageType::MsgHeartbeat,
@@ -2613,8 +2611,12 @@ mod tests {
                 ..Message::default()
             }
             .encode(&mut bytes);
-            let mut receipt = client.handle().admit_receive(2, bytes, deadline()).unwrap();
-            assert!(finish(&mut receipt).is_ok());
+            let mut receipt = client
+                .handle()
+                .admit_receive(2, bytes, driven.until())
+                .unwrap();
+            assert!(matches!(receipt.try_result(), Ok(None)));
+            assert!(finish(&mut driven, &mut receipt).is_ok());
             assert!(matches!(receipt.try_result(), Err(Refusal::Invalid { .. })));
             assert!(matches!(
                 client.handle().admit_receive(2, Vec::new(), Instant::now()),
@@ -2643,10 +2645,11 @@ mod tests {
             assert!(matches!(receipt.try_result(), Err(Refusal::Timeout)));
             drop(sender);
 
+            // An owner gone before the deadline fences the receipt.
             let (sender, receiver) = mpsc::sync_channel(1);
             let mut receipt = ReceiveReceipt {
                 receiver: Mutex::new(receiver),
-                until: deadline(),
+                until: Instant::now() + Duration::from_secs(3600),
                 completed: false,
             };
             drop(sender);

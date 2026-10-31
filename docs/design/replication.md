@@ -126,8 +126,12 @@ them. The three-owner scenarios move to the test shell. Their thread-shell helpe
 the relay's blocking call, `seeded_nodes` and `known_leader`, with their five-second budgets of the
 real clock. `expired_sql_rolls_back_before_actor_continues` moves too: its call's work moves its
 owner's clock to the deadline before a query of ten million rows, which the SQL deadline interrupts
-at its first check. The module's other single-owner tests stay on the thread shell until kiln goal
-08cac9bdacc7869b87d6b7f02afd0b71.
+at its first check. The single-owner tests move too (kiln goal 08cac9bdacc7869b87d6b7f02afd0b71). A
+lone member of three answers the leaderless tests, and a single voter, elected by its own campaign,
+answers the rest. A call waits for its deadline until its owner's clock reaches it. Admission is
+tested from inside a call's work, while the owner runs it. The thread shell's helpers go with them:
+`deadline()`, `open()`, `leader()` and `call()`. The tests read the real clock only for the hour's
+lead, a hang guard, and for deadlines already past when read, which answer the same at any load.
 
 Production keeps one code path (CLAUDE.md section 8). The step is the same function, and the
 production shell adds only its clock, `Instant::now`, and the channel wait.
