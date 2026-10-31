@@ -1205,9 +1205,13 @@ mod tests {
         let path = directory.path().join("db");
         std::fs::File::create(&path).unwrap();
         let owner = endpoint::bind(&path).unwrap();
-        let address = owner.listener.local_addr().unwrap();
+        // The impostor listens first and the dead owner's record then names its port, so no port
+        // is freed for another socket to take before the impostor binds it.
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        owner
+            .name_port(listener.local_addr().unwrap().port())
+            .unwrap();
         drop(owner);
-        let listener = std::net::TcpListener::bind(address).unwrap();
         let fake = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let _hello: Hello = read_limit(&mut stream, until(), 256).unwrap();
