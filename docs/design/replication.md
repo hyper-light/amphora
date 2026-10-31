@@ -63,3 +63,95 @@ with different random/default/trigger output; an acknowledged applied index reop
 rows or membership; a stale preparation changing state; or snapshot installation making a new
 index durable before every image page. The focused persistence tests exercise these boundaries;
 quorum, leader-loss and host integration remain separate required gates.
+
+## The owner's time (2026-10-31)
+
+The replicated owner reads time at one place. Each step of its loop runs at an instant its shell
+gives it (`Actor::step_at(at, input)`), and every time the owner reads is that instant `at`:
+- the tick (`run_loop`, one tick per `TICK` of `at`, never a catch-up);
+- the clock hyper-durable is driven with (`now()`: `at` less the owner's start, the instant at which
+  its shell started it);
+- the leadership-transfer period and its stamp (`bootstrap`);
+- the bootstrap's internal sixty-second lease (`bootstrap`);
+- every deadline check: the waiting queue and the pending operation in `expire()`, `requeue()`,
+  a wire record's and a call's deadline in `receive()`, and the pending operation's deadline in
+  `prepare()`, at its read completion and after its preparation.
+
+The production shell is the owner thread. Before each step it takes `Instant::now()`, then waits on
+the bounded channel (`recv_timeout(POLL)`) for the next input. The handle's caller-side reads stay
+on the real clock, because they are the caller's own deadlines:
+- `submit`, and `receive` with its `enqueue_receive`, before enqueueing and while waiting for the
+  answer;
+- `ReceiveReceipt::try_result`;
+- `start` and its `open`, which make the owner, on the caller's own deadline. `start` also gives the
+  owner thread its first instant.
+
+A test shell holds all of a group's owners on the test's own thread. It steps each owner at that
+owner's own virtual instant, as a machine's own clock: the real clock at the shell's start plus an
+hour, plus an offset that only the test advances. It relays wire records between steps.
+- It elects by having one owner campaign (`Replica::campaign`) while every clock stands still.
+  Ticking every owner instead raced their election timers against the candidates' persisting,
+  because vote requests too wait for their writes, and split the votes for a dozen terms.
+- It holds every clock still through a scenario. No tick, heartbeat or quorum check happens then,
+  so no election does either, whatever the disk's latency.
+- A nemesis forces an election at a chosen point: the leader hands the lead to another owner
+  (`Replica::transfer`, which no lease refuses), or the test advances chosen owners' clocks past
+  their election timeout or the leader's quorum check.
+- Before a restart, it advances every clock past hyper-durable's quiet period, so each owner states
+  its durable commit.
+
+A test caller enqueues its call and polls the answer between steps; it never blocks on a channel.
+Its deadline is a virtual instant, so it expires only when the test advances a clock past it. The
+hour's lead keeps any real-clock check of a test deadline (a receipt's poll) true for an hour. A
+round with nothing to relay yields `POLL` to the disk, and a counted budget of rounds, about a
+minute of such yields, calls a scenario hung. Both are hang guards, and no test's verdict depends on
+them. The three-owner scenarios move to the test shell. Their thread-shell helpers go with them:
+the relay's blocking call, `seeded_nodes` and `known_leader`, with their five-second budgets of the
+real clock. The module's single-owner tests stay on the thread shell for now.
+
+Production keeps one code path (CLAUDE.md section 8). The step is the same function, and the
+production shell adds only `Instant::now()` and the channel wait.
+
+The owner elects on its ticks, in hyper-raft's Ticks mode: 10 ms ticks, a campaign after 20 to 40
+ticks without a leader, and a quorum check every 20. Raft's broadcast time includes each member's
+persisting, and a member answers only after its write (hyper-durable sends a Ready's persisted
+messages after its write). On a loaded machine, then, a follower's slow write silences its answers
+past the leader's quorum window, and the leader steps down. A follower that misses heartbeats for an
+election timeout campaigns. In both cases a proposal in flight answers UnknownOutcome, as the
+paragraph on retry boundaries above requires.
+
+follower_origin_captures_once_and_reads_after_local_durable_apply and
+autonomous_quorum_seed_preserves_unchanged_pages_then_delta_and_restart took those answers for
+failures, and failed at the base 327a8f9 under load: 3 of 36 full-suite rounds at load 26-96. Their
+five-second waits also ran out, at the election, at a call, and at an owner's start.
+
+On driven time the same tests assert what they asserted before, with no election during a
+scenario. A nemesis variant forces an election at each step instead and asserts what must hold
+anyway:
+- never two Oks for the two captures, and never two of their rows;
+- every answer is Ok, the stale capture's refusal, or UnknownOutcome;
+- the seed's original image is intact on every replica.
+This is the leader-loss gate listed above as still required.
+
+Decided for production owners: this change gives them no patience. A follower's slow write already
+deposes a sound leader today: a liveness cost, never a safety one. Whether an owner should give
+hyper-raft its patience and quorum patience from the stalls it measures (`Raft::set_patience`,
+`set_quorum_patience`) is decided on measurements of owners' stalls under load, in kiln goal
+6b112f14729c899e826452260ca618c1. The single-owner tests move to the test shell in kiln goal
+08cac9bdacc7869b87d6b7f02afd0b71.
+
+Evidence: kiln plan 01a18f5daea470a78f8009c26fb9ab9b and its research
+01a18f5daeab73f9be931a367c7e7759 (the failures and their messages at 327a8f9, f961f4b and
+7780186; the traced step-downs); hyper-durable's time comes only from its owner ("One tick of the
+owner's period", "`now` is the owner's monotonic clock", replica.rs); etcd's raft keeps time as an
+abstract tick its user drives so that its behavior is deterministic (etcd-io/raft README);
+FoundationDB's simulator abstracts network, disk, time and randomness so that every failure
+reproduces (Zhou et al., SIGMOD 2021, section 4); Raft's availability depends on timing, and its
+safety must not (Ongaro and Ousterhout 2014, section 5.6).
+
+Falsified by:
+- a scenario whose outcome differs between the test shell and real threads for the same order of
+  inputs;
+- a term change during a scenario with no nemesis;
+- a test whose verdict still depends on the real clock;
+- an owner read of the real clock outside its shell.
