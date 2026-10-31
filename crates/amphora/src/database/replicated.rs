@@ -162,14 +162,20 @@ struct Actor {
     // At most COMMANDS admitted operations wait behind the sole prepared transaction.
     waiting: VecDeque<Envelope>,
     serial: u64,
+    // Every time this owner reads comes from this clock (replication.md, "The owner's time").
+    clock: Clock,
     started: Instant,
     ticked: Instant,
-    // The instant of the step under way: every time this owner reads (replication.md, "The
-    // owner's time"). Its shell gives it: the real clock on the owner thread, a test's own clock.
+    // The instant this owner last read from its clock: at its step's start, and again after a
+    // preparation, whose work takes time of its own.
     at: Instant,
     published: u64,
     transferred: Option<(u64, Instant)>,
 }
+
+/// An owner's time, from its shell: the real clock for the owner thread, one its test moves for a
+/// test shell.
+type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 fn fenced(reason: impl std::fmt::Display) -> Refusal {
     Refusal::Fenced(reason.to_string())
@@ -364,7 +370,7 @@ pub(super) fn start(
         changed,
         lease,
         until,
-        Instant::now(),
+        Arc::new(Instant::now),
     )?;
     std::thread::Builder::new()
         .name("amphora.replica".into())
@@ -374,7 +380,7 @@ pub(super) fn start(
 }
 
 /// An owner and its handle, not yet running: `start` runs it on the owner thread, and a test
-/// shell steps it itself. `at` is the instant its shell starts it at.
+/// shell steps it itself. `clock` is its shell's; the owner starts at its first reading.
 fn open(
     path: &Path,
     log_path: &Path,
@@ -382,7 +388,7 @@ fn open(
     changed: Arc<Changed>,
     lease: Arc<File>,
     until: Instant,
-    at: Instant,
+    clock: Clock,
 ) -> Result<(Client, Actor, mpsc::Receiver<Envelope>), Refusal> {
     if Instant::now() >= until {
         return Err(Refusal::Timeout);
@@ -444,6 +450,7 @@ fn open(
         status: Mutex::new(Ok(status(&replica))),
     });
     let (sender, receiver) = mpsc::sync_channel(COMMANDS);
+    let at = clock();
     let mut actor = Actor {
         published: replica.applied().index,
         replica,
@@ -456,6 +463,7 @@ fn open(
         waiting: VecDeque::new(),
         serial: 0,
         transferred: None,
+        clock,
         started: at,
         ticked: at,
         at,
@@ -609,7 +617,7 @@ impl Actor {
             }
         }
     }
-    /// The owner thread: each step at the real clock, after waiting up to `POLL` for an input.
+    /// The owner thread: each step after waiting up to `POLL` for an input.
     fn run_loop(&mut self, receiver: &mpsc::Receiver<Envelope>) -> Result<(), Refusal> {
         loop {
             let input = match receiver.recv_timeout(POLL) {
@@ -617,12 +625,13 @@ impl Actor {
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             };
-            self.step_at(Instant::now(), input)?;
+            self.run_step(input)?;
         }
     }
-    /// One step at `at`, the only time this owner reads: the input first, then a tick if one is
-    /// due, the core's work, deadlines, and what waits.
-    fn step_at(&mut self, at: Instant, input: Option<Envelope>) -> Result<(), Refusal> {
+    /// One step at its clock's reading: the input first, then a tick if one is due, the core's
+    /// work, deadlines, and what waits.
+    fn run_step(&mut self, input: Option<Envelope>) -> Result<(), Refusal> {
+        let at = (self.clock)();
         self.at = at;
         if let Some(envelope) = input {
             self.receive(envelope)?;
@@ -1086,10 +1095,11 @@ impl Actor {
                 .prepare_compaction(&pending.namespace, *before, pending.until, room)
                 .map(|(prepared, progress)| (prepared, Answer::Compacted(progress)))
         } else {
+            let clock = Arc::clone(&self.clock);
             self.replica.machine_mut().prepare_db(|db| {
                 // The guard ends with application evaluation, before prepare_pages rolls back its
                 // speculative transaction. Cleanup must run even after the SQL deadline elapsed.
-                let _deadline = db.deadline(pending.until);
+                let _deadline = db.deadline_on(pending.until, move || clock());
                 if restore::incomplete(db)? {
                     return Err(api::invalid("database", "restore is incomplete").into());
                 }
@@ -1104,6 +1114,9 @@ impl Actor {
                 }
             })
         };
+        // The preparation ran the caller's work, which takes time of its own: its deadline is
+        // judged at the clock's reading after it, never at the step's start.
+        self.at = (self.clock)();
         // A failed whole rollback poisons this machine. Stop its existing owner instead of
         // accepting another request against an unverified speculative base.
         if bounded && let Err(Refusal::Fenced(reason)) = &prepared {
@@ -1145,6 +1158,7 @@ impl Actor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
 
     fn deadline() -> Instant {
         Instant::now() + Duration::from_secs(5)
@@ -1411,44 +1425,6 @@ mod tests {
         assert_eq!(progress.visited, 0);
         assert_eq!(evaluated.load(Ordering::Relaxed), 1);
     }
-    /// U15/CP-T1.8: a SQL deadline interrupts execution, rolls back capture and frees the driver.
-    #[test]
-    fn expired_sql_rolls_back_before_actor_continues() {
-        let dir = tempfile::tempdir().unwrap();
-        let client = open(dir.path(), vec![1]);
-        leader(&client);
-        let ran = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&ran);
-        let operation = Operation::Call(Mutex::new(Some(Box::new(move |db| {
-            counted.fetch_add(1, Ordering::Relaxed);
-            db.exec("CREATE TABLE cancelled_actor_write(value); WITH RECURSIVE n(x) AS(VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000000) SELECT sum(x) FROM n")?;
-            Ok(Box::new(Vec::<u8>::new()) as Box<dyn Any + Send>)
-        }))));
-        let result = client.submit(
-            String::new(),
-            operation,
-            Instant::now() + Duration::from_millis(200),
-        );
-        assert!(matches!(
-            result,
-            Err(Refusal::Timeout | Refusal::UnknownOutcome)
-        ));
-        assert_eq!(ran.load(Ordering::Relaxed), 1);
-        let retained = call(&client, |db| {
-            let mut count = 0;
-            db.query(
-                "SELECT count(*) FROM sqlite_schema WHERE name='cancelled_actor_write'",
-                [],
-                |row| {
-                    count = row.get::<i64>(0).map_err(unavailable)?;
-                    Ok(false)
-                },
-            )?;
-            Ok(vec![u8::try_from(count)?])
-        })
-        .unwrap();
-        assert_eq!(retained, vec![0]);
-    }
     struct PumpPacket {
         from: u64,
         message: Outbound,
@@ -1655,36 +1631,58 @@ mod tests {
     const ROUNDS: usize = 60_000;
 
     /// A test's own clocks and the owners it steps (replication.md, "The owner's time"). Each
-    /// owner steps at its own instant, as a machine's own clock, which moves only when the test
-    /// advances it. Its instants start an hour past the real clock, so a real-clock check of a test
-    /// deadline (a receipt's poll) holds for an hour: a hang guard, never a verdict.
+    /// owner reads its own clock, as a machine reads its own, and only the test moves it: between
+    /// steps, or from a call's work while the owner runs it. Its instants start an hour past the
+    /// real clock, so a real-clock check of a test deadline (a receipt's poll) holds for an hour:
+    /// a hang guard, never a verdict.
     struct Driven {
         owners: Vec<(Actor, mpsc::Receiver<Envelope>)>,
         base: Instant,
-        offsets: Vec<Duration>,
+        // Each owner's clock: the nanoseconds it reads past `base`.
+        clocks: Vec<Arc<AtomicU64>>,
+    }
+    /// The time a driven clock reads past its shell's base.
+    fn offset(clock: &AtomicU64) -> Duration {
+        Duration::from_nanos(clock.load(Ordering::Acquire))
+    }
+    /// Moves a driven clock to `to`, its shell's `base` plus some offset.
+    fn set(clock: &AtomicU64, base: Instant, to: Instant) {
+        let nanos = u64::try_from(to.duration_since(base).as_nanos()).unwrap();
+        clock.store(nanos, Ordering::Release);
     }
     impl Driven {
         fn new() -> Self {
             Self {
                 owners: Vec::new(),
                 base: Instant::now() + Duration::from_secs(3600),
-                offsets: Vec::new(),
+                clocks: Vec::new(),
             }
         }
-        /// A call's or a record's budget on these clocks: it runs out only if the test advances
-        /// a clock past it.
+        /// A call's or a record's budget on these clocks: it runs out only if the test moves a
+        /// clock past it.
         fn until(&self) -> Instant {
             self.base
-                + self.offsets.iter().copied().max().unwrap_or_default()
+                + self
+                    .clocks
+                    .iter()
+                    .map(|clock| offset(clock))
+                    .max()
+                    .unwrap_or_default()
                 + Duration::from_secs(5)
         }
         fn advance(&mut self, owner: usize, by: Duration) {
-            *self.offsets.get_mut(owner).unwrap() += by;
+            let clock = self.clocks.get(owner).unwrap();
+            set(clock, self.base, self.base + offset(clock) + by);
+        }
+        /// Owner `owner`'s clock, for a call's work to move while the owner runs it.
+        fn clock(&self, owner: usize) -> Arc<AtomicU64> {
+            Arc::clone(self.clocks.get(owner).unwrap())
         }
         fn open(
             &mut self,
             dir: &Path,
             node_id: u64,
+            voters: Vec<u64>,
             bootstrap: Option<api::replication::Bootstrap>,
         ) -> Client {
             let path = dir.join(format!("state-{node_id}.db"));
@@ -1699,34 +1697,35 @@ mod tests {
                 }
             }
             let lease = lease.expect("the previous owner kept its lease");
+            let reading = Arc::new(AtomicU64::new(0));
+            let (base, read) = (self.base, Arc::clone(&reading));
             let (client, actor, receiver) = super::open(
                 &path,
                 &dir.join(format!("raft-{node_id}.log")),
                 ReplicaConfig {
                     node_id,
-                    voters: vec![1, 2, 3],
+                    voters,
                     learners: Vec::new(),
                     bootstrap,
                 },
                 Arc::new(Changed::default()),
                 lease,
                 self.until(),
-                self.base,
+                Arc::new(move || base + offset(&read)),
             )
             .unwrap();
             self.owners.push((actor, receiver));
-            self.offsets.push(Duration::ZERO);
+            self.clocks.push(reading);
             client
         }
         /// One round: every owner takes each input waiting for it, then steps once more, each at
-        /// its own instant.
+        /// its own clock's reading.
         fn step(&mut self) {
-            for ((owner, inputs), offset) in self.owners.iter_mut().zip(&self.offsets) {
-                let at = self.base + *offset;
+            for (owner, inputs) in &mut self.owners {
                 while let Ok(input) = inputs.try_recv() {
-                    owner.step_at(at, Some(input)).unwrap();
+                    owner.run_step(Some(input)).unwrap();
                 }
-                owner.step_at(at, None).unwrap();
+                owner.run_step(None).unwrap();
             }
         }
         /// One relay round and one step; a round with nothing to relay yields `POLL` to the disk.
@@ -1869,13 +1868,131 @@ mod tests {
             .collect()
     }
 
+    /// U15/CP-T1.8 on driven time (replication.md, "The owner's time"): a call whose own work
+    /// outlasts its deadline is refused and never proposed. Do: the call's work inserts a row,
+    /// then moves its owner's clock to the call's deadline, as slow work moves the real clock.
+    /// Expect: Timeout, no row on any owner, and no election.
+    #[test]
+    fn a_call_whose_work_outlasts_its_deadline_is_refused_and_never_proposed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let elected = terms(&clients);
+        let origin = clients.get(leader).unwrap();
+        driven
+            .call(&mut pump, origin, |db| {
+                db.exec("CREATE TABLE slow_items(value)")?;
+                Ok(Vec::new())
+            })
+            .unwrap();
+        // The call's deadline is a second past its owner's clock, inside the relay's budget for
+        // the records it carries, so the clock reaching it expires the call alone.
+        let (clock, base) = (driven.clock(leader), driven.base);
+        let until = base + offset(&clock) + Duration::from_secs(1);
+        let answer = submit(origin, until, move |db| {
+            db.exec("INSERT INTO slow_items VALUES(1)")?;
+            set(&clock, base, until);
+            Ok(Vec::new())
+        });
+        assert_eq!(driven.settle(&mut pump, &answer), Err(Refusal::Timeout));
+        for client in &clients {
+            let rows = driven
+                .call(&mut pump, client, |db| {
+                    let mut count = 0;
+                    db.query("SELECT count(*) FROM slow_items", [], |row| {
+                        count = row.get::<i64>(0).map_err(unavailable)?;
+                        Ok(false)
+                    })?;
+                    Ok(vec![u8::try_from(count)?])
+                })
+                .unwrap();
+            assert_eq!(rows, vec![0]);
+        }
+        assert_eq!(
+            terms(&clients),
+            elected,
+            "an election happened during the scenario"
+        );
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// How many tables named cancelled_actor_write the database has.
+    fn cancelled_tables(db: &mut Db) -> anyhow::Result<u8> {
+        let mut count = 0;
+        db.query(
+            "SELECT count(*) FROM sqlite_schema WHERE name='cancelled_actor_write'",
+            [],
+            |row| {
+                count = row.get::<i64>(0).map_err(unavailable)?;
+                Ok(false)
+            },
+        )?;
+        Ok(u8::try_from(count)?)
+    }
+
+    /// U15/CP-T1.8 on driven time: a SQL deadline interrupts execution, rolls back its capture
+    /// and frees the owner. Do: the call's work creates a table, moves its owner's clock to the
+    /// call's deadline, as long work moves the real clock, then runs a query of ten million rows.
+    /// Expect: the query interrupted at its first deadline check, Timeout, the table rolled back,
+    /// and the owner's next call answered.
+    #[test]
+    fn expired_sql_rolls_back_before_actor_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = vec![driven.open(dir.path(), 1, vec![1], None)];
+        let mut pump = Pump::new(&clients);
+        driven.elect(&mut pump, &clients, 0, 1);
+        let ran = Arc::new(AtomicUsize::new(0));
+        let created = Arc::new(AtomicUsize::new(0));
+        let interrupted = Arc::new(AtomicUsize::new(0));
+        let (counted, made, stopped) = (
+            Arc::clone(&ran),
+            Arc::clone(&created),
+            Arc::clone(&interrupted),
+        );
+        let (clock, base, until) = (driven.clock(0), driven.base, driven.until());
+        let answer = submit(clients.first().unwrap(), until, move |db| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            db.exec("CREATE TABLE cancelled_actor_write(value)")?;
+            made.store(usize::from(cancelled_tables(db)?), Ordering::Relaxed);
+            set(&clock, base, until);
+            // Through the row runner, which reports an interrupt as one (the batch runner
+            // reports it as busy).
+            let result = db.query_owned("WITH RECURSIVE n(x) AS(VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000000) SELECT sum(x) FROM n", [], |_| Ok(true));
+            if matches!(&result, Err(error) if format!("{error:#}").contains("interrupt")) {
+                stopped.fetch_add(1, Ordering::Relaxed);
+            }
+            result?;
+            Ok(Vec::new())
+        });
+        assert_eq!(driven.settle(&mut pump, &answer), Err(Refusal::Timeout));
+        assert_eq!(ran.load(Ordering::Relaxed), 1);
+        assert_eq!(created.load(Ordering::Relaxed), 1);
+        assert_eq!(interrupted.load(Ordering::Relaxed), 1);
+        let retained = driven
+            .call(&mut pump, clients.first().unwrap(), |db| {
+                Ok(vec![cancelled_tables(db)?])
+            })
+            .unwrap();
+        assert_eq!(retained, vec![0]);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
     /// U15/CP-T1.8 on driven time (replication.md, "The owner's time"): follower calls use the
     /// real leader's ReadIndex and proposal forwarding, and no election happens during the scenario.
     #[test]
     fn follower_origin_captures_once_and_reads_after_local_durable_apply() {
         let dir = tempfile::tempdir().unwrap();
         let mut driven = Driven::new();
-        let clients: Vec<Client> = (1..=3).map(|n| driven.open(dir.path(), n, None)).collect();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
         let mut pump = Pump::new(&clients);
         let leader = driven.elect(&mut pump, &clients, 0, 1);
         let elected = terms(&clients);
@@ -1983,7 +2100,9 @@ mod tests {
         for position in 0..5 {
             let dir = tempfile::tempdir().unwrap();
             let mut driven = Driven::new();
-            let clients: Vec<Client> = (1..=3).map(|n| driven.open(dir.path(), n, None)).collect();
+            let clients: Vec<Client> = (1..=3)
+                .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+                .collect();
             let mut pump = Pump::new(&clients);
             pump.refusals = Some(0);
             let leader = driven.elect(&mut pump, &clients, 0, 1);
@@ -2205,7 +2324,7 @@ mod tests {
         let bootstrap = crate::replication::bootstrap::inspect_source(&source, 3).unwrap();
         let mut driven = Driven::new();
         let clients: Vec<Client> = (1..=3)
-            .map(|n| driven.open(dir.path(), n, Some(bootstrap.clone())))
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], Some(bootstrap.clone())))
             .collect();
         let mut pump = Pump::new(&clients);
         driven.elect(&mut pump, &clients, 0, 0);
@@ -2251,7 +2370,7 @@ mod tests {
 
         let mut driven = Driven::new();
         let reopened: Vec<Client> = (1..=3)
-            .map(|n| driven.open(dir.path(), n, Some(bootstrap.clone())))
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], Some(bootstrap.clone())))
             .collect();
         let mut pump = Pump::new(&reopened);
         driven.elect(&mut pump, &reopened, 0, 0);
@@ -2315,7 +2434,7 @@ mod tests {
         };
         let mut driven = Driven::new();
         let clients: Vec<Client> = (1..=3)
-            .map(|n| driven.open(dir.path(), n, Some(bootstrap.clone())))
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], Some(bootstrap.clone())))
             .collect();
         let mut pump = Pump::new(&clients);
         pump.refusals = Some(0);
@@ -2375,7 +2494,7 @@ mod tests {
         // Reopened, the group elects again and the lead moves while the replicas are read.
         let mut driven = Driven::new();
         let reopened: Vec<Client> = (1..=3)
-            .map(|n| driven.open(dir.path(), n, Some(bootstrap.clone())))
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], Some(bootstrap.clone())))
             .collect();
         let mut pump = Pump::new(&reopened);
         pump.refusals = Some(0);
