@@ -66,29 +66,46 @@ quorum, leader-loss and host integration remain separate required gates.
 
 ## The owner's time (2026-10-31)
 
-The replicated owner reads time at one place. Each step of its loop runs at an instant its shell
-gives it (`Actor::step_at(at, input)`), and every time the owner reads is that instant `at`:
-- the tick (`run_loop`, one tick per `TICK` of `at`, never a catch-up);
-- the clock hyper-durable is driven with (`now()`: `at` less the owner's start, the instant at which
-  its shell started it);
+The replicated owner reads time from one clock, its shell's (`Clock`). It reads it at the start of
+each step of its loop (`Actor::run_step(input)`), and again after each preparation, because a
+preparation runs the caller's own work, which takes time of its own. Every time the owner reads is
+its latest reading `at`:
+- the tick (`run_step`, one tick per `TICK` of `at`, never a catch-up);
+- the clock hyper-durable is driven with (`now()`: `at` less the owner's start, its clock's first
+  reading);
 - the leadership-transfer period and its stamp (`bootstrap`);
 - the bootstrap's internal sixty-second lease (`bootstrap`);
 - every deadline check: the waiting queue and the pending operation in `expire()`, `requeue()`,
   a wire record's and a call's deadline in `receive()`, and the pending operation's deadline in
-  `prepare()`, at its read completion and after its preparation.
+  `prepare()`, at its read completion and after its preparation;
+- the SQL deadline that interrupts a call's work (`Db::deadline_on`: the engine's progress handler,
+  every 1,024 VM instructions), which reads the clock itself.
 
-The production shell is the owner thread. Before each step it takes `Instant::now()`, then waits on
-the bounded channel (`recv_timeout(POLL)`) for the next input. The handle's caller-side reads stay
-on the real clock, because they are the caller's own deadlines:
+The base 327a8f9 read the real clock after a preparation. This decision's first version (2e7728d)
+judged that deadline at the step's instant instead, which in production can't see the work's time:
+a call whose work outlasted its deadline was proposed, and one its SQL deadline interrupted answered
+the interrupt's error, not Timeout. `a_call_whose_work_outlasts_its_deadline_is_refused_and_never_proposed`
+failed that way, and passes once the owner reads its clock after a preparation (kiln goal
+557f980dfca48b428bbbb4687324653f).
+
+A compaction step's own deadline checks read the real clock, as the local database's do
+(`compaction::ready`, `compaction::deadline_result` and the step's SQL deadline). On the owner
+thread the two clocks are one. In a test, a call's deadline is an hour ahead of the real clock, so
+those checks never fire there: they are hang guards.
+
+The production shell is the owner thread. Its clock is the real one (`Instant::now`), and before
+each step it waits on the bounded channel (`recv_timeout(POLL)`) for the next input. The handle's
+caller-side reads stay on the real clock, because they are the caller's own deadlines:
 - `submit`, and `receive` with its `enqueue_receive`, before enqueueing and while waiting for the
   answer;
 - `ReceiveReceipt::try_result`;
 - `start` and its `open`, which make the owner, on the caller's own deadline. `start` also gives the
-  owner thread its first instant.
+  owner thread its clock.
 
-A test shell holds all of a group's owners on the test's own thread. It steps each owner at that
-owner's own virtual instant, as a machine's own clock: the real clock at the shell's start plus an
-hour, plus an offset that only the test advances. It relays wire records between steps.
+A test shell holds all of a group's owners on the test's own thread. Each owner reads its own
+virtual clock, as a machine reads its own: the real clock at the shell's start plus an hour, plus an
+offset that only the test moves, between steps or from a call's work while its owner runs it, as
+slow work moves the real clock. It relays wire records between steps.
 - It elects by having one owner campaign (`Replica::campaign`) while every clock stands still.
   Ticking every owner instead raced their election timers against the candidates' persisting,
   because vote requests too wait for their writes, and split the votes for a dozen terms.
@@ -107,10 +124,13 @@ round with nothing to relay yields `POLL` to the disk, and a counted budget of r
 minute of such yields, calls a scenario hung. Both are hang guards, and no test's verdict depends on
 them. The three-owner scenarios move to the test shell. Their thread-shell helpers go with them:
 the relay's blocking call, `seeded_nodes` and `known_leader`, with their five-second budgets of the
-real clock. The module's single-owner tests stay on the thread shell for now.
+real clock. `expired_sql_rolls_back_before_actor_continues` moves too: its call's work moves its
+owner's clock to the deadline before a query of ten million rows, which the SQL deadline interrupts
+at its first check. The module's other single-owner tests stay on the thread shell until kiln goal
+08cac9bdacc7869b87d6b7f02afd0b71.
 
 Production keeps one code path (CLAUDE.md section 8). The step is the same function, and the
-production shell adds only `Instant::now()` and the channel wait.
+production shell adds only its clock, `Instant::now`, and the channel wait.
 
 The owner elects on its ticks, in hyper-raft's Ticks mode: 10 ms ticks, a campaign after 20 to 40
 ticks without a leader, and a quorum check every 20. Raft's broadcast time includes each member's
@@ -154,4 +174,5 @@ Falsified by:
   inputs;
 - a term change during a scenario with no nemesis;
 - a test whose verdict still depends on the real clock;
-- an owner read of the real clock outside its shell.
+- an owner's read of time that isn't its clock's, other than a compaction step's own checks;
+- a call whose work outlasts its deadline that is proposed, or that answers anything but Timeout.
