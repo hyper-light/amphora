@@ -79,3 +79,89 @@ fn an_upsert_settles_its_constraint_whatever_the_statements_or_clause() {
         ["1|1|19", "3|3|3"]
     );
 }
+
+/// Do: the rest of the matrix, each case on rows set afresh: a named conflict's DO NOTHING under
+/// OR REPLACE and OR ABORT, and a conflict no upsert names under OR REPLACE, OR ABORT and OR
+/// IGNORE, and a conflict on both. Expect: sqlite3 3.54.0's rows or error (its output beside each):
+/// the DO NOTHING for the constraint it names; for the others, OR REPLACE replaces the conflicting
+/// row, OR ABORT fails the statement and keeps the rows, and OR IGNORE skips the row; on both, the
+/// named one's upsert, in either declaration order (E4; T-T1.7.1).
+#[test]
+fn the_or_clause_settles_the_conflicts_no_upsert_names() {
+    let conn = open();
+    conn.execute("CREATE TABLE t(u UNIQUE, v)").unwrap();
+    conn.execute("INSERT INTO t VALUES(1,'a')").unwrap();
+    // G1|1|a
+    conn.execute("INSERT OR REPLACE INTO t VALUES(1,'x') ON CONFLICT(u) DO NOTHING")
+        .unwrap();
+    assert_eq!(rows(&conn, "SELECT * FROM t"), ["1|a"]);
+    // G2|1|a
+    conn.execute("INSERT OR ABORT INTO t VALUES(1,'y') ON CONFLICT(u) DO NOTHING")
+        .unwrap();
+    assert_eq!(rows(&conn, "SELECT * FROM t"), ["1|a"]);
+
+    conn.execute("CREATE TABLE r(id INTEGER PRIMARY KEY, u UNIQUE, w UNIQUE)")
+        .unwrap();
+    let reset = |conn: &Arc<Connection>| {
+        conn.execute("DELETE FROM r").unwrap();
+        conn.execute("INSERT INTO r VALUES(1,1,1),(3,3,3)").unwrap();
+    };
+    // G3|1|1|1, G3|4|4|3 and G4, the same: the conflict on w goes to OR REPLACE.
+    for upsert in ["DO UPDATE SET w=9", "DO NOTHING"] {
+        reset(&conn);
+        conn.execute(format!(
+            "INSERT OR REPLACE INTO r VALUES(4,4,3) ON CONFLICT(u) {upsert}"
+        ))
+        .unwrap();
+        assert_eq!(
+            rows(&conn, "SELECT * FROM r ORDER BY id"),
+            ["1|1|1", "4|4|3"],
+            "{upsert}"
+        );
+    }
+    // G5 and G6: "UNIQUE constraint failed: r.w", and the rows stay (1|1|1, 3|3|3).
+    for upsert in ["DO UPDATE SET w=9", "DO NOTHING"] {
+        reset(&conn);
+        let error = conn
+            .execute(format!(
+                "INSERT OR ABORT INTO r VALUES(4,4,3) ON CONFLICT(u) {upsert}"
+            ))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("UNIQUE constraint failed: r.w"),
+            "{upsert}: {error}"
+        );
+        assert_eq!(
+            rows(&conn, "SELECT * FROM r ORDER BY id"),
+            ["1|1|1", "3|3|3"],
+            "{upsert}"
+        );
+    }
+    // G7|1|1|1, G7|3|3|3
+    reset(&conn);
+    conn.execute("INSERT OR IGNORE INTO r VALUES(4,4,3) ON CONFLICT(u) DO NOTHING")
+        .unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT * FROM r ORDER BY id"),
+        ["1|1|1", "3|3|3"]
+    );
+    // G8|1|1|9, G8|3|3|3: a conflict on both: the named one's DO UPDATE runs and the insert, with
+    // its REPLACE of row 3, never happens.
+    reset(&conn);
+    conn.execute("INSERT OR REPLACE INTO r VALUES(4,1,3) ON CONFLICT(u) DO UPDATE SET w=9")
+        .unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT * FROM r ORDER BY id"),
+        ["1|1|9", "3|3|3"]
+    );
+    // G9|1|9|1, G9|3|3|3: the same with the unnamed column declared first.
+    conn.execute("CREATE TABLE s(id INTEGER PRIMARY KEY, w UNIQUE, u UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO s VALUES(1,1,1),(3,3,3)").unwrap();
+    conn.execute("INSERT OR REPLACE INTO s VALUES(4,3,1) ON CONFLICT(u) DO UPDATE SET w=9")
+        .unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT * FROM s ORDER BY id"),
+        ["1|9|1", "3|3|3"]
+    );
+}

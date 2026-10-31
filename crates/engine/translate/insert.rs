@@ -3231,20 +3231,37 @@ fn emit_unique_index_check(
                 }
             }
         }
-        // No matching UPSERT handler so we emit constraint error
-        // (if conflict clause matched - VM will jump to later instructions and skip halt)
-        let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
-        let (description, on_error) = halt_desc_and_on_error(
-            &raw_desc,
-            preflight.effective_on_conflict,
-            program.flags.has_statement_conflict(),
-        );
-        program.emit_insn(Insn::Halt {
-            err_code: SQLITE_CONSTRAINT_UNIQUE,
-            description,
-            on_error,
-            description_reg: None,
-        });
+        if preflight.on_replace {
+            // Amphora: no upsert covers this constraint and REPLACE settles it: delete the
+            // conflicting row. With an upsert, the commit phase writes every index entry, so none
+            // is written here (the unify audit's E4).
+            program.emit_insn(Insn::IdxRowId {
+                cursor_id: idx_cursor_id,
+                dest: ctx.conflict_rowid_reg,
+            });
+            emit_replace_delete_conflicting_row(
+                program,
+                resolver,
+                preflight.connection,
+                ctx,
+                preflight.table_references,
+            )?;
+        } else {
+            // No matching UPSERT handler so we emit constraint error
+            // (if conflict clause matched - VM will jump to later instructions and skip halt)
+            let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
+            let (description, on_error) = halt_desc_and_on_error(
+                &raw_desc,
+                preflight.effective_on_conflict,
+                program.flags.has_statement_conflict(),
+            );
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_CONSTRAINT_UNIQUE,
+                description,
+                on_error,
+                description_reg: None,
+            });
+        }
 
         // continue preflight with next constraint
         program.preassign_label_to_next_insn(next_check);
@@ -3375,8 +3392,12 @@ fn emit_preflight_constraint_checks(
             }
         }
 
-        let effective_on_replace =
-            matches!(effective, ResolveType::Replace) && preflight.upsert_actions.is_empty();
+        // Amphora: a constraint an upsert names, or its catch-all takes, is settled by that upsert;
+        // the others by their own algorithm, REPLACE included, as SQLite settles them. REPLACE was
+        // off for every constraint once a statement had an upsert, so `INSERT OR REPLACE ... ON
+        // CONFLICT(u) DO UPDATE` refused a conflict on another column (the unify audit's E4;
+        // sqlite.org/lang_upsert.html).
+        let effective_on_replace = matches!(effective, ResolveType::Replace) && !upserted;
         preflight.on_replace = effective_on_replace;
         preflight.effective_on_conflict = effective;
 
@@ -3714,8 +3735,8 @@ struct ConstraintsToCheck {
 struct PreflightCtx<'a, 'b> {
     /// UPSERT action handlers (target, label, upsert clause)
     upsert_actions: &'a [(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
-    /// Whether ON CONFLICT REPLACE is active globally (without UPSERT).
-    /// This is true when the statement has INSERT OR REPLACE (applies to all constraints).
+    /// Whether REPLACE settles the constraint being checked: its effective algorithm is REPLACE
+    /// and no upsert covers it. Set per constraint in emit_preflight_constraint_checks.
     on_replace: bool,
     /// The effective conflict resolution for the current constraint being checked.
     /// Updated per-constraint in emit_preflight_constraint_checks.
