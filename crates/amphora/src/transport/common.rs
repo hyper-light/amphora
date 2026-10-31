@@ -250,7 +250,7 @@ impl Owner {
                                 .name("amphora.client".into())
                                 .spawn(move || {
                                     let _permit = permit;
-                                    if let Err(error) = serve(stream, token, &*acquire, &waits) {
+                                    if let Err(error) = serve(stream, token, &*acquire, &waits, GREETING_MAX) {
                                         tracing::debug!(target: "amphora.transport", event = "connection_finished", %error);
                                     }
                                 });
@@ -309,7 +309,7 @@ impl Client {
         remaining(until)?;
         let auth_until = until.min(
             Instant::now()
-                .checked_add(Duration::from_secs(2))
+                .checked_add(GREETING_MAX)
                 .ok_or(Refusal::Timeout)?,
         );
         let (mut stream, token) = endpoint::connect(&self.path, auth_until)?;
@@ -622,11 +622,10 @@ fn serve(
     token: [u8; 32],
     acquire: &dyn Fn() -> Option<crate::database::Database>,
     waits: &Arc<AtomicUsize>,
+    greeting: Duration,
 ) -> Result<(), Refusal> {
     let started = Instant::now();
-    let greeting_until = started
-        .checked_add(Duration::from_secs(2))
-        .ok_or(Refusal::Timeout)?;
+    let greeting_until = started.checked_add(greeting).ok_or(Refusal::Timeout)?;
     let hello: Hello = read_limit(&mut stream, greeting_until, 256)?;
     if hello.version != 2 || hello.millis == 0 || Duration::from_millis(hello.millis) > SESSION_MAX
     {
@@ -989,18 +988,16 @@ impl Records for Namespace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::HANG;
     fn pair() -> (Stream, Stream) {
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let client = std::net::TcpStream::connect_timeout(
-            &listener.local_addr().unwrap(),
-            Duration::from_secs(2),
-        )
-        .unwrap();
+        let client =
+            std::net::TcpStream::connect_timeout(&listener.local_addr().unwrap(), HANG).unwrap();
         let (server, _) = listener.accept().unwrap();
         (client, server)
     }
     fn until() -> Instant {
-        Instant::now() + Duration::from_secs(5)
+        Instant::now() + HANG
     }
 
     /// Whether this is the child copy of the test binary that `test` runs alone, to be stopped
@@ -1117,7 +1114,7 @@ mod tests {
         let mut stream = Stream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut peer, _) = listener.accept().unwrap();
         // A send cut short leaves the rest of the frame unread: the read refuses, never hangs.
-        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        peer.set_read_timeout(Some(HANG)).unwrap();
         let (send_id, id) = std::sync::mpsc::channel();
         let writer = thread::spawn(move || {
             let bytes = vec![7u8; frame];
@@ -1235,6 +1232,8 @@ mod tests {
     #[test]
     fn wrong_capability_never_acquires_database() {
         // U05/U06: authentication precedes writer/Records access.
+        // The longest session the protocol allows: it bounds the whole session, compaction included.
+        let millis = u64::try_from(SESSION_MAX.as_millis()).unwrap();
         let (mut client, server) = pair();
         let accessed = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&accessed);
@@ -1247,6 +1246,7 @@ mod tests {
                     None
                 },
                 &Arc::new(AtomicUsize::new(0)),
+                HANG,
             )
         });
         write(
@@ -1254,7 +1254,7 @@ mod tests {
             &Hello {
                 version: 2,
                 nonce: [2; 32],
-                millis: 1000,
+                millis,
             },
             until(),
         )
@@ -1263,7 +1263,7 @@ mod tests {
         let hello = Hello {
             version: 2,
             nonce: [2; 32],
-            millis: 1000,
+            millis,
         };
         let proof = auth::proof(&[9; 32], false, &hello, &challenge.nonce).unwrap();
         write(&mut client, &proof, until()).unwrap();
@@ -1287,12 +1287,13 @@ mod tests {
                         Some(db.clone())
                     },
                     &Arc::new(AtomicUsize::new(0)),
+                    HANG,
                 )
             });
             let hello = Hello {
                 version: 2,
                 nonce: [2; 32],
-                millis: 1000,
+                millis,
             };
             write(&mut client, &hello, until()).unwrap();
             let challenge: Challenge = read(&mut client, until()).unwrap();
