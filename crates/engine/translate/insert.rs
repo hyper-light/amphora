@@ -3341,14 +3341,20 @@ fn emit_preflight_constraint_checks(
             }
         };
         // REPLACE constraints must sort after all non-REPLACE ones
-        // (schema.rs:add_index + IPK deferral ensure this).
-        if effective == ResolveType::Replace {
-            seen_replace = true;
-        } else {
-            turso_assert!(
-                !seen_replace,
-                "non-REPLACE constraint after REPLACE constraint — sort order invariant violated"
-            );
+        // (schema.rs:add_index + IPK deferral ensure this). Amphora: a constraint an upsert
+        // covers sorts first and is settled by that upsert's DO UPDATE or DO NOTHING, never by its
+        // own clause (sqlite.org/lang_upsert.html), so the order doesn't count it: an upsert naming
+        // an INTEGER PRIMARY KEY ON CONFLICT REPLACE beside a UNIQUE column panicked here (the
+        // unify audit's E3).
+        let upserted = position.is_some() || constraints.upsert_catch_all_position.is_some();
+        if !upserted {
+            if effective == ResolveType::Replace {
+                seen_replace = true;
+            } else if seen_replace {
+                return Err(crate::LimboError::InternalError(
+                    "a constraint without REPLACE was ordered after one with it".into(),
+                ));
+            }
         }
 
         let effective_on_replace =
@@ -3766,23 +3772,31 @@ fn build_constraints_to_check(
     turso_debug_assert!(
         has_statement_conflict || {
             let mut saw_replace = false;
-            constraints_to_check.iter().all(|(c, _)| {
-                let mode = match c {
-                    ResolvedUpsertTarget::PrimaryKey => {
-                        rowid_alias_conflict_clause.unwrap_or(ResolveType::Abort)
+            let catch_all = matches!(
+                upsert_actions.last(),
+                Some((ResolvedUpsertTarget::CatchAll, ..))
+            );
+            // A constraint an upsert covers goes first and keeps no clause of its own.
+            constraints_to_check
+                .iter()
+                .filter(|(_, position)| position.is_none() && !catch_all)
+                .all(|(c, _)| {
+                    let mode = match c {
+                        ResolvedUpsertTarget::PrimaryKey => {
+                            rowid_alias_conflict_clause.unwrap_or(ResolveType::Abort)
+                        }
+                        ResolvedUpsertTarget::Index(idx) => {
+                            idx.on_conflict.unwrap_or(ResolveType::Abort)
+                        }
+                        ResolvedUpsertTarget::CatchAll => return true,
+                    };
+                    if mode == ResolveType::Replace {
+                        saw_replace = true;
+                        true
+                    } else {
+                        !saw_replace
                     }
-                    ResolvedUpsertTarget::Index(idx) => {
-                        idx.on_conflict.unwrap_or(ResolveType::Abort)
-                    }
-                    ResolvedUpsertTarget::CatchAll => return true,
-                };
-                if mode == ResolveType::Replace {
-                    saw_replace = true;
-                    true
-                } else {
-                    !saw_replace
-                }
-            })
+                })
         },
         "constraints must have all REPLACE entries at the end"
     );
