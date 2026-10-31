@@ -2142,11 +2142,29 @@ fn bind_insert(
     }
     if let ResolveType::Ignore = on_conflict {
         program.set_resolve_type(ResolveType::Ignore);
-        upsert.replace(Box::new(ast::Upsert {
+        // Amphora: OR IGNORE settles the uniqueness conflicts the statement's upsert doesn't name:
+        // a DO NOTHING without a target, after the upsert's own clauses. Replacing the clauses
+        // with it skipped an `ON CONFLICT(u) DO UPDATE` under OR IGNORE (the unify audit's E4;
+        // sqlite.org/lang_upsert.html). A chain that ends without a target already covers all.
+        let catch_all = Box::new(ast::Upsert {
             do_clause: UpsertDo::Nothing,
             index: None,
             next: None,
-        }));
+        });
+        match upsert.as_mut() {
+            None => upsert = Some(catch_all),
+            Some(first) => {
+                let mut last = first;
+                while last.next.is_some() {
+                    last = last.next.as_mut().ok_or_else(|| {
+                        crate::LimboError::InternalError("an upsert clause vanished".into())
+                    })?;
+                }
+                if last.index.is_some() {
+                    last.next = Some(catch_all);
+                }
+            }
+        }
     } else {
         program.set_resolve_type(on_conflict);
     }
