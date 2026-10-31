@@ -41,7 +41,7 @@ tests = [
 id = "CP-T1.3"
 title = "Turso multi-writer: MVCC, serializable"
 criteria = [
-  { id = "AC-T1.3.1", text = "Usable now: the conversation store commits from many writers at once, in a change request that passes the gate, with every Turso change in UPSTREAM.md and offered upstream" },
+  { id = "AC-T1.3.1", text = "Usable now: the conversation store commits from many writers at once, in a change request that passes the gate, every change to the engine (Amphora's own since 2026-10-20) in its design record" },
   { id = "AC-T1.3.2", text = "durable single-row commits per second, 32 writers is at least 20000, measured by Amphora's bench on a quiet adacachy NVMe" },
   { id = "AC-T1.3.3", text = "commit p99 at that load is at most 5 ms, measured by Amphora's bench" },
   { id = "AC-T1.3.4", text = "commit p99.9 at that load is at most 15 ms, measured by Amphora's bench" },

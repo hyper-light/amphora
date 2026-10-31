@@ -1,0 +1,1087 @@
+2026-10-27T15:35:59Z == job-d
+2026-10-27T15:35:59Z ==> /c/Users/corph/.cache/planner-bench/records/job-d.log <==
+2026-10-27T15:35:59Z 
+2026-10-27T15:36:00Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-b.log <==
+2026-10-27T15:36:00Z 
+2026-10-27T15:36:00Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c.log <==
+2026-10-27T15:40:50Z 
+2026-10-27T15:40:50Z ==> /c/Users/corph/.cache/planner-bench/records/job-d.log <==
+2026-10-27T15:40:50Z 1a amphora: 438.0 ms
+2026-10-27T15:43:24Z 1a sqlite: 215.3 ms
+2026-10-27T15:47:43Z 1a duckdb: 138.2 ms
+2026-10-27T15:47:53Z 1a duckdb-mt: 58.8 ms
+2026-10-27T15:48:05Z 1a postgres: 4.3 ms
+2026-10-27T15:48:24Z 1b amphora: 380.5 ms
+2026-10-27T15:48:35Z 1b sqlite: 199.7 ms
+2026-10-27T15:48:46Z 1b duckdb: 91.3 ms
+2026-10-27T15:48:56Z 1b duckdb-mt: 44.7 ms
+2026-10-27T15:49:07Z 1b postgres: 1.6 ms
+2026-10-27T15:49:22Z 1c amphora: 319.4 ms
+2026-10-27T15:49:34Z 1c sqlite: 286.0 ms
+2026-10-27T15:49:44Z 1c duckdb: 120.7 ms
+2026-10-27T15:49:55Z 1c duckdb-mt: 47.1 ms
+2026-10-27T15:50:05Z 1c postgres: 3.6 ms
+2026-10-27T15:50:21Z 1d amphora: 418.7 ms
+2026-10-27T15:50:32Z 1d sqlite: 210.4 ms
+2026-10-27T15:50:43Z 1d duckdb: 88.9 ms
+2026-10-27T15:50:54Z 1d duckdb-mt: 46.4 ms
+2026-10-27T15:51:05Z 1d postgres: 1.5 ms
+2026-10-27T15:52:44Z 2a amphora: 233.2 ms
+2026-10-27T15:52:56Z 2a sqlite: 145.4 ms
+2026-10-27T15:53:07Z 2a duckdb: 279.4 ms
+2026-10-27T15:53:18Z 2a duckdb-mt: 71.8 ms
+2026-10-27T15:53:32Z 2a postgres: 245.6 ms
+2026-10-27T15:53:48Z 2b amphora: 224.8 ms
+2026-10-27T15:53:59Z 2b sqlite: 137.8 ms
+2026-10-27T15:54:10Z 2b duckdb: 266.8 ms
+2026-10-27T15:54:21Z 2b duckdb-mt: 67.3 ms
+2026-10-27T15:54:32Z 2b postgres: 237.7 ms
+2026-10-27T15:54:47Z 2c amphora: 221.8 ms
+2026-10-27T15:54:58Z 2c sqlite: 133.7 ms
+2026-10-27T15:55:09Z 2c duckdb: 50.1 ms
+2026-10-27T15:55:19Z 2c duckdb-mt: 36.2 ms
+2026-10-27T15:55:30Z 2c postgres: 211.2 ms
+2026-10-27T15:55:45Z 2d amphora: 227.9 ms
+2026-10-27T15:55:56Z 2d sqlite: 165.9 ms
+2026-10-27T15:56:12Z 2d duckdb: 297.5 ms
+2026-10-27T15:56:23Z 2d duckdb-mt: 75.7 ms
+2026-10-27T15:56:36Z 2d postgres: 320.2 ms
+2026-10-27T15:58:30Z 3a amphora: 2743.9 ms
+2026-10-27T16:01:37Z 3a sqlite: 87.6 ms
+2026-10-27T16:02:00Z 3a duckdb: 840.3 ms
+2026-10-27T16:02:15Z 3a duckdb-mt: 137.5 ms
+2026-10-27T16:02:29Z 3a postgres: 91.8 ms
+2026-10-27T16:02:49Z 3b amphora: 1244.8 ms
+2026-10-27T16:03:17Z 3b sqlite: 35.4 ms
+2026-10-27T16:03:49Z 3b duckdb: 691.7 ms
+2026-10-27T16:04:32Z 3b duckdb-mt: 196.7 ms
+2026-10-27T16:04:47Z 3b postgres: 59.3 ms
+2026-10-27T16:05:08Z 3c amphora: 254.1 ms
+2026-10-27T16:05:19Z 3c sqlite: 186.2 ms
+2026-10-27T16:05:37Z 3c duckdb: 914.9 ms
+2026-10-27T16:06:35Z 3c duckdb-mt: 213.6 ms
+2026-10-27T16:06:48Z 3c postgres: 160.2 ms
+2026-10-27T16:07:09Z 4a amphora: 955.2 ms
+2026-10-27T16:07:19Z 4a sqlite: 90.1 ms
+2026-10-27T16:07:32Z 4a duckdb: 525.3 ms
+2026-10-27T16:07:42Z 4a duckdb-mt: 145.3 ms
+2026-10-27T16:07:53Z 4a postgres: 58.1 ms
+2026-10-27T16:08:12Z 4b amphora: 46.5 ms
+2026-10-27T16:08:27Z 4b sqlite: 83.9 ms
+2026-10-27T16:08:38Z 4b duckdb: 177.6 ms
+2026-10-27T16:08:49Z 4b duckdb-mt: 67.3 ms
+2026-10-27T16:08:59Z 4b postgres: 32.4 ms
+2026-10-27T16:11:46Z 4c amphora: 1881.9 ms
+2026-10-27T16:14:50Z 4c sqlite: 103.6 ms
+2026-10-27T16:15:12Z 4c duckdb: 711.1 ms
+2026-10-27T16:15:22Z 4c duckdb-mt: 160.9 ms
+2026-10-27T16:15:38Z 4c postgres: 63.8 ms
+2026-10-27T16:15:53Z 5a amphora: 222.9 ms
+2026-10-27T16:16:28Z 5a sqlite: 89.4 ms
+2026-10-27T16:16:39Z 5a duckdb: 207.0 ms
+2026-10-27T16:16:55Z 5a duckdb-mt: 299.6 ms
+2026-10-27T16:17:06Z 5a postgres: 74.2 ms
+2026-10-27T16:17:20Z 5b amphora: 209.0 ms
+2026-10-27T16:17:31Z 5b sqlite: 87.0 ms
+2026-10-27T16:17:42Z 5b duckdb: 105.5 ms
+2026-10-27T16:17:53Z 5b duckdb-mt: 249.4 ms
+2026-10-27T16:18:03Z 5b postgres: 74.1 ms
+2026-10-27T16:18:19Z 5c amphora: 296.7 ms
+2026-10-27T16:18:31Z 5c sqlite: 117.9 ms
+2026-10-27T16:18:53Z 5c duckdb: 811.5 ms
+2026-10-27T16:19:04Z 5c duckdb-mt: 263.4 ms
+2026-10-27T16:19:15Z 5c postgres: 95.1 ms
+2026-10-27T16:23:26Z 6a amphora: 10.8 ms
+2026-10-27T16:24:47Z 6a sqlite: 590.4 ms
+2026-10-27T16:26:07Z 6a duckdb: 616.2 ms
+2026-10-27T16:26:19Z 6a duckdb-mt: 187.7 ms
+2026-10-27T16:26:56Z 6a postgres: 9.7 ms
+2026-10-27T16:27:15Z 6b amphora: 99.4 ms
+2026-10-27T16:27:29Z 6b sqlite: 637.1 ms
+2026-10-27T16:28:01Z 6b duckdb: 631.7 ms
+2026-10-27T16:28:17Z 6b duckdb-mt: 155.8 ms
+2026-10-27T16:29:15Z 6b postgres: 154.4 ms
+2026-10-27T16:35:56Z 6c amphora: 7.3 ms
+2026-10-27T16:36:08Z 6c sqlite: 463.1 ms
+2026-10-27T16:36:19Z 6c duckdb: 117.6 ms
+2026-10-27T16:36:29Z 6c duckdb-mt: 44.8 ms
+2026-10-27T16:36:40Z 6c postgres: 5.7 ms
+2026-10-27T16:39:02Z 6d amphora: 5421.1 ms
+2026-10-27T16:40:06Z 6d sqlite: 705.5 ms
+2026-10-27T16:40:25Z 6d duckdb: 1208.0 ms
+2026-10-27T16:40:46Z 6d duckdb-mt: 326.6 ms
+2026-10-27T16:42:14Z 6d postgres: 4190.7 ms
+2026-10-27T16:42:41Z 6e amphora: 11.5 ms
+2026-10-27T16:42:59Z 6e sqlite: 444.5 ms
+2026-10-27T16:43:11Z 6e duckdb: 579.4 ms
+2026-10-27T16:43:22Z 6e duckdb-mt: 213.3 ms
+2026-10-27T16:43:32Z 6e postgres: 9.7 ms
+2026-10-27T16:51:05Z 6f amphora: 5400.0 ms
+2026-10-27T16:51:59Z 6f sqlite: 2582.0 ms
+2026-10-27T16:52:20Z 6f duckdb: 3188.7 ms
+2026-10-27T16:57:29Z 6f duckdb-mt: 710.1 ms
+2026-10-27T16:58:39Z 6f postgres: 3926.2 ms
+2026-10-27T16:59:01Z 7a amphora: 676.8 ms
+2026-10-27T16:59:16Z 7a sqlite: 493.0 ms
+2026-10-27T16:59:27Z 7a duckdb: 298.6 ms
+2026-10-27T16:59:38Z 7a duckdb-mt: 216.6 ms
+2026-10-27T16:59:52Z 7a postgres: 558.4 ms
+2026-10-27T17:00:11Z 7b amphora: 122.7 ms
+2026-10-27T17:00:32Z 7b sqlite: 301.1 ms
+2026-10-27T17:00:44Z 7b duckdb: 245.0 ms
+2026-10-27T17:00:55Z 7b duckdb-mt: 175.2 ms
+2026-10-27T17:01:14Z 7b postgres: 153.0 ms
+2026-10-27T17:02:07Z 7c amphora: 7012.9 ms
+2026-10-27T17:02:42Z 7c sqlite: 5946.9 ms
+2026-10-27T17:02:55Z 7c duckdb: 1053.8 ms
+2026-10-27T17:03:07Z 7c duckdb-mt: 479.3 ms
+2026-10-27T17:03:27Z 7c postgres: 1299.8 ms
+2026-10-27T17:03:58Z 8a amphora: 2509.6 ms
+2026-10-27T17:04:20Z 8a sqlite: 2276.7 ms
+2026-10-27T17:04:33Z 8a duckdb: 597.9 ms
+2026-10-27T17:04:44Z 8a duckdb-mt: 251.4 ms
+2026-10-27T17:05:20Z 8a postgres: 1688.3 ms
+2026-10-27T17:05:35Z 8b amphora: 126.1 ms
+2026-10-27T17:05:46Z 8b sqlite: 92.8 ms
+2026-10-27T17:05:58Z 8b duckdb: 542.2 ms
+2026-10-27T17:06:09Z 8b duckdb-mt: 245.8 ms
+2026-10-27T17:06:20Z 8b postgres: 147.9 ms
+2026-10-27T17:07:35Z 8c amphora: 11970.3 ms
+2026-10-27T17:10:23Z 8c sqlite: 46584.4 ms
+2026-10-27T17:10:48Z 8c duckdb: 3093.6 ms
+2026-10-27T17:11:00Z 8c duckdb-mt: 768.1 ms
+2026-10-27T17:11:19Z 8c postgres: 2608.6 ms
+2026-10-27T17:11:49Z 8d amphora: 3214.1 ms
+2026-10-27T17:14:03Z 8d sqlite: 41101.1 ms
+2026-10-27T17:14:16Z 8d duckdb: 948.0 ms
+2026-10-27T17:14:28Z 8d duckdb-mt: 481.1 ms
+2026-10-27T17:14:42Z 8d postgres: 1303.9 ms
+2026-10-27T17:15:43Z 9a amphora: 9859.9 ms
+2026-10-27T17:16:22Z 9a sqlite: 7758.4 ms
+2026-10-27T17:16:36Z 9a duckdb: 1227.9 ms
+2026-10-27T17:16:49Z 9a duckdb-mt: 623.2 ms
+2026-10-27T17:17:01Z 9a postgres: 254.3 ms
+2026-10-27T17:17:29Z 9b amphora: 3059.3 ms
+2026-10-27T17:17:48Z 9b sqlite: 2954.8 ms
+2026-10-27T17:18:01Z 9b duckdb: 883.0 ms
+2026-10-27T17:18:13Z 9b duckdb-mt: 505.1 ms
+2026-10-27T17:18:24Z 9b postgres: 241.9 ms
+2026-10-27T17:18:50Z 9c amphora: 1975.9 ms
+2026-10-27T17:21:10Z 9c sqlite: 42117.8 ms
+2026-10-27T17:21:24Z 9c duckdb: 1349.4 ms
+2026-10-27T17:21:37Z 9c duckdb-mt: 600.5 ms
+2026-10-27T17:21:53Z 9c postgres: 877.2 ms
+2026-10-27T17:22:31Z 9d amphora: 4815.0 ms
+2026-10-27T17:24:51Z 9d sqlite: 42386.2 ms
+2026-10-27T17:25:07Z 9d duckdb: 1869.9 ms
+2026-10-27T17:25:19Z 9d duckdb-mt: 710.9 ms
+2026-10-27T17:25:35Z 9d postgres: 1616.4 ms
+2026-10-27T17:26:04Z 10a amphora: 3025.8 ms
+2026-10-27T17:26:16Z 10a sqlite: 606.0 ms
+2026-10-27T17:26:28Z 10a duckdb: 675.7 ms
+2026-10-27T17:26:40Z 10a duckdb-mt: 328.6 ms
+2026-10-27T17:26:51Z 10a postgres: 409.4 ms
+2026-10-27T17:27:09Z 10b amphora: 822.8 ms
+2026-10-27T17:27:20Z 10b sqlite: 137.1 ms
+2026-10-27T17:27:32Z 10b duckdb: 621.8 ms
+2026-10-27T17:27:44Z 10b duckdb-mt: 302.7 ms
+2026-10-27T17:27:55Z 10b postgres: 204.3 ms
+2026-10-27T17:30:05Z 10c amphora: 27693.4 ms
+2026-10-27T17:54:01Z 10c sqlite: 472145.9 ms
+2026-10-27T17:54:15Z 10c duckdb: 1313.4 ms
+2026-10-27T17:54:28Z 10c duckdb-mt: 431.8 ms
+2026-10-27T17:54:44Z 10c postgres: 2030.4 ms
+2026-10-27T17:54:58Z 11a amphora: 12.6 ms
+2026-10-27T17:55:09Z 11a sqlite: 87.5 ms
+2026-10-27T17:55:20Z 11a duckdb: 133.0 ms
+2026-10-27T17:55:31Z 11a duckdb-mt: 130.2 ms
+2026-10-27T17:55:42Z 11a postgres: 26.6 ms
+2026-10-27T17:55:56Z 11b amphora: 6.3 ms
+2026-10-27T17:56:06Z 11b sqlite: 1.0 ms
+2026-10-27T17:56:17Z 11b duckdb: 92.2 ms
+2026-10-27T17:56:29Z 11b duckdb-mt: 93.0 ms
+2026-10-27T17:56:39Z 11b postgres: 15.5 ms
+2026-10-27T17:56:55Z 11c amphora: 506.3 ms
+2026-10-27T17:57:06Z 11c sqlite: 132.5 ms
+2026-10-27T17:57:17Z 11c duckdb: 220.2 ms
+2026-10-27T17:57:28Z 11c duckdb-mt: 235.3 ms
+2026-10-27T17:57:39Z 11c postgres: 60.8 ms
+2026-10-27T17:57:55Z 11d amphora: 531.1 ms
+2026-10-27T17:58:07Z 11d sqlite: 414.4 ms
+2026-10-27T17:58:18Z 11d duckdb: 224.5 ms
+2026-10-27T17:58:29Z 11d duckdb-mt: 250.7 ms
+2026-10-27T17:58:39Z 11d postgres: 53.9 ms
+2026-10-27T17:58:56Z 12a amphora: 167.6 ms
+2026-10-27T17:59:12Z 12a sqlite: 1319.7 ms
+2026-10-27T17:59:24Z 12a duckdb: 548.6 ms
+2026-10-27T17:59:35Z 12a duckdb-mt: 453.5 ms
+2026-10-27T17:59:48Z 12a postgres: 166.2 ms
+2026-10-27T18:00:03Z 12b amphora: 132.5 ms
+2026-10-27T18:00:25Z 12b sqlite: 2297.9 ms
+2026-10-27T18:00:37Z 12b duckdb: 641.7 ms
+2026-10-27T18:00:49Z 12b duckdb-mt: 347.4 ms
+2026-10-27T18:01:00Z 12b postgres: 3.0 ms
+2026-10-27T18:01:20Z 12c amphora: 1074.8 ms
+2026-10-27T18:01:42Z 12c sqlite: 2081.7 ms
+2026-10-27T18:01:55Z 12c duckdb: 639.2 ms
+2026-10-27T18:02:07Z 12c duckdb-mt: 514.7 ms
+2026-10-27T18:02:21Z 12c postgres: 656.6 ms
+2026-10-27T18:02:41Z 13a amphora: 1064.0 ms
+2026-10-27T18:02:58Z 13a sqlite: 600.9 ms
+2026-10-27T18:03:10Z 13a duckdb: 609.4 ms
+2026-10-27T18:03:22Z 13a duckdb-mt: 384.4 ms
+2026-10-27T18:03:36Z 13a postgres: 1263.9 ms
+2026-10-27T18:03:54Z 13b amphora: 876.8 ms
+2026-10-27T18:04:08Z 13b sqlite: 1457.5 ms
+2026-10-27T18:04:21Z 13b duckdb: 731.5 ms
+2026-10-27T18:04:32Z 13b duckdb-mt: 390.6 ms
+2026-10-27T18:04:45Z 13b postgres: 482.6 ms
+2026-10-27T18:05:02Z 13c amphora: 821.1 ms
+2026-10-27T18:05:17Z 13c sqlite: 1390.8 ms
+2026-10-27T18:05:29Z 13c duckdb: 593.3 ms
+2026-10-27T18:05:41Z 13c duckdb-mt: 346.1 ms
+2026-10-27T18:05:52Z 13c postgres: 444.8 ms
+2026-10-27T18:06:26Z 13d amphora: 3418.4 ms
+2026-10-27T18:06:58Z 13d sqlite: 4482.5 ms
+2026-10-27T18:07:11Z 13d duckdb: 805.6 ms
+2026-10-27T18:07:23Z 13d duckdb-mt: 435.9 ms
+2026-10-27T18:07:39Z 13d postgres: 1792.7 ms
+2026-10-27T18:07:54Z 14a amphora: 181.3 ms
+2026-10-27T18:08:06Z 14a sqlite: 306.3 ms
+2026-10-27T18:08:18Z 14a duckdb: 559.9 ms
+2026-10-27T18:08:30Z 14a duckdb-mt: 553.2 ms
+2026-10-27T18:08:44Z 14a postgres: 213.5 ms
+2026-10-27T18:08:58Z 14b amphora: 53.6 ms
+2026-10-27T18:09:09Z 14b sqlite: 187.1 ms
+2026-10-27T18:09:21Z 14b duckdb: 557.0 ms
+2026-10-27T18:09:32Z 14b duckdb-mt: 329.3 ms
+2026-10-27T18:09:43Z 14b postgres: 85.6 ms
+2026-10-27T18:09:59Z 14c amphora: 442.4 ms
+2026-10-27T18:10:12Z 14c sqlite: 584.4 ms
+2026-10-27T18:10:24Z 14c duckdb: 781.0 ms
+2026-10-27T18:10:42Z 14c duckdb-mt: 538.3 ms
+2026-10-27T18:10:53Z 14c postgres: 360.3 ms
+2026-10-27T18:11:09Z 15a amphora: 479.6 ms
+2026-10-27T18:11:25Z 15a sqlite: 1223.7 ms
+2026-10-27T18:11:28Z 15a duckdb: no time
+2026-10-27T18:11:31Z 15a duckdb-mt: no time
+2026-10-27T18:11:42Z 15a postgres: 279.7 ms
+2026-10-27T18:11:56Z 15b amphora: 29.9 ms
+2026-10-27T18:12:07Z 15b sqlite: 19.2 ms
+2026-10-27T18:12:10Z 15b duckdb: no time
+2026-10-27T18:12:14Z 15b duckdb-mt: no time
+2026-10-27T18:12:30Z 15b postgres: 17.9 ms
+2026-10-27T18:13:32Z 15c amphora: 11372.4 ms
+2026-10-27T18:14:21Z 15c sqlite: 11184.0 ms
+2026-10-27T18:14:25Z 15c duckdb: no time
+2026-10-27T18:14:28Z 15c duckdb-mt: no time
+2026-10-27T18:14:39Z 15c postgres: 222.2 ms
+2026-10-27T18:15:40Z 15d amphora: 11437.0 ms
+2026-10-27T18:16:21Z 15d sqlite: 9862.2 ms
+2026-10-27T18:16:47Z 15d duckdb: no time
+2026-10-27T18:17:50Z == job-d
+2026-10-27T18:17:50Z ==> /c/Users/corph/.cache/planner-bench/records/job-d.log <==
+2026-10-27T18:17:50Z 
+2026-10-27T18:17:50Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-b.log <==
+2026-10-27T18:17:50Z 
+2026-10-27T18:17:50Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c.log <==
+2026-10-27T18:18:08Z 
+2026-10-27T18:18:08Z ==> /c/Users/corph/.cache/planner-bench/records/job-d.log <==
+2026-10-27T18:18:08Z 15d duckdb-mt: no time
+2026-10-27T18:18:24Z 16a amphora: 260.6 ms
+2026-10-27T18:18:35Z 16a sqlite: 61.4 ms
+2026-10-27T18:18:47Z 16a duckdb: 277.5 ms
+2026-10-27T18:18:57Z 16a duckdb-mt: 105.5 ms
+2026-10-27T18:19:59Z 16b amphora: 9794.7 ms
+2026-10-27T18:20:35Z 16b sqlite: 7189.2 ms
+2026-10-27T18:20:54Z 16b duckdb: 3004.1 ms
+2026-10-27T18:21:06Z 16b duckdb-mt: 506.2 ms
+2026-10-27T18:21:23Z 16c amphora: 762.9 ms
+2026-10-27T18:21:35Z 16c sqlite: 579.8 ms
+2026-10-27T18:21:48Z 16c duckdb: 1110.0 ms
+2026-10-27T18:22:00Z 16c duckdb-mt: 227.3 ms
+2026-10-27T18:22:27Z 16d amphora: 1861.5 ms
+2026-10-27T18:22:39Z 16d sqlite: 447.8 ms
+2026-10-27T18:22:52Z 16d duckdb: 1084.4 ms
+2026-10-27T18:23:03Z 16d duckdb-mt: 228.2 ms
+2026-10-27T18:23:38Z 17a amphora: 5003.6 ms
+2026-10-27T18:23:57Z 17a sqlite: 2762.8 ms
+2026-10-27T18:24:12Z 17a duckdb: 1542.3 ms
+2026-10-27T18:24:23Z 17a duckdb-mt: 239.3 ms
+2026-10-27T18:25:23Z 17b amphora: 11036.6 ms
+2026-10-27T18:25:49Z 17b sqlite: 5073.8 ms
+2026-10-27T18:26:08Z 17b duckdb: 2703.6 ms
+2026-10-27T18:26:19Z 17b duckdb-mt: 359.0 ms
+2026-10-27T18:27:19Z 17c amphora: 11126.5 ms
+2026-10-27T18:27:45Z 17c sqlite: 5032.4 ms
+2026-10-27T18:28:03Z 17c duckdb: 2707.5 ms
+2026-10-27T18:28:14Z 17c duckdb-mt: 355.7 ms
+2026-10-27T18:29:14Z 17d amphora: 11199.1 ms
+2026-10-27T18:29:31Z 17d sqlite: 2273.6 ms
+2026-10-27T18:29:50Z 17d duckdb: 2787.7 ms
+2026-10-27T18:30:02Z 17d duckdb-mt: 360.2 ms
+2026-10-27T18:30:36Z 17e amphora: 4936.1 ms
+2026-10-27T18:30:58Z 17e sqlite: 4018.1 ms
+2026-10-27T18:31:15Z 17e duckdb: 1936.6 ms
+2026-10-27T18:31:26Z 17e duckdb-mt: 290.1 ms
+2026-10-27T18:32:29Z 17f amphora: 11326.2 ms
+2026-10-27T18:32:58Z 17f sqlite: 6181.8 ms
+2026-10-27T18:33:18Z 17f duckdb: 2996.5 ms
+2026-10-27T18:33:29Z 17f duckdb-mt: 367.9 ms
+2026-10-27T18:34:27Z 18a amphora: 9499.7 ms
+2026-10-27T18:35:37Z 18a sqlite: 18692.9 ms
+2026-10-27T18:35:52Z 18a duckdb: 1381.9 ms
+2026-10-27T18:36:03Z 18a duckdb-mt: 393.5 ms
+2026-10-27T18:36:19Z 18b amphora: 183.8 ms
+2026-10-27T18:36:32Z 18b sqlite: 710.0 ms
+2026-10-27T18:36:45Z 18b duckdb: 913.7 ms
+2026-10-27T18:36:56Z 18b duckdb-mt: 274.0 ms
+2026-10-27T18:37:45Z 18c amphora: 7673.0 ms
+2026-10-27T18:39:07Z 18c sqlite: 23077.1 ms
+2026-10-27T18:39:22Z 18c duckdb: 1387.0 ms
+2026-10-27T18:39:34Z 18c duckdb-mt: 400.7 ms
+2026-10-27T18:40:22Z 19a amphora: 8094.0 ms
+2026-10-27T18:40:50Z 19a sqlite: 5257.5 ms
+2026-10-27T18:41:05Z 19a duckdb: 1570.0 ms
+2026-10-27T18:41:17Z 19a duckdb-mt: 596.8 ms
+2026-10-27T18:41:32Z 19b amphora: 295.7 ms
+2026-10-27T18:42:08Z 19b sqlite: 8565.3 ms
+2026-10-27T18:42:21Z 19b duckdb: 936.1 ms
+2026-10-27T18:42:34Z 19b duckdb-mt: 337.8 ms
+2026-10-27T18:43:13Z 19c amphora: 6362.6 ms
+2026-10-27T18:44:32Z 19c sqlite: 22590.1 ms
+2026-10-27T18:44:48Z 19c duckdb: 2054.8 ms
+2026-10-27T18:45:01Z 19c duckdb-mt: 668.5 ms
+2026-10-27T18:53:44Z 19d amphora: 122513.7 ms
+2026-10-27T18:55:09Z 19d sqlite: 24141.5 ms
+2026-10-27T18:55:27Z 19d duckdb: 2355.3 ms
+2026-10-27T18:55:40Z 19d duckdb-mt: 805.8 ms
+2026-10-27T18:56:16Z 20a amphora: 3100.1 ms
+2026-10-27T18:57:04Z 20a sqlite: 8717.9 ms
+2026-10-27T18:57:19Z 20a duckdb: 1462.3 ms
+2026-10-27T18:57:31Z 20a duckdb-mt: 492.0 ms
+2026-10-27T18:57:49Z 20b amphora: 1008.2 ms
+2026-10-27T18:58:45Z 20b sqlite: 12144.6 ms
+2026-10-27T18:59:00Z 20b duckdb: 1562.2 ms
+2026-10-27T18:59:12Z 20b duckdb-mt: 563.4 ms
+2026-10-27T18:59:30Z 20c amphora: 1047.9 ms
+2026-10-27T18:59:50Z 20c sqlite: 2479.0 ms
+2026-10-27T19:00:05Z 20c duckdb: 1549.7 ms
+2026-10-27T19:00:17Z 20c duckdb-mt: 565.2 ms
+2026-10-27T19:00:35Z 21a amphora: 27.2 ms
+2026-10-27T19:00:45Z 21a sqlite: 12.3 ms
+2026-10-27T19:00:56Z 21a duckdb: 239.8 ms
+2026-10-27T19:01:07Z 21a duckdb-mt: 193.3 ms
+2026-10-27T19:01:21Z 21b amphora: 16.9 ms
+2026-10-27T19:01:32Z 21b sqlite: 11.0 ms
+2026-10-27T19:01:44Z 21b duckdb: 199.4 ms
+2026-10-27T19:01:54Z 21b duckdb-mt: 162.0 ms
+2026-10-27T19:02:08Z 21c amphora: 35.6 ms
+2026-10-27T19:02:19Z 21c sqlite: 13.2 ms
+2026-10-27T19:02:30Z 21c duckdb: 238.1 ms
+2026-10-27T19:02:41Z 21c duckdb-mt: 192.0 ms
+2026-10-27T19:02:58Z 22a amphora: 733.0 ms
+2026-10-27T19:03:10Z 22a sqlite: 479.3 ms
+2026-10-27T19:03:25Z 22a duckdb: 995.6 ms
+2026-10-27T19:03:37Z 22a duckdb-mt: 833.2 ms
+2026-10-27T19:03:52Z 22b amphora: 151.5 ms
+2026-10-27T19:04:03Z 22b sqlite: 298.9 ms
+2026-10-27T19:04:16Z 22b duckdb: 859.6 ms
+2026-10-27T19:04:29Z 22b duckdb-mt: 720.3 ms
+2026-10-27T19:05:02Z 22c amphora: 4620.6 ms
+2026-10-27T19:05:18Z 22c sqlite: 1847.1 ms
+2026-10-27T19:05:35Z 22c duckdb: 2265.9 ms
+2026-10-27T19:05:49Z 22c duckdb-mt: 1107.5 ms
+2026-10-27T19:06:41Z 22d amphora: 9287.4 ms
+2026-10-27T19:07:07Z 22d sqlite: 4501.4 ms
+2026-10-27T19:07:32Z 22d duckdb: 4601.2 ms
+2026-10-27T19:07:46Z 22d duckdb-mt: 1502.1 ms
+2026-10-27T19:08:02Z 23a amphora: 465.8 ms
+2026-10-27T19:08:15Z 23a sqlite: 760.6 ms
+2026-10-27T19:08:29Z 23a duckdb: 727.2 ms
+2026-10-27T19:08:41Z 23a duckdb-mt: 535.9 ms
+2026-10-27T19:08:55Z 23b amphora: 94.1 ms
+2026-10-27T19:09:12Z 23b sqlite: 2021.5 ms
+2026-10-27T19:09:24Z 23b duckdb: 657.5 ms
+2026-10-27T19:09:36Z 23b duckdb-mt: 477.7 ms
+2026-10-27T19:09:55Z 23c amphora: 1256.2 ms
+2026-10-27T19:10:10Z 23c sqlite: 1157.4 ms
+2026-10-27T19:10:23Z 23c duckdb: 765.4 ms
+2026-10-27T19:10:35Z 23c duckdb-mt: 586.8 ms
+2026-10-27T19:10:52Z 24a amphora: 644.6 ms
+2026-10-27T19:11:25Z 24a sqlite: 6712.1 ms
+2026-10-27T19:11:40Z 24a duckdb: 1629.3 ms
+2026-10-27T19:11:54Z 24a duckdb-mt: 854.3 ms
+2026-10-27T19:12:08Z 24b amphora: 130.3 ms
+2026-10-27T19:12:19Z 24b sqlite: 26.9 ms
+2026-10-27T19:12:31Z 24b duckdb: 747.5 ms
+2026-10-27T19:12:43Z 24b duckdb-mt: 376.6 ms
+2026-10-27T19:15:48Z 25a amphora: 3920.1 ms
+2026-10-27T19:16:19Z 25a sqlite: 5111.1 ms
+2026-10-27T19:17:25Z 25a duckdb: 1466.5 ms
+2026-10-27T19:18:28Z 25a duckdb-mt: 760.2 ms
+2026-10-27T19:18:47Z 25b amphora: 172.0 ms
+2026-10-27T19:19:21Z 25b sqlite: 1414.2 ms
+2026-10-27T19:19:35Z 25b duckdb: 948.8 ms
+2026-10-27T19:19:47Z 25b duckdb-mt: 479.6 ms
+2026-10-27T19:20:46Z 25c amphora: 9737.4 ms
+2026-10-27T19:21:27Z 25c sqlite: 9588.9 ms
+2026-10-27T19:21:42Z 25c duckdb: 1607.8 ms
+2026-10-27T19:21:55Z 25c duckdb-mt: 809.1 ms
+2026-10-27T19:23:16Z 26a amphora: 16417.8 ms
+2026-10-27T19:25:58Z 26a sqlite: 15495.9 ms
+2026-10-27T19:27:10Z 26a duckdb: 2068.0 ms
+2026-10-27T19:28:14Z 26a duckdb-mt: 1141.4 ms
+2026-10-27T19:29:29Z 26b amphora: 1388.8 ms
+2026-10-27T19:30:58Z 26b sqlite: 16705.9 ms
+2026-10-27T19:31:11Z 26b duckdb: 983.5 ms
+2026-10-27T19:31:24Z 26b duckdb-mt: 789.6 ms
+2026-10-27T19:38:26Z 26c amphora: 52872.5 ms
+2026-10-27T19:39:27Z 26c sqlite: 16185.5 ms
+2026-10-27T19:39:43Z 26c duckdb: 1949.9 ms
+2026-10-27T19:39:58Z 26c duckdb-mt: 1122.2 ms
+2026-10-27T19:40:16Z 27a amphora: 710.9 ms
+2026-10-27T19:40:29Z 27a sqlite: 1077.2 ms
+2026-10-27T19:40:41Z 27a duckdb: 388.2 ms
+2026-10-27T19:40:52Z 27a duckdb-mt: 357.9 ms
+2026-10-27T19:41:07Z 27b amphora: 94.6 ms
+2026-10-27T19:41:17Z 27b sqlite: 69.3 ms
+2026-10-27T19:42:01Z 27b duckdb: 443.6 ms
+2026-10-27T19:45:42Z 27b duckdb-mt: 342.2 ms
+2026-10-27T19:47:38Z 27c amphora: 1378.7 ms
+2026-10-27T19:47:53Z 27c sqlite: 1533.9 ms
+2026-10-27T19:48:27Z 27c duckdb: 416.0 ms
+2026-10-27T19:48:38Z 27c duckdb-mt: 394.6 ms
+2026-10-27T19:48:57Z 28a amphora: 1009.3 ms
+2026-10-27T19:49:14Z 28a sqlite: 2013.6 ms
+2026-10-27T19:49:29Z 28a duckdb: 1556.0 ms
+2026-10-27T19:49:58Z 28a duckdb-mt: 1382.1 ms
+2026-10-27T19:55:41Z 28b amphora: 195.6 ms
+2026-10-27T19:55:54Z 28b sqlite: 682.0 ms
+2026-10-27T19:56:13Z 28b duckdb: 1191.9 ms
+2026-10-27T19:56:26Z 28b duckdb-mt: 1097.8 ms
+2026-10-27T19:56:48Z 28c amphora: 1515.6 ms
+2026-10-27T19:57:55Z 28c sqlite: 1557.8 ms
+2026-10-27T20:03:02Z 28c duckdb: 1889.5 ms
+2026-10-27T20:03:17Z 28c duckdb-mt: 1434.2 ms
+2026-10-27T20:03:35Z 29a amphora: 32.9 ms
+2026-10-27T20:03:46Z 29a sqlite: 9.7 ms
+2026-10-27T20:04:00Z 29a duckdb: 1261.9 ms
+2026-10-27T20:04:13Z 29a duckdb-mt: 721.9 ms
+2026-10-27T20:04:28Z 29b amphora: 31.6 ms
+2026-10-27T20:04:38Z 29b sqlite: 9.4 ms
+2026-10-27T20:04:52Z 29b duckdb: 1209.1 ms
+2026-10-27T20:05:05Z 29b duckdb-mt: 829.6 ms
+2026-10-27T20:05:35Z 29c amphora: 3164.8 ms
+2026-10-27T20:05:51Z 29c sqlite: 583.1 ms
+2026-10-27T20:06:07Z 29c duckdb: 1407.9 ms
+2026-10-27T20:06:20Z 29c duckdb-mt: 926.6 ms
+2026-10-27T20:06:39Z 30a amphora: 1015.1 ms
+2026-10-27T20:07:01Z 30a sqlite: 2755.2 ms
+2026-10-27T20:07:16Z 30a duckdb: 1582.0 ms
+2026-10-27T20:07:30Z 30a duckdb-mt: 1079.8 ms
+2026-10-27T20:07:46Z 30b amphora: 251.7 ms
+2026-10-27T20:08:04Z 30b sqlite: 2672.1 ms
+2026-10-27T20:08:20Z 30b duckdb: 1539.4 ms
+2026-10-27T20:08:32Z 30b duckdb-mt: 797.5 ms
+2026-10-27T20:09:02Z 30c amphora: 2872.8 ms
+2026-10-27T20:09:20Z 30c sqlite: 2465.2 ms
+2026-10-27T20:09:38Z 30c duckdb: 2097.2 ms
+2026-10-27T20:09:52Z 30c duckdb-mt: 1263.6 ms
+2026-10-27T20:10:12Z 31a amphora: 1414.7 ms
+2026-10-27T20:10:29Z 31a sqlite: 1597.8 ms
+2026-10-27T20:10:43Z 31a duckdb: 1470.9 ms
+2026-10-27T20:10:56Z 31a duckdb-mt: 841.6 ms
+2026-10-27T20:11:12Z 31b amphora: 257.0 ms
+2026-10-27T20:11:26Z 31b sqlite: 1175.7 ms
+2026-10-27T20:11:41Z 31b duckdb: 1552.3 ms
+2026-10-27T20:11:54Z 31b duckdb-mt: 758.6 ms
+2026-10-27T20:12:14Z 31c amphora: 1595.8 ms
+2026-10-27T20:12:30Z 31c sqlite: 1867.4 ms
+2026-10-27T20:12:45Z 31c duckdb: 1697.5 ms
+2026-10-27T20:12:59Z 31c duckdb-mt: 925.1 ms
+2026-10-27T20:13:14Z 32a amphora: 182.4 ms
+2026-10-27T20:13:25Z 32a sqlite: 58.9 ms
+2026-10-27T20:13:35Z 32a duckdb: 26.8 ms
+2026-10-27T20:13:46Z 32a duckdb-mt: 46.0 ms
+2026-10-27T20:14:00Z 32b amphora: 183.2 ms
+2026-10-27T20:14:11Z 32b sqlite: 58.5 ms
+2026-10-27T20:14:22Z 32b duckdb: 266.8 ms
+2026-10-27T20:14:33Z 32b duckdb-mt: 232.7 ms
+2026-10-27T20:14:48Z 33a amphora: 28.1 ms
+2026-10-27T20:14:58Z 33a sqlite: 22.8 ms
+2026-10-27T20:15:10Z 33a duckdb: 597.5 ms
+2026-10-27T20:15:23Z 33a duckdb-mt: 621.9 ms
+2026-10-27T20:15:36Z 33b amphora: 26.7 ms
+2026-10-27T20:15:47Z 33b sqlite: 2.8 ms
+2026-10-27T20:16:00Z 33b duckdb: 966.2 ms
+2026-10-27T20:16:13Z 33b duckdb-mt: 853.4 ms
+2026-10-27T20:16:31Z 33c amphora: 670.5 ms
+2026-10-27T20:16:41Z 33c sqlite: 32.1 ms
+2026-10-27T20:16:54Z 33c duckdb: 693.4 ms
+2026-10-27T20:17:06Z 33c duckdb-mt: 687.0 ms
+2026-10-27T20:17:19Z == tpch-sf10-b
+2026-10-27T20:23:21Z 
+2026-10-27T20:23:22Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-b.log <==
+2026-10-27T20:23:22Z q01 amphora: 52303.2 ms
+2026-10-27T20:27:00Z q01 sqlite: 65156.0 ms
+2026-10-27T20:27:20Z q01 duckdb: 2886.1 ms
+2026-10-27T20:27:31Z q01 duckdb-mt: 240.0 ms
+2026-10-27T20:27:54Z q02 amphora: 342.9 ms
+2026-10-27T20:29:01Z q02 sqlite: 3457.1 ms
+2026-10-27T20:29:13Z q02 duckdb: 246.9 ms
+2026-10-27T20:29:23Z q02 duckdb-mt: 160.9 ms
+2026-10-27T20:32:23Z q03 amphora: 28478.4 ms
+2026-10-27T20:35:39Z q03 sqlite: 40252.4 ms
+2026-10-27T20:35:55Z q03 duckdb: 1704.9 ms
+2026-10-27T20:36:06Z q03 duckdb-mt: 203.5 ms
+2026-10-27T20:37:33Z q04 amphora: 9920.3 ms
+2026-10-27T20:38:02Z q04 sqlite: 6492.9 ms
+2026-10-27T20:38:17Z q04 duckdb: 1369.2 ms
+2026-10-27T20:38:29Z q04 duckdb-mt: 190.2 ms
+2026-10-27T20:39:51Z q05 amphora: 16534.1 ms
+2026-10-27T20:49:02Z q05 sqlite: 174178.7 ms
+2026-10-27T20:49:18Z q05 duckdb: 1770.1 ms
+2026-10-27T20:49:29Z q05 duckdb-mt: 282.4 ms
+2026-10-27T20:51:18Z q06 amphora: 22172.2 ms
+2026-10-27T20:52:07Z q06 sqlite: 12460.1 ms
+2026-10-27T20:52:20Z q06 duckdb: 702.4 ms
+2026-10-27T20:52:30Z q06 duckdb-mt: 73.8 ms
+2026-10-27T20:55:41Z q07 amphora: 43471.4 ms
+2026-10-27T21:05:45Z q07 sqlite: no time
+2026-10-27T21:06:01Z q07 duckdb: 1682.0 ms
+2026-10-27T21:06:12Z q07 duckdb-mt: 254.7 ms
+2026-10-27T21:08:44Z q08 amphora: 31240.9 ms
+2026-10-27T21:11:31Z q08 sqlite: 50573.2 ms
+2026-10-27T21:11:48Z q08 duckdb: 1593.7 ms
+2026-10-27T21:12:00Z q08 duckdb-mt: 300.8 ms
+2026-10-27T21:23:52Z q09 amphora: 164734.3 ms
+2026-10-27T21:28:58Z q09 sqlite: 92183.4 ms
+2026-10-27T21:29:28Z q09 duckdb: 6087.8 ms
+2026-10-27T21:29:40Z q09 duckdb-mt: 469.0 ms
+2026-10-27T21:31:00Z q10 amphora: 13681.2 ms
+2026-10-27T21:33:27Z q10 sqlite: 44123.6 ms
+2026-10-27T21:34:01Z q10 duckdb: 7195.3 ms
+2026-10-27T21:34:15Z q10 duckdb-mt: 805.2 ms
+2026-10-27T21:35:01Z q11 amphora: 1741.0 ms
+2026-10-27T21:35:15Z q11 sqlite: 966.0 ms
+2026-10-27T21:35:53Z q11 duckdb: 8683.9 ms
+2026-10-27T21:36:03Z q11 duckdb-mt: 137.0 ms
+2026-10-27T21:37:58Z q12 amphora: 24403.4 ms
+2026-10-27T21:39:23Z q12 sqlite: 24203.1 ms
+2026-10-27T21:39:39Z q12 duckdb: 1451.1 ms
+2026-10-27T21:39:50Z q12 duckdb-mt: 200.3 ms
+2026-10-27T21:43:02Z q13 amphora: 39079.9 ms
+2026-10-27T21:44:51Z q13 sqlite: 30835.4 ms
+2026-10-27T21:53:18Z q13 duckdb: 161952.5 ms
+2026-10-27T21:53:32Z q13 duckdb-mt: 1203.6 ms
+2026-10-27T21:55:34Z q14 amphora: 24996.6 ms
+2026-10-27T22:20:51Z q14 sqlite: 487068.4 ms
+2026-10-27T22:21:06Z q14 duckdb: 1277.7 ms
+2026-10-27T22:21:17Z q14 duckdb-mt: 195.6 ms
+2026-10-27T22:24:33Z q15 amphora: 46000.5 ms
+2026-10-27T22:48:55Z q15 sqlite: 477629.8 ms
+2026-10-27T22:51:21Z q15 duckdb: 44440.3 ms
+2026-10-27T22:51:33Z q15 duckdb-mt: 559.0 ms
+2026-10-27T22:52:06Z q16 amphora: 3008.8 ms
+2026-10-27T22:52:26Z q16 sqlite: 1663.9 ms
+2026-10-27T22:55:47Z q16 duckdb: 63085.9 ms
+2026-10-27T22:56:00Z q16 duckdb-mt: 992.1 ms
+2026-10-27T22:56:25Z q17 amphora: 1386.3 ms
+2026-10-27T22:56:41Z q17 sqlite: 1068.7 ms
+2026-10-27T22:56:58Z q17 duckdb: 1812.7 ms
+2026-10-27T22:57:10Z q17 duckdb-mt: 396.3 ms
+2026-10-27T23:00:11Z q18 amphora: 39479.5 ms
+2026-10-27T23:01:15Z q18 sqlite: 16426.9 ms
+2026-10-27T23:22:06Z q18 duckdb: 409658.6 ms
+2026-10-27T23:22:21Z q18 duckdb-mt: 1737.2 ms
+2026-10-27T23:23:38Z q19 amphora: 10108.5 ms
+2026-10-27T23:23:53Z q19 sqlite: 611.7 ms
+2026-10-27T23:24:07Z q19 duckdb: 1165.4 ms
+2026-10-27T23:24:18Z q19 duckdb-mt: 175.8 ms
+2026-10-27T23:25:07Z q20 amphora: 7926.4 ms
+2026-10-27T23:25:36Z q20 sqlite: 6096.1 ms
+2026-10-27T23:25:51Z q20 duckdb: 1315.5 ms
+2026-10-27T23:26:03Z q20 duckdb-mt: 448.1 ms
+2026-10-27T23:30:24Z q21 amphora: 53087.8 ms
+2026-10-27T23:32:11Z q21 sqlite: 31001.7 ms
+2026-10-27T23:32:32Z q21 duckdb: 3540.4 ms
+2026-10-27T23:32:45Z q21 duckdb-mt: 555.3 ms
+2026-10-27T23:33:07Z q22 amphora: 1397.5 ms
+2026-10-27T23:33:20Z q22 sqlite: 695.6 ms
+2026-10-27T23:33:36Z q22 duckdb: 1978.4 ms
+2026-10-27T23:33:48Z q22 duckdb-mt: 306.7 ms
+2026-10-27T23:33:57Z == tpch-sf10-c
+2026-10-27T23:37:56Z 
+2026-10-27T23:37:56Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c.log <==
+2026-10-27T23:37:56Z q01 amphora: 53525.2 ms
+2026-10-27T23:41:26Z q01 sqlite: 66211.4 ms
+2026-10-27T23:41:46Z q01 duckdb: 2851.0 ms
+2026-10-27T23:41:57Z q01 duckdb-mt: 241.7 ms
+2026-10-27T23:42:14Z q02 amphora: 349.8 ms
+2026-10-27T23:42:38Z q02 sqlite: 3474.7 ms
+2026-10-27T23:42:49Z q02 duckdb: 247.7 ms
+2026-10-27T23:43:00Z q02 duckdb-mt: 160.8 ms
+2026-10-27T23:45:11Z q03 amphora: 28303.3 ms
+2026-10-27T23:47:24Z q03 sqlite: 40165.4 ms
+2026-10-27T23:47:41Z q03 duckdb: 1842.1 ms
+2026-10-27T23:47:52Z q03 duckdb-mt: 200.8 ms
+2026-10-27T23:48:48Z q04 amphora: 9882.8 ms
+2026-10-27T23:49:18Z q04 sqlite: 6375.4 ms
+2026-10-27T23:49:33Z q04 duckdb: 1362.0 ms
+2026-10-27T23:49:44Z q04 duckdb-mt: 187.3 ms
+2026-10-27T23:51:05Z q05 amphora: 16342.0 ms
+2026-10-27T23:59:59Z q05 sqlite: 173909.2 ms
+2026-10-28T00:00:15Z q05 duckdb: 1812.4 ms
+2026-10-28T00:00:26Z q05 duckdb-mt: 286.9 ms
+2026-10-28T00:02:10Z q06 amphora: 22146.0 ms
+2026-10-28T00:02:59Z q06 sqlite: 12448.8 ms
+2026-10-28T00:03:12Z q06 duckdb: 702.8 ms
+2026-10-28T00:03:22Z q06 duckdb-mt: 73.7 ms
+2026-10-28T00:06:31Z q07 amphora: 43341.1 ms
+2026-10-28T00:16:35Z q07 sqlite: no time
+2026-10-28T00:16:51Z q07 duckdb: 1652.3 ms
+2026-10-28T00:17:02Z q07 duckdb-mt: 266.5 ms
+2026-10-28T00:19:25Z q08 amphora: 31120.9 ms
+2026-10-28T00:22:07Z q08 sqlite: 49892.2 ms
+2026-10-28T00:22:23Z q08 duckdb: 1564.8 ms
+2026-10-28T00:22:34Z q08 duckdb-mt: 310.3 ms
+2026-10-28T00:23:58Z == tpch-sf10-c
+2026-10-28T00:35:17Z q09 amphora: 161926.8 ms
+2026-10-28T00:40:07Z q09 sqlite: 91594.4 ms
+2026-10-28T00:40:36Z q09 duckdb: 6104.5 ms
+2026-10-28T00:40:48Z q09 duckdb-mt: 428.2 ms
+2026-10-28T00:42:07Z q10 amphora: 14991.0 ms
+2026-10-28T00:44:39Z q10 sqlite: 44393.5 ms
+2026-10-28T00:45:13Z q10 duckdb: 7201.5 ms
+2026-10-28T00:45:25Z q10 duckdb-mt: 467.8 ms
+2026-10-28T00:45:56Z q11 amphora: 3349.5 ms
+2026-10-28T00:46:11Z q11 sqlite: 992.3 ms
+2026-10-28T00:46:48Z q11 duckdb: 8779.8 ms
+2026-10-28T00:46:59Z q11 duckdb-mt: 120.5 ms
+2026-10-28T00:48:51Z q12 amphora: 24452.7 ms
+2026-10-28T00:50:16Z q12 sqlite: 24081.6 ms
+2026-10-28T00:50:32Z q12 duckdb: 1432.7 ms
+2026-10-28T00:50:43Z q12 duckdb-mt: 194.3 ms
+2026-10-28T00:54:18Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c.log <==
+2026-10-28T00:54:18Z 
+2026-10-28T00:54:18Z ==> /c/Users/corph/.cache/planner-bench/records/job-d-again.log <==
+2026-10-28T00:54:18Z 
+2026-10-28T00:54:18Z == tpch-sf10-c
+2026-10-28T00:54:18Z ==> /c/Users/corph/.cache/planner-bench/records/job-d.log <==
+2026-10-28T00:54:18Z 
+2026-10-28T00:54:18Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-b.log <==
+2026-10-28T00:57:22Z 
+2026-10-28T00:57:22Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c.log <==
+2026-10-28T00:57:22Z q13 amphora: 37159.5 ms
+2026-10-28T00:59:09Z q13 sqlite: 30544.6 ms
+2026-10-28T01:08:41Z q13 duckdb: 163944.5 ms
+2026-10-28T01:08:54Z q13 duckdb-mt: 803.9 ms
+2026-10-28T01:11:15Z q14 amphora: 31293.5 ms
+2026-10-28T01:37:33Z q14 sqlite: 485912.6 ms
+2026-10-28T01:37:48Z q14 duckdb: 1170.5 ms
+2026-10-28T01:37:59Z q14 duckdb-mt: 149.7 ms
+2026-10-28T01:41:19Z q15 amphora: 46152.6 ms
+2026-10-28T01:55:29Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c.log <==
+2026-10-28T01:55:29Z 
+2026-10-28T01:55:29Z ==> /c/Users/corph/.cache/planner-bench/records/job-d-again.log <==
+2026-10-28T01:55:29Z 
+2026-10-28T01:55:29Z == tpch-sf10-c
+2026-10-28T01:55:29Z ==> /c/Users/corph/.cache/planner-bench/records/job-d.log <==
+2026-10-28T01:55:29Z 
+2026-10-28T01:55:29Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-b.log <==
+2026-10-28T02:20:51Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c.log <==
+2026-10-28T02:20:51Z 
+2026-10-28T02:20:51Z ==> /c/Users/corph/.cache/planner-bench/records/job-d-again.log <==
+2026-10-28T02:20:51Z 
+2026-10-28T02:20:51Z == tpch-sf10-c
+2026-10-28T02:20:51Z ==> /c/Users/corph/.cache/planner-bench/records/job-d.log <==
+2026-10-28T02:20:52Z 
+2026-10-28T02:20:52Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-b.log <==
+2026-10-28T02:32:03Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c.log <==
+2026-10-28T02:32:03Z 
+2026-10-28T02:32:03Z ==> /c/Users/corph/.cache/planner-bench/records/job-d-again.log <==
+2026-10-28T02:32:03Z 
+2026-10-28T02:32:03Z == tpch-sf10-c
+2026-10-28T02:32:03Z ==> /c/Users/corph/.cache/planner-bench/records/job-d.log <==
+2026-10-28T02:32:03Z 
+2026-10-28T02:32:03Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-b.log <==
+2026-10-28T02:56:10Z 
+2026-10-28T02:56:10Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c.log <==
+2026-10-28T02:56:10Z q15 sqlite: 474444.2 ms
+2026-10-28T02:58:36Z q15 duckdb: 44679.3 ms
+2026-10-28T02:58:48Z q15 duckdb-mt: 342.0 ms
+2026-10-28T02:59:15Z q16 amphora: 2962.0 ms
+2026-10-28T02:59:31Z q16 sqlite: 1824.8 ms
+2026-10-28T03:03:01Z q16 duckdb: 64037.0 ms
+2026-10-28T03:03:13Z q16 duckdb-mt: 502.0 ms
+2026-10-28T03:03:34Z q17 amphora: 1354.5 ms
+2026-10-28T03:03:48Z q17 sqlite: 1065.8 ms
+2026-10-28T03:04:05Z q17 duckdb: 1873.1 ms
+2026-10-28T03:04:17Z q17 duckdb-mt: 314.6 ms
+2026-10-28T03:07:16Z q18 amphora: 40996.2 ms
+2026-10-28T03:08:20Z q18 sqlite: 16968.0 ms
+2026-10-28T03:30:17Z q18 duckdb: 431383.4 ms
+2026-10-28T03:30:33Z q18 duckdb-mt: 1697.9 ms
+2026-10-28T03:31:52Z q19 amphora: 10642.8 ms
+2026-10-28T03:32:06Z q19 sqlite: 644.0 ms
+2026-10-28T03:32:21Z q19 duckdb: 1231.8 ms
+2026-10-28T03:32:32Z q19 duckdb-mt: 177.2 ms
+2026-10-28T03:33:35Z q20 amphora: 9042.5 ms
+2026-10-28T03:34:09Z q20 sqlite: 7172.9 ms
+2026-10-28T03:34:25Z q20 duckdb: 1775.0 ms
+2026-10-28T03:34:37Z q20 duckdb-mt: 457.1 ms
+2026-10-28T03:38:58Z q21 amphora: 55231.2 ms
+2026-10-28T03:40:48Z q21 sqlite: 32705.2 ms
+2026-10-28T03:41:10Z q21 duckdb: 3738.8 ms
+2026-10-28T03:41:22Z q21 duckdb-mt: 531.2 ms
+2026-10-28T03:41:47Z q22 amphora: 1480.7 ms
+2026-10-28T03:42:00Z q22 sqlite: 725.5 ms
+2026-10-28T03:42:17Z q22 duckdb: 2126.4 ms
+2026-10-28T03:42:28Z q22 duckdb-mt: 297.0 ms
+2026-10-28T03:42:35Z == job-d-again amphora
+2026-10-28T03:43:00Z 
+2026-10-28T03:43:00Z ==> /c/Users/corph/.cache/planner-bench/records/job-d-again.log <==
+2026-10-28T03:43:00Z 1a amphora: 443.5 ms
+2026-10-28T03:43:19Z 2a amphora: 227.8 ms
+2026-10-28T03:44:01Z 3a amphora: 2520.9 ms
+2026-10-28T03:44:27Z 4c amphora: 1848.8 ms
+2026-10-28T03:44:41Z 6a amphora: 11.1 ms
+2026-10-28T03:44:55Z 6c amphora: 7.2 ms
+2026-10-28T03:46:04Z 6d amphora: 4318.5 ms
+2026-10-28T03:46:18Z 6e amphora: 11.4 ms
+2026-10-28T03:46:48Z 6f amphora: 4365.7 ms
+2026-10-28T03:47:24Z 25a amphora: 3128.3 ms
+2026-10-28T03:47:44Z 26b amphora: 1360.6 ms
+2026-10-28T03:51:35Z 26c amphora: 52561.6 ms
+2026-10-28T03:51:55Z 27c amphora: 1245.0 ms
+2026-10-28T03:52:10Z 28b amphora: 196.5 ms
+2026-10-28T03:52:13Z == job-d-again sqlite
+2026-10-28T03:52:34Z 1a sqlite: 193.2 ms
+2026-10-28T03:52:46Z 3a sqlite: 79.5 ms
+2026-10-28T03:52:57Z 3b sqlite: 34.7 ms
+2026-10-28T03:53:08Z 4c sqlite: 94.7 ms
+2026-10-28T03:53:19Z 5a sqlite: 82.5 ms
+2026-10-28T03:53:33Z 6a sqlite: 452.4 ms
+2026-10-28T03:53:51Z 6d sqlite: 596.1 ms
+2026-10-28T03:55:31Z 26a sqlite: 14977.2 ms
+2026-10-28T03:56:25Z 26b sqlite: 14644.6 ms
+2026-10-28T03:56:42Z 28c sqlite: 1336.2 ms
+2026-10-28T03:56:42Z == job-d-again duckdb
+2026-10-28T03:56:58Z 1a duckdb: 149.3 ms
+2026-10-28T03:57:10Z 3b duckdb: 604.4 ms
+2026-10-28T03:57:23Z 6a duckdb: 522.8 ms
+2026-10-28T03:57:35Z 6b duckdb: 557.2 ms
+2026-10-28T03:57:49Z 25a duckdb: 1315.5 ms
+2026-10-28T03:58:05Z 26a duckdb: 1847.4 ms
+2026-10-28T03:58:16Z 27b duckdb: 329.7 ms
+2026-10-28T03:58:32Z == job-d-again duckdb-mt
+2026-10-28T03:58:33Z 28c duckdb: 1639.7 ms
+2026-10-28T03:58:48Z 1a duckdb-mt: 60.0 ms
+2026-10-28T03:58:59Z 3b duckdb-mt: 136.1 ms
+2026-10-28T03:59:10Z 3c duckdb-mt: 158.0 ms
+2026-10-28T03:59:21Z 6b duckdb-mt: 105.4 ms
+2026-10-28T03:59:33Z 6f duckdb-mt: 399.2 ms
+2026-10-28T03:59:44Z 25a duckdb-mt: 391.7 ms
+2026-10-28T03:59:57Z 26a duckdb-mt: 696.7 ms
+2026-10-28T04:00:08Z 27b duckdb-mt: 293.4 ms
+2026-10-28T04:00:22Z 28a duckdb-mt: 1047.1 ms
+2026-10-28T04:06:05Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:06:06Z 
+2026-10-28T04:06:06Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:06:06Z 
+2026-10-28T04:06:06Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:06:06Z == tpch-sf10-c-again amphora
+2026-10-28T04:06:06Z 
+2026-10-28T04:06:06Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:17:25Z 
+2026-10-28T04:17:25Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:17:25Z q09 amphora: 158486.0 ms
+2026-10-28T04:17:25Z 
+2026-10-28T04:17:25Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:17:25Z q09 amphora: 158486.0 ms
+2026-10-28T04:17:25Z 
+2026-10-28T04:17:25Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:17:25Z q09 amphora: 158486.0 ms
+2026-10-28T04:17:25Z 
+2026-10-28T04:17:25Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:17:25Z q09 amphora: 158486.0 ms
+2026-10-28T04:18:46Z 
+2026-10-28T04:18:46Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:18:46Z q10 amphora: 15210.6 ms
+2026-10-28T04:18:46Z 
+2026-10-28T04:18:46Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:18:46Z q10 amphora: 15210.6 ms
+2026-10-28T04:18:46Z 
+2026-10-28T04:18:46Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:18:46Z q10 amphora: 15210.6 ms
+2026-10-28T04:18:46Z 
+2026-10-28T04:18:46Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:18:46Z q10 amphora: 15210.6 ms
+2026-10-28T04:19:15Z 
+2026-10-28T04:19:15Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:19:15Z q11 amphora: 3461.2 ms
+2026-10-28T04:19:15Z 
+2026-10-28T04:19:15Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:19:15Z q11 amphora: 3461.2 ms
+2026-10-28T04:19:15Z 
+2026-10-28T04:19:15Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:19:15Z q11 amphora: 3461.2 ms
+2026-10-28T04:19:15Z 
+2026-10-28T04:19:15Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:19:15Z q11 amphora: 3461.2 ms
+2026-10-28T04:21:09Z 
+2026-10-28T04:21:10Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:21:10Z q12 amphora: 24703.7 ms
+2026-10-28T04:21:10Z 
+2026-10-28T04:21:10Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:21:10Z q12 amphora: 24703.7 ms
+2026-10-28T04:21:10Z 
+2026-10-28T04:21:10Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:21:10Z q12 amphora: 24703.7 ms
+2026-10-28T04:21:10Z 
+2026-10-28T04:21:10Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:21:10Z q12 amphora: 24703.7 ms
+2026-10-28T04:25:26Z 
+2026-10-28T04:25:26Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:25:26Z q13 amphora: 39630.9 ms
+2026-10-28T04:25:26Z 
+2026-10-28T04:25:26Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:25:26Z q13 amphora: 39630.9 ms
+2026-10-28T04:25:26Z 
+2026-10-28T04:25:26Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:25:26Z q13 amphora: 39630.9 ms
+2026-10-28T04:25:26Z 
+2026-10-28T04:25:26Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:25:26Z q13 amphora: 39630.9 ms
+2026-10-28T04:27:28Z 
+2026-10-28T04:27:28Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:27:28Z q14 amphora: 26112.1 ms
+2026-10-28T04:27:28Z 
+2026-10-28T04:27:28Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:27:28Z q14 amphora: 26112.1 ms
+2026-10-28T04:27:28Z 
+2026-10-28T04:27:28Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:27:28Z q14 amphora: 26112.1 ms
+2026-10-28T04:27:28Z 
+2026-10-28T04:27:29Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:27:29Z q14 amphora: 26112.1 ms
+2026-10-28T04:27:31Z == tpch-sf10-c-again sqlite
+2026-10-28T04:37:40Z 
+2026-10-28T04:37:40Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:37:40Z q07 sqlite: no time
+2026-10-28T04:37:40Z 
+2026-10-28T04:37:40Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:37:40Z q07 sqlite: no time
+2026-10-28T04:37:40Z 
+2026-10-28T04:37:40Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:37:40Z q07 sqlite: no time
+2026-10-28T04:37:40Z 
+2026-10-28T04:37:40Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:37:40Z q07 sqlite: no time
+2026-10-28T04:43:48Z 
+2026-10-28T04:43:48Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:43:48Z q09 sqlite: 92991.3 ms
+2026-10-28T04:43:48Z 
+2026-10-28T04:43:48Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:43:48Z q09 sqlite: 92991.3 ms
+2026-10-28T04:43:48Z 
+2026-10-28T04:43:48Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:43:48Z q09 sqlite: 92991.3 ms
+2026-10-28T04:43:48Z 
+2026-10-28T04:43:48Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:43:48Z q09 sqlite: 92991.3 ms
+2026-10-28T04:46:28Z 
+2026-10-28T04:46:28Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:46:28Z q10 sqlite: 45231.7 ms
+2026-10-28T04:46:28Z 
+2026-10-28T04:46:28Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:46:28Z q10 sqlite: 45231.7 ms
+2026-10-28T04:46:28Z 
+2026-10-28T04:46:28Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:46:28Z q10 sqlite: 45231.7 ms
+2026-10-28T04:46:28Z 
+2026-10-28T04:46:28Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:46:28Z q10 sqlite: 45231.7 ms
+2026-10-28T04:46:42Z 
+2026-10-28T04:46:42Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:46:42Z q11 sqlite: 968.6 ms
+2026-10-28T04:46:42Z 
+2026-10-28T04:46:42Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:46:42Z q11 sqlite: 968.6 ms
+2026-10-28T04:46:42Z 
+2026-10-28T04:46:42Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:46:42Z q11 sqlite: 968.6 ms
+2026-10-28T04:46:42Z 
+2026-10-28T04:46:42Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:46:42Z q11 sqlite: 968.6 ms
+2026-10-28T04:48:07Z 
+2026-10-28T04:48:07Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:48:07Z q12 sqlite: 23972.7 ms
+2026-10-28T04:48:07Z 
+2026-10-28T04:48:07Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:48:07Z q12 sqlite: 23972.7 ms
+2026-10-28T04:48:07Z 
+2026-10-28T04:48:07Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:48:07Z q12 sqlite: 23972.7 ms
+2026-10-28T04:48:07Z 
+2026-10-28T04:48:07Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:48:07Z q12 sqlite: 23972.7 ms
+2026-10-28T04:49:53Z 
+2026-10-28T04:49:53Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:49:53Z q13 sqlite: 30922.3 ms
+2026-10-28T04:49:53Z 
+2026-10-28T04:49:53Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:49:53Z q13 sqlite: 30922.3 ms
+2026-10-28T04:49:53Z 
+2026-10-28T04:49:53Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:49:53Z q13 sqlite: 30922.3 ms
+2026-10-28T04:49:53Z 
+2026-10-28T04:49:53Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T04:49:53Z q13 sqlite: 30922.3 ms
+2026-10-28T05:15:43Z 
+2026-10-28T05:15:43Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:15:43Z q14 sqlite: 488840.7 ms
+2026-10-28T05:15:43Z 
+2026-10-28T05:15:43Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:15:43Z q14 sqlite: 488840.7 ms
+2026-10-28T05:15:43Z 
+2026-10-28T05:15:43Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:15:43Z q14 sqlite: 488840.7 ms
+2026-10-28T05:15:43Z 
+2026-10-28T05:15:43Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:15:43Z q14 sqlite: 488840.7 ms
+2026-10-28T05:15:43Z == tpch-sf10-c-again duckdb
+2026-10-28T05:21:23Z 
+2026-10-28T05:21:24Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:21:24Z q09 duckdb: 6647.8 ms
+2026-10-28T05:21:24Z 
+2026-10-28T05:21:24Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:21:24Z q09 duckdb: 6647.8 ms
+2026-10-28T05:21:24Z 
+2026-10-28T05:21:24Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:21:24Z q09 duckdb: 6647.8 ms
+2026-10-28T05:21:24Z 
+2026-10-28T05:21:24Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:21:24Z q09 duckdb: 6647.8 ms
+2026-10-28T05:23:45Z 
+2026-10-28T05:23:45Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:23:45Z q10 duckdb: 7893.1 ms
+2026-10-28T05:23:45Z 
+2026-10-28T05:23:45Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:23:45Z q10 duckdb: 7893.1 ms
+2026-10-28T05:23:45Z 
+2026-10-28T05:23:45Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:23:45Z q10 duckdb: 7893.1 ms
+2026-10-28T05:23:45Z 
+2026-10-28T05:23:45Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:23:45Z q10 duckdb: 7893.1 ms
+2026-10-28T05:24:24Z 
+2026-10-28T05:24:25Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:24:25Z q11 duckdb: 8986.8 ms
+2026-10-28T05:24:25Z 
+2026-10-28T05:24:25Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:24:25Z q11 duckdb: 8986.8 ms
+2026-10-28T05:24:25Z 
+2026-10-28T05:24:25Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:24:25Z q11 duckdb: 8986.8 ms
+2026-10-28T05:24:25Z 
+2026-10-28T05:24:25Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:24:25Z q11 duckdb: 8986.8 ms
+2026-10-28T05:24:45Z 
+2026-10-28T05:24:45Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:24:45Z q12 duckdb: 1507.7 ms
+2026-10-28T05:24:45Z 
+2026-10-28T05:24:45Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:24:45Z q12 duckdb: 1507.7 ms
+2026-10-28T05:24:45Z 
+2026-10-28T05:24:45Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:24:45Z q12 duckdb: 1507.7 ms
+2026-10-28T05:24:45Z 
+2026-10-28T05:24:45Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:24:45Z q12 duckdb: 1507.7 ms
+2026-10-28T05:36:20Z 
+2026-10-28T05:36:20Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:36:20Z q13 duckdb: 180380.2 ms
+2026-10-28T05:36:20Z 
+2026-10-28T05:36:21Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:36:21Z q13 duckdb: 180380.2 ms
+2026-10-28T05:36:21Z 
+2026-10-28T05:36:21Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:36:21Z q13 duckdb: 180380.2 ms
+2026-10-28T05:36:21Z 
+2026-10-28T05:36:21Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T05:36:21Z q13 duckdb: 180380.2 ms
+2026-10-28T06:02:32Z 
+2026-10-28T06:02:32Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:02:32Z q18 duckdb: 431856.6 ms
+2026-10-28T06:02:32Z 
+2026-10-28T06:02:33Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:02:33Z q18 duckdb: 431856.6 ms
+2026-10-28T06:02:33Z 
+2026-10-28T06:02:33Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:02:33Z q18 duckdb: 431856.6 ms
+2026-10-28T06:02:33Z 
+2026-10-28T06:02:33Z == tpch-sf10-c-again duckdb-mt
+2026-10-28T06:02:33Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:02:33Z q18 duckdb: 431856.6 ms
+2026-10-28T06:02:50Z 
+2026-10-28T06:02:50Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:02:51Z q09 duckdb-mt: 454.4 ms
+2026-10-28T06:02:51Z 
+2026-10-28T06:02:51Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:02:51Z q09 duckdb-mt: 454.4 ms
+2026-10-28T06:02:51Z 
+2026-10-28T06:02:51Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:02:51Z q09 duckdb-mt: 454.4 ms
+2026-10-28T06:02:51Z 
+2026-10-28T06:02:51Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:02:51Z q09 duckdb-mt: 454.4 ms
+2026-10-28T06:03:03Z 
+2026-10-28T06:03:03Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:03:03Z q10 duckdb-mt: 582.3 ms
+2026-10-28T06:03:03Z 
+2026-10-28T06:03:03Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:03:03Z q10 duckdb-mt: 582.3 ms
+2026-10-28T06:03:03Z 
+2026-10-28T06:03:03Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:03:03Z q10 duckdb-mt: 582.3 ms
+2026-10-28T06:03:03Z 
+2026-10-28T06:03:03Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:03:03Z q10 duckdb-mt: 582.3 ms
+2026-10-28T06:03:13Z 
+2026-10-28T06:03:13Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:03:13Z q11 duckdb-mt: 91.8 ms
+2026-10-28T06:03:13Z 
+2026-10-28T06:03:13Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:03:13Z q11 duckdb-mt: 91.8 ms
+2026-10-28T06:03:13Z 
+2026-10-28T06:03:13Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:03:13Z q11 duckdb-mt: 91.8 ms
+2026-10-28T06:03:13Z 
+2026-10-28T06:03:13Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:03:13Z q11 duckdb-mt: 91.8 ms
+2026-10-28T06:03:25Z 
+2026-10-28T06:03:25Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:03:25Z q12 duckdb-mt: 180.7 ms
+2026-10-28T06:03:25Z 
+2026-10-28T06:03:25Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:03:25Z q12 duckdb-mt: 180.7 ms
+2026-10-28T06:03:25Z 
+2026-10-28T06:03:25Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:03:25Z q12 duckdb-mt: 180.7 ms
+2026-10-28T06:03:25Z 
+2026-10-28T06:03:25Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:03:25Z q12 duckdb-mt: 180.7 ms
+2026-10-28T06:03:37Z 
+2026-10-28T06:03:37Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:03:37Z q13 duckdb-mt: 681.8 ms
+2026-10-28T06:03:37Z 
+2026-10-28T06:03:37Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:03:37Z q13 duckdb-mt: 681.8 ms
+2026-10-28T06:03:37Z 
+2026-10-28T06:03:37Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:03:37Z q13 duckdb-mt: 681.8 ms
+2026-10-28T06:03:37Z 
+2026-10-28T06:03:37Z ==> /c/Users/corph/.cache/planner-bench/records/tpch-sf10-c-again.log <==
+2026-10-28T06:03:37Z q13 duckdb-mt: 681.8 ms

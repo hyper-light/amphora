@@ -1,0 +1,23 @@
+# norec Wrong: WHERE p keeps 1 rows; p is TRUE for 0 of them
+
+seed 20261027, state 30727
+
+## Statements
+
+```sql
+CREATE TABLE t1(c0 VARCHAR(10) UNIQUE, c1 INT UNIQUE, c2 DOUBLE COLLATE BINARY PRIMARY KEY NOT NULL, c3 VARCHAR(10) COLLATE RTRIM NOT NULL);
+INSERT OR IGNORE INTO t1 VALUES (0.0, 3, 1e308, 3);
+```
+
+## Queries
+
+```sql
+SELECT 1 FROM t1 AS a0 WHERE (CAST(1000000000000000.0 AS INTEGER) BETWEEN a0.c1 AND a0.c0);
+SELECT (CASE WHEN (CAST(1000000000000000.0 AS INTEGER) BETWEEN a0.c1 AND a0.c0) THEN 1 ELSE 0 END) FROM t1 AS a0;
+```
+
+## What differed
+
+```
+WHERE p keeps 1 rows; p is TRUE for 0 of them
+```

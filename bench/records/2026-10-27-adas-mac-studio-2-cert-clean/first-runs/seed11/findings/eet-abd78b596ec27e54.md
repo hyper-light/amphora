@@ -1,0 +1,33 @@
+# eet Panic: dirty pages should be empty for read txn
+
+seed 11, state 50178
+
+## Statements
+
+```sql
+CREATE TABLE t0(c0 INT COLLATE NOCASE UNIQUE, c1 DOUBLE, c2 REAL);
+INSERT OR IGNORE INTO t0 VALUES ('1.5', '0x10', 'A');
+INSERT INTO t0 VALUES (x'41', NULL, 7), ('10', 3.0, 0.5), (0, 0.5, NULL);
+INSERT OR IGNORE INTO t0 VALUES (x'41', 2, 9007199254740993), ('_', x'41', -100);
+INSERT OR IGNORE INTO t0 VALUES (-9223372036854775808, 1.5, 'a'), (255, 3, 2.0), (-100, x'00', 3.0);
+INSERT INTO t0 VALUES (100, '-1', NULL), (x'c3bf', 1e308, x'');
+INSERT INTO t0 VALUES (1e308, '1', 0), (2, -9223372036854775808, 'ABC');
+INSERT OR IGNORE INTO t0 VALUES (0.1, 255, 100);
+INSERT INTO t0 VALUES (1000000000000000.0, 9223372036854775807, NULL), (' a', 10, NULL);
+CREATE TABLE t1(c0 NUMERIC, c1 INT, c2 INT, c3 REAL COLLATE BINARY);
+INSERT INTO t1 VALUES (' a', 3, 3, NULL), (-2.5, '1', x'41', '0x10');
+CREATE INDEX i0 ON t1(c2);
+```
+
+## Queries
+
+```sql
+SELECT a1.c0, (~ 1000000000000000.0), -9223372036854775808 FROM t0 AS a0 LEFT JOIN t0 AS a1 ON (atanh(a1.c1) <= json_patch(a1.c0, '1e3'));
+SELECT a1.c0, (~ 1000000000000000.0), -9223372036854775808 FROM t0 AS a0 LEFT JOIN t0 AS a1 ON (CASE WHEN ((-1 AND (NOT -1)) AND (-1 NOTNULL)) THEN 'abc' ELSE (atanh(a1.c1) <= json_patch(a1.c0, (CASE WHEN ' a' THEN '1e3' ELSE '1e3' END))) END);
+```
+
+## What differed
+
+```
+dirty pages should be empty for read txn
+```

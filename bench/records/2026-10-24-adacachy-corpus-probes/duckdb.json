@@ -1,0 +1,6252 @@
+{
+ "engine": "duckdb",
+ "version": "DuckDB 2.0.0 (Python module)",
+ "sqlglot": "30.24.0",
+ "seconds": 38.4,
+ "crashes": 0,
+ "results": [
+  {
+   "id": "function.core:abs",
+   "sql": "SELECT ABS(-3), ABS(2.5), ABS(NULL)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3,
+     2.5,
+     null
+    ]
+   ]
+  },
+  {
+   "id": "function.core:changes",
+   "status": "no equivalent",
+   "error": "none: DuckDB reports rows changed to the client"
+  },
+  {
+   "id": "function.core:char",
+   "sql": "SELECT CHR(72)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "H"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:coalesce",
+   "sql": "SELECT COALESCE(NULL, NULL, 3)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.core:concat",
+   "sql": "SELECT CONCAT('a', NULL, 'b', 1)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "ab1"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:concat_ws",
+   "sql": "SELECT CONCAT_WS('-', 'a', NULL, 'b')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "a-b"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:format",
+   "sql": "SELECT FORMAT('%d-%s', 7, 'x')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "%d-%s"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:glob",
+   "sql": "SELECT 'abc' GLOB 'a*', 'bc' GLOB 'a*'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "function.core:hex",
+   "sql": "SELECT HEX('AB'), HEX(255)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "4142",
+     "FF"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:if",
+   "sql": "SELECT CASE WHEN 1 > 2 THEN 'a' ELSE 'b' END",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "b"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:ifnull",
+   "sql": "SELECT COALESCE(NULL, 'z')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "z"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:iif",
+   "sql": "SELECT CASE WHEN 1 < 2 THEN 'yes' ELSE 'no' END",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "yes"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:instr",
+   "sql": "SELECT STRPOS('hello', 'll')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.core:last_insert_rowid",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no rowid counter; INSERT ... RETURNING gives a new key"
+  },
+  {
+   "id": "function.core:length",
+   "sql": "SELECT length('h\u00e9llo'), octet_length('\\x01\\x02'::BLOB), length(NULL)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     5,
+     2,
+     null
+    ]
+   ]
+  },
+  {
+   "id": "function.core:like",
+   "sql": "SELECT 'abc' LIKE 'a%', 'a%' LIKE 'a\\%' ESCAPE '\\'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.core:likelihood",
+   "sql": "SELECT 1 = 1",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.core:likely",
+   "sql": "SELECT 1 = 1",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.core:load_extension",
+   "status": "no equivalent",
+   "error": "none: DuckDB loads extensions with INSTALL and LOAD, statements"
+  },
+  {
+   "id": "function.core:lower",
+   "sql": "SELECT LOWER('AbC')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "abc"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:ltrim",
+   "sql": "SELECT LTRIM('  ab'), LTRIM('xxab', 'x')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "ab",
+     "ab"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:max",
+   "sql": "SELECT greatest(1, 5, 3)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "function.core:min",
+   "sql": "SELECT least(4, 2, 8)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "function.core:nullif",
+   "sql": "SELECT NULLIF(3, 3), NULLIF(3, 4)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     null,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.core:octet_length",
+   "sql": "SELECT octet_length(encode('h\u00e9llo'))",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     6
+    ]
+   ]
+  },
+  {
+   "id": "function.core:printf",
+   "sql": "SELECT PRINTF('%5.2f|%-3s|%03d', 3.14159, 'a', 7)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     " 3.14|a  |007"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:quote",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no function that writes a value as an SQL literal"
+  },
+  {
+   "id": "function.core:random",
+   "sql": "SELECT TYPEOF(RANDOM())",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "DOUBLE"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:randomblob",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no random-bytes function"
+  },
+  {
+   "id": "function.core:replace",
+   "sql": "SELECT REPLACE('banana', 'an', 'AN')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "bANANa"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:round",
+   "sql": "SELECT ROUND(2.567, 2), ROUND(2.5), ROUND(-2.5)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2.57,
+     3,
+     -3
+    ]
+   ]
+  },
+  {
+   "id": "function.core:rtrim",
+   "sql": "SELECT RTRIM('ab  '), RTRIM('abyy', 'y')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "ab",
+     "ab"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:sign",
+   "sql": "SELECT SIGN(-7), SIGN(0), SIGN(2.5)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     -1,
+     0,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.core:soundex",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no soundex()",
+   "requires": "SQLITE_SOUNDEX"
+  },
+  {
+   "id": "function.core:sqlite_compileoption_get",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no compile-option query"
+  },
+  {
+   "id": "function.core:sqlite_compileoption_used",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no compile-option query"
+  },
+  {
+   "id": "function.core:sqlite_offset",
+   "status": "no equivalent",
+   "error": "none: DuckDB rows have no byte offset query",
+   "requires": "SQLITE_ENABLE_OFFSET_SQL_FUNC"
+  },
+  {
+   "id": "function.core:sqlite_source_id",
+   "sql": "SELECT typeof(source_id) FROM pragma_version()",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "VARCHAR"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:sqlite_version",
+   "sql": "SELECT typeof(version())",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "VARCHAR"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:substr",
+   "sql": "SELECT SUBSTRING('database', 2, 3), SUBSTRING('database', -4), SUBSTRING('database', 5)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "ata",
+     "base",
+     "base"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:substring",
+   "sql": "SELECT SUBSTRING('database', 2, 3)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "ata"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:total_changes",
+   "status": "no equivalent",
+   "error": "none: DuckDB keeps no per-connection count of rows changed"
+  },
+  {
+   "id": "function.core:trim",
+   "sql": "SELECT TRIM('  ab  '), TRIM('xxabxx', 'x')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "ab",
+     "ab"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:typeof",
+   "sql": "SELECT TYPEOF(1), TYPEOF(1.5), TYPEOF('a'), TYPEOF(UNHEX('00')), TYPEOF(NULL)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "INTEGER",
+     "DECIMAL(2,1)",
+     "VARCHAR",
+     "BLOB",
+     "\"NULL\""
+    ]
+   ]
+  },
+  {
+   "id": "function.core:unhex",
+   "sql": "SELECT UNHEX('4142') = CAST('AB' AS BLOB)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.core:unicode",
+   "sql": "SELECT UNICODE('A')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     65
+    ]
+   ]
+  },
+  {
+   "id": "function.core:unistr",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no unistr(); chr() builds one character at a time"
+  },
+  {
+   "id": "function.core:unistr_quote",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no unistr_quote()"
+  },
+  {
+   "id": "function.core:unlikely",
+   "sql": "SELECT 1 = 2",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "function.core:upper",
+   "sql": "SELECT UPPER('aBc')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "ABC"
+    ]
+   ]
+  },
+  {
+   "id": "function.core:zeroblob",
+   "sql": "SELECT octet_length(repeat('\\x00'::BLOB, 4))",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     4
+    ]
+   ]
+  },
+  {
+   "id": "function.math:acos",
+   "sql": "SELECT ROUND(ACOS(0.5), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1.047198
+    ]
+   ]
+  },
+  {
+   "id": "function.math:acosh",
+   "sql": "SELECT ROUND(ACOSH(2), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1.316958
+    ]
+   ]
+  },
+  {
+   "id": "function.math:asin",
+   "sql": "SELECT ROUND(ASIN(0.5), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0.523599
+    ]
+   ]
+  },
+  {
+   "id": "function.math:asinh",
+   "sql": "SELECT ROUND(ASINH(1), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0.881374
+    ]
+   ]
+  },
+  {
+   "id": "function.math:atan",
+   "sql": "SELECT ROUND(ATAN(1), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0.785398
+    ]
+   ]
+  },
+  {
+   "id": "function.math:atan2",
+   "sql": "SELECT ROUND(ATAN2(1, 2), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0.463648
+    ]
+   ]
+  },
+  {
+   "id": "function.math:atanh",
+   "sql": "SELECT ROUND(ATANH(0.5), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0.549306
+    ]
+   ]
+  },
+  {
+   "id": "function.math:ceil",
+   "sql": "SELECT CEIL(2.1), CEIL(-2.1)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3,
+     -2
+    ]
+   ]
+  },
+  {
+   "id": "function.math:ceiling",
+   "sql": "SELECT CEIL(2.1)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.math:cos",
+   "sql": "SELECT ROUND(COS(1), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0.540302
+    ]
+   ]
+  },
+  {
+   "id": "function.math:cosh",
+   "sql": "SELECT ROUND(COSH(1), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1.543081
+    ]
+   ]
+  },
+  {
+   "id": "function.math:degrees",
+   "sql": "SELECT ROUND(DEGREES(PI()), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     180
+    ]
+   ]
+  },
+  {
+   "id": "function.math:exp",
+   "sql": "SELECT ROUND(EXP(1), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2.718282
+    ]
+   ]
+  },
+  {
+   "id": "function.math:floor",
+   "sql": "SELECT FLOOR(2.9), FLOOR(-2.1)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2,
+     -3
+    ]
+   ]
+  },
+  {
+   "id": "function.math:ln",
+   "sql": "SELECT ROUND(LN(10), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2.302585
+    ]
+   ]
+  },
+  {
+   "id": "function.math:log",
+   "sql": "SELECT ROUND(LOG(100), 6), ROUND(LOG(2, 8), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.math:log10",
+   "sql": "SELECT ROUND(LOG(10, 1000), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.math:log2",
+   "sql": "SELECT ROUND(LOG(2, 8), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.math:mod",
+   "sql": "SELECT 7 % 3, 7.5 % 2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1.5
+    ]
+   ]
+  },
+  {
+   "id": "function.math:pi",
+   "sql": "SELECT ROUND(PI(), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3.141593
+    ]
+   ]
+  },
+  {
+   "id": "function.math:pow",
+   "sql": "SELECT POWER(2, 10)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1024
+    ]
+   ]
+  },
+  {
+   "id": "function.math:power",
+   "sql": "SELECT POWER(3, 3)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     27
+    ]
+   ]
+  },
+  {
+   "id": "function.math:radians",
+   "sql": "SELECT ROUND(RADIANS(180), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3.141593
+    ]
+   ]
+  },
+  {
+   "id": "function.math:sin",
+   "sql": "SELECT ROUND(SIN(1), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0.841471
+    ]
+   ]
+  },
+  {
+   "id": "function.math:sinh",
+   "sql": "SELECT ROUND(SINH(1), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1.175201
+    ]
+   ]
+  },
+  {
+   "id": "function.math:sqrt",
+   "sql": "SELECT SQRT(16), SQRT(2.25)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     4,
+     1.5
+    ]
+   ]
+  },
+  {
+   "id": "function.math:tan",
+   "sql": "SELECT ROUND(TAN(1), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1.557408
+    ]
+   ]
+  },
+  {
+   "id": "function.math:tanh",
+   "sql": "SELECT ROUND(TANH(1), 6)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0.761594
+    ]
+   ]
+  },
+  {
+   "id": "function.math:trunc",
+   "sql": "SELECT TRUNC(2.7), TRUNC(-2.7)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2,
+     -2
+    ]
+   ]
+  },
+  {
+   "id": "function.datetime:date",
+   "sql": "SELECT (DATE '2024-02-28' + INTERVAL 1 DAY)::DATE::VARCHAR, epoch_ms(0)::DATE::VARCHAR",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-02-29",
+     "1970-01-01"
+    ]
+   ]
+  },
+  {
+   "id": "function.datetime:time",
+   "sql": "SELECT (TIMESTAMP '2024-01-01 13:45:30')::TIME::VARCHAR, (TIME '13:45' + INTERVAL 30 MINUTE)::VARCHAR",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "13:45:30",
+     "14:15:00"
+    ]
+   ]
+  },
+  {
+   "id": "function.datetime:datetime",
+   "sql": "SELECT strftime(TIMESTAMP '2024-01-31 10:00:00' + INTERVAL 1 MONTH, '%Y-%m-%d %H:%M:%S'), strftime(epoch_ms(1700000000000), '%Y-%m-%d %H:%M:%S')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-02-29 10:00:00",
+     "2023-11-14 22:13:20"
+    ]
+   ]
+  },
+  {
+   "id": "function.datetime:julianday",
+   "sql": "SELECT julian(TIMESTAMP '2000-01-01 12:00:00')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     2451545.5
+    ]
+   ]
+  },
+  {
+   "id": "function.datetime:unixepoch",
+   "sql": "SELECT epoch(TIMESTAMP '2024-01-01 00:00:00')::BIGINT",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1704067200
+    ]
+   ]
+  },
+  {
+   "id": "function.datetime:strftime",
+   "sql": "SELECT STRFTIME(CAST('2024-03-15 08:05:00' AS TIMESTAMP), '%Y-%m-%d %H:%M %j %w')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-15 08:05 075 5"
+    ]
+   ]
+  },
+  {
+   "id": "function.datetime:timediff",
+   "sql": "SELECT age(TIMESTAMP '2024-03-15', TIMESTAMP '2024-01-01')::VARCHAR",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2 months 14 days"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:NNN days",
+   "sql": "SELECT (DATE '2024-01-01' + INTERVAL 10 DAY)::DATE::VARCHAR",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-01-11"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:NNN hours",
+   "sql": "SELECT strftime(TIMESTAMP '2024-01-01' + INTERVAL 5 HOUR, '%Y-%m-%d %H:%M:%S')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-01-01 05:00:00"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:NNN minutes",
+   "sql": "SELECT strftime(TIMESTAMP '2024-01-01' - INTERVAL 90 MINUTE, '%Y-%m-%d %H:%M:%S')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2023-12-31 22:30:00"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:NNN seconds",
+   "sql": "SELECT strftime(TIMESTAMP '2024-01-01' + INTERVAL 3600 SECOND, '%Y-%m-%d %H:%M:%S')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-01-01 01:00:00"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:NNN months",
+   "sql": "SELECT (DATE '2024-01-31' + INTERVAL 1 MONTH)::DATE::VARCHAR",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-02-29"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:NNN years",
+   "sql": "SELECT (DATE '2024-02-29' + INTERVAL 1 YEAR)::DATE::VARCHAR",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2025-02-28"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:start of month",
+   "sql": "SELECT date_trunc('month', DATE '2024-03-15')::DATE::VARCHAR",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-01"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:start of year",
+   "sql": "SELECT date_trunc('year', DATE '2024-03-15')::DATE::VARCHAR",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-01-01"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:start of day",
+   "sql": "SELECT strftime(date_trunc('day', TIMESTAMP '2024-03-15 10:11:12'), '%Y-%m-%d %H:%M:%S')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-15 00:00:00"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:weekday N",
+   "sql": "SELECT (DATE '2024-03-15' + INTERVAL ((7 - dayofweek(DATE '2024-03-15')) % 7) DAY)::DATE::VARCHAR",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-17"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:unixepoch",
+   "sql": "SELECT strftime(epoch_ms(1710460800000), '%Y-%m-%d %H:%M:%S')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-15 00:00:00"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:julianday",
+   "sql": "SELECT (TIMESTAMP '1970-01-01' + INTERVAL (2460385.5 - 2440587.5) DAY)::DATE::VARCHAR",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-16"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:auto",
+   "sql": "SELECT strftime(epoch_ms(1710460800000), '%Y-%m-%d %H:%M:%S')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-15 00:00:00"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:localtime",
+   "sql": "SELECT typeof(strftime(TIMESTAMPTZ '2024-03-15 00:00:00+00', '%Y-%m-%d %H:%M:%S'))",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "VARCHAR"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:utc",
+   "sql": "SELECT typeof(strftime(TIMESTAMP '2024-03-15 00:00:00', '%Y-%m-%d %H:%M:%S'))",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "VARCHAR"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:subsec",
+   "sql": "SELECT typeof(strftime(now(), '%Y-%m-%d %H:%M:%S.%g'))",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "VARCHAR"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:subsecond",
+   "sql": "SELECT typeof(strftime(now(), '%Y-%m-%d %H:%M:%S.%g'))",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "VARCHAR"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:ceiling",
+   "sql": "SELECT (date_trunc('month', DATE '2024-01-31') + INTERVAL 1 MONTH + INTERVAL (day(DATE '2024-01-31') - 1) DAY)::DATE::VARCHAR",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-03-02"
+    ]
+   ]
+  },
+  {
+   "id": "datetime.modifier:floor",
+   "sql": "SELECT (DATE '2024-01-31' + INTERVAL 1 MONTH)::DATE::VARCHAR",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "2024-02-29"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json",
+   "sql": "SELECT JSON(' {\"x\" : 1} ')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"x\":1}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_array",
+   "sql": "SELECT JSON_ARRAY(1, 'a', NULL, 2.5)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "[1,\"a\",null,2.5]"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_array_insert",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no function that inserts into a JSON array"
+  },
+  {
+   "id": "function.json:json_array_length",
+   "sql": "SELECT JSON_ARRAY_LENGTH('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.b')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_each",
+   "sql": "SELECT key, value, type FROM JSON_EACH('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}') ORDER BY key NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "a",
+     "1",
+     "UBIGINT"
+    ],
+    [
+     "b",
+     "[1,2,{\"c\":3}]",
+     "ARRAY"
+    ],
+    [
+     "d",
+     "null",
+     "NULL"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_error_position",
+   "status": "no equivalent",
+   "error": "none: DuckDB tells valid JSON from invalid (json_valid) but not where it breaks"
+  },
+  {
+   "id": "function.json:json_extract",
+   "sql": "SELECT '{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}' ->> '$.b[2].c', '{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}' -> '$.a'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "3",
+     "1"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_group_array",
+   "sql": "SELECT json_group_array(a) FROM (SELECT a FROM t ORDER BY a)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "[1,2,3,4,5]"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_group_object",
+   "sql": "SELECT JSON_GROUP_OBJECT(b, a) FROM (SELECT a, b FROM t WHERE NOT b IS NULL ORDER BY a NULLS FIRST)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"one\":1,\"two\":2,\"three\":3,\"five\":5}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_insert",
+   "status": "no equivalent",
+   "error": "none: DuckDB's json extension has no json_insert() (json_merge_patch and json_transform reshape documents instead)"
+  },
+  {
+   "id": "function.json:json_object",
+   "sql": "SELECT JSON_OBJECT('k', 1, 'v', 'x')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"k\":1,\"v\":\"x\"}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_patch",
+   "sql": "SELECT json_merge_patch('{\"a\":1,\"b\":2}', '{\"b\":null,\"c\":3}')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\":1,\"c\":3}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_pretty",
+   "sql": "SELECT JSON_PRETTY('{\"a\":[1,2]}')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "{\n    \"a\": [\n        1,\n        2\n    ]\n}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_quote",
+   "sql": "SELECT JSON_QUOTE('a\"b'), JSON_QUOTE(3)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "\"a\\\"b\"",
+     "3"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_remove",
+   "status": "no equivalent",
+   "error": "none: DuckDB's json extension has no json_remove() (json_merge_patch and json_transform reshape documents instead)"
+  },
+  {
+   "id": "function.json:json_replace",
+   "status": "no equivalent",
+   "error": "none: DuckDB's json extension has no json_replace() (json_merge_patch and json_transform reshape documents instead)"
+  },
+  {
+   "id": "function.json:json_set",
+   "status": "no equivalent",
+   "error": "none: DuckDB's json extension has no json_set() (json_merge_patch and json_transform reshape documents instead)"
+  },
+  {
+   "id": "function.json:json_tree",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no recursive JSON walk with SQLite's fullkey and type columns"
+  },
+  {
+   "id": "function.json:json_type",
+   "sql": "SELECT JSON_TYPE('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.b'), JSON_TYPE('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.d')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "ARRAY",
+     "NULL"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:json_valid",
+   "sql": "SELECT json_valid('{\"a\":1}'), json_valid('{a:1}'), json_valid('{a:1}')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb",
+   "sql": "SELECT json('{\"a\":1}')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\":1}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_array",
+   "sql": "SELECT json_array(1, 2)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "[1,2]"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_array_insert",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no function that inserts into a JSON array"
+  },
+  {
+   "id": "function.json:jsonb_each",
+   "sql": "SELECT key FROM json_each('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}') ORDER BY key",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "a"
+    ],
+    [
+     "b"
+    ],
+    [
+     "d"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_extract",
+   "sql": "SELECT json_extract('{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null}', '$.b')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "[1,2,{\"c\":3}]"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_group_array",
+   "sql": "SELECT json_group_array(a) FROM (SELECT a FROM t ORDER BY a)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "[1,2,3,4,5]"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_group_object",
+   "sql": "SELECT json_group_object(b, a) FROM (SELECT a, b FROM t WHERE b IS NOT NULL ORDER BY a)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "{\"one\":1,\"two\":2,\"three\":3,\"five\":5}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_insert",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no JSON insert function"
+  },
+  {
+   "id": "function.json:jsonb_object",
+   "sql": "SELECT json_object('k', 1)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "{\"k\":1}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_patch",
+   "sql": "SELECT json_merge_patch('{\"a\":1}', '{\"b\":2}')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "{\"a\":1,\"b\":2}"
+    ]
+   ]
+  },
+  {
+   "id": "function.json:jsonb_remove",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no JSON remove function"
+  },
+  {
+   "id": "function.json:jsonb_replace",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no JSON replace function"
+  },
+  {
+   "id": "function.json:jsonb_set",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no JSON set function"
+  },
+  {
+   "id": "function.json:jsonb_tree",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no recursive JSON walk with SQLite's columns"
+  },
+  {
+   "id": "function.aggregate:avg",
+   "sql": "SELECT AVG(c), AVG(a) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3.5,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:count",
+   "sql": "SELECT COUNT(*), COUNT(b), COUNT(DISTINCT a % 2) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     5,
+     4,
+     2
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:group_concat",
+   "sql": "SELECT LISTAGG(b, '|' ORDER BY a NULLS FIRST) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "one|two|three|five"
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:string_agg",
+   "sql": "SELECT LISTAGG(b, ',' ORDER BY a DESC) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "five,three,two,one"
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:max",
+   "sql": "SELECT MAX(c), MAX(b) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     5.5,
+     "two"
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:min",
+   "sql": "SELECT MIN(c), MIN(b) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1.5,
+     "five"
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:sum",
+   "sql": "SELECT SUM(a), SUM(c) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     15,
+     14
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:total",
+   "sql": "SELECT coalesce(sum(c), 0)::DOUBLE, coalesce(sum(NULL::DOUBLE), 0)::DOUBLE FROM t",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     14,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:median",
+   "sql": "SELECT MEDIAN(c) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3.5
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:percentile",
+   "sql": "SELECT quantile_cont(c, 0.5) FROM t",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     3.5
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:percentile_cont",
+   "sql": "SELECT QUANTILE_CONT(c, 0.25) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2.25
+    ]
+   ]
+  },
+  {
+   "id": "function.aggregate:percentile_disc",
+   "sql": "SELECT QUANTILE_DISC(c, 0.25) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1.5
+    ]
+   ]
+  },
+  {
+   "id": "function.window:row_number",
+   "sql": "SELECT a, ROW_NUMBER() OVER (ORDER BY a NULLS FIRST) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     4,
+     4
+    ],
+    [
+     5,
+     5
+    ]
+   ]
+  },
+  {
+   "id": "function.window:rank",
+   "sql": "SELECT a, RANK() OVER (ORDER BY a % 2 NULLS FIRST) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     3
+    ],
+    [
+     2,
+     1
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     4,
+     1
+    ],
+    [
+     5,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "function.window:dense_rank",
+   "sql": "SELECT a, DENSE_RANK() OVER (ORDER BY a % 2 NULLS FIRST) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     2
+    ],
+    [
+     2,
+     1
+    ],
+    [
+     3,
+     2
+    ],
+    [
+     4,
+     1
+    ],
+    [
+     5,
+     2
+    ]
+   ]
+  },
+  {
+   "id": "function.window:percent_rank",
+   "sql": "SELECT a, PERCENT_RANK() OVER (ORDER BY a NULLS FIRST) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ],
+    [
+     2,
+     0.25
+    ],
+    [
+     3,
+     0.5
+    ],
+    [
+     4,
+     0.75
+    ],
+    [
+     5,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.window:cume_dist",
+   "sql": "SELECT a, CUME_DIST() OVER (ORDER BY a NULLS FIRST) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0.2
+    ],
+    [
+     2,
+     0.4
+    ],
+    [
+     3,
+     0.6
+    ],
+    [
+     4,
+     0.8
+    ],
+    [
+     5,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "function.window:ntile",
+   "sql": "SELECT a, NTILE(2) OVER (ORDER BY a NULLS FIRST) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     1
+    ],
+    [
+     3,
+     1
+    ],
+    [
+     4,
+     2
+    ],
+    [
+     5,
+     2
+    ]
+   ]
+  },
+  {
+   "id": "function.window:lag",
+   "sql": "SELECT a, LAG(b) OVER (ORDER BY a NULLS FIRST), LAG(b, 2, 'none') OVER (ORDER BY a NULLS FIRST) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     null,
+     "none"
+    ],
+    [
+     2,
+     "one",
+     "none"
+    ],
+    [
+     3,
+     "two",
+     "one"
+    ],
+    [
+     4,
+     "three",
+     "two"
+    ],
+    [
+     5,
+     null,
+     "three"
+    ]
+   ]
+  },
+  {
+   "id": "function.window:lead",
+   "sql": "SELECT a, LEAD(b) OVER (ORDER BY a NULLS FIRST) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "two"
+    ],
+    [
+     2,
+     "three"
+    ],
+    [
+     3,
+     null
+    ],
+    [
+     4,
+     "five"
+    ],
+    [
+     5,
+     null
+    ]
+   ]
+  },
+  {
+   "id": "function.window:first_value",
+   "sql": "SELECT a, FIRST_VALUE(b) OVER (ORDER BY a NULLS FIRST) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "one"
+    ],
+    [
+     2,
+     "one"
+    ],
+    [
+     3,
+     "one"
+    ],
+    [
+     4,
+     "one"
+    ],
+    [
+     5,
+     "one"
+    ]
+   ]
+  },
+  {
+   "id": "function.window:last_value",
+   "sql": "SELECT a, LAST_VALUE(b) OVER (ORDER BY a NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "five"
+    ],
+    [
+     2,
+     "five"
+    ],
+    [
+     3,
+     "five"
+    ],
+    [
+     4,
+     "five"
+    ],
+    [
+     5,
+     "five"
+    ]
+   ]
+  },
+  {
+   "id": "function.window:nth_value",
+   "sql": "SELECT a, NTH_VALUE(b, 2) OVER (ORDER BY a NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "two"
+    ],
+    [
+     2,
+     "two"
+    ],
+    [
+     3,
+     "two"
+    ],
+    [
+     4,
+     "two"
+    ],
+    [
+     5,
+     "two"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#rows",
+   "sql": "SELECT a, SUM(a) OVER (ORDER BY a NULLS FIRST ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     3
+    ],
+    [
+     2,
+     6
+    ],
+    [
+     3,
+     9
+    ],
+    [
+     4,
+     12
+    ],
+    [
+     5,
+     9
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#range",
+   "sql": "SELECT a, SUM(a) OVER (ORDER BY a NULLS FIRST RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     3,
+     5
+    ],
+    [
+     4,
+     7
+    ],
+    [
+     5,
+     9
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#groups",
+   "sql": "SELECT a, COUNT(*) OVER (ORDER BY a % 2 NULLS FIRST GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     3
+    ],
+    [
+     2,
+     5
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     4,
+     5
+    ],
+    [
+     5,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#exclude-current-row",
+   "sql": "SELECT a, SUM(a) OVER (ORDER BY a NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     14
+    ],
+    [
+     2,
+     13
+    ],
+    [
+     3,
+     12
+    ],
+    [
+     4,
+     11
+    ],
+    [
+     5,
+     10
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#exclude-group",
+   "sql": "SELECT a, COUNT(*) OVER (ORDER BY a % 2 NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     2
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     3,
+     2
+    ],
+    [
+     4,
+     3
+    ],
+    [
+     5,
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#exclude-ties",
+   "sql": "SELECT a, COUNT(*) OVER (ORDER BY a % 2 NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     3
+    ],
+    [
+     2,
+     4
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     4,
+     4
+    ],
+    [
+     5,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#partition",
+   "sql": "SELECT a, SUM(a) OVER (PARTITION BY a % 2 ORDER BY a NULLS FIRST) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     3,
+     4
+    ],
+    [
+     4,
+     6
+    ],
+    [
+     5,
+     9
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#named-window",
+   "sql": "SELECT a, SUM(a) OVER w, COUNT(*) OVER w FROM t WINDOW w AS (ORDER BY a NULLS FIRST) ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1,
+     1
+    ],
+    [
+     2,
+     3,
+     2
+    ],
+    [
+     3,
+     6,
+     3
+    ],
+    [
+     4,
+     10,
+     4
+    ],
+    [
+     5,
+     15,
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#window-chaining",
+   "sql": "SELECT a, SUM(a) OVER (w ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t WINDOW w AS (ORDER BY a NULLS FIRST) ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     3,
+     5
+    ],
+    [
+     4,
+     7
+    ],
+    [
+     5,
+     9
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec#aggregate-filter",
+   "sql": "SELECT a, COUNT(*) FILTER(WHERE a > 2) OVER (ORDER BY a NULLS FIRST) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ],
+    [
+     2,
+     0
+    ],
+    [
+     3,
+     1
+    ],
+    [
+     4,
+     2
+    ],
+    [
+     5,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "operator:~",
+   "sql": "SELECT ~5",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     -6
+    ]
+   ]
+  },
+  {
+   "id": "operator:+ (unary)",
+   "sql": "SELECT 3, 'x'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3,
+     "x"
+    ]
+   ]
+  },
+  {
+   "id": "operator:- (unary)",
+   "sql": "SELECT -(3), -('4'::INTEGER)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     -3,
+     -4
+    ]
+   ]
+  },
+  {
+   "id": "operator:+",
+   "sql": "SELECT 1 + 2, 1.5 + 2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3,
+     3.5
+    ]
+   ]
+  },
+  {
+   "id": "operator:-",
+   "sql": "SELECT 5 - 7, 2.5 - 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     -2,
+     1.5
+    ]
+   ]
+  },
+  {
+   "id": "operator:COLLATE",
+   "sql": "SELECT 'a' = 'A' COLLATE NOCASE",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:||",
+   "sql": "SELECT 'a' || 'b' || 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "ab1"
+    ]
+   ]
+  },
+  {
+   "id": "operator:->",
+   "sql": "SELECT '{\"a\":{\"b\":2}}' -> '$.a'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "{\"b\":2}"
+    ]
+   ]
+  },
+  {
+   "id": "operator:->>",
+   "sql": "SELECT '{\"a\":{\"b\":2}}' ->> '$.a.b'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "2"
+    ]
+   ]
+  },
+  {
+   "id": "operator:*",
+   "sql": "SELECT 6 * 7",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     42
+    ]
+   ]
+  },
+  {
+   "id": "operator:/",
+   "sql": "SELECT 7 / NULLIF(2, 0), 7.0 / NULLIF(2, 0)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3.5,
+     3.5
+    ]
+   ]
+  },
+  {
+   "id": "operator:%",
+   "sql": "SELECT 7 % 3",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:&",
+   "sql": "SELECT 6 & 3",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "operator:|",
+   "sql": "SELECT 6 | 3",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     7
+    ]
+   ]
+  },
+  {
+   "id": "operator:<<",
+   "sql": "SELECT 1 << 4",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     16
+    ]
+   ]
+  },
+  {
+   "id": "operator:>>",
+   "sql": "SELECT 256 >> 2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     64
+    ]
+   ]
+  },
+  {
+   "id": "operator:<",
+   "sql": "SELECT 1 < 2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:>",
+   "sql": "SELECT 2 > 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:<=",
+   "sql": "SELECT 2 <= 2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:>=",
+   "sql": "SELECT 2 >= 3",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "operator:=",
+   "sql": "SELECT 1 = 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:==",
+   "sql": "SELECT 1 = 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:<>",
+   "sql": "SELECT 1 <> 2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:!=",
+   "sql": "SELECT 1 <> 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "operator:IS",
+   "sql": "SELECT NULL IS NOT DISTINCT FROM NULL, 1 IS NOT DISTINCT FROM 1",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:IS NOT",
+   "sql": "SELECT NOT 1 IS NULL",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:IS DISTINCT FROM",
+   "sql": "SELECT 1 IS DISTINCT FROM NULL",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:IS NOT DISTINCT FROM",
+   "sql": "SELECT NULL IS NOT DISTINCT FROM NULL",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:IN",
+   "sql": "SELECT 2 IN (1, 2, 3), 5 IN (SELECT a FROM t)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT IN",
+   "sql": "SELECT NOT 9 IN (1, 2)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:LIKE",
+   "sql": "SELECT 'Abc' LIKE 'a%'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT LIKE",
+   "sql": "SELECT 'abc' NOT LIKE 'b%'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:GLOB",
+   "sql": "SELECT 'abc' GLOB 'a?c'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT GLOB",
+   "sql": "SELECT NOT 'abc' GLOB 'A*'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:REGEXP",
+   "sql": "SELECT regexp_matches('abc', 'b'), regexp_matches('abc', '^b')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT REGEXP",
+   "sql": "SELECT NOT regexp_matches('abc', 'z')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:ESCAPE",
+   "sql": "SELECT 'a%' LIKE 'a!%' ESCAPE '!'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:BETWEEN",
+   "sql": "SELECT 2 BETWEEN 1 AND 3",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT BETWEEN",
+   "sql": "SELECT NOT 5 BETWEEN 1 AND 3",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:ISNULL",
+   "sql": "SELECT NULL IS NULL",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOTNULL",
+   "sql": "SELECT NOT 1 IS NULL",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT NULL",
+   "sql": "SELECT NOT 1 IS NULL",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:EXISTS",
+   "sql": "SELECT EXISTS(SELECT 1 FROM t WHERE a = 3)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT EXISTS",
+   "sql": "SELECT NOT EXISTS(SELECT 1 FROM t WHERE a = 9)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:CASE",
+   "sql": "SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 2 > 1 THEN 'b' ELSE 'c' END, CASE 3 WHEN 3 THEN 'x' END",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "b",
+     "x"
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT#1",
+   "sql": "SELECT NOT 0, NOT 5",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "operator:NOT#2",
+   "sql": "SELECT NOT FALSE, NOT TRUE",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "operator:AND#1",
+   "sql": "SELECT 1 AND 0, 1 AND NULL",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     null
+    ]
+   ]
+  },
+  {
+   "id": "operator:AND#2",
+   "sql": "SELECT TRUE AND FALSE, TRUE AND NULL",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     null
+    ]
+   ]
+  },
+  {
+   "id": "operator:OR#1",
+   "sql": "SELECT 0 OR NULL, 1 OR NULL",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     null,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:OR#2",
+   "sql": "SELECT FALSE OR NULL, TRUE OR NULL",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     null,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "operator:CAST#1",
+   "sql": "SELECT CAST(5 AS TEXT), CAST('7' AS INT), CAST(2 AS REAL)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "5",
+     7,
+     2
+    ]
+   ]
+  },
+  {
+   "id": "operator:CAST#2",
+   "sql": "SELECT CAST(3.9 AS INT), CAST(-3.9 AS INT)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     4,
+     -4
+    ]
+   ]
+  },
+  {
+   "id": "operator:CAST#3",
+   "status": "no equivalent",
+   "error": "none: DuckDB refuses text that isn't a whole number rather than reading its numeric prefix"
+  },
+  {
+   "id": "operator:MATCH",
+   "status": "no equivalent",
+   "error": "none: DuckDB's full-text search is the fts extension (PRAGMA create_fts_index), installed apart"
+  },
+  {
+   "id": "operator:NOT MATCH",
+   "status": "no equivalent",
+   "error": "none: SQLite's NOT MATCH needs an application-defined match()",
+   "requires": "an application-defined match() function"
+  },
+  {
+   "id": "affinity:TEXT",
+   "sql": "SELECT TYPEOF(x) FROM (SELECT CAST(12 AS TEXT) AS x)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "VARCHAR"
+    ]
+   ]
+  },
+  {
+   "id": "affinity:NUMERIC",
+   "sql": "SELECT TYPEOF(CAST('12' AS DECIMAL)), TYPEOF(CAST('1.5' AS DECIMAL)), TYPEOF(CAST('abc' AS DECIMAL))",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "DECIMAL(18,3)",
+     "DECIMAL(18,3)",
+     "DECIMAL(18,3)"
+    ]
+   ]
+  },
+  {
+   "id": "affinity:INTEGER",
+   "sql": "SELECT TYPEOF(v) FROM (SELECT CAST('7' AS INT) AS v)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "INTEGER"
+    ]
+   ]
+  },
+  {
+   "id": "affinity:REAL",
+   "sql": "SELECT TYPEOF(CAST(7 AS REAL))",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "FLOAT"
+    ]
+   ]
+  },
+  {
+   "id": "affinity:BLOB",
+   "sql": "SELECT TYPEOF(CAST('ab' AS BLOB))",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "BLOB"
+    ]
+   ]
+  },
+  {
+   "id": "affinity:column",
+   "sql": "SELECT TYPEOF(n), TYPEOF(s), TYPEOF(i) FROM ta",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "DECIMAL(18,3)",
+     "VARCHAR",
+     "INTEGER"
+    ]
+   ]
+  },
+  {
+   "id": "collation:BINARY",
+   "sql": "SELECT 'a' < 'B' COLLATE BINARY",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "ParserException: Parser Error: syntax error at or near \"BINARY\"\n\nLINE 1: SELECT 'a' < 'B' COLLATE BINARY\n                                 ^^^^^^"
+  },
+  {
+   "id": "collation:NOCASE",
+   "sql": "SELECT b FROM t WHERE b = 'ONE' COLLATE NOCASE",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "one"
+    ]
+   ]
+  },
+  {
+   "id": "collation:RTRIM",
+   "sql": "SELECT 'a  ' = 'a' COLLATE RTRIM",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Collation with name rtrim does not exist!\nDid you mean \"tr\"?"
+  },
+  {
+   "id": "storage_class:NULL",
+   "sql": "SELECT TYPEOF(NULL)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "\"NULL\""
+    ]
+   ]
+  },
+  {
+   "id": "storage_class:INTEGER",
+   "sql": "SELECT TYPEOF(1)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "INTEGER"
+    ]
+   ]
+  },
+  {
+   "id": "storage_class:REAL",
+   "sql": "SELECT TYPEOF(1.5)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "DECIMAL(2,1)"
+    ]
+   ]
+  },
+  {
+   "id": "storage_class:TEXT",
+   "sql": "SELECT TYPEOF('t')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "VARCHAR"
+    ]
+   ]
+  },
+  {
+   "id": "storage_class:BLOB",
+   "sql": "SELECT TYPEOF(UNHEX('01'))",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "BLOB"
+    ]
+   ]
+  },
+  {
+   "id": "expression:scalar subquery",
+   "sql": "SELECT (SELECT MAX(a) FROM t), (SELECT b FROM t WHERE a = 2)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     5,
+     "two"
+    ]
+   ]
+  },
+  {
+   "id": "expression:correlated subquery",
+   "sql": "SELECT a, (SELECT COUNT(*) FROM u WHERE u.a = t.a) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     3,
+     0
+    ],
+    [
+     4,
+     0
+    ],
+    [
+     5,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "expression:row value",
+   "sql": "SELECT (1, 2) = (1, 2), (1, 2) < (1, 3), (2, 'y') IN (SELECT a, d FROM u)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "expression:boolean expression",
+   "status": "no equivalent",
+   "error": "none: DuckDB: a condition must be boolean there: text has no truth value"
+  },
+  {
+   "id": "rule.affinity:INT gives INTEGER",
+   "sql": "SELECT TYPEOF(x), TYPEOF(y) FROM r",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Type with name MEDIUMINT does not exist!\nDid you mean \"main.BIGINT\"?\n\nLINE 1: CREATE TABLE r (x BIGINT, y MEDIUMINT)\n                                    ^^^^^^^^^"
+  },
+  {
+   "id": "rule.affinity:CHAR, CLOB or TEXT gives TEXT",
+   "sql": "SELECT TYPEOF(a), TYPEOF(b), TYPEOF(c) FROM r",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Type with name NTEXT does not exist!\nDid you mean \"main.TEXT\"?\n\nLINE 1: CREATE TABLE r (a TEXT(10), b TEXT, c NTEXT)\n                                              ^^^^^"
+  },
+  {
+   "id": "rule.affinity:BLOB or no type gives BLOB",
+   "sql": "SELECT TYPEOF(a), TYPEOF(b) FROM r",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "ParserException: Parser Error: Column b must have a type or be defined as a GENERATED column."
+  },
+  {
+   "id": "rule.affinity:REAL, FLOA or DOUB gives REAL",
+   "sql": "SELECT TYPEOF(a), TYPEOF(b), TYPEOF(c) FROM r",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "FLOAT",
+     "FLOAT",
+     "DOUBLE"
+    ]
+   ]
+  },
+  {
+   "id": "rule.affinity:otherwise NUMERIC",
+   "sql": "SELECT TYPEOF(a), a, TYPEOF(b), TYPEOF(c) FROM r",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "ConversionException: Conversion Error: Could not convert string '2' to BOOL\n\nLINE 1: INSERT INTO r VALUES ('1.0', '2', '2024-01-01')\n                                     ^^^"
+  },
+  {
+   "id": "rule.affinity:the rules apply in order",
+   "status": "no equivalent",
+   "error": "none: DuckDB takes only its own type names: SQLite's affinity from the letters of any declared type has no counterpart there"
+  },
+  {
+   "id": "rule.expression-affinity:an IN list has no affinity",
+   "sql": "SELECT 1 IN (SELECT t FROM r), 1 IN ('1')",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "BinderException: Binder Error: Cannot compare values of type INTEGER_LITERAL and VARCHAR in IN/ANY/ALL clause - an explicit cast is required\n\nLINE 1: SELECT 1 IN (SELECT t FROM r), 1 IN ('1')\n                    ^^^^^^^^^^^^^^^^^"
+  },
+  {
+   "id": "rule.expression-affinity:a column keeps its affinity",
+   "sql": "SELECT n = '5', (n) = '5' FROM r",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.expression-affinity:an operator removes affinity",
+   "sql": "SELECT n = '5', n + 0 = '5' FROM r",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.expression-affinity:CAST gives its type's affinity",
+   "sql": "SELECT CAST(5 AS TEXT) = 5, CAST('5' AS INT) = '5'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.expression-affinity:COLLATE keeps its operand's affinity",
+   "sql": "SELECT (n COLLATE NOCASE) = '5' FROM r",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "BinderException: Binder Error: collations are only supported for type varchar\n\nLINE 1: SELECT (n COLLATE NOCASE) = '5' FROM r\n                ^"
+  },
+  {
+   "id": "rule.expression-affinity:otherwise no affinity",
+   "sql": "SELECT 5 = '5', '5' = 5",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.expression-affinity:view and subquery columns",
+   "sql": "SELECT x = '1', y = '1' FROM rv",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.expression-affinity:compound view columns",
+   "sql": "SELECT COUNT(*) FROM (SELECT a AS c FROM r UNION ALL SELECT b FROM s) WHERE c = '2'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:NULL is less than any value",
+   "sql": "SELECT x FROM (SELECT 1 AS x UNION ALL SELECT NULL UNION ALL SELECT -5) ORDER BY x NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     null
+    ],
+    [
+     -5
+    ],
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:numbers before text and blobs",
+   "sql": "SELECT 1 < '0', 2 < UNHEX('01'), 99.5 < ''",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "BinderException: Binder Error: Cannot compare values of type INTEGER_LITERAL and type BLOB - an explicit cast is required\n\nLINE 1: SELECT 1 < '0', 2 < UNHEX('01'), 99.5 < ''\n                        ^^^^^^^^^^^^^^^"
+  },
+  {
+   "id": "rule.comparison:numbers compare numerically",
+   "sql": "SELECT 2 < 10, 2.5 < 3, 3 = 3.0",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:text before blobs",
+   "sql": "SELECT 'zzz' < UNHEX('00')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:text compares by collation",
+   "sql": "SELECT 'a' < 'B', 'a' < 'B' COLLATE NOCASE",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:blobs compare by memcmp",
+   "sql": "SELECT UNHEX('0102') < UNHEX('0201'), UNHEX('01') < UNHEX('0100')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:numeric affinity goes to the other operand",
+   "sql": "SELECT n > '9', n = '10.0' FROM r",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:text affinity goes to an operand with none",
+   "sql": "SELECT t = 10, t > 9 FROM r",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "BinderException: Binder Error: Cannot compare values of type VARCHAR and type INTEGER_LITERAL - an explicit cast is required\n\nLINE 1: SELECT t = 10, t > 9 FROM r\n                       ^^^^^"
+  },
+  {
+   "id": "rule.comparison:otherwise compared as is",
+   "sql": "SELECT '10' = 10, UNHEX('31') = '1'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.comparison:BETWEEN is two comparisons",
+   "sql": "SELECT t BETWEEN 1 AND 9, t BETWEEN 10 AND 20 FROM r",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "BinderException: Binder Error: Cannot mix values of type VARCHAR and INTEGER_LITERAL in BETWEEN clause - an explicit cast is required\n\nLINE 1: SELECT t BETWEEN 1 AND 9, t BETWEEN 10 AND 20 FROM r\n                 ^^^^^^^^^^^^^^^"
+  },
+  {
+   "id": "rule.comparison:IN compares as equality",
+   "sql": "SELECT (SELECT n IN (SELECT t FROM s) FROM r), '1' IN (SELECT n FROM r)",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "BinderException: Binder Error: Cannot compare values of type INTEGER and VARCHAR in IN/ANY/ALL clause - an explicit cast is required\n\nLINE 1: SELECT (SELECT n IN (SELECT t FROM s) FROM r), '1' IN (SELECT n FROM r)\n                            ^^^^^^^^^^^^^^^^^"
+  },
+  {
+   "id": "rule.sort:ORDER BY orders by storage class",
+   "sql": "SELECT x FROM (SELECT UNHEX('00') AS x UNION ALL SELECT 'b' UNION ALL SELECT 2 UNION ALL SELECT NULL UNION ALL SELECT 1.5 UNION ALL SELECT 'A') ORDER BY x NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "ConversionException: Conversion Error: Unimplemented type for cast (DECIMAL(2,1) -> BLOB)\n\nLINE 1: ... 'b' UNION ALL SELECT 2 UNION ALL SELECT NULL UNION ALL SELECT 1.5 UNION ALL SELECT 'A') ORDER BY x NULLS FIRST\n                                                                          ^"
+  },
+  {
+   "id": "rule.sort:GROUP BY keeps classes apart",
+   "sql": "SELECT COUNT(*) AS n FROM (SELECT 1 AS x UNION ALL SELECT 1.0 UNION ALL SELECT '1') GROUP BY x ORDER BY n NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "rule.sort:compound SELECTs compare as is",
+   "sql": "SELECT COUNT(*) FROM (SELECT n FROM r UNION SELECT '1')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.collation:columns default to BINARY",
+   "sql": "SELECT t = 'A' FROM r",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "rule.collation:an explicit COLLATE wins, left first",
+   "sql": "SELECT t = 'A' COLLATE BINARY, 'A' COLLATE NOCASE = t COLLATE BINARY FROM r",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "ParserException: Parser Error: syntax error at or near \",\"\n\nLINE 1: SELECT t = 'A' COLLATE BINARY, 'A' COLLATE NOCASE = t COLLATE BINARY FROM r\n                                     ^"
+  },
+  {
+   "id": "rule.collation:then a column's collation, left first",
+   "sql": "SELECT x = y, y = x FROM r",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "ParserException: Parser Error: syntax error at or near \"BINARY\"\n\nLINE 1: CREATE TABLE r (x TEXT COLLATE NOCASE, y TEXT COLLATE BINARY)\n                                                              ^^^^^^"
+  },
+  {
+   "id": "rule.collation:otherwise BINARY",
+   "sql": "SELECT 'a' = 'A'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "rule.collation:the leftmost COLLATE anywhere wins",
+   "sql": "SELECT 'a' COLLATE NOCASE = ('A' COLLATE BINARY), 'x' = ('X' COLLATE NOCASE) || ''",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "ParserException: Parser Error: syntax error at or near \")\"\n\nLINE 1: SELECT 'a' COLLATE NOCASE = ('A' COLLATE BINARY), 'x' = ('X' COLLATE NOCASE) || ''\n                                                       ^"
+  },
+  {
+   "id": "rule.collation:IN uses the left operand's collation",
+   "sql": "SELECT 'a' COLLATE NOCASE IN ('A'), 'a' IN ('A' COLLATE NOCASE)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "rule.collation:ORDER BY uses COLLATE, then the column's#1",
+   "sql": "SELECT t FROM r ORDER BY t COLLATE BINARY NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "ParserException: Parser Error: syntax error at or near \"NULLS\"\n\nLINE 1: SELECT t FROM r ORDER BY t COLLATE BINARY NULLS FIRST\n                                                  ^^^^^"
+  },
+  {
+   "id": "rule.collation:ORDER BY uses COLLATE, then the column's#2",
+   "sql": "SELECT t FROM r ORDER BY t NULLS FIRST, t COLLATE BINARY NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "ParserException: Parser Error: syntax error at or near \"NULLS\"\n\nLINE 1: SELECT t FROM r ORDER BY t NULLS FIRST, t COLLATE BINARY NULLS FIRST\n                                                                 ^^^^^"
+  },
+  {
+   "id": "word:TRUE",
+   "sql": "SELECT TRUE, TRUE::INTEGER + 1",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     2
+    ]
+   ]
+  },
+  {
+   "id": "word:FALSE",
+   "sql": "SELECT FALSE, FALSE IS FALSE",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "word:STRICT#1",
+   "status": "no equivalent",
+   "error": "none: DuckDB's column types are always enforced there; it has no ANY type and no rowid to leave out"
+  },
+  {
+   "id": "word:STRICT#2",
+   "status": "no equivalent",
+   "error": "none: DuckDB's column types are always enforced there; it has no ANY type and no rowid to leave out"
+  },
+  {
+   "id": "word:STORED",
+   "status": "no equivalent",
+   "error": "none: DuckDB's generated columns are virtual only"
+  },
+  {
+   "id": "word:ROWID",
+   "status": "no equivalent",
+   "error": "none: DuckDB's tables there have no rowid: a primary key table is already clustered by it (InnoDB) or keeps rows apart from its indexes"
+  },
+  {
+   "id": "word:EXPRESSIONS",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no REINDEX"
+  },
+  {
+   "id": "word:E",
+   "sql": "SELECT 1e3, 2.5E-1, 1E+2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1000,
+     0.25,
+     100
+    ]
+   ]
+  },
+  {
+   "id": "keyword:INNER",
+   "sql": "SELECT t.a, u.d FROM t INNER JOIN u ON t.a = u.a ORDER BY t.a NULLS FIRST, u.d NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ],
+    [
+     2,
+     "yy"
+    ]
+   ]
+  },
+  {
+   "id": "keyword:CONSTRAINT",
+   "sql": "INSERT INTO kc VALUES (1);\nSELECT a FROM kc",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "keyword:FAIL",
+   "sql": "INSERT INTO kp VALUES (2); SELECT count(*) FROM kp",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE kp (k INT PRIMARY KEY)",
+    "INSERT INTO kp VALUES (1)"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "keyword:NO",
+   "sql": "INSERT INTO kn VALUES (1);\nSELECT COUNT(*) FROM kn",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "keyword:ACTION",
+   "sql": "INSERT INTO ka VALUES (1);\nSELECT COUNT(*) FROM ka",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "keyword:RESTRICT",
+   "sql": "INSERT INTO kr VALUES (1);\nSELECT COUNT(*) FROM kr",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "keyword:OTHERS",
+   "sql": "SELECT a, SUM(a) OVER (ORDER BY a NULLS FIRST ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE NO OTHERS) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     3
+    ],
+    [
+     2,
+     6
+    ],
+    [
+     3,
+     9
+    ],
+    [
+     4,
+     12
+    ],
+    [
+     5,
+     9
+    ]
+   ]
+  },
+  {
+   "id": "parameter:?NNN",
+   "sql": "SELECT $1 + 1",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     42
+    ]
+   ]
+  },
+  {
+   "id": "parameter:?",
+   "sql": "SELECT ? * 2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     42
+    ]
+   ]
+  },
+  {
+   "id": "parameter::AAAA",
+   "sql": "SELECT $v IS NULL",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "parameter:@AAAA",
+   "sql": "SELECT $w + 0",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "parameter:$AAAA",
+   "sql": "SELECT $x || 'y'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "xy"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:select-stmt#1",
+   "sql": "SELECT a, b FROM t WHERE a > 1 ORDER BY a DESC LIMIT 2 OFFSET 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     4,
+     null
+    ],
+    [
+     3,
+     "three"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:select-stmt#2",
+   "sql": "SELECT DISTINCT a % 2 FROM t ORDER BY 1 NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ],
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:select-stmt#3",
+   "sql": "SELECT a FROM t ORDER BY a NULLS FIRST LIMIT 2 OFFSET 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ],
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:select-core#1",
+   "sql": "SELECT a % 2 AS g, COUNT(*), SUM(a) FROM t GROUP BY g HAVING COUNT(*) > 1 ORDER BY g NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     2,
+     6
+    ],
+    [
+     1,
+     3,
+     9
+    ]
+   ]
+  },
+  {
+   "id": "syntax:select-core#2",
+   "sql": "VALUES (1, 'a'), (2, 'b')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "a"
+    ],
+    [
+     2,
+     "b"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:select-core#3",
+   "sql": "SELECT 1 + 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:simple-select-stmt",
+   "sql": "SELECT a FROM t ORDER BY a LIMIT 3",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:factored-select-stmt",
+   "sql": "WITH x AS (SELECT a FROM t) SELECT a FROM x ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     3
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:compound-select-stmt#1",
+   "sql": "SELECT a FROM t UNION SELECT a FROM u ORDER BY 1 NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     3
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ]
+   ]
+  },
+  {
+   "id": "syntax:compound-select-stmt#2",
+   "sql": "SELECT a FROM t UNION ALL SELECT a FROM u ORDER BY 1 NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     3
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ]
+   ]
+  },
+  {
+   "id": "syntax:compound-select-stmt#3",
+   "sql": "SELECT a FROM t INTERSECT SELECT a FROM u ORDER BY 1 NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:compound-select-stmt#4",
+   "sql": "SELECT a FROM t EXCEPT SELECT a FROM u ORDER BY 1 NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:compound-operator",
+   "sql": "SELECT 1 UNION ALL SELECT 2 ORDER BY 1 NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:common-table-expression#1",
+   "sql": "WITH x(v) AS MATERIALIZED (SELECT a FROM t) SELECT COUNT(*) FROM x",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:common-table-expression#2",
+   "sql": "WITH x(v) AS NOT MATERIALIZED (SELECT a FROM t) SELECT SUM(v) FROM x",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     15
+    ]
+   ]
+  },
+  {
+   "id": "syntax:recursive-cte#1",
+   "sql": "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5) SELECT i FROM n ORDER BY i NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     3
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:recursive-cte#2",
+   "sql": "WITH RECURSIVE f(i, v) AS (SELECT 1, 1 UNION ALL SELECT i + 1, v * (i + 1) FROM f WHERE i < 6) SELECT v FROM f ORDER BY i DESC LIMIT 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     720
+    ]
+   ]
+  },
+  {
+   "id": "syntax:with-clause",
+   "sql": "WITH a1 AS (SELECT 1 AS v), a2 AS (SELECT v + 1 AS v FROM a1) SELECT v FROM a2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:cte-table-name",
+   "sql": "WITH x(p, q) AS (SELECT 1, 2) SELECT p + q FROM x",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-clause#1",
+   "sql": "SELECT t.a, u.d FROM t JOIN u ON t.a = u.a ORDER BY t.a NULLS FIRST, u.d NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ],
+    [
+     2,
+     "yy"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-clause#2",
+   "sql": "SELECT t.a, u.d FROM t LEFT JOIN u ON t.a = u.a ORDER BY t.a NULLS FIRST, u.d NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ],
+    [
+     2,
+     "yy"
+    ],
+    [
+     3,
+     null
+    ],
+    [
+     4,
+     null
+    ],
+    [
+     5,
+     null
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-clause#3",
+   "sql": "SELECT t.a, u.d FROM t RIGHT JOIN u ON t.a = u.a ORDER BY u.a NULLS FIRST, u.d NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ],
+    [
+     2,
+     "yy"
+    ],
+    [
+     null,
+     "z"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-clause#4",
+   "sql": "SELECT t.a, u.d FROM t FULL OUTER JOIN u ON t.a = u.a ORDER BY COALESCE(t.a, u.a) NULLS FIRST, u.d NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ],
+    [
+     2,
+     "yy"
+    ],
+    [
+     3,
+     null
+    ],
+    [
+     4,
+     null
+    ],
+    [
+     5,
+     null
+    ],
+    [
+     null,
+     "z"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-clause#5",
+   "sql": "SELECT COUNT(*) FROM t CROSS JOIN u",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     20
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-clause#6",
+   "sql": "SELECT a, d FROM t NATURAL JOIN u ORDER BY a NULLS FIRST, d NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ],
+    [
+     2,
+     "yy"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-constraint",
+   "sql": "SELECT a, b, d FROM t JOIN u USING (a) ORDER BY a NULLS FIRST, d NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "one",
+     "x"
+    ],
+    [
+     2,
+     "two",
+     "y"
+    ],
+    [
+     2,
+     "two",
+     "yy"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-operator#1",
+   "sql": "SELECT COUNT(*) FROM t CROSS JOIN u WHERE t.a = u.a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:join-operator#2",
+   "sql": "SELECT COUNT(*) FROM t LEFT OUTER JOIN u ON t.a = u.a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     6
+    ]
+   ]
+  },
+  {
+   "id": "syntax:table-or-subquery#1",
+   "sql": "SELECT s.x FROM (SELECT a * 2 AS x FROM t) AS s ORDER BY s.x NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ],
+    [
+     4
+    ],
+    [
+     6
+    ],
+    [
+     8
+    ],
+    [
+     10
+    ]
+   ]
+  },
+  {
+   "id": "syntax:table-or-subquery#2",
+   "sql": "SELECT value FROM JSON_EACH('[3,1,2]') ORDER BY value NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "1"
+    ],
+    [
+     "2"
+    ],
+    [
+     "3"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:result-column#1",
+   "sql": "SELECT t.*, u.d FROM t JOIN u ON t.a = u.a ORDER BY t.a NULLS FIRST, u.d NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "one",
+     1.5,
+     "x"
+    ],
+    [
+     2,
+     "two",
+     2.5,
+     "y"
+    ],
+    [
+     2,
+     "two",
+     2.5,
+     "yy"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:result-column#2",
+   "sql": "SELECT * FROM u ORDER BY a NULLS FIRST, d NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ],
+    [
+     2,
+     "yy"
+    ],
+    [
+     6,
+     "z"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:ordering-term#1",
+   "sql": "SELECT b FROM t ORDER BY b COLLATE NOCASE DESC NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     null
+    ],
+    [
+     "two"
+    ],
+    [
+     "three"
+    ],
+    [
+     "one"
+    ],
+    [
+     "five"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:ordering-term#2",
+   "sql": "SELECT b FROM t ORDER BY b ASC",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "five"
+    ],
+    [
+     "one"
+    ],
+    [
+     "three"
+    ],
+    [
+     "two"
+    ],
+    [
+     null
+    ]
+   ]
+  },
+  {
+   "id": "syntax:qualified-table-name",
+   "status": "no equivalent",
+   "error": "none: DuckDB takes no index hints"
+  },
+  {
+   "id": "syntax:insert-stmt#1",
+   "sql": "INSERT INTO t (a, b) VALUES (10, 'ten') RETURNING a, b",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     10,
+     "ten"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:insert-stmt#2",
+   "sql": "INSERT OR IGNORE INTO pk VALUES (1, 'dup')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "syntax:insert-stmt#3",
+   "sql": "INSERT OR REPLACE INTO pk VALUES (1, 'new')",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:insert-stmt#4",
+   "sql": "INSERT INTO t SELECT a + 100, b, c FROM t WHERE a < 3",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:insert-stmt#5",
+   "sql": "INSERT INTO t DEFAULT VALUES",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:insert-stmt#6",
+   "sql": "INSERT OR REPLACE INTO pk VALUES (2, 'two')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')",
+    "CREATE TABLE pk (k INT PRIMARY KEY, v TEXT)",
+    "INSERT INTO pk VALUES (1, 'one')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:upsert-clause#1",
+   "sql": "INSERT INTO pk VALUES (1, 'up') ON CONFLICT (k) DO UPDATE SET v = excluded.v || '!' RETURNING k, v",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')",
+    "CREATE TABLE pk (k INT PRIMARY KEY, v TEXT)",
+    "INSERT INTO pk VALUES (1, 'one')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "up!"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:upsert-clause#2",
+   "sql": "INSERT INTO pk VALUES (1, 'no') ON CONFLICT DO NOTHING",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "id": "syntax:returning-clause#1",
+   "sql": "DELETE FROM t WHERE a = 5 RETURNING *",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     5,
+     "five",
+     5.5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:returning-clause#2",
+   "sql": "UPDATE t SET c = 0 WHERE a = 1 RETURNING a, c * 2 AS dbl",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "syntax:update-stmt#1",
+   "sql": "UPDATE t SET b = UPPER(b), c = c + 1 WHERE a < 3",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:update-stmt#2",
+   "status": "no equivalent",
+   "error": "none: DuckDB's UPDATE has no conflict resolution"
+  },
+  {
+   "id": "syntax:update-stmt#3",
+   "sql": "UPDATE t SET (b, c) = ('p', 9.5) WHERE a = 2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:update-stmt#4",
+   "sql": "UPDATE t SET b = u.d FROM u WHERE t.a = u.a",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:update-stmt-limited",
+   "sql": "UPDATE t SET b = 'lim' WHERE rowid IN (SELECT rowid FROM t WHERE a > 0 ORDER BY a LIMIT 2)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ],
+   "requires": "SQLITE_ENABLE_UPDATE_DELETE_LIMIT"
+  },
+  {
+   "id": "syntax:delete-stmt",
+   "sql": "DELETE FROM t WHERE a IN (SELECT a FROM u)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:delete-stmt-limited",
+   "sql": "DELETE FROM t WHERE rowid IN (SELECT rowid FROM t WHERE a > 0 ORDER BY a DESC LIMIT 1)",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ],
+   "requires": "SQLITE_ENABLE_UPDATE_DELETE_LIMIT"
+  },
+  {
+   "id": "syntax:create-table-stmt#1",
+   "sql": "CREATE TABLE IF NOT EXISTS ct (a INT PRIMARY KEY, b TEXT NOT NULL DEFAULT 'x', c REAL CHECK (c >= 0), UNIQUE (b))",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-table-stmt#2",
+   "sql": "CREATE TEMPORARY TABLE ctt AS SELECT a, b FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:create-table-stmt#3",
+   "sql": "CREATE TEMPORARY TABLE ctt2 (x INT)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:column-def#1",
+   "sql": "CREATE SEQUENCE cd_a; CREATE TABLE cd(a INTEGER PRIMARY KEY DEFAULT nextval('cd_a'), v TEXT); INSERT INTO cd(v) VALUES ('x'), ('y'); SELECT a, v FROM cd ORDER BY a",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     "x"
+    ],
+    [
+     2,
+     "y"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:column-def#2",
+   "sql": "CREATE TABLE cd (b TEXT COLLATE NOCASE);\nINSERT INTO cd VALUES ('Abc');\nSELECT COUNT(*) FROM cd WHERE b = 'aBC'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:column-def#3",
+   "sql": "CREATE TABLE cd (a INT, c INT AS a * 2 PERSISTED);\nINSERT INTO cd (a) VALUES (4);\nSELECT c FROM cd",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "ParserException: Parser Error: syntax error at or near \"a\"\n\nLINE 1: CREATE TABLE cd (a INT, c INT AS a * 2 PERSISTED)\n                                         ^"
+  },
+  {
+   "id": "syntax:column-def#4",
+   "sql": "CREATE TABLE cd (a INT, d INT AS (a + 1));\nINSERT INTO cd (a) VALUES (4);\nSELECT d FROM cd",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:column-constraint#1",
+   "status": "no equivalent",
+   "error": "none: DuckDB resolves conflicts per statement (INSERT OR REPLACE, ON CONFLICT), not per constraint"
+  },
+  {
+   "id": "syntax:column-constraint#2",
+   "sql": "CREATE TABLE cc (b INT UNIQUE NOT NULL);\nINSERT INTO cc VALUES (1);\nSELECT COUNT(*) FROM cc",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:column-constraint#3",
+   "sql": "CREATE TABLE cc (c INT REFERENCES pk (k) ON DELETE CASCADE);\nINSERT INTO cc VALUES (1);\nDELETE FROM pk;\nSELECT COUNT(*) FROM cc",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "ParserException: Parser Error: FOREIGN KEY constraints cannot use CASCADE, SET NULL or SET DEFAULT"
+  },
+  {
+   "id": "syntax:column-constraint#4",
+   "sql": "CREATE TABLE cc (d INT DEFAULT (1 + 1), e TEXT);\nINSERT INTO cc (e) VALUES ('x');\nSELECT d FROM cc",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:table-constraint#1",
+   "sql": "CREATE TABLE tc (a INT, b INT, PRIMARY KEY (a, b), CHECK (a < b));\nINSERT INTO tc VALUES (1, 2);\nSELECT COUNT(*) FROM tc",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:table-constraint#2",
+   "status": "no equivalent",
+   "error": "none: DuckDB checks constraints at once: it has no deferrable constraints"
+  },
+  {
+   "id": "syntax:foreign-key-clause",
+   "status": "no equivalent",
+   "error": "none: DuckDB's foreign keys take no ON UPDATE or ON DELETE actions"
+  },
+  {
+   "id": "syntax:conflict-clause",
+   "status": "no equivalent",
+   "error": "none: DuckDB resolves conflicts per statement (INSERT OR IGNORE), not per constraint"
+  },
+  {
+   "id": "syntax:table-options#1",
+   "status": "no equivalent",
+   "error": "none: DuckDB's tables there have no rowid: a primary key table is already clustered by it (InnoDB) or keeps rows apart from its indexes"
+  },
+  {
+   "id": "syntax:table-options#2",
+   "status": "no equivalent",
+   "error": "none: DuckDB's column types are always enforced there; it has no ANY type and no rowid to leave out"
+  },
+  {
+   "id": "syntax:table-options#3",
+   "status": "no equivalent",
+   "error": "none: DuckDB's column types are always enforced there; it has no ANY type and no rowid to leave out"
+  },
+  {
+   "id": "syntax:type-name#1",
+   "sql": "CREATE TABLE tn (a TEXT(20), b DECIMAL(10, 2), c DOUBLE);\nINSERT INTO tn VALUES ('x', 1.25, 2.5);\nSELECT a, b, c FROM tn",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "x",
+     1.25,
+     2.5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:type-name#2",
+   "sql": "CREATE TABLE tn(d UBIGINT); INSERT INTO tn VALUES (7); SELECT d FROM tn",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     7
+    ]
+   ]
+  },
+  {
+   "id": "syntax:create-index-stmt#1",
+   "sql": "CREATE UNIQUE INDEX IF NOT EXISTS ix ON t(a DESC)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-index-stmt#2",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no partial indexes"
+  },
+  {
+   "id": "syntax:create-index-stmt#3",
+   "sql": "CREATE INDEX ex ON t(LOWER(b) NULLS FIRST)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-index-stmt#4",
+   "sql": "CREATE INDEX cx ON t(b COLLATE NOCASE NULLS FIRST)",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "NotImplementedException: Not implemented Error: Index with collation not supported yet!"
+  },
+  {
+   "id": "syntax:indexed-column",
+   "sql": "CREATE INDEX ic ON t(b COLLATE NOCASE ASC NULLS FIRST)",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "NotImplementedException: Not implemented Error: Index with collation not supported yet!"
+  },
+  {
+   "id": "syntax:create-view-stmt#1",
+   "sql": "CREATE VIEW IF NOT EXISTS v1 (x, y) AS SELECT a, b FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-view-stmt#2",
+   "sql": "CREATE TEMPORARY VIEW v2 AS SELECT COUNT(*) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:create-trigger-stmt#1",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no triggers"
+  },
+  {
+   "id": "syntax:create-trigger-stmt#2",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no triggers"
+  },
+  {
+   "id": "syntax:create-trigger-stmt#3",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no triggers"
+  },
+  {
+   "id": "syntax:create-trigger-stmt#4",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no triggers"
+  },
+  {
+   "id": "syntax:raise-function",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no triggers"
+  },
+  {
+   "id": "syntax:create-virtual-table-stmt#1",
+   "status": "no equivalent",
+   "error": "none: SQLite's virtual-table modules (FTS5, R-Tree) are its own; the fts extension's PRAGMA create_fts_index is the counterpart, with its own syntax"
+  },
+  {
+   "id": "syntax:create-virtual-table-stmt#2",
+   "status": "no equivalent",
+   "error": "none: SQLite's virtual-table modules (FTS5, R-Tree) are its own; the spatial extension's R-tree index is the counterpart, with its own syntax"
+  },
+  {
+   "id": "syntax:alter-table-stmt#1",
+   "sql": "ALTER TABLE t RENAME TO t9",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:alter-table-stmt#2",
+   "sql": "ALTER TABLE t RENAME COLUMN b TO bb",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:alter-table-stmt#3",
+   "sql": "ALTER TABLE t ADD COLUMN e TEXT DEFAULT 'e'",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:alter-table-stmt#4",
+   "sql": "ALTER TABLE t DROP COLUMN c",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:drop-table-stmt",
+   "sql": "DROP TABLE IF EXISTS u",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:drop-index-stmt",
+   "sql": "DROP INDEX IF EXISTS ti",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:drop-view-stmt",
+   "sql": "DROP VIEW IF EXISTS nope",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:drop-trigger-stmt",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no triggers"
+  },
+  {
+   "id": "syntax:analyze-stmt#1",
+   "sql": "ANALYZE",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:analyze-stmt#2",
+   "sql": "ANALYZE t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:attach-stmt",
+   "sql": "ATTACH ':memory:' AS aux",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:detach-stmt",
+   "sql": "DETACH aux",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:begin-stmt#1",
+   "sql": "BEGIN TRANSACTION",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:begin-stmt#2",
+   "sql": "BEGIN TRANSACTION",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:begin-stmt#3",
+   "sql": "BEGIN TRANSACTION",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:commit-stmt#1",
+   "sql": "COMMIT",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:commit-stmt#2",
+   "sql": "END TRANSACTION",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')",
+    "BEGIN TRANSACTION"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:rollback-stmt",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no savepoints"
+  },
+  {
+   "id": "syntax:savepoint-stmt",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no savepoints"
+  },
+  {
+   "id": "syntax:release-stmt",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no savepoints"
+  },
+  {
+   "id": "syntax:reindex-stmt#1",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no REINDEX"
+  },
+  {
+   "id": "syntax:reindex-stmt#2",
+   "status": "no equivalent",
+   "error": "none: DuckDB has no REINDEX"
+  },
+  {
+   "id": "syntax:vacuum-stmt",
+   "sql": "VACUUM",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:pragma-stmt#1",
+   "sql": "PRAGMA table_info('t')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     "a",
+     "INTEGER",
+     0,
+     null,
+     0
+    ],
+    [
+     1,
+     "b",
+     "VARCHAR",
+     0,
+     null,
+     0
+    ],
+    [
+     2,
+     "c",
+     "FLOAT",
+     0,
+     null,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "syntax:pragma-stmt#2",
+   "status": "no equivalent",
+   "error": "none: DuckDB keeps no user version number in a database"
+  },
+  {
+   "id": "syntax:pragma-value",
+   "sql": "SET memory_limit = '2GB'",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:expr",
+   "sql": "SELECT (1 + 2) * 3, -a, NOT a IS NULL, b LIKE 't%' FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     9,
+     -1,
+     1,
+     0
+    ],
+    [
+     9,
+     -2,
+     1,
+     1
+    ],
+    [
+     9,
+     -3,
+     1,
+     1
+    ],
+    [
+     9,
+     -4,
+     1,
+     null
+    ],
+    [
+     9,
+     -5,
+     1,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "syntax:literal-value",
+   "sql": "SELECT 1, 1.5, 'txt', UNHEX('0F'), NULL, TRUE, FALSE, TYPEOF(CURRENT_DATE), TYPEOF(CURRENT_TIME), TYPEOF(CURRENT_TIMESTAMP)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1.5,
+     "txt",
+     "x'0f'",
+     null,
+     1,
+     0,
+     "DATE",
+     "TIME WITH TIME ZONE",
+     "TIMESTAMP WITH TIME ZONE"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:numeric-literal",
+   "sql": "SELECT UNHEX('1F'), 1e3, 0.5, 1 AS _000_000, 2.5E-1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "x'1f'",
+     1000,
+     0.5,
+     1,
+     0.25
+    ]
+   ]
+  },
+  {
+   "id": "syntax:signed-number",
+   "sql": "CREATE TABLE sn (a INT DEFAULT -1, b REAL DEFAULT 2.5)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "syntax:function-arguments#1",
+   "sql": "SELECT COUNT(DISTINCT a), LISTAGG(DISTINCT b, ',') FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     5,
+     "one,three,five,two"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:function-arguments#2",
+   "sql": "SELECT COUNT(*) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:simple-function-invocation",
+   "sql": "SELECT ABS(-1)",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:aggregate-function-invocation#1",
+   "sql": "SELECT SUM(DISTINCT a % 3) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:aggregate-function-invocation#2",
+   "sql": "SELECT LISTAGG(b, ',' ORDER BY a DESC) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "five,three,two,one"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:window-function-invocation",
+   "sql": "SELECT a, SUM(a) FILTER(WHERE a > 1) OVER (ORDER BY a NULLS FIRST) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     null
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     3,
+     5
+    ],
+    [
+     4,
+     9
+    ],
+    [
+     5,
+     14
+    ]
+   ]
+  },
+  {
+   "id": "syntax:over-clause",
+   "sql": "SELECT a, COUNT(*) OVER (PARTITION BY a % 2) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     3
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     4,
+     2
+    ],
+    [
+     5,
+     3
+    ]
+   ]
+  },
+  {
+   "id": "syntax:window-defn",
+   "sql": "SELECT a, MAX(a) OVER w FROM t WINDOW w AS (PARTITION BY a % 2 ORDER BY a NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     4,
+     4
+    ],
+    [
+     5,
+     5
+    ]
+   ]
+  },
+  {
+   "id": "syntax:filter-clause#1",
+   "sql": "SELECT COUNT(*) FILTER(WHERE b IS NULL) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:filter-clause#2",
+   "sql": "SELECT COUNT(*) FILTER(WHERE a > 2), SUM(a) FILTER(WHERE NOT b IS NULL) FROM t",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     3,
+     11
+    ]
+   ]
+  },
+  {
+   "id": "syntax:frame-spec",
+   "sql": "SELECT a, SUM(a) OVER (ORDER BY a NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t ORDER BY a NULLS FIRST",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     3,
+     6
+    ],
+    [
+     4,
+     10
+    ],
+    [
+     5,
+     15
+    ]
+   ]
+  },
+  {
+   "id": "syntax:column-name-list",
+   "sql": "UPDATE t SET a = 1, b = 'z' WHERE a = 4",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:comment-syntax#1",
+   "sql": "SELECT 1 /* a comment */",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "syntax:comment-syntax#2",
+   "sql": "/* inline */ SELECT 2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "syntax:sql-stmt#1",
+   "sql": "EXPLAIN SELECT 1",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     "physical_plan",
+     "\u256d\u2500 Projection \u2500\u2500\u2500\u256e\n\u2502 Projections: 1 \u2502\n\u2502 ~1 row         \u2502\n\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\n\u256d\u2500 Dummy Scan \u2500\u2500\u2500\u256e\n\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\n"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:sql-stmt#2",
+   "sql": "EXPLAIN SELECT a FROM t WHERE a = 1",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "physical_plan",
+     "\u256d\u2500 Seq Scan \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e\n\u2502 Table: \"376\".main.t   \u2502\n\u2502 Type: Sequential Scan \u2502\n\u2502 Projections: a        \u2502\n\u2502 Filters: a = 1        \u2502\n\u2502 ~1 row                \u2502\n\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\n"
+    ]
+   ]
+  },
+  {
+   "id": "syntax:sql-stmt-list",
+   "sql": "SELECT 1;\nSELECT 2",
+   "spelling": "sqlglot",
+   "status": "ok",
+   "rows": [
+    [
+     2
+    ]
+   ]
+  },
+  {
+   "id": "pragma:analysis_limit",
+   "sql": "PRAGMA analysis_limit",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name analysis_limit does not exist!\nDid you mean \"database_list\"?"
+  },
+  {
+   "id": "pragma:application_id",
+   "sql": "PRAGMA application_id",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name application_id does not exist!\nDid you mean \"enable_verification\"?"
+  },
+  {
+   "id": "pragma:auto_vacuum",
+   "sql": "PRAGMA auto_vacuum",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name auto_vacuum does not exist!\nDid you mean \"platform\"?"
+  },
+  {
+   "id": "pragma:automatic_index",
+   "sql": "PRAGMA automatic_index",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name automatic_index does not exist!\nDid you mean \"enable_optimizer\"?"
+  },
+  {
+   "id": "pragma:busy_timeout",
+   "sql": "PRAGMA busy_timeout",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name busy_timeout does not exist!\nDid you mean \"functions\"?"
+  },
+  {
+   "id": "pragma:cache_size",
+   "sql": "PRAGMA cache_size",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name cache_size does not exist!\nDid you mean \"database_size\"?"
+  },
+  {
+   "id": "pragma:cache_spill",
+   "sql": "PRAGMA cache_spill",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name cache_spill does not exist!\nDid you mean \"disable_profile\"?"
+  },
+  {
+   "id": "pragma:case_sensitive_like",
+   "sql": "PRAGMA case_sensitive_like",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name case_sensitive_like does not exist!\nDid you mean \"json_execute_serialized_sql\"?"
+  },
+  {
+   "id": "pragma:cell_size_check",
+   "sql": "PRAGMA cell_size_check",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name cell_size_check does not exist!\nDid you mean \"force_checkpoint\"?"
+  },
+  {
+   "id": "pragma:checkpoint_fullfsync",
+   "sql": "PRAGMA checkpoint_fullfsync",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name checkpoint_fullfsync does not exist!\nDid you mean \"enable_profiling\"?"
+  },
+  {
+   "id": "pragma:collation_list",
+   "sql": "SELECT collname FROM pragma_collations() LIMIT 0",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "pragma:compile_options",
+   "sql": "PRAGMA compile_options",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name compile_options does not exist!\nDid you mean \"collations\"?"
+  },
+  {
+   "id": "pragma:count_changes",
+   "sql": "PRAGMA count_changes",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name count_changes does not exist!\nDid you mean \"functions\"?"
+  },
+  {
+   "id": "pragma:data_store_directory",
+   "sql": "PRAGMA data_store_directory",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name data_store_directory does not exist!\nDid you mean \"database_size\"?",
+   "requires": "Windows's VFS"
+  },
+  {
+   "id": "pragma:data_version",
+   "sql": "PRAGMA data_version",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name data_version does not exist!\nDid you mean \"version\"?"
+  },
+  {
+   "id": "pragma:database_list",
+   "sql": "PRAGMA database_list",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     20738,
+     "393",
+     "/home/adalundhe/.cache/probe-xxh2w3ol/393.duckdb"
+    ]
+   ]
+  },
+  {
+   "id": "pragma:default_cache_size",
+   "sql": "PRAGMA default_cache_size",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name default_cache_size does not exist!\nDid you mean \"disable_object_cache\"?"
+  },
+  {
+   "id": "pragma:defer_foreign_keys",
+   "sql": "PRAGMA defer_foreign_keys",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name defer_foreign_keys does not exist!\nDid you mean \"enable_print_progress_bar\"?"
+  },
+  {
+   "id": "pragma:empty_result_callbacks",
+   "sql": "PRAGMA empty_result_callbacks",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name empty_result_callbacks does not exist!\nDid you mean \"verify_parallelism\"?"
+  },
+  {
+   "id": "pragma:encoding",
+   "sql": "PRAGMA encoding",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name encoding does not exist!\nDid you mean \"functions\"?"
+  },
+  {
+   "id": "pragma:foreign_key_check",
+   "sql": "PRAGMA foreign_key_check",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name foreign_key_check does not exist!\nDid you mean \"force_checkpoint\"?"
+  },
+  {
+   "id": "pragma:foreign_key_list",
+   "sql": "SELECT constraint_text FROM duckdb_constraints() WHERE table_name = 't' AND constraint_type = 'FOREIGN KEY'",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "pragma:foreign_keys",
+   "sql": "PRAGMA foreign_keys",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name foreign_keys does not exist!\nDid you mean \"version\"?"
+  },
+  {
+   "id": "pragma:freelist_count",
+   "sql": "PRAGMA freelist_count",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name freelist_count does not exist!\nDid you mean \"force_checkpoint\"?"
+  },
+  {
+   "id": "pragma:full_column_names",
+   "sql": "PRAGMA full_column_names",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name full_column_names does not exist!\nDid you mean \"functions\"?"
+  },
+  {
+   "id": "pragma:fullfsync",
+   "sql": "PRAGMA fullfsync",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name fullfsync does not exist!\nDid you mean \"functions\"?"
+  },
+  {
+   "id": "pragma:function_list",
+   "sql": "SELECT function_name FROM duckdb_functions() LIMIT 0",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "pragma:hard_heap_limit",
+   "sql": "PRAGMA hard_heap_limit",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name hard_heap_limit does not exist!\nDid you mean \"database_list\"?"
+  },
+  {
+   "id": "pragma:ignore_check_constraints",
+   "sql": "PRAGMA ignore_check_constraints",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name ignore_check_constraints does not exist!\nDid you mean \"force_checkpoint\"?"
+  },
+  {
+   "id": "pragma:incremental_vacuum",
+   "sql": "PRAGMA incremental_vacuum",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name incremental_vacuum does not exist!\nDid you mean \"disable_verification\"?"
+  },
+  {
+   "id": "pragma:index_info",
+   "sql": "PRAGMA index_info = ti",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: unrecognized configuration parameter \"index_info\"\n\nDid you mean: \"index_scan_max_count\""
+  },
+  {
+   "id": "pragma:index_list",
+   "sql": "SELECT index_name FROM duckdb_indexes() WHERE table_name = 't'",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')",
+    "CREATE INDEX ti ON t(a NULLS FIRST)"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "ti"
+    ]
+   ]
+  },
+  {
+   "id": "pragma:index_xinfo",
+   "sql": "PRAGMA index_xinfo = ti",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: unrecognized configuration parameter \"index_xinfo\"\n\nDid you mean: \"index_scan_max_count\""
+  },
+  {
+   "id": "pragma:integrity_check",
+   "sql": "PRAGMA integrity_check",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name integrity_check does not exist!\nDid you mean \"force_checkpoint\"?"
+  },
+  {
+   "id": "pragma:journal_mode",
+   "sql": "PRAGMA journal_mode",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name journal_mode does not exist!\nDid you mean \"user_agent\"?"
+  },
+  {
+   "id": "pragma:journal_size_limit",
+   "sql": "PRAGMA journal_size_limit",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name journal_size_limit does not exist!\nDid you mean \"disable_optimizer\"?"
+  },
+  {
+   "id": "pragma:legacy_alter_table",
+   "sql": "PRAGMA legacy_alter_table",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name legacy_alter_table does not exist!\nDid you mean \"disable_verify_parallelism\"?"
+  },
+  {
+   "id": "pragma:legacy_file_format",
+   "sql": "PRAGMA legacy_file_format",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name legacy_file_format does not exist!\nDid you mean \"platform\"?",
+   "requires": "nothing: it no longer functions (a no-op)"
+  },
+  {
+   "id": "pragma:locking_mode",
+   "sql": "PRAGMA locking_mode",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name locking_mode does not exist!\nDid you mean \"collations\"?"
+  },
+  {
+   "id": "pragma:max_page_count",
+   "sql": "PRAGMA max_page_count",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name max_page_count does not exist!\nDid you mean \"user_agent\"?"
+  },
+  {
+   "id": "pragma:mmap_size",
+   "sql": "PRAGMA mmap_size",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name mmap_size does not exist!\nDid you mean \"import_database\"?"
+  },
+  {
+   "id": "pragma:module_list",
+   "sql": "PRAGMA module_list",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name module_list does not exist!\nDid you mean \"database_list\"?"
+  },
+  {
+   "id": "pragma:optimize",
+   "sql": "ANALYZE",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "pragma:page_count",
+   "sql": "PRAGMA page_count",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name page_count does not exist!\nDid you mean \"user_agent\"?"
+  },
+  {
+   "id": "pragma:page_size",
+   "sql": "SELECT current_setting('default_block_size') IS NOT NULL",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "id": "pragma:parser_trace",
+   "sql": "PRAGMA parser_trace",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name parser_trace does not exist!\nDid you mean \"disable_print_progress_bar\"?",
+   "requires": "SQLITE_DEBUG"
+  },
+  {
+   "id": "pragma:pragma_list",
+   "sql": "PRAGMA pragma_list",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name pragma_list does not exist!\nDid you mean \"database_list\"?"
+  },
+  {
+   "id": "pragma:query_only",
+   "sql": "PRAGMA query_only",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name query_only does not exist!\nDid you mean \"user_agent\"?"
+  },
+  {
+   "id": "pragma:quick_check",
+   "sql": "PRAGMA quick_check",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name quick_check does not exist!\nDid you mean \"force_checkpoint\"?"
+  },
+  {
+   "id": "pragma:read_uncommitted",
+   "sql": "PRAGMA read_uncommitted",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name read_uncommitted does not exist!\nDid you mean \"user_agent\"?"
+  },
+  {
+   "id": "pragma:recursive_triggers",
+   "sql": "PRAGMA recursive_triggers",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name recursive_triggers does not exist!\nDid you mean \"verify_parallelism\"?"
+  },
+  {
+   "id": "pragma:reverse_unordered_selects",
+   "sql": "PRAGMA reverse_unordered_selects",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name reverse_unordered_selects does not exist!\nDid you mean \"json_execute_serialized_sql\"?"
+  },
+  {
+   "id": "pragma:schema_version",
+   "sql": "PRAGMA schema_version",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name schema_version does not exist!\nDid you mean \"disable_verification\"?"
+  },
+  {
+   "id": "pragma:secure_delete",
+   "sql": "PRAGMA secure_delete",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name secure_delete does not exist!\nDid you mean \"json_execute_serialized_sql\"?"
+  },
+  {
+   "id": "pragma:short_column_names",
+   "sql": "PRAGMA short_column_names",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name short_column_names does not exist!\nDid you mean \"show_tables\"?"
+  },
+  {
+   "id": "pragma:shrink_memory",
+   "sql": "PRAGMA shrink_memory",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name shrink_memory does not exist!\nDid you mean \"storage_info\"?"
+  },
+  {
+   "id": "pragma:soft_heap_limit",
+   "sql": "PRAGMA soft_heap_limit",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name soft_heap_limit does not exist!\nDid you mean \"disable_optimizer\"?"
+  },
+  {
+   "id": "pragma:stats",
+   "sql": "PRAGMA stats",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name \"stats\" is not in the catalog, a function by this name exists in the core_functions extension, but it's of a different type, namely Scalar Function",
+   "requires": "a testing build (its output is deliberately undocumented)"
+  },
+  {
+   "id": "pragma:synchronous",
+   "sql": "PRAGMA synchronous",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name synchronous does not exist!\nDid you mean \"show\"?"
+  },
+  {
+   "id": "pragma:table_info",
+   "sql": "PRAGMA table_info('t')",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     0,
+     "a",
+     "INTEGER",
+     0,
+     null,
+     0
+    ],
+    [
+     1,
+     "b",
+     "VARCHAR",
+     0,
+     null,
+     0
+    ],
+    [
+     2,
+     "c",
+     "FLOAT",
+     0,
+     null,
+     0
+    ]
+   ]
+  },
+  {
+   "id": "pragma:table_list",
+   "sql": "SELECT schema_name, table_name, 'table' FROM duckdb_tables()",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": [
+    [
+     "main",
+     "t",
+     "table"
+    ],
+    [
+     "main",
+     "u",
+     "table"
+    ]
+   ]
+  },
+  {
+   "id": "pragma:table_xinfo",
+   "sql": "PRAGMA table_xinfo = t",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: unrecognized configuration parameter \"table_xinfo\"\n\nDid you mean: \"table_function_identifier_conversion\""
+  },
+  {
+   "id": "pragma:temp_store",
+   "sql": "PRAGMA temp_store",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name temp_store does not exist!\nDid you mean \"import_database\"?"
+  },
+  {
+   "id": "pragma:temp_store_directory",
+   "sql": "PRAGMA temp_store_directory",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name temp_store_directory does not exist!\nDid you mean \"enable_profile\"?"
+  },
+  {
+   "id": "pragma:threads",
+   "sql": "PRAGMA threads",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name threads does not exist!\nDid you mean \"show_tables_expanded\"?"
+  },
+  {
+   "id": "pragma:trusted_schema",
+   "sql": "PRAGMA trusted_schema",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name trusted_schema does not exist!\nDid you mean \"user_agent\"?"
+  },
+  {
+   "id": "pragma:user_version",
+   "sql": "PRAGMA user_version",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name user_version does not exist!\nDid you mean \"user_agent\"?"
+  },
+  {
+   "id": "pragma:vdbe_addoptrace",
+   "sql": "PRAGMA vdbe_addoptrace",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name vdbe_addoptrace does not exist!\nDid you mean \"disable_verification\"?",
+   "requires": "SQLITE_DEBUG"
+  },
+  {
+   "id": "pragma:vdbe_debug",
+   "sql": "PRAGMA vdbe_debug",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name vdbe_debug does not exist!\nDid you mean \"disable_profiling\"?",
+   "requires": "SQLITE_DEBUG"
+  },
+  {
+   "id": "pragma:vdbe_listing",
+   "sql": "PRAGMA vdbe_listing",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name vdbe_listing does not exist!\nDid you mean \"disable_profiling\"?",
+   "requires": "SQLITE_DEBUG"
+  },
+  {
+   "id": "pragma:vdbe_trace",
+   "sql": "PRAGMA vdbe_trace",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name vdbe_trace does not exist!\nDid you mean \"disable_verification\"?",
+   "requires": "SQLITE_DEBUG"
+  },
+  {
+   "id": "pragma:wal_autocheckpoint",
+   "sql": "PRAGMA wal_autocheckpoint",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name wal_autocheckpoint does not exist!\nDid you mean \"force_checkpoint\"?"
+  },
+  {
+   "id": "pragma:wal_checkpoint",
+   "sql": "CHECKPOINT",
+   "spelling": "rule",
+   "setup_sql": [
+    "CREATE TABLE t (a INT, b TEXT, c REAL)",
+    "INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL), (4, NULL, 4.5), (5, 'five', 5.5)",
+    "CREATE TABLE u (a INT, d TEXT)",
+    "INSERT INTO u VALUES (1, 'x'), (2, 'y'), (2, 'yy'), (6, 'z')"
+   ],
+   "status": "ok",
+   "rows": []
+  },
+  {
+   "id": "pragma:writable_schema",
+   "sql": "PRAGMA writable_schema",
+   "spelling": "sqlglot",
+   "status": "error",
+   "error": "CatalogException: Catalog Error: Pragma Function with name writable_schema does not exist!\nDid you mean \"disable_verification\"?"
+  }
+ ]
+}

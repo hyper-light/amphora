@@ -1,0 +1,206 @@
+> CREATE TABLE t(id INTEGER PRIMARY KEY, k INT, v INT);
+
+> CREATE TABLE u(id INTEGER PRIMARY KEY, k INT);
+
+> CREATE INDEX t_k ON t(k);
+
+> INSERT INTO t(k, v) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000) SELECT i % 5, i FROM n;
+
+> INSERT INTO u(k) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10) SELECT i FROM n;
+
+> -- keep before
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM u JOIN t ON t.k = u.k;
+{
+  "nodes": [
+    {
+      "detail": "HASH JOIN u",
+      "id": 1,
+      "op": {
+        "estimate": {
+          "access_cost": 300110000,
+          "input_rows": 1000000,
+          "output_rows": 100000000000,
+          "rows_per_input": 100000,
+          "total_cost": 300133000
+        },
+        "table": "u",
+        "type": "hash_join"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SCAN t",
+      "id": 2,
+      "op": {
+        "estimate": {
+          "access_cost": 23000,
+          "input_rows": 1,
+          "output_rows": 1000000,
+          "rows_per_input": 1000000,
+          "total_cost": 23000
+        },
+        "join": "inner",
+        "source": "table",
+        "table": "t",
+        "type": "scan"
+      },
+      "parent": null
+    }
+  ],
+  "output_rows": 100000000000,
+  "result_columns": [
+    "id",
+    "k",
+    "id",
+    "k",
+    "v"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM u JOIN t ON t.k = u.k",
+  "version": 1
+}
+
+> ANALYZE;
+
+> -- rerun before
+{
+  "nodes": [
+    {
+      "detail": "HASH JOIN u",
+      "id": 1,
+      "op": {
+        "estimate": {
+          "access_cost": 300110000,
+          "input_rows": 1000000,
+          "output_rows": 100000000000,
+          "rows_per_input": 100000,
+          "total_cost": 300133000
+        },
+        "table": "u",
+        "type": "hash_join"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SCAN t",
+      "id": 2,
+      "op": {
+        "estimate": {
+          "access_cost": 23000,
+          "input_rows": 1,
+          "output_rows": 1000000,
+          "rows_per_input": 1000000,
+          "total_cost": 23000
+        },
+        "join": "inner",
+        "source": "table",
+        "table": "t",
+        "type": "scan"
+      },
+      "parent": null
+    }
+  ],
+  "output_rows": 100000000000,
+  "result_columns": [
+    "id",
+    "k",
+    "id",
+    "k",
+    "v"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM u JOIN t ON t.k = u.k",
+  "version": 1
+}
+
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM u JOIN t ON t.k = u.k;
+{
+  "nodes": [
+    {
+      "detail": "HASH JOIN u",
+      "id": 1,
+      "op": {
+        "estimate": {
+          "access_cost": 31.07,
+          "input_rows": 5000,
+          "output_rows": 5000,
+          "rows_per_input": 1,
+          "total_cost": 146.07
+        },
+        "table": "u",
+        "type": "hash_join"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SCAN t",
+      "id": 2,
+      "op": {
+        "estimate": {
+          "access_cost": 115,
+          "input_rows": 1,
+          "output_rows": 5000,
+          "rows_per_input": 5000,
+          "total_cost": 115
+        },
+        "join": "inner",
+        "source": "table",
+        "table": "t",
+        "type": "scan"
+      },
+      "parent": null
+    }
+  ],
+  "output_rows": 5000,
+  "result_columns": [
+    "id",
+    "k",
+    "id",
+    "k",
+    "v"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM u JOIN t ON t.k = u.k",
+  "version": 1
+}
+
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM t WHERE k = ?;
+{
+  "nodes": [
+    {
+      "detail": "SCAN t",
+      "id": 1,
+      "op": {
+        "estimate": {
+          "access_cost": 115,
+          "input_rows": 1,
+          "output_rows": 1000,
+          "rows_per_input": 1000,
+          "total_cost": 115
+        },
+        "source": "table",
+        "table": "t",
+        "type": "scan"
+      },
+      "parent": null
+    }
+  ],
+  "output_rows": 1000,
+  "result_columns": [
+    "id",
+    "k",
+    "v"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM t WHERE k = ?",
+  "version": 1
+}
+
+> -- counted
+> SELECT * FROM t WHERE k = 1;
+rows: 1000
+plan 0 loops : no estimate, counted 1
+plan 0 prefix t position 0: estimated 1000 rows, counted 1000
+
+> -- counted
+> SELECT * FROM t WHERE k = 9;
+rows: 0
+plan 0 loops : no estimate, counted 1
+plan 0 prefix t position 0: estimated 1000 rows, counted 0
+

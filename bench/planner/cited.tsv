@@ -1,0 +1,90 @@
+number	format	records	in_record	how	what
+113	,.0f	job-b,job-at,job-pg	yes	job qerr 0 count	JOB's queries, each with its first table's prefix
+52	,.0f	job-b,job-at,job-pg	no	job largest largest>=1000 count	JOB queries whose largest intermediate result's q-error is 1,000 or more
+77%	pct	job-b,job-at,job-pg	no	job share largest>=1000	their share of Amphora's time on JOB (best of 3, summed)
+0.819	.3f	job-b,job-at,job-pg	no	job versus sqlite largest>=1000 geomean	SQLite's time over Amphora's on those 52, geometric mean
+0.509	.3f	job-b,job-at,job-pg	no	job versus duckdb largest>=1000 geomean	DuckDB's (one thread) time over Amphora's on those 52
+0.344	.3f	job-b,job-at,job-pg	no	job versus postgres largest>=1000 geomean	PostgreSQL's time over Amphora's on those 52
+61	,.0f	job-b,job-at,job-pg	no	job largest largest<1000 count	the other JOB queries
+1.416	.3f	job-b,job-at,job-pg	no	job versus sqlite largest<1000 geomean	SQLite's time over Amphora's on the other 61
+1.823	.3f	job-b,job-at,job-pg	no	job versus duckdb largest<1000 geomean	DuckDB's (one thread) time over Amphora's on the other 61
+0.362	.3f	job-b,job-at,job-pg	no	job versus postgres largest<1000 geomean	PostgreSQL's time over Amphora's on the other 61
+6	,.0f	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	no	tpch_SF_10 largest largest>=1000 count	TPC-H SF 10 queries whose largest result's q-error is 1,000 or more
+0.725	.3f	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	no	tpch_SF_10 versus sqlite largest>=1000 geomean	SQLite's time over Amphora's on those 6
+15	,.0f	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	no	tpch_SF_10 versus sqlite largest<1000 queries	the other TPC-H SF 10 queries SQLite finished
+1.465	.3f	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	no	tpch_SF_10 versus sqlite largest<1000 geomean	SQLite's time over Amphora's on those 15
+28	,.0f	job-b,job-at,job-pg	no	job versus sqlite tables=10-12 queries	JOB queries whose plan joins 10 to 12 tables
+1.813	.3f	job-b,job-at,job-pg	no	job versus sqlite tables=10-12 geomean	SQLite's time over Amphora's on those 28
+9	,.0f	job-b,job-at,job-pg	no	job versus sqlite tables>12 queries	JOB queries whose plan joins more than 12 tables
+0.405	.3f	job-b,job-at,job-pg	no	job versus sqlite tables>12 geomean	SQLite's time over Amphora's on those 9
+456,178	,.0f	job-b,job-at,job-pg	no	job prefix 17a 0 2 est	17a's estimate at its third table, t
+1.57	.2f	job-b,job-at,job-pg	no	job prefix 17a 0 3 est	17a's estimate at its fourth table, mc
+41,840	,.0f	job-b,job-at,job-pg	no	job prefix 17a 0 2 act	17a's rows counted at t
+148,552	,.0f	job-b,job-at,job-pg	no	job prefix 17a 0 3 act	17a's rows counted at mc
+343	,.0f	job-b,job-at,job-pg	no	job below 1 1000 prefixes	JOB prefixes estimated below 1 row while counting 1,000 or more
+977	,.0f	job-b,job-at,job-pg	yes	job qerr all count	JOB's prefixes
+88	,.0f	job-b,job-at,job-pg	no	job below 1 1000 queries	JOB queries holding such a prefix
+18.8	summary	tpch-sf1-b	yes	tpch_SF_1 qerr all median	TPC-H SF 1's median q-error over every prefix
+9.39	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 qerr all median	TPC-H SF 10's median q-error over every prefix
+1.07e+03	summary	job-b,job-at,job-pg	yes	job qerr 3 median	JOB's median q-error at prefixes of three joins
+7.797e+06	summary	job-b,job-at,job-pg	yes	job largest all p95	the 95th percentile of JOB's largest intermediate results' q-errors
+16	,.0f	job-b,job-at,job-pg	yes	job first 13417 any	JOB first tables off by 13,417 or more
+15	,.0f	job-b,job-at,job-pg	yes	job first 13417 k	of those, keyword's (alias k)
+13,417	,.0f	job-b,job-at,job-pg	yes	job prefix 2a 0 0 est	a keyword prefix's estimate (2a's first table)
+1	,.0f	job-b,job-at,job-pg	no	job prefix 2a 0 0 act	its rows counted
+1.44	.2f	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 prefix q16 1 0 est	q16's part, estimated, SF 10
+296,824	,.0f	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 prefix q16 1 0 act	q16's part, counted, SF 10
+1.187e+06	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q16 max_q	q16's largest q-error, SF 10
+2e-05	g	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	no	tpch_SF_10 prefix q12 0 0 est	q12's lineitem, estimated, SF 10
+310,803	,.0f	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	no	tpch_SF_10 prefix q12 0 0 act	q12's lineitem, counted, SF 10
+3.108e+05	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q12 max_q	q12's largest q-error, SF 10
+23,500	,.0f	job-b,job-at,job-pg	no	job prefix 9a 0 0 est	9a's first table, company_name by country_code, estimated
+84,843	,.0f	job-b,job-at,job-pg	no	job prefix 9a 0 0 act	the same, counted
+1.342e+04	summary	job-b,job-at,job-pg	yes	job qerr 0 p90	the 90th percentile of JOB's first tables' q-errors
+1.342e+04	summary	job-b,job-at,job-pg	yes	job qerr 0 p95	the 95th percentile of JOB's first tables' q-errors
+10.5	summary	job-b,job-at,job-pg	no	job qerr_exact p90 k 13417	the same with the 15 keyword prefixes taken as exact
+692	summary	job-b,job-at,job-pg	yes	job query 33c ms amphora	33c, Amphora, best ms
+30.9	summary	job-b,job-at,job-pg	yes	job query 33c ms sqlite	33c, SQLite, best ms
+3.46e+03	summary	job-b,job-at,job-pg	yes	job query 29c ms amphora	29c, Amphora, best ms
+570	summary	job-b,job-at,job-pg	yes	job query 29c ms sqlite	29c, SQLite, best ms
+92.1	.1f	job-b,job-at,job-pg	yes	job plan_ms max	JOB's longest planning time (27c), best of 3
+1.9	.1f	job-b,job-at,job-pg	yes	job plan_ms median	JOB's median planning time
+1.2	g	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	no	tpch_SF_10 prefix q19 0 0 est	q19's part, estimated, SF 10
+239,849	,.0f	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	no	tpch_SF_10 prefix q19 0 0 act	q19's part, counted, SF 10
+1.999e+05	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q19 max_q	q19's largest q-error, SF 10
+1.011e+04	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q19 ms amphora	q19, Amphora, best ms, SF 10
+612	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q19 ms sqlite	q19, SQLite, best ms, SF 10
+448	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q19 ms postgres	q19, PostgreSQL, best ms, SF 10
+1.9e+03	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q06 max_q	q06's largest q-error, SF 10
+66.3	summary	job-b,job-at,job-pg	no	job qerr_exact p95 k 13417	the 95th percentile of JOB's first tables' q-errors with the keyword prefixes exact
+59,986,052	,.0f	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	no	tpch_SF_10 prefix q09 0 0 act	q09's lineitem rows, SF 10
+3,261,613	,.0f	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	no	tpch_SF_10 prefix q09 0 1 act	q09's rows past part, SF 10
+1.585e+05	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q09 ms amphora	q09, Amphora, best ms, SF 10
+2.380e+04	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q09 ms postgres	q09, PostgreSQL, best ms, SF 10
+1.634e+04	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q05 ms amphora	q05, Amphora, best ms, SF 10
+8.15e+03	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q05 ms postgres	q05, PostgreSQL, best ms, SF 10
+3.112e+04	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q08 ms amphora	q08, Amphora, best ms, SF 10
+2.19e+03	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q08 ms postgres	q08, PostgreSQL, best ms, SF 10
+30	,.0f	job-b,job-at,job-pg	no	job inner_scans count	JOB plans whose loop after the first scans a table whole
+0.4	g	job-b,job-at,job-pg	no	job inner_scans est_min	the least estimate of the table before such a loop
+1.2	g	job-b,job-at,job-pg	no	job inner_scans est_max	the greatest
+1	,.0f	job-b,job-at,job-pg	no	job inner_scans act_max	the most rows counted there
+0	,.0f	tpch-sf1-b	no	tpch_SF_1 inner_scans count	TPC-H SF 1 plans with such a loop
+0	,.0f	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	no	tpch_SF_10 inner_scans count	TPC-H SF 10 plans with such a loop
+0.20	.2f	job-b,job-at,job-pg	no	job spearman	Spearman's correlation of each JOB plan's estimated cost with Amphora's time
+83	,.0f	job-b,job-at,job-pg	yes	job versus postgres all faster	JOB queries PostgreSQL ran faster
+0.354	.3f	job-b,job-at,job-pg	yes	job versus postgres all geomean	PostgreSQL's time over Amphora's on JOB
+0.5	.1f	tpch-sf1-b	yes	tpch_SF_1 plan_ms median	TPC-H SF 1's median planning time
+0.6	.1f	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 plan_ms median	TPC-H SF 10's median planning time
+5.309e+04	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q21 ms amphora	q21, Amphora, best ms, SF 10
+1.195e+04	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q21 ms postgres	q21, PostgreSQL, best ms, SF 10
+3.54e+03	summary	tpch-sf10-a,tpch-sf10-b,tpch-sf10-c,tpch-sf10-c-again,tpch-sf10-pg	yes	tpch_SF_10 query q21 ms duckdb	q21, DuckDB on one thread, best ms, SF 10
+791	,.0f	job-b,job-at,job-pg	no	job under	JOB prefixes estimated below the rows they counted
+414,668	,.0f	job-b,job-at,job-pg	no	job slowest 20 amphora	Amphora's time on its 20 slowest JOB queries, ms
+514,502	,.0f	job-b,job-at,job-pg	no	job total amphora	Amphora's time on all of JOB, ms
+103,893	,.0f	job-b,job-at,job-pg	no	job slowest 20 postgres	PostgreSQL's time on the same 20, ms
+113	,.0f	job-text	no	queries-with-surplus count	JOB queries with equality terms beyond those that connect their classes
+2,032	,.0f	job-text	no	28a connected	connected subsets of 28a's join graph (28b and 28c the same)
+1,517	,.0f	job-text	no	33a connected	connected subsets of 33a's join graph
+13,246	,.0f	job-text	no	29a connected	connected subsets of 29a's join graph
+905	,.0f	job-text	no	27a connected	connected subsets of 27a's join graph

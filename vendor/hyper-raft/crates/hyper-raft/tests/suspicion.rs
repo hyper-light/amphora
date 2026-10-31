@@ -1,0 +1,1658 @@
+//! Elections started by suspicion (timing step L-2, `docs/timing.md` §2.3), each rule on a
+//! group in time: a network that delivers every message a fixed one-way latency after it was
+//! sent, members that persist what they take at once, and one clock. The owner's part is the
+//! harness's: it tells the members what its detectors say, wakes each member after each call and
+//! at its deadline, and does nothing else. No member ever ticks.
+#![allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::unreachable,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::disallowed_macros,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cognitive_complexity,
+    unreachable_pub
+)]
+mod support;
+
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use hyper_raft::Timing;
+use hyper_raft::proto::{
+    ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Message,
+    MessageType,
+};
+use support::{New, Replica, Settings, Store};
+
+/// The one-way latency of the harness's network, nanoseconds: a millisecond.
+const LATENCY: u64 = 1_000_000;
+/// The timer granularity the span is searched to: a microsecond, finer than any span here.
+const GRANULARITY: Duration = Duration::from_micros(1);
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a soak sets the seed count from the environment; the default is the gate's"
+)]
+fn count(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+/// The timing hyper-timing's law gives a group of `voters` on this network: the split-vote span
+/// for all but a crashed leader's voters, on the one-way latency and a vote round of one round
+/// trip (nothing is flushed), and the round's tail, one round trip.
+fn timing_for(voters: u32) -> (Timing, hyper_timing::Span) {
+    let available = if voters - 1 > voters / 2 {
+        voters - 1
+    } else {
+        voters
+    };
+    let round = Duration::from_nanos(2 * LATENCY);
+    let span = hyper_timing::election_span(
+        voters,
+        available,
+        Duration::from_nanos(LATENCY),
+        round,
+        GRANULARITY,
+    )
+    .expect("a span");
+    (
+        Timing {
+            span: span.span,
+            round,
+            election: span.election,
+        },
+        span,
+    )
+}
+
+/// A group in time (the module's documentation).
+struct Sim {
+    nodes: Vec<Option<New>>,
+    /// Messages in flight, by when they arrive and in the order sent.
+    flight: BTreeMap<(u64, u64), Message>,
+    sent_count: u64,
+    now: u64,
+    /// Every message sent, in order.
+    sent: Vec<Message>,
+    /// When each message in `sent` was sent.
+    sent_at: Vec<u64>,
+    /// Members cut off: what is sent to them is lost.
+    cut: Vec<u64>,
+    /// Who led each term.
+    leaders: BTreeMap<u64, u64>,
+    /// The members' timing: how long a run may go with nothing moving.
+    timing: Timing,
+    /// Every read a member answered: who, and the read's context.
+    answered: Vec<(u64, Vec<u8>)>,
+    /// How much later than its other messages each member's vote answers arrive: its vote's
+    /// write, on a disk slower than the others' (a member grants once its vote is durable).
+    slow_votes: BTreeMap<u64, u64>,
+}
+
+impl Sim {
+    /// `count` members of a group whose configuration is `boot`, electing by suspicion with
+    /// `timing`, each member's draws seeded from `seed`.
+    fn new(count: u64, boot: &ConfState, timing: Timing, seed: u64) -> Self {
+        Self::with(&Settings::focal().by_suspicion(), count, boot, timing, seed)
+    }
+    /// As [`Sim::new`], each member opened with `settings`.
+    fn with(settings: &Settings, count: u64, boot: &ConfState, timing: Timing, seed: u64) -> Self {
+        let nodes = (1..=count)
+            .map(|id| {
+                let mut node = New::open(
+                    id,
+                    Store::new(boot.clone()),
+                    settings,
+                    seed.wrapping_mul(1_000_003).wrapping_add(id),
+                    count as usize,
+                );
+                node.raw.set_timing(timing).unwrap();
+                Some(node)
+            })
+            .collect();
+        Self {
+            nodes,
+            flight: BTreeMap::new(),
+            sent_count: 0,
+            now: 0,
+            sent: Vec::new(),
+            sent_at: Vec::new(),
+            cut: Vec::new(),
+            leaders: BTreeMap::new(),
+            timing,
+            answered: Vec::new(),
+            slow_votes: BTreeMap::new(),
+        }
+    }
+    fn voters(voters: &[u64]) -> ConfState {
+        ConfState {
+            voters: voters.to_vec(),
+            ..ConfState::default()
+        }
+    }
+    fn node(&mut self, id: u64) -> &mut New {
+        self.nodes[(id - 1) as usize]
+            .as_mut()
+            .expect("a member that runs")
+    }
+    fn peek(&self, id: u64) -> &New {
+        self.nodes[(id - 1) as usize]
+            .as_ref()
+            .expect("a member that runs")
+    }
+    fn up(&self) -> Vec<u64> {
+        (1..=self.nodes.len() as u64)
+            .filter(|id| self.nodes[(*id - 1) as usize].is_some())
+            .collect()
+    }
+    /// After a call on `id`, the owner wakes it at its clock and sends what it gives.
+    fn settle(&mut self, id: u64) {
+        let now = self.now;
+        let node = self.node(id);
+        node.wake(now);
+        let output = node.drain();
+        let view = node.view();
+        for (_, context) in &output.reads {
+            self.answered.push((id, context.clone()));
+        }
+        if view.role == 2 {
+            let leader = *self.leaders.entry(view.term).or_insert(id);
+            assert_eq!(leader, id, "two leaders of term {}", view.term);
+        }
+        for message in output.messages {
+            let write = if message.msg_type == MessageType::MsgRequestVoteResponse {
+                self.slow_votes.get(&id).copied().unwrap_or(0)
+            } else {
+                0
+            };
+            self.sent.push(message.clone());
+            self.sent_at.push(self.now);
+            self.sent_count += 1;
+            self.flight
+                .insert((self.now + LATENCY + write, self.sent_count), message);
+        }
+    }
+    /// The next event: a message arriving, or a member's deadline. False when there is none.
+    fn next(&mut self) -> bool {
+        let arrival = self.flight.keys().next().map(|(at, _)| *at);
+        let deadline = self
+            .up()
+            .into_iter()
+            .filter_map(|id| self.peek(id).deadline().map(|at| (at, id)))
+            .min();
+        match (arrival, deadline) {
+            (None, None) => false,
+            (Some(at), deadline) if deadline.is_none_or(|(due, _)| at <= due) => {
+                let key = *self.flight.keys().next().unwrap();
+                let message = self.flight.remove(&key).unwrap();
+                self.now = self.now.max(at);
+                let to = message.to;
+                if self.nodes[(to - 1) as usize].is_some() && !self.cut.contains(&to) {
+                    self.node(to).step(message);
+                    self.settle(to);
+                }
+                true
+            }
+            (_, Some((due, id))) => {
+                self.now = self.now.max(due);
+                self.settle(id);
+                true
+            }
+            (Some(_), None) => unreachable!("matched above"),
+        }
+    }
+    /// How long a run may go with no member's term, commit, applied index or last index moving before it
+    /// is stuck (`docs/sim.md` §4.2): the longest draw of the span, the election's three rounds and
+    /// a replication round, from the members' own timing. The test suspects explicitly, so no
+    /// detection time is added.
+    fn quiet(&self) -> u64 {
+        (self.timing.span + self.timing.round * 4).as_nanos() as u64
+    }
+    /// What moves, as `docs/sim.md` §4.2 counts it: each member's term, commit, applied index and
+    /// last index. A role is not: a pre-candidate that asks and falls back moves none of them, and
+    /// a group whose members only do that is stuck.
+    fn progress(&self) -> Vec<(u64, u64, u64, u64, u64)> {
+        self.up()
+            .into_iter()
+            .map(|id| {
+                let view = self.peek(id).view();
+                (id, view.term, view.commit, view.applied, view.last_index)
+            })
+            .collect()
+    }
+    /// Runs until nothing is in flight and nothing is due; false when it is stuck instead: events
+    /// go on and nothing moves for a quiet period.
+    fn run(&mut self) -> bool {
+        self.run_until(|_| false)
+    }
+    /// Runs until `done` holds, or until nothing is in flight and nothing is due (then whether
+    /// `done` holds); false when it is stuck.
+    fn run_until(&mut self, mut done: impl FnMut(&Self) -> bool) -> bool {
+        let mut seen = self.progress();
+        let mut moved = self.now;
+        loop {
+            if done(self) {
+                return true;
+            }
+            if !self.next() {
+                return done(self) || self.flight.is_empty();
+            }
+            let now = self.progress();
+            if now != seen {
+                seen = now;
+                moved = self.now;
+            } else if self.now > moved + self.quiet() {
+                return false;
+            }
+        }
+    }
+    /// Runs until `done` holds, or until the clock passes `until`: a directed test that counts what
+    /// members do while nothing moves (a wrong suspicion's asks), bounded by the time those take on
+    /// the members' own timing rather than by the quiet period, which such a run is meant to pass.
+    /// False when `until` passes, or nothing is left to run, before `done` holds.
+    fn run_until_time(&mut self, until: u64, mut done: impl FnMut(&Self) -> bool) -> bool {
+        while !done(self) {
+            if self.now > until || !self.next() {
+                return done(self);
+            }
+        }
+        true
+    }
+    /// The clock moves on by `by` with nothing delivered: a member woken now finds what fell due.
+    fn pass(&mut self, by: u64) {
+        let end = self.now + by;
+        while let Some(due) = self
+            .up()
+            .into_iter()
+            .filter_map(|id| self.peek(id).deadline().map(|at| (at, id)))
+            .min()
+            .filter(|(at, _)| *at <= end)
+        {
+            self.now = self.now.max(due.0);
+            self.settle(due.1);
+        }
+        self.now = end;
+    }
+    fn leader(&self) -> Option<u64> {
+        self.up()
+            .into_iter()
+            .filter(|id| self.peek(*id).view().role == 2)
+            .max_by_key(|id| self.peek(*id).view().term)
+    }
+    /// The member stops: what it sent is still in flight, what is sent to it is lost.
+    fn stop(&mut self, id: u64) {
+        self.nodes[(id - 1) as usize] = None;
+    }
+    fn suspect(&mut self, at: u64, of: u64) {
+        self.node(at).suspect(of);
+        self.settle(at);
+    }
+    fn trust(&mut self, at: u64, of: u64) {
+        self.node(at).trust(of);
+        self.settle(at);
+    }
+    fn term(&self, id: u64) -> u64 {
+        self.peek(id).view().term
+    }
+    /// Elects `id`, as an owner that founds a group tells one member to campaign.
+    fn found(&mut self, id: u64) {
+        self.node(id).campaign();
+        self.settle(id);
+        assert!(self.run_until(|sim| sim.leader() == Some(id)));
+        // Everything in flight lands, and the group goes quiet.
+        assert!(self.run(), "the group never went quiet");
+    }
+    /// When `member` sent each hand-over order from `from` on.
+    fn order_times(&self, member: u64, from: usize) -> Vec<u64> {
+        self.sent[from..]
+            .iter()
+            .zip(&self.sent_at[from..])
+            .filter(|(m, _)| m.msg_type == MessageType::MsgTimeoutNow && m.from == member)
+            .map(|(_, at)| *at)
+            .collect()
+    }
+    fn count_sent(&self, from: usize, kind: MessageType) -> usize {
+        self.sent[from..]
+            .iter()
+            .filter(|m| m.msg_type == kind)
+            .count()
+    }
+}
+
+/// A group opened together, with no history and no word from any detector, elects: every
+/// member knows no leader and draws its delay over the span from when it opened, as followers
+/// that suspected their leader together do. Then, its work done, it goes quiet: no member is due
+/// to wake, and the clock passing an hour sends nothing (no ticks, no heartbeats).
+#[test]
+fn a_group_opened_on_no_history_elects_and_then_sleeps() {
+    let (timing, _) = timing_for(3);
+    for seed in 0..64 {
+        let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, seed);
+        for id in 1..=3 {
+            sim.settle(id);
+        }
+        assert!(
+            sim.run_until(|sim| sim.leader().is_some()),
+            "seed {seed}: no leader"
+        );
+        let leader = sim.leader().unwrap();
+        sim.node(leader).propose(b"x".to_vec());
+        sim.settle(leader);
+        assert!(sim.run(), "seed {seed}: never quiet");
+        for id in 1..=3 {
+            assert_eq!(sim.peek(id).deadline(), None, "seed {seed}: member {id}");
+            assert_eq!(sim.peek(id).app().index, 2, "seed {seed}: member {id}");
+        }
+        let sent = sim.sent.len();
+        let term = sim.term(leader);
+        sim.pass(3_600 * 1_000_000_000);
+        assert_eq!(sim.sent.len(), sent, "seed {seed}: an idle group sent");
+        assert_eq!(sim.term(leader), term);
+        assert_eq!(sim.leader(), Some(leader));
+    }
+}
+
+/// An election starts only on suspicion: with the leader alive and trusted, its followers never
+/// campaign however long the clock runs; once their detectors suspect it, they do, and a new
+/// leader is elected in the next term.
+#[test]
+fn elections_start_only_on_suspicion() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 1);
+    sim.found(1);
+    let sent = sim.sent.len();
+    sim.pass(86_400 * 1_000_000_000);
+    assert_eq!(sim.sent.len(), sent, "a day passed and something was sent");
+    assert_eq!(sim.leader(), Some(1));
+    sim.stop(1);
+    sim.pass(86_400 * 1_000_000_000);
+    assert_eq!(
+        sim.sent.len(),
+        sent,
+        "nothing suspected the leader, nothing moved"
+    );
+    for id in [2, 3] {
+        sim.suspect(id, 1);
+    }
+    assert!(sim.run_until(|sim| sim.leader().is_some()));
+    let leader = sim.leader().unwrap();
+    assert!(leader == 2 || leader == 3);
+    assert!(sim.term(leader) > 1);
+}
+
+/// The delay from a suspicion to a campaign is the election law's draw, `election_delay` over
+/// the span, at the member's seed and its campaign count, exactly. How the draws spread over
+/// `[0, W)` is the law's to show, in hyper-timing.
+#[test]
+fn the_delay_is_the_laws_draw() {
+    let (timing, _) = timing_for(3);
+    let first = count("HYPER_RAFT_SEED", 0);
+    for seed in first..first + count("HYPER_RAFT_SEEDS", 1_000) {
+        let settings = Settings::focal().by_suspicion();
+        let local = seed.wrapping_mul(0x2545_f491_4f6c_dd1d);
+        let mut node = New::open(2, Store::new(Sim::voters(&[1, 2, 3])), &settings, local, 3);
+        node.raw.set_timing(timing).unwrap();
+        let opened = 7_000_000_000;
+        node.wake(opened);
+        let due = node
+            .deadline()
+            .expect("a member that knows no leader is armed");
+        let drawn = hyper_timing::election_delay(timing.span, local, 0);
+        assert_eq!(due - opened, drawn.as_nanos() as u64, "seed {seed}");
+    }
+}
+
+/// Every arming draws anew, so a member's delays are independent across elections as the law
+/// takes them. A member draws when it opens, follows a leader it trusts, then twice suspects it
+/// and trusts it again: each suspicion's delay is the law's draw at the next index, from the wake
+/// that timed it. A draw kept until it fired leaned the next election's delays long, since the
+/// members whose delays fired drew again and the others kept theirs: 135 first rounds of the
+/// split test's 1,000 crashes split against the law's 110.8.
+#[test]
+fn every_arming_draws_anew() {
+    let (timing, _) = timing_for(3);
+    let settings = Settings::focal().by_suspicion();
+    let local = 0x2545_f491_4f6c_dd1d;
+    let draw = |index| hyper_timing::election_delay(timing.span, local, index).as_nanos() as u64;
+    let mut node = New::open(2, Store::new(Sim::voters(&[1, 2, 3])), &settings, local, 3);
+    node.raw.set_timing(timing).unwrap();
+    let mut now = 7_000_000_000;
+    node.wake(now);
+    assert_eq!(node.deadline(), Some(now + draw(0)));
+    node.step(Message {
+        msg_type: MessageType::MsgHeartbeat,
+        from: 1,
+        to: 2,
+        term: 1,
+        ..Message::default()
+    });
+    node.wake(now);
+    node.drain();
+    assert_eq!(node.deadline(), None, "it trusts the leader it follows");
+    for index in 1..=2 {
+        now += timing.span.as_nanos() as u64;
+        node.suspect(1);
+        node.wake(now);
+        assert_eq!(
+            node.deadline(),
+            Some(now + draw(index)),
+            "suspicion {index}"
+        );
+        node.trust(1);
+        node.wake(now);
+        assert_eq!(node.deadline(), None, "trusted again {index}");
+    }
+}
+
+/// Split votes resolve, and a first round splits exactly when the law says it does. Five voters;
+/// the leader crashes and the four others suspect it at the same instant; each campaigns after its
+/// own draw over the span `election_span` chose for this network. The law's event (Ongaro,
+/// dissertation §9.2; the span's `split` is its probability): the round fails when `s − ⌊n/2⌋ + 1`
+/// of the `s` available start within the one-way latency `l` of the first. Here, with pre-vote:
+/// the first starter's vote requests leave a round trip after its draw and land `3l` after it; a
+/// member that started within `l` of it became a candidate `2l` after its own draw, before they
+/// land, and refuses; two such refusals leave the first short of three votes, and no one else can
+/// win the term, since each of the others either voted for itself or for the first. So each
+/// crash's first round is predicted from the four delays the members armed before it runs, and
+/// must come out as predicted. A start exactly `l` after the first makes the candidacy and the
+/// request coincide,
+/// which the harness's order breaks, and either outcome is the protocol's. Every crash elects, and
+/// the seeds must hold rounds of both kinds.
+#[test]
+fn split_votes_resolve_and_split_exactly_when_the_law_says() {
+    let voters = 5u64;
+    let (timing, span) = timing_for(voters as u32);
+    let crowd = (voters - 1 - voters / 2 + 1) as usize;
+    let first = count("HYPER_RAFT_SEED", 0);
+    let trials = count("HYPER_RAFT_SEEDS", 1_000);
+    let (mut split, mut whole, mut terms) = (0u64, 0u64, 0u64);
+    for seed in first..first + trials {
+        let mut sim = Sim::new(voters, &Sim::voters(&[1, 2, 3, 4, 5]), timing, seed);
+        sim.found(1);
+        let term = sim.term(1);
+        sim.stop(1);
+        for id in 2..=voters {
+            sim.node(id).suspect(1);
+        }
+        for id in 2..=voters {
+            sim.settle(id);
+        }
+        let mut delays: Vec<u64> = (2..=voters)
+            .map(|id| {
+                sim.peek(id)
+                    .deadline()
+                    .expect("a member that suspects is armed")
+                    - sim.now
+            })
+            .collect();
+        delays.sort_unstable();
+        let crowded = delays[crowd - 1] - delays[0];
+        assert!(
+            sim.run_until(|sim| sim.leader().is_some_and(|l| l != 1)),
+            "seed {seed}: no leader"
+        );
+        let elected = sim.term(sim.leader().unwrap());
+        terms += elected - term;
+        let splits = elected > term + 1;
+        match crowded.cmp(&LATENCY) {
+            Ordering::Less => assert!(
+                splits,
+                "seed {seed}: delays {delays:?} split the vote, and the first round elected"
+            ),
+            Ordering::Greater => assert!(
+                !splits,
+                "seed {seed}: delays {delays:?} elect in the first round, and it split"
+            ),
+            Ordering::Equal => {}
+        }
+        if splits {
+            split += 1;
+        } else {
+            whole += 1;
+        }
+    }
+    println!(
+        "{trials} crashes: {split} first rounds split, the law's expectation {:.1} (split {:.4}, span {:?}); {terms} terms",
+        span.split * trials as f64,
+        span.split,
+        span.span
+    );
+    assert!(
+        split > 0 && whole > 0,
+        "seeds {first}..{}: {split} first rounds split and {whole} elected; the test needs both",
+        first + trials
+    );
+}
+
+/// A suspicion withdrawn before the delay ends cancels the campaign: the follower trusts its
+/// leader again, nothing is due, and nothing is sent.
+#[test]
+fn a_suspicion_withdrawn_before_the_delay_cancels_the_campaign() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 3);
+    sim.found(1);
+    let sent = sim.sent.len();
+    sim.suspect(2, 1);
+    let due = sim.peek(2).deadline().expect("armed");
+    assert!(due > sim.now, "a delay of zero draws nothing to cancel");
+    sim.now += (due - sim.now) / 2;
+    sim.trust(2, 1);
+    assert_eq!(sim.peek(2).deadline(), None);
+    sim.pass(3_600 * 1_000_000_000);
+    assert_eq!(sim.sent.len(), sent);
+    assert_eq!(sim.term(2), sim.term(1));
+}
+
+/// Pre-vote keeps its role: a follower whose detector wrongly suspects the leader asks for
+/// pre-votes, the other follower, which trusts the leader, grants none, and the leader tells the
+/// asker who leads. No term moves.
+#[test]
+fn a_member_that_trusts_its_leader_refuses_a_pre_vote() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 4);
+    sim.found(1);
+    let from = sim.sent.len();
+    let term = sim.term(1);
+    sim.suspect(3, 1);
+    // While its detector is wrong it asks again, a round and a draw after each ask: three asks, two
+    // requests each. The first comes a draw over the span after the suspicion, each next one a
+    // round and a draw after the last, so all three by three rounds and spans; its leader's answers
+    // move no term, so the run waits on that time and not on the quiet period.
+    let asked = |sim: &Sim| sim.count_sent(from, MessageType::MsgRequestPreVote) >= 6;
+    let asks = (timing.round + timing.span).as_nanos() as u64 * 3;
+    assert!(sim.run_until_time(sim.now + asks, asked));
+    sim.trust(3, 1);
+    assert!(
+        sim.run(),
+        "it trusts its leader again, and the group goes quiet"
+    );
+    let granted = sim.sent[from..]
+        .iter()
+        .filter(|m| m.msg_type == MessageType::MsgRequestPreVoteResponse && !m.reject)
+        .count();
+    assert_eq!(
+        granted, 0,
+        "a member that trusts its leader granted a pre-vote"
+    );
+    assert_eq!(sim.leader(), Some(1));
+    for id in 1..=3 {
+        assert_eq!(sim.term(id), term, "member {id}");
+    }
+    // The leader told it who leads.
+    assert_eq!(sim.peek(3).view().leader, 1);
+}
+
+/// A leader both followers suspect is deposed though it is up and answers. Each follower that asks
+/// for pre-votes hears the leader's answer, a heartbeat of the leader's term, before the other
+/// follower's grant: the leader is asked first. A pre-candidate keeps the leader's term, so that
+/// heartbeat would make it a follower again and its asking would end, ask after ask (the kill test's
+/// `stall-leader` on windows-2025, diagnostic run 37209985474: no campaign won in a second). A
+/// pre-candidate drops what a leader it suspects sends it in that leader's term, as a lost message.
+#[test]
+fn a_suspected_leader_that_answers_a_pre_vote_is_deposed() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 5);
+    sim.found(1);
+    let term = sim.term(1);
+    sim.suspect(2, 1);
+    sim.suspect(3, 1);
+    assert!(
+        sim.run_until(|sim| sim.leader().is_some_and(|leader| leader != 1)),
+        "no follower was elected: {:?}",
+        sim.progress()
+    );
+    let leader = sim.leader().unwrap();
+    assert!(sim.term(leader) > term, "{:?}", sim.progress());
+}
+
+/// Whether member `id` and those it trusts are a quorum of each half of its configuration.
+fn trusts_a_quorum(sim: &Sim, id: u64) -> bool {
+    sim.peek(id)
+        .raw
+        .raft
+        .campaign_state()
+        .expect("a member that elects by suspicion")
+        .trusted_quorum
+}
+
+/// A leader's detectors leave it no quorum once they suspect so many voters that it and those it
+/// trusts are no quorum of either half of its configuration: in a simple configuration, a
+/// majority; in a joint one, a majority of either half while the other is whole. It leads on
+/// either way, and hands over only to a voter that can be elected without it.
+#[test]
+fn a_leader_is_left_no_quorum_when_its_detectors_suspect_a_majority_of_either_half() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 5);
+    sim.found(1);
+    sim.suspect(1, 2);
+    assert!(
+        trusts_a_quorum(&sim, 1),
+        "one of three suspected leaves a quorum"
+    );
+    sim.suspect(1, 3);
+    assert!(
+        !trusts_a_quorum(&sim, 1),
+        "two of three suspected leave none"
+    );
+    assert_eq!(sim.peek(1).view().role, 2, "it leads on");
+
+    // Joint: {1, 2, 3} and {1, 4, 5}.
+    let joint = ConfState {
+        voters: vec![1, 4, 5],
+        voters_outgoing: vec![1, 2, 3],
+        ..ConfState::default()
+    };
+    for (suspected, stays) in [
+        (vec![2], true),
+        (vec![4], true),
+        (vec![2, 4], true),
+        (vec![2, 3], false),
+        (vec![4, 5], false),
+    ] {
+        let mut sim = Sim::new(5, &joint, timing, 6);
+        sim.found(1);
+        for &member in &suspected {
+            sim.suspect(1, member);
+        }
+        assert_eq!(
+            trusts_a_quorum(&sim, 1),
+            stays,
+            "suspecting {suspected:?} of a joint configuration"
+        );
+        assert_eq!(sim.peek(1).view().role, 2, "it leads on");
+    }
+}
+
+/// A leader its detectors leave no quorum hands over to a voter that can be elected without it:
+/// its followers trust its node, which lives, and would never campaign; the voter that holds the
+/// most of its log, of those it trusts, is told at once to campaign where it can be, and the group
+/// elects it, the leader leading until then.
+#[test]
+fn a_leader_left_no_quorum_hands_over_to_a_voter_elected_without_it() {
+    let (timing, _) = timing_for(5);
+    let mut sim = Sim::new(5, &Sim::voters(&[1, 2, 3, 4, 5]), timing, 7);
+    sim.found(1);
+    let from = sim.sent.len();
+    // The leader's detectors are wrong about three of its four followers, which trust it.
+    for member in [3, 4, 5] {
+        sim.suspect(1, member);
+    }
+    assert_eq!(sim.peek(1).view().role, 2, "it leads on");
+    let orders: Vec<&Message> = sim.sent[from..]
+        .iter()
+        .filter(|m| m.msg_type == MessageType::MsgTimeoutNow)
+        .collect();
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].to, 2, "the one voter it still trusted");
+    assert_eq!(orders[0].context, hyper_raft::proto::IF_ELECTED_WITHOUT);
+    assert!(sim.run_until(|sim| sim.leader().is_some_and(|leader| leader != 1)));
+    assert_eq!(sim.leader(), Some(2));
+}
+
+/// A leader whose detectors suspect every other voter leads on and still hands over, a round and
+/// a draw later while it suspects them still: a suspicion says only that it does not hear the voter,
+/// not that the voter does not hear it, and its followers, which hear it and trust it for good,
+/// would never campaign. Here each can be elected without it, and the one told to is. Handing over
+/// to none, it stood leaderless for as long as its suspicions lasted (mantle's node simulation, a
+/// leader whose plane went deaf; mantle's Windows CI, run 39503516282).
+#[test]
+fn a_leader_that_suspects_every_other_voter_hands_over_all_the_same() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 7);
+    sim.found(1);
+    let from = sim.sent.len();
+    sim.suspect(1, 2);
+    sim.suspect(1, 3);
+    assert_eq!(sim.peek(1).view().role, 2, "it leads on");
+    // It may be the one that stalled: no order at once (the next test).
+    assert_eq!(sim.count_sent(from, MessageType::MsgTimeoutNow), 0);
+    assert!(
+        sim.run_until(|sim| sim.leader().is_some_and(|leader| leader != 1)),
+        "its followers trusted it and no one campaigned"
+    );
+    assert_eq!(
+        sim.count_sent(from, MessageType::MsgTimeoutNow),
+        1,
+        "it told no voter to campaign"
+    );
+    assert!(sim.leader() != Some(1));
+}
+
+/// A leader that suspects every other voter for less than a round, as one whose host stalls does,
+/// orders no hand-over at once: within a round and a draw it trusts a quorum again, and it leads on
+/// in its term, its followers having trusted it throughout. Ordered at once, the heir's campaign
+/// moved the group's leadership at every short stall (mantle's cluster tests on a loaded Linux
+/// runner, run 39525134119: the leader elected during a cut lost its leadership around the rejoin,
+/// to the lowest id holding the log, in three tests of three); stepped down, it was elected again
+/// in a later term, the group leaderless meanwhile.
+#[test]
+fn a_leader_that_suspects_every_voter_for_less_than_a_round_leads_on() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 7);
+    sim.found(1);
+    let term = sim.term(1);
+    let from = sim.sent.len();
+    sim.suspect(1, 2);
+    sim.suspect(1, 3);
+    assert_eq!(sim.peek(1).view().role, 2, "it leads on");
+    sim.trust(1, 2);
+    sim.trust(1, 3);
+    assert!(sim.run(), "the group did not come to rest");
+    assert_eq!(
+        sim.count_sent(from, MessageType::MsgTimeoutNow),
+        0,
+        "it handed over"
+    );
+    assert_eq!(
+        sim.leader(),
+        Some(1),
+        "its stall moved the group's leadership"
+    );
+    assert_eq!(sim.term(1), term, "its stall cost a term");
+}
+
+/// A leader in the joint configuration that replaces a failed voter with a spare (`{1, 2, 3}` to
+/// `{1, 2, 4}`, 3 dead) suspects the survivor 2 as well and is left no quorum of the old half; the
+/// heir it trusts is the spare, which has not taken the joint entry and is a learner by its own
+/// configuration, so it refuses the order; 2 trusts the leader, and 3 too, whose death only the
+/// leader's detectors saw, so it takes the order next. The group elects all the same within the
+/// rounds its timing states (mantle's `a_follower_lost_for_good_is_replaced_*`, stalled once in five
+/// rounds on a pinned Linux runner at `757740c`).
+#[test]
+fn a_leader_whose_heir_is_a_spare_that_has_not_taken_its_change_still_hands_over() {
+    let (timing, _) = timing_for(3);
+    let boot = ConfState {
+        voters: vec![1, 2, 3],
+        learners: vec![4],
+        ..ConfState::default()
+    };
+    let mut sim = Sim::new(4, &boot, timing, 11);
+    sim.found(1);
+    sim.stop(3);
+    sim.suspect(1, 3);
+    sim.cut.push(4);
+    let change = ConfChangeV2 {
+        transition: ConfChangeTransition::Explicit,
+        changes: vec![
+            ConfChangeSingle {
+                change_type: ConfChangeType::AddNode,
+                node_id: 4,
+            },
+            ConfChangeSingle {
+                change_type: ConfChangeType::RemoveNode,
+                node_id: 3,
+            },
+        ],
+        context: vec![],
+    };
+    sim.node(1).propose_change(&change);
+    sim.settle(1);
+    let joint = sim.peek(1).view().last_index;
+    assert!(sim.run_until(|sim| sim.peek(1).view().commit >= joint));
+    sim.cut.clear();
+    let from = sim.sent.len();
+    let term = sim.term(1);
+    sim.suspect(1, 2);
+    assert!(
+        !trusts_a_quorum(&sim, 1),
+        "it kept a quorum of the old half"
+    );
+    // Its first order may go to the spare, which refuses it as a learner; then 2.
+    let elected = sim.run_until(|sim| sim.leader().is_some_and(|leader| leader != 1));
+    let orders: Vec<u64> = sim.sent[from..]
+        .iter()
+        .filter(|m| m.msg_type == MessageType::MsgTimeoutNow)
+        .map(|m| m.to)
+        .collect();
+    assert!(
+        elected,
+        "no leader; orders {orders:?}, terms {:?}",
+        [1, 2, 4].map(|id| sim.term(id))
+    );
+    assert!(sim.term(1) > term);
+}
+
+/// A leader left no quorum orders no heir sooner than the election the law expects (`T_E`) after
+/// its last order, as a member that led does: each order may force a campaign, and a second before
+/// the first can finish makes two candidates that split the vote. Leader 1 of five suspects every
+/// other voter for good and hears nothing, so its term never moves and it orders for as long as
+/// the run lasts; re-ordered a round and a draw after the last, stepped-down members forced a new
+/// heir every 4 to 9 ms on loopback, and two within one millisecond (mantle's cluster suite at
+/// `eb85154`).
+#[test]
+fn no_heir_is_ordered_within_an_expected_election_of_the_last() {
+    let (timing, _) = timing_for(5);
+    let election = timing.election.as_nanos() as u64;
+    let mut sim = Sim::new(5, &Sim::voters(&[1, 2, 3, 4, 5]), timing, 7);
+    sim.found(1);
+    let from = sim.sent.len();
+    for member in [2, 3, 4, 5] {
+        sim.suspect(1, member);
+    }
+    assert_eq!(sim.peek(1).view().role, 2, "it leads on");
+    sim.cut.push(1);
+    let until = sim.now + 20 * election;
+    sim.run_until_time(until, |_| false);
+    let mut orders = Vec::new();
+    for message in &sim.sent[from..] {
+        if message.msg_type == MessageType::MsgTimeoutNow && message.from == 1 {
+            orders.push(message.to);
+        }
+    }
+    assert!(
+        orders.len() >= 2,
+        "it ordered {orders:?}: the test needs it to order again"
+    );
+    let times = sim.order_times(1, from);
+    for pair in times.windows(2) {
+        assert!(
+            pair[1] - pair[0] >= election,
+            "orders {} ns apart, within an expected election of {election} ns: {orders:?}",
+            pair[1] - pair[0]
+        );
+    }
+    assert!(
+        (2..=5).any(|id| sim.peek(id).view().role == 2),
+        "the others elected no one"
+    );
+}
+
+/// Each term a member leads starts its hand-overs from the first heir: the voter it trusts that
+/// holds the most. Leader 1 hands over once, to 2; led again, it is left no quorum trusting only 3,
+/// and names 3, not whichever voter its count from the first term reached.
+#[test]
+fn a_leader_that_led_before_hands_over_first_to_the_voter_it_trusts() {
+    let (timing, _) = timing_for(5);
+    let mut sim = Sim::new(5, &Sim::voters(&[1, 2, 3, 4, 5]), timing, 7);
+    sim.found(1);
+    for member in [3, 4, 5] {
+        sim.suspect(1, member);
+    }
+    assert!(sim.run_until(|sim| sim.leader() == Some(2)));
+    for member in [3, 4, 5] {
+        sim.trust(1, member);
+    }
+    sim.node(2).transfer(1);
+    sim.settle(2);
+    assert!(sim.run_until(|sim| sim.leader() == Some(1)));
+    assert!(sim.run(), "the group never went quiet");
+    let from = sim.sent.len();
+    for member in [2, 4, 5] {
+        sim.suspect(1, member);
+    }
+    assert_eq!(sim.peek(1).view().role, 2, "it leads on");
+    let orders: Vec<u64> = sim.sent[from..]
+        .iter()
+        .filter(|m| m.msg_type == MessageType::MsgTimeoutNow)
+        .map(|m| m.to)
+        .collect();
+    assert_eq!(orders, [3], "the one voter it still trusted");
+    assert!(sim.run_until(|sim| sim.leader().is_some_and(|l| l != 1)));
+    assert_eq!(sim.leader(), Some(3));
+}
+
+/// A leader's first heir may be dead: left no quorum, it names first the voter that holds the most
+/// of its log, trusted ones first. Leader 1 of five is left no quorum trusting only 2, which holds
+/// an entry the others lack and is dead; it then suspects 2 as well, and its next hand-overs name
+/// the live voters, which trust it, in turn, and they elect one of themselves, by their own votes:
+/// the leader, holding the entry they lack, refuses them.
+#[test]
+fn a_dead_heir_that_holds_the_most_does_not_absorb_every_hand_over() {
+    let (timing, _) = timing_for(5);
+    let mut sim = Sim::new(5, &Sim::voters(&[1, 2, 3, 4, 5]), timing, 7);
+    sim.found(1);
+    sim.cut.extend([3, 4, 5]);
+    sim.node(1).propose(b"only 2 holds it".to_vec());
+    sim.settle(1);
+    assert!(!sim.run_until(|_| false), "a write that cannot commit");
+    sim.stop(2);
+    // Suspected while still cut off, they are sent nothing more and never catch up: 2 alone
+    // holds the most, and the first hand-over names it, the one voter trusted.
+    for member in [3, 4, 5] {
+        sim.suspect(1, member);
+    }
+    assert_eq!(sim.peek(1).view().role, 2, "it leads on");
+    sim.suspect(1, 2);
+    sim.cut.clear();
+    assert!(
+        sim.run_until(|sim| sim.leader().is_some_and(|leader| leader != 1)),
+        "every hand-over went to the dead heir"
+    );
+    assert!(![1, 2].contains(&sim.leader().unwrap_or(0)));
+}
+
+/// What a group of three keeps while its third voter is stopped and both the others suspect it,
+/// checked after every event: member 1 leads `term`, and member 2 follows it in that term, naming
+/// it its leader.
+fn led_on_by_one(sim: &Sim, term: u64) {
+    let (one, two) = (sim.peek(1).view(), sim.peek(2).view());
+    assert_eq!(
+        (one.role, one.term),
+        (2, term),
+        "member 1 no longer leads its term at {} ns",
+        sim.now
+    );
+    assert_eq!(
+        (two.role, two.leader, two.term),
+        (0, 1, term),
+        "member 2 no longer follows member 1 at {} ns",
+        sim.now
+    );
+}
+
+/// mantle's roll, its third stop (serve-cell `abef6120`, CI's busy shape): of three voters one is
+/// stopped and both others suspect it, and the leader suspects the one live voter it has, three
+/// times, each time for longer than a round, a draw and an expected election, while their messages
+/// still pass. Acting on it can produce no leader: a voter elected without the leader's vote needs
+/// the stopped one's. So the leader leads on, its follower follows, no term moves, no campaign is
+/// asked for, and a write taken during each suspicion commits. Before, each suspicion left the
+/// leader no trusted quorum, it stepped down with no heir it trusted, and was elected again a
+/// round and a draw later: three terms for three mistakes, the group leaderless each time.
+#[test]
+fn a_leader_that_suspects_its_one_live_voter_while_the_third_is_stopped_leads_on() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 21);
+    sim.found(1);
+    let term = sim.term(1);
+    sim.stop(3);
+    sim.suspect(1, 3);
+    sim.suspect(2, 3);
+    led_on_by_one(&sim, term);
+    let from = sim.sent.len();
+    let hold = (timing.round + timing.span + timing.election).as_nanos() as u64 * 2;
+    for mistake in 0..3u64 {
+        sim.suspect(1, 2);
+        led_on_by_one(&sim, term);
+        sim.node(1)
+            .propose(format!("taken during mistake {mistake}").into_bytes());
+        sim.settle(1);
+        let index = sim.peek(1).view().last_index;
+        let until = sim.now + hold;
+        sim.run_until_time(until, |sim| {
+            led_on_by_one(sim, term);
+            false
+        });
+        assert!(
+            sim.peek(2).view().applied >= index,
+            "the write taken during mistake {mistake} was not applied by member 2"
+        );
+        sim.trust(1, 2);
+        led_on_by_one(&sim, term);
+    }
+    // It told member 2 to campaign where 2 could be elected without it, and 2, which suspects the
+    // stopped voter, could not.
+    let ordered = sim.sent[from..]
+        .iter()
+        .filter(|m| {
+            m.msg_type == MessageType::MsgTimeoutNow
+                && m.to == 2
+                && m.context == hyper_raft::proto::IF_ELECTED_WITHOUT
+        })
+        .count();
+    assert!(ordered > 0, "member 2 was never told to campaign");
+    for kind in [MessageType::MsgRequestPreVote, MessageType::MsgRequestVote] {
+        assert_eq!(sim.count_sent(from, kind), 0, "{kind:?} sent");
+    }
+    assert!(sim.run(), "the group did not come to rest");
+    led_on_by_one(&sim, term);
+}
+
+/// mantle's roll, its first stop: two voters suspect each other from soon after they meet and
+/// neither suspicion is withdrawn. While the third voter is up, the leader leads by it, and the
+/// other asks for pre-votes the third refuses, hearing nothing of its leader meanwhile. Once the
+/// third is stopped and both suspect it, acting on any suspicion can produce no leader: the leader
+/// leads on, and the other, whose campaign could win only by the vote of the leader it suspects,
+/// asks no more and follows it again, and a write commits. Before, each leader lost its trusted
+/// quorum at the stopped voter's suspicion and stepped down, handing over to the other, which won
+/// by its vote and stepped down in turn: terms climbing, each leader gone within a round.
+#[test]
+fn voters_that_suspect_each_other_for_good_keep_their_leader_once_the_third_is_stopped() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 22);
+    sim.found(1);
+    let term = sim.term(1);
+    let from = sim.sent.len();
+    sim.suspect(1, 2);
+    sim.suspect(2, 1);
+    let asks = (timing.round + timing.span).as_nanos() as u64 * 3;
+    assert!(
+        sim.run_until_time(sim.now + asks, |sim| sim
+            .count_sent(from, MessageType::MsgRequestPreVote)
+            >= 4),
+        "member 2 did not ask for pre-votes"
+    );
+    assert_eq!(sim.peek(2).view().role, 3, "member 2 asks");
+    assert_eq!(sim.leader(), Some(1));
+    assert_eq!(sim.term(1), term);
+    sim.stop(3);
+    sim.suspect(1, 3);
+    sim.suspect(2, 3);
+    led_on_by_one(&sim, term);
+    let until = sim.now + (timing.round + timing.span + timing.election).as_nanos() as u64 * 6;
+    sim.run_until_time(until, |sim| {
+        led_on_by_one(sim, term);
+        false
+    });
+    sim.node(1)
+        .propose(b"taken with both suspicions held".to_vec());
+    sim.settle(1);
+    let index = sim.peek(1).view().last_index;
+    let until = sim.now + (timing.round + timing.span + timing.election).as_nanos() as u64 * 6;
+    assert!(
+        sim.run_until_time(until, |sim| {
+            led_on_by_one(sim, term);
+            sim.peek(2).view().applied >= index
+        }),
+        "the write was not applied by member 2"
+    );
+}
+
+/// A leader its detectors leave no quorum counts the voters it suspects among those it beats while
+/// work is in flight: it commits only by some of them. Of three voters one is stopped, and the
+/// leader suspects the other as well, wrongly; the append of its write to that voter is lost, and
+/// its beat sends it again. Left out, as a suspected member is while a trusted quorum is left, the
+/// write waited until the leader trusted the voter again.
+#[test]
+fn a_leader_without_a_trusted_quorum_beats_the_voters_it_suspects() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 23);
+    sim.found(1);
+    let term = sim.term(1);
+    sim.stop(3);
+    sim.suspect(1, 3);
+    sim.suspect(2, 3);
+    sim.suspect(1, 2);
+    sim.node(1).propose(b"its append lost".to_vec());
+    sim.settle(1);
+    let index = sim.peek(1).view().last_index;
+    let lost: Vec<_> = sim
+        .flight
+        .iter()
+        .filter(|(_, m)| m.to == 2 && m.msg_type == MessageType::MsgAppend)
+        .map(|(key, _)| *key)
+        .collect();
+    assert_eq!(lost.len(), 1);
+    sim.flight.remove(&lost[0]);
+    let until = sim.now + (timing.round + timing.span + timing.election).as_nanos() as u64 * 2;
+    assert!(
+        sim.run_until_time(until, |sim| {
+            led_on_by_one(sim, term);
+            sim.peek(2).view().applied >= index
+        }),
+        "the write was not applied by member 2"
+    );
+}
+
+/// A leader that leads on with no quorum its detectors trust answers no read without a quorum's
+/// acknowledgement of a heartbeat round in its term (ReadIndex, thesis §6.4): it holds no lease.
+/// Cut off so that it hears no voter, as a leader whose plane went deaf, it suspects both; they hear
+/// it, and the heir it orders is elected by the other in a later term, which commits a write. The
+/// old leader leads on in its term, unaware, and the read asked of it is not answered; heard again,
+/// it follows the new leader, and the read is let go unanswered. One that answered by a lease would
+/// have answered from a term that had ended, before the write the group committed after it.
+#[test]
+fn a_leader_left_no_quorum_answers_no_read_without_a_quorums_acknowledgement() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 41);
+    sim.found(1);
+    let term = sim.term(1);
+    sim.cut.push(1);
+    sim.suspect(1, 2);
+    sim.suspect(1, 3);
+    sim.node(1).read(b"from a leader cut off".to_vec());
+    sim.settle(1);
+    assert_eq!(
+        sim.peek(1).raw.raft.reads_held(),
+        1,
+        "the leader left no quorum took the read"
+    );
+    assert!(
+        sim.run_until(|sim| sim.leader().is_some_and(|leader| leader != 1)),
+        "the voters that hear each other elected no one"
+    );
+    let new = sim.leader().unwrap();
+    sim.node(new).propose(b"after the old term".to_vec());
+    sim.settle(new);
+    let index = sim.peek(new).view().last_index;
+    assert!(sim.run_until(|sim| sim.peek(new).view().commit >= index));
+    assert_eq!(
+        (sim.peek(1).view().role, sim.term(1)),
+        (2, term),
+        "the old leader learned of the new term while cut off"
+    );
+    let until = sim.now + (timing.round + timing.span + timing.election).as_nanos() as u64 * 4;
+    sim.run_until_time(until, |_| false);
+    assert!(
+        sim.answered.iter().all(|(id, _)| *id != 1),
+        "the leader cut off answered a read: {:?}",
+        sim.answered
+    );
+    assert_eq!(
+        sim.peek(1).raw.raft.reads_held(),
+        1,
+        "the leader cut off let its read go"
+    );
+    sim.cut.clear();
+    assert!(
+        sim.run_until(|sim| sim.term(1) > term),
+        "the old leader never heard the new term"
+    );
+    assert!(
+        sim.answered.iter().all(|(id, _)| *id != 1),
+        "the old leader answered a read: {:?}",
+        sim.answered
+    );
+    assert_eq!(
+        sim.peek(1).raw.raft.reads_held(),
+        0,
+        "the old leader kept its read past its term"
+    );
+}
+
+/// A member whose node announced its stop (`RawNode::stopped`, from hyper-liveness's
+/// `Change::Stopped`) takes no leader from its group, on the fast track as well. A stopping node may
+/// still run its members
+/// for a while, and what it sent may arrive after its announcement: here an order its leader sent
+/// before taking the announcement reaches it, and it campaigns, forced. The members that took the
+/// announcement drop its requests for votes and what it sends of its later term, a fast vote
+/// among it, and the leader, wrongly suspecting the other member too and so left no quorum,
+/// orders it to campaign never.
+/// Taken as a suspicion alone, the forced request moved the leader to the stopping member's term,
+/// leading nothing (`docs/models/SuspicionStopNoDrop.cfg`).
+#[test]
+fn a_member_whose_stop_was_announced_takes_no_leader_from_its_group() {
+    let (timing, _) = timing_for(3);
+    let settings = Settings::fast().by_suspicion();
+    let mut sim = Sim::with(&settings, 3, &Sim::voters(&[1, 2, 3]), timing, 43);
+    sim.found(1);
+    let term = sim.term(1);
+    for id in [1, 2] {
+        sim.node(id).raw.stopped(3).unwrap();
+        sim.settle(id);
+        assert!(sim.peek(id).raw.raft.stops(3) && sim.peek(id).raw.raft.suspects(3));
+    }
+    let from = sim.sent.len();
+    sim.node(3).step(Message {
+        msg_type: MessageType::MsgTimeoutNow,
+        from: 1,
+        to: 3,
+        term,
+        ..Message::default()
+    });
+    sim.settle(3);
+    assert_eq!(
+        sim.term(3),
+        term + 1,
+        "the stopping member campaigned, forced"
+    );
+    sim.suspect(1, 2);
+    assert!(!trusts_a_quorum(&sim, 1));
+    let until = sim.now + (timing.round + timing.span + timing.election).as_nanos() as u64 * 4;
+    sim.run_until_time(until, |_| false);
+    assert_eq!(
+        (sim.peek(1).view().role, sim.term(1)),
+        (2, term),
+        "the leader lost its term to the stopping member"
+    );
+    let view = sim.peek(2).view();
+    assert_eq!(
+        (view.role, view.leader, view.term),
+        (0, 1, term),
+        "the other member left the leader"
+    );
+    assert_eq!(
+        sim.sent[from..]
+            .iter()
+            .filter(|m| m.msg_type == MessageType::MsgTimeoutNow && m.from == 1 && m.to == 3)
+            .count(),
+        0,
+        "the leader ordered the stopping member to campaign"
+    );
+    // A fast vote of its later term, as its fast track would send one: dropped as well.
+    let later = sim.term(3);
+    sim.node(1).step(Message {
+        msg_type: MessageType::MsgFastVote,
+        from: 3,
+        to: 1,
+        term: later,
+        ..Message::default()
+    });
+    sim.settle(1);
+    assert_eq!(
+        (sim.peek(1).view().role, sim.term(1)),
+        (2, term),
+        "a fast vote of the stopping member's term deposed the leader"
+    );
+    sim.node(1).propose(b"while 3 stops".to_vec());
+    sim.settle(1);
+    let index = sim.peek(1).view().last_index;
+    assert!(sim.run_until(|sim| sim.peek(1).view().commit >= index));
+}
+
+/// A leader that removes itself counts its commits by the configuration it wrote, which needs both
+/// of the voters it leaves: with one cut off, the removal waits, and the leader leads on (Ongaro's
+/// thesis §4.2.2). Once the removal is committed and applied, the leader hands the group to a
+/// voter that holds its whole log, and the group elects it.
+#[test]
+fn a_leader_that_removes_itself_hands_over_once_the_voters_it_leaves_commit_it() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 8);
+    sim.found(1);
+    sim.cut.push(3);
+    let change = ConfChangeV2 {
+        transition: ConfChangeTransition::Auto,
+        changes: vec![ConfChangeSingle {
+            change_type: ConfChangeType::RemoveNode,
+            node_id: 1,
+        }],
+        context: vec![],
+    };
+    sim.node(1).propose_change(&change);
+    sim.settle(1);
+    let removal = sim.peek(1).view().last_index;
+    assert!(!sim.run_until(|sim| sim.peek(1).view().role != 2));
+    assert_eq!(sim.peek(1).view().role, 2);
+    assert!(sim.peek(1).view().commit < removal);
+    sim.cut.clear();
+    assert!(sim.run_until(|sim| sim.peek(1).view().role != 2));
+    assert!(
+        sim.sent
+            .iter()
+            .any(|m| m.msg_type == MessageType::MsgTimeoutNow && m.from == 1)
+    );
+    assert!(sim.run_until(|sim| sim.leader().is_some_and(|l| l != 1)));
+}
+
+/// A member whose campaigns its owner holds (its log may lack what it acknowledged, or it is
+/// stalled for room) does not campaign whatever its detectors say, and is due for nothing; let
+/// go, it campaigns.
+#[test]
+fn no_campaign_while_held() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 9);
+    sim.found(1);
+    sim.stop(1);
+    sim.node(2).raw.hold_campaigns(true).unwrap();
+    sim.node(3).raw.hold_campaigns(true).unwrap();
+    let sent = sim.sent.len();
+    sim.suspect(2, 1);
+    sim.suspect(3, 1);
+    assert_eq!(sim.peek(2).deadline(), None);
+    sim.pass(3_600 * 1_000_000_000);
+    assert_eq!(sim.sent.len(), sent);
+    sim.node(2).raw.hold_campaigns(false).unwrap();
+    sim.settle(2);
+    assert!(sim.run_until(|sim| sim.leader() == Some(2)));
+}
+
+/// A restarted leader its owner holds from campaigning (its log was marked) leads nothing, and
+/// its followers trust its node, which lives. It voted for itself in its term, so it may have led
+/// it: it hands over until its term moves, and the group elects without it.
+#[test]
+fn a_restarted_leader_held_from_campaigning_hands_over() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 10);
+    sim.found(1);
+    let store = std::mem::take(sim.node(1).store_mut());
+    let mut node = New::open(1, store, &Settings::focal().by_suspicion(), 99, 3);
+    node.raw.set_timing(timing).unwrap();
+    node.raw.hold_campaigns(true).unwrap();
+    sim.nodes[0] = Some(node);
+    sim.settle(1);
+    for id in [2, 3] {
+        assert_eq!(sim.peek(id).view().leader, 1, "they trust its node");
+    }
+    assert!(sim.run_until(|sim| sim.leader().is_some()));
+    assert!(sim.leader() != Some(1));
+    // Its order is answered once the term has moved, and it stops.
+    assert!(sim.run(), "it handed over for ever");
+}
+
+/// A restarted leader held from campaigning, whose first heir cannot act on the order (cut off
+/// here; a learner by its own configuration in the schedule that found it, seed 75 of the faults
+/// at rest by suspicion), names the next heir that holds as much at its next hand-over: knowing
+/// nothing of what its followers hold, it takes them in turn. Naming the first for good, its
+/// other follower trusted its node and the group elected no one.
+#[test]
+fn a_restarted_leader_hands_over_to_each_heir_in_turn() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 10);
+    sim.found(1);
+    sim.cut.push(2);
+    let store = std::mem::take(sim.node(1).store_mut());
+    let mut node = New::open(1, store, &Settings::focal().by_suspicion(), 99, 3);
+    node.raw.set_timing(timing).unwrap();
+    node.raw.hold_campaigns(true).unwrap();
+    sim.nodes[0] = Some(node);
+    sim.settle(1);
+    assert!(
+        sim.run_until(|sim| sim.leader().is_some()),
+        "its follower kept trusting its node"
+    );
+    assert_eq!(sim.leader(), Some(3));
+}
+
+/// What the detectors said of a member goes when the configuration stops naming it. A member
+/// removed while suspected and added again was still suspected by the leader's core, and nothing
+/// told it otherwise (its owner tells a replica only of the peers it shares a group with); when
+/// another member then failed, the leader counted its live member out of its quorum, stepped down,
+/// and the group, two live voters of three, never elected again: the leader saw no quorum to
+/// campaign with, and the other trusted the leader's node.
+#[test]
+fn a_member_removed_while_suspected_is_believed_anew_when_added_again() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 13);
+    sim.found(1);
+    sim.suspect(1, 3);
+    let change = |change_type, node_id| ConfChangeV2 {
+        transition: ConfChangeTransition::Auto,
+        changes: vec![ConfChangeSingle {
+            change_type,
+            node_id,
+        }],
+        context: vec![],
+    };
+    sim.node(1)
+        .propose_change(&change(ConfChangeType::RemoveNode, 3));
+    sim.settle(1);
+    // Counted by from the moment it is written; the next change waits for it to be applied.
+    let removal = sim.peek(1).view().last_index;
+    assert!(!sim.peek(1).raw.raft.configuration().contains(3));
+    assert!(
+        !sim.peek(1).raw.raft.suspects(3),
+        "removed, it is believed of no more"
+    );
+    assert!(sim.run_until(|sim| sim.peek(1).view().applied >= removal));
+    sim.node(1)
+        .propose_change(&change(ConfChangeType::AddNode, 3));
+    sim.settle(1);
+    let addition = sim.peek(1).view().last_index;
+    assert!(sim.peek(1).raw.raft.configuration().votes(3));
+    assert!(sim.run_until(|sim| sim.peek(1).view().applied >= addition));
+    sim.stop(2);
+    sim.suspect(1, 2);
+    sim.suspect(3, 2);
+    assert!(sim.run(), "the group did not come to rest");
+    assert_eq!(
+        sim.leader(),
+        Some(1),
+        "1 and 3 are a quorum, and 1 leads on"
+    );
+}
+
+/// A leader told a member started again empties its window to it and probes it from what it is
+/// known to hold: what was in flight went with the incarnation that stopped.
+#[test]
+fn a_leader_probes_a_member_that_started_again() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 11);
+    sim.found(1);
+    sim.cut.push(3);
+    sim.node(1).propose(b"lost on its way".to_vec());
+    sim.settle(1);
+    let before = sim.peek(1).raw.raft.tracker().get(3).cloned().unwrap();
+    assert!(before.inflights.count() > 0);
+    sim.node(1).raw.restarted(3).unwrap();
+    let after = sim.peek(1).raw.raft.tracker().get(3).cloned().unwrap();
+    assert_eq!(after.inflights.count(), 0);
+    assert_eq!(after.state, hyper_raft::progress::ProgressState::Probe);
+    assert_eq!(after.next_index, after.matched + 1);
+}
+
+/// A member that holds the leader's whole log, with nothing in flight to it, lost nothing while it
+/// was suspected or as it started again: the leader tells it who leads, and the group, idle, goes
+/// quiet. Probed all the same, it was answered with nothing new, and an answer moves a probe on only
+/// with news, so the leader beat once a round for good, a heartbeat to every member each time,
+/// until the group's next write: after every mistake its detectors withdrew.
+#[test]
+fn a_leader_that_trusts_again_a_member_that_holds_its_log_goes_quiet() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 31);
+    sim.found(1);
+    sim.suspect(1, 2);
+    sim.trust(1, 2);
+    let from = sim.sent.len();
+    assert!(sim.run(), "the leader beat for good after trusting 2 again");
+    assert_eq!(sim.peek(1).deadline(), None);
+    assert!(
+        sim.count_sent(from, MessageType::MsgHeartbeat) <= 2,
+        "the leader beat after trusting 2 again"
+    );
+    sim.node(1).raw.restarted(3).unwrap();
+    sim.settle(1);
+    assert!(sim.run(), "the leader beat for good after 3 started again");
+    assert_eq!(sim.peek(1).deadline(), None);
+}
+
+/// A member cut off while its group commits is sent a window of what the cut loses. Trusted again,
+/// it is taken for unreachable while it was suspected, as a transport's report that it was is
+/// (raft's `MsgUnreachable`): the leader gives the window up and asks where it is at once, not
+/// once a beat has passed with the window unanswered, and it catches up.
+#[test]
+fn a_member_cut_off_while_its_group_commits_is_asked_where_it_is_once_trusted() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 13);
+    sim.found(1);
+    sim.cut.push(3);
+    sim.suspect(1, 3);
+    sim.suspect(2, 3);
+    let window = sim.peek(1).raw.raft.config().max_inflight_msgs;
+    for k in 0..window {
+        sim.node(1)
+            .propose(format!("committed while 3 was cut off: {k}").into_bytes());
+        sim.settle(1);
+        assert!(sim.run(), "1 and 2 commit");
+    }
+    let full = sim.peek(1).raw.raft.tracker().get(3).cloned().unwrap();
+    assert!(
+        full.inflights.full(),
+        "the window to 3 holds what the cut lost: {full:?}"
+    );
+    sim.cut.clear();
+    sim.trust(2, 3);
+    let from = sim.sent.len();
+    sim.trust(1, 3);
+    let asked = sim.peek(1).raw.raft.tracker().get(3).cloned().unwrap();
+    assert_eq!(asked.state, hyper_raft::progress::ProgressState::Probe);
+    assert_eq!(asked.inflights.count(), 0);
+    assert_eq!(asked.next_index, asked.matched + 1);
+    assert_eq!(
+        sim.sent[from..]
+            .iter()
+            .filter(|m| m.to == 3 && m.msg_type == MessageType::MsgHeartbeat)
+            .count(),
+        1,
+        "the leader asks 3 where it is"
+    );
+    assert!(sim.run());
+    let leader = sim.peek(1).view();
+    for id in 2..=3 {
+        let view = sim.peek(id).view();
+        assert_eq!(
+            (view.last_index, view.commit),
+            (leader.last_index, leader.commit),
+            "member {id}"
+        );
+    }
+}
+
+/// A follower whose detectors see its leader's node start again forgets it, and campaigns.
+#[test]
+fn a_follower_forgets_a_leader_that_started_again() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 12);
+    sim.found(1);
+    sim.stop(1);
+    for id in [2, 3] {
+        sim.node(id).raw.restarted(1).unwrap();
+        assert_eq!(sim.peek(id).view().leader, 0);
+        sim.settle(id);
+        assert!(sim.peek(id).deadline().is_some(), "member {id} campaigns");
+    }
+    assert!(sim.run_until(|sim| sim.leader().is_some()));
+}
+
+/// A leader beats only while its group has work in flight: an append lost on its way leaves a
+/// follower behind, the leader wakes a round tail later and sends a heartbeat, the answer shows
+/// the gap, the entry is sent again, and once every member holds it and its commit the leader is
+/// due for nothing.
+#[test]
+fn a_leader_beats_while_work_is_in_flight_and_then_sleeps() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 11);
+    sim.found(1);
+    assert_eq!(sim.peek(1).deadline(), None);
+    sim.node(1).propose(b"lost".to_vec());
+    sim.settle(1);
+    // The append to member 3 is lost.
+    let lost: Vec<_> = sim
+        .flight
+        .iter()
+        .filter(|(_, m)| m.to == 3 && m.msg_type == MessageType::MsgAppend)
+        .map(|(key, _)| *key)
+        .collect();
+    assert_eq!(lost.len(), 1);
+    sim.flight.remove(&lost[0]);
+    let beat = sim
+        .peek(1)
+        .deadline()
+        .expect("work in flight: a beat is due");
+    assert_eq!(beat, sim.now + timing.round.as_nanos() as u64);
+    let from = sim.sent.len();
+    assert!(sim.run());
+    assert!(sim.count_sent(from, MessageType::MsgHeartbeat) > 0);
+    for id in 1..=3 {
+        assert_eq!(sim.peek(id).app().index, 2, "member {id}");
+        assert_eq!(sim.peek(id).deadline(), None, "member {id}");
+    }
+}
+
+/// A sole voter campaigns at once, with no timing at all: it has no one to split a vote with and
+/// no leader to suspect.
+#[test]
+fn a_sole_voter_elects_itself_without_timing() {
+    let settings = Settings::focal().by_suspicion();
+    let mut node = New::open(1, Store::new(Sim::voters(&[1])), &settings, 1, 1);
+    node.wake(0);
+    node.drain();
+    assert_eq!(node.view().role, 2);
+}
+
+/// A sole voter campaigns at once, and once a term: its vote counts once the hard state naming it
+/// is durable (`docs/durable.md` I9), and a wake before then finds it waiting for that write, with
+/// nothing armed. Campaigning at every wake, it moved its term past the write it waited for each
+/// time its owner woke it first, as an owner does after every call: hyper-durable-e2e's member
+/// alone reached term 1,232,434 before one write outran the calls between them.
+#[test]
+fn a_sole_voter_waits_for_its_own_vote_and_campaigns_once() {
+    let settings = Settings::focal().by_suspicion();
+    let mut node = New::open(1, Store::new(Sim::voters(&[1])), &settings, 1, 1);
+    node.wake(0);
+    let term = node.raw.raft.term();
+    assert_eq!(node.raw.raft.state(), hyper_raft::StateRole::Candidate);
+    let ready = node.raw.ready().unwrap();
+    let hard = *ready.hard_state().expect("its term and vote to write");
+    assert_eq!((hard.term, hard.vote), (term, 1));
+    node.raw.advance_issued(ready).unwrap();
+    for now in 1..=3 {
+        node.wake(now);
+        assert_eq!(
+            (node.raw.raft.term(), node.raw.raft.state()),
+            (term, hyper_raft::StateRole::Candidate),
+            "a wake at {now} with its vote out"
+        );
+        assert_eq!(node.raw.deadline(), None, "a campaign armed at {now}");
+    }
+    node.raw.store_mut().0.hard_state = hard;
+    node.raw.on_persist(1).unwrap();
+    assert_eq!(
+        (node.raw.raft.term(), node.raw.raft.state()),
+        (term, hyper_raft::StateRole::Leader)
+    );
+}
+
+/// A member that elects by suspicion takes no ticks, and one on ticks takes no word of its
+/// detectors: each is refused, and nothing changes.
+#[test]
+fn ticks_and_suspicion_do_not_mix() {
+    let settings = Settings::focal().by_suspicion();
+    let mut node = New::open(1, Store::new(Sim::voters(&[1, 2, 3])), &settings, 1, 3);
+    assert!(matches!(
+        node.raw.tick(),
+        Err(hyper_raft::Error::Settings(_))
+    ));
+    let mut ticking = New::open(
+        1,
+        Store::new(Sim::voters(&[1, 2, 3])),
+        &Settings::focal(),
+        1,
+        3,
+    );
+    assert!(matches!(
+        ticking.raw.suspect(2),
+        Err(hyper_raft::Error::Settings(_))
+    ));
+    assert_eq!(ticking.raw.deadline(), None);
+    assert_eq!(ticking.raw.wake(1), Ok(false));
+    // Without pre-vote and check-quorum, elections by suspicion are refused at open.
+    let config = hyper_raft::Config {
+        elections: hyper_raft::Elections::Suspicion,
+        ..hyper_raft::Config::new(1, support::limits(1, 1))
+    };
+    assert!(matches!(
+        config.validate(),
+        Err(hyper_raft::Error::Settings(_))
+    ));
+}
+
+/// A candidate whose voter writes its vote slower than the candidate writes its own is elected by
+/// that voter's grant: once a grant has come, late or not, it knows how long one takes and gives
+/// each candidacy that long before it asks again (`Watch::grant_wait`). The round counts only the
+/// candidate's own writes (the owner's ballot): asking again a round and a draw on, it moved on
+/// before every grant came and spent a term each time, for ever while the voter's disk stayed slow
+/// (Quiver's lab, kiln's CP-T2.2 step 7: 113 terms for one leader's kill, 70 % of the grants
+/// coming after their candidate had moved on). The candidacies that start before the first grant
+/// can come go, each at least a round and a pre-vote's round trip; the one under way when it
+/// comes waits for its own grant and is elected.
+#[test]
+fn a_candidate_waits_for_a_voter_that_writes_its_vote_slowly() {
+    let (timing, _) = timing_for(3);
+    let slow = 8 * timing.round.as_nanos() as u64;
+    for seed in 0..64 {
+        let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, seed);
+        sim.found(1);
+        // Node 2 grants eight rounds after it is asked, and campaigns not at all: node 3 is the
+        // one candidate.
+        sim.slow_votes.insert(2, slow);
+        sim.node(2).raw.hold_campaigns(true).unwrap();
+        let before = sim.term(3);
+        sim.stop(1);
+        sim.suspect(2, 1);
+        sim.suspect(3, 1);
+        let until = sim.now + 200 * slow;
+        assert!(
+            sim.run_until_time(until, |sim| sim.leader() == Some(3)),
+            "seed {seed}: node 3 not elected within {} ms; in term {}, {} terms on",
+            200 * slow / 1_000_000,
+            sim.term(3),
+            sim.term(3) - before
+        );
+        let terms = sim.term(3) - before;
+        let round = timing.round.as_nanos() as u64;
+        let bound = 1 + (slow + 2 * LATENCY).div_ceil(round + 2 * LATENCY);
+        assert!(
+            terms <= bound,
+            "seed {seed}: {terms} terms to elect node 3, more than {bound}"
+        );
+    }
+}

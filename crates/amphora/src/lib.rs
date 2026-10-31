@@ -1,5 +1,38 @@
-//! Amphora: the database kiln keeps every record in: KilnDB made a product. For now this is the `amphora` binary saying what it is; Amphora itself
-//! comes with CP-T1.1 (docs/design/README.md, STATUS.md).
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::disallowed_macros
+    )
+)]
+//! Amphora: the database kiln keeps every record in: KilnDB made a product (docs/design/README.md,
+//! STATUS.md).
+//!
+//! - [`store`]: a database's commit pipeline and its readers (CP-T1.1): one writer with a group
+//!   commit and no timer, durable beside it by a flusher, readers on connections of their own, and
+//!   no checkpoint in a commit's way.
+//! - [`groups`]: a store in groups on one node, keys spread over them by hash, so writes go on in
+//!   parallel.
+//! - [`db`]: stores on Amphora's engine (`crates/engine`).
+//! - [`meter`]: what a store counts.
+//! - [`memory`]: the memory this process may use, as the system says (the process's page pool is a
+//!   part of it).
+//!
+//! The `amphora` binary says what it is ([`reply`]).
+
+pub mod database;
+pub mod db;
+pub mod groups;
+pub mod memory;
+pub mod meter;
+pub mod replication;
+pub mod sql;
+pub mod store;
+pub mod transport;
 
 /// What `amphora` prints for its arguments, where, and the exit status.
 #[derive(Debug, PartialEq, Eq)]

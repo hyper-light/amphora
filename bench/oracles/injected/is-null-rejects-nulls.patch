@@ -1,0 +1,19 @@
+--- a/crates/engine/translate/optimizer/mod.rs
++++ b/crates/engine/translate/optimizer/mod.rs
+@@ -2343,7 +2343,6 @@
+         // These can be TRUE (or produce a non-NULL value) even when every
+         // input is NULL, so nothing below them proves anything.
+         ast::Expr::Binary(_, Is | IsNot, _)
+-        | ast::Expr::IsNull(_)
+         | ast::Expr::NotNull(_)
+         | ast::Expr::Case { .. }
+         | ast::Expr::FunctionCall { .. }
+@@ -2383,7 +2382,7 @@
+         } => rejects(lhs) || (rejects(start) && rejects(end)),
+ 
+         // NULL-propagating wrappers.
+-        ast::Expr::Unary(_, inner) | ast::Expr::Cast { expr: inner, .. } => rejects(inner),
++        ast::Expr::Unary(_, inner) | ast::Expr::Cast { expr: inner, .. } | ast::Expr::IsNull(inner) => rejects(inner),
+         ast::Expr::Collate(inner, _) => rejects(inner),
+         // A single-element parenthesized expression is just grouping; a
+         // row value (more elements) is compared element-wise and can be

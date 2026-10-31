@@ -1,0 +1,105 @@
+> CREATE TABLE c(ck INT, name TEXT);
+
+> CREATE TABLE o(id INTEGER PRIMARY KEY, ck INT);
+
+> INSERT INTO c(ck, name) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500) SELECT i, 'c' || i FROM n;
+
+> INSERT INTO o(ck) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000) SELECT 1 + i % 500 FROM n;
+
+> ANALYZE;
+
+> -- counted
+> SELECT * FROM o JOIN c ON c.ck = o.ck;
+rows: 5000
+plan 0 loops : no estimate, counted 1
+plan 0 hash_build o position 0: estimated 5000 rows, counted 5000
+plan 0 prefix c position 1: estimated 250000 rows, counted 5000
+
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM o JOIN c ON c.ck = o.ck;
+{
+  "nodes": [
+    {
+      "detail": "HASH JOIN c",
+      "id": 1,
+      "op": {
+        "estimate": {
+          "access_cost": 778.5,
+          "input_rows": 5000,
+          "output_rows": 250000,
+          "rows_per_input": 50,
+          "total_cost": 893.5
+        },
+        "join": "inner",
+        "table": "c",
+        "type": "hash_join"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SCAN o",
+      "id": 2,
+      "op": {
+        "estimate": {
+          "access_cost": 115,
+          "input_rows": 1,
+          "output_rows": 5000,
+          "rows_per_input": 5000,
+          "total_cost": 115
+        },
+        "source": "table",
+        "table": "o",
+        "type": "scan"
+      },
+      "parent": null
+    }
+  ],
+  "output_rows": 250000,
+  "result_columns": [
+    "id",
+    "ck",
+    "ck",
+    "name"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM o JOIN c ON c.ck = o.ck",
+  "version": 1
+}
+
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT ck, count(*) FROM o GROUP BY ck;
+{
+  "nodes": [
+    {
+      "detail": "SCAN o",
+      "id": 1,
+      "op": {
+        "estimate": {
+          "access_cost": 115,
+          "input_rows": 1,
+          "output_rows": 5000,
+          "rows_per_input": 5000,
+          "total_cost": 115
+        },
+        "source": "table",
+        "table": "o",
+        "type": "scan"
+      },
+      "parent": null
+    },
+    {
+      "detail": "USE HASH TABLE FOR GROUP BY",
+      "id": 5,
+      "op": {
+        "method": "hash",
+        "type": "group_by"
+      },
+      "parent": null
+    }
+  ],
+  "output_rows": 5000,
+  "result_columns": [
+    "ck",
+    "count(*)"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT ck, count(*) FROM o GROUP BY ck",
+  "version": 1
+}
+

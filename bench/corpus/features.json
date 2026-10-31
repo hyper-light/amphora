@@ -1,0 +1,5275 @@
+{
+ "sqlite_doc": "sqlite-doc-3540100",
+ "counts": {
+  "syntax": 71,
+  "function.core": 51,
+  "function.aggregate": 12,
+  "function.window": 11,
+  "function.datetime": 7,
+  "function.math": 29,
+  "function.json": 34,
+  "datetime.modifier": 19,
+  "pragma": 74,
+  "operator": 51,
+  "parameter": 5,
+  "expression": 4,
+  "affinity": 5,
+  "collation": 3,
+  "storage_class": 5,
+  "rule.affinity": 6,
+  "rule.expression-affinity": 8,
+  "rule.comparison": 11,
+  "rule.sort": 3,
+  "rule.collation": 7,
+  "keyword": 147,
+  "word": 7
+ },
+ "features": [
+  {
+   "id": "syntax:aggregate-function-invocation",
+   "kind": "syntax",
+   "name": "aggregate-function-invocation",
+   "doc": "https://www.sqlite.org/syntax/aggregate-function-invocation.html",
+   "keywords": [
+    "BY",
+    "DISTINCT",
+    "ORDER"
+   ],
+   "productions": [
+    "aggregate-func",
+    "expr",
+    "filter-clause",
+    "ordering-term"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    "*",
+    ","
+   ]
+  },
+  {
+   "id": "syntax:alter-table-stmt",
+   "kind": "syntax",
+   "name": "alter-table-stmt",
+   "doc": "https://www.sqlite.org/syntax/alter-table-stmt.html",
+   "keywords": [
+    "ADD",
+    "ALTER",
+    "CHECK",
+    "COLUMN",
+    "CONSTRAINT",
+    "DROP",
+    "NOT",
+    "NULL",
+    "RENAME",
+    "SET",
+    "TABLE",
+    "TO"
+   ],
+   "productions": [
+    "column-def",
+    "column-name",
+    "conflict-clause",
+    "constraint-name",
+    "expr",
+    "new-column-name",
+    "new-table-name",
+    "schema-name",
+    "table-name"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    "."
+   ]
+  },
+  {
+   "id": "syntax:analyze-stmt",
+   "kind": "syntax",
+   "name": "analyze-stmt",
+   "doc": "https://www.sqlite.org/syntax/analyze-stmt.html",
+   "keywords": [
+    "ANALYZE"
+   ],
+   "productions": [
+    "index-or-table-name",
+    "schema-name",
+    "table-or-index-name"
+   ],
+   "punctuation": [
+    "."
+   ]
+  },
+  {
+   "id": "syntax:attach-stmt",
+   "kind": "syntax",
+   "name": "attach-stmt",
+   "doc": "https://www.sqlite.org/syntax/attach-stmt.html",
+   "keywords": [
+    "AS",
+    "ATTACH",
+    "DATABASE"
+   ],
+   "productions": [
+    "expr",
+    "schema-name"
+   ],
+   "punctuation": []
+  },
+  {
+   "id": "syntax:begin-stmt",
+   "kind": "syntax",
+   "name": "begin-stmt",
+   "doc": "https://www.sqlite.org/syntax/begin-stmt.html",
+   "keywords": [
+    "BEGIN",
+    "DEFERRED",
+    "EXCLUSIVE",
+    "IMMEDIATE",
+    "TRANSACTION"
+   ],
+   "productions": [],
+   "punctuation": []
+  },
+  {
+   "id": "syntax:column-constraint",
+   "kind": "syntax",
+   "name": "column-constraint",
+   "doc": "https://www.sqlite.org/syntax/column-constraint.html",
+   "keywords": [
+    "ALWAYS",
+    "AS",
+    "ASC",
+    "AUTOINCREMENT",
+    "CHECK",
+    "COLLATE",
+    "CONSTRAINT",
+    "DEFAULT",
+    "DESC",
+    "GENERATED",
+    "KEY",
+    "NOT",
+    "NULL",
+    "PRIMARY",
+    "STORED",
+    "UNIQUE",
+    "VIRTUAL"
+   ],
+   "productions": [
+    "collation-name",
+    "conflict-clause",
+    "expr",
+    "foreign-key-clause",
+    "literal-value",
+    "name",
+    "signed-number"
+   ],
+   "punctuation": [
+    "(",
+    ")"
+   ]
+  },
+  {
+   "id": "syntax:column-def",
+   "kind": "syntax",
+   "name": "column-def",
+   "doc": "https://www.sqlite.org/syntax/column-def.html",
+   "keywords": [],
+   "productions": [
+    "column-constraint",
+    "column-name",
+    "type-name"
+   ],
+   "punctuation": []
+  },
+  {
+   "id": "syntax:column-name-list",
+   "kind": "syntax",
+   "name": "column-name-list",
+   "doc": "https://www.sqlite.org/syntax/column-name-list.html",
+   "keywords": [],
+   "productions": [
+    "column-name"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ","
+   ]
+  },
+  {
+   "id": "syntax:comment-syntax",
+   "kind": "syntax",
+   "name": "comment-syntax",
+   "doc": "https://www.sqlite.org/syntax/comment-syntax.html",
+   "keywords": [],
+   "productions": [
+    "anything-except-newline",
+    "end-of-input",
+    "newline"
+   ],
+   "punctuation": [
+    "*/",
+    "--",
+    "/*",
+    "anything-except-*/"
+   ]
+  },
+  {
+   "id": "syntax:commit-stmt",
+   "kind": "syntax",
+   "name": "commit-stmt",
+   "doc": "https://www.sqlite.org/syntax/commit-stmt.html",
+   "keywords": [
+    "COMMIT",
+    "END",
+    "TRANSACTION"
+   ],
+   "productions": [],
+   "punctuation": []
+  },
+  {
+   "id": "syntax:common-table-expression",
+   "kind": "syntax",
+   "name": "common-table-expression",
+   "doc": "https://www.sqlite.org/syntax/common-table-expression.html",
+   "keywords": [
+    "AS",
+    "MATERIALIZED",
+    "NOT"
+   ],
+   "productions": [
+    "column-name",
+    "select-stmt",
+    "table-name"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ","
+   ]
+  },
+  {
+   "id": "syntax:compound-operator",
+   "kind": "syntax",
+   "name": "compound-operator",
+   "doc": "https://www.sqlite.org/syntax/compound-operator.html",
+   "keywords": [
+    "ALL",
+    "EXCEPT",
+    "INTERSECT",
+    "UNION"
+   ],
+   "productions": [],
+   "punctuation": []
+  },
+  {
+   "id": "syntax:compound-select-stmt",
+   "kind": "syntax",
+   "name": "compound-select-stmt",
+   "doc": "https://www.sqlite.org/syntax/compound-select-stmt.html",
+   "keywords": [
+    "ALL",
+    "BY",
+    "EXCEPT",
+    "INTERSECT",
+    "LIMIT",
+    "OFFSET",
+    "ORDER",
+    "RECURSIVE",
+    "UNION",
+    "WITH"
+   ],
+   "productions": [
+    "common-table-expression",
+    "expr",
+    "ordering-term",
+    "select-core"
+   ],
+   "punctuation": [
+    ","
+   ]
+  },
+  {
+   "id": "syntax:conflict-clause",
+   "kind": "syntax",
+   "name": "conflict-clause",
+   "doc": "https://www.sqlite.org/syntax/conflict-clause.html",
+   "keywords": [
+    "ABORT",
+    "CONFLICT",
+    "FAIL",
+    "IGNORE",
+    "ON",
+    "REPLACE",
+    "ROLLBACK"
+   ],
+   "productions": [],
+   "punctuation": []
+  },
+  {
+   "id": "syntax:create-index-stmt",
+   "kind": "syntax",
+   "name": "create-index-stmt",
+   "doc": "https://www.sqlite.org/syntax/create-index-stmt.html",
+   "keywords": [
+    "CREATE",
+    "EXISTS",
+    "IF",
+    "INDEX",
+    "NOT",
+    "ON",
+    "UNIQUE",
+    "WHERE"
+   ],
+   "productions": [
+    "expr",
+    "index-name",
+    "indexed-column",
+    "schema-name",
+    "table-name"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ",",
+    "."
+   ]
+  },
+  {
+   "id": "syntax:create-table-stmt",
+   "kind": "syntax",
+   "name": "create-table-stmt",
+   "doc": "https://www.sqlite.org/syntax/create-table-stmt.html",
+   "keywords": [
+    "AS",
+    "CREATE",
+    "EXISTS",
+    "IF",
+    "NOT",
+    "TABLE",
+    "TEMP",
+    "TEMPORARY"
+   ],
+   "productions": [
+    "column-def",
+    "schema-name",
+    "select-stmt",
+    "table-constraint",
+    "table-name",
+    "table-options"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ",",
+    "."
+   ]
+  },
+  {
+   "id": "syntax:create-trigger-stmt",
+   "kind": "syntax",
+   "name": "create-trigger-stmt",
+   "doc": "https://www.sqlite.org/syntax/create-trigger-stmt.html",
+   "keywords": [
+    "AFTER",
+    "BEFORE",
+    "BEGIN",
+    "CREATE",
+    "DELETE",
+    "EACH",
+    "END",
+    "EXISTS",
+    "FOR",
+    "IF",
+    "INSERT",
+    "INSTEAD",
+    "NOT",
+    "OF",
+    "ON",
+    "ROW",
+    "TEMP",
+    "TEMPORARY",
+    "TRIGGER",
+    "UPDATE",
+    "WHEN"
+   ],
+   "productions": [
+    "column-name",
+    "delete-stmt",
+    "expr",
+    "insert-stmt",
+    "schema-name",
+    "select-stmt",
+    "table-name",
+    "trigger-name",
+    "update-stmt"
+   ],
+   "punctuation": [
+    ",",
+    ".",
+    ";"
+   ]
+  },
+  {
+   "id": "syntax:create-view-stmt",
+   "kind": "syntax",
+   "name": "create-view-stmt",
+   "doc": "https://www.sqlite.org/syntax/create-view-stmt.html",
+   "keywords": [
+    "AS",
+    "CREATE",
+    "EXISTS",
+    "IF",
+    "NOT",
+    "TEMP",
+    "TEMPORARY",
+    "VIEW"
+   ],
+   "productions": [
+    "column-name",
+    "schema-name",
+    "select-stmt",
+    "view-name"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ",",
+    "."
+   ]
+  },
+  {
+   "id": "syntax:create-virtual-table-stmt",
+   "kind": "syntax",
+   "name": "create-virtual-table-stmt",
+   "doc": "https://www.sqlite.org/syntax/create-virtual-table-stmt.html",
+   "keywords": [
+    "CREATE",
+    "EXISTS",
+    "IF",
+    "NOT",
+    "TABLE",
+    "USING",
+    "VIRTUAL"
+   ],
+   "productions": [
+    "module-argument",
+    "module-name",
+    "schema-name",
+    "table-name"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ",",
+    "."
+   ]
+  },
+  {
+   "id": "syntax:cte-table-name",
+   "kind": "syntax",
+   "name": "cte-table-name",
+   "doc": "https://www.sqlite.org/syntax/cte-table-name.html",
+   "keywords": [],
+   "productions": [
+    "column-name",
+    "table-name"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ","
+   ]
+  },
+  {
+   "id": "syntax:delete-stmt-limited",
+   "kind": "syntax",
+   "name": "delete-stmt-limited",
+   "doc": "https://www.sqlite.org/syntax/delete-stmt-limited.html",
+   "keywords": [
+    "BY",
+    "DELETE",
+    "FROM",
+    "LIMIT",
+    "OFFSET",
+    "ORDER",
+    "RECURSIVE",
+    "WHERE",
+    "WITH"
+   ],
+   "productions": [
+    "common-table-expression",
+    "expr",
+    "ordering-term",
+    "qualified-table-name",
+    "returning-clause"
+   ],
+   "punctuation": [
+    ","
+   ]
+  },
+  {
+   "id": "syntax:delete-stmt",
+   "kind": "syntax",
+   "name": "delete-stmt",
+   "doc": "https://www.sqlite.org/syntax/delete-stmt.html",
+   "keywords": [
+    "DELETE",
+    "FROM",
+    "RECURSIVE",
+    "WHERE",
+    "WITH"
+   ],
+   "productions": [
+    "common-table-expression",
+    "expr",
+    "qualified-table-name",
+    "returning-clause"
+   ],
+   "punctuation": [
+    ","
+   ]
+  },
+  {
+   "id": "syntax:detach-stmt",
+   "kind": "syntax",
+   "name": "detach-stmt",
+   "doc": "https://www.sqlite.org/syntax/detach-stmt.html",
+   "keywords": [
+    "DATABASE",
+    "DETACH"
+   ],
+   "productions": [
+    "schema-name"
+   ],
+   "punctuation": []
+  },
+  {
+   "id": "syntax:drop-index-stmt",
+   "kind": "syntax",
+   "name": "drop-index-stmt",
+   "doc": "https://www.sqlite.org/syntax/drop-index-stmt.html",
+   "keywords": [
+    "DROP",
+    "EXISTS",
+    "IF",
+    "INDEX"
+   ],
+   "productions": [
+    "index-name",
+    "schema-name"
+   ],
+   "punctuation": [
+    "."
+   ]
+  },
+  {
+   "id": "syntax:drop-table-stmt",
+   "kind": "syntax",
+   "name": "drop-table-stmt",
+   "doc": "https://www.sqlite.org/syntax/drop-table-stmt.html",
+   "keywords": [
+    "DROP",
+    "EXISTS",
+    "IF",
+    "TABLE"
+   ],
+   "productions": [
+    "schema-name",
+    "table-name"
+   ],
+   "punctuation": [
+    "."
+   ]
+  },
+  {
+   "id": "syntax:drop-trigger-stmt",
+   "kind": "syntax",
+   "name": "drop-trigger-stmt",
+   "doc": "https://www.sqlite.org/syntax/drop-trigger-stmt.html",
+   "keywords": [
+    "DROP",
+    "EXISTS",
+    "IF",
+    "TRIGGER"
+   ],
+   "productions": [
+    "schema-name",
+    "trigger-name"
+   ],
+   "punctuation": [
+    "."
+   ]
+  },
+  {
+   "id": "syntax:drop-view-stmt",
+   "kind": "syntax",
+   "name": "drop-view-stmt",
+   "doc": "https://www.sqlite.org/syntax/drop-view-stmt.html",
+   "keywords": [
+    "DROP",
+    "EXISTS",
+    "IF",
+    "VIEW"
+   ],
+   "productions": [
+    "schema-name",
+    "view-name"
+   ],
+   "punctuation": [
+    "."
+   ]
+  },
+  {
+   "id": "syntax:expr",
+   "kind": "syntax",
+   "name": "expr",
+   "doc": "https://www.sqlite.org/syntax/expr.html",
+   "keywords": [
+    "AND",
+    "AS",
+    "BETWEEN",
+    "CASE",
+    "CAST",
+    "COLLATE",
+    "DISTINCT",
+    "ELSE",
+    "END",
+    "ESCAPE",
+    "EXISTS",
+    "FROM",
+    "GLOB",
+    "IN",
+    "IS",
+    "ISNULL",
+    "LIKE",
+    "MATCH",
+    "NOT",
+    "NOTNULL",
+    "NULL",
+    "REGEXP",
+    "THEN",
+    "WHEN"
+   ],
+   "productions": [
+    "binary-operator",
+    "bind-parameter",
+    "collation-name",
+    "column-name",
+    "expr",
+    "filter-clause",
+    "function-arguments",
+    "function-name",
+    "literal-value",
+    "over-clause",
+    "raise-function",
+    "schema-name",
+    "select-stmt",
+    "table-function",
+    "table-name",
+    "type-name",
+    "unary-operator"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ",",
+    "."
+   ]
+  },
+  {
+   "id": "syntax:factored-select-stmt",
+   "kind": "syntax",
+   "name": "factored-select-stmt",
+   "doc": "https://www.sqlite.org/syntax/factored-select-stmt.html",
+   "keywords": [
+    "BY",
+    "LIMIT",
+    "OFFSET",
+    "ORDER",
+    "RECURSIVE",
+    "WITH"
+   ],
+   "productions": [
+    "common-table-expression",
+    "compound-operator",
+    "expr",
+    "ordering-term",
+    "select-core"
+   ],
+   "punctuation": [
+    ","
+   ]
+  },
+  {
+   "id": "syntax:filter-clause",
+   "kind": "syntax",
+   "name": "filter-clause",
+   "doc": "https://www.sqlite.org/syntax/filter-clause.html",
+   "keywords": [
+    "FILTER",
+    "WHERE"
+   ],
+   "productions": [
+    "expr"
+   ],
+   "punctuation": [
+    "(",
+    ")"
+   ]
+  },
+  {
+   "id": "syntax:foreign-key-clause",
+   "kind": "syntax",
+   "name": "foreign-key-clause",
+   "doc": "https://www.sqlite.org/syntax/foreign-key-clause.html",
+   "keywords": [
+    "ACTION",
+    "CASCADE",
+    "DEFAULT",
+    "DEFERRABLE",
+    "DEFERRED",
+    "DELETE",
+    "IMMEDIATE",
+    "INITIALLY",
+    "MATCH",
+    "NO",
+    "NOT",
+    "NULL",
+    "ON",
+    "REFERENCES",
+    "RESTRICT",
+    "SET",
+    "UPDATE"
+   ],
+   "productions": [
+    "column-name",
+    "foreign-table",
+    "name"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ","
+   ]
+  },
+  {
+   "id": "syntax:frame-spec",
+   "kind": "syntax",
+   "name": "frame-spec",
+   "doc": "https://www.sqlite.org/syntax/frame-spec.html",
+   "keywords": [
+    "AND",
+    "BETWEEN",
+    "CURRENT",
+    "EXCLUDE",
+    "FOLLOWING",
+    "GROUP",
+    "GROUPS",
+    "NO",
+    "OTHERS",
+    "PRECEDING",
+    "RANGE",
+    "ROW",
+    "ROWS",
+    "TIES",
+    "UNBOUNDED"
+   ],
+   "productions": [
+    "expr"
+   ],
+   "punctuation": []
+  },
+  {
+   "id": "syntax:function-arguments",
+   "kind": "syntax",
+   "name": "function-arguments",
+   "doc": "https://www.sqlite.org/syntax/function-arguments.html",
+   "keywords": [
+    "BY",
+    "DISTINCT",
+    "ORDER"
+   ],
+   "productions": [
+    "expr",
+    "ordering-term"
+   ],
+   "punctuation": [
+    "*",
+    ","
+   ]
+  },
+  {
+   "id": "syntax:indexed-column",
+   "kind": "syntax",
+   "name": "indexed-column",
+   "doc": "https://www.sqlite.org/syntax/indexed-column.html",
+   "keywords": [
+    "ASC",
+    "COLLATE",
+    "DESC"
+   ],
+   "productions": [
+    "collation-name",
+    "column-name",
+    "expr"
+   ],
+   "punctuation": []
+  },
+  {
+   "id": "syntax:insert-stmt",
+   "kind": "syntax",
+   "name": "insert-stmt",
+   "doc": "https://www.sqlite.org/syntax/insert-stmt.html",
+   "keywords": [
+    "ABORT",
+    "AS",
+    "DEFAULT",
+    "FAIL",
+    "IGNORE",
+    "INSERT",
+    "INTO",
+    "OR",
+    "RECURSIVE",
+    "REPLACE",
+    "ROLLBACK",
+    "VALUES",
+    "WITH"
+   ],
+   "productions": [
+    "alias",
+    "column-name",
+    "common-table-expression",
+    "expr",
+    "returning-clause",
+    "schema-name",
+    "select-stmt",
+    "table-name",
+    "upsert-clause"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ",",
+    "."
+   ]
+  },
+  {
+   "id": "syntax:join-clause",
+   "kind": "syntax",
+   "name": "join-clause",
+   "doc": "https://www.sqlite.org/syntax/join-clause.html",
+   "keywords": [],
+   "productions": [
+    "join-constraint",
+    "join-operator",
+    "table-or-subquery"
+   ],
+   "punctuation": []
+  },
+  {
+   "id": "syntax:join-constraint",
+   "kind": "syntax",
+   "name": "join-constraint",
+   "doc": "https://www.sqlite.org/syntax/join-constraint.html",
+   "keywords": [
+    "ON",
+    "USING"
+   ],
+   "productions": [
+    "column-name",
+    "expr"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ","
+   ]
+  },
+  {
+   "id": "syntax:join-operator",
+   "kind": "syntax",
+   "name": "join-operator",
+   "doc": "https://www.sqlite.org/syntax/join-operator.html",
+   "keywords": [
+    "CROSS",
+    "FULL",
+    "INNER",
+    "JOIN",
+    "LEFT",
+    "NATURAL",
+    "OUTER",
+    "RIGHT"
+   ],
+   "productions": [],
+   "punctuation": [
+    ","
+   ]
+  },
+  {
+   "id": "syntax:literal-value",
+   "kind": "syntax",
+   "name": "literal-value",
+   "doc": "https://www.sqlite.org/syntax/literal-value.html",
+   "keywords": [
+    "CURRENT_DATE",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "FALSE",
+    "NULL",
+    "TRUE"
+   ],
+   "productions": [
+    "blob-literal",
+    "numeric-literal",
+    "string-literal"
+   ],
+   "punctuation": []
+  },
+  {
+   "id": "syntax:numeric-literal",
+   "kind": "syntax",
+   "name": "numeric-literal",
+   "doc": "https://www.sqlite.org/syntax/numeric-literal.html",
+   "keywords": [
+    "E"
+   ],
+   "productions": [
+    "digit",
+    "e",
+    "hexdigit"
+   ],
+   "punctuation": [
+    "+",
+    "-",
+    ".",
+    "0X",
+    "0x",
+    "_"
+   ]
+  },
+  {
+   "id": "syntax:ordering-term",
+   "kind": "syntax",
+   "name": "ordering-term",
+   "doc": "https://www.sqlite.org/syntax/ordering-term.html",
+   "keywords": [
+    "ASC",
+    "COLLATE",
+    "DESC",
+    "FIRST",
+    "LAST",
+    "NULLS"
+   ],
+   "productions": [
+    "collation-name",
+    "expr"
+   ],
+   "punctuation": []
+  },
+  {
+   "id": "syntax:over-clause",
+   "kind": "syntax",
+   "name": "over-clause",
+   "doc": "https://www.sqlite.org/syntax/over-clause.html",
+   "keywords": [
+    "BY",
+    "ORDER",
+    "OVER",
+    "PARTITION"
+   ],
+   "productions": [
+    "base-window-name",
+    "expr",
+    "frame-spec",
+    "ordering-term",
+    "window-name"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ","
+   ]
+  },
+  {
+   "id": "syntax:pragma-stmt",
+   "kind": "syntax",
+   "name": "pragma-stmt",
+   "doc": "https://www.sqlite.org/syntax/pragma-stmt.html",
+   "keywords": [
+    "PRAGMA"
+   ],
+   "productions": [
+    "pragma-name",
+    "pragma-value",
+    "schema-name"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ".",
+    "="
+   ]
+  },
+  {
+   "id": "syntax:pragma-value",
+   "kind": "syntax",
+   "name": "pragma-value",
+   "doc": "https://www.sqlite.org/syntax/pragma-value.html",
+   "keywords": [],
+   "productions": [
+    "name",
+    "signed-literal",
+    "signed-number"
+   ],
+   "punctuation": []
+  },
+  {
+   "id": "syntax:qualified-table-name",
+   "kind": "syntax",
+   "name": "qualified-table-name",
+   "doc": "https://www.sqlite.org/syntax/qualified-table-name.html",
+   "keywords": [
+    "AS",
+    "BY",
+    "INDEXED",
+    "NOT"
+   ],
+   "productions": [
+    "alias",
+    "index-name",
+    "schema-name",
+    "table-name"
+   ],
+   "punctuation": [
+    "."
+   ]
+  },
+  {
+   "id": "syntax:raise-function",
+   "kind": "syntax",
+   "name": "raise-function",
+   "doc": "https://www.sqlite.org/syntax/raise-function.html",
+   "keywords": [
+    "ABORT",
+    "FAIL",
+    "IGNORE",
+    "RAISE",
+    "ROLLBACK"
+   ],
+   "productions": [
+    "expr"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ","
+   ]
+  },
+  {
+   "id": "syntax:recursive-cte",
+   "kind": "syntax",
+   "name": "recursive-cte",
+   "doc": "https://www.sqlite.org/syntax/recursive-cte.html",
+   "keywords": [
+    "ALL",
+    "AS",
+    "UNION"
+   ],
+   "productions": [
+    "cte-table-name",
+    "initial-select",
+    "recursive-select"
+   ],
+   "punctuation": [
+    "(",
+    ")"
+   ]
+  },
+  {
+   "id": "syntax:reindex-stmt",
+   "kind": "syntax",
+   "name": "reindex-stmt",
+   "doc": "https://www.sqlite.org/syntax/reindex-stmt.html",
+   "keywords": [
+    "EXPRESSIONS",
+    "REINDEX"
+   ],
+   "productions": [
+    "collation-name",
+    "index-name",
+    "schema-name",
+    "table-name"
+   ],
+   "punctuation": [
+    "."
+   ]
+  },
+  {
+   "id": "syntax:release-stmt",
+   "kind": "syntax",
+   "name": "release-stmt",
+   "doc": "https://www.sqlite.org/syntax/release-stmt.html",
+   "keywords": [
+    "RELEASE",
+    "SAVEPOINT"
+   ],
+   "productions": [
+    "savepoint-name"
+   ],
+   "punctuation": []
+  },
+  {
+   "id": "syntax:result-column",
+   "kind": "syntax",
+   "name": "result-column",
+   "doc": "https://www.sqlite.org/syntax/result-column.html",
+   "keywords": [
+    "AS"
+   ],
+   "productions": [
+    "column-alias",
+    "expr",
+    "table-name"
+   ],
+   "punctuation": [
+    "*",
+    "."
+   ]
+  },
+  {
+   "id": "syntax:returning-clause",
+   "kind": "syntax",
+   "name": "returning-clause",
+   "doc": "https://www.sqlite.org/syntax/returning-clause.html",
+   "keywords": [
+    "AS",
+    "RETURNING"
+   ],
+   "productions": [
+    "column-alias",
+    "expr"
+   ],
+   "punctuation": [
+    "*",
+    ","
+   ]
+  },
+  {
+   "id": "syntax:rollback-stmt",
+   "kind": "syntax",
+   "name": "rollback-stmt",
+   "doc": "https://www.sqlite.org/syntax/rollback-stmt.html",
+   "keywords": [
+    "ROLLBACK",
+    "SAVEPOINT",
+    "TO",
+    "TRANSACTION"
+   ],
+   "productions": [
+    "savepoint-name"
+   ],
+   "punctuation": []
+  },
+  {
+   "id": "syntax:savepoint-stmt",
+   "kind": "syntax",
+   "name": "savepoint-stmt",
+   "doc": "https://www.sqlite.org/syntax/savepoint-stmt.html",
+   "keywords": [
+    "SAVEPOINT"
+   ],
+   "productions": [
+    "savepoint-name"
+   ],
+   "punctuation": []
+  },
+  {
+   "id": "syntax:select-core",
+   "kind": "syntax",
+   "name": "select-core",
+   "doc": "https://www.sqlite.org/syntax/select-core.html",
+   "keywords": [
+    "ALL",
+    "AS",
+    "BY",
+    "DISTINCT",
+    "FROM",
+    "GROUP",
+    "HAVING",
+    "SELECT",
+    "VALUES",
+    "WHERE",
+    "WINDOW"
+   ],
+   "productions": [
+    "expr",
+    "join-clause",
+    "result-column",
+    "table-or-subquery",
+    "window-defn",
+    "window-name"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ","
+   ]
+  },
+  {
+   "id": "syntax:select-stmt",
+   "kind": "syntax",
+   "name": "select-stmt",
+   "doc": "https://www.sqlite.org/syntax/select-stmt.html",
+   "keywords": [
+    "ALL",
+    "AS",
+    "BY",
+    "DISTINCT",
+    "FROM",
+    "GROUP",
+    "HAVING",
+    "LIMIT",
+    "OFFSET",
+    "ORDER",
+    "RECURSIVE",
+    "SELECT",
+    "VALUES",
+    "WHERE",
+    "WINDOW",
+    "WITH"
+   ],
+   "productions": [
+    "common-table-expression",
+    "compound-operator",
+    "expr",
+    "join-clause",
+    "ordering-term",
+    "result-column",
+    "select-core",
+    "table-or-subquery",
+    "window-defn",
+    "window-name"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ","
+   ]
+  },
+  {
+   "id": "syntax:signed-number",
+   "kind": "syntax",
+   "name": "signed-number",
+   "doc": "https://www.sqlite.org/syntax/signed-number.html",
+   "keywords": [],
+   "productions": [
+    "numeric-literal"
+   ],
+   "punctuation": [
+    "+",
+    "-"
+   ]
+  },
+  {
+   "id": "syntax:simple-function-invocation",
+   "kind": "syntax",
+   "name": "simple-function-invocation",
+   "doc": "https://www.sqlite.org/syntax/simple-function-invocation.html",
+   "keywords": [],
+   "productions": [
+    "expr",
+    "simple-func"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    "*",
+    ","
+   ]
+  },
+  {
+   "id": "syntax:simple-select-stmt",
+   "kind": "syntax",
+   "name": "simple-select-stmt",
+   "doc": "https://www.sqlite.org/syntax/simple-select-stmt.html",
+   "keywords": [
+    "BY",
+    "LIMIT",
+    "OFFSET",
+    "ORDER",
+    "RECURSIVE",
+    "WITH"
+   ],
+   "productions": [
+    "common-table-expression",
+    "expr",
+    "ordering-term",
+    "select-core"
+   ],
+   "punctuation": [
+    ","
+   ]
+  },
+  {
+   "id": "syntax:sql-stmt-list",
+   "kind": "syntax",
+   "name": "sql-stmt-list",
+   "doc": "https://www.sqlite.org/syntax/sql-stmt-list.html",
+   "keywords": [],
+   "productions": [
+    "sql-stmt"
+   ],
+   "punctuation": [
+    ";"
+   ]
+  },
+  {
+   "id": "syntax:sql-stmt",
+   "kind": "syntax",
+   "name": "sql-stmt",
+   "doc": "https://www.sqlite.org/syntax/sql-stmt.html",
+   "keywords": [
+    "EXPLAIN",
+    "PLAN",
+    "QUERY"
+   ],
+   "productions": [
+    "alter-table-stmt",
+    "analyze-stmt",
+    "attach-stmt",
+    "begin-stmt",
+    "commit-stmt",
+    "create-index-stmt",
+    "create-table-stmt",
+    "create-trigger-stmt",
+    "create-view-stmt",
+    "create-virtual-table-stmt",
+    "delete-stmt",
+    "delete-stmt-limited",
+    "detach-stmt",
+    "drop-index-stmt",
+    "drop-table-stmt",
+    "drop-trigger-stmt",
+    "drop-view-stmt",
+    "insert-stmt",
+    "pragma-stmt",
+    "reindex-stmt",
+    "release-stmt",
+    "rollback-stmt",
+    "savepoint-stmt",
+    "select-stmt",
+    "update-stmt",
+    "update-stmt-limited",
+    "vacuum-stmt"
+   ],
+   "punctuation": []
+  },
+  {
+   "id": "syntax:table-constraint",
+   "kind": "syntax",
+   "name": "table-constraint",
+   "doc": "https://www.sqlite.org/syntax/table-constraint.html",
+   "keywords": [
+    "AUTOINCREMENT",
+    "CHECK",
+    "CONSTRAINT",
+    "FOREIGN",
+    "KEY",
+    "PRIMARY",
+    "UNIQUE"
+   ],
+   "productions": [
+    "column-name",
+    "conflict-clause",
+    "expr",
+    "foreign-key-clause",
+    "indexed-column",
+    "name"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ","
+   ]
+  },
+  {
+   "id": "syntax:table-options",
+   "kind": "syntax",
+   "name": "table-options",
+   "doc": "https://www.sqlite.org/syntax/table-options.html",
+   "keywords": [
+    "ROWID",
+    "STRICT",
+    "WITHOUT"
+   ],
+   "productions": [],
+   "punctuation": [
+    ","
+   ]
+  },
+  {
+   "id": "syntax:table-or-subquery",
+   "kind": "syntax",
+   "name": "table-or-subquery",
+   "doc": "https://www.sqlite.org/syntax/table-or-subquery.html",
+   "keywords": [
+    "AS",
+    "BY",
+    "INDEXED",
+    "NOT"
+   ],
+   "productions": [
+    "expr",
+    "index-name",
+    "join-clause",
+    "schema-name",
+    "select-stmt",
+    "table-alias",
+    "table-function-name",
+    "table-name",
+    "table-or-subquery"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ",",
+    "."
+   ]
+  },
+  {
+   "id": "syntax:type-name",
+   "kind": "syntax",
+   "name": "type-name",
+   "doc": "https://www.sqlite.org/syntax/type-name.html",
+   "keywords": [],
+   "productions": [
+    "name",
+    "signed-number"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ","
+   ]
+  },
+  {
+   "id": "syntax:update-stmt-limited",
+   "kind": "syntax",
+   "name": "update-stmt-limited",
+   "doc": "https://www.sqlite.org/syntax/update-stmt-limited.html",
+   "keywords": [
+    "ABORT",
+    "BY",
+    "FAIL",
+    "FROM",
+    "IGNORE",
+    "LIMIT",
+    "OFFSET",
+    "OR",
+    "ORDER",
+    "RECURSIVE",
+    "REPLACE",
+    "ROLLBACK",
+    "SET",
+    "UPDATE",
+    "WHERE",
+    "WITH"
+   ],
+   "productions": [
+    "column-name",
+    "column-name-list",
+    "common-table-expression",
+    "expr",
+    "join-clause",
+    "ordering-term",
+    "qualified-table-name",
+    "returning-clause",
+    "table-or-subquery"
+   ],
+   "punctuation": [
+    ",",
+    "="
+   ]
+  },
+  {
+   "id": "syntax:update-stmt",
+   "kind": "syntax",
+   "name": "update-stmt",
+   "doc": "https://www.sqlite.org/syntax/update-stmt.html",
+   "keywords": [
+    "ABORT",
+    "FAIL",
+    "FROM",
+    "IGNORE",
+    "OR",
+    "RECURSIVE",
+    "REPLACE",
+    "ROLLBACK",
+    "SET",
+    "UPDATE",
+    "WHERE",
+    "WITH"
+   ],
+   "productions": [
+    "column-name",
+    "column-name-list",
+    "common-table-expression",
+    "expr",
+    "join-clause",
+    "qualified-table-name",
+    "returning-clause",
+    "table-or-subquery"
+   ],
+   "punctuation": [
+    ",",
+    "="
+   ]
+  },
+  {
+   "id": "syntax:upsert-clause",
+   "kind": "syntax",
+   "name": "upsert-clause",
+   "doc": "https://www.sqlite.org/syntax/upsert-clause.html",
+   "keywords": [
+    "CONFLICT",
+    "DO",
+    "NOTHING",
+    "ON",
+    "SET",
+    "UPDATE",
+    "WHERE"
+   ],
+   "productions": [
+    "column-name",
+    "column-name-list",
+    "expr",
+    "indexed-column"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ",",
+    "=",
+    "conflict\u00a0target"
+   ]
+  },
+  {
+   "id": "syntax:vacuum-stmt",
+   "kind": "syntax",
+   "name": "vacuum-stmt",
+   "doc": "https://www.sqlite.org/syntax/vacuum-stmt.html",
+   "keywords": [
+    "INTO",
+    "VACUUM"
+   ],
+   "productions": [
+    "filename",
+    "schema-name"
+   ],
+   "punctuation": []
+  },
+  {
+   "id": "syntax:window-defn",
+   "kind": "syntax",
+   "name": "window-defn",
+   "doc": "https://www.sqlite.org/syntax/window-defn.html",
+   "keywords": [
+    "BY",
+    "ORDER",
+    "PARTITION"
+   ],
+   "productions": [
+    "base-window-name",
+    "expr",
+    "frame-spec",
+    "ordering-term"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ","
+   ]
+  },
+  {
+   "id": "syntax:window-function-invocation",
+   "kind": "syntax",
+   "name": "window-function-invocation",
+   "doc": "https://www.sqlite.org/syntax/window-function-invocation.html",
+   "keywords": [
+    "OVER"
+   ],
+   "productions": [
+    "expr",
+    "filter-clause",
+    "window-defn",
+    "window-func",
+    "window-name"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    "*",
+    ","
+   ]
+  },
+  {
+   "id": "syntax:with-clause",
+   "kind": "syntax",
+   "name": "with-clause",
+   "doc": "https://www.sqlite.org/syntax/with-clause.html",
+   "keywords": [
+    "AS",
+    "MATERIALIZED",
+    "NOT",
+    "RECURSIVE",
+    "WITH"
+   ],
+   "productions": [
+    "cte-table-name",
+    "select-stmt"
+   ],
+   "punctuation": [
+    "(",
+    ")",
+    ","
+   ]
+  },
+  {
+   "id": "function.core:abs",
+   "kind": "function.core",
+   "name": "abs",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#abs",
+   "signatures": [
+    "abs(X)"
+   ]
+  },
+  {
+   "id": "function.core:changes",
+   "kind": "function.core",
+   "name": "changes",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#changes",
+   "signatures": [
+    "changes()"
+   ]
+  },
+  {
+   "id": "function.core:char",
+   "kind": "function.core",
+   "name": "char",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#char",
+   "signatures": [
+    "char(X1,X2,...,XN)"
+   ]
+  },
+  {
+   "id": "function.core:coalesce",
+   "kind": "function.core",
+   "name": "coalesce",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#coalesce",
+   "signatures": [
+    "coalesce(X,Y,...)"
+   ]
+  },
+  {
+   "id": "function.core:concat",
+   "kind": "function.core",
+   "name": "concat",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#concat",
+   "signatures": [
+    "concat(X,...)"
+   ]
+  },
+  {
+   "id": "function.core:concat_ws",
+   "kind": "function.core",
+   "name": "concat_ws",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#concat_ws",
+   "signatures": [
+    "concat_ws(SEP,X,...)"
+   ]
+  },
+  {
+   "id": "function.core:format",
+   "kind": "function.core",
+   "name": "format",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#format",
+   "signatures": [
+    "format(FORMAT,...)"
+   ]
+  },
+  {
+   "id": "function.core:glob",
+   "kind": "function.core",
+   "name": "glob",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#glob",
+   "signatures": [
+    "glob(X,Y)"
+   ]
+  },
+  {
+   "id": "function.core:hex",
+   "kind": "function.core",
+   "name": "hex",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#hex",
+   "signatures": [
+    "hex(X)"
+   ]
+  },
+  {
+   "id": "function.core:if",
+   "kind": "function.core",
+   "name": "if",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#if",
+   "signatures": [
+    "if(B1,V1,...)"
+   ]
+  },
+  {
+   "id": "function.core:ifnull",
+   "kind": "function.core",
+   "name": "ifnull",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#ifnull",
+   "signatures": [
+    "ifnull(X,Y)"
+   ]
+  },
+  {
+   "id": "function.core:iif",
+   "kind": "function.core",
+   "name": "iif",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#iif",
+   "signatures": [
+    "iif(B1,V1,...)"
+   ]
+  },
+  {
+   "id": "function.core:instr",
+   "kind": "function.core",
+   "name": "instr",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#instr",
+   "signatures": [
+    "instr(X,Y)"
+   ]
+  },
+  {
+   "id": "function.core:last_insert_rowid",
+   "kind": "function.core",
+   "name": "last_insert_rowid",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#last_insert_rowid",
+   "signatures": [
+    "last_insert_rowid()"
+   ]
+  },
+  {
+   "id": "function.core:length",
+   "kind": "function.core",
+   "name": "length",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#length",
+   "signatures": [
+    "length(X)"
+   ]
+  },
+  {
+   "id": "function.core:like",
+   "kind": "function.core",
+   "name": "like",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#like",
+   "signatures": [
+    "like(X,Y)",
+    "like(X,Y,Z)"
+   ]
+  },
+  {
+   "id": "function.core:likelihood",
+   "kind": "function.core",
+   "name": "likelihood",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#likelihood",
+   "signatures": [
+    "likelihood(X,Y)"
+   ]
+  },
+  {
+   "id": "function.core:likely",
+   "kind": "function.core",
+   "name": "likely",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#likely",
+   "signatures": [
+    "likely(X)"
+   ]
+  },
+  {
+   "id": "function.core:load_extension",
+   "kind": "function.core",
+   "name": "load_extension",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#load_extension",
+   "signatures": [
+    "load_extension(X)",
+    "load_extension(X,Y)"
+   ]
+  },
+  {
+   "id": "function.core:lower",
+   "kind": "function.core",
+   "name": "lower",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#lower",
+   "signatures": [
+    "lower(X)"
+   ]
+  },
+  {
+   "id": "function.core:ltrim",
+   "kind": "function.core",
+   "name": "ltrim",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#ltrim",
+   "signatures": [
+    "ltrim(X)",
+    "ltrim(X,Y)"
+   ]
+  },
+  {
+   "id": "function.core:max",
+   "kind": "function.core",
+   "name": "max",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#max",
+   "signatures": [
+    "max(X,Y,...)"
+   ]
+  },
+  {
+   "id": "function.core:min",
+   "kind": "function.core",
+   "name": "min",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#min",
+   "signatures": [
+    "min(X,Y,...)"
+   ]
+  },
+  {
+   "id": "function.core:nullif",
+   "kind": "function.core",
+   "name": "nullif",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#nullif",
+   "signatures": [
+    "nullif(X,Y)"
+   ]
+  },
+  {
+   "id": "function.core:octet_length",
+   "kind": "function.core",
+   "name": "octet_length",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#octet_length",
+   "signatures": [
+    "octet_length(X)"
+   ]
+  },
+  {
+   "id": "function.core:printf",
+   "kind": "function.core",
+   "name": "printf",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#printf",
+   "signatures": [
+    "printf(FORMAT,...)"
+   ]
+  },
+  {
+   "id": "function.core:quote",
+   "kind": "function.core",
+   "name": "quote",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#quote",
+   "signatures": [
+    "quote(X)"
+   ]
+  },
+  {
+   "id": "function.core:random",
+   "kind": "function.core",
+   "name": "random",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#random",
+   "signatures": [
+    "random()"
+   ]
+  },
+  {
+   "id": "function.core:randomblob",
+   "kind": "function.core",
+   "name": "randomblob",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#randomblob",
+   "signatures": [
+    "randomblob(N)"
+   ]
+  },
+  {
+   "id": "function.core:replace",
+   "kind": "function.core",
+   "name": "replace",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#replace",
+   "signatures": [
+    "replace(X,Y,Z)"
+   ]
+  },
+  {
+   "id": "function.core:round",
+   "kind": "function.core",
+   "name": "round",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#round",
+   "signatures": [
+    "round(X)",
+    "round(X,Y)"
+   ]
+  },
+  {
+   "id": "function.core:rtrim",
+   "kind": "function.core",
+   "name": "rtrim",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#rtrim",
+   "signatures": [
+    "rtrim(X)",
+    "rtrim(X,Y)"
+   ]
+  },
+  {
+   "id": "function.core:sign",
+   "kind": "function.core",
+   "name": "sign",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#sign",
+   "signatures": [
+    "sign(X)"
+   ]
+  },
+  {
+   "id": "function.core:soundex",
+   "kind": "function.core",
+   "name": "soundex",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#soundex",
+   "signatures": [
+    "soundex(X)"
+   ]
+  },
+  {
+   "id": "function.core:sqlite_compileoption_get",
+   "kind": "function.core",
+   "name": "sqlite_compileoption_get",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#sqlite_compileoption_get",
+   "signatures": [
+    "sqlite_compileoption_get(N)"
+   ]
+  },
+  {
+   "id": "function.core:sqlite_compileoption_used",
+   "kind": "function.core",
+   "name": "sqlite_compileoption_used",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#sqlite_compileoption_used",
+   "signatures": [
+    "sqlite_compileoption_used(X)"
+   ]
+  },
+  {
+   "id": "function.core:sqlite_offset",
+   "kind": "function.core",
+   "name": "sqlite_offset",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#sqlite_offset",
+   "signatures": [
+    "sqlite_offset(X)"
+   ]
+  },
+  {
+   "id": "function.core:sqlite_source_id",
+   "kind": "function.core",
+   "name": "sqlite_source_id",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#sqlite_source_id",
+   "signatures": [
+    "sqlite_source_id()"
+   ]
+  },
+  {
+   "id": "function.core:sqlite_version",
+   "kind": "function.core",
+   "name": "sqlite_version",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#sqlite_version",
+   "signatures": [
+    "sqlite_version()"
+   ]
+  },
+  {
+   "id": "function.core:substr",
+   "kind": "function.core",
+   "name": "substr",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#substr",
+   "signatures": [
+    "substr(X,Y)",
+    "substr(X,Y,Z)"
+   ]
+  },
+  {
+   "id": "function.core:substring",
+   "kind": "function.core",
+   "name": "substring",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#substring",
+   "signatures": [
+    "substring(X,Y)",
+    "substring(X,Y,Z)"
+   ]
+  },
+  {
+   "id": "function.core:total_changes",
+   "kind": "function.core",
+   "name": "total_changes",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#total_changes",
+   "signatures": [
+    "total_changes()"
+   ]
+  },
+  {
+   "id": "function.core:trim",
+   "kind": "function.core",
+   "name": "trim",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#trim",
+   "signatures": [
+    "trim(X)",
+    "trim(X,Y)"
+   ]
+  },
+  {
+   "id": "function.core:typeof",
+   "kind": "function.core",
+   "name": "typeof",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#typeof",
+   "signatures": [
+    "typeof(X)"
+   ]
+  },
+  {
+   "id": "function.core:unhex",
+   "kind": "function.core",
+   "name": "unhex",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#unhex",
+   "signatures": [
+    "unhex(X)",
+    "unhex(X,Y)"
+   ]
+  },
+  {
+   "id": "function.core:unicode",
+   "kind": "function.core",
+   "name": "unicode",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#unicode",
+   "signatures": [
+    "unicode(X)"
+   ]
+  },
+  {
+   "id": "function.core:unistr",
+   "kind": "function.core",
+   "name": "unistr",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#unistr",
+   "signatures": [
+    "unistr(X)"
+   ]
+  },
+  {
+   "id": "function.core:unistr_quote",
+   "kind": "function.core",
+   "name": "unistr_quote",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#unistr_quote",
+   "signatures": [
+    "unistr_quote(X)"
+   ]
+  },
+  {
+   "id": "function.core:unlikely",
+   "kind": "function.core",
+   "name": "unlikely",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#unlikely",
+   "signatures": [
+    "unlikely(X)"
+   ]
+  },
+  {
+   "id": "function.core:upper",
+   "kind": "function.core",
+   "name": "upper",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#upper",
+   "signatures": [
+    "upper(X)"
+   ]
+  },
+  {
+   "id": "function.core:zeroblob",
+   "kind": "function.core",
+   "name": "zeroblob",
+   "doc": "https://www.sqlite.org/lang_corefunc.html#zeroblob",
+   "signatures": [
+    "zeroblob(N)"
+   ]
+  },
+  {
+   "id": "function.aggregate:avg",
+   "kind": "function.aggregate",
+   "name": "avg",
+   "doc": "https://www.sqlite.org/lang_aggfunc.html#avg",
+   "signatures": [
+    "avg()",
+    "avg(X)"
+   ]
+  },
+  {
+   "id": "function.aggregate:count",
+   "kind": "function.aggregate",
+   "name": "count",
+   "doc": "https://www.sqlite.org/lang_aggfunc.html#count",
+   "signatures": [
+    "count()",
+    "count(*)",
+    "count(X)",
+    "count(distinct X)"
+   ]
+  },
+  {
+   "id": "function.aggregate:group_concat",
+   "kind": "function.aggregate",
+   "name": "group_concat",
+   "doc": "https://www.sqlite.org/lang_aggfunc.html#group_concat",
+   "signatures": [
+    "group_concat()",
+    "group_concat(X)",
+    "group_concat(X,Y)"
+   ]
+  },
+  {
+   "id": "function.aggregate:max",
+   "kind": "function.aggregate",
+   "name": "max",
+   "doc": "https://www.sqlite.org/lang_aggfunc.html#max",
+   "signatures": [
+    "max()",
+    "max(X)"
+   ]
+  },
+  {
+   "id": "function.aggregate:median",
+   "kind": "function.aggregate",
+   "name": "median",
+   "doc": "https://www.sqlite.org/lang_aggfunc.html#median",
+   "signatures": [
+    "median()",
+    "median(X)"
+   ]
+  },
+  {
+   "id": "function.aggregate:min",
+   "kind": "function.aggregate",
+   "name": "min",
+   "doc": "https://www.sqlite.org/lang_aggfunc.html#min",
+   "signatures": [
+    "min()",
+    "min(X)"
+   ]
+  },
+  {
+   "id": "function.aggregate:percentile",
+   "kind": "function.aggregate",
+   "name": "percentile",
+   "doc": "https://www.sqlite.org/lang_aggfunc.html#percentile",
+   "signatures": [
+    "percentile()",
+    "percentile(Y,P)",
+    "percentile(Y,P*100)"
+   ]
+  },
+  {
+   "id": "function.aggregate:percentile_cont",
+   "kind": "function.aggregate",
+   "name": "percentile_cont",
+   "doc": "https://www.sqlite.org/lang_aggfunc.html#percentile_cont",
+   "signatures": [
+    "percentile_cont()",
+    "percentile_cont(X,0.5)",
+    "percentile_cont(Y,P)",
+    "percentile_cont(Y,p/100.0)"
+   ]
+  },
+  {
+   "id": "function.aggregate:percentile_disc",
+   "kind": "function.aggregate",
+   "name": "percentile_disc",
+   "doc": "https://www.sqlite.org/lang_aggfunc.html#percentile_disc",
+   "signatures": [
+    "percentile_disc(Y,P)"
+   ]
+  },
+  {
+   "id": "function.aggregate:string_agg",
+   "kind": "function.aggregate",
+   "name": "string_agg",
+   "doc": "https://www.sqlite.org/lang_aggfunc.html#string_agg",
+   "signatures": [
+    "string_agg()",
+    "string_agg(X,Y)"
+   ]
+  },
+  {
+   "id": "function.aggregate:sum",
+   "kind": "function.aggregate",
+   "name": "sum",
+   "doc": "https://www.sqlite.org/lang_aggfunc.html#sum",
+   "signatures": [
+    "sum()",
+    "sum(X)",
+    "sum(x)"
+   ]
+  },
+  {
+   "id": "function.aggregate:total",
+   "kind": "function.aggregate",
+   "name": "total",
+   "doc": "https://www.sqlite.org/lang_aggfunc.html#total",
+   "signatures": [
+    "total()",
+    "total(X)"
+   ]
+  },
+  {
+   "id": "function.window:cume_dist",
+   "kind": "function.window",
+   "name": "cume_dist",
+   "doc": "https://www.sqlite.org/windowfunctions.html#cume_dist",
+   "signatures": [
+    "cume_dist()"
+   ]
+  },
+  {
+   "id": "function.window:dense_rank",
+   "kind": "function.window",
+   "name": "dense_rank",
+   "doc": "https://www.sqlite.org/windowfunctions.html#dense_rank",
+   "signatures": [
+    "dense_rank()"
+   ]
+  },
+  {
+   "id": "function.window:first_value",
+   "kind": "function.window",
+   "name": "first_value",
+   "doc": "https://www.sqlite.org/windowfunctions.html#first_value",
+   "signatures": [
+    "first_value()",
+    "first_value(b)",
+    "first_value(expr)"
+   ]
+  },
+  {
+   "id": "function.window:lag",
+   "kind": "function.window",
+   "name": "lag",
+   "doc": "https://www.sqlite.org/windowfunctions.html#lag",
+   "signatures": [
+    "lag()",
+    "lag(b)",
+    "lag(expr)",
+    "lag(expr, offset)",
+    "lag(expr, offset, default)"
+   ]
+  },
+  {
+   "id": "function.window:last_value",
+   "kind": "function.window",
+   "name": "last_value",
+   "doc": "https://www.sqlite.org/windowfunctions.html#last_value",
+   "signatures": [
+    "last_value()",
+    "last_value(b)",
+    "last_value(expr)"
+   ]
+  },
+  {
+   "id": "function.window:lead",
+   "kind": "function.window",
+   "name": "lead",
+   "doc": "https://www.sqlite.org/windowfunctions.html#lead",
+   "signatures": [
+    "lead()",
+    "lead(b, 2, 'n/a')",
+    "lead(expr)",
+    "lead(expr, offset)",
+    "lead(expr, offset, default)"
+   ]
+  },
+  {
+   "id": "function.window:nth_value",
+   "kind": "function.window",
+   "name": "nth_value",
+   "doc": "https://www.sqlite.org/windowfunctions.html#nth_value",
+   "signatures": [
+    "nth_value()",
+    "nth_value(b, 3)",
+    "nth_value(expr, N)"
+   ]
+  },
+  {
+   "id": "function.window:ntile",
+   "kind": "function.window",
+   "name": "ntile",
+   "doc": "https://www.sqlite.org/windowfunctions.html#ntile",
+   "signatures": [
+    "ntile()",
+    "ntile(2)",
+    "ntile(4)",
+    "ntile(N)"
+   ]
+  },
+  {
+   "id": "function.window:percent_rank",
+   "kind": "function.window",
+   "name": "percent_rank",
+   "doc": "https://www.sqlite.org/windowfunctions.html#percent_rank",
+   "signatures": [
+    "percent_rank()"
+   ]
+  },
+  {
+   "id": "function.window:rank",
+   "kind": "function.window",
+   "name": "rank",
+   "doc": "https://www.sqlite.org/windowfunctions.html#rank",
+   "signatures": [
+    "rank()"
+   ]
+  },
+  {
+   "id": "function.window:row_number",
+   "kind": "function.window",
+   "name": "row_number",
+   "doc": "https://www.sqlite.org/windowfunctions.html#row_number",
+   "signatures": [
+    "row_number()"
+   ]
+  },
+  {
+   "id": "function.datetime:date",
+   "kind": "function.datetime",
+   "name": "date",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#date",
+   "signatures": [
+    "date('2026-01-01','end of year','weekday -5')",
+    "date('now','end of month')",
+    "date('now','start of year','+9 months','weekday 2')",
+    "date()",
+    "date(...)",
+    "date(time-value, modifier, modifier, ...)"
+   ]
+  },
+  {
+   "id": "function.datetime:datetime",
+   "kind": "function.datetime",
+   "name": "datetime",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#datetime",
+   "signatures": [
+    "datetime()",
+    "datetime(...)",
+    "datetime(1092941466, 'auto')",
+    "datetime(1092941466, 'unixepoch')",
+    "datetime(1092941466, 'unixepoch', 'localtime')",
+    "datetime(A)",
+    "datetime(B, timediff(A,B))",
+    "datetime(time-value, modifier, modifier, ...)"
+   ]
+  },
+  {
+   "id": "function.datetime:julianday",
+   "kind": "function.datetime",
+   "name": "julianday",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#julianday",
+   "signatures": [
+    "julianday('1776-07-04')",
+    "julianday('now')",
+    "julianday()",
+    "julianday(...)",
+    "julianday(A)",
+    "julianday(B)",
+    "julianday(time-value, modifier, modifier, ...)"
+   ]
+  },
+  {
+   "id": "function.datetime:strftime",
+   "kind": "function.datetime",
+   "name": "strftime",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#strftime",
+   "signatures": [
+    "strftime('%F %T', ...)",
+    "strftime('%F', ...)",
+    "strftime('%J', ...)",
+    "strftime('%T', ...)",
+    "strftime('%s')",
+    "strftime('%s', ...)",
+    "strftime()",
+    "strftime(format, time-value, modifier, modifier, ...)"
+   ]
+  },
+  {
+   "id": "function.datetime:time",
+   "kind": "function.datetime",
+   "name": "time",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#time",
+   "signatures": [
+    "time()",
+    "time(...)",
+    "time(time-value, modifier, modifier, ...)"
+   ]
+  },
+  {
+   "id": "function.datetime:timediff",
+   "kind": "function.datetime",
+   "name": "timediff",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#timediff",
+   "signatures": [
+    "timediff('2023-02-15','2023-03-15')",
+    "timediff('2023-03-15','2023-04-15')",
+    "timediff('now','1809-02-12')",
+    "timediff()",
+    "timediff(A,B)",
+    "timediff(time-value, time-value)"
+   ]
+  },
+  {
+   "id": "function.datetime:unixepoch",
+   "kind": "function.datetime",
+   "name": "unixepoch",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#unixepoch",
+   "signatures": [
+    "unixepoch('2004-01-01 02:34:56')",
+    "unixepoch('now','subsec')",
+    "unixepoch('subsec')",
+    "unixepoch()",
+    "unixepoch(...)",
+    "unixepoch(A)",
+    "unixepoch(B)",
+    "unixepoch(time-value, modifier, modifier, ...)"
+   ]
+  },
+  {
+   "id": "function.math:acos",
+   "kind": "function.math",
+   "name": "acos",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#acos",
+   "signatures": [
+    "acos(X)"
+   ]
+  },
+  {
+   "id": "function.math:acosh",
+   "kind": "function.math",
+   "name": "acosh",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#acosh",
+   "signatures": [
+    "acosh(X)"
+   ]
+  },
+  {
+   "id": "function.math:asin",
+   "kind": "function.math",
+   "name": "asin",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#asin",
+   "signatures": [
+    "asin(X)"
+   ]
+  },
+  {
+   "id": "function.math:asinh",
+   "kind": "function.math",
+   "name": "asinh",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#asinh",
+   "signatures": [
+    "asinh(X)"
+   ]
+  },
+  {
+   "id": "function.math:atan",
+   "kind": "function.math",
+   "name": "atan",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#atan",
+   "signatures": [
+    "atan(X)"
+   ]
+  },
+  {
+   "id": "function.math:atan2",
+   "kind": "function.math",
+   "name": "atan2",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#atan2",
+   "signatures": [
+    "atan2(Y,X)"
+   ]
+  },
+  {
+   "id": "function.math:atanh",
+   "kind": "function.math",
+   "name": "atanh",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#atanh",
+   "signatures": [
+    "atanh(X)"
+   ]
+  },
+  {
+   "id": "function.math:ceil",
+   "kind": "function.math",
+   "name": "ceil",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#ceil",
+   "signatures": [
+    "ceil(X)"
+   ]
+  },
+  {
+   "id": "function.math:ceiling",
+   "kind": "function.math",
+   "name": "ceiling",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#ceiling",
+   "signatures": [
+    "ceiling(X)"
+   ]
+  },
+  {
+   "id": "function.math:cos",
+   "kind": "function.math",
+   "name": "cos",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#cos",
+   "signatures": [
+    "cos(X)"
+   ]
+  },
+  {
+   "id": "function.math:cosh",
+   "kind": "function.math",
+   "name": "cosh",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#cosh",
+   "signatures": [
+    "cosh(X)"
+   ]
+  },
+  {
+   "id": "function.math:degrees",
+   "kind": "function.math",
+   "name": "degrees",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#degrees",
+   "signatures": [
+    "degrees(X)"
+   ]
+  },
+  {
+   "id": "function.math:exp",
+   "kind": "function.math",
+   "name": "exp",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#exp",
+   "signatures": [
+    "exp(X)"
+   ]
+  },
+  {
+   "id": "function.math:floor",
+   "kind": "function.math",
+   "name": "floor",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#floor",
+   "signatures": [
+    "floor(X)"
+   ]
+  },
+  {
+   "id": "function.math:ln",
+   "kind": "function.math",
+   "name": "ln",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#ln",
+   "signatures": [
+    "ln(X)"
+   ]
+  },
+  {
+   "id": "function.math:log",
+   "kind": "function.math",
+   "name": "log",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#log",
+   "signatures": [
+    "log(B,X)",
+    "log(X)"
+   ]
+  },
+  {
+   "id": "function.math:log10",
+   "kind": "function.math",
+   "name": "log10",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#log10",
+   "signatures": [
+    "log10(X)"
+   ]
+  },
+  {
+   "id": "function.math:log2",
+   "kind": "function.math",
+   "name": "log2",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#log2",
+   "signatures": [
+    "log2(X)"
+   ]
+  },
+  {
+   "id": "function.math:mod",
+   "kind": "function.math",
+   "name": "mod",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#mod",
+   "signatures": [
+    "mod(X,Y)"
+   ]
+  },
+  {
+   "id": "function.math:pi",
+   "kind": "function.math",
+   "name": "pi",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#pi",
+   "signatures": [
+    "pi()"
+   ]
+  },
+  {
+   "id": "function.math:pow",
+   "kind": "function.math",
+   "name": "pow",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#pow",
+   "signatures": [
+    "pow(X,Y)"
+   ]
+  },
+  {
+   "id": "function.math:power",
+   "kind": "function.math",
+   "name": "power",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#power",
+   "signatures": [
+    "power(X,Y)"
+   ]
+  },
+  {
+   "id": "function.math:radians",
+   "kind": "function.math",
+   "name": "radians",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#radians",
+   "signatures": [
+    "radians(X)"
+   ]
+  },
+  {
+   "id": "function.math:sin",
+   "kind": "function.math",
+   "name": "sin",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#sin",
+   "signatures": [
+    "sin(X)"
+   ]
+  },
+  {
+   "id": "function.math:sinh",
+   "kind": "function.math",
+   "name": "sinh",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#sinh",
+   "signatures": [
+    "sinh(X)"
+   ]
+  },
+  {
+   "id": "function.math:sqrt",
+   "kind": "function.math",
+   "name": "sqrt",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#sqrt",
+   "signatures": [
+    "sqrt(X)"
+   ]
+  },
+  {
+   "id": "function.math:tan",
+   "kind": "function.math",
+   "name": "tan",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#tan",
+   "signatures": [
+    "tan(X)"
+   ]
+  },
+  {
+   "id": "function.math:tanh",
+   "kind": "function.math",
+   "name": "tanh",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#tanh",
+   "signatures": [
+    "tanh(X)"
+   ]
+  },
+  {
+   "id": "function.math:trunc",
+   "kind": "function.math",
+   "name": "trunc",
+   "doc": "https://www.sqlite.org/lang_mathfunc.html#trunc",
+   "signatures": [
+    "trunc(X)"
+   ]
+  },
+  {
+   "id": "function.json:json",
+   "kind": "function.json",
+   "name": "json",
+   "doc": "https://www.sqlite.org/json1.html#json",
+   "signatures": [
+    "json()",
+    "json(X)",
+    "json(json)"
+   ]
+  },
+  {
+   "id": "function.json:json_array",
+   "kind": "function.json",
+   "name": "json_array",
+   "doc": "https://www.sqlite.org/json1.html#json_array",
+   "signatures": [
+    "json_array()",
+    "json_array(value1,value2,...)"
+   ]
+  },
+  {
+   "id": "function.json:json_array_insert",
+   "kind": "function.json",
+   "name": "json_array_insert",
+   "doc": "https://www.sqlite.org/json1.html#json_array_insert",
+   "signatures": [
+    "json_array_insert()",
+    "json_array_insert(json,path,value,...)"
+   ]
+  },
+  {
+   "id": "function.json:json_array_length",
+   "kind": "function.json",
+   "name": "json_array_length",
+   "doc": "https://www.sqlite.org/json1.html#json_array_length",
+   "signatures": [
+    "json_array_length()",
+    "json_array_length(X)",
+    "json_array_length(X,P)",
+    "json_array_length(json)",
+    "json_array_length(json,path)"
+   ]
+  },
+  {
+   "id": "function.json:json_each",
+   "kind": "function.json",
+   "name": "json_each",
+   "doc": "https://www.sqlite.org/json1.html#json_each",
+   "signatures": [
+    "json_each()",
+    "json_each(X)",
+    "json_each(X,P)",
+    "json_each(json)",
+    "json_each(json,path)"
+   ]
+  },
+  {
+   "id": "function.json:json_error_position",
+   "kind": "function.json",
+   "name": "json_error_position",
+   "doc": "https://www.sqlite.org/json1.html#json_error_position",
+   "signatures": [
+    "json_error_position()",
+    "json_error_position(X)",
+    "json_error_position(json)"
+   ]
+  },
+  {
+   "id": "function.json:json_extract",
+   "kind": "function.json",
+   "name": "json_extract",
+   "doc": "https://www.sqlite.org/json1.html#json_extract",
+   "signatures": [
+    "json_extract()",
+    "json_extract(X,P1,P2,...)",
+    "json_extract(json,path,...)"
+   ]
+  },
+  {
+   "id": "function.json:json_group_array",
+   "kind": "function.json",
+   "name": "json_group_array",
+   "doc": "https://www.sqlite.org/json1.html#json_group_array",
+   "signatures": [
+    "json_group_array()",
+    "json_group_array(X)",
+    "json_group_array(value)"
+   ]
+  },
+  {
+   "id": "function.json:json_group_object",
+   "kind": "function.json",
+   "name": "json_group_object",
+   "doc": "https://www.sqlite.org/json1.html#json_group_object",
+   "signatures": [
+    "json_group_object()",
+    "json_group_object(NAME,VALUE)",
+    "json_group_object(label,value)"
+   ]
+  },
+  {
+   "id": "function.json:json_insert",
+   "kind": "function.json",
+   "name": "json_insert",
+   "doc": "https://www.sqlite.org/json1.html#json_insert",
+   "signatures": [
+    "json_insert()",
+    "json_insert(json,path,value,...)"
+   ]
+  },
+  {
+   "id": "function.json:json_object",
+   "kind": "function.json",
+   "name": "json_object",
+   "doc": "https://www.sqlite.org/json1.html#json_object",
+   "signatures": [
+    "json_object()",
+    "json_object(label1,value1,...)"
+   ]
+  },
+  {
+   "id": "function.json:json_patch",
+   "kind": "function.json",
+   "name": "json_patch",
+   "doc": "https://www.sqlite.org/json1.html#json_patch",
+   "signatures": [
+    "json_patch()",
+    "json_patch(T,P)",
+    "json_patch(json1,json2)"
+   ]
+  },
+  {
+   "id": "function.json:json_pretty",
+   "kind": "function.json",
+   "name": "json_pretty",
+   "doc": "https://www.sqlite.org/json1.html#json_pretty",
+   "signatures": [
+    "json_pretty()",
+    "json_pretty(json)"
+   ]
+  },
+  {
+   "id": "function.json:json_quote",
+   "kind": "function.json",
+   "name": "json_quote",
+   "doc": "https://www.sqlite.org/json1.html#json_quote",
+   "signatures": [
+    "json_quote()",
+    "json_quote(NULL)",
+    "json_quote(X)",
+    "json_quote(value)"
+   ]
+  },
+  {
+   "id": "function.json:json_remove",
+   "kind": "function.json",
+   "name": "json_remove",
+   "doc": "https://www.sqlite.org/json1.html#json_remove",
+   "signatures": [
+    "json_remove()",
+    "json_remove(X)",
+    "json_remove(X,P,...)",
+    "json_remove(json,path,...)"
+   ]
+  },
+  {
+   "id": "function.json:json_replace",
+   "kind": "function.json",
+   "name": "json_replace",
+   "doc": "https://www.sqlite.org/json1.html#json_replace",
+   "signatures": [
+    "json_replace()",
+    "json_replace(json,path,value,...)"
+   ]
+  },
+  {
+   "id": "function.json:json_set",
+   "kind": "function.json",
+   "name": "json_set",
+   "doc": "https://www.sqlite.org/json1.html#json_set",
+   "signatures": [
+    "json_set()",
+    "json_set(json,path,value,...)"
+   ]
+  },
+  {
+   "id": "function.json:json_tree",
+   "kind": "function.json",
+   "name": "json_tree",
+   "doc": "https://www.sqlite.org/json1.html#json_tree",
+   "signatures": [
+    "json_tree()",
+    "json_tree(X)",
+    "json_tree(X,P)",
+    "json_tree(json)",
+    "json_tree(json,path)"
+   ]
+  },
+  {
+   "id": "function.json:json_type",
+   "kind": "function.json",
+   "name": "json_type",
+   "doc": "https://www.sqlite.org/json1.html#json_type",
+   "signatures": [
+    "json_type()",
+    "json_type(X)",
+    "json_type(X,P)",
+    "json_type(json)",
+    "json_type(json,path)"
+   ]
+  },
+  {
+   "id": "function.json:json_valid",
+   "kind": "function.json",
+   "name": "json_valid",
+   "doc": "https://www.sqlite.org/json1.html#json_valid",
+   "signatures": [
+    "json_valid()",
+    "json_valid(NULL)",
+    "json_valid(X)",
+    "json_valid(X,2)",
+    "json_valid(X,Y)",
+    "json_valid(json)",
+    "json_valid(json,flags)"
+   ]
+  },
+  {
+   "id": "function.json:jsonb",
+   "kind": "function.json",
+   "name": "jsonb",
+   "doc": "https://www.sqlite.org/json1.html#jsonb",
+   "signatures": [
+    "jsonb()",
+    "jsonb(X)",
+    "jsonb(json)"
+   ]
+  },
+  {
+   "id": "function.json:jsonb_array",
+   "kind": "function.json",
+   "name": "jsonb_array",
+   "doc": "https://www.sqlite.org/json1.html#jsonb_array",
+   "signatures": [
+    "jsonb_array()",
+    "jsonb_array(value1,value2,...)"
+   ]
+  },
+  {
+   "id": "function.json:jsonb_array_insert",
+   "kind": "function.json",
+   "name": "jsonb_array_insert",
+   "doc": "https://www.sqlite.org/json1.html#jsonb_array_insert",
+   "signatures": [
+    "jsonb_array_insert()",
+    "jsonb_array_insert(json,path,value,...)"
+   ]
+  },
+  {
+   "id": "function.json:jsonb_each",
+   "kind": "function.json",
+   "name": "jsonb_each",
+   "doc": "https://www.sqlite.org/json1.html#jsonb_each",
+   "signatures": [
+    "jsonb_each()",
+    "jsonb_each(X)",
+    "jsonb_each(X,P)",
+    "jsonb_each(json)",
+    "jsonb_each(json,path)"
+   ]
+  },
+  {
+   "id": "function.json:jsonb_extract",
+   "kind": "function.json",
+   "name": "jsonb_extract",
+   "doc": "https://www.sqlite.org/json1.html#jsonb_extract",
+   "signatures": [
+    "jsonb_extract()",
+    "jsonb_extract(json,path,...)"
+   ]
+  },
+  {
+   "id": "function.json:jsonb_group_array",
+   "kind": "function.json",
+   "name": "jsonb_group_array",
+   "doc": "https://www.sqlite.org/json1.html#jsonb_group_array",
+   "signatures": [
+    "jsonb_group_array()",
+    "jsonb_group_array(value)"
+   ]
+  },
+  {
+   "id": "function.json:jsonb_group_object",
+   "kind": "function.json",
+   "name": "jsonb_group_object",
+   "doc": "https://www.sqlite.org/json1.html#jsonb_group_object",
+   "signatures": [
+    "jsonb_group_object()",
+    "jsonb_group_object(label,value)"
+   ]
+  },
+  {
+   "id": "function.json:jsonb_insert",
+   "kind": "function.json",
+   "name": "jsonb_insert",
+   "doc": "https://www.sqlite.org/json1.html#jsonb_insert",
+   "signatures": [
+    "jsonb_insert()",
+    "jsonb_insert(json,path,value,...)"
+   ]
+  },
+  {
+   "id": "function.json:jsonb_object",
+   "kind": "function.json",
+   "name": "jsonb_object",
+   "doc": "https://www.sqlite.org/json1.html#jsonb_object",
+   "signatures": [
+    "jsonb_object()",
+    "jsonb_object(label1,value1,...)"
+   ]
+  },
+  {
+   "id": "function.json:jsonb_patch",
+   "kind": "function.json",
+   "name": "jsonb_patch",
+   "doc": "https://www.sqlite.org/json1.html#jsonb_patch",
+   "signatures": [
+    "jsonb_patch()",
+    "jsonb_patch(json1,json2)"
+   ]
+  },
+  {
+   "id": "function.json:jsonb_remove",
+   "kind": "function.json",
+   "name": "jsonb_remove",
+   "doc": "https://www.sqlite.org/json1.html#jsonb_remove",
+   "signatures": [
+    "jsonb_remove()",
+    "jsonb_remove(json,path,...)"
+   ]
+  },
+  {
+   "id": "function.json:jsonb_replace",
+   "kind": "function.json",
+   "name": "jsonb_replace",
+   "doc": "https://www.sqlite.org/json1.html#jsonb_replace",
+   "signatures": [
+    "jsonb_replace()",
+    "jsonb_replace(json,path,value,...)"
+   ]
+  },
+  {
+   "id": "function.json:jsonb_set",
+   "kind": "function.json",
+   "name": "jsonb_set",
+   "doc": "https://www.sqlite.org/json1.html#jsonb_set",
+   "signatures": [
+    "jsonb_set()",
+    "jsonb_set(json,path,value,...)"
+   ]
+  },
+  {
+   "id": "function.json:jsonb_tree",
+   "kind": "function.json",
+   "name": "jsonb_tree",
+   "doc": "https://www.sqlite.org/json1.html#jsonb_tree",
+   "signatures": [
+    "jsonb_tree()",
+    "jsonb_tree(X)",
+    "jsonb_tree(X,P)",
+    "jsonb_tree(json)",
+    "jsonb_tree(json,path)"
+   ]
+  },
+  {
+   "id": "datetime.modifier:NNN days",
+   "kind": "datetime.modifier",
+   "name": "NNN days",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#dtmods"
+  },
+  {
+   "id": "datetime.modifier:NNN hours",
+   "kind": "datetime.modifier",
+   "name": "NNN hours",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#dtmods"
+  },
+  {
+   "id": "datetime.modifier:NNN minutes",
+   "kind": "datetime.modifier",
+   "name": "NNN minutes",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#dtmods"
+  },
+  {
+   "id": "datetime.modifier:NNN months",
+   "kind": "datetime.modifier",
+   "name": "NNN months",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#dtmods"
+  },
+  {
+   "id": "datetime.modifier:NNN seconds",
+   "kind": "datetime.modifier",
+   "name": "NNN seconds",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#dtmods"
+  },
+  {
+   "id": "datetime.modifier:NNN years",
+   "kind": "datetime.modifier",
+   "name": "NNN years",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#dtmods"
+  },
+  {
+   "id": "datetime.modifier:auto",
+   "kind": "datetime.modifier",
+   "name": "auto",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#dtmods"
+  },
+  {
+   "id": "datetime.modifier:ceiling",
+   "kind": "datetime.modifier",
+   "name": "ceiling",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#dtmods"
+  },
+  {
+   "id": "datetime.modifier:floor",
+   "kind": "datetime.modifier",
+   "name": "floor",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#dtmods"
+  },
+  {
+   "id": "datetime.modifier:julianday",
+   "kind": "datetime.modifier",
+   "name": "julianday",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#dtmods"
+  },
+  {
+   "id": "datetime.modifier:localtime",
+   "kind": "datetime.modifier",
+   "name": "localtime",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#dtmods"
+  },
+  {
+   "id": "datetime.modifier:start of day",
+   "kind": "datetime.modifier",
+   "name": "start of day",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#dtmods"
+  },
+  {
+   "id": "datetime.modifier:start of month",
+   "kind": "datetime.modifier",
+   "name": "start of month",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#dtmods"
+  },
+  {
+   "id": "datetime.modifier:start of year",
+   "kind": "datetime.modifier",
+   "name": "start of year",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#dtmods"
+  },
+  {
+   "id": "datetime.modifier:subsec",
+   "kind": "datetime.modifier",
+   "name": "subsec",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#dtmods"
+  },
+  {
+   "id": "datetime.modifier:subsecond",
+   "kind": "datetime.modifier",
+   "name": "subsecond",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#dtmods"
+  },
+  {
+   "id": "datetime.modifier:unixepoch",
+   "kind": "datetime.modifier",
+   "name": "unixepoch",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#dtmods"
+  },
+  {
+   "id": "datetime.modifier:utc",
+   "kind": "datetime.modifier",
+   "name": "utc",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#dtmods"
+  },
+  {
+   "id": "datetime.modifier:weekday N",
+   "kind": "datetime.modifier",
+   "name": "weekday N",
+   "doc": "https://www.sqlite.org/lang_datefunc.html#dtmods"
+  },
+  {
+   "id": "pragma:analysis_limit",
+   "kind": "pragma",
+   "name": "analysis_limit",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_analysis_limit"
+  },
+  {
+   "id": "pragma:application_id",
+   "kind": "pragma",
+   "name": "application_id",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_application_id"
+  },
+  {
+   "id": "pragma:auto_vacuum",
+   "kind": "pragma",
+   "name": "auto_vacuum",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_auto_vacuum"
+  },
+  {
+   "id": "pragma:automatic_index",
+   "kind": "pragma",
+   "name": "automatic_index",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_automatic_index"
+  },
+  {
+   "id": "pragma:busy_timeout",
+   "kind": "pragma",
+   "name": "busy_timeout",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_busy_timeout"
+  },
+  {
+   "id": "pragma:cache_size",
+   "kind": "pragma",
+   "name": "cache_size",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_cache_size"
+  },
+  {
+   "id": "pragma:cache_spill",
+   "kind": "pragma",
+   "name": "cache_spill",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_cache_spill"
+  },
+  {
+   "id": "pragma:case_sensitive_like",
+   "kind": "pragma",
+   "name": "case_sensitive_like",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_case_sensitive_like"
+  },
+  {
+   "id": "pragma:cell_size_check",
+   "kind": "pragma",
+   "name": "cell_size_check",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_cell_size_check"
+  },
+  {
+   "id": "pragma:checkpoint_fullfsync",
+   "kind": "pragma",
+   "name": "checkpoint_fullfsync",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_checkpoint_fullfsync"
+  },
+  {
+   "id": "pragma:collation_list",
+   "kind": "pragma",
+   "name": "collation_list",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_collation_list"
+  },
+  {
+   "id": "pragma:compile_options",
+   "kind": "pragma",
+   "name": "compile_options",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_compile_options"
+  },
+  {
+   "id": "pragma:count_changes",
+   "kind": "pragma",
+   "name": "count_changes",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_count_changes"
+  },
+  {
+   "id": "pragma:data_store_directory",
+   "kind": "pragma",
+   "name": "data_store_directory",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_data_store_directory"
+  },
+  {
+   "id": "pragma:data_version",
+   "kind": "pragma",
+   "name": "data_version",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_data_version"
+  },
+  {
+   "id": "pragma:database_list",
+   "kind": "pragma",
+   "name": "database_list",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_database_list"
+  },
+  {
+   "id": "pragma:default_cache_size",
+   "kind": "pragma",
+   "name": "default_cache_size",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_default_cache_size"
+  },
+  {
+   "id": "pragma:defer_foreign_keys",
+   "kind": "pragma",
+   "name": "defer_foreign_keys",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_defer_foreign_keys"
+  },
+  {
+   "id": "pragma:empty_result_callbacks",
+   "kind": "pragma",
+   "name": "empty_result_callbacks",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_empty_result_callbacks"
+  },
+  {
+   "id": "pragma:encoding",
+   "kind": "pragma",
+   "name": "encoding",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_encoding"
+  },
+  {
+   "id": "pragma:foreign_key_check",
+   "kind": "pragma",
+   "name": "foreign_key_check",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_foreign_key_check"
+  },
+  {
+   "id": "pragma:foreign_key_list",
+   "kind": "pragma",
+   "name": "foreign_key_list",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_foreign_key_list"
+  },
+  {
+   "id": "pragma:foreign_keys",
+   "kind": "pragma",
+   "name": "foreign_keys",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_foreign_keys"
+  },
+  {
+   "id": "pragma:freelist_count",
+   "kind": "pragma",
+   "name": "freelist_count",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_freelist_count"
+  },
+  {
+   "id": "pragma:full_column_names",
+   "kind": "pragma",
+   "name": "full_column_names",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_full_column_names"
+  },
+  {
+   "id": "pragma:fullfsync",
+   "kind": "pragma",
+   "name": "fullfsync",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_fullfsync"
+  },
+  {
+   "id": "pragma:function_list",
+   "kind": "pragma",
+   "name": "function_list",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_function_list"
+  },
+  {
+   "id": "pragma:hard_heap_limit",
+   "kind": "pragma",
+   "name": "hard_heap_limit",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_hard_heap_limit"
+  },
+  {
+   "id": "pragma:ignore_check_constraints",
+   "kind": "pragma",
+   "name": "ignore_check_constraints",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_ignore_check_constraints"
+  },
+  {
+   "id": "pragma:incremental_vacuum",
+   "kind": "pragma",
+   "name": "incremental_vacuum",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_incremental_vacuum"
+  },
+  {
+   "id": "pragma:index_info",
+   "kind": "pragma",
+   "name": "index_info",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_index_info"
+  },
+  {
+   "id": "pragma:index_list",
+   "kind": "pragma",
+   "name": "index_list",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_index_list"
+  },
+  {
+   "id": "pragma:index_xinfo",
+   "kind": "pragma",
+   "name": "index_xinfo",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_index_xinfo"
+  },
+  {
+   "id": "pragma:integrity_check",
+   "kind": "pragma",
+   "name": "integrity_check",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_integrity_check"
+  },
+  {
+   "id": "pragma:journal_mode",
+   "kind": "pragma",
+   "name": "journal_mode",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_journal_mode"
+  },
+  {
+   "id": "pragma:journal_size_limit",
+   "kind": "pragma",
+   "name": "journal_size_limit",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_journal_size_limit"
+  },
+  {
+   "id": "pragma:legacy_alter_table",
+   "kind": "pragma",
+   "name": "legacy_alter_table",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_legacy_alter_table"
+  },
+  {
+   "id": "pragma:legacy_file_format",
+   "kind": "pragma",
+   "name": "legacy_file_format",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_legacy_file_format"
+  },
+  {
+   "id": "pragma:locking_mode",
+   "kind": "pragma",
+   "name": "locking_mode",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_locking_mode"
+  },
+  {
+   "id": "pragma:max_page_count",
+   "kind": "pragma",
+   "name": "max_page_count",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_max_page_count"
+  },
+  {
+   "id": "pragma:mmap_size",
+   "kind": "pragma",
+   "name": "mmap_size",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_mmap_size"
+  },
+  {
+   "id": "pragma:module_list",
+   "kind": "pragma",
+   "name": "module_list",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_module_list"
+  },
+  {
+   "id": "pragma:optimize",
+   "kind": "pragma",
+   "name": "optimize",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_optimize"
+  },
+  {
+   "id": "pragma:page_count",
+   "kind": "pragma",
+   "name": "page_count",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_page_count"
+  },
+  {
+   "id": "pragma:page_size",
+   "kind": "pragma",
+   "name": "page_size",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_page_size"
+  },
+  {
+   "id": "pragma:parser_trace",
+   "kind": "pragma",
+   "name": "parser_trace",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_parser_trace"
+  },
+  {
+   "id": "pragma:pragma_list",
+   "kind": "pragma",
+   "name": "pragma_list",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_pragma_list"
+  },
+  {
+   "id": "pragma:query_only",
+   "kind": "pragma",
+   "name": "query_only",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_query_only"
+  },
+  {
+   "id": "pragma:quick_check",
+   "kind": "pragma",
+   "name": "quick_check",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_quick_check"
+  },
+  {
+   "id": "pragma:read_uncommitted",
+   "kind": "pragma",
+   "name": "read_uncommitted",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_read_uncommitted"
+  },
+  {
+   "id": "pragma:recursive_triggers",
+   "kind": "pragma",
+   "name": "recursive_triggers",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_recursive_triggers"
+  },
+  {
+   "id": "pragma:reverse_unordered_selects",
+   "kind": "pragma",
+   "name": "reverse_unordered_selects",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_reverse_unordered_selects"
+  },
+  {
+   "id": "pragma:schema_version",
+   "kind": "pragma",
+   "name": "schema_version",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_schema_version"
+  },
+  {
+   "id": "pragma:secure_delete",
+   "kind": "pragma",
+   "name": "secure_delete",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_secure_delete"
+  },
+  {
+   "id": "pragma:short_column_names",
+   "kind": "pragma",
+   "name": "short_column_names",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_short_column_names"
+  },
+  {
+   "id": "pragma:shrink_memory",
+   "kind": "pragma",
+   "name": "shrink_memory",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_shrink_memory"
+  },
+  {
+   "id": "pragma:soft_heap_limit",
+   "kind": "pragma",
+   "name": "soft_heap_limit",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_soft_heap_limit"
+  },
+  {
+   "id": "pragma:stats",
+   "kind": "pragma",
+   "name": "stats",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_stats"
+  },
+  {
+   "id": "pragma:synchronous",
+   "kind": "pragma",
+   "name": "synchronous",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_synchronous"
+  },
+  {
+   "id": "pragma:table_info",
+   "kind": "pragma",
+   "name": "table_info",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_table_info"
+  },
+  {
+   "id": "pragma:table_list",
+   "kind": "pragma",
+   "name": "table_list",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_table_list"
+  },
+  {
+   "id": "pragma:table_xinfo",
+   "kind": "pragma",
+   "name": "table_xinfo",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_table_xinfo"
+  },
+  {
+   "id": "pragma:temp_store",
+   "kind": "pragma",
+   "name": "temp_store",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_temp_store"
+  },
+  {
+   "id": "pragma:temp_store_directory",
+   "kind": "pragma",
+   "name": "temp_store_directory",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_temp_store_directory"
+  },
+  {
+   "id": "pragma:threads",
+   "kind": "pragma",
+   "name": "threads",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_threads"
+  },
+  {
+   "id": "pragma:trusted_schema",
+   "kind": "pragma",
+   "name": "trusted_schema",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_trusted_schema"
+  },
+  {
+   "id": "pragma:user_version",
+   "kind": "pragma",
+   "name": "user_version",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_user_version"
+  },
+  {
+   "id": "pragma:vdbe_addoptrace",
+   "kind": "pragma",
+   "name": "vdbe_addoptrace",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_vdbe_addoptrace"
+  },
+  {
+   "id": "pragma:vdbe_debug",
+   "kind": "pragma",
+   "name": "vdbe_debug",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_vdbe_debug"
+  },
+  {
+   "id": "pragma:vdbe_listing",
+   "kind": "pragma",
+   "name": "vdbe_listing",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_vdbe_listing"
+  },
+  {
+   "id": "pragma:vdbe_trace",
+   "kind": "pragma",
+   "name": "vdbe_trace",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_vdbe_trace"
+  },
+  {
+   "id": "pragma:wal_autocheckpoint",
+   "kind": "pragma",
+   "name": "wal_autocheckpoint",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_wal_autocheckpoint"
+  },
+  {
+   "id": "pragma:wal_checkpoint",
+   "kind": "pragma",
+   "name": "wal_checkpoint",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_wal_checkpoint"
+  },
+  {
+   "id": "pragma:writable_schema",
+   "kind": "pragma",
+   "name": "writable_schema",
+   "doc": "https://www.sqlite.org/pragma.html#pragma_writable_schema"
+  },
+  {
+   "id": "operator:~",
+   "kind": "operator",
+   "name": "~",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:+ (unary)",
+   "kind": "operator",
+   "name": "+ (unary)",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:- (unary)",
+   "kind": "operator",
+   "name": "- (unary)",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:COLLATE",
+   "kind": "operator",
+   "name": "COLLATE",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:||",
+   "kind": "operator",
+   "name": "||",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:->",
+   "kind": "operator",
+   "name": "->",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:->>",
+   "kind": "operator",
+   "name": "->>",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:*",
+   "kind": "operator",
+   "name": "*",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:/",
+   "kind": "operator",
+   "name": "/",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:%",
+   "kind": "operator",
+   "name": "%",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:+",
+   "kind": "operator",
+   "name": "+",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:-",
+   "kind": "operator",
+   "name": "-",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:&",
+   "kind": "operator",
+   "name": "&",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:|",
+   "kind": "operator",
+   "name": "|",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:<<",
+   "kind": "operator",
+   "name": "<<",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:>>",
+   "kind": "operator",
+   "name": ">>",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:ESCAPE",
+   "kind": "operator",
+   "name": "ESCAPE",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:<",
+   "kind": "operator",
+   "name": "<",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:>",
+   "kind": "operator",
+   "name": ">",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:<=",
+   "kind": "operator",
+   "name": "<=",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:>=",
+   "kind": "operator",
+   "name": ">=",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:BETWEEN",
+   "kind": "operator",
+   "name": "BETWEEN",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:IS NOT DISTINCT FROM",
+   "kind": "operator",
+   "name": "IS NOT DISTINCT FROM",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:IS DISTINCT FROM",
+   "kind": "operator",
+   "name": "IS DISTINCT FROM",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:IS NOT",
+   "kind": "operator",
+   "name": "IS NOT",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:ISNULL",
+   "kind": "operator",
+   "name": "ISNULL",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:NOTNULL",
+   "kind": "operator",
+   "name": "NOTNULL",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:NOT NULL",
+   "kind": "operator",
+   "name": "NOT NULL",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:=",
+   "kind": "operator",
+   "name": "=",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:==",
+   "kind": "operator",
+   "name": "==",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:<>",
+   "kind": "operator",
+   "name": "<>",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:!=",
+   "kind": "operator",
+   "name": "!=",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:IS",
+   "kind": "operator",
+   "name": "IS",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:IN",
+   "kind": "operator",
+   "name": "IN",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:MATCH",
+   "kind": "operator",
+   "name": "MATCH",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:LIKE",
+   "kind": "operator",
+   "name": "LIKE",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:REGEXP",
+   "kind": "operator",
+   "name": "REGEXP",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:GLOB",
+   "kind": "operator",
+   "name": "GLOB",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:NOT",
+   "kind": "operator",
+   "name": "NOT",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:AND",
+   "kind": "operator",
+   "name": "AND",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:OR",
+   "kind": "operator",
+   "name": "OR",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:NOT BETWEEN",
+   "kind": "operator",
+   "name": "NOT BETWEEN",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:NOT IN",
+   "kind": "operator",
+   "name": "NOT IN",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:NOT GLOB",
+   "kind": "operator",
+   "name": "NOT GLOB",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:NOT LIKE",
+   "kind": "operator",
+   "name": "NOT LIKE",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:NOT MATCH",
+   "kind": "operator",
+   "name": "NOT MATCH",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:NOT REGEXP",
+   "kind": "operator",
+   "name": "NOT REGEXP",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:EXISTS",
+   "kind": "operator",
+   "name": "EXISTS",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:NOT EXISTS",
+   "kind": "operator",
+   "name": "NOT EXISTS",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:CASE",
+   "kind": "operator",
+   "name": "CASE",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "operator:CAST",
+   "kind": "operator",
+   "name": "CAST",
+   "doc": "https://www.sqlite.org/lang_expr.html#operators"
+  },
+  {
+   "id": "parameter:?NNN",
+   "kind": "parameter",
+   "name": "?NNN",
+   "doc": "https://www.sqlite.org/lang_expr.html#varparam"
+  },
+  {
+   "id": "parameter:?",
+   "kind": "parameter",
+   "name": "?",
+   "doc": "https://www.sqlite.org/lang_expr.html#varparam"
+  },
+  {
+   "id": "parameter::AAAA",
+   "kind": "parameter",
+   "name": ":AAAA",
+   "doc": "https://www.sqlite.org/lang_expr.html#varparam"
+  },
+  {
+   "id": "parameter:@AAAA",
+   "kind": "parameter",
+   "name": "@AAAA",
+   "doc": "https://www.sqlite.org/lang_expr.html#varparam"
+  },
+  {
+   "id": "parameter:$AAAA",
+   "kind": "parameter",
+   "name": "$AAAA",
+   "doc": "https://www.sqlite.org/lang_expr.html#varparam"
+  },
+  {
+   "id": "expression:scalar subquery",
+   "kind": "expression",
+   "name": "scalar subquery",
+   "doc": "https://www.sqlite.org/lang_expr.html"
+  },
+  {
+   "id": "expression:correlated subquery",
+   "kind": "expression",
+   "name": "correlated subquery",
+   "doc": "https://www.sqlite.org/lang_expr.html"
+  },
+  {
+   "id": "expression:row value",
+   "kind": "expression",
+   "name": "row value",
+   "doc": "https://www.sqlite.org/rowvalue.html"
+  },
+  {
+   "id": "expression:boolean expression",
+   "kind": "expression",
+   "name": "boolean expression",
+   "doc": "https://www.sqlite.org/lang_expr.html"
+  },
+  {
+   "id": "affinity:TEXT",
+   "kind": "affinity",
+   "name": "TEXT",
+   "doc": "https://www.sqlite.org/datatype3.html#type_affinity"
+  },
+  {
+   "id": "affinity:NUMERIC",
+   "kind": "affinity",
+   "name": "NUMERIC",
+   "doc": "https://www.sqlite.org/datatype3.html#type_affinity"
+  },
+  {
+   "id": "affinity:INTEGER",
+   "kind": "affinity",
+   "name": "INTEGER",
+   "doc": "https://www.sqlite.org/datatype3.html#type_affinity"
+  },
+  {
+   "id": "affinity:REAL",
+   "kind": "affinity",
+   "name": "REAL",
+   "doc": "https://www.sqlite.org/datatype3.html#type_affinity"
+  },
+  {
+   "id": "affinity:BLOB",
+   "kind": "affinity",
+   "name": "BLOB",
+   "doc": "https://www.sqlite.org/datatype3.html#type_affinity"
+  },
+  {
+   "id": "collation:BINARY",
+   "kind": "collation",
+   "name": "BINARY",
+   "doc": "https://www.sqlite.org/datatype3.html#collation"
+  },
+  {
+   "id": "collation:NOCASE",
+   "kind": "collation",
+   "name": "NOCASE",
+   "doc": "https://www.sqlite.org/datatype3.html#collation"
+  },
+  {
+   "id": "collation:RTRIM",
+   "kind": "collation",
+   "name": "RTRIM",
+   "doc": "https://www.sqlite.org/datatype3.html#collation"
+  },
+  {
+   "id": "storage_class:NULL",
+   "kind": "storage_class",
+   "name": "NULL",
+   "doc": "https://www.sqlite.org/datatype3.html#storage_classes_and_datatypes"
+  },
+  {
+   "id": "storage_class:INTEGER",
+   "kind": "storage_class",
+   "name": "INTEGER",
+   "doc": "https://www.sqlite.org/datatype3.html#storage_classes_and_datatypes"
+  },
+  {
+   "id": "storage_class:REAL",
+   "kind": "storage_class",
+   "name": "REAL",
+   "doc": "https://www.sqlite.org/datatype3.html#storage_classes_and_datatypes"
+  },
+  {
+   "id": "storage_class:TEXT",
+   "kind": "storage_class",
+   "name": "TEXT",
+   "doc": "https://www.sqlite.org/datatype3.html#storage_classes_and_datatypes"
+  },
+  {
+   "id": "storage_class:BLOB",
+   "kind": "storage_class",
+   "name": "BLOB",
+   "doc": "https://www.sqlite.org/datatype3.html#storage_classes_and_datatypes"
+  },
+  {
+   "id": "rule.affinity:INT gives INTEGER",
+   "kind": "rule.affinity",
+   "name": "INT gives INTEGER",
+   "doc": "https://www.sqlite.org/datatype3.html#affinity",
+   "quote": "If the declared type contains the string \"INT\" then it is assigned INTEGER affinity."
+  },
+  {
+   "id": "rule.affinity:CHAR, CLOB or TEXT gives TEXT",
+   "kind": "rule.affinity",
+   "name": "CHAR, CLOB or TEXT gives TEXT",
+   "doc": "https://www.sqlite.org/datatype3.html#affinity",
+   "quote": "If the declared type of the column contains any of the strings \"CHAR\", \"CLOB\", or \"TEXT\" then that column has TEXT affinity."
+  },
+  {
+   "id": "rule.affinity:BLOB or no type gives BLOB",
+   "kind": "rule.affinity",
+   "name": "BLOB or no type gives BLOB",
+   "doc": "https://www.sqlite.org/datatype3.html#affinity",
+   "quote": "If the declared type for a column contains the string \"BLOB\" or if no type is specified then the column has affinity BLOB."
+  },
+  {
+   "id": "rule.affinity:REAL, FLOA or DOUB gives REAL",
+   "kind": "rule.affinity",
+   "name": "REAL, FLOA or DOUB gives REAL",
+   "doc": "https://www.sqlite.org/datatype3.html#affinity",
+   "quote": "If the declared type for a column contains any of the strings \"REAL\", \"FLOA\", or \"DOUB\" then the column has REAL affinity."
+  },
+  {
+   "id": "rule.affinity:otherwise NUMERIC",
+   "kind": "rule.affinity",
+   "name": "otherwise NUMERIC",
+   "doc": "https://www.sqlite.org/datatype3.html#affinity",
+   "quote": "Otherwise, the affinity is NUMERIC."
+  },
+  {
+   "id": "rule.affinity:the rules apply in order",
+   "kind": "rule.affinity",
+   "name": "the rules apply in order",
+   "doc": "https://www.sqlite.org/datatype3.html#affinity",
+   "quote": "Note that the order of the rules for determining column affinity is important."
+  },
+  {
+   "id": "rule.expression-affinity:an IN list has no affinity",
+   "kind": "rule.expression-affinity",
+   "name": "an IN list has no affinity",
+   "doc": "https://www.sqlite.org/datatype3.html#affinity",
+   "quote": "The right-hand operand of an IN or NOT IN operator has no affinity if the operand is a list"
+  },
+  {
+   "id": "rule.expression-affinity:a column keeps its affinity",
+   "kind": "rule.expression-affinity",
+   "name": "a column keeps its affinity",
+   "doc": "https://www.sqlite.org/datatype3.html#affinity",
+   "quote": "When an expression is a simple reference to a column of a real table (not a VIEW or subquery) then the expression has the same affinity as the table column."
+  },
+  {
+   "id": "rule.expression-affinity:an operator removes affinity",
+   "kind": "rule.expression-affinity",
+   "name": "an operator removes affinity",
+   "doc": "https://www.sqlite.org/datatype3.html#affinity",
+   "quote": "Any operators applied to column names, including the no-op unary \"+\" operator, convert the column name into an expression which always has no affinity."
+  },
+  {
+   "id": "rule.expression-affinity:CAST gives its type's affinity",
+   "kind": "rule.expression-affinity",
+   "name": "CAST gives its type's affinity",
+   "doc": "https://www.sqlite.org/datatype3.html#affinity",
+   "quote": "has an affinity that is the same as a column with a declared type of"
+  },
+  {
+   "id": "rule.expression-affinity:COLLATE keeps its operand's affinity",
+   "kind": "rule.expression-affinity",
+   "name": "COLLATE keeps its operand's affinity",
+   "doc": "https://www.sqlite.org/datatype3.html#affinity",
+   "quote": "A COLLATE operator has the same affinity as its left-hand side operand."
+  },
+  {
+   "id": "rule.expression-affinity:otherwise no affinity",
+   "kind": "rule.expression-affinity",
+   "name": "otherwise no affinity",
+   "doc": "https://www.sqlite.org/datatype3.html#affinity",
+   "quote": "Otherwise, an expression has no affinity."
+  },
+  {
+   "id": "rule.expression-affinity:view and subquery columns",
+   "kind": "rule.expression-affinity",
+   "name": "view and subquery columns",
+   "doc": "https://www.sqlite.org/datatype3.html#affview",
+   "quote": "the affinity for columns of a VIEW or subquery are determined by the expression affinity rules above"
+  },
+  {
+   "id": "rule.expression-affinity:compound view columns",
+   "kind": "rule.expression-affinity",
+   "name": "compound view columns",
+   "doc": "https://www.sqlite.org/datatype3.html#affview",
+   "quote": "the affinity of each column of the VIEW or subquery will be the affinity of the corresponding result column for one of the individual SELECT statements"
+  },
+  {
+   "id": "rule.comparison:NULL is less than any value",
+   "kind": "rule.comparison",
+   "name": "NULL is less than any value",
+   "doc": "https://www.sqlite.org/datatype3.html#comparisons",
+   "quote": "A value with storage class NULL is considered less than any other value"
+  },
+  {
+   "id": "rule.comparison:numbers before text and blobs",
+   "kind": "rule.comparison",
+   "name": "numbers before text and blobs",
+   "doc": "https://www.sqlite.org/datatype3.html#comparisons",
+   "quote": "An INTEGER or REAL value is less than any TEXT or BLOB value."
+  },
+  {
+   "id": "rule.comparison:numbers compare numerically",
+   "kind": "rule.comparison",
+   "name": "numbers compare numerically",
+   "doc": "https://www.sqlite.org/datatype3.html#comparisons",
+   "quote": "When an INTEGER or REAL is compared to another INTEGER or REAL, a numerical comparison is performed."
+  },
+  {
+   "id": "rule.comparison:text before blobs",
+   "kind": "rule.comparison",
+   "name": "text before blobs",
+   "doc": "https://www.sqlite.org/datatype3.html#comparisons",
+   "quote": "A TEXT value is less than a BLOB value."
+  },
+  {
+   "id": "rule.comparison:text compares by collation",
+   "kind": "rule.comparison",
+   "name": "text compares by collation",
+   "doc": "https://www.sqlite.org/datatype3.html#comparisons",
+   "quote": "When two TEXT values are compared an appropriate collating sequence is used to determine the result."
+  },
+  {
+   "id": "rule.comparison:blobs compare by memcmp",
+   "kind": "rule.comparison",
+   "name": "blobs compare by memcmp",
+   "doc": "https://www.sqlite.org/datatype3.html#comparisons",
+   "quote": "When two BLOB values are compared, the result is determined using memcmp()."
+  },
+  {
+   "id": "rule.comparison:numeric affinity goes to the other operand",
+   "kind": "rule.comparison",
+   "name": "numeric affinity goes to the other operand",
+   "doc": "https://www.sqlite.org/datatype3.html#compaff",
+   "quote": "If one operand has INTEGER, REAL or NUMERIC affinity and the other operand has TEXT or BLOB or no affinity then NUMERIC affinity is applied to the other operand."
+  },
+  {
+   "id": "rule.comparison:text affinity goes to an operand with none",
+   "kind": "rule.comparison",
+   "name": "text affinity goes to an operand with none",
+   "doc": "https://www.sqlite.org/datatype3.html#compaff",
+   "quote": "If one operand has TEXT affinity and the other has no affinity, then TEXT affinity is applied to the other operand."
+  },
+  {
+   "id": "rule.comparison:otherwise compared as is",
+   "kind": "rule.comparison",
+   "name": "otherwise compared as is",
+   "doc": "https://www.sqlite.org/datatype3.html#compaff",
+   "quote": "Otherwise, no affinity is applied and both operands are compared as is."
+  },
+  {
+   "id": "rule.comparison:BETWEEN is two comparisons",
+   "kind": "rule.comparison",
+   "name": "BETWEEN is two comparisons",
+   "doc": "https://www.sqlite.org/datatype3.html#compaff",
+   "quote": "The expression \"a BETWEEN b AND c\" is treated as two separate binary comparisons"
+  },
+  {
+   "id": "rule.comparison:IN compares as equality",
+   "kind": "rule.comparison",
+   "name": "IN compares as equality",
+   "doc": "https://www.sqlite.org/datatype3.html#compaff",
+   "quote": "Datatype conversions in comparisons of the form \"x IN (SELECT y ...)\" are handled as if the comparison were really \"x=y\"."
+  },
+  {
+   "id": "rule.sort:ORDER BY orders by storage class",
+   "kind": "rule.sort",
+   "name": "ORDER BY orders by storage class",
+   "doc": "https://www.sqlite.org/datatype3.html#comparisons",
+   "quote": "values with storage class NULL come first, followed by INTEGER and REAL values interspersed in numeric order, followed by TEXT values in collating sequence order, and finally BLOB values in memcmp() order."
+  },
+  {
+   "id": "rule.sort:GROUP BY keeps classes apart",
+   "kind": "rule.sort",
+   "name": "GROUP BY keeps classes apart",
+   "doc": "https://www.sqlite.org/datatype3.html#comparisons",
+   "quote": "values with different storage classes are considered distinct, except for INTEGER and REAL values which are considered equal if they are numerically equal."
+  },
+  {
+   "id": "rule.sort:compound SELECTs compare as is",
+   "kind": "rule.sort",
+   "name": "compound SELECTs compare as is",
+   "doc": "https://www.sqlite.org/datatype3.html#comparisons",
+   "quote": "No affinity is applied to comparison operands for the implicit comparisons associated with UNION, INTERSECT, or EXCEPT"
+  },
+  {
+   "id": "rule.collation:columns default to BINARY",
+   "kind": "rule.collation",
+   "name": "columns default to BINARY",
+   "doc": "https://www.sqlite.org/datatype3.html#collation",
+   "quote": "If no collating function is explicitly defined, then the collating function defaults to BINARY."
+  },
+  {
+   "id": "rule.collation:an explicit COLLATE wins, left first",
+   "kind": "rule.collation",
+   "name": "an explicit COLLATE wins, left first",
+   "doc": "https://www.sqlite.org/datatype3.html#collation",
+   "quote": "then the explicit collating function is used for comparison, with precedence to the collating function of the left operand."
+  },
+  {
+   "id": "rule.collation:then a column's collation, left first",
+   "kind": "rule.collation",
+   "name": "then a column's collation, left first",
+   "doc": "https://www.sqlite.org/datatype3.html#collation",
+   "quote": "If either operand is a column, then the collating function of that column is used with precedence to the left operand."
+  },
+  {
+   "id": "rule.collation:otherwise BINARY",
+   "kind": "rule.collation",
+   "name": "otherwise BINARY",
+   "doc": "https://www.sqlite.org/datatype3.html#collation",
+   "quote": "Otherwise, the BINARY collating function is used for comparison."
+  },
+  {
+   "id": "rule.collation:the leftmost COLLATE anywhere wins",
+   "kind": "rule.collation",
+   "name": "the leftmost COLLATE anywhere wins",
+   "doc": "https://www.sqlite.org/datatype3.html#collation",
+   "quote": "the left most explicit collating function is used regardless of how deeply the COLLATE operators are nested"
+  },
+  {
+   "id": "rule.collation:IN uses the left operand's collation",
+   "kind": "rule.collation",
+   "name": "IN uses the left operand's collation",
+   "doc": "https://www.sqlite.org/datatype3.html#collation",
+   "quote": "The collating sequence used for expressions of the form \"x IN (y, z, ...)\" is the collating sequence of x."
+  },
+  {
+   "id": "rule.collation:ORDER BY uses COLLATE, then the column's",
+   "kind": "rule.collation",
+   "name": "ORDER BY uses COLLATE, then the column's",
+   "doc": "https://www.sqlite.org/datatype3.html#collation",
+   "quote": "Otherwise, if the expression sorted by an ORDER BY clause is a column, then the collating sequence of the column is used to determine sort order."
+  },
+  {
+   "id": "keyword:ABORT",
+   "kind": "keyword",
+   "name": "ABORT",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:ACTION",
+   "kind": "keyword",
+   "name": "ACTION",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:ADD",
+   "kind": "keyword",
+   "name": "ADD",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:AFTER",
+   "kind": "keyword",
+   "name": "AFTER",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:ALL",
+   "kind": "keyword",
+   "name": "ALL",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:ALTER",
+   "kind": "keyword",
+   "name": "ALTER",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:ALWAYS",
+   "kind": "keyword",
+   "name": "ALWAYS",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:ANALYZE",
+   "kind": "keyword",
+   "name": "ANALYZE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:AND",
+   "kind": "keyword",
+   "name": "AND",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:AS",
+   "kind": "keyword",
+   "name": "AS",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:ASC",
+   "kind": "keyword",
+   "name": "ASC",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:ATTACH",
+   "kind": "keyword",
+   "name": "ATTACH",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:AUTOINCREMENT",
+   "kind": "keyword",
+   "name": "AUTOINCREMENT",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:BEFORE",
+   "kind": "keyword",
+   "name": "BEFORE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:BEGIN",
+   "kind": "keyword",
+   "name": "BEGIN",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:BETWEEN",
+   "kind": "keyword",
+   "name": "BETWEEN",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:BY",
+   "kind": "keyword",
+   "name": "BY",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:CASCADE",
+   "kind": "keyword",
+   "name": "CASCADE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:CASE",
+   "kind": "keyword",
+   "name": "CASE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:CAST",
+   "kind": "keyword",
+   "name": "CAST",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:CHECK",
+   "kind": "keyword",
+   "name": "CHECK",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:COLLATE",
+   "kind": "keyword",
+   "name": "COLLATE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:COLUMN",
+   "kind": "keyword",
+   "name": "COLUMN",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:COMMIT",
+   "kind": "keyword",
+   "name": "COMMIT",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:CONFLICT",
+   "kind": "keyword",
+   "name": "CONFLICT",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:CONSTRAINT",
+   "kind": "keyword",
+   "name": "CONSTRAINT",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:CREATE",
+   "kind": "keyword",
+   "name": "CREATE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:CROSS",
+   "kind": "keyword",
+   "name": "CROSS",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:CURRENT",
+   "kind": "keyword",
+   "name": "CURRENT",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:CURRENT_DATE",
+   "kind": "keyword",
+   "name": "CURRENT_DATE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:CURRENT_TIME",
+   "kind": "keyword",
+   "name": "CURRENT_TIME",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:CURRENT_TIMESTAMP",
+   "kind": "keyword",
+   "name": "CURRENT_TIMESTAMP",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:DATABASE",
+   "kind": "keyword",
+   "name": "DATABASE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:DEFAULT",
+   "kind": "keyword",
+   "name": "DEFAULT",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:DEFERRABLE",
+   "kind": "keyword",
+   "name": "DEFERRABLE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:DEFERRED",
+   "kind": "keyword",
+   "name": "DEFERRED",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:DELETE",
+   "kind": "keyword",
+   "name": "DELETE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:DESC",
+   "kind": "keyword",
+   "name": "DESC",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:DETACH",
+   "kind": "keyword",
+   "name": "DETACH",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:DISTINCT",
+   "kind": "keyword",
+   "name": "DISTINCT",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:DO",
+   "kind": "keyword",
+   "name": "DO",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:DROP",
+   "kind": "keyword",
+   "name": "DROP",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:EACH",
+   "kind": "keyword",
+   "name": "EACH",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:ELSE",
+   "kind": "keyword",
+   "name": "ELSE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:END",
+   "kind": "keyword",
+   "name": "END",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:ESCAPE",
+   "kind": "keyword",
+   "name": "ESCAPE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:EXCEPT",
+   "kind": "keyword",
+   "name": "EXCEPT",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:EXCLUDE",
+   "kind": "keyword",
+   "name": "EXCLUDE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:EXCLUSIVE",
+   "kind": "keyword",
+   "name": "EXCLUSIVE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:EXISTS",
+   "kind": "keyword",
+   "name": "EXISTS",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:EXPLAIN",
+   "kind": "keyword",
+   "name": "EXPLAIN",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:FAIL",
+   "kind": "keyword",
+   "name": "FAIL",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:FILTER",
+   "kind": "keyword",
+   "name": "FILTER",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:FIRST",
+   "kind": "keyword",
+   "name": "FIRST",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:FOLLOWING",
+   "kind": "keyword",
+   "name": "FOLLOWING",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:FOR",
+   "kind": "keyword",
+   "name": "FOR",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:FOREIGN",
+   "kind": "keyword",
+   "name": "FOREIGN",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:FROM",
+   "kind": "keyword",
+   "name": "FROM",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:FULL",
+   "kind": "keyword",
+   "name": "FULL",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:GENERATED",
+   "kind": "keyword",
+   "name": "GENERATED",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:GLOB",
+   "kind": "keyword",
+   "name": "GLOB",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:GROUP",
+   "kind": "keyword",
+   "name": "GROUP",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:GROUPS",
+   "kind": "keyword",
+   "name": "GROUPS",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:HAVING",
+   "kind": "keyword",
+   "name": "HAVING",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:IF",
+   "kind": "keyword",
+   "name": "IF",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:IGNORE",
+   "kind": "keyword",
+   "name": "IGNORE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:IMMEDIATE",
+   "kind": "keyword",
+   "name": "IMMEDIATE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:IN",
+   "kind": "keyword",
+   "name": "IN",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:INDEX",
+   "kind": "keyword",
+   "name": "INDEX",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:INDEXED",
+   "kind": "keyword",
+   "name": "INDEXED",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:INITIALLY",
+   "kind": "keyword",
+   "name": "INITIALLY",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:INNER",
+   "kind": "keyword",
+   "name": "INNER",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:INSERT",
+   "kind": "keyword",
+   "name": "INSERT",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:INSTEAD",
+   "kind": "keyword",
+   "name": "INSTEAD",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:INTERSECT",
+   "kind": "keyword",
+   "name": "INTERSECT",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:INTO",
+   "kind": "keyword",
+   "name": "INTO",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:IS",
+   "kind": "keyword",
+   "name": "IS",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:ISNULL",
+   "kind": "keyword",
+   "name": "ISNULL",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:JOIN",
+   "kind": "keyword",
+   "name": "JOIN",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:KEY",
+   "kind": "keyword",
+   "name": "KEY",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:LAST",
+   "kind": "keyword",
+   "name": "LAST",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:LEFT",
+   "kind": "keyword",
+   "name": "LEFT",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:LIKE",
+   "kind": "keyword",
+   "name": "LIKE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:LIMIT",
+   "kind": "keyword",
+   "name": "LIMIT",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:MATCH",
+   "kind": "keyword",
+   "name": "MATCH",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:MATERIALIZED",
+   "kind": "keyword",
+   "name": "MATERIALIZED",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:NATURAL",
+   "kind": "keyword",
+   "name": "NATURAL",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:NO",
+   "kind": "keyword",
+   "name": "NO",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:NOT",
+   "kind": "keyword",
+   "name": "NOT",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:NOTHING",
+   "kind": "keyword",
+   "name": "NOTHING",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:NOTNULL",
+   "kind": "keyword",
+   "name": "NOTNULL",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:NULL",
+   "kind": "keyword",
+   "name": "NULL",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:NULLS",
+   "kind": "keyword",
+   "name": "NULLS",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:OF",
+   "kind": "keyword",
+   "name": "OF",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:OFFSET",
+   "kind": "keyword",
+   "name": "OFFSET",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:ON",
+   "kind": "keyword",
+   "name": "ON",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:OR",
+   "kind": "keyword",
+   "name": "OR",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:ORDER",
+   "kind": "keyword",
+   "name": "ORDER",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:OTHERS",
+   "kind": "keyword",
+   "name": "OTHERS",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:OUTER",
+   "kind": "keyword",
+   "name": "OUTER",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:OVER",
+   "kind": "keyword",
+   "name": "OVER",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:PARTITION",
+   "kind": "keyword",
+   "name": "PARTITION",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:PLAN",
+   "kind": "keyword",
+   "name": "PLAN",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:PRAGMA",
+   "kind": "keyword",
+   "name": "PRAGMA",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:PRECEDING",
+   "kind": "keyword",
+   "name": "PRECEDING",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:PRIMARY",
+   "kind": "keyword",
+   "name": "PRIMARY",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:QUERY",
+   "kind": "keyword",
+   "name": "QUERY",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:RAISE",
+   "kind": "keyword",
+   "name": "RAISE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:RANGE",
+   "kind": "keyword",
+   "name": "RANGE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:RECURSIVE",
+   "kind": "keyword",
+   "name": "RECURSIVE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:REFERENCES",
+   "kind": "keyword",
+   "name": "REFERENCES",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:REGEXP",
+   "kind": "keyword",
+   "name": "REGEXP",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:REINDEX",
+   "kind": "keyword",
+   "name": "REINDEX",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:RELEASE",
+   "kind": "keyword",
+   "name": "RELEASE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:RENAME",
+   "kind": "keyword",
+   "name": "RENAME",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:REPLACE",
+   "kind": "keyword",
+   "name": "REPLACE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:RESTRICT",
+   "kind": "keyword",
+   "name": "RESTRICT",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:RETURNING",
+   "kind": "keyword",
+   "name": "RETURNING",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:RIGHT",
+   "kind": "keyword",
+   "name": "RIGHT",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:ROLLBACK",
+   "kind": "keyword",
+   "name": "ROLLBACK",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:ROW",
+   "kind": "keyword",
+   "name": "ROW",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:ROWS",
+   "kind": "keyword",
+   "name": "ROWS",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:SAVEPOINT",
+   "kind": "keyword",
+   "name": "SAVEPOINT",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:SELECT",
+   "kind": "keyword",
+   "name": "SELECT",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:SET",
+   "kind": "keyword",
+   "name": "SET",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:TABLE",
+   "kind": "keyword",
+   "name": "TABLE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:TEMP",
+   "kind": "keyword",
+   "name": "TEMP",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:TEMPORARY",
+   "kind": "keyword",
+   "name": "TEMPORARY",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:THEN",
+   "kind": "keyword",
+   "name": "THEN",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:TIES",
+   "kind": "keyword",
+   "name": "TIES",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:TO",
+   "kind": "keyword",
+   "name": "TO",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:TRANSACTION",
+   "kind": "keyword",
+   "name": "TRANSACTION",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:TRIGGER",
+   "kind": "keyword",
+   "name": "TRIGGER",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:UNBOUNDED",
+   "kind": "keyword",
+   "name": "UNBOUNDED",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:UNION",
+   "kind": "keyword",
+   "name": "UNION",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:UNIQUE",
+   "kind": "keyword",
+   "name": "UNIQUE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:UPDATE",
+   "kind": "keyword",
+   "name": "UPDATE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:USING",
+   "kind": "keyword",
+   "name": "USING",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:VACUUM",
+   "kind": "keyword",
+   "name": "VACUUM",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:VALUES",
+   "kind": "keyword",
+   "name": "VALUES",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:VIEW",
+   "kind": "keyword",
+   "name": "VIEW",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:VIRTUAL",
+   "kind": "keyword",
+   "name": "VIRTUAL",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:WHEN",
+   "kind": "keyword",
+   "name": "WHEN",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:WHERE",
+   "kind": "keyword",
+   "name": "WHERE",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:WINDOW",
+   "kind": "keyword",
+   "name": "WINDOW",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:WITH",
+   "kind": "keyword",
+   "name": "WITH",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "keyword:WITHOUT",
+   "kind": "keyword",
+   "name": "WITHOUT",
+   "doc": "https://www.sqlite.org/lang_keywords.html"
+  },
+  {
+   "id": "word:E",
+   "kind": "word",
+   "name": "E",
+   "doc": "https://www.sqlite.org/syntax/numeric-literal.html",
+   "productions": [
+    "numeric-literal"
+   ]
+  },
+  {
+   "id": "word:EXPRESSIONS",
+   "kind": "word",
+   "name": "EXPRESSIONS",
+   "doc": "https://www.sqlite.org/syntax/reindex-stmt.html",
+   "productions": [
+    "reindex-stmt"
+   ]
+  },
+  {
+   "id": "word:FALSE",
+   "kind": "word",
+   "name": "FALSE",
+   "doc": "https://www.sqlite.org/syntax/literal-value.html",
+   "productions": [
+    "literal-value"
+   ]
+  },
+  {
+   "id": "word:ROWID",
+   "kind": "word",
+   "name": "ROWID",
+   "doc": "https://www.sqlite.org/syntax/table-options.html",
+   "productions": [
+    "table-options"
+   ]
+  },
+  {
+   "id": "word:STORED",
+   "kind": "word",
+   "name": "STORED",
+   "doc": "https://www.sqlite.org/syntax/column-constraint.html",
+   "productions": [
+    "column-constraint"
+   ]
+  },
+  {
+   "id": "word:STRICT",
+   "kind": "word",
+   "name": "STRICT",
+   "doc": "https://www.sqlite.org/syntax/table-options.html",
+   "productions": [
+    "table-options"
+   ]
+  },
+  {
+   "id": "word:TRUE",
+   "kind": "word",
+   "name": "TRUE",
+   "doc": "https://www.sqlite.org/syntax/literal-value.html",
+   "productions": [
+    "literal-value"
+   ]
+  }
+ ]
+}

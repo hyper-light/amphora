@@ -1,0 +1,300 @@
+bench	query	most_tables_in_one_from	join_kinds	subqueries
+JOB	1a	5	-	-
+JOB	1b	5	-	-
+JOB	1c	5	-	-
+JOB	1d	5	-	-
+JOB	2a	5	-	-
+JOB	2b	5	-	-
+JOB	2c	5	-	-
+JOB	2d	5	-	-
+JOB	3a	4	-	-
+JOB	3b	4	-	-
+JOB	3c	4	-	-
+JOB	4a	5	-	-
+JOB	4b	5	-	-
+JOB	4c	5	-	-
+JOB	5a	5	-	-
+JOB	5b	5	-	-
+JOB	5c	5	-	-
+JOB	6a	5	-	-
+JOB	6b	5	-	-
+JOB	6c	5	-	-
+JOB	6d	5	-	-
+JOB	6e	5	-	-
+JOB	6f	5	-	-
+JOB	7a	8	-	-
+JOB	7b	8	-	-
+JOB	7c	8	-	-
+JOB	8a	7	-	-
+JOB	8b	7	-	-
+JOB	8c	7	-	-
+JOB	8d	7	-	-
+JOB	9a	8	-	-
+JOB	9b	8	-	-
+JOB	9c	8	-	-
+JOB	9d	8	-	-
+JOB	10a	7	-	-
+JOB	10b	7	-	-
+JOB	10c	7	-	-
+JOB	11a	8	-	-
+JOB	11b	8	-	-
+JOB	11c	8	-	-
+JOB	11d	8	-	-
+JOB	12a	8	-	-
+JOB	12b	8	-	-
+JOB	12c	8	-	-
+JOB	13a	9	-	-
+JOB	13b	9	-	-
+JOB	13c	9	-	-
+JOB	13d	9	-	-
+JOB	14a	8	-	-
+JOB	14b	8	-	-
+JOB	14c	8	-	-
+JOB	15a	9	-	-
+JOB	15b	9	-	-
+JOB	15c	9	-	-
+JOB	15d	9	-	-
+JOB	16a	8	-	-
+JOB	16b	8	-	-
+JOB	16c	8	-	-
+JOB	16d	8	-	-
+JOB	17a	7	-	-
+JOB	17b	7	-	-
+JOB	17c	7	-	-
+JOB	17d	7	-	-
+JOB	17e	7	-	-
+JOB	17f	7	-	-
+JOB	18a	7	-	-
+JOB	18b	7	-	-
+JOB	18c	7	-	-
+JOB	19a	10	-	-
+JOB	19b	10	-	-
+JOB	19c	10	-	-
+JOB	19d	10	-	-
+JOB	20a	10	-	-
+JOB	20b	10	-	-
+JOB	20c	10	-	-
+JOB	21a	9	-	-
+JOB	21b	9	-	-
+JOB	21c	9	-	-
+JOB	22a	11	-	-
+JOB	22b	11	-	-
+JOB	22c	11	-	-
+JOB	22d	11	-	-
+JOB	23a	11	-	-
+JOB	23b	11	-	-
+JOB	23c	11	-	-
+JOB	24a	12	-	-
+JOB	24b	12	-	-
+JOB	25a	9	-	-
+JOB	25b	9	-	-
+JOB	25c	9	-	-
+JOB	26a	12	-	-
+JOB	26b	12	-	-
+JOB	26c	12	-	-
+JOB	27a	12	-	-
+JOB	27b	12	-	-
+JOB	27c	12	-	-
+JOB	28a	14	-	-
+JOB	28b	14	-	-
+JOB	28c	14	-	-
+JOB	29a	17	-	-
+JOB	29b	17	-	-
+JOB	29c	17	-	-
+JOB	30a	12	-	-
+JOB	30b	12	-	-
+JOB	30c	12	-	-
+JOB	31a	11	-	-
+JOB	31b	11	-	-
+JOB	31c	11	-	-
+JOB	32a	6	-	-
+JOB	32b	6	-	-
+JOB	33a	14	-	-
+JOB	33b	14	-	-
+JOB	33c	14	-	-
+TPC-H	Q1	1	-	-
+TPC-H	Q2	5	-	scalar correlated
+TPC-H	Q3	3	-	-
+TPC-H	Q4	1	-	exists correlated
+TPC-H	Q5	6	-	-
+TPC-H	Q6	1	-	-
+TPC-H	Q7	6	-	-
+TPC-H	Q8	8	-	-
+TPC-H	Q9	6	-	-
+TPC-H	Q10	4	-	-
+TPC-H	Q11	3	-	scalar
+TPC-H	Q12	2	-	-
+TPC-H	Q13	2	left	-
+TPC-H	Q14	2	-	-
+TPC-H	Q15	2	-	scalar
+TPC-H	Q16	2	-	not in
+TPC-H	Q17	2	-	scalar correlated
+TPC-H	Q18	3	-	in
+TPC-H	Q19	2	-	-
+TPC-H	Q20	2	-	in, in, scalar correlated
+TPC-H	Q21	4	-	exists correlated, not exists correlated
+TPC-H	Q22	1	-	scalar, not exists correlated
+TPC-DS	Q1	3	-	scalar correlated
+TPC-DS	Q2	2	-	-
+TPC-DS	Q3	3	-	-
+TPC-DS	Q4	6	-	-
+TPC-DS	Q5	3	left	-
+TPC-DS	Q6	5	-	scalar, scalar correlated
+TPC-DS	Q7	5	-	-
+TPC-DS	Q8	4	-	-
+TPC-DS	Q9	1	-	scalar, scalar, scalar, scalar, scalar, scalar, scalar, scalar, scalar, scalar, scalar, scalar, scalar, scalar, scalar
+TPC-DS	Q10	3	-	exists correlated, exists correlated, exists correlated
+TPC-DS	Q11	4	-	-
+TPC-DS	Q12	3	-	-
+TPC-DS	Q13	6	-	-
+TPC-DS	Q14	3	-	in correlated, scalar, in, scalar, in, scalar
+TPC-DS	Q15	4	-	-
+TPC-DS	Q16	4	-	exists correlated, not exists correlated
+TPC-DS	Q17	8	-	-
+TPC-DS	Q18	7	-	-
+TPC-DS	Q19	6	-	-
+TPC-DS	Q20	3	-	-
+TPC-DS	Q21	4	-	-
+TPC-DS	Q22	3	-	-
+TPC-DS	Q23	4	-	in, in
+TPC-DS	Q24	6	-	scalar
+TPC-DS	Q25	8	-	-
+TPC-DS	Q26	5	-	-
+TPC-DS	Q27	5	-	-
+TPC-DS	Q28	6	-	-
+TPC-DS	Q29	8	-	-
+TPC-DS	Q30	3	-	scalar correlated
+TPC-DS	Q31	6	-	-
+TPC-DS	Q32	3	-	scalar correlated
+TPC-DS	Q33	4	-	in, in, in
+TPC-DS	Q34	4	-	-
+TPC-DS	Q35	3	-	exists correlated, exists correlated, exists correlated
+TPC-DS	Q36	4	-	-
+TPC-DS	Q37	4	-	-
+TPC-DS	Q38	3	-	-
+TPC-DS	Q39	4	-	-
+TPC-DS	Q40	5	left	-
+TPC-DS	Q41	1	-	scalar correlated
+TPC-DS	Q42	3	-	-
+TPC-DS	Q43	3	-	-
+TPC-DS	Q44	4	-	scalar, scalar
+TPC-DS	Q45	5	-	in
+TPC-DS	Q46	5	-	-
+TPC-DS	Q47	4	-	-
+TPC-DS	Q48	5	-	-
+TPC-DS	Q49	3	left	-
+TPC-DS	Q50	5	-	-
+TPC-DS	Q51	2	full	-
+TPC-DS	Q52	3	-	-
+TPC-DS	Q53	4	-	-
+TPC-DS	Q54	5	-	scalar, scalar
+TPC-DS	Q55	3	-	-
+TPC-DS	Q56	4	-	in, in, in
+TPC-DS	Q57	4	-	-
+TPC-DS	Q58	3	-	in, scalar, in, scalar, in, scalar
+TPC-DS	Q59	3	-	-
+TPC-DS	Q60	4	-	in, in, in
+TPC-DS	Q61	7	-	-
+TPC-DS	Q62	5	-	-
+TPC-DS	Q63	4	-	-
+TPC-DS	Q64	18	-	-
+TPC-DS	Q65	4	-	-
+TPC-DS	Q66	5	-	-
+TPC-DS	Q67	4	-	-
+TPC-DS	Q68	5	-	-
+TPC-DS	Q69	3	-	exists correlated, not exists correlated, not exists correlated
+TPC-DS	Q70	3	-	in correlated
+TPC-DS	Q71	3	-	-
+TPC-DS	Q72	11	inner,left	-
+TPC-DS	Q73	4	-	-
+TPC-DS	Q74	4	-	-
+TPC-DS	Q75	4	inner,left	-
+TPC-DS	Q76	3	-	-
+TPC-DS	Q77	3	left	-
+TPC-DS	Q78	3	inner,left	-
+TPC-DS	Q79	4	-	-
+TPC-DS	Q80	6	left	-
+TPC-DS	Q81	3	-	scalar correlated
+TPC-DS	Q82	4	-	-
+TPC-DS	Q83	3	-	in, in, in, in, in, in
+TPC-DS	Q84	6	-	-
+TPC-DS	Q85	8	-	-
+TPC-DS	Q86	3	-	-
+TPC-DS	Q87	3	-	scalar, scalar
+TPC-DS	Q88	8	-	-
+TPC-DS	Q89	4	-	-
+TPC-DS	Q90	4	-	-
+TPC-DS	Q91	7	-	-
+TPC-DS	Q92	3	-	scalar correlated
+TPC-DS	Q93	3	left	-
+TPC-DS	Q94	4	-	exists correlated, not exists correlated
+TPC-DS	Q95	4	-	in correlated, in correlated
+TPC-DS	Q96	4	-	-
+TPC-DS	Q97	2	full	-
+TPC-DS	Q98	3	-	-
+TPC-DS	Q99	5	-	-
+CH-benCHmark	Q1	1	-	-
+CH-benCHmark	Q2	6	-	-
+CH-benCHmark	Q3	4	-	-
+CH-benCHmark	Q4	1	-	exists correlated
+CH-benCHmark	Q5	7	-	-
+CH-benCHmark	Q6	1	-	-
+CH-benCHmark	Q7	7	-	-
+CH-benCHmark	Q8	9	-	-
+CH-benCHmark	Q9	6	-	-
+CH-benCHmark	Q10	4	-	-
+CH-benCHmark	Q11	3	-	scalar
+CH-benCHmark	Q12	2	-	-
+CH-benCHmark	Q13	2	left	-
+CH-benCHmark	Q14	2	-	-
+CH-benCHmark	Q15	2	-	-
+CH-benCHmark	Q16	2	-	not in
+CH-benCHmark	Q17	2	-	-
+CH-benCHmark	Q18	3	-	-
+CH-benCHmark	Q19	2	-	-
+CH-benCHmark	Q20	3	inner	in
+CH-benCHmark	Q21	5	-	not exists correlated
+CH-benCHmark	Q22	1	-	scalar, not exists correlated
+ClickBench	Q0	1	-	-
+ClickBench	Q1	1	-	-
+ClickBench	Q2	1	-	-
+ClickBench	Q3	1	-	-
+ClickBench	Q4	1	-	-
+ClickBench	Q5	1	-	-
+ClickBench	Q6	1	-	-
+ClickBench	Q7	1	-	-
+ClickBench	Q8	1	-	-
+ClickBench	Q9	1	-	-
+ClickBench	Q10	1	-	-
+ClickBench	Q11	1	-	-
+ClickBench	Q12	1	-	-
+ClickBench	Q13	1	-	-
+ClickBench	Q14	1	-	-
+ClickBench	Q15	1	-	-
+ClickBench	Q16	1	-	-
+ClickBench	Q17	1	-	-
+ClickBench	Q18	1	-	-
+ClickBench	Q19	1	-	-
+ClickBench	Q20	1	-	-
+ClickBench	Q21	1	-	-
+ClickBench	Q22	1	-	-
+ClickBench	Q23	1	-	-
+ClickBench	Q24	1	-	-
+ClickBench	Q25	1	-	-
+ClickBench	Q26	1	-	-
+ClickBench	Q27	1	-	-
+ClickBench	Q28	1	-	-
+ClickBench	Q29	1	-	-
+ClickBench	Q30	1	-	-
+ClickBench	Q31	1	-	-
+ClickBench	Q32	1	-	-
+ClickBench	Q33	1	-	-
+ClickBench	Q34	1	-	-
+ClickBench	Q35	1	-	-
+ClickBench	Q36	1	-	-
+ClickBench	Q37	1	-	-
+ClickBench	Q38	1	-	-
+ClickBench	Q39	1	-	-
+ClickBench	Q40	1	-	-
+ClickBench	Q41	1	-	-
+ClickBench	Q42	1	-	-

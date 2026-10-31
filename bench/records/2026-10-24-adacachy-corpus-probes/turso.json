@@ -1,0 +1,7196 @@
+{
+  "engine": "turso",
+  "results": [
+    {
+      "id": "function.core:abs",
+      "rows": [
+        [
+          3,
+          2.5,
+          null
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:changes",
+      "rows": [
+        [
+          4
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:char",
+      "rows": [
+        [
+          "Hi"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:coalesce",
+      "rows": [
+        [
+          3
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:concat",
+      "rows": [
+        [
+          "ab1"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:concat_ws",
+      "rows": [
+        [
+          "a-b"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:format",
+      "rows": [
+        [
+          "7-x"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:glob",
+      "rows": [
+        [
+          1,
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:hex",
+      "rows": [
+        [
+          "4142",
+          "323535"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:if",
+      "rows": [
+        [
+          "b"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:ifnull",
+      "rows": [
+        [
+          "z"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:iif",
+      "rows": [
+        [
+          "yes"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:instr",
+      "rows": [
+        [
+          3
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:last_insert_rowid",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:length",
+      "rows": [
+        [
+          5,
+          2,
+          null
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:like",
+      "rows": [
+        [
+          1,
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:likelihood",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:likely",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "error": "Parse error: runtime extension loading is disabled",
+      "id": "function.core:load_extension",
+      "status": "error"
+    },
+    {
+      "id": "function.core:lower",
+      "rows": [
+        [
+          "abc"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:ltrim",
+      "rows": [
+        [
+          "ab",
+          "ab"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:max",
+      "rows": [
+        [
+          5
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:min",
+      "rows": [
+        [
+          2
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:nullif",
+      "rows": [
+        [
+          null,
+          3
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:octet_length",
+      "rows": [
+        [
+          6
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:printf",
+      "rows": [
+        [
+          " 3.14|a  |007"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:quote",
+      "rows": [
+        [
+          "'it''s'",
+          "NULL",
+          "X'AB'"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:random",
+      "rows": [
+        [
+          "integer"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:randomblob",
+      "rows": [
+        [
+          8
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:replace",
+      "rows": [
+        [
+          "bANANa"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:round",
+      "rows": [
+        [
+          2.57,
+          3.0,
+          -3.0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:rtrim",
+      "rows": [
+        [
+          "ab",
+          "ab"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:sign",
+      "rows": [
+        [
+          -1,
+          0,
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:soundex",
+      "requires": "SQLITE_SOUNDEX",
+      "rows": [
+        [
+          "R163"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "error": "Parse error: no such function: sqlite_compileoption_get",
+      "id": "function.core:sqlite_compileoption_get",
+      "status": "error"
+    },
+    {
+      "error": "Parse error: no such function: sqlite_compileoption_used",
+      "id": "function.core:sqlite_compileoption_used",
+      "status": "error"
+    },
+    {
+      "error": "Parse error: no such function: sqlite_offset",
+      "id": "function.core:sqlite_offset",
+      "requires": "SQLITE_ENABLE_OFFSET_SQL_FUNC",
+      "status": "error"
+    },
+    {
+      "id": "function.core:sqlite_source_id",
+      "rows": [
+        [
+          "text"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:sqlite_version",
+      "rows": [
+        [
+          "text"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:substr",
+      "rows": [
+        [
+          "ata",
+          "base",
+          "base"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:substring",
+      "rows": [
+        [
+          "ata"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:total_changes",
+      "rows": [
+        [
+          "integer"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:trim",
+      "rows": [
+        [
+          "ab",
+          "ab"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:typeof",
+      "rows": [
+        [
+          "integer",
+          "real",
+          "text",
+          "blob",
+          "null"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:unhex",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:unicode",
+      "rows": [
+        [
+          65
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:unistr",
+      "rows": [
+        [
+          "Aé"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:unistr_quote",
+      "rows": [
+        [
+          "'a''b'"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:unlikely",
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:upper",
+      "rows": [
+        [
+          "ABC"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.core:zeroblob",
+      "rows": [
+        [
+          4,
+          "blob"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:acos",
+      "rows": [
+        [
+          1.047198
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:acosh",
+      "rows": [
+        [
+          1.316958
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:asin",
+      "rows": [
+        [
+          0.523599
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:asinh",
+      "rows": [
+        [
+          0.881374
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:atan",
+      "rows": [
+        [
+          0.785398
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:atan2",
+      "rows": [
+        [
+          0.463648
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:atanh",
+      "rows": [
+        [
+          0.549306
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:ceil",
+      "rows": [
+        [
+          3.0,
+          -2.0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:ceiling",
+      "rows": [
+        [
+          3.0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:cos",
+      "rows": [
+        [
+          0.540302
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:cosh",
+      "rows": [
+        [
+          1.543081
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:degrees",
+      "rows": [
+        [
+          180.0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:exp",
+      "rows": [
+        [
+          2.718282
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:floor",
+      "rows": [
+        [
+          2.0,
+          -3.0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:ln",
+      "rows": [
+        [
+          2.302585
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:log",
+      "rows": [
+        [
+          2.0,
+          3.0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:log10",
+      "rows": [
+        [
+          3.0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:log2",
+      "rows": [
+        [
+          3.0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:mod",
+      "rows": [
+        [
+          1.0,
+          1.5
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:pi",
+      "rows": [
+        [
+          3.141593
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:pow",
+      "rows": [
+        [
+          1024.0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:power",
+      "rows": [
+        [
+          27.0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:radians",
+      "rows": [
+        [
+          3.141593
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:sin",
+      "rows": [
+        [
+          0.841471
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:sinh",
+      "rows": [
+        [
+          1.175201
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:sqrt",
+      "rows": [
+        [
+          4.0,
+          1.5
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:tan",
+      "rows": [
+        [
+          1.557408
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:tanh",
+      "rows": [
+        [
+          0.761594
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.math:trunc",
+      "rows": [
+        [
+          2.0,
+          -2.0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.datetime:date",
+      "rows": [
+        [
+          "2024-02-29",
+          "1970-01-01"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.datetime:time",
+      "rows": [
+        [
+          "13:45:30",
+          "14:15:00"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.datetime:datetime",
+      "rows": [
+        [
+          "2024-03-02 10:00:00",
+          "2023-11-14 22:13:20"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.datetime:julianday",
+      "rows": [
+        [
+          2451545.0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.datetime:unixepoch",
+      "rows": [
+        [
+          1704067200
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.datetime:strftime",
+      "rows": [
+        [
+          "2024-03-15 08:05 075 5"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.datetime:timediff",
+      "rows": [
+        [
+          "+0000-02-14 00:00:00.000"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "datetime.modifier:NNN days",
+      "rows": [
+        [
+          "2024-01-11"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "datetime.modifier:NNN hours",
+      "rows": [
+        [
+          "2024-01-01 05:00:00"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "datetime.modifier:NNN minutes",
+      "rows": [
+        [
+          "2023-12-31 22:30:00"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "datetime.modifier:NNN seconds",
+      "rows": [
+        [
+          "2024-01-01 01:00:00"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "datetime.modifier:NNN months",
+      "rows": [
+        [
+          "2024-03-02"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "datetime.modifier:NNN years",
+      "rows": [
+        [
+          "2025-03-01"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "datetime.modifier:start of month",
+      "rows": [
+        [
+          "2024-03-01"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "datetime.modifier:start of year",
+      "rows": [
+        [
+          "2024-01-01"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "datetime.modifier:start of day",
+      "rows": [
+        [
+          "2024-03-15 00:00:00"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "datetime.modifier:weekday N",
+      "rows": [
+        [
+          "2024-03-17"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "datetime.modifier:unixepoch",
+      "rows": [
+        [
+          "2024-03-15 00:00:00"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "datetime.modifier:julianday",
+      "rows": [
+        [
+          "2024-03-16"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "datetime.modifier:auto",
+      "rows": [
+        [
+          "2024-03-15 00:00:00"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "datetime.modifier:localtime",
+      "rows": [
+        [
+          "text"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "datetime.modifier:utc",
+      "rows": [
+        [
+          "text"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "datetime.modifier:subsec",
+      "rows": [
+        [
+          "text"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "datetime.modifier:subsecond",
+      "rows": [
+        [
+          "text"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "datetime.modifier:ceiling",
+      "rows": [
+        [
+          "2024-03-02"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "datetime.modifier:floor",
+      "rows": [
+        [
+          "2024-02-29"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:json",
+      "rows": [
+        [
+          "{\"x\":1}"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:json_array",
+      "rows": [
+        [
+          "[1,\"a\",null,2.5]"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "error": "Parse error: no such function: json_array_insert",
+      "id": "function.json:json_array_insert",
+      "status": "error"
+    },
+    {
+      "id": "function.json:json_array_length",
+      "rows": [
+        [
+          3
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:json_each",
+      "rows": [
+        [
+          "a",
+          1,
+          "integer"
+        ],
+        [
+          "b",
+          "[1,2,{\"c\":3}]",
+          "array"
+        ],
+        [
+          "d",
+          null,
+          "null"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:json_error_position",
+      "rows": [
+        [
+          6
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:json_extract",
+      "rows": [
+        [
+          3,
+          "[1,null]"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:json_group_array",
+      "rows": [
+        [
+          "[1,2,3,4,5]"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:json_group_object",
+      "rows": [
+        [
+          "{\"one\":1,\"two\":2,\"three\":3,\"five\":5}"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:json_insert",
+      "rows": [
+        [
+          "{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null,\"e\":5}"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:json_object",
+      "rows": [
+        [
+          "{\"k\":1,\"v\":\"x\"}"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:json_patch",
+      "rows": [
+        [
+          "{\"a\":1,\"c\":3}"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:json_pretty",
+      "rows": [
+        [
+          "{\n    \"a\": [\n        1,\n        2\n    ]\n}"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:json_quote",
+      "rows": [
+        [
+          "\"a\\\"b\"",
+          "3"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:json_remove",
+      "rows": [
+        [
+          "{\"a\":1}"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:json_replace",
+      "rows": [
+        [
+          "{\"a\":7,\"b\":[1,2,{\"c\":3}],\"d\":null}"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:json_set",
+      "rows": [
+        [
+          "{\"a\":8,\"b\":[1,2,{\"c\":3}],\"d\":null,\"e\":\"n\"}"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:json_tree",
+      "rows": [
+        [
+          "$",
+          "object"
+        ],
+        [
+          "$.a",
+          "integer"
+        ],
+        [
+          "$.b",
+          "array"
+        ],
+        [
+          "$.b[0]",
+          "integer"
+        ],
+        [
+          "$.b[1]",
+          "integer"
+        ],
+        [
+          "$.b[2]",
+          "object"
+        ],
+        [
+          "$.b[2].c",
+          "integer"
+        ],
+        [
+          "$.d",
+          "null"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:json_type",
+      "rows": [
+        [
+          "array",
+          "null"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:json_valid",
+      "rows": [
+        [
+          1,
+          0,
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:jsonb",
+      "rows": [
+        [
+          "{\"a\":1}"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:jsonb_array",
+      "rows": [
+        [
+          "[1,2]"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "error": "Parse error: no such function: jsonb_array_insert",
+      "id": "function.json:jsonb_array_insert",
+      "status": "error"
+    },
+    {
+      "error": "Parse error: no such table: jsonb_each",
+      "id": "function.json:jsonb_each",
+      "status": "error"
+    },
+    {
+      "id": "function.json:jsonb_extract",
+      "rows": [
+        [
+          "[1,2,{\"c\":3}]"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:jsonb_group_array",
+      "rows": [
+        [
+          "[1,2,3,4,5]"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:jsonb_group_object",
+      "rows": [
+        [
+          "{\"one\":1,\"two\":2,\"three\":3,\"five\":5}"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:jsonb_insert",
+      "rows": [
+        [
+          "{\"a\":1,\"b\":[1,2,{\"c\":3}],\"d\":null,\"e\":5}"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:jsonb_object",
+      "rows": [
+        [
+          "{\"k\":1}"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:jsonb_patch",
+      "rows": [
+        [
+          "{\"a\":1,\"b\":2}"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:jsonb_remove",
+      "rows": [
+        [
+          "{\"a\":1,\"d\":null}"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:jsonb_replace",
+      "rows": [
+        [
+          "{\"a\":2,\"b\":[1,2,{\"c\":3}],\"d\":null}"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.json:jsonb_set",
+      "rows": [
+        [
+          "{\"a\":3,\"b\":[1,2,{\"c\":3}],\"d\":null}"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "error": "Parse error: no such table: jsonb_tree",
+      "id": "function.json:jsonb_tree",
+      "status": "error"
+    },
+    {
+      "id": "function.aggregate:avg",
+      "rows": [
+        [
+          3.5,
+          3.0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.aggregate:count",
+      "rows": [
+        [
+          5,
+          4,
+          2
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "error": "Parse error: ORDER BY clause is not supported yet in aggregate functions",
+      "id": "function.aggregate:group_concat",
+      "status": "error"
+    },
+    {
+      "error": "Parse error: ORDER BY clause is not supported yet in aggregate functions",
+      "id": "function.aggregate:string_agg",
+      "status": "error"
+    },
+    {
+      "id": "function.aggregate:max",
+      "rows": [
+        [
+          5.5,
+          "two"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.aggregate:min",
+      "rows": [
+        [
+          1.5,
+          "five"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.aggregate:sum",
+      "rows": [
+        [
+          15,
+          14.0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.aggregate:total",
+      "rows": [
+        [
+          14.0,
+          0.0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "error": "Parse error: no such function: median",
+      "id": "function.aggregate:median",
+      "status": "error"
+    },
+    {
+      "error": "Parse error: no such function: percentile",
+      "id": "function.aggregate:percentile",
+      "status": "error"
+    },
+    {
+      "error": "Parse error: no such function: percentile_cont",
+      "id": "function.aggregate:percentile_cont",
+      "status": "error"
+    },
+    {
+      "error": "Parse error: no such function: percentile_disc",
+      "id": "function.aggregate:percentile_disc",
+      "status": "error"
+    },
+    {
+      "id": "function.window:row_number",
+      "rows": [
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          3
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          5,
+          5
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.window:rank",
+      "rows": [
+        [
+          1,
+          3
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          3,
+          3
+        ],
+        [
+          4,
+          1
+        ],
+        [
+          5,
+          3
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.window:dense_rank",
+      "rows": [
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          3,
+          2
+        ],
+        [
+          4,
+          1
+        ],
+        [
+          5,
+          2
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.window:percent_rank",
+      "rows": [
+        [
+          1,
+          0.0
+        ],
+        [
+          2,
+          0.25
+        ],
+        [
+          3,
+          0.5
+        ],
+        [
+          4,
+          0.75
+        ],
+        [
+          5,
+          1.0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.window:cume_dist",
+      "rows": [
+        [
+          1,
+          0.2
+        ],
+        [
+          2,
+          0.4
+        ],
+        [
+          3,
+          0.6
+        ],
+        [
+          4,
+          0.8
+        ],
+        [
+          5,
+          1.0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.window:ntile",
+      "rows": [
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          3,
+          1
+        ],
+        [
+          4,
+          2
+        ],
+        [
+          5,
+          2
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.window:lag",
+      "rows": [
+        [
+          1,
+          null,
+          "none"
+        ],
+        [
+          2,
+          "one",
+          "none"
+        ],
+        [
+          3,
+          "two",
+          "one"
+        ],
+        [
+          4,
+          "three",
+          "two"
+        ],
+        [
+          5,
+          null,
+          "three"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.window:lead",
+      "rows": [
+        [
+          1,
+          "two"
+        ],
+        [
+          2,
+          "three"
+        ],
+        [
+          3,
+          null
+        ],
+        [
+          4,
+          "five"
+        ],
+        [
+          5,
+          null
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.window:first_value",
+      "rows": [
+        [
+          1,
+          "one"
+        ],
+        [
+          2,
+          "one"
+        ],
+        [
+          3,
+          "one"
+        ],
+        [
+          4,
+          "one"
+        ],
+        [
+          5,
+          "one"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.window:last_value",
+      "rows": [
+        [
+          1,
+          "five"
+        ],
+        [
+          2,
+          "five"
+        ],
+        [
+          3,
+          "five"
+        ],
+        [
+          4,
+          "five"
+        ],
+        [
+          5,
+          "five"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "function.window:nth_value",
+      "rows": [
+        [
+          1,
+          "two"
+        ],
+        [
+          2,
+          "two"
+        ],
+        [
+          3,
+          "two"
+        ],
+        [
+          4,
+          "two"
+        ],
+        [
+          5,
+          "two"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:frame-spec#rows",
+      "rows": [
+        [
+          1,
+          3
+        ],
+        [
+          2,
+          6
+        ],
+        [
+          3,
+          9
+        ],
+        [
+          4,
+          12
+        ],
+        [
+          5,
+          9
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:frame-spec#range",
+      "rows": [
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          3
+        ],
+        [
+          3,
+          5
+        ],
+        [
+          4,
+          7
+        ],
+        [
+          5,
+          9
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:frame-spec#groups",
+      "rows": [
+        [
+          1,
+          3
+        ],
+        [
+          2,
+          5
+        ],
+        [
+          3,
+          3
+        ],
+        [
+          4,
+          5
+        ],
+        [
+          5,
+          3
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:frame-spec#exclude-current-row",
+      "rows": [
+        [
+          1,
+          14
+        ],
+        [
+          2,
+          13
+        ],
+        [
+          3,
+          12
+        ],
+        [
+          4,
+          11
+        ],
+        [
+          5,
+          10
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:frame-spec#exclude-group",
+      "rows": [
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          3
+        ],
+        [
+          3,
+          2
+        ],
+        [
+          4,
+          3
+        ],
+        [
+          5,
+          2
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:frame-spec#exclude-ties",
+      "rows": [
+        [
+          1,
+          3
+        ],
+        [
+          2,
+          4
+        ],
+        [
+          3,
+          3
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          5,
+          3
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:frame-spec#partition",
+      "rows": [
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          4
+        ],
+        [
+          4,
+          6
+        ],
+        [
+          5,
+          9
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:frame-spec#named-window",
+      "rows": [
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          2,
+          3,
+          2
+        ],
+        [
+          3,
+          6,
+          3
+        ],
+        [
+          4,
+          10,
+          4
+        ],
+        [
+          5,
+          15,
+          5
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:frame-spec#window-chaining",
+      "rows": [
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          3
+        ],
+        [
+          3,
+          5
+        ],
+        [
+          4,
+          7
+        ],
+        [
+          5,
+          9
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:frame-spec#aggregate-filter",
+      "rows": [
+        [
+          1,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          3,
+          1
+        ],
+        [
+          4,
+          2
+        ],
+        [
+          5,
+          3
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:~",
+      "rows": [
+        [
+          -6
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:+ (unary)",
+      "rows": [
+        [
+          3,
+          "x"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:- (unary)",
+      "rows": [
+        [
+          -3,
+          -4
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:+",
+      "rows": [
+        [
+          3,
+          3.5
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:-",
+      "rows": [
+        [
+          -2,
+          1.5
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:COLLATE",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:||",
+      "rows": [
+        [
+          "ab1"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:->",
+      "rows": [
+        [
+          "{\"b\":2}"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:->>",
+      "rows": [
+        [
+          2
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:*",
+      "rows": [
+        [
+          42
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:/",
+      "rows": [
+        [
+          3,
+          3.5
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:%",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:&",
+      "rows": [
+        [
+          2
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:|",
+      "rows": [
+        [
+          7
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:<<",
+      "rows": [
+        [
+          16
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:>>",
+      "rows": [
+        [
+          64
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:<",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:>",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:<=",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:>=",
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:=",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:==",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:<>",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:!=",
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:IS",
+      "rows": [
+        [
+          1,
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:IS NOT",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:IS DISTINCT FROM",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:IS NOT DISTINCT FROM",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:IN",
+      "rows": [
+        [
+          1,
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:NOT IN",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:LIKE",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:NOT LIKE",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:GLOB",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:NOT GLOB",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:REGEXP",
+      "rows": [
+        [
+          1,
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:NOT REGEXP",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:ESCAPE",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:BETWEEN",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:NOT BETWEEN",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:ISNULL",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:NOTNULL",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:NOT NULL",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:EXISTS",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:NOT EXISTS",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:CASE",
+      "rows": [
+        [
+          "b",
+          "x"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:NOT#1",
+      "rows": [
+        [
+          1,
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:NOT#2",
+      "rows": [
+        [
+          1,
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:AND#1",
+      "rows": [
+        [
+          0,
+          null
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:AND#2",
+      "rows": [
+        [
+          0,
+          null
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:OR#1",
+      "rows": [
+        [
+          null,
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:OR#2",
+      "rows": [
+        [
+          null,
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:CAST#1",
+      "rows": [
+        [
+          "5",
+          7,
+          2.0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:CAST#2",
+      "rows": [
+        [
+          3,
+          -3
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "operator:CAST#3",
+      "rows": [
+        [
+          12,
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "error": "Parse error: no such module: fts5",
+      "id": "operator:MATCH",
+      "status": "error"
+    },
+    {
+      "error": "Parse error: MATCH requires the 'fts' feature to be enabled",
+      "id": "operator:NOT MATCH",
+      "requires": "an application-defined match() function",
+      "status": "error"
+    },
+    {
+      "id": "affinity:TEXT",
+      "rows": [
+        [
+          "text"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "affinity:NUMERIC",
+      "rows": [
+        [
+          "integer",
+          "real",
+          "integer"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "affinity:INTEGER",
+      "rows": [
+        [
+          "integer"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "affinity:REAL",
+      "rows": [
+        [
+          "real"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "affinity:BLOB",
+      "rows": [
+        [
+          "blob"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "affinity:column",
+      "rows": [
+        [
+          "integer",
+          "text",
+          "integer"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "collation:BINARY",
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "collation:NOCASE",
+      "rows": [
+        [
+          "one"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "collation:RTRIM",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "storage_class:NULL",
+      "rows": [
+        [
+          "null"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "storage_class:INTEGER",
+      "rows": [
+        [
+          "integer"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "storage_class:REAL",
+      "rows": [
+        [
+          "real"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "storage_class:TEXT",
+      "rows": [
+        [
+          "text"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "storage_class:BLOB",
+      "rows": [
+        [
+          "blob"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "expression:scalar subquery",
+      "rows": [
+        [
+          5,
+          "two"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "expression:correlated subquery",
+      "rows": [
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          5,
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "expression:row value",
+      "rows": [
+        [
+          1,
+          1,
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "expression:boolean expression",
+      "rows": [
+        [
+          0,
+          1,
+          1,
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.affinity:INT gives INTEGER",
+      "rows": [
+        [
+          "integer",
+          "integer"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.affinity:CHAR, CLOB or TEXT gives TEXT",
+      "rows": [
+        [
+          "text",
+          "text",
+          "text"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.affinity:BLOB or no type gives BLOB",
+      "rows": [
+        [
+          "text",
+          "text"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.affinity:REAL, FLOA or DOUB gives REAL",
+      "rows": [
+        [
+          "real",
+          "real",
+          "real"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.affinity:otherwise NUMERIC",
+      "rows": [
+        [
+          "integer",
+          1,
+          "integer",
+          "text"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.affinity:the rules apply in order",
+      "rows": [
+        [
+          "integer",
+          "integer"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.expression-affinity:an IN list has no affinity",
+      "rows": [
+        [
+          1,
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.expression-affinity:a column keeps its affinity",
+      "rows": [
+        [
+          1,
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.expression-affinity:an operator removes affinity",
+      "rows": [
+        [
+          0,
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.expression-affinity:CAST gives its type's affinity",
+      "rows": [
+        [
+          1,
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.expression-affinity:COLLATE keeps its operand's affinity",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.expression-affinity:otherwise no affinity",
+      "rows": [
+        [
+          0,
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.expression-affinity:view and subquery columns",
+      "rows": [
+        [
+          1,
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.expression-affinity:compound view columns",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.comparison:NULL is less than any value",
+      "rows": [
+        [
+          null
+        ],
+        [
+          -5
+        ],
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.comparison:numbers before text and blobs",
+      "rows": [
+        [
+          1,
+          1,
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.comparison:numbers compare numerically",
+      "rows": [
+        [
+          1,
+          1,
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.comparison:text before blobs",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.comparison:text compares by collation",
+      "rows": [
+        [
+          0,
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.comparison:blobs compare by memcmp",
+      "rows": [
+        [
+          1,
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.comparison:numeric affinity goes to the other operand",
+      "rows": [
+        [
+          1,
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.comparison:text affinity goes to an operand with none",
+      "rows": [
+        [
+          1,
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.comparison:otherwise compared as is",
+      "rows": [
+        [
+          0,
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.comparison:BETWEEN is two comparisons",
+      "rows": [
+        [
+          1,
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.comparison:IN compares as equality",
+      "rows": [
+        [
+          1,
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.sort:ORDER BY orders by storage class",
+      "rows": [
+        [
+          null
+        ],
+        [
+          1.5
+        ],
+        [
+          2
+        ],
+        [
+          "A"
+        ],
+        [
+          "b"
+        ],
+        [
+          "x'00'"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.sort:GROUP BY keeps classes apart",
+      "rows": [
+        [
+          1
+        ],
+        [
+          2
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.sort:compound SELECTs compare as is",
+      "rows": [
+        [
+          2
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.collation:columns default to BINARY",
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.collation:an explicit COLLATE wins, left first",
+      "rows": [
+        [
+          0,
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.collation:then a column's collation, left first",
+      "rows": [
+        [
+          1,
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.collation:otherwise BINARY",
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.collation:the leftmost COLLATE anywhere wins",
+      "rows": [
+        [
+          1,
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.collation:IN uses the left operand's collation",
+      "rows": [
+        [
+          1,
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.collation:ORDER BY uses COLLATE, then the column's#1",
+      "rows": [
+        [
+          "A"
+        ],
+        [
+          "B"
+        ],
+        [
+          "a"
+        ],
+        [
+          "b"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "rule.collation:ORDER BY uses COLLATE, then the column's#2",
+      "rows": [
+        [
+          "A"
+        ],
+        [
+          "a"
+        ],
+        [
+          "B"
+        ],
+        [
+          "b"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "word:TRUE",
+      "rows": [
+        [
+          1,
+          2
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "word:FALSE",
+      "rows": [
+        [
+          0,
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "word:STRICT#1",
+      "rows": [
+        [
+          "integer",
+          "text"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "error": "cannot store TEXT value in INTEGER column st.k (19)",
+      "id": "word:STRICT#2",
+      "status": "error"
+    },
+    {
+      "error": "Parse error: Generated columns require --experimental-generated-columns flag",
+      "id": "word:STORED",
+      "status": "error"
+    },
+    {
+      "error": "Parse error: WITHOUT ROWID tables are an experimental feature. Enable with --experimental-without-rowid flag",
+      "id": "word:ROWID",
+      "status": "error"
+    },
+    {
+      "error": "Parse error: unable to identify the object to be reindexed",
+      "id": "word:EXPRESSIONS",
+      "status": "error"
+    },
+    {
+      "id": "word:E",
+      "rows": [
+        [
+          1000.0,
+          0.25,
+          100.0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "keyword:INNER",
+      "rows": [
+        [
+          1,
+          "x"
+        ],
+        [
+          2,
+          "y"
+        ],
+        [
+          2,
+          "yy"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "keyword:CONSTRAINT",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "keyword:FAIL",
+      "rows": [
+        [
+          2
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "keyword:NO",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "keyword:ACTION",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "keyword:RESTRICT",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "keyword:OTHERS",
+      "rows": [
+        [
+          1,
+          3
+        ],
+        [
+          2,
+          6
+        ],
+        [
+          3,
+          9
+        ],
+        [
+          4,
+          12
+        ],
+        [
+          5,
+          9
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "parameter:?NNN",
+      "rows": [
+        [
+          42
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "parameter:?",
+      "rows": [
+        [
+          42
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "parameter::AAAA",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "parameter:@AAAA",
+      "rows": [
+        [
+          5
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "parameter:$AAAA",
+      "rows": [
+        [
+          "xy"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:select-stmt#1",
+      "rows": [
+        [
+          4,
+          null
+        ],
+        [
+          3,
+          "three"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:select-stmt#2",
+      "rows": [
+        [
+          0
+        ],
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:select-stmt#3",
+      "rows": [
+        [
+          2
+        ],
+        [
+          3
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:select-core#1",
+      "rows": [
+        [
+          0,
+          2,
+          6
+        ],
+        [
+          1,
+          3,
+          9
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:select-core#2",
+      "rows": [
+        [
+          1,
+          "a"
+        ],
+        [
+          2,
+          "b"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:select-core#3",
+      "rows": [
+        [
+          2
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:simple-select-stmt",
+      "rows": [
+        [
+          1
+        ],
+        [
+          2
+        ],
+        [
+          3
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:factored-select-stmt",
+      "rows": [
+        [
+          1
+        ],
+        [
+          2
+        ],
+        [
+          3
+        ],
+        [
+          4
+        ],
+        [
+          5
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:compound-select-stmt#1",
+      "rows": [
+        [
+          1
+        ],
+        [
+          2
+        ],
+        [
+          3
+        ],
+        [
+          4
+        ],
+        [
+          5
+        ],
+        [
+          6
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:compound-select-stmt#2",
+      "rows": [
+        [
+          1
+        ],
+        [
+          1
+        ],
+        [
+          2
+        ],
+        [
+          2
+        ],
+        [
+          2
+        ],
+        [
+          3
+        ],
+        [
+          4
+        ],
+        [
+          5
+        ],
+        [
+          6
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:compound-select-stmt#3",
+      "rows": [
+        [
+          1
+        ],
+        [
+          2
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:compound-select-stmt#4",
+      "rows": [
+        [
+          3
+        ],
+        [
+          4
+        ],
+        [
+          5
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:compound-operator",
+      "rows": [
+        [
+          1
+        ],
+        [
+          2
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:common-table-expression#1",
+      "rows": [
+        [
+          5
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:common-table-expression#2",
+      "rows": [
+        [
+          15
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:recursive-cte#1",
+      "rows": [
+        [
+          1
+        ],
+        [
+          2
+        ],
+        [
+          3
+        ],
+        [
+          4
+        ],
+        [
+          5
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:recursive-cte#2",
+      "rows": [
+        [
+          720
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:with-clause",
+      "rows": [
+        [
+          2
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:cte-table-name",
+      "rows": [
+        [
+          3
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:join-clause#1",
+      "rows": [
+        [
+          1,
+          "x"
+        ],
+        [
+          2,
+          "y"
+        ],
+        [
+          2,
+          "yy"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:join-clause#2",
+      "rows": [
+        [
+          1,
+          "x"
+        ],
+        [
+          2,
+          "y"
+        ],
+        [
+          2,
+          "yy"
+        ],
+        [
+          3,
+          null
+        ],
+        [
+          4,
+          null
+        ],
+        [
+          5,
+          null
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:join-clause#3",
+      "rows": [
+        [
+          1,
+          "x"
+        ],
+        [
+          2,
+          "y"
+        ],
+        [
+          2,
+          "yy"
+        ],
+        [
+          null,
+          "z"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:join-clause#4",
+      "rows": [
+        [
+          1,
+          "x"
+        ],
+        [
+          2,
+          "y"
+        ],
+        [
+          2,
+          "yy"
+        ],
+        [
+          3,
+          null
+        ],
+        [
+          4,
+          null
+        ],
+        [
+          5,
+          null
+        ],
+        [
+          null,
+          "z"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:join-clause#5",
+      "rows": [
+        [
+          20
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:join-clause#6",
+      "rows": [
+        [
+          1,
+          "x"
+        ],
+        [
+          2,
+          "y"
+        ],
+        [
+          2,
+          "yy"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:join-constraint",
+      "rows": [
+        [
+          1,
+          "one",
+          "x"
+        ],
+        [
+          2,
+          "two",
+          "y"
+        ],
+        [
+          2,
+          "two",
+          "yy"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:join-operator#1",
+      "rows": [
+        [
+          3
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:join-operator#2",
+      "rows": [
+        [
+          6
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:table-or-subquery#1",
+      "rows": [
+        [
+          2
+        ],
+        [
+          4
+        ],
+        [
+          6
+        ],
+        [
+          8
+        ],
+        [
+          10
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:table-or-subquery#2",
+      "rows": [
+        [
+          1
+        ],
+        [
+          2
+        ],
+        [
+          3
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:result-column#1",
+      "rows": [
+        [
+          1,
+          "one",
+          1.5,
+          "x"
+        ],
+        [
+          2,
+          "two",
+          2.5,
+          "y"
+        ],
+        [
+          2,
+          "two",
+          2.5,
+          "yy"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:result-column#2",
+      "rows": [
+        [
+          1,
+          "x"
+        ],
+        [
+          2,
+          "y"
+        ],
+        [
+          2,
+          "yy"
+        ],
+        [
+          6,
+          "z"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:ordering-term#1",
+      "rows": [
+        [
+          null
+        ],
+        [
+          "two"
+        ],
+        [
+          "three"
+        ],
+        [
+          "one"
+        ],
+        [
+          "five"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:ordering-term#2",
+      "rows": [
+        [
+          "five"
+        ],
+        [
+          "one"
+        ],
+        [
+          "three"
+        ],
+        [
+          "two"
+        ],
+        [
+          null
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:qualified-table-name",
+      "rows": [
+        [
+          4
+        ],
+        [
+          5
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:insert-stmt#1",
+      "rows": [
+        [
+          10,
+          "ten"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:insert-stmt#2",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:insert-stmt#3",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:insert-stmt#4",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:insert-stmt#5",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:insert-stmt#6",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:upsert-clause#1",
+      "rows": [
+        [
+          1,
+          "up!"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:upsert-clause#2",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:returning-clause#1",
+      "rows": [
+        [
+          5,
+          "five",
+          5.5
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:returning-clause#2",
+      "rows": [
+        [
+          1,
+          0.0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:update-stmt#1",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:update-stmt#2",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:update-stmt#3",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:update-stmt#4",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "error": "near \"ORDER\": syntax error",
+      "id": "syntax:update-stmt-limited",
+      "requires": "SQLITE_ENABLE_UPDATE_DELETE_LIMIT",
+      "status": "error"
+    },
+    {
+      "id": "syntax:delete-stmt",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "error": "near \"ORDER\": syntax error",
+      "id": "syntax:delete-stmt-limited",
+      "requires": "SQLITE_ENABLE_UPDATE_DELETE_LIMIT",
+      "status": "error"
+    },
+    {
+      "id": "syntax:create-table-stmt#1",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:create-table-stmt#2",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:create-table-stmt#3",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:column-def#1",
+      "rows": [
+        [
+          1,
+          "x"
+        ],
+        [
+          2,
+          "y"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:column-def#2",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "error": "Parse error: Generated columns require --experimental-generated-columns flag",
+      "id": "syntax:column-def#3",
+      "status": "error"
+    },
+    {
+      "error": "Parse error: Generated columns require --experimental-generated-columns flag",
+      "id": "syntax:column-def#4",
+      "status": "error"
+    },
+    {
+      "id": "syntax:column-constraint#1",
+      "rows": [
+        [
+          "y"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:column-constraint#2",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:column-constraint#3",
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:column-constraint#4",
+      "rows": [
+        [
+          2
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:table-constraint#1",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:table-constraint#2",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:foreign-key-clause",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:conflict-clause",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "error": "Parse error: WITHOUT ROWID tables are an experimental feature. Enable with --experimental-without-rowid flag",
+      "id": "syntax:table-options#1",
+      "status": "error"
+    },
+    {
+      "id": "syntax:table-options#2",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "error": "Parse error: WITHOUT ROWID tables are an experimental feature. Enable with --experimental-without-rowid flag",
+      "id": "syntax:table-options#3",
+      "status": "error"
+    },
+    {
+      "id": "syntax:type-name#1",
+      "rows": [
+        [
+          "x",
+          1.25,
+          2.5
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:type-name#2",
+      "rows": [
+        [
+          7
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:create-index-stmt#1",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:create-index-stmt#2",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:create-index-stmt#3",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:create-index-stmt#4",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:indexed-column",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:create-view-stmt#1",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:create-view-stmt#2",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:create-trigger-stmt#1",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:create-trigger-stmt#2",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:create-trigger-stmt#3",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "error": "Parse error: INSTEAD OF triggers are not supported yet",
+      "id": "syntax:create-trigger-stmt#4",
+      "status": "error"
+    },
+    {
+      "id": "syntax:raise-function",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "error": "Parse error: no such module: fts5",
+      "id": "syntax:create-virtual-table-stmt#1",
+      "status": "error"
+    },
+    {
+      "error": "Parse error: no such module: rtree",
+      "id": "syntax:create-virtual-table-stmt#2",
+      "status": "error"
+    },
+    {
+      "id": "syntax:alter-table-stmt#1",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:alter-table-stmt#2",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:alter-table-stmt#3",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:alter-table-stmt#4",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:drop-table-stmt",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:drop-index-stmt",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:drop-view-stmt",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:drop-trigger-stmt",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:analyze-stmt#1",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:analyze-stmt#2",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "error": "Parse error: ATTACH is an experimental feature. Enable with --experimental-attach flag",
+      "id": "syntax:attach-stmt",
+      "status": "error"
+    },
+    {
+      "error": "Parse error: ATTACH is an experimental feature. Enable with --experimental-attach flag",
+      "id": "syntax:detach-stmt",
+      "status": "error"
+    },
+    {
+      "id": "syntax:begin-stmt#1",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:begin-stmt#2",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:begin-stmt#3",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:commit-stmt#1",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:commit-stmt#2",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:rollback-stmt",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:savepoint-stmt",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:release-stmt",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:reindex-stmt#1",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:reindex-stmt#2",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "error": "Parse error: VACUUM is an experimental feature. Enable with --experimental-vacuum flag",
+      "id": "syntax:vacuum-stmt",
+      "status": "error"
+    },
+    {
+      "id": "syntax:pragma-stmt#1",
+      "rows": [
+        [
+          0,
+          "a",
+          "INTEGER",
+          0,
+          null,
+          0
+        ],
+        [
+          1,
+          "b",
+          "TEXT",
+          0,
+          null,
+          0
+        ],
+        [
+          2,
+          "c",
+          "REAL",
+          0,
+          null,
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:pragma-stmt#2",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:pragma-value",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:expr",
+      "rows": [
+        [
+          9,
+          -1,
+          1,
+          0
+        ],
+        [
+          9,
+          -2,
+          1,
+          1
+        ],
+        [
+          9,
+          -3,
+          1,
+          1
+        ],
+        [
+          9,
+          -4,
+          1,
+          null
+        ],
+        [
+          9,
+          -5,
+          1,
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:literal-value",
+      "rows": [
+        [
+          1,
+          1.5,
+          "txt",
+          "x'0f'",
+          null,
+          1,
+          0,
+          "text",
+          "text",
+          "text"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:numeric-literal",
+      "rows": [
+        [
+          31,
+          1000.0,
+          0.5,
+          1000000,
+          0.25
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:signed-number",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:function-arguments#1",
+      "rows": [
+        [
+          5,
+          "one,two,three,five"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:function-arguments#2",
+      "rows": [
+        [
+          5
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:simple-function-invocation",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:aggregate-function-invocation#1",
+      "rows": [
+        [
+          3
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "error": "Parse error: ORDER BY clause is not supported yet in aggregate functions",
+      "id": "syntax:aggregate-function-invocation#2",
+      "status": "error"
+    },
+    {
+      "id": "syntax:window-function-invocation",
+      "rows": [
+        [
+          1,
+          null
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          5
+        ],
+        [
+          4,
+          9
+        ],
+        [
+          5,
+          14
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:over-clause",
+      "rows": [
+        [
+          1,
+          3
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          3
+        ],
+        [
+          4,
+          2
+        ],
+        [
+          5,
+          3
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:window-defn",
+      "rows": [
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          3
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          5,
+          5
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:filter-clause#1",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:filter-clause#2",
+      "rows": [
+        [
+          3,
+          11
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:frame-spec",
+      "rows": [
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          3
+        ],
+        [
+          3,
+          6
+        ],
+        [
+          4,
+          10
+        ],
+        [
+          5,
+          15
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:column-name-list",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:comment-syntax#1",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:comment-syntax#2",
+      "rows": [
+        [
+          2
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:sql-stmt#1",
+      "rows": [
+        [
+          0,
+          "Init",
+          0,
+          3,
+          0,
+          "",
+          0,
+          "Start at 3"
+        ],
+        [
+          1,
+          "ResultRow",
+          1,
+          1,
+          0,
+          "",
+          0,
+          "output=r[1]"
+        ],
+        [
+          2,
+          "Halt",
+          0,
+          0,
+          0,
+          "",
+          0,
+          ""
+        ],
+        [
+          3,
+          "Integer",
+          1,
+          1,
+          0,
+          "",
+          0,
+          "r[1]=1"
+        ],
+        [
+          4,
+          "Goto",
+          0,
+          1,
+          0,
+          "",
+          0,
+          ""
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:sql-stmt#2",
+      "rows": [
+        [
+          1,
+          0,
+          0,
+          "SCAN t"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "syntax:sql-stmt-list",
+      "rows": [
+        [
+          2
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:analysis_limit",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:application_id",
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:auto_vacuum",
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:automatic_index",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:busy_timeout",
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:cache_size",
+      "rows": [
+        [
+          -2000
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:cache_spill",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:case_sensitive_like",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:cell_size_check",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:checkpoint_fullfsync",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:collation_list",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:compile_options",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:count_changes",
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:data_store_directory",
+      "requires": "Windows's VFS",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:data_version",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:database_list",
+      "rows": [
+        [
+          0,
+          "main",
+          "/home/adalundhe/.cache/amphora-probe/turso-4037190/451.db"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:default_cache_size",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:defer_foreign_keys",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:empty_result_callbacks",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:encoding",
+      "rows": [
+        [
+          "UTF-8"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:foreign_key_check",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:foreign_key_list",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:foreign_keys",
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:freelist_count",
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:full_column_names",
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:fullfsync",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:function_list",
+      "rows": [
+        [
+          "changes",
+          1,
+          "s",
+          "utf8",
+          0,
+          2097152
+        ],
+        [
+          "char",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "coalesce",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "concat",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "concat_ws",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "glob",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "ifnull",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "iif",
+          1,
+          "s",
+          "utf8",
+          3,
+          2099200
+        ],
+        [
+          "instr",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "like",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "like",
+          1,
+          "s",
+          "utf8",
+          3,
+          2099200
+        ],
+        [
+          "abs",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "upper",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "lower",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "random",
+          1,
+          "s",
+          "utf8",
+          0,
+          2097152
+        ],
+        [
+          "randomblob",
+          1,
+          "s",
+          "utf8",
+          1,
+          2097152
+        ],
+        [
+          "trim",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "trim",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "ltrim",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "ltrim",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "rtrim",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "rtrim",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "round",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "round",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "length",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "octet_length",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "min",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "max",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "nullif",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "sign",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "substr",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "substr",
+          1,
+          "s",
+          "utf8",
+          3,
+          2099200
+        ],
+        [
+          "substring",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "substring",
+          1,
+          "s",
+          "utf8",
+          3,
+          2099200
+        ],
+        [
+          "soundex",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "date",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2097152
+        ],
+        [
+          "time",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2097152
+        ],
+        [
+          "total_changes",
+          1,
+          "s",
+          "utf8",
+          0,
+          2097152
+        ],
+        [
+          "datetime",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2097152
+        ],
+        [
+          "subtype",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "typeof",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "unicode",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "unistr",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "unistr_quote",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "quote",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "sqlite_version",
+          1,
+          "s",
+          "utf8",
+          0,
+          2097152
+        ],
+        [
+          "turso_version",
+          1,
+          "s",
+          "utf8",
+          0,
+          2097152
+        ],
+        [
+          "sqlite_source_id",
+          1,
+          "s",
+          "utf8",
+          0,
+          2097152
+        ],
+        [
+          "unixepoch",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2097152
+        ],
+        [
+          "julianday",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2097152
+        ],
+        [
+          "hex",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "unhex",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "unhex",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "get_byte",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "set_byte",
+          1,
+          "s",
+          "utf8",
+          3,
+          2099200
+        ],
+        [
+          "zeroblob",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "last_insert_rowid",
+          1,
+          "s",
+          "utf8",
+          0,
+          2097152
+        ],
+        [
+          "replace",
+          1,
+          "s",
+          "utf8",
+          3,
+          2099200
+        ],
+        [
+          "load_extension",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2097152
+        ],
+        [
+          "strftime",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2097152
+        ],
+        [
+          "printf",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "likely",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "timediff",
+          1,
+          "s",
+          "utf8",
+          2,
+          2097152
+        ],
+        [
+          "likelihood",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "unlikely",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "sequence_watermark_experimental",
+          1,
+          "s",
+          "utf8",
+          1,
+          2097152
+        ],
+        [
+          "test_uint_encode",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "test_uint_decode",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "test_uint_add",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "test_uint_sub",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "test_uint_mul",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "test_uint_div",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "test_uint_lt",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "test_uint_eq",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "string_reverse",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "gcd",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "lcm",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "repeat",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "lpad",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "lpad",
+          1,
+          "s",
+          "utf8",
+          3,
+          2099200
+        ],
+        [
+          "rpad",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "rpad",
+          1,
+          "s",
+          "utf8",
+          3,
+          2099200
+        ],
+        [
+          "boolean_to_int",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "int_to_boolean",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "validate_ipaddr",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "numeric_encode",
+          1,
+          "s",
+          "utf8",
+          3,
+          2099200
+        ],
+        [
+          "numeric_decode",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "numeric_add",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "numeric_sub",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "numeric_mul",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "numeric_div",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "numeric_lt",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "numeric_eq",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "date_plus",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "date_minus",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "array_length",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "array_length",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "array_append",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "array_prepend",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "array_cat",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "array_remove",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "array_contains",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "array_position",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "array_slice",
+          1,
+          "s",
+          "utf8",
+          3,
+          2099200
+        ],
+        [
+          "string_to_array",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "string_to_array",
+          1,
+          "s",
+          "utf8",
+          3,
+          2099200
+        ],
+        [
+          "array_to_string",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "array_to_string",
+          1,
+          "s",
+          "utf8",
+          3,
+          2099200
+        ],
+        [
+          "array_overlap",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "array_contains_all",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "struct_pack",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "struct_extract",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "union_value",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "union_tag",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "union_extract",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "nextval",
+          1,
+          "s",
+          "utf8",
+          1,
+          2097152
+        ],
+        [
+          "currval",
+          1,
+          "s",
+          "utf8",
+          1,
+          2097152
+        ],
+        [
+          "setval",
+          1,
+          "s",
+          "utf8",
+          2,
+          2097152
+        ],
+        [
+          "setval",
+          1,
+          "s",
+          "utf8",
+          3,
+          2097152
+        ],
+        [
+          "avg",
+          1,
+          "w",
+          "utf8",
+          1,
+          2097152
+        ],
+        [
+          "count",
+          1,
+          "w",
+          "utf8",
+          1,
+          2097152
+        ],
+        [
+          "count",
+          1,
+          "w",
+          "utf8",
+          0,
+          2097152
+        ],
+        [
+          "group_concat",
+          1,
+          "w",
+          "utf8",
+          1,
+          2097152
+        ],
+        [
+          "group_concat",
+          1,
+          "w",
+          "utf8",
+          2,
+          2097152
+        ],
+        [
+          "max",
+          1,
+          "w",
+          "utf8",
+          1,
+          2097152
+        ],
+        [
+          "min",
+          1,
+          "w",
+          "utf8",
+          1,
+          2097152
+        ],
+        [
+          "string_agg",
+          1,
+          "w",
+          "utf8",
+          2,
+          2097152
+        ],
+        [
+          "sum",
+          1,
+          "w",
+          "utf8",
+          1,
+          2097152
+        ],
+        [
+          "total",
+          1,
+          "w",
+          "utf8",
+          1,
+          2097152
+        ],
+        [
+          "jsonb_group_array",
+          1,
+          "w",
+          "utf8",
+          1,
+          2097152
+        ],
+        [
+          "json_group_array",
+          1,
+          "w",
+          "utf8",
+          1,
+          2097152
+        ],
+        [
+          "jsonb_group_object",
+          1,
+          "w",
+          "utf8",
+          2,
+          2097152
+        ],
+        [
+          "json_group_object",
+          1,
+          "w",
+          "utf8",
+          2,
+          2097152
+        ],
+        [
+          "array_agg",
+          1,
+          "w",
+          "utf8",
+          1,
+          2097152
+        ],
+        [
+          "row_number",
+          1,
+          "w",
+          "utf8",
+          0,
+          2099200
+        ],
+        [
+          "rank",
+          1,
+          "w",
+          "utf8",
+          0,
+          2099200
+        ],
+        [
+          "dense_rank",
+          1,
+          "w",
+          "utf8",
+          0,
+          2099200
+        ],
+        [
+          "percent_rank",
+          1,
+          "w",
+          "utf8",
+          0,
+          2099200
+        ],
+        [
+          "cume_dist",
+          1,
+          "w",
+          "utf8",
+          0,
+          2099200
+        ],
+        [
+          "ntile",
+          1,
+          "w",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "lag",
+          1,
+          "w",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "lag",
+          1,
+          "w",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "lag",
+          1,
+          "w",
+          "utf8",
+          3,
+          2099200
+        ],
+        [
+          "lead",
+          1,
+          "w",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "lead",
+          1,
+          "w",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "lead",
+          1,
+          "w",
+          "utf8",
+          3,
+          2099200
+        ],
+        [
+          "first_value",
+          1,
+          "w",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "last_value",
+          1,
+          "w",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "nth_value",
+          1,
+          "w",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "acos",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "acosh",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "asin",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "asinh",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "atan",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "atan2",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "atanh",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "ceil",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "ceiling",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "cos",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "cosh",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "degrees",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "exp",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "floor",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "ln",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "log",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "log",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "log10",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "log2",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "mod",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "pi",
+          1,
+          "s",
+          "utf8",
+          0,
+          2099200
+        ],
+        [
+          "pow",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "power",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "radians",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "sin",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "sinh",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "sqrt",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "tan",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "tanh",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "trunc",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "vector",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "vector32",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "vector32_sparse",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "vector64",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "vector8",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "vector1bit",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "vector_extract",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "vector_distance_cos",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "vector_distance_l2",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "vector_distance_jaccard",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "vector_distance_dot",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "vector_concat",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "vector_slice",
+          1,
+          "s",
+          "utf8",
+          3,
+          2099200
+        ],
+        [
+          "json",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "jsonb",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "json_array",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "jsonb_array",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "json_array_length",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "json_array_length",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "json_extract",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "jsonb_extract",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "json_object",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "jsonb_object",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "json_type",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "json_type",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "json_error_position",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "json_valid",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "json_valid",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "json_patch",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "jsonb_patch",
+          1,
+          "s",
+          "utf8",
+          2,
+          2099200
+        ],
+        [
+          "json_remove",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "jsonb_remove",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "json_replace",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "jsonb_replace",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "json_insert",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "jsonb_insert",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "json_pretty",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "json_set",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "jsonb_set",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "json_quote",
+          1,
+          "s",
+          "utf8",
+          1,
+          2099200
+        ],
+        [
+          "format",
+          1,
+          "s",
+          "utf8",
+          -1,
+          2099200
+        ],
+        [
+          "if",
+          1,
+          "s",
+          "utf8",
+          3,
+          2099200
+        ],
+        [
+          "regexp",
+          0,
+          "s",
+          "utf8",
+          -1,
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:hard_heap_limit",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:ignore_check_constraints",
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:incremental_vacuum",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:index_info",
+      "rows": [
+        [
+          0,
+          0,
+          "a"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:index_list",
+      "rows": [
+        [
+          0,
+          "ti",
+          0,
+          "c",
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:index_xinfo",
+      "rows": [
+        [
+          0,
+          0,
+          "a",
+          0,
+          "BINARY",
+          1
+        ],
+        [
+          1,
+          -1,
+          "",
+          0,
+          "BINARY",
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:integrity_check",
+      "rows": [
+        [
+          "ok"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:journal_mode",
+      "rows": [
+        [
+          "wal"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:journal_size_limit",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:legacy_alter_table",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:legacy_file_format",
+      "requires": "nothing: it no longer functions (a no-op)",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:locking_mode",
+      "rows": [
+        [
+          "exclusive"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:max_page_count",
+      "rows": [
+        [
+          4294967294
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:mmap_size",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:module_list",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:optimize",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:page_count",
+      "rows": [
+        [
+          3
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:page_size",
+      "rows": [
+        [
+          4096
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:parser_trace",
+      "requires": "SQLITE_DEBUG",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:pragma_list",
+      "rows": [
+        [
+          "application_id"
+        ],
+        [
+          "auto_vacuum"
+        ],
+        [
+          "busy_timeout"
+        ],
+        [
+          "cache_size"
+        ],
+        [
+          "cache_spill"
+        ],
+        [
+          "count_changes"
+        ],
+        [
+          "cipher"
+        ],
+        [
+          "data_sync_retry"
+        ],
+        [
+          "database_list"
+        ],
+        [
+          "encoding"
+        ],
+        [
+          "freelist_count"
+        ],
+        [
+          "foreign_keys"
+        ],
+        [
+          "foreign_key_list"
+        ],
+        [
+          "full_column_names"
+        ],
+        [
+          "function_list"
+        ],
+        [
+          "ignore_check_constraints"
+        ],
+        [
+          "integrity_check"
+        ],
+        [
+          "journal_mode"
+        ],
+        [
+          "locking_mode"
+        ],
+        [
+          "quick_check"
+        ],
+        [
+          "hexkey"
+        ],
+        [
+          "legacy_file_format"
+        ],
+        [
+          "max_page_count"
+        ],
+        [
+          "module_list"
+        ],
+        [
+          "page_count"
+        ],
+        [
+          "page_size"
+        ],
+        [
+          "query_only"
+        ],
+        [
+          "schema_version"
+        ],
+        [
+          "short_column_names"
+        ],
+        [
+          "i_am_a_dummy"
+        ],
+        [
+          "require_where"
+        ],
+        [
+          "synchronous"
+        ],
+        [
+          "temp_store"
+        ],
+        [
+          "index_info"
+        ],
+        [
+          "index_xinfo"
+        ],
+        [
+          "index_list"
+        ],
+        [
+          "table_list"
+        ],
+        [
+          "table_info"
+        ],
+        [
+          "table_xinfo"
+        ],
+        [
+          "capture_data_changes_conn"
+        ],
+        [
+          "unstable_capture_data_changes_conn"
+        ],
+        [
+          "user_version"
+        ],
+        [
+          "wal_autocheckpoint"
+        ],
+        [
+          "wal_checkpoint"
+        ],
+        [
+          "mvcc_checkpoint_threshold"
+        ],
+        [
+          "mvcc_gc_threshold"
+        ],
+        [
+          "mvcc_group_commit"
+        ],
+        [
+          "fts_merge_threshold"
+        ],
+        [
+          "list_types"
+        ],
+        [
+          "empty_result_callbacks"
+        ],
+        [
+          "vdbe_trace"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:query_only",
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:quick_check",
+      "rows": [
+        [
+          "ok"
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:read_uncommitted",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:recursive_triggers",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:reverse_unordered_selects",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:schema_version",
+      "rows": [
+        [
+          2
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:secure_delete",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:short_column_names",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:shrink_memory",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:soft_heap_limit",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:stats",
+      "requires": "a testing build (its output is deliberately undocumented)",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:synchronous",
+      "rows": [
+        [
+          2
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:table_info",
+      "rows": [
+        [
+          0,
+          "a",
+          "INTEGER",
+          0,
+          null,
+          0
+        ],
+        [
+          1,
+          "b",
+          "TEXT",
+          0,
+          null,
+          0
+        ],
+        [
+          2,
+          "c",
+          "REAL",
+          0,
+          null,
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:table_list",
+      "rows": [
+        [
+          "main",
+          "t",
+          "table",
+          3,
+          0,
+          0
+        ],
+        [
+          "main",
+          "sqlite_schema",
+          "table",
+          5,
+          0,
+          0
+        ],
+        [
+          "main",
+          "u",
+          "table",
+          2,
+          0,
+          0
+        ],
+        [
+          "temp",
+          "sqlite_temp_schema",
+          "table",
+          5,
+          0,
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:table_xinfo",
+      "rows": [
+        [
+          0,
+          "a",
+          "INTEGER",
+          0,
+          null,
+          0,
+          0
+        ],
+        [
+          1,
+          "b",
+          "TEXT",
+          0,
+          null,
+          0,
+          0
+        ],
+        [
+          2,
+          "c",
+          "REAL",
+          0,
+          null,
+          0,
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:temp_store",
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:temp_store_directory",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:threads",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:trusted_schema",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:user_version",
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:vdbe_addoptrace",
+      "requires": "SQLITE_DEBUG",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:vdbe_debug",
+      "requires": "SQLITE_DEBUG",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:vdbe_listing",
+      "requires": "SQLITE_DEBUG",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:vdbe_trace",
+      "requires": "SQLITE_DEBUG",
+      "rows": [],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:wal_autocheckpoint",
+      "rows": [
+        [
+          1000
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:wal_checkpoint",
+      "rows": [
+        [
+          0,
+          6,
+          6
+        ]
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "pragma:writable_schema",
+      "rows": [],
+      "status": "ok"
+    }
+  ],
+  "seconds": 38.377757913,
+  "version": "Turso 0.9.0-pre.1 at 3e09a82"
+}

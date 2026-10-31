@@ -1,0 +1,175 @@
+> CREATE TABLE l(id INTEGER PRIMARY KEY, k INT);
+
+> CREATE TABLE r(id INTEGER PRIMARY KEY, k INT);
+
+> INSERT INTO l(k) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100) SELECT i FROM n;
+
+> INSERT INTO r(k) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000) SELECT 1000 + i FROM n;
+
+> CREATE INDEX r_k ON r(k);
+
+> ANALYZE;
+
+> -- counted
+> SELECT * FROM l LEFT JOIN r ON r.k = l.k;
+rows: 100
+plan 0 loops : no estimate, counted 1
+plan 0 prefix l position 0: estimated 100 rows, counted 100
+plan 0 prefix r position 1: estimated 136.78794411714424 rows, counted 100
+
+> -- counted
+> SELECT * FROM l RIGHT JOIN r ON r.k = l.k;
+rows: 1000
+plan 0 loops : no estimate, counted 1
+plan 0 prefix l position 0: estimated 100 rows, counted 100
+plan 0 prefix r position 1: estimated 136.78794411714424 rows, counted 1000
+
+> -- counted
+> SELECT * FROM l FULL JOIN r ON r.k = l.k;
+rows: 1100
+plan 0 loops : no estimate, counted 1
+plan 0 prefix l position 0: estimated 100 rows, counted 100
+plan 0 prefix r position 1: estimated 136.78794411714424 rows, counted 1100
+
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM l FULL JOIN r ON r.k = l.k;
+{
+  "nodes": [
+    {
+      "detail": "SCAN l",
+      "id": 1,
+      "op": {
+        "estimate": {
+          "access_cost": 2.3,
+          "input_rows": 1,
+          "output_rows": 100,
+          "rows_per_input": 100,
+          "total_cost": 2.3
+        },
+        "source": "table",
+        "table": "l",
+        "type": "scan"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SEARCH r USING INDEX r_k (k=?) LEFT-JOIN",
+      "id": 2,
+      "op": {
+        "constraints": [
+          "k=?"
+        ],
+        "estimate": {
+          "access_cost": 21.8,
+          "input_rows": 100,
+          "output_rows": 136.78794411714424,
+          "rows_per_input": 1.3678794411714423,
+          "total_cost": 24.1
+        },
+        "index": {
+          "covering": false,
+          "ephemeral": false,
+          "name": "r_k"
+        },
+        "join": "full",
+        "search_kind": "seek",
+        "table": "r",
+        "type": "search"
+      },
+      "parent": null
+    },
+    {
+      "detail": "RIGHT-JOIN r",
+      "id": 3,
+      "op": {
+        "table": "r",
+        "type": "right_join"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SCAN r",
+      "id": 4,
+      "op": {
+        "estimate": {
+          "access_cost": 21.8,
+          "input_rows": 100,
+          "output_rows": 136.78794411714424,
+          "rows_per_input": 1.3678794411714423,
+          "total_cost": 24.1
+        },
+        "source": "table",
+        "table": "r",
+        "type": "scan"
+      },
+      "parent": 3
+    }
+  ],
+  "output_rows": 136.78794411714424,
+  "result_columns": [
+    "id",
+    "k",
+    "id",
+    "k"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM l FULL JOIN r ON r.k = l.k",
+  "version": 1
+}
+
+> EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM l JOIN r ON r.k = l.k;
+{
+  "nodes": [
+    {
+      "detail": "SCAN l",
+      "id": 1,
+      "op": {
+        "estimate": {
+          "access_cost": 2.3,
+          "input_rows": 1,
+          "output_rows": 100,
+          "rows_per_input": 100,
+          "total_cost": 2.3
+        },
+        "source": "table",
+        "table": "l",
+        "type": "scan"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SEARCH r USING COVERING INDEX r_k (k=?)",
+      "id": 2,
+      "op": {
+        "constraints": [
+          "k=?"
+        ],
+        "estimate": {
+          "access_cost": 21.8,
+          "input_rows": 100,
+          "output_rows": 100,
+          "rows_per_input": 1,
+          "total_cost": 24.1
+        },
+        "index": {
+          "covering": true,
+          "ephemeral": false,
+          "name": "r_k"
+        },
+        "join": "inner",
+        "search_kind": "seek",
+        "table": "r",
+        "type": "search"
+      },
+      "parent": null
+    }
+  ],
+  "output_rows": 100,
+  "result_columns": [
+    "id",
+    "k",
+    "id",
+    "k"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM l JOIN r ON r.k = l.k",
+  "version": 1
+}
+

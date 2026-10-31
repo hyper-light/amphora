@@ -1,5 +1,5 @@
 # amphora
-Distributed SQLite from laptop to global scale for agents
+Agentic database for durable, transactional records - from a laptop to global multi-region.
 
 Amphora is the database kiln keeps every record in: KilnDB made a product. It keeps records, never bytes: kiln's sessions, conversations, goals, plans, deploys, CI, runners, places,
 repos, sync, settings, users, grants and audit, and the records of Hex, Veil, Reliquary and Quiver's

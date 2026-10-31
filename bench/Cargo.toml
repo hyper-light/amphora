@@ -1,0 +1,39 @@
+[package]
+name = "amphora-bench"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Amphora against vanilla Turso, SQLite and clustered MySQL (Vitess) on kiln's conversation workload (K0)"
+
+# A workspace of its own, outside Amphora's gates: its MySQL client and SQLite (compiled from C)
+# never enter Amphora's build, its lock file or its macOS and Windows checks.
+[workspace]
+
+[dependencies]
+amphora = { path = "../crates/amphora" }
+amphora-engine = { path = "../crates/engine", default-features = false, features = ["fs", "json", "pure-rust-crypto", "checksum"] }
+# Vanilla Turso: upstream at the revision Amphora's engine was taken from, none of Amphora's changes.
+turso_core = { git = "https://github.com/tursodatabase/turso", rev = "3e09a82750d8290ef96e3830896e7205b7c0b9e6", default-features = false, features = ["fs", "json", "pure-rust-crypto"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+# The oracles' reference (`--oracle`): the system's SQLite, loaded at run time, so it's the release
+# the correctness corpus is checked on, not the bundled one the benchmarks link.
+libloading = "0.8.9"
+mysql = { version = "26", default-features = false, features = ["minimal"] }
+# PostgreSQL, OrioleDB and CedarDB (Postgres's protocol): the synchronous client, here only.
+postgres = "0.19"
+# ClickHouse's HTTP interface: a small blocking client, no async runtime, no TLS.
+ureq = { version = "3", default-features = false }
+# The planner bench's DuckDB (`--planner`), compiled in as SQLite is.
+duckdb = { version = "1", features = ["bundled"] }
+anyhow = "1"
+# float_roundtrip: the planner bench keeps estimates exactly as EXPLAIN QUERY PLAN FORMAT=JSON gives them.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+
+# AMPHORA_PROFILE (Unix only): a sampling profile of the mixed phase (a timer signal and backtraces: no root, no
+# perf), written as a flamegraph and the hottest frames.
+[target.'cfg(unix)'.dependencies]
+pprof = { version = "0.14", default-features = false, features = ["flamegraph"] }
+
+[profile.release]
+debug = "line-tables-only"

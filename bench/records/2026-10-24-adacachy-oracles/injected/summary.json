@@ -1,0 +1,1888 @@
+{
+  "duplicates": 4,
+  "findings": {
+    "cert-0f1f3e5deb54bbf6": {
+      "at_seconds": 1663.361820171,
+      "detail": "the more restrictive query is estimated at 160000000000 rows, the query at 5000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "cert-87c13cd34ed16274": {
+      "at_seconds": 1809.176903119,
+      "detail": "the more restrictive query is estimated at 1000000 rows, the query at 1",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 4
+    },
+    "cert-9c1ecb617f883e88": {
+      "at_seconds": 1747.002420778,
+      "detail": "the more restrictive query is estimated at 100000000000 rows, the query at 1000000000",
+      "kind": "Estimate",
+      "oracle": "cert",
+      "statements": 2
+    },
+    "diff-084c8c0aa45de4a2": {
+      "at_seconds": 805.417186423,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-0e3919d00ee937be": {
+      "at_seconds": 1234.90037611,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-21a4a6c0205e3f3e": {
+      "at_seconds": 865.787250442,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-21ab75bea576ec30": {
+      "at_seconds": 1296.931082342,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-23c99313389064b3": {
+      "at_seconds": 20.987374564,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-3886f7bdb9c51162": {
+      "at_seconds": 1620.505063899,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-38988223cc9de4f4": {
+      "at_seconds": 20.566908709,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-52a31f909cba9309": {
+      "at_seconds": 103.954428398,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-539914f0a1631349": {
+      "at_seconds": 432.677658219,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-8b2bec437888edcb": {
+      "at_seconds": 1726.587776996,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-8d5d42a52b15b055": {
+      "at_seconds": 1726.422420781,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-912010ac6201c679": {
+      "at_seconds": 1726.826120181,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-93f83c6f4fa01cc8": {
+      "at_seconds": 1453.93423805,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-96c684a4bb641b7a": {
+      "at_seconds": 1747.057363011,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-9b31e139e6ac3a30": {
+      "at_seconds": 1747.239849165,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-9e5a9d149931d33d": {
+      "at_seconds": 596.350350784,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-9fa7340227dff0c2": {
+      "at_seconds": 825.491179685,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-a62d3a04048b3976": {
+      "at_seconds": 268.816149454,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-a78b77f9e0e7f06a": {
+      "at_seconds": 0.474551968,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-b5d6883d5d48f286": {
+      "at_seconds": 453.373822293,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-b5f26ee85e7b33ff": {
+      "at_seconds": 759.569422929,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-becba9a65574ed81": {
+      "at_seconds": 677.589824964,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-c406d6ef00cffe23": {
+      "at_seconds": 186.538582176,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-c587c9832c32f32a": {
+      "at_seconds": 1664.680971248,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-ca5d75d8f5777037": {
+      "at_seconds": 1112.150411879,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-cc87e279e92011a6": {
+      "at_seconds": 596.147424254,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-e4d3c8218b202bfc": {
+      "at_seconds": 554.68433492,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-e5272a28134557c5": {
+      "at_seconds": 349.882630118,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-eec070d6e2186c8f": {
+      "at_seconds": 62.348052296,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-fe7880981df3bca1": {
+      "at_seconds": 227.681085615,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "dqp-07297d51861e1473": {
+      "at_seconds": 1519.405101503,
+      "detail": "another plan gives other rows",
+      "kind": "Wrong",
+      "oracle": "dqp",
+      "statements": 2
+    },
+    "dqp-311086ffd7db81f0": {
+      "at_seconds": 371.525264519,
+      "detail": "another plan gives other rows",
+      "kind": "Wrong",
+      "oracle": "dqp",
+      "statements": 2
+    },
+    "dqp-3c4d28276445a42b": {
+      "at_seconds": 1662.459428064,
+      "detail": "another plan gives other rows",
+      "kind": "Wrong",
+      "oracle": "dqp",
+      "statements": 2
+    },
+    "dqp-3e7d6e93805f43ec": {
+      "at_seconds": 289.729262228,
+      "detail": "another plan gives other rows",
+      "kind": "Wrong",
+      "oracle": "dqp",
+      "statements": 2
+    },
+    "dqp-53f0af2e660f432e": {
+      "at_seconds": 1069.582987144,
+      "detail": "another plan gives other rows",
+      "kind": "Wrong",
+      "oracle": "dqp",
+      "statements": 2
+    },
+    "dqp-b841187c34f0a382": {
+      "at_seconds": 1661.932610906,
+      "detail": "another plan gives other rows",
+      "kind": "Wrong",
+      "oracle": "dqp",
+      "statements": 2
+    },
+    "dqp-d46ed0beac26d25d": {
+      "at_seconds": 124.506316625,
+      "detail": "another plan gives other rows",
+      "kind": "Wrong",
+      "oracle": "dqp",
+      "statements": 2
+    },
+    "eet-0ea924fb43538f9b": {
+      "at_seconds": 1008.858376508,
+      "detail": "an equivalent form gives other rows",
+      "kind": "Wrong",
+      "oracle": "eet",
+      "statements": 3
+    },
+    "eet-2134e9982e1a6fe4": {
+      "at_seconds": 738.12905375,
+      "detail": "an equivalent form gives other rows",
+      "kind": "Wrong",
+      "oracle": "eet",
+      "statements": 3
+    },
+    "eet-21d8d7a14e40df0c": {
+      "at_seconds": 207.418868233,
+      "detail": "an equivalent form gives other rows",
+      "kind": "Wrong",
+      "oracle": "eet",
+      "statements": 2
+    },
+    "eet-28e01bedcf336c74": {
+      "at_seconds": 988.390199447,
+      "detail": "an equivalent form gives other rows",
+      "kind": "Wrong",
+      "oracle": "eet",
+      "statements": 2
+    },
+    "eet-2f2826c4bf32a36c": {
+      "at_seconds": 574.97751469,
+      "detail": "an equivalent form gives other rows",
+      "kind": "Wrong",
+      "oracle": "eet",
+      "statements": 2
+    },
+    "eet-376c318c2ad54070": {
+      "at_seconds": 1641.264868591,
+      "detail": "an equivalent form gives other rows",
+      "kind": "Wrong",
+      "oracle": "eet",
+      "statements": 3
+    },
+    "eet-4bedb29b271e8bf9": {
+      "at_seconds": 758.957832222,
+      "detail": "an equivalent form gives other rows",
+      "kind": "Wrong",
+      "oracle": "eet",
+      "statements": 2
+    },
+    "eet-59eda0438d7a1d5e": {
+      "at_seconds": 124.176345795,
+      "detail": "an equivalent form gives other rows",
+      "kind": "Wrong",
+      "oracle": "eet",
+      "statements": 2
+    },
+    "eet-5b0410ece288c708": {
+      "at_seconds": 1070.71474405,
+      "detail": "an equivalent form gives other rows",
+      "kind": "Wrong",
+      "oracle": "eet",
+      "statements": 3
+    },
+    "eet-6e2793146127a3bf": {
+      "at_seconds": 1620.839996281,
+      "detail": "an equivalent form gives other rows",
+      "kind": "Wrong",
+      "oracle": "eet",
+      "statements": 3
+    },
+    "eet-6fb6977c149f025c": {
+      "at_seconds": 62.857650711,
+      "detail": "an equivalent form gives other rows",
+      "kind": "Wrong",
+      "oracle": "eet",
+      "statements": 2
+    },
+    "eet-973ebb3eb0804ff6": {
+      "at_seconds": 1029.378357645,
+      "detail": "an equivalent form gives other rows",
+      "kind": "Wrong",
+      "oracle": "eet",
+      "statements": 4
+    },
+    "eet-bf8eca4a8a3f55cc": {
+      "at_seconds": 514.342174326,
+      "detail": "an equivalent form gives other rows",
+      "kind": "Wrong",
+      "oracle": "eet",
+      "statements": 3
+    },
+    "eet-d0b23939c7b210db": {
+      "at_seconds": 248.45408058,
+      "detail": "an equivalent form gives other rows",
+      "kind": "Wrong",
+      "oracle": "eet",
+      "statements": 6
+    },
+    "eet-da768cd225167880": {
+      "at_seconds": 596.887855863,
+      "detail": "an equivalent form gives other rows",
+      "kind": "Wrong",
+      "oracle": "eet",
+      "statements": 2
+    },
+    "norec-0373942630bba84a": {
+      "at_seconds": 1090.730942324,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 3
+    },
+    "norec-073c7029539dda3b": {
+      "at_seconds": 886.465603042,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 3
+    },
+    "norec-0e4593c300a5ac4d": {
+      "at_seconds": 575.698137418,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 2
+    },
+    "norec-1bfabbfd86cf45b6": {
+      "at_seconds": 988.470081767,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 2
+    },
+    "norec-35dcb917005b4baf": {
+      "at_seconds": 1049.432879302,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 2
+    },
+    "norec-3ced0bbfb74454dc": {
+      "at_seconds": 865.694177607,
+      "detail": "WHERE p keeps 2 rows; p is TRUE for 0 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 2
+    },
+    "norec-3fbf59309c346d33": {
+      "at_seconds": 309.847641577,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 2
+    },
+    "norec-4319363451e1e4ce": {
+      "at_seconds": 1091.542060067,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 3
+    },
+    "norec-4a50976c74777511": {
+      "at_seconds": 165.655550171,
+      "detail": "WHERE p keeps 1 rows; p is TRUE for 0 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 3
+    },
+    "norec-4c1c3df930102e46": {
+      "at_seconds": 1663.932300217,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 3
+    },
+    "norec-4d43ae0ed8e724c9": {
+      "at_seconds": 21.236615427,
+      "detail": "WHERE p keeps 1 rows; p is TRUE for 2 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 2
+    },
+    "norec-59941d024a24efd5": {
+      "at_seconds": 329.859400733,
+      "detail": "WHERE p keeps 2 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 3
+    },
+    "norec-5c75167e7c54a00c": {
+      "at_seconds": 269.092777699,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 3
+    },
+    "norec-5d6d2949aefe7d8a": {
+      "at_seconds": 845.642283406,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 2
+    },
+    "norec-5e7084cbfd361a41": {
+      "at_seconds": 207.31836483,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 2
+    },
+    "norec-627dcaa7c4611d07": {
+      "at_seconds": 947.86692482,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 3
+    },
+    "norec-681219153a0488ff": {
+      "at_seconds": 1378.657664131,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 2
+    },
+    "norec-6b16dc2d0c4ef57f": {
+      "at_seconds": 1398.763269106,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 3
+    },
+    "norec-70870926948fc5ec": {
+      "at_seconds": 83.354098027,
+      "detail": "WHERE p keeps 1 rows; p is TRUE for 0 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 4
+    },
+    "norec-8b0504185bf23d73": {
+      "at_seconds": 62.595529137,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 2
+    },
+    "norec-9a0939a481940c59": {
+      "at_seconds": 371.243146983,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 3
+    },
+    "norec-9f3bf63be16ccbf8": {
+      "at_seconds": 927.692874748,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 2
+    },
+    "norec-a3eec6722f4eaf8a": {
+      "at_seconds": 473.996364936,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 3
+    },
+    "norec-b1750516baf61cf7": {
+      "at_seconds": 268.933567254,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 3
+    },
+    "norec-b9dd6c5d25555259": {
+      "at_seconds": 62.498097352,
+      "detail": "WHERE p keeps 1 rows; p is TRUE for 2 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 2
+    },
+    "norec-c183057477dafc57": {
+      "at_seconds": 21.869112774,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 3
+    },
+    "norec-d9e38ea3145941cd": {
+      "at_seconds": 1153.069468593,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 3
+    },
+    "norec-e169d926e12f3061": {
+      "at_seconds": 145.203439161,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 3
+    },
+    "norec-e8fa5151fbdcd1bf": {
+      "at_seconds": 1663.755908995,
+      "detail": "WHERE p keeps 0 rows; p is TRUE for 1 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 3
+    },
+    "norec-e9dd03455f674762": {
+      "at_seconds": 907.52209049,
+      "detail": "WHERE p keeps 1 rows; p is TRUE for 0 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 2
+    },
+    "norec-fa2aac56e0b23336": {
+      "at_seconds": 574.784068244,
+      "detail": "WHERE p keeps 2 rows; p is TRUE for 0 of them",
+      "kind": "Wrong",
+      "oracle": "norec",
+      "statements": 4
+    },
+    "pqs-0009cd86e6f0da10": {
+      "at_seconds": 1427.846820686,
+      "detail": "the pivot (rowid 4), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 4
+    },
+    "pqs-1f654b49ae45d111": {
+      "at_seconds": 166.063172786,
+      "detail": "the pivot (rowid 4), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 3
+    },
+    "pqs-2b79953529881a3f": {
+      "at_seconds": 124.905044107,
+      "detail": "the pivot (rowid 4), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 3
+    },
+    "pqs-344431c5ab0f55d4": {
+      "at_seconds": 1747.759969305,
+      "detail": "the pivot (rowid 16), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 9
+    },
+    "pqs-3f6c31d83ffdf06c": {
+      "at_seconds": 494.289002989,
+      "detail": "the pivot (rowid 4), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 3
+    },
+    "pqs-47ec88ea049d54aa": {
+      "at_seconds": 785.128788966,
+      "detail": "the pivot (rowid 8), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 5
+    },
+    "pqs-489ca3f55a74aae8": {
+      "at_seconds": 1235.972204405,
+      "detail": "the pivot (rowid 1), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 2
+    },
+    "pqs-5303bc761ce38060": {
+      "at_seconds": 1154.325373936,
+      "detail": "the pivot (rowid 3), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 2
+    },
+    "pqs-65e3c49f6372f8d8": {
+      "at_seconds": 1498.374695546,
+      "detail": "the pivot (rowid 5), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 4
+    },
+    "pqs-66e10657395ea783": {
+      "at_seconds": 62.786993186,
+      "detail": "the pivot (rowid 4), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 3
+    },
+    "pqs-69329c7543ecb595": {
+      "at_seconds": 1297.079914712,
+      "detail": "the pivot (rowid 4), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 4
+    },
+    "pqs-7b7168a43c0e6194": {
+      "at_seconds": 1337.697062988,
+      "detail": "the pivot (rowid 10), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 5
+    },
+    "pqs-b57154786b3a9534": {
+      "at_seconds": 20.753559984,
+      "detail": "the pivot (rowid 4), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 3
+    },
+    "pqs-c8457165c14b5fb5": {
+      "at_seconds": 1429.071548793,
+      "detail": "the pivot (rowid 8), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 6
+    },
+    "pqs-d782ae9068317a36": {
+      "at_seconds": 1256.801951248,
+      "detail": "the pivot (rowid 19), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 9
+    },
+    "pqs-f5c51a7923329dd8": {
+      "at_seconds": 637.449502907,
+      "detail": "the pivot (rowid 2), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 2
+    },
+    "tlp-0165c5436026ae99": {
+      "at_seconds": 21.759169717,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-01b702907582d3d7": {
+      "at_seconds": 1256.647575415,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-02d107b1f8630946": {
+      "at_seconds": 473.716291068,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-061d24fbe638b71d": {
+      "at_seconds": 988.676142866,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-0831c27ce52d15f7": {
+      "at_seconds": 1498.073594521,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-0881797c1f89e9ed": {
+      "at_seconds": 637.360936915,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-08b68c60dbb4e1ab": {
+      "at_seconds": 227.819930688,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-0986a86ea3359e8a": {
+      "at_seconds": 1725.343806969,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-0c3d71c5fd19738b": {
+      "at_seconds": 1663.548059325,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-0ca37ebbfff5cbe5": {
+      "at_seconds": 1112.254796216,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-0ddeddf2a1056350": {
+      "at_seconds": 1276.822009137,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-0de2bbd099f33d1a": {
+      "at_seconds": 1235.627448121,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-0dea680db7901492": {
+      "at_seconds": 1704.88408876,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-0ed03d6b9d37a5f7": {
+      "at_seconds": 1452.619172201,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-0f01d01e996cd2f6": {
+      "at_seconds": 289.247594437,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 1
+    },
+    "tlp-12553bd2eb2d4fb1": {
+      "at_seconds": 697.834797847,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-16e7f043c7d221b9": {
+      "at_seconds": 1539.423653594,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 1
+    },
+    "tlp-1a12e3463b73d14e": {
+      "at_seconds": 186.67202955,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-1a8f8f3d0ac2db22": {
+      "at_seconds": 780.430119105,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-1d0b3796831fae9a": {
+      "at_seconds": 760.372769767,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-1ff60407cb623e28": {
+      "at_seconds": 20.90445896,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-20fc0a36c7a128e9": {
+      "at_seconds": 228.394679973,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-21d6fda7a3135f25": {
+      "at_seconds": 1236.561497196,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-21f56f43e114eec6": {
+      "at_seconds": 370.653571326,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-21ff87759ec3b759": {
+      "at_seconds": 1579.839080991,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 4
+    },
+    "tlp-2657770fd348073a": {
+      "at_seconds": 432.416294751,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 4
+    },
+    "tlp-26a0e75c3623a912": {
+      "at_seconds": 575.135622318,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-26fda60f9ad087ea": {
+      "at_seconds": 1008.69880592,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-2abb60dfb17902e3": {
+      "at_seconds": 1337.176257499,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-2da50d4710cdb9e6": {
+      "at_seconds": 1662.105626194,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-2df0af86f9f62dc4": {
+      "at_seconds": 1152.813197571,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-2fe1bd4d825dd997": {
+      "at_seconds": 103.608166055,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-30c114e1cdba6929": {
+      "at_seconds": 784.842630627,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-30f0574917fec503": {
+      "at_seconds": 514.537555669,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-31486ffc68e266df": {
+      "at_seconds": 41.906021427,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-3216da1b0d78eabe": {
+      "at_seconds": 596.751760896,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-332208266c1788f9": {
+      "at_seconds": 738.050231345,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-349d6d0e4cf9f05e": {
+      "at_seconds": 596.551111669,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-38b4939d88471540": {
+      "at_seconds": 759.266787046,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-38c94a6f8b5209b6": {
+      "at_seconds": 21.648889621,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-38dfed39b3aa1295": {
+      "at_seconds": 737.936801922,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 5
+    },
+    "tlp-3a6d138974dc0d18": {
+      "at_seconds": 782.206240577,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-3a7d2c21b519ae2a": {
+      "at_seconds": 1358.541120397,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 4
+    },
+    "tlp-3d94cd0af8bc6a08": {
+      "at_seconds": 1419.675947491,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-3e0e31f482ac5e53": {
+      "at_seconds": 1726.940886622,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-401d44230b912d23": {
+      "at_seconds": 1725.843158856,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-42044e8a0c0601f9": {
+      "at_seconds": 1153.650662083,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 1
+    },
+    "tlp-43b39acc01156ec9": {
+      "at_seconds": 1132.572575717,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-44709fd79a319298": {
+      "at_seconds": 1132.75163067,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-46ded08a717614dc": {
+      "at_seconds": 1477.438408072,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-48ef2a825d1598fc": {
+      "at_seconds": 1423.229485561,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-4a6ab3d7bab1f7f1": {
+      "at_seconds": 21.516127673,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-4a9918c01f0e7dbd": {
+      "at_seconds": 453.658334312,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-4aa7bb8ab3b0c5d3": {
+      "at_seconds": 575.396381035,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-4c486bee29e9eb06": {
+      "at_seconds": 21.067093006,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-4c4b8afb18a1e003": {
+      "at_seconds": 83.471347154,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-4ffdda4aafd7f686": {
+      "at_seconds": 494.182675241,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-50281a316780842d": {
+      "at_seconds": 103.891124941,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-52a3e2d715c01f53": {
+      "at_seconds": 1132.359629323,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 4
+    },
+    "tlp-547ee430ba2cdd0f": {
+      "at_seconds": 1234.9918311,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-55357801758aa4ca": {
+      "at_seconds": 1684.699336264,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-57c418343fa18859": {
+      "at_seconds": 1069.900166614,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-5d56caf23b6e03af": {
+      "at_seconds": 783.136879043,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-5d8b7b91db9f723a": {
+      "at_seconds": 968.251665885,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-5e68abfd81491dc3": {
+      "at_seconds": 227.588251007,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-65720c3266c6dc12": {
+      "at_seconds": 1725.900912478,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-678405f73f11c543": {
+      "at_seconds": 1641.721776436,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-67e308373f419c65": {
+      "at_seconds": 1450.159123519,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-698f970c5e63ece3": {
+      "at_seconds": 21.390909795,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-6c3072337d9d2067": {
+      "at_seconds": 805.136670562,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-72bd027d4d607474": {
+      "at_seconds": 207.495782617,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-76d2b799c2c38ab0": {
+      "at_seconds": 575.308261555,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-77afebf8d83c647f": {
+      "at_seconds": 1070.216292456,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-789cfee6546e27eb": {
+      "at_seconds": 616.930723252,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 4
+    },
+    "tlp-7fda89ee7a350770": {
+      "at_seconds": 289.500888889,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-7ff999a7db543edd": {
+      "at_seconds": 1449.440477743,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 4
+    },
+    "tlp-80b27b82730a8cc5": {
+      "at_seconds": 207.064589999,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-871845ed3a59d34e": {
+      "at_seconds": 1641.898948017,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-898785c4041cb634": {
+      "at_seconds": 1518.502336715,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 4
+    },
+    "tlp-8a36e07aaf3c479c": {
+      "at_seconds": 617.033586135,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 1
+    },
+    "tlp-8eb6f0bbb4809b5d": {
+      "at_seconds": 927.81935972,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-8fde5e3d357e3ed5": {
+      "at_seconds": 371.016381126,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-92a3937a2c2dee37": {
+      "at_seconds": 145.033179126,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-944736a59ce4db98": {
+      "at_seconds": 124.072727229,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-949e01b9abd721be": {
+      "at_seconds": 717.858242481,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-94af276decbe3ce8": {
+      "at_seconds": 474.171810248,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-959a54205890d41e": {
+      "at_seconds": 1236.438318212,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-9787768978b1f398": {
+      "at_seconds": 1641.563058477,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 1
+    },
+    "tlp-97c867de773efe55": {
+      "at_seconds": 1235.896241175,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-97dd0f5dc53eeeab": {
+      "at_seconds": 637.532648887,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-9839a0174b3485b7": {
+      "at_seconds": 1423.911726002,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 1
+    },
+    "tlp-985c65725f0cfb49": {
+      "at_seconds": 371.6844607,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-987363c9676fa08b": {
+      "at_seconds": 637.057032775,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-9d7b49907208124a": {
+      "at_seconds": 1559.464270454,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 4
+    },
+    "tlp-9e74afb8ef8721f0": {
+      "at_seconds": 453.221882949,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-a0e1b5b4fdab0c6c": {
+      "at_seconds": 1174.493974273,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-a629ec539f01ed3e": {
+      "at_seconds": 1358.647475832,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-a79626b0b8c89ec1": {
+      "at_seconds": 1235.428065087,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-a928757bef078e31": {
+      "at_seconds": 1662.743057359,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-ad2ef3c2bb833f5f": {
+      "at_seconds": 433.014173923,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-aecf7f8e9fa168aa": {
+      "at_seconds": 825.588593017,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-b15432e8a839893f": {
+      "at_seconds": 103.700021211,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-bae367011423cf16": {
+      "at_seconds": 62.694915983,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-bdba8a4c45dd9905": {
+      "at_seconds": 1748.270161525,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-bf8f7b23cb4ca9be": {
+      "at_seconds": 758.172683058,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-c005a375003baec2": {
+      "at_seconds": 268.597126837,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-c0a2079a11496708": {
+      "at_seconds": 124.128477558,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-c166c4c1fbe751fb": {
+      "at_seconds": 412.212029587,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-c6355b34b684c484": {
+      "at_seconds": 1154.127705323,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-cd5ba632fbfe3b23": {
+      "at_seconds": 1457.100839935,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-cd62fb00606ba30f": {
+      "at_seconds": 886.111688211,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-d4875fdeab4237bd": {
+      "at_seconds": 1317.146035729,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-d7208092e63f30e5": {
+      "at_seconds": 1768.37426712,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-d798f464ef7ecad2": {
+      "at_seconds": 1725.681759049,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-d84312dcc255fadb": {
+      "at_seconds": 1662.287664944,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-d8554edbe03b07e5": {
+      "at_seconds": 1338.40203346,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-d947e802726d0a7c": {
+      "at_seconds": 1236.190737831,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-d97592f14a8a7124": {
+      "at_seconds": 391.819845008,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-d9aa199c00a977a4": {
+      "at_seconds": 1214.860821671,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-db0661508a65b718": {
+      "at_seconds": 906.877366871,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-dc3824e91feaca47": {
+      "at_seconds": 575.81844413,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 1
+    },
+    "tlp-df1b7ee38fed09d3": {
+      "at_seconds": 186.981940922,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-dfd8cd70dbbb020b": {
+      "at_seconds": 576.091844005,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-e013fc5eede77f6f": {
+      "at_seconds": 927.588478227,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-e0b8bcd82ab54414": {
+      "at_seconds": 350.245790706,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-e344bde0f02acf0c": {
+      "at_seconds": 1194.501523266,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-e546ec17738e2936": {
+      "at_seconds": 1662.605054344,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-e70d8edb2ebac833": {
+      "at_seconds": 534.603160524,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 1
+    },
+    "tlp-e777057eb6068cab": {
+      "at_seconds": 392.051927584,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-e969e2615200ee52": {
+      "at_seconds": 186.312159509,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-ea28f696abcb51be": {
+      "at_seconds": 1664.43064245,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-eb836e782490d1ca": {
+      "at_seconds": 207.583724118,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-ebd612316e34602f": {
+      "at_seconds": 186.734429386,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 1
+    },
+    "tlp-ec69edc98b276cf7": {
+      "at_seconds": 967.896816643,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 6
+    },
+    "tlp-ef8d9b7aa8fdb8fd": {
+      "at_seconds": 657.570513837,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-f18e77b1f9ff217c": {
+      "at_seconds": 988.280627331,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-f1b75ed47be2a849": {
+      "at_seconds": 1726.171697286,
+      "detail": "the query's rows aren't the UNION of its partitions'",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-f948b02ada48e4da": {
+      "at_seconds": 1070.618366536,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 3
+    },
+    "tlp-fab701f17e38086e": {
+      "at_seconds": 1746.948055794,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-fc9a2c8e9acd3a1d": {
+      "at_seconds": 1788.759981976,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 4
+    },
+    "tlp-fccacd2e6386890d": {
+      "at_seconds": 760.128771462,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-fd0d8989f9ec9570": {
+      "at_seconds": 1600.151145597,
+      "detail": "the query's aggregate isn't its partitions' combined",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    },
+    "tlp-fd38a37e040f2414": {
+      "at_seconds": 1455.877047056,
+      "detail": "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+      "kind": "Wrong",
+      "oracle": "tlp",
+      "statements": 2
+    }
+  },
+  "functions": 101,
+  "label": "",
+  "oracles": {
+    "cert": {
+      "checks": 10047,
+      "failed": 3,
+      "passed": 9124,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "no estimate": 920
+      }
+    },
+    "diff": {
+      "checks": 10046,
+      "failed": 31,
+      "passed": 7501,
+      "plans_changed": 0,
+      "refused": {
+        "JSON path error near: \"#\"": 1,
+        "JSON path error near: \"################\"": 1,
+        "JSON path error near: \"#.#\"": 1,
+        "JSON path error near: \"-#.#\"": 1,
+        "Parse error: Unexpected end of input": 1,
+        "Parse error: bad JSON path: '##'": 1,
+        "Parse error: bad JSON path: '#.#'": 1,
+        "Parse error: bad JSON path: ''": 1,
+        "Parse error: malformed JSON": 9,
+        "integer overflow": 1,
+        "json_object() labels must be TEXT": 1,
+        "json_object() requires an even number of arguments": 3,
+        "json_set() needs an odd number of arguments": 1
+      },
+      "skipped": {
+        "a bare column: its row is any of its group's": 889,
+        "sqlite refused": 1602
+      }
+    },
+    "dqp": {
+      "checks": 10046,
+      "failed": 7,
+      "passed": 7026,
+      "plans_changed": 2530,
+      "refused": {},
+      "skipped": {
+        "a bare column: its row is any of its group's": 813,
+        "a derived query meets a value's error (evaluation order)": 13,
+        "amphora refused the base": 1610,
+        "the index can't serve the query": 577
+      }
+    },
+    "eet": {
+      "checks": 10047,
+      "failed": 15,
+      "passed": 7452,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a bare column: its row is any of its group's": 1004,
+        "a derived query meets a value's error (evaluation order)": 10,
+        "amphora refused the base": 1566
+      }
+    },
+    "norec": {
+      "checks": 10046,
+      "failed": 32,
+      "passed": 8707,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a derived query meets a value's error (evaluation order)": 85,
+        "amphora refused both": 1222
+      }
+    },
+    "pqs": {
+      "checks": 9090,
+      "failed": 16,
+      "passed": 8083,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "sqlite can't evaluate it": 823,
+        "sqlite misses its own pivot": 168
+      }
+    },
+    "same": {
+      "checks": 1759,
+      "failed": 0,
+      "passed": 1759,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {}
+    },
+    "tlp": {
+      "checks": 10046,
+      "failed": 145,
+      "passed": 7813,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a derived query errors on SQLite too": 151,
+        "a derived query meets a value's error (evaluation order)": 406,
+        "amphora refused the base": 1531
+      }
+    }
+  },
+  "seconds": 1809.180575166,
+  "seed": 20261024,
+  "setup_refused": {},
+  "sqlite": "3.54.0",
+  "sqlite_options": [
+    "ATOMIC_INTRINSICS=1",
+    "COMPILER=gcc-16.2.1 20260810",
+    "DEFAULT_AUTOVACUUM",
+    "DEFAULT_CACHE_SIZE=-2000",
+    "DEFAULT_FILE_FORMAT=4",
+    "DEFAULT_JOURNAL_SIZE_LIMIT=-1",
+    "DEFAULT_MMAP_SIZE=0",
+    "DEFAULT_PAGE_SIZE=4096",
+    "DEFAULT_PCACHE_INITSZ=20",
+    "DEFAULT_RECURSIVE_TRIGGERS",
+    "DEFAULT_SECTOR_SIZE=4096",
+    "DEFAULT_SYNCHRONOUS=2",
+    "DEFAULT_WAL_AUTOCHECKPOINT=1000",
+    "DEFAULT_WAL_SYNCHRONOUS=2",
+    "DEFAULT_WORKER_THREADS=0",
+    "DIRECT_OVERFLOW_READ",
+    "ENABLE_COLUMN_METADATA",
+    "ENABLE_DBSTAT_VTAB",
+    "ENABLE_FTS3",
+    "ENABLE_FTS3_PARENTHESIS",
+    "ENABLE_FTS4",
+    "ENABLE_FTS5",
+    "ENABLE_MATH_FUNCTIONS",
+    "ENABLE_PERCENTILE",
+    "ENABLE_PREUPDATE_HOOK",
+    "ENABLE_RTREE",
+    "ENABLE_SESSION",
+    "ENABLE_STAT4",
+    "ENABLE_STMTVTAB",
+    "ENABLE_UNLOCK_NOTIFY",
+    "HAVE_ISNAN",
+    "LIKE_DOESNT_MATCH_BLOBS",
+    "MALLOC_SOFT_LIMIT=1024",
+    "MAX_ATTACHED=10",
+    "MAX_COLUMN=2000",
+    "MAX_COMPOUND_SELECT=500",
+    "MAX_DEFAULT_PAGE_SIZE=8192",
+    "MAX_EXPR_DEPTH=10000",
+    "MAX_FUNCTION_ARG=1000",
+    "MAX_LENGTH=1000000000",
+    "MAX_LIKE_PATTERN_LENGTH=50000",
+    "MAX_MMAP_SIZE=0x7fff0000",
+    "MAX_PAGE_COUNT=0xfffffffe",
+    "MAX_PAGE_SIZE=65536",
+    "MAX_SCHEMA=10000000",
+    "MAX_SQL_LENGTH=1000000000",
+    "MAX_TRIGGER_DEPTH=1000",
+    "MAX_VARIABLE_NUMBER=250000",
+    "MAX_VDBE_OP=250000000",
+    "MAX_WORKER_THREADS=8",
+    "MUTEX_PTHREADS",
+    "SECURE_DELETE",
+    "SYSTEM_MALLOC",
+    "TEMP_STORE=1",
+    "THREADSAFE=1"
+  ],
+  "states": 1759
+}

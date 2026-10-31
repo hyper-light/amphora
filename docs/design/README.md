@@ -36,19 +36,24 @@ Kiln vendors it at `vendor/amphora` and reaches it only through kiln-seams' `Rec
 - **Placement and sharding after Vitess and PlanetScale:** keyspaces with a VSchema, primary and
   lookup vindexes, automatic split and merge with fenced transfers, VReplication-style moves,
   cells to contain failures, and leaders that follow locality.
-- **Turso, with carte blanche.** Amphora owns its copy (`vendor/turso`): each change has its row in
-  `UPSTREAM.md`, keeps Turso's own suites passing, meets this repository's rules, and is offered
-  upstream.
+- **Turso, made Amphora's own.** The engine (`crates/engine*`) is Turso's four crates as of 3e09a82
+  and Amphora's own code since (its `ORIGIN.md`): each change keeps its suites passing and meets
+  this repository's rules, and what is left of the inherited code that breaks them is counted down
+  (CLAUDE.md §1). Nothing is synced with Turso in either direction: Amphora is a database of its own.
 
 ## Decisions
 
 | Decision | Made by | Status |
 |---|---|---|
 | The commit pipeline: adaptive group commit, its batch budget | CP-T1.1, CP-T1.4 | open |
-| The MVCC scheme: SSI or OCC with precision locking | CP-T1.2, CP-T1.3 | open |
+| The MVCC scheme and the storage under it: in-place versions with undo in one shared buffer pool, B-link trees, row-level redo at commit, serializable by precision locking (`engine.md`) | CP-T1.2, CP-T1.3 | made, being built |
 | I/O per platform: io_uring and direct I/O, `F_BARRIERFSYNC`/`F_FULLFSYNC`, `FlushFileBuffers` | CP-T1.4 | open |
 | The client protocol: libSQL's Hrana, the Postgres wire protocol, or both | CP-T1.2 | open |
 | Replication: hyper-raft groups, the Raft log as the write-ahead log, commit classes | CP-T1.8 | open |
 | Placement and sharding: the directory, split and merge thresholds, cells | CP-T1.9 | open |
 | Transactions across groups and follower reads | CP-T1.10 | open |
 | Regions: region-local groups, the global root, the multi-region class | CP-T1.11 | open |
+| The engine: Turso's four crates made Amphora's own (`crates/engine*`, its `ORIGIN.md`), not vendored; CLAUDE.md §1 on every line Amphora writes, the rest counted down (`scripts/engine-ratchet.toml`) | Ada, 2026-10-20 | made |
+| The planner where the bench suite found it choosing far more work: closed ranges, sorts, GLOB prefixes, skip-scans, a composite key's columns without statistics (`planner.md`) | CP-T1.2 | made |
+| The executor's work repeated on every run of a statement or row: ephemeral tables kept between runs, an IN subquery's list searched once a row, a subquery run only where it is read (`executor.md`) | CP-T1.2 | made |
+| Where answers depart from SQLite's, each for a stated reason: TEXT is well-formed UTF-8 (`semantics.md`) | G2 step 3 | made |

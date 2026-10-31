@@ -1,0 +1,5 @@
+finding	c87e332 engine	33599f1	system sqlite3 3.54.0	cause
+diff-9694c3d5d048ba1f	fails	fails	1 row, as Amphora	AH
+diff-f08e47b86b16bc48	fails	fails	1 row, as Amphora	AH
+diff-8bb8b642344f1c0c	fails	fails	NULL|NULL|1, as Amphora	AH
+eet-5d073f0af8f98282	fails	fails	-	CE

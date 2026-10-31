@@ -1,0 +1,27 @@
+# tlp Wrong: the query's rows aren't the UNION of its partitions'
+
+seed 20261024, state 1640
+
+## Statements
+
+```sql
+CREATE TABLE t1(c0 BOOLEAN UNIQUE);
+INSERT OR IGNORE INTO t1 VALUES (9223372036854775807);
+CREATE TABLE t2(c0 BLOB, c1 VARCHAR(10) NOT NULL, c2 BLOB COLLATE RTRIM UNIQUE, c3 BLOB);
+```
+
+## Queries
+
+```sql
+SELECT -100, NULL FROM t1 AS a0 LEFT JOIN t2 AS a1 ON NULL GROUP BY NULL, NULL;
+SELECT -100, NULL FROM t1 AS a0 LEFT JOIN t2 AS a1 ON NULL WHERE a1.c3 GROUP BY NULL, NULL UNION SELECT -100, NULL FROM t1 AS a0 LEFT JOIN t2 AS a1 ON NULL WHERE (NOT a1.c3) GROUP BY NULL, NULL UNION SELECT -100, NULL FROM t1 AS a0 LEFT JOIN t2 AS a1 ON NULL WHERE (a1.c3 ISNULL) GROUP BY NULL, NULL;
+```
+
+## What differed
+
+```
+the query's rows aren't the UNION of its partitions'
+  expected: 1 rows
+    -100, NULL
+  Amphora:  0 rows
+```

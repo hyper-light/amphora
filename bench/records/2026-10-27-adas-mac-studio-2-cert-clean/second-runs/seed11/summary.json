@@ -1,0 +1,273 @@
+{
+  "duplicates": 0,
+  "findings": {
+    "diff-243487fcb9e98d38": {
+      "at_seconds": 1217.226032333,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-2ae0cd601c4f2139": {
+      "at_seconds": 14.239982125,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-3064c68395dc9aac": {
+      "at_seconds": 216.906980708,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-662a693d7e38c916": {
+      "at_seconds": 469.108864667,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-a4ba99214e344a9f": {
+      "at_seconds": 1325.630006042,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-a6a081a46ecf71c6": {
+      "at_seconds": 1495.094200042,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-eaaf0bdfbf9d6c13": {
+      "at_seconds": 1616.204425875,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    }
+  },
+  "functions": 101,
+  "label": "",
+  "oracles": {
+    "cert": {
+      "checks": 430469,
+      "failed": 0,
+      "passed": 430428,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "sqlite refused": 41
+      }
+    },
+    "diff": {
+      "checks": 430469,
+      "failed": 7,
+      "passed": 357144,
+      "plans_changed": 0,
+      "refused": {
+        "ESCAPE expression must be a single character": 13,
+        "FLAGS parameter to json_valid() must be between # and ##": 21,
+        "JSON cannot hold BLOB values": 42,
+        "JSON path error near: \"#\"": 26,
+        "JSON path error near: \"##\"": 3,
+        "JSON path error near: \"###\"": 3,
+        "JSON path error near: \"################\"": 2,
+        "JSON path error near: \"################.#\"": 1,
+        "JSON path error near: \"###.#\"": 2,
+        "JSON path error near: \"##.#\"": 1,
+        "JSON path error near: \"#.#\"": 17,
+        "JSON path error near: \"#.#e+###\"": 2,
+        "JSON path error near: \"-###################\"": 2,
+        "JSON path error near: \"-###.#\"": 1,
+        "JSON path error near: \"-#.#\"": 4,
+        "JSON path error near: \"-#.################e+##\"": 2,
+        "JSON path error near: \"-#.#e-###\"": 3,
+        "Parse error: Unexpected character": 49,
+        "Parse error: Unexpected end of input": 20,
+        "Parse error: bad JSON path: '\u0001\u0002'": 3,
+        "Parse error: bad JSON path: ' '": 1,
+        "Parse error: bad JSON path: ' a'": 5,
+        "Parse error: bad JSON path: '\"true\"'": 1,
+        "Parse error: bad JSON path: '##'": 3,
+        "Parse error: bad JSON path: '#'": 8,
+        "Parse error: bad JSON path: '#.#'": 5,
+        "Parse error: bad JSON path: '#e#'": 3,
+        "Parse error: bad JSON path: '#x##'": 5,
+        "Parse error: bad JSON path: '%'": 5,
+        "Parse error: bad JSON path: ''": 6,
+        "Parse error: bad JSON path: '-#'": 2,
+        "Parse error: bad JSON path: 'A'": 2,
+        "Parse error: bad JSON path: 'ABC'": 2,
+        "Parse error: bad JSON path: '[#,#,#]'": 2,
+        "Parse error: bad JSON path: 'a'": 3,
+        "Parse error: bad JSON path: 'abc'": 1,
+        "Parse error: bad JSON path: 'integer'": 1,
+        "Parse error: bad JSON path: 'true'": 3,
+        "Parse error: bad JSON path: 'x'": 1,
+        "Parse error: bad JSON path: '{\"#.#\":################}'": 1,
+        "Parse error: bad JSON path: 'é'": 3,
+        "Parse error: bad JSON path: 'ÿ'": 1,
+        "Parse error: malformed JSON": 203,
+        "integer overflow": 2,
+        "json_array_insert() needs an odd number of arguments": 27,
+        "json_insert() needs an odd number of arguments": 21,
+        "json_object() labels must be TEXT": 21,
+        "json_object() requires an even number of arguments": 44,
+        "json_replace() needs an odd number of arguments": 22,
+        "json_set() needs an odd number of arguments": 31,
+        "string or blob too big": 19
+      },
+      "skipped": {
+        "SQLite's answer holds ill-formed UTF-8 (garbage in, garbage out)": 17,
+        "a bare column: its row is any of its group's": 38875,
+        "sqlite refused": 33755
+      }
+    },
+    "dqp": {
+      "checks": 430469,
+      "failed": 0,
+      "passed": 333573,
+      "plans_changed": 117767,
+      "refused": {},
+      "skipped": {
+        "a bare column: its row is any of its group's": 38761,
+        "a derived query meets a value's error (evaluation order)": 522,
+        "amphora refused the base": 32484,
+        "the index can't serve the query": 25128,
+        "the relation fails on SQLite too": 1
+      }
+    },
+    "eet": {
+      "checks": 430469,
+      "failed": 0,
+      "passed": 352287,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a bare column: its row is any of its group's": 45430,
+        "a derived query errors on SQLite too": 350,
+        "a derived query meets a value's error (evaluation order)": 426,
+        "amphora refused the base": 31976
+      }
+    },
+    "norec": {
+      "checks": 430469,
+      "failed": 0,
+      "passed": 396479,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a derived query meets a value's error (evaluation order)": 4199,
+        "amphora refused both": 29791
+      }
+    },
+    "order": {
+      "checks": 430469,
+      "failed": 0,
+      "passed": 430469,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {}
+    },
+    "pqs": {
+      "checks": 390229,
+      "failed": 0,
+      "passed": 361212,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a derived query meets a value's error (evaluation order)": 12,
+        "sqlite can't evaluate it": 22157,
+        "sqlite misses its own pivot": 6848
+      }
+    },
+    "same": {
+      "checks": 86094,
+      "failed": 0,
+      "passed": 86094,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {}
+    },
+    "tlp": {
+      "checks": 430469,
+      "failed": 0,
+      "passed": 370778,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a REAL sum's partitions round apart from it": 3937,
+        "a derived query meets a value's error (evaluation order)": 12999,
+        "a partition's sum overflows": 20,
+        "amphora refused the base": 42735
+      }
+    }
+  },
+  "seconds": 1800.003229917,
+  "seed": 11,
+  "setup_refused": {},
+  "sqlite": "3.54.0",
+  "sqlite_options": [
+    "ATOMIC_INTRINSICS=1",
+    "COMPILER=clang-17.0.0",
+    "DEFAULT_AUTOVACUUM",
+    "DEFAULT_CACHE_SIZE=-2000",
+    "DEFAULT_FILE_FORMAT=4",
+    "DEFAULT_JOURNAL_SIZE_LIMIT=-1",
+    "DEFAULT_MMAP_SIZE=0",
+    "DEFAULT_PAGE_SIZE=4096",
+    "DEFAULT_PCACHE_INITSZ=20",
+    "DEFAULT_RECURSIVE_TRIGGERS",
+    "DEFAULT_SECTOR_SIZE=4096",
+    "DEFAULT_SYNCHRONOUS=2",
+    "DEFAULT_WAL_AUTOCHECKPOINT=1000",
+    "DEFAULT_WAL_SYNCHRONOUS=2",
+    "DEFAULT_WORKER_THREADS=0",
+    "DIRECT_OVERFLOW_READ",
+    "ENABLE_COLUMN_METADATA",
+    "ENABLE_DBSTAT_VTAB",
+    "ENABLE_FTS3",
+    "ENABLE_FTS3_PARENTHESIS",
+    "ENABLE_FTS4",
+    "ENABLE_FTS5",
+    "ENABLE_MATH_FUNCTIONS",
+    "ENABLE_PERCENTILE",
+    "ENABLE_PREUPDATE_HOOK",
+    "ENABLE_RTREE",
+    "ENABLE_SESSION",
+    "ENABLE_STAT4",
+    "ENABLE_STMTVTAB",
+    "ENABLE_UNLOCK_NOTIFY",
+    "HAVE_ISNAN",
+    "LIKE_DOESNT_MATCH_BLOBS",
+    "MALLOC_SOFT_LIMIT=1024",
+    "MAX_ATTACHED=10",
+    "MAX_COLUMN=2000",
+    "MAX_COMPOUND_SELECT=500",
+    "MAX_DEFAULT_PAGE_SIZE=8192",
+    "MAX_EXPR_DEPTH=10000",
+    "MAX_FUNCTION_ARG=1000",
+    "MAX_LENGTH=1000000000",
+    "MAX_LIKE_PATTERN_LENGTH=50000",
+    "MAX_MMAP_SIZE=0x7fff0000",
+    "MAX_PAGE_COUNT=0xfffffffe",
+    "MAX_PAGE_SIZE=65536",
+    "MAX_SCHEMA=10000000",
+    "MAX_SQL_LENGTH=1000000000",
+    "MAX_TRIGGER_DEPTH=1000",
+    "MAX_VARIABLE_NUMBER=250000",
+    "MAX_VDBE_OP=250000000",
+    "MAX_WORKER_THREADS=8",
+    "MUTEX_PTHREADS",
+    "SECURE_DELETE",
+    "SYSTEM_MALLOC",
+    "TEMP_STORE=1",
+    "THREADSAFE=1"
+  ],
+  "states": 86094
+}
