@@ -2757,6 +2757,10 @@ mod tests {
         answers: std::collections::BTreeMap<u64, Series>,
         term: u64,
         leader: u64,
+        /// Times this member, leading, was stepped down by its quorum check in its own term.
+        step_downs: u64,
+        /// Terms it moved to: elections.
+        elections: u64,
         changes: Vec<String>,
     }
     impl Stalls {
@@ -2787,12 +2791,16 @@ mod tests {
             if (term, leader) == (self.term, self.leader) {
                 return;
             }
-            let cause = if self.leader == id && leader != id && term == self.term {
-                "the leader's quorum check stepped it down"
-            } else if term != self.term {
+            let cause = if term != self.term {
+                self.elections += 1;
                 "an election"
+            } else if self.leader == id && leader != id {
+                self.step_downs += 1;
+                "its quorum check stepped it down"
+            } else if leader == 0 {
+                "its leader stepped down"
             } else {
-                "a leader learned"
+                "the election's leader learned"
             };
             if self.term != 0 {
                 self.changes.push(format!(
@@ -2946,7 +2954,12 @@ mod tests {
                     gaps.over(limit)
                 );
             }
-            println!("member {node_id}: leader changes: {}", stalls.changes.len());
+            println!(
+                "member {node_id}: step-downs by its own quorum check: {}; elections: {}; changes seen: {}",
+                stalls.step_downs,
+                stalls.elections,
+                stalls.changes.len()
+            );
             for change in &stalls.changes {
                 println!("member {node_id}:   {change}");
             }
