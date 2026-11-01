@@ -274,18 +274,34 @@ measured reaches the others over Wi-Fi: ping averages 16.7-242 ms, user-level ro
   Mac's p50 is 3.9 ms).
 - The proposer's apply flush stays in the answer's path until item 4 is built.
 
-**What building it takes.**
-- The fate labels and `Config::fates`.
-- The suspicion feed.
-- The class at the Database seam, with its typed refusal.
-- Apply answering before its flush, with the group flusher, `durable()` at the flushed point, and the log-before-WAL
-  invariant.
-- Tests:
-  - the simulator power-cutting each fate at every step, losing nothing acknowledged over 10,000 seeds;
-  - a whole-site power cut losing nothing older than the promise window;
-  - members of one fate never committing held;
-  - the replicated-flake plan's nemesis, run again.
-- Metrics: commits by class and the commit's seconds by class, named with the Kiln Metrics agent.
+**What is built** (t1/fast-ack, 2026-11-01):
+- `Durability`, `Fates`, `Database::open_replicated_with` and `attach_replicated_with`, all additive.
+- The typed refusal (`validate_durability`).
+- The core's fates and `apply_unpersisted` (`settings`).
+- The machine applying class entries without a flush, `durable()` at the flushed point, and `acts_at_start` false
+  for them.
+- The owner's flushing thread, one flush out at a time.
+- A remote client reopening with the durability it stated.
+
+Its tests:
+- the answer before the leader's flush, red with the apply flushing every entry;
+- the refusals;
+- the core's settings;
+- the power-cut nemesis: one member of three fates cut and restarted at the end of each round of writes, its log
+  and database losing what they hadn't flushed, every acknowledged write read back (12 seeds in the suite; 10,000
+  by hand, `AMPHORA_POWER_SEEDS`).
+
+Not built, and none of it weakens the one-fate guarantee:
+- **The suspicion feed** (`suspect_held` from hyper-liveness, not vendored). Without it no member is ever
+  suspected. A held quorum spans two fates either way, and the leader counts only its disk. The feed narrows what
+  a gray, failing member's held answers can commit, a refinement beyond one fate's loss.
+- **Metrics by class.** hyper-raft's core doesn't say which quorum committed an entry, and `ReplicaStatus` crosses
+  the transport, so a field there is a wire change. Each takes its own change, with names agreed with the Kiln
+  Metrics agent (CLAUDE.md section 10).
+- **The answer moving to the leader** for writes made at a follower (item 6).
+- **Fates checked across members.** The owner's transport identity doesn't name the durability, so members that
+  disagree aren't refused at the transport.
+- **A whole-site power cut bounded by the promise window,** as a test of its own.
 
 Falsified by:
 - an acknowledged write lost after one fate's failure, or after the leader's;
