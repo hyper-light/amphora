@@ -872,7 +872,7 @@ pub fn step(
                 }
                 pause(BUSY_WAIT);
             }
-            StepResult::Interrupt => anyhow::bail!("a statement was interrupted"),
+            StepResult::Interrupt => return Err(fail(LimboError::Interrupt)),
         }
     }
 }
@@ -967,7 +967,10 @@ mod tests {
         });
         let error = exec.unwrap_err();
         assert!(
-            matches!(error.downcast_ref::<LimboError>(), Some(LimboError::Interrupt)),
+            matches!(
+                error.downcast_ref::<LimboError>(),
+                Some(LimboError::Interrupt)
+            ),
             "{error:#}"
         );
         let query = db.transaction(|db| {
@@ -976,7 +979,10 @@ mod tests {
         });
         let error = query.unwrap_err();
         assert!(
-            matches!(error.downcast_ref::<LimboError>(), Some(LimboError::Interrupt)),
+            matches!(
+                error.downcast_ref::<LimboError>(),
+                Some(LimboError::Interrupt)
+            ),
             "{error:#}"
         );
         db.transaction(|db| db.exec("INSERT INTO numbers VALUES (1)"))

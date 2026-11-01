@@ -1945,8 +1945,7 @@ mod tests {
             db.exec("CREATE TABLE cancelled_actor_write(value)")?;
             made.store(usize::from(cancelled_tables(db)?), Ordering::Relaxed);
             set(&clock, base, until);
-            // Through the row runner, which reports an interrupt as one (the batch runner
-            // reports it as busy).
+            // Each runner reports an interrupt as one (bug 68a308b7).
             let result = db.query_owned("WITH RECURSIVE n(x) AS(VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000000) SELECT sum(x) FROM n", [], |_| Ok(true));
             if matches!(&result, Err(error) if format!("{error:#}").contains("interrupt")) {
                 stopped.fetch_add(1, Ordering::Relaxed);

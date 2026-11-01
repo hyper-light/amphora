@@ -5971,14 +5971,20 @@ pub fn op_program(
                                 return Ok(state.suspend_on_io(io));
                             }
                             StepResult::Row => continue,
-                            StepResult::Interrupt | StepResult::Busy => {
+                            step @ (StepResult::Interrupt | StepResult::Busy) => {
                                 *state.active_op_state.program() = OpProgramState::Step {
                                     is_trigger,
                                     statement,
                                     saved_last_insert_rowid,
                                     saved_changes_value: saved_last_changes_value,
                                 };
-                                return Err(LimboError::Busy.into());
+                                // An interrupt is the caller's own; busy is another connection's.
+                                let error = if matches!(step, StepResult::Interrupt) {
+                                    LimboError::Interrupt
+                                } else {
+                                    LimboError::Busy
+                                };
+                                return Err(error.into());
                             }
                         },
                         Err(LimboError::Constraint(constraint_err)) => {
