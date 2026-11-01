@@ -181,11 +181,13 @@ Falsified by:
 - an owner's read of time that isn't its clock's, other than a compaction step's own checks;
 - a call whose work outlasts its deadline that is proposed, or that answers anything but Timeout.
 
-## Fast acknowledgement: the replicated class (proposed 2026-11-01, for Ada's word)
+## Fast acknowledgement: the replicated class (approved 2026-11-01, being built)
 
-Proposed, not built: kiln goal 1b2c66ae884889609ce5248729385a0a, which Ada set on 2026-11-01 ("we should explore a way
-to make it work with our replication and RAFT right?"). Nothing is built without her word on this design. Measurements
-and sources are in docs/research/fast-acknowledgement.md.
+Kiln goal 1b2c66ae884889609ce5248729385a0a, which Ada set on 2026-11-01 ("we should explore a way to make it work with
+our replication and RAFT right?"). Measurements and sources are in docs/research/fast-acknowledgement.md.
+
+**Decision (Ada, 2026-11-01).** Asked whether to build it, opt-in per database with the default unchanged, she chose
+"Approve and build it now". It is built failing test first, gated, on a branch, and merged only on her word.
 
 **Why.** Amphora acknowledges a write only after a local flush that began after its commit (store.md: "one is
 acknowledged only once a flush that began after its commit ends (AC-T1.4.4)"), so every small write pays one:
