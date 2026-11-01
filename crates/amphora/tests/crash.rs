@@ -1131,6 +1131,70 @@ fn a_commit_that_lands_during_a_flush_is_not_counted_durable_by_it() {
     assert_eq!(copied.left, 0, "{copied:?}");
 }
 
+/// Rows that insert their number (Some) or only read (None), each batch in one transaction.
+struct Mixed {
+    db: Db,
+}
+
+impl Engine for Mixed {
+    type Row = Option<i64>;
+    type Reader = Db;
+
+    fn key(_: &Option<i64>) -> &str {
+        "t"
+    }
+
+    fn apply(&mut self, rows: &[Option<i64>]) -> anyhow::Result<usize> {
+        self.db.transaction(|db| {
+            for row in rows {
+                match row {
+                    Some(n) => db.query(
+                        "INSERT INTO t (n) VALUES (?1)",
+                        [Value::from_i64(*n)],
+                        |_| Ok(true),
+                    )?,
+                    None => db.query("SELECT count(*) FROM t", Vec::new(), |_| Ok(true))?,
+                }
+            }
+            Ok(rows.len())
+        })
+    }
+
+    fn flusher(&self) -> Option<Flush> {
+        Some(self.db.flusher())
+    }
+}
+
+/// AC-T1.1.1, docs/design/store.md decision 15 (kiln goal f4b650c4): do a batch that only reads with
+/// every flush of the disk held; expect it told durable at once, no flush held for it. A commit
+/// that wrote nothing leaves the log as the last flush made it, so the flush its ticket waits for
+/// has nothing to sync. Then a write: its flush is held until let go, so the hold holds.
+#[test]
+fn a_batch_that_wrote_nothing_is_durable_with_every_flush_held() {
+    let until = || Instant::now() + Duration::from_secs(30);
+    let disk = Disk::new(1, HashMap::new());
+    let db = Db::open_with(std::path::Path::new(PATH), disk.clone()).unwrap();
+    db.exec("CREATE TABLE t (n INTEGER)").unwrap();
+    let store = Store::start(Mixed { db }, Config::default()).unwrap();
+    store
+        .durable(&store.put(vec![Some(1)]).unwrap(), until())
+        .unwrap();
+    disk.hold();
+    // The 30 s budget is a hang guard: a flush this batch needed would wait for the hold forever.
+    store
+        .durable(&store.put(vec![None]).unwrap(), until())
+        .unwrap();
+    assert_eq!(
+        disk.holding.0.lock().unwrap().1,
+        0,
+        "a flush was held for a batch that only read"
+    );
+    let write = store.put(vec![Some(2)]).unwrap();
+    disk.held(1);
+    disk.let_go();
+    store.durable(&write, until()).unwrap();
+}
+
 /// T-T1.1.1, a sample run in every gate: a power cut at a change drawn from each seed's workload,
 /// and the restart keeps every acknowledged batch, no refused one, and every other whole or not at
 /// all.

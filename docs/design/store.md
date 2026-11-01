@@ -1219,3 +1219,39 @@ outgrown twice its bound, so that is paid once for each such log, not at every r
 (`files.rs`); an acknowledged write lost, or a database refused, after a power cut around a restart
 that cut the log (`tests/crash.rs`); a restart that cuts the log holding the writer much longer than
 one that keeps it, or the commits after it slower than after a restart that keeps the file.
+
+## 32. A batch that wrote nothing is durable as the last flush left it
+
+**Decision.** A batch whose commit wrote nothing, a session that only read, waits for no flush of
+its own. Its ticket waits for a flush, like every batch's (decision 15). That flush finds the log
+where the last flush left it, so it returns without syncing, and the batch is told durable at once.
+If an earlier commit's flush is still to come, the batch waits for it: every commit the batch could
+have seen is durable before it is answered, so its answer rests only on durable writes. Writes keep
+their rule: one is acknowledged only once a flush that began after its commit ends (AC-T1.4.4).
+
+**Why.** kiln's W24-AC10 lookups on 29be700 took about 92 ms each on adacachy (load 40-90), and
+that was read as read-only calls each waiting for a fresh fsync (kiln goal f4b650c4). They don't.
+A read-only `Database::call` writes no frames and waits for no fsync (docs/research/read-only-calls.md).
+Those lookups write a hit count on every hit, and a write waits for its flush.
+
+**Sources.** A read-only transaction that depends on commits not yet durable must wait for them,
+and only for them. Kimura, Graefe and Kuno ("Efficient Locking Techniques for Databases on Modern
+Hardware", ADMS 2012, §5.3): a read-only transaction "immediately exits if the maximum tag is
+already durable. Otherwise, it wakes up the log flusher and waits until the LSN becomes durable."
+Aether (Johnson et al., PVLDB 3(1), 2010, §3.1): a transaction that read a pre-committed
+transaction's data "must not be allowed to return results to the user until both their own and
+their predecessor's log records have reached the disk". Engines skip the flush for a transaction
+that wrote nothing. PostgreSQL's `RecordTransactionCommit` (`xact.c`, REL_18_0) writes no commit
+record without a transaction ID, and SQLite's `sqlite3PagerCommitPhaseOne` (3.54.1) returns early
+"If no database changes have been made".
+
+**Evidence.** `crates/amphora/tests/crash.rs`,
+`a_batch_that_wrote_nothing_is_durable_with_every_flush_held`: on the simulated disk with every
+flush held, a batch that only reads is told durable at once, with no flush held, and a write's
+flush stays held until let go. It passes at 29be700, and a mutant whose flusher syncs even with
+nothing new in the log fails it (its 30 s hang guard; adas-mac-studio-3, 2026-11-01). The probe in
+docs/research/read-only-calls.md: 1,500 read-only calls left the log at 791,072 bytes, p50 about
+78 µs.
+
+**Falsified by.** A batch that wrote nothing waiting for a flush that syncs (the test above), or
+answered before an earlier commit it could have seen is durable.
