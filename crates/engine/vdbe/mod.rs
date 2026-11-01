@@ -4279,24 +4279,41 @@ mod tests {
     fn runners_and_triggers_report_an_interrupt_as_one() {
         const LONG: &str = "WITH RECURSIVE t(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM t WHERE x<100000) SELECT sum(x) FROM t";
         let io = Arc::new(crate::MemoryIO::new());
-        let db = crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+        let db =
+            crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE big(x)").unwrap();
         conn.execute("INSERT INTO big WITH RECURSIVE t(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM t WHERE x<1000) SELECT x FROM t").unwrap();
         conn.execute("CREATE TABLE fired(x)").unwrap();
         conn.execute("CREATE TABLE log(x)").unwrap();
         conn.execute("CREATE TRIGGER long_body AFTER INSERT ON fired BEGIN INSERT INTO log SELECT a.x FROM big a, big b; END").unwrap();
-        let (mut ignored, mut collected) = (conn.prepare(LONG).unwrap(), conn.prepare(LONG).unwrap());
+        let (mut ignored, mut collected) =
+            (conn.prepare(LONG).unwrap(), conn.prepare(LONG).unwrap());
         let mut insert = conn.prepare("INSERT INTO fired VALUES (1)").unwrap();
 
         conn.set_progress_handler(1, Some(Box::new(|| true)));
-        assert!(matches!(ignored.run_ignore_rows(), Err(LimboError::Interrupt)));
-        assert!(matches!(collected.run_collect_rows(), Err(LimboError::Interrupt)));
-        assert!(matches!(conn.prepare_execute_batch(LONG), Err(LimboError::Interrupt)));
-        assert!(matches!(conn.pragma("table_info", "'fired'"), Err(LimboError::Interrupt)));
+        assert!(matches!(
+            ignored.run_ignore_rows(),
+            Err(LimboError::Interrupt)
+        ));
+        assert!(matches!(
+            collected.run_collect_rows(),
+            Err(LimboError::Interrupt)
+        ));
+        assert!(matches!(
+            conn.prepare_execute_batch(LONG),
+            Err(LimboError::Interrupt)
+        ));
+        assert!(matches!(
+            conn.pragma("table_info", "'fired'"),
+            Err(LimboError::Interrupt)
+        ));
 
         conn.set_progress_handler(1000, Some(Box::new(|| true)));
-        assert!(matches!(insert.run_ignore_rows(), Err(LimboError::Interrupt)));
+        assert!(matches!(
+            insert.run_ignore_rows(),
+            Err(LimboError::Interrupt)
+        ));
     }
 
     #[test]
