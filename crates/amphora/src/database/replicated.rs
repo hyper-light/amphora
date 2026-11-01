@@ -1784,7 +1784,8 @@ mod tests {
     /// real clock, so a real-clock check of a test deadline (a receipt's poll) holds for an hour:
     /// a hang guard, never a verdict.
     struct Driven<F: BlockFile + 'static = DeviceFile> {
-        owners: Vec<(Actor<F>, mpsc::Receiver<Envelope>)>,
+        // Each member's owner, by member order; none while a test has cut its power.
+        owners: Vec<Option<(Actor<F>, mpsc::Receiver<Envelope>)>>,
         base: Instant,
         // Each owner's clock: the nanoseconds it reads past `base`.
         clocks: Vec<Arc<AtomicU64>>,
@@ -1852,7 +1853,7 @@ mod tests {
                 clock,
             )
             .unwrap();
-            self.owners.push((actor, receiver));
+            self.owners.push(Some((actor, receiver)));
             self.clocks.push(reading);
             client
         }
@@ -1885,14 +1886,21 @@ mod tests {
         fn clock(&self, owner: usize) -> Arc<AtomicU64> {
             Arc::clone(self.clocks.get(owner).unwrap())
         }
+        /// Owner `owner`, which must be running.
+        fn owner(&self, owner: usize) -> &Actor<F> {
+            &self.owners.get(owner).unwrap().as_ref().unwrap().0
+        }
+        fn owner_mut(&mut self, owner: usize) -> &mut Actor<F> {
+            &mut self.owners.get_mut(owner).unwrap().as_mut().unwrap().0
+        }
         /// Owner `owner`'s flushes of its database's log wait for the test (`Driven::flush`).
         fn hold_flushes(&mut self, owner: usize) {
-            self.owners.get_mut(owner).unwrap().0.flushing = Flushing::Held;
+            self.owner_mut(owner).flushing = Flushing::Held;
         }
         /// Flushes owner `owner`'s database log now, as its flushing thread would: what it has
         /// applied is durable after.
         fn flush(&mut self, owner: usize) {
-            let actor = &mut self.owners.get_mut(owner).unwrap().0;
+            let actor = self.owner_mut(owner);
             assert!(
                 matches!(actor.flushing, Flushing::Held),
                 "owner {owner}'s flushes aren't held"
@@ -1912,7 +1920,7 @@ mod tests {
         /// One round: every owner takes each input waiting for it, then steps once more, each at
         /// its own clock's reading.
         fn step(&mut self) {
-            for (owner, inputs) in &mut self.owners {
+            for (owner, inputs) in self.owners.iter_mut().flatten() {
                 while let Ok(input) = inputs.try_recv() {
                     owner.run_step(Some(input)).unwrap();
                 }
@@ -1935,13 +1943,7 @@ mod tests {
             first: usize,
             applied: u64,
         ) -> usize {
-            self.owners
-                .get_mut(first)
-                .unwrap()
-                .0
-                .replica
-                .campaign()
-                .unwrap();
+            self.owner_mut(first).replica.campaign().unwrap();
             self.follow(pump, clients, applied)
         }
         /// Rounds, time standing still, until every owner follows one leader with at least
@@ -1968,13 +1970,7 @@ mod tests {
         /// refuses), every clock standing still; rounds go on until every owner follows `to`.
         fn transfer(&mut self, pump: &mut Pump<'_>, clients: &[Client], from: usize, to: usize) {
             let id = u64::try_from(to + 1).unwrap();
-            self.owners
-                .get_mut(from)
-                .unwrap()
-                .0
-                .replica
-                .transfer(id)
-                .unwrap();
+            self.owner_mut(from).replica.transfer(id).unwrap();
             for _ in 0..ROUNDS {
                 self.round(pump);
                 if clients
@@ -2030,6 +2026,486 @@ mod tests {
             panic!("admitted records still untaken after {ROUNDS} rounds");
         }
     }
+    /// A memory disk whose power a test cuts (the replicated class's power-cut tests): what a
+    /// file's last sync made durable survives a cut, nothing written to it since. The disk restarted
+    /// on what survived is another disk, so a dying owner's writes never reach it.
+    struct PowerDisk {
+        id: u64,
+        files: Mutex<std::collections::HashMap<String, Arc<PowerFile>>>,
+    }
+    /// A file of a [`PowerDisk`]: what its syncs made durable, and what a reader sees.
+    #[derive(Default)]
+    struct PowerFile {
+        held: Mutex<(Vec<u8>, Vec<u8>)>,
+    }
+    /// Gives each disk its own file identities: the engine keeps one database open per file.
+    static POWER_DISKS: AtomicU64 = AtomicU64::new(0);
+    impl PowerDisk {
+        fn new(image: std::collections::HashMap<String, Vec<u8>>) -> Arc<Self> {
+            let files = image
+                .into_iter()
+                .map(|(path, bytes)| {
+                    let held = Mutex::new((bytes.clone(), bytes));
+                    (path, Arc::new(PowerFile { held }))
+                })
+                .collect();
+            Arc::new(Self {
+                id: POWER_DISKS.fetch_add(1, Ordering::Relaxed),
+                files: Mutex::new(files),
+            })
+        }
+        /// The power cut: what each file's syncs made durable.
+        fn cut(&self) -> std::collections::HashMap<String, Vec<u8>> {
+            let files = self.files.lock().unwrap();
+            files
+                .iter()
+                .map(|(path, file)| (path.clone(), file.held.lock().unwrap().0.clone()))
+                .collect()
+        }
+    }
+    impl PowerFile {
+        fn write(
+            &self,
+            pos: u64,
+            data: &[u8],
+            c: amphora_engine::Completion,
+        ) -> amphora_engine::Result<amphora_engine::Completion> {
+            let mut held = self.held.lock().unwrap();
+            let pos = usize::try_from(pos).unwrap();
+            let end = pos + data.len();
+            if held.1.len() < end {
+                held.1.resize(end, 0);
+            }
+            held.1[pos..end].copy_from_slice(data);
+            drop(held);
+            c.complete(i32::try_from(data.len()).unwrap());
+            Ok(c)
+        }
+    }
+    impl amphora_engine::File for PowerFile {
+        fn lock_file(&self, _exclusive: bool) -> amphora_engine::Result<()> {
+            Ok(())
+        }
+        fn unlock_file(&self) -> amphora_engine::Result<()> {
+            Ok(())
+        }
+        fn pread(
+            &self,
+            pos: u64,
+            c: amphora_engine::Completion,
+        ) -> amphora_engine::Result<amphora_engine::Completion> {
+            let n = {
+                let held = self.held.lock().unwrap();
+                let dst = c.as_read().buf().as_mut_slice();
+                let src = held
+                    .1
+                    .get(usize::try_from(pos).unwrap()..)
+                    .unwrap_or_default();
+                let n = src.len().min(dst.len());
+                dst[..n].copy_from_slice(&src[..n]);
+                n
+            };
+            c.complete(i32::try_from(n).unwrap());
+            Ok(c)
+        }
+        fn pwrite(
+            &self,
+            pos: u64,
+            buffer: Arc<amphora_engine::Buffer>,
+            c: amphora_engine::Completion,
+        ) -> amphora_engine::Result<amphora_engine::Completion> {
+            self.write(pos, buffer.as_slice(), c)
+        }
+        fn pwritev(
+            &self,
+            pos: u64,
+            buffers: Vec<Arc<amphora_engine::Buffer>>,
+            c: amphora_engine::Completion,
+        ) -> amphora_engine::Result<amphora_engine::Completion> {
+            let data: Vec<u8> = buffers
+                .iter()
+                .flat_map(|b| b.as_slice().iter().copied())
+                .collect();
+            self.write(pos, &data, c)
+        }
+        fn sync(
+            &self,
+            c: amphora_engine::Completion,
+            _sync_type: amphora_engine::io::FileSyncType,
+        ) -> amphora_engine::Result<amphora_engine::Completion> {
+            let mut held = self.held.lock().unwrap();
+            held.0 = held.1.clone();
+            drop(held);
+            c.complete(0);
+            Ok(c)
+        }
+        fn truncate(
+            &self,
+            len: u64,
+            c: amphora_engine::Completion,
+        ) -> amphora_engine::Result<amphora_engine::Completion> {
+            self.held
+                .lock()
+                .unwrap()
+                .1
+                .resize(usize::try_from(len).unwrap(), 0);
+            c.complete(0);
+            Ok(c)
+        }
+        fn size(&self) -> amphora_engine::Result<u64> {
+            Ok(self.held.lock().unwrap().1.len() as u64)
+        }
+    }
+    impl amphora_engine::Clock for PowerDisk {
+        fn current_time_monotonic(&self) -> amphora_engine::MonotonicInstant {
+            amphora_engine::MonotonicInstant::now()
+        }
+        fn current_time_wall_clock(&self) -> amphora_engine::WallClockInstant {
+            amphora_engine::WallClockInstant::now()
+        }
+    }
+    impl amphora_engine::IO for PowerDisk {
+        fn open_file(
+            &self,
+            path: &str,
+            flags: amphora_engine::OpenFlags,
+            _direct: bool,
+        ) -> amphora_engine::Result<Arc<dyn amphora_engine::File>> {
+            let mut files = self.files.lock().unwrap();
+            if let Some(file) = files.get(path) {
+                return Ok(file.clone());
+            }
+            if !flags.contains(amphora_engine::OpenFlags::Create) {
+                return Err(amphora_engine::LimboError::CompletionError(
+                    amphora_engine::CompletionError::IOError(std::io::ErrorKind::NotFound, "open"),
+                ));
+            }
+            let file = Arc::new(PowerFile::default());
+            files.insert(path.to_owned(), file.clone());
+            Ok(file)
+        }
+        fn remove_file(&self, path: &str) -> amphora_engine::Result<()> {
+            self.files.lock().unwrap().remove(path);
+            Ok(())
+        }
+        fn file_id(&self, path: &str) -> amphora_engine::Result<amphora_engine::io::FileId> {
+            Ok(amphora_engine::io::FileId::from_path_hash(&format!(
+                "power-{}:{path}",
+                self.id
+            )))
+        }
+    }
+
+    /// A member's storage whose power a test cuts: its log on hyper-block's simulated device
+    /// (power-loss semantics, `Crash`), its database on a [`PowerDisk`].
+    struct Power {
+        log: hyper_block::sim::SimDevice,
+        disk: Arc<PowerDisk>,
+    }
+    impl Power {
+        fn new(seed: u64) -> Self {
+            let align = hyper_block::buf::Alignment::new(4096).unwrap();
+            let sector = hyper_block::buf::Alignment::new(512).unwrap();
+            Self {
+                log: hyper_block::sim::SimDevice::new(align, sector, seed, 2).unwrap(),
+                disk: PowerDisk::new(std::collections::HashMap::new()),
+            }
+        }
+    }
+
+    impl Driven<hyper_block::sim::SimHandle> {
+        /// A shell whose members run on storage the test cuts the power of.
+        fn powered() -> Self {
+            Self::empty()
+        }
+        /// Member `node_id` on `power`: its database on the power disk, its log on the device; its
+        /// leases on files under `dir`. Its clock is `reading`, a new one when none is given.
+        fn open_power(
+            &mut self,
+            dir: &Path,
+            node_id: u64,
+            voters: Vec<u64>,
+            durability: Durability,
+            power: &Power,
+        ) -> Client {
+            let reading = Arc::new(AtomicU64::new(0));
+            let (client, owner) = self.power_owner(
+                dir,
+                node_id,
+                voters,
+                durability,
+                power,
+                Arc::clone(&reading),
+            );
+            self.owners.push(Some(owner));
+            self.clocks.push(reading);
+            client
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn power_owner(
+            &self,
+            dir: &Path,
+            node_id: u64,
+            voters: Vec<u64>,
+            durability: Durability,
+            power: &Power,
+            reading: Arc<AtomicU64>,
+        ) -> (
+            Client,
+            (Actor<hyper_block::sim::SimHandle>, mpsc::Receiver<Envelope>),
+        ) {
+            let machine_lease = lease(&dir.join(format!("state-{node_id}.lease")));
+            let log_owner =
+                Arc::try_unwrap(lease(&dir.join(format!("raft-{node_id}.lease")))).unwrap();
+            let replicated = matches!(durability, Durability::Replicated(_));
+            let machine = crate::replication::Machine::open_on(
+                Path::new(&format!("/power/state-{node_id}.db")),
+                Arc::clone(&power.disk) as Arc<dyn amphora_engine::IO>,
+                ConfState {
+                    voters: voters.clone(),
+                    ..ConfState::default()
+                },
+                Arc::clone(&machine_lease),
+                node_id,
+                replicated,
+            )
+            .unwrap();
+            let base = self.base;
+            let read = Arc::clone(&reading);
+            let (client, actor, receiver) = super::open_on(
+                machine,
+                log_owner,
+                power.log.handle().unwrap(),
+                ReplicaConfig {
+                    node_id,
+                    voters,
+                    learners: Vec::new(),
+                    bootstrap: None,
+                },
+                durability,
+                Arc::new(Changed::default()),
+                machine_lease,
+                self.until(),
+                Arc::new(move || base + offset(&read)),
+            )
+            .unwrap();
+            (client, (actor, receiver))
+        }
+        /// Member `owner`'s power cut, and the member restarted on what survived: its log loses
+        /// what it hadn't flushed, its database what it hadn't synced. The other members run on.
+        /// Its clock runs on too. Returns the restarted member's client.
+        fn power_cut(
+            &mut self,
+            dir: &Path,
+            owner: usize,
+            voters: Vec<u64>,
+            durability: Durability,
+            power: &mut Power,
+        ) -> Client {
+            power.log.crash(hyper_block::sim::Crash::LoseAll).unwrap();
+            let survived = power.disk.cut();
+            drop(self.owners.get_mut(owner).unwrap().take());
+            // What the dying owner wrote after the cut never happened either.
+            power.log.crash(hyper_block::sim::Crash::LoseAll).unwrap();
+            power.disk = PowerDisk::new(survived);
+            let node_id = u64::try_from(owner + 1).unwrap();
+            let reading = Arc::clone(self.clocks.get(owner).unwrap());
+            let (client, restarted) =
+                self.power_owner(dir, node_id, voters, durability, power, reading);
+            *self.owners.get_mut(owner).unwrap() = Some(restarted);
+            client
+        }
+    }
+
+    /// A seeded generator (xorshift64*): a seed's schedule is its own.
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % n.max(1)
+        }
+    }
+
+    /// What one seed of the power-cut nemesis did.
+    #[derive(Default)]
+    struct Cuts {
+        acknowledged: usize,
+        cuts: usize,
+        /// Cuts of a leader whose database held an acknowledged write unflushed.
+        unflushed_leader: usize,
+    }
+
+    /// One seed: three voters in three fates, two to span, their flushes held and let go at random;
+    /// rounds of writes at the leader, each round ending in one member's power cut and restart, and
+    /// a leader elected among the members that ran on when the cut one led. Every acknowledged
+    /// write must be read back at the end.
+    fn power_seed(seed: u64) -> Cuts {
+        const ROUNDS_PER_SEED: u64 = 3;
+        let dir = tempfile::tempdir().unwrap();
+        let mut rng = Rng(seed | 1);
+        let durability = Durability::Replicated(api::replication::Fates {
+            of: vec![(1, 10), (2, 20), (3, 30)],
+            spanning: 2,
+        });
+        let voters = vec![1, 2, 3];
+        let mut power: Vec<Power> = (0..3u64).map(|n| Power::new(seed * 4 + n)).collect();
+        let mut driven = Driven::powered();
+        let mut clients: Vec<Client> = (1..=3u64)
+            .map(|n| {
+                let at = usize::try_from(n - 1).unwrap();
+                driven.open_power(
+                    dir.path(),
+                    n,
+                    voters.clone(),
+                    durability.clone(),
+                    power.get(at).unwrap(),
+                )
+            })
+            .collect();
+        for owner in 0..3 {
+            driven.hold_flushes(owner);
+        }
+        let mut done = Cuts::default();
+        let mut acknowledged = Vec::new();
+        let mut value = 0u64;
+        let mut pump = Pump::new(&clients);
+        let mut leader = driven.elect(&mut pump, &clients, 0, 1);
+        driven
+            .call(&mut pump, clients.get(leader).unwrap(), |db| {
+                db.exec("CREATE TABLE kept(value INTEGER PRIMARY KEY)")?;
+                Ok(Vec::new())
+            })
+            .unwrap_or_else(|e| panic!("seed {seed}: the table: {e:?}"));
+        for _ in 0..ROUNDS_PER_SEED {
+            for _ in 0..=rng.below(4) {
+                value += 1;
+                let v = value;
+                match driven.call(&mut pump, clients.get(leader).unwrap(), move |db| {
+                    db.exec(&format!("INSERT INTO kept VALUES ({v})"))?;
+                    Ok(Vec::new())
+                }) {
+                    Ok(_) => acknowledged.push(v),
+                    Err(Refusal::UnknownOutcome | Refusal::Timeout) => {}
+                    Err(error) => panic!("seed {seed}: write {v}: {error:?}"),
+                }
+                if rng.below(3) == 0 {
+                    driven.flush(usize::try_from(rng.below(3)).unwrap());
+                }
+            }
+            let victim = usize::try_from(rng.below(3)).unwrap();
+            if victim == leader && driven.owner(leader).replica.machine().unflushed().is_some() {
+                done.unflushed_leader += 1;
+            }
+            driven.drain(&mut pump);
+            pump.finish();
+            let restarted = driven.power_cut(
+                dir.path(),
+                victim,
+                voters.clone(),
+                durability.clone(),
+                power.get_mut(victim).unwrap(),
+            );
+            *clients.get_mut(victim).unwrap() = restarted;
+            driven.hold_flushes(victim);
+            done.cuts += 1;
+            pump = Pump::new(&clients);
+            let candidate = if victim == leader {
+                (victim + 1) % 3
+            } else {
+                leader
+            };
+            leader = driven.elect(&mut pump, &clients, candidate, 1);
+        }
+        let read = driven
+            .call(&mut pump, clients.get(leader).unwrap(), |db| {
+                let mut values = Vec::new();
+                db.query_owned("SELECT value FROM kept ORDER BY value", [], |row| {
+                    values.push(row.get::<i64>(0)?.to_string());
+                    Ok(true)
+                })?;
+                Ok(values.join(",").into_bytes())
+            })
+            .unwrap_or_else(|e| panic!("seed {seed}: the read: {e:?}"));
+        driven.drain(&mut pump);
+        pump.finish();
+        let read = String::from_utf8(read).unwrap();
+        let kept: std::collections::BTreeSet<&str> =
+            read.split(',').filter(|v| !v.is_empty()).collect();
+        for v in &acknowledged {
+            assert!(
+                kept.contains(v.to_string().as_str()),
+                "seed {seed}: acknowledged write {v} lost; kept {read}; acknowledged {acknowledged:?}"
+            );
+        }
+        done.acknowledged = acknowledged.len();
+        done
+    }
+
+    /// Runs seeds `from..from + n` of the power-cut nemesis on `workers` threads; a failing seed
+    /// panics with its account.
+    fn power_seeds(n: u64, from: u64, workers: usize) {
+        let next = AtomicU64::new(from);
+        let total = Mutex::new(Cuts::default());
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    loop {
+                        let seed = next.fetch_add(1, Ordering::Relaxed);
+                        if seed >= from + n {
+                            return;
+                        }
+                        let done = power_seed(seed);
+                        let mut total = total.lock().unwrap();
+                        total.acknowledged += done.acknowledged;
+                        total.cuts += done.cuts;
+                        total.unflushed_leader += done.unflushed_leader;
+                    }
+                });
+            }
+        });
+        let total = total.into_inner().unwrap();
+        println!(
+            "power-cut nemesis: seeds {from}..{}, {} writes acknowledged, {} cuts, {} of them of a leader holding a write unflushed, none lost",
+            from + n,
+            total.acknowledged,
+            total.cuts,
+            total.unflushed_leader
+        );
+        // Non-vacuity: writes were acknowledged, members were cut, and some cut hit a leader that
+        // held an acknowledged write unflushed.
+        assert!(
+            total.acknowledged > 0 && total.cuts > 0,
+            "nothing was acknowledged or cut"
+        );
+        assert!(
+            total.unflushed_leader > 0,
+            "no cut hit a leader holding a write unflushed"
+        );
+    }
+
+    /// CP-T1.8 (AC-T1.8.5), the replicated class under a nemesis (replication.md, "Fast
+    /// acknowledgement": one member's crash or power cut loses nothing acknowledged while the
+    /// other fates hold it). Do: 12 seeds of rounds of writes at the leader, the flushes held and
+    /// let go at random, each round ending in one member's power cut, its log losing what it hadn't
+    /// flushed and its database what it hadn't synced. Expect: every acknowledged write read back,
+    /// with cuts of leaders holding writes unflushed among them.
+    #[test]
+    fn a_member_power_cut_loses_no_acknowledged_replicated_write() {
+        power_seeds(12, 0, 4);
+    }
+
+    /// The same nemesis over 10,000 seeds, the plan's measure, run by hand or nightly. A machine can
+    /// take a share: `AMPHORA_POWER_SEEDS=from:count` (default 0:10000).
+    #[test]
+    #[ignore = "10,000 seeds: run with --ignored"]
+    fn a_member_power_cut_loses_no_acknowledged_replicated_write_over_10000_seeds() {
+        let share = std::env::var("AMPHORA_POWER_SEEDS").unwrap_or_else(|_| "0:10000".into());
+        let (from, count) = share.split_once(':').unwrap();
+        power_seeds(count.parse().unwrap(), from.parse().unwrap(), 8);
+    }
+
     /// Enqueues `operation` at `client` without waiting: its answer comes on the returned receiver.
     fn enqueue(
         client: &Client,
@@ -2218,30 +2694,13 @@ mod tests {
             Ok(b"answered".to_vec())
         });
         assert_eq!(answer, Ok(b"answered".to_vec()));
-        let held = driven
-            .owners
-            .get(leader)
-            .unwrap()
-            .0
-            .replica
-            .machine()
-            .unflushed();
+        let held = driven.owner(leader).replica.machine().unflushed();
         assert!(
             held.is_some(),
             "the leader answered with its log flushed for the write, not held: {held:?}"
         );
         driven.flush(leader);
-        assert_eq!(
-            driven
-                .owners
-                .get(leader)
-                .unwrap()
-                .0
-                .replica
-                .machine()
-                .unflushed(),
-            None
-        );
+        assert_eq!(driven.owner(leader).replica.machine().unflushed(), None);
         driven.drain(&mut pump);
         pump.finish();
     }
@@ -2292,15 +2751,7 @@ mod tests {
         let _replicated = driven.open_with(dir.path(), 1, vec![1, 2, 3], None, durability);
         let persisted_dir = tempfile::tempdir().unwrap();
         let _persisted = driven.open(persisted_dir.path(), 1, vec![1, 2, 3], None);
-        let config = driven
-            .owners
-            .first()
-            .unwrap()
-            .0
-            .replica
-            .core()
-            .raft
-            .config();
+        let config = driven.owner(0).replica.core().raft.config();
         let fates = config
             .fates
             .as_ref()
@@ -2308,7 +2759,7 @@ mod tests {
         assert_eq!(fates.of, vec![(1, 10), (2, 20), (3, 30)]);
         assert_eq!(fates.spanning, 2);
         assert!(config.apply_unpersisted);
-        let config = driven.owners.get(1).unwrap().0.replica.core().raft.config();
+        let config = driven.owner(1).replica.core().raft.config();
         assert!(config.fates.is_none() && !config.apply_unpersisted);
     }
 

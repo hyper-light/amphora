@@ -163,6 +163,44 @@ impl Machine {
         bootstrap: Option<api::replication::Bootstrap>,
         replicated: bool,
     ) -> Result<Self, Refusal> {
+        Self::open_db(
+            || Db::open(path),
+            initial,
+            owner,
+            node_id,
+            bootstrap,
+            replicated,
+        )
+    }
+
+    /// [`Machine::open_with_owner`] on `io`: a test's disk, whose power the test cuts.
+    #[cfg(test)]
+    pub(crate) fn open_on(
+        path: &Path,
+        io: std::sync::Arc<dyn amphora_engine::IO>,
+        initial: ConfState,
+        owner: std::sync::Arc<std::fs::File>,
+        node_id: u64,
+        replicated: bool,
+    ) -> Result<Self, Refusal> {
+        Self::open_db(
+            || Db::open_with(path, io),
+            initial,
+            owner,
+            node_id,
+            None,
+            replicated,
+        )
+    }
+
+    fn open_db(
+        open: impl FnOnce() -> anyhow::Result<Db>,
+        initial: ConfState,
+        owner: std::sync::Arc<std::fs::File>,
+        node_id: u64,
+        bootstrap: Option<api::replication::Bootstrap>,
+        replicated: bool,
+    ) -> Result<Self, Refusal> {
         if let Some(declaration) = &bootstrap
             && (node_id == 0 || !initial.voters.contains(&declaration.source_node))
         {
@@ -171,7 +209,7 @@ impl Machine {
                 "the declared source must be an initial voter and the local node ID must be positive",
             ));
         }
-        let mut db = Db::open(path).map_err(unavailable)?;
+        let mut db = open().map_err(unavailable)?;
         db.hold_owner(std::sync::Arc::clone(&owner));
         let mut marked = false;
         db.query(
