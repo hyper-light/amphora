@@ -171,6 +171,9 @@ struct Actor {
     at: Instant,
     published: u64,
     transferred: Option<(u64, Instant)>,
+    // A measurement's record of this owner's stalls (kiln goal 6b112f14, step 1): test-only.
+    #[cfg(test)]
+    stalls: Option<Arc<Mutex<tests::Stalls>>>,
 }
 
 /// An owner's time, from its shell: the real clock for the owner thread, one its test moves for a
@@ -463,6 +466,8 @@ fn open(
         waiting: VecDeque::new(),
         serial: 0,
         transferred: None,
+        #[cfg(test)]
+        stalls: None,
         clock,
         started: at,
         ticked: at,
@@ -636,10 +641,18 @@ impl Actor {
         if let Some(envelope) = input {
             self.receive(envelope)?;
         }
+        #[cfg(test)]
+        if let Some(stalls) = &self.stalls {
+            locked(stalls)?.stepped(at);
+        }
         if at.saturating_duration_since(self.ticked) >= TICK {
             // A delayed owner does not invent missed heartbeats or run an unbounded catchup.
             self.ticked = at;
             self.replica.tick().map_err(raft_error)?;
+            #[cfg(test)]
+            if let Some(stalls) = &self.stalls {
+                locked(stalls)?.ticked(at);
+            }
         }
         for _ in 0..DRIVE_QUANTUM {
             let mut output = Output::default();
@@ -648,6 +661,10 @@ impl Actor {
                 .replica
                 .drive(nanos, std::task::Waker::noop(), &mut output)
                 .map_err(raft_error)?;
+            #[cfg(test)]
+            if let (Some(stalls), Some((submitted, taken))) = (&self.stalls, driven.flushed) {
+                locked(stalls)?.wrote(Duration::from_nanos(taken.saturating_sub(submitted)));
+            }
             self.release(output)?;
             if !driven.more {
                 break;
@@ -677,6 +694,15 @@ impl Actor {
             self.replica
                 .compact(0, nanos, std::task::Waker::noop())
                 .map_err(raft_error)?;
+        }
+        #[cfg(test)]
+        if let Some(stalls) = &self.stalls {
+            let (term, leader, id) = (
+                self.replica.term(),
+                self.replica.leader(),
+                self.replica.id(),
+            );
+            locked(stalls)?.led(term, leader, id);
         }
         *locked(&self.control.status)? = Ok(status(&self.replica));
         Ok(())
@@ -831,6 +857,12 @@ impl Actor {
         Ok(())
     }
     fn step(&mut self, from: u64, bytes: &[u8]) -> Result<(), Refusal> {
+        #[cfg(test)]
+        if let Some(stalls) = &self.stalls
+            && self.replica.leader() == self.replica.id()
+        {
+            locked(stalls)?.answered(from, self.at);
+        }
         let message = Message::decode(bytes)
             .map_err(|error| api::invalid("replica wire record", &error.to_string()))?;
         if message.from != from || message.to != self.replica.id() || from == self.replica.id() {
@@ -2655,5 +2687,282 @@ mod tests {
             drop(sender);
             assert!(matches!(receipt.try_result(), Err(Refusal::Fenced(_))));
         }
+    }
+
+    /// The lease on a member's state file, waited for while a previous owner lets it go.
+    fn lease(path: &Path) -> Arc<File> {
+        for _ in 0..ROUNDS {
+            match exclusive_file(path) {
+                Ok(file) => return Arc::new(file),
+                Err(_) => std::thread::park_timeout(POLL),
+            }
+        }
+        panic!("the previous owner kept its lease");
+    }
+
+    /// One series of a measurement: at most `CAP` samples kept, the rest counted (CLAUDE.md
+    /// section 2).
+    #[derive(Default)]
+    struct Series {
+        samples: Vec<Duration>,
+        dropped: u64,
+    }
+    impl Series {
+        const CAP: usize = 4_000_000;
+        fn add(&mut self, d: Duration) {
+            if self.samples.len() < Self::CAP {
+                self.samples.push(d);
+            } else {
+                self.dropped += 1;
+            }
+        }
+        fn over(&self, limit: Duration) -> usize {
+            self.samples.iter().filter(|d| **d > limit).count()
+        }
+        /// p50, p99, p99.9 and max, in ms, and the count.
+        fn summary(&self) -> String {
+            let mut sorted = self.samples.clone();
+            sorted.sort();
+            let q = |p: f64| {
+                let i = ((sorted.len() as f64 * p).ceil() as usize).saturating_sub(1);
+                sorted.get(i).copied().unwrap_or_default().as_secs_f64() * 1e3
+            };
+            format!(
+                "p50 {:.3} ms p99 {:.3} ms p99.9 {:.3} ms max {:.3} ms ({} samples{})",
+                q(0.50),
+                q(0.99),
+                q(0.999),
+                sorted.last().copied().unwrap_or_default().as_secs_f64() * 1e3,
+                sorted.len(),
+                if self.dropped > 0 {
+                    format!(", {} past the cap", self.dropped)
+                } else {
+                    String::new()
+                }
+            )
+        }
+    }
+
+    /// What one owner's measurement saw (kiln goal 6b112f14, step 1): its step and tick gaps, its
+    /// log writes' times from submit to durable, each follower's answer gaps while it led, and
+    /// each change of leader with its cause.
+    #[derive(Default)]
+    pub(super) struct Stalls {
+        last_step: Option<Instant>,
+        last_tick: Option<Instant>,
+        steps: Series,
+        ticks: Series,
+        writes: Series,
+        last_answer: std::collections::BTreeMap<u64, Instant>,
+        answers: std::collections::BTreeMap<u64, Series>,
+        term: u64,
+        leader: u64,
+        changes: Vec<String>,
+    }
+    impl Stalls {
+        pub(super) fn stepped(&mut self, at: Instant) {
+            if let Some(last) = self.last_step.replace(at) {
+                self.steps.add(at.saturating_duration_since(last));
+            }
+        }
+        pub(super) fn ticked(&mut self, at: Instant) {
+            if let Some(last) = self.last_tick.replace(at) {
+                self.ticks.add(at.saturating_duration_since(last));
+            }
+        }
+        pub(super) fn wrote(&mut self, took: Duration) {
+            self.writes.add(took);
+        }
+        pub(super) fn answered(&mut self, from: u64, at: Instant) {
+            if let Some(last) = self.last_answer.insert(from, at) {
+                self.answers
+                    .entry(from)
+                    .or_default()
+                    .add(at.saturating_duration_since(last));
+            }
+        }
+        /// A change of leader: a step-down by the quorum check when this owner led and stops
+        /// leading in the same term, an election when the term moves.
+        pub(super) fn led(&mut self, term: u64, leader: u64, id: u64) {
+            if (term, leader) == (self.term, self.leader) {
+                return;
+            }
+            let cause = if self.leader == id && leader != id && term == self.term {
+                "the leader's quorum check stepped it down"
+            } else if term != self.term {
+                "an election"
+            } else {
+                "a leader learned"
+            };
+            if self.term != 0 {
+                self.changes.push(format!(
+                    "term {} leader {} -> term {term} leader {leader}: {cause}",
+                    self.term, self.leader
+                ));
+            }
+            self.last_answer.clear();
+            (self.term, self.leader) = (term, leader);
+        }
+    }
+
+    /// Kiln goal 6b112f14, step 1 (replication.md, "The owner's time"): how long a production
+    /// owner's writes and periods stall on this host. Do: three voters on this host's disk under
+    /// ~/.cache (Disk::Flushed), on the real clock, relayed in-process, a write every 20 ms at the
+    /// first member for AMPHORA_STALL_SECONDS (default 1,800). Expect: for each member, the
+    /// p50, p99, p99.9 and max of its log writes, steps and ticks, each follower's answer gaps as
+    /// its leader saw them, the gaps over 200 ms and the leader changes with their causes; and
+    /// none of the series empty.
+    #[test]
+    #[ignore = "a measurement of this host: AMPHORA_STALL_SECONDS of three owners on its disk"]
+    fn production_owner_stalls_measured_on_this_host() {
+        let seconds: u64 = std::env::var("AMPHORA_STALL_SECONDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_800);
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .unwrap();
+        let root = Path::new(&home).join(".cache").join("amphora-stalls");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::tempdir_in(&root).unwrap();
+        let until = Instant::now() + Duration::from_secs(seconds + 600);
+        let mut clients = Vec::new();
+        let mut records = Vec::new();
+        let mut owners = Vec::new();
+        for node_id in 1..=3u64 {
+            let path = dir.path().join(format!("state-{node_id}.db"));
+            let (client, mut actor, receiver) = super::open(
+                &path,
+                &dir.path().join(format!("raft-{node_id}.log")),
+                ReplicaConfig {
+                    node_id,
+                    voters: vec![1, 2, 3],
+                    learners: Vec::new(),
+                    bootstrap: None,
+                },
+                Arc::new(Changed::default()),
+                lease(&path),
+                until,
+                Arc::new(Instant::now),
+            )
+            .unwrap();
+            let stalls = Arc::new(Mutex::new(Stalls::default()));
+            actor.stalls = Some(Arc::clone(&stalls));
+            records.push(stalls);
+            owners.push(std::thread::spawn(move || actor.run(receiver)));
+            clients.push(client);
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handles: Vec<ReplicaHandle> = clients.iter().map(Client::handle).collect();
+        let relay = {
+            let (stop, handles) = (Arc::clone(&stop), handles.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let mut moved = 0;
+                    for (from, handle) in (1u64..).zip(&handles) {
+                        for record in handle.drain(OUTGOING_MESSAGES).unwrap_or_default() {
+                            let to = usize::try_from(record.to - 1).unwrap();
+                            let deadline = Instant::now() + Duration::from_secs(5);
+                            let _ = handles
+                                .get(to)
+                                .unwrap()
+                                .receive(from, record.bytes, deadline);
+                            moved += 1;
+                        }
+                    }
+                    if moved == 0 {
+                        std::thread::park_timeout(POLL);
+                    }
+                }
+            })
+        };
+        let writer = clients.first().unwrap();
+        let first = Instant::now();
+        loop {
+            match submit(writer, Instant::now() + Duration::from_secs(30), |db| {
+                db.exec("CREATE TABLE IF NOT EXISTS kiln_like(id INTEGER PRIMARY KEY, body BLOB)")?;
+                Ok(Vec::new())
+            })
+            .recv()
+            .unwrap()
+            {
+                Ok(_) => break,
+                Err(_) if first.elapsed() < Duration::from_secs(120) => {
+                    std::thread::sleep(Duration::from_millis(100))
+                }
+                Err(error) => panic!("no leader took the first write: {error:?}"),
+            }
+        }
+        let (mut acknowledged, mut refused) = (0u64, 0u64);
+        let start = Instant::now();
+        let mut next = start;
+        while start.elapsed() < Duration::from_secs(seconds) {
+            let answer = submit(writer, Instant::now() + Duration::from_secs(30), |db| {
+                db.exec("INSERT INTO kiln_like(body) VALUES (randomblob(512))")?;
+                Ok(Vec::new())
+            });
+            match answer.recv() {
+                Ok(Ok(_)) => acknowledged += 1,
+                _ => refused += 1,
+            }
+            next += Duration::from_millis(20);
+            if let Some(wait) = next.checked_duration_since(Instant::now()) {
+                std::thread::sleep(wait);
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        relay.join().unwrap();
+        drop(handles);
+        drop(clients);
+        for owner in owners {
+            let _ = owner.join();
+        }
+        println!(
+            "stalls: {seconds} s on {}, load {}, {acknowledged} writes acknowledged, {refused} refused",
+            dir.path().display(),
+            std::fs::read_to_string("/proc/loadavg")
+                .unwrap_or_else(|_| "?".into())
+                .trim()
+        );
+        let limit = Duration::from_millis(200);
+        for (node_id, record) in (1..).zip(&records) {
+            let stalls = record.lock().unwrap();
+            println!(
+                "member {node_id}: log write submit to durable: {}",
+                stalls.writes.summary()
+            );
+            println!(
+                "member {node_id}: owner step gap: {}",
+                stalls.steps.summary()
+            );
+            println!(
+                "member {node_id}: owner tick gap: {}",
+                stalls.ticks.summary()
+            );
+            for (from, gaps) in &stalls.answers {
+                println!(
+                    "member {node_id}: answer gaps from {from} while leading: {}; over 200 ms: {}",
+                    gaps.summary(),
+                    gaps.over(limit)
+                );
+            }
+            println!("member {node_id}: leader changes: {}", stalls.changes.len());
+            for change in &stalls.changes {
+                println!("member {node_id}:   {change}");
+            }
+            assert!(
+                !stalls.writes.samples.is_empty()
+                    && !stalls.steps.samples.is_empty()
+                    && !stalls.ticks.samples.is_empty(),
+                "member {node_id} counted no writes, steps or ticks"
+            );
+        }
+        assert!(
+            records
+                .iter()
+                .any(|r| !r.lock().unwrap().answers.is_empty()),
+            "no leader counted an answer"
+        );
+        assert!(acknowledged > 0, "no write was acknowledged");
     }
 }
