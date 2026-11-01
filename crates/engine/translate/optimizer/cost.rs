@@ -619,9 +619,33 @@ pub(super) fn estimate_skip_scan_cost(
     )
 }
 
-/// Amphora: what an index read in the query's order costs when it stops after `goal_rows`
-/// rows, the rows a literal LIMIT keeps over what the remaining terms keep of them
-/// (`docs/design/planner.md` decision 16): a seek, then at most `goal_rows` of its range.
+/// Amphora: the rows a one-table read may stop after (`docs/design/planner.md` decisions 16
+/// and 17).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RowGoal {
+    /// A literal LIMIT, and a literal OFFSET if any: the rows they keep.
+    Rows(f64),
+    /// A LIMIT or OFFSET known only as the statement runs: at least these rows, at most all the
+    /// read keeps.
+    AtLeast(f64),
+}
+
+impl RowGoal {
+    /// The rows the read is costed to keep, of the `kept` its range and remaining terms keep: a
+    /// literal's own, or the q-middle of the fewest and `kept`, the estimate whose q-error is
+    /// least whatever value is bound (decision 17; Moerkotte, Neumann and Steidl, PVLDB 2(1),
+    /// 2009, section 2).
+    fn rows(self, kept: f64) -> f64 {
+        match self {
+            Self::Rows(rows) => rows,
+            Self::AtLeast(fewest) => (fewest * kept).sqrt().min(kept).max(fewest),
+        }
+    }
+}
+
+/// Amphora: what an index read in the query's order costs when it stops at its row goal, the
+/// goal's rows over what the remaining terms keep of them (`residual_selectivity`;
+/// `docs/design/planner.md` decisions 16 and 17): a seek, then at most those rows of its range.
 #[expect(clippy::too_many_arguments)]
 pub fn estimate_ordered_cost_to_goal(
     index_info: IndexInfo,
@@ -629,7 +653,8 @@ pub fn estimate_ordered_cost_to_goal(
     usable_constraint_refs: &[RangeConstraintRef],
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
-    goal_rows: f64,
+    goal: RowGoal,
+    residual_selectivity: f64,
     params: &CostModelParams,
     analyze_ctx: Option<&AnalyzeCtx>,
 ) -> Cost {
@@ -646,6 +671,7 @@ pub fn estimate_ordered_cost_to_goal(
             params,
         )
     };
+    let goal_rows = goal.rows(rows_per_seek * residual_selectivity) / residual_selectivity;
     estimate_index_cost(
         *base_row_count,
         tree_depth,

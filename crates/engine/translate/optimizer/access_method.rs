@@ -39,7 +39,7 @@ use super::{
         constraints_selectivity, estimate_btree_depth, estimate_cost_for_scan_or_seek,
         estimate_ephemeral_index_build_cost, estimate_index_cost, estimate_ordered_cost_to_goal,
         estimate_rows_per_seek, estimate_scan_cost, estimate_skip_scan_cost, AnalyzeCtx, Cost,
-        IndexInfo,
+        IndexInfo, RowGoal,
     },
     join::JoinPlanningContext,
     multi_index::{
@@ -258,7 +258,7 @@ pub(super) fn choose_best_btree_candidate(
     lhs_mask: &TableMask,
     rhs_table_idx: usize,
     maybe_order_target: Option<&OrderTarget>,
-    row_goal: Option<f64>,
+    row_goal: Option<RowGoal>,
     schema: &Schema,
     available_indexes: &AvailableIndexes,
     analyze_stats: &AnalyzeStats,
@@ -571,9 +571,10 @@ pub(super) fn choose_best_btree_candidate(
         // Adjusted output: lower means the loop delivers fewer rows downstream.
         let adjusted_output = residual_selectivity;
 
-        // Amphora: an index read in the query's order stops once it has the rows a literal LIMIT
-        // keeps, so it reads the goal's rows over what the remaining terms keep of them, not its
-        // whole range (decision 16; SQLite and PostgreSQL cost such a read to its row goal).
+        // Amphora: an index read in the query's order stops once it has the rows its LIMIT keeps,
+        // so it reads the goal's rows over what the remaining terms keep of them, not its whole
+        // range (decision 16; SQLite and PostgreSQL cost such a read to its row goal). A LIMIT
+        // known only as the statement runs keeps the q-middle of its rows (decision 17).
         let cost = match (row_goal, is_index_ordered, skip_rows_per_value) {
             (Some(goal), true, None) if residual_selectivity > 0.0 => {
                 let to_goal = estimate_ordered_cost_to_goal(
@@ -582,7 +583,8 @@ pub(super) fn choose_best_btree_candidate(
                     &usable_constraint_refs,
                     input_cardinality,
                     candidate_base_row_count,
-                    goal / residual_selectivity,
+                    goal,
+                    residual_selectivity,
                     params,
                     Some(&analyze_ctx),
                 );
@@ -993,7 +995,7 @@ fn find_best_access_method_for_btree(
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     allow_automatic_index: bool,
-    row_goal: Option<f64>,
+    row_goal: Option<RowGoal>,
     where_clause: &[WhereTerm],
     ready_where: &[(usize, usize)],
     available_indexes: &AvailableIndexes,

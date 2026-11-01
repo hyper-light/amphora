@@ -28,7 +28,7 @@ use crate::{
             cost::{
                 constraints_selectivity, estimate_rows_per_seek,
                 index_access_is_unique_point_lookup, rows_per_leaf_page_for_index,
-                where_expr_steps, AnalyzeCtx, Cost, IndexInfo, RowCountEstimate,
+                where_expr_steps, AnalyzeCtx, Cost, IndexInfo, RowCountEstimate, RowGoal,
             },
             order::plan_satisfies_order_target,
         },
@@ -52,9 +52,9 @@ pub(crate) struct JoinPlanningContext<'a> {
     pub cost_limit: Option<Cost>,
     /// Whether this table read may build an automatic index.
     pub allow_automatic_index: bool,
-    /// Amphora: the rows a literal LIMIT (and OFFSET) leaves a one-table read to produce before
-    /// it stops (`docs/design/planner.md` decision 16), None when it reads to its end.
-    pub row_goal: Option<f64>,
+    /// Amphora: the rows a LIMIT (and OFFSET) leaves a one-table read to produce before it stops
+    /// (`docs/design/planner.md` decisions 16 and 17), None when it reads to its end.
+    pub row_goal: Option<RowGoal>,
 }
 
 impl<'a> JoinPlanningContext<'a> {

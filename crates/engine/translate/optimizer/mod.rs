@@ -1161,18 +1161,18 @@ fn find_select_plan_form(
         None
     };
     // Amphora: a read of one table, with no grouping, aggregate, window or DISTINCT between it
-    // and a literal LIMIT, may stop after the rows the LIMIT and OFFSET keep (decision 16, E5).
+    // and its LIMIT, may stop after the rows the LIMIT and OFFSET keep (decisions 16 and 17, E5).
     let row_goal = (plan.table_references.joined_tables().len() == 1
         && plan.group_by.is_none()
         && plan.aggregates.is_empty()
         && plan.window.is_none()
         && !plan.distinctness.is_distinct())
-    .then(|| plan.limit.as_deref().and_then(literal_limit_rows))
-    .flatten()
-    .and_then(|limit| match plan.offset.as_deref() {
-        None => Some(limit),
-        Some(offset) => literal_limit_rows(offset).map(|offset| limit + offset),
-    });
+    .then(|| {
+        plan.limit
+            .as_deref()
+            .and_then(|limit| limit_row_goal(limit, plan.offset.as_deref()))
+    })
+    .flatten();
     let table_plan = find_table_access_plan(
         schema,
         resolver,
@@ -2425,6 +2425,25 @@ fn estimate_select_output_rows(plan: &SelectPlan, input_rows: f64, schema: &Sche
     rows_per_call.map_or(input_rows, |rows| input_rows.min(calls * rows))
 }
 
+/// Amphora: the row goal of a read under `limit` and `offset` (decisions 16 and 17). Literals give
+/// the rows they keep. A LIMIT or OFFSET known only as the statement runs gives the fewest rows the
+/// read can keep: a literal LIMIT's, or one row and a literal OFFSET's. A negative literal LIMIT is
+/// no limit, and a negative literal OFFSET leaves no goal, as decision 16 had it.
+fn limit_row_goal(limit: &Expr, offset: Option<&Expr>) -> Option<cost::RowGoal> {
+    let literal = |expr: &Expr| crate::util::parse_signed_number(expr).is_ok();
+    let skip = match offset {
+        None => Some(0.0),
+        Some(offset) if literal(offset) => Some(literal_limit_rows(offset)?),
+        Some(_) => None,
+    };
+    match (literal_limit_rows(limit), skip) {
+        (Some(rows), Some(skip)) => Some(cost::RowGoal::Rows(rows + skip)),
+        (Some(rows), None) => Some(cost::RowGoal::AtLeast(rows)),
+        (None, _) if literal(limit) => None,
+        (None, skip) => Some(cost::RowGoal::AtLeast(1.0 + skip.unwrap_or(0.0))),
+    }
+}
+
 /// The rows a LIMIT keeps when it is a literal number: a negative LIMIT is no limit in SQLite, and
 /// any other expression is known only as the statement runs.
 fn literal_limit_rows(limit: &Expr) -> Option<f64> {
@@ -2749,8 +2768,9 @@ fn find_table_access_plan(
     // Amphora: the aggregates of a GROUP BY that would group in a hash table were its rows not
     // read in its order (`docs/design/planner.md` decision 7), None for one that would sort.
     hashed_aggregates: Option<usize>,
-    // Amphora: the rows a one-table read may stop after (decision 16), None to read to the end.
-    row_goal: Option<f64>,
+    // Amphora: the rows a one-table read may stop after (decisions 16 and 17), None to read to the
+    // end.
+    row_goal: Option<cost::RowGoal>,
 ) -> Result<Option<TableAccessPlan>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
