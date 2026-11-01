@@ -4269,6 +4269,36 @@ mod tests {
         }
     }
 
+    /// Amphora bug 68a308b7: every runner reports an interrupted statement as an interrupt, never
+    /// as busy, which is another connection's activity (sqlite.org/rescode.html: SQLITE_INTERRUPT,
+    /// SQLITE_BUSY). Do: with a progress handler that interrupts at its first check, run a long
+    /// statement through each runner; then, checking every 1,000 instructions, fire a trigger whose
+    /// body is long, so its subprogram is the one interrupted. Expect: LimboError::Interrupt from
+    /// each.
+    #[test]
+    fn runners_and_triggers_report_an_interrupt_as_one() {
+        const LONG: &str = "WITH RECURSIVE t(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM t WHERE x<100000) SELECT sum(x) FROM t";
+        let io = Arc::new(crate::MemoryIO::new());
+        let db = crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE big(x)").unwrap();
+        conn.execute("INSERT INTO big WITH RECURSIVE t(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM t WHERE x<1000) SELECT x FROM t").unwrap();
+        conn.execute("CREATE TABLE fired(x)").unwrap();
+        conn.execute("CREATE TABLE log(x)").unwrap();
+        conn.execute("CREATE TRIGGER long_body AFTER INSERT ON fired BEGIN INSERT INTO log SELECT a.x FROM big a, big b; END").unwrap();
+        let (mut ignored, mut collected) = (conn.prepare(LONG).unwrap(), conn.prepare(LONG).unwrap());
+        let mut insert = conn.prepare("INSERT INTO fired VALUES (1)").unwrap();
+
+        conn.set_progress_handler(1, Some(Box::new(|| true)));
+        assert!(matches!(ignored.run_ignore_rows(), Err(LimboError::Interrupt)));
+        assert!(matches!(collected.run_collect_rows(), Err(LimboError::Interrupt)));
+        assert!(matches!(conn.prepare_execute_batch(LONG), Err(LimboError::Interrupt)));
+        assert!(matches!(conn.pragma("table_info", "'fired'"), Err(LimboError::Interrupt)));
+
+        conn.set_progress_handler(1000, Some(Box::new(|| true)));
+        assert!(matches!(insert.run_ignore_rows(), Err(LimboError::Interrupt)));
+    }
+
     #[test]
     fn active_opcode_helpers_initialize_defaults() {
         let mut state = ProgramState::new(1, 0);
