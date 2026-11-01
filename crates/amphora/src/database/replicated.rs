@@ -9,6 +9,7 @@ use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use api::replication::{Outbound, ReplicaConfig, ReplicaStatus};
+use hyper_block::block::BlockFile;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_durable::{Bytes, GroupStore, Output, Replica, StateMachine};
 use hyper_raft::proto::{ConfState, Message};
@@ -29,7 +30,7 @@ const TICK: Duration = Duration::from_millis(10);
 const POLL: Duration = Duration::from_millis(1);
 const DRIVE_QUANTUM: usize = 32;
 
-type Durable = Replica<GroupStore<DeviceFile>, crate::replication::Machine, Bytes>;
+type Durable<F = DeviceFile> = Replica<GroupStore<F>, crate::replication::Machine, Bytes>;
 type Response<T> = mpsc::SyncSender<Result<T, Refusal>>;
 
 /// A bounded ingress and egress handle. Clones share one product-owned Raft actor.
@@ -149,10 +150,10 @@ enum Phase {
     Proposed(Answer),
     Bootstrap(Option<Operation>),
 }
-struct Actor {
-    replica: Durable,
+struct Actor<F: BlockFile + 'static = DeviceFile> {
+    replica: Durable<F>,
     // Keep the log owner and its exclusive lease until the replica has drained/dropped.
-    _log: hyper_log::Log<DeviceFile>,
+    _log: hyper_log::Log<F>,
     _log_owner: File,
     // Drop after the log writer has drained; reopen cannot race its final disk completion.
     _lease: Arc<File>,
@@ -413,6 +414,24 @@ fn open(
         hyper_block::buf::Alignment::new(4096).map_err(unavailable)?,
     )
     .map_err(unavailable)?;
+    open_on(
+        machine, log_owner, file, config, changed, lease, until, clock,
+    )
+}
+
+/// [`open`] past its machine and its log's device: `file` is the system's device file, or a
+/// test's simulated one (hyper-block's `SimHandle`), whose power the test can cut.
+#[allow(clippy::too_many_arguments)]
+fn open_on<F: BlockFile + 'static>(
+    machine: crate::replication::Machine,
+    log_owner: File,
+    file: F,
+    config: ReplicaConfig,
+    changed: Arc<Changed>,
+    lease: Arc<File>,
+    until: Instant,
+    clock: Clock,
+) -> Result<(Client, Actor<F>, mpsc::Receiver<Envelope>), Refusal> {
     let settings = settings(config.node_id)?;
     let log_config = hyper_log::Config {
         segment_bytes: 64 << 20,
@@ -550,7 +569,7 @@ fn settings(id: u64) -> Result<hyper_durable::Settings, Refusal> {
         quiet: Duration::from_millis(50),
     })
 }
-fn status(replica: &Durable) -> ReplicaStatus {
+fn status<F: BlockFile + 'static>(replica: &Durable<F>) -> ReplicaStatus {
     ReplicaStatus {
         node_id: replica.id(),
         leader: replica.leader(),
@@ -564,7 +583,7 @@ fn status(replica: &Durable) -> ReplicaStatus {
     }
 }
 
-impl Actor {
+impl<F: BlockFile + 'static> Actor<F> {
     fn now(&self) -> Result<u64, Refusal> {
         u64::try_from(self.at.saturating_duration_since(self.started).as_nanos())
             .map_err(unavailable)
@@ -1602,8 +1621,8 @@ mod tests {
     /// steps, or from a call's work while the owner runs it. Its instants start an hour past the
     /// real clock, so a real-clock check of a test deadline (a receipt's poll) holds for an hour:
     /// a hang guard, never a verdict.
-    struct Driven {
-        owners: Vec<(Actor, mpsc::Receiver<Envelope>)>,
+    struct Driven<F: BlockFile + 'static = DeviceFile> {
+        owners: Vec<(Actor<F>, mpsc::Receiver<Envelope>)>,
         base: Instant,
         // Each owner's clock: the nanoseconds it reads past `base`.
         clocks: Vec<Arc<AtomicU64>>,
@@ -1617,8 +1636,55 @@ mod tests {
         let nanos = u64::try_from(to.duration_since(base).as_nanos()).unwrap();
         clock.store(nanos, Ordering::Release);
     }
+    /// The lease on a member's state file: the previous owner of the path lets go of it as its
+    /// owner drops, which a test waits for, its rounds counted.
+    fn lease(path: &Path) -> Arc<File> {
+        for _ in 0..ROUNDS {
+            match exclusive_file(path) {
+                Ok(file) => return Arc::new(file),
+                Err(_) => std::thread::park_timeout(POLL),
+            }
+        }
+        panic!("the previous owner kept its lease");
+    }
     impl Driven {
+        /// A shell whose members run on the system's files.
         fn new() -> Self {
+            Self::empty()
+        }
+        /// A member on the system's files: its state and its log under `dir`.
+        fn open(
+            &mut self,
+            dir: &Path,
+            node_id: u64,
+            voters: Vec<u64>,
+            bootstrap: Option<api::replication::Bootstrap>,
+        ) -> Client {
+            let path = dir.join(format!("state-{node_id}.db"));
+            let lease = lease(&path);
+            let (reading, clock) = self.reading();
+            let (client, actor, receiver) = super::open(
+                &path,
+                &dir.join(format!("raft-{node_id}.log")),
+                ReplicaConfig {
+                    node_id,
+                    voters,
+                    learners: Vec::new(),
+                    bootstrap,
+                },
+                Arc::new(Changed::default()),
+                lease,
+                self.until(),
+                clock,
+            )
+            .unwrap();
+            self.owners.push((actor, receiver));
+            self.clocks.push(reading);
+            client
+        }
+    }
+    impl<F: BlockFile + 'static> Driven<F> {
+        fn empty() -> Self {
             Self {
                 owners: Vec::new(),
                 base: Instant::now() + Duration::from_secs(3600),
@@ -1645,45 +1711,12 @@ mod tests {
         fn clock(&self, owner: usize) -> Arc<AtomicU64> {
             Arc::clone(self.clocks.get(owner).unwrap())
         }
-        fn open(
-            &mut self,
-            dir: &Path,
-            node_id: u64,
-            voters: Vec<u64>,
-            bootstrap: Option<api::replication::Bootstrap>,
-        ) -> Client {
-            let path = dir.join(format!("state-{node_id}.db"));
-            let mut lease = None;
-            for _ in 0..ROUNDS {
-                match exclusive_file(&path) {
-                    Ok(file) => {
-                        lease = Some(Arc::new(file));
-                        break;
-                    }
-                    Err(_) => std::thread::park_timeout(POLL),
-                }
-            }
-            let lease = lease.expect("the previous owner kept its lease");
+        /// A new member's clock: its reading, which only the test moves, and the clock its owner
+        /// reads it through.
+        fn reading(&self) -> (Arc<AtomicU64>, Clock) {
             let reading = Arc::new(AtomicU64::new(0));
             let (base, read) = (self.base, Arc::clone(&reading));
-            let (client, actor, receiver) = super::open(
-                &path,
-                &dir.join(format!("raft-{node_id}.log")),
-                ReplicaConfig {
-                    node_id,
-                    voters,
-                    learners: Vec::new(),
-                    bootstrap,
-                },
-                Arc::new(Changed::default()),
-                lease,
-                self.until(),
-                Arc::new(move || base + offset(&read)),
-            )
-            .unwrap();
-            self.owners.push((actor, receiver));
-            self.clocks.push(reading);
-            client
+            (reading, Arc::new(move || base + offset(&read)))
         }
         /// One round: every owner takes each input waiting for it, then steps once more, each at
         /// its own clock's reading.
