@@ -8,10 +8,10 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
-use api::replication::{Outbound, ReplicaConfig, ReplicaStatus};
+use api::replication::{Durability, Outbound, ReplicaConfig, ReplicaStatus};
 use hyper_block::block::BlockFile;
 use hyper_block::file::{CachingRequest, DeviceFile};
-use hyper_durable::{Bytes, GroupStore, Output, Replica, StateMachine};
+use hyper_durable::{Bytes, GroupStore, Output, Point, Replica, StateMachine};
 use hyper_raft::proto::{ConfState, Message};
 use hyper_raft::wire::Record;
 
@@ -172,6 +172,52 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     at: Instant,
     published: u64,
     transferred: Option<(u64, Instant)>,
+    flushing: Flushing,
+}
+
+/// The replicated class's flushes of the machine's log (docs/design/replication.md, "Fast
+/// acknowledgement"): one out at a time, off the owner's step. The owner hands each the point it had
+/// applied, and takes the point back once the flush has made it durable.
+enum Flushing {
+    /// Outside the class: the machine flushes with each entry it applies.
+    Inline,
+    /// The owner's flushing thread, and whether a flush is out.
+    Thread {
+        ask: mpsc::SyncSender<Point>,
+        done: mpsc::Receiver<Result<Point, String>>,
+        out: bool,
+    },
+    /// A test's: the log is flushed when the test says so (`Driven::flush`).
+    #[cfg(test)]
+    Held,
+}
+
+impl Flushing {
+    /// The flushing for `durability`: in the replicated class, a thread that runs `flush` for each
+    /// point it's handed.
+    fn start(durability: &Durability, flush: crate::store::Flush) -> Result<Self, Refusal> {
+        if matches!(durability, Durability::Persisted) {
+            return Ok(Self::Inline);
+        }
+        let (ask, asked) = mpsc::sync_channel::<Point>(1);
+        let (finished, done) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("amphora.replica.flush".into())
+            .spawn(move || {
+                for at in asked {
+                    let result = flush().map(|()| at).map_err(|e| e.to_string());
+                    if finished.send(result).is_err() {
+                        return;
+                    }
+                }
+            })
+            .map_err(unavailable)?;
+        Ok(Self::Thread {
+            ask,
+            done,
+            out: false,
+        })
+    }
 }
 
 /// An owner's time, from its shell: the real clock for the owner thread, one its test moves for a
@@ -360,6 +406,7 @@ pub(super) fn start(
     path: &Path,
     log_path: &Path,
     config: ReplicaConfig,
+    durability: Durability,
     changed: Arc<Changed>,
     lease: Arc<File>,
     until: Instant,
@@ -368,6 +415,7 @@ pub(super) fn start(
         path,
         log_path,
         config,
+        durability,
         changed,
         lease,
         until,
@@ -382,10 +430,12 @@ pub(super) fn start(
 
 /// An owner and its handle, not yet running: `start` runs it on the owner thread, and a test
 /// shell steps it itself. `clock` is its shell's; the owner starts at its first reading.
+#[allow(clippy::too_many_arguments)]
 fn open(
     path: &Path,
     log_path: &Path,
     config: ReplicaConfig,
+    durability: Durability,
     changed: Arc<Changed>,
     lease: Arc<File>,
     until: Instant,
@@ -395,6 +445,7 @@ fn open(
         return Err(Refusal::Timeout);
     }
     validate(&config)?;
+    validate_durability(&config, &durability)?;
     let log_owner = exclusive_file(log_path)?;
     let machine = crate::replication::Machine::open_with_owner(
         path,
@@ -406,6 +457,7 @@ fn open(
         Arc::clone(&lease),
         config.node_id,
         config.bootstrap.clone(),
+        matches!(durability, Durability::Replicated(_)),
     )?;
     let file = DeviceFile::open(
         log_path,
@@ -415,7 +467,7 @@ fn open(
     )
     .map_err(unavailable)?;
     open_on(
-        machine, log_owner, file, config, changed, lease, until, clock,
+        machine, log_owner, file, config, durability, changed, lease, until, clock,
     )
 }
 
@@ -427,12 +479,14 @@ fn open_on<F: BlockFile + 'static>(
     log_owner: File,
     file: F,
     config: ReplicaConfig,
+    durability: Durability,
     changed: Arc<Changed>,
     lease: Arc<File>,
     until: Instant,
     clock: Clock,
 ) -> Result<(Client, Actor<F>, mpsc::Receiver<Envelope>), Refusal> {
-    let settings = settings(config.node_id)?;
+    let settings = settings(config.node_id, &durability)?;
+    let flushing = Flushing::start(&durability, machine.log_flusher())?;
     let log_config = hyper_log::Config {
         segment_bytes: 64 << 20,
         max_segments: 16,
@@ -472,6 +526,7 @@ fn open_on<F: BlockFile + 'static>(
     let at = clock();
     let mut actor = Actor {
         published: replica.applied().index,
+        flushing,
         replica,
         _log: log,
         _log_owner: log_owner,
@@ -538,7 +593,64 @@ fn validate(config: &ReplicaConfig) -> Result<(), Refusal> {
     }
     Ok(())
 }
-fn settings(id: u64) -> Result<hyper_durable::Settings, Refusal> {
+/// The replicated class's configuration (docs/design/replication.md, "Fast acknowledgement"): every
+/// member states one fate, and the voters span at least the two or more fates a write's holders
+/// must. A configuration that can't is refused, typed, naming what it spans.
+fn validate_durability(config: &ReplicaConfig, durability: &Durability) -> Result<(), Refusal> {
+    let Durability::Replicated(fates) = durability else {
+        return Ok(());
+    };
+    if fates.spanning < 2 {
+        return Err(api::invalid(
+            "replicated class",
+            "a write's holders must span at least two fates",
+        ));
+    }
+    let members: std::collections::BTreeSet<u64> = config
+        .voters
+        .iter()
+        .chain(&config.learners)
+        .copied()
+        .collect();
+    let mut stated = std::collections::BTreeMap::new();
+    for (member, fate) in &fates.of {
+        if !members.contains(member) {
+            return Err(api::invalid(
+                "replicated class",
+                "a fate is stated for a node that isn't a member",
+            ));
+        }
+        if stated.insert(*member, *fate).is_some() {
+            return Err(api::invalid(
+                "replicated class",
+                "a member's fate is stated twice",
+            ));
+        }
+    }
+    if stated.len() != members.len() {
+        return Err(api::invalid(
+            "replicated class",
+            "every member states its fate",
+        ));
+    }
+    let spanned: std::collections::BTreeSet<u64> = config
+        .voters
+        .iter()
+        .filter_map(|voter| stated.get(voter).copied())
+        .collect();
+    let asked = usize::try_from(fates.spanning).map_err(unavailable)?;
+    if spanned.len() < asked {
+        return Err(api::invalid(
+            "replicated class",
+            &format!(
+                "the voters span {} fates, fewer than the {asked} a write's holders must span",
+                spanned.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+fn settings(id: u64, durability: &Durability) -> Result<hyper_durable::Settings, Refusal> {
     let mut limits = hyper_raft::Limits::derive(hyper_raft::Stated {
         message: MESSAGE_BYTES,
         members: MEMBERS,
@@ -551,8 +663,24 @@ fn settings(id: u64) -> Result<hyper_durable::Settings, Refusal> {
     limits.unstable_entries = 1024;
     limits.entries_per_message = 1024;
     limits.proposals = 1;
+    // The replicated class: a commit on entries held in memory across fates (hyper-raft R-8), and a
+    // leader applying what its own term committed before its own write is durable (R-6).
+    let fates = match durability {
+        Durability::Persisted => None,
+        Durability::Replicated(fates) => {
+            let mut of = fates.of.clone();
+            of.sort_unstable();
+            Some(hyper_raft::Fates {
+                of,
+                spanning: usize::try_from(fates.spanning).map_err(unavailable)?,
+            })
+        }
+    };
+    let apply_unpersisted = fates.is_some();
     Ok(hyper_durable::Settings {
         core: hyper_raft::Config {
+            fates,
+            apply_unpersisted,
             check_quorum: true,
             pre_vote: true,
             max_size_per_msg: u64::try_from(MESSAGE_BYTES).map_err(unavailable)?,
@@ -672,6 +800,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 break;
             }
         }
+        self.flush()?;
         if self.replica.applied().index != self.published {
             self.refresh()?;
         }
@@ -699,6 +828,39 @@ impl<F: BlockFile + 'static> Actor<F> {
         }
         *locked(&self.control.status)? = Ok(status(&self.replica));
         Ok(())
+    }
+    /// The replicated class's flushing: takes what a finished flush made durable, and hands the
+    /// flushing thread the point applied when none is out. A failed flush leaves the log's state
+    /// unknown, so the owner fences.
+    fn flush(&mut self) -> Result<(), Refusal> {
+        match &mut self.flushing {
+            Flushing::Inline => Ok(()),
+            Flushing::Thread { ask, done, out } => {
+                match done.try_recv() {
+                    Ok(Ok(at)) => {
+                        self.replica.machine_mut().flushed_through(at);
+                        *out = false;
+                    }
+                    Ok(Err(error)) => {
+                        return Err(fenced(format!(
+                            "the database's log failed a flush: {error}"
+                        )));
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return Err(fenced("the replica's flushing thread ended"));
+                    }
+                }
+                if !*out && let Some(at) = self.replica.machine().unflushed() {
+                    ask.try_send(at)
+                        .map_err(|_| fenced("the replica's flushing thread took no flush"))?;
+                    *out = true;
+                }
+                Ok(())
+            }
+            #[cfg(test)]
+            Flushing::Held => Ok(()),
+        }
     }
     fn expire(&mut self) {
         // Expired callers relinquish queued operations even while a seed or proposal is held.
@@ -1660,6 +1822,17 @@ mod tests {
             voters: Vec<u64>,
             bootstrap: Option<api::replication::Bootstrap>,
         ) -> Client {
+            self.open_with(dir, node_id, voters, bootstrap, Durability::Persisted)
+        }
+        /// [`Driven::open`], its writes acknowledged as `durability` says.
+        fn open_with(
+            &mut self,
+            dir: &Path,
+            node_id: u64,
+            voters: Vec<u64>,
+            bootstrap: Option<api::replication::Bootstrap>,
+            durability: Durability,
+        ) -> Client {
             let path = dir.join(format!("state-{node_id}.db"));
             let lease = lease(&path);
             let (reading, clock) = self.reading();
@@ -1672,6 +1845,7 @@ mod tests {
                     learners: Vec::new(),
                     bootstrap,
                 },
+                durability,
                 Arc::new(Changed::default()),
                 lease,
                 self.until(),
@@ -1710,6 +1884,23 @@ mod tests {
         /// Owner `owner`'s clock, for a call's work to move while the owner runs it.
         fn clock(&self, owner: usize) -> Arc<AtomicU64> {
             Arc::clone(self.clocks.get(owner).unwrap())
+        }
+        /// Owner `owner`'s flushes of its database's log wait for the test (`Driven::flush`).
+        fn hold_flushes(&mut self, owner: usize) {
+            self.owners.get_mut(owner).unwrap().0.flushing = Flushing::Held;
+        }
+        /// Flushes owner `owner`'s database log now, as its flushing thread would: what it has
+        /// applied is durable after.
+        fn flush(&mut self, owner: usize) {
+            let actor = &mut self.owners.get_mut(owner).unwrap().0;
+            assert!(
+                matches!(actor.flushing, Flushing::Held),
+                "owner {owner}'s flushes aren't held"
+            );
+            if let Some(at) = actor.replica.machine().unflushed() {
+                actor.replica.machine().log_flusher()().unwrap();
+                actor.replica.machine_mut().flushed_through(at);
+            }
         }
         /// A new member's clock: its reading, which only the test moves, and the clock its owner
         /// reads it through.
@@ -1999,6 +2190,126 @@ mod tests {
         assert_eq!(retained, vec![0]);
         driven.drain(&mut pump);
         pump.finish();
+    }
+
+    /// CP-T1.8 (AC-T1.8.3), the replicated class (replication.md, "Fast acknowledgement"): a
+    /// write is answered once its commit is applied, without its leader flushing the database's
+    /// log for it. Do: three voters, each its own fate, two to span, their flushes held by the test;
+    /// a write at the leader. Expect: its answer while the leader holds it applied and unflushed;
+    /// then the held flush makes it durable.
+    #[test]
+    fn a_replicated_write_is_answered_before_its_leader_flushes_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let durability = Durability::Replicated(api::replication::Fates {
+            of: vec![(1, 10), (2, 20), (3, 30)],
+            spanning: 2,
+        });
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open_with(dir.path(), n, vec![1, 2, 3], None, durability.clone()))
+            .collect();
+        for owner in 0..3 {
+            driven.hold_flushes(owner);
+        }
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let answer = driven.call(&mut pump, clients.get(leader).unwrap(), |db| {
+            db.exec("CREATE TABLE answered_unflushed(value)")?;
+            Ok(b"answered".to_vec())
+        });
+        assert_eq!(answer, Ok(b"answered".to_vec()));
+        let held = driven
+            .owners
+            .get(leader)
+            .unwrap()
+            .0
+            .replica
+            .machine()
+            .unflushed();
+        assert!(
+            held.is_some(),
+            "the leader answered with its log flushed for the write, not held: {held:?}"
+        );
+        driven.flush(leader);
+        assert_eq!(
+            driven
+                .owners
+                .get(leader)
+                .unwrap()
+                .0
+                .replica
+                .machine()
+                .unflushed(),
+            None
+        );
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// CP-T1.8, the replicated class's configuration (replication.md, "Fast acknowledgement"): a
+    /// group that can't span the fates asked is refused, typed. Do: a voter set in one fate, one to
+    /// span, a member with no fate, a non-member's fate, a fate stated twice, then three fates with
+    /// two to span. Expect: each refused naming why, and the last taken.
+    #[test]
+    fn the_replicated_class_is_refused_where_its_voters_span_too_few_fates() {
+        let config = ReplicaConfig {
+            node_id: 1,
+            voters: vec![1, 2, 3],
+            learners: Vec::new(),
+            bootstrap: None,
+        };
+        let class = |of: Vec<(u64, u64)>, spanning: u32| {
+            Durability::Replicated(api::replication::Fates { of, spanning })
+        };
+        let refused = |durability: Durability| match validate_durability(&config, &durability) {
+            Err(Refusal::Invalid { why, .. }) => why,
+            other => panic!("expected a typed refusal, got {other:?}"),
+        };
+        assert!(refused(class(vec![(1, 7), (2, 7), (3, 7)], 2)).contains("span 1 fates"));
+        assert!(refused(class(vec![(1, 1), (2, 2), (3, 3)], 1)).contains("at least two"));
+        assert!(refused(class(vec![(1, 1), (2, 2)], 2)).contains("every member"));
+        assert!(refused(class(vec![(1, 1), (2, 2), (3, 3), (4, 4)], 2)).contains("isn't a member"));
+        assert!(refused(class(vec![(1, 1), (1, 2), (3, 3)], 2)).contains("twice"));
+        assert_eq!(
+            validate_durability(&config, &class(vec![(3, 30), (1, 10), (2, 20)], 2)),
+            Ok(())
+        );
+        assert_eq!(validate_durability(&config, &Durability::Persisted), Ok(()));
+    }
+
+    /// CP-T1.8, the replicated class reaches the core (hyper-raft R-8 and R-6): its fates, ordered
+    /// by member, and a leader applying before its own write is durable; the persisted class keeps
+    /// neither. Do: open one member of each. Expect: the replicated one's core holds the fates and
+    /// applies unpersisted, the persisted one's neither.
+    #[test]
+    fn the_replicated_class_reaches_the_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let durability = Durability::Replicated(api::replication::Fates {
+            of: vec![(2, 20), (1, 10), (3, 30)],
+            spanning: 2,
+        });
+        let _replicated = driven.open_with(dir.path(), 1, vec![1, 2, 3], None, durability);
+        let persisted_dir = tempfile::tempdir().unwrap();
+        let _persisted = driven.open(persisted_dir.path(), 1, vec![1, 2, 3], None);
+        let config = driven
+            .owners
+            .first()
+            .unwrap()
+            .0
+            .replica
+            .core()
+            .raft
+            .config();
+        let fates = config
+            .fates
+            .as_ref()
+            .expect("the replicated class states its fates");
+        assert_eq!(fates.of, vec![(1, 10), (2, 20), (3, 30)]);
+        assert_eq!(fates.spanning, 2);
+        assert!(config.apply_unpersisted);
+        let config = driven.owners.get(1).unwrap().0.replica.core().raft.config();
+        assert!(config.fates.is_none() && !config.apply_unpersisted);
     }
 
     /// U15/CP-T1.8 on driven time (replication.md, "The owner's time"): follower calls use the

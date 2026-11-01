@@ -5,25 +5,37 @@ use serde::{Deserialize, Serialize};
 pub(super) struct Backend {
     pub(super) client: crate::transport::Client,
     path: PathBuf,
-    restart: Mutex<Option<(PathBuf, api::replication::ReplicaConfig)>>,
+    restart: Mutex<
+        Option<(
+            PathBuf,
+            api::replication::ReplicaConfig,
+            api::replication::Durability,
+        )>,
+    >,
     promoted: Mutex<Option<Database>>,
 }
 impl Backend {
     pub(super) fn configure(
         &self,
-        replica: Option<(&Path, &api::replication::ReplicaConfig)>,
+        replica: Option<(
+            &Path,
+            &api::replication::ReplicaConfig,
+            &api::replication::Durability,
+        )>,
     ) -> Result<(), Refusal> {
-        if let Some((path, config)) = replica {
+        if let Some((path, config, durability)) = replica {
             let mut restart = locked(&self.restart)?;
             match restart.as_ref() {
-                Some((existing, current)) if existing != path || current != config => {
+                Some((existing, current, acknowledged))
+                    if existing != path || current != config || acknowledged != durability =>
+                {
                     return Err(api::invalid(
                         "replica ownership",
                         "client has different reopening configuration",
                     ));
                 }
                 Some(_) => (),
-                None => *restart = Some((path.to_path_buf(), config.clone())),
+                None => *restart = Some((path.to_path_buf(), config.clone(), durability.clone())),
             }
         }
         Ok(())
@@ -37,7 +49,9 @@ impl Backend {
         // FnOnce is submitted until selection finishes, so this cannot replay an unknown write.
         let restart = locked(&self.restart)?.clone();
         let database = match restart {
-            Some((log, config)) => Database::open_replicated(&self.path, &log, config, until)?,
+            Some((log, config, durability)) => {
+                Database::open_replicated_with(&self.path, &log, config, durability, until)?
+            }
             None => Database::open(&self.path, until)?,
         };
         if !matches!(&database.shared.writer, Writer::Client(_)) {
@@ -92,16 +106,31 @@ pub(super) fn publish(database: &Database, path: &Path) -> Result<(), Refusal> {
 
 pub(super) fn attach(
     path: &Path,
-    replica: Option<(&Path, &api::replication::ReplicaConfig)>,
+    replica: Option<(
+        &Path,
+        &api::replication::ReplicaConfig,
+        &api::replication::Durability,
+    )>,
     until: Instant,
 ) -> Result<Database, Refusal> {
     let client = crate::transport::Client::connect(path, until)?;
-    let identity = validate(&client, replica, until)?;
+    let identity = validate(
+        &client,
+        replica.map(|(path, config, _)| (path, config)),
+        until,
+    )?;
+    // The owner's identity names no durability, so a client that stated none reopens persisted.
     let restart = match replica {
-        Some((path, config)) => Some((path.to_path_buf(), config.clone())),
-        None => identity
-            .replica
-            .map(|(path, config)| (PathBuf::from(path), config)),
+        Some((path, config, durability)) => {
+            Some((path.to_path_buf(), config.clone(), durability.clone()))
+        }
+        None => identity.replica.map(|(path, config)| {
+            (
+                PathBuf::from(path),
+                config,
+                api::replication::Durability::Persisted,
+            )
+        }),
     };
     Ok(Database {
         shared: Arc::new(Shared {
@@ -195,6 +224,24 @@ impl Database {
         config: api::replication::ReplicaConfig,
         until: Instant,
     ) -> Result<Option<Self>, Refusal> {
+        Self::attach_replicated_with(
+            path,
+            log_path,
+            config,
+            api::replication::Durability::Persisted,
+            until,
+        )
+    }
+
+    /// [`Database::attach_replicated`], reopening as `durability` says if this client takes the
+    /// owner's place.
+    pub fn attach_replicated_with(
+        path: &Path,
+        log_path: &Path,
+        config: api::replication::ReplicaConfig,
+        durability: api::replication::Durability,
+        until: Instant,
+    ) -> Result<Option<Self>, Refusal> {
         if Instant::now() >= until {
             return Err(Refusal::Timeout);
         }
@@ -202,7 +249,8 @@ impl Database {
         let log = canonical_path(log_path)?;
         log.to_str()
             .ok_or_else(|| api::invalid("replica path", "not UTF-8"))?;
-        let expected = Some((log.as_path(), &config));
+        let expected = Some((log.as_path(), &config, &durability));
+        let identified = Some((log.as_path(), &config));
         let mut owners = locked_until(OWNERS.get_or_init(Mutex::default), until)?;
         owners.retain(|_, owner| owner.shared.strong_count() > 0 || owner.lease.strong_count() > 0);
         let identity = file_identity(&path)?;
@@ -214,7 +262,7 @@ impl Database {
                     return Err(api::invalid("replica ownership", "restore is incomplete"));
                 }
                 match &shared.writer {
-                    Writer::Client(backend) => match validate(&backend.client, expected, until) {
+                    Writer::Client(backend) => match validate(&backend.client, identified, until) {
                         Ok(_) => {
                             backend.configure(expected)?;
                             return Ok(Some(Self { shared }));
@@ -227,8 +275,9 @@ impl Database {
                     Writer::Replicated {
                         log_path,
                         config: current,
+                        durability: acknowledged,
                         ..
-                    } if log_path == &log && current == &config => {
+                    } if log_path == &log && current == &config && acknowledged == &durability => {
                         return Ok(Some(Self { shared }));
                     }
                     _ => {

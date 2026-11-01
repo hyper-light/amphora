@@ -97,7 +97,14 @@ pub struct Applied {
 /// Owned exclusively by one hyper-durable Replica. It has no application-side writer alongside it.
 pub struct Machine {
     db: Db,
+    /// The last entry applied.
     point: Point,
+    /// The last entry a finished flush of the database's log covers: what a restart opens with
+    /// applied ([`StateMachine::durable`]). Behind `point` only in the replicated class.
+    flushed: Point,
+    /// The replicated class (docs/design/replication.md, "Fast acknowledgement"): an ordinary entry
+    /// is applied without a flush of its own, and the owner flushes the log behind it.
+    replicated: bool,
     configuration: ConfState,
     baseline: bootstrap::Baseline,
     _owner: std::sync::Arc<std::fs::File>,
@@ -145,7 +152,7 @@ fn marker(db: &mut Db, point: Point, configuration: &ConfState) -> anyhow::Resul
 impl Machine {
     pub fn open(path: &Path, initial: ConfState) -> Result<Self, Refusal> {
         let owner = std::sync::Arc::new(crate::database::exclusive_file(path)?);
-        Self::open_with_owner(path, initial, owner, 0, None)
+        Self::open_with_owner(path, initial, owner, 0, None, false)
     }
 
     pub(crate) fn open_with_owner(
@@ -154,6 +161,7 @@ impl Machine {
         owner: std::sync::Arc<std::fs::File>,
         node_id: u64,
         bootstrap: Option<api::replication::Bootstrap>,
+        replicated: bool,
     ) -> Result<Self, Refusal> {
         if let Some(declaration) = &bootstrap
             && (node_id == 0 || !initial.voters.contains(&declaration.source_node))
@@ -247,6 +255,8 @@ impl Machine {
         Ok(Self {
             db,
             point,
+            flushed: point,
+            replicated,
             configuration,
             baseline,
             _owner: owner,
@@ -391,19 +401,46 @@ impl Machine {
         Ok(answer)
     }
 
+    /// Applies `pages` at `at`, and flushes the log with them unless `flush` says the owner will.
     fn advance(
         &mut self,
         at: Point,
         pages: &[(u32, Vec<u8>)],
         configuration: &ConfState,
+        flush: bool,
     ) -> Result<(), Fatal> {
         self.db
             .apply_pages(pages, |db| marker(db, at, configuration))
             .map_err(failed)?;
-        self.db.flusher()().map_err(failed)?;
+        if flush {
+            self.db.flusher()().map_err(failed)?;
+            self.flushed = at;
+        }
         self.point = at;
         self.configuration = configuration.clone();
         Ok(())
+    }
+
+    /// The last entry applied that no finished flush covers yet: in the replicated class only.
+    pub(crate) fn unflushed(&self) -> Option<Point> {
+        if self.point.index > self.flushed.index {
+            Some(self.point)
+        } else {
+            None
+        }
+    }
+
+    /// A flush of the database's log, to run on the owner's flushing thread: what was committed
+    /// before it began is durable once it ends (`Db::flusher`).
+    pub(crate) fn log_flusher(&self) -> crate::store::Flush {
+        self.db.flusher()
+    }
+
+    /// A flush begun once `at` was applied has finished: a restart opens with `at` applied.
+    pub(crate) fn flushed_through(&mut self, at: Point) {
+        if at.index > self.flushed.index && at.index <= self.point.index {
+            self.flushed = at;
+        }
     }
 }
 
@@ -429,6 +466,7 @@ impl StateMachine for Machine {
                 .map_err(failed)?
         {
             self.point = at;
+            self.flushed = at;
             answers.push(Applied {
                 index: entry.index,
                 context: entry.context.to_vec(),
@@ -453,7 +491,7 @@ impl StateMachine for Machine {
                 ));
             }
         }
-        self.advance(at, &pages, &self.configuration.clone())?;
+        self.advance(at, &pages, &self.configuration.clone(), !self.replicated)?;
         if !entry.data.is_empty() {
             answers.push(Applied {
                 index: entry.index,
@@ -470,16 +508,20 @@ impl StateMachine for Machine {
         _: &ConfChangeV2,
         configuration: &ConfState,
     ) -> Result<(), Fatal> {
-        self.advance(at, &[], configuration)
+        self.advance(at, &[], configuration, true)
     }
     fn durable(&self) -> Point {
-        self.point
+        self.flushed
     }
     fn configuration(&self) -> &ConfState {
         &self.configuration
     }
-    fn acts_at_start(&self, _: &EntryRef<'_>) -> bool {
-        true
+    /// Every entry outside the replicated class, which the shell applies only on the member's durable
+    /// commit (durable.md §4.1). In the class only the seed's: an ordinary entry is applied on the
+    /// commit, held or classic, and a restart that finds it past the member's log opens the log at
+    /// the machine's point (durable.md §4.3).
+    fn acts_at_start(&self, entry: &EntryRef<'_>) -> bool {
+        !self.replicated || bootstrap::is_seed(entry.data)
     }
 
     fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
@@ -543,11 +585,14 @@ impl StateMachine for Machine {
             .map_err(failed)?;
         self.db.flusher()().map_err(failed)?;
         self.point = at;
+        self.flushed = at;
         self.configuration = configuration.clone();
         self.baseline.completed();
         Ok(())
     }
     fn persist(&mut self) -> Result<(), Fatal> {
-        self.db.flusher()().map_err(failed)
+        self.db.flusher()().map_err(failed)?;
+        self.flushed = self.point;
+        Ok(())
     }
 }
