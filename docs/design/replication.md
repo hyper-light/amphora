@@ -241,6 +241,12 @@ such writes "could possibly roll back in the event of a transient loss (e.g. cra
    - One invariant holds it together: the WAL never makes durable an entry the member's own log hasn't. A restart
      never finds the machine ahead of its log; it replays from `durable()` what its group committed.
 5. **The answer.** It leaves once the entry has committed, held or classic, and the proposer has applied it in memory.
+6. **Where it pays.** A leader may apply an entry of its own term once it commits, before its own write is durable
+   (R-6, `Config::apply_unpersisted`, durable.md §4.2). A follower applies only what its own log holds durably,
+   because "a follower's apply serves no answer" there. So a write proposed at the leader answers on the held commit,
+   while one proposed at a follower still waits for that follower's own log write. Unless the answer moves to the
+   leader, the class speeds writes made at the leader. hyper-durable reopens a member whose machine got ahead of its
+   log by starting the log at the machine's point (durable.md §4.3, case 3).
 
 **What it guarantees** (three voters, fates asked 2):
 - **One member crashes or loses power:** nothing acknowledged is lost. Every held commit spans two fates, so a member of
