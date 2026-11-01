@@ -230,6 +230,33 @@ pub(crate) fn refused(error: &anyhow::Error) -> Refusal {
     }
     unavailable(format!("{error:#}"))
 }
+/// A query's session on `db`, a reader or the writer between its commits: once, before its
+/// deadline, never on a database whose restore is unfinished.
+fn run_query<R, F>(db: &mut Db, until: Instant, session: &Mutex<Option<F>>) -> anyhow::Result<R>
+where
+    F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R>,
+{
+    let f = locked(session)?
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("SQL query was already executed"))?;
+    if Instant::now() >= until {
+        return Err(Refusal::Timeout.into());
+    }
+    if restore::incomplete(db)? {
+        return Err(api::invalid("database", "restore is incomplete").into());
+    }
+    let done = db.query_transaction(|db| {
+        let _deadline = db.deadline(until);
+        let mut connection = crate::sql::Connection::new(db);
+        let value = f(&mut connection)?;
+        connection.finish()?;
+        Ok(value)
+    });
+    if done.is_err() && Instant::now() >= until {
+        return Err(Refusal::Timeout.into());
+    }
+    done
+}
 fn locked<T>(m: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, Refusal> {
     m.lock()
         .map_err(|_| unavailable("a database response lock was poisoned"))
@@ -655,6 +682,31 @@ impl Database {
                 .map_err(|_| unavailable("wrong SQL session answer")),
             _ => Err(unavailable("wrong SQL session answer")),
         }
+    }
+
+    /// Runs one read-only SQL session on a reader beside the writer (docs/design/store.md,
+    /// decision 33): it sees what was committed when it began, waits for neither the writer nor a
+    /// flush, and writes nothing, its writing statements refused. A remote or replicated database
+    /// runs it as a [`Database::call`].
+    pub fn query<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
+    {
+        let database = self.resolve(until)?;
+        let Writer::Local(store) = &database.shared.writer else {
+            return database.call(until, f);
+        };
+        // The store runs the session on a reader, or on the writer while it has none to lend.
+        let session = Arc::new(Mutex::new(Some(f)));
+        let on_writer = Arc::clone(&session);
+        store
+            .read_committed(
+                until,
+                |reader| run_query(reader, until, &session),
+                move |engine| run_query(&mut engine.db, until, &on_writer),
+            )
+            .map_err(|e| refused(&e))
     }
 
     /// One atomic batch, including SELECT or DML RETURNING results. Parameters and SQL are owned;

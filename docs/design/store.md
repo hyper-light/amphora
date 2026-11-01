@@ -1255,3 +1255,38 @@ docs/research/read-only-calls.md: 1,500 read-only calls left the log at 791,072 
 
 **Falsified by.** A batch that wrote nothing waiting for a flush that syncs (the test above), or
 answered before an earlier commit it could have seen is durable.
+
+## 33. A query runs beside the writer, on a reader, and writes nothing
+
+**Decision.** `Database::query` runs a read-only SQL session on one of the store's readers, on its
+caller's thread, the readers beside the writer this store already keeps. It runs on the writer
+only when the store has no reader to lend (while its file is replaced), between commits. It sees
+what was committed when it began, one snapshot (a deferred `BEGIN`), and waits for neither the
+writer's queue nor a flush. It writes nothing: the engine's `query_only` refuses every statement
+that writes, and the session ends rolled back. A remote or replicated database runs a query as a
+call.
+
+**Why.** Commands go to the one writer and queries to its readers (CQRS; Ada, 2026-11-01, kiln goal
+f4b650c4). A read-only session through `Database::call` waits behind the writer: behind every batch
+handed over before it, and, while a session holds the writer, until that session ends.
+
+**What it sees.** What is committed, as the store's record reads see it (`Store::read_committed`).
+So a query can see a commit that is not yet durable, which a power cut could take back, though no
+writer was acknowledged for it (decision 15). A session whose answer must rest only on durable
+writes goes through `Database::call` (decision 32).
+
+**Sources.** SQLite's write-ahead log (sqlite.org/wal.html): "A COMMIT occurs when a special record
+indicating a commit is appended to the WAL", and "When a read operation begins on a WAL-mode
+database, it first remembers the location of the last valid commit record in the WAL": a reader
+reads committed frames and never waits on the writer. The engine refuses writing statements under
+`query_only` (`crates/engine/translate/mod.rs`: "Cannot execute write statement in query_only mode").
+
+**Evidence.** `crates/amphora/tests/database.rs`,
+`a_query_answers_beside_a_held_writer_and_writes_nothing`. A session held the writer with its insert
+uncommitted, and a query answered with the committed count (1) in 0.07 s. With `query` taking
+`call`'s path, as before this decision, the query waited behind the writer until its 30 s deadline
+and failed with Timeout. Once the writer went, a query saw the insert (2). A query that wrote was
+refused, and the table stayed at 2 (adas-mac-studio-3, 2026-11-01).
+
+**Falsified by.** A query that waits behind the writer or a flush (the test above), one that writes,
+or one that sees a commit made after it began.

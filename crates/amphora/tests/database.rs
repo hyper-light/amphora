@@ -749,3 +749,53 @@ fn sql_and_records_share_one_transaction_and_publish_only_durable_changes() {
         b"committed"
     );
 }
+
+/// AC-T1.1.1, docs/design/store.md decision 33 (kiln goal f4b650c4): do a query while another
+/// session holds the writer, its insert uncommitted; expect the query answered with what was
+/// committed, the held insert unseen. Let the writer go: a later query sees the insert. Do a query
+/// that writes: expect it refused and the table as it was.
+#[test]
+fn a_query_answers_beside_a_held_writer_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::open(&dir.path().join("queries.db"), until()).unwrap());
+    db.call(until(), |c| {
+        c.execute_batch("CREATE TABLE t(n INTEGER); INSERT INTO t VALUES (1)")?;
+        Ok(())
+    })
+    .unwrap();
+    let count = |db: &Database| -> Result<i64, Refusal> {
+        db.query(until(), |c| {
+            Ok(c.query_row("SELECT count(*) FROM t", [], |r| r.get(0usize))?)
+        })
+    };
+    // A hang guard: each wait on the held session ends at its own fact long before this.
+    let guard = Duration::from_secs(30);
+    let (held, holding) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let writer = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            db.call(until(), move |c| {
+                c.execute("INSERT INTO t VALUES (2)", [])?;
+                held.send(())?;
+                released.recv_timeout(guard)?;
+                Ok(())
+            })
+        })
+    };
+    holding.recv_timeout(guard).unwrap();
+    assert_eq!(
+        count(&db).unwrap(),
+        1,
+        "the query saw an uncommitted insert"
+    );
+    release.send(()).unwrap();
+    writer.join().unwrap().unwrap();
+    assert_eq!(count(&db).unwrap(), 2);
+    let wrote = db.query(until(), |c| {
+        c.execute("INSERT INTO t VALUES (3)", [])?;
+        Ok(())
+    });
+    assert!(wrote.is_err(), "a query wrote: {wrote:?}");
+    assert_eq!(count(&db).unwrap(), 2);
+}
