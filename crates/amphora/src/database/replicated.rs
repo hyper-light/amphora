@@ -2211,6 +2211,18 @@ mod tests {
                 disk: PowerDisk::new(std::collections::HashMap::new()),
             }
         }
+        /// The power cut: the log loses what it held unflushed, and the database keeps what its
+        /// files' syncs made durable, which this returns.
+        fn cut(&mut self) -> std::collections::HashMap<String, Vec<u8>> {
+            self.log.crash(hyper_block::sim::Crash::LoseAll).unwrap();
+            self.disk.cut()
+        }
+        /// The power back, once the dying owner is gone: what it wrote after the cut never
+        /// happened either, and the database is a disk of what `survived`.
+        fn restore(&mut self, survived: std::collections::HashMap<String, Vec<u8>>) {
+            self.log.crash(hyper_block::sim::Crash::LoseAll).unwrap();
+            self.disk = PowerDisk::new(survived);
+        }
     }
 
     impl Driven<hyper_block::sim::SimHandle> {
@@ -2302,12 +2314,9 @@ mod tests {
             durability: Durability,
             power: &mut Power,
         ) -> Client {
-            power.log.crash(hyper_block::sim::Crash::LoseAll).unwrap();
-            let survived = power.disk.cut();
+            let survived = power.cut();
             drop(self.owners.get_mut(owner).unwrap().take());
-            // What the dying owner wrote after the cut never happened either.
-            power.log.crash(hyper_block::sim::Crash::LoseAll).unwrap();
-            power.disk = PowerDisk::new(survived);
+            power.restore(survived);
             let node_id = u64::try_from(owner + 1).unwrap();
             let reading = Arc::clone(self.clocks.get(owner).unwrap());
             let (client, restarted) =
@@ -2443,11 +2452,12 @@ mod tests {
         done
     }
 
-    /// Runs seeds `from..from + n` of the power-cut nemesis on `workers` threads; a failing seed
-    /// panics with its account.
+    /// Runs seeds `from..from + n` of the power-cut nemesis on `workers` threads. Every seed runs,
+    /// and the run fails naming each failing seed with its account, whatever panicked in it.
     fn power_seeds(n: u64, from: u64, workers: usize) {
         let next = AtomicU64::new(from);
         let total = Mutex::new(Cuts::default());
+        let failed = Mutex::new(Vec::new());
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 scope.spawn(|| {
@@ -2456,15 +2466,33 @@ mod tests {
                         if seed >= from + n {
                             return;
                         }
-                        let done = power_seed(seed);
-                        let mut total = total.lock().unwrap();
-                        total.acknowledged += done.acknowledged;
-                        total.cuts += done.cuts;
-                        total.unflushed_leader += done.unflushed_leader;
+                        match std::panic::catch_unwind(|| power_seed(seed)) {
+                            Ok(done) => {
+                                let mut total = total.lock().unwrap();
+                                total.acknowledged += done.acknowledged;
+                                total.cuts += done.cuts;
+                                total.unflushed_leader += done.unflushed_leader;
+                            }
+                            Err(panic) => {
+                                let account = panic
+                                    .downcast_ref::<String>()
+                                    .cloned()
+                                    .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                                    .unwrap_or_default();
+                                failed.lock().unwrap().push((seed, account));
+                            }
+                        }
                     }
                 });
             }
         });
+        let mut failed = failed.into_inner().unwrap();
+        failed.sort();
+        assert!(
+            failed.is_empty(),
+            "{} of the seeds failed: {failed:#?}",
+            failed.len()
+        );
         let total = total.into_inner().unwrap();
         println!(
             "power-cut nemesis: seeds {from}..{}, {} writes acknowledged, {} cuts, {} of them of a leader holding a write unflushed, none lost",
@@ -2483,6 +2511,42 @@ mod tests {
             total.unflushed_leader > 0,
             "no cut hit a leader holding a write unflushed"
         );
+    }
+
+    /// The nemesis's power cut is a machine's (AC-T1.8.5): nothing a powered-off machine does
+    /// reaches its disk. A dying owner's log drains what it took before its threads end, writes
+    /// and flushes among it, through its own handle onto the same device. Do: through a member's
+    /// log device, write and flush one block and write a second unflushed; cut the power; write
+    /// and flush a third through the same handle, as that drain does; restore the power. Expect:
+    /// the late write or its flush refused, and only the first block durable.
+    #[test]
+    fn nothing_a_member_writes_after_its_power_cut_survives_it() {
+        let align = hyper_block::buf::Alignment::new(4096).unwrap();
+        let block = |byte: u8| {
+            let mut buf = hyper_block::buf::AlignedBuf::zeroed(4096, align).unwrap();
+            buf.extend_from_slice(&[byte; 4096]).unwrap();
+            buf
+        };
+        let mut power = Power::new(7);
+        let dying = power.log.handle().unwrap();
+        dying.write_all_at(block(b'a').as_slice(), 0).unwrap();
+        dying.sync_data().unwrap();
+        dying.write_all_at(block(b'b').as_slice(), 4096).unwrap();
+        let survived = power.cut();
+        let late = dying
+            .write_all_at(block(b'c').as_slice(), 8192)
+            .and_then(|()| dying.sync_data());
+        drop(dying);
+        power.restore(survived);
+        let image = power.log.durable_image().unwrap();
+        assert_eq!(image.get(..4096), Some(&[b'a'; 4096][..]));
+        for (at, byte) in [(4096, b'b'), (8192, b'c')] {
+            assert!(
+                image.get(at..at + 4096) != Some(&[byte; 4096][..]),
+                "the block written at {at} survived the cut"
+            );
+        }
+        assert!(late.is_err(), "a write and flush after the cut succeeded");
     }
 
     /// CP-T1.8 (AC-T1.8.5), the replicated class under a nemesis (replication.md, "Fast
