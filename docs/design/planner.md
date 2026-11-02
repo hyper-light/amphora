@@ -899,6 +899,11 @@ them, and none is under `LIMIT ?`. The planner's other tests pass unchanged:
 - `oracle_findings.rs`, with each CERT cause's test;
 - the engine's 2,660 library tests.
 
+The bench suite's 52 statements (`amphora-bench --suite --target amphora --explain`, release builds of
+432a2ab and 110ad12 on jupiter, 2026-11-02, the bench given the root's patches as bug c7af55d0 asks):
+every plan the same before and after. `offset_deep`, the one whose OFFSET is a parameter (`LIMIT 20
+OFFSET ?`), stays a scan of items in rowid order, the order its ORDER BY asks.
+
 **Falsified by.** A statement whose bound LIMIT routinely asks for most of a large range, where the
 ordered read, a lookup for each row, does more work than the scan and sort it beat. Decision 5
 measured that at about 3.4× for a whole 200,000-row table. Or one whose remaining terms keep far

@@ -118,7 +118,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   every row as SQLite's does. So a keyset page, `WHERE (family, key, rev) > (?1, ?2, ?3) ORDER BY
   family, key, rev LIMIT 8`, reads from the cursor and stops at its LIMIT, and a pass is linear in
   its rows where it was quadratic. A page reading columns the index lacks seeks once ANALYZE has
-  counted the table; the OR chain spelling of a keyset stays a scan, as in SQLite.
+  counted the table, or under a LIMIT (decisions 16 and 17); the OR chain spelling of a keyset stays a
+  scan, as in SQLite.
+- **An ordered read under a LIMIT stops at its rows, a bound LIMIT too** (docs/design/planner.md
+  decisions 16 and 17, `crates/engine/tests/rowid_index_order.rs`): a one-table read in an index's
+  order is costed to the rows a literal LIMIT keeps, and under a LIMIT bound as a parameter, as kiln
+  binds every LIMIT, to the q-middle of the fewest and all the read keeps. Keyset pages and kiln's
+  conversation feed (`records_by_rev`) search the index as SQLite 3.54.0 does, reading at most
+  LIMIT + 2 rows a page, where they scanned and sorted the whole table.
 - **Readers keep their pages across commits** (docs/design/store.md decision 18,
   `crates/engine/storage/changes.rs`): a connection starting a read transaction forgets only the
   pages written since its last one, where SQLite and Turso forget its whole cache; it forgets
