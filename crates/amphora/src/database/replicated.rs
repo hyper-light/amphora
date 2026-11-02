@@ -2211,16 +2211,21 @@ mod tests {
                 disk: PowerDisk::new(std::collections::HashMap::new()),
             }
         }
-        /// The power cut: the log loses what it held unflushed, and the database keeps what its
-        /// files' syncs made durable, which this returns.
+        /// The power cut: the log's device refuses every write and flush from now on, so the dying
+        /// owner's drain reaches nothing, and loses what it held unflushed; the database keeps what
+        /// its files' syncs made durable, which this returns.
         fn cut(&mut self) -> std::collections::HashMap<String, Vec<u8>> {
+            self.log
+                .inject(hyper_block::sim::Fault::PowerCut { ops: 0 })
+                .unwrap();
             self.log.crash(hyper_block::sim::Crash::LoseAll).unwrap();
             self.disk.cut()
         }
-        /// The power back, once the dying owner is gone: what it wrote after the cut never
-        /// happened either, and the database is a disk of what `survived`.
+        /// The power back, once the dying owner is gone: the device takes writes again, and the
+        /// database is a disk of what `survived`.
         fn restore(&mut self, survived: std::collections::HashMap<String, Vec<u8>>) {
             self.log.crash(hyper_block::sim::Crash::LoseAll).unwrap();
+            self.log.clear_faults().unwrap();
             self.disk = PowerDisk::new(survived);
         }
     }
