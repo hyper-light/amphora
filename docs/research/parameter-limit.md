@@ -39,8 +39,9 @@ Through the autoindex (the explicit index plans the same, naming `t_i`):
   statistics there are three per rowid index kind. After ANALYZE there are two per kind, since a
   row value then seeks.
 - The WITHOUT ROWID key plans as sqlite3 in every form: `SEARCH t USING PRIMARY KEY (...)` or
-  `SCAN t`. ANALYZE refuses that database, "ANALYZE on tables without rowid is not supported"
-  (kiln goal 5adc688955008b23b0bf7490eee18a45), so its plans after ANALYZE are untested.
+  `SCAN t`. At 29be700 ANALYZE refused that database, "ANALYZE on tables without rowid is not
+  supported" (kiln goal 5adc688955008b23b0bf7490eee18a45, fixed in 18667db), so its plans after
+  ANALYZE were not probed.
 - Kiln's conversation feed, on kiln's own DDL (`records`, `records_by_rev ON records (rev)`, kiln
   dc19ac9e52 `crates/kiln/src/convo/sql.rs:52-61`), has the same shape. `FEED_RECORDS` reads `rev >
   ?1 ORDER BY rev LIMIT ?2` (line 189) and `RECORDS_BELOW` reads `rev < ?1 ORDER BY rev DESC LIMIT
