@@ -289,7 +289,9 @@ Its tests:
 - the core's settings;
 - the power-cut nemesis: one member of three fates cut and restarted at the end of each round of writes, its log
   and database losing what they hadn't flushed, every acknowledged write read back (12 seeds in the suite; 10,000
-  by hand, `AMPHORA_POWER_SEEDS`).
+  by hand, `AMPHORA_POWER_SEEDS`, each failing seed named with its account);
+- the cut itself: nothing the dying member writes after it survives, as on a powered-off machine (its log's device
+  refuses every write and flush from the cut on, though the dying log drains what it took before its threads end).
 
 Not built, and none of it weakens the one-fate guarantee:
 - **The suspicion feed** (`suspect_held` from hyper-liveness, not vendored). Without it no member is ever
