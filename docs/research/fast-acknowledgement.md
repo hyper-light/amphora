@@ -29,10 +29,12 @@ flushprobe.py appends 4,096 bytes and flushes, 2,000 times, in a file of its own
 | adas-mac-studio-3, rerun | Darwin 25.2.0 | apfs | F_FULLFSYNC | 1.51-1.52 | 2,000 | 3.937 ms | 7.560 ms | 9.127 ms | 11.953 ms | 2026-11-02 00:22:19 |
 | adas-mac-studio-2 | Darwin 25.2.0 | apfs | F_FULLFSYNC | 1.51-1.56 | 2,000 | 3.808 ms | 4.954 ms | 7.738 ms | 21.221 ms | 2026-11-02 00:22:05 |
 | adas-mac-studio-2, rerun | Darwin 25.2.0 | apfs | F_FULLFSYNC | 1.36-1.51 | 2,000 | 3.070 ms | 5.496 ms | 32.545 ms | 71.090 ms | 2026-11-02 00:22:12 |
+| adas-mac-studio-2, loaded | Darwin 25.2.0 | apfs | F_FULLFSYNC | 8.11-8.56 | 2,000 | 3.072 ms | 4.982 ms | 6.649 ms | 10.489 ms | 2026-11-02 00:43:33 |
 
 The calm runs (load under 2, nothing compiling) are calm-flush.sh at 90efba3 of the probe carrier: it waits until the
 load has stayed under 2 for 90 s, then runs the probe twice, a record and its rerun. Each rerun's p50 is within 20% of
-its record's: studio-3 3.937 against 3.932 ms (0.1%), studio-2 3.070 against 3.808 ms (19%).
+its record's: studio-3 3.937 against 3.932 ms (0.1%), studio-2 3.070 against 3.808 ms (19%). studio-2's loaded run had
+eight test workers of the power-cut nemesis beside it, a load of CPUs, not of its disk.
 
 Still to come: Linux at calm. fedora-2 ran at load 15-17 under two CI jobs and has been offline since; adacachy's load
 has stayed between 30 and 190 under production and other sessions' builds.
