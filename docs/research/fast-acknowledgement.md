@@ -10,8 +10,10 @@ MCP run. The probes are flushprobe.py and rttprobe.py, at commit e61a5bd of ~/.c
   quorum's flushes plus a round trip.
 - **A held commit** (hyper-raft R-8, raft.md §3.7 at 4d72e19b) waits for a round trip to a held quorum whose fates span
   what the owner asks, or for the leader's own write plus one follower's memory, whichever comes first.
-- **Amphora's state machine** flushes its WAL before apply answers (replication.rs `Machine::advance`). So until that
-  changes, every answer also waits for one local flush on the proposing member.
+- **Amphora's state machine** flushes its WAL before apply answers (replication.rs `Machine::advance`), so every answer
+  also waits for one local flush on the proposing member. The replicated class, built on t1/fast-ack (02f960e), takes
+  that flush off the answer: an entry applies without it, and the owner's flushing thread makes the machine durable
+  behind.
 
 ## The flush: a 4 KiB append and the flush Amphora's engine uses
 
@@ -23,9 +25,17 @@ flushprobe.py appends 4,096 bytes and flushes, 2,000 times, in a file of its own
 | adas-mac-studio-3 | Darwin 25.2.0 | apfs | F_FULLFSYNC | 2.03-2.30 | 2,000 | 3.928 ms | 6.014 ms | 7.892 ms | 10.917 ms | 2026-11-01 20:47:36 |
 | adacachy | Linux 7.2.9-2-cachyos | btrfs (nvme1n1p2, /@home) | fdatasync | 75.96-78.50 | 2,000 | 21.324 ms | 1,340.648 ms | 4,271.056 ms | 5,625.591 ms | 2026-11-01 20:49:49 |
 | kiln-a094a12d (fedora-2) | Linux 6.19.10-300.fc44 | btrfs (nvme1n1p3, /home) | fdatasync | 15.48-16.82 | 2,000 | 8.836 ms | 18.266 ms | 25.415 ms | 209.365 ms | 2026-11-01 21:09:48 |
+| adas-mac-studio-3 | Darwin 25.2.0 | apfs | F_FULLFSYNC | 1.52-1.56 | 2,000 | 3.932 ms | 7.532 ms | 9.516 ms | 10.849 ms | 2026-11-02 00:22:11 |
+| adas-mac-studio-3, rerun | Darwin 25.2.0 | apfs | F_FULLFSYNC | 1.51-1.52 | 2,000 | 3.937 ms | 7.560 ms | 9.127 ms | 11.953 ms | 2026-11-02 00:22:19 |
+| adas-mac-studio-2 | Darwin 25.2.0 | apfs | F_FULLFSYNC | 1.51-1.56 | 2,000 | 3.808 ms | 4.954 ms | 7.738 ms | 21.221 ms | 2026-11-02 00:22:05 |
+| adas-mac-studio-2, rerun | Darwin 25.2.0 | apfs | F_FULLFSYNC | 1.36-1.51 | 2,000 | 3.070 ms | 5.496 ms | 32.545 ms | 71.090 ms | 2026-11-02 00:22:12 |
 
-Still to come: Linux at calm (load under 2). fedora-2 ran at load 15-17 under two CI jobs, and adacachy has not been
-calm today; its load has run 30-190 under other sessions' builds.
+The calm runs (load under 2, nothing compiling) are calm-flush.sh at 90efba3 of the probe carrier: it waits until the
+load has stayed under 2 for 90 s, then runs the probe twice, a record and its rerun. Each rerun's p50 is within 20% of
+its record's: studio-3 3.937 against 3.932 ms (0.1%), studio-2 3.070 against 3.808 ms (19%).
+
+Still to come: Linux at calm. fedora-2 ran at load 15-17 under two CI jobs and has been offline since; adacachy's load
+has stayed between 30 and 190 under production and other sessions' builds.
 
 ## The round trip: a 64-byte datagram and its answer
 
@@ -57,10 +67,14 @@ Still to come: a wired pair, if one exists.
   There, a commit held across fates would answer sooner than one waiting for that disk.
 - btrfs's flush is slow even at moderate load: fedora-2's p50 is 8.8 ms and p99 18.3 ms at load 15-17, near this
   Wi-Fi's typical round trip (ping average 16.7 ms), with a max of 209 ms against the link's 718 ms.
-- On a calm Mac, the flush (p99 6.0 ms) is far shorter than this Wi-Fi's round trip (p99 374-542 ms). There a held
+- The proposer's apply flush adds one local flush to every answer while it stays: on a calm Mac p50 3.1-3.9 ms and p99
+  5.0-7.6 ms (studio-2 and studio-3), on btrfs p50 8.8 ms at load 15-17 and 21.3 ms at load 76-78, with tails to
+  seconds there.
+- On a calm Mac, the flush (p99 5.0-7.6 ms) is far shorter than this Wi-Fi's round trip (p99 374-542 ms). There a held
   commit would answer later, not sooner, unless the members share a wired network. R-8 commits on whichever quorum
   comes first (raft.md §3.7: "never slower than the classic commit"), so where it is slower it is simply not used.
-- Wi-Fi drops datagrams (4-83 of 2,000 here). A held commit then waits for the transport's resend, and a member whose
-  answers stall is suspected and no longer counted (`suspect_held`).
+- Wi-Fi drops datagrams (4-83 of 2,000 here). A held commit then waits for the transport's resend. A member whose
+  answers stall will be suspected and no longer counted once the suspicion feed (`suspect_held`) is in; it is not built
+  yet (docs/design/replication.md, "Not built").
 - The kernel's ping shows the link itself is slow and bursty here (adacachy to jupiter: min 2.6 ms, max 283 ms). The
   user-level probes add each host's scheduling on top (adacachy's p50 37.7 ms at load 77).
