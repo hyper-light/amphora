@@ -783,6 +783,18 @@ mod tests {
         assert!(hashed * 10.0 < sorted);
     }
 
+    /// Amphora: do: cost a read's goal under a literal LIMIT, and under one known only as the
+    /// statement runs, for reads keeping a million rows, 400 and fewer than the fewest. Expect: a
+    /// literal's own rows; otherwise the q-middle of the fewest and all the read keeps, never fewer
+    /// than the fewest (decision 17; AC-T1.13.4).
+    #[test]
+    fn a_goal_known_only_as_the_statement_runs_is_the_q_middle() {
+        assert_eq!(RowGoal::Rows(8.0).rows(1_000_000.0), 8.0);
+        assert_eq!(RowGoal::AtLeast(1.0).rows(1_000_000.0), 1_000.0);
+        assert_eq!(RowGoal::AtLeast(4.0).rows(400.0), 40.0);
+        assert_eq!(RowGoal::AtLeast(6.0).rows(2.0), 6.0);
+    }
+
     /// Amphora: do: look up rows at random in a table bigger than the cache and in one it holds.
     /// Expect: Mackert and Lohman's three cases (decision 5): a page a row while the cache fills,
     /// then every lookup a read but for the fraction of the table cached; at most the table's

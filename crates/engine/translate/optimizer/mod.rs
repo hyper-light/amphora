@@ -5242,6 +5242,36 @@ mod tests {
         );
     }
 
+    /// Do: give limit_row_goal each kind of LIMIT and OFFSET: a literal, a negative literal and a
+    /// bound parameter. Expect: literals the rows they keep; a bound LIMIT at least one row and a
+    /// literal OFFSET's; a bound OFFSET at least a literal LIMIT's; a negative literal LIMIT no goal,
+    /// and a negative literal OFFSET none either (decisions 16 and 17; AC-T1.13.4).
+    #[test]
+    fn a_limit_known_only_as_the_statement_runs_keeps_the_fewest_rows() {
+        use super::{cost::RowGoal, limit_row_goal};
+        let goal = |clause: &str| {
+            let sql = format!("SELECT 1 {clause}");
+            let mut parser = amphora_engine_parser::parser::Parser::new(sql.as_bytes());
+            let Some(ast::Cmd::Stmt(ast::Stmt::Select(select))) = parser.next_cmd().unwrap() else {
+                panic!("{sql} is not a SELECT");
+            };
+            let limit = select.limit.unwrap();
+            limit_row_goal(&limit.expr, limit.offset.as_deref())
+        };
+        for (clause, want) in [
+            ("LIMIT 8", Some(RowGoal::Rows(8.0))),
+            ("LIMIT 8 OFFSET 4", Some(RowGoal::Rows(12.0))),
+            ("LIMIT 8 OFFSET ?1", Some(RowGoal::AtLeast(8.0))),
+            ("LIMIT ?1", Some(RowGoal::AtLeast(1.0))),
+            ("LIMIT ?1 OFFSET 5", Some(RowGoal::AtLeast(6.0))),
+            ("LIMIT ?1 OFFSET ?2", Some(RowGoal::AtLeast(1.0))),
+            ("LIMIT -1", None),
+            ("LIMIT 8 OFFSET -1", None),
+        ] {
+            assert_eq!(goal(clause), want, "{clause}");
+        }
+    }
+
     use super::{where_term_rejects_null_row, Optimizable};
     use crate::translate::emitter::{DoubleQuotedDml, Resolver};
     use crate::{schema::Schema, DatabaseCatalog, RwLock, SymbolTable};
