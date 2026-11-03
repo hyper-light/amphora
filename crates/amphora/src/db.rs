@@ -807,6 +807,27 @@ impl Db {
         done
     }
 
+    /// `f` in one read transaction (`BEGIN`, deferred), its statements on one snapshot of what was
+    /// committed when it began, with every statement that writes refused (the engine's
+    /// `query_only`) and the transaction ended by a rollback, so nothing it did stays: a query
+    /// beside the writer (docs/design/store.md, decision 33).
+    pub(crate) fn query_transaction<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.conn.set_query_only(true);
+        let done = self.query("BEGIN", [], |_| Ok(true)).and_then(|()| f(self));
+        let ended = if self.conn.get_auto_commit() {
+            Ok(())
+        } else {
+            self.query("ROLLBACK", [], |_| Ok(true))
+        };
+        self.conn.set_query_only(false);
+        let value = done?;
+        ended?;
+        Ok(value)
+    }
+
     /// `f` on each of `batches`, in order, in one transaction ([`Db::transaction`]) that ends
     /// before a batch its cache might not hold: once the pages written so far, and as many again
     /// as the last batch wrote, pass what the cache holds before it spills written pages into the

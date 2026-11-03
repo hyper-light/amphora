@@ -1219,3 +1219,74 @@ outgrown twice its bound, so that is paid once for each such log, not at every r
 (`files.rs`); an acknowledged write lost, or a database refused, after a power cut around a restart
 that cut the log (`tests/crash.rs`); a restart that cuts the log holding the writer much longer than
 one that keeps it, or the commits after it slower than after a restart that keeps the file.
+
+## 32. A batch that wrote nothing is durable as the last flush left it
+
+**Decision.** A batch whose commit wrote nothing, a session that only read, waits for no flush of
+its own. Its ticket waits for a flush, like every batch's (decision 15). That flush finds the log
+where the last flush left it, so it returns without syncing, and the batch is told durable at once.
+If an earlier commit's flush is still to come, the batch waits for it: every commit the batch could
+have seen is durable before it is answered, so its answer rests only on durable writes. Writes keep
+their rule: one is acknowledged only once a flush that began after its commit ends (AC-T1.4.4).
+
+**Why.** kiln's W24-AC10 lookups on 29be700 took about 92 ms each on adacachy (load 40-90), and
+that was read as read-only calls each waiting for a fresh fsync (kiln goal f4b650c4). They don't.
+A read-only `Database::call` writes no frames and waits for no fsync (docs/research/read-only-calls.md).
+Those lookups write a hit count on every hit, and a write waits for its flush.
+
+**Sources.** A read-only transaction that depends on commits not yet durable must wait for them,
+and only for them. Kimura, Graefe and Kuno ("Efficient Locking Techniques for Databases on Modern
+Hardware", ADMS 2012, §5.3): a read-only transaction "immediately exits if the maximum tag is
+already durable. Otherwise, it wakes up the log flusher and waits until the LSN becomes durable."
+Aether (Johnson et al., PVLDB 3(1), 2010, §3.1): a transaction that read a pre-committed
+transaction's data "must not be allowed to return results to the user until both their own and
+their predecessor's log records have reached the disk". Engines skip the flush for a transaction
+that wrote nothing. PostgreSQL's `RecordTransactionCommit` (`xact.c`, REL_18_0) writes no commit
+record without a transaction ID, and SQLite's `sqlite3PagerCommitPhaseOne` (3.54.1) returns early
+"If no database changes have been made".
+
+**Evidence.** `crates/amphora/tests/crash.rs`,
+`a_batch_that_wrote_nothing_is_durable_with_every_flush_held`: on the simulated disk with every
+flush held, a batch that only reads is told durable at once, with no flush held, and a write's
+flush stays held until let go. It passes at 29be700, and a mutant whose flusher syncs even with
+nothing new in the log fails it (its 30 s hang guard; adas-mac-studio-3, 2026-11-01). The probe in
+docs/research/read-only-calls.md: 1,500 read-only calls left the log at 791,072 bytes, p50 about
+78 µs.
+
+**Falsified by.** A batch that wrote nothing waiting for a flush that syncs (the test above), or
+answered before an earlier commit it could have seen is durable.
+
+## 33. A query runs beside the writer, on a reader, and writes nothing
+
+**Decision.** `Database::query` runs a read-only SQL session on one of the store's readers, on its
+caller's thread, the readers beside the writer this store already keeps. It runs on the writer
+only when the store has no reader to lend (while its file is replaced), between commits. It sees
+what was committed when it began, one snapshot (a deferred `BEGIN`), and waits for neither the
+writer's queue nor a flush. It writes nothing: the engine's `query_only` refuses every statement
+that writes, and the session ends rolled back. A remote or replicated database runs a query as a
+call.
+
+**Why.** Commands go to the one writer and queries to its readers (CQRS; Ada, 2026-11-01, kiln goal
+f4b650c4). A read-only session through `Database::call` waits behind the writer: behind every batch
+handed over before it, and, while a session holds the writer, until that session ends.
+
+**What it sees.** What is committed, as the store's record reads see it (`Store::read_committed`).
+So a query can see a commit that is not yet durable, which a power cut could take back, though no
+writer was acknowledged for it (decision 15). A session whose answer must rest only on durable
+writes goes through `Database::call` (decision 32).
+
+**Sources.** SQLite's write-ahead log (sqlite.org/wal.html): "A COMMIT occurs when a special record
+indicating a commit is appended to the WAL", and "When a read operation begins on a WAL-mode
+database, it first remembers the location of the last valid commit record in the WAL": a reader
+reads committed frames and never waits on the writer. The engine refuses writing statements under
+`query_only` (`crates/engine/translate/mod.rs`: "Cannot execute write statement in query_only mode").
+
+**Evidence.** `crates/amphora/tests/database.rs`,
+`a_query_answers_beside_a_held_writer_and_writes_nothing`. A session held the writer with its insert
+uncommitted, and a query answered with the committed count (1) in 0.07 s. With `query` taking
+`call`'s path, as before this decision, the query waited behind the writer until its 30 s deadline
+and failed with Timeout. Once the writer went, a query saw the insert (2). A query that wrote was
+refused, and the table stayed at 2 (adas-mac-studio-3, 2026-11-01).
+
+**Falsified by.** A query that waits behind the writer or a flush (the test above), one that writes,
+or one that sees a commit made after it began.
