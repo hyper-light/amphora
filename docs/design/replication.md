@@ -180,3 +180,70 @@ Falsified by:
 - a test whose verdict still depends on the real clock;
 - an owner's read of time that isn't its clock's, other than a compaction step's own checks;
 - a call whose work outlasts its deadline that is proposed, or that answers anything but Timeout.
+
+## Membership (2026-11-03)
+
+kiln makes every node it installs a member of its one replication group (kiln plan
+01a1a283e14c75eb8a28a9347287e4c5, step 1): a node that joins is added as a learner, and one that
+is deleted is removed. Amphora fixed its members when a replica opened (`ReplicaConfig`) and gave
+no way to change them. `ReplicaHandle::change` now takes one `MemberChange`: add a learner, promote
+a learner to voter, demote a voter to learner, or remove a member. `ReplicaHandle::status` reads
+the configuration the replica has applied (`voters`, `learners`).
+
+- Only the leader takes a change. Another member refuses it as `NotLeader`, naming the leader it
+  knows, so the host takes it there. A write is different: a follower's or a learner's call passes
+  the leader's ReadIndex and its proposal is forwarded, as before, and applies only once committed.
+- One change at a time, in a slot of its own beside the write under way (`Changing`); neither
+  waits for the other. A second change, or one asked while the core still holds a change it has not
+  applied, is refused as `Unavailable`. So is one asked while the group takes its seed.
+- A change first passes a ReadIndex barrier, as a call does. A leader confirms reads only once it
+  has committed in its term, and releases one only once it has applied through it. So the change
+  is judged against a configuration that is current, and an election's conservative pending mark
+  (the core's `pending_conf_index`, set to its last index when it becomes leader) is applied.
+- Two phases (Ongaro and Ousterhout 2014, section 6): the change is proposed into a joint
+  configuration (`ConfChangeTransition::Implicit`), and the leader proposes the way out by itself
+  once that entry commits. The owner answers once its entry is applied in the term it proposed it
+  in and the configuration applied is no longer joint. A change the configuration already shows
+  proposes nothing and answers at once. A change the core would refuse when applied (one that
+  leaves no voter) is refused before it is proposed, by applying hyper-raft's own `Plan` to the
+  configuration, so it is never committed as a change that changes nothing. The same check refuses
+  one past the members a group may have (`TooLarge`, `MEMBERS` and the core's `Limits::members`).
+  The leader neither demotes nor removes itself: it hands on its lead first.
+- The core takes a change by marking its entry as its pending change. The owner reads that mark
+  before and after proposing, so an entry the core kept in place stating nothing is answered
+  `Unavailable`, never awaited.
+- Once proposed, a change whose lead moves or whose deadline passes before it is seen applied
+  answers `UnknownOutcome`: the caller reads the configuration before trying again. Once applied it
+  is committed; a new leader leaves the joint configuration by itself, and a deadline then answers
+  the status applied.
+- A wire record's sender is checked against the members the core counts by: the newest
+  configuration its log states, applied or not (hyper-raft's `Raft::configuration`, docs/raft.md
+  §3.4). It was checked against the configuration applied, which lags: a leader sends to a member
+  it adds from the moment it appends the change, and refused that member's answers until it
+  applied it. A removed member's records are refused from the moment the leader appends the
+  removal, which is also when it stops sending to it.
+- A member to be added opens as the learner it is to be: the group's voters and itself as a
+  learner. It campaigns for nothing, and catches up from the leader's log or a snapshot once added.
+  Replaying the log from its start under that configuration converges on the leader's: adding a
+  learner that is one already changes nothing (hyper-raft's `Configuration::change`).
+
+Evidence: Raft's configuration changes in two phases, with new servers joining as non-voting
+members first ([Ongaro and Ousterhout 2014](https://raft.github.io/raft.pdf), section 6); etcd's
+learners neither vote nor count toward a quorum until promoted
+([etcd's learner design](https://etcd.io/docs/v3.5/learning/design-learner/)); hyper-raft's
+`Raft::propose` keeps a change it can't take in place stating nothing, and its configuration is the
+newest its log states (`vendor/hyper-raft/crates/hyper-raft/src/raft.rs`); hyper-durable applies a
+change the core refuses as one that leaves the configuration as it was (`Replica::apply_change`).
+The tests: `a_learner_added_has_every_write_and_once_removed_receives_none`,
+`a_learner_is_promoted_and_demoted_through_the_joint_configuration`,
+`member_changes_are_refused_off_the_leader_at_once_or_when_impossible`,
+`a_changed_membership_holds_through_a_restart`,
+`a_change_past_its_deadline_answers_what_its_stage_knows`,
+`a_change_at_its_barrier_is_refused_once_the_lead_is_lost`,
+`a_change_another_lead_wrote_over_is_never_answered_done` and
+`a_change_holds_through_an_election_at_each_stage`.
+
+Falsified by: a change answered Ok whose configuration the replica has not applied; a change that
+commits as one changing nothing; two changes in flight on one leader; a learner missing a write
+made before or after it was added; any record sent to a member after its removal was answered; a
+removed member applying a write of its own; a member's answers refused while the leader counts it.
