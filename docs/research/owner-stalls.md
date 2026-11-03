@@ -27,23 +27,24 @@ The plan asks for at least three runs each:
 What is recorded so far:
 - **jupiter** (Windows 11 Pro 10.0.26200, NTFS, beside its shared work): three runs. Windows gives no load average;
   kiln's runner snapshots during the runs showed 1 to 24 of its 32 cores idle.
-- **adacachy** (Linux 7.2.9-cachyos, btrfs on NVMe, production's host): six runs.
+- **adacachy** (Linux 7.2.9-cachyos, btrfs on NVMe, production's host): seven runs.
   - Two at c5bd98e, at load 39-148 and 29-155, far over the gates' band, with production's I/O pressure at
     60-87%. Production's readiness check went unanswered once during the second (2026-11-01 ~23:28Z), and a
     third was stopped. These two are recorded as adacachy over the band, not as the loaded condition.
-  - Four at 93e311f by the guarded job (`stalls-adacachy-guarded.sh`). It starts a run only once the load has
-    held within 25-55 for 90 s with production ready, and stops it if production's readiness check fails twice
-    in a row, which stopped four earlier tries. adacachy's load moves fast: each run went above 55 at times.
+  - Five at 93e311f and bc3b203 by the guarded job (`stalls-adacachy-guarded.sh`). It starts a run only once the
+    load has held within 25-55 for 90 s with production ready, and stops it if production's readiness check fails
+    twice in a row, which stopped four earlier tries. adacachy's load moves fast: each run went above 55 at times.
     A run counts as the loaded condition when the median of its load samples (every 30 s) is within 25-55, its
-    range beside. Two do (medians 49.9 and 52.3), and two are over the band (medians 61.8 and 58.7).
-- Still to take on adacachy: one more loaded run, and the three calm runs. adacachy was never calm from
-  2026-11-02 01:22Z on: its calm watchers found no load under 2, and the load sampled there ran from 20.9 to 469.
+    range beside. Three do (medians 49.9, 52.3 and 40.3), and two are over the band (medians 61.8 and 58.7).
+- Still to take on adacachy: the three calm runs. The guarded job waits for each window: the load under 2 with
+  nothing compiling and production ready, held for 90 s. adacachy was never calm from 2026-11-02 01:22Z on: its
+  calm watchers found no load under 2, and the load sampled there ran from 20.9 to 469.
 
 ## Runs
 
-Each run: c5bd98e or 93e311f (which adds only this record), 1,800 s, a write every 20 ms. Times in ms; answer gaps
-are each follower's as its leader saw them, with the count over 200 ms in brackets; the last column counts the
-member's own quorum-check step-downs, the terms it moved to, and the leader changes it saw.
+Each run: c5bd98e, 93e311f or bc3b203 (which add only this record), 1,800 s, a write every 20 ms. Times in ms;
+answer gaps are each follower's as its leader saw them, with the count over 200 ms in brackets; the last column
+counts the member's own quorum-check step-downs, the terms it moved to, and the leader changes it saw.
 
 ### jupiter, run 1
 
@@ -138,3 +139,14 @@ refused.
 | 1 | 35.578/1514.219/4227.388/8323.568 | 1.074/2.204/42.030/5165.173 | 10.707/46.851/112.694/5167.328 | from 2: 0.122/161.406/967.338/5159.107 (91); from 3: 0.032/150.748/600.568/5158.490 (94) | 91/503/1020 |
 | 2 | 35.359/1477.442/4366.502/8837.759 | 1.073/1.811/43.129/5165.593 | 10.706/47.846/117.666/5174.062 | from 1: 0.146/144.863/385.601/3869.546 (101); from 3: 0.071/155.182/555.999/3869.752 (105) | 91/503/1005 |
 | 3 | 35.419/1493.028/4084.651/8323.507 | 1.073/1.798/43.248/5886.872 | 10.704/48.393/118.079/5892.227 | from 1: 0.148/142.651/337.546/5247.870 (88); from 2: 0.136/157.344/501.816/5246.961 (85) | 67/503/1006 |
+
+### adacachy, loaded, run 5 (bc3b203)
+
+2026-11-03 00:49:09Z to 01:19:22Z, load 25.4-125.4, median 40.3 (sampled every 30 s). 8,990 writes acknowledged,
+188 refused.
+
+| member | write submit to durable p50/p99/p99.9/max ms | owner step gap p50/p99/p99.9/max ms | owner tick gap p50/p99/p99.9/max ms | answer gaps while leading p50/p99/p99.9/max ms (over 200 ms) | step-downs / elections / changes |
+|---|---|---|---|---|---|
+| 1 | 36.143/550.960/3697.415/22200.168 | 1.062/2.273/46.566/8006.711 | 10.621/51.546/110.868/8012.019 | from 2: 0.089/172.452/375.240/3322.347 (150); from 3: 0.019/159.824/323.930/3319.998 (150) | 89/473/920 |
+| 2 | 36.081/474.688/3492.732/22200.560 | 1.062/2.013/47.622/8006.008 | 10.619/52.352/110.750/8010.261 | from 1: 0.107/149.510/327.101/4000.720 (103); from 3: 0.048/161.719/557.682/4106.532 (104) | 63/473/900 |
+| 3 | 36.110/518.109/3545.236/22200.197 | 1.061/1.972/47.402/8006.262 | 10.619/52.423/112.367/8009.437 | from 1: 0.117/137.725/281.362/4097.775 (84); from 2: 0.114/149.266/308.263/4096.841 (88) | 63/473/901 |
