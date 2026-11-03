@@ -27,19 +27,23 @@ The plan asks for at least three runs each:
 What is recorded so far:
 - **jupiter** (Windows 11 Pro 10.0.26200, NTFS, beside its shared work): three runs. Windows gives no load average;
   kiln's runner snapshots during the runs showed 1 to 24 of its 32 cores idle.
-- **adacachy** (Linux 7.2.9-cachyos, btrfs on NVMe, production's host): two runs, at load 39-148 and 29-155, far
-  over the gates' band, with production's I/O pressure at 60-87%. Production's readiness check went
-  unanswered once during the second run (2026-11-01 ~23:28Z), and the third run was stopped.
-  These two are recorded as adacachy over the band, not as the loaded condition.
-- The loaded (25-55) and calm runs on adacachy are not yet taken. A guarded job waits for each
-  window (`stalls-adacachy-guarded.sh`). It starts a run only once its condition has held for 90 s
-  with production ready, and stops it if production's readiness check fails twice in a row.
+- **adacachy** (Linux 7.2.9-cachyos, btrfs on NVMe, production's host): six runs.
+  - Two at c5bd98e, at load 39-148 and 29-155, far over the gates' band, with production's I/O pressure at
+    60-87%. Production's readiness check went unanswered once during the second (2026-11-01 ~23:28Z), and a
+    third was stopped. These two are recorded as adacachy over the band, not as the loaded condition.
+  - Four at 93e311f by the guarded job (`stalls-adacachy-guarded.sh`). It starts a run only once the load has
+    held within 25-55 for 90 s with production ready, and stops it if production's readiness check fails twice
+    in a row, which stopped four earlier tries. adacachy's load moves fast: each run went above 55 at times.
+    A run counts as the loaded condition when the median of its load samples (every 30 s) is within 25-55, its
+    range beside. Two do (medians 49.9 and 52.3), and two are over the band (medians 61.8 and 58.7).
+- Still to take on adacachy: one more loaded run, and the three calm runs. adacachy was never calm from
+  2026-11-02 01:22Z on: its calm watchers found no load under 2, and the load sampled there ran from 20.9 to 469.
 
 ## Runs
 
-Each run: c5bd98e, 1,800 s, a write every 20 ms. Times in ms; answer gaps are each follower's as
-its leader saw them, with the count over 200 ms in brackets; the last column counts the member's own
-quorum-check step-downs, the terms it moved to, and the leader changes it saw.
+Each run: c5bd98e or 93e311f (which adds only this record), 1,800 s, a write every 20 ms. Times in ms; answer gaps
+are each follower's as its leader saw them, with the count over 200 ms in brackets; the last column counts the
+member's own quorum-check step-downs, the terms it moved to, and the leader changes it saw.
 
 ### jupiter, run 1
 
@@ -90,3 +94,47 @@ quorum-check step-downs, the terms it moved to, and the leader changes it saw.
 | 1 | 46.190/1583.410/4831.505/11541.000 | 1.113/2.219/50.323/4446.106 | 10.918/54.318/151.289/4451.546 | from 2: 0.068/178.658/378.344/4529.613 (193); from 3: 0.017/165.427/348.209/4529.219 (189) | 127/556/1136 |
 | 2 | 45.842/1604.509/4832.162/10206.490 | 1.113/2.066/50.712/16657.861 | 10.915/54.867/148.918/16664.484 | from 1: 0.095/171.329/481.000/4559.798 (105); from 3: 0.045/184.027/520.135/4559.125 (112) | 86/556/1125 |
 | 3 | 45.941/1554.726/4609.127/10207.616 | 1.113/2.029/50.012/4446.109 | 10.922/54.482/149.848/4454.930 | from 1: 0.101/170.391/382.484/2492.350 (114); from 2: 0.067/180.960/496.987/2492.543 (107) | 72/556/1128 |
+
+### adacachy, loaded, run 1 (93e311f)
+
+2026-11-02 00:28:16Z to 00:58:35Z, load 28.5-159.6, median 49.9 (sampled every 30 s). 6,464 writes acknowledged,
+241 refused.
+
+| member | write submit to durable p50/p99/p99.9/max ms | owner step gap p50/p99/p99.9/max ms | owner tick gap p50/p99/p99.9/max ms | answer gaps while leading p50/p99/p99.9/max ms (over 200 ms) | step-downs / elections / changes |
+|---|---|---|---|---|---|
+| 1 | 53.167/1162.997/3620.196/7889.683 | 1.112/1.878/50.269/4075.419 | 10.939/55.073/126.641/4075.419 | from 2: 0.048/170.095/396.293/4138.317 (146); from 3: 0.014/160.879/363.857/4139.250 (153) | 113/522/1090 |
+| 2 | 53.049/1162.569/3410.234/7889.539 | 1.112/1.485/50.582/4076.277 | 10.943/55.318/121.273/4080.726 | from 1: 0.082/161.485/533.239/3083.123 (114); from 3: 0.036/171.377/610.545/3083.333 (114) | 84/522/1090 |
+| 3 | 52.934/1167.607/3620.348/7396.203 | 1.112/1.486/51.231/4076.305 | 10.942/55.954/136.865/4081.893 | from 1: 0.081/171.259/585.884/5347.205 (113); from 2: 0.034/180.727/663.218/2644.241 (117) | 79/522/1073 |
+
+### adacachy, loaded, run 2 (93e311f)
+
+2026-11-02 08:08:57Z to 08:39:22Z, load 38.7-72.8, median 52.3 (sampled every 30 s). 3,824 writes acknowledged, 223
+refused.
+
+| member | write submit to durable p50/p99/p99.9/max ms | owner step gap p50/p99/p99.9/max ms | owner tick gap p50/p99/p99.9/max ms | answer gaps while leading p50/p99/p99.9/max ms (over 200 ms) | step-downs / elections / changes |
+|---|---|---|---|---|---|
+| 1 | 59.372/2530.040/6846.210/14410.467 | 1.063/1.150/42.918/6527.271 | 10.621/48.313/121.586/6536.945 | from 2: 0.027/201.524/1417.374/4967.128 (170); from 3: 0.009/189.752/876.673/4968.192 (169) | 98/655/1205 |
+| 2 | 59.400/2571.589/6846.177/14410.670 | 1.063/1.136/43.677/6521.658 | 10.618/48.772/120.714/6530.244 | from 1: 0.072/184.527/1642.788/6554.087 (107); from 3: 0.028/190.142/2286.190/6554.048 (103) | 85/655/1201 |
+| 3 | 59.293/2499.193/6558.709/14410.448 | 1.063/1.132/43.835/9477.636 | 10.617/49.228/123.007/9483.032 | from 1: 0.071/190.863/1528.489/9645.032 (115); from 2: 0.018/199.963/1765.884/9645.445 (115) | 85/655/1197 |
+
+### adacachy, over the band, run 3 (93e311f)
+
+2026-11-02 08:45:23Z to 09:15:32Z, load 44.3-90.6, median 61.8 (sampled every 30 s). 4,382 writes acknowledged, 257
+refused.
+
+| member | write submit to durable p50/p99/p99.9/max ms | owner step gap p50/p99/p99.9/max ms | owner tick gap p50/p99/p99.9/max ms | answer gaps while leading p50/p99/p99.9/max ms (over 200 ms) | step-downs / elections / changes |
+|---|---|---|---|---|---|
+| 1 | 47.939/2377.840/5639.939/12739.897 | 1.070/1.601/40.870/7628.579 | 10.677/46.125/118.950/7631.121 | from 2: 0.060/188.262/1615.118/7714.853 (148); from 3: 0.018/174.954/1113.206/7711.043 (148) | 122/686/1280 |
+| 2 | 47.957/2446.437/6123.641/12739.329 | 1.070/1.432/41.129/7631.754 | 10.671/46.408/118.857/7640.442 | from 1: 0.122/168.535/707.919/3587.127 (104); from 3: 0.048/183.394/1216.057/3587.217 (103) | 97/686/1279 |
+| 3 | 47.785/2467.817/5842.871/12739.537 | 1.070/1.424/41.273/7629.418 | 10.671/46.531/120.371/7634.836 | from 1: 0.120/169.834/473.435/4905.500 (101); from 2: 0.055/187.595/1046.269/4904.349 (105) | 76/686/1283 |
+
+### adacachy, over the band, run 4 (93e311f)
+
+2026-11-02 09:19:02Z to 09:49:13Z, load 46.7-78.7, median 58.7 (sampled every 30 s). 7,191 writes acknowledged, 220
+refused.
+
+| member | write submit to durable p50/p99/p99.9/max ms | owner step gap p50/p99/p99.9/max ms | owner tick gap p50/p99/p99.9/max ms | answer gaps while leading p50/p99/p99.9/max ms (over 200 ms) | step-downs / elections / changes |
+|---|---|---|---|---|---|
+| 1 | 35.578/1514.219/4227.388/8323.568 | 1.074/2.204/42.030/5165.173 | 10.707/46.851/112.694/5167.328 | from 2: 0.122/161.406/967.338/5159.107 (91); from 3: 0.032/150.748/600.568/5158.490 (94) | 91/503/1020 |
+| 2 | 35.359/1477.442/4366.502/8837.759 | 1.073/1.811/43.129/5165.593 | 10.706/47.846/117.666/5174.062 | from 1: 0.146/144.863/385.601/3869.546 (101); from 3: 0.071/155.182/555.999/3869.752 (105) | 91/503/1005 |
+| 3 | 35.419/1493.028/4084.651/8323.507 | 1.073/1.798/43.248/5886.872 | 10.704/48.393/118.079/5892.227 | from 1: 0.148/142.651/337.546/5247.870 (88); from 2: 0.136/157.344/501.816/5246.961 (85) | 67/503/1006 |
