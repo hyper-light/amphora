@@ -36,9 +36,13 @@ What is recorded so far:
     twice in a row, which stopped four earlier tries. adacachy's load moves fast: each run went above 55 at times.
     A run counts as the loaded condition when the median of its load samples (every 30 s) is within 25-55, its
     range beside. Three do (medians 49.9, 52.3 and 40.3), and two are over the band (medians 61.8 and 58.7).
-- Still to take on adacachy: the three calm runs. The guarded job waits for each window: the load under 2 with
-  nothing compiling and production ready, held for 90 s. adacachy was never calm from 2026-11-02 01:22Z on: its
-  calm watchers found no load under 2, and the load sampled there ran from 20.9 to 469.
+- The calm condition is dropped (Ada, 2026-11-04). adacachy was never calm from 2026-11-02 01:22Z on: its calm
+  watchers found no load under 2, and the load sampled there ran from 20.9 to 469. On fedora, where Ada moved the
+  calm runs on 2026-11-03, a guarded job (`stalls-fedora-calm.sh`: load under 2 with nothing compiling, at most 3
+  tasks running and the disk under a quarter busy, held 90 s) waited from 2026-11-03 03:01Z to 2026-11-04 06:18Z.
+  It started three runs, at 16:45Z, 17:23Z and 19:39Z, and stopped each within 5.5-6.5 minutes when other work
+  raised the load again (to 7.5, 21.3 and 23.0), and no other window came. So step 2's decision rests on the
+  loaded adacachy runs and jupiter's, where the stalls occur.
 
 ## Runs
 
@@ -46,7 +50,7 @@ Each run: c5bd98e, 93e311f or bc3b203 (which add only this record), 1,800 s, a w
 answer gaps are each follower's as its leader saw them, with the count over 200 ms in brackets; the last column
 counts the member's own quorum-check step-downs, the terms it moved to, and the leader changes it saw.
 
-### jupiter, run 1
+### jupiter, run 1 (c5bd98e)
 
 2026-11-01 22:26:52Z to 22:57:19Z, no load average (Windows). 17,213 writes acknowledged, 49 refused.
 
@@ -56,7 +60,7 @@ counts the member's own quorum-check step-downs, the terms it moved to, and the 
 | 2 | 15.120/91.936/832.310/5544.306 | 0.800/31.443/47.325/3351.614 | 15.508/33.414/62.558/3351.614 | from 1: 0.414/61.858/153.793/1275.035 (14); from 3: 0.249/71.627/179.195/1275.080 (14) | 14/99/215 |
 | 3 | 15.046/91.733/831.374/5543.838 | 0.556/31.408/47.079/4423.551 | 15.509/33.616/64.514/4423.551 | from 1: 0.343/61.220/155.119/1167.131 (13); from 2: 0.440/68.723/201.300/1167.205 (16) | 11/99/212 |
 
-### jupiter, run 2
+### jupiter, run 2 (c5bd98e)
 
 2026-11-01 22:57:20Z to 23:27:37Z, no load average (Windows). 14,484 writes acknowledged, 37 refused.
 
@@ -66,7 +70,7 @@ counts the member's own quorum-check step-downs, the terms it moved to, and the 
 | 2 | 15.387/156.940/712.017/8941.751 | 0.422/31.881/64.363/3695.078 | 15.591/46.409/94.684/3695.078 | from 1: 0.399/109.001/281.793/2464.428 (164); from 3: 0.242/126.443/300.183/2465.005 (174) | 14/84/167 |
 | 3 | 15.219/168.738/711.884/8941.522 | 0.602/31.987/69.145/3695.519 | 15.590/46.357/94.826/3695.519 | from 1: 0.421/77.521/189.369/1220.103 (21); from 2: 0.538/92.578/216.980/1220.457 (24) | 11/84/168 |
 
-### jupiter, run 3
+### jupiter, run 3 (c5bd98e)
 
 2026-11-01 23:27:38Z to 23:57:48Z, no load average (Windows). 15,430 writes acknowledged, 22 refused.
 
@@ -76,7 +80,7 @@ counts the member's own quorum-check step-downs, the terms it moved to, and the 
 | 2 | 15.414/173.593/505.722/10737.078 | 0.525/31.704/78.201/1674.051 | 15.627/43.342/105.862/1674.051 | from 1: 0.266/108.728/298.337/582.416 (103); from 3: 0.146/125.388/331.339/581.564 (101) | 11/66/125 |
 | 3 | 15.398/173.829/532.792/10642.658 | 0.354/31.645/77.548/1674.177 | 15.628/44.023/107.996/1674.177 | from 1: 0.251/94.918/272.056/1781.898 (84); from 2: 0.284/116.323/292.435/1765.556 (84) | 7/66/125 |
 
-### adacachy, over the band, run 1
+### adacachy, over the band, run 1 (c5bd98e)
 
 2026-11-01 22:31:44Z to 23:02:10Z, load 39.2-147.8 (sampled every 30 s). 6,682 writes acknowledged, 191 refused.
 
@@ -86,7 +90,7 @@ counts the member's own quorum-check step-downs, the terms it moved to, and the 
 | 2 | 39.105/1373.516/4486.520/11187.296 | 1.120/2.717/51.329/13150.902 | 10.523/54.967/148.193/13152.135 | from 1: 0.153/179.511/372.601/9635.228 (197); from 3: 0.072/192.548/422.680/9269.470 (188) | 73/463/939 |
 | 3 | 39.269/1443.419/4251.885/11188.389 | 1.120/2.729/51.161/13151.647 | 10.533/54.766/155.840/13152.702 | from 1: 0.175/159.111/514.437/13204.146 (98); from 2: 0.144/169.939/1061.737/13204.261 (90) | 61/462/941 |
 
-### adacachy, over the band, run 2
+### adacachy, over the band, run 2 (c5bd98e)
 
 2026-11-01 23:02:10Z to 23:32:24Z, load 28.7-155.4 (sampled every 30 s). 6,093 writes acknowledged, 244 refused.
 
