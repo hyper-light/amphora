@@ -37,10 +37,14 @@ as a dev-dependency, as kiln's sync tests do.
 The former IOCP patch `0002` is superseded by upstream at `53a28a0`, with its regressions, and is dropped.
 The Darwin FIFO patch `0003` remains: upstream kqueue code is unchanged at this pin.
 
-`0006` is upstream's to take: it is offered as one commit on upstream's tree at this pin (`c90d5c8` on branch
-`upstream/commit-stats`, a clone kept at `~/.cache/hyper-raft-class-metrics`), its test red before the count and
-hyper-raft's lib tests, clippy and fmt passing after on an M4 Max. Pushing it is Ada's word; once upstream takes
-it, a re-vendor drops the patch.
+`0006` is upstream's to take. It is offered as one commit on upstream's main: `d5d5f8f`, on `0856e05`, branch
+`upstream/commit-stats-main` in a clone kept at `~/.cache/hyper-raft-class-metrics`, with its push remote disabled.
+- Its test was red before the count. hyper-raft's `scripts/gates.sh` (contracts, fmt, clippy with all features,
+  and every test: 2,904 passed, 0 failed, 98 ignored) exited 0 on an M4 Max (adas-mac-studio.local-2,
+  2026-11-06); the other five CI targets haven't run it.
+- Upstream main's seven commits past this pin don't touch the files it changes, so the vendored patch is the same
+  change.
+- Pushing it is Ada's word. Once upstream takes it, a re-vendor drops the patch.
 
 ## Taking a newer upstream
 
