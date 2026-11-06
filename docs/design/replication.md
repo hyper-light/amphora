@@ -310,3 +310,51 @@ a removal written over whose member's records are still refused; a change or a h
 while the core is joint or has a change to apply; a leader that can't be removed
 once it has handed on its lead; a transfer answered Ok while this member follows another; a
 learner added while the database is past the snapshot ceiling.
+
+## A forward that meets an election (2026-11-06)
+
+Serves AC-T1.8.1: a record survives the loss of the leader, and a write the loss drops is answered,
+never applied unseen. docs/requirements.toml has no criterion of leader loss alone; AC-T1.8.4 is
+failover latency, which this decision does not measure.
+
+A follower forwards its caller's proposal to the leader it knows (hyper-raft's `step_follower`).
+While the lead moves, the forward can reach that member after it has stopped leading. While it hands
+its lead over, it refuses the forward `Dropped::Transferring`. Once the transferee's vote request has
+moved it to the new term, and before the new leader's first append reaches it, it is a follower
+that knows no leader, and it refuses the forward `Dropped::NoLeader` (hyper-raft's `step_follower`
+and `step_candidate`). Either refusal answers the wire record's receipt, typed:
+`Unavailable("refused: the proposal is dropped: …")`. The proposal never entered a log. The origin
+answers its own caller on the term or leader change (`Phase::Proposed`: UnknownOutcome), as the
+retry boundary above requires. The receiving member has no caller to answer.
+
+Decided: the owner's answers stand, and the test relay tolerates both causes. A nemesis election
+may produce either, and hyper-raft classes both as ordinary refusals retried at the next leader
+(`Dropped`'s documentation), never the caller's bug. The relay had tolerated only Transferring, so
+`seed_and_delta_hold_through_an_election_at_each_step` failed whenever the forward arrived after
+the step-down: 2 runs in 400 alone and 11 in 150 under the full suite at 521e4bc (kiln goal
+fa50935c43758a6ea075b7fe77bb3fa5). `a_forward_that_arrives_mid_election_is_refused_no_leader_and_answers_unknown`
+places the arrival in that gap on driven time. The relay holds the forward, the lead moves, and the
+forward is released once the old leader stands in the new term with no leader. Before this change
+it failed 50 runs of 50 on fedora, with the reported refusal.
+
+Rejected: answering a dropped forward Ok at the receiver, as hyper-raft does for a forwarded read
+(`drop_read`). The refusal is the only record that the forward was dropped, and nothing is dropped
+silently (CLAUDE.md section 3). Also rejected: the receiver re-forwarding the proposal, or the origin
+proposing it again. An evaluated session is never replayed, and its captured base is stale once the
+term changes.
+
+Evidence: etcd's raft refuses the same three cases with `ErrProposalDropped`, "so that the proposer
+can be notified and fail fast" (etcd-io/raft c51f010: raft.go lines 86-88; stepLeader line 1305, a
+transfer in progress; stepCandidate line 1677 and stepFollower line 1714, "no leader at term %d;
+dropping proposal"). Its `Node.Propose` states that a request "can be lost without notice, therefore
+it is user's job to ensure proposal retries" (node.go line 222). In Raft, a server that doesn't lead
+refuses a client's request, and the client retries at another server (Ongaro's dissertation,
+section 6.2). A request whose answer is lost may be applied only once (section 6.3), so Amphora
+answers UnknownOutcome instead of replaying it. Source notes: docs/research/forwarded-proposals.md.
+
+Falsified by:
+- a receipt refused NoLeader by a member that knows a leader in its term;
+- a dropped forward whose origin's caller is answered Ok, or whose row appears on any replica;
+- a dropped forward whose origin's caller is answered anything but UnknownOutcome, Timeout past its
+  deadline, or a refusal given before proposing;
+- a relay tolerance that admits a Dropped cause other than Transferring and NoLeader.

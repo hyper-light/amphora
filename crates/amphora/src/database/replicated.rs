@@ -1822,6 +1822,8 @@ mod tests {
         Captures {
             leader: usize,
             held: [Option<PumpPacket>; 2],
+            // How many of `held` to fill before they may be released: one or two.
+            want: usize,
         },
     }
     /// CP-T1.8: mirror the carrier's bounded admission and observe every processed receipt.
@@ -1834,8 +1836,10 @@ mod tests {
         next_source: usize,
         records: usize,
         bytes: usize,
-        // A nemesis's elections: a leader handing off its lead refuses the proposals forwarded
-        // to it, and those refusals are counted here instead of failing the test.
+        // A nemesis's elections: a leader handing off its lead, and an old leader that has taken
+        // the new term before it hears the new leader, refuse the proposals forwarded to them
+        // (replication.md, "A forward that meets an election"). Those refusals are counted here
+        // instead of failing the test.
         refusals: Option<usize>,
         // Members removed from the group: what they sent before the removal reaches a leader that
         // no longer counts them, which refuses it as a non-member's.
@@ -1875,7 +1879,12 @@ mod tests {
                 self.bytes -= pending.bytes;
                 if let (Some(refusals), true, Err(Refusal::Unavailable(why))) =
                     (self.refusals.as_mut(), pending.proposal, &result)
-                    && why.contains("transferring its leadership")
+                    && [
+                        hyper_raft::Dropped::Transferring,
+                        hyper_raft::Dropped::NoLeader,
+                    ]
+                    .iter()
+                    .any(|cause| why.ends_with(&cause.to_string()))
                 {
                     *refusals += 1;
                     continue;
@@ -1953,12 +1962,13 @@ mod tests {
                         };
                         self.records += 1;
                         self.bytes += packet.message.bytes.len();
-                        if let PumpPhase::Captures { leader, held } = &mut self.phase {
+                        if let PumpPhase::Captures { leader, held, want } = &mut self.phase {
                             let record = Message::decode(&packet.message.bytes).unwrap();
                             if record.msg_type == hyper_raft::proto::MessageType::MsgPropose {
                                 assert_ne!(index, *leader);
                                 assert_eq!(packet.message.to, u64::try_from(*leader + 1).unwrap());
                                 assert!(held.iter().flatten().all(|other| other.from != from));
+                                assert!(held.iter().flatten().count() < *want);
                                 *held.iter_mut().find(|slot| slot.is_none()).unwrap() =
                                     Some(packet);
                                 continue;
@@ -1975,15 +1985,17 @@ mod tests {
             self.reap();
             admitted
         }
-        fn begin_captures(&mut self, leader: usize) {
+        fn begin_captures(&mut self, leader: usize, want: usize) {
             assert!(matches!(self.phase, PumpPhase::Relay));
+            assert!((1..=2).contains(&want));
             self.phase = PumpPhase::Captures {
                 leader,
                 held: [None, None],
+                want,
             };
         }
         fn captures_ready(&self) -> bool {
-            matches!(&self.phase, PumpPhase::Captures { held, .. } if held.iter().all(Option::is_some))
+            matches!(&self.phase, PumpPhase::Captures { held, want, .. } if held.iter().flatten().count() == *want)
         }
         fn release_captures(&mut self) {
             assert!(self.captures_ready());
@@ -1992,8 +2004,8 @@ mod tests {
             else {
                 panic!("capture phase disappeared")
             };
-            for packet in held {
-                self.admit(packet.unwrap());
+            for packet in held.into_iter().flatten() {
+                self.admit(packet);
             }
             self.reap();
         }
@@ -2488,7 +2500,7 @@ mod tests {
         // Both forwarded proposals are held, so both captures use the same committed base; exactly
         // one page set may apply and the stale one's answer is refused.
         let captures = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
-        pump.begin_captures(leader);
+        pump.begin_captures(leader, 2);
         let answers: Vec<_> = (1..=2usize)
             .map(|offset| {
                 let captures = Arc::clone(&captures);
@@ -2633,7 +2645,7 @@ mod tests {
                 continue;
             }
             assert!(created.is_ok(), "position {position}: {created:?}");
-            pump.begin_captures(leader);
+            pump.begin_captures(leader, 2);
             let answers: Vec<_> = (1..=2usize)
                 .map(|offset| {
                     submit(
@@ -4172,6 +4184,92 @@ mod tests {
                 values.first().unwrap()
             );
             assert_eq!(driven.call(&mut pump, client, unchanged).unwrap(), original);
+        }
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// U15/AC-T1.8.1 under a nemesis (replication.md, "A forward that meets an election"): a
+    /// follower's proposal is held on its way to the leader while the lead moves, and arrives
+    /// once the old leader has stepped down to the new term and knows no leader yet. The old
+    /// leader refuses it typed, NoLeader, a cause hyper-raft retries at the next leader; the
+    /// relay counts that refusal, the call answers UnknownOutcome, and no replica has its row.
+    #[test]
+    fn a_forward_that_arrives_mid_election_is_refused_no_leader_and_answers_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        pump.refusals = Some(0);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let (origin, next) = ((leader + 1) % 3, (leader + 2) % 3);
+        let count = |db: &mut Db| -> anyhow::Result<Vec<u8>> {
+            let mut count = 0;
+            db.query("SELECT count(*) FROM forward_items", [], |row| {
+                count = row.get::<i64>(0).map_err(unavailable)?;
+                Ok(false)
+            })?;
+            Ok(vec![u8::try_from(count)?])
+        };
+        driven
+            .call(&mut pump, clients.get(leader).unwrap(), |db| {
+                db.exec("CREATE TABLE forward_items(value BLOB)")?;
+                Ok(Vec::new())
+            })
+            .unwrap();
+
+        // The origin's forward is held before it reaches the leader.
+        pump.begin_captures(leader, 1);
+        let insert = submit(clients.get(origin).unwrap(), driven.until(), |db| {
+            db.exec("INSERT INTO forward_items VALUES(x'01')")?;
+            Ok(vec![1])
+        });
+        for _ in 0..ROUNDS {
+            if pump.captures_ready() {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        assert!(pump.captures_ready(), "the origin forwarded no proposal");
+
+        // The lead moves to the third owner; the forward is released once the old leader has
+        // taken the new term and knows no leader in it.
+        let elected = driven.owners.get(leader).unwrap().0.replica.term();
+        driven
+            .owners
+            .get_mut(leader)
+            .unwrap()
+            .0
+            .replica
+            .transfer(u64::try_from(next + 1).unwrap())
+            .unwrap();
+        for _ in 0..ROUNDS {
+            let old = &driven.owners.get(leader).unwrap().0.replica;
+            if old.term() > elected && old.leader() == 0 {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        let old = &driven.owners.get(leader).unwrap().0.replica;
+        assert!(
+            old.term() > elected && old.leader() == 0,
+            "the old leader never stood leaderless in a new term"
+        );
+        pump.release_captures();
+
+        let answered = driven.settle(&mut pump, &insert);
+        assert!(
+            matches!(answered, Err(Refusal::UnknownOutcome)),
+            "{answered:?}"
+        );
+        // The origin answers on the new term alone; the old leader's receipt is reaped here.
+        driven.drain(&mut pump);
+        assert_eq!(pump.refusals, Some(1), "the forward was not refused");
+        driven.follow(&mut pump, &clients, 0);
+        for client in &clients {
+            assert_eq!(driven.call(&mut pump, client, count).unwrap(), vec![0]);
         }
         driven.drain(&mut pump);
         pump.finish();
