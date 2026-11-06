@@ -673,7 +673,7 @@ learns that commit from its leader. So, in the replicated class:
 **Tests:**
 - An owner stating the replicated class refuses an attachment stating persisted, or other fates. One stating the
   same fates in another order is taken. One stating nothing takes the owner's class. The test was red with the
-  identity naming no durability.
+  identity naming no durability (`an_attachment_whose_durability_differs_from_its_owners_is_refused`, T-T1.8.C1).
 - In the replicated class, a write made at a follower is answered while that follower's own write of it is held.
   The test holds the flushes of the follower's log device once its write is in the leader's log. Held any sooner,
   the follower sends nothing: hyper-durable keeps a member's messages back while a write of its own is out. A

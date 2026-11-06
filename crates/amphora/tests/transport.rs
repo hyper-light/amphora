@@ -253,7 +253,7 @@ fn transport_child() {
     }
 }
 
-/// CP-T1.8 (AC-T1.8.5) and CP-T1.5, the replicated class checked at the transport
+/// CP-T1.8 (AC-T1.8.5, T-T1.8.C1) and CP-T1.5, the replicated class checked at the transport
 /// (replication.md, "Fates and durability checked"): the owner's identity names its durability.
 /// Do: an owner process in the replicated class (three fates, two to span); attach stating the
 /// persisted class, then other fates; then the same fates in another order; then open stating no

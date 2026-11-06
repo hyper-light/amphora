@@ -130,6 +130,8 @@ tests = [
   { id = "T-T1.8.M3", text = "A change holds through a deadline, an election and a restart at each stage, and a change another lead replaces gives the member back" },
   { id = "T-T1.8.M4", text = "The leader is removed once it has handed on its lead, and each way a hand-off ends answers as it should" },
   { id = "T-T1.8.M5", text = "A joiner to a database past the snapshot ceiling is refused before the change is proposed" },
+  # Amphora's own: the replicated class (docs/design/replication.md, "Fates and durability checked").
+  { id = "T-T1.8.C1", text = "An attachment whose durability differs from its owner's is refused, typed; the same fates in another order are taken; a process stating no replica restarts in the owner's class" },
 ]
 
 [[goal]]
