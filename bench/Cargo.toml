@@ -37,3 +37,11 @@ pprof = { version = "0.14", default-features = false, features = ["flamegraph"] 
 
 [profile.release]
 debug = "line-tables-only"
+
+# The vendored hyper-light crates, as the workspace's root patches them (vendor/MANIFEST.toml): the
+# bench is a workspace of its own, and amphora's replication depends on them by name.
+[patch.crates-io]
+hyper-durable = { path = "../vendor/hyper-raft/crates/hyper-durable" }
+hyper-raft = { path = "../vendor/hyper-raft/crates/hyper-raft" }
+hyper-log = { path = "../vendor/hyper-raft/crates/hyper-log" }
+hyper-block = { path = "../vendor/hyper-raft/crates/hyper-block" }
