@@ -165,5 +165,44 @@ by `disk-stalls-200.sh` (the probe carrier), with the load sampled before each r
 | Adas-Mac-Studio-2 (macOS, M4 Max) | 220f47b (50190df) | 2026-11-06 16:25Z to 16:28Z | `a_leader_whose_followers_answer_as_late_as_it_measured_keeps_its_lead` | 200 | 0 | 4.54-6.25 |
 | Adas-Mac-Studio-2 (macOS, M4 Max) | 220f47b (50190df) | 2026-11-06 16:25Z to 16:28Z | `a_leader_cut_off_from_its_followers_steps_down_within_its_patience` | 200 | 0 | 3.72-5.12 |
 
-Both nemesis tests passed after the loops on the same host (load 3.90 and 3.83). These runs are below the
-plan's load of 25 or more; the loaded loop is still to come.
+| Adas-Mac-Studio-3 (macOS, M4 Max), loaded as below | 7133cd8 (2afa2bf) | 2026-11-06 17:20Z to 17:48Z | `a_leader_whose_followers_answer_as_late_as_it_measured_keeps_its_lead` | 200 | 0 | 31.42-63.56, median 45.26 |
+| Adas-Mac-Studio-3 (macOS, M4 Max), loaded as below | 7133cd8 (2afa2bf) | 2026-11-06 17:20Z to 17:48Z | `a_leader_cut_off_from_its_followers_steps_down_within_its_patience` | 200 | 0 | 26.56-38.60, median 28.66 |
+
+Both nemesis tests passed after each loop: on Adas-Mac-Studio-2 at load 3.90 and 3.83, and on Adas-Mac-Studio-3
+under the load at 26.42 and 26.44. Adas-Mac-Studio-2's runs are below the plan's load of 25 or more;
+Adas-Mac-Studio-3's, made under the falsifier's load right after it, are all above it.
+
+## The falsifier: the patience in force, under load
+
+Kiln goal 6b112f14, the decision's falsifier (replication.md, "The leader's quorum patience"): step 1's measurement,
+the same test, with the patience in force, on a host under load in step 1's band. It is falsified if a member's
+quorum-check step-downs in a run are not fewer than the fewest of step 1's loaded runs at fixed ticks (63).
+
+adacachy is ruled out (it runs production) and fedora did not answer, so the run is on Adas-Mac-Studio-3 (macOS, M4
+Max, 14 cores, APFS on its internal SSD) under load the job made itself, holding the host's heavy lock
+(`disk-stalls-loaded.sh`, probe carrier 272bfc2):
+- disk and CPU together: six looping copies of the amphora test suite (14 threads each; its tests write databases)
+  and a 1 GiB write-and-sync loop, always on;
+- twelve groups of four CPU spinners, paused and resumed a group at a time to hold load1 within 25-55. macOS's load
+  counts runnable threads only, not those waiting on the disk as Linux's does, so the disk load alone held it near 5;
+- load1 and iostat sampled every 30 s. macOS's iostat gives no busy share; its transfers per second and MB/s stand
+  for it.
+
+25-55 on 14 cores is more per core than on adacachy's 32. The run is one, on another host than step 1's loaded runs;
+a run at fixed ticks on the same host under the same load is its control.
+
+### Adas-Mac-Studio-3, loaded, the patience in force (7133cd8)
+
+2026-11-06 16:49:55Z to 17:20:10Z, load 6.09-54.96, median 49.13 (67 samples every 30 s, from the load's start; in
+band 90 s before the run began at 50.57). Disk: 2143 to 21919 transfers a second. 4,441 writes acknowledged, 26
+refused.
+
+| member | write submit to durable p50/p99/p99.9/max ms | owner step gap p50/p99/p99.9/max ms | owner tick gap p50/p99/p99.9/max ms | answer gaps while leading p50/p99/p99.9/max ms (over 200 ms) | step-downs / elections / changes |
+|---|---|---|---|---|---|
+| 1 | 78.471/899.273/3590.718/7061.690 | 4.483/57.700/190.996/952.564 | 13.600/119.595/287.242/954.977 | from 2: 0.029/326.556/598.581/1374.210 (780); from 3: 0.025/300.762/542.861/1331.209 (756) | 12/170/249 |
+| 2 | 77.622/1034.704/3910.353/9960.922 | 4.378/58.133/190.053/1049.374 | 13.635/118.835/278.470/1056.796 | from 1: 0.040/335.591/696.899/1813.522 (1161); from 3: 0.045/341.329/716.689/2793.207 (1118) | 11/169/240 |
+| 3 | 78.039/996.562/3740.427/8180.929 | 4.891/63.646/198.244/3229.039 | 13.541/122.504/294.450/3233.587 | from 1: 0.046/291.208/616.215/1120.118 (136); from 2: 0.035/295.064/616.328/932.264 (125) | 8/171/272 |
+
+Not falsified: the members' own quorum checks stepped them down 12, 11 and 8 times, each fewer than 63. The terms
+still moved 169 to 171 times: most changes were a leader that stepped down or a follower that campaigned, which
+the decision leaves to the followers' own timers (a member's own patience stays zero).
