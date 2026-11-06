@@ -231,7 +231,14 @@ those gaps overstate what its check judges.
 ### The rule
 
 The check is a liveness device only (thesis §6.2): reads are ReadIndex reads a quorum confirms, no
-read is answered by a lease, and a leader commits nothing without a quorum. A later check deposes
+read is answered by a lease, and a leader commits nothing without a quorum. hyper-raft has no lease
+read: its reads wait for a round of a quorum's answers ("No clock is trusted", `read.rs`), and a
+leader answers one alone only where it is the one voter (`Raft::serve_read`; its tests
+`reads_asked_together_leave_in_one_round_and_one_answer_confirms_them` and
+`a_leader_the_newest_configuration_leaves_out_answers_no_read_alone`). The owner takes every call
+through that read (`Actor::receive`, `Replica::read`), and
+`a_leader_cut_off_from_its_followers_steps_down_within_its_patience` asks a read of a patient
+leader cut off from its followers and finds it unanswered until the leader steps down. A later check deposes
 no sound leader; it costs the time a leader cut off from its followers takes to learn it. The
 followers' side is unchanged: each still campaigns after its own election timeout without its
 leader, so a dead leader is replaced as fast as before.
@@ -246,7 +253,9 @@ leader, so a dead leader is replaced as fast as before.
   deposed by the gaps above its quantile; the window bounds how long one gap is believed.
 - **Quorum**: the k-th smallest of the other voters' tails, k being half the voters rounded down
   (focal's `quorum_tail`): a check needs k of them, and the ones that answer first suffice. Of two
-  followers, the smaller tail.
+  followers, the smaller tail. In a joint configuration the check needs a majority of each set, so
+  the patience is the larger of the two sets' tails, each over its own voters, and a voter of
+  either set is measured.
 - **Patience**: that tail less the election timeout, never below zero. A leader whose check is due
   after as many ticks as the gap is never deposed by a silence that long wherever it falls, since
   its check counts every answer since the last (`docs/raft.md` §3.6).
@@ -265,7 +274,8 @@ leader, so a dead leader is replaced as fast as before.
 - **A member's own patience** (`Raft::set_patience`) stays zero: its own stalls already count one
   tick, so they never run its election timer, and a patience for its leader's stalls would delay
   replacing a dead leader.
-- **The flush stays where it is.** The patience covers a voter's answer gaps whatever holds them,
+- **The flush stays where it is.** The default Persisted owner still flushes its log inline, on
+  the owner thread. The patience covers a voter's answer gaps whatever holds them,
   its owner's blocked steps among them (step gaps reached 9477.636 ms on adacachy and 7206.711 ms
   on jupiter). Moving the flush off the owner thread is t1/fast-ack's Flushing driver, the one flush
   driver: it would shorten the gaps this window measures and change nothing in this rule.
@@ -275,15 +285,21 @@ leader, so a dead leader is replaced as fast as before.
   owner's functions: `Actor::run_step` sets the patience before each tick, and `Actor::step` counts
   a voter's message in the term the owner leads. The measure is a pure core
   (`database::patience`).
-- **Metrics**: none in this change. The names proposed, for Kiln Metrics' agreement, are
-  `amphora_replica_quorum_patience_seconds` (a gauge: the patience in force) and
-  `amphora_replica_answer_gaps_refused_total` (gaps past the ceiling).
+- **Metrics**, in base units: `amphora_replica_quorum_patience_seconds` (a gauge: the patience in
+  force, its ticks times `TICK`) and `amphora_replica_quorum_patience_refused_total` (gaps past the
+  ceiling). They are added once Kiln Metrics agrees them; until then the refusal is the event
+  above.
 
 `replicated.rs` is Codex's. Codex's agent has ended, and its role is held by amphora-seam-owner
 (kiln agent 01a1b152d389767493f79adff5245f64, on Ada's word), whose agreement stands for Codex's.
-This decision was sent to it under the keys amphora-disk-stalls-quorum-patience-decision-20261106
-and amphora-disk-stalls-decision-split-20261106, and its answer is recorded here when given. No
-step 3 code lands before it.
+This decision was sent to it under the keys amphora-disk-stalls-quorum-patience-decision-20261106,
+amphora-disk-stalls-decision-split-20261106 and amphora-disk-stalls-decision-dcf884c-20261106. It
+agreed (2026-11-06) with six changes, made here: a joint configuration's two sets, the read path
+cited, no clamp at the ceiling, the metrics in base units agreed with Kiln Metrics, the falsifier
+run before the goal closes, and the inline flush noted as fast-ack's. Its reasons: the check is
+liveness only and the followers' timers are unchanged; the options are weighed on the record; k
+other tails make a majority with the leader; the measure reads no clock; the window and the
+ceiling bound it; a gap past the ceiling is refused, never clamped.
 
 Evidence: step 1's record (`docs/research/owner-stalls.md`); Raft's timing requirement and its
 check of the quorum (Ongaro's dissertation §3.4 and §6.2, https://raft.github.io/raft.pdf; Ongaro
@@ -301,6 +317,7 @@ Falsified by:
   in force after the first check following the cut, or past the ceiling
   (`a_leader_cut_off_from_its_followers_steps_down_within_its_patience`);
 - a read answered or an entry committed by a leader without a quorum;
-- step 1's measurement re-run on loaded adacachy with the patience in force, in which a member's
-  quorum-check step-downs in a run are not fewer than the fewest at fixed ticks (63): then the
-  step-downs are not the followers' tails this patience covers. Not yet run.
+- step 1's measurement re-run with the patience in force, on loaded adacachy or a Mac Studio under
+  the same load, in which a member's quorum-check step-downs in a run are not fewer than the fewest
+  at fixed ticks (63): then the step-downs are not the followers' tails this patience covers. Its
+  runs are recorded beside step 1's in `docs/research/owner-stalls.md`.
