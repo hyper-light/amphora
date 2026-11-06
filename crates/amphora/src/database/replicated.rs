@@ -2723,15 +2723,16 @@ mod tests {
         fn summary(&self) -> String {
             let mut sorted = self.samples.clone();
             sorted.sort();
-            let q = |p: f64| {
-                let i = ((sorted.len() as f64 * p).ceil() as usize).saturating_sub(1);
+            // The sample at rank ceil(n · per_mille / 1000), as before in integers.
+            let q = |per_mille: usize| {
+                let i = (sorted.len() * per_mille).div_ceil(1000).saturating_sub(1);
                 sorted.get(i).copied().unwrap_or_default().as_secs_f64() * 1e3
             };
             format!(
                 "p50 {:.3} ms p99 {:.3} ms p99.9 {:.3} ms max {:.3} ms ({} samples{})",
-                q(0.50),
-                q(0.99),
-                q(0.999),
+                q(500),
+                q(990),
+                q(999),
                 sorted.last().copied().unwrap_or_default().as_secs_f64() * 1e3,
                 sorted.len(),
                 if self.dropped > 0 {
@@ -2896,7 +2897,7 @@ mod tests {
             {
                 Ok(_) => break,
                 Err(_) if first.elapsed() < Duration::from_secs(120) => {
-                    std::thread::sleep(Duration::from_millis(100))
+                    std::thread::park_timeout(Duration::from_millis(100))
                 }
                 Err(error) => panic!("no leader took the first write: {error:?}"),
             }
@@ -2914,8 +2915,9 @@ mod tests {
                 _ => refused += 1,
             }
             next += Duration::from_millis(20);
-            if let Some(wait) = next.checked_duration_since(Instant::now()) {
-                std::thread::sleep(wait);
+            // A pacing wait; an early wake waits again for what is left.
+            while let Some(wait) = next.checked_duration_since(Instant::now()) {
+                std::thread::park_timeout(wait);
             }
         }
         stop.store(true, Ordering::Relaxed);
