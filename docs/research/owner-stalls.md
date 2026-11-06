@@ -209,3 +209,18 @@ refused.
 Not falsified: the members' own quorum checks stepped them down 12, 11 and 8 times, each fewer than 63. The terms
 still moved 169 to 171 times: most changes were a leader that stepped down or a follower that campaigned, which
 the decision leaves to the followers' own timers (a member's own patience stays zero).
+
+## An open liveness cost: terms that still move
+
+With the patience in force, leaders' own quorum checks stepped them down 12, 11 and 8 times in the run above, but the
+terms still moved 169 to 171 times in 1,800 s. Those changes are not the quorum check's: they are followers that
+campaigned when they heard nothing from their leader for an election timeout, while the leader's owner thread stood
+still (its step gaps reached 952.564, 1049.374 and 3229.039 ms), and the leaders that stepped down as a newer term
+reached them. The decision leaves them to the followers' own timers on purpose (replication.md, "The leader's quorum
+patience": a member's own patience stays zero). Each such change still answers the proposals in flight
+UnknownOutcome. It is open, recorded here, and not fixed by this goal. What would address it:
+- the leader's owner thread not standing still on its own log: the inline flush moving off the owner thread. For the
+  replicated class that is t1/fast-ack's Flushing driver; for the default Persisted class nothing does it yet;
+- or a follower patience before it campaigns, which the decision rejected: it delays replacing a dead leader, which
+  AC-T1.8.4 bounds.
+The owner of replicated.rs asked the Amphora agent to give it a goal.
