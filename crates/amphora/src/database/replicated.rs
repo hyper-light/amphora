@@ -147,8 +147,10 @@ enum Input {
         until: Instant,
         response: Response<ReplicaStatus>,
     },
-    /// Where catching up each learner stands, judged at once (`ReplicaHandle::catch_up`).
+    /// Where catching up each learner stands, judged at once (`ReplicaHandle::catch_up`), unless
+    /// `until` has passed: a stale request stages no learner's round.
     CatchUp {
+        until: Instant,
         response: Response<Vec<(u64, CatchUp)>>,
     },
 }
@@ -483,13 +485,14 @@ impl ReplicaHandle {
     /// staged, its first round sending what the leader holds then; asked again, it is judged as an
     /// election timeout passes, and its rounds end as its answers arrive. A new leader stages its
     /// learners afresh. Promoting a learner is the host's change to make. Refused off the leader,
-    /// naming the leader known (`NotLeader`).
+    /// naming the leader known (`NotLeader`); past `until` when the owner takes it (`Timeout`),
+    /// staging nothing.
     pub fn catch_up(&self, until: Instant) -> Result<Vec<(u64, CatchUp)>, Refusal> {
         if Instant::now() >= until {
             return Err(Refusal::Timeout);
         }
         let (response, receiver) = mpsc::sync_channel(1);
-        self.enqueue(Input::CatchUp { response }, CHANGE_BYTES)?;
+        self.enqueue(Input::CatchUp { until, response }, CHANGE_BYTES)?;
         receiver
             .recv_timeout(until.saturating_duration_since(Instant::now()))
             .map_err(|error| match error {
@@ -774,7 +777,7 @@ impl Actor {
                 Input::Change { response, .. } | Input::Transfer { response, .. } => {
                     answer(response, Err(reason.clone()))
                 }
-                Input::CatchUp { response } => answer(response, Err(reason.clone())),
+                Input::CatchUp { response, .. } => answer(response, Err(reason.clone())),
             }
         }
     }
@@ -1147,7 +1150,11 @@ impl Actor {
                     }
                 }
             }
-            Input::CatchUp { response } => {
+            Input::CatchUp { until, response } => {
+                if self.at >= until {
+                    answer(response, Err(Refusal::Timeout));
+                    return Ok(());
+                }
                 let judged = self.catching_up();
                 let fatal = match &judged {
                     Err(error @ Refusal::Fenced(_)) => Some(error.clone()),
@@ -2937,11 +2944,14 @@ mod tests {
     }
     /// Asks `client` where catching up each learner stands, without waiting: its answer comes on
     /// the returned receiver.
-    fn judged(client: &Client) -> mpsc::Receiver<Result<Vec<(u64, CatchUp)>, Refusal>> {
+    fn judged(
+        client: &Client,
+        until: Instant,
+    ) -> mpsc::Receiver<Result<Vec<(u64, CatchUp)>, Refusal>> {
         let (response, receiver) = mpsc::sync_channel(1);
         client
             .handle
-            .enqueue(Input::CatchUp { response }, CHANGE_BYTES)
+            .enqueue(Input::CatchUp { until, response }, CHANGE_BYTES)
             .unwrap();
         receiver
     }
@@ -2976,9 +2986,12 @@ mod tests {
         let (voter, learner) = (&clients[0], &clients[1]);
         driven.elect(&mut pump, &clients[..1], 0, 1);
         write(&mut driven, &mut pump, voter, 1);
-        assert_eq!(driven.answer(&mut pump, &judged(voter)), Ok(Vec::new()));
         assert_eq!(
-            driven.answer(&mut pump, &judged(learner)),
+            driven.answer(&mut pump, &judged(voter, driven.until())),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            driven.answer(&mut pump, &judged(learner, driven.until())),
             Err(Refusal::NotLeader { leader: None })
         );
 
@@ -2992,7 +3005,9 @@ mod tests {
         write(&mut driven, &mut pump, voter, 2);
         let mut stands = Vec::new();
         for _ in 0..ROUNDS {
-            stands = driven.answer(&mut pump, &judged(voter)).unwrap();
+            stands = driven
+                .answer(&mut pump, &judged(voter, driven.until()))
+                .unwrap();
             if stands == vec![(2, CatchUp::Ready)] {
                 break;
             }
@@ -3003,7 +3018,7 @@ mod tests {
         catch_up(&mut driven, &mut pump, &clients, 0, 1);
         assert_eq!(held(&mut driven, 1), vec![1, 2]);
         assert_eq!(
-            driven.answer(&mut pump, &judged(learner)),
+            driven.answer(&mut pump, &judged(learner, driven.until())),
             Err(Refusal::NotLeader { leader: Some(1) })
         );
 
@@ -3012,7 +3027,10 @@ mod tests {
             .answer(&mut pump, &change(voter, until, MemberChange::Promote(2)))
             .unwrap();
         assert_eq!((promoted.voters, promoted.learners), (vec![1, 2], vec![]));
-        assert_eq!(driven.answer(&mut pump, &judged(voter)), Ok(Vec::new()));
+        assert_eq!(
+            driven.answer(&mut pump, &judged(voter, driven.until())),
+            Ok(Vec::new())
+        );
         driven.drain(&mut pump);
         pump.finish();
     }
@@ -3022,8 +3040,9 @@ mod tests {
     /// over an election timeout, and staged afresh when asked again (Ongaro's thesis section
     /// 4.2.1: the leader aborts for a server that "will never catch up", and "the caller may always
     /// try again"). Do, in a group of one voter: add member 9, which has no owner, so what the
-    /// leader sends it is lost; ask where it stands, then again once an election timeout has
-    /// passed on the leader's clock, then once more. Expect: Pending, Aborted, Pending.
+    /// leader sends it is lost; ask where it stands with a deadline already past; let an election
+    /// timeout pass on the leader's clock and ask; let another pass and ask, then once more.
+    /// Expect: Timeout, staging nothing; Pending; Aborted; Pending.
     #[test]
     fn a_learner_that_never_answers_is_given_up_after_an_election_timeout() {
         let dir = tempfile::tempdir().unwrap();
@@ -3063,22 +3082,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!((added.voters, added.learners), (vec![1], vec![9]));
+        // An election timeout on ticks: the core's election_tick, each tick a step past TICK.
+        let election = |driven: &mut Driven| {
+            for _ in 0..=leader_core_election_tick(driven) {
+                driven.advance(0, TICK);
+                drop(leader.handle().drain(OUTGOING_MESSAGES).unwrap());
+                driven.step();
+            }
+        };
+        // A request whose deadline passed before the owner took it stages nothing: an election
+        // timeout later, the learner is staged afresh, not given up.
+        let stale = Instant::now();
         assert_eq!(
-            lost(&mut driven, leader, &judged(leader)),
+            lost(&mut driven, leader, &judged(leader, stale)),
+            Err(Refusal::Timeout)
+        );
+        election(&mut driven);
+        assert_eq!(
+            {
+                let until = driven.until();
+                lost(&mut driven, leader, &judged(leader, until))
+            },
             Ok(vec![(9, CatchUp::Pending)])
         );
-        // An election timeout on ticks: the core's election_tick, each tick a step past TICK.
-        for _ in 0..=leader_core_election_tick(&driven) {
-            driven.advance(0, TICK);
-            drop(leader.handle().drain(OUTGOING_MESSAGES).unwrap());
-            driven.step();
-        }
+        election(&mut driven);
         assert_eq!(
-            lost(&mut driven, leader, &judged(leader)),
+            {
+                let until = driven.until();
+                lost(&mut driven, leader, &judged(leader, until))
+            },
             Ok(vec![(9, CatchUp::Aborted)])
         );
         assert_eq!(
-            lost(&mut driven, leader, &judged(leader)),
+            {
+                let until = driven.until();
+                lost(&mut driven, leader, &judged(leader, until))
+            },
             Ok(vec![(9, CatchUp::Pending)])
         );
     }

@@ -269,7 +269,9 @@ joint configuration leaves, empty outside one). `ReplicaHandle::transfer` hands 
   shrink over one (staged afresh when asked again), else `Pending`. A new leader stages afresh, and
   a learner whose removal the core has appended but not applied is left out. Only the leader
   answers, as only it tracks each learner's progress; another member refuses `NotLeader`, naming
-  the leader it knows. It is answered at once, beside the write under way, charged as a change is
+  the leader it knows. A request whose deadline passed before the owner took it answers `Timeout`
+  and stages nothing, so a stale request never starts a learner's round. It is answered at once,
+  beside the write under way, charged as a change is
   at admission, and bounded by the configuration's learners (hyper-raft keeps one staging a
   learner). Promoting is the host's change to make (`MemberChange::Promote`), and nothing promotes
   by itself. A fatal error from the core while judging fences the owner, as a wire record's does;
