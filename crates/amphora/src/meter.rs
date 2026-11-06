@@ -362,11 +362,16 @@ mod tests {
     fn flushes_count_in_the_first_bucket_whose_bound_holds_them() {
         assert_eq!(flush_bucket(Duration::from_micros(50)), 0);
         assert_eq!(flush_bucket(Duration::from_nanos(62_500)), 0);
+        assert_eq!(flush_bucket(Duration::from_nanos(62_501)), 1);
         assert_eq!(flush_bucket(Duration::from_micros(400)), 3);
         assert_eq!(flush_bucket(Duration::from_millis(1)), 4);
         assert_eq!(flush_bucket(Duration::from_micros(1_001)), 5);
         assert_eq!(flush_bucket(Duration::from_micros(3_928)), 6);
         assert_eq!(flush_bucket(Duration::from_millis(16_384)), 18);
+        assert_eq!(
+            flush_bucket(Duration::from_millis(16_384) + Duration::from_nanos(1)),
+            FLUSH_BUCKETS - 1
+        );
         assert_eq!(flush_bucket(Duration::from_secs(600)), FLUSH_BUCKETS - 1);
     }
 
