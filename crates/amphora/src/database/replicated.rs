@@ -481,7 +481,7 @@ fn open(
     Ok((client, actor, receiver))
 }
 
-fn validate(config: &ReplicaConfig) -> Result<(), Refusal> {
+pub(super) fn validate(config: &ReplicaConfig) -> Result<(), Refusal> {
     let count = config
         .voters
         .len()

@@ -247,6 +247,17 @@ additive constructors carry them, and the existing ones keep their behavior:
   (`database::remote::tests::attach_refuses_at_the_owner_bound_before_it_touches_the_lease`,
   failing before the fix). `Database::owner` already bounded first.
 
+- The unguarded opens decide their refusals before they make a directory too (kiln goal 017b5e3d,
+  reported to Codex's role as a side effect before a refusal). They resolve paths with
+  `resolved_path`: the deepest existing ancestor made canonical, then the missing names below it,
+  as `create_dir_all` will make them. The database's parent is made by its lease, after the owner
+  table's refusals and bound; the log's by its own lease, once this process owns the database; the
+  replica configuration is checked before either. `attach_replicated` makes no directory at all: no
+  owner can hold a lease under a directory that doesn't exist, so it answers None. A missing
+  directory named by `..` can't be resolved before it is made, and is refused. What remains: a
+  refusal that depends on the database's contents (the machine's checks, the log missing beside
+  replicated state) comes after the log's lease has made the log's directory.
+
 Evidence: `database::guards::tests` with a Drop witness: sixteen same-key opens and an unguarded
 one keep one group, which outlives every `Database` clone and drops with the lease free (after the
 writer, readers and flusher drained); other guards, an unguarded owner, another file at the path
@@ -267,4 +278,7 @@ Falsified by: a group dropped while a reader, opener, flusher, actor or machine 
 holds an engine handle; two groups alive for one owner after a same-key reopen; a guarded open
 that makes a parent directory (at resolution or after it), reuses an unguarded, differently keyed or remote owner, or reuses
 an owner whose stored file identity differs from the file at the path; or attach making the
-endpoint directory at a full owner table.
+endpoint directory at a full owner table, or an unguarded open refused by the owner table, its
+bound or its configuration having made a directory
+(`database::remote::tests::refused_replicated_opens_leave_no_directory_they_made`,
+`opens_refused_at_the_owner_bound_make_no_directory`).

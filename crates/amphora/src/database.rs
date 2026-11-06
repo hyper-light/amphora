@@ -205,6 +205,46 @@ fn canonical_path(path: &Path) -> Result<PathBuf, Refusal> {
     existing_path(path)
 }
 
+/// `path` made canonical without making anything, as it will be once the directories it names are
+/// made: the deepest of its ancestors that exists made canonical, then the names below it. An
+/// unguarded open decides every refusal on this path before the step that needs its directory
+/// makes it (local-owner-transport.md, "Owner guards").
+fn resolved_path(path: &Path) -> Result<PathBuf, Refusal> {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) && !path.exists() {
+        return Err(api::invalid("database path", "dangling symlink"));
+    }
+    if path.try_exists().map_err(unavailable)? {
+        return path.canonicalize().map_err(unavailable);
+    }
+    let mut missing = vec![
+        path.file_name()
+            .ok_or_else(|| api::invalid("database path", "no file name"))?,
+    ];
+    let mut ancestor = parent(path);
+    loop {
+        // The transport's bound on a database path's depth (endpoint.rs).
+        api::bound("database directory depth", missing.len(), 256)?;
+        match ancestor.canonicalize() {
+            Ok(mut resolved) => {
+                while let Some(name) = missing.pop() {
+                    resolved.push(name);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(ancestor.file_name().ok_or_else(|| {
+                    api::invalid(
+                        "database path",
+                        "it names a missing directory by `..`, which can't be resolved before it is made",
+                    )
+                })?);
+                ancestor = parent(ancestor);
+            }
+            Err(error) => return Err(unavailable(error)),
+        }
+    }
+}
+
 /// `path` made canonical without making anything: a guarded open's parent directory exists, or it
 /// is refused (local-owner-transport.md, "Owner guards").
 fn existing_path(path: &Path) -> Result<PathBuf, Refusal> {
@@ -491,7 +531,8 @@ impl Database {
     ) -> Result<Self, Refusal> {
         let path = match guards {
             Some(_) => existing_path(path)?,
-            None => canonical_path(path)?,
+            // Its parent is made by the lease, past every refusal before it.
+            None => resolved_path(path)?,
         };
         loop {
             if Instant::now() >= until {
@@ -668,13 +709,15 @@ impl Database {
         guards: Option<Guards>,
         until: Instant,
     ) -> Result<Self, Refusal> {
+        // The log's parent is made by its lease, once this process owns the database.
         let log_path = match guards {
             Some(_) => existing_path(log_path)?,
-            None => canonical_path(log_path)?,
+            None => resolved_path(log_path)?,
         };
         log_path
             .to_str()
             .ok_or_else(|| api::invalid("replica path", "not UTF-8"))?;
+        replicated::validate(&config)?;
         let node_id = config.node_id;
         Self::owner(
             path,
