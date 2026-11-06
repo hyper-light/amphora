@@ -53,6 +53,18 @@ pub struct Fates {
     pub spanning: u32,
 }
 
+/// What the host's node-level failure detector (hyper-liveness) concluded of a member's node,
+/// told to each replicated database the node shares with it (docs/design/replication.md, "The
+/// suspicion feed"). Under the replicated class a suspected member's held answers aren't counted
+/// until it is trusted again; elections never take a verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Verdict {
+    /// `Change::Suspected`, or `Change::Stopped`: the member's node is suspected.
+    Suspected(u64),
+    /// `Change::Trusted`, or `Change::Restarted`: the member's node is trusted again.
+    Trusted(u64),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Outbound {
     pub to: u64,

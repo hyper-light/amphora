@@ -72,6 +72,10 @@ impl Backend {
 pub(crate) struct Identity {
     pub restoring: bool,
     pub replica: Option<(String, api::replication::ReplicaConfig)>,
+    /// A replicated owner's durability, its fates in member order; appended (replication.md,
+    /// "Fates and durability checked"): an older client leaves it unread at its frame's end.
+    #[serde(default)]
+    pub durability: Option<api::replication::Durability>,
 }
 
 pub(super) fn publish(database: &Database, path: &Path) -> Result<(), Refusal> {
@@ -114,23 +118,24 @@ pub(super) fn attach(
     until: Instant,
 ) -> Result<Database, Refusal> {
     let client = crate::transport::Client::connect(path, until)?;
-    let identity = validate(
-        &client,
-        replica.map(|(path, config, _)| (path, config)),
-        until,
-    )?;
-    // The owner's identity names no durability, so a client that stated none reopens persisted.
+    let identity = validate(&client, replica, until)?;
+    // A client that stated no replica reopens one in the class its owner names.
     let restart = match replica {
         Some((path, config, durability)) => {
             Some((path.to_path_buf(), config.clone(), durability.clone()))
         }
-        None => identity.replica.map(|(path, config)| {
-            (
-                PathBuf::from(path),
-                config,
-                api::replication::Durability::Persisted,
-            )
-        }),
+        None => match (identity.replica, identity.durability) {
+            (Some((path, config)), Some(durability)) => {
+                Some((PathBuf::from(path), config, durability))
+            }
+            (Some(_), None) => {
+                return Err(api::invalid(
+                    "replica ownership",
+                    "the active owner names no durability",
+                ));
+            }
+            (None, _) => None,
+        },
     };
     Ok(Database {
         shared: Arc::new(Shared {
@@ -152,7 +157,11 @@ pub(super) fn attach(
 
 pub(super) fn validate(
     client: &crate::transport::Client,
-    replica: Option<(&Path, &api::replication::ReplicaConfig)>,
+    replica: Option<(
+        &Path,
+        &api::replication::ReplicaConfig,
+        &api::replication::Durability,
+    )>,
     until: Instant,
 ) -> Result<Identity, Refusal> {
     let identity = client
@@ -164,7 +173,7 @@ pub(super) fn validate(
     if identity.restoring {
         return Err(api::invalid("database owner", "restore is incomplete"));
     }
-    if let Some((path, config)) = replica {
+    if let Some((path, config, durability)) = replica {
         let matches = identity
             .replica
             .as_ref()
@@ -173,6 +182,12 @@ pub(super) fn validate(
             return Err(api::invalid(
                 "replica ownership",
                 "the active owner has different replication configuration",
+            ));
+        }
+        if identity.durability.as_ref() != Some(durability) {
+            return Err(api::invalid(
+                "replica ownership",
+                "the active owner acknowledges writes under a different durability",
             ));
         }
     }
@@ -285,8 +300,8 @@ impl Database {
         };
         log.to_str()
             .ok_or_else(|| api::invalid("replica path", "not UTF-8"))?;
+        let durability = canonical(durability);
         let expected = Some((log.as_path(), &config, &durability));
-        let identified = Some((log.as_path(), &config));
         let mut owners = locked_until(OWNERS.get_or_init(Mutex::default), until)?;
         owners.retain(|_, owner| owner.shared.strong_count() > 0 || owner.lease.strong_count() > 0);
         let identity = file_identity(&path)?;
@@ -301,7 +316,7 @@ impl Database {
                     return Err(api::invalid("replica ownership", "restore is incomplete"));
                 }
                 match &shared.writer {
-                    Writer::Client(backend) => match validate(&backend.client, identified, until) {
+                    Writer::Client(backend) => match validate(&backend.client, expected, until) {
                         Ok(_) => {
                             backend.configure(expected)?;
                             return Ok(Some(Self { shared }));
@@ -383,17 +398,23 @@ impl Database {
         })
     }
     pub(crate) fn transport_identity(&self) -> Result<Identity, Refusal> {
-        let replica = match &self.shared.writer {
+        let (replica, durability) = match &self.shared.writer {
             Writer::Replicated {
-                log_path, config, ..
-            } => Some((
-                log_path
-                    .to_str()
-                    .ok_or_else(|| api::invalid("replica path", "not UTF-8"))?
-                    .to_owned(),
-                config.clone(),
-            )),
-            Writer::Local(_) => None,
+                log_path,
+                config,
+                durability,
+                ..
+            } => (
+                Some((
+                    log_path
+                        .to_str()
+                        .ok_or_else(|| api::invalid("replica path", "not UTF-8"))?
+                        .to_owned(),
+                    config.clone(),
+                )),
+                Some(durability.clone()),
+            ),
+            Writer::Local(_) => (None, None),
             Writer::Client(_) => {
                 return Err(api::invalid(
                     "database owner",
@@ -404,6 +425,7 @@ impl Database {
         Ok(Identity {
             restoring: self.shared.restoring.load(Ordering::Acquire),
             replica,
+            durability,
         })
     }
     pub(super) fn remote_client(&self) -> Option<&crate::transport::Client> {
@@ -699,5 +721,51 @@ mod tests {
         let attached = Database::attach_replicated(&path, &log, config, until()).unwrap();
         assert!(attached.is_some(), "the persisted attach found no owner");
         drop(owner);
+    }
+
+    /// The owner's identity before it named a durability.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Before {
+        restoring: bool,
+        replica: Option<(String, api::replication::ReplicaConfig)>,
+    }
+
+    /// CP-T1.5, the identity's append-only change (replication.md, "Fates and durability
+    /// checked"). Do: encode an identity naming a durability and read it as the identity before;
+    /// encode one of before and read it as today's. Expect: the older reader takes what it knew;
+    /// today's refuses the shorter frame rather than reading a durability into it.
+    #[test]
+    fn the_identity_names_its_durability_append_only() {
+        let config = api::replication::ReplicaConfig {
+            node_id: 1,
+            voters: vec![1, 2, 3],
+            learners: Vec::new(),
+            bootstrap: None,
+        };
+        let replica = Some(("raft.log".to_owned(), config));
+        let named = Identity {
+            restoring: false,
+            replica: replica.clone(),
+            durability: Some(api::replication::Durability::Replicated(
+                api::replication::Fates {
+                    of: vec![(1, 10), (2, 20), (3, 30)],
+                    spanning: 2,
+                },
+            )),
+        };
+        let bytes = postcard::to_allocvec(&named).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<Before>(&bytes).unwrap(),
+            Before {
+                restoring: false,
+                replica: replica.clone(),
+            }
+        );
+        let before = postcard::to_allocvec(&Before {
+            restoring: false,
+            replica,
+        })
+        .unwrap();
+        assert!(postcard::from_bytes::<Identity>(&before).is_err());
     }
 }

@@ -86,6 +86,46 @@ impl Prepared {
     }
 }
 
+/// A prepared transaction's base, the fields its encoding starts with: read without its pages.
+#[derive(Deserialize)]
+struct Base {
+    base_index: u64,
+    base_term: u64,
+}
+
+/// The base fence: a prepared transaction applies only on the point it was prepared at. Every
+/// entry applied moves the point, so the entry before it in the log decides.
+fn on_base(base_index: u64, base_term: u64, point: Point) -> Result<(), Refusal> {
+    if base_index == point.index && base_term == point.term {
+        Ok(())
+    } else {
+        Err(api::invalid(
+            "prepared transaction",
+            "the database advanced since preparation",
+        ))
+    }
+}
+
+/// What applying the prepared transaction `data` will answer, the entry before it in the log being
+/// `before`: decided from the log, so that a follower in the replicated class answers on its
+/// group's commit (replication.md, "A write made at a follower is answered on the leader's
+/// commit"). The outer error is a malformed entry, whose apply fences.
+pub(crate) fn verdict(data: &[u8], before: Point) -> Result<Result<(), Refusal>, Refusal> {
+    api::bound(
+        "replicated command",
+        data.len(),
+        COMMAND_BYTES.saturating_add(ENVELOPE_BYTES),
+    )?;
+    let base: Base = if let Some(payload) = data.strip_prefix(BASELINE_DELTA) {
+        let (_, base): (api::replication::Bootstrap, Base) =
+            postcard::from_bytes(payload).map_err(unavailable)?;
+        base
+    } else {
+        postcard::from_bytes(data).map_err(unavailable)?
+    };
+    Ok(on_base(base.base_index, base.base_term, before))
+}
+
 /// A local apply result is released only after both Raft commitment and the real state flush.
 #[derive(Debug)]
 pub struct Applied {
@@ -548,13 +588,9 @@ impl StateMachine for Machine {
             if prepared.baseline.as_ref() != self.baseline.declaration() {
                 return Err(failed("resolved delta baseline identity differs"));
             }
-            if prepared.base_index == self.point.index && prepared.base_term == self.point.term {
+            result = on_base(prepared.base_index, prepared.base_term, self.point);
+            if result.is_ok() {
                 pages = prepared.pages;
-            } else {
-                result = Err(api::invalid(
-                    "prepared transaction",
-                    "the database advanced since preparation",
-                ));
             }
         }
         self.advance(at, &pages, &self.configuration.clone(), !self.replicated)?;

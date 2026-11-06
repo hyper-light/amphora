@@ -364,9 +364,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   members spanning the fates asked hold it (hyper-raft R-8), before its leader flushes its own log. One member's
   power cut loses nothing acknowledged: the nemesis cuts and restarts a member at the end of each round of
   writes. Its metrics (flush backlog, flush seconds, commits by quorum; replication.md, "Metrics") are built on
-  t1/class-metrics, not merged; their core count is upstream in hyper-raft (`d5d5f8f`, vendored).
-  Left: the suspicion feed (hyper-liveness), the answer moving to the leader for writes made at a follower, fates
-  checked across members.
+  t1/class-metrics, not merged; their core count is upstream in hyper-raft (`d5d5f8f`, vendored). Built on
+  t1/class-quorum, not merged:
+  - the suspicion feed: the host's hyper-liveness verdicts, told through `ReplicaHandle::verdict`, leave a suspected
+    member out of held quorums until trusted;
+  - the owner's identity naming its durability, so an attachment in another class is refused, typed;
+  - a write made at a follower answered on its group's commit, before its own log write.
+
+  Left: the host running hyper-liveness and telling its verdicts; the class stated once for a group across its
+  nodes.
 - **What the language matrix found** (`bench/corpus/matrix.md`): the IN operator's collation is
   fixed (the oracles' cause E); left, from a failing test, `index_xinfo`'s NULL; then the missing
   features by how often users reach them (ORDER BY in aggregates, median and percentiles, the JSON

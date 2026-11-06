@@ -28,6 +28,8 @@ Each change is recorded in `vendor/patches/hyper-raft/`, applied in this order o
 
 | `crates/hyper-transport/src/{lib,endpoint}.rs`, `tests/exchange.rs` | Frames retain their actual connection epoch; an exporter lookup accepts exactly that peer/epoch, sharing the existing live-connection lookup | Authenticate delayed control capabilities and readiness against their true TLS origin without selecting a replacement connection, changing transport wire bytes, or adding another connection owner | `0004-cp-t2-2-frame-connection-provenance-and-exact-tls-exporter.patch` |
 
+| `crates/hyper-durable/src/replica.rs` | `Replica::suspect_held` and `Replica::trust_held`: the owner's node-level detector's verdicts for the held count alone (core step R-8, `RawNode::suspect_held`, `trust_held`), additive | Amphora elects on ticks, where `Replica::suspect`, `trust` and `restarted` are refused once they've taken the held part; its replicated class needs a suspected member left out of held quorums without its elections taking a detector's word (Amphora's docs/design/replication.md, "The suspicion feed") | `0005-cp-t1-8-the-held-count-fed-on-ticks.patch` |
+
 The first change is Quiver's and kiln's policy, not hyper-raft's, so it isn't offered upstream: hyper-durable
 calls `RamStore` slates' case (each write complete as it's submitted), and gating it in hyper-raft
 would reach slates. Focal's agent agrees (2026-10-22), and notes that Focal names `RamStore` only in a

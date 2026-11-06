@@ -408,7 +408,7 @@ such writes "could possibly roll back in the event of a transient loss (e.g. cra
 2. **Fates declared.** Each member's replica configuration names its fate: what it fails with, its host and its power
    feed. The owner sets `Config::fates` to the number asked.
 3. **Suspicion fed.** The owner gives hyper-raft its node-level detector's verdicts (`suspect_held`, `trust_held`,
-   from hyper-liveness), never the group's own heartbeats.
+   from hyper-liveness), never the group's own heartbeats ("The suspicion feed", below).
 4. **Apply answers before its flush.**
    - For an entry committed under the replicated class, the machine applies it and the answer leaves without waiting
      for the engine's WAL flush. A group flusher makes it durable after.
@@ -471,6 +471,10 @@ measured reaches the others over Wi-Fi: ping averages 16.7-242 ms, user-level ro
   for them.
 - The owner's flushing thread, one flush out at a time.
 - A remote client reopening with the durability it stated.
+- The suspicion feed on t1/class-quorum ("The suspicion feed", below): `ReplicaHandle::verdict` and the owner
+  giving each verdict to the held count.
+- On t1/class-quorum, the owner's identity naming its durability, and a follower's write answered on its group's
+  commit ("Fates and durability checked, and a follower's answer", below).
 
 Its tests:
 - the answer before the leader's flush, red with the apply flushing every entry;
@@ -481,6 +485,7 @@ Its tests:
   by hand, `AMPHORA_POWER_SEEDS`, each failing seed named with its account);
 - the cut itself: nothing the dying member writes after it survives, as on a powered-off machine (its log's device
   refuses every write and flush from the cut on, though the dying log drains what it took before its threads end).
+- a member the detector suspects left out of held quorums until trusted ("The suspicion feed", below).
 
 **Metrics** (t1/class-metrics, kiln goal 8f0f29ac; CLAUDE.md section 10). Each member's owner counts the class as it
 goes, and its host reads the counts through `ReplicaHandle::counters`, a plain snapshot
@@ -531,12 +536,6 @@ Falsified by: a backlog above 0 once a flush began after the last apply has ende
 group of one fate or of the persisted class; an entry counted under both quorums, or under neither.
 
 Not built, and none of it weakens the one-fate guarantee:
-- **The suspicion feed** (`suspect_held` from hyper-liveness, not vendored). Without it no member is ever
-  suspected. A held quorum spans two fates either way, and the leader counts only its disk. The feed narrows what
-  a gray, failing member's held answers can commit, a refinement beyond one fate's loss.
-- **The answer moving to the leader** for writes made at a follower (item 6).
-- **Fates checked across members.** The owner's transport identity doesn't name the durability, so members that
-  disagree aren't refused at the transport.
 - **A whole-site power cut bounded by the promise window,** as a test of its own.
 
 Falsified by:
@@ -546,3 +545,128 @@ Falsified by:
 - a whole-site power cut losing a write older than the promise window;
 - a restart finding the machine's WAL ahead of the member's own log;
 - held commits answering later than classic ones at p50 on the same members, against "never slower".
+
+### The suspicion feed (2026-11-06)
+
+Kiln goal dcdd872a0ed78f37902b06dd95dd3bf1. Sources and quotes are in docs/research/suspicion-feed.md.
+
+**Decision.** The detector is hyper-liveness, run by the host, and its verdicts reach the held count alone.
+- **Which detector.** hyper-liveness, vendored already at 4d72e19b (the "not vendored" above was out of date). It is
+  the detector R-8 names ("the owner's node-level detector decides (hyper-liveness), never the group's own
+  heartbeats", raft.md §3.7). It keeps one stream per pair of nodes, shared by every group they share, judged by
+  NFD-E (Chen, Toueg and Aguilera 2002). Each heartbeat proves a recent flush, so a node whose disk stalls is
+  suspected. A stalled member still answers held from memory, so that proof is the one the held count needs; a
+  group's own heartbeats would keep counting it (gray failure's "differential observability", Huang et al. 2017).
+  No equivalent is written here: one would duplicate a vendored, tested detector.
+- **Who runs it.** The host. Amphora carries no records between nodes ("Hosts carry authenticated wire records
+  only"), and hyper-liveness's heartbeats ride the host's datagram plane, one detector per node for all its groups.
+  The host maps each `Change` to `api::replication::Verdict` and tells every replicated database it shares with that
+  member, through `ReplicaHandle::verdict`:
+  - `Suspected` or `Stopped` become `Verdict::Suspected`;
+  - `Trusted` or `Restarted` become `Verdict::Trusted`;
+  - the disk and mode changes concern elections, which Amphora doesn't take from a detector, and aren't told.
+- **What it reaches.** The held count alone. Amphora elects on ticks, and there hyper-durable's `Replica::suspect`,
+  `trust` and `restarted` are refused once they've taken the held part ("On ticks the replica elects by the owner's
+  ticks and takes no detector's word", hyper-durable tests/shell.rs). Relying on a refusal's side effect is
+  refused here. Vendor change 0005 adds `Replica::suspect_held` and `trust_held`, the core's `RawNode` calls under
+  the shell's unwind boundary. It is additive, and named in vendor/hyper-raft/UPSTREAM.md to offer upstream. Moving
+  Amphora's elections to suspicion, as Focal's bus does, is another change, and not this one.
+- **Its refusals.** A verdict of this member, or of a node the configuration doesn't name, is refused, typed
+  (`Refusal::Invalid`): the core would keep nothing of it, and a dropped verdict would be silent. A full queue is
+  `Refusal::Full`, a passed deadline `Refusal::Timeout`, an ended owner `Refusal::Fenced`. The verdict takes one
+  slot of the owner's bounded queue (`COMMANDS`), charged its size. The core's set is bounded by the members limit
+  (`Error::Capacity`).
+- **A reopened owner** trusts every member until its host tells it again. That is safe: every held quorum spans the
+  fates asked whether or not anyone is suspected, and the leader counts only its disk. The host restates what its
+  detector believes to a database it opens, as Focal's owner does for a reopened replica.
+
+**Its test** (`a_member_the_detector_suspects_isnt_counted_in_a_held_quorum_until_trusted`):
+- three voters of three fates, two to span;
+- the followers' durable answers held back by the relay, their held answers let through;
+- with both followers suspected, a write at the leader isn't answered, though both followers said they hold it;
+- trusting one, the write is answered by a held quorum (the leader's disk and that member's memory);
+- with both suspected again, the next write is answered only once the durable answers are let through: the classic
+  quorum.
+It was red with the verdict taken and not given to the core.
+
+Falsified by:
+- a held commit counted from a member the host's detector suspects;
+- a verdict accepted and dropped: one of a non-member answered `Ok`, or one taken and not reaching the core;
+- a verdict changing an election.
+
+### Fates and durability checked, and a follower's answer (2026-11-06)
+
+Kiln goal db9c7620ad5e8df0a91eb2379ae77cb9: the two remaining items above, "the answer moving to the leader" (item 6)
+and "fates checked across members".
+
+**1. The owner's identity names its durability.** Every process that opens a member's database meets one owner:
+either it is the owner (in this process), or it reaches the owner over the local transport
+(docs/design/local-owner-transport.md: "Authenticated identity includes the complete replication reopening
+configuration; an explicitly configured attachment must match it"). The durability is part of that reopening
+configuration, and until now the identity left it out:
+- An in-process open compared it (`acknowledged == durability`), but in the fates' given order. The same fates in
+  another order were refused.
+- An attachment over the transport compared only the log path and the configuration. A process stating the
+  replicated class was attached to a persisted owner, or to one with other fates.
+- A process that stated no replica restarted the member persisted when it took the owner's place
+  (`remote::attach`: "a client that stated none reopens persisted"), silently changing a replicated member's class.
+
+The change:
+- `Identity` gains `durability: Option<Durability>`, appended: `Some` for a replicated owner, `None` for a standalone
+  one.
+- Both checks compare the class canonically (fates by member). A difference is refused, typed: `Refusal::Invalid`,
+  "replica ownership", naming the durability.
+- A process that stated no replica restarts with the durability the owner named.
+
+**The wire change is append-only.** The field is the identity's last, and the identity is the last thing in its
+answer's frame. postcard reads a frame from its start and leaves what follows unread, so an older client reading a
+newer owner's identity takes what it knew and ignores the rest. A newer client reading an older owner's identity
+finds the frame ending early. That is a decode failure: an owner it can't verify, refused as any other, never taken
+for the persisted class. The protocol version stays 2: no variant moves. `ReplicaStatus.bootstrapping` set the
+precedent.
+
+**Across nodes**, each member's owner states its own class, and its leader counts held answers by the leader's own
+map of fates. What one node states isn't checked against another's here: the raft wire is hyper-raft's, carried by
+the host, and the configuration both come from is the host's. A member that states the persisted class answers
+nothing held, so that disagreement only loses speed. Fates that disagree across nodes would let a leader count a held
+quorum within one real fate. Closing that needs the class stated once for the group: in its log at bootstrap, each
+member refusing an entry that states another. That is not built.
+
+**2. A write made at a follower is answered on the leader's commit.** Today a follower answers when it applies the
+write, and hyper-durable applies at a follower only what its own log holds durably (item 6). Under the replicated
+class, the write is acknowledged by the group's commit, held or classic, not by the proposer's disk. The follower
+learns that commit from its leader. So, in the replicated class:
+- a follower answers once the commit it has heard covers its entry, and its log holds that entry. It doesn't wait
+  for its own log write or its apply.
+- The answer's result is the apply's, decided from the log. The machine applies a prepared write only if the
+  database's point before it is the write's base (`Machine::apply`, "the database advanced since preparation"), and
+  every entry moves that point. So the write succeeds exactly when the entry before it in the log is its base:
+  `(index - 1, term(index - 1)) == (base_index, base_term)`.
+- The owner keeps the write pending until it applies, as now, so no later preparation can use the base before the
+  write is in it. When it applies, its result must agree with the answer given; if it doesn't, the owner fences
+  (an invariant broken, never a silent difference).
+- A later call at the follower crosses a ReadIndex barrier, which waits for the follower's apply. A caller therefore
+  reads its own write wherever it reads next.
+- The leader is unchanged: it already answers on the commit (R-6, `apply_unpersisted`). The persisted class is
+  unchanged: its answer waits for the proposer's own flush.
+
+**Tests:**
+- An owner stating the replicated class refuses an attachment stating persisted, or other fates. One stating the
+  same fates in another order is taken. One stating nothing takes the owner's class. The test was red with the
+  identity naming no durability.
+- In the replicated class, a write made at a follower is answered while that follower's own write of it is held.
+  The test holds the flushes of the follower's log device once its write is in the leader's log. Held any sooner,
+  the follower sends nothing: hyper-durable keeps a member's messages back while a write of its own is out. A
+  write at the leader, prepared on the same base, makes one of the two refused; the follower's apply must agree
+  with its answer. The test was red with the follower answering at its apply: unanswered until the hold's hang
+  guard (120 s) failed the follower's log.
+- The identity's change read both ways: an older reader takes a newer identity, and a newer reader refuses an
+  older one (`the_identity_names_its_durability_append_only`).
+
+Falsified by:
+- an attachment taken whose durability differs from its owner's;
+- a member reopened in another class than its owner's;
+- an older or newer peer's identity misread rather than refused;
+- a follower's answer that differs from its write's apply;
+- a follower answering before the group committed its write;
+- a later read at that follower missing the write.

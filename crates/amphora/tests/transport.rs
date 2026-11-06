@@ -32,6 +32,19 @@ fn replica_config() -> api::replication::ReplicaConfig {
         bootstrap: None,
     }
 }
+/// Three voters, of which this process is the first: a configuration that can span the
+/// replicated class's fates. Nothing here elects in it.
+fn class_config() -> api::replication::ReplicaConfig {
+    api::replication::ReplicaConfig {
+        node_id: 1,
+        voters: vec![1, 2, 3],
+        learners: vec![],
+        bootstrap: None,
+    }
+}
+fn class(of: Vec<(u64, u64)>, spanning: u32) -> api::replication::Durability {
+    api::replication::Durability::Replicated(api::replication::Fates { of, spanning })
+}
 fn known_leader(database: &Database) {
     let deadline = until();
     loop {
@@ -122,6 +135,20 @@ fn transport_child() {
         .unwrap()
         .as_str()
     {
+        "hold_class" => {
+            let database = Database::open_replicated_with(
+                path,
+                &path.with_extension("log"),
+                class_config(),
+                class(vec![(1, 10), (2, 20), (3, 30)], 2),
+                until(),
+            )
+            .unwrap();
+            std::io::stdout().write_all(b"\nowner-ready\n").unwrap();
+            std::io::stdout().flush().unwrap();
+            let _ = std::io::stdin().read_exact(&mut [0]);
+            drop(database);
+        }
         mode @ ("hold_owner" | "hold_replica") => {
             let database = if mode == "hold_replica" {
                 let database = Database::open_replicated(
@@ -224,6 +251,64 @@ fn transport_child() {
         }
         _ => panic!("unknown child mode"),
     }
+}
+
+/// CP-T1.8 (AC-T1.8.3) and CP-T1.5, the replicated class checked at the transport
+/// (replication.md, "Fates and durability checked"): the owner's identity names its durability.
+/// Do: an owner process in the replicated class (three fates, two to span); attach stating the
+/// persisted class, then other fates; then the same fates in another order; then open stating no
+/// replica, let the owner exit and take its place. Expect: the first two refused, typed; the third
+/// taken; the member reopened in the owner's class, so that an attachment stating persisted is
+/// still refused and one stating its fates taken.
+#[test]
+fn an_attachment_whose_durability_differs_from_its_owners_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let log = path.with_extension("log");
+    let mut predecessor = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "transport_child", "--nocapture"])
+        .env("AMPHORA_TRANSPORT_TEST_PATH", &path)
+        .env("AMPHORA_TRANSPORT_TEST_MODE", "hold_class")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(predecessor.stdout.take().unwrap());
+    let mut ready = String::new();
+    use std::io::BufRead;
+    loop {
+        ready.clear();
+        assert_ne!(stdout.read_line(&mut ready).unwrap(), 0);
+        if ready.trim() == "owner-ready" {
+            break;
+        }
+    }
+    let attach = |durability| {
+        Database::attach_replicated_with(&path, &log, class_config(), durability, until())
+    };
+    let refused = |result: Result<Option<Database>, api::Refusal>| match result {
+        Err(api::Refusal::Invalid { what, why }) => format!("{what}: {why}"),
+        Err(other) => panic!("refused untyped: {other:?}"),
+        Ok(_) => panic!("attached with another durability than its owner's"),
+    };
+    let persisted = refused(attach(api::replication::Durability::Persisted));
+    assert!(persisted.contains("durability"), "{persisted}");
+    refused(attach(class(vec![(1, 10), (2, 20), (3, 30)], 3)));
+    refused(attach(class(vec![(1, 10), (2, 20), (3, 10)], 2)));
+    let reordered = attach(class(vec![(3, 30), (1, 10), (2, 20)], 2))
+        .unwrap()
+        .expect("the owner is live");
+    drop(reordered);
+
+    let plain = Database::open(&path, until()).unwrap();
+    predecessor.stdin.take().unwrap().write_all(b"x").unwrap();
+    assert!(predecessor.wait().unwrap().success());
+    assert!(plain.ensure_owner(until()).unwrap().is_some());
+    refused(attach(api::replication::Durability::Persisted));
+    attach(class(vec![(2, 20), (3, 30), (1, 10)], 2))
+        .unwrap()
+        .expect("the reopened owner is live");
+    drop(plain);
 }
 
 #[test]
