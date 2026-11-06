@@ -154,7 +154,10 @@ fn run(seed: u64, format: LogFormat, reader_pages: i64) {
                             .map(|b| (id, b.clone()))
                             .into_iter()
                             .collect();
-                        assert_eq!(got, want, "seed {seed} {format:?} pages {reader_pages} step {step}: row {id}");
+                        assert_eq!(
+                            got, want,
+                            "seed {seed} {format:?} pages {reader_pages} step {step}: row {id}"
+                        );
                     }
                 }
             }

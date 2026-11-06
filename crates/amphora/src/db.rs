@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use amphora_engine::io::FileSyncType;
 pub use amphora_engine::LogFormat;
+use amphora_engine::io::FileSyncType;
 use amphora_engine::{
     CheckpointMode, Completion, CompletionError, ConnectOpts, Connection, Database, DatabaseOpts,
     IO, IOExt, LimboError, OpenFlags, OpenOptions, PlatformIO, Row, SqliteDialect, Statement,

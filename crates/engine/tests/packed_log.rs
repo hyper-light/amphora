@@ -723,7 +723,10 @@ fn a_mixed_log_holds_its_spills_as_pages_and_its_commits_as_records() {
         assert_eq!(table(reader), want);
     }
     let shared = db.shared_page_counts().unwrap();
-    assert!(shared.hits > 0, "no page was read from the shared pages: {shared:?}");
+    assert!(
+        shared.hits > 0,
+        "no page was read from the shared pages: {shared:?}"
+    );
     integrity(&readers[0]);
 }
 
