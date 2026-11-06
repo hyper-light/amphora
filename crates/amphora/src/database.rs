@@ -767,6 +767,7 @@ impl Database {
             .ok_or_else(|| api::invalid("replica path", "not UTF-8"))?;
         replicated::validate(&config)?;
         let durability = canonical(durability);
+        replicated::validate_durability(&config, &durability)?;
         let node_id = config.node_id;
         Self::owner(
             path,

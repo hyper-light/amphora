@@ -771,7 +771,10 @@ pub(super) fn validate(config: &ReplicaConfig) -> Result<(), Refusal> {
 /// The replicated class's configuration (docs/design/replication.md, "Fast acknowledgement"): every
 /// member states one fate, and the voters span at least the two or more fates a write's holders
 /// must. A configuration that can't is refused, typed, naming what it spans.
-fn validate_durability(config: &ReplicaConfig, durability: &Durability) -> Result<(), Refusal> {
+pub(super) fn validate_durability(
+    config: &ReplicaConfig,
+    durability: &Durability,
+) -> Result<(), Refusal> {
     let Durability::Replicated(fates) = durability else {
         return Ok(());
     };
