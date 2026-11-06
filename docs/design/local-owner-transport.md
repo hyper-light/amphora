@@ -254,9 +254,18 @@ additive constructors carry them, and the existing ones keep their behavior:
   table's refusals and bound; the log's by its own lease, once this process owns the database; the
   replica configuration is checked before either. `attach_replicated` makes no directory at all: no
   owner can hold a lease under a directory that doesn't exist, so it answers None. A missing
-  directory named by `..` can't be resolved before it is made, and is refused. What remains: a
-  refusal that depends on the database's contents (the machine's checks, the log missing beside
-  replicated state) comes after the log's lease has made the log's directory.
+  directory named by `..` can't be resolved before it is made, and is refused.
+- What remains, decided (amphora-seam-owner, in Codex's place, 2026-11-06): the refusals that need
+  the database's contents come after the log's lease. `replicated::open` takes the log's lease
+  first, which makes the log's parent directory and its `<log>.client` endpoint at the log path
+  given. Then `Machine::open_with_owner`'s refusals (such as an unfinished restore, a baseline
+  declaration whose source isn't an initial voter, a replica table without its applied marker)
+  leave those behind. Then the log file is made, and the fence "state exists but its replication log is
+  missing" (an empty log beside a database whose durable index isn't zero) leaves an empty log
+  file as well. Each is a typed, fail-closed refusal, and nothing in the database changes. They
+  aren't moved before the log's lease: opening the machine first would write its applied marker
+  into the database before the log is held, an effect on the database itself, and the fence can't
+  be decided earlier, since it needs the machine's durable index.
 
 Evidence: `database::guards::tests` with a Drop witness: sixteen same-key opens and an unguarded
 one keep one group, which outlives every `Database` clone and drops with the lease free (after the
