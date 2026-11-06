@@ -293,13 +293,48 @@ Its tests:
 - the cut itself: nothing the dying member writes after it survives, as on a powered-off machine (its log's device
   refuses every write and flush from the cut on, though the dying log drains what it took before its threads end).
 
+**Metrics** (t1/class-metrics, kiln goal 8f0f29ac; CLAUDE.md section 10). Each member's owner counts the class as it
+goes, and its host reads the counts through `ReplicaHandle::counters`, a plain snapshot
+(`meter::ReplicaCounters`), never through `ReplicaStatus`, which crosses the transport. The host exports them by
+`meter::REPLICA_METRICS`, as kiln exports its conversation stores' counters:
+
+| metric | type | what it counts |
+|---|---|---|
+| `amphora_replica_flush_backlog_entries` | gauge | entries the member applied that its database's log hasn't flushed: what a whole-site power cut can take; 0 in the persisted class, which flushes each entry it applies |
+| `amphora_replica_flush_seconds` | histogram | each flush the flushing thread ran, timed on that thread; buckets of at most 2^i ms, 1 ms to 16.384 s, then the rest |
+| `amphora_replica_commits_total{quorum}` | counter | entries the member committed as leader, by the quorum that committed each first: `held` or `classic` |
+
+- The flush's buckets span what was measured, 3.9 ms (p50, a calm Mac) to 5.6 s (max, loaded adacachy), with
+  room on both sides. A histogram, not a summary: "you cannot use a summary if you need to aggregate the
+  observations from a number of instances" (Prometheus, "Histograms and summaries"), and a group's members are
+  aggregated.
+- Commits by quorum need hyper-raft's core to say which committed (`Raft::commit_stats`, a recorded patch,
+  `vendor/patches/hyper-raft/0005`). Its commit takes the first of the classic quorum's index and the held
+  quorum's, so what a commit moves through the classic index the classic quorum holds, and past it only the
+  held quorum did. The fast track, which Amphora doesn't run, counts its own (`FastStats::committed`).
+- Labels: only `quorum`, two values. The host adds its own for the member (kiln: the store and the machine).
+
+Dashboard row **Amphora replicated class**, one panel each:
+
+| panel | query |
+|---|---|
+| Flush backlog (entries) | `amphora_replica_flush_backlog_entries` by machine |
+| Flush seconds p50 / p99 | `histogram_quantile(0.5 / 0.99, sum by (le) (rate(amphora_replica_flush_seconds_bucket[5m])))` |
+| Commits by quorum (held share) | `sum(rate(amphora_replica_commits_total{quorum="held"}[5m])) / sum(rate(amphora_replica_commits_total[5m]))` |
+
+Its tests: the counts a host reads, through a held flush and the flushing thread's, and none in the persisted
+class (`the_replicated_class_counts_its_backlog_flushes_and_commits`); the buckets
+(`flushes_count_in_the_first_bucket_whose_bound_holds_them`); the names here equal to the code's
+(`the_replica_metrics_are_the_ones_the_design_names`); the core's count
+(`a_leader_counts_each_commit_by_the_quorum_that_made_it_first`, in hyper-raft).
+
+Falsified by: a backlog above 0 once a flush began after the last apply has ended; a held commit counted in a
+group of one fate or of the persisted class; an entry counted under both quorums, or under neither.
+
 Not built, and none of it weakens the one-fate guarantee:
 - **The suspicion feed** (`suspect_held` from hyper-liveness, not vendored). Without it no member is ever
   suspected. A held quorum spans two fates either way, and the leader counts only its disk. The feed narrows what
   a gray, failing member's held answers can commit, a refinement beyond one fate's loss.
-- **Metrics by class.** hyper-raft's core doesn't say which quorum committed an entry, and `ReplicaStatus` crosses
-  the transport, so a field there is a wire change. Each takes its own change, with names agreed with the Kiln
-  Metrics agent (CLAUDE.md section 10).
 - **The answer moving to the leader** for writes made at a follower (item 6).
 - **Fates checked across members.** The owner's transport identity doesn't name the durability, so members that
   disagree aren't refused at the transport.
