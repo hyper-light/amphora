@@ -316,7 +316,7 @@ impl Client {
         let millis =
             u64::try_from(remaining(until)?.min(SESSION_MAX).as_millis()).map_err(unavailable)?;
         let hello = Hello {
-            version: 2,
+            version: VERSION,
             nonce: auth::nonce()?,
             millis,
         };
@@ -627,9 +627,18 @@ fn serve(
     let started = Instant::now();
     let greeting_until = started.checked_add(greeting).ok_or(Refusal::Timeout)?;
     let hello: Hello = read_limit(&mut stream, greeting_until, 256)?;
-    if hello.version != 2 || hello.millis == 0 || Duration::from_millis(hello.millis) > SESSION_MAX
-    {
-        return Err(api::invalid("owner greeting", "version or deadline"));
+    // A peer of another version is refused here, before any frame whose shape differs.
+    if hello.version != VERSION {
+        return Err(api::invalid(
+            "owner greeting",
+            &format!(
+                "the peer speaks version {}, this owner speaks {VERSION}",
+                hello.version
+            ),
+        ));
+    }
+    if hello.millis == 0 || Duration::from_millis(hello.millis) > SESSION_MAX {
+        return Err(api::invalid("owner greeting", "deadline"));
     }
     let nonce = auth::nonce()?;
     write_auth(
@@ -1233,6 +1242,48 @@ mod tests {
         fake.join().unwrap();
     }
 
+    /// CP-T1.8 (local-owner-transport.md, "Versions"): a peer of another protocol version is
+    /// refused at the greeting, typed, naming both versions, before any challenge or database.
+    /// Do: a client greets with version 2, the version before ReplicaStatus grew voters_outgoing.
+    /// Expect: Invalid naming 2 and this owner's version, no challenge sent, nothing acquired.
+    #[test]
+    fn a_peer_of_another_version_is_refused_at_the_greeting() {
+        let (mut client, server) = pair();
+        let accessed = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&accessed);
+        let task = thread::spawn(move || {
+            serve(
+                server,
+                [1; 32],
+                &|| {
+                    observed.fetch_add(1, Ordering::AcqRel);
+                    None
+                },
+                &Arc::new(AtomicUsize::new(0)),
+                HANG,
+            )
+        });
+        let hello = Hello {
+            version: 2,
+            nonce: [2; 32],
+            millis: 1000,
+        };
+        write(&mut client, &hello, until()).unwrap();
+        let refused = task.join().unwrap();
+        assert!(
+            matches!(
+                &refused,
+                Err(Refusal::Invalid { what, why })
+                    if what == "owner greeting"
+                        && why.contains("version 2")
+                        && why.contains(&format!("speaks {VERSION}"))
+            ),
+            "{refused:?}"
+        );
+        assert!(read::<Challenge>(&mut client, until()).is_err());
+        assert_eq!(accessed.load(Ordering::Acquire), 0);
+    }
+
     #[test]
     fn wrong_capability_never_acquires_database() {
         // U05/U06: authentication precedes writer/Records access.
@@ -1256,7 +1307,7 @@ mod tests {
         write(
             &mut client,
             &Hello {
-                version: 2,
+                version: VERSION,
                 nonce: [2; 32],
                 millis,
             },
@@ -1265,7 +1316,7 @@ mod tests {
         .unwrap();
         let challenge: Challenge = read(&mut client, until()).unwrap();
         let hello = Hello {
-            version: 2,
+            version: VERSION,
             nonce: [2; 32],
             millis,
         };
@@ -1295,7 +1346,7 @@ mod tests {
                 )
             });
             let hello = Hello {
-                version: 2,
+                version: VERSION,
                 nonce: [2; 32],
                 millis,
             };

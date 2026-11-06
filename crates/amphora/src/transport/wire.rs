@@ -15,6 +15,9 @@ pub(super) const SESSION_MAX: std::time::Duration = std::time::Duration::from_se
 /// claim (local-owner-transport.md, its resource limits).
 pub(super) const GREETING_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 pub(super) const CAP_BOUNDED_COMPACTION: u64 = 1;
+/// The protocol both ends speak. Postcard is not self-describing, so a field added to any message
+/// changes it (local-owner-transport.md, "Versions"). 3: ReplicaStatus gained voters_outgoing.
+pub(super) const VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Hello {

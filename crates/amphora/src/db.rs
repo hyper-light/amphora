@@ -692,20 +692,35 @@ impl Db {
         result
     }
 
+    /// The pages an image of this database holds now, and their bytes.
+    fn image_extent(&self) -> anyhow::Result<(u32, usize)> {
+        let pager = self.conn.get_pager();
+        let count = self
+            .io
+            .block(|| pager.with_header(|h| h.database_size.get()))?;
+        let page_size = usize::try_from(self.conn.get_page_size().get())?;
+        let size = usize::try_from(count)?
+            .checked_mul(page_size)
+            .ok_or_else(|| anyhow::anyhow!("snapshot size overflow"))?;
+        Ok((count, size))
+    }
+
+    /// The bytes an image of this database would hold now, as `image_pages` counts them.
+    pub(crate) fn image_bytes(&mut self) -> anyhow::Result<usize> {
+        self.exec("BEGIN")?;
+        let result = self.image_extent().map(|(_, size)| size);
+        self.exec("ROLLBACK")?;
+        result
+    }
+
     pub(crate) fn image_pages(&mut self, max_bytes: usize) -> anyhow::Result<Pages> {
         self.exec("BEGIN")?;
         let result = (|| {
-            let pager = self.conn.get_pager();
-            let count = self
-                .io
-                .block(|| pager.with_header(|h| h.database_size.get()))?;
-            let page_size = usize::try_from(self.conn.get_page_size().get())?;
-            let size = usize::try_from(count)?
-                .checked_mul(page_size)
-                .ok_or_else(|| anyhow::anyhow!("snapshot size overflow"))?;
+            let (count, size) = self.image_extent()?;
             if size > max_bytes {
                 anyhow::bail!("snapshot exceeds its byte budget");
             }
+            let pager = self.conn.get_pager();
             let mut pages = Vec::with_capacity(usize::try_from(count)?);
             for id in 1..=count {
                 let (page, completion) = self.io.block(|| pager.read_page(i64::from(id)))?;
