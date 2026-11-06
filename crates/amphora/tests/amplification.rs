@@ -1,5 +1,5 @@
-//! Small durable commits' write amplification (kiln goal 60805ec4, docs/design/store.md decision
-//! 35; AC-T1.4.4): the store on a disk that counts what is written to the log and to the file, under
+//! Small durable commits' write amplification (kiln goal 60805ec4, docs/design/store.md decisions
+//! 35 and 37; AC-T1.4.4): the store on a disk that counts what is written to the log and to the file, under
 //! the unify audit's batched leg (kiln's log index posting 128 grams a durable call, its
 //! statements and its shape), and the bytes written per byte of the rows its commits wrote.
 
@@ -421,15 +421,16 @@ fn batched_leg(config: Config) -> Wrote {
     }
 }
 
-/// Decision 35: the batched leg, each call durable before the next as kiln's indexer waits for it,
-/// writes into the file at most a quarter of what it writes into the log. The checkpoint copies a
-/// page that many small commits change once for them all, not once for every period's commits.
-#[test]
-fn small_commits_copy_their_pages_once_for_many_commits() {
-    let w = batched_leg(Config::default());
+/// The batched leg on the store's defaults, run once for the tests that read it.
+fn default_leg() -> &'static Wrote {
+    static LEG: std::sync::OnceLock<Wrote> = std::sync::OnceLock::new();
+    LEG.get_or_init(|| batched_leg(Config::default()))
+}
+
+/// What a leg wrote, for a failing assertion.
+fn account(w: &Wrote) -> String {
     let per_row = |b: u64| b as f64 / w.rows as f64;
-    assert!(
-        w.file.saturating_mul(4) <= w.log,
+    format!(
         "{} calls committed {} bytes of rows and wrote {} into the log ({:.1} a byte of rows, {} flushes) and {} into the file ({:.1}, {} flushes)",
         w.calls,
         w.rows,
@@ -439,5 +440,22 @@ fn small_commits_copy_their_pages_once_for_many_commits() {
         w.file,
         per_row(w.file),
         w.file_flushes,
-    );
+    )
+}
+
+/// Decision 37: the batched leg logs its commits' changes, not their pages: at most 4 bytes of log
+/// for each byte of the rows its calls commit, where a page a frame wrote 16.6.
+#[test]
+fn small_commits_log_their_changes_not_their_pages() {
+    let w = default_leg();
+    assert!(w.log <= w.rows.saturating_mul(4), "{}", account(w));
+}
+
+/// Decision 35: the batched leg, each call durable before the next as kiln's indexer waits for it,
+/// writes into the file at most a quarter of what it writes into the log. The checkpoint copies a
+/// page that many small commits change once for them all, not once for every period's commits.
+#[test]
+fn small_commits_copy_their_pages_once_for_many_commits() {
+    let w = default_leg();
+    assert!(w.file.saturating_mul(4) <= w.log, "{}", account(w));
 }
