@@ -3192,9 +3192,8 @@ impl Connection {
                     let row: Vec<Value> = stmt.row().unwrap().get_values().cloned().collect();
                     results.push(row);
                 }
-                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy);
-                }
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy),
                 _ => break,
             }
         }

@@ -678,9 +678,8 @@ pub(crate) fn vacuum_target_build_step(
                         state.phase = VacuumTargetBuildPhase::CollectSchemaRows { schema_stmt };
                         return Ok(crate::IOResult::IO(io));
                     }
-                    crate::StepResult::Busy | crate::StepResult::Interrupt => {
-                        return Err(LimboError::Busy.into());
-                    }
+                    crate::StepResult::Busy => return Err(LimboError::Busy.into()),
+                    crate::StepResult::Interrupt => return Err(LimboError::Interrupt.into()),
                 }
             }
 
@@ -744,9 +743,8 @@ pub(crate) fn vacuum_target_build_step(
                     };
                     return Ok(crate::IOResult::IO(io));
                 }
-                crate::StepResult::Busy | crate::StepResult::Interrupt => {
-                    return Err(LimboError::Busy.into());
-                }
+                crate::StepResult::Busy => return Err(LimboError::Busy.into()),
+                crate::StepResult::Interrupt => return Err(LimboError::Interrupt.into()),
             },
 
             // Phase 2: Copy data for all storage-backed tables.
@@ -881,9 +879,8 @@ pub(crate) fn vacuum_target_build_step(
                     };
                     return Ok(crate::IOResult::IO(io));
                 }
-                crate::StepResult::Busy | crate::StepResult::Interrupt => {
-                    return Err(LimboError::Busy.into());
-                }
+                crate::StepResult::Busy => return Err(LimboError::Busy.into()),
+                crate::StepResult::Interrupt => return Err(LimboError::Interrupt.into()),
             },
 
             VacuumTargetBuildPhase::StepTargetInsert {
@@ -916,9 +913,8 @@ pub(crate) fn vacuum_target_build_step(
                     };
                     return Ok(crate::IOResult::IO(io));
                 }
-                crate::StepResult::Busy | crate::StepResult::Interrupt => {
-                    return Err(LimboError::Busy.into());
-                }
+                crate::StepResult::Busy => return Err(LimboError::Busy.into()),
+                crate::StepResult::Interrupt => return Err(LimboError::Interrupt.into()),
             },
 
             // Phase 3: Create user-defined secondary indexes.
@@ -966,9 +962,8 @@ pub(crate) fn vacuum_target_build_step(
                     };
                     return Ok(crate::IOResult::IO(io));
                 }
-                crate::StepResult::Busy | crate::StepResult::Interrupt => {
-                    return Err(LimboError::Busy.into());
-                }
+                crate::StepResult::Busy => return Err(LimboError::Busy.into()),
+                crate::StepResult::Interrupt => return Err(LimboError::Interrupt.into()),
             },
 
             // Phase 4: Create triggers, views, and rootpage=0 schema objects.
@@ -1012,9 +1007,8 @@ pub(crate) fn vacuum_target_build_step(
                     };
                     return Ok(crate::IOResult::IO(io));
                 }
-                crate::StepResult::Busy | crate::StepResult::Interrupt => {
-                    return Err(LimboError::Busy.into());
-                }
+                crate::StepResult::Busy => return Err(LimboError::Busy.into()),
+                crate::StepResult::Interrupt => return Err(LimboError::Interrupt.into()),
             },
 
             VacuumTargetBuildPhase::FinalizeTargetHeader => {

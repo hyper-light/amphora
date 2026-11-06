@@ -908,7 +908,7 @@ pub fn step(
                 }
                 pause(BUSY_WAIT);
             }
-            StepResult::Interrupt => anyhow::bail!("a statement was interrupted"),
+            StepResult::Interrupt => return Err(fail(LimboError::Interrupt)),
         }
     }
 }
@@ -981,6 +981,55 @@ mod tests {
                 .query("SELECT value FROM original", [], |_| Ok(false))
                 .is_err()
         );
+    }
+
+    /// U05/U15, bug 68a308b7: Db::exec of a statement its deadline interrupts reports the
+    /// engine's interrupt, never busy, which is another connection's activity
+    /// (sqlite.org/rescode.html: SQLITE_INTERRUPT, SQLITE_BUSY). Do: exec a long insert under a
+    /// deadline already past, then the same through Db::query's own runner. Expect:
+    /// LimboError::Interrupt from both, nothing of either inserted, and the writer usable after.
+    #[test]
+    fn exec_and_query_report_a_deadline_interrupt_as_an_interrupt() {
+        let mut db = Db::open_with(
+            Path::new(":memory:interrupt"),
+            Arc::new(amphora_engine::MemoryIO::new()),
+        )
+        .unwrap();
+        db.exec("CREATE TABLE numbers(n)").unwrap();
+        const LONG: &str = "INSERT INTO numbers WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < 10000000) SELECT x FROM n";
+        let exec = db.transaction(|db| {
+            let _deadline = db.deadline(Instant::now());
+            db.exec(LONG)
+        });
+        let error = exec.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<LimboError>(),
+                Some(LimboError::Interrupt)
+            ),
+            "{error:#}"
+        );
+        let query = db.transaction(|db| {
+            let _deadline = db.deadline(Instant::now());
+            db.query(LONG, [], |_| Ok(true))
+        });
+        let error = query.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<LimboError>(),
+                Some(LimboError::Interrupt)
+            ),
+            "{error:#}"
+        );
+        db.transaction(|db| db.exec("INSERT INTO numbers VALUES (1)"))
+            .unwrap();
+        let mut count = 0;
+        db.query("SELECT count(*) FROM numbers", [], |row| {
+            count = row.get::<i64>(0).unwrap();
+            Ok(false)
+        })
+        .unwrap();
+        assert_eq!(count, 1);
     }
 
     /// U05/U15: an expired SQL VM is interrupted and the guard clears before rollback,
