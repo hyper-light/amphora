@@ -10235,6 +10235,88 @@ mod tests {
         pump.finish();
     }
 
+    /// The values of member_items a connection sees: none while there is no such table.
+    fn values(db: &mut Db) -> anyhow::Result<Vec<u8>> {
+        let mut tables = 0;
+        db.query(
+            "SELECT count(*) FROM sqlite_schema WHERE name='member_items'",
+            [],
+            |row| {
+                tables = row.get::<i64>(0).map_err(unavailable)?;
+                Ok(false)
+            },
+        )?;
+        let mut values = Vec::new();
+        if tables == 1 {
+            db.query("SELECT value FROM member_items ORDER BY value", [], |row| {
+                values.push(u8::try_from(row.get::<i64>(0).map_err(unavailable)?)?);
+                Ok(true)
+            })?;
+        }
+        Ok(values)
+    }
+    /// Steps owner `owner` alone, `rounds` times, taking each input waiting for it: nothing relayed.
+    fn step_alone(driven: &mut Driven, owner: usize, rounds: usize) {
+        let (actor, inputs) = driven.owners.get_mut(owner).unwrap().as_mut().unwrap();
+        for _ in 0..rounds {
+            while let Ok(input) = inputs.try_recv() {
+                actor.run_step(Some(input)).unwrap();
+            }
+            actor.run_step(None).unwrap();
+        }
+    }
+    /// A read of `values` on owner `owner`'s own state (replication.md, "A local read on a
+    /// replica"). Before the local read, the only read a replica has is a call, which crosses
+    /// its leader's ReadIndex: with nothing relayed, it is unanswered.
+    fn read_here(
+        driven: &mut Driven,
+        owner: usize,
+        client: &Client,
+        until: Instant,
+    ) -> Result<Vec<u8>, Refusal> {
+        let asked = submit(client, until, values);
+        step_alone(driven, owner, 64);
+        match asked.try_recv() {
+            Ok(answer) => answer.map(called),
+            Err(_) => Err(Refusal::Unavailable(
+                "a read on this replica waits for its leader".into(),
+            )),
+        }
+    }
+
+    /// CP-T1.10, Amphora goal 13f90c05 (replication.md, "A local read on a replica"), on driven
+    /// time: a local read answers with the leader gone. Do: a voter and its learner, 1 and 2
+    /// written and caught up; then the voter is gone (nothing relayed, its owner never stepped
+    /// again); the learner reads its own state. Expect: 1 and 2.
+    #[test]
+    #[ignore = "red until the local read (Amphora goal 13f90c05)"]
+    fn a_local_read_answers_with_the_leader_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = vec![
+            driven.open(dir.path(), 1, vec![1], None),
+            driven.open_member(dir.path(), 2, vec![1], vec![2], None),
+        ];
+        let mut pump = Pump::new(&clients);
+        let (voter, learner) = (clients.first().unwrap(), clients.get(1).unwrap());
+        driven.elect(&mut pump, clients.get(..1).unwrap(), 0, 1);
+        let until = driven.until();
+        driven
+            .answer(
+                &mut pump,
+                &change(voter, until, MemberChange::AddLearner(2)),
+            )
+            .unwrap();
+        write(&mut driven, &mut pump, voter, 1);
+        write(&mut driven, &mut pump, voter, 2);
+        catch_up(&mut driven, &mut pump, &clients, 0, 1);
+        driven.drain(&mut pump);
+        pump.finish();
+
+        let until = driven.until();
+        assert_eq!(read_here(&mut driven, 1, learner, until), Ok(vec![1, 2]));
+    }
+
     mod receive_receipts {
         use super::*;
 
