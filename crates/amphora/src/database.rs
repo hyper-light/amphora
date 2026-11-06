@@ -184,6 +184,18 @@ fn admission_refusal(error: store::Refused) -> Refusal {
     }
 }
 
+/// A durability with its fates in member order, so that two statements of one class compare equal
+/// wherever the owner's is checked (replication.md, "Fates and durability checked").
+fn canonical(durability: api::replication::Durability) -> api::replication::Durability {
+    match durability {
+        api::replication::Durability::Replicated(mut fates) => {
+            fates.of.sort_unstable();
+            api::replication::Durability::Replicated(fates)
+        }
+        persisted @ api::replication::Durability::Persisted => persisted,
+    }
+}
+
 fn canonical_path(path: &Path) -> Result<PathBuf, Refusal> {
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) && !path.exists() {
         return Err(api::invalid("database path", "dangling symlink"));
@@ -400,11 +412,7 @@ impl Database {
                         ));
                     }
                     if let Writer::Client(backend) = &shared.writer {
-                        match remote::validate(
-                            &backend.client,
-                            replica.map(|(path, config, _)| (path, config)),
-                            until,
-                        ) {
+                        match remote::validate(&backend.client, replica, until) {
                             Ok(_) => {
                                 backend.configure(replica)?;
                                 return Ok(Self { shared });
@@ -538,6 +546,7 @@ impl Database {
         log_path
             .to_str()
             .ok_or_else(|| api::invalid("replica path", "not UTF-8"))?;
+        let durability = canonical(durability);
         let node_id = config.node_id;
         Self::owner(
             path,

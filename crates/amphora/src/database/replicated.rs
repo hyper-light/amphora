@@ -154,6 +154,9 @@ enum Phase {
     Barrier(Option<Operation>),
     Proposed(Answer),
     Bootstrap(Option<Operation>),
+    /// A follower's write in the replicated class, answered on its group's commit with this
+    /// result, kept until it applies (`Actor::answer_committed`).
+    Answered(Result<(), Refusal>),
 }
 struct Actor<F: BlockFile + 'static = DeviceFile> {
     replica: Durable<F>,
@@ -832,6 +835,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 break;
             }
         }
+        self.answer_committed();
         self.flush()?;
         if self.replica.applied().index != self.published {
             self.refresh()?;
@@ -935,7 +939,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                     self.requeue(pending);
                 }
             }
-            Phase::Proposed(_) | Phase::Bootstrap(_) => {
+            Phase::Proposed(_) | Phase::Bootstrap(_) | Phase::Answered(_) => {
                 if let Some(response) = pending.response.take() {
                     answer(response, Err(unknown()));
                 }
@@ -1126,6 +1130,15 @@ impl<F: BlockFile + 'static> Actor<F> {
             if matches && let Some(mut pending) = self.pending.take() {
                 let result = match pending.phase {
                     Phase::Proposed(value) => applied.result.map(|()| value),
+                    // Answered on the commit: the apply must decide as the log did.
+                    Phase::Answered(given) => {
+                        if given.is_ok() != applied.result.is_ok() {
+                            return Err(fenced(
+                                "a follower's answer on the commit differs from its write's apply",
+                            ));
+                        }
+                        continue;
+                    }
                     Phase::Barrier(_) => {
                         Err(fenced("a read barrier matched an unapplied proposal"))
                     }
@@ -1159,9 +1172,14 @@ impl<F: BlockFile + 'static> Actor<F> {
                 .as_ref()
                 .is_some_and(|p| p.context == entry.context)
                 && let Some(mut pending) = self.pending.take()
-                && let Some(response) = pending.response.take()
             {
-                answer(response, Err(unknown()));
+                // Only an uncommitted entry is displaced; one answered on its commit never is.
+                if matches!(pending.phase, Phase::Answered(_)) {
+                    return Err(fenced("a write answered on its commit was displaced"));
+                }
+                if let Some(response) = pending.response.take() {
+                    answer(response, Err(unknown()));
+                }
             }
         }
         let mut outgoing = locked(&self.control.outgoing)?;
@@ -1185,6 +1203,59 @@ impl<F: BlockFile + 'static> Actor<F> {
             });
         }
         Ok(())
+    }
+    /// The replicated class at a follower (replication.md, "A write made at a follower is answered
+    /// on the leader's commit"): a write made here is answered once the commit this member has
+    /// heard covers its entry, with what its apply will answer, decided from the log; its own log
+    /// write and apply come after. Only entries past this member's log write are looked at, the
+    /// core's unstable entries (`Limits::unstable_entries`); one this member's log holds already
+    /// is answered at its apply, which follows.
+    fn answer_committed(&mut self) {
+        let raft = &self.replica.core().raft;
+        if raft.config().fates.is_none() || self.replica.is_leader() {
+            return;
+        }
+        let Some(pending) = self.pending.as_ref() else {
+            return;
+        };
+        if !matches!(pending.phase, Phase::Proposed(_)) {
+            return;
+        }
+        let log = raft.log();
+        let committed = log.committed();
+        let Some(entry) = log
+            .unstable()
+            .entries()
+            .iter()
+            .take_while(|entry| entry.index <= committed)
+            .find(|entry| entry.context == pending.context)
+        else {
+            return;
+        };
+        // An entry whose predecessor's term this member no longer has is answered at its apply.
+        let Some(before) = entry.index.checked_sub(1).and_then(|index| {
+            Some(Point {
+                index,
+                term: log.term(index).ok()?,
+            })
+        }) else {
+            return;
+        };
+        let result = match crate::replication::verdict(&entry.data, before) {
+            Ok(result) => result,
+            // A malformed entry fences at its apply, which answers.
+            Err(_) => return,
+        };
+        let Some(mut pending) = self.pending.take() else {
+            return;
+        };
+        if let Phase::Proposed(value) =
+            std::mem::replace(&mut pending.phase, Phase::Answered(result.clone()))
+            && let Some(response) = pending.response.take()
+        {
+            answer(response, result.map(|()| value));
+        }
+        self.pending = Some(pending);
     }
     fn context(&mut self) -> Result<Vec<u8>, Refusal> {
         self.serial = self
@@ -2361,7 +2432,6 @@ mod tests {
             self.clocks.push(reading);
             client
         }
-        #[allow(clippy::too_many_arguments)]
         fn power_owner(
             &self,
             dir: &Path,
@@ -2374,6 +2444,25 @@ mod tests {
             Client,
             (Actor<hyper_block::sim::SimHandle>, mpsc::Receiver<Envelope>),
         ) {
+            let log = power.log.handle().unwrap();
+            self.owner_on(dir, node_id, voters, durability, power, log, reading)
+        }
+    }
+
+    impl<F: BlockFile + 'static> Driven<F> {
+        /// Member `node_id`: its database on `power`'s disk, its log on `log`, its leases on files
+        /// under `dir`, its clock `reading`.
+        #[allow(clippy::too_many_arguments)]
+        fn owner_on(
+            &self,
+            dir: &Path,
+            node_id: u64,
+            voters: Vec<u64>,
+            durability: Durability,
+            power: &Power,
+            log: F,
+            reading: Arc<AtomicU64>,
+        ) -> (Client, (Actor<F>, mpsc::Receiver<Envelope>)) {
             let machine_lease = lease(&dir.join(format!("state-{node_id}.lease")));
             let log_owner =
                 Arc::try_unwrap(lease(&dir.join(format!("raft-{node_id}.lease")))).unwrap();
@@ -2395,7 +2484,7 @@ mod tests {
             let (client, actor, receiver) = super::open_on(
                 machine,
                 log_owner,
-                power.log.handle().unwrap(),
+                log,
                 ReplicaConfig {
                     node_id,
                     voters,
@@ -2411,6 +2500,9 @@ mod tests {
             .unwrap();
             (client, (actor, receiver))
         }
+    }
+
+    impl Driven<hyper_block::sim::SimHandle> {
         /// Member `owner`'s power cut, and the member restarted on what survived: its log loses
         /// what it hadn't flushed, its database what it hadn't synced. The other members run on.
         /// Its clock runs on too. Returns the restarted member's client.
@@ -2432,6 +2524,258 @@ mod tests {
             *self.owners.get_mut(owner).unwrap() = Some(restarted);
             client
         }
+    }
+
+    /// Holds the flushes of a member's log device while the test says so: its writes go on, and
+    /// none becomes durable until the test lets them go. The log's own threads wait here, never
+    /// the test's.
+    #[derive(Default)]
+    struct Gate {
+        held: Mutex<bool>,
+        moved: std::sync::Condvar,
+    }
+    impl Gate {
+        fn hold(&self) {
+            *self.held.lock().unwrap() = true;
+        }
+        fn release(&self) {
+            *self.held.lock().unwrap() = false;
+            self.moved.notify_all();
+        }
+        /// Waits while the flushes are held, up to the transport tests' hang guard: a hang,
+        /// never a verdict.
+        fn pass(&self) -> Result<(), hyper_block::DiskError> {
+            let until = Instant::now() + crate::transport::HANG;
+            let mut held = self.held.lock().unwrap();
+            while *held {
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(hyper_block::DiskError::Io {
+                        op: "a held flush",
+                        path: std::path::PathBuf::new(),
+                        source: std::io::Error::from(std::io::ErrorKind::TimedOut),
+                    });
+                }
+                held = self.moved.wait_timeout(held, left).unwrap().0;
+            }
+            Ok(())
+        }
+    }
+    /// A member's log on a simulated device whose flushes, and writes durable on their own, wait
+    /// at its gate.
+    struct Gated {
+        log: hyper_block::sim::SimHandle,
+        gate: Arc<Gate>,
+    }
+    impl BlockFile for Gated {
+        fn alignment(&self) -> hyper_block::buf::Alignment {
+            self.log.alignment()
+        }
+        fn layout_block(&self) -> hyper_block::buf::Alignment {
+            self.log.layout_block()
+        }
+        fn len(&self) -> Result<u64, hyper_block::DiskError> {
+            self.log.len()
+        }
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), hyper_block::DiskError> {
+            self.log.read_exact_at(buf, offset)
+        }
+        fn read_resident_at(
+            &mut self,
+            buf: &mut [u8],
+            offset: u64,
+        ) -> Result<bool, hyper_block::DiskError> {
+            self.log.read_resident_at(buf, offset)
+        }
+        fn reads_resident(&self) -> bool {
+            self.log.reads_resident()
+        }
+        fn residency(&self) -> hyper_block::Residency {
+            self.log.residency()
+        }
+        fn set_residency_shadow(&mut self, on: bool) {
+            self.log.set_residency_shadow(on);
+        }
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), hyper_block::DiskError> {
+            self.log.write_all_at(buf, offset)
+        }
+        fn sync_data(&self) -> Result<(), hyper_block::DiskError> {
+            self.gate.pass()?;
+            self.log.sync_data()
+        }
+        fn fills_new_space(&self) -> bool {
+            self.log.fills_new_space()
+        }
+        fn grows_by_segments(&self) -> bool {
+            self.log.grows_by_segments()
+        }
+        fn grow(&self, len: u64) -> Result<Option<u64>, hyper_block::DiskError> {
+            self.log.grow(len)
+        }
+        fn write_whole(
+            &self,
+            offset: u64,
+            copies: u64,
+            fill: &[u8],
+        ) -> Result<(), hyper_block::DiskError> {
+            self.log.write_whole(offset, copies, fill)
+        }
+        fn segment_end(&self, offset: u64) -> Result<Option<u64>, hyper_block::DiskError> {
+            self.log.segment_end(offset)
+        }
+        fn write_durable_at(
+            &self,
+            buf: &[u8],
+            offset: u64,
+        ) -> Result<hyper_block::block::Durable, hyper_block::DiskError> {
+            self.gate.pass()?;
+            self.log.write_durable_at(buf, offset)
+        }
+        fn try_clone(&self) -> Result<Self, hyper_block::DiskError> {
+            Ok(Self {
+                log: self.log.try_clone()?,
+                gate: Arc::clone(&self.gate),
+            })
+        }
+    }
+    impl Driven<Gated> {
+        /// Member `node_id`: its database on `power`'s disk, its log on `power`'s device behind
+        /// `gate`.
+        fn open_gated(
+            &mut self,
+            dir: &Path,
+            node_id: u64,
+            voters: Vec<u64>,
+            durability: Durability,
+            power: &Power,
+            gate: &Arc<Gate>,
+        ) -> Client {
+            let reading = Arc::new(AtomicU64::new(0));
+            let log = Gated {
+                log: power.log.handle().unwrap(),
+                gate: Arc::clone(gate),
+            };
+            let (client, owner) = self.owner_on(
+                dir,
+                node_id,
+                voters,
+                durability,
+                power,
+                log,
+                Arc::clone(&reading),
+            );
+            self.owners.push(Some(owner));
+            self.clocks.push(reading);
+            client
+        }
+    }
+
+    /// CP-T1.8 (AC-T1.8.3), the replicated class's answer for a write made at a follower
+    /// (replication.md, "A write made at a follower is answered on the leader's commit"). Do: three
+    /// voters of three fates, two to span; writes at the leader that every member applies; then a
+    /// write at a follower and one at the leader, both prepared on one base; the follower's log
+    /// flushes held once its write is in the leader's log. Expect: the follower's answer while it
+    /// hasn't applied its write; of the two writes one taken and the other refused as its apply
+    /// refuses it; once the flushes go, the follower applies as it answered and reads the write
+    /// that took.
+    #[test]
+    fn a_write_at_a_follower_is_answered_on_its_groups_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::<Gated>::empty();
+        let durability = Durability::Replicated(api::replication::Fates {
+            of: vec![(1, 10), (2, 20), (3, 30)],
+            spanning: 2,
+        });
+        let powers: Vec<Power> = (1..=3).map(Power::new).collect();
+        let gates: Vec<Arc<Gate>> = (0..3).map(|_| Arc::new(Gate::default())).collect();
+        let clients: Vec<Client> = (0..3)
+            .map(|i| {
+                driven.open_gated(
+                    dir.path(),
+                    u64::try_from(i + 1).unwrap(),
+                    vec![1, 2, 3],
+                    durability.clone(),
+                    powers.get(i).unwrap(),
+                    gates.get(i).unwrap(),
+                )
+            })
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        // Writes before the test's, so that each follower states a durable promise and answers
+        // held at once (hyper-raft R-8).
+        for n in 0..4 {
+            let answer = driven.call(&mut pump, clients.get(leader).unwrap(), move |db| {
+                db.exec(&format!("CREATE TABLE warm{n}(value)"))?;
+                Ok(Vec::new())
+            });
+            assert_eq!(answer, Ok(Vec::new()));
+        }
+        let applied = clients
+            .get(leader)
+            .unwrap()
+            .handle()
+            .status()
+            .unwrap()
+            .applied;
+        driven.follow(&mut pump, &clients, applied);
+
+        let follower = (0..3).find(|i| *i != leader).unwrap();
+        let id = u64::try_from(follower + 1).unwrap();
+        let write = |made: u8| {
+            move |db: &mut Db| {
+                db.exec(&format!("INSERT INTO warm0 VALUES ({made})"))?;
+                Ok(vec![made])
+            }
+        };
+        let at_follower = submit(clients.get(follower).unwrap(), driven.until(), write(1));
+        let at_leader = submit(clients.get(leader).unwrap(), driven.until(), write(2));
+        // Rounds until the follower's write is in the leader's log: its proposal has left it, and
+        // the leader's append of it is still to be relayed.
+        let index = (0..ROUNDS)
+            .find_map(|_| {
+                driven.round(&mut pump);
+                let log = driven.owner(leader).replica.core().raft.log();
+                log.entries(applied + 1, u64::MAX, 16)
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry.context.starts_with(&id.to_le_bytes()))
+                    .map(|entry| entry.index)
+            })
+            .expect("the follower's write never reached its leader");
+        gates.get(follower).unwrap().hold();
+        let answered = driven.settle(&mut pump, &at_follower);
+        let at = driven.owner(follower).replica.applied().index;
+        assert!(
+            at < index,
+            "the follower answered at its apply ({at}), not on the commit of {index}"
+        );
+        let other = driven.settle(&mut pump, &at_leader);
+        let results = [answered, other];
+        let taken: Vec<&Vec<u8>> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+        assert_eq!(taken.len(), 1, "{results:?}");
+        assert!(
+            results.iter().any(|result| matches!(
+                result,
+                Err(Refusal::Invalid { why, .. }) if why.contains("advanced since preparation")
+            )),
+            "{results:?}"
+        );
+
+        gates.get(follower).unwrap().release();
+        driven.follow(&mut pump, &clients, index);
+        let rows = driven.call(&mut pump, clients.get(follower).unwrap(), |db| {
+            let mut rows = Vec::new();
+            db.query("SELECT value FROM warm0", [], |row| {
+                rows.push(row.get_value(0).to_string());
+                Ok(true)
+            })?;
+            Ok(rows.join(",").into_bytes())
+        });
+        let made = taken.first().unwrap().first().unwrap().to_string();
+        assert_eq!(rows, Ok(made.into_bytes()));
+        driven.drain(&mut pump);
+        pump.finish();
     }
 
     /// A seeded generator (xorshift64*): a seed's schedule is its own.
