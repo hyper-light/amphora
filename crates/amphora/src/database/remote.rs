@@ -243,11 +243,13 @@ impl Database {
                 return Err(unavailable("previous database owner is draining"));
             }
         }
+        // Admission before the probe: a probe makes the endpoint directory and takes the lease,
+        // which a full table would refuse to anyone who went on to open.
+        api::bound("open database owners", owners.len().saturating_add(1), 4096)?;
         if let Some(lease) = try_exclusive_file(&path)? {
             drop(lease);
             return Ok(None);
         }
-        api::bound("open database owners", owners.len().saturating_add(1), 4096)?;
         let database = attach(&path, expected, until)?;
         owners.insert(
             path,
@@ -372,5 +374,59 @@ pub(super) fn submit(
         Operation::Call(_) | Operation::Mutation(Mutation::Sql(_) | Mutation::Migrate(_)) => {
             Err(api::invalid("client operation", "unexpected dispatch"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn until() -> Instant {
+        Instant::now() + crate::transport::HANG
+    }
+
+    #[test]
+    fn attach_refuses_at_the_owner_bound_before_it_touches_the_lease() {
+        // CP-T1.5 (U05): attach with the owner table full, on a database no process owns, is
+        // refused at the bound and leaves no endpoint directory or lease behind.
+        if !in_child(
+            "database::remote::tests::attach_refuses_at_the_owner_bound_before_it_touches_the_lease",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let held = Arc::new(File::create(dir.path().join("held")).unwrap());
+        {
+            let mut owners = OWNERS.get_or_init(Mutex::default).lock().unwrap();
+            for n in 0..4096 {
+                owners.insert(
+                    dir.path().join(format!("full-{n}")),
+                    Owner {
+                        shared: Weak::new(),
+                        lease: Arc::downgrade(&held),
+                        identity: None,
+                    },
+                );
+            }
+        }
+        let path = dir.path().join("db");
+        let config = api::replication::ReplicaConfig {
+            node_id: 1,
+            voters: vec![1],
+            learners: vec![],
+            bootstrap: None,
+        };
+        let attached = Database::attach_replicated(&path, &dir.path().join("log"), config, until());
+        assert!(
+            matches!(attached, Err(Refusal::TooLarge { limit: 4096, .. })),
+            "attach at the bound: {:?}",
+            attached.map(|d| d.is_some())
+        );
+        let mut sidecar = path.into_os_string();
+        sidecar.push(".client");
+        assert!(
+            !Path::new(&sidecar).exists(),
+            "the refused attach made the endpoint directory"
+        );
     }
 }
