@@ -226,8 +226,10 @@ additive constructors carry them, and the existing ones keep their behavior:
   replicated machine), and its log's lease resolves its path the same way (`exclusive_file_of`).
   A parent removed after the open resolved it is refused with the same error, never made again: a
   remade directory is another directory (the host binds its group to the parent's file identity),
-  and the host's guards would protect nothing, with nobody told. Asked by amphora-seam-owner, in
-  Codex's place, on 2026-11-06.
+  and the host's guards would protect nothing, with nobody told. A parent removed in the narrow
+  window between that resolution and the engine's or the lease's open ends as an I/O error
+  (`Refusal::Unavailable`), not this typed refusal; nothing is made there either. Asked by
+  amphora-seam-owner, in Codex's place, on 2026-11-06.
 - Under the owner table's lock, before any endpoint or lease effect, a guarded open meeting a live
   owner in this process admits it only if that owner is not a client, the file at the path now is
   the file it stored (its identity), and it holds guards of the same key. Then the incoming guards
