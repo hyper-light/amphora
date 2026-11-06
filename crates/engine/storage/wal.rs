@@ -3861,6 +3861,30 @@ fn pack_checksum(checksum: (u32, u32)) -> u64 {
 }
 
 impl WalFile {
+    /// Amphora: a frame of `page` with its checksum left at zero, for a spill writing it back over
+    /// a frame of its own transaction. The commit computes the checksum of every frame from the
+    /// first one written over (`Wal::rechain`), so one computed here would be thrown away, and a
+    /// transaction that spills heavily writes its pages over again many times (Amphora's
+    /// `docs/design/store.md`, decision 30).
+    fn prepare_unchained_frame(
+        buffer_pool: &Arc<BufferPool>,
+        wal_header: &WalHeader,
+        page_number: u32,
+        page: &[u8],
+        page_transform: &PageTransform,
+    ) -> Result<Arc<Buffer>> {
+        let frame = prepare_wal_frame_header(buffer_pool, wal_header, page_number, 0);
+        let bytes = frame.as_mut_slice();
+        let short = || LimboError::InternalError("a log frame shorter than its header".into());
+        bytes
+            .get_mut(16..WAL_FRAME_HEADER_SIZE)
+            .ok_or_else(short)?
+            .fill(0);
+        let body = bytes.get_mut(WAL_FRAME_HEADER_SIZE..).ok_or_else(short)?;
+        Self::transform_page(page_transform, page_number, page, body)?;
+        Ok(frame)
+    }
+
     fn prepare_transformed_frame(
         buffer_pool: &Arc<BufferPool>,
         wal_header: &WalHeader,
@@ -6294,12 +6318,10 @@ impl WalFile {
             for (_, page) in &run {
                 let page_number =
                     u32::try_from(page.get().id()).map_err(|_| LimboError::IntegerOverflow)?;
-                let (_, bytes) = Self::prepare_transformed_frame(
+                let bytes = Self::prepare_unchained_frame(
                     &self.buffer_pool,
                     header,
-                    self.last_checksum(),
                     page_number,
-                    0,
                     page.get_contents().as_ptr(),
                     page_transform,
                 )?;

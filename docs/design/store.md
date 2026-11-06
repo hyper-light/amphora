@@ -1090,7 +1090,10 @@ the retained Arc and exact Weak owner keep those allocations alive until cleanup
 
 **Decision.** A page a write transaction already wrote into the log past its committed end is
 written back over that frame when it spills again, or a cache flush writes it again, not appended
-(`WalFile::append_frames_vectored`, `write_over`; frames next to each other in one write). The
+(`WalFile::append_frames_vectored`, `write_over`; frames next to each other in one write). A frame
+written over holds no checksum until its commit (`prepare_unchained_frame`): the commit computes
+every frame's from the first one written over, so one computed at the spill would be thrown away,
+and a transaction that spills heavily writes its pages over again many times. The
 frame keeps its page, so the frame cache, the list of changed pages (decision 18) and readers, who
 see frames only up to the committed end, are untouched. The first frame written over is noted: its
 checksum, and every later frame's, no longer chain. Before a commit prepares its frames,
@@ -1159,6 +1162,14 @@ What it costs, the four legs in turn with c87e332's (release binaries, adacachy 
 makes Amphora's, 50.3 s against c87e332's 76.9 s (frames written one at a time, not together: 64.4
 s); in a copy-on-write directory with compression, 59.6 s against 39.5 s, every frame written over
 there a new extent.
+
+On a quiet Mac (adas-mac-studio-3, M4 Max, APFS; `bench/records/2026-11-06-studio3-wal-regression.md`)
+the audit's legs, one call each, took the same time as on 542f5a9, before this decision, while the
+disks wrote 13-16 times less. With checksums computed at each write over (521e4bc), 4 MiB took
+6.49 s against 6.39 s, 1.6% longer. A spill that writes over now computes none
+(`a_frame_a_spill_writes_over_holds_no_checksum_until_its_commit`, red before), and best of 2
+against 542f5a9: 1 MiB 1.19 s against 1.18 s, 4 MiB 6.39 s against 6.45 s, 8 MiB 14.16 s against
+15.11 s, the disks writing 658-786 MiB against 10.1 GB.
 
 **Falsified by.** A transaction whose log holds more frames past the last commit than the pages it
 dirtied before its commit, or more than twice them after (`spilled_log.rs`); a row read back other
