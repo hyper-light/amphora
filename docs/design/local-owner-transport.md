@@ -122,6 +122,9 @@ whose shape differs. Postcard is not self-describing: a field added to a message
 decode error mid-session, `Unavailable`, not the default. So every change to any message's fields
 bumps the version, and an owner and its clients change version together across a drain: stop the
 clients, replace the owner and the clients, start again. Nothing decodes another version's records.
+The owner's refusal is its own result, never a frame: it writes nothing and closes the connection,
+so a client of another version sees the connection closed before any challenge, whatever shape its
+frames have.
 
 Version 3: `ReplicaStatus` gained `voters_outgoing` (replication.md, "Membership"). Version 2 had
 already added `bootstrapping` without a bump; a version-2 client of an owner with that field would
