@@ -3,9 +3,11 @@
 The crates Focal's bus is built on (`vendor/focal-bus`), at hyper-raft's `main`.
 
 - **Upstream:** https://github.com/hyper-light/hyper-raft, commit
-  `4d72e19b9533851e19602eee57053a5a7337b2cd` (2026-10-28), MIT (`LICENSE`): hyper-raft's `main` since
-  its `main` and `fate-commit` lines met (the merge `7d5e536`). Focal's exact `f8052a5` base
-  originally used `25cf889`; its recorded compatibility patch adapts the bus to this shared pin.
+  `d5d5f8f66368bb8a08822518dd45d257e95e2dbf` (2026-11-06), MIT (`LICENSE`): hyper-raft's `main` with the
+  leader's commit count by quorum (R-8, `Raft::commit_stats`; Amphora's replicated class's metrics, kiln goal
+  8f0f29ac), which was Amphora's patch 0006 until upstream took it. The pin before was `4d72e19` (2026-10-28),
+  hyper-raft's `main` since its `main` and `fate-commit` lines met (the merge `7d5e536`). Focal's exact
+  `f8052a5` base originally used `25cf889`; its recorded compatibility patch adapts the bus to this shared pin.
 - **What is here:** upstream's root manifest and the fifteen crates, whole, at upstream's paths:
   `hyper-block`, `hyper-datagram`, `hyper-durable`, `hyper-liveness`, `hyper-log`, `hyper-measure`,
   `hyper-quic`, `hyper-raft`, `hyper-rt`, `hyper-rt-transport`, `hyper-seal`, `hyper-sim`,
@@ -26,8 +28,6 @@ Each change is recorded in `vendor/patches/hyper-raft/`, applied in this order o
 
 | `crates/hyper-transport/src/{lib,endpoint}.rs`, `tests/exchange.rs` | Frames retain their actual connection epoch; an exporter lookup accepts exactly that peer/epoch, sharing the existing live-connection lookup | Authenticate delayed control capabilities and readiness against their true TLS origin without selecting a replacement connection, changing transport wire bytes, or adding another connection owner | `0004-cp-t2-2-frame-connection-provenance-and-exact-tls-exporter.patch` |
 
-| `crates/hyper-raft/src/{lib,raft,tests}.rs` | `Raft::commit_stats`: a leader counts the entries it commits by the quorum that committed each first, `CommitStats { classic, held }`, counted where `Raft::commit` takes the first of the two (R-8, `docs/raft.md` §3.7); its test `a_leader_counts_each_commit_by_the_quorum_that_made_it_first` | Amphora's replicated class exports its commits by quorum (`amphora_replica_commits_total{quorum}`, docs/design/replication.md "Metrics", kiln goal 8f0f29ac), and only the core knows which quorum moved its commit; no wire or behavior change | `0006-r-8-a-leader-counts-its-commits-by-quorum.patch` |
-
 The first change is Quiver's and kiln's policy, not hyper-raft's, so it isn't offered upstream: hyper-durable
 calls `RamStore` slates' case (each write complete as it's submitted), and gating it in hyper-raft
 would reach slates. Focal's agent agrees (2026-10-22), and notes that Focal names `RamStore` only in a
@@ -36,15 +36,6 @@ as a dev-dependency, as kiln's sync tests do.
 
 The former IOCP patch `0002` is superseded by upstream at `53a28a0`, with its regressions, and is dropped.
 The Darwin FIFO patch `0003` remains: upstream kqueue code is unchanged at this pin.
-
-`0006` is upstream's to take. It is offered as one commit on upstream's main: `d5d5f8f`, on `0856e05`, branch
-`upstream/commit-stats-main` in a clone kept at `~/.cache/hyper-raft-class-metrics`, with its push remote disabled.
-- Its test was red before the count. hyper-raft's `scripts/gates.sh` (contracts, fmt, clippy with all features,
-  and every test: 2,904 passed, 0 failed, 98 ignored) exited 0 on an M4 Max (adas-mac-studio.local-2,
-  2026-11-06); the other five CI targets haven't run it.
-- Upstream main's seven commits past this pin don't touch the files it changes, so the vendored patch is the same
-  change.
-- Pushing it is Ada's word. Once upstream takes it, a re-vendor drops the patch.
 
 ## Taking a newer upstream
 
