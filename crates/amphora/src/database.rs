@@ -26,12 +26,15 @@ use crate::db::Db;
 use crate::store::{self, Checkpointed, Engine, Flush, Opener, Store};
 
 pub(crate) mod compaction;
+mod guards;
 mod import;
 pub(crate) mod remote;
 pub(crate) mod replicated;
 mod restore;
 pub(crate) mod session;
 mod watch;
+pub use guards::Guards;
+pub(crate) use guards::Owned;
 pub use restore::Restore;
 pub use watch::Watch;
 
@@ -77,7 +80,7 @@ struct Shared {
     restoring: AtomicBool,
     admitted: Arc<AtomicUsize>,
     // The engine, readers and flusher retain the same lease until asynchronous drain ends.
-    _owner: Option<Arc<File>>,
+    _owner: Option<Owned>,
 }
 
 enum Writer {
@@ -94,6 +97,8 @@ struct Owner {
     shared: Weak<Shared>,
     lease: Weak<File>,
     identity: Option<amphora_engine::io::FileId>,
+    // The key of the guards this owner was opened with; None for an unguarded owner or a client.
+    key: Option<[u8; 32]>,
 }
 static OWNERS: OnceLock<Mutex<BTreeMap<PathBuf, Owner>>> = OnceLock::new();
 
@@ -183,22 +188,123 @@ fn admission_refusal(error: store::Refused) -> Refusal {
     }
 }
 
+fn parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// `path` made canonical, its parent directory made first if it is missing.
 fn canonical_path(path: &Path) -> Result<PathBuf, Refusal> {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) && !path.exists() {
+        return Err(api::invalid("database path", "dangling symlink"));
+    }
+    if !path.try_exists().map_err(unavailable)? {
+        std::fs::create_dir_all(parent(path)).map_err(unavailable)?;
+    }
+    existing_path(path)
+}
+
+/// `path` made canonical without making anything, as it will be once the directories it names are
+/// made: the deepest of its ancestors that exists made canonical, then the names below it. An
+/// unguarded open decides every refusal on this path before the step that needs its directory
+/// makes it (local-owner-transport.md, "Owner guards").
+fn resolved_path(path: &Path) -> Result<PathBuf, Refusal> {
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) && !path.exists() {
         return Err(api::invalid("database path", "dangling symlink"));
     }
     if path.try_exists().map_err(unavailable)? {
         return path.canonicalize().map_err(unavailable);
     }
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent).map_err(unavailable)?;
+    let mut missing = vec![
+        path.file_name()
+            .ok_or_else(|| api::invalid("database path", "no file name"))?,
+    ];
+    let mut ancestor = parent(path);
+    loop {
+        // The transport's bound on a database path's depth (endpoint.rs).
+        api::bound("database directory depth", missing.len(), 256)?;
+        match ancestor.canonicalize() {
+            Ok(mut resolved) => {
+                while let Some(name) = missing.pop() {
+                    resolved.push(name);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(ancestor.file_name().ok_or_else(|| {
+                    api::invalid(
+                        "database path",
+                        "it names a missing directory by `..`, which can't be resolved before it is made",
+                    )
+                })?);
+                ancestor = parent(ancestor);
+            }
+            Err(error) => return Err(unavailable(error)),
+        }
+    }
+}
+
+/// `path` made canonical without making anything: a guarded open's parent directory exists, or it
+/// is refused (local-owner-transport.md, "Owner guards").
+fn existing_path(path: &Path) -> Result<PathBuf, Refusal> {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) && !path.exists() {
+        return Err(api::invalid("database path", "dangling symlink"));
+    }
+    if path.try_exists().map_err(unavailable)? {
+        return path.canonicalize().map_err(unavailable);
+    }
     let name = path
         .file_name()
         .ok_or_else(|| api::invalid("database path", "no file name"))?;
-    Ok(parent.canonicalize().map_err(unavailable)?.join(name))
+    match parent(path).canonicalize() {
+        Ok(parent) => Ok(parent.join(name)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(api::invalid(
+            "database path",
+            "its parent directory does not exist, and a guarded open makes none",
+        )),
+        Err(error) => Err(unavailable(error)),
+    }
+}
+
+/// A guarded open's admission to a live owner, under the owner table's lock and before any
+/// endpoint or lease effect (local-owner-transport.md, "Owner guards"): the owner is this
+/// process's, the file at the path now is the file it opened, and it holds guards of the same key.
+fn admit_guarded(
+    owner: &Owner,
+    shared: &Shared,
+    identity: Option<amphora_engine::io::FileId>,
+    guards: &Guards,
+) -> Result<(), Refusal> {
+    if matches!(shared.writer, Writer::Client(_)) {
+        return Err(remote_owner());
+    }
+    if owner.identity.is_none() || owner.identity != identity {
+        return Err(api::invalid(
+            "database ownership",
+            "the file at this path is not the live owner's file: the live owner must drain first",
+        ));
+    }
+    match owner.key {
+        Some(key) if key == guards.key() => Ok(()),
+        Some(_) => Err(api::invalid(
+            "database ownership",
+            "the live owner holds other guards: it must drain first",
+        )),
+        None => Err(api::invalid(
+            "database ownership",
+            "the live owner is unguarded: it must drain first",
+        )),
+    }
+}
+
+/// Another process owns the database. Its identity can't show which files it opened, so a guarded
+/// open neither attaches to it as a client nor takes its place.
+fn remote_owner() -> Refusal {
+    api::invalid(
+        "database ownership",
+        "another process owns this database, and a guarded open must own it: that owner must drain first",
+    )
 }
 
 fn file_identity(path: &Path) -> Result<Option<amphora_engine::io::FileId>, Refusal> {
@@ -220,6 +326,26 @@ fn try_exclusive_file(path: &Path) -> Result<Option<File>, Refusal> {
 pub(crate) fn exclusive_file(path: &Path) -> Result<File, Refusal> {
     try_exclusive_file(path)?
         .ok_or_else(|| unavailable("database ownership is held by another owner"))
+}
+
+/// [`exclusive_file`] for `owner`'s files: a guarded owner's makes no parent directory, and a
+/// parent removed since its open resolved it is refused, never made again: the host's guards
+/// protect the directory that was there (local-owner-transport.md, "Owner guards").
+pub(crate) fn exclusive_file_of(path: &Path, owner: &Owned) -> Result<File, Refusal> {
+    if !owner.guarded() {
+        return exclusive_file(path);
+    }
+    crate::transport::try_lease(&existing_path(path)?)?
+        .ok_or_else(|| unavailable("database ownership is held by another owner"))
+}
+
+/// The database at `path` for `owner`, as [`exclusive_file_of`] makes its directories.
+pub(crate) fn open_db(path: &Path, owner: &Owned) -> Result<Db, Refusal> {
+    if !owner.guarded() {
+        return Db::open(path).map_err(unavailable);
+    }
+    let path = existing_path(path)?;
+    Db::open_made(&path, &crate::db::Sharing::Off).map_err(unavailable)
 }
 pub(crate) fn refused(error: &anyhow::Error) -> Refusal {
     if let Some(refusal) = error.downcast_ref::<Refusal>() {
@@ -384,11 +510,12 @@ impl Database {
         path: &Path,
         until: Instant,
         restoring: bool,
+        guards: Option<Guards>,
         initialize: impl FnOnce(&mut Db) -> Result<(), Refusal>,
     ) -> Result<Self, Refusal> {
-        Self::owner(path, until, restoring, None, |path, owner| {
-            let mut db = Db::open(path).map_err(unavailable)?;
-            db.hold_owner(Arc::clone(&owner));
+        Self::owner(path, until, restoring, None, guards, |path, owner| {
+            let mut db = open_db(path, &owner)?;
+            db.hold_owner(owner.clone());
             initialize(&mut db)?;
             Self::from_db_mode(db, until, restoring, Some(owner))
         })
@@ -399,9 +526,14 @@ impl Database {
         until: Instant,
         restoring: bool,
         replica: Option<(&Path, &api::replication::ReplicaConfig)>,
-        create: impl FnOnce(&Path, Arc<File>) -> Result<Self, Refusal>,
+        guards: Option<Guards>,
+        create: impl FnOnce(&Path, Owned) -> Result<Self, Refusal>,
     ) -> Result<Self, Refusal> {
-        let path = canonical_path(path)?;
+        let path = match guards {
+            Some(_) => existing_path(path)?,
+            // Its parent is made by the lease, past every refusal before it.
+            None => resolved_path(path)?,
+        };
         loop {
             if Instant::now() >= until {
                 return Err(Refusal::Timeout);
@@ -415,6 +547,10 @@ impl Database {
                 identity.and_then(|id| owners.values().find(|owner| owner.identity == Some(id)))
             }) {
                 if let Some(shared) = owner.shared.upgrade() {
+                    // A reused owner keeps its own group; the incoming guards are dropped.
+                    if let Some(guards) = &guards {
+                        admit_guarded(owner, &shared, identity, guards)?;
+                    }
                     if restoring || shared.restoring.load(Ordering::Acquire) {
                         return Err(api::invalid(
                             "database ownership",
@@ -471,7 +607,15 @@ impl Database {
                 }
             }
             api::bound("open database owners", owners.len().saturating_add(1), 4096)?;
-            let Some(lease) = try_exclusive_file(&path)? else {
+            let lease = match guards {
+                // The path is canonical and its parent exists: the lease makes no directory above.
+                Some(_) => crate::transport::try_lease(&path)?,
+                None => try_exclusive_file(&path)?,
+            };
+            let Some(lease) = lease else {
+                if guards.is_some() {
+                    return Err(remote_owner());
+                }
                 if restoring {
                     return Err(api::invalid(
                         "restore",
@@ -486,6 +630,7 @@ impl Database {
                                 shared: Arc::downgrade(&database.shared),
                                 lease: Weak::new(),
                                 identity,
+                                key: None,
                             },
                         );
                         return Ok(database);
@@ -502,16 +647,18 @@ impl Database {
                     Err(error) => return Err(error),
                 }
             };
-            let owner = Arc::new(lease);
-            let database = create(&path, Arc::clone(&owner))?;
+            let key = guards.as_ref().map(Guards::key);
+            let owner = Owned::new(Arc::new(lease), guards);
+            let database = create(&path, owner.clone())?;
             remote::publish(&database, &path)?;
             let identity = file_identity(&path)?;
             owners.insert(
                 path,
                 Owner {
                     shared: Arc::downgrade(&database.shared),
-                    lease: Arc::downgrade(&owner),
+                    lease: Arc::downgrade(owner.lease()),
                     identity,
+                    key,
                 },
             );
             return Ok(database);
@@ -519,7 +666,17 @@ impl Database {
     }
 
     pub fn open(path: &Path, until: Instant) -> Result<Self, Refusal> {
-        Self::open_owned(path, until, false, |_| Ok(()))
+        Self::open_owned(path, until, false, None, |_| Ok(()))
+    }
+
+    /// [`Database::open`], this process owning the database with `guards` kept beside its lease
+    /// until the owner has drained (local-owner-transport.md, "Owner guards"). It makes no
+    /// directory: a missing parent is refused. A live owner in this process is reused only if
+    /// it was opened at this file with guards of the same key, and then keeps its own group; an
+    /// unguarded owner, other guards, another file at the path, or another process's owner is
+    /// refused before any endpoint or lease effect, until that owner drains.
+    pub fn open_guarded(path: &Path, guards: Guards, until: Instant) -> Result<Self, Refusal> {
+        Self::open_owned(path, until, false, Some(guards), |_| Ok(()))
     }
 
     /// Opens the one product-owned hyper-durable writer. The host carries authenticated wire
@@ -530,16 +687,44 @@ impl Database {
         config: api::replication::ReplicaConfig,
         until: Instant,
     ) -> Result<Self, Refusal> {
-        let log_path = canonical_path(log_path)?;
+        Self::replicated(path, log_path, config, None, until)
+    }
+
+    /// [`Database::open_replicated`] with `guards`, as [`Database::open_guarded`] keeps them; the
+    /// log's parent directory must exist too.
+    pub fn open_replicated_guarded(
+        path: &Path,
+        log_path: &Path,
+        config: api::replication::ReplicaConfig,
+        guards: Guards,
+        until: Instant,
+    ) -> Result<Self, Refusal> {
+        Self::replicated(path, log_path, config, Some(guards), until)
+    }
+
+    fn replicated(
+        path: &Path,
+        log_path: &Path,
+        config: api::replication::ReplicaConfig,
+        guards: Option<Guards>,
+        until: Instant,
+    ) -> Result<Self, Refusal> {
+        // The log's parent is made by its lease, once this process owns the database.
+        let log_path = match guards {
+            Some(_) => existing_path(log_path)?,
+            None => resolved_path(log_path)?,
+        };
         log_path
             .to_str()
             .ok_or_else(|| api::invalid("replica path", "not UTF-8"))?;
+        replicated::validate(&config)?;
         let node_id = config.node_id;
         Self::owner(
             path,
             until,
             false,
             Some((&log_path, &config)),
+            guards,
             |path, owner| {
                 let changed = Arc::new(Changed::default());
                 let client = replicated::start(
@@ -547,7 +732,7 @@ impl Database {
                     &log_path,
                     config.clone(),
                     Arc::clone(&changed),
-                    Arc::clone(&owner),
+                    owner.clone(),
                     until,
                 )?;
                 Ok(Self {
@@ -595,7 +780,7 @@ impl Database {
         db: Db,
         until: Instant,
         restoring: bool,
-        owner: Option<Arc<File>>,
+        owner: Option<Owned>,
     ) -> Result<Self, Refusal> {
         bootstrap_db(&db)?;
         let mut replicated = false;
@@ -1604,4 +1789,22 @@ fn successor(prefix: &[u8]) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+/// Whether this is the copy of the test binary that runs `test` alone, in a process of its own: a
+/// test that fills or reads the process's owner table can't share it with the tests beside it. The
+/// parent runs the child and checks that it passed.
+#[cfg(test)]
+pub(crate) fn in_child(test: &str) -> bool {
+    const CHILD: &str = "AMPHORA_DATABASE_CHILD";
+    if std::env::var_os(CHILD).is_some_and(|name| name == test) {
+        return true;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env(CHILD, test)
+        .status()
+        .unwrap();
+    assert!(status.success(), "{test} in a child process: {status}");
+    false
 }

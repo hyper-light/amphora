@@ -1301,3 +1301,96 @@ refused, and the table stayed at 2 (adas-mac-studio-3, 2026-11-01).
 
 **Falsified by.** A query that waits behind the writer or a flush (the test above), one that writes,
 or one that sees a commit made after it began.
+
+## 34. A prepared statement is validated once and held between executes
+
+**Decision.** The public SQL API's `Statement` (`crates/api/src/sql.rs`) holds what
+`Session::prepare` gave it, and each execute runs that. The local session (`crates/amphora/src/sql.rs`,
+`Db`) validates the text once there and holds its engine statement, taken out of Db's statement
+cache or prepared (`Db::cached`, `Db::prepare_held`): an execute neither parses the text nor looks it up. Validation
+reads the text alone (the whole statement parsed, its tokens walked for reserved names, transaction
+and connection control refused), so its answer can't change between executes. A held statement is
+prepared again only when the schema changed since it was (`Db::run_held`, by the cache's own test of
+the schema), and dropped, it goes back to the cache, kept while that schema stands
+(`Db::give_back`), reset with its bindings cleared. While it's held, the same text is prepared anew
+for anyone else: a statement in use is never handed out twice. A call given text
+(`Connection::execute`, `query_row`) validates unless its cache entry carries decision 36's mark,
+`execute_batch` every time, and a session that says nothing (`Session::prepare`'s default, the remote client's, whose owner validates
+what it receives) keeps the text and validates it on every execute; no wire format changes.
+
+The cache (`db/cache.rs`) keeps at most `TX_MAX` (1,000) statements and `SQL_MAX` (1 MiB) of their
+text, and evicts the least recently used until both hold. Its recency order is a list linked
+through its map by the statements' text, so taking, returning and evicting a statement each cost a
+few map operations; the order was a queue searched end to end on every take and every return.
+
+**Why.** The unify audit's finding 4: every execute of a prepared statement parsed its SQL again to
+validate it, 1,001 parses for 1,000 executes, though Db's statement cache spared the engine's own
+prepare. On kiln's hot statements at e2e67247 that validation was 27% of a REAPI digest's CPU time
+(2,891 of 10,729 ns: memo.rs `missing`'s EXISTS, cas.rs `object`'s SELECT and UPDATE), 35% of a log
+search page's (15,269 of 43,175 ns) and 17% of a posting INSERT's (649 of 3,756 ns), by
+`amphora-bench --sql-api --shapes parse` beside each shape, the writer thread's CPU time, best of 3,
+on adacachy at load 15 to 22: an estimate beside production, not a recorded run.
+
+**Sources.** sqlite.org/c3ref/stmt.html: "The original SQL text is source code. A prepared statement
+object is the compiled object code", and its life-cycle prepares once, then binds, steps and resets
+it again and again ("Reset the prepared statement using sqlite3_reset() then go back to step 2. Do
+this zero or more times"). The plan's research `01a18d12143072d5992fe36a5f3b2ccb` keeps the notes.
+
+**Evidence.** `crates/amphora/src/sql.rs`, `a_prepared_statement_is_parsed_once_however_often_it_runs`:
+1,000 executes of one `prepare_cached` INSERT and 1,000 runs of log search's next page (kiln's
+`ci/logsearch.rs` at r80, three correlated subqueries) through one `prepare_cached` statement. At
+e2e67247 the INSERT parsed 1,001 times (the test failed there, its pages already right); with this
+decision each text parsed once, every page's rows the same as e2e67247's (blocks 2 and 1 of leg l1,
+then 7 of l0), and the same INSERT given as text parsed again.
+`a_held_statement_follows_the_schema_and_is_never_handed_out_twice`: a held `SELECT * FROM held`
+read one column, then two after `ALTER TABLE held ADD COLUMN c`, as a new one did; one INSERT
+prepared twice gave two statements, which wrote ten rows in turn. `db/cache.rs`,
+`a_full_cache_evicts_its_least_recently_used_statement`: a cache at its own bounds given `TX_MAX` + 1
+statements, the first taken and returned before the last, evicted the second-oldest, kept the first
+and held `TX_MAX`.
+
+**Falsified by.** A prepared statement that runs what validation refuses (its text can't change, so
+this would be a fault in `prepare`); a text call that runs without validation; or, at plan step 3,
+the parser above 1% of a prepared statement's hot loop.
+
+## 36. A validated text is marked on its statement-cache entry
+
+**Decision.** Db's statement-cache entry (`db/cache.rs`) carries whether the session's
+one-statement validation, `validate(sql, false)` in `crates/amphora/src/sql.rs`, accepted its text.
+Every Session path that runs or prepares one statement (`query`, a text call's and a remote
+client's Query; `column_count`; `prepare`, which `prepare_cached` and the owner's answer to a remote
+Columns use) takes the entry with its mark (`Db::cached`): a marked hit runs without a parse, a
+miss or an unmarked hit is validated before it is prepared or stepped, and only that validation's
+success marks it (`Held::mark`). A refused text is never marked, and an unmarked hit it refused goes
+back as it was. Db's private SQL (`query_owned`, `column_count`) keeps an entry's mark and never
+sets one, so an entry the product cached for itself is validated on its first Session use. The mark
+lives in the entry and goes with it: an eviction, a replacement (`put` gives the new statement the
+putter's mark), a schema change and a restore (`Cache::schema`, `Cache::clear`) drop it. A statement
+held by a `Statement` is out of the cache, so the same text given meanwhile is prepared and
+validated anew. `execute_batch` (`validate(sql, true)`) and the database's `execute`/`migrate`
+validators are unchanged and keep no mark. Nothing crosses the wire, and there is no second set
+of texts.
+
+**Why.** Decision 34 made a held statement's executes parse nothing, but each `prepare_cached`
+validated its text again, and so did every text call: kiln prepares per request (log search's page,
+memo.rs `missing`) and runs text calls in its hot paths, so each still parsed once per request. The
+mark is sound for the reason decision 34's hold is: validation reads the text alone, and the
+entry's key is that text.
+
+**Sources.** Decision 34's: SQLite compiles a statement once from its text (sqlite.org/c3ref/stmt.html).
+
+**Evidence.** `crates/amphora/src/sql.rs`, `a_validated_text_keeps_its_mark_until_its_cache_entry_goes`:
+an INSERT run as text three times and a SELECT prepared anew three times parsed once each, and no
+more in a second `Database::call`; `BEGIN` and a reserved name, each run twice, were refused and
+parsed both times; after `CREATE TABLE`, the SELECT parsed once more.
+`a_privately_cached_or_evicted_text_is_validated_again`: a text Db's private path cached was not
+parsed there, then parsed once on its first prepare and not on its second; a text evicted by
+`TX_MAX` newer ones parsed again. `a_session_mark_never_widens_database_execute`: `SAVEPOINT s` and `RELEASE s`, run
+twice each as Session text calls, parsed once each, marked; `Database::execute` still refused both
+("connection and transaction control belongs to Amphora"): its validator reads no mark. Decision
+34's tests pass unchanged.
+
+**Falsified by.** A Session path that runs a text no validation accepted while its entry stood: a
+private-SQL entry run unvalidated, a refused text run on its second call, or a mark that survives
+its entry's eviction, replacement, schema change or restore; or `Database::execute` or
+`migrate` accepting a text because a session marked it.

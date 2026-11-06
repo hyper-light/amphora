@@ -216,3 +216,101 @@ Falsified by:
 - a transport test whose outcome changes with the machine's load;
 - a measured whole run past a twentieth of `HANG`. That last one calls for measuring again, not for
   a larger guard.
+
+## Owner guards (2026-11-06)
+
+kiln's Windows host store keeps handles that pin its database's files and directories (its
+"guards") and must hold them as long as Amphora has those files open. Codex proposed the hook
+(kiln-unify proposal sha256 6e2e9c80, 2026-10-30); the Amphora agent decided its rules the same day
+(the decisions sent to Codex as amphora-reply-codex-keepalive-decisions-2026-10-30). Three
+additive constructors carry them, and the existing ones keep their behavior:
+`Database::open_guarded`, `Database::open_replicated_guarded` and
+`Database::attach_replicated_guarded`, each taking a `Guards::new(key, keep)`.
+
+- `keep` is held, never read. `key` is the host's assertion that two groups protect the same files;
+  Amphora compares it and does not verify it. No token type, serialization or wire change.
+- The owner lease and the guards travel together as one `Owned`, cloned wherever the lease is held:
+  the `Db` (and each reader), a reader's opener, the flusher, `Shared`, the replicated actor and its
+  `Machine`. The owner table still holds a `Weak` of the lease alone, so drain is decided as before:
+  the last holder of the lease has dropped. `Owned` declares the lease before the guards, so the
+  group outlives the lease it came with.
+- The engine's handles drop before the lease and its guards in every holder. `Db` declares its owner
+  after its engine fields; the opener and the flusher capture one `EngineHandles` (engine IO,
+  database, then owner) as a whole. Before this, the flusher captured the lease as its own
+  variable, and the Reference leaves the drop order of a closure's moved captures unspecified;
+  measured at this change, rustc dropped the lease while the flusher's engine handle was still alive
+  (`db::tests::the_owner_guards_drop_after_the_engine_in_every_holder` failed with one engine
+  handle left, and passes with `EngineHandles`).
+- A guarded open makes no directory: its database and log paths are made canonical without
+  creating a parent (`existing_path`), and a missing parent is refused before the owner table, the
+  endpoint or the lease is touched. The lease then makes only the database's own `.client`
+  endpoint directory, as every owner's does. The steps after resolution make nothing either: a
+  guarded owner's engine opens without `create_dir_all` (`open_db`, for the local writer and the
+  replicated machine), and its log's lease resolves its path the same way (`exclusive_file_of`).
+  A parent removed after the open resolved it is refused with the same error, never made again: a
+  remade directory is another directory (the host binds its group to the parent's file identity),
+  and the host's guards would protect nothing, with nobody told. A parent removed in the narrow
+  window between that resolution and the engine's or the lease's open ends as an I/O error
+  (`Refusal::Unavailable`), not this typed refusal; nothing is made there either. Asked by
+  amphora-seam-owner, in Codex's place, on 2026-11-06.
+- Under the owner table's lock, before any endpoint or lease effect, a guarded open meeting a live
+  owner in this process admits it only if that owner is not a client, the file at the path now is
+  the file it stored (its identity), and it holds guards of the same key. Then the incoming guards
+  are dropped and the owner keeps its own group: one group per owner, never accumulated. An
+  unguarded owner, other guards, or another file at the path is refused with
+  `Refusal::Invalid` ("database ownership"): that owner must drain first. An unguarded open may
+  reuse a guarded owner, whose group stays.
+- Another process's owner is refused: its identity can't show which files it opened, so there is
+  no guarded client and no guarded promotion. Guarded means this process is or becomes the
+  owner. The refusal follows the failed lease attempt, the only way to learn of that owner, which
+  changes nothing.
+- `attach_replicated` now checks the owner bound before it probes the lease. The probe makes the
+  endpoint directory and holds the lease for an instant; at a full table attach answered "no
+  owner" after those effects, and the open that followed was refused at the same bound
+  (`database::remote::tests::attach_refuses_at_the_owner_bound_before_it_touches_the_lease`,
+  failing before the fix). `Database::owner` already bounded first.
+
+- The unguarded opens decide their refusals before they make a directory too (kiln goal 017b5e3d,
+  reported to Codex's role as a side effect before a refusal). They resolve paths with
+  `resolved_path`: the deepest existing ancestor made canonical, then the missing names below it,
+  as `create_dir_all` will make them. The database's parent is made by its lease, after the owner
+  table's refusals and bound; the log's by its own lease, once this process owns the database; the
+  replica configuration is checked before either. `attach_replicated` makes no directory at all: no
+  owner can hold a lease under a directory that doesn't exist, so it answers None. A missing
+  directory named by `..` can't be resolved before it is made, and is refused.
+- What remains, decided (amphora-seam-owner, in Codex's place, 2026-11-06): the refusals that need
+  the database's contents come after the log's lease. `replicated::open` takes the log's lease
+  first, which makes the log's parent directory and its `<log>.client` endpoint at the log path
+  given. Then `Machine::open_with_owner`'s refusals (such as an unfinished restore, a baseline
+  declaration whose source isn't an initial voter, a replica table without its applied marker)
+  leave those behind. Then the log file is made, and the fence "state exists but its replication log is
+  missing" (an empty log beside a database whose durable index isn't zero) leaves an empty log
+  file as well. Each is a typed, fail-closed refusal, and nothing in the database changes. They
+  aren't moved before the log's lease: opening the machine first would write its applied marker
+  into the database before the log is held, an effect on the database itself, and the fence can't
+  be decided earlier, since it needs the machine's durable index.
+
+Evidence: `database::guards::tests` with a Drop witness: sixteen same-key opens and an unguarded
+one keep one group, which outlives every `Database` clone and drops with the lease free (after the
+writer, readers and flusher drained); other guards, an unguarded owner, another file at the path
+and another process's owner are each refused with the incoming group dropped at once and the live
+owner untouched; a missing parent is refused with nothing made, and a parent removed after resolution
+is refused by each later step and not made again; the replicated owner is reused and
+attached by the same key. Removing the admission, or resolving guarded paths with
+`canonical_path`, fails these tests. They show Amphora's side on each platform; whether the host's
+handles protect a Windows path is the host's own test.
+
+Sources: the Rust Reference, "Destructors"
+(doc.rust-lang.org/reference/destructors.html, read 2026-11-06): "The fields of a struct are
+dropped in declaration order", and "The variables that a closure captures by move are dropped in
+an unspecified order". Rust's `File::try_lock` (cited above) for the lease's release on the last
+handle's close.
+
+Falsified by: a group dropped while a reader, opener, flusher, actor or machine of its owner still
+holds an engine handle; two groups alive for one owner after a same-key reopen; a guarded open
+that makes a parent directory (at resolution or after it), reuses an unguarded, differently keyed or remote owner, or reuses
+an owner whose stored file identity differs from the file at the path; or attach making the
+endpoint directory at a full owner table, or an unguarded open refused by the owner table, its
+bound or its configuration having made a directory
+(`database::remote::tests::refused_replicated_opens_leave_no_directory_they_made`,
+`opens_refused_at_the_owner_bound_make_no_directory`).

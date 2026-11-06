@@ -199,7 +199,7 @@ struct Actor {
     _log: hyper_log::Log<DeviceFile>,
     _log_owner: File,
     // Drop after the log writer has drained; reopen cannot race its final disk completion.
-    _lease: Arc<File>,
+    _lease: Owned,
     changed: Arc<Changed>,
     control: Arc<Control>,
     pending: Option<Pending>,
@@ -477,7 +477,7 @@ pub(super) fn start(
     log_path: &Path,
     config: ReplicaConfig,
     changed: Arc<Changed>,
-    lease: Arc<File>,
+    lease: Owned,
     until: Instant,
 ) -> Result<Client, Refusal> {
     let (client, mut actor, receiver) = open(
@@ -503,7 +503,7 @@ fn open(
     log_path: &Path,
     config: ReplicaConfig,
     changed: Arc<Changed>,
-    lease: Arc<File>,
+    lease: Owned,
     until: Instant,
     clock: Clock,
 ) -> Result<(Client, Actor, mpsc::Receiver<Envelope>), Refusal> {
@@ -511,7 +511,7 @@ fn open(
         return Err(Refusal::Timeout);
     }
     validate(&config)?;
-    let log_owner = exclusive_file(log_path)?;
+    let log_owner = exclusive_file_of(log_path, &lease)?;
     let machine = crate::replication::Machine::open_with_owner(
         path,
         ConfState {
@@ -519,7 +519,7 @@ fn open(
             learners: config.learners.clone(),
             ..ConfState::default()
         },
-        Arc::clone(&lease),
+        lease.clone(),
         config.node_id,
         config.bootstrap.clone(),
     )?;
@@ -600,7 +600,7 @@ fn open(
     Ok((client, actor, receiver))
 }
 
-fn validate(config: &ReplicaConfig) -> Result<(), Refusal> {
+pub(super) fn validate(config: &ReplicaConfig) -> Result<(), Refusal> {
     let count = config
         .voters
         .len()
@@ -2115,7 +2115,7 @@ mod tests {
             for _ in 0..ROUNDS {
                 match exclusive_file(&path) {
                     Ok(file) => {
-                        lease = Some(Arc::new(file));
+                        lease = Some(Owned::new(Arc::new(file), None));
                         break;
                     }
                     Err(_) => std::thread::park_timeout(POLL),

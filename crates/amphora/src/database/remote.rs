@@ -195,11 +195,38 @@ impl Database {
         config: api::replication::ReplicaConfig,
         until: Instant,
     ) -> Result<Option<Self>, Refusal> {
+        Self::attach_owner(path, log_path, config, None, until)
+    }
+
+    /// [`Database::attach_replicated`] for a host that owns with `guards`
+    /// ([`Database::open_replicated_guarded`]): it makes no directory and never attaches as a
+    /// client. It answers this process's live owner opened at this file with guards of the same
+    /// key and this configuration, or None when no owner holds the lease; an unguarded owner,
+    /// other guards, another file at the path, or another process's owner is refused.
+    pub fn attach_replicated_guarded(
+        path: &Path,
+        log_path: &Path,
+        config: api::replication::ReplicaConfig,
+        guards: Guards,
+        until: Instant,
+    ) -> Result<Option<Self>, Refusal> {
+        Self::attach_owner(path, log_path, config, Some(guards), until)
+    }
+
+    fn attach_owner(
+        path: &Path,
+        log_path: &Path,
+        config: api::replication::ReplicaConfig,
+        guards: Option<Guards>,
+        until: Instant,
+    ) -> Result<Option<Self>, Refusal> {
         if Instant::now() >= until {
             return Err(Refusal::Timeout);
         }
-        let path = canonical_path(path)?;
-        let log = canonical_path(log_path)?;
+        let (path, log) = match guards {
+            Some(_) => (existing_path(path)?, existing_path(log_path)?),
+            None => (resolved_path(path)?, resolved_path(log_path)?),
+        };
         log.to_str()
             .ok_or_else(|| api::invalid("replica path", "not UTF-8"))?;
         let expected = Some((log.as_path(), &config));
@@ -210,6 +237,9 @@ impl Database {
             identity.and_then(|id| owners.values().find(|owner| owner.identity == Some(id)))
         }) {
             if let Some(shared) = owner.shared.upgrade() {
+                if let Some(guards) = &guards {
+                    admit_guarded(owner, &shared, identity, guards)?;
+                }
                 if shared.restoring.load(Ordering::Acquire) {
                     return Err(api::invalid("replica ownership", "restore is incomplete"));
                 }
@@ -243,11 +273,25 @@ impl Database {
                 return Err(unavailable("previous database owner is draining"));
             }
         }
-        if let Some(lease) = try_exclusive_file(&path)? {
+        // Admission before the probe: a probe makes the endpoint directory and takes the lease,
+        // which a full table would refuse to anyone who went on to open.
+        api::bound("open database owners", owners.len().saturating_add(1), 4096)?;
+        // No owner holds a lease under a directory that doesn't exist; attach makes no directory.
+        if !parent(&path).try_exists().map_err(unavailable)? {
+            return Ok(None);
+        }
+        let lease = match guards {
+            // The path is canonical and its parent exists: the probe makes no directory above.
+            Some(_) => crate::transport::try_lease(&path)?,
+            None => try_exclusive_file(&path)?,
+        };
+        if let Some(lease) = lease {
             drop(lease);
             return Ok(None);
         }
-        api::bound("open database owners", owners.len().saturating_add(1), 4096)?;
+        if guards.is_some() {
+            return Err(remote_owner());
+        }
         let database = attach(&path, expected, until)?;
         owners.insert(
             path,
@@ -255,6 +299,7 @@ impl Database {
                 shared: Arc::downgrade(&database.shared),
                 lease: Weak::new(),
                 identity,
+                key: None,
             },
         );
         Ok(Some(database))
@@ -372,5 +417,175 @@ pub(super) fn submit(
         Operation::Call(_) | Operation::Mutation(Mutation::Sql(_) | Mutation::Migrate(_)) => {
             Err(api::invalid("client operation", "unexpected dispatch"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn until() -> Instant {
+        Instant::now() + crate::transport::HANG
+    }
+
+    fn config() -> api::replication::ReplicaConfig {
+        api::replication::ReplicaConfig {
+            node_id: 1,
+            voters: vec![1],
+            learners: vec![],
+            bootstrap: None,
+        }
+    }
+
+    /// The entries of `dir`, to compare before and after an open.
+    fn entries(dir: &Path) -> Vec<std::ffi::OsString> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn refused_replicated_opens_leave_no_directory_they_made() {
+        // CP-T1.5 (U05), local-owner-transport.md "Owner guards": an unguarded open_replicated
+        // or attach_replicated refused by the owner table or by its configuration makes no
+        // directory first, and an attach that finds no owner makes none either.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let owner =
+            Database::open_replicated(&path, &dir.path().join("log"), config(), until()).unwrap();
+        let before = entries(dir.path());
+        let elsewhere = dir.path().join("new").join("log");
+        let refused = Database::open_replicated(&path, &elsewhere, config(), until());
+        assert!(
+            matches!(refused, Err(Refusal::Invalid { .. })),
+            "{:?}",
+            refused.err()
+        );
+        let refused = Database::attach_replicated(&path, &elsewhere, config(), until());
+        assert!(
+            matches!(refused, Err(Refusal::Invalid { .. })),
+            "{:?}",
+            refused.err()
+        );
+        let invalid = api::replication::ReplicaConfig {
+            node_id: 0,
+            ..config()
+        };
+        let (missing_db, missing_log) = (
+            dir.path().join("a").join("db"),
+            dir.path().join("b").join("log"),
+        );
+        let refused = Database::open_replicated(&missing_db, &missing_log, invalid, until());
+        assert!(
+            matches!(refused, Err(Refusal::Invalid { .. })),
+            "{:?}",
+            refused.err()
+        );
+        let attached = Database::attach_replicated(&missing_db, &missing_log, config(), until());
+        assert!(
+            matches!(attached, Ok(None)),
+            "{:?}",
+            attached.map(|d| d.is_some())
+        );
+        assert_eq!(
+            entries(dir.path()),
+            before,
+            "a refused open made a directory"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn opens_refused_at_the_owner_bound_make_no_directory() {
+        // CP-T1.5 (U05): with the owner table full, open, open_replicated and attach_replicated
+        // under directories that don't exist are refused at the bound and make none of them.
+        if !in_child("database::remote::tests::opens_refused_at_the_owner_bound_make_no_directory")
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let held = Arc::new(File::create(dir.path().join("held")).unwrap());
+        {
+            let mut owners = OWNERS.get_or_init(Mutex::default).lock().unwrap();
+            for n in 0..4096 {
+                owners.insert(
+                    dir.path().join(format!("full-{n}")),
+                    Owner {
+                        shared: Weak::new(),
+                        lease: Arc::downgrade(&held),
+                        identity: None,
+                        key: None,
+                    },
+                );
+            }
+        }
+        let before = entries(dir.path());
+        let (db, log) = (
+            dir.path().join("a").join("db"),
+            dir.path().join("b").join("log"),
+        );
+        let full = |refused: Result<(), Refusal>| {
+            assert!(
+                matches!(refused, Err(Refusal::TooLarge { limit: 4096, .. })),
+                "{refused:?}"
+            );
+        };
+        full(Database::open(&db, until()).map(drop));
+        full(Database::open_replicated(&db, &log, config(), until()).map(drop));
+        full(Database::attach_replicated(&db, &log, config(), until()).map(drop));
+        assert_eq!(
+            entries(dir.path()),
+            before,
+            "a refused open made a directory"
+        );
+    }
+
+    #[test]
+    fn attach_refuses_at_the_owner_bound_before_it_touches_the_lease() {
+        // CP-T1.5 (U05): attach with the owner table full, on a database no process owns, is
+        // refused at the bound and leaves no endpoint directory or lease behind.
+        if !in_child(
+            "database::remote::tests::attach_refuses_at_the_owner_bound_before_it_touches_the_lease",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let held = Arc::new(File::create(dir.path().join("held")).unwrap());
+        {
+            let mut owners = OWNERS.get_or_init(Mutex::default).lock().unwrap();
+            for n in 0..4096 {
+                owners.insert(
+                    dir.path().join(format!("full-{n}")),
+                    Owner {
+                        shared: Weak::new(),
+                        lease: Arc::downgrade(&held),
+                        identity: None,
+                        key: None,
+                    },
+                );
+            }
+        }
+        let path = dir.path().join("db");
+        let config = api::replication::ReplicaConfig {
+            node_id: 1,
+            voters: vec![1],
+            learners: vec![],
+            bootstrap: None,
+        };
+        let attached = Database::attach_replicated(&path, &dir.path().join("log"), config, until());
+        assert!(
+            matches!(attached, Err(Refusal::TooLarge { limit: 4096, .. })),
+            "attach at the bound: {:?}",
+            attached.map(|d| d.is_some())
+        );
+        let mut sidecar = path.into_os_string();
+        sidecar.push(".client");
+        assert!(
+            !Path::new(&sidecar).exists(),
+            "the refused attach made the endpoint directory"
+        );
     }
 }
