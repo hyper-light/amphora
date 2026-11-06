@@ -171,6 +171,9 @@ struct Actor {
     at: Instant,
     published: u64,
     transferred: Option<(u64, Instant)>,
+    // What this owner measured of its voters' answers while it led: its quorum patience
+    // (replication.md, "The leader's quorum patience").
+    answers: patience::Answers,
     // A measurement's record of this owner's stalls (kiln goal 6b112f14, step 1): test-only.
     #[cfg(test)]
     stalls: Option<Arc<Mutex<tests::Stalls>>>,
@@ -466,6 +469,7 @@ fn open(
         waiting: VecDeque::new(),
         serial: 0,
         transferred: None,
+        answers: patience::Answers::default(),
         #[cfg(test)]
         stalls: None,
         clock,
@@ -648,6 +652,18 @@ impl Actor {
         if at.saturating_duration_since(self.ticked) >= TICK {
             // A delayed owner does not invent missed heartbeats or run an unbounded catchup.
             self.ticked = at;
+            // The quorum patience in force for this tick's check, from the answers measured.
+            let leading = self.replica.is_leader().then(|| self.replica.term());
+            let conf = self.replica.configuration();
+            let (voters, outgoing) = (&conf.voters, &conf.voters_outgoing);
+            self.answers.tick(leading, voters, outgoing)?;
+            let election = self.replica.core().raft.config().election_tick;
+            let patience = self
+                .answers
+                .patience(voters, outgoing, self.replica.id(), election);
+            self.replica
+                .set_quorum_patience(patience)
+                .map_err(raft_error)?;
             self.replica.tick().map_err(raft_error)?;
             #[cfg(test)]
             if let Some(stalls) = &self.stalls {
@@ -885,6 +901,13 @@ impl Actor {
                 "replica sender",
                 "sender is not a current member",
             ));
+        }
+        if self.replica.is_leader()
+            && message.term == self.replica.term()
+            && (conf.voters.contains(&from) || conf.voters_outgoing.contains(&from))
+            && let Err(unmeasured) = self.answers.heard(from, message.term)
+        {
+            tracing::warn!(target: "amphora.replica", event = "quorum_patience_refused", error = %unmeasured, "an answer gap was not learned for the leader's quorum patience");
         }
         self.replica.step(message).map_err(raft_error)
     }
@@ -2350,7 +2373,6 @@ mod tests {
     /// it, no term changed, and the call commits once the followers answer, its row on every
     /// replica.
     #[test]
-    #[ignore = "red until the leader's quorum patience (kiln goal 6b112f14, step 3)"]
     fn a_leader_whose_followers_answer_as_late_as_it_measured_keeps_its_lead() {
         let dir = tempfile::tempdir().unwrap();
         let mut driven = Driven::new();
@@ -2407,6 +2429,136 @@ mod tests {
         assert_eq!(terms(&clients), before, "the term changed after the hold");
         driven.drain(&mut pump);
         pump.finish();
+    }
+
+    /// CP-T1.8, kiln goal 6b112f14 step 3 (replication.md, "The leader's quorum patience"): the
+    /// cost of the patience is bounded. Do: the leader measures a gap of `HELD` ticks
+    /// (`measured_lead`), then, in a fresh term, is cut off from both followers, neither way
+    /// relayed, just before its first check, and a read is asked of it. Expect: that check passes
+    /// on the answers before the cut, the leader steps down within the election timeout and its
+    /// patience after it, a patience within the ceiling, and the read is not answered while it
+    /// is cut off: no lease answers a read.
+    #[test]
+    fn a_leader_cut_off_from_its_followers_steps_down_within_its_patience() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = measured_lead(&mut driven, &mut pump, &clients);
+        let id = u64::try_from(leader + 1).unwrap();
+        driven.tick(&mut pump, leader);
+        let raft = &driven.owners.get(leader).unwrap().0.replica.core().raft;
+        let (election, patience) = (raft.config().election_tick, raft.quorum_patience());
+        assert!(
+            patience <= patience::QUORUM_CEILING - election,
+            "{patience}"
+        );
+        let due = election + patience;
+        for _ in 1..due - 1 {
+            driven.tick(&mut pump, leader);
+        }
+        pump.held = vec![0, 1, 2];
+        // A read asked of the patient leader while it is cut off: no quorum confirms it.
+        let read = submit(clients.get(leader).unwrap(), driven.until(), |_| {
+            Ok(vec![1])
+        });
+        let mut after = None;
+        for count in due - 1..=due + election + patience::QUORUM_CEILING {
+            if clients
+                .get(leader)
+                .unwrap()
+                .handle()
+                .status()
+                .unwrap()
+                .leader
+                != id
+            {
+                after = Some(count.checked_sub(due));
+                break;
+            }
+            driven.tick(&mut pump, leader);
+        }
+        assert!(
+            matches!(read.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "a leader cut off from its followers answered a read"
+        );
+        let after = after
+            .expect("the cut-off leader never stepped down")
+            .expect("the cut-off leader stepped down before its first check");
+        assert!(
+            after <= election + patience,
+            "stepped down {after} ticks after its first check, past {election} + {patience}"
+        );
+        pump.held.clear();
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// The numbers a text states: each maximal run of characters between spaces and punctuation
+    /// that holds a digit and no letter, its ends' commas and periods stripped; a section's sign
+    /// (`§3.6`) is a citation, not a number.
+    fn numbers(text: &str) -> Vec<&str> {
+        text.split(|c: char| c.is_whitespace() || "/|()[];:*`\"'?".contains(c))
+            .map(|word| word.trim_matches(|c| c == '.' || c == ','))
+            .filter(|word| {
+                !word.starts_with('§')
+                    && word.chars().any(|c| c.is_ascii_digit())
+                    && !word.chars().any(char::is_alphabetic)
+            })
+            .collect()
+    }
+
+    /// Kiln goal 6b112f14 step 2, doc-truth: do read the decision "The leader's quorum patience"
+    /// and step 1's record. Expect every number the decision states to be in the record, or to be
+    /// one of the design's own, each as the code has it: the tick, the ceiling, the patience at
+    /// the ceiling, a cut-off leader's cost, the window; else AC-T1.8.4's bound, a source's year
+    /// or the decision's date.
+    #[test]
+    fn the_decisions_numbers_are_step_ones_or_its_own() {
+        let design = include_str!("../../../../docs/design/replication.md");
+        let decision = design
+            .split_once("## The leader's quorum patience")
+            .unwrap()
+            .1;
+        let record = numbers(include_str!("../../../../docs/research/owner-stalls.md"));
+        let requirements = include_str!("../../../../docs/requirements.toml");
+        let election = settings(1).unwrap().core.election_tick;
+        let ceiling = patience::QUORUM_CEILING;
+        let tick = TICK.as_millis();
+        let seconds = |ticks: usize| {
+            let ms = u128::try_from(ticks).unwrap() * tick;
+            format!("{}", f64::from(u32::try_from(ms).unwrap()) / 1000.0)
+        };
+        let generation = usize::try_from(patience::GENERATION).unwrap();
+        let own = [
+            tick.to_string(),
+            ceiling.to_string(),
+            (ceiling - election).to_string(),
+            seconds(ceiling),
+            (2 * ceiling).to_string(),
+            seconds(2 * ceiling),
+            (2 * election).to_string(),
+            (2 * u128::try_from(election).unwrap() * tick).to_string(),
+            format!("{},{:03}", generation / 1000, generation % 1000),
+            seconds(generation),
+            seconds(2 * generation),
+        ];
+        assert!(requirements.contains("failover p99 is at most 1000 ms"));
+        let cited = ["1000", "2014", "2017", "2018", "2026-11-06"];
+        let stray: Vec<&str> = numbers(decision)
+            .into_iter()
+            .filter(|n| !record.contains(n) && !own.iter().any(|o| o == n) && !cited.contains(n))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "numbers neither in step 1's record nor the design's own: {stray:?}"
+        );
+        assert!(
+            numbers(decision).len() > 40,
+            "the decision states its numbers"
+        );
     }
 
     /// U15/CP-T1.8: malformed membership and a source that cannot lead are refused at admission.
