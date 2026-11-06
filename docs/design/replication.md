@@ -384,8 +384,8 @@ In replicated mode an answer waits twice:
 CP-T1.8 already names a faster class: a replicated-class commit, p99 at most 2 ms for 3 nodes on a LAN (AC-T1.8.3),
 beside the persisted quorum commit's 5 ms (AC-T1.8.2).
 
-**What hyper-raft already does.** The revision Amphora vendors (4d72e19b) builds R-8, commits on entries held in memory
-across fates (raft.md §3.7):
+**What hyper-raft already does.** The revision Amphora vendored when this was decided (4d72e19b; d5d5f8f since)
+builds R-8, commits on entries held in memory across fates (raft.md §3.7):
 - A follower answers at once for entries its durable promises cover.
 - The leader counts itself by its disk alone.
 - An entry commits on the first of the classic quorum and a held quorum: a majority of unsuspected voters "whose fates
@@ -482,13 +482,58 @@ Its tests:
 - the cut itself: nothing the dying member writes after it survives, as on a powered-off machine (its log's device
   refuses every write and flush from the cut on, though the dying log drains what it took before its threads end).
 
+**Metrics** (t1/class-metrics, kiln goal 8f0f29ac; CLAUDE.md section 10). Each member's owner counts the class as it
+goes, and its host reads the counts through `ReplicaHandle::counters`, a plain snapshot
+(`meter::ReplicaCounters`), never through `ReplicaStatus`, which crosses the transport. The host exports them by
+`meter::REPLICA_METRICS`, as kiln exports its conversation stores' counters:
+
+| metric | type | what it counts |
+|---|---|---|
+| `amphora_replica_flush_backlog_entries` | gauge | entries the member applied that its database's log hasn't flushed: what a whole-site power cut can take; 0 in the persisted class, which flushes each entry it applies |
+| `amphora_replica_flush_seconds` | histogram | each flush the flushing thread completed, timed on that thread (a failed flush fences the owner, so none is counted); buckets of at most 62.5 µs · 2^i, 62.5 µs to 16.384 s (19 bounds), then the rest |
+| `amphora_replica_commits_total{quorum}` | counter | entries the member committed as leader, by the quorum that committed each first: `held` or `classic`; leader only, so a follower's stays at 0 |
+
+- The names are the Kiln Metrics agent's agreement (kiln agent 01a14bf7, message key
+  `amphora-class-metrics/names/v1`, 2026-11-06): "Agreed on all three names, with one change to (2)'s buckets".
+- The flush's buckets span what was measured, 3.9 ms (p50, a calm Mac) to 5.6 s (max, loaded adacachy), and
+  reach below a millisecond as that agreement asked: "kiln's production host is Linux on NVMe, where a quiet
+  fsync takes well under a millisecond", and kiln's own sub-millisecond histograms start at 50 µs
+  (`STALL_BUCKETS`, kiln's crates/kiln/src/metrics.rs). A histogram, not a summary: "you cannot use a summary if you need to aggregate the
+  observations from a number of instances" (Prometheus, "Histograms and summaries"), and a group's members are
+  aggregated.
+- The flushing thread times its flushes on the real clock, not the owner's ("The owner's time"): it measures a
+  disk's real I/O, and no decision of the owner reads it, so it is outside that rule.
+- Commits by quorum need hyper-raft's core to say which committed (`Raft::commit_stats`, upstream at hyper-raft
+  `d5d5f8f`, the revision Amphora vendors). Its commit takes the first of the classic quorum's index and the held
+  quorum's, so what a commit moves through the classic index the classic quorum holds, and past it only the
+  held quorum did. The fast track, which Amphora doesn't run, counts its own (`FastStats::committed`).
+- Labels: Amphora adds only `quorum`, two values. The host adds its own: kiln adds `db`, the record family's
+  name (a fixed, small set: one kiln holds several replicated databases, and a sum by machine would hide which
+  one is behind), and its machine labels.
+
+Dashboard row **Amphora replicated class**, one panel each, in PromQL (any host's form) and in kiln's own
+queries. kiln carries it as a group of a built-in "Stores" dashboard (crates/kiln/src/observe/dashboards.rs) and
+in its Grafana overview (deploy/grafana/dashboards/kiln-overview.json):
+
+| panel | PromQL | kiln |
+|---|---|---|
+| Flush backlog (entries) | `max by (instance, db) (amphora_replica_flush_backlog_entries)` | `max:amphora_replica_flush_backlog_entries{$host} by {host,db}` |
+| Flush seconds p50 / p99 | `histogram_quantile(0.5 / 0.99, sum by (le, db) (rate(amphora_replica_flush_seconds_bucket[5m])))` | `p50:` and `p99:amphora_replica_flush_seconds{$host} by {db}` |
+| Commits by quorum, stacked: the held share is the bars' proportion | `sum by (quorum) (rate(amphora_replica_commits_total[5m]))` | `sum:amphora_replica_commits_total{$host} by {quorum}.as_count()` |
+
+Its tests: the counts a host reads, through a held flush and the flushing thread's, and none in the persisted
+class (`the_replicated_class_counts_its_backlog_flushes_and_commits`); the buckets
+(`flushes_count_in_the_first_bucket_whose_bound_holds_them`); the names here equal to the code's
+(`the_replica_metrics_are_the_ones_the_design_names`); the core's count
+(`a_leader_counts_each_commit_by_the_quorum_that_made_it_first`, in hyper-raft).
+
+Falsified by: a backlog above 0 once a flush began after the last apply has ended; a held commit counted in a
+group of one fate or of the persisted class; an entry counted under both quorums, or under neither.
+
 Not built, and none of it weakens the one-fate guarantee:
 - **The suspicion feed** (`suspect_held` from hyper-liveness, not vendored). Without it no member is ever
   suspected. A held quorum spans two fates either way, and the leader counts only its disk. The feed narrows what
   a gray, failing member's held answers can commit, a refinement beyond one fate's loss.
-- **Metrics by class.** hyper-raft's core doesn't say which quorum committed an entry, and `ReplicaStatus` crosses
-  the transport, so a field there is a wire change. Each takes its own change, with names agreed with the Kiln
-  Metrics agent (CLAUDE.md section 10).
 - **The answer moving to the leader** for writes made at a follower (item 6).
 - **Fates checked across members.** The owner's transport identity doesn't name the durability, so members that
   disagree aren't refused at the transport.

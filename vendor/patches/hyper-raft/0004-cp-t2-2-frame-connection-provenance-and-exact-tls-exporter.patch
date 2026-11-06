@@ -2,10 +2,10 @@ Subject: CP-T2.2 frame connection provenance and exact TLS exporter
 Why: Authenticate queued control frames by their actual transport epoch rather than a certificate-stable peer replacement, retaining the existing connection owner and wire protocol
 
 diff --git a/crates/hyper-transport/src/endpoint.rs b/crates/hyper-transport/src/endpoint.rs
-index cdc35329f4de7580ec708dde96ab4aa477e73247..9e1af1da12ba139c4e8a2c0fde7c059210c1f601 100644
+index 02865bb3a70485fbf765830109fce73cf016651d..aa8ccfe81fb637eb572774db896a90208763d1f7 100644
 --- a/crates/hyper-transport/src/endpoint.rs
 +++ b/crates/hyper-transport/src/endpoint.rs
-@@ -1734,14 +1734,36 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C,
+@@ -1768,14 +1768,36 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C,
          Ok(conn.epoch)
      }
  
@@ -42,9 +42,9 @@ index cdc35329f4de7580ec708dde96ab4aa477e73247..9e1af1da12ba139c4e8a2c0fde7c0592
 -        })
 +        }).map(Box::as_ref)
      }
-
+ 
      /// What the path to `peer` measures now.
-@@ -4882,6 +4904,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
+@@ -5122,6 +5144,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                  self.events.push_back(Waiting {
                      event: Event::Frame {
                          peer,
@@ -53,10 +53,10 @@ index cdc35329f4de7580ec708dde96ab4aa477e73247..9e1af1da12ba139c4e8a2c0fde7c0592
                          kind,
                          frame,
 diff --git a/crates/hyper-transport/src/lib.rs b/crates/hyper-transport/src/lib.rs
-index b12bbb8087d69aaeb48bf28e7b099fe8f5f45bb0..45c80fdc22f584c8b130e141653733fc575f7d31 100644
+index fe6011f89c2537b4723537c3fffa513f41f58386..31b7dbd77b91105234676ea860b247ec5944a831 100644
 --- a/crates/hyper-transport/src/lib.rs
 +++ b/crates/hyper-transport/src/lib.rs
-@@ -257,6 +257,8 @@ pub enum Event<C: Classes> {
+@@ -262,6 +262,8 @@ pub enum Event<C: Classes> {
      Frame {
          /// The peer.
          peer: PeerId,
@@ -65,7 +65,7 @@ index b12bbb8087d69aaeb48bf28e7b099fe8f5f45bb0..45c80fdc22f584c8b130e141653733fc
          /// The lane.
          lane: LaneId,
          /// The frame's kind.
-@@ -363,12 +365,13 @@ impl<C: Classes> Debug for Event<C> {
+@@ -368,12 +370,13 @@ impl<C: Classes> Debug for Event<C> {
              }
              Self::Frame {
                  peer,
@@ -81,10 +81,10 @@ index b12bbb8087d69aaeb48bf28e7b099fe8f5f45bb0..45c80fdc22f584c8b130e141653733fc
              ),
              Self::Refused {
 diff --git a/crates/hyper-transport/tests/exchange.rs b/crates/hyper-transport/tests/exchange.rs
-index 6c622b4f6e6c0c0a67318a502cdc586c48bdaa4b..beee70913470cee062146101b204158dd75cd7da 100644
+index 1a54f6ab6c6c18dda8ea98ab287ec7165abe31eb..62c58f6e97f36bb67dfb31bbe9cee737572c07b4 100644
 --- a/crates/hyper-transport/tests/exchange.rs
 +++ b/crates/hyper-transport/tests/exchange.rs
-@@ -2559,16 +2559,19 @@ fn a_peer_is_held_to_its_lanes_windows_across_its_connections() {
+@@ -2773,16 +2773,19 @@ fn a_peer_is_held_to_its_lanes_windows_across_its_connections() {
      net.exchange();
      // The old connection's frames and the peer's one lifecycle event, its new connection.
      assert_eq!(frames_waiting(&net), seats + 1, "the new lane is not read");
@@ -107,7 +107,7 @@ index 6c622b4f6e6c0c0a67318a502cdc586c48bdaa4b..beee70913470cee062146101b204158d
                  net.b.release(frame);
              }
              Event::Connected { peer: 1, epoch, .. } => assert_eq!(epoch, 2),
-@@ -2625,6 +2628,13 @@ fn a_request_names_the_connection_it_came_on() {
+@@ -2839,6 +2842,13 @@ fn a_request_names_the_connection_it_came_on() {
      assert!(!net.b.connection_live(1, 1), "the first connection went");
      assert!(net.b.connection_live(1, 2), "the second is up");
      assert!(!net.b.connection_live(1, 3), "no third");

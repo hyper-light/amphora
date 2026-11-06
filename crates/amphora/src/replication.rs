@@ -490,6 +490,12 @@ impl Machine {
         }
     }
 
+    /// Entries applied that no finished flush covers yet: never below none, as a flush never
+    /// covers more than was applied.
+    pub(crate) fn flush_backlog(&self) -> u64 {
+        self.point.index.saturating_sub(self.flushed.index)
+    }
+
     /// A flush of the database's log, to run on the owner's flushing thread: what was committed
     /// before it began is durable once it ends (`Db::flusher`).
     pub(crate) fn log_flusher(&self) -> crate::store::Flush {

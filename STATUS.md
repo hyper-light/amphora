@@ -363,8 +363,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   t1/fast-ack, not merged. A replicated database opened with `Durability::Replicated(Fates)` answers a write once
   members spanning the fates asked hold it (hyper-raft R-8), before its leader flushes its own log. One member's
   power cut loses nothing acknowledged: the nemesis cuts and restarts a member at the end of each round of
-  writes. Left: the suspicion feed (hyper-liveness), metrics by class (with the Kiln Metrics agent), the answer
-  moving to the leader for writes made at a follower, fates checked across members.
+  writes. Its metrics (flush backlog, flush seconds, commits by quorum; replication.md, "Metrics") are built on
+  t1/class-metrics, not merged; their core count is upstream in hyper-raft (`d5d5f8f`, vendored).
+  Left: the suspicion feed (hyper-liveness), the answer moving to the leader for writes made at a follower, fates
+  checked across members.
 - **What the language matrix found** (`bench/corpus/matrix.md`): the IN operator's collation is
   fixed (the oracles' cause E); left, from a failing test, `index_xinfo`'s NULL; then the missing
   features by how often users reach them (ORDER BY in aggregates, median and percentiles, the JSON

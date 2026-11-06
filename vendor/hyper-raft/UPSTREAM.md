@@ -3,9 +3,11 @@
 The crates Focal's bus is built on (`vendor/focal-bus`), at hyper-raft's `main`.
 
 - **Upstream:** https://github.com/hyper-light/hyper-raft, commit
-  `4d72e19b9533851e19602eee57053a5a7337b2cd` (2026-10-28), MIT (`LICENSE`): hyper-raft's `main` since
-  its `main` and `fate-commit` lines met (the merge `7d5e536`). Focal's exact `f8052a5` base
-  originally used `25cf889`; its recorded compatibility patch adapts the bus to this shared pin.
+  `d5d5f8f66368bb8a08822518dd45d257e95e2dbf` (2026-11-06), MIT (`LICENSE`): hyper-raft's `main` with the
+  leader's commit count by quorum (R-8, `Raft::commit_stats`; Amphora's replicated class's metrics, kiln goal
+  8f0f29ac), which was Amphora's patch 0006 until upstream took it. The pin before was `4d72e19` (2026-10-28),
+  hyper-raft's `main` since its `main` and `fate-commit` lines met (the merge `7d5e536`). Focal's exact
+  `f8052a5` base originally used `25cf889`; its recorded compatibility patch adapts the bus to this shared pin.
 - **What is here:** upstream's root manifest and the fifteen crates, whole, at upstream's paths:
   `hyper-block`, `hyper-datagram`, `hyper-durable`, `hyper-liveness`, `hyper-log`, `hyper-measure`,
   `hyper-quic`, `hyper-raft`, `hyper-rt`, `hyper-rt-transport`, `hyper-seal`, `hyper-sim`,

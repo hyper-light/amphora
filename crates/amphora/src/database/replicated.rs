@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
+use crate::meter::{ReplicaCounters, ReplicaMeter};
 use api::replication::{Durability, MemberChange, Outbound, ReplicaConfig, ReplicaStatus};
 use hyper_block::block::BlockFile;
 use hyper_block::file::{CachingRequest, DeviceFile};
@@ -104,6 +105,7 @@ struct Control {
     admitted: AtomicUsize,
     outgoing: Mutex<Outgoing>,
     status: Mutex<Result<ReplicaStatus, Refusal>>,
+    meter: Arc<ReplicaMeter>,
 }
 #[derive(Default)]
 struct Outgoing {
@@ -240,8 +242,12 @@ enum Flushing {
 
 impl Flushing {
     /// The flushing for `durability`: in the replicated class, a thread that runs `flush` for each
-    /// point it's handed.
-    fn start(durability: &Durability, flush: crate::store::Flush) -> Result<Self, Refusal> {
+    /// point it's handed, and counts each it finishes in `meter`.
+    fn start(
+        durability: &Durability,
+        flush: crate::store::Flush,
+        meter: Arc<ReplicaMeter>,
+    ) -> Result<Self, Refusal> {
         if matches!(durability, Durability::Persisted) {
             return Ok(Self::Inline);
         }
@@ -251,7 +257,13 @@ impl Flushing {
             .name("amphora.replica.flush".into())
             .spawn(move || {
                 for at in asked {
+                    // The disk's time, not the owner's: a flush is real I/O however its owner's
+                    // clock runs.
+                    let began = Instant::now();
                     let result = flush().map(|()| at).map_err(|e| e.to_string());
+                    if result.is_ok() {
+                        meter.flushed(began.elapsed());
+                    }
                     if finished.send(result).is_err() {
                         return;
                     }
@@ -517,6 +529,12 @@ impl ReplicaHandle {
                 mpsc::RecvTimeoutError::Disconnected => unknown(),
             })?
     }
+
+    /// The replicated class's counters (`crate::meter::REPLICA_METRICS`), for the host to export:
+    /// read without asking the owner, and no wire type.
+    pub fn counters(&self) -> ReplicaCounters {
+        self.shared.meter.counters()
+    }
 }
 
 pub(super) fn start(
@@ -603,7 +621,8 @@ fn open_on<F: BlockFile + 'static>(
     clock: Clock,
 ) -> Result<(Client, Actor<F>, mpsc::Receiver<Envelope>), Refusal> {
     let settings = settings(config.node_id, &durability)?;
-    let flushing = Flushing::start(&durability, machine.log_flusher())?;
+    let meter = Arc::new(ReplicaMeter::default());
+    let flushing = Flushing::start(&durability, machine.log_flusher(), Arc::clone(&meter))?;
     let log_config = hyper_log::Config {
         segment_bytes: 64 << 20,
         max_segments: 16,
@@ -638,6 +657,7 @@ fn open_on<F: BlockFile + 'static>(
         admitted: AtomicUsize::new(0),
         outgoing: Mutex::default(),
         status: Mutex::new(Ok(status(&replica))),
+        meter,
     });
     let (sender, receiver) = mpsc::sync_channel(COMMANDS);
     let at = clock();
@@ -963,6 +983,12 @@ impl<F: BlockFile + 'static> Actor<F> {
                 .map_err(raft_error)?;
         }
         *locked(&self.control.status)? = Ok(status(&self.replica));
+        let commits = self.replica.core().raft.commit_stats();
+        self.control.meter.stepped(
+            self.replica.machine().flush_backlog(),
+            commits.held,
+            commits.classic,
+        );
         Ok(())
     }
     /// The replicated class's flushing: takes what a finished flush made durable, and hands the
@@ -3289,6 +3315,101 @@ mod tests {
         driven.flush(leader);
         assert_eq!(driven.owner(leader).replica.machine().unflushed(), None);
         driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// CP-T1.8 (AC-T1.8.3), the replicated class's metrics (replication.md, "Metrics"): what its
+    /// host reads of a member through its handle. Do: three voters, each its own fate, two to
+    /// span, the leader's flushes held; a write at the leader; its flush; then a write with the
+    /// flushing thread's. Expect: the leader's backlog counts the write until its flush and is 0
+    /// after, each entry it committed is counted once, by its quorum, and the thread's flush is
+    /// counted in a bucket and in the time; a persisted member counts no backlog, no flush and no
+    /// held commit.
+    #[test]
+    fn the_replicated_class_counts_its_backlog_flushes_and_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let durability = Durability::Replicated(api::replication::Fates {
+            of: vec![(1, 10), (2, 20), (3, 30)],
+            spanning: 2,
+        });
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open_with(dir.path(), n, vec![1, 2, 3], None, durability.clone()))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let handle = clients.get(leader).unwrap().handle();
+        driven.hold_flushes(leader);
+        let answer = driven.call(&mut pump, clients.get(leader).unwrap(), |db| {
+            db.exec("CREATE TABLE counted(value)")?;
+            Ok(Vec::new())
+        });
+        assert_eq!(answer, Ok(Vec::new()));
+        let held = handle.counters();
+        assert!(
+            held.flush_backlog >= 1,
+            "the write applied and unflushed: {held:?}"
+        );
+        let committed =
+            |driven: &Driven| driven.owner(leader).replica.core().raft.log().committed();
+        assert_eq!(
+            held.commits_held + held.commits_classic,
+            committed(&driven),
+            "each entry committed counted once, by its quorum: {held:?}"
+        );
+        driven.flush(leader);
+        driven.step();
+        assert_eq!(handle.counters().flush_backlog, 0);
+
+        let owner = driven.owner(leader);
+        let thread = Flushing::start(
+            &durability,
+            owner.replica.machine().log_flusher(),
+            Arc::clone(&owner.control.meter),
+        )
+        .unwrap();
+        driven.owner_mut(leader).flushing = thread;
+        let answer = driven.call(&mut pump, clients.get(leader).unwrap(), |db| {
+            db.exec("INSERT INTO counted VALUES (1)")?;
+            Ok(Vec::new())
+        });
+        assert_eq!(answer, Ok(Vec::new()));
+        let mut flushed = handle.counters();
+        for _ in 0..ROUNDS {
+            if flushed.flush_backlog == 0 && flushed.flushes.iter().sum::<u64>() >= 1 {
+                break;
+            }
+            driven.round(&mut pump);
+            flushed = handle.counters();
+        }
+        assert_eq!(flushed.flush_backlog, 0, "{flushed:?}");
+        assert!(flushed.flushes.iter().sum::<u64>() >= 1, "{flushed:?}");
+        assert!(flushed.flush_time > Duration::ZERO, "{flushed:?}");
+        assert_eq!(
+            flushed.commits_held + flushed.commits_classic,
+            committed(&driven),
+            "{flushed:?}"
+        );
+        driven.drain(&mut pump);
+        pump.finish();
+
+        let persisted_dir = tempfile::tempdir().unwrap();
+        let mut persisted = Driven::new();
+        let single = vec![persisted.open(persisted_dir.path(), 1, vec![1], None)];
+        let mut pump = Pump::new(&single);
+        persisted.elect(&mut pump, &single, 0, 1);
+        let answer = persisted.call(&mut pump, single.first().unwrap(), |db| {
+            db.exec("CREATE TABLE counted(value)")?;
+            Ok(Vec::new())
+        });
+        assert_eq!(answer, Ok(Vec::new()));
+        persisted.step();
+        let counted = single.first().unwrap().handle().counters();
+        assert_eq!(counted.flush_backlog, 0);
+        assert_eq!(counted.flushes, [0; crate::meter::FLUSH_BUCKETS]);
+        assert_eq!(counted.commits_held, 0);
+        assert!(counted.commits_classic >= 2, "{counted:?}");
+        persisted.drain(&mut pump);
         pump.finish();
     }
 
