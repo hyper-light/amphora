@@ -26,7 +26,7 @@ Each change is recorded in `vendor/patches/hyper-raft/`, applied in this order o
 
 | `crates/hyper-transport/src/{lib,endpoint}.rs`, `tests/exchange.rs` | Frames retain their actual connection epoch; an exporter lookup accepts exactly that peer/epoch, sharing the existing live-connection lookup | Authenticate delayed control capabilities and readiness against their true TLS origin without selecting a replacement connection, changing transport wire bytes, or adding another connection owner | `0004-cp-t2-2-frame-connection-provenance-and-exact-tls-exporter.patch` |
 
-| `crates/hyper-raft/src/{lib,raft,tests}.rs` | `Raft::commit_stats`: a leader counts the entries it commits by the quorum that committed each first, `CommitStats { classic, held }`, counted where `Raft::commit` takes the first of the two (R-8, `docs/raft.md` §3.7); its test `a_leader_counts_each_commit_by_the_quorum_that_made_it_first` | Amphora's replicated class exports its commits by quorum (`amphora_replica_commits_total{quorum}`, docs/design/replication.md "Metrics", kiln goal 8f0f29ac), and only the core knows which quorum moved its commit; no wire or behavior change | `0005-r-8-a-leader-counts-its-commits-by-quorum.patch` |
+| `crates/hyper-raft/src/{lib,raft,tests}.rs` | `Raft::commit_stats`: a leader counts the entries it commits by the quorum that committed each first, `CommitStats { classic, held }`, counted where `Raft::commit` takes the first of the two (R-8, `docs/raft.md` §3.7); its test `a_leader_counts_each_commit_by_the_quorum_that_made_it_first` | Amphora's replicated class exports its commits by quorum (`amphora_replica_commits_total{quorum}`, docs/design/replication.md "Metrics", kiln goal 8f0f29ac), and only the core knows which quorum moved its commit; no wire or behavior change | `0006-r-8-a-leader-counts-its-commits-by-quorum.patch` |
 
 The first change is Quiver's and kiln's policy, not hyper-raft's, so it isn't offered upstream: hyper-durable
 calls `RamStore` slates' case (each write complete as it's submitted), and gating it in hyper-raft
@@ -37,7 +37,7 @@ as a dev-dependency, as kiln's sync tests do.
 The former IOCP patch `0002` is superseded by upstream at `53a28a0`, with its regressions, and is dropped.
 The Darwin FIFO patch `0003` remains: upstream kqueue code is unchanged at this pin.
 
-`0005` is upstream's to take: it is offered as one commit on upstream's tree at this pin (`c90d5c8` on branch
+`0006` is upstream's to take: it is offered as one commit on upstream's tree at this pin (`c90d5c8` on branch
 `upstream/commit-stats`, a clone kept at `~/.cache/hyper-raft-class-metrics`), its test red before the count and
 hyper-raft's lib tests, clippy and fmt passing after on an M4 Max. Pushing it is Ada's word; once upstream takes
 it, a re-vendor drops the patch.

@@ -313,7 +313,7 @@ goes, and its host reads the counts through `ReplicaHandle::counters`, a plain s
   observations from a number of instances" (Prometheus, "Histograms and summaries"), and a group's members are
   aggregated.
 - Commits by quorum need hyper-raft's core to say which committed (`Raft::commit_stats`, a recorded patch,
-  `vendor/patches/hyper-raft/0005`). Its commit takes the first of the classic quorum's index and the held
+  `vendor/patches/hyper-raft/0006`). Its commit takes the first of the classic quorum's index and the held
   quorum's, so what a commit moves through the classic index the classic quorum holds, and past it only the
   held quorum did. The fast track, which Amphora doesn't run, counts its own (`FastStats::committed`).
 - Labels: Amphora adds only `quorum`, two values. The host adds its own: kiln adds `db`, the record family's
