@@ -200,9 +200,12 @@ enum Phase {
     Barrier(Option<Operation>),
     Proposed(Answer),
     Bootstrap(Option<Operation>),
-    /// A follower's write in the replicated class, answered on its group's commit with this
-    /// result, kept until it applies (`Actor::answer_committed`).
-    Answered(Result<(), Refusal>),
+    /// A follower's write in the replicated class, answered on its group's commit with `result`,
+    /// kept until its entry, at `index`, applies (`Actor::answer_committed`).
+    Answered {
+        result: Result<(), Refusal>,
+        index: u64,
+    },
 }
 struct Actor<F: BlockFile + 'static = DeviceFile> {
     replica: Durable<F>,
@@ -1081,6 +1084,15 @@ impl<F: BlockFile + 'static> Actor<F> {
         let Some(pending) = self.pending.as_ref() else {
             return;
         };
+        if let Phase::Answered { index, .. } = pending.phase {
+            // Committed and answered: its entry applies in whatever term, and `release` checks
+            // the apply against the answer, so neither a new term nor the deadline ends it. Applied
+            // through it with no apply answered, an image covered it: nothing is left to check.
+            if self.replica.applied().index >= index {
+                self.pending = None;
+            }
+            return;
+        }
         let expired = self.at >= pending.until;
         let changed_term = pending.term != self.replica.term()
             || pending.leader != self.replica.leader()
@@ -1101,7 +1113,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                     self.requeue(pending);
                 }
             }
-            Phase::Proposed(_) | Phase::Bootstrap(_) | Phase::Answered(_) => {
+            Phase::Proposed(_) | Phase::Bootstrap(_) | Phase::Answered { .. } => {
                 if let Some(response) = pending.response.take() {
                     answer(response, Err(unknown()));
                 }
@@ -1569,7 +1581,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 let result = match pending.phase {
                     Phase::Proposed(value) => applied.result.map(|()| value),
                     // Answered on the commit: the apply must decide as the log did.
-                    Phase::Answered(given) => {
+                    Phase::Answered { result: given, .. } => {
                         if given.is_ok() != applied.result.is_ok() {
                             return Err(fenced(
                                 "a follower's answer on the commit differs from its write's apply",
@@ -1612,14 +1624,9 @@ impl<F: BlockFile + 'static> Actor<F> {
                 .as_ref()
                 .is_some_and(|p| p.context == entry.context)
                 && let Some(mut pending) = self.pending.take()
+                && let Some(response) = pending.response.take()
             {
-                // Only an uncommitted entry is displaced; one answered on its commit never is.
-                if matches!(pending.phase, Phase::Answered(_)) {
-                    return Err(fenced("a write answered on its commit was displaced"));
-                }
-                if let Some(response) = pending.response.take() {
-                    answer(response, Err(unknown()));
-                }
+                answer(response, Err(unknown()));
             }
         }
         let mut outgoing = locked(&self.control.outgoing)?;
@@ -1681,6 +1688,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         }) else {
             return;
         };
+        let index = entry.index;
         let result = match crate::replication::verdict(&entry.data, before) {
             Ok(result) => result,
             // A malformed entry fences at its apply, which answers.
@@ -1689,9 +1697,13 @@ impl<F: BlockFile + 'static> Actor<F> {
         let Some(mut pending) = self.pending.take() else {
             return;
         };
-        if let Phase::Proposed(value) =
-            std::mem::replace(&mut pending.phase, Phase::Answered(result.clone()))
-            && let Some(response) = pending.response.take()
+        if let Phase::Proposed(value) = std::mem::replace(
+            &mut pending.phase,
+            Phase::Answered {
+                result: result.clone(),
+                index,
+            },
+        ) && let Some(response) = pending.response.take()
         {
             answer(response, result.map(|()| value));
         }
@@ -3215,7 +3227,237 @@ mod tests {
         }
     }
 
-    /// CP-T1.8 (AC-T1.8.3), the replicated class's answer for a write made at a follower
+    impl Driven<Gated> {
+        /// Member `owner`'s power cut while its log's flushes are held, and the member restarted on
+        /// what survived with its gate open: the held flushes meet the cut device and make nothing
+        /// durable. Returns the restarted member's client.
+        fn gated_cut(
+            &mut self,
+            dir: &Path,
+            owner: usize,
+            power: &mut Power,
+            gate: &Arc<Gate>,
+        ) -> Client {
+            let survived = power.cut();
+            gate.release();
+            drop(self.owners.get_mut(owner).unwrap().take());
+            power.restore(survived);
+            let node_id = u64::try_from(owner + 1).unwrap();
+            let reading = Arc::clone(self.clocks.get(owner).unwrap());
+            let log = Gated {
+                log: power.log.handle().unwrap(),
+                gate: Arc::clone(gate),
+            };
+            let (client, restarted) =
+                self.owner_on(dir, node_id, vec![1, 2, 3], fated(), power, log, reading);
+            *self.owners.get_mut(owner).unwrap() = Some(restarted);
+            client
+        }
+    }
+
+    /// Three members of three fates, two to span.
+    fn fated() -> Durability {
+        Durability::Replicated(api::replication::Fates {
+            of: vec![(1, 10), (2, 20), (3, 30)],
+            spanning: 2,
+        })
+    }
+
+    /// Three voters of three fates, two to span, each on its own power and its log behind its own
+    /// gate.
+    fn gated(dir: &Path) -> (Driven<Gated>, Vec<Power>, Vec<Arc<Gate>>, Vec<Client>) {
+        let mut driven = Driven::<Gated>::empty();
+        let powers: Vec<Power> = (1..=3).map(Power::new).collect();
+        let gates: Vec<Arc<Gate>> = (0..3).map(|_| Arc::new(Gate::default())).collect();
+        let clients = (0..3)
+            .map(|i| {
+                driven.open_gated(
+                    dir,
+                    u64::try_from(i + 1).unwrap(),
+                    vec![1, 2, 3],
+                    fated(),
+                    powers.get(i).unwrap(),
+                    gates.get(i).unwrap(),
+                )
+            })
+            .collect();
+        (driven, powers, gates, clients)
+    }
+
+    /// The values of warm0, read through `client`.
+    fn warm0(driven: &mut Driven<Gated>, pump: &mut Pump<'_>, client: &Client) -> String {
+        let rows = driven
+            .call(pump, client, |db| {
+                let mut rows = Vec::new();
+                db.query("SELECT value FROM warm0", [], |row| {
+                    rows.push(row.get_value(0).to_string());
+                    Ok(true)
+                })?;
+                Ok(rows.join(",").into_bytes())
+            })
+            .unwrap();
+        String::from_utf8(rows).unwrap()
+    }
+
+    /// A leader elected and written at until each follower states a durable promise; then the
+    /// value 1 written into warm0 at a follower, whose log's flushes are held once the write is in
+    /// the leader's log, and rounds until the follower answers it on the group's commit, before it
+    /// applies it. Returns the leader, the follower and the write's index.
+    fn answered_at_a_follower(
+        driven: &mut Driven<Gated>,
+        pump: &mut Pump<'_>,
+        clients: &[Client],
+        gates: &[Arc<Gate>],
+    ) -> (usize, usize, u64) {
+        let leader = driven.elect(pump, clients, 0, 1);
+        for n in 0..4 {
+            let answer = driven.call(pump, clients.get(leader).unwrap(), move |db| {
+                db.exec(&format!("CREATE TABLE warm{n}(value)"))?;
+                Ok(Vec::new())
+            });
+            assert_eq!(answer, Ok(Vec::new()));
+        }
+        let applied = clients
+            .get(leader)
+            .unwrap()
+            .handle()
+            .status()
+            .unwrap()
+            .applied;
+        driven.follow(pump, clients, applied);
+        let follower = (0..3).find(|i| *i != leader).unwrap();
+        let id = u64::try_from(follower + 1).unwrap();
+        let write = submit(clients.get(follower).unwrap(), driven.until(), |db| {
+            db.exec("INSERT INTO warm0 VALUES (1)")?;
+            Ok(vec![1])
+        });
+        let index = (0..ROUNDS)
+            .find_map(|_| {
+                driven.round(pump);
+                let log = driven.owner(leader).replica.core().raft.log();
+                log.entries(applied + 1, u64::MAX, 16)
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry.context.starts_with(&id.to_le_bytes()))
+                    .map(|entry| entry.index)
+            })
+            .expect("the follower's write never reached its leader");
+        gates.get(follower).unwrap().hold();
+        assert_eq!(driven.settle(pump, &write), Ok(vec![1]));
+        let at = driven.owner(follower).replica.applied().index;
+        assert!(
+            at < index,
+            "the follower answered at its apply ({at}), not on the commit of {index}"
+        );
+        (leader, follower, index)
+    }
+
+    /// CP-T1.8 (AC-T1.8.5), a follower's answer on its group's commit (replication.md, "A write
+    /// made at a follower is answered on the leader's commit"). Do: a write answered at a follower
+    /// whose log's flushes are held; the lead handed to the third member. Expect: the follower in
+    /// the new term, its write not applied and still pending, so its apply is still checked against
+    /// its answer; once its flushes go, it applies with nothing pending and reads the write.
+    #[test]
+    fn a_follower_keeps_its_answered_write_across_a_term_change_until_it_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut driven, _powers, gates, clients) = gated(dir.path());
+        let mut pump = Pump::new(&clients);
+        let (leader, follower, index) =
+            answered_at_a_follower(&mut driven, &mut pump, &clients, &gates);
+        let third = (0..3).find(|i| *i != leader && *i != follower).unwrap();
+        let term = driven.owner(follower).replica.term();
+        driven.transfer(&mut pump, &clients, leader, third);
+        let owner = driven.owner(follower);
+        assert!(owner.replica.term() > term, "no new term at the follower");
+        assert!(owner.replica.applied().index < index, "applied while held");
+        assert!(
+            owner.pending.is_some(),
+            "the answered write was dropped at the term change, before its apply"
+        );
+        gates.get(follower).unwrap().release();
+        driven.follow(&mut pump, &clients, index);
+        assert!(driven.owner(follower).pending.is_none());
+        assert_eq!(
+            warm0(&mut driven, &mut pump, clients.get(follower).unwrap()),
+            "1"
+        );
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// CP-T1.8 (AC-T1.8.5): a follower cut after it answered a write on its group's commit, and
+    /// before its own log flushed it, loses nothing acknowledged. Do: a write answered at a follower
+    /// whose log's flushes are held; its power cut, its log losing what it hadn't flushed, and the
+    /// member restarted. Expect: every member, the restarted one among them, reads the write.
+    #[test]
+    fn a_follower_cut_after_answering_on_the_commit_loses_nothing_acknowledged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut driven, mut powers, gates, mut clients) = gated(dir.path());
+        let mut pump = Pump::new(&clients);
+        let (leader, follower, index) =
+            answered_at_a_follower(&mut driven, &mut pump, &clients, &gates);
+        driven.drain(&mut pump);
+        pump.finish();
+        let restarted = driven.gated_cut(
+            dir.path(),
+            follower,
+            powers.get_mut(follower).unwrap(),
+            gates.get(follower).unwrap(),
+        );
+        *clients.get_mut(follower).unwrap() = restarted;
+        let mut pump = Pump::new(&clients);
+        // Driven clocks stand still, so the leader's heartbeats go only as its own clock moves:
+        // one tick a round, until the restarted member follows it through the write.
+        let id = u64::try_from(leader + 1).unwrap();
+        let caught_up = (0..ROUNDS).any(|_| {
+            driven.advance(leader, TICK);
+            driven.round(&mut pump);
+            clients.iter().all(|client| {
+                let status = client.handle().status().unwrap();
+                status.leader == id && status.applied >= index
+            })
+        });
+        assert!(
+            caught_up,
+            "the restarted member never followed through {index}"
+        );
+        for client in &clients {
+            assert_eq!(warm0(&mut driven, &mut pump, client), "1");
+        }
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// CP-T1.8 (AC-T1.8.5), the identity of a follower's answer with its apply (replication.md, "A
+    /// write made at a follower is answered on the leader's commit"). Do: a write answered at a
+    /// follower; an apply of it that refuses, given to the owner. Expect: the owner fences, naming
+    /// the difference, rather than answer the write otherwise than it did.
+    #[test]
+    fn an_apply_that_differs_from_the_answer_on_the_commit_fences() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut driven, _powers, gates, clients) = gated(dir.path());
+        let mut pump = Pump::new(&clients);
+        let (_, follower, index) = answered_at_a_follower(&mut driven, &mut pump, &clients, &gates);
+        let owner = driven.owner_mut(follower);
+        let context = owner.pending.as_ref().unwrap().context.clone();
+        let refused = owner.release(Output {
+            answers: vec![crate::replication::Applied {
+                index,
+                context,
+                result: Err(api::invalid("test", "the apply refuses")),
+            }],
+            ..Output::default()
+        });
+        assert!(
+            matches!(&refused, Err(Refusal::Fenced(why)) if why.contains("differs")),
+            "{refused:?}"
+        );
+        gates.get(follower).unwrap().release();
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// CP-T1.8 (AC-T1.8.5), the replicated class's answer for a write made at a follower
     /// (replication.md, "A write made at a follower is answered on the leader's commit"). Do: three
     /// voters of three fates, two to span; writes at the leader that every member applies; then a
     /// write at a follower and one at the leader, both prepared on one base; the follower's log
@@ -3941,6 +4183,97 @@ mod tests {
         assert!(config.apply_unpersisted);
         let config = driven.owner(1).replica.core().raft.config();
         assert!(config.fates.is_none() && !config.apply_unpersisted);
+    }
+
+    /// CP-T1.8 (AC-T1.8.3), the suspicion feed (replication.md, "The suspicion feed"): a verdict
+    /// told to a member while it follows stays in force once it leads. Do: three voters of three
+    /// fates, two to span; member B suspected at follower A; the lead handed to A, and writes there;
+    /// the old leader cut off; B's durable answers kept back by the relay, its held ones let
+    /// through; a write at A. Expect: no answer though B said it holds the write, since A's disk
+    /// and a suspected member's memory are no held quorum; once B's durable answers pass, the
+    /// answer, the classic quorum's. Then, the control: B trusted at A, its durable answers kept
+    /// back again, and a write answered on the held quorum.
+    #[test]
+    fn a_verdict_told_while_following_stays_in_force_once_leading() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open_with(dir.path(), n, vec![1, 2, 3], None, fated()))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let old = driven.elect(&mut pump, &clients, 0, 1);
+        let (a, b) = ((old + 1) % 3, (old + 2) % 3);
+        let b_id = u64::try_from(b + 1).unwrap();
+        assert_eq!(
+            tell(&mut driven, &clients, a, Verdict::Suspected(b_id)),
+            Ok(())
+        );
+        driven.transfer(&mut pump, &clients, old, a);
+        // Writes at the new leader, so that B states a durable promise to it and answers held at
+        // once (hyper-raft R-8).
+        for n in 0..4 {
+            let answer = driven.call(&mut pump, clients.get(a).unwrap(), move |db| {
+                db.exec(&format!("CREATE TABLE warm{n}(value)"))?;
+                Ok(Vec::new())
+            });
+            assert_eq!(answer, Ok(Vec::new()));
+        }
+        let applied = clients.get(a).unwrap().handle().status().unwrap().applied;
+        driven.follow(&mut pump, &clients, applied);
+        pump.lost.push(u64::try_from(old + 1).unwrap());
+
+        // A write at A, and rounds until B said it holds it.
+        let held_by_b = |driven: &mut Driven, pump: &mut Pump<'_>, before: u64| -> u64 {
+            for _ in 0..ROUNDS {
+                driven.round(pump);
+                let raft = &driven.owner(a).replica.core().raft;
+                let last = raft.log().last_index().unwrap();
+                if last > before && raft.tracker().get(b_id).unwrap().held >= last {
+                    return last;
+                }
+            }
+            panic!("B never said it holds the write in {ROUNDS} driven rounds");
+        };
+        pump.hold_durable();
+        let before = driven
+            .owner(a)
+            .replica
+            .core()
+            .raft
+            .log()
+            .last_index()
+            .unwrap();
+        let write = submit(clients.get(a).unwrap(), driven.until(), |db| {
+            db.exec("INSERT INTO warm0 VALUES (1)")?;
+            Ok(b"suspected".to_vec())
+        });
+        let index = held_by_b(&mut driven, &mut pump, before);
+        for _ in 0..100 {
+            driven.round(&mut pump);
+        }
+        let committed = driven.owner(a).replica.core().raft.log().committed();
+        assert!(
+            committed < index && matches!(write.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "a held quorum counted a member suspected while its leader followed: committed \
+             {committed} of {index}"
+        );
+        pump.let_durable();
+        assert_eq!(driven.settle(&mut pump, &write), Ok(b"suspected".to_vec()));
+
+        assert_eq!(
+            tell(&mut driven, &clients, a, Verdict::Trusted(b_id)),
+            Ok(())
+        );
+        pump.hold_durable();
+        let control = submit(clients.get(a).unwrap(), driven.until(), |db| {
+            db.exec("INSERT INTO warm0 VALUES (2)")?;
+            Ok(b"trusted".to_vec())
+        });
+        assert_eq!(driven.settle(&mut pump, &control), Ok(b"trusted".to_vec()));
+        pump.let_durable();
+        pump.lost.clear();
+        driven.drain(&mut pump);
+        pump.finish();
     }
 
     /// CP-T1.8 (AC-T1.8.3), the suspicion feed (replication.md, "The suspicion feed"): a member the

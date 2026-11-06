@@ -589,8 +589,16 @@ Kiln goal dcdd872a0ed78f37902b06dd95dd3bf1. Sources and quotes are in docs/resea
   quorum.
 It was red with the verdict taken and not given to the core.
 
+**A verdict told while following stays in force once leading**
+(`a_verdict_told_while_following_stays_in_force_once_leading`, asked by amphora-seam-owner at 15097f9). A member is
+suspected at a follower, and the lead is then handed to that follower. The old leader is cut off, and the suspected
+member's durable answers are held back while its held ones pass. A write at the new leader isn't answered: its own
+disk and a suspected member's memory are no held quorum. Once the durable answers pass, the classic quorum answers it.
+As the control, the member is trusted and its durable answers are held back again, and the next write is answered on
+the held quorum. The core keeps its suspected set across `reset` and `become_leader` (hyper-raft, core step R-8).
+
 Falsified by:
-- a held commit counted from a member the host's detector suspects;
+- a held commit counted from a member the host's detector suspects, including one suspected before this member led;
 - a verdict accepted and dropped: one of a non-member answered `Ok`, or one taken and not reaching the core;
 - a verdict changing an election.
 
@@ -618,12 +626,11 @@ The change:
   "replica ownership", naming the durability.
 - A process that stated no replica restarts with the durability the owner named.
 
-**The wire change is append-only.** The field is the identity's last, and the identity is the last thing in its
-answer's frame. postcard reads a frame from its start and leaves what follows unread, so an older client reading a
-newer owner's identity takes what it knew and ignores the rest. A newer client reading an older owner's identity
-finds the frame ending early. That is a decode failure: an owner it can't verify, refused as any other, never taken
-for the persisted class. The protocol version stays 2: no variant moves. `ReplicaStatus.bootstrapping` set the
-precedent.
+**The wire change bumps the protocol version to 4** (local-owner-transport.md, "Versions"). postcard isn't
+self-describing: a struct is its fields in order, with no lengths or names on the wire, so a decoder can't tell a
+missing trailing field from a short frame, and `#[serde(default)]` fills nothing on decode. An identity with the field
+is a different record, so owner and client change version together across a drain, and a peer of version 3 is refused
+at the greeting, before any identity is read. The field carries no `serde(default)`: it would never apply.
 
 **Across nodes**, each member's owner states its own class, and its leader counts held answers by the leader's own
 map of fates. What one node states isn't checked against another's here: the raft wire is hyper-raft's, carried by
@@ -645,6 +652,20 @@ learns that commit from its leader. So, in the replicated class:
 - The owner keeps the write pending until it applies, as now, so no later preparation can use the base before the
   write is in it. When it applies, its result must agree with the answer given; if it doesn't, the owner fences
   (an invariant broken, never a silent difference).
+- Neither a new term nor the caller's deadline ends that pending write: it is committed, so it applies in whatever
+  term follows, and its apply is still checked against its answer. A follower whose applied point passes the write
+  with no apply answered (an image installed over it) drops it then: nothing is left to check, and nothing waits
+  on it. A proposed write that is not yet answered is ended by a new term as before (`UnknownOutcome`).
+- Why the verdict is final (the sources). A follower commits only through what its leader says is committed and its
+  own log matches (hyper-raft `RaftLog::commit_to`, through `maybe_append`; `maybe_commit` at a leader counts only
+  an entry of its own term), and two logs that hold an entry of one index and term are identical up to it (Log
+  Matching, [raft.pdf](https://raft.github.io/raft.pdf) Figure 3 and section 5.3). A committed entry is in the log of
+  every later leader (Leader Completeness, section 5.4), so neither the write nor the entry before it is ever
+  replaced, and `term(index - 1)` read at the commit is the one its apply meets. Every committed entry moves the
+  machine's point: a write through `Machine::apply`, a change through `apply_change`, both by `advance`, and an
+  image through `install` (crates/amphora/src/replication.rs). So the point before the write's apply is
+  `(index - 1, term(index - 1))`, and `replication::verdict` decides from it what `Machine::apply`'s base fence
+  (`on_base`) will.
 - A later call at the follower crosses a ReadIndex barrier, which waits for the follower's apply. A caller therefore
   reads its own write wherever it reads next.
 - The leader is unchanged: it already answers on the commit (R-6, `apply_unpersisted`). The persisted class is
@@ -660,8 +681,16 @@ learns that commit from its leader. So, in the replicated class:
   write at the leader, prepared on the same base, makes one of the two refused; the follower's apply must agree
   with its answer. The test was red with the follower answering at its apply: unanswered until the hold's hang
   guard (120 s) failed the follower's log.
-- The identity's change read both ways: an older reader takes a newer identity, and a newer reader refuses an
-  older one (`the_identity_names_its_durability_append_only`).
+- The identity read across versions: version 3's reader would take a version-4 identity without its durability,
+  silently, which is why the version moved; today's refuses version 3's shorter frame
+  (`the_identitys_durability_is_a_new_version`).
+- The answered write kept across a term change until it applies (`a_follower_keeps_its_answered_write_across_a_term_change_until_it_applies`),
+  red when a new term dropped it.
+- A follower cut after answering and before its own log flushed loses nothing acknowledged
+  (`a_follower_cut_after_answering_on_the_commit_loses_nothing_acknowledged`, AC-T1.8.5).
+- An apply that differs from the answer fences (`an_apply_that_differs_from_the_answer_on_the_commit_fences`). The
+  displacement arm f8d1738 had for an answered write is removed: `Output::displaced` carries only what the fast track
+  proposed, which Amphora doesn't run, and an answered write is committed besides.
 
 Falsified by:
 - an attachment taken whose durability differs from its owner's;
