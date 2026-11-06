@@ -14,6 +14,9 @@
 //! the calls' whole time (their commits too): one JSON line a run, then the best of each. Where Linux
 //! keeps it, the closures' own CPU time too (the writer thread's, /proc/thread-self/schedstat): on a
 //! loaded machine a capped run's wall clock counts the time it waits for a CPU, its CPU time doesn't.
+//! AMPHORA_PROFILE=<prefix> (Unix only) samples each run 997 times a second, written as
+//! <prefix>-<shape>-<run>.{svg,txt,folded} (main.rs, write_profile); bench/prof_share.py gives the
+//! SQL parser's share of a shape's loop from the .folded file.
 //!
 //! usage: amphora-bench --sql-api --dir <dir> [--shapes reapi,logsearch,insert] [--runs 3]
 //!        [--digests 100000] [--pages 10000] [--rows 100000] [--per-call 1000]
@@ -463,13 +466,21 @@ pub fn main() -> anyhow::Result<()> {
             "insert" => None,
             other => anyhow::bail!("no shape {other}: reapi, logsearch, insert or parse"),
         };
+        let profile = std::env::var("AMPHORA_PROFILE").ok();
         for run in 1..=o.runs {
             let load = crate::planner::load_average();
+            let profiler = match &profile {
+                Some(_) => Some(crate::profile_start()?),
+                None => None,
+            };
             let t = match (shape.as_str(), &db) {
                 ("reapi", Some(db)) => reapi_run(db, reapi.as_deref().unwrap_or_default(), o.per_call)?,
                 ("logsearch", Some(db)) => logsearch_run(db, o.pages, o.pages_per_call)?,
                 _ => insert_run(&fresh(&o.dir, &format!("insert-{run}.db"))?, o.rows, o.per_call)?,
             };
+            if let (Some(prefix), Some(guard)) = (&profile, profiler) {
+                crate::write_profile(&format!("{prefix}-{shape}-{run}"), &guard)?;
+            }
             let (inside, whole) = (Timed::per_execute(t.inside, t.executes), Timed::per_execute(t.whole, t.executes));
             let cpu = t.cpu.map(|ns| ns as f64 / t.executes.max(1) as f64);
             best = Some(best.map_or((inside, whole, cpu), |(i, w, c)| (i.min(inside), w.min(whole), c.zip(cpu).map(|(c, cpu)| c.min(cpu)))));
