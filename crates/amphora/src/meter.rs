@@ -273,7 +273,7 @@ pub const REPLICA_METRICS: [(&str, &str, &str); 3] = [
     (
         "amphora_replica_flush_seconds",
         "histogram",
-        "Each flush of the database's log the replicated class's flushing thread ran.",
+        "Each flush of the database's log the replicated class's flushing thread completed; a failed flush fences the owner.",
     ),
     (
         "amphora_replica_commits_total",

@@ -301,7 +301,7 @@ goes, and its host reads the counts through `ReplicaHandle::counters`, a plain s
 | metric | type | what it counts |
 |---|---|---|
 | `amphora_replica_flush_backlog_entries` | gauge | entries the member applied that its database's log hasn't flushed: what a whole-site power cut can take; 0 in the persisted class, which flushes each entry it applies |
-| `amphora_replica_flush_seconds` | histogram | each flush the flushing thread ran, timed on that thread; buckets of at most 62.5 µs · 2^i, 62.5 µs to 16.384 s (19 bounds), then the rest |
+| `amphora_replica_flush_seconds` | histogram | each flush the flushing thread completed, timed on that thread (a failed flush fences the owner, so none is counted); buckets of at most 62.5 µs · 2^i, 62.5 µs to 16.384 s (19 bounds), then the rest |
 | `amphora_replica_commits_total{quorum}` | counter | entries the member committed as leader, by the quorum that committed each first: `held` or `classic`; leader only, so a follower's stays at 0 |
 
 - The names are the Kiln Metrics agent's agreement (kiln agent 01a14bf7, message key
@@ -312,6 +312,8 @@ goes, and its host reads the counts through `ReplicaHandle::counters`, a plain s
   (`STALL_BUCKETS`, kiln's crates/kiln/src/metrics.rs). A histogram, not a summary: "you cannot use a summary if you need to aggregate the
   observations from a number of instances" (Prometheus, "Histograms and summaries"), and a group's members are
   aggregated.
+- The flushing thread times its flushes on the real clock, not the owner's ("The owner's time"): it measures a
+  disk's real I/O, and no decision of the owner reads it, so it is outside that rule.
 - Commits by quorum need hyper-raft's core to say which committed (`Raft::commit_stats`, a recorded patch,
   `vendor/patches/hyper-raft/0006`). Its commit takes the first of the classic quorum's index and the held
   quorum's, so what a commit moves through the classic index the classic quorum holds, and past it only the
