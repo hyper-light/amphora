@@ -875,31 +875,54 @@ fn spill_edits() -> Vec<(i64, i64)> {
         .collect()
 }
 
-/// The edits in one transaction, a savepoint for each inside one for each 20, as kiln's log search
-/// nests them.
-fn spill_transaction(db: &mut Db, edits: &[(i64, i64)]) -> anyhow::Result<()> {
-    db.transaction(|db| {
-        for (k, &(doc, term)) in (1i64..).zip(edits) {
-            if k % 20 == 1 {
-                if k > 1 {
-                    db.exec("RELEASE step")?;
-                }
-                db.exec("SAVEPOINT step")?;
+/// The edits, a savepoint for each inside one for each 20, as kiln's log search nests them.
+fn spill_edits_in(db: &mut Db, edits: &[(i64, i64)]) -> anyhow::Result<()> {
+    for (k, &(doc, term)) in (1i64..).zip(edits) {
+        if k % 20 == 1 {
+            if k > 1 {
+                db.exec("RELEASE step")?;
             }
-            db.exec("SAVEPOINT edit")?;
-            let body = [Value::from_i64(doc), Value::from_text(spill_body(doc, k))];
-            db.query("UPDATE docs SET body = ?2 WHERE id = ?1", body, |_| Ok(true))?;
-            let posting = [Value::from_i64(term), Value::from_i64(k)];
-            db.query("INSERT INTO postings (term, doc) VALUES (?1, ?2)", posting, |_| Ok(true))?;
-            db.query(
-                "INSERT INTO terms (term, docs) VALUES (?1, 1) ON CONFLICT (term) DO UPDATE SET docs = docs + 1",
-                [Value::from_i64(term)],
-                |_| Ok(true),
-            )?;
-            db.exec("RELEASE edit")?;
+            db.exec("SAVEPOINT step")?;
         }
-        db.exec("RELEASE step")
+        db.exec("SAVEPOINT edit")?;
+        let body = [Value::from_i64(doc), Value::from_text(spill_body(doc, k))];
+        db.query("UPDATE docs SET body = ?2 WHERE id = ?1", body, |_| Ok(true))?;
+        let posting = [Value::from_i64(term), Value::from_i64(k)];
+        db.query("INSERT INTO postings (term, doc) VALUES (?1, ?2)", posting, |_| Ok(true))?;
+        db.query(
+            "INSERT INTO terms (term, docs) VALUES (?1, 1) ON CONFLICT (term) DO UPDATE SET docs = docs + 1",
+            [Value::from_i64(term)],
+            |_| Ok(true),
+        )?;
+        db.exec("RELEASE edit")?;
+    }
+    db.exec("RELEASE step")
+}
+
+/// The edits in one transaction.
+fn spill_transaction(db: &mut Db, edits: &[(i64, i64)]) -> anyhow::Result<()> {
+    db.transaction(|db| spill_edits_in(db, edits))
+}
+
+/// A database of the baseline's documents, made durable, keeping 200 pages from here on.
+fn spill_baseline(disk: &Arc<Disk>) -> Result<Db, String> {
+    let path = std::path::Path::new(SPILL_PATH);
+    let mut db = Db::open_with(path, disk.clone()).map_err(|e| format!("open: {e:#}"))?;
+    db.exec(SPILL_SCHEMA)
+        .map_err(|e| format!("schema: {e:#}"))?;
+    db.transaction(|db| {
+        for doc in 0..SPILL_DOCS {
+            let body = [Value::from_i64(doc), Value::from_text(spill_body(doc, 0))];
+            db.query("INSERT INTO docs (id, body) VALUES (?1, ?2)", body, |_| {
+                Ok(true)
+            })?;
+        }
+        Ok(())
     })
+    .map_err(|e| format!("baseline: {e:#}"))?;
+    db.flusher()().map_err(|e| format!("flush: {e}"))?;
+    db.keep_pages(200).map_err(|e| format!("cache: {e:#}"))?;
+    Ok(db)
 }
 
 fn count(db: &mut Db, sql: &'static str, params: Vec<Value>) -> Result<i64, String> {
@@ -930,21 +953,7 @@ fn spill_seed(seed: u64) -> Result<SpillSeen, String> {
     let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
     let disk = Disk::new(seed, HashMap::new());
     let path = std::path::Path::new(SPILL_PATH);
-    let mut db = Db::open_with(path, disk.clone()).map_err(|e| format!("open: {e:#}"))?;
-    db.exec(SPILL_SCHEMA)
-        .map_err(|e| format!("schema: {e:#}"))?;
-    db.transaction(|db| {
-        for doc in 0..SPILL_DOCS {
-            let body = [Value::from_i64(doc), Value::from_text(spill_body(doc, 0))];
-            db.query("INSERT INTO docs (id, body) VALUES (?1, ?2)", body, |_| {
-                Ok(true)
-            })?;
-        }
-        Ok(())
-    })
-    .map_err(|e| format!("baseline: {e:#}"))?;
-    db.flusher()().map_err(|e| format!("flush: {e}"))?;
-    db.keep_pages(200).map_err(|e| format!("cache: {e:#}"))?;
+    let mut db = spill_baseline(&disk)?;
     let edits = spill_edits();
     disk.arm(1 + rng.below(SPILL_CHANGES));
     let committed = spill_transaction(&mut db, &edits).is_ok();
@@ -1106,6 +1115,37 @@ fn ten_thousand_power_cuts_in_spilled_transactions() {
 /// T-T1.1.1, the flusher's mark (docs/design/store.md, decision 15): a flush counts durable only
 /// what the log held when it began. A commit that lands while a flush runs, held here, is not
 /// copied by a checkpoint after it, which flushes no log of its own for what the mark covers.
+/// Decision 30 of docs/design/store.md: the commit computes the checksum of every frame from the
+/// first one a spill wrote over, so a spill computes none for the frames it writes over. Do: a
+/// transaction spills its pages over their frames; read its log before it commits, then commit,
+/// flush and restart. Expect: frames in the log with no checksum, and every edit after the restart,
+/// whose recovery checks each frame's.
+#[test]
+fn a_frame_a_spill_writes_over_holds_no_checksum_until_its_commit() {
+    let disk = Disk::new(1, HashMap::new());
+    let mut db = spill_baseline(&disk).unwrap();
+    let edits = spill_edits();
+    let unchecked = db
+        .transaction(|db| {
+            spill_edits_in(db, &edits)?;
+            let files = disk.files.lock().unwrap();
+            let held = files[&format!("{SPILL_PATH}-wal")].held.lock().unwrap();
+            let frames = held.seen.get(32..).unwrap_or_default();
+            Ok(frames
+                .chunks_exact(4096 + 24)
+                .filter(|frame| frame[..4] != [0; 4] && frame[16..24] == [0; 8])
+                .count())
+        })
+        .unwrap();
+    assert!(unchecked > 0, "every frame held a checksum before the commit");
+    db.flusher()().unwrap();
+    drop(db);
+    let path = std::path::Path::new(SPILL_PATH);
+    let mut db = Db::open_with(path, Disk::new(1, disk.image())).unwrap();
+    let postings = count(&mut db, "SELECT count(*) FROM postings", vec![]).unwrap();
+    assert_eq!(postings, i64::try_from(SPILL_EDITS).unwrap());
+}
+
 #[test]
 fn a_commit_that_lands_during_a_flush_is_not_counted_durable_by_it() {
     let disk = Disk::new(1, HashMap::new());
