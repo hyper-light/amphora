@@ -67,6 +67,36 @@ The amplification reproduces at 616-626 times the text, the same on both, so dec
 1,552 times counted `/proc/self/io` on btrfs at load 13-30, a different counter on a different file system. Each run
 ended with 4 MiB of database and 208 MiB of log.
 
+## The same A/B on a second Mac (adas-mac-studio-2)
+
+The first A/B again, main 521e4bc ("new") against 542f5a9 ("old"), on a second machine of the same kind, by the
+carrier's `wal-ab-mac.sh` under launchd.
+
+- host: adas-mac-studio-2, Mac Studio (Mac16,9), Apple M4 Max, 14 cores, 36 GB, APFS on its internal SSD, macOS 26.2.
+- binaries: the same harness and corpus, built there 2026-11-06 04:47:28Z and 04:49:28Z, release, rustc 1.99.1. sha256
+  begins 3f99d26cadb4b381 (new) and 4c892b862936965d (old); they differ from studio-3's because the debug info names
+  the checkout's path.
+- load: the script waited from 04:49Z to 06:58:07Z for three looks 30 s apart under 2 with no rustc, cc1, clang or ld.
+  1.53 when measuring began; 3.34, 3.36, 2.97, 2.69, 3.25, 3.06 and 2.56 at the start of each later phase, under the
+  runs' own work and the host's; 2.13 at the end.
+- runs: 2026-11-06 06:58:07Z to 07:01:01Z, two rounds, alternating new and old. Log: `~/.cache/wal-ab-studio2.log`
+  there.
+
+| leg | new, rounds 1 and 2 | old, rounds 1 and 2 | new, best against old |
+|---|---|---|---|
+| 1 MiB | 1.19 s, 1.19 s | 1.18 s, 1.18 s | 1.19 s against 1.18 s |
+| 4 MiB | 6.30 s, 6.45 s | 6.41 s, 6.56 s | 1.7% faster |
+| 8 MiB | 14.26 s, 14.24 s | 14.51 s, 14.21 s | 0.2% slower |
+| batched 1 MiB | 18.4 s, 17.9 s | 18.2 s, 18.4 s | 1.6% faster |
+
+The database and log grew as on studio-3: 39.9, 178.2 and 360.9 MiB new against 102.3, 2,774.4 and 7,188.3 MiB old.
+The disks wrote 839 and 711 MiB for new's three legs against 10,090 and 10,110 MiB, and 581 and 577 MiB for its
+batched leg against 580 and 588. The batched calls' p50 was 10.05-10.17 ms on both, their p99 15.82-17.04 ms.
+
+So studio-2 agrees with studio-3: no leg is slower by more than the runs varied among themselves (old's 8 MiB leg took
+14.21 to 14.51 s), and the small commits' amplification is the same on both builds. Its 4 MiB leg doesn't show
+studio-3's 1.6% for 521e4bc: here new was the faster, which puts that 1.6% within what the two machines vary by.
+
 ## The same legs under load (fedora, for comparison)
 
 fedora-2, btrfs, 2026-11-05 06:35-06:44Z, load 25-43 from other work, `nice -n 10`, one round of new then old, twice.
