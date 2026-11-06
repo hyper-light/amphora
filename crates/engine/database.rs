@@ -3168,18 +3168,22 @@ impl Database {
         }
     }
 
-    /// Amphora: new generations of the log are packed, or not (`storage/packed.rs`; Amphora's
-    /// `docs/design/store.md`, decision 16): a generation takes its format when its header is
-    /// written, so the log's current one keeps its own. Refused for a log shared between
-    /// processes, whose other processes couldn't read the records.
-    pub fn wal_pack(&self, pack: bool) -> Result<()> {
+    /// Amphora: the format new generations of the log take (`storage/packed.rs`; Amphora's
+    /// `docs/design/store.md`, decisions 16 and 37): a generation takes its format when its header
+    /// is written, so the log's current one keeps its own. A format with records is refused for a
+    /// log shared between processes, whose other processes couldn't read them; a packed one for a
+    /// database that shares its pages.
+    pub fn wal_format(&self, format: crate::storage::packed::LogFormat) -> Result<()> {
         #[cfg(host_shared_wal)]
-        if pack && self.shared_wal_coordination()?.is_some() {
+        if format.holds_records() && self.shared_wal_coordination()?.is_some() {
             return Err(LimboError::InvalidArgument(
-                "a packed log is read by one process; this one is shared between processes".into(),
+                "a log of records is read by one process; this one is shared between processes"
+                    .into(),
             ));
         }
-        if pack && self.db_file.shared_pages().is_some() {
+        if format == crate::storage::packed::LogFormat::Packed
+            && self.db_file.shared_pages().is_some()
+        {
             return Err(LimboError::InvalidArgument(
                 "a packed log's pages aren't shared; this database shares its pages".into(),
             ));
@@ -3187,8 +3191,8 @@ impl Database {
         self.shared_wal
             .read()
             .runtime
-            .pack
-            .store(pack, Ordering::Release);
+            .format
+            .store(format.file_format(), Ordering::Release);
         Ok(())
     }
 
@@ -3221,10 +3225,11 @@ impl Database {
             ));
         }
         // Packing asked for now, or the log's generation on disk packed (recovery reads it as it
-        // was written; nothing asks again after a restart of the process).
+        // was written; nothing asks again after a restart of the process). A mixed log's pages
+        // are shared (decision 37).
         let packed = {
             let shared = self.shared_wal.read();
-            shared.runtime.pack.load(Ordering::Acquire)
+            shared.runtime.format.load(Ordering::Acquire) == crate::storage::packed::PACKED_FORMAT
                 || shared.metadata.wal_header.lock().file_format
                     == crate::storage::packed::PACKED_FORMAT
         };
@@ -3370,7 +3375,7 @@ impl Database {
     ) -> Result<Arc<dyn Wal>> {
         #[cfg(host_shared_wal)]
         if let Some(authority) = self.shared_wal_coordination()? {
-            // Amphora: other processes couldn't read a packed log's records.
+            // Amphora: other processes couldn't read a packed or mixed log's records.
             let format = self
                 .shared_wal
                 .read()
@@ -3378,9 +3383,9 @@ impl Database {
                 .wal_header
                 .lock()
                 .file_format;
-            if format == crate::storage::packed::PACKED_FORMAT {
+            if crate::storage::packed::LogFormat::of(format).is_some_and(|f| f.holds_records()) {
                 return Err(LimboError::InvalidArgument(
-                    "this log is packed, and a packed log is read by one process".into(),
+                    "this log holds records, and a log of records is read by one process".into(),
                 ));
             }
             return Ok(Arc::new(WalFile::new_with_shared_coordination(

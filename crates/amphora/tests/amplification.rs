@@ -424,7 +424,11 @@ fn batched_leg(config: Config) -> Wrote {
 /// The batched leg on the store's defaults, run once for the tests that read it.
 fn default_leg() -> &'static Wrote {
     static LEG: std::sync::OnceLock<Wrote> = std::sync::OnceLock::new();
-    LEG.get_or_init(|| batched_leg(Config::default()))
+    LEG.get_or_init(|| {
+        let w = batched_leg(Config::default());
+        eprintln!("{}", account(&w));
+        w
+    })
 }
 
 /// What a leg wrote, for a failing assertion.

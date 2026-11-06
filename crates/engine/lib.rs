@@ -177,6 +177,7 @@ pub use storage::{
     buffer_pool::BufferPool,
     database::{DatabaseStorage, IOContext},
     encryption::{CipherMode, EncryptionContext, EncryptionKey},
+    packed::LogFormat,
     page_transform::{PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation},
     pager::{Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},

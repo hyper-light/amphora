@@ -10,6 +10,10 @@
 //! the record's slot count where a page number would be, the others [`CONTINUATION`]; the record's
 //! last slot carries the commit's database size when it ends one. The slots' checksums chain as
 //! frames' do.
+//!
+//! A mixed generation ([`MIXED_FORMAT`], decision 37) holds page frames and records side by side:
+//! spills write page frames (over the transaction's own, decision 30), commits write records. A
+//! record's first slot carries [`RECORD_HEAD`] with its slot count, apart from page numbers.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -26,8 +30,77 @@ pub(crate) const PAGE_FORMAT: u32 = 3_007_000;
 /// The log header's file format for a packed generation.
 pub(crate) const PACKED_FORMAT: u32 = 0x414d_5002;
 
+/// The log header's file format for a mixed generation: page frames and records side by side
+/// (Amphora's docs/design/store.md, decision 37).
+pub(crate) const MIXED_FORMAT: u32 = 0x414d_5003;
+
 /// The page-number field of a record's slots after its first.
 pub(crate) const CONTINUATION: u32 = u32::MAX;
+
+/// In a mixed generation, the bit of a page-number field that marks a record's first slot (its
+/// slot count in the bits below): a page frame's page number is below it.
+pub(crate) const RECORD_HEAD: u32 = 0x8000_0000;
+
+/// What a generation of the log holds: one page a frame (SQLite's), packed records only
+/// (decision 16), or page frames for spills and records for commits (decision 37).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFormat {
+    Pages,
+    Packed,
+    Mixed,
+}
+
+impl LogFormat {
+    /// The format a log header's file format names: None for one this engine doesn't write.
+    pub(crate) fn of(file_format: u32) -> Option<Self> {
+        match file_format {
+            PAGE_FORMAT => Some(Self::Pages),
+            PACKED_FORMAT => Some(Self::Packed),
+            MIXED_FORMAT => Some(Self::Mixed),
+            _ => None,
+        }
+    }
+
+    /// The log header's file format for this format.
+    pub(crate) fn file_format(self) -> u32 {
+        match self {
+            Self::Pages => PAGE_FORMAT,
+            Self::Packed => PACKED_FORMAT,
+            Self::Mixed => MIXED_FORMAT,
+        }
+    }
+
+    /// Whether a generation of this format writes records.
+    pub(crate) fn holds_records(self) -> bool {
+        !matches!(self, Self::Pages)
+    }
+
+    /// The page-number field of the first slot of a record of `slots` slots.
+    pub(crate) fn head_field(self, slots: u32) -> Result<u32> {
+        match self {
+            Self::Packed => Ok(slots),
+            Self::Mixed if slots < RECORD_HEAD => Ok(RECORD_HEAD | slots),
+            Self::Mixed => Err(corrupt("record takes too many slots")),
+            Self::Pages => Err(LimboError::InternalError(
+                "a record in a log of one page a frame".into(),
+            )),
+        }
+    }
+
+    /// The slot count a record's first slot claims in `page_field`: None for a field that is no
+    /// record's first slot (0, [`CONTINUATION`], or in a mixed generation a page number).
+    pub(crate) fn head_slots(self, page_field: u32) -> Option<u32> {
+        match self {
+            Self::Packed => is_first_slot(page_field).then_some(page_field),
+            Self::Mixed => {
+                let slots = page_field & !RECORD_HEAD;
+                (page_field != CONTINUATION && page_field & RECORD_HEAD != 0 && slots != 0)
+                    .then_some(slots)
+            }
+            Self::Pages => None,
+        }
+    }
+}
 
 /// A record's payload starts with its stored and raw lengths.
 const PAYLOAD_HEADER: usize = 8;
@@ -349,8 +422,8 @@ pub(crate) fn slots(payload_len: usize, page_size: usize) -> Result<u32> {
     u32::try_from(slots).map_err(|_| corrupt("record takes too many slots"))
 }
 
-/// The slot count a record's first slot carries in its frame header's page-number field: one that
-/// is neither 0 (no frame) nor [`CONTINUATION`].
+/// The slot count a packed record's first slot carries in its frame header's page-number field: one
+/// that is neither 0 (no frame) nor [`CONTINUATION`].
 pub(crate) fn is_first_slot(page_field: u32) -> bool {
     page_field != 0 && page_field != CONTINUATION
 }
@@ -927,5 +1000,30 @@ mod tests {
         assert!(is_first_slot(513));
         assert!(!is_first_slot(0));
         assert!(!is_first_slot(CONTINUATION));
+    }
+
+    /// Decision 37: in a mixed generation a record's first slot is told from a page frame, a
+    /// continuation and an empty slot by its marked page field, and every count a record can take
+    /// reads back as written; a packed generation keeps its unmarked counts.
+    #[test]
+    fn a_mixed_records_first_slot_is_told_from_a_page_frame() {
+        let mixed = LogFormat::Mixed;
+        for slots in [1, 2, 65, most_slots(4096).unwrap()] {
+            let field = mixed.head_field(slots).unwrap();
+            assert_eq!(mixed.head_slots(field), Some(slots));
+            assert_eq!(LogFormat::Packed.head_field(slots).unwrap(), slots);
+        }
+        for page in [1, 2, 4096, RECORD_HEAD - 1] {
+            assert_eq!(mixed.head_slots(page), None, "page {page} is a page frame");
+        }
+        assert_eq!(mixed.head_slots(0), None);
+        assert_eq!(mixed.head_slots(CONTINUATION), None);
+        assert_eq!(mixed.head_slots(RECORD_HEAD), None, "a head of no slots");
+        assert!(mixed.head_field(RECORD_HEAD).is_err());
+        assert!(LogFormat::Pages.head_field(1).is_err());
+        for format in [LogFormat::Pages, LogFormat::Packed, LogFormat::Mixed] {
+            assert_eq!(LogFormat::of(format.file_format()), Some(format));
+        }
+        assert_eq!(LogFormat::of(0x414d_5004), None);
     }
 }

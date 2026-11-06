@@ -22,7 +22,7 @@ use std::{fmt, sync::Arc};
 use super::buffer_pool::BufferPool;
 use super::changes::{latest_by_page, ChangeLog};
 use super::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
-use super::packed::{self, Record, Records};
+use super::packed::{self, LogFormat, Record, Records};
 use super::pager::{Logged, PageRef, Pager};
 use super::sqlite3_ondisk::{
     self, checksum_wal, DatabaseHeader, WalHeader, WAL_MAGIC_BE, WAL_MAGIC_LE,
@@ -1688,11 +1688,7 @@ impl WalCoordination for InProcessWalCoordination {
                 hdr.salt_2 = io.generate_random_number() as u32;
             }
             // Amphora: a generation takes its format as its header is written, and keeps it.
-            hdr.file_format = if shared.runtime.pack.load(Ordering::Acquire) {
-                packed::PACKED_FORMAT
-            } else {
-                packed::PAGE_FORMAT
-            };
+            hdr.file_format = shared.runtime.format.load(Ordering::Acquire);
 
             let prefix = &hdr.as_bytes()[..WAL_HEADER_SIZE - 8];
             let use_native = (hdr.magic & 1) != 0;
@@ -1731,13 +1727,22 @@ impl WalCoordination for InProcessWalCoordination {
             .runtime
             .frame_cache_high_water
             .load(Ordering::Acquire);
+        // Amphora: in a mixed generation the slots written again can cut into a record, which then
+        // goes from the cache, the record registry and the list of changes whole, from its first
+        // slot, as `cache_record`'s guard has it (decision 37).
+        let mut cut = None;
         if frame_id <= high_water {
+            let mut records = shared.runtime.records.lock();
+            let from = records.covering(frame_id).unwrap_or(frame_id);
+            records.drop_after(from.saturating_sub(1));
+            drop(records);
             frame_cache.retain(|_page_id, frames| {
-                while frames.last().is_some_and(|&frame| frame >= frame_id) {
+                while frames.last().is_some_and(|&frame| frame >= from) {
                     frames.pop();
                 }
                 !frames.is_empty()
             });
+            cut = Some(from);
         }
         match frame_cache.get_mut(&page_id) {
             Some(frames) => {
@@ -1748,11 +1753,12 @@ impl WalCoordination for InProcessWalCoordination {
             }
         }
         // Amphora: listed in frame order for readers to forget (decision 18).
-        shared
-            .runtime
-            .changes
-            .lock()
-            .record(frame_id, 1, std::iter::once(page_id));
+        let mut changes = shared.runtime.changes.lock();
+        if let Some(from) = cut {
+            changes.drop_from(from);
+        }
+        changes.record(frame_id, 1, std::iter::once(page_id));
+        drop(changes);
         shared
             .runtime
             .frame_cache_high_water
@@ -3570,8 +3576,9 @@ pub struct WalSharedRuntime {
     /// wrap. Once either occurs, only identity-bearing prefixes can publish durability. Accessed
     /// under the shared WAL guard; no additional admission-path synchronization is needed.
     pub(crate) legacy_durable_allowed: bool,
-    /// Amphora: new generations of the log are packed (`packed.rs`, decision 16).
-    pub(crate) pack: AtomicBool,
+    /// Amphora: the file format new generations of the log take (`packed::LogFormat`'s,
+    /// decisions 16 and 37).
+    pub(crate) format: AtomicU32,
     /// Amphora: the packed records of the log's generation, and those decoded (`packed::Records`).
     /// A leaf lock: nothing else is locked while it is held, and it is never held across IO.
     pub(crate) records: Arc<SpinLock<Records>>,
@@ -3965,16 +3972,33 @@ impl WalFile {
         Ok(())
     }
 
-    /// Amphora: whether the log's generation of `header` is packed (`packed.rs`).
-    fn is_packed(header: &WalHeader) -> bool {
-        header.file_format == packed::PACKED_FORMAT
+    /// Amphora: the format of the log's generation of `header` (`packed::LogFormat`): one page a
+    /// frame where the header names none of Amphora's (SQLite's own, or one not yet written).
+    fn format(header: &WalHeader) -> LogFormat {
+        LogFormat::of(header.file_format).unwrap_or(LogFormat::Pages)
     }
 
-    /// Amphora: refuses what reads or writes the log a page a frame when its generation is packed.
-    fn refuse_packed(&self, what: &str) -> Result<()> {
-        if Self::is_packed(&self.coordination.wal_header()) {
+    /// Amphora: whether `frame` of the log's generation of `header` is a record's first slot: every
+    /// frame of a packed generation, the frames the record registry holds of a mixed one, no frame
+    /// of one a page a frame (decision 37).
+    fn holds_record(&self, header: &WalHeader, frame: u64) -> bool {
+        match Self::format(header) {
+            LogFormat::Pages => false,
+            LogFormat::Packed => true,
+            LogFormat::Mixed => self
+                .with_shared(|shared| shared.runtime.records.clone())
+                .lock()
+                .slots_of(frame)
+                .is_some(),
+        }
+    }
+
+    /// Amphora: refuses what reads or writes the log a page a frame when its generation holds
+    /// records.
+    fn refuse_records(&self, what: &str) -> Result<()> {
+        if Self::format(&self.coordination.wal_header()).holds_records() {
             return Err(LimboError::InvalidArgument(format!(
-                "{what} reads or writes the log a page a frame, and this log is packed"
+                "{what} reads or writes the log a page a frame, and this log holds records"
             )));
         }
         Ok(())
@@ -4078,10 +4102,13 @@ impl WalFile {
                 .ok_or_else(|| LimboError::InternalError("a record past its entries".into()))?;
             let (payload, record) = packed::encode(held, page_size)?;
             let slots = packed::slots(payload.len(), page_size)?;
+            // A packed generation's first slot carries the count, a mixed one's marks it apart
+            // from page numbers (decision 37).
+            let head_field = Self::format(header).head_field(slots)?;
             let ends = index.checked_add(1) == Some(count);
             for slot in 0..slots {
                 let field = if slot == 0 {
-                    slots
+                    head_field
                 } else {
                     packed::CONTINUATION
                 };
@@ -4888,9 +4915,9 @@ impl Wal for WalFile {
             frame.set_wal_tag(frame_id, epoch_at_issue);
             None
         });
-        // Amphora: a packed generation's page is read from its record.
+        // Amphora: a page a record holds is read from the record.
         let header = self.coordination.wal_header();
-        if Self::is_packed(&header) {
+        if self.holds_record(&header, frame_id) {
             let number = u32::try_from(page_idx).map_err(|_| LimboError::IntegerOverflow)?;
             let complete = sqlite3_ondisk::wal_page_reader(
                 complete,
@@ -4929,7 +4956,7 @@ impl Wal for WalFile {
         scratch_buf: Option<Arc<Buffer>>,
         group: Option<&mut CompletionGroup>,
     ) -> Result<Completion> {
-        self.refuse_packed("read_frames_batch")?;
+        self.refuse_records("read_frames_batch")?;
         turso_assert!(
             !pages.is_empty(),
             "read_frames_batch requires at least one page"
@@ -5084,7 +5111,7 @@ impl Wal for WalFile {
     // this method involves IO and cross "async" boundary - so juggling with references is bad and dangerous
     fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<Completion> {
         tracing::debug!("read_frame_raw({})", frame_id);
-        self.refuse_packed("read_frame_raw")?;
+        self.refuse_records("read_frame_raw")?;
         let offset = self.frame_offset(frame_id);
         let expected_frame_len = WAL_FRAME_HEADER_SIZE + self.page_size() as usize;
         if frame.len() != expected_frame_len {
@@ -5172,7 +5199,7 @@ impl Wal for WalFile {
             bail_corrupt_error!("invalid page size: {}", page.len());
         };
         self.ensure_header_if_needed(page_size, sync_type)?;
-        self.refuse_packed("write_frame_raw")?;
+        self.refuse_records("write_frame_raw")?;
         // Amphora: frames this write transaction wrote over don't chain until its commit chains
         // them again (decision 30); a raw frame, which may commit them, can't follow them.
         if self.rewritten.load(Ordering::Acquire) != 0 {
@@ -5573,7 +5600,7 @@ impl Wal for WalFile {
     }
 
     fn changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>> {
-        self.refuse_packed("changed_pages_after")?;
+        self.refuse_records("changed_pages_after")?;
         let frame_count = self.get_max_frame();
         let page_size = self.page_size();
         let mut frame = vec![0u8; page_size as usize + WAL_FRAME_HEADER_SIZE];
@@ -5760,7 +5787,8 @@ impl Wal for WalFile {
             rolling_checksum = (header.checksum_1, header.checksum_2);
         }
 
-        if Self::is_packed(&header) {
+        // Amphora: a packed or mixed generation's commit writes records (decision 37).
+        if Self::format(&header).holds_records() {
             return self.prepare_records(
                 pages,
                 &header,
@@ -5887,7 +5915,10 @@ impl Wal for WalFile {
             "page size mismatch, tried to change page size after WAL header was already initialized",
             { "shared_page_size": shared_page_size, "page_size": page_sz.get() }
         );
-        if Self::is_packed(&header) {
+        // Amphora: a packed generation's spills are records; a mixed one's are page frames,
+        // written over the transaction's own as below (decision 37).
+        let format = Self::format(&header);
+        if format == LogFormat::Packed {
             return self.append_records(&pages, &header, epoch);
         }
         let page_transform = self.io_ctx.read().page_transform().clone();
@@ -5905,11 +5936,25 @@ impl Wal for WalFile {
         for page in pages {
             let page_id =
                 u64::try_from(page.get().id()).map_err(|_| LimboError::IntegerOverflow)?;
+            // Amphora: a mixed generation tells a record's first slot by its page field's high
+            // bit, which no page frame's page may carry (decision 37).
+            if format == LogFormat::Mixed && page_id >= u64::from(packed::RECORD_HEAD) {
+                return Err(LimboError::InvalidArgument(format!(
+                    "page {page_id} is past the pages a mixed log can hold"
+                )));
+            }
             match self
                 .coordination
                 .latest_frame(page_id, local)
                 .filter(|&frame| frame > committed)
             {
+                // Only a spill writes past the committed end, and in a mixed generation a spill
+                // writes page frames: a record there is a bookkeeping fault, never written over.
+                Some(frame) if self.holds_record(&header, frame) => {
+                    return Err(LimboError::InternalError(format!(
+                        "frame {frame} past the committed end holds a record"
+                    )));
+                }
                 Some(frame) => over.push((frame, page)),
                 None => appended.push(page),
             }
@@ -6528,7 +6573,6 @@ impl WalFile {
                     }
                     let epoch = self.coordination.checkpoint_epoch();
                     let header = self.coordination.wal_header();
-                    let packed = Self::is_packed(&header);
                     // Issue reads until we hit limits
                     'inner: while ongoing_chkpt.should_issue_reads() {
                         let (page_id, target_frame) = {
@@ -6554,9 +6598,9 @@ impl WalFile {
                             }
                             continue 'inner;
                         }
-                        // Amphora: in a packed generation the pages of a record (in order, as
-                        // sorted by frame) are read with one read of it.
-                        if packed {
+                        // Amphora: the pages of a record (in order, as sorted by frame) are read
+                        // with one read of it.
+                        if self.holds_record(&header, target_frame) {
                             let current = usize::try_from(ongoing_chkpt.current_page)
                                 .map_err(|_| LimboError::IntegerOverflow)?;
                             let room = MAX_INFLIGHT_READS
@@ -7368,7 +7412,7 @@ impl WalFileShared {
                 )),
                 durable: SpinLock::new(None),
                 legacy_durable_allowed: true,
-                pack: AtomicBool::new(false),
+                format: AtomicU32::new(packed::PAGE_FORMAT),
                 records: Arc::new(SpinLock::new(Records::default())),
                 changes: SpinLock::new(ChangeLog::default()),
                 #[cfg(test)]
@@ -7451,7 +7495,7 @@ impl WalFileShared {
                 )),
                 durable: SpinLock::new(None),
                 legacy_durable_allowed: true,
-                pack: AtomicBool::new(false),
+                format: AtomicU32::new(packed::PAGE_FORMAT),
                 records: Arc::new(SpinLock::new(Records::default())),
                 changes: SpinLock::new(ChangeLog::default()),
                 #[cfg(test)]
@@ -7500,7 +7544,7 @@ impl WalFileShared {
                 )),
                 durable: SpinLock::new(None),
                 legacy_durable_allowed: true,
-                pack: AtomicBool::new(false),
+                format: AtomicU32::new(packed::PAGE_FORMAT),
                 records: Arc::new(SpinLock::new(Records::default())),
                 changes: SpinLock::new(ChangeLog::default()),
                 #[cfg(test)]

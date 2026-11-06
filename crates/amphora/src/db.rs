@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use amphora_engine::io::FileSyncType;
+pub use amphora_engine::LogFormat;
 use amphora_engine::{
     CheckpointMode, Completion, CompletionError, ConnectOpts, Connection, Database, DatabaseOpts,
     IO, IOExt, LimboError, OpenFlags, OpenOptions, PlatformIO, Row, SqliteDialect, Statement,
@@ -61,7 +62,8 @@ pub enum Sharing {
     Process,
     /// A pool of the caller's: one budget for the databases it gives it to.
     Pool(Arc<SharedPages>),
-    /// None: each connection keeps its own cache alone (a packed log needs this; decision 16).
+    /// None: each connection keeps its own cache alone (a packed log needs this; decision 16; a
+    /// mixed one, decision 37, doesn't).
     Off,
 }
 
@@ -296,6 +298,8 @@ impl Db {
         d.exec("PRAGMA foreign_keys = ON")?;
         d.exec("PRAGMA wal_autocheckpoint = 0")?;
         d.exec(&format!("PRAGMA cache_size = {WRITER_PAGES}"))?;
+        // A commit logs its pages' changes (docs/design/store.md, decision 37).
+        d.log_format(LogFormat::Mixed)?;
         match sharing {
             Sharing::Process => {
                 if let Err(e) = d.share_pages_in(&process_pages()) {
@@ -480,14 +484,14 @@ impl Db {
         self.owner = Some(owner);
     }
 
-    /// Whether the log's generations from the next one written are packed (docs/design/store.md,
-    /// decisions 16 and 17): not unless this asks, while the bench weighs them (`AMPHORA_PACK_LOG`).
-    /// A generation keeps the format it began with. A packed log's pages aren't shared: a database
-    /// that packs it is opened with [`Sharing::Off`].
-    pub fn pack_log(&self, pack: bool) -> anyhow::Result<()> {
+    /// The format the log's generations take from the next one written (docs/design/store.md,
+    /// decisions 16, 17 and 37): mixed as opened, commits logged as records of their changes and
+    /// spills as pages. A generation keeps the format it began with. A packed log's pages aren't
+    /// shared: a database that packs it is opened with [`Sharing::Off`].
+    pub fn log_format(&self, format: LogFormat) -> anyhow::Result<()> {
         self.db
-            .wal_pack(pack)
-            .map_err(|e| anyhow::anyhow!("packing {}'s log: {e}", self.path.display()))
+            .wal_format(format)
+            .map_err(|e| anyhow::anyhow!("setting {}'s log format: {e}", self.path.display()))
     }
 
     /// Shares the pages this database's connections read among them, `pages` at most

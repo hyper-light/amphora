@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
-use amphora::db::{Db, Sharing};
+use amphora::db::{Db, LogFormat, Sharing};
 use amphora::store::{Checkpointed, Config, Engine, Flush, Opener, Refused, Store};
 use amphora_engine::io::{FileId, FileSyncType};
 use amphora_engine::{
@@ -593,20 +593,24 @@ fn one_seed(seed: u64) -> Result<Seen, String> {
     let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
     let disk = Disk::new(seed, HashMap::new());
     let path = std::path::Path::new(PATH);
-    // Every other seed on a packed log (docs/design/store.md, decisions 16 and 17), whose pages
-    // aren't shared; the others share the process's pages (decision 26). Reopened, a packed log
+    // Half the seeds on a mixed log, as a store opens one (docs/design/store.md, decision 37), a
+    // quarter on a packed log (decisions 16 and 17), whose pages aren't shared, and a quarter a page
+    // a frame; all but the packed share the process's pages (decision 26). Reopened, a packed log
     // refuses to share by itself.
-    let packed = seed.is_multiple_of(2);
-    let sharing = if packed {
+    let format = match seed % 4 {
+        1 => LogFormat::Packed,
+        3 => LogFormat::Pages,
+        _ => LogFormat::Mixed,
+    };
+    let sharing = if format == LogFormat::Packed {
         Sharing::Off
     } else {
         Sharing::Process
     };
     let mut db =
         Db::open_with_sharing(path, disk.clone(), &sharing).map_err(|e| format!("open: {e:#}"))?;
-    if packed {
-        db.pack_log(true).map_err(|e| format!("pack: {e:#}"))?;
-    }
+    db.log_format(format)
+        .map_err(|e| format!("log format: {e:#}"))?;
     // Every third seed keeps no more log than its bound across a restart, so each restart, past
     // the bound, cuts the log's file to nothing (docs/design/store.md, decision 31); the others keep
     // their logs' files (decision 13).
@@ -912,9 +916,13 @@ fn spill_transaction(db: &mut Db, edits: &[(i64, i64)]) -> anyhow::Result<()> {
 }
 
 /// A database of the baseline's documents, made durable, keeping 200 pages from here on.
-fn spill_baseline(disk: &Arc<Disk>) -> Result<Db, String> {
+/// The spilling transaction's baseline on `disk`, in a log of `format`: a mixed one (decision 37),
+/// whose commits are records beside the spills' page frames, or one a page a frame.
+fn spill_baseline(disk: &Arc<Disk>, format: LogFormat) -> Result<Db, String> {
     let path = std::path::Path::new(SPILL_PATH);
     let mut db = Db::open_with(path, disk.clone()).map_err(|e| format!("open: {e:#}"))?;
+    db.log_format(format)
+        .map_err(|e| format!("log format: {e:#}"))?;
     db.exec(SPILL_SCHEMA)
         .map_err(|e| format!("schema: {e:#}"))?;
     db.transaction(|db| {
@@ -960,7 +968,13 @@ fn spill_seed(seed: u64) -> Result<SpillSeen, String> {
     let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
     let disk = Disk::new(seed, HashMap::new());
     let path = std::path::Path::new(SPILL_PATH);
-    let mut db = spill_baseline(&disk)?;
+    // Every other seed a page a frame, the others mixed (decision 37).
+    let format = if seed.is_multiple_of(2) {
+        LogFormat::Mixed
+    } else {
+        LogFormat::Pages
+    };
+    let mut db = spill_baseline(&disk, format)?;
     let edits = spill_edits();
     disk.arm(1 + rng.below(SPILL_CHANGES));
     let committed = spill_transaction(&mut db, &edits).is_ok();
@@ -1130,7 +1144,7 @@ fn ten_thousand_power_cuts_in_spilled_transactions() {
 #[test]
 fn a_frame_a_spill_writes_over_holds_no_checksum_until_its_commit() {
     let disk = Disk::new(1, HashMap::new());
-    let mut db = spill_baseline(&disk).unwrap();
+    let mut db = spill_baseline(&disk, LogFormat::Mixed).unwrap();
     let edits = spill_edits();
     let unchecked = db
         .transaction(|db| {

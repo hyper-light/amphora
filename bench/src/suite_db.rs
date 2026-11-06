@@ -239,7 +239,7 @@ mod amphora_target {
             };
             let db = Db::open_sharing(&path, &sharing)?;
             if std::env::var("AMPHORA_PACK_LOG").ok().as_deref() == Some("1") {
-                db.pack_log(true)?;
+                db.log_format(amphora::db::LogFormat::Packed)?;
             }
             if let Some(pages) = std::env::var("AMPHORA_WRITER_PAGES").ok().and_then(|v| v.parse().ok()) {
                 db.keep_pages(pages)?;
