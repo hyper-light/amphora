@@ -3993,6 +3993,27 @@ impl WalFile {
         }
     }
 
+    /// Amphora: refuses what reads or writes `frame` as a page frame where it is a record's slot:
+    /// every frame of a packed generation, and of a mixed one the slots of its records (its page
+    /// frames, a spill's or a raw write's, are read and written as ever; decision 37).
+    fn refuse_record_slot(&self, what: &str, frame: u64) -> Result<()> {
+        let in_record = match Self::format(&self.coordination.wal_header()) {
+            LogFormat::Pages => false,
+            LogFormat::Packed => true,
+            LogFormat::Mixed => self
+                .with_shared(|shared| shared.runtime.records.clone())
+                .lock()
+                .covering(frame)
+                .is_some(),
+        };
+        if in_record {
+            return Err(LimboError::InvalidArgument(format!(
+                "{what} reads or writes frame {frame} as a page, and it is a record's slot"
+            )));
+        }
+        Ok(())
+    }
+
     /// Amphora: refuses what reads or writes the log a page a frame when its generation holds
     /// records.
     fn refuse_records(&self, what: &str) -> Result<()> {
@@ -5111,7 +5132,7 @@ impl Wal for WalFile {
     // this method involves IO and cross "async" boundary - so juggling with references is bad and dangerous
     fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<Completion> {
         tracing::debug!("read_frame_raw({})", frame_id);
-        self.refuse_records("read_frame_raw")?;
+        self.refuse_record_slot("read_frame_raw", frame_id)?;
         let offset = self.frame_offset(frame_id);
         let expected_frame_len = WAL_FRAME_HEADER_SIZE + self.page_size() as usize;
         if frame.len() != expected_frame_len {
@@ -5199,7 +5220,14 @@ impl Wal for WalFile {
             bail_corrupt_error!("invalid page size: {}", page.len());
         };
         self.ensure_header_if_needed(page_size, sync_type)?;
-        self.refuse_records("write_frame_raw")?;
+        self.refuse_record_slot("write_frame_raw", frame_id)?;
+        if Self::format(&self.coordination.wal_header()) == LogFormat::Mixed
+            && page_id >= u64::from(packed::RECORD_HEAD)
+        {
+            return Err(LimboError::InvalidArgument(format!(
+                "page {page_id} is past the pages a mixed log can hold"
+            )));
+        }
         // Amphora: frames this write transaction wrote over don't chain until its commit chains
         // them again (decision 30); a raw frame, which may commit them, can't follow them.
         if self.rewritten.load(Ordering::Acquire) != 0 {

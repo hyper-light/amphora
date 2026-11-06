@@ -1410,8 +1410,10 @@ commit. A mixed log's pages are shared (decisions 20 and 26): a page read from a
 image under its page and the record's frame, as a page frame's does. Generations keep the format they
 began with: page-a-frame and packed logs written before read as ever, and recovery refuses a header
 whose format it doesn't know rather than read it as page frames. Page numbers at or past `0x8000_0000`
-(8 TiB of 4 KiB pages) are refused in a mixed generation. The raw frame interface (Turso's sync) and
-the multi-process authority refuse a mixed log, as they refuse a packed one.
+(8 TiB of 4 KiB pages) are refused in a mixed generation. The raw frame interface (Turso's sync's,
+and the pages a replica installs, `Db::apply_pages`) reads and writes a mixed log's page frames as
+ever and refuses a record's slots; the multi-process authority refuses a mixed log, as it refuses a
+packed one.
 
 **Why.** Decision 35's plan: on the unify audit's batched leg the log takes 16.6 bytes a byte of the
 rows the calls commit, a 4 KiB page for each page a commit touches; a packed log with deltas took
