@@ -47,4 +47,8 @@ pub struct ReplicaStatus {
     /// Initial data is not exposed until its declared image is committed and applied.
     #[serde(default)]
     pub bootstrapping: bool,
+    /// The voters a joint configuration leaves (replication.md, "Membership"): empty unless the
+    /// group is between two configurations.
+    #[serde(default)]
+    pub voters_outgoing: Vec<u64>,
 }

@@ -141,6 +141,20 @@ enum Input {
         until: Instant,
         response: Response<ReplicaStatus>,
     },
+    Transfer {
+        to: u64,
+        until: Instant,
+        response: Response<ReplicaStatus>,
+    },
+}
+/// The hand-off of the lead under way (replication.md, "Membership"): asked of the leader in
+/// `term`, answered once this member follows `to`.
+struct Transferring {
+    to: u64,
+    term: u64,
+    until: Instant,
+    response: Response<ReplicaStatus>,
+    _reservation: Reservation,
 }
 /// The change of members under way (replication.md, "Membership"): one at a time, beside the
 /// write under way, which neither waits for.
@@ -189,6 +203,7 @@ struct Actor {
     control: Arc<Control>,
     pending: Option<Pending>,
     changing: Option<Changing>,
+    transferring: Option<Transferring>,
     // At most COMMANDS admitted operations wait behind the sole prepared transaction.
     waiting: VecDeque<Envelope>,
     serial: u64,
@@ -243,8 +258,10 @@ impl ReplicaHandle {
             let next = charged.checked_add(bytes).ok_or(Refusal::Full {
                 limit: QUEUED_BYTES,
             })?;
-            if matches!(&command, Input::Submit { .. } | Input::Change { .. })
-                && next > application_limit
+            if matches!(
+                &command,
+                Input::Submit { .. } | Input::Change { .. } | Input::Transfer { .. }
+            ) && next > application_limit
             {
                 return Err(Refusal::Full {
                     limit: application_limit,
@@ -419,6 +436,34 @@ impl ReplicaHandle {
                 mpsc::RecvTimeoutError::Disconnected => unknown(),
             })?
     }
+
+    /// Hands the lead to the voter `to` (replication.md, "Membership"), so that the leader can
+    /// then be demoted or removed by its successor. Only the leader takes one, and not while a
+    /// change of members or the group's seed is under way. It answers its status once it follows
+    /// `to`, at once when it is `to`. Refused: off the leader, or once the lead went to another,
+    /// naming the leader known (`NotLeader`); while a change or another hand-off is under way, or
+    /// when `to` did not take the lead within an election timeout (`Unavailable`); to a member
+    /// that does not vote (`Invalid`). UnknownOutcome: the deadline passed first; read the status.
+    pub fn transfer(&self, to: u64, until: Instant) -> Result<ReplicaStatus, Refusal> {
+        if Instant::now() >= until {
+            return Err(Refusal::Timeout);
+        }
+        let (response, receiver) = mpsc::sync_channel(1);
+        self.enqueue(
+            Input::Transfer {
+                to,
+                until,
+                response,
+            },
+            CHANGE_BYTES,
+        )?;
+        receiver
+            .recv_timeout(until.saturating_duration_since(Instant::now()))
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => unknown(),
+                mpsc::RecvTimeoutError::Disconnected => unknown(),
+            })?
+    }
 }
 
 pub(super) fn start(
@@ -527,6 +572,7 @@ fn open(
         control: Arc::clone(&control),
         pending: None,
         changing: None,
+        transferring: None,
         waiting: VecDeque::new(),
         serial: 0,
         transferred: None,
@@ -628,6 +674,7 @@ fn status(replica: &Durable) -> ReplicaStatus {
         voters: replica.configuration().voters.clone(),
         learners: replica.configuration().learners.clone(),
         fenced: replica.fenced().map(ToString::to_string),
+        voters_outgoing: replica.configuration().voters_outgoing.clone(),
     }
 }
 
@@ -669,6 +716,9 @@ impl Actor {
             };
             answer(changing.response, result);
         }
+        if let Some(transferring) = self.transferring.take() {
+            answer(transferring.response, Err(unknown()));
+        }
         if let Ok(mut status) = self.control.status.lock() {
             *status = Err(reason.clone());
         }
@@ -688,7 +738,9 @@ impl Actor {
             match envelope.command {
                 Input::Submit { response, .. } => answer(response, Err(reason.clone())),
                 Input::Receive { response, .. } => answer(response, Err(reason.clone())),
-                Input::Change { response, .. } => answer(response, Err(reason.clone())),
+                Input::Change { response, .. } | Input::Transfer { response, .. } => {
+                    answer(response, Err(reason.clone()))
+                }
             }
         }
     }
@@ -734,6 +786,7 @@ impl Actor {
         self.expire();
         self.expire_change();
         self.settle_change();
+        self.settle_transfer();
         self.bootstrap()?;
         if !self.replica.machine().bootstrap_pending()
             && self.pending.is_none()
@@ -1016,15 +1069,75 @@ impl Actor {
                     }
                 }
             }
+            Input::Transfer {
+                to,
+                until,
+                response,
+            } => {
+                if self.at >= until {
+                    answer(response, Err(Refusal::Timeout));
+                } else if let Err(refusal) = self.may_change() {
+                    answer(response, Err(refusal));
+                } else if to == self.replica.id() {
+                    answer(response, Ok(status(&self.replica)));
+                } else if !self.replica.core().raft.configuration().votes(to) {
+                    // The core gives up, saying nothing, a hand-off to a member that can't lead.
+                    answer(
+                        response,
+                        Err(api::invalid("lead transfer", "only a voter takes the lead")),
+                    );
+                } else {
+                    match self.replica.transfer(to) {
+                        Ok(()) => {
+                            self.transferring = Some(Transferring {
+                                to,
+                                term: self.replica.term(),
+                                until,
+                                response,
+                                _reservation,
+                            })
+                        }
+                        Err(error) => answer(response, Err(raft_error(error))),
+                    }
+                }
+            }
         }
         Ok(())
+    }
+    /// The hand-off under way: answered once this member follows `to`, once the lead went to
+    /// another, once the core gave it up (it does within an election timeout), or past its
+    /// deadline.
+    fn settle_transfer(&mut self) {
+        let Some(transferring) = self.transferring.as_ref() else {
+            return;
+        };
+        let leader = self.replica.leader();
+        let result = if leader == transferring.to {
+            Ok(status(&self.replica))
+        } else if self.at >= transferring.until {
+            Err(unknown())
+        } else if leader != 0 && leader != self.replica.id() {
+            Err(not_leader(leader))
+        } else if self.replica.is_leader()
+            && (self.replica.term() != transferring.term
+                || self.replica.core().raft.lead_transferee().is_none())
+        {
+            Err(unavailable(
+                "the lead was not taken within an election timeout; try again",
+            ))
+        } else {
+            return;
+        };
+        if let Some(transferring) = self.transferring.take() {
+            answer(transferring.response, result);
+        }
     }
     /// Whether this owner takes a change of members now.
     fn may_change(&self) -> Result<(), Refusal> {
         if !self.replica.is_leader() {
             return Err(not_leader(self.replica.leader()));
         }
-        if self.changing.is_some() {
+        if self.changing.is_some() || self.transferring.is_some() {
             return Err(unavailable(
                 "a change of members is under way; try again once it is answered",
             ));
@@ -1038,7 +1151,7 @@ impl Actor {
     }
     /// What `change` asks of the group as this leader leads it now: the joint change that makes
     /// it, none when the group is so already, or why the group can't take it.
-    fn member_change(&self, change: MemberChange) -> Result<Option<ConfChangeV2>, Refusal> {
+    fn member_change(&mut self, change: MemberChange) -> Result<Option<ConfChangeV2>, Refusal> {
         let raft = &self.replica.core().raft;
         let configuration = raft.configuration();
         if configuration.is_joint() || raft.has_pending_conf() {
@@ -1072,7 +1185,7 @@ impl Actor {
             MemberChange::Demote(_) if !votes => return invalid("only a voter is demoted"),
             MemberChange::Remove(_) if !learns && !votes => return Ok(None),
             MemberChange::Demote(_) | MemberChange::Remove(_) if member == self.replica.id() => {
-                return invalid("the leader leaves the voters only after it hands on its lead");
+                return invalid("the leader hands on its lead first (transfer), then is changed");
             }
             MemberChange::Demote(_) => ConfChangeType::AddLearnerNode,
             MemberChange::Remove(_) => ConfChangeType::RemoveNode,
@@ -1097,6 +1210,11 @@ impl Actor {
             changed.configuration.members().count(),
             raft.config().limits.members.min(MEMBERS),
         )?;
+        // A joiner catches up by the leader's image once the log no longer reaches back: past
+        // the image's ceiling it never could, so it is refused here, not added to fall behind.
+        if matches!(change, MemberChange::AddLearner(_)) {
+            self.replica.machine_mut().admits_joiner()?;
+        }
         Ok(Some(proposal))
     }
     fn step(&mut self, from: u64, bytes: &[u8]) -> Result<(), Refusal> {
@@ -2633,6 +2751,27 @@ mod tests {
             .unwrap();
         receiver
     }
+    /// Enqueues a hand-off of the lead to `to` at `client` without waiting: its answer comes on
+    /// the returned receiver.
+    fn transfer(
+        client: &Client,
+        until: Instant,
+        to: u64,
+    ) -> mpsc::Receiver<Result<ReplicaStatus, Refusal>> {
+        let (response, receiver) = mpsc::sync_channel(1);
+        client
+            .handle
+            .enqueue(
+                Input::Transfer {
+                    to,
+                    until,
+                    response,
+                },
+                CHANGE_BYTES,
+            )
+            .unwrap();
+        receiver
+    }
     /// Writes `value` into member_items through `client`.
     fn write(driven: &mut Driven, pump: &mut Pump<'_>, client: &Client, value: u8) {
         driven
@@ -2705,8 +2844,9 @@ mod tests {
     /// the voter; add member 2 as a learner; write 2 on the voter and 3 on the learner; remove the
     /// learner; write 4 on the voter; then write 5 on the removed member. Expect: each change
     /// answered with the configuration it made, two entries on (into the joint configuration and
-    /// out of it); 1, 2 and 3 on both; from the removal on, no record sent to the removed member
-    /// and 4 on the voter alone; its own write 5 never applied there by itself, Timeout.
+    /// out of it); 1, 2 and 3 on both, within 5 s of every clock; from the removal on, no record
+    /// sent to the removed member and 4 on the voter alone; its own write 5 never applied there by
+    /// itself, Timeout.
     #[test]
     fn a_learner_added_has_every_write_and_once_removed_receives_none() {
         let dir = tempfile::tempdir().unwrap();
@@ -2740,6 +2880,13 @@ mod tests {
         catch_up(&mut driven, &mut pump, &clients, 0, 1);
         assert_eq!(held(&mut driven, 0), vec![1, 2, 3]);
         assert_eq!(held(&mut driven, 1), vec![1, 2, 3]);
+        // The writes reach the learner within 5 s: here, before any clock moves at all.
+        assert!(
+            driven
+                .clocks
+                .iter()
+                .all(|clock| offset(clock) < Duration::from_secs(5))
+        );
 
         pump.departed.push(2);
         let until = driven.until();
@@ -3014,8 +3161,8 @@ mod tests {
     /// Do: a change's deadline passes at its barrier; then, relayed to its proposal, another's; then,
     /// relayed until the joint configuration it made is applied, a third's. Expect: Timeout, with
     /// nothing proposed; UnknownOutcome, and with the relay back it applies all the same, as reading
-    /// the configuration shows; the status applied, and with the relay back the group leaves the
-    /// joint configuration.
+    /// the configuration shows; the status applied, naming the voters of the joint configuration
+    /// it is in (`voters_outgoing`), and with the relay back the group leaves it.
     #[test]
     fn a_change_past_its_deadline_answers_what_its_stage_knows() {
         let dir = tempfile::tempdir().unwrap();
@@ -3065,17 +3212,31 @@ mod tests {
         pump.departed.push(4);
         let until = deadline(&clock, driven.base);
         let asked = change(led, until, MemberChange::Remove(4));
-        reach(&mut driven, &mut pump, "the removal applied", |driven| {
-            applied_configuration(driven, leader).learners.is_empty()
-        });
-        // The way out of the joint configuration is still to come, unless a slow disk applied
-        // both phases in one step.
-        let answered = asked.try_recv().unwrap_or_else(|_| {
-            set(&clock, driven.base, until);
-            driven.step();
-            asked.try_recv().unwrap()
-        });
-        assert_eq!(answered.unwrap().learners, Vec::<u64>::new());
+        // The leader proposes the way out only once it has applied the joint configuration, and
+        // that commits only on a relay round more, so a round ends with the joint one applied.
+        reach(
+            &mut driven,
+            &mut pump,
+            "the joint configuration",
+            |driven| {
+                !applied_configuration(driven, leader)
+                    .voters_outgoing
+                    .is_empty()
+            },
+        );
+        let joint = led.handle().status().unwrap();
+        assert_eq!(
+            (joint.voters_outgoing, joint.learners),
+            (vec![1, 2, 3], vec![])
+        );
+        assert!(matches!(asked.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        set(&clock, driven.base, until);
+        driven.step();
+        let answered = asked.try_recv().unwrap().unwrap();
+        assert_eq!(
+            (answered.voters_outgoing, answered.learners),
+            (vec![1, 2, 3], vec![])
+        );
         settled(&mut driven, &mut pump, 3, &[]);
         write(&mut driven, &mut pump, led, 1);
         driven.drain(&mut pump);
@@ -3246,6 +3407,258 @@ mod tests {
             driven.drain(&mut pump);
             pump.finish();
         }
+    }
+
+    /// CP-T1.8 on driven time (replication.md, "Membership"): the leader is removed once it has
+    /// handed on its lead. Do, in a group of three voters: ask a follower to hand on the lead; ask
+    /// the leader to hand it to a non-member and to itself, and to remove itself; then the leader
+    /// hands it to a follower, the new leader removes the old one, and writes. Expect: NotLeader
+    /// naming the leader; Invalid; the status at once, in the same term; Invalid, saying to hand
+    /// the lead on first; then the follower leading, in a later term; the removal answered with
+    /// the other two voters; the write on both of them, none on the removed member, and no record
+    /// delivered to it from the removal's answer on.
+    #[test]
+    fn the_leader_is_removed_once_it_has_handed_on_its_lead() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let (heir, other) = ((leader + 1) % 3, (leader + 2) % 3);
+        let id = |owner: usize| u64::try_from(owner + 1).unwrap();
+        let before = clients[leader].handle().status().unwrap();
+        let until = driven.until();
+        assert_eq!(
+            driven.answer(&mut pump, &transfer(&clients[heir], until, id(heir))),
+            Err(Refusal::NotLeader {
+                leader: Some(id(leader))
+            })
+        );
+        assert!(matches!(
+            driven.answer(&mut pump, &transfer(&clients[leader], until, 9)),
+            Err(Refusal::Invalid { what, .. }) if what == "lead transfer"
+        ));
+        let stayed = driven
+            .answer(&mut pump, &transfer(&clients[leader], until, id(leader)))
+            .unwrap();
+        assert_eq!((stayed.leader, stayed.term), (id(leader), before.term));
+        assert!(matches!(
+            driven.answer(
+                &mut pump,
+                &change(&clients[leader], until, MemberChange::Remove(id(leader)))
+            ),
+            Err(Refusal::Invalid { why, .. }) if why.contains("transfer")
+        ));
+
+        let handed = driven
+            .answer(&mut pump, &transfer(&clients[leader], until, id(heir)))
+            .unwrap();
+        assert_eq!(handed.leader, id(heir));
+        assert!(handed.term > before.term, "{handed:?}");
+        assert_eq!(driven.follow(&mut pump, &clients, 1), heir);
+
+        pump.departed.push(id(leader));
+        let until = driven.until();
+        let removed = driven
+            .answer(
+                &mut pump,
+                &change(&clients[heir], until, MemberChange::Remove(id(leader))),
+            )
+            .unwrap();
+        let mut rest = vec![id(heir), id(other)];
+        rest.sort_unstable();
+        assert_eq!((removed.voters, removed.learners), (rest, vec![]));
+        quiet(&mut driven, &mut pump);
+        let sent = pump.delivered.get(&id(leader)).copied().unwrap_or_default();
+        write(&mut driven, &mut pump, &clients[heir], 1);
+        catch_up(&mut driven, &mut pump, &clients, heir, other);
+        quiet(&mut driven, &mut pump);
+        assert_eq!(
+            pump.delivered.get(&id(leader)).copied().unwrap_or_default(),
+            sent
+        );
+        assert_eq!(held(&mut driven, heir), vec![1]);
+        assert_eq!(held(&mut driven, other), vec![1]);
+        assert_eq!(held(&mut driven, leader), Vec::<u8>::new());
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// CP-T1.8 on driven time (replication.md, "Membership"): a member that joins catches up by
+    /// the leader's image when its log no longer reaches back, and that image is bounded, so a
+    /// database past the snapshot ceiling refuses a joiner before the change is proposed. Do: in a
+    /// group of one voter, its ceiling lowered to 64 KiB, write a 128 KiB row; add member 2 as a
+    /// learner; raise the ceiling back; add it again. Expect: TooLarge naming the database's bytes
+    /// and the ceiling, nothing proposed and no learner; then the learner added, with the row.
+    #[test]
+    fn a_joiner_to_a_database_past_the_snapshot_ceiling_is_refused_before_it_is_proposed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = vec![
+            driven.open(dir.path(), 1, vec![1], None),
+            driven.open_member(dir.path(), 2, vec![1], vec![2], None),
+        ];
+        let mut pump = Pump::new(&clients);
+        driven.elect(&mut pump, &clients[..1], 0, 1);
+        driven.owners[0]
+            .0
+            .replica
+            .machine_mut()
+            .set_snapshot_bytes(64 << 10);
+        driven
+            .call(&mut pump, &clients[0], |db| {
+                db.exec("CREATE TABLE joined(b)")?;
+                db.exec("INSERT INTO joined VALUES(randomblob(131072))")?;
+                Ok(Vec::new())
+            })
+            .unwrap();
+        let proposed = pending_change(&driven, 0);
+        let until = driven.until();
+        let refused = driven.answer(
+            &mut pump,
+            &change(&clients[0], until, MemberChange::AddLearner(2)),
+        );
+        assert!(
+            matches!(
+                &refused,
+                Err(Refusal::TooLarge { what, size, limit })
+                    if what.contains("joiner") && *size > 128 << 10 && *limit == 64 << 10
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(pending_change(&driven, 0), proposed);
+        assert_eq!(
+            clients[0].handle().status().unwrap().learners,
+            Vec::<u64>::new()
+        );
+
+        driven.owners[0]
+            .0
+            .replica
+            .machine_mut()
+            .set_snapshot_bytes(crate::replication::SNAPSHOT_BYTES);
+        let added = driven
+            .answer(
+                &mut pump,
+                &change(&clients[0], until, MemberChange::AddLearner(2)),
+            )
+            .unwrap();
+        assert_eq!(added.learners, vec![2]);
+        catch_up(&mut driven, &mut pump, &clients, 0, 1);
+        let rows = driven.owners[1]
+            .0
+            .replica
+            .machine_mut()
+            .read_db(|db| {
+                let mut rows = 0;
+                db.query("SELECT length(b) FROM joined", [], |row| {
+                    rows += row.get::<i64>(0).map_err(unavailable)?;
+                    Ok(true)
+                })?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(rows, 128 << 10);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// CP-T1.8 on driven time (replication.md, "Membership"; docs/raft.md §3.4): a member's
+    /// records count by the newest configuration its log states, applied or not, so a removal
+    /// another lead writes over gives the member back. Do: in a group of three voters and learner
+    /// 4, the leader appends 4's removal, whose records are lost; the other two, their clocks past
+    /// an election timeout, elect one of them, whose entry takes that index; a write. Expect: the
+    /// old leader refuses a record from 4 while its log holds the removal; once the new leader's
+    /// entry replaces it, its configuration names 4 again and it takes 4's record; the change
+    /// answered UnknownOutcome, and the write reaches 4.
+    #[test]
+    fn a_removal_another_lead_wrote_over_gives_the_member_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let mut clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        clients.push(driven.open_member(dir.path(), 4, vec![1, 2, 3], vec![4], None));
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients[..3], 0, 1);
+        let until = driven.until();
+        driven
+            .answer(
+                &mut pump,
+                &change(&clients[leader], until, MemberChange::AddLearner(4)),
+            )
+            .unwrap();
+        settled(&mut driven, &mut pump, 3, &[4]);
+        driven.drain(&mut pump);
+        // From the removal on, what 4 sent before it reaches a leader that no longer counts it.
+        pump.departed.push(4);
+        let proposed = pending_change(&driven, leader);
+        let asked = change(&clients[leader], until, MemberChange::Remove(4));
+        reach(&mut driven, &mut pump, "the removal appended", |driven| {
+            pending_change(driven, leader) > proposed
+        });
+        clients[leader].handle().drain(OUTGOING_MESSAGES).unwrap();
+        let counts = |driven: &Driven| {
+            driven.owners[leader]
+                .0
+                .replica
+                .core()
+                .raft
+                .configuration()
+                .contains(4)
+        };
+        assert!(!counts(&driven));
+        let from_learner = |driven: &mut Driven| {
+            let mut record = hyper_raft::proto::message(
+                u64::try_from(leader + 1).unwrap(),
+                hyper_raft::proto::MessageType::MsgHeartbeatResponse,
+            );
+            record.from = 4;
+            record.term = driven.owners[leader].0.replica.term();
+            let mut bytes = Vec::new();
+            record.encode(&mut bytes);
+            let mut receipt = clients[leader]
+                .handle()
+                .admit_receive(4, bytes, driven.until())
+                .unwrap();
+            driven.step();
+            receipt.try_result()
+        };
+        assert!(matches!(
+            from_learner(&mut driven),
+            Err(Refusal::Invalid { why, .. }) if why == "sender is not a current member"
+        ));
+        // Lost too: whatever that step had the old leader send.
+        clients[leader].handle().drain(OUTGOING_MESSAGES).unwrap();
+
+        let others: Vec<usize> = (0..3).filter(|owner| *owner != leader).collect();
+        let answered = (0..ROUNDS)
+            .find_map(|_| {
+                for owner in &others {
+                    driven.advance(*owner, TICK);
+                }
+                driven.round(&mut pump);
+                asked.try_recv().ok()
+            })
+            .unwrap();
+        assert_eq!(answered, Err(Refusal::UnknownOutcome));
+        reach(
+            &mut driven,
+            &mut pump,
+            "the removal written over",
+            |driven| driven.owners[leader].0.replica.applied().index > proposed && counts(driven),
+        );
+        settled(&mut driven, &mut pump, 3, &[4]);
+        assert_eq!(from_learner(&mut driven), Ok(Some(())));
+        let led =
+            usize::try_from(clients[others[0]].handle().status().unwrap().leader - 1).unwrap();
+        write(&mut driven, &mut pump, &clients[led], 1);
+        catch_up(&mut driven, &mut pump, &clients, led, 3);
+        assert_eq!(held(&mut driven, 3), vec![1]);
+        driven.drain(&mut pump);
+        pump.finish();
     }
     fn unchanged(db: &mut Db) -> anyhow::Result<Vec<u8>> {
         let mut value = Vec::new();

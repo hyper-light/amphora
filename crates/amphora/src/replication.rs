@@ -100,6 +100,8 @@ pub struct Machine {
     point: Point,
     configuration: ConfState,
     baseline: bootstrap::Baseline,
+    // The largest image this machine makes or installs: SNAPSHOT_BYTES, lowered only by a test.
+    snapshot_bytes: usize,
     _owner: std::sync::Arc<std::fs::File>,
 }
 
@@ -249,8 +251,25 @@ impl Machine {
             point,
             configuration,
             baseline,
+            snapshot_bytes: SNAPSHOT_BYTES,
             _owner: owner,
         })
+    }
+
+    /// A member that joins catches up by this machine's image once the log no longer reaches
+    /// back, and an image is bounded (replication.md, "Membership"): past its ceiling, a joiner
+    /// is refused before it is added, never left unable to catch up.
+    pub(crate) fn admits_joiner(&mut self) -> Result<(), Refusal> {
+        let size = self.db.image_bytes().map_err(unavailable)?;
+        api::bound(
+            "database a joiner installs as a snapshot",
+            size,
+            self.snapshot_bytes,
+        )
+    }
+    #[cfg(test)]
+    pub(crate) fn set_snapshot_bytes(&mut self, bytes: usize) {
+        self.snapshot_bytes = bytes;
     }
 
     pub(crate) fn bootstrap_pending(&self) -> bool {
@@ -484,7 +503,7 @@ impl StateMachine for Machine {
 
     fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
         self.require_baseline().map_err(failed)?;
-        let pages = self.db.image_pages(SNAPSHOT_BYTES).map_err(failed)?;
+        let pages = self.db.image_pages(self.snapshot_bytes).map_err(failed)?;
         let bytes = if let Some(declaration) = self.baseline.declaration() {
             let mut bytes = BASELINE_SNAPSHOT.to_vec();
             bytes.extend(
@@ -501,7 +520,7 @@ impl StateMachine for Machine {
         api::bound(
             "snapshot",
             bytes.len(),
-            SNAPSHOT_BYTES.saturating_add(ENVELOPE_BYTES),
+            self.snapshot_bytes.saturating_add(ENVELOPE_BYTES),
         )
         .map_err(failed)?;
         into.extend_from_slice(&bytes);
@@ -514,7 +533,7 @@ impl StateMachine for Machine {
         api::bound(
             "snapshot",
             image.len(),
-            SNAPSHOT_BYTES.saturating_add(ENVELOPE_BYTES),
+            self.snapshot_bytes.saturating_add(ENVELOPE_BYTES),
         )
         .map_err(failed)?;
         let pages: Vec<(u32, Vec<u8>)> =
@@ -530,7 +549,7 @@ impl StateMachine for Machine {
                 }
                 postcard::from_bytes(image).map_err(failed)?
             };
-        validate_pages(&pages, SNAPSHOT_BYTES).map_err(failed)?;
+        validate_pages(&pages, self.snapshot_bytes).map_err(failed)?;
         if pages.first().map(|p| p.0) != Some(1) {
             return Err(failed("snapshot lacks its database header"));
         }
