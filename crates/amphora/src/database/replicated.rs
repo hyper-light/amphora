@@ -3035,16 +3035,19 @@ mod tests {
         let mut driven = Driven::new();
         let full = driven.open_member(dir.path(), 1, vec![1], (2..=64).collect(), None);
         driven.owners[0].0.replica.campaign().unwrap();
-        for _ in 0..ROUNDS {
-            if full.handle().status().unwrap().leader == 1 {
-                break;
-            }
+        // Its lead and the change's barrier each wait on its disk: each step yields to it, and
+        // the change is asked only once the voter leads.
+        let led = (0..ROUNDS).any(|_| {
             driven.step();
-        }
+            std::thread::park_timeout(POLL);
+            full.handle().status().unwrap().leader == 1
+        });
+        assert!(led, "the voter did not lead in {ROUNDS} driven steps");
         let asked = change(&full, driven.until(), MemberChange::AddLearner(65));
         let refused = (0..ROUNDS)
             .find_map(|_| {
                 driven.step();
+                std::thread::park_timeout(POLL);
                 asked.try_recv().ok()
             })
             .unwrap();
@@ -3161,8 +3164,9 @@ mod tests {
     /// Do: a change's deadline passes at its barrier; then, relayed to its proposal, another's; then,
     /// relayed until the joint configuration it made is applied, a third's. Expect: Timeout, with
     /// nothing proposed; UnknownOutcome, and with the relay back it applies all the same, as reading
-    /// the configuration shows; the status applied, naming the voters of the joint configuration
-    /// it is in (`voters_outgoing`), and with the relay back the group leaves it.
+    /// the configuration shows; while the joint configuration is applied, the status names its
+    /// outgoing voters (`voters_outgoing`), and the deadline answers the status applied; with the
+    /// relay back the group leaves it.
     #[test]
     fn a_change_past_its_deadline_answers_what_its_stage_knows() {
         let dir = tempfile::tempdir().unwrap();
@@ -3212,8 +3216,8 @@ mod tests {
         pump.departed.push(4);
         let until = deadline(&clock, driven.base);
         let asked = change(led, until, MemberChange::Remove(4));
-        // The leader proposes the way out only once it has applied the joint configuration, and
-        // that commits only on a relay round more, so a round ends with the joint one applied.
+        // Each round ends with what the leader has applied published, the joint configuration
+        // too: its way out comes only after the joint one is committed.
         reach(
             &mut driven,
             &mut pump,
@@ -3232,10 +3236,15 @@ mod tests {
         assert!(matches!(asked.try_recv(), Err(mpsc::TryRecvError::Empty)));
         set(&clock, driven.base, until);
         driven.step();
+        // The status applied: still joint, or out of it if the way out had committed while the
+        // leader's disk held back the joint configuration's apply.
         let answered = asked.try_recv().unwrap().unwrap();
         assert_eq!(
             (answered.voters_outgoing, answered.learners),
-            (vec![1, 2, 3], vec![])
+            (
+                applied_configuration(&driven, leader).voters_outgoing,
+                vec![]
+            )
         );
         settled(&mut driven, &mut pump, 3, &[]);
         write(&mut driven, &mut pump, led, 1);
