@@ -524,6 +524,8 @@ in its Grafana overview (deploy/grafana/dashboards/kiln-overview.json):
 | Flush backlog (entries) | `max by (instance, db) (amphora_replica_flush_backlog_entries)` | `max:amphora_replica_flush_backlog_entries{$host} by {host,db}` |
 | Flush seconds p50 / p99 | `histogram_quantile(0.5 / 0.99, sum by (le, db) (rate(amphora_replica_flush_seconds_bucket[5m])))` | `p50:` and `p99:amphora_replica_flush_seconds{$host} by {db}` |
 | Commits by quorum, stacked: the held share is the bars' proportion | `sum by (quorum) (rate(amphora_replica_commits_total[5m]))` | `sum:amphora_replica_commits_total{$host} by {quorum}.as_count()` |
+| Quorum patience (seconds), the leader's ("The leader's quorum patience") | `max by (instance, db) (amphora_replica_quorum_patience_seconds)` | `max:amphora_replica_quorum_patience_seconds{$host} by {host,db}` |
+| Answer gaps refused past the patience's ceiling | `sum by (db) (rate(amphora_replica_quorum_patience_refused_total[5m]))` | `sum:amphora_replica_quorum_patience_refused_total{$host} by {db}.as_count()` |
 
 Its tests: the counts a host reads, through a held flush and the flushing thread's, and none in the persisted
 class (`the_replicated_class_counts_its_backlog_flushes_and_commits`); the buckets
@@ -774,7 +776,12 @@ leader, so a dead leader is replaced as fast as before.
   (focal's `quorum_tail`): a check needs k of them, and the ones that answer first suffice. Of two
   followers, the smaller tail. In a joint configuration the check needs a majority of each set, so
   the patience is the larger of the two sets' tails, each over its own voters, and a voter of
-  either set is measured.
+  either set is measured. The sets are the ones the core's check counts: the newest configuration
+  its log states, applied or not (`raft.configuration()`, its tracker's; "Membership"), never the
+  applied one, which lags while a change is in the log, so the patience would measure voters the
+  check doesn't count. A sender is checked against the same configuration. Agreed by
+  amphora-seam-owner at the line's merge (t1/replicated-line). Tested driven, a group held joint:
+  `a_leader_in_a_joint_configuration_keeps_its_lead_through_the_late_halfs_tail`.
 - **Patience**: that tail less the election timeout, never below zero. A leader whose check is due
   after as many ticks as the gap is never deposed by a silence that long wherever it falls, since
   its check counts every answer since the last (`docs/raft.md` §3.6).
@@ -812,9 +819,13 @@ leader, so a dead leader is replaced as fast as before.
     or has measured no answer gap.";
   - `amphora_replica_quorum_patience_refused_total`, a counter: "Answer gaps a leading replica
     refused to learn for its quorum patience, because they passed its ceiling."
-  No labels from Amphora (it may add only small closed sets); kiln adds its own. They are wired
-  into the replica meter (`meter.rs`, t1/class-metrics) once both branches are on main; until
-  then the refusal is the event above.
+  No labels from Amphora (it may add only small closed sets); kiln adds its own. They are in the
+  replica meter (`meter::REPLICA_METRICS`, read through `ReplicaHandle::counters`, Amphora goal
+  867fa589): the owner sets the gauge where it sets the patience, the patience in ticks of `TICK`
+  while it leads and zero while it follows, and counts a gap refused past the ceiling where
+  `heard` refuses it; the event above stays beside the count. A gap refused because the leader
+  measures as many voters as it can (`Unmeasured::Full`) is the event alone, outside the
+  counter's help line. Tested by `the_quorum_patience_and_its_refusals_are_counted_for_the_host`.
 
 `replicated.rs` is Codex's. Codex's agent has ended, and its role is held by amphora-seam-owner
 (kiln agent 01a1b152d389767493f79adff5245f64, on Ada's word), whose agreement stands for Codex's.

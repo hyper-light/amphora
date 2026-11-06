@@ -264,7 +264,7 @@ pub fn flush_bucket(d: Duration) -> usize {
 
 /// The replicated class's metrics, as their host exports them: name, type and help, in the
 /// order of [`ReplicaCounters`]' fields (docs/design/replication.md, "Metrics").
-pub const REPLICA_METRICS: [(&str, &str, &str); 3] = [
+pub const REPLICA_METRICS: [(&str, &str, &str); 5] = [
     (
         "amphora_replica_flush_backlog_entries",
         "gauge",
@@ -280,6 +280,18 @@ pub const REPLICA_METRICS: [(&str, &str, &str); 3] = [
         "counter",
         "Entries this member committed as leader, by the quorum that committed each first (quorum: held, classic); leader only, so a follower's stays at 0.",
     ),
+    // The leader's quorum patience (replication.md, "The leader's quorum patience"), its help lines
+    // as Kiln Metrics agreed them (amphora-class-metrics/names/v1-disk-stalls).
+    (
+        "amphora_replica_quorum_patience_seconds",
+        "gauge",
+        "The ticks this replica, while it leads, waits beyond its election timeout before its quorum check, in seconds; zero while it follows or has measured no answer gap.",
+    ),
+    (
+        "amphora_replica_quorum_patience_refused_total",
+        "counter",
+        "Answer gaps a leading replica refused to learn for its quorum patience, because they passed its ceiling.",
+    ),
 ];
 
 /// A replica owner's counters for the replicated class, bumped by its owner and its flushing
@@ -291,6 +303,8 @@ pub struct ReplicaMeter {
     flush_us: AtomicU64,
     held: AtomicU64,
     classic: AtomicU64,
+    patience_us: AtomicU64,
+    refused: AtomicU64,
 }
 
 /// What a replica owner's counters say now ([`REPLICA_METRICS`]).
@@ -306,6 +320,10 @@ pub struct ReplicaCounters {
     /// classic quorum.
     pub commits_held: u64,
     pub commits_classic: u64,
+    /// The quorum patience in force while this member leads; zero while it follows.
+    pub quorum_patience: Duration,
+    /// Answer gaps refused for the patience because they passed its ceiling.
+    pub quorum_patience_refused: u64,
 }
 
 impl ReplicaMeter {
@@ -323,6 +341,16 @@ impl ReplicaMeter {
         self.classic.store(classic, Ordering::Relaxed);
     }
 
+    /// The quorum patience the owner set for this tick's check: zero while it follows.
+    pub fn patience(&self, patience: Duration) {
+        self.patience_us.store(micros(patience), Ordering::Relaxed);
+    }
+
+    /// An answer gap the owner refused to learn, past the patience's ceiling.
+    pub fn refused(&self) {
+        self.refused.fetch_add(1, Ordering::Relaxed);
+    }
+
     #[must_use]
     pub fn counters(&self) -> ReplicaCounters {
         ReplicaCounters {
@@ -333,6 +361,8 @@ impl ReplicaMeter {
             flush_time: Duration::from_micros(self.flush_us.load(Ordering::Relaxed)),
             commits_held: self.held.load(Ordering::Relaxed),
             commits_classic: self.classic.load(Ordering::Relaxed),
+            quorum_patience: Duration::from_micros(self.patience_us.load(Ordering::Relaxed)),
+            quorum_patience_refused: self.refused.load(Ordering::Relaxed),
         }
     }
 }
@@ -376,21 +406,13 @@ mod tests {
     }
 
     /// CP-T1.8, doc truth (CLAUDE.md sections 6 and 10): the replicated class's metrics are the
-    /// ones its design names. Do: read docs/design/replication.md's section on the class. Expect:
-    /// every `amphora_replica_` name there (a histogram's `_bucket` series as the histogram) is in
-    /// [`REPLICA_METRICS`], and every name there is in that section. The quorum patience's names,
-    /// agreed and not yet exported, are in a section of their own.
+    /// ones its design names. Do: read docs/design/replication.md. Expect: every
+    /// `amphora_replica_` name there (a histogram's `_bucket` series as the histogram) is in
+    /// [`REPLICA_METRICS`], and every name there is in the design.
     #[test]
     fn the_replica_metrics_are_the_ones_the_design_names() {
         let design = include_str!("../../../docs/design/replication.md");
-        let class = design
-            .split_once("## Fast acknowledgement: the replicated class")
-            .unwrap()
-            .1;
-        let class = class
-            .split_once("\n## ")
-            .map_or(class, |(section, _)| section);
-        let named: std::collections::BTreeSet<&str> = class
+        let named: std::collections::BTreeSet<&str> = design
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .filter(|word| word.starts_with("amphora_replica_"))
             .map(|word| word.strip_suffix("_bucket").unwrap_or(word))

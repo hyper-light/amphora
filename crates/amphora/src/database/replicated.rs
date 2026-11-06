@@ -1007,6 +1007,12 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.replica
                 .set_quorum_patience(patience)
                 .map_err(raft_error)?;
+            let shown = if leading.is_some() { patience } else { 0 };
+            let shown = u32::try_from(shown)
+                .ok()
+                .and_then(|ticks| TICK.checked_mul(ticks))
+                .ok_or_else(|| fenced("the quorum patience overflowed its gauge"))?;
+            self.control.meter.patience(shown);
             self.replica.tick().map_err(raft_error)?;
             #[cfg(test)]
             if let Some(stalls) = &self.stalls {
@@ -1596,6 +1602,9 @@ impl<F: BlockFile + 'static> Actor<F> {
             && self.replica.core().raft.configuration().votes(from)
             && let Err(unmeasured) = self.answers.heard(from, message.term)
         {
+            if matches!(unmeasured, patience::Unmeasured::PastCeiling { .. }) {
+                self.control.meter.refused();
+            }
             tracing::warn!(target: "amphora.replica", event = "quorum_patience_refused", error = %unmeasured, "an answer gap was not learned for the leader's quorum patience");
         }
         self.replica.step(message).map_err(raft_error)
@@ -4946,6 +4955,54 @@ mod tests {
         let changed = driven.answer(&mut pump, &asked).unwrap();
         assert_eq!(changed.learners, vec![demoted_id]);
         assert!(changed.voters_outgoing.is_empty(), "{changed:?}");
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// CP-T1.8, kiln goals 6b112f14 and 867fa589 (replication.md, "The leader's quorum patience",
+    /// its metrics; CLAUDE.md section 10): the patience and its refusals as the host reads them.
+    /// Do: the leader measures a gap of `HELD` ticks in its followers' answers (`measured_lead`)
+    /// and ticks on; then one follower's answers are held past the ceiling while the other's flow,
+    /// and let go. Expect: the leader's `amphora_replica_quorum_patience_seconds` is its core's
+    /// patience in ticks of `TICK`, its followers' zero, and nothing refused; then the leader still
+    /// leads and has refused that one gap.
+    #[test]
+    fn the_quorum_patience_and_its_refusals_are_counted_for_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = measured_lead(&mut driven, &mut pump, &clients);
+        let id = u64::try_from(leader + 1).unwrap();
+        driven.tick(&mut pump, leader);
+        let ticks = driven.owner(leader).replica.core().raft.quorum_patience();
+        assert!(ticks > 0, "no patience after a measured gap");
+        let counters = |owner: usize| clients.get(owner).unwrap().handle().counters();
+        assert_eq!(
+            counters(leader).quorum_patience,
+            TICK * u32::try_from(ticks).unwrap()
+        );
+        assert_eq!(counters(leader).quorum_patience_refused, 0);
+        for follower in (0..3).filter(|i| *i != leader) {
+            assert_eq!(counters(follower).quorum_patience, Duration::ZERO);
+        }
+
+        let late = (leader + 1) % 3;
+        pump.held = vec![late];
+        for _ in 0..=patience::QUORUM_CEILING {
+            driven.tick(&mut pump, leader);
+        }
+        pump.held.clear();
+        driven.tick(&mut pump, leader);
+        assert!(
+            clients
+                .iter()
+                .all(|c| c.handle().status().unwrap().leader == id),
+            "the leader lost its lead with one follower answering"
+        );
+        assert_eq!(counters(leader).quorum_patience_refused, 1);
         driven.drain(&mut pump);
         pump.finish();
     }
