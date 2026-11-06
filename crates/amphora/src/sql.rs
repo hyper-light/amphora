@@ -741,4 +741,43 @@ mod tests {
             "the newest kept its mark"
         );
     }
+
+    // Finding 4's mark (amphora-seam-owner, 2026-11-06, Codex's remaining concern). Do: run
+    // `SAVEPOINT s` and `RELEASE s` twice each as Session text calls, which the session's
+    // validation accepts and marks; then submit each text to Database::execute. Expect: each text
+    // parsed once by the session, its entry marked; Database::execute still refuses both, by its
+    // own validator: a Session mark never widens it (AC-T1.1.1; docs/design/store.md, decision 36).
+    #[test]
+    fn a_session_mark_never_widens_database_execute() {
+        const SAVEPOINT: &str = "SAVEPOINT s /* marked by a session */";
+        const RELEASE: &str = "RELEASE s /* marked by a session */";
+        let db = crate::database::Database::in_memory(until()).unwrap();
+        db.call(until(), |c| {
+            for _ in 0..2 {
+                c.execute(SAVEPOINT, [])?;
+                c.execute(RELEASE, [])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            [super::parses(SAVEPOINT), super::parses(RELEASE)],
+            [1, 1],
+            "the session validated each text once and marked its entry"
+        );
+        for sql in [SAVEPOINT, RELEASE] {
+            let refused = db.execute(
+                vec![amphora_api::Statement {
+                    sql: sql.into(),
+                    params: vec![],
+                }],
+                until(),
+            );
+            assert!(
+                matches!(&refused, Err(Refusal::Invalid { what, why })
+                    if what == "SQL" && why == "connection and transaction control belongs to Amphora"),
+                "{sql}: {refused:?}"
+            );
+        }
+    }
 }

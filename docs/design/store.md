@@ -1374,8 +1374,12 @@ more in a second `Database::call`; `BEGIN` and a reserved name, each run twice, 
 parsed both times; after `CREATE TABLE`, the SELECT parsed once more.
 `a_privately_cached_or_evicted_text_is_validated_again`: a text Db's private path cached was not
 parsed there, then parsed once on its first prepare and not on its second; a text evicted by
-`TX_MAX` newer ones parsed again. Decision 34's tests pass unchanged.
+`TX_MAX` newer ones parsed again. `a_session_mark_never_widens_database_execute`: `SAVEPOINT s` and `RELEASE s`, run
+twice each as Session text calls, parsed once each, marked; `Database::execute` still refused both
+("connection and transaction control belongs to Amphora"): its validator reads no mark. Decision
+34's tests pass unchanged.
 
 **Falsified by.** A Session path that runs a text no validation accepted while its entry stood: a
 private-SQL entry run unvalidated, a refused text run on its second call, or a mark that survives
-its entry's eviction, replacement, schema change or restore.
+its entry's eviction, replacement, schema change or restore; or `Database::execute` or
+`migrate` accepting a text because a session marked it.
