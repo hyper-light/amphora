@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
-use api::replication::{MemberChange, Outbound, ReplicaConfig, ReplicaStatus};
+use api::replication::{CatchUp, MemberChange, Outbound, ReplicaConfig, ReplicaStatus};
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_durable::{Bytes, GroupStore, Output, Replica, StateMachine};
 use hyper_raft::proto::{
@@ -147,6 +147,10 @@ enum Input {
         until: Instant,
         response: Response<ReplicaStatus>,
     },
+    /// Where catching up each learner stands, judged at once (`ReplicaHandle::catch_up`).
+    CatchUp {
+        response: Response<Vec<(u64, CatchUp)>>,
+    },
 }
 /// The hand-off of the lead under way (replication.md, "Membership"): asked of the leader in
 /// `term`, answered once this member follows `to`.
@@ -261,7 +265,10 @@ impl ReplicaHandle {
             })?;
             if matches!(
                 &command,
-                Input::Submit { .. } | Input::Change { .. } | Input::Transfer { .. }
+                Input::Submit { .. }
+                    | Input::Change { .. }
+                    | Input::Transfer { .. }
+                    | Input::CatchUp { .. }
             ) && next > application_limit
             {
                 return Err(Refusal::Full {
@@ -468,6 +475,26 @@ impl ReplicaHandle {
             .map_err(|error| match error {
                 mpsc::RecvTimeoutError::Timeout => unknown(),
                 mpsc::RecvTimeoutError::Disconnected => unknown(),
+            })?
+    }
+
+    /// Where catching up each of the group's learners stands, as this leader judges it now
+    /// (replication.md, "Membership"; hyper-raft's `Raft::catch_up`). Asked first, a learner is
+    /// staged, its first round sending what the leader holds then; asked again, it is judged as an
+    /// election timeout passes, and its rounds end as its answers arrive. A new leader stages its
+    /// learners afresh. Promoting a learner is the host's change to make. Refused off the leader,
+    /// naming the leader known (`NotLeader`).
+    pub fn catch_up(&self, until: Instant) -> Result<Vec<(u64, CatchUp)>, Refusal> {
+        if Instant::now() >= until {
+            return Err(Refusal::Timeout);
+        }
+        let (response, receiver) = mpsc::sync_channel(1);
+        self.enqueue(Input::CatchUp { response }, CHANGE_BYTES)?;
+        receiver
+            .recv_timeout(until.saturating_duration_since(Instant::now()))
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => Refusal::Timeout,
+                mpsc::RecvTimeoutError::Disconnected => fenced("replica owner ended"),
             })?
     }
 }
@@ -747,6 +774,7 @@ impl Actor {
                 Input::Change { response, .. } | Input::Transfer { response, .. } => {
                     answer(response, Err(reason.clone()))
                 }
+                Input::CatchUp { response } => answer(response, Err(reason.clone())),
             }
         }
     }
@@ -1119,8 +1147,40 @@ impl Actor {
                     }
                 }
             }
+            Input::CatchUp { response } => {
+                let judged = self.catching_up();
+                let fatal = match &judged {
+                    Err(error @ Refusal::Fenced(_)) => Some(error.clone()),
+                    _ => None,
+                };
+                answer(response, judged);
+                if let Some(error) = fatal {
+                    return Err(error);
+                }
+            }
         }
         Ok(())
+    }
+    /// Where catching up each learner of the configuration applied stands, judged now
+    /// (`ReplicaHandle::catch_up`). A learner the core no longer counts, its removal appended but
+    /// not yet applied, is left out.
+    fn catching_up(&mut self) -> Result<Vec<(u64, CatchUp)>, Refusal> {
+        if !self.replica.is_leader() {
+            return Err(not_leader(self.replica.leader()));
+        }
+        let learners = self.replica.configuration().learners.clone();
+        let mut judged = Vec::with_capacity(learners.len());
+        for member in learners {
+            let stands = match self.replica.catch_up(member).map_err(raft_error)? {
+                hyper_raft::CatchUp::Ready => CatchUp::Ready,
+                hyper_raft::CatchUp::Pending => CatchUp::Pending,
+                hyper_raft::CatchUp::Aborted => CatchUp::Aborted,
+                hyper_raft::CatchUp::NotLeader => return Err(not_leader(self.replica.leader())),
+                hyper_raft::CatchUp::NotMember => continue,
+            };
+            judged.push((member, stands));
+        }
+        Ok(judged)
     }
     /// The hand-off under way: answered once this member follows `to`, once the lead went to
     /// another, once the core gave it up (it does within an election timeout), or past its
@@ -2874,6 +2934,153 @@ mod tests {
             }
         }
         panic!("the group did not go quiet in {ROUNDS} driven rounds");
+    }
+    /// Asks `client` where catching up each learner stands, without waiting: its answer comes on
+    /// the returned receiver.
+    fn judged(client: &Client) -> mpsc::Receiver<Result<Vec<(u64, CatchUp)>, Refusal>> {
+        let (response, receiver) = mpsc::sync_channel(1);
+        client
+            .handle
+            .enqueue(Input::CatchUp { response }, CHANGE_BYTES)
+            .unwrap();
+        receiver
+    }
+    /// The ticks owner 0's core waits, at least, before it campaigns: an election timeout.
+    fn leader_core_election_tick(driven: &Driven) -> usize {
+        driven.owners[0]
+            .0
+            .replica
+            .core()
+            .raft
+            .config()
+            .election_tick
+    }
+
+    /// AC-T1.8.M1 (CP-T1.8) on driven time (replication.md, "Membership"; kiln plan 01a1a283e14c,
+    /// its docs/p2p.md P3): the leader says how far each learner has caught up, judged in rounds
+    /// (Ongaro's thesis section 4.2.1), for its host to promote only a learner that won't stall
+    /// commits. Do: ask the leader and a member to be added before the add; add the member as a
+    /// learner and ask the leader as rounds go; ask the learner; promote it and ask the leader
+    /// again. Expect: no learner to judge, and NotLeader naming no leader from the member; the
+    /// learner Pending, then Ready within the rounds, no time passing; NotLeader naming the leader
+    /// from the learner; once it votes, no learner to judge.
+    #[test]
+    fn the_leader_judges_a_learners_catch_up_in_rounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = vec![
+            driven.open(dir.path(), 1, vec![1], None),
+            driven.open_member(dir.path(), 2, vec![1], vec![2], None),
+        ];
+        let mut pump = Pump::new(&clients);
+        let (voter, learner) = (&clients[0], &clients[1]);
+        driven.elect(&mut pump, &clients[..1], 0, 1);
+        write(&mut driven, &mut pump, voter, 1);
+        assert_eq!(driven.answer(&mut pump, &judged(voter)), Ok(Vec::new()));
+        assert_eq!(
+            driven.answer(&mut pump, &judged(learner)),
+            Err(Refusal::NotLeader { leader: None })
+        );
+
+        let until = driven.until();
+        driven
+            .answer(
+                &mut pump,
+                &change(voter, until, MemberChange::AddLearner(2)),
+            )
+            .unwrap();
+        write(&mut driven, &mut pump, voter, 2);
+        let mut stands = Vec::new();
+        for _ in 0..ROUNDS {
+            stands = driven.answer(&mut pump, &judged(voter)).unwrap();
+            if stands == vec![(2, CatchUp::Ready)] {
+                break;
+            }
+            assert_eq!(stands, vec![(2, CatchUp::Pending)]);
+            driven.round(&mut pump);
+        }
+        assert_eq!(stands, vec![(2, CatchUp::Ready)]);
+        catch_up(&mut driven, &mut pump, &clients, 0, 1);
+        assert_eq!(held(&mut driven, 1), vec![1, 2]);
+        assert_eq!(
+            driven.answer(&mut pump, &judged(learner)),
+            Err(Refusal::NotLeader { leader: Some(1) })
+        );
+
+        let until = driven.until();
+        let promoted = driven
+            .answer(&mut pump, &change(voter, until, MemberChange::Promote(2)))
+            .unwrap();
+        assert_eq!((promoted.voters, promoted.learners), (vec![1, 2], vec![]));
+        assert_eq!(driven.answer(&mut pump, &judged(voter)), Ok(Vec::new()));
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.M1 (CP-T1.8) on driven time (replication.md, "Membership"; kiln plan 01a1a283e14c,
+    /// its docs/p2p.md P3): a learner that never answers is given up once its lag hasn't shrunk
+    /// over an election timeout, and staged afresh when asked again (Ongaro's thesis section
+    /// 4.2.1: the leader aborts for a server that "will never catch up", and "the caller may always
+    /// try again"). Do, in a group of one voter: add member 9, which has no owner, so what the
+    /// leader sends it is lost; ask where it stands, then again once an election timeout has
+    /// passed on the leader's clock, then once more. Expect: Pending, Aborted, Pending.
+    #[test]
+    fn a_learner_that_never_answers_is_given_up_after_an_election_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = vec![driven.open(dir.path(), 1, vec![1], None)];
+        let mut pump = Pump::new(&clients);
+        driven.elect(&mut pump, &clients, 0, 1);
+        write(&mut driven, &mut pump, &clients[0], 1);
+        driven.drain(&mut pump);
+        pump.finish();
+        // Rounds without the pump, what the leader sends lost, until `answer` comes. Each round
+        // yields `POLL` to the disk, as a round with nothing to relay does.
+        fn lost<T>(
+            driven: &mut Driven,
+            client: &Client,
+            answer: &mpsc::Receiver<Result<T, Refusal>>,
+        ) -> Result<T, Refusal> {
+            for _ in 0..ROUNDS {
+                match answer.try_recv() {
+                    Ok(result) => return result,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        drop(client.handle().drain(OUTGOING_MESSAGES).unwrap());
+                        std::thread::park_timeout(POLL);
+                        driven.step();
+                    }
+                    Err(error) => panic!("owner ended: {error}"),
+                }
+            }
+            panic!("a driven operation was unanswered after {ROUNDS} rounds");
+        }
+        let leader = &clients[0];
+        let until = driven.until();
+        let added = lost(
+            &mut driven,
+            leader,
+            &change(leader, until, MemberChange::AddLearner(9)),
+        )
+        .unwrap();
+        assert_eq!((added.voters, added.learners), (vec![1], vec![9]));
+        assert_eq!(
+            lost(&mut driven, leader, &judged(leader)),
+            Ok(vec![(9, CatchUp::Pending)])
+        );
+        // An election timeout on ticks: the core's election_tick, each tick a step past TICK.
+        for _ in 0..=leader_core_election_tick(&driven) {
+            driven.advance(0, TICK);
+            drop(leader.handle().drain(OUTGOING_MESSAGES).unwrap());
+            driven.step();
+        }
+        assert_eq!(
+            lost(&mut driven, leader, &judged(leader)),
+            Ok(vec![(9, CatchUp::Aborted)])
+        );
+        assert_eq!(
+            lost(&mut driven, leader, &judged(leader)),
+            Ok(vec![(9, CatchUp::Pending)])
+        );
     }
 
     /// AC-T1.8.M1, T-T1.8.M1 (CP-T1.8) on driven time (replication.md, "Membership"; kiln plan

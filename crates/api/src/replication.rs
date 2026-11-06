@@ -29,6 +29,19 @@ pub enum MemberChange {
     /// A member removed. Nothing more is sent to it.
     Remove(u64),
 }
+/// Where catching up a learner stands, as its group's leader judges it (replication.md,
+/// "Membership"; Ongaro's thesis section 4.2.1): replication to it goes in rounds, each sending
+/// what the leader held as the round began. A learner promoted once ready doesn't stall commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CatchUp {
+    /// A round ended within an election timeout: it may vote without leaving a gap.
+    Ready,
+    /// Its rounds are under way.
+    Pending,
+    /// Its lag didn't shrink over a whole election timeout: it is unavailable, or slower than the
+    /// leader appends. Asked again, it is judged afresh.
+    Aborted,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Outbound {
     pub to: u64,
