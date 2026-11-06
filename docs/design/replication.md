@@ -1199,3 +1199,65 @@ Falsified by:
 - a join row written before J is applied, a raise applied before J, or two members' image digests differing at one
   applied index through the upgrade;
 - before J, an attestation counted that committed before the last configuration change.
+
+## A local read on a replica (2026-11-06)
+
+CP-T1.10 (follower reads), kiln's every-node plan (kiln plan 01a1a283e14c, step 4; its vendored patch 0003, "A local
+read on a replica"), Amphora goal 13f90c05. kiln serves every node from its own replica, and a node must read with its
+group's leader gone or out of reach. Today every read on a replica goes through the leader: `Database::query` on a
+replicated database runs as a `Database::call`, which crosses the leader's ReadIndex before it evaluates.
+
+### What a replica's own state can promise
+
+A replica applies only entries the group committed, in log order, and a preparation that is not committed rolls back
+without a commit ("Resolved transactions" above). Its applied state is therefore always a prefix of the group's
+committed history: a state the group was in, never one it was not. On one replica that prefix only grows, since its
+applied index never goes back (it is durable with the state it marks). Nothing bounds how far behind the group's
+commit that prefix is: a replica cut off from its leader keeps answering from where it stopped.
+
+Against `Consistency`:
+- **Linearizable** is not something a replica can answer alone. A linearizable read must see every write acknowledged
+  before it began, which only the group's current leader knows, and only once a quorum confirms it still leads: the
+  ReadIndex (Ongaro's dissertation §6.4). A follower may serve one by asking the leader for its read index and waiting
+  until it has applied that far (same section), which still needs the leader. A lease read answers without that round
+  but trusts bounded clock drift (§6.4.1); hyper-raft has none ("No clock is trusted", `read.rs`). Linearizable reads
+  stay where they are: through the leader.
+- **Snapshot(rev)** names a state of the group's history, and any replica that has applied that revision can answer it
+  exactly, refusing it typed (`Ahead`) until it has. That is how Spanner serves a read at a timestamp at any replica
+  whose safe time has passed it (Corbett et al., OSDI 2012, §4.1.3) and CockroachDB its follower reads below a closed
+  timestamp (Taft et al., SIGMOD 2020). Records' Snapshot reads on a replica's own state are this decision's next
+  step, not this change.
+- **A local read**, what kiln asks for, names no revision: it reads whatever the replica has applied when it begins.
+  It is etcd's serializable read ("serializable member-local reads", etcd's `RangeRequest.serializable`; its reads are
+  linearizable unless asked so). It is neither of the two above, so it is a method of its own, never a Consistency.
+
+### The decision
+
+`Database::query_local` runs one read-only SQL session on this node's own committed state:
+- on a replica, on a reader of the owner's applied state beside the owner, asking the leader nothing: it answers with
+  the leader gone or out of reach;
+- it sees a prefix of the group's committed history: never a preparation, a proposal, or anything the group has not
+  committed; on one replica, never an older state than a local read that ended before it began;
+- it promises no freshness: a caller that needs every acknowledged write uses `Database::query`, which crosses the
+  leader;
+- a learner promises exactly what a follower does. It applies the same committed entries and counts in no quorum, so
+  it can confirm nothing, but its applied prefix is the group's (Ongaro's dissertation §4.2.1, members that catch up
+  without voting; etcd's learners serve serializable reads only);
+- refused, typed, while the replica has not taken its group's first image (its state is no group's yet), once its
+  owner has ended, and while it is fenced;
+- standalone, it is `Database::query`; an attached client's runs on its owner's state, asked only once the owner says
+  it can.
+Its readers are bounded: at most four at once, each its own connection with its own pages; a read waits for one up to
+its deadline and is refused Timeout past it.
+
+Evidence and sources: the resolved-transaction design above (only committed entries apply); Ongaro's dissertation
+§4.2.1, §6.4 and §6.4.1 (https://raft.github.io/raft.pdf); hyper-raft's `read.rs`; etcd's API reference
+(`RangeRequest.serializable`) and its learner design; Corbett et al., "Spanner: Google's Globally-Distributed
+Database", OSDI 2012, §4.1.3; Taft et al., "CockroachDB: The Resilient Geo-Distributed SQL Database", SIGMOD 2020.
+
+Falsified by:
+- a local read that sees a preparation, a proposal, or any write the group has not committed;
+- a local read on a replica that sees an older state than one that ended on that replica before it began;
+- a local read answered before its replica took its group's first image, or once its owner ended or was fenced;
+- a `Database::query` on a replica answered without the leader's ReadIndex;
+- more than four readers at once on one replica, or a read that waits past its deadline.
