@@ -72,9 +72,8 @@ impl Backend {
 pub(crate) struct Identity {
     pub restoring: bool,
     pub replica: Option<(String, api::replication::ReplicaConfig)>,
-    /// A replicated owner's durability, its fates in member order; appended (replication.md,
-    /// "Fates and durability checked"): an older client leaves it unread at its frame's end.
-    #[serde(default)]
+    /// A replicated owner's durability, its fates in member order (replication.md, "Fates and
+    /// durability checked"); added at wire::VERSION 4.
     pub durability: Option<api::replication::Durability>,
 }
 
@@ -723,19 +722,21 @@ mod tests {
         drop(owner);
     }
 
-    /// The owner's identity before it named a durability.
+    /// The owner's identity at wire::VERSION 3, before it named a durability.
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct Before {
         restoring: bool,
         replica: Option<(String, api::replication::ReplicaConfig)>,
     }
 
-    /// CP-T1.5, the identity's append-only change (replication.md, "Fates and durability
-    /// checked"). Do: encode an identity naming a durability and read it as the identity before;
-    /// encode one of before and read it as today's. Expect: the older reader takes what it knew;
-    /// today's refuses the shorter frame rather than reading a durability into it.
+    /// CP-T1.5 and CP-T1.8 (AC-T1.8.5), why the identity's durability is wire::VERSION 4 (replication.md, "Fates and
+    /// durability checked"; local-owner-transport.md, "Versions"). Do: encode an identity naming a
+    /// durability and read it as version 3's; encode one of version 3 and read it as today's.
+    /// Expect: version 3's reader takes the frame without its durability, silently, so the two
+    /// can't share a version and the greeting refuses the other; today's refuses the shorter frame
+    /// rather than reading a durability into it.
     #[test]
-    fn the_identity_names_its_durability_append_only() {
+    fn the_identitys_durability_is_a_new_version() {
         let config = api::replication::ReplicaConfig {
             node_id: 1,
             voters: vec![1, 2, 3],

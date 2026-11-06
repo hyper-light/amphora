@@ -126,7 +126,8 @@ The owner's refusal is its own result, never a frame: it writes nothing and clos
 so a client of another version sees the connection closed before any challenge, whatever shape its
 frames have.
 
-Version 3: `ReplicaStatus` gained `voters_outgoing` (replication.md, "Membership"). Version 2 had
+Version 4: the owner's `Identity` gained `durability` (replication.md, "Fates and durability
+checked"). Version 3: `ReplicaStatus` gained `voters_outgoing` (replication.md, "Membership"). Version 2 had
 already added `bootstrapping` without a bump; a version-2 client of an owner with that field would
 have failed the same way. The test: `a_peer_of_another_version_is_refused_at_the_greeting`.
 
@@ -270,9 +271,9 @@ additive constructors carry them, and the existing ones keep their behavior:
   that states the replicated class at a guarded owner is refused `Refusal::Invalid` ("replica
   ownership", a different live owner), never answered persisted in its place
   (`database::remote::tests::a_guarded_owner_refuses_a_replicated_open_or_attach_in_this_process`).
-  Another process's attach stating it becomes that owner's client: the owner's identity names no
-  durability yet, so its writes are acknowledged persisted, stronger than asked, until the identity
-  check across members makes that a typed refusal too. Agreed by amphora-seam-owner, 2026-11-06.
+  Another process's attach stating it is refused the same way at the transport: the owner's
+  identity names its durability (version 4), and a different one is refused, typed (replication.md,
+  "Fates and durability checked"). Agreed by amphora-seam-owner, 2026-11-06.
 - `attach_replicated` now checks the owner bound before it probes the lease. The probe makes the
   endpoint directory and holds the lease for an instant; at a full table attach answered "no
   owner" after those effects, and the open that followed was refused at the same bound
