@@ -285,10 +285,17 @@ leader, so a dead leader is replaced as fast as before.
   owner's functions: `Actor::run_step` sets the patience before each tick, and `Actor::step` counts
   a voter's message in the term the owner leads. The measure is a pure core
   (`database::patience`).
-- **Metrics**, in base units: `amphora_replica_quorum_patience_seconds` (a gauge: the patience in
-  force, its ticks times `TICK`) and `amphora_replica_quorum_patience_refused_total` (gaps past the
-  ceiling). They are added once Kiln Metrics agrees them; until then the refusal is the event
-  above.
+- **Metrics**, in base units, agreed with Kiln Metrics under the key
+  `amphora-class-metrics/names/v1-disk-stalls` (through amphora-class-metrics), on its condition
+  that their help lines define them:
+  - `amphora_replica_quorum_patience_seconds`, a gauge: "The ticks this replica, while it leads,
+    waits beyond its election timeout before its quorum check, in seconds; zero while it follows
+    or has measured no answer gap.";
+  - `amphora_replica_quorum_patience_refused_total`, a counter: "Answer gaps a leading replica
+    refused to learn for its quorum patience, because they passed its ceiling."
+  No labels from Amphora (it may add only small closed sets); kiln adds its own. They are wired
+  into the replica meter (`meter.rs`, t1/class-metrics) once both branches are on main; until
+  then the refusal is the event above.
 
 `replicated.rs` is Codex's. Codex's agent has ended, and its role is held by amphora-seam-owner
 (kiln agent 01a1b152d389767493f79adff5245f64, on Ada's word), whose agreement stands for Codex's.
