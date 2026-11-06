@@ -578,6 +578,36 @@ mod tests {
     }
 
     #[test]
+    fn a_replicated_open_refused_for_its_durability_makes_no_directory() {
+        // CP-T1.5 (U05) and CP-T1.8, local-owner-transport.md "Owner guards": a durability the
+        // configuration can't take (one fate asked, below the two a held quorum needs) is refused
+        // with the configuration's other refusals, before the log's lease makes a directory.
+        let dir = tempfile::tempdir().unwrap();
+        let before = entries(dir.path());
+        let one_fate = api::replication::Durability::Replicated(api::replication::Fates {
+            of: vec![(1, 1)],
+            spanning: 1,
+        });
+        let refused = Database::open_replicated_with(
+            &dir.path().join("a").join("db"),
+            &dir.path().join("b").join("log"),
+            config(),
+            one_fate,
+            until(),
+        );
+        assert!(
+            matches!(&refused, Err(Refusal::Invalid { what, .. }) if what == "replicated class"),
+            "{:?}",
+            refused.err()
+        );
+        assert_eq!(
+            entries(dir.path()),
+            before,
+            "a refused open made a directory"
+        );
+    }
+
+    #[test]
     fn opens_refused_at_the_owner_bound_make_no_directory() {
         // CP-T1.5 (U05): with the owner table full, open, open_replicated and attach_replicated
         // under directories that don't exist are refused at the bound and make none of them.
