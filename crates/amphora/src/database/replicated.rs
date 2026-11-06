@@ -1454,6 +1454,9 @@ mod tests {
         // A nemesis's elections: a leader handing off its lead refuses the proposals forwarded
         // to it, and those refusals are counted here instead of failing the test.
         refusals: Option<usize>,
+        // Owners whose records stay in their own queues, untaken: a follower whose answers are
+        // held, as its own slow write holds them (kiln goal 6b112f14).
+        held: Vec<usize>,
     }
     impl<'a> Pump<'a> {
         fn new(clients: &'a [Client]) -> Self {
@@ -1466,6 +1469,7 @@ mod tests {
                 records: 0,
                 bytes: 0,
                 refusals: None,
+                held: Vec::new(),
             }
         }
         fn reap(&mut self) {
@@ -1532,6 +1536,9 @@ mod tests {
                         break;
                     }
                     let index = (first + offset) % self.clients.len();
+                    if self.held.contains(&index) {
+                        continue;
+                    }
                     let from = u64::try_from(index + 1).unwrap();
                     // No later record from this origin may overtake its retained proposal.
                     if let PumpPhase::Captures { held, .. } = &self.phase
@@ -1825,6 +1832,36 @@ mod tests {
         ) -> Result<Vec<u8>, Refusal> {
             let answer = submit(client, self.until(), f);
             self.settle(pump, &answer)
+        }
+        /// Rounds, time standing still, until the group is quiet: no write out on any owner's
+        /// disk, every admitted record taken, and a round with nothing to relay. A held owner's
+        /// records wait in its own queue.
+        fn quiet(&mut self, pump: &mut Pump<'_>) {
+            for _ in 0..ROUNDS {
+                let admitted = pump.drive_until(self.until());
+                if admitted == 0
+                    && pump.records == 0
+                    && self
+                        .owners
+                        .iter()
+                        .all(|(owner, _)| owner.replica.in_flight() == 0)
+                {
+                    return;
+                }
+                if admitted == 0 {
+                    std::thread::park_timeout(POLL);
+                }
+                self.step();
+            }
+            panic!("the group was not quiet after {ROUNDS} driven rounds");
+        }
+        /// Owner `owner`'s clock moves one tick, every owner steps, and rounds go on until the
+        /// group is quiet: what the tick sent is answered at the same count of its ticks, unless
+        /// the answer is held.
+        fn tick(&mut self, pump: &mut Pump<'_>, owner: usize) {
+            self.advance(owner, TICK);
+            self.step();
+            self.quiet(pump);
         }
         /// Rounds until every record the relay admitted has been taken, so the pump can finish.
         fn drain(&mut self, pump: &mut Pump<'_>) {
@@ -2266,6 +2303,110 @@ mod tests {
             driven.drain(&mut pump);
             pump.finish();
         }
+    }
+
+    /// The ticks of the leader between two answers of each follower whose answers are held: past
+    /// the election timeout of 20 ticks, and short of two, so that a leader at fixed ticks
+    /// survives it or not by where it falls (replication.md, "The leader's quorum patience").
+    const HELD: usize = 30;
+
+    /// Kiln goal 6b112f14, step 3: owner 0 is elected, then leads while both followers' answers
+    /// are held for `HELD` of its ticks, from its count 22 to 52. Its checks at fixed ticks, at 20,
+    /// 40 and 60, each find an answer (at 20 or 22, then at 52), so it keeps its lead and has
+    /// measured that gap. The lead then moves away and back, and owner 0 leads a fresh term, its
+    /// checks counted from 0 again. Returns its index and its followers'.
+    fn measured_lead(driven: &mut Driven, pump: &mut Pump<'_>, clients: &[Client]) -> usize {
+        let leader = driven.elect(pump, clients, 0, 1);
+        let followers: Vec<usize> = (0..3).filter(|i| *i != leader).collect();
+        for _ in 0..22 {
+            driven.tick(pump, leader);
+        }
+        pump.held.clone_from(&followers);
+        for _ in 0..HELD {
+            driven.tick(pump, leader);
+        }
+        pump.held.clear();
+        driven.quiet(pump);
+        let id = u64::try_from(leader + 1).unwrap();
+        assert!(
+            clients
+                .iter()
+                .all(|c| c.handle().status().unwrap().leader == id),
+            "the leader lost its lead while it measured its followers' answers"
+        );
+        let other = *followers.first().unwrap();
+        driven.transfer(pump, clients, leader, other);
+        driven.transfer(pump, clients, other, leader);
+        driven.quiet(pump);
+        leader
+    }
+
+    /// CP-T1.8, kiln goal 6b112f14 step 3 (replication.md, "The leader's quorum patience"): a
+    /// follower's write held past the quorum window no longer deposes a sound leader. Do: the
+    /// leader measures a gap of `HELD` ticks in its followers' answers (`measured_lead`), then, in
+    /// a fresh term, both followers' answers are held for `HELD` of its ticks again, from its count
+    /// 18 to 48, while a call it took is in flight. At fixed ticks the hold covers its whole
+    /// window from 20 to 40 and its check at 40 steps it down. Expect: every owner still follows
+    /// it, no term changed, and the call commits once the followers answer, its row on every
+    /// replica.
+    #[test]
+    #[ignore = "red until the leader's quorum patience (kiln goal 6b112f14, step 3)"]
+    fn a_leader_whose_followers_answer_as_late_as_it_measured_keeps_its_lead() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = measured_lead(&mut driven, &mut pump, &clients);
+        let id = u64::try_from(leader + 1).unwrap();
+        let before = terms(&clients);
+        for _ in 0..18 {
+            driven.tick(&mut pump, leader);
+        }
+        pump.held = (0..3).filter(|i| *i != leader).collect();
+        let call = submit(clients.get(leader).unwrap(), driven.until(), |db| {
+            db.exec("CREATE TABLE held(value); INSERT INTO held VALUES(1)")?;
+            Ok(vec![1])
+        });
+        for _ in 0..HELD {
+            driven.tick(&mut pump, leader);
+        }
+        pump.held.clear();
+        driven.quiet(&mut pump);
+        let leaders: Vec<u64> = clients
+            .iter()
+            .map(|c| c.handle().status().unwrap().leader)
+            .collect();
+        assert!(
+            leaders.iter().all(|l| *l == id),
+            "the leader stepped down at its quorum check while its followers' answers were held \
+             for {HELD} ticks: leaders {leaders:?}, terms {before:?} -> {:?}",
+            terms(&clients)
+        );
+        assert_eq!(
+            terms(&clients),
+            before,
+            "the term changed while the followers' answers were held"
+        );
+        assert_eq!(driven.settle(&mut pump, &call), Ok(vec![1]));
+        // The acknowledged write is on every replica: read through each, after ReadIndex.
+        for client in &clients {
+            let rows = driven
+                .call(&mut pump, client, |db| {
+                    let mut rows = 0;
+                    db.query("SELECT count(*) FROM held", [], |row| {
+                        rows = row.get::<i64>(0).map_err(unavailable)?;
+                        Ok(false)
+                    })?;
+                    Ok(vec![u8::try_from(rows)?])
+                })
+                .unwrap();
+            assert_eq!(rows, vec![1], "an acknowledged write is missing");
+        }
+        assert_eq!(terms(&clients), before, "the term changed after the hold");
+        driven.drain(&mut pump);
+        pump.finish();
     }
 
     /// U15/CP-T1.8: malformed membership and a source that cannot lead are refused at admission.
