@@ -2514,7 +2514,7 @@ mod tests {
         pump.finish();
     }
 
-    /// U15/CP-T1.8 under a nemesis (replication.md, "A forward that meets an election"): a
+    /// U15/AC-T1.8.1 under a nemesis (replication.md, "A forward that meets an election"): a
     /// follower's proposal is held on its way to the leader while the lead moves, and arrives
     /// once the old leader has stepped down to the new term and knows no leader yet. The old
     /// leader refuses it typed, NoLeader, a cause hyper-raft retries at the next leader; the

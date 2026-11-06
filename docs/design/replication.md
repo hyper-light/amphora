@@ -183,6 +183,10 @@ Falsified by:
 
 ## A forward that meets an election (2026-11-06)
 
+Serves AC-T1.8.1: a record survives the loss of the leader, and a write the loss drops is answered,
+never applied unseen. docs/requirements.toml has no criterion of leader loss alone; AC-T1.8.4 is
+failover latency, which this decision does not measure.
+
 A follower forwards its caller's proposal to the leader it knows (hyper-raft's `step_follower`).
 While the lead moves, the forward can reach that member after it has stopped leading. While it hands
 its lead over, it refuses the forward `Dropped::Transferring`. Once the transferee's vote request has
