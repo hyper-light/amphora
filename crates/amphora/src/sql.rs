@@ -165,6 +165,32 @@ fn validate(sql: &str, batch: bool) -> Result<()> {
     Ok(())
 }
 
+/// `sql`'s statement, taken from Db's statement cache or prepared, validated as one statement
+/// unless its cache entry carries the mark of an earlier validation. Validation reads the text
+/// alone, so a mark can't go stale while its entry stands, and the entry takes its mark with it
+/// when it's evicted, replaced or dropped for a schema change or a restore. A miss or an unmarked
+/// hit is validated before it's prepared or stepped, and only that validation's success marks it
+/// (docs/design/store.md, decision 36).
+fn held(db: &Db, sql: &str) -> Result<Held> {
+    let mut held = match db.cached(sql).map_err(failed)? {
+        Some(held) if held.validated() => return Ok(held),
+        Some(held) => {
+            if let Err(refused) = validate(sql, false) {
+                // Db's private SQL cached it; a refusal here leaves that entry as it was.
+                db.give_back(held).map_err(failed)?;
+                return Err(refused);
+            }
+            held
+        }
+        None => {
+            validate(sql, false)?;
+            db.prepare_held(sql).map_err(failed)?
+        }
+    };
+    held.mark();
+    Ok(held)
+}
+
 impl Session for Db {
     fn records_get(
         &self,
@@ -181,18 +207,22 @@ impl Session for Db {
         validate(sql, true)?;
         self.exec(sql).map_err(failed)
     }
+    // A text call, a remote client's Query among them, parses only what its cache entry's mark
+    // doesn't vouch for. A statement that fails as it steps isn't kept.
     fn query(&self, sql: &str, params: Vec<Value>, first: bool) -> Result<Vec<Vec<Value>>> {
-        validate(sql, false)?;
-        rows(params, first, |params, each| {
-            self.query_owned(sql, params, each)
-        })
+        let mut held = held(self, sql)?;
+        let rows = rows(params, first, |params, each| {
+            self.run_held(&mut held, params, each)
+        })?;
+        self.give_back(held).map_err(failed)?;
+        Ok(rows)
     }
     // Validation reads the text alone, so the statement validated and held here runs again and
     // again without a parse or a lookup by its text: parsing on every execute cost a sixth to a
-    // third of kiln's hot statements (docs/design/store.md, decision 34).
+    // third of kiln's hot statements (docs/design/store.md, decision 34). Prepared again, as
+    // kiln does per request, its text isn't parsed again while its entry keeps the mark.
     fn prepare<'s>(&'s self, sql: &str) -> Result<(Box<dyn Prepared + 's>, usize)> {
-        validate(sql, false)?;
-        let held = self.hold(sql).map_err(failed)?;
+        let held = held(self, sql)?;
         let columns = held.columns();
         Ok((
             Box::new(Kept {
@@ -203,8 +233,10 @@ impl Session for Db {
         ))
     }
     fn column_count(&self, sql: &str) -> Result<usize> {
-        validate(sql, false)?;
-        Db::column_count(self, sql).map_err(failed)
+        let held = held(self, sql)?;
+        let columns = held.columns();
+        self.give_back(held).map_err(failed)?;
+        Ok(columns)
     }
     fn changes(&self) -> i64 {
         Db::changes(self)
@@ -520,8 +552,9 @@ mod tests {
     // The unify audit's finding 4. Do: 1,000 executes of one prepare_cached INSERT, and 1,000 runs
     // of one prepare_cached query, log search's next page as kiln's ci/logsearch.rs writes it.
     // Expect: each SQL text parsed once, at prepare, and every run of the query answering alike;
-    // the same INSERT given as text parses again. The session's validate parsed the text again on
-    // every execute: 1,001 parses each (AC-T1.1.1; docs/design/store.md, decision 34).
+    // the same INSERT given as text while its statement is held (out of the cache, so unmarked)
+    // parses again. The session's validate parsed the text again on every execute: 1,001 parses
+    // each (AC-T1.1.1; docs/design/store.md, decisions 34 and 36).
     #[test]
     fn a_prepared_statement_is_parsed_once_however_often_it_runs() {
         use amphora_api::Value;
@@ -578,11 +611,134 @@ mod tests {
             "every run answers alike"
         );
         assert_eq!(prepared, 1, "parses of the INSERT for 1,000 executes");
-        assert_eq!(text, 2, "the same INSERT given as text parses again");
+        assert_eq!(
+            text, 2,
+            "the same INSERT given as text while its statement is held parses again"
+        );
         assert_eq!(
             super::parses(PAGE),
             1,
             "parses of the page query for 1,000 runs"
+        );
+    }
+
+    // Finding 4's mark (Codex's spec, 2026-10-30; kiln goal 4320a144). Do: in one call, run an
+    // INSERT as text three times, prepare a SELECT anew three times, and run two refused texts
+    // twice each; in a second call, run the INSERT and prepare the SELECT again; then change the
+    // schema and prepare the SELECT once more. Expect: the INSERT and the SELECT parsed once
+    // across both calls, their entries marked by that validation; each refused text parsed both
+    // times, never marked; the SELECT parsed again once the schema change dropped its entry
+    // (AC-T1.1.1; docs/design/store.md, decision 36).
+    #[test]
+    fn a_validated_text_keeps_its_mark_until_its_cache_entry_goes() {
+        use amphora_api::Value;
+        const INSERT: &str = "INSERT INTO marked(a) VALUES (?1)";
+        const SELECT: &str = "SELECT count(*) FROM marked WHERE a >= ?1";
+        const CONTROL: &str = "BEGIN /* never marked */";
+        const RESERVED: &str = "SELECT * FROM __amphora_versions /* never marked */";
+        fn select(c: &crate::sql::Connection<'_>) -> crate::sql::Result<i64> {
+            c.prepare_cached(SELECT)?
+                .query_row(vec![Value::Integer(0)], |r| r.get(0))
+        }
+        let db = crate::database::Database::in_memory(until()).unwrap();
+        let (texts, refusals) = db
+            .call(until(), |c| {
+                c.execute_batch("CREATE TABLE marked(a INTEGER)")?;
+                for i in 0..3i64 {
+                    c.execute(INSERT, vec![Value::Integer(i)])?;
+                }
+                for _ in 0..3 {
+                    select(c)?;
+                }
+                let mut refusals = 0;
+                for _ in 0..2 {
+                    for refused in [CONTROL, RESERVED] {
+                        refusals += usize::from(c.execute(refused, []).is_err());
+                    }
+                }
+                Ok(([super::parses(INSERT), super::parses(SELECT)], refusals))
+            })
+            .unwrap();
+        assert_eq!(
+            texts,
+            [1, 1],
+            "the INSERT as text three times, the SELECT prepared three times"
+        );
+        assert_eq!(refusals, 4, "every refused text refused each time");
+        assert_eq!(
+            [super::parses(CONTROL), super::parses(RESERVED)],
+            [2, 2],
+            "a refused text is parsed again each time: it's never marked"
+        );
+        let (count, after) = db
+            .call(until(), |c| {
+                c.execute(INSERT, vec![Value::Integer(3)])?;
+                let count = select(c)?;
+                let again = [super::parses(INSERT), super::parses(SELECT)];
+                c.execute_batch("CREATE TABLE marked_after(a INTEGER)")?;
+                select(c)?;
+                Ok((
+                    count,
+                    [again, [super::parses(INSERT), super::parses(SELECT)]],
+                ))
+            })
+            .unwrap();
+        assert_eq!(count, 4);
+        assert_eq!(
+            after,
+            [[1, 1], [1, 2]],
+            "marked across calls; the SELECT validated again after the schema change dropped its entry"
+        );
+    }
+
+    // Finding 4's mark (kiln goal 4320a144). Do: run a text through Db's private path, then
+    // prepare it twice through a session on the same Db; then prepare TX_MAX + 1 more texts and
+    // the first of them again. Expect: the privately cached text validated on its first session
+    // use (Db's private SQL never marks an entry) and not after, and the evicted text validated
+    // again, its mark gone with its entry (AC-T1.1.1; docs/design/store.md, decision 36).
+    #[test]
+    fn a_privately_cached_or_evicted_text_is_validated_again() {
+        const PRIVATE: &str = "SELECT 7 AS privately_cached";
+        let db = crate::db::Db::open_with(
+            std::path::Path::new("private-mark.db"),
+            std::sync::Arc::new(amphora_engine::MemoryIO::new()),
+        )
+        .unwrap();
+        db.query_owned(PRIVATE, [], |_| Ok(true)).unwrap();
+        assert_eq!(
+            super::parses(PRIVATE),
+            0,
+            "Db's private path doesn't validate"
+        );
+        let c = super::Connection::new(&db);
+        let prepared = |sql: &str| -> i64 {
+            c.prepare_cached(sql)
+                .unwrap()
+                .query_row([], |r| r.get(0))
+                .unwrap()
+        };
+        for _ in 0..2 {
+            assert_eq!(prepared(PRIVATE), 7);
+        }
+        assert_eq!(
+            super::parses(PRIVATE),
+            1,
+            "validated on its first session use, then marked"
+        );
+        let text = |n: usize| format!("SELECT {n} AS evicted_{n}");
+        for n in 0..=amphora_api::TX_MAX {
+            prepared(&text(n));
+        }
+        prepared(&text(0));
+        assert_eq!(
+            super::parses(&text(0)),
+            2,
+            "evicted by TX_MAX newer texts, validated again"
+        );
+        assert_eq!(
+            super::parses(&text(amphora_api::TX_MAX)),
+            1,
+            "the newest kept its mark"
         );
     }
 }

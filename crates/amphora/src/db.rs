@@ -510,6 +510,7 @@ impl Db {
     }
 
     /// Owned/dynamic SQL without an unbounded statement cache (U05). The caller bounds results.
+    /// It keeps its cache entry's validation mark and never sets one: only the session validates.
     pub fn query_owned(
         &self,
         sql: &str,
@@ -519,17 +520,17 @@ impl Db {
         self.ensure_unfenced()?;
         let schema = self.conn.current_schema();
         self.statements.schema(Arc::clone(&schema))?;
-        let mut stmt = match self.statements.take(sql)? {
-            Some(stmt) => stmt,
-            None => self.conn.prepare(sql).map_err(fail)?,
+        let (mut stmt, marked) = match self.statements.take(sql)? {
+            Some(taken) => taken,
+            None => (self.conn.prepare(sql).map_err(fail)?, false),
         };
         step(self.io.as_ref(), &mut stmt, params, each)?;
         let current = self.conn.current_schema();
         self.statements.schema(Arc::clone(&current))?;
         // A callback can change schema and run another query. Never return this checked-out
         // statement under that later schema's cache identity.
-        if Arc::ptr_eq(&schema, &current) && schema.schema_version == current.schema_version {
-            self.statements.put(sql, stmt)?;
+        if same_schema(&schema, &current) {
+            self.statements.put(sql, stmt, marked)?;
         }
         Ok(())
     }
@@ -538,33 +539,48 @@ impl Db {
         self.conn.changes()
     }
 
+    /// Keeps its cache entry's validation mark and never sets one, as [`Db::query_owned`].
     pub fn column_count(&self, sql: &str) -> anyhow::Result<usize> {
         self.ensure_unfenced()?;
         self.statements.schema(self.conn.current_schema())?;
-        let stmt = match self.statements.take(sql)? {
-            Some(stmt) => stmt,
-            None => self.conn.prepare(sql).map_err(fail)?,
+        let (stmt, marked) = match self.statements.take(sql)? {
+            Some(taken) => taken,
+            None => (self.conn.prepare(sql).map_err(fail)?, false),
         };
         let columns = stmt.num_columns();
-        self.statements.put(sql, stmt)?;
+        self.statements.put(sql, stmt, marked)?;
         Ok(columns)
     }
 
-    /// Takes `sql`'s statement out of the cache, or prepares it, for a caller that runs it again
-    /// and again with [`Db::run_held`] until [`Db::give_back`] returns it (docs/design/store.md,
-    /// decision 34). While it's held, the same text is prepared anew for anyone else.
-    pub(crate) fn hold(&self, sql: &str) -> anyhow::Result<Held> {
+    /// Takes `sql`'s statement out of the cache, with its validation mark, for a caller that runs
+    /// it again and again with [`Db::run_held`] until [`Db::give_back`] returns it
+    /// (docs/design/store.md, decisions 34 and 36). While it's held, the same text is prepared
+    /// anew for anyone else.
+    pub(crate) fn cached(&self, sql: &str) -> anyhow::Result<Option<Held>> {
         self.ensure_unfenced()?;
         let schema = self.conn.current_schema();
         self.statements.schema(Arc::clone(&schema))?;
-        let statement = match self.statements.take(sql)? {
-            Some(statement) => statement,
-            None => self.conn.prepare(sql).map_err(fail)?,
-        };
+        Ok(self
+            .statements
+            .take(sql)?
+            .map(|(statement, validated)| Held {
+                sql: sql.to_owned(),
+                statement,
+                schema,
+                validated,
+            }))
+    }
+
+    /// Prepares `sql` for a caller that holds it as [`Db::cached`] says, unmarked.
+    pub(crate) fn prepare_held(&self, sql: &str) -> anyhow::Result<Held> {
+        self.ensure_unfenced()?;
+        let schema = self.conn.current_schema();
+        self.statements.schema(Arc::clone(&schema))?;
         Ok(Held {
             sql: sql.to_owned(),
-            statement,
+            statement: self.conn.prepare(sql).map_err(fail)?,
             schema,
+            validated: false,
         })
     }
 
@@ -586,13 +602,14 @@ impl Db {
         step(self.io.as_ref(), &mut held.statement, params, each)
     }
 
-    /// Returns a held statement to the cache, kept for the next caller while the schema is the
-    /// one it was prepared under.
+    /// Returns a held statement to the cache with its mark, kept for the next caller while the
+    /// schema is the one it was prepared under.
     pub(crate) fn give_back(&self, held: Held) -> anyhow::Result<()> {
         let current = self.conn.current_schema();
         self.statements.schema(Arc::clone(&current))?;
         if same_schema(&held.schema, &current) {
-            self.statements.put(&held.sql, held.statement)?;
+            self.statements
+                .put(&held.sql, held.statement, held.validated)?;
         }
         Ok(())
     }
@@ -905,16 +922,27 @@ impl Db {
     }
 }
 
-/// A statement held by its caller between executes: its text and the schema it was prepared under.
+/// A statement held by its caller between executes: its text, the schema it was prepared under,
+/// and whether the session's validation accepted the text.
 pub(crate) struct Held {
     sql: String,
     statement: Statement,
     schema: Arc<amphora_engine::schema::Schema>,
+    validated: bool,
 }
 
 impl Held {
     pub(crate) fn columns(&self) -> usize {
         self.statement.num_columns()
+    }
+
+    pub(crate) fn validated(&self) -> bool {
+        self.validated
+    }
+
+    /// The session's validation accepted the text: only `sql::validate`'s success calls this.
+    pub(crate) fn mark(&mut self) {
+        self.validated = true;
     }
 }
 

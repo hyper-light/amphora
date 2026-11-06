@@ -5,7 +5,10 @@
 //! statement makes it most recently used; eviction takes the least recently used, until both
 //! budgets hold. Oversized entries execute normally and are simply not retained. The recency order
 //! is a list linked through the map, so taking, returning and evicting a statement each cost a few
-//! map operations, never a search of the order (docs/design/store.md, decision 34).
+//! map operations, never a search of the order (docs/design/store.md, decision 34). An entry also
+//! carries whether the session's validation accepted its text: only the session sets that mark,
+//! and it goes with the entry when the entry is evicted, replaced or dropped for a schema change
+//! or a restore (decision 36).
 
 use amphora_engine::{Statement, schema::Schema};
 use std::collections::HashMap;
@@ -38,9 +41,11 @@ impl Default for Limits {
     }
 }
 
-/// A kept statement and its neighbours in the recency order, named by their text.
+/// A kept statement, whether the session's validation accepted its text, and its neighbours in
+/// the recency order, named by their text.
 struct Entry {
     statement: Statement,
+    validated: bool,
     older: Option<Arc<str>>,
     newer: Option<Arc<str>>,
 }
@@ -54,8 +59,8 @@ struct State {
     schema: Option<(Arc<Schema>, u32)>,
 }
 impl State {
-    /// Takes `sql`'s statement out, its neighbours joined where it was.
-    fn remove(&mut self, sql: &str) -> Result<Option<Statement>> {
+    /// Takes `sql`'s statement out with its mark, its neighbours joined where it was.
+    fn remove(&mut self, sql: &str) -> Result<Option<(Statement, bool)>> {
         let Some((key, entry)) = self.statements.remove_entry(sql) else {
             return Ok(None);
         };
@@ -83,12 +88,18 @@ impl State {
             .sql_bytes
             .checked_sub(key.len())
             .ok_or(Error::Accounting)?;
-        Ok(Some(entry.statement))
+        Ok(Some((entry.statement, entry.validated)))
     }
 
     /// Keeps `statement` as the most recently used, its text making `sql_bytes` in all: the
     /// caller has checked both budgets and taken out any statement kept for the same text.
-    fn push(&mut self, key: Arc<str>, statement: Statement, sql_bytes: usize) -> Result<()> {
+    fn push(
+        &mut self,
+        key: Arc<str>,
+        statement: Statement,
+        validated: bool,
+        sql_bytes: usize,
+    ) -> Result<()> {
         match &self.newest {
             Some(newest) => {
                 self.statements
@@ -100,6 +111,7 @@ impl State {
         }
         let entry = Entry {
             statement,
+            validated,
             older: self.newest.replace(Arc::clone(&key)),
             newer: None,
         };
@@ -140,13 +152,15 @@ impl Cache {
         Ok(())
     }
 
-    pub(super) fn take(&self, sql: &str) -> Result<Option<Statement>> {
+    /// Takes `sql`'s statement out, with whether the session's validation accepted its text.
+    pub(super) fn take(&self, sql: &str) -> Result<Option<(Statement, bool)>> {
         self.locked()?.remove(sql)
     }
 
     /// Only successfully executed/prepared statements are returned here. Reset before taking
     /// the lock, and clear parameters so cached statements retain no request values or blobs.
-    pub(super) fn put(&self, sql: &str, mut statement: Statement) -> Result<()> {
+    /// `validated` says the session's validation accepted the text; nothing else may set it.
+    pub(super) fn put(&self, sql: &str, mut statement: Statement, validated: bool) -> Result<()> {
         statement.reset().map_err(|e| Error::Reset(e.to_string()))?;
         statement.clear_bindings();
         if self.limits.entries == 0 || sql.len() > self.limits.sql_bytes {
@@ -155,7 +169,7 @@ impl Cache {
         let mut retired = Vec::new();
         {
             let mut state = self.locked()?;
-            if let Some(prior) = state.remove(sql)? {
+            if let Some((prior, _)) = state.remove(sql)? {
                 retired.push(prior);
             }
             // Both budgets are administrative and finite. At most the entry budget's number
@@ -172,12 +186,12 @@ impl Cache {
                     .checked_add(sql.len())
                     .ok_or(Error::Accounting)?;
                 if state.statements.len() < self.limits.entries && bytes <= self.limits.sql_bytes {
-                    state.push(Arc::from(sql), statement, bytes)?;
+                    state.push(Arc::from(sql), statement, validated, bytes)?;
                     admitted = true;
                     break;
                 }
                 let oldest = state.oldest.clone().ok_or(Error::Accounting)?;
-                retired.push(state.remove(&oldest)?.ok_or(Error::Accounting)?);
+                retired.push(state.remove(&oldest)?.ok_or(Error::Accounting)?.0);
             }
             if !admitted {
                 return Err(Error::Accounting);
@@ -223,8 +237,8 @@ mod tests {
             NonZero::new(1).ok_or_else(|| anyhow::anyhow!("parameter index"))?,
             Value::from_text("prior request".to_owned()),
         )?;
-        cache.put("SELECT ?1", statement)?;
-        let mut statement = cache
+        cache.put("SELECT ?1", statement, false)?;
+        let (mut statement, _) = cache
             .take("SELECT ?1")?
             .ok_or_else(|| anyhow::anyhow!("cached statement missing"))?;
         assert!(matches!(statement.step()?, StepResult::Row));
@@ -235,18 +249,18 @@ mod tests {
             ),
             "request values are cleared before retention"
         );
-        cache.put("SELECT ?1", statement)?;
-        cache.put("SELECT 2", db.conn.prepare("SELECT 2")?)?;
-        cache.put("SELECT 3", db.conn.prepare("SELECT 3")?)?;
+        cache.put("SELECT ?1", statement, false)?;
+        cache.put("SELECT 2", db.conn.prepare("SELECT 2")?, false)?;
+        cache.put("SELECT 3", db.conn.prepare("SELECT 3")?, false)?;
         assert!(
             cache.take("SELECT ?1")?.is_none(),
             "least recently used entry was evicted"
         );
-        let statement = cache
+        let (statement, _) = cache
             .take("SELECT 2")?
             .ok_or_else(|| anyhow::anyhow!("second statement missing"))?;
-        cache.put("SELECT 2", statement)?;
-        cache.put("SELECT 4", db.conn.prepare("SELECT 4")?)?;
+        cache.put("SELECT 2", statement, false)?;
+        cache.put("SELECT 4", db.conn.prepare("SELECT 4")?, false)?;
         assert!(
             cache.take("SELECT 3")?.is_none(),
             "checkout and return refreshes recency"
@@ -261,9 +275,9 @@ mod tests {
                 sql_bytes: 16,
             },
         };
-        bytes.put("SELECT 2", db.conn.prepare("SELECT 2")?)?;
-        bytes.put("SELECT 3", db.conn.prepare("SELECT 3")?)?;
-        bytes.put("SELECT 12345", db.conn.prepare("SELECT 12345")?)?;
+        bytes.put("SELECT 2", db.conn.prepare("SELECT 2")?, false)?;
+        bytes.put("SELECT 3", db.conn.prepare("SELECT 3")?, false)?;
+        bytes.put("SELECT 12345", db.conn.prepare("SELECT 12345")?, false)?;
         assert!(
             bytes.take("SELECT 2")?.is_none() && bytes.take("SELECT 3")?.is_none(),
             "SQL byte budget evicts while entry slots remain"
@@ -285,14 +299,14 @@ mod tests {
         let max = amphora_api::TX_MAX;
         for n in 0..max {
             let sql = format!("SELECT {n}");
-            cache.put(&sql, db.conn.prepare(&sql)?)?;
+            cache.put(&sql, db.conn.prepare(&sql)?, false)?;
         }
-        let first = cache
+        let (first, _) = cache
             .take("SELECT 0")?
             .ok_or_else(|| anyhow::anyhow!("the first statement is missing"))?;
-        cache.put("SELECT 0", first)?;
+        cache.put("SELECT 0", first, false)?;
         let last = format!("SELECT {max}");
-        cache.put(&last, db.conn.prepare(&last)?)?;
+        cache.put(&last, db.conn.prepare(&last)?, false)?;
         assert_eq!(
             cache.locked()?.statements.len(),
             max,
