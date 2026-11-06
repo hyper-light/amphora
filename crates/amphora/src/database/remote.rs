@@ -195,11 +195,38 @@ impl Database {
         config: api::replication::ReplicaConfig,
         until: Instant,
     ) -> Result<Option<Self>, Refusal> {
+        Self::attach_owner(path, log_path, config, None, until)
+    }
+
+    /// [`Database::attach_replicated`] for a host that owns with `guards`
+    /// ([`Database::open_replicated_guarded`]): it makes no directory and never attaches as a
+    /// client. It answers this process's live owner opened at this file with guards of the same
+    /// key and this configuration, or None when no owner holds the lease; an unguarded owner,
+    /// other guards, another file at the path, or another process's owner is refused.
+    pub fn attach_replicated_guarded(
+        path: &Path,
+        log_path: &Path,
+        config: api::replication::ReplicaConfig,
+        guards: Guards,
+        until: Instant,
+    ) -> Result<Option<Self>, Refusal> {
+        Self::attach_owner(path, log_path, config, Some(guards), until)
+    }
+
+    fn attach_owner(
+        path: &Path,
+        log_path: &Path,
+        config: api::replication::ReplicaConfig,
+        guards: Option<Guards>,
+        until: Instant,
+    ) -> Result<Option<Self>, Refusal> {
         if Instant::now() >= until {
             return Err(Refusal::Timeout);
         }
-        let path = canonical_path(path)?;
-        let log = canonical_path(log_path)?;
+        let (path, log) = match guards {
+            Some(_) => (existing_path(path)?, existing_path(log_path)?),
+            None => (canonical_path(path)?, canonical_path(log_path)?),
+        };
         log.to_str()
             .ok_or_else(|| api::invalid("replica path", "not UTF-8"))?;
         let expected = Some((log.as_path(), &config));
@@ -210,6 +237,9 @@ impl Database {
             identity.and_then(|id| owners.values().find(|owner| owner.identity == Some(id)))
         }) {
             if let Some(shared) = owner.shared.upgrade() {
+                if let Some(guards) = &guards {
+                    admit_guarded(owner, &shared, identity, guards)?;
+                }
                 if shared.restoring.load(Ordering::Acquire) {
                     return Err(api::invalid("replica ownership", "restore is incomplete"));
                 }
@@ -246,9 +276,17 @@ impl Database {
         // Admission before the probe: a probe makes the endpoint directory and takes the lease,
         // which a full table would refuse to anyone who went on to open.
         api::bound("open database owners", owners.len().saturating_add(1), 4096)?;
-        if let Some(lease) = try_exclusive_file(&path)? {
+        let lease = match guards {
+            // The path is canonical and its parent exists: the probe makes no directory above.
+            Some(_) => crate::transport::try_lease(&path)?,
+            None => try_exclusive_file(&path)?,
+        };
+        if let Some(lease) = lease {
             drop(lease);
             return Ok(None);
+        }
+        if guards.is_some() {
+            return Err(remote_owner());
         }
         let database = attach(&path, expected, until)?;
         owners.insert(
@@ -257,6 +295,7 @@ impl Database {
                 shared: Arc::downgrade(&database.shared),
                 lease: Weak::new(),
                 identity,
+                key: None,
             },
         );
         Ok(Some(database))
@@ -405,6 +444,7 @@ mod tests {
                         shared: Weak::new(),
                         lease: Arc::downgrade(&held),
                         identity: None,
+                        key: None,
                     },
                 );
             }

@@ -100,7 +100,7 @@ pub struct Machine {
     point: Point,
     configuration: ConfState,
     baseline: bootstrap::Baseline,
-    _owner: std::sync::Arc<std::fs::File>,
+    _owner: crate::database::Owned,
 }
 
 fn unavailable(e: impl std::fmt::Display) -> Refusal {
@@ -144,14 +144,17 @@ fn marker(db: &mut Db, point: Point, configuration: &ConfState) -> anyhow::Resul
 
 impl Machine {
     pub fn open(path: &Path, initial: ConfState) -> Result<Self, Refusal> {
-        let owner = std::sync::Arc::new(crate::database::exclusive_file(path)?);
+        let owner = crate::database::Owned::new(
+            std::sync::Arc::new(crate::database::exclusive_file(path)?),
+            None,
+        );
         Self::open_with_owner(path, initial, owner, 0, None)
     }
 
     pub(crate) fn open_with_owner(
         path: &Path,
         initial: ConfState,
-        owner: std::sync::Arc<std::fs::File>,
+        owner: crate::database::Owned,
         node_id: u64,
         bootstrap: Option<api::replication::Bootstrap>,
     ) -> Result<Self, Refusal> {
@@ -164,7 +167,7 @@ impl Machine {
             ));
         }
         let mut db = Db::open(path).map_err(unavailable)?;
-        db.hold_owner(std::sync::Arc::clone(&owner));
+        db.hold_owner(owner.clone());
         let mut marked = false;
         db.query(
             "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '__amphora_replica'",

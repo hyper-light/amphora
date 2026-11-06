@@ -18,7 +18,10 @@ pub fn is_replica(path: &std::path::Path) -> Result<bool, Refusal> {
     if !path.try_exists().map_err(unavailable)? {
         return Ok(false);
     }
-    let owner = std::sync::Arc::new(crate::database::exclusive_file(path)?);
+    let owner = crate::database::Owned::new(
+        std::sync::Arc::new(crate::database::exclusive_file(path)?),
+        None,
+    );
     let mut db = Db::open_readonly(path).map_err(unavailable)?;
     db.hold_owner(owner);
     let mut marked = false;
@@ -32,7 +35,10 @@ pub fn inspect_source(path: &std::path::Path, source_node: u64) -> Result<Bootst
     if source_node == 0 {
         return Err(api::invalid("baseline source", "node ID must be positive"));
     }
-    let owner = std::sync::Arc::new(crate::database::exclusive_file(path)?);
+    let owner = crate::database::Owned::new(
+        std::sync::Arc::new(crate::database::exclusive_file(path)?),
+        None,
+    );
     let mut db = Db::open_readonly(path).map_err(unavailable)?;
     db.hold_owner(owner);
     if table_exists(&db)? {
@@ -575,7 +581,10 @@ mod tests {
         };
         let open = |node| {
             let path = dir.path().join(format!("machine-{node}.db"));
-            let owner = std::sync::Arc::new(crate::database::exclusive_file(&path).unwrap());
+            let owner = crate::database::Owned::new(
+                std::sync::Arc::new(crate::database::exclusive_file(&path).unwrap()),
+                None,
+            );
             super::super::Machine::open_with_owner(
                 &path,
                 conf.clone(),

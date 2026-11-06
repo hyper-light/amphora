@@ -145,11 +145,20 @@ pub struct Db {
     conn: Arc<Connection>,
     path: PathBuf,
     statements: cache::Cache,
-    owner: Option<Arc<std::fs::File>>,
+    // After the engine's handles, so dropped after them: the lease and its guards outlive them.
+    owner: Option<crate::database::Owned>,
     // Shared by this owner's readers: a failed rollback may never be reused as clean state.
     fenced: Arc<AtomicBool>,
     /// The frames of log a restart keeps the log's file for ([`Db::keep_log`]).
     log_kept: u64,
+}
+
+/// What a reader's opener and the flusher keep of their database: the engine's handles, then the
+/// owner lease and its guards, which drop after them.
+struct EngineHandles {
+    io: Arc<dyn IO>,
+    db: Arc<Database>,
+    owner: Option<crate::database::Owned>,
 }
 
 pub(crate) struct Deadline {
@@ -334,19 +343,25 @@ impl Db {
     /// Opens readers on this database from any thread.
     #[must_use]
     pub fn opener(&self) -> Opener<Self> {
-        let (io, db, path) = (self.io.clone(), self.db.clone(), self.path.clone());
-        let owner = self.owner.clone();
+        let held = EngineHandles {
+            io: self.io.clone(),
+            db: self.db.clone(),
+            owner: self.owner.clone(),
+        };
+        let path = self.path.clone();
         let fenced = Arc::clone(&self.fenced);
         let log_kept = self.log_kept;
         Arc::new(move || {
+            // The whole of `held` is captured, so its fields drop in their declared order.
+            let held = &held;
             Self::check_fence(&fenced)?;
             let r = Self {
-                io: io.clone(),
-                db: db.clone(),
-                conn: db.connect(ConnectOpts::new()).map_err(fail)?,
+                io: held.io.clone(),
+                db: held.db.clone(),
+                conn: held.db.connect(ConnectOpts::new()).map_err(fail)?,
                 path: path.clone(),
                 statements: cache::Cache::default(),
-                owner: owner.clone(),
+                owner: held.owner.clone(),
                 fenced: Arc::clone(&fenced),
                 log_kept,
             };
@@ -361,10 +376,14 @@ impl Db {
     /// [`Db::keep_log`]), so once it has been as long as it gets, a flush writes no metadata.
     pub fn flusher(&self) -> Flush {
         let wal = format!("{}-wal", self.path.display());
-        let (io, db) = (self.io.clone(), self.db.clone());
-        let owner = self.owner.clone();
+        let held = EngineHandles {
+            io: self.io.clone(),
+            db: self.db.clone(),
+            owner: self.owner.clone(),
+        };
         Box::new(move || {
-            let _lease = &owner;
+            // The whole of `held` is captured, so its fields drop in their declared order.
+            let EngineHandles { io, db, .. } = &held;
             // Where the log ends before the flush begins: every frame up to it is durable once
             // the flush ends, and the checkpointer copies those without a flush of its own.
             let prefix = db.wal_prefix();
@@ -465,7 +484,7 @@ impl Db {
         &self.path
     }
 
-    pub(crate) fn hold_owner(&mut self, owner: Arc<std::fs::File>) {
+    pub(crate) fn hold_owner(&mut self, owner: crate::database::Owned) {
         self.owner = Some(owner);
     }
 
@@ -997,6 +1016,56 @@ pub fn step(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Says, as it drops, how many strong handles its engine still has.
+    struct EngineWitness {
+        engine: std::sync::Weak<Database>,
+        dropped: std::sync::mpsc::Sender<usize>,
+    }
+    impl Drop for EngineWitness {
+        fn drop(&mut self) {
+            self.dropped.send(self.engine.strong_count()).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_owner_guards_drop_after_the_engine_in_every_holder() {
+        // CP-T1.5 (U05), local-owner-transport.md "Owner guards": a reader, a reader's opener
+        // and the flusher each keep the owner's guards until they drop, and drop the engine's
+        // handles before them. Each holder is made the last, then dropped: the guards drop
+        // then, with no engine handle left.
+        type Holder = Box<dyn FnOnce(&Db) -> Box<dyn std::any::Any>>;
+        let holders: [(&str, Holder); 3] = [
+            ("reader", Box::new(|db| Box::new(db.reader().unwrap()))),
+            ("opener", Box::new(|db| Box::new(db.opener()))),
+            ("flusher", Box::new(|db| Box::new(db.flusher()))),
+        ];
+        for (name, hold) in holders {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = Db::open(&dir.path().join("db")).unwrap();
+            let (sender, dropped) = std::sync::mpsc::channel();
+            let witness = EngineWitness {
+                engine: Arc::downgrade(&db.db),
+                dropped: sender,
+            };
+            db.hold_owner(crate::database::Owned::new(
+                Arc::new(std::fs::File::create(dir.path().join("lease")).unwrap()),
+                Some(crate::database::Guards::new([7; 32], Arc::new(witness))),
+            ));
+            let holder = hold(&db);
+            drop(db);
+            assert!(
+                dropped.try_recv().is_err(),
+                "{name}: the guards dropped early"
+            );
+            drop(holder);
+            assert_eq!(
+                dropped.try_recv().unwrap(),
+                0,
+                "{name}: the guards dropped before the engine's handles"
+            );
+        }
+    }
 
     /// U15/CP-T1.8: failure after raw pages and schema refresh must expose neither the imported
     /// catalog nor its rows. A later successful apply persists both through the real flusher.
