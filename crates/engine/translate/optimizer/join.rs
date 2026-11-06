@@ -4609,4 +4609,51 @@ mod tests {
         assert!(!can_replace_build_index_with_hash(&constraints[1], false));
         assert!(can_replace_build_index_with_hash(&constraints[1], true));
     }
+
+    /// Do: ask for the greedy search's starting table when every table must follow another (an
+    /// outer join's right table each). Expect: a typed planning error, not a panic (CLAUDE.md §1;
+    /// planner audit row 16; T-PL.3.1).
+    #[test]
+    fn no_starting_table_is_a_typed_error() {
+        let mut ids = TableRefIdCounter::new();
+        let joined_tables: Vec<JoinedTable> = (0..2)
+            .map(|n| {
+                let table = _create_btree_table(
+                    &format!("t{n}"),
+                    _create_column_list(&["id"], Type::Integer),
+                );
+                _create_table_reference(table, None, ids.next())
+            })
+            .collect();
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let available_indexes = AvailableIndexes::default();
+        let constraints = constraints_from_where_clause(
+            &[],
+            &table_references,
+            &available_indexes,
+            &[],
+            &empty_schema(),
+            &DEFAULT_PARAMS,
+        )
+        .unwrap();
+        let mut deps: HashMap<usize, TableMask> = HashMap::default();
+        for (table, other) in [(0, 1), (1, 0)] {
+            let mut mask = TableMask::default();
+            mask.set(other).unwrap();
+            deps.insert(table, mask);
+        }
+        let start = find_best_starting_table(
+            2,
+            table_references.joined_tables(),
+            &constraints,
+            &default_base_rows(2),
+            &deps,
+            &AnalyzeStats::default(),
+            &DEFAULT_PARAMS,
+        );
+        assert!(
+            matches!(start, Err(LimboError::PlanningError(_))),
+            "{start:?}"
+        );
+    }
 }
