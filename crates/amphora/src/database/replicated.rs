@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
-use api::replication::{Durability, Outbound, ReplicaConfig, ReplicaStatus};
+use api::replication::{Durability, Outbound, ReplicaConfig, ReplicaStatus, Verdict};
 use hyper_block::block::BlockFile;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_durable::{Bytes, GroupStore, Output, Point, Replica, StateMachine};
@@ -130,6 +130,11 @@ enum Input {
     Receive {
         from: u64,
         bytes: Vec<u8>,
+        until: Instant,
+        response: Response<()>,
+    },
+    Verdict {
+        verdict: Verdict,
         until: Instant,
         response: Response<()>,
     },
@@ -399,6 +404,31 @@ impl ReplicaHandle {
 
     pub fn status(&self) -> Result<ReplicaStatus, Refusal> {
         locked(&self.shared.status)?.clone()
+    }
+
+    /// Tells the owner what the host's node-level failure detector concluded of a member's node
+    /// (docs/design/replication.md, "The suspicion feed"). Success waits until the owner has taken
+    /// it. A verdict of this member or of a node that isn't a member is refused, typed; a reopened
+    /// owner trusts every member until the host tells it again.
+    pub fn verdict(&self, verdict: Verdict, until: Instant) -> Result<(), Refusal> {
+        if Instant::now() >= until {
+            return Err(Refusal::Timeout);
+        }
+        let (response, receiver) = mpsc::sync_channel(1);
+        self.enqueue(
+            Input::Verdict {
+                verdict,
+                until,
+                response,
+            },
+            std::mem::size_of::<Verdict>(),
+        )?;
+        receiver
+            .recv_timeout(until.saturating_duration_since(Instant::now()))
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => Refusal::Timeout,
+                mpsc::RecvTimeoutError::Disconnected => fenced("replica owner ended"),
+            })?
     }
 }
 
@@ -760,7 +790,9 @@ impl<F: BlockFile + 'static> Actor<F> {
             };
             match envelope.command {
                 Input::Submit { response, .. } => answer(response, Err(reason.clone())),
-                Input::Receive { response, .. } => answer(response, Err(reason.clone())),
+                Input::Receive { response, .. } | Input::Verdict { response, .. } => {
+                    answer(response, Err(reason.clone()))
+                }
             }
         }
     }
@@ -964,6 +996,23 @@ impl<F: BlockFile + 'static> Actor<F> {
                     return Err(error);
                 }
             }
+            Input::Verdict {
+                verdict,
+                until,
+                response,
+            } => {
+                let result = if self.at >= until {
+                    Err(Refusal::Timeout)
+                } else {
+                    self.heard(verdict)
+                };
+                let fatal = matches!(&result, Err(Refusal::Fenced(_)));
+                let error = result.as_ref().err().cloned();
+                answer(response, result);
+                if fatal && let Some(error) = error {
+                    return Err(error);
+                }
+            }
             Input::Submit {
                 namespace,
                 operation,
@@ -1036,6 +1085,33 @@ impl<F: BlockFile + 'static> Actor<F> {
             ));
         }
         self.replica.step(message).map_err(raft_error)
+    }
+    /// The host's detector's verdict, for the held count alone (hyper-raft R-8): Amphora elects on
+    /// ticks, and its elections take no detector's word.
+    fn heard(&mut self, verdict: Verdict) -> Result<(), Refusal> {
+        let member = match verdict {
+            Verdict::Suspected(member) | Verdict::Trusted(member) => member,
+        };
+        let conf = self.replica.configuration();
+        if member == self.replica.id()
+            || !conf
+                .voters
+                .iter()
+                .chain(&conf.learners)
+                .chain(&conf.voters_outgoing)
+                .chain(&conf.learners_next)
+                .any(|id| *id == member)
+        {
+            return Err(api::invalid(
+                "replica verdict",
+                "the member is this node or not a current member",
+            ));
+        }
+        match verdict {
+            Verdict::Suspected(_) => self.replica.suspect_held(member),
+            Verdict::Trusted(_) => self.replica.trust_held(member),
+        }
+        .map_err(raft_error)
     }
     fn release(&mut self, output: Output<crate::replication::Applied>) -> Result<(), Refusal> {
         // Publish durable follower and leader state before releasing any result or read.
@@ -1603,6 +1679,9 @@ mod tests {
         // A nemesis's elections: a leader handing off its lead refuses the proposals forwarded
         // to it, and those refusals are counted here instead of failing the test.
         refusals: Option<usize>,
+        // While some, the durable answers to appends, kept back in order: held answers pass, so
+        // only a held quorum can commit (the suspicion feed's test). Counted in `records`.
+        durable: Option<Vec<PumpPacket>>,
     }
     impl<'a> Pump<'a> {
         fn new(clients: &'a [Client]) -> Self {
@@ -1615,6 +1694,7 @@ mod tests {
                 records: 0,
                 bytes: 0,
                 refusals: None,
+                durable: None,
             }
         }
         fn reap(&mut self) {
@@ -1709,6 +1789,16 @@ mod tests {
                                 continue;
                             }
                         }
+                        if let Some(durable) = self.durable.as_mut() {
+                            let record = Message::decode(&packet.message.bytes).unwrap();
+                            if record.msg_type == hyper_raft::proto::MessageType::MsgAppendResponse
+                                && !record.held
+                                && !record.reject
+                            {
+                                durable.push(packet);
+                                continue;
+                            }
+                        }
                         self.admit(packet);
                         admitted += 1;
                     }
@@ -1742,11 +1832,24 @@ mod tests {
             }
             self.reap();
         }
+        /// Keeps every durable answer to an append back from now on, letting held answers pass.
+        fn hold_durable(&mut self) {
+            assert!(self.durable.is_none());
+            self.durable = Some(Vec::new());
+        }
+        /// Lets the durable answers kept back through, in order, and keeps none from now on.
+        fn let_durable(&mut self) {
+            for packet in self.durable.take().unwrap() {
+                self.admit(packet);
+            }
+            self.reap();
+        }
         fn finish(mut self) {
             assert!(
                 matches!(self.phase, PumpPhase::Relay),
                 "retained proposals were not released"
             );
+            assert!(self.durable.is_none(), "durable answers were kept back");
             // No new records or grace deadline: try_result enforces each admitted until.
             while self.records != 0 {
                 self.reap();
@@ -2608,6 +2711,31 @@ mod tests {
         }))));
         enqueue(client, until, "", operation)
     }
+    /// Tells owner `owner` the host detector's `verdict` and steps every owner once: what the
+    /// owner answered, which it has by then.
+    fn tell(
+        driven: &mut Driven,
+        clients: &[Client],
+        owner: usize,
+        verdict: Verdict,
+    ) -> Result<(), Refusal> {
+        let (response, receiver) = mpsc::sync_channel(1);
+        clients
+            .get(owner)
+            .unwrap()
+            .handle
+            .enqueue(
+                Input::Verdict {
+                    verdict,
+                    until: driven.until(),
+                    response,
+                },
+                std::mem::size_of::<Verdict>(),
+            )
+            .unwrap();
+        driven.step();
+        receiver.try_recv().unwrap()
+    }
     fn called(answer: Answer) -> Vec<u8> {
         match answer {
             Answer::Called(value) => *value.downcast::<Vec<u8>>().unwrap(),
@@ -2830,6 +2958,139 @@ mod tests {
         assert!(config.apply_unpersisted);
         let config = driven.owner(1).replica.core().raft.config();
         assert!(config.fates.is_none() && !config.apply_unpersisted);
+    }
+
+    /// CP-T1.8 (AC-T1.8.3), the suspicion feed (replication.md, "The suspicion feed"): a member the
+    /// host's detector suspects isn't counted in a held quorum until it is trusted, and meanwhile
+    /// a write waits for the classic quorum. Do: three voters of three fates, two to span; the
+    /// followers' durable answers kept back by the relay, their held answers let through; both
+    /// followers suspected at the leader; a write there. Expect: no answer though both followers
+    /// said they hold it; trusting one, the answer (the leader's disk and that member's memory).
+    /// Then both suspected again and a second write: answered only once the durable answers pass.
+    /// A verdict of the leader itself or of a non-member is refused, typed.
+    #[test]
+    fn a_member_the_detector_suspects_isnt_counted_in_a_held_quorum_until_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let durability = Durability::Replicated(api::replication::Fates {
+            of: vec![(1, 10), (2, 20), (3, 30)],
+            spanning: 2,
+        });
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open_with(dir.path(), n, vec![1, 2, 3], None, durability.clone()))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let at = clients.get(leader).unwrap();
+        let id = u64::try_from(leader + 1).unwrap();
+        let followers: Vec<u64> = (1..=3).filter(|member| *member != id).collect();
+        // Writes before the test's, so that each follower states a durable promise and answers
+        // held at once (hyper-raft R-8).
+        for n in 0..4 {
+            let answer = driven.call(&mut pump, at, move |db| {
+                db.exec(&format!("CREATE TABLE warm{n}(value)"))?;
+                Ok(Vec::new())
+            });
+            assert_eq!(answer, Ok(Vec::new()));
+        }
+        // Rounds until every follower said it holds the leader's last entry, which isn't
+        // committed: the write is proposed and only a held quorum could have answered it.
+        let held_by_all = |driven: &mut Driven, pump: &mut Pump<'_>, before: u64| -> u64 {
+            for _ in 0..ROUNDS {
+                driven.round(pump);
+                let raft = &driven.owner(leader).replica.core().raft;
+                let last = raft.log().last_index().unwrap();
+                if last > before
+                    && followers
+                        .iter()
+                        .all(|f| raft.tracker().get(*f).unwrap().held >= last)
+                {
+                    return last;
+                }
+            }
+            panic!("the followers never said they hold the write in {ROUNDS} driven rounds");
+        };
+
+        pump.hold_durable();
+        for follower in &followers {
+            assert_eq!(
+                tell(&mut driven, &clients, leader, Verdict::Suspected(*follower)),
+                Ok(())
+            );
+        }
+        let before = driven
+            .owner(leader)
+            .replica
+            .core()
+            .raft
+            .log()
+            .last_index()
+            .unwrap();
+        let first = submit(at, driven.until(), |db| {
+            db.exec("INSERT INTO warm0 VALUES (1)")?;
+            Ok(b"first".to_vec())
+        });
+        let index = held_by_all(&mut driven, &mut pump, before);
+        for _ in 0..100 {
+            driven.round(&mut pump);
+        }
+        let committed = driven.owner(leader).replica.core().raft.log().committed();
+        assert!(
+            committed < index && matches!(first.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "a held quorum of suspected members committed {index} (committed {committed})"
+        );
+        let trusted = *followers.first().unwrap();
+        assert_eq!(
+            tell(&mut driven, &clients, leader, Verdict::Trusted(trusted)),
+            Ok(())
+        );
+        assert_eq!(driven.settle(&mut pump, &first), Ok(b"first".to_vec()));
+
+        assert_eq!(
+            tell(&mut driven, &clients, leader, Verdict::Suspected(trusted)),
+            Ok(())
+        );
+        let before = driven
+            .owner(leader)
+            .replica
+            .core()
+            .raft
+            .log()
+            .last_index()
+            .unwrap();
+        let second = submit(at, driven.until(), |db| {
+            db.exec("INSERT INTO warm0 VALUES (2)")?;
+            Ok(b"second".to_vec())
+        });
+        let index = held_by_all(&mut driven, &mut pump, before);
+        for _ in 0..100 {
+            driven.round(&mut pump);
+        }
+        let committed = driven.owner(leader).replica.core().raft.log().committed();
+        assert!(
+            committed < index && matches!(second.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "a held quorum of suspected members committed {index} (committed {committed})"
+        );
+        pump.let_durable();
+        assert_eq!(driven.settle(&mut pump, &second), Ok(b"second".to_vec()));
+
+        for refused in [Verdict::Suspected(id), Verdict::Trusted(9)] {
+            assert!(
+                matches!(
+                    tell(&mut driven, &clients, leader, refused),
+                    Err(Refusal::Invalid { .. })
+                ),
+                "{refused:?} was taken"
+            );
+        }
+        for follower in &followers {
+            assert_eq!(
+                tell(&mut driven, &clients, leader, Verdict::Trusted(*follower)),
+                Ok(())
+            );
+        }
+        driven.drain(&mut pump);
+        pump.finish();
     }
 
     /// U15/CP-T1.8 on driven time (replication.md, "The owner's time"): follower calls use the

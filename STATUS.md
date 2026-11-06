@@ -356,7 +356,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   t1/fast-ack, not merged. A replicated database opened with `Durability::Replicated(Fates)` answers a write once
   members spanning the fates asked hold it (hyper-raft R-8), before its leader flushes its own log. One member's
   power cut loses nothing acknowledged: the nemesis cuts and restarts a member at the end of each round of
-  writes. Left: the suspicion feed (hyper-liveness), metrics by class (with the Kiln Metrics agent), the answer
+  writes. The suspicion feed is built on t1/class-quorum, not merged: the host's hyper-liveness verdicts, told
+  through `ReplicaHandle::verdict`, leave a suspected member out of held quorums until trusted. Left: the host
+  running hyper-liveness and telling its verdicts, metrics by class (with the Kiln Metrics agent), the answer
   moving to the leader for writes made at a follower, fates checked across members.
 - **What the language matrix found** (`bench/corpus/matrix.md`): the IN operator's collation is
   fixed (the oracles' cause E); left, from a failing test, `index_xinfo`'s NULL; then the missing

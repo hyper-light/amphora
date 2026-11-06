@@ -230,7 +230,7 @@ such writes "could possibly roll back in the event of a transient loss (e.g. cra
 2. **Fates declared.** Each member's replica configuration names its fate: what it fails with, its host and its power
    feed. The owner sets `Config::fates` to the number asked.
 3. **Suspicion fed.** The owner gives hyper-raft its node-level detector's verdicts (`suspect_held`, `trust_held`,
-   from hyper-liveness), never the group's own heartbeats.
+   from hyper-liveness), never the group's own heartbeats ("The suspicion feed", below).
 4. **Apply answers before its flush.**
    - For an entry committed under the replicated class, the machine applies it and the answer leaves without waiting
      for the engine's WAL flush. A group flusher makes it durable after.
@@ -282,6 +282,8 @@ measured reaches the others over Wi-Fi: ping averages 16.7-242 ms, user-level ro
   for them.
 - The owner's flushing thread, one flush out at a time.
 - A remote client reopening with the durability it stated.
+- The suspicion feed on t1/class-quorum ("The suspicion feed", below): `ReplicaHandle::verdict` and the owner
+  giving each verdict to the held count.
 
 Its tests:
 - the answer before the leader's flush, red with the apply flushing every entry;
@@ -292,11 +294,9 @@ Its tests:
   by hand, `AMPHORA_POWER_SEEDS`, each failing seed named with its account);
 - the cut itself: nothing the dying member writes after it survives, as on a powered-off machine (its log's device
   refuses every write and flush from the cut on, though the dying log drains what it took before its threads end).
+- a member the detector suspects left out of held quorums until trusted ("The suspicion feed", below).
 
 Not built, and none of it weakens the one-fate guarantee:
-- **The suspicion feed** (`suspect_held` from hyper-liveness, not vendored). Without it no member is ever
-  suspected. A held quorum spans two fates either way, and the leader counts only its disk. The feed narrows what
-  a gray, failing member's held answers can commit, a refinement beyond one fate's loss.
 - **Metrics by class.** hyper-raft's core doesn't say which quorum committed an entry, and `ReplicaStatus` crosses
   the transport, so a field there is a wire change. Each takes its own change, with names agreed with the Kiln
   Metrics agent (CLAUDE.md section 10).
@@ -312,3 +312,51 @@ Falsified by:
 - a whole-site power cut losing a write older than the promise window;
 - a restart finding the machine's WAL ahead of the member's own log;
 - held commits answering later than classic ones at p50 on the same members, against "never slower".
+
+### The suspicion feed (2026-11-06)
+
+Kiln goal dcdd872a0ed78f37902b06dd95dd3bf1. Sources and quotes are in docs/research/suspicion-feed.md.
+
+**Decision.** The detector is hyper-liveness, run by the host, and its verdicts reach the held count alone.
+- **Which detector.** hyper-liveness, vendored already at 4d72e19b (the "not vendored" above was out of date). It is
+  the detector R-8 names ("the owner's node-level detector decides (hyper-liveness), never the group's own
+  heartbeats", raft.md §3.7). It keeps one stream per pair of nodes, shared by every group they share, judged by
+  NFD-E (Chen, Toueg and Aguilera 2002). Each heartbeat proves a recent flush, so a node whose disk stalls is
+  suspected. A stalled member still answers held from memory, so that proof is the one the held count needs; a
+  group's own heartbeats would keep counting it (gray failure's "differential observability", Huang et al. 2017).
+  No equivalent is written here: one would duplicate a vendored, tested detector.
+- **Who runs it.** The host. Amphora carries no records between nodes ("Hosts carry authenticated wire records
+  only"), and hyper-liveness's heartbeats ride the host's datagram plane, one detector per node for all its groups.
+  The host maps each `Change` to `api::replication::Verdict` and tells every replicated database it shares with that
+  member, through `ReplicaHandle::verdict`:
+  - `Suspected` or `Stopped` become `Verdict::Suspected`;
+  - `Trusted` or `Restarted` become `Verdict::Trusted`;
+  - the disk and mode changes concern elections, which Amphora doesn't take from a detector, and aren't told.
+- **What it reaches.** The held count alone. Amphora elects on ticks, and there hyper-durable's `Replica::suspect`,
+  `trust` and `restarted` are refused once they've taken the held part ("On ticks the replica elects by the owner's
+  ticks and takes no detector's word", hyper-durable tests/shell.rs). Relying on a refusal's side effect is
+  refused here. Vendor change 0005 adds `Replica::suspect_held` and `trust_held`, the core's `RawNode` calls under
+  the shell's unwind boundary. It is additive, and named in vendor/hyper-raft/UPSTREAM.md to offer upstream. Moving
+  Amphora's elections to suspicion, as Focal's bus does, is another change, and not this one.
+- **Its refusals.** A verdict of this member, or of a node the configuration doesn't name, is refused, typed
+  (`Refusal::Invalid`): the core would keep nothing of it, and a dropped verdict would be silent. A full queue is
+  `Refusal::Full`, a passed deadline `Refusal::Timeout`, an ended owner `Refusal::Fenced`. The verdict takes one
+  slot of the owner's bounded queue (`COMMANDS`), charged its size. The core's set is bounded by the members limit
+  (`Error::Capacity`).
+- **A reopened owner** trusts every member until its host tells it again. That is safe: every held quorum spans the
+  fates asked whether or not anyone is suspected, and the leader counts only its disk. The host restates what its
+  detector believes to a database it opens, as Focal's owner does for a reopened replica.
+
+**Its test** (`a_member_the_detector_suspects_isnt_counted_in_a_held_quorum_until_trusted`):
+- three voters of three fates, two to span;
+- the followers' durable answers held back by the relay, their held answers let through;
+- with both followers suspected, a write at the leader isn't answered, though both followers said they hold it;
+- trusting one, the write is answered by a held quorum (the leader's disk and that member's memory);
+- with both suspected again, the next write is answered only once the durable answers are let through: the classic
+  quorum.
+It was red with the verdict taken and not given to the core.
+
+Falsified by:
+- a held commit counted from a member the host's detector suspects;
+- a verdict accepted and dropped: one of a non-member answered `Ok`, or one taken and not reaching the core;
+- a verdict changing an election.
