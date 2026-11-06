@@ -394,7 +394,7 @@ fn open(
         return Err(Refusal::Timeout);
     }
     validate(&config)?;
-    let log_owner = exclusive_file(log_path)?;
+    let log_owner = exclusive_file_of(log_path, &lease)?;
     let machine = crate::replication::Machine::open_with_owner(
         path,
         ConfState {

@@ -166,7 +166,7 @@ impl Machine {
                 "the declared source must be an initial voter and the local node ID must be positive",
             ));
         }
-        let mut db = Db::open(path).map_err(unavailable)?;
+        let mut db = crate::database::open_db(path, &owner)?;
         db.hold_owner(owner.clone());
         let mut marked = false;
         db.query(

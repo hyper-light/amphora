@@ -30,19 +30,21 @@ impl Guards {
 pub(crate) struct Owned {
     lease: Arc<File>,
     // Declared after the lease, so dropped after it: the group outlives the lease it came with.
-    _guards: Option<Guards>,
+    guards: Option<Guards>,
 }
 
 impl Owned {
     pub(crate) fn new(lease: Arc<File>, guards: Option<Guards>) -> Self {
-        Self {
-            lease,
-            _guards: guards,
-        }
+        Self { lease, guards }
     }
 
     pub(crate) fn lease(&self) -> &Arc<File> {
         &self.lease
+    }
+
+    /// Whether a guarded open made this owner: then nothing it opens makes a directory.
+    pub(crate) fn guarded(&self) -> bool {
+        self.guards.is_some()
     }
 }
 
@@ -344,6 +346,58 @@ mod tests {
         assert_eq!(witnesses.so_far(), vec![0, 2, 3, 4]);
         drop((owner, again, attached));
         assert_eq!(witnesses.next(), (1, true));
+    }
+
+    #[test]
+    fn a_guarded_owner_never_remakes_a_parent_removed_after_its_open_resolved_it() {
+        // CP-T1.5 (U05), local-owner-transport.md "Owner guards": the parent is resolved, then
+        // removed. The steps that follow resolution (the engine's open, the replicated
+        // machine's, and the log's lease the replicated owner takes first) each refuse a
+        // guarded owner and make nothing; an unguarded owner's engine makes it again, as before.
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        std::fs::create_dir(&gone).unwrap();
+        let path = existing_path(&gone.join("db")).unwrap();
+        let log = existing_path(&gone.join("log")).unwrap();
+        std::fs::remove_dir(&gone).unwrap();
+        let owned = |guards: Option<Guards>| {
+            Owned::new(
+                Arc::new(File::create(dir.path().join("lease")).unwrap()),
+                guards,
+            )
+        };
+        let guarded = || owned(Some(Guards::new([1; 32], Arc::new(()))));
+        let missing = "parent directory does not exist";
+
+        let why = reason(open_db(&path, &guarded()));
+        assert!(why.contains(missing), "{why}");
+        let why = reason(crate::replication::Machine::open_with_owner(
+            &path,
+            hyper_raft::proto::ConfState {
+                voters: vec![1],
+                ..hyper_raft::proto::ConfState::default()
+            },
+            guarded(),
+            1,
+            None,
+        ));
+        assert!(why.contains(missing), "{why}");
+        let why = reason(replicated::start(
+            &dir.path().join("db"),
+            &log,
+            config(),
+            Arc::new(Changed::default()),
+            guarded(),
+            until(),
+        ));
+        assert!(why.contains(missing), "{why}");
+        assert!(!gone.exists(), "a guarded owner made its parent again");
+
+        drop(open_db(&path, &owned(None)).unwrap());
+        assert!(
+            gone.is_dir(),
+            "the unguarded open no longer makes its parent"
+        );
     }
 
     /// Holds an unguarded owner of the database at `AMPHORA_GUARDS_HOLD` for a test in another

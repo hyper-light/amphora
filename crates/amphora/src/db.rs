@@ -250,6 +250,11 @@ impl Db {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        Self::open_made(path, sharing)
+    }
+
+    /// [`Db::open_sharing`] in a directory that exists: it makes none.
+    pub(crate) fn open_made(path: &Path, sharing: &Sharing) -> anyhow::Result<Self> {
         in_place(path);
         in_place(&wal_path(path));
         Self::open_with_sharing(path, Arc::new(PlatformIO::new().map_err(fail)?), sharing)

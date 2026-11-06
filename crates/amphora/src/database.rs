@@ -287,6 +287,26 @@ pub(crate) fn exclusive_file(path: &Path) -> Result<File, Refusal> {
     try_exclusive_file(path)?
         .ok_or_else(|| unavailable("database ownership is held by another owner"))
 }
+
+/// [`exclusive_file`] for `owner`'s files: a guarded owner's makes no parent directory, and a
+/// parent removed since its open resolved it is refused, never made again: the host's guards
+/// protect the directory that was there (local-owner-transport.md, "Owner guards").
+pub(crate) fn exclusive_file_of(path: &Path, owner: &Owned) -> Result<File, Refusal> {
+    if !owner.guarded() {
+        return exclusive_file(path);
+    }
+    crate::transport::try_lease(&existing_path(path)?)?
+        .ok_or_else(|| unavailable("database ownership is held by another owner"))
+}
+
+/// The database at `path` for `owner`, as [`exclusive_file_of`] makes its directories.
+pub(crate) fn open_db(path: &Path, owner: &Owned) -> Result<Db, Refusal> {
+    if !owner.guarded() {
+        return Db::open(path).map_err(unavailable);
+    }
+    let path = existing_path(path)?;
+    Db::open_made(&path, &crate::db::Sharing::Off).map_err(unavailable)
+}
 pub(crate) fn refused(error: &anyhow::Error) -> Refusal {
     if let Some(refusal) = error.downcast_ref::<Refusal>() {
         return refusal.clone();
@@ -454,7 +474,7 @@ impl Database {
         initialize: impl FnOnce(&mut Db) -> Result<(), Refusal>,
     ) -> Result<Self, Refusal> {
         Self::owner(path, until, restoring, None, guards, |path, owner| {
-            let mut db = Db::open(path).map_err(unavailable)?;
+            let mut db = open_db(path, &owner)?;
             db.hold_owner(owner.clone());
             initialize(&mut db)?;
             Self::from_db_mode(db, until, restoring, Some(owner))

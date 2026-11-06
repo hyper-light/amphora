@@ -221,9 +221,13 @@ additive constructors carry them, and the existing ones keep their behavior:
 - A guarded open makes no directory: its database and log paths are made canonical without
   creating a parent (`existing_path`), and a missing parent is refused before the owner table, the
   endpoint or the lease is touched. The lease then makes only the database's own `.client`
-  endpoint directory, as every owner's does. Later steps of the open (`Db::open`, the log's lease)
-  still call `create_dir_all` on a parent that exists, which makes nothing; the host's guards keep
-  that parent in place.
+  endpoint directory, as every owner's does. The steps after resolution make nothing either: a
+  guarded owner's engine opens without `create_dir_all` (`open_db`, for the local writer and the
+  replicated machine), and its log's lease resolves its path the same way (`exclusive_file_of`).
+  A parent removed after the open resolved it is refused with the same error, never made again: a
+  remade directory is another directory (the host binds its group to the parent's file identity),
+  and the host's guards would protect nothing, with nobody told. Asked by amphora-seam-owner, in
+  Codex's place, on 2026-11-06.
 - Under the owner table's lock, before any endpoint or lease effect, a guarded open meeting a live
   owner in this process admits it only if that owner is not a client, the file at the path now is
   the file it stored (its identity), and it holds guards of the same key. Then the incoming guards
@@ -245,7 +249,8 @@ Evidence: `database::guards::tests` with a Drop witness: sixteen same-key opens 
 one keep one group, which outlives every `Database` clone and drops with the lease free (after the
 writer, readers and flusher drained); other guards, an unguarded owner, another file at the path
 and another process's owner are each refused with the incoming group dropped at once and the live
-owner untouched; a missing parent is refused with nothing made; the replicated owner is reused and
+owner untouched; a missing parent is refused with nothing made, and a parent removed after resolution
+is refused by each later step and not made again; the replicated owner is reused and
 attached by the same key. Removing the admission, or resolving guarded paths with
 `canonical_path`, fails these tests. They show Amphora's side on each platform; whether the host's
 handles protect a Windows path is the host's own test.
@@ -258,6 +263,6 @@ handle's close.
 
 Falsified by: a group dropped while a reader, opener, flusher, actor or machine of its owner still
 holds an engine handle; two groups alive for one owner after a same-key reopen; a guarded open
-that makes a parent directory, reuses an unguarded, differently keyed or remote owner, or reuses
+that makes a parent directory (at resolution or after it), reuses an unguarded, differently keyed or remote owner, or reuses
 an owner whose stored file identity differs from the file at the path; or attach making the
 endpoint directory at a full owner table.
