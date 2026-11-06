@@ -886,9 +886,15 @@ fn spill_edits_in(db: &mut Db, edits: &[(i64, i64)]) -> anyhow::Result<()> {
         }
         db.exec("SAVEPOINT edit")?;
         let body = [Value::from_i64(doc), Value::from_text(spill_body(doc, k))];
-        db.query("UPDATE docs SET body = ?2 WHERE id = ?1", body, |_| Ok(true))?;
+        db.query("UPDATE docs SET body = ?2 WHERE id = ?1", body, |_| {
+            Ok(true)
+        })?;
         let posting = [Value::from_i64(term), Value::from_i64(k)];
-        db.query("INSERT INTO postings (term, doc) VALUES (?1, ?2)", posting, |_| Ok(true))?;
+        db.query(
+            "INSERT INTO postings (term, doc) VALUES (?1, ?2)",
+            posting,
+            |_| Ok(true),
+        )?;
         db.query(
             "INSERT INTO terms (term, docs) VALUES (?1, 1) ON CONFLICT (term) DO UPDATE SET docs = docs + 1",
             [Value::from_i64(term)],
@@ -1132,12 +1138,17 @@ fn a_frame_a_spill_writes_over_holds_no_checksum_until_its_commit() {
             let held = files[&format!("{SPILL_PATH}-wal")].held.lock().unwrap();
             let frames = held.seen.get(32..).unwrap_or_default();
             Ok(frames
-                .chunks_exact(4096 + 24)
+                .as_chunks::<{ 4096 + 24 }>()
+                .0
+                .iter()
                 .filter(|frame| frame[..4] != [0; 4] && frame[16..24] == [0; 8])
                 .count())
         })
         .unwrap();
-    assert!(unchecked > 0, "every frame held a checksum before the commit");
+    assert!(
+        unchecked > 0,
+        "every frame held a checksum before the commit"
+    );
     db.flusher()().unwrap();
     drop(db);
     let path = std::path::Path::new(SPILL_PATH);
