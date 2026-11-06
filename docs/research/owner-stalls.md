@@ -210,6 +210,51 @@ Not falsified: the members' own quorum checks stepped them down 12, 11 and 8 tim
 still moved 169 to 171 times: most changes were a leader that stepped down or a follower that campaigned, which
 the decision leaves to the followers' own timers (a member's own patience stays zero).
 
+### fedora, its own load: the patience in force, then fixed ticks (effcefb, then d95462c)
+
+Kiln goal dce003f1, the plan's condition: one `systemd-run --user` unit on fedora (Linux x86_64, 32 cores, btrfs on a
+Samsung SSD 9100 PRO, `nvme1n1`), `disk-stalls-fedora.sh` (probe carrier a525ae5, sha256 2178f086…), holding the
+host's heavy lock, with no load made by the job: what ran beside it was the host's own (other agents' gates and labs).
+Unit `replicated-line-stalls-20261106T220949Z`, run by amphora-replicated-line. Both arms are step 1's measurement
+(`production_owner_stalls_measured_on_this_host`, `AMPHORA_STALL_SECONDS=1800`), back to back on the same host: the
+patience in force at t1/replicated-line effcefb (tree 53d30ebe), then fixed ticks at d95462c (tree 3fb092b6, the
+commit before the change), each built in a target directory of its own. load1 and the NVMe busy share
+(`/proc/diskstats` io_ticks) were sampled every 30 s.
+
+The patience in force (effcefb): 2026-11-06 22:13:35Z to 22:43:41Z, load 8.48-71.89, median 18.89 (60 samples);
+`nvme1n1` busy 32-81 %, median 68 %. 28,941 writes acknowledged, 11 refused.
+
+| member | write submit to durable p50/p99/p99.9/max ms | owner step gap p50/p99/p99.9/max ms | owner tick gap p50/p99/p99.9/max ms | answer gaps while leading p50/p99/p99.9/max ms (over 200 ms) | step-downs / elections / changes |
+|---|---|---|---|---|---|
+| 1 | 18.445/43.711/179.981/6869.126 | 1.081/12.756/22.052/1058.180 | 10.815/28.088/48.373/1058.180 | from 2: 1.185/54.058/142.239/659.082 (26); from 3: 0.143/50.299/121.949/660.965 (24) | 5/25/59 |
+| 2 | 18.607/42.708/175.786/6869.256 | 1.080/13.385/22.266/6457.346 | 10.817/28.502/51.849/6458.436 | from 1: 0.729/50.034/117.403/614.239 (26); from 3: 0.553/53.809/153.614/604.155 (26) | 8/25/62 |
+| 3 | 18.471/44.257/184.385/6868.947 | 1.079/13.434/22.548/2669.576 | 10.814/28.704/50.255/2676.037 | from 1: 1.185/43.074/78.922/898.234 (9); from 2: 1.207/45.858/92.507/902.449 (10) | 6/25/63 |
+
+Fixed ticks, the same-host control (d95462c): 2026-11-06 22:43:41Z to 23:14:30Z, load 11.86-113.54, median 29.52 (60
+samples); `nvme1n1` busy 8-77 %, median 55.5 %. 19,693 writes acknowledged, 107 refused.
+
+| member | write submit to durable p50/p99/p99.9/max ms | owner step gap p50/p99/p99.9/max ms | owner tick gap p50/p99/p99.9/max ms | answer gaps while leading p50/p99/p99.9/max ms (over 200 ms) | step-downs / elections / changes |
+|---|---|---|---|---|---|
+| 1 | 18.648/122.092/2025.685/15731.303 | 1.079/11.867/26.037/12846.201 | 10.772/31.356/138.782/12851.636 | from 2: 0.287/98.934/427.983/6487.881 (82); from 3: 0.110/83.221/387.599/6480.199 (81) | 63/307/611 |
+| 2 | 18.561/120.932/2017.494/15761.881 | 1.078/12.572/26.419/12859.905 | 10.764/31.918/145.747/12868.432 | from 1: 0.265/60.317/236.857/6479.777 (60); from 3: 0.191/73.878/294.669/6480.336 (62) | 45/307/613 |
+| 3 | 17.331/119.481/1840.076/15731.108 | 1.077/12.386/26.246/12861.291 | 10.765/31.935/147.441/12861.291 | from 1: 1.206/53.983/172.214/5919.588 (63); from 2: 1.223/61.016/216.095/5920.467 (64) | 43/307/614 |
+
+Not falsified: with the patience in force the members' own quorum checks stepped them down 5, 8 and 6 times, each
+fewer than 63, and the terms moved 25 times; at fixed ticks on the same host they stepped down 63, 45 and 43 times and
+the terms moved 307 times. The control is clearly above. What weakens the comparison: fedora's own load was not the
+same in the two arms. The control's half hour ran heavier (median 29.52 against 18.89, peaks 113.54 against 71.89), and
+its owner threads stood still longer (step gaps to 12.8 s against 6.5 s). The patience arm's median is below step 1's
+loaded band (25-55). A load the host makes on its own can't be held level. The arms are recorded as they ran, each
+with its band; the control's longer stalls account for some of its step-downs, and not, by this run alone, for how
+many.
+
+The loops, after both arms, at effcefb: `a_leader_whose_followers_answer_as_late_as_it_measured_keeps_its_lead` 0 of
+200 failed at load 77.41-117.20; `a_leader_cut_off_from_its_followers_steps_down_within_its_patience` 0 of 200 failed
+at load 59.12-77.41; both nemesis tests (`follower_origin_captures_hold_through_an_election_at_each_step`,
+`seed_and_delta_hold_through_an_election_at_each_step`) passed at load 64.68. The run ended 23:15:49Z. An earlier
+attempt of the unit (22:05:42Z) stopped before either arm: the script built both trees into one target directory, and
+the control's build took the head's `amphora-api` as fresh. It is fixed at probe carrier a525ae5.
+
 ## An open liveness cost: terms that still move
 
 With the patience in force, leaders' own quorum checks stepped them down 12, 11 and 8 times in the run above, but the

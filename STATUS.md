@@ -360,19 +360,23 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 ## Next
 
 - **The replicated class** (docs/design/replication.md, "Fast acknowledgement"; Ada's word 2026-11-01): built on
-  t1/fast-ack, not merged. A replicated database opened with `Durability::Replicated(Fates)` answers a write once
-  members spanning the fates asked hold it (hyper-raft R-8), before its leader flushes its own log. One member's
-  power cut loses nothing acknowledged: the nemesis cuts and restarts a member at the end of each round of
-  writes. Its metrics (flush backlog, flush seconds, commits by quorum; replication.md, "Metrics") are built on
-  t1/class-metrics, not merged; their core count is upstream in hyper-raft (`d5d5f8f`, vendored). Built on
-  t1/class-quorum, not merged:
+  t1/replicated-line, not on main (fast-ack, class-metrics, class-quorum and disk-stalls, merged in that order). A
+  replicated database opened with `Durability::Replicated(Fates)` answers a write once members spanning the fates
+  asked hold it (hyper-raft R-8), before its leader flushes its own log. One member's power cut loses nothing
+  acknowledged: the nemesis cuts and restarts a member at the end of each round of writes. Its metrics (flush
+  backlog, flush seconds, commits by quorum; replication.md, "Metrics") are exported by `ReplicaHandle::counters`;
+  their core count is upstream in hyper-raft (`d5d5f8f`, vendored). Also on the line:
   - the suspicion feed: the host's hyper-liveness verdicts, told through `ReplicaHandle::verdict`, leave a suspected
-    member out of held quorums until trusted;
-  - the owner's identity naming its durability, so an attachment in another class is refused, typed;
-  - a write made at a follower answered on its group's commit, before its own log write.
+    member out of held quorums until trusted (vendor patch 0005, offered upstream on Ada's word);
+  - the owner's identity naming its durability (transport version 4), so an attachment in another class is refused,
+    typed;
+  - a write made at a follower answered on its group's commit, before its own log write, kept until it applies;
+  - the leader's quorum patience (replication.md, "The leader's quorum patience"): on fedora's own load its own
+    checks stepped members down 5-8 times in 1,800 s against 43-63 at fixed ticks (docs/research/owner-stalls.md).
 
   Left: the host running hyper-liveness and telling its verdicts; the class stated once for a group across its
-  nodes.
+  nodes; the quorum patience's two metrics exported (names agreed); a member's fate carried by its change; the terms
+  that still move on a leader's own stalls (owner-stalls.md).
 - **What the language matrix found** (`bench/corpus/matrix.md`): the IN operator's collation is
   fixed (the oracles' cause E); left, from a failing test, `index_xinfo`'s NULL; then the missing
   features by how often users reach them (ORDER BY in aggregates, median and percentiles, the JSON
