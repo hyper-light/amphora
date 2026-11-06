@@ -35,6 +35,25 @@ at 4 MiB of log text, and 8 MiB past a 30 s deadline it had met in 21.1 s. It al
 The audit's slowdown doesn't reproduce here. Every leg answered, the 8 MiB leg in 14.2 s, and decision 30 costs at most
 1.6%, at 4 MiB, while the disks write 13-16 times less.
 
+## A spill that writes over computes no checksum (d2c7395)
+
+Ada asked that the 1.6% at 4 MiB be cut. A spill that writes a page back over its frame computed the
+frame's whole checksum, which the commit computes again (decision 30). Since d2c7395 it computes none.
+Measured the same way, the fix against 542f5a9, 2026-11-06 07:36:52Z to 07:39:55Z, load 1.11 when
+measuring began, 1.32 to 2.13 at the start of each later phase, 2.37 at the end. The fix's binary's
+sha256 begins 3d82bd3c8ddf7b60.
+
+| leg | fix, rounds 1 and 2 | old, rounds 1 and 2 | fix, best against old |
+|---|---|---|---|
+| 1 MiB | 1.19 s, 1.21 s | 1.21 s, 1.18 s | 1.19 s against 1.18 s |
+| 4 MiB | 6.39 s, 6.39 s | 6.67 s, 6.45 s | 0.9% faster |
+| 8 MiB | 14.24 s, 14.16 s | 15.11 s, 15.46 s | 6.3% faster |
+| batched 1 MiB | 18.4 s, 18.2 s | 20.6 s, 18.5 s | 1.6% faster |
+
+The disks wrote 786 and 658 MiB for the fix's three legs against 10,106 and 10,101 MiB, and 593 and
+590 MiB for its batched leg against 619 and 598. At 1 MiB the two differ by 0.01 s, less than either
+varied between the two runs (1.17 to 1.21 s).
+
 ## Many small commits
 
 | | call p50 | call p99 | max | time | disks wrote, for 1 MiB of text |
@@ -63,5 +82,5 @@ difference. At 8 MiB old didn't finish, so there the old log's gigabytes cost mo
 
 ## Not counted
 
-A first run on this host, 04:38:58Z to 04:42:02Z, gave much the same times, but its load check read nothing: launchd's PATH
-had no `/usr/sbin`, so `sysctl` wasn't found and an empty load passed as calm. It is left out.
+A first run on this host, 04:38:58Z to 04:42:02Z, gave much the same times, but its load check read nothing:
+launchd's PATH had no `/usr/sbin`, so `sysctl` wasn't found and an empty load passed as calm. It is left out.
