@@ -1389,3 +1389,59 @@ must write at most a quarter of the log's bytes. Red at 13e385d. What `copy_afte
 acknowledged batch lost by a power cut with frames left uncopied across commits (`tests/crash.rs`,
 whose seeds copy after 0 to 7 frames); at 32 writers and more, commits slower or their tails longer
 than with a copy at every period (decision 4's bench).
+
+## 37. A commit logs its pages' changes: a log of both kinds of slot
+
+**Decision.** A new generation of the log is mixed (its header's file format
+`packed::MIXED_FORMAT`, `0x414d5003`; Amphora's default, `Db::open`): a commit writes its pages as
+packed records (decision 16), each page a delta against its version the log already holds where one
+saves half the page (decision 17), else its image; a spill or a cache flush writes whole page frames,
+over the transaction's own frames as decision 30 has it, and the commit chains them again before its
+records. A slot is told by its page field: a page number below `0x8000_0000` is a page frame, a
+record's first slot carries `0x8000_0000` with its slot count, and its other slots the continuation
+mark (`u32::MAX`). The frame index maps each page of a record to the record's first slot, so read
+marks, backfill, the durable mark (decision 15), the checkpointer's list (decision 24) and restarts
+keep their frames; whether a frame is a record is the record registry's to say (`Records::slots_of`).
+A read, a checkpoint's copy and recovery go by it, a page frame read as ever and a record rebuilt
+through its chain (decision 17). A chain never reaches past a page frame: a delta is made only
+against the page's latest frame in the generation (`Wal::delta`), and a spill's frame is published
+before the commit prepares its records, so a page spilled in a transaction is logged whole at its
+commit. A mixed log's pages are shared (decisions 20 and 26): a page read from a record publishes its
+image under its page and the record's frame, as a page frame's does. Generations keep the format they
+began with: page-a-frame and packed logs written before read as ever, and recovery refuses a header
+whose format it doesn't know rather than read it as page frames. Page numbers at or past `0x8000_0000`
+(8 TiB of 4 KiB pages) are refused in a mixed generation. The raw frame interface (Turso's sync) and
+the multi-process authority refuse a mixed log, as they refuse a packed one.
+
+**Why.** Decision 35's plan: on the unify audit's batched leg the log takes 16.6 bytes a byte of the
+rows the calls commit, a 4 KiB page for each page a commit touches; a packed log with deltas took
+3.0-3.2 (`docs/research/small-commits.md`). The packed log couldn't be the default: its spills append
+records, which would grow a big transaction's log back toward decision 30's gigabytes, its pages
+weren't shared, and it cost the comprehensive bench's bulk statements a wait not found (decision 16).
+Spills stay page frames written over, so a transaction's log stays bounded by the pages it dirtied;
+commits, which are what small writes are made of, become the records.
+
+**The bound.** On the batched leg the log takes at most 4 bytes a byte of rows
+(`small_commits_log_their_changes_not_their_pages`), against 16.6; with decision 35's copies (at
+most a quarter of the log), at most 5 bytes a byte of rows written in all, against 26.4 before
+either. On a quiet Mac's disks the per-flush cost (decision 35: about 107 KiB a `F_FULLFSYNC`) is
+then most of what a durable call writes.
+
+**Sources.** ARIES (Mohan, Haderle, Lindsay, Pirahesh and Schwarz, ACM TODS 17(1), 1992): log
+records describe the change made to a page, physiologically, not the page. PostgreSQL's
+`full_page_writes` (its documentation, `runtime-config-wal`): a page's first change after a
+checkpoint is logged whole, later ones as the change, the split decision 17 makes at the page's first
+version in a generation. SQLite's WAL format (sqlite.org/fileformat2.html, "The WAL File Format"):
+frame headers, the checksum chain from the header's salts, recovery stopping at the first frame that
+doesn't hold, and a commit valid only once a frame with its database size follows; and
+sqlite.org/wal.html: frames past the last commit stand for nothing, which is what lets a spill's
+frames be written over (decision 30). The LZ4 block format (decision 16).
+
+**Falsified by.** The batched leg's log above 4 bytes a byte of rows (the test above); a row read back
+other than as committed, on a fresh connection, after a checkpoint, after recovery or through the
+shared pages, in a mixed log (`crates/engine/tests/packed_log.rs`, `shared_pages.rs`,
+`reader_cache.rs` on mixed logs); an acknowledged batch lost or torn by a power cut in a mixed log,
+spills written over beside records included (`crates/amphora/tests/crash.rs`); a transaction's log
+holding more frames past its last commit than the pages it dirtied (`spilled_log.rs` on a mixed
+log); the audit's 1, 4 and 8 MiB legs or the comprehensive bench's bulk statements slower than
+page-a-frame at 13e385d.
