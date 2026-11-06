@@ -189,3 +189,147 @@ tests = [
   { id = "T-T1.13.1", text = "Fire drills: a node powered off, a disk stalled for 10 s, a network partition, a region lost" },
   { id = "T-T1.13.2", text = "A fresh machine to a working Amphora from its README alone, by a fresh subagent" },
 ]
+
+# Amphora's own IDs for the planner (kiln plan 01a16eab7f457673b4cf9933adacfc4d, step 7): the ranked
+# changes of docs/research/planner.md section 9, each a goal in kiln (PL.1 to PL.13, in rank order)
+# whose measurement these name. Each is measured by bench/planner/record.sh on the change and on its
+# parent, on one machine, each run begun at a load under 2; step 3's numbers are the baselines.
+
+[[own]]
+id = "PL.1"
+title = "Join sizes from equivalence classes, with key caps (planner rank 1)"
+criteria = [
+  { id = "AC-PL.1.1", text = "JOB prefixes estimated below one row while counting 1,000 or more is under 35, against 343 at step 3" },
+  { id = "AC-PL.1.2", text = "JOB's median q-error at three joins is under 100 (1.07e+03 at step 3), and its largest intermediate results' p95 under 1e+05 (7.797e+06)" },
+  { id = "AC-PL.1.3", text = "JOB's time over the parent's is 0.85 or less by geometric mean, and TPC-H SF 10's median q-error is not above the parent's (9.39 at step 3)" },
+]
+tests = [
+  { id = "T-PL.1.1", text = "A query given join terms its equivalence classes already imply, then one more class-merging term — passes when no added term raises a set's estimate (CERT) and the order check is clean" },
+]
+
+[[own]]
+id = "PL.2"
+title = "Distinct counts and a sample per table, kept by ANALYZE (planner rank 2)"
+criteria = [
+  { id = "AC-PL.2.1", text = "JOB's first-table q-error p90 is 11 or less (1.342e+04 at step 3), its 15 keyword prefixes within 1.1 of their counts" },
+  { id = "AC-PL.2.2", text = "TPC-H SF 10's q16 part is within 10 of its count and q12's lineitem within 100" },
+  { id = "AC-PL.2.3", text = "JOB and TPC-H run no slower than the parent beyond its passes' spread, and a statement prepared before ANALYZE plans again after it" },
+]
+tests = [
+  { id = "T-PL.2.1", text = "ANALYZE of a table larger than the sample's bound — passes when its memory stays within the stated bound and the sketch's distinct count is within its stated error" },
+]
+
+[[own]]
+id = "PL.3"
+title = "Connected subsets within a counted budget, the greedy search fixed (planner rank 3)"
+criteria = [
+  { id = "AC-PL.3.1", text = "SQLite's time over Amphora's on JOB's 9 queries above 12 tables is 1 or more (0.405 at step 3)" },
+  { id = "AC-PL.3.2", text = "Every JOB query plans in at most 92.1 ms, the median not above 1.9 ms" },
+]
+tests = [
+  { id = "T-PL.3.1", text = "A join of more tables than the budget allows — passes when planning ends within its budget with a typed result and no panic" },
+]
+
+[[own]]
+id = "PL.4"
+title = "Each table's filters estimated together on its sample (planner rank 4)"
+criteria = [
+  { id = "AC-PL.4.1", text = "TPC-H SF 10's q19 part is within 10 of its count (1.2 against 239,849 at step 3) and q19 runs in under twice SQLite's 612 ms (1.011e+04 at step 3)" },
+  { id = "AC-PL.4.2", text = "q06's lineitem is within 2 of its count (off by 1.9e+03), and JOB's first-table q-error p95 under 20 (1.342e+04)" },
+  { id = "AC-PL.4.3", text = "JOB's median planning time is at most twice step 3's 1.9 ms" },
+]
+tests = [
+  { id = "T-PL.4.1", text = "A filter made more restrictive by one conjunct — passes when its estimate never rises (CERT), with and without a sample" },
+]
+
+[[own]]
+id = "PL.5"
+title = "Bloom filters passed to a star join's fact table (planner rank 5)"
+criteria = [
+  { id = "AC-PL.5.1", text = "TPC-H SF 10's q09 runs twice as fast as on its parent (1.585e+05 ms at step 3), and q05 and q08 faster than on theirs" },
+  { id = "AC-PL.5.2", text = "SSB is loaded and measured on the parent before the change" },
+]
+tests = [
+  { id = "T-PL.5.1", text = "A star join whose dimension filters keep no fact row — passes when the answer is unchanged and the filters' memory stays within their stated bound" },
+]
+
+[[own]]
+id = "PL.6"
+title = "No nested loop without an index beneath an outer not bounded at one row (planner rank 6)"
+criteria = [
+  { id = "AC-PL.6.1", text = "JOB plans with such a loop is exactly 0 (30 at step 3), their times within the passes' spread of their parents'; TPC-H has none" },
+]
+tests = [
+  { id = "T-PL.6.1", text = "The audit's 10-no-adaptive at 3,000 rows a table — passes when q is read once" },
+]
+
+[[own]]
+id = "PL.7"
+title = "The cost model against measured time (planner rank 7)"
+criteria = [
+  { id = "AC-PL.7.1", text = "The rank correlation of estimated cost with time on JOB is 0.8 or more with counted rows in place of estimates (0.20 at step 3)" },
+  { id = "AC-PL.7.2", text = "P-error is recorded for every JOB and TPC-H query" },
+]
+tests = [
+  { id = "T-PL.7.1", text = "The audit's 09-cost-model — passes when its tables of 8 and 1,011 pages no longer both scan at one cost" },
+]
+
+[[own]]
+id = "PL.8"
+title = "Bushy plans over connected pairs, with the CD-C conflict detector (planner rank 8)"
+criteria = [
+  { id = "AC-PL.8.1", text = "JOB's time over the parent's is 0.95 or less by geometric mean, and each query whose plan turns bushy runs faster than on its parent" },
+]
+tests = [
+  { id = "T-PL.8.1", text = "The audit's 03-right-full-barrier — passes when the RIGHT JOIN reads tiny first (total_cost 23,007.0 where it is 328,300,039,000.3)" },
+  { id = "T-PL.8.2", text = "Outer, semi and anti joins reordered by the conflict detector, against SQLite's answers — passes when every answer is unchanged" },
+]
+
+[[own]]
+id = "PL.9"
+title = "Statistics kept as rows change, and statements re-planned as they move (planner rank 9)"
+criteria = [
+  { id = "AC-PL.9.1", text = "CH-benCHmark's analytical queries run faster than on the parent as its tables grow, ANALYZE on the same schedule (measured on the parent first)" },
+  { id = "AC-PL.9.2", text = "The bench suite's writes are within 2% of the parent, with AC-T1.1.3's write rate and AC-T1.1.4's p99 held at K0's load" },
+]
+tests = [
+  { id = "T-PL.9.1", text = "A table grown tenfold after its statement was prepared — passes when the statement plans again once and its answer is unchanged" },
+]
+
+[[own]]
+id = "PL.10"
+title = "General unnesting by dependent joins, top-down, on a worklist (planner rank 10)"
+criteria = [
+  { id = "AC-PL.10.1", text = "TPC-H SF 10's q21 runs in under PostgreSQL's 1.195e+04 ms where it is unnested (5.309e+04 at step 3)" },
+  { id = "AC-PL.10.2", text = "TPC-DS is loaded and its ten queries measured on the parent before the change" },
+]
+tests = [
+  { id = "T-PL.10.1", text = "Correlated subqueries nested to the worklist's bound, against SQLite's answers — passes when every answer is unchanged and nothing recurses" },
+]
+
+[[own]]
+id = "PL.11"
+title = "Degree-sequence upper bounds as a guard (planner rank 11)"
+criteria = [
+  { id = "AC-PL.11.1", text = "JOB and TPC-H prefixes estimated above their bound is exactly 0, with step 3's 791 underestimates left as they are" },
+]
+tests = []
+
+[[own]]
+id = "PL.12"
+title = "Custom plans, then a generic one, for prepared statements (planner rank 12)"
+criteria = [
+  { id = "AC-PL.12.1", text = "TPC-H's 22 queries prepared once and run with qgen's parameters: no query slower than its generic plan (measured on the parent first)" },
+  { id = "AC-PL.12.2", text = "The bench suite's prepared statements are within 2% of the parent" },
+]
+tests = []
+
+[[own]]
+id = "PL.13"
+title = "An adaptive join switch and mid-query re-optimization (planner rank 13)"
+criteria = [
+  { id = "AC-PL.13.1", text = "JOB's 20 slowest queries run 27% faster than on the parent (414,668 ms of 514,502 at step 3)" },
+]
+tests = [
+  { id = "T-PL.13.1", text = "A join whose build side outgrows its estimate mid-query — passes when it switches method within its memory bound and its answer is unchanged" },
+]
