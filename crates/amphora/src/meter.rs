@@ -376,13 +376,21 @@ mod tests {
     }
 
     /// CP-T1.8, doc truth (CLAUDE.md sections 6 and 10): the replicated class's metrics are the
-    /// ones its design names. Do: read docs/design/replication.md. Expect: every
-    /// `amphora_replica_` name there (a histogram's `_bucket` series as the histogram) is in
-    /// [`REPLICA_METRICS`], and every name there is in the design.
+    /// ones its design names. Do: read docs/design/replication.md's section on the class. Expect:
+    /// every `amphora_replica_` name there (a histogram's `_bucket` series as the histogram) is in
+    /// [`REPLICA_METRICS`], and every name there is in that section. The quorum patience's names,
+    /// agreed and not yet exported, are in a section of their own.
     #[test]
     fn the_replica_metrics_are_the_ones_the_design_names() {
         let design = include_str!("../../../docs/design/replication.md");
-        let named: std::collections::BTreeSet<&str> = design
+        let class = design
+            .split_once("## Fast acknowledgement: the replicated class")
+            .unwrap()
+            .1;
+        let class = class
+            .split_once("\n## ")
+            .map_or(class, |(section, _)| section);
+        let named: std::collections::BTreeSet<&str> = class
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .filter(|word| word.starts_with("amphora_replica_"))
             .map(|word| word.strip_suffix("_bucket").unwrap_or(word))

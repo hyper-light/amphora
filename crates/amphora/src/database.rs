@@ -28,6 +28,7 @@ use crate::store::{self, Checkpointed, Engine, Flush, Opener, Store};
 pub(crate) mod compaction;
 mod guards;
 mod import;
+mod patience;
 pub(crate) mod remote;
 pub(crate) mod replicated;
 mod restore;

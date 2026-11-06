@@ -232,6 +232,12 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     published: u64,
     transferred: Option<(u64, Instant)>,
     flushing: Flushing,
+    // What this owner measured of its voters' answers while it led: its quorum patience
+    // (replication.md, "The leader's quorum patience").
+    answers: patience::Answers,
+    // A measurement's record of this owner's stalls (kiln goal 6b112f14, step 1): test-only.
+    #[cfg(test)]
+    stalls: Option<Arc<Mutex<tests::Stalls>>>,
 }
 
 /// The replicated class's flushes of the machine's log (docs/design/replication.md, "Fast
@@ -712,6 +718,9 @@ fn open_on<F: BlockFile + 'static>(
         waiting: VecDeque::new(),
         serial: 0,
         transferred: None,
+        answers: patience::Answers::default(),
+        #[cfg(test)]
+        stalls: None,
         clock,
         started: at,
         ticked: at,
@@ -977,10 +986,32 @@ impl<F: BlockFile + 'static> Actor<F> {
         if let Some(envelope) = input {
             self.receive(envelope)?;
         }
+        #[cfg(test)]
+        if let Some(stalls) = &self.stalls {
+            locked(stalls)?.stepped(at);
+        }
         if at.saturating_duration_since(self.ticked) >= TICK {
             // A delayed owner does not invent missed heartbeats or run an unbounded catchup.
             self.ticked = at;
+            // The quorum patience in force for this tick's check, from the answers measured.
+            let leading = self.replica.is_leader().then(|| self.replica.term());
+            // The voters the core's quorum check counts: the newest configuration its log states,
+            // both halves of a joint one (replication.md, "Membership").
+            let configuration = self.replica.core().raft.configuration();
+            let (voters, outgoing) = (configuration.voters(), configuration.outgoing());
+            self.answers.tick(leading, voters, outgoing)?;
+            let election = self.replica.core().raft.config().election_tick;
+            let patience = self
+                .answers
+                .patience(voters, outgoing, self.replica.id(), election);
+            self.replica
+                .set_quorum_patience(patience)
+                .map_err(raft_error)?;
             self.replica.tick().map_err(raft_error)?;
+            #[cfg(test)]
+            if let Some(stalls) = &self.stalls {
+                locked(stalls)?.ticked(at);
+            }
         }
         for _ in 0..DRIVE_QUANTUM {
             let mut output = Output::default();
@@ -989,6 +1020,10 @@ impl<F: BlockFile + 'static> Actor<F> {
                 .replica
                 .drive(nanos, std::task::Waker::noop(), &mut output)
                 .map_err(raft_error)?;
+            #[cfg(test)]
+            if let (Some(stalls), Some((submitted, taken))) = (&self.stalls, driven.flushed) {
+                locked(stalls)?.wrote(Duration::from_nanos(taken.saturating_sub(submitted)));
+            }
             self.release(output)?;
             if !driven.more {
                 break;
@@ -1023,6 +1058,15 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.replica
                 .compact(0, nanos, std::task::Waker::noop())
                 .map_err(raft_error)?;
+        }
+        #[cfg(test)]
+        if let Some(stalls) = &self.stalls {
+            let (term, leader, id) = (
+                self.replica.term(),
+                self.replica.leader(),
+                self.replica.id(),
+            );
+            locked(stalls)?.led(term, leader, id);
         }
         *locked(&self.control.status)? = Ok(status(&self.replica));
         let commits = self.replica.core().raft.commit_stats();
@@ -1524,6 +1568,12 @@ impl<F: BlockFile + 'static> Actor<F> {
         Ok(Some(proposal))
     }
     fn step(&mut self, from: u64, bytes: &[u8]) -> Result<(), Refusal> {
+        #[cfg(test)]
+        if let Some(stalls) = &self.stalls
+            && self.replica.leader() == self.replica.id()
+        {
+            locked(stalls)?.answered(from, self.at);
+        }
         let message = Message::decode(bytes)
             .map_err(|error| api::invalid("replica wire record", &error.to_string()))?;
         if message.from != from || message.to != self.replica.id() || from == self.replica.id() {
@@ -1540,6 +1590,13 @@ impl<F: BlockFile + 'static> Actor<F> {
                 "replica sender",
                 "sender is not a current member",
             ));
+        }
+        if self.replica.is_leader()
+            && message.term == self.replica.term()
+            && self.replica.core().raft.configuration().votes(from)
+            && let Err(unmeasured) = self.answers.heard(from, message.term)
+        {
+            tracing::warn!(target: "amphora.replica", event = "quorum_patience_refused", error = %unmeasured, "an answer gap was not learned for the leader's quorum patience");
         }
         self.replica.step(message).map_err(raft_error)
     }
@@ -2220,6 +2277,9 @@ mod tests {
         // While some, the durable answers to appends, kept back in order: held answers pass, so
         // only a held quorum can commit (the suspicion feed's test). Counted in `records`.
         durable: Option<Vec<PumpPacket>>,
+        // Owners whose records stay in their own queues, untaken: a follower whose answers are
+        // held, as its own slow write holds them (kiln goal 6b112f14).
+        held: Vec<usize>,
     }
     impl<'a> Pump<'a> {
         fn new(clients: &'a [Client]) -> Self {
@@ -2236,6 +2296,7 @@ mod tests {
                 delivered: BTreeMap::new(),
                 lost: Vec::new(),
                 durable: None,
+                held: Vec::new(),
             }
         }
         fn reap(&mut self) {
@@ -2315,6 +2376,9 @@ mod tests {
                         break;
                     }
                     let index = (first + offset) % self.clients.len();
+                    if self.held.contains(&index) {
+                        continue;
+                    }
                     let from = u64::try_from(index + 1).unwrap();
                     // No later record from this origin may overtake its retained proposal.
                     if let PumpPhase::Captures { held, .. } = &self.phase
@@ -2746,6 +2810,37 @@ mod tests {
         ) -> Result<Vec<u8>, Refusal> {
             let answer = submit(client, self.until(), f);
             self.settle(pump, &answer)
+        }
+        /// Rounds, time standing still, until the group is quiet: no write out on any owner's
+        /// disk, every admitted record taken, and a round with nothing to relay. A held owner's
+        /// records wait in its own queue.
+        fn quiet(&mut self, pump: &mut Pump<'_>) {
+            for _ in 0..ROUNDS {
+                let admitted = pump.drive_until(self.until());
+                if admitted == 0
+                    && pump.records == 0
+                    && self
+                        .owners
+                        .iter()
+                        .flatten()
+                        .all(|(owner, _)| owner.replica.in_flight() == 0)
+                {
+                    return;
+                }
+                if admitted == 0 {
+                    std::thread::park_timeout(POLL);
+                }
+                self.step();
+            }
+            panic!("the group was not quiet after {ROUNDS} driven rounds");
+        }
+        /// Owner `owner`'s clock moves one tick, every owner steps, and rounds go on until the
+        /// group is quiet: what the tick sent is answered at the same count of its ticks, unless
+        /// the answer is held.
+        fn tick(&mut self, pump: &mut Pump<'_>, owner: usize) {
+            self.advance(owner, TICK);
+            self.step();
+            self.quiet(pump);
         }
         /// Rounds until every record the relay admitted has been taken, so the pump can finish.
         fn drain(&mut self, pump: &mut Pump<'_>) {
@@ -4680,6 +4775,314 @@ mod tests {
         }
     }
 
+    /// The ticks of the leader between two answers of each follower whose answers are held: past
+    /// the election timeout of 20 ticks, and short of two, so that a leader at fixed ticks
+    /// survives it or not by where it falls (replication.md, "The leader's quorum patience").
+    const HELD: usize = 30;
+
+    /// Kiln goal 6b112f14, step 3: owner 0 is elected, then leads while both followers' answers
+    /// are held for `HELD` of its ticks, from its count 22 to 52. Its checks at fixed ticks, at 20,
+    /// 40 and 60, each find an answer (at 20 or 22, then at 52), so it keeps its lead and has
+    /// measured that gap. The lead then moves away and back, and owner 0 leads a fresh term, its
+    /// checks counted from 0 again. Returns its index and its followers'.
+    fn measured_lead(driven: &mut Driven, pump: &mut Pump<'_>, clients: &[Client]) -> usize {
+        let leader = driven.elect(pump, clients, 0, 1);
+        let followers: Vec<usize> = (0..3).filter(|i| *i != leader).collect();
+        for _ in 0..22 {
+            driven.tick(pump, leader);
+        }
+        pump.held.clone_from(&followers);
+        for _ in 0..HELD {
+            driven.tick(pump, leader);
+        }
+        pump.held.clear();
+        driven.quiet(pump);
+        let id = u64::try_from(leader + 1).unwrap();
+        assert!(
+            clients
+                .iter()
+                .all(|c| c.handle().status().unwrap().leader == id),
+            "the leader lost its lead while it measured its followers' answers"
+        );
+        let other = *followers.first().unwrap();
+        driven.transfer(pump, clients, leader, other);
+        driven.transfer(pump, clients, other, leader);
+        driven.quiet(pump);
+        leader
+    }
+
+    /// CP-T1.8, kiln goal 6b112f14 step 3 (replication.md, "The leader's quorum patience"): a
+    /// follower's write held past the quorum window no longer deposes a sound leader. Do: the
+    /// leader measures a gap of `HELD` ticks in its followers' answers (`measured_lead`), then, in
+    /// a fresh term, both followers' answers are held for `HELD` of its ticks again, from its count
+    /// 18 to 48, while a call it took is in flight. At fixed ticks the hold covers its whole
+    /// window from 20 to 40 and its check at 40 steps it down. Expect: every owner still follows
+    /// it, no term changed, and the call commits once the followers answer, its row on every
+    /// replica.
+    #[test]
+    fn a_leader_whose_followers_answer_as_late_as_it_measured_keeps_its_lead() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = measured_lead(&mut driven, &mut pump, &clients);
+        let id = u64::try_from(leader + 1).unwrap();
+        let before = terms(&clients);
+        for _ in 0..18 {
+            driven.tick(&mut pump, leader);
+        }
+        pump.held = (0..3).filter(|i| *i != leader).collect();
+        let call = submit(clients.get(leader).unwrap(), driven.until(), |db| {
+            db.exec("CREATE TABLE held(value); INSERT INTO held VALUES(1)")?;
+            Ok(vec![1])
+        });
+        for _ in 0..HELD {
+            driven.tick(&mut pump, leader);
+        }
+        pump.held.clear();
+        driven.quiet(&mut pump);
+        let leaders: Vec<u64> = clients
+            .iter()
+            .map(|c| c.handle().status().unwrap().leader)
+            .collect();
+        assert!(
+            leaders.iter().all(|l| *l == id),
+            "the leader stepped down at its quorum check while its followers' answers were held \
+             for {HELD} ticks: leaders {leaders:?}, terms {before:?} -> {:?}",
+            terms(&clients)
+        );
+        assert_eq!(
+            terms(&clients),
+            before,
+            "the term changed while the followers' answers were held"
+        );
+        assert_eq!(driven.settle(&mut pump, &call), Ok(vec![1]));
+        // The acknowledged write is on every replica: read through each, after ReadIndex.
+        for client in &clients {
+            let rows = driven
+                .call(&mut pump, client, |db| {
+                    let mut rows = 0;
+                    db.query("SELECT count(*) FROM held", [], |row| {
+                        rows = row.get::<i64>(0).map_err(unavailable)?;
+                        Ok(false)
+                    })?;
+                    Ok(vec![u8::try_from(rows)?])
+                })
+                .unwrap();
+            assert_eq!(rows, vec![1], "an acknowledged write is missing");
+        }
+        assert_eq!(terms(&clients), before, "the term changed after the hold");
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// CP-T1.8, kiln goal 6b112f14 step 3, and AC-T1.8.M1 (replication.md, "The leader's quorum
+    /// patience" and "Membership"): through a joint configuration the leader's patience covers the
+    /// voters its quorum check counts. Do: the leader measures a gap of `HELD` ticks in its
+    /// followers' answers (`measured_lead`); at its count 18 in a fresh term, it demotes one
+    /// follower; from the moment the way out is appended, the other follower's answers are held
+    /// for `HELD` ticks, to its count 48. The group's applied configuration stays joint, since only
+    /// that follower can commit the way out, and the core's check counts the way out's voters, the
+    /// leader and that follower, so no quorum answers through the window 20 to 40 and at fixed
+    /// ticks its check at 40 steps it down. Expect: every owner still follows it, no term changed,
+    /// the applied configuration joint all through the hold; then the change answers with the
+    /// demoted member a learner.
+    #[test]
+    fn a_leader_in_a_joint_configuration_keeps_its_lead_through_the_late_halfs_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = measured_lead(&mut driven, &mut pump, &clients);
+        let id = u64::try_from(leader + 1).unwrap();
+        let (late, demoted) = ((leader + 1) % 3, (leader + 2) % 3);
+        let demoted_id = u64::try_from(demoted + 1).unwrap();
+        let before = terms(&clients);
+        for _ in 0..18 {
+            driven.tick(&mut pump, leader);
+        }
+        let proposed = pending_change(&driven, leader);
+        let until = driven.until() + Duration::from_secs(3600);
+        let asked = change(
+            clients.get(leader).unwrap(),
+            until,
+            MemberChange::Demote(demoted_id),
+        );
+        reach(&mut driven, &mut pump, "the joint entry", |driven| {
+            pending_change(driven, leader) > proposed
+        });
+        let joint = pending_change(&driven, leader);
+        reach(&mut driven, &mut pump, "the way out appended", |driven| {
+            pending_change(driven, leader) > joint
+        });
+        // Only the late follower's answers can commit the way out, so the group stays joint.
+        pump.held = vec![late];
+        for _ in 0..HELD {
+            driven.tick(&mut pump, leader);
+            assert!(
+                !applied_configuration(&driven, leader)
+                    .voters_outgoing
+                    .is_empty(),
+                "the group left its joint configuration during the hold"
+            );
+        }
+        pump.held.clear();
+        driven.quiet(&mut pump);
+        let leaders: Vec<u64> = clients
+            .iter()
+            .map(|c| c.handle().status().unwrap().leader)
+            .collect();
+        assert!(
+            leaders.iter().all(|l| *l == id),
+            "the leader stepped down in its joint configuration while the late half's answers \
+             were held for {HELD} ticks: leaders {leaders:?}, terms {before:?} -> {:?}",
+            terms(&clients)
+        );
+        assert_eq!(terms(&clients), before, "the term changed during the hold");
+        let changed = driven.answer(&mut pump, &asked).unwrap();
+        assert_eq!(changed.learners, vec![demoted_id]);
+        assert!(changed.voters_outgoing.is_empty(), "{changed:?}");
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// CP-T1.8, kiln goal 6b112f14 step 3 (replication.md, "The leader's quorum patience"): the
+    /// cost of the patience is bounded. Do: the leader measures a gap of `HELD` ticks
+    /// (`measured_lead`), then, in a fresh term, is cut off from both followers, neither way
+    /// relayed, just before its first check, and a read is asked of it. Expect: that check passes
+    /// on the answers before the cut, the leader steps down within the election timeout and its
+    /// patience after it, a patience within the ceiling, and the read is not answered while it
+    /// is cut off: no lease answers a read.
+    #[test]
+    fn a_leader_cut_off_from_its_followers_steps_down_within_its_patience() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = measured_lead(&mut driven, &mut pump, &clients);
+        let id = u64::try_from(leader + 1).unwrap();
+        driven.tick(&mut pump, leader);
+        let raft = &driven.owner(leader).replica.core().raft;
+        let (election, patience) = (raft.config().election_tick, raft.quorum_patience());
+        assert!(
+            patience <= patience::QUORUM_CEILING - election,
+            "{patience}"
+        );
+        let due = election + patience;
+        for _ in 1..due - 1 {
+            driven.tick(&mut pump, leader);
+        }
+        pump.held = vec![0, 1, 2];
+        // A read asked of the patient leader while it is cut off: no quorum confirms it.
+        let read = submit(clients.get(leader).unwrap(), driven.until(), |_| {
+            Ok(vec![1])
+        });
+        let mut after = None;
+        for count in due - 1..=due + election + patience::QUORUM_CEILING {
+            if clients
+                .get(leader)
+                .unwrap()
+                .handle()
+                .status()
+                .unwrap()
+                .leader
+                != id
+            {
+                after = Some(count.checked_sub(due));
+                break;
+            }
+            driven.tick(&mut pump, leader);
+        }
+        assert!(
+            matches!(read.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "a leader cut off from its followers answered a read"
+        );
+        let after = after
+            .expect("the cut-off leader never stepped down")
+            .expect("the cut-off leader stepped down before its first check");
+        assert!(
+            after <= election + patience,
+            "stepped down {after} ticks after its first check, past {election} + {patience}"
+        );
+        pump.held.clear();
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// The numbers a text states: each maximal run of characters between spaces and punctuation
+    /// that holds a digit and no letter, its ends' commas and periods stripped; a section's sign
+    /// (`§3.6`) is a citation, not a number.
+    fn numbers(text: &str) -> Vec<&str> {
+        text.split(|c: char| c.is_whitespace() || "/|()[];:*`\"'?".contains(c))
+            .map(|word| word.trim_matches(|c| c == '.' || c == ','))
+            .filter(|word| {
+                !word.starts_with('§')
+                    && word.chars().any(|c| c.is_ascii_digit())
+                    && !word.chars().any(char::is_alphabetic)
+            })
+            .collect()
+    }
+
+    /// Kiln goal 6b112f14 step 2, doc-truth: do read the decision "The leader's quorum patience"
+    /// and step 1's record. Expect every number the decision states to be in the record, or to be
+    /// one of the design's own, each as the code has it: the tick, the ceiling, the patience at
+    /// the ceiling, a cut-off leader's cost, the window; else AC-T1.8.4's bound, a source's year
+    /// or the decision's date.
+    #[test]
+    fn the_decisions_numbers_are_step_ones_or_its_own() {
+        let design = include_str!("../../../../docs/design/replication.md");
+        let decision = design
+            .split_once("## The leader's quorum patience")
+            .unwrap()
+            .1;
+        let record = numbers(include_str!("../../../../docs/research/owner-stalls.md"));
+        let requirements = include_str!("../../../../docs/requirements.toml");
+        let election = settings(1, &Durability::Persisted)
+            .unwrap()
+            .core
+            .election_tick;
+        let ceiling = patience::QUORUM_CEILING;
+        let tick = TICK.as_millis();
+        let seconds = |ticks: usize| {
+            let ms = u128::try_from(ticks).unwrap() * tick;
+            format!("{}", f64::from(u32::try_from(ms).unwrap()) / 1000.0)
+        };
+        let generation = usize::try_from(patience::GENERATION).unwrap();
+        let own = [
+            tick.to_string(),
+            ceiling.to_string(),
+            (ceiling - election).to_string(),
+            seconds(ceiling),
+            (2 * ceiling).to_string(),
+            seconds(2 * ceiling),
+            (2 * election).to_string(),
+            (2 * u128::try_from(election).unwrap() * tick).to_string(),
+            format!("{},{:03}", generation / 1000, generation % 1000),
+            seconds(generation),
+            seconds(2 * generation),
+        ];
+        assert!(requirements.contains("failover p99 is at most 1000 ms"));
+        let cited = ["1000", "2014", "2017", "2018", "2026-11-06"];
+        let stray: Vec<&str> = numbers(decision)
+            .into_iter()
+            .filter(|n| !record.contains(n) && !own.iter().any(|o| o == n) && !cited.contains(n))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "numbers neither in step 1's record nor the design's own: {stray:?}"
+        );
+        assert!(
+            numbers(decision).len() > 40,
+            "the decision states its numbers"
+        );
+    }
+
     /// U15/CP-T1.8: malformed membership and a source that cannot lead are refused at admission.
     #[test]
     fn malformed_initial_membership_is_refused() {
@@ -6361,5 +6764,287 @@ mod tests {
             drop(sender);
             assert!(matches!(receipt.try_result(), Err(Refusal::Fenced(_))));
         }
+    }
+
+    /// One series of a measurement: at most `CAP` samples kept, the rest counted (CLAUDE.md
+    /// section 2).
+    #[derive(Default)]
+    struct Series {
+        samples: Vec<Duration>,
+        dropped: u64,
+    }
+    impl Series {
+        const CAP: usize = 4_000_000;
+        fn add(&mut self, d: Duration) {
+            if self.samples.len() < Self::CAP {
+                self.samples.push(d);
+            } else {
+                self.dropped += 1;
+            }
+        }
+        fn over(&self, limit: Duration) -> usize {
+            self.samples.iter().filter(|d| **d > limit).count()
+        }
+        /// p50, p99, p99.9 and max, in ms, and the count.
+        fn summary(&self) -> String {
+            let mut sorted = self.samples.clone();
+            sorted.sort();
+            // The sample at rank ceil(n · per_mille / 1000), as before in integers.
+            let q = |per_mille: usize| {
+                let i = (sorted.len() * per_mille).div_ceil(1000).saturating_sub(1);
+                sorted.get(i).copied().unwrap_or_default().as_secs_f64() * 1e3
+            };
+            format!(
+                "p50 {:.3} ms p99 {:.3} ms p99.9 {:.3} ms max {:.3} ms ({} samples{})",
+                q(500),
+                q(990),
+                q(999),
+                sorted.last().copied().unwrap_or_default().as_secs_f64() * 1e3,
+                sorted.len(),
+                if self.dropped > 0 {
+                    format!(", {} past the cap", self.dropped)
+                } else {
+                    String::new()
+                }
+            )
+        }
+    }
+
+    /// What one owner's measurement saw (kiln goal 6b112f14, step 1): its step and tick gaps, its
+    /// log writes' times from submit to durable, each follower's answer gaps while it led, and
+    /// each change of leader with its cause.
+    #[derive(Default)]
+    pub(super) struct Stalls {
+        last_step: Option<Instant>,
+        last_tick: Option<Instant>,
+        steps: Series,
+        ticks: Series,
+        writes: Series,
+        last_answer: std::collections::BTreeMap<u64, Instant>,
+        answers: std::collections::BTreeMap<u64, Series>,
+        term: u64,
+        leader: u64,
+        /// Times this member, leading, was stepped down by its quorum check in its own term.
+        step_downs: u64,
+        /// Terms it moved to: elections.
+        elections: u64,
+        changes: Vec<String>,
+    }
+    impl Stalls {
+        pub(super) fn stepped(&mut self, at: Instant) {
+            if let Some(last) = self.last_step.replace(at) {
+                self.steps.add(at.saturating_duration_since(last));
+            }
+        }
+        pub(super) fn ticked(&mut self, at: Instant) {
+            if let Some(last) = self.last_tick.replace(at) {
+                self.ticks.add(at.saturating_duration_since(last));
+            }
+        }
+        pub(super) fn wrote(&mut self, took: Duration) {
+            self.writes.add(took);
+        }
+        pub(super) fn answered(&mut self, from: u64, at: Instant) {
+            if let Some(last) = self.last_answer.insert(from, at) {
+                self.answers
+                    .entry(from)
+                    .or_default()
+                    .add(at.saturating_duration_since(last));
+            }
+        }
+        /// A change of leader: a step-down by the quorum check when this owner led and stops
+        /// leading in the same term, an election when the term moves.
+        pub(super) fn led(&mut self, term: u64, leader: u64, id: u64) {
+            if (term, leader) == (self.term, self.leader) {
+                return;
+            }
+            let cause = if term != self.term {
+                self.elections += 1;
+                "an election"
+            } else if self.leader == id && leader != id {
+                self.step_downs += 1;
+                "its quorum check stepped it down"
+            } else if leader == 0 {
+                "its leader stepped down"
+            } else {
+                "the election's leader learned"
+            };
+            if self.term != 0 {
+                self.changes.push(format!(
+                    "term {} leader {} -> term {term} leader {leader}: {cause}",
+                    self.term, self.leader
+                ));
+            }
+            self.last_answer.clear();
+            (self.term, self.leader) = (term, leader);
+        }
+    }
+
+    /// Kiln goal 6b112f14, step 1 (replication.md, "The owner's time"): how long a production
+    /// owner's writes and periods stall on this host. Do: three voters on this host's disk under
+    /// ~/.cache (Disk::Flushed), on the real clock, relayed in-process, a write every 20 ms at the
+    /// first member for AMPHORA_STALL_SECONDS (default 1,800). Expect: for each member, the
+    /// p50, p99, p99.9 and max of its log writes, steps and ticks, each follower's answer gaps as
+    /// its leader saw them, the gaps over 200 ms and the leader changes with their causes; and
+    /// none of the series empty.
+    #[test]
+    #[ignore = "a measurement of this host: AMPHORA_STALL_SECONDS of three owners on its disk"]
+    fn production_owner_stalls_measured_on_this_host() {
+        let seconds: u64 = std::env::var("AMPHORA_STALL_SECONDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_800);
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .unwrap();
+        let root = Path::new(&home).join(".cache").join("amphora-stalls");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::tempdir_in(&root).unwrap();
+        let until = Instant::now() + Duration::from_secs(seconds + 600);
+        let mut clients = Vec::new();
+        let mut records = Vec::new();
+        let mut owners = Vec::new();
+        for node_id in 1..=3u64 {
+            let path = dir.path().join(format!("state-{node_id}.db"));
+            let (client, mut actor, receiver) = super::open(
+                &path,
+                &dir.path().join(format!("raft-{node_id}.log")),
+                ReplicaConfig {
+                    node_id,
+                    voters: vec![1, 2, 3],
+                    learners: Vec::new(),
+                    bootstrap: None,
+                },
+                Durability::Persisted,
+                Arc::new(Changed::default()),
+                Owned::new(lease(&path), None),
+                until,
+                Arc::new(Instant::now),
+            )
+            .unwrap();
+            let stalls = Arc::new(Mutex::new(Stalls::default()));
+            actor.stalls = Some(Arc::clone(&stalls));
+            records.push(stalls);
+            owners.push(std::thread::spawn(move || actor.run(receiver)));
+            clients.push(client);
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handles: Vec<ReplicaHandle> = clients.iter().map(Client::handle).collect();
+        let relay = {
+            let (stop, handles) = (Arc::clone(&stop), handles.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let mut moved = 0;
+                    for (from, handle) in (1u64..).zip(&handles) {
+                        for record in handle.drain(OUTGOING_MESSAGES).unwrap_or_default() {
+                            let to = usize::try_from(record.to - 1).unwrap();
+                            let deadline = Instant::now() + Duration::from_secs(5);
+                            let _ = handles
+                                .get(to)
+                                .unwrap()
+                                .receive(from, record.bytes, deadline);
+                            moved += 1;
+                        }
+                    }
+                    if moved == 0 {
+                        std::thread::park_timeout(POLL);
+                    }
+                }
+            })
+        };
+        let writer = clients.first().unwrap();
+        let first = Instant::now();
+        loop {
+            match submit(writer, Instant::now() + Duration::from_secs(30), |db| {
+                db.exec("CREATE TABLE IF NOT EXISTS kiln_like(id INTEGER PRIMARY KEY, body BLOB)")?;
+                Ok(Vec::new())
+            })
+            .recv()
+            .unwrap()
+            {
+                Ok(_) => break,
+                Err(_) if first.elapsed() < Duration::from_secs(120) => {
+                    std::thread::park_timeout(Duration::from_millis(100))
+                }
+                Err(error) => panic!("no leader took the first write: {error:?}"),
+            }
+        }
+        let (mut acknowledged, mut refused) = (0u64, 0u64);
+        let start = Instant::now();
+        let mut next = start;
+        while start.elapsed() < Duration::from_secs(seconds) {
+            let answer = submit(writer, Instant::now() + Duration::from_secs(30), |db| {
+                db.exec("INSERT INTO kiln_like(body) VALUES (randomblob(512))")?;
+                Ok(Vec::new())
+            });
+            match answer.recv() {
+                Ok(Ok(_)) => acknowledged += 1,
+                _ => refused += 1,
+            }
+            next += Duration::from_millis(20);
+            // A pacing wait; an early wake waits again for what is left.
+            while let Some(wait) = next.checked_duration_since(Instant::now()) {
+                std::thread::park_timeout(wait);
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        relay.join().unwrap();
+        drop(handles);
+        drop(clients);
+        for owner in owners {
+            let _ = owner.join();
+        }
+        println!(
+            "stalls: {seconds} s on {}, load {}, {acknowledged} writes acknowledged, {refused} refused",
+            dir.path().display(),
+            std::fs::read_to_string("/proc/loadavg")
+                .unwrap_or_else(|_| "?".into())
+                .trim()
+        );
+        let limit = Duration::from_millis(200);
+        for (node_id, record) in (1..).zip(&records) {
+            let stalls = record.lock().unwrap();
+            println!(
+                "member {node_id}: log write submit to durable: {}",
+                stalls.writes.summary()
+            );
+            println!(
+                "member {node_id}: owner step gap: {}",
+                stalls.steps.summary()
+            );
+            println!(
+                "member {node_id}: owner tick gap: {}",
+                stalls.ticks.summary()
+            );
+            for (from, gaps) in &stalls.answers {
+                println!(
+                    "member {node_id}: answer gaps from {from} while leading: {}; over 200 ms: {}",
+                    gaps.summary(),
+                    gaps.over(limit)
+                );
+            }
+            println!(
+                "member {node_id}: step-downs by its own quorum check: {}; elections: {}; changes seen: {}",
+                stalls.step_downs,
+                stalls.elections,
+                stalls.changes.len()
+            );
+            for change in &stalls.changes {
+                println!("member {node_id}:   {change}");
+            }
+            assert!(
+                !stalls.writes.samples.is_empty()
+                    && !stalls.steps.samples.is_empty()
+                    && !stalls.ticks.samples.is_empty(),
+                "member {node_id} counted no writes, steps or ticks"
+            );
+        }
+        assert!(
+            records
+                .iter()
+                .any(|r| !r.lock().unwrap().answers.is_empty()),
+            "no leader counted an answer"
+        );
+        assert!(acknowledged > 0, "no write was acknowledged");
     }
 }
