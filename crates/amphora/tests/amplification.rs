@@ -31,6 +31,18 @@ use amphora_engine::{
 /// commits land between checkpoints as they do on a disk.
 const FLUSH_TAKES: Duration = Duration::from_millis(3);
 
+/// Parks this thread for `d` (a park ends early for no reason sometimes: the rest is parked again).
+fn pause(d: Duration) {
+    let until = Instant::now() + d;
+    loop {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        std::thread::park_timeout(left);
+    }
+}
+
 /// Bytes written to and flushes of the log and of the file.
 #[derive(Default)]
 struct Counts {
@@ -103,7 +115,7 @@ impl File for CountedFile {
             &self.counts.file_flushes
         };
         to.fetch_add(1, Ordering::Relaxed);
-        std::thread::sleep(FLUSH_TAKES);
+        pause(FLUSH_TAKES);
         self.inner.sync(c, sync_type)
     }
 

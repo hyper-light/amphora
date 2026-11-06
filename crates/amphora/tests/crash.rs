@@ -1138,8 +1138,9 @@ fn a_frame_a_spill_writes_over_holds_no_checksum_until_its_commit() {
             let files = disk.files.lock().unwrap();
             let held = files[&format!("{SPILL_PATH}-wal")].held.lock().unwrap();
             let frames = held.seen.get(32..).unwrap_or_default();
+            let (frames, _) = frames.as_chunks::<{ 4096 + 24 }>();
             Ok(frames
-                .chunks_exact(4096 + 24)
+                .iter()
                 .filter(|frame| frame[..4] != [0; 4] && frame[16..24] == [0; 8])
                 .count())
         })
