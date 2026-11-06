@@ -379,7 +379,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 - **CP-T1.2**: Baselines on a quiet machine against SQLite, Postgres 17, Vitess, CockroachDB and TiDB; the research; the client protocol; `docs/design/` written to it.
 - **CP-T1.3**: many writers on one database: the storage of docs/design/engine.md (in-place versions with undo in one shared buffer pool, B-link trees, row-level redo at commit, serializable by precision locking), built beside the current engine and the default once the suite says so. Turso's MVCC was measured as the way there and set aside: on the whole suite, reads 0.64 times the store's at the median, point reads at 32 clients 0.2 times, 4.5 GB resident against 1.3 (fedora, 2026-10-22, checks).
 - **The planner** (docs/research/planner.md; plan 01a16eab7f457673b4cf9933adacfc4d). Today it orders joins
-  left-deep, by a dynamic program over table subsets up to 12 tables and a greedy search above; it
+  left-deep, by a dynamic program over its connected subsets, a size at a time on a worklist, while
+  they number 10,000 or fewer, and past that by a greedy search that adds the table of fewest joined
+  rows (decision 19, built on t1/planner-search; JOB's measurement against its parent waits on
+  jupiter); it
   estimates from `sqlite_stat1`'s index prefixes, with fixed selectivities where no index leads,
   one estimate per joined set whatever the order (decision 13); it weighs a hash join only where the
   table joined has no seek, so JOB and TPC-H run index nested loops; it plans once, at prepare; CERT
@@ -391,7 +394,7 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   can't give: the page-miss path, per-row execution, hash joins where a seek exists, parallel
   execution); then the ranked changes of section 9, measured as `docs/requirements.toml`'s PL.1 to
   PL.13 say: join sizes from equivalence classes (PL.1, goal b4c804c3), distinct counts and a sample
-  per table (PL.2, 3492da3a), the join search above 12 tables (PL.3, f692c137), each table's filters
+  per table (PL.2, 3492da3a), the join search above 12 tables (PL.3, f692c137: built and tested, its JOB measurement open), each table's filters
   estimated together (PL.4, 210578d2), Bloom filters to a star join's fact table (PL.5, 96c74342), no
   index-less nested loop beneath an unbounded outer (PL.6, 5e23ff8b), the cost model against time
   (PL.7, e0e7a1df), bushy plans with CD-C (PL.8, c837cde3), statistics kept as rows change (PL.9,

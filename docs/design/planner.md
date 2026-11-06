@@ -960,3 +960,36 @@ DuckDB's enumerator leaves its dynamic program for a greedy one past 10,000 pair
 (plan_enumerator.cpp, f24). Leis et al., "How Good Are Query Optimizers, Really?", PVLDB 9(3),
 2015: on JOB exhaustive search beat the heuristics even with estimation errors, GOO's plans up to
 21 times the optimum (f27); Greedy Operator Ordering joins the pair of least result size (f28).
+
+**Evidence.** Tests that failed at 8d9e353, the commit before the change (fedora, 2026-11-06), and
+pass with it (6395771, on adas-mac-studio.local, the engine at 0bfaaee with the change: clippy
+`--all-targets -D warnings` clean, `join_search.rs`, `planner.rs` and `records_plans.rs`, and the
+engine's 2,665 library tests):
+- `thirteen_tables_within_the_budget_are_searched_exactly` (`crates/engine/tests/join_search.rs`):
+  the audit's star of a fact table and 12 dimensions, the last filtered, reads the filtered
+  dimension among its first two tables, where 8d9e353 read it last.
+- `a_join_past_the_budget_is_ordered_by_the_fewest_rows`: a star of 40 tables, 2^39 connected
+  subsets, is planned whole by the greedy search with the filtered dimension among its first two,
+  where 8d9e353 read it last.
+- `no_starting_table_is_a_typed_error` (`join.rs`): a join none of whose tables may start is a
+  planning error, where 8d9e353 panicked (`best.expect("no valid starting table")`).
+
+And tests of the walk itself, in `join.rs`:
+- `the_connected_walk_finds_the_subsets_the_walk_of_every_subset_keeps`: over 400 random join
+  graphs of 2 to 9 tables, with outer, semi and anti joins and RIGHT or FULL barriers, the
+  connected walk finds, size by size, exactly the subsets the walk of every subset kept. Below the
+  budget the search therefore builds the plans it built before. More than 50 of the graphs have
+  ordering constraints and more than 5 are joined only by cross products.
+- `subsets_past_the_budget_are_refused`: a chain of 4 tables (6 subsets of two or more) is
+  refused under a budget of 5 and walked under 6.
+- `a_long_chain_is_searched_and_a_wide_star_refused`: a chain of 63 tables, the most a query
+  joins, is 1,953 subsets, inside the budget; a star of 40 is refused.
+
+`scripts/engine-ratchet.toml` falls with it (f6fddfd): `unwrap_used` 452 to 451 and `expect_used`
+873 to 871, the greedy search's three calls; `arithmetic_side_effects` 3406 to 3401 and
+`cast_possible_truncation` 560 to 559, the walk of every subset.
+
+**Falsified by.** JOB's 9 queries above 12 tables no faster than on the parent; a query past the
+budget slower than its parent's plan; a query of 10 to 12 tables planned differently from the
+parent (the model test says none is); or a JOB query planned in more than 92.1 ms, which would
+say the budget is too large for this search's cost per subset.
