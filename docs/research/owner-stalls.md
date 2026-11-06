@@ -169,8 +169,9 @@ by `disk-stalls-200.sh` (the probe carrier), with the load sampled before each r
 | Adas-Mac-Studio-3 (macOS, M4 Max), loaded as below | 7133cd8 (2afa2bf) | 2026-11-06 17:20Z to 17:48Z | `a_leader_cut_off_from_its_followers_steps_down_within_its_patience` | 200 | 0 | 26.56-38.60, median 28.66 |
 
 Both nemesis tests passed after each loop: on Adas-Mac-Studio-2 at load 3.90 and 3.83, and on Adas-Mac-Studio-3
-under the load at 26.42 and 26.44. Adas-Mac-Studio-2's runs are below the plan's load of 25 or more;
-Adas-Mac-Studio-3's, made under the falsifier's load right after it, are all above it.
+under the load at 26.42 and 26.44. Adas-Mac-Studio-2's runs are below the plan's load of 25 or more.
+Adas-Mac-Studio-3's are above it, but under the load the falsifier's job made (below), so they are not the plan's
+condition either; its loaded loops are made on fedora's own load.
 
 ## The falsifier: the patience in force, under load
 
@@ -188,8 +189,10 @@ Max, 14 cores, APFS on its internal SSD) under load the job made itself, holding
 - load1 and iostat sampled every 30 s. macOS's iostat gives no busy share; its transfers per second and MB/s stand
   for it.
 
-25-55 on 14 cores is more per core than on adacachy's 32. The run is one, on another host than step 1's loaded runs;
-a run at fixed ticks on the same host under the same load is its control.
+25-55 on 14 cores is more per core than on adacachy's 32. The run is one, on another host than step 1's loaded runs.
+It is a run under load the job made, and the Amphora agent rules that out as the plan's condition: a build added for
+the run measures that build, not the host's own load. It stays here as such; the plan's loaded runs are made on
+fedora's own load.
 
 ### Adas-Mac-Studio-3, loaded, the patience in force (7133cd8)
 
