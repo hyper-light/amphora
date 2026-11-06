@@ -154,3 +154,16 @@ refused.
 | 1 | 36.143/550.960/3697.415/22200.168 | 1.062/2.273/46.566/8006.711 | 10.621/51.546/110.868/8012.019 | from 2: 0.089/172.452/375.240/3322.347 (150); from 3: 0.019/159.824/323.930/3319.998 (150) | 89/473/920 |
 | 2 | 36.081/474.688/3492.732/22200.560 | 1.062/2.013/47.622/8006.008 | 10.619/52.352/110.750/8010.261 | from 1: 0.107/149.510/327.101/4000.720 (103); from 3: 0.048/161.719/557.682/4106.532 (104) | 63/473/900 |
 | 3 | 36.110/518.109/3545.236/22200.197 | 1.061/1.972/47.402/8006.262 | 10.619/52.423/112.367/8009.437 | from 1: 0.117/137.725/281.362/4097.775 (84); from 2: 0.114/149.266/308.263/4096.841 (88) | 63/473/901 |
+
+## Step 3: the quorum patience's tests, looped
+
+Kiln goal 6b112f14, step 3 (replication.md, "The leader's quorum patience"). Each test's binary was run alone, 200 times,
+by `disk-stalls-200.sh` (the probe carrier), with the load sampled before each run.
+
+| host | commit (tree) | date | test | runs | failed | load |
+|---|---|---|---|---|---|---|
+| Adas-Mac-Studio-2 (macOS, M4 Max) | 220f47b (50190df) | 2026-11-06 16:25Z to 16:28Z | `a_leader_whose_followers_answer_as_late_as_it_measured_keeps_its_lead` | 200 | 0 | 4.54-6.25 |
+| Adas-Mac-Studio-2 (macOS, M4 Max) | 220f47b (50190df) | 2026-11-06 16:25Z to 16:28Z | `a_leader_cut_off_from_its_followers_steps_down_within_its_patience` | 200 | 0 | 3.72-5.12 |
+
+Both nemesis tests passed after the loops on the same host (load 3.90 and 3.83). These runs are below the
+plan's load of 25 or more; the loaded loop is still to come.
