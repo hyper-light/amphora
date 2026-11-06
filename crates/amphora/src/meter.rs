@@ -239,19 +239,25 @@ impl Meter {
     }
 }
 
-/// How long the replicated class's flushes took, by power of two of milliseconds: bucket `i`
-/// holds those of at most 2^i ms, from 1 ms to 16.384 s, and the last the rest. The measured
-/// flushes run from 3.9 ms (p50, a calm Mac) to 5.6 s (max, loaded btrfs; replication.md, "Fast
-/// acknowledgement"), inside that span.
-pub const FLUSH_BUCKETS: usize = 16;
-const LAST_FLUSH: u32 = 15;
+/// How long the replicated class's flushes took, by power of two: bucket `i` holds those of at
+/// most 62.5 µs · 2^i, from 62.5 µs to 16.384 s, and the last the rest. The measured flushes run
+/// from 3.9 ms (p50, a calm Mac) to 5.6 s (max, loaded btrfs; replication.md, "Fast
+/// acknowledgement"); the bounds below a millisecond are for a quiet fsync on NVMe, kiln's
+/// production disk, as the Kiln Metrics agent asked (replication.md, "Metrics").
+pub const FLUSH_BUCKETS: usize = 20;
+const LAST_FLUSH: u32 = 19;
+const FIRST_FLUSH_BOUND_NS: u64 = 62_500;
 
 /// The bucket a flush of `d` counts in.
 #[must_use]
 pub fn flush_bucket(d: Duration) -> usize {
-    let us = micros(d);
+    let ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
     let bucket = (0..LAST_FLUSH)
-        .find(|i| 1000u64.checked_shl(*i).is_some_and(|bound| us <= bound))
+        .find(|i| {
+            FIRST_FLUSH_BOUND_NS
+                .checked_shl(*i)
+                .is_some_and(|bound| ns <= bound)
+        })
         .unwrap_or(LAST_FLUSH);
     usize::try_from(bucket).unwrap_or(FLUSH_BUCKETS.saturating_sub(1))
 }
@@ -272,7 +278,7 @@ pub const REPLICA_METRICS: [(&str, &str, &str); 3] = [
     (
         "amphora_replica_commits_total",
         "counter",
-        "Entries this member committed as leader, by the quorum that committed each first (quorum: held, classic).",
+        "Entries this member committed as leader, by the quorum that committed each first (quorum: held, classic); leader only, so a follower's stays at 0.",
     ),
 ];
 
@@ -350,15 +356,17 @@ mod tests {
         assert_eq!(wait_quantile(&b, 0.99), Some(16));
     }
 
-    /// Flushes count by power of two of milliseconds, each in the first bucket whose bound holds
-    /// it (CP-T1.8: the replicated class's flush seconds, which its dashboard charts).
+    /// Flushes count by power of two from 62.5 µs, each in the first bucket whose bound holds it
+    /// (CP-T1.8: the replicated class's flush seconds, which its dashboard charts).
     #[test]
     fn flushes_count_in_the_first_bucket_whose_bound_holds_them() {
-        assert_eq!(flush_bucket(Duration::from_micros(400)), 0);
-        assert_eq!(flush_bucket(Duration::from_millis(1)), 0);
-        assert_eq!(flush_bucket(Duration::from_micros(1_001)), 1);
-        assert_eq!(flush_bucket(Duration::from_micros(3_928)), 2);
-        assert_eq!(flush_bucket(Duration::from_millis(16_384)), 14);
+        assert_eq!(flush_bucket(Duration::from_micros(50)), 0);
+        assert_eq!(flush_bucket(Duration::from_nanos(62_500)), 0);
+        assert_eq!(flush_bucket(Duration::from_micros(400)), 3);
+        assert_eq!(flush_bucket(Duration::from_millis(1)), 4);
+        assert_eq!(flush_bucket(Duration::from_micros(1_001)), 5);
+        assert_eq!(flush_bucket(Duration::from_micros(3_928)), 6);
+        assert_eq!(flush_bucket(Duration::from_millis(16_384)), 18);
         assert_eq!(flush_bucket(Duration::from_secs(600)), FLUSH_BUCKETS - 1);
     }
 

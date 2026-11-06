@@ -301,26 +301,34 @@ goes, and its host reads the counts through `ReplicaHandle::counters`, a plain s
 | metric | type | what it counts |
 |---|---|---|
 | `amphora_replica_flush_backlog_entries` | gauge | entries the member applied that its database's log hasn't flushed: what a whole-site power cut can take; 0 in the persisted class, which flushes each entry it applies |
-| `amphora_replica_flush_seconds` | histogram | each flush the flushing thread ran, timed on that thread; buckets of at most 2^i ms, 1 ms to 16.384 s, then the rest |
-| `amphora_replica_commits_total{quorum}` | counter | entries the member committed as leader, by the quorum that committed each first: `held` or `classic` |
+| `amphora_replica_flush_seconds` | histogram | each flush the flushing thread ran, timed on that thread; buckets of at most 62.5 µs · 2^i, 62.5 µs to 16.384 s (19 bounds), then the rest |
+| `amphora_replica_commits_total{quorum}` | counter | entries the member committed as leader, by the quorum that committed each first: `held` or `classic`; leader only, so a follower's stays at 0 |
 
-- The flush's buckets span what was measured, 3.9 ms (p50, a calm Mac) to 5.6 s (max, loaded adacachy), with
-  room on both sides. A histogram, not a summary: "you cannot use a summary if you need to aggregate the
+- The names are the Kiln Metrics agent's agreement (kiln agent 01a14bf7, message key
+  `amphora-class-metrics/names/v1`, 2026-11-06): "Agreed on all three names, with one change to (2)'s buckets".
+- The flush's buckets span what was measured, 3.9 ms (p50, a calm Mac) to 5.6 s (max, loaded adacachy), and
+  reach below a millisecond as that agreement asked: "kiln's production host is Linux on NVMe, where a quiet
+  fsync takes well under a millisecond", and kiln's own sub-millisecond histograms start at 50 µs
+  (`STALL_BUCKETS`, kiln's crates/kiln/src/metrics.rs). A histogram, not a summary: "you cannot use a summary if you need to aggregate the
   observations from a number of instances" (Prometheus, "Histograms and summaries"), and a group's members are
   aggregated.
 - Commits by quorum need hyper-raft's core to say which committed (`Raft::commit_stats`, a recorded patch,
   `vendor/patches/hyper-raft/0005`). Its commit takes the first of the classic quorum's index and the held
   quorum's, so what a commit moves through the classic index the classic quorum holds, and past it only the
   held quorum did. The fast track, which Amphora doesn't run, counts its own (`FastStats::committed`).
-- Labels: only `quorum`, two values. The host adds its own for the member (kiln: the store and the machine).
+- Labels: Amphora adds only `quorum`, two values. The host adds its own: kiln adds `db`, the record family's
+  name (a fixed, small set: one kiln holds several replicated databases, and a sum by machine would hide which
+  one is behind), and its machine labels.
 
-Dashboard row **Amphora replicated class**, one panel each:
+Dashboard row **Amphora replicated class**, one panel each, in PromQL (any host's form) and in kiln's own
+queries. kiln carries it as a group of a built-in "Stores" dashboard (crates/kiln/src/observe/dashboards.rs) and
+in its Grafana overview (deploy/grafana/dashboards/kiln-overview.json):
 
-| panel | query |
-|---|---|
-| Flush backlog (entries) | `amphora_replica_flush_backlog_entries` by machine |
-| Flush seconds p50 / p99 | `histogram_quantile(0.5 / 0.99, sum by (le) (rate(amphora_replica_flush_seconds_bucket[5m])))` |
-| Commits by quorum (held share) | `sum(rate(amphora_replica_commits_total{quorum="held"}[5m])) / sum(rate(amphora_replica_commits_total[5m]))` |
+| panel | PromQL | kiln |
+|---|---|---|
+| Flush backlog (entries) | `max by (instance, db) (amphora_replica_flush_backlog_entries)` | `max:amphora_replica_flush_backlog_entries{$host} by {host,db}` |
+| Flush seconds p50 / p99 | `histogram_quantile(0.5 / 0.99, sum by (le, db) (rate(amphora_replica_flush_seconds_bucket[5m])))` | `p50:` and `p99:amphora_replica_flush_seconds{$host} by {db}` |
+| Commits by quorum, stacked: the held share is the bars' proportion | `sum by (quorum) (rate(amphora_replica_commits_total[5m]))` | `sum:amphora_replica_commits_total{$host} by {quorum}.as_count()` |
 
 Its tests: the counts a host reads, through a held flush and the flushing thread's, and none in the persisted
 class (`the_replicated_class_counts_its_backlog_flushes_and_commits`); the buckets
