@@ -1267,6 +1267,7 @@ dependencies = [
  "crc32c",
  "getrandom 0.4.3",
  "hyper-rt",
+ "hyper-sim",
  "libc",
  "rustix",
  "thiserror",
@@ -1335,6 +1336,10 @@ dependencies = [
  "thiserror",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "hyper-sim"
+version = "0.1.0"
 
 [[package]]
 name = "hyper-timing"

@@ -380,12 +380,14 @@ mod tests {
             guarded(),
             1,
             None,
+            false,
         ));
         assert!(why.contains(missing), "{why}");
         let why = reason(replicated::start(
             &dir.path().join("db"),
             &log,
             config(),
+            api::replication::Durability::Persisted,
             Arc::new(Changed::default()),
             guarded(),
             until(),

@@ -264,6 +264,15 @@ additive constructors carry them, and the existing ones keep their behavior:
   no guarded client and no guarded promotion. Guarded means this process is or becomes the
   owner. The refusal follows the failed lease attempt, the only way to learn of that owner, which
   changes nothing.
+- Guarded opens are persisted: no guarded constructor takes a durability (replication.md, "Fast
+  acknowledgement: the replicated class"), since no host asks for one; a guarded host that wants the
+  replicated class gets it through a later additive constructor. An open or attach in this process
+  that states the replicated class at a guarded owner is refused `Refusal::Invalid` ("replica
+  ownership", a different live owner), never answered persisted in its place
+  (`database::remote::tests::a_guarded_owner_refuses_a_replicated_open_or_attach_in_this_process`).
+  Another process's attach stating it becomes that owner's client: the owner's identity names no
+  durability yet, so its writes are acknowledged persisted, stronger than asked, until the identity
+  check across members makes that a typed refusal too. Agreed by amphora-seam-owner, 2026-11-06.
 - `attach_replicated` now checks the owner bound before it probes the lease. The probe makes the
   endpoint directory and holds the lease for an instant; at a full table attach answered "no
   owner" after those effects, and the open that followed was refused at the same bound

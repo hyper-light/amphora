@@ -91,6 +91,7 @@ enum Writer {
         log_path: PathBuf,
         node_id: u64,
         config: api::replication::ReplicaConfig,
+        durability: api::replication::Durability,
     },
 }
 struct Owner {
@@ -525,7 +526,11 @@ impl Database {
         path: &Path,
         until: Instant,
         restoring: bool,
-        replica: Option<(&Path, &api::replication::ReplicaConfig)>,
+        replica: Option<(
+            &Path,
+            &api::replication::ReplicaConfig,
+            &api::replication::Durability,
+        )>,
         guards: Option<Guards>,
         create: impl FnOnce(&Path, Owned) -> Result<Self, Refusal>,
     ) -> Result<Self, Refusal> {
@@ -558,7 +563,11 @@ impl Database {
                         ));
                     }
                     if let Writer::Client(backend) = &shared.writer {
-                        match remote::validate(&backend.client, replica, until) {
+                        match remote::validate(
+                            &backend.client,
+                            replica.map(|(path, config, _)| (path, config)),
+                            until,
+                        ) {
                             Ok(_) => {
                                 backend.configure(replica)?;
                                 return Ok(Self { shared });
@@ -572,16 +581,18 @@ impl Database {
                             ) => (),
                             Err(error) => return Err(error),
                         }
-                    } else if let Some((log_path, config)) = replica {
+                    } else if let Some((log_path, config, durability)) = replica {
                         match &shared.writer {
                             Writer::Replicated {
                                 log_path: existing,
                                 node_id: id,
                                 config: current,
+                                durability: acknowledged,
                                 ..
                             } if existing == log_path
                                 && *id == config.node_id
-                                && current == config => {}
+                                && current == config
+                                && acknowledged == durability => {}
                             _ => {
                                 return Err(api::invalid(
                                     "replica ownership",
@@ -687,7 +698,14 @@ impl Database {
         config: api::replication::ReplicaConfig,
         until: Instant,
     ) -> Result<Self, Refusal> {
-        Self::replicated(path, log_path, config, None, until)
+        Self::replicated(
+            path,
+            log_path,
+            config,
+            api::replication::Durability::Persisted,
+            None,
+            until,
+        )
     }
 
     /// [`Database::open_replicated`] with `guards`, as [`Database::open_guarded`] keeps them; the
@@ -699,13 +717,35 @@ impl Database {
         guards: Guards,
         until: Instant,
     ) -> Result<Self, Refusal> {
-        Self::replicated(path, log_path, config, Some(guards), until)
+        Self::replicated(
+            path,
+            log_path,
+            config,
+            api::replication::Durability::Persisted,
+            Some(guards),
+            until,
+        )
+    }
+
+    /// [`Database::open_replicated`], its writes acknowledged as `durability` says: the replicated
+    /// class answers once members spanning the fates asked hold a write (docs/design/replication.md,
+    /// "Fast acknowledgement: the replicated class"). A configuration whose voters span fewer fates
+    /// is refused, typed.
+    pub fn open_replicated_with(
+        path: &Path,
+        log_path: &Path,
+        config: api::replication::ReplicaConfig,
+        durability: api::replication::Durability,
+        until: Instant,
+    ) -> Result<Self, Refusal> {
+        Self::replicated(path, log_path, config, durability, None, until)
     }
 
     fn replicated(
         path: &Path,
         log_path: &Path,
         config: api::replication::ReplicaConfig,
+        durability: api::replication::Durability,
         guards: Option<Guards>,
         until: Instant,
     ) -> Result<Self, Refusal> {
@@ -723,7 +763,7 @@ impl Database {
             path,
             until,
             false,
-            Some((&log_path, &config)),
+            Some((&log_path, &config, &durability)),
             guards,
             |path, owner| {
                 let changed = Arc::new(Changed::default());
@@ -731,6 +771,7 @@ impl Database {
                     path,
                     &log_path,
                     config.clone(),
+                    durability.clone(),
                     Arc::clone(&changed),
                     owner.clone(),
                     until,
@@ -744,6 +785,7 @@ impl Database {
                             log_path: log_path.clone(),
                             node_id,
                             config: config.clone(),
+                            durability: durability.clone(),
                         },
                         changed,
                         restoring: AtomicBool::new(false),

@@ -29,6 +29,30 @@ pub enum MemberChange {
     /// A member removed. Nothing more is sent to it.
     Remove(u64),
 }
+
+/// When a replicated database acknowledges a write (docs/design/replication.md, "Fast acknowledgement:
+/// the replicated class").
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Durability {
+    /// Once a quorum's disks hold it and the proposer's own log is flushed.
+    #[default]
+    Persisted,
+    /// Once members spanning `spanning` distinct fates hold it, in memory or on disk. Losing every
+    /// member of one fate loses nothing acknowledged; losing every fate at once can lose what was
+    /// acknowledged past the members' last durable promises.
+    Replicated(Fates),
+}
+
+/// What each member fails with, and how many distinct fates a write's holders must span.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fates {
+    /// Each member and its fate: the operator's number for what it fails with, its host and its
+    /// power feed. Every member states one.
+    pub of: Vec<(u64, u64)>,
+    /// The distinct fates a write's holders must span before it is acknowledged: at least 2.
+    pub spanning: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Outbound {
     pub to: u64,
