@@ -1,4 +1,4 @@
-//! The join search past 12 tables (docs/design/planner.md decision 18; planner rank 3, PL.3): a join
+//! The join search past 12 tables (docs/design/planner.md decision 19; planner rank 3, PL.3): a join
 //! whose connected subsets fit the search's budget is searched exactly, whatever its table count,
 //! and one past it is ordered by the greedy search, which adds at each step the table whose joined
 //! set has the fewest estimated rows (AC-PL.3.1, T-PL.3.1).

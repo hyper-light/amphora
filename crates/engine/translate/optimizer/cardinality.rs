@@ -24,10 +24,10 @@ use crate::translate::{
 };
 
 /// How many sets the memo keeps. The search asks for at most its own subsets: the dynamic
-/// programming search's 2^12 below `GREEDY_JOIN_THRESHOLD` tables, the greedy search's n² prefixes
-/// above it, and the prefixes before each RIGHT or FULL JOIN. A set asked for past the bound is
-/// computed again each time, to the same number.
-const MEMO_SETS: usize = 1 << 13;
+/// programming search's `JOIN_SEARCH_BUDGET` (10,000) and its single tables, or past it the greedy
+/// search's n² sets (at most 63² = 3,969), and the prefixes before each RIGHT or FULL JOIN. A set
+/// asked for past the bound is computed again each time, to the same number.
+const MEMO_SETS: usize = 1 << 14;
 
 /// How a table's rows enter the sets that hold it.
 #[derive(Clone, Copy, PartialEq, Eq)]

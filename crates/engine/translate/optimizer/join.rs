@@ -1,4 +1,4 @@
-use crate::{alloc::TryReserveError, turso_assert_eq, turso_assert_greater_than};
+use crate::{turso_assert_eq, turso_assert_greater_than};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use smallvec::SmallVec;
@@ -1156,10 +1156,6 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
 
     let num_tables = joined_tables.len();
 
-    // For large queries, use greedy join ordering instead of exhaustive DP.
-    // The DP algorithm has O(2^n) complexity which becomes prohibitively slow
-    // beyond ~12 tables. The greedy algorithm is O(n²) and produces good
-    // (though not always optimal) plans.
     let where_terms =
         build_where_term_info(where_clause, table_references, subqueries, constraints)?;
     let mut set_rows = JoinedSetRows::new(
@@ -1172,7 +1168,33 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         params,
     );
     let set_rows = &mut set_rows;
-    if num_tables > GREEDY_JOIN_THRESHOLD {
+
+    // As mentioned, inner joins are commutative. Outer joins are NOT.
+    // Example:
+    // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
+    // If there are outer joins in the plan, ensure correct ordering.
+    let (left_join_illegal_map, required_lhs_by_table) = {
+        let required_lhs_by_table = required_lhs_by_table(joined_tables)?;
+        if required_lhs_by_table.iter().all(TableMask::is_empty) {
+            (None, None)
+        } else {
+            (
+                Some(left_join_illegal_map(&required_lhs_by_table)?),
+                Some(required_lhs_by_table),
+            )
+        }
+    };
+
+    // The subsets the search builds plans for, by size; past the budget, none, and the greedy
+    // search orders the join instead (docs/design/planner.md decision 19).
+    let Some(subsets) = searchable_subsets(
+        num_tables,
+        &where_terms,
+        required_lhs_by_table.as_deref(),
+        left_join_illegal_map.as_ref(),
+        JOIN_SEARCH_BUDGET,
+    )?
+    else {
         return compute_greedy_join_order(
             set_rows,
             joined_tables,
@@ -1191,7 +1213,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
             table_references,
             schema,
         );
-    }
+    };
 
     // Compute naive left-to-right plan to use as pruning threshold
     let naive_plan = compute_naive_left_deep_plan(
@@ -1270,7 +1292,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // subset plan is not always the best foundation for the next join. Keeping variants
     // lets the planner choose a better join order later (e.g. for hash-join chaining).
     let mut best_plan_memo: HashMap<TableMask, HashMap<usize, JoinN>> =
-        HashMap::with_capacity_and_hasher(2usize.pow(num_tables as u32 - 1), Default::default());
+        HashMap::with_capacity_and_hasher(subsets.iter().map(Vec::len).sum(), Default::default());
 
     // Dynamic programming base case: calculate the best way to access each single table, as if
     // there were no other tables.
@@ -1313,44 +1335,10 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     }
     join_order.clear();
 
-    // As mentioned, inner joins are commutative. Outer joins are NOT.
-    // Example:
-    // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
-    // If there are outer joins in the plan, ensure correct ordering.
-    let (left_join_illegal_map, required_lhs_by_table) = {
-        let required_lhs_by_table = required_lhs_by_table(joined_tables)?;
-        if required_lhs_by_table.iter().all(TableMask::is_empty) {
-            (None, None)
-        } else {
-            // map from lhs table index to the rhs tables that must come after it
-            let mut left_join_illegal_map: HashMap<usize, TableMask> = HashMap::default();
-            for (rhs, required_lhs) in required_lhs_by_table.iter().enumerate() {
-                for lhs in required_lhs.iter() {
-                    if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&lhs) {
-                        illegal_lhs.set(rhs)?;
-                    } else {
-                        let mut mask = TableMask::default();
-                        mask.set(rhs)?;
-                        left_join_illegal_map.insert(lhs, mask);
-                    }
-                }
-            }
-            (Some(left_join_illegal_map), Some(required_lhs_by_table))
-        }
-    };
-
-    // Now that we have our single-table base cases, we can start considering join subsets of 2 tables and more.
-    // Try to join each single table to each other table.
-    for subset_size in 2..=num_tables {
-        for mask in generate_join_bitmasks(num_tables, subset_size) {
-            let mask = mask?;
-            if required_lhs_by_table.as_ref().is_some_and(|required| {
-                required.iter().enumerate().any(|(table, required)| {
-                    mask.get(table) && !mask.contains_all_set_bits_of(required)
-                })
-            }) {
-                continue;
-            }
+    // Now that we have our single-table base cases, we can start considering join subsets of 2 tables and more:
+    // each subset `searchable_subsets` found, a size at a time, holding every table each of its tables must follow.
+    for (subset_size, level) in (1usize..).zip(&subsets).skip(1) {
+        for mask in level {
             // Keep track of the best way to join this subset of tables per possible last table.
             // This preserves alternative join orders that may be more expensive for the subset
             // but enable cheaper joins when adding more tables.
@@ -1535,7 +1523,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     }
                 }
             } else if !best_for_mask_by_last.is_empty() {
-                best_plan_memo.insert(mask, best_for_mask_by_last);
+                best_plan_memo.insert(mask.try_clone()?, best_for_mask_by_last);
             }
         }
     }
@@ -1597,14 +1585,112 @@ fn tables_are_connected(
         .any(|term| term.table_mask.get(candidate) && term.table_mask.intersects(prefix))
 }
 
-/// Above this threshold, use greedy O(n²) ordering instead of exhaustive O(2^n) DP.
-pub const GREEDY_JOIN_THRESHOLD: usize = 12;
+/// The subsets of two tables or more the search builds plans for before it gives the join to the
+/// greedy search (docs/design/planner.md decision 19): Neumann and Radke's budget of 10,000
+/// connected subgraphs, within which they solve exactly (SIGMOD 2018), measured on JOB in
+/// bench/records/2026-11-06-jupiter-planner-search.md.
+pub const JOIN_SEARCH_BUDGET: usize = 10_000;
 
-/// Greedy Operator Ordering (GOO) for join optimization. O(n²) time, O(n) space.
+/// The subsets of tables the search builds a plan for, by size (the first level the single tables,
+/// each next one the sets a table larger), in the order found; `None` once they pass `budget`.
 ///
-/// Builds a left-deep join tree by:
-/// 1. Starting with the table that best balances local filtering and indexed-seek benefits
-/// 2. Greedily adding the remaining table with lowest marginal cost
+/// A set is the plan of a smaller one with one more table, which `compute_best_join_order` takes
+/// when that table may follow every table of the smaller set (`can_add_table_to_prefix`) and the
+/// set holds every table each of its tables must follow, and when it is joined to the smaller set
+/// by a term or no table that may follow it is: so the sets are the connected ones, cross products
+/// only where no join term is left, as DPccp enumerates (Moerkotte and Neumann, VLDB 2006), on a
+/// worklist instead of its recursion (CLAUDE.md §11), each set extended one table at a time so
+/// plans stay left-deep. The walk does at most `budget` times the tables' count of checks.
+fn searchable_subsets(
+    num_tables: usize,
+    where_terms: &[WhereTermInfo],
+    required_lhs_by_table: Option<&[TableMask]>,
+    left_join_illegal_map: Option<&HashMap<usize, TableMask>>,
+    budget: usize,
+) -> Result<Option<Vec<Vec<TableMask>>>> {
+    // The tables each table shares a term with: a set and a table are joined by a term when the
+    // table's neighbours meet the set (`tables_are_connected`).
+    let mut neighbours: Vec<TableMask> = Vec::with_capacity(num_tables);
+    for table in 0..num_tables {
+        let mut mask = TableMask::default();
+        for term in where_terms.iter().filter(|term| term.table_mask.get(table)) {
+            mask.union_with(&term.table_mask)?;
+        }
+        mask.clear(table);
+        neighbours.push(mask);
+    }
+    let holds_its_required = |set: &TableMask| {
+        required_lhs_by_table.is_none_or(|required| {
+            set.iter().all(|table| {
+                required
+                    .get(table)
+                    .is_none_or(|required| set.contains_all_set_bits_of(required))
+            })
+        })
+    };
+    let joined = |set: &TableMask, table: usize| {
+        neighbours
+            .get(table)
+            .is_some_and(|neighbours| neighbours.intersects(set))
+    };
+
+    let mut singles = Vec::with_capacity(num_tables);
+    for table in 0..num_tables {
+        let mut mask = TableMask::default();
+        mask.set(table)?;
+        singles.push(mask);
+    }
+    let mut levels = vec![singles];
+    let mut found = 0usize;
+    while let Some(level) = levels.last() {
+        let mut next: Vec<TableMask> = Vec::new();
+        let mut seen: HashSet<TableMask> = HashSet::default();
+        for set in level {
+            let legal = |table: usize| {
+                !set.get(table)
+                    && can_add_table_to_prefix(
+                        set,
+                        table,
+                        required_lhs_by_table,
+                        left_join_illegal_map,
+                    )
+            };
+            let must_join = (0..num_tables).any(|table| legal(table) && joined(set, table));
+            for table in (0..num_tables).filter(|&table| legal(table)) {
+                if must_join && !joined(set, table) {
+                    continue;
+                }
+                let mut grown = set.try_clone()?;
+                grown.set(table)?;
+                if !holds_its_required(&grown) || seen.contains(&grown) {
+                    continue;
+                }
+                found = found.checked_add(1).ok_or_else(|| {
+                    LimboError::PlanningError("join search: subsets overflow".to_string())
+                })?;
+                if found > budget {
+                    return Ok(None);
+                }
+                seen.insert(grown.try_clone()?);
+                next.push(grown);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        levels.push(next);
+    }
+    Ok(Some(levels))
+}
+
+/// The join order past `JOIN_SEARCH_BUDGET`'s subsets (docs/design/planner.md decision 19): a
+/// left-deep tree, n² joins tried, O(n) space, built by
+/// 1. starting with the table that best balances local filtering and indexed-seek benefits;
+/// 2. adding at each step, of the tables that may come next, the one whose joined set has the
+///    fewest estimated rows (`JoinedSetRows`), the cheaper plan where they tie: a table's filter
+///    counts at the step it is added, for every step after it. This is the step of Greedy Operator
+///    Ordering (Fegaras, DEXA 1998), which merges the pair of trees of the smallest result, taken
+///    one table at a time.
 ///
 /// Respects outer join ordering constraints.
 #[allow(clippy::too_many_arguments)]
@@ -1658,7 +1744,7 @@ fn compute_greedy_join_order<'a>(
     });
     remaining.clear(first_idx);
 
-    let mut current_plan: Option<JoinN> = join_lhs_and_rhs(
+    let mut current_plan: JoinN = join_lhs_and_rhs(
         None,
         set_rows,
         initial_input_cardinality,
@@ -1680,20 +1766,15 @@ fn compute_greedy_join_order<'a>(
         available_indexes,
         table_references,
         schema,
-    )?;
+    )?
+    .ok_or_else(|| LimboError::PlanningError("no query solution".to_string()))?;
 
-    if current_plan.is_none() {
-        return Err(LimboError::PlanningError("no query solution".to_string()));
-    }
-
-    // Greedily add remaining tables, always picking lowest marginal cost.
+    // Greedily add remaining tables, always picking the fewest rows joined.
     while !remaining.is_empty() {
         let current_mask: TableMask = join_order.iter().map(|m| m.original_idx).try_collect()?;
 
-        // Placeholder for candidate evaluation (avoids cloning)
-        join_order.push(JoinOrderMember::default());
-
-        let mut best: Option<(usize, JoinN)> = None;
+        // The best next table: its index, its joined set's rows and its plan.
+        let mut best: Option<(usize, f64, JoinN)> = None;
 
         let candidate_is_legal = |candidate| {
             left_join_deps
@@ -1713,13 +1794,13 @@ fn compute_greedy_join_order<'a>(
             }
 
             let table = &joined_tables[idx];
-            let last = join_order.last_mut().unwrap();
-            last.table_id = table.internal_id;
-            last.original_idx = idx;
-            last.is_outer = table.join_info.as_ref().is_some_and(|ji| ji.is_outer());
-
-            if let Some(plan) = join_lhs_and_rhs(
-                current_plan.as_ref(),
+            join_order.push(JoinOrderMember {
+                table_id: table.internal_id,
+                original_idx: idx,
+                is_outer: table.join_info.as_ref().is_some_and(|ji| ji.is_outer()),
+            });
+            let plan = join_lhs_and_rhs(
+                Some(&current_plan),
                 set_rows,
                 initial_input_cardinality,
                 table,
@@ -1740,16 +1821,22 @@ fn compute_greedy_join_order<'a>(
                 available_indexes,
                 table_references,
                 schema,
-            )? {
-                if best.as_ref().is_none_or(|(_, b)| plan.cost < b.cost) {
-                    best = Some((idx, plan));
-                }
+            );
+            join_order.pop();
+            let Some(plan) = plan? else {
+                continue;
+            };
+            let mut joined = current_mask.try_clone()?;
+            joined.set(idx)?;
+            let rows = set_rows.rows(&joined);
+            if best.as_ref().is_none_or(|(_, best_rows, best_plan)| {
+                rows < *best_rows || (rows == *best_rows && plan.cost < best_plan.cost)
+            }) {
+                best = Some((idx, rows, plan));
             }
         }
 
-        join_order.pop();
-
-        let (next_idx, next_plan) = best.ok_or_else(|| {
+        let (next_idx, _, next_plan) = best.ok_or_else(|| {
             LimboError::PlanningError("Greedy join ordering: no valid next table".to_string())
         })?;
 
@@ -1763,13 +1850,24 @@ fn compute_greedy_join_order<'a>(
                 .is_some_and(|ji| ji.is_outer()),
         });
         remaining.clear(next_idx);
-        current_plan = Some(next_plan);
+        current_plan = next_plan;
     }
 
     Ok(Some(BestJoinOrderResult {
-        best_plan: current_plan.expect("loop invariant: current_plan always Some"),
+        best_plan: current_plan,
         best_ordered_plan: None, // Greedy doesn't track ordered variants
     }))
+}
+
+/// From each table, the tables that must come after it: `required_lhs_by_table` turned around.
+fn left_join_illegal_map(required_lhs_by_table: &[TableMask]) -> Result<HashMap<usize, TableMask>> {
+    let mut left_join_illegal_map: HashMap<usize, TableMask> = HashMap::default();
+    for (rhs, required_lhs) in required_lhs_by_table.iter().enumerate() {
+        for lhs in required_lhs.iter() {
+            left_join_illegal_map.entry(lhs).or_default().set(rhs)?;
+        }
+    }
+    Ok(left_join_illegal_map)
 }
 
 /// For each table, the tables that must come before it in any join order.
@@ -1860,8 +1958,11 @@ fn find_best_starting_table(
         }
     }
 
-    // Table 0 can never be outer join RHS, so best is always Some.
-    Ok(best.expect("no valid starting table").0)
+    // Table 0 is never an outer join's right table, so a query's join has a start; a set of
+    // tables without one is refused.
+    best.map(|(table, _)| table).ok_or_else(|| {
+        LimboError::PlanningError("Greedy join ordering: no valid starting table".to_string())
+    })
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -2261,56 +2362,6 @@ fn ready_where_work(
             ready.then_some((term_idx, info.extra_steps))
         })
         .collect()
-}
-
-/// Iterator that generates all possible size k bitmasks for a given number of tables.
-/// For example, given: 3 tables and k=2, the bitmasks are:
-/// - 0b011 (tables 0, 1)
-/// - 0b101 (tables 0, 2)
-/// - 0b110 (tables 1, 2)
-///
-/// This is used in the dynamic programming approach to finding the best way to join a subset of N tables.
-struct JoinBitmaskIter {
-    current: u128,
-    max_exclusive: u128,
-}
-
-impl JoinBitmaskIter {
-    fn new(table_number_max_exclusive: usize, how_many: usize) -> Self {
-        Self {
-            current: (1 << how_many) - 1, // Start with smallest k-bit number (e.g., 000111 for k=3)
-            max_exclusive: 1 << table_number_max_exclusive,
-        }
-    }
-}
-
-impl Iterator for JoinBitmaskIter {
-    type Item = Result<TableMask, TryReserveError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current >= self.max_exclusive {
-            return None;
-        }
-
-        let result = match TableMask::try_from(self.current) {
-            Ok(res) => res,
-            Err(e) => return Some(Err(e)),
-        };
-
-        // Gosper's hack: compute next k-bit combination in lexicographic order
-        let c = self.current & (!self.current + 1); // rightmost set bit
-        let r = self.current + c; // add it to get a carry
-        let ones = self.current ^ r; // changed bits
-        let ones = (ones >> 2) / c; // right-adjust shifted bits
-        self.current = r | ones; // form the next combination
-
-        Some(Ok(result))
-    }
-}
-
-/// Generate all possible bitmasks of size `how_many` for a given number of tables.
-fn generate_join_bitmasks(table_number_max_exclusive: usize, how_many: usize) -> JoinBitmaskIter {
-    JoinBitmaskIter::new(table_number_max_exclusive, how_many)
 }
 
 #[cfg(test)]
@@ -2727,16 +2778,182 @@ mod tests {
         (table_references, table_ids)
     }
 
+    /// A join graph's terms as the search sees them: each term the tables it reads.
+    fn graph_terms(terms: &[&[usize]]) -> Vec<WhereTermInfo> {
+        terms
+            .iter()
+            .map(|tables| WhereTermInfo {
+                table_mask: tables.iter().copied().try_collect().unwrap(),
+                extra_steps: 0,
+                equal_tables: None,
+                home_table: None,
+            })
+            .collect()
+    }
+
+    /// The subsets the search built plans for before decision 19: every subset of each size, kept
+    /// where some table of it may follow the rest, already kept, by the same rule.
+    fn every_subset_walk(
+        num_tables: usize,
+        where_terms: &[WhereTermInfo],
+        required: Option<&[TableMask]>,
+        illegal: Option<&HashMap<usize, TableMask>>,
+    ) -> Vec<HashSet<u64>> {
+        let mut levels: Vec<HashSet<u64>> = vec![(0..num_tables).map(|t| 1u64 << t).collect()];
+        for size in 2..=num_tables {
+            let mut level = HashSet::default();
+            for bits in (1u64..1 << num_tables).filter(|b| b.count_ones() as usize == size) {
+                let mask = TableMask::try_from(u128::from(bits)).unwrap();
+                if required.is_some_and(|required| {
+                    required
+                        .iter()
+                        .enumerate()
+                        .any(|(t, r)| mask.get(t) && !mask.contains_all_set_bits_of(r))
+                }) {
+                    continue;
+                }
+                let kept = mask.iter().any(|rhs| {
+                    let lhs_bits = bits & !(1 << rhs);
+                    let lhs = TableMask::try_from(u128::from(lhs_bits)).unwrap();
+                    levels[size - 2].contains(&lhs_bits)
+                        && can_add_table_to_prefix(&lhs, rhs, required, illegal)
+                        && (!has_connected_legal_candidate(
+                            &lhs,
+                            num_tables,
+                            where_terms,
+                            required,
+                            illegal,
+                        ) || tables_are_connected(&lhs, rhs, where_terms))
+                });
+                if kept {
+                    level.insert(bits);
+                }
+            }
+            if level.is_empty() {
+                break;
+            }
+            levels.push(level);
+        }
+        levels
+    }
+
+    /// Do: find the subsets of random join graphs of up to 9 tables, with random outer and
+    /// semi joins (tables that must follow every table before them) and RIGHT or FULL joins
+    /// (barriers), by the connected walk and by the walk of every subset. Expect: the same subsets
+    /// at every size, so the search keeps every plan it kept (planner rank 3's falsifier).
     #[test]
-    fn test_generate_bitmasks() -> std::result::Result<(), TryReserveError> {
-        let bitmasks = generate_join_bitmasks(4, 2).collect::<std::result::Result<Vec<_>, _>>()?;
-        assert!(bitmasks.contains(&TableMask::try_from(0b0011u128)?)); // {0,1}
-        assert!(bitmasks.contains(&TableMask::try_from(0b0101u128)?)); // {0,2}
-        assert!(bitmasks.contains(&TableMask::try_from(0b0110u128)?)); // {1,2}
-        assert!(bitmasks.contains(&TableMask::try_from(0b1001u128)?)); // {0,3}
-        assert!(bitmasks.contains(&TableMask::try_from(0b1010u128)?)); // {1,3}
-        assert!(bitmasks.contains(&TableMask::try_from(0b1100u128)?)); // {2,3}
-        Ok(())
+    fn the_connected_walk_finds_the_subsets_the_walk_of_every_subset_keeps() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        let mut constrained_graphs = 0;
+        let mut cross_products = 0;
+        for _ in 0..400 {
+            let num_tables = 2 + next(8) as usize;
+            let mut terms: Vec<Vec<usize>> = Vec::new();
+            for _ in 0..next(num_tables as u64 + 3) {
+                let mut term = vec![next(num_tables as u64) as usize];
+                for _ in 0..next(3) {
+                    term.push(next(num_tables as u64) as usize);
+                }
+                terms.push(term);
+            }
+            let term_refs: Vec<&[usize]> = terms.iter().map(Vec::as_slice).collect();
+            let where_terms = graph_terms(&term_refs);
+            let mut required = vec![TableMask::default(); num_tables];
+            for j in 1..num_tables {
+                match next(6) {
+                    0 => (0..j).for_each(|i| required[j].set(i).unwrap()),
+                    1 => required
+                        .iter_mut()
+                        .skip(j + 1)
+                        .for_each(|r| r.set(j).unwrap()),
+                    _ => {}
+                }
+            }
+            let required = (!required.iter().all(TableMask::is_empty)).then_some(required);
+            let illegal = required
+                .as_deref()
+                .map(|required| left_join_illegal_map(required).unwrap());
+            constrained_graphs += usize::from(required.is_some());
+
+            let expected = every_subset_walk(
+                num_tables,
+                &where_terms,
+                required.as_deref(),
+                illegal.as_ref(),
+            );
+            let found = searchable_subsets(
+                num_tables,
+                &where_terms,
+                required.as_deref(),
+                illegal.as_ref(),
+                usize::MAX,
+            )
+            .unwrap()
+            .unwrap();
+            let found: Vec<HashSet<u64>> = found
+                .iter()
+                .map(|level| {
+                    level
+                        .iter()
+                        .map(|mask| mask.iter().map(|t| 1u64 << t).sum())
+                        .collect()
+                })
+                .collect();
+            assert_eq!(
+                found, expected,
+                "{num_tables} tables, terms {terms:?}, {required:?}"
+            );
+            cross_products += usize::from(
+                expected
+                    .last()
+                    .is_some_and(|l| l.contains(&((1u64 << num_tables) - 1)))
+                    && !where_terms.iter().any(|t| t.table_mask.count() > 1),
+            );
+        }
+        // Non-vacuity: graphs with ordering constraints and graphs joined by cross products only.
+        assert!(constrained_graphs > 50, "{constrained_graphs}");
+        assert!(cross_products > 5, "{cross_products}");
+    }
+
+    /// Do: count a chain of 4 tables' subsets (6 of two tables or more) under budgets of 5 and 6.
+    /// Expect: none past the budget of 5, every one within 6 (T-PL.3.1).
+    #[test]
+    fn subsets_past_the_budget_are_refused() {
+        let where_terms = graph_terms(&[&[0, 1], &[1, 2], &[2, 3]]);
+        assert!(searchable_subsets(4, &where_terms, None, None, 5)
+            .unwrap()
+            .is_none());
+        let levels = searchable_subsets(4, &where_terms, None, None, 6)
+            .unwrap()
+            .unwrap();
+        let sizes: Vec<usize> = levels.iter().map(Vec::len).collect();
+        assert_eq!(sizes, [4, 3, 2, 1]);
+    }
+
+    /// Do: count the subsets of a chain of 63 tables, the most a query joins, and of a star of 40.
+    /// Expect: the chain's 1,953 within the budget, so it is searched exactly; the star's 2^39 past
+    /// it, refused (T-PL.3.1).
+    #[test]
+    fn a_long_chain_is_searched_and_a_wide_star_refused() {
+        let chain: Vec<[usize; 2]> = (0..62).map(|t| [t, t + 1]).collect();
+        let chain: Vec<&[usize]> = chain.iter().map(|t| t.as_slice()).collect();
+        let levels = searchable_subsets(63, &graph_terms(&chain), None, None, JOIN_SEARCH_BUDGET)
+            .unwrap()
+            .unwrap();
+        assert_eq!(levels.iter().skip(1).map(Vec::len).sum::<usize>(), 1_953);
+        let star: Vec<[usize; 2]> = (1..40).map(|t| [0, t]).collect();
+        let star: Vec<&[usize]> = star.iter().map(|t| t.as_slice()).collect();
+        assert!(
+            searchable_subsets(40, &graph_terms(&star), None, None, JOIN_SEARCH_BUDGET)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
