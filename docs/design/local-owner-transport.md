@@ -113,6 +113,26 @@ handle-relative operations, validation and refusal semantics. [RFC 2104](https:/
 specifies the HMAC construction; direction/domain labels and nonce binding are this protocol's
 choice, falsified by a reflected or replayed proof authenticating a new connection.
 
+## Versions (2026-11-06)
+
+The greeting carries the protocol version (`wire::VERSION`), and the owner refuses a peer of any
+other version at once, `Invalid`, naming both versions, before a challenge and before any frame
+whose shape differs. Postcard is not self-describing: a field added to a message is not filled by
+`#[serde(default)]` on decode, so a client reading an older owner's longer or shorter record gets a
+decode error mid-session, `Unavailable`, not the default. So every change to any message's fields
+bumps the version, and an owner and its clients change version together across a drain: stop the
+clients, replace the owner and the clients, start again. Nothing decodes another version's records.
+
+Version 3: `ReplicaStatus` gained `voters_outgoing` (replication.md, "Membership"). Version 2 had
+already added `bootstrapping` without a bump; a version-2 client of an owner with that field would
+have failed the same way. The test: `a_peer_of_another_version_is_refused_at_the_greeting`.
+
+Evidence: postcard's wire format: "A struct is encoded as the elements that comprise it, in their
+order of definition", and "their length and field names are not encoded on the wire"
+([postcard's wire format, section 28](https://postcard.jamesmunns.com/wire-format.html)), so a
+decoder can't tell a missing trailing field from a short frame. Falsified by: a session that decodes a
+record of another version, or a refusal of another version that comes after the greeting.
+
 ## The tests' budgets (2026-10-31)
 
 None of the transport tests is about latency. Their budgets were real-clock guesses, and a loaded

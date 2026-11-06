@@ -117,9 +117,19 @@ criteria = [
   { id = "AC-T1.8.4", text = "leader failover p99 is at most 1000 ms, measured by a kill -9 bench" },
   { id = "AC-T1.8.5", text = "acknowledged writes lost under kill -9 of any node is exactly 0, measured by the simulator over 10,000 seeds and a three-machine lab" },
   { id = "AC-T1.8.6", text = "The same differential suite passes at 1 node and 3 nodes: one code path" },
+  # Amphora's own: membership changes (docs/design/replication.md, "Membership").
+  { id = "AC-T1.8.M1", text = "A group changes its members at runtime through a joint configuration: a change answers Ok only once committed, and one change or hand-off at a time, none while joint" },
+  { id = "AC-T1.8.M2", text = "The leader hands on its lead before it is demoted or removed, and a hand-off answers only as its outcome shows" },
+  { id = "AC-T1.8.M3", text = "A learner is added only while the database is within the snapshot ceiling; past it the change is refused TooLarge before it is proposed" },
 ]
 tests = [
   { id = "T-T1.8.1", text = "A laptop offline writes to its outbox, then reconnects — passes when every write commits, in order, with no duplicate" },
+  # Amphora's own: membership changes (docs/design/replication.md, "Membership").
+  { id = "T-T1.8.M1", text = "One voter adds a learner: writes before and after reach it within 5 s, none after its removal" },
+  { id = "T-T1.8.M2", text = "Changes are refused off the leader, at once, when impossible, past the most members, beside another change and while joint" },
+  { id = "T-T1.8.M3", text = "A change holds through a deadline, an election and a restart at each stage, and a change another lead replaces gives the member back" },
+  { id = "T-T1.8.M4", text = "The leader is removed once it has handed on its lead, and each way a hand-off ends answers as it should" },
+  { id = "T-T1.8.M5", text = "A joiner to a database past the snapshot ceiling is refused before the change is proposed" },
 ]
 
 [[goal]]

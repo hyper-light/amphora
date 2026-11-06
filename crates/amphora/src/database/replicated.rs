@@ -30,7 +30,8 @@ const MESSAGE_BYTES: usize = crate::replication::COMMAND_BYTES.saturating_add(2 
 const TICK: Duration = Duration::from_millis(10);
 const POLL: Duration = Duration::from_millis(1);
 const DRIVE_QUANTUM: usize = 32;
-// A change of members is a few bytes; its charge holds its place in the queue's byte budget.
+// The admission charge of a change of members or a hand-off of the lead: policy, not a measured
+// size. Each is a few bytes; the charge holds its place in the queue's byte budget.
 const CHANGE_BYTES: usize = 1024;
 
 type Durable = Replica<GroupStore<DeviceFile>, crate::replication::Machine, Bytes>;
@@ -411,11 +412,15 @@ impl ReplicaHandle {
     /// Makes `change` to the group's members (replication.md, "Membership"). Only the leader takes
     /// one, one at a time. It proposes it through a joint configuration, which it leaves by itself,
     /// and answers its status once the group has left it. A change the configuration already
-    /// shows proposes nothing and answers at once. Refused: off the leader, naming the leader known
-    /// (`NotLeader`); while another change is under way or the group takes its seed
-    /// (`Unavailable`); when the configuration can't take it (`Invalid`), or past the members a
-    /// group may have (`TooLarge`). UnknownOutcome: it was proposed, and the lead moved or the
-    /// deadline passed before it was seen applied. Read the configuration before trying again.
+    /// shows proposes nothing and answers at once. A change whose deadline passes once its joint
+    /// configuration is applied answers its status too: it is committed, the status shows the
+    /// group still joint (`voters_outgoing`), and the leader leaves it by itself. Refused: off the
+    /// leader, naming the leader known (`NotLeader`); while another change or a hand-off is under
+    /// way, while the group is leaving a joint configuration or has a change still to apply, or
+    /// while it takes its seed (`Unavailable`); when the configuration can't take it (`Invalid`),
+    /// or past the members a group may have, or a learner past the snapshot ceiling (`TooLarge`).
+    /// UnknownOutcome: it was proposed, and the lead moved or the deadline passed before it was
+    /// seen applied. Read the configuration before trying again.
     pub fn change(&self, change: MemberChange, until: Instant) -> Result<ReplicaStatus, Refusal> {
         if Instant::now() >= until {
             return Err(Refusal::Timeout);
@@ -437,13 +442,14 @@ impl ReplicaHandle {
             })?
     }
 
-    /// Hands the lead to the voter `to` (replication.md, "Membership"), so that the leader can
-    /// then be demoted or removed by its successor. Only the leader takes one, and not while a
-    /// change of members or the group's seed is under way. It answers its status once it follows
-    /// `to`, at once when it is `to`. Refused: off the leader, or once the lead went to another,
-    /// naming the leader known (`NotLeader`); while a change or another hand-off is under way, or
-    /// when `to` did not take the lead within an election timeout (`Unavailable`); to a member
-    /// that does not vote (`Invalid`). UnknownOutcome: the deadline passed first; read the status.
+    /// Hands the lead to the voter `to` (replication.md, "Membership"), so that the leader can then
+    /// be demoted or removed by its successor. Only the leader takes one, and not while a change of
+    /// members, a joint configuration or the group's seed is under way. It answers its status once
+    /// it follows `to`, at once when it is `to`. Refused: off the leader, or once the lead went to
+    /// another, naming the leader known (`NotLeader`); while a change or another hand-off is under
+    /// way, or when `to` did not take the lead within an election timeout (`Unavailable`); to a
+    /// member that does not vote (`Invalid`). UnknownOutcome: the deadline passed first; read the
+    /// status.
     pub fn transfer(&self, to: u64, until: Instant) -> Result<ReplicaStatus, Refusal> {
         if Instant::now() >= until {
             return Err(Refusal::Timeout);
@@ -1021,7 +1027,13 @@ impl Actor {
                         });
                     }
                 } else {
-                    let context = self.context()?;
+                    let context = match self.context() {
+                        Ok(context) => context,
+                        Err(refusal) => {
+                            answer(response, Err(refusal.clone()));
+                            return Err(refusal);
+                        }
+                    };
                     match self.replica.read(context.clone()) {
                         Ok(()) => {
                             self.pending = Some(Pending {
@@ -1051,7 +1063,13 @@ impl Actor {
                 } else {
                     // The barrier: this leader's term has committed, and its configuration is
                     // applied through what the group had committed when the change came.
-                    let context = self.context()?;
+                    let context = match self.context() {
+                        Ok(context) => context,
+                        Err(refusal) => {
+                            answer(response, Err(refusal.clone()));
+                            return Err(refusal);
+                        }
+                    };
                     match self.replica.read(context.clone()) {
                         Ok(()) => {
                             self.changing = Some(Changing {
@@ -1145,6 +1163,19 @@ impl Actor {
         if self.replica.machine().bootstrap_pending() {
             return Err(unavailable(
                 "the group is taking its seed; change its members once it has",
+            ));
+        }
+        // A change only once the last is applied, and a hand-off only once its voter can have the
+        // way out of a joint configuration: one admitted while joint loses its election for nothing.
+        let raft = &self.replica.core().raft;
+        if raft.configuration().is_joint() {
+            return Err(unavailable(
+                "the group is leaving a joint configuration; try again once it has",
+            ));
+        }
+        if raft.has_pending_conf() {
+            return Err(unavailable(
+                "the group has a change of members still to apply; try again once it has",
             ));
         }
         Ok(())
@@ -1811,6 +1842,8 @@ mod tests {
         departed: Vec<u64>,
         // Records admitted to each member, by its identity.
         delivered: BTreeMap<u64, usize>,
+        // Members cut off: every record to one is lost, as on a link that is down.
+        lost: Vec<u64>,
     }
     impl<'a> Pump<'a> {
         fn new(clients: &'a [Client]) -> Self {
@@ -1825,6 +1858,7 @@ mod tests {
                 refusals: None,
                 departed: Vec::new(),
                 delivered: BTreeMap::new(),
+                lost: Vec::new(),
             }
         }
         fn reap(&mut self) {
@@ -1908,6 +1942,9 @@ mod tests {
                     }
                     for message in self.clients.get(index).unwrap().handle().drain(1).unwrap() {
                         drained = true;
+                        if self.lost.contains(&message.to) {
+                            continue;
+                        }
                         api::bound("fixture wire record", message.bytes.len(), WIRE_BYTES).unwrap();
                         let packet = PumpPacket {
                             from,
@@ -2839,14 +2876,14 @@ mod tests {
         panic!("the group did not go quiet in {ROUNDS} driven rounds");
     }
 
-    /// CP-T1.8 on driven time (replication.md, "Membership"; kiln plan 01a1a283e14c, step 1): a
-    /// group of one voter adds a learner, writes before and after, then removes it. Do: write 1 on
-    /// the voter; add member 2 as a learner; write 2 on the voter and 3 on the learner; remove the
-    /// learner; write 4 on the voter; then write 5 on the removed member. Expect: each change
-    /// answered with the configuration it made, two entries on (into the joint configuration and
-    /// out of it); 1, 2 and 3 on both, within 5 s of every clock; from the removal on, no record
-    /// sent to the removed member and 4 on the voter alone; its own write 5 never applied there by
-    /// itself, Timeout.
+    /// AC-T1.8.M1, T-T1.8.M1 (CP-T1.8) on driven time (replication.md, "Membership"; kiln plan
+    /// 01a1a283e14c, step 1): a group of one voter adds a learner, writes before and after, then
+    /// removes it. Do: write 1 on the voter; add member 2 as a learner; write 2 on the voter and 3
+    /// on the learner; remove the learner; write 4 on the voter; then write 5 on the removed
+    /// member. Expect: each change answered with the configuration it made, two entries on (into
+    /// the joint configuration and out of it); 1, 2 and 3 on both, within 5 s of every clock; from
+    /// the removal on, no record sent to the removed member and 4 on the voter alone; its own write
+    /// 5 never applied there by itself, Timeout.
     #[test]
     fn a_learner_added_has_every_write_and_once_removed_receives_none() {
         let dir = tempfile::tempdir().unwrap();
@@ -2923,11 +2960,11 @@ mod tests {
         pump.finish();
     }
 
-    /// CP-T1.8 on driven time (replication.md, "Membership"): a learner is promoted to voter and
-    /// demoted again, each through the joint configuration. Do: add member 2 as a learner, promote
-    /// it, write, demote it, write. Expect: each change answered with the configuration it made,
-    /// two entries on; while 2 votes, the write commits through it; once demoted it still has every
-    /// write, and no election happens.
+    /// AC-T1.8.M1, T-T1.8.M3 (CP-T1.8) on driven time (replication.md, "Membership"): a learner is
+    /// promoted to voter and demoted again, each through the joint configuration. Do: add member 2
+    /// as a learner, promote it, write, demote it, write. Expect: each change answered with the
+    /// configuration it made, two entries on; while 2 votes, the write commits through it; once
+    /// demoted it still has every write, and no election happens.
     #[test]
     fn a_learner_is_promoted_and_demoted_through_the_joint_configuration() {
         let dir = tempfile::tempdir().unwrap();
@@ -2973,13 +3010,14 @@ mod tests {
         pump.finish();
     }
 
-    /// CP-T1.8 on driven time (replication.md, "Membership"): only the leader changes members, one
-    /// change at a time, and only as the configuration can take it. Do, in a group of three voters:
-    /// ask a follower; ask the leader for two changes at once; promote a non-member, add a voter as
-    /// a learner, demote and remove the leader; add a learner to a group of the most members.
-    /// Expect: NotLeader naming the leader; the first of the two answered and the second
-    /// Unavailable; Invalid for each the configuration can't take and TooLarge past the members,
-    /// each proposing nothing; a change the configuration already shows answered with it.
+    /// AC-T1.8.M1, T-T1.8.M2 (CP-T1.8) on driven time (replication.md, "Membership"): only the
+    /// leader changes members, one change at a time, and only as the configuration can take it. Do,
+    /// in a group of three voters: ask a follower; ask the leader for two changes at once; promote
+    /// a non-member, add a voter as a learner, demote and remove the leader; add a learner to a
+    /// group of the most members. Expect: NotLeader naming the leader; the first of the two
+    /// answered and the second Unavailable; Invalid for each the configuration can't take and
+    /// TooLarge past the members, each proposing nothing; a change the configuration already shows
+    /// answered with it.
     #[test]
     fn member_changes_are_refused_off_the_leader_at_once_or_when_impossible() {
         let dir = tempfile::tempdir().unwrap();
@@ -3062,10 +3100,10 @@ mod tests {
         let status = full.handle().status().unwrap();
         assert_eq!((status.voters.len(), status.learners.len()), (1, 63));
     }
-    /// CP-T1.8 on driven time (replication.md, "Membership"): the members a group changed to are
-    /// what it reopens with, whatever its config first named. Do: add member 2 as a learner, write,
-    /// restart both from the configs they first opened with, write again. Expect: the configuration
-    /// reopened names the learner, and it has both writes.
+    /// AC-T1.8.M1, T-T1.8.M3 (CP-T1.8) on driven time (replication.md, "Membership"): the members a
+    /// group changed to are what it reopens with, whatever its config first named. Do: add member 2
+    /// as a learner, write, restart both from the configs they first opened with, write again.
+    /// Expect: the configuration reopened names the learner, and it has both writes.
     #[test]
     fn a_changed_membership_holds_through_a_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -3159,14 +3197,14 @@ mod tests {
         });
     }
 
-    /// CP-T1.8 on driven time (replication.md, "Membership"): a change past its deadline answers
-    /// what its stage knows. In a group of three voters, the relay held so that nothing moves on:
-    /// Do: a change's deadline passes at its barrier; then, relayed to its proposal, another's; then,
-    /// relayed until the joint configuration it made is applied, a third's. Expect: Timeout, with
-    /// nothing proposed; UnknownOutcome, and with the relay back it applies all the same, as reading
-    /// the configuration shows; while the joint configuration is applied, the status names its
-    /// outgoing voters (`voters_outgoing`), and the deadline answers the status applied; with the
-    /// relay back the group leaves it.
+    /// AC-T1.8.M1, T-T1.8.M3 (CP-T1.8) on driven time (replication.md, "Membership"): a change past
+    /// its deadline answers what its stage knows. In a group of three voters, the relay held so
+    /// that nothing moves on: Do: a change's deadline passes at its barrier; then, relayed to its
+    /// proposal, another's; then, relayed until the joint configuration it made is applied, a
+    /// third's. Expect: Timeout, with nothing proposed; UnknownOutcome, and with the relay back it
+    /// applies all the same, as reading the configuration shows; while the joint configuration is
+    /// applied, the status names its outgoing voters (`voters_outgoing`), and the deadline answers
+    /// the status applied; with the relay back the group leaves it.
     #[test]
     fn a_change_past_its_deadline_answers_what_its_stage_knows() {
         let dir = tempfile::tempdir().unwrap();
@@ -3252,10 +3290,10 @@ mod tests {
         pump.finish();
     }
 
-    /// CP-T1.8 on driven time (replication.md, "Membership"): a change at its barrier when its lead
-    /// is lost is refused, with nothing proposed. Do: in a group of three voters, the relay held,
-    /// ask the leader for a change, then move its clock until its quorum check finds no quorum.
-    /// Expect: NotLeader, naming no leader, and no member changed.
+    /// AC-T1.8.M1, T-T1.8.M3 (CP-T1.8) on driven time (replication.md, "Membership"): a change at
+    /// its barrier when its lead is lost is refused, with nothing proposed. Do: in a group of three
+    /// voters, the relay held, ask the leader for a change, then move its clock until its quorum
+    /// check finds no quorum. Expect: NotLeader, naming no leader, and no member changed.
     #[test]
     fn a_change_at_its_barrier_is_refused_once_the_lead_is_lost() {
         let dir = tempfile::tempdir().unwrap();
@@ -3290,11 +3328,12 @@ mod tests {
         pump.finish();
     }
 
-    /// CP-T1.8 on driven time (replication.md, "Membership"): a change proposed and then lost is
-    /// never answered as done, though the index it held is applied. Do: in a group of three voters,
-    /// the leader proposes a change whose records are lost; the other two, their clocks past an
-    /// election timeout, elect one of them, whose entry takes that index. Expect: UnknownOutcome,
-    /// no member changed anywhere, and the new leader takes the change when asked again.
+    /// AC-T1.8.M1, T-T1.8.M3 (CP-T1.8) on driven time (replication.md, "Membership"): a change
+    /// proposed and then lost is never answered as done, though the index it held is applied. Do:
+    /// in a group of three voters, the leader proposes a change whose records are lost; the other
+    /// two, their clocks past an election timeout, elect one of them, whose entry takes that index.
+    /// Expect: UnknownOutcome, no member changed anywhere, and the new leader takes the change when
+    /// asked again.
     #[test]
     fn a_change_another_lead_wrote_over_is_never_answered_done() {
         let dir = tempfile::tempdir().unwrap();
@@ -3342,13 +3381,13 @@ mod tests {
         pump.finish();
     }
 
-    /// CP-T1.8 under a nemesis (replication.md, "Membership"): a change holds through an election
-    /// at each of its stages. Do, in a group of three voters: the lead moves as the change passes
-    /// its barrier, once it is proposed, and once its joint configuration is applied. Expect: at the
-    /// barrier, a refusal saying to ask again, nothing changed; once proposed, Ok or UnknownOutcome,
-    /// and the new leader carries it through; once applied, Ok. Each time the group leaves the joint
-    /// configuration by itself, the new leader takes the change (asked again, shown already), and a
-    /// write reaches the learner.
+    /// AC-T1.8.M1, T-T1.8.M3 (CP-T1.8) under a nemesis (replication.md, "Membership"): a change
+    /// holds through an election at each of its stages. Do, in a group of three voters: the lead
+    /// moves as the change passes its barrier, once it is proposed, and once its joint
+    /// configuration is applied. Expect: at the barrier, a refusal saying to ask again, nothing
+    /// changed; once proposed, Ok or UnknownOutcome, and the new leader carries it through; once
+    /// applied, Ok. Each time the group leaves the joint configuration by itself, the new leader
+    /// takes the change (asked again, shown already), and a write reaches the learner.
     #[test]
     fn a_change_holds_through_an_election_at_each_stage() {
         for stage in 0..3 {
@@ -3418,14 +3457,14 @@ mod tests {
         }
     }
 
-    /// CP-T1.8 on driven time (replication.md, "Membership"): the leader is removed once it has
-    /// handed on its lead. Do, in a group of three voters: ask a follower to hand on the lead; ask
-    /// the leader to hand it to a non-member and to itself, and to remove itself; then the leader
-    /// hands it to a follower, the new leader removes the old one, and writes. Expect: NotLeader
-    /// naming the leader; Invalid; the status at once, in the same term; Invalid, saying to hand
-    /// the lead on first; then the follower leading, in a later term; the removal answered with
-    /// the other two voters; the write on both of them, none on the removed member, and no record
-    /// delivered to it from the removal's answer on.
+    /// AC-T1.8.M2, T-T1.8.M4 (CP-T1.8) on driven time (replication.md, "Membership"): the leader is
+    /// removed once it has handed on its lead. Do, in a group of three voters: ask a follower to
+    /// hand on the lead; ask the leader to hand it to a non-member and to itself, and to remove
+    /// itself; then the leader hands it to a follower, the new leader removes the old one, and
+    /// writes. Expect: NotLeader naming the leader; Invalid; the status at once, in the same term;
+    /// Invalid, saying to hand the lead on first; then the follower leading, in a later term; the
+    /// removal answered with the other two voters; the write on both of them, none on the removed
+    /// member, and no record delivered to it from the removal's answer on.
     #[test]
     fn the_leader_is_removed_once_it_has_handed_on_its_lead() {
         let dir = tempfile::tempdir().unwrap();
@@ -3495,12 +3534,13 @@ mod tests {
         pump.finish();
     }
 
-    /// CP-T1.8 on driven time (replication.md, "Membership"): a member that joins catches up by
-    /// the leader's image when its log no longer reaches back, and that image is bounded, so a
-    /// database past the snapshot ceiling refuses a joiner before the change is proposed. Do: in a
-    /// group of one voter, its ceiling lowered to 64 KiB, write a 128 KiB row; add member 2 as a
-    /// learner; raise the ceiling back; add it again. Expect: TooLarge naming the database's bytes
-    /// and the ceiling, nothing proposed and no learner; then the learner added, with the row.
+    /// AC-T1.8.M3, T-T1.8.M5 (CP-T1.8) on driven time (replication.md, "Membership"): a member that
+    /// joins catches up by the leader's image when its log no longer reaches back, and that image
+    /// is bounded, so a database past the snapshot ceiling refuses a joiner before the change is
+    /// proposed. Do: in a group of one voter, its ceiling lowered to 64 KiB, write a 128 KiB row;
+    /// add member 2 as a learner; raise the ceiling back; add it again. Expect: TooLarge naming the
+    /// database's bytes and the ceiling, nothing proposed and no learner; then the learner added,
+    /// with the row.
     #[test]
     fn a_joiner_to_a_database_past_the_snapshot_ceiling_is_refused_before_it_is_proposed() {
         let dir = tempfile::tempdir().unwrap();
@@ -3574,14 +3614,14 @@ mod tests {
         pump.finish();
     }
 
-    /// CP-T1.8 on driven time (replication.md, "Membership"; docs/raft.md §3.4): a member's
-    /// records count by the newest configuration its log states, applied or not, so a removal
-    /// another lead writes over gives the member back. Do: in a group of three voters and learner
-    /// 4, the leader appends 4's removal, whose records are lost; the other two, their clocks past
-    /// an election timeout, elect one of them, whose entry takes that index; a write. Expect: the
-    /// old leader refuses a record from 4 while its log holds the removal; once the new leader's
-    /// entry replaces it, its configuration names 4 again and it takes 4's record; the change
-    /// answered UnknownOutcome, and the write reaches 4.
+    /// AC-T1.8.M1, T-T1.8.M3 (CP-T1.8) on driven time (replication.md, "Membership"; Ongaro's
+    /// dissertation, section 4.1): a member's records count by the newest configuration its log
+    /// states, applied or not, so a removal another lead writes over gives the member back. Do: in
+    /// a group of three voters and learner 4, the leader appends 4's removal, whose records are
+    /// lost; the other two, their clocks past an election timeout, elect one of them, whose entry
+    /// takes that index; a write. Expect: the old leader refuses a record from 4 while its log
+    /// holds the removal; once the new leader's entry replaces it, its configuration names 4 again
+    /// and it takes 4's record; the change answered UnknownOutcome, and the write reaches 4.
     #[test]
     fn a_removal_another_lead_wrote_over_gives_the_member_back() {
         let dir = tempfile::tempdir().unwrap();
@@ -3669,6 +3709,252 @@ mod tests {
         driven.drain(&mut pump);
         pump.finish();
     }
+    /// A group of three voters and member 4, opened as the learner it is to be.
+    fn three_and_a_learner(driven: &mut Driven, dir: &Path) -> Vec<Client> {
+        let mut clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir, n, vec![1, 2, 3], None))
+            .collect();
+        clients.push(driven.open_member(dir, 4, vec![1, 2, 3], vec![4], None));
+        clients
+    }
+
+    /// AC-T1.8.M1, T-T1.8.M2 (CP-T1.8) on driven time (replication.md, "Membership"): a change past
+    /// its deadline once its joint configuration is applied answers its status, joint, and neither
+    /// a change nor a hand-off is taken until the group has left it. Do, in a group of three
+    /// voters: add learner 4, the relay held from the moment the leader appends its way out, so the
+    /// group stays joint; its deadline passes; then ask the leader for another change and for a
+    /// hand-off. Expect: the status, with voters_outgoing [1, 2, 3] and learner 4; both refused
+    /// Unavailable, saying the group is leaving a joint configuration or has a change to apply;
+    /// with the relay back, the group leaves it and takes the next change.
+    #[test]
+    fn a_change_or_hand_off_is_refused_while_the_group_leaves_a_joint_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients[..3], 0, 1);
+        let led = &clients[leader];
+        let clock = driven.clock(leader);
+        let until = driven.base + offset(&clock) + Duration::from_secs(1);
+        let proposed = pending_change(&driven, leader);
+        let asked = change(led, until, MemberChange::AddLearner(4));
+        reach(&mut driven, &mut pump, "the joint entry", |driven| {
+            pending_change(driven, leader) > proposed
+        });
+        let joint = pending_change(&driven, leader);
+        // The way out is appended once the joint entry commits. From then on the relay is held:
+        // what the leader sends of it waits in its queue, so it can't commit.
+        reach(&mut driven, &mut pump, "the way out appended", |driven| {
+            pending_change(driven, leader) > joint
+        });
+        for _ in 0..ROUNDS {
+            if !applied_configuration(&driven, leader)
+                .voters_outgoing
+                .is_empty()
+            {
+                break;
+            }
+            driven.step();
+            std::thread::park_timeout(POLL);
+        }
+        assert_eq!(
+            applied_configuration(&driven, leader).voters_outgoing,
+            vec![1, 2, 3]
+        );
+        set(&clock, driven.base, until);
+        driven.step();
+        let answered = asked.try_recv().unwrap().unwrap();
+        assert_eq!(
+            (answered.voters_outgoing, answered.learners),
+            (vec![1, 2, 3], vec![4])
+        );
+
+        let later = driven.base + offset(&clock) + Duration::from_secs(5);
+        let other = u64::try_from((leader + 1) % 3 + 1).unwrap();
+        for refused in [
+            change(led, later, MemberChange::Promote(4)),
+            transfer(led, later, other),
+        ] {
+            driven.step();
+            assert!(matches!(
+                refused.try_recv().unwrap(),
+                Err(Refusal::Unavailable(why))
+                    if why.contains("leaving a joint configuration")
+                        || why.contains("still to apply")
+            ),);
+        }
+        // The relay back: the way out reaches the followers and commits.
+        settled(&mut driven, &mut pump, 3, &[4]);
+        let until = driven.until();
+        let promoted = driven
+            .answer(&mut pump, &change(led, until, MemberChange::Promote(4)))
+            .unwrap();
+        assert_eq!(promoted.voters, vec![1, 2, 3, 4]);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.M2, T-T1.8.M4 (CP-T1.8) on driven time (replication.md, "Membership"): a hand-off
+    /// the core gives up is refused, and the lead stays. Do, in a group of three voters, every
+    /// record to one follower lost: the leader hands its lead to that follower; the leader's and
+    /// the other follower's clocks run on. Expect: Unavailable, saying the lead was not taken, and
+    /// the leader still leading, in its term.
+    #[test]
+    fn a_hand_off_the_core_gives_up_is_refused_and_the_lead_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let (heir, other) = ((leader + 1) % 3, (leader + 2) % 3);
+        let term = clients[leader].handle().status().unwrap().term;
+        pump.lost.push(u64::try_from(heir + 1).unwrap());
+        let asked = transfer(
+            &clients[leader],
+            driven.until(),
+            u64::try_from(heir + 1).unwrap(),
+        );
+        let answered = (0..ROUNDS)
+            .find_map(|_| {
+                driven.advance(leader, TICK);
+                driven.advance(other, TICK);
+                driven.round(&mut pump);
+                asked.try_recv().ok()
+            })
+            .unwrap();
+        assert!(
+            matches!(&answered, Err(Refusal::Unavailable(why)) if why.contains("not taken")),
+            "{answered:?}"
+        );
+        let status = clients[leader].handle().status().unwrap();
+        assert_eq!(
+            (status.leader, status.term),
+            (u64::try_from(leader + 1).unwrap(), term)
+        );
+        pump.lost.clear();
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.M2, T-T1.8.M4 (CP-T1.8) on driven time (replication.md, "Membership"): a hand-off
+    /// whose lead goes to a third member is refused naming it. Do, in a group of three voters,
+    /// every record to one follower lost: the leader is asked to hand its lead to that follower,
+    /// and its core then hands it to the other (as a disk-stall hand-off does). Expect: NotLeader
+    /// naming the other follower.
+    #[test]
+    fn a_hand_off_whose_lead_goes_to_a_third_member_is_refused_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let (heir, other) = ((leader + 1) % 3, (leader + 2) % 3);
+        let other_id = u64::try_from(other + 1).unwrap();
+        pump.lost.push(u64::try_from(heir + 1).unwrap());
+        let asked = transfer(
+            &clients[leader],
+            driven.until(),
+            u64::try_from(heir + 1).unwrap(),
+        );
+        driven.step();
+        assert!(matches!(asked.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        driven.owners[leader].0.replica.transfer(other_id).unwrap();
+        assert_eq!(
+            driven.answer(&mut pump, &asked),
+            Err(Refusal::NotLeader {
+                leader: Some(other_id)
+            })
+        );
+        pump.lost.clear();
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.M2, T-T1.8.M4 (CP-T1.8) on driven time (replication.md, "Membership"): a hand-off
+    /// past its deadline before the lead moves answers UnknownOutcome. Do, in a group of three
+    /// voters, every record to one follower lost: the leader hands its lead to that follower, and
+    /// its clock reaches the hand-off's deadline. Expect: UnknownOutcome, and the status read shows
+    /// who leads.
+    #[test]
+    fn a_hand_off_past_its_deadline_answers_unknown_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let heir = (leader + 1) % 3;
+        pump.lost.push(u64::try_from(heir + 1).unwrap());
+        let clock = driven.clock(leader);
+        let until = driven.base + offset(&clock) + Duration::from_secs(1);
+        let asked = transfer(&clients[leader], until, u64::try_from(heir + 1).unwrap());
+        driven.step();
+        assert!(matches!(asked.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        set(&clock, driven.base, until);
+        driven.step();
+        assert_eq!(asked.try_recv().unwrap(), Err(Refusal::UnknownOutcome));
+        assert_eq!(
+            clients[leader].handle().status().unwrap().leader,
+            u64::try_from(leader + 1).unwrap()
+        );
+        pump.lost.clear();
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.M2, T-T1.8.M4 (CP-T1.8) on driven time (replication.md, "Membership"): a hand-off is
+    /// refused beside a change, a change beside a hand-off, and a hand-off to a learner. Do, in a
+    /// group of three voters and learner 4: ask a change and then a hand-off; then, every record to
+    /// a follower lost, a hand-off to it and then a change; then a hand-off to learner 4. Expect:
+    /// the second of each pair Unavailable, saying a change is under way; Invalid for the learner.
+    #[test]
+    fn a_hand_off_is_refused_beside_a_change_and_to_a_learner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients[..3], 0, 1);
+        let led = &clients[leader];
+        let heir = u64::try_from((leader + 1) % 3 + 1).unwrap();
+        let until = driven.until();
+        let first = change(led, until, MemberChange::AddLearner(4));
+        let beside = transfer(led, until, heir);
+        assert!(matches!(
+            driven.answer(&mut pump, &beside),
+            Err(Refusal::Unavailable(why)) if why.contains("under way")
+        ));
+        assert_eq!(driven.answer(&mut pump, &first).unwrap().learners, vec![4]);
+        settled(&mut driven, &mut pump, 3, &[4]);
+
+        pump.lost.push(heir);
+        let handing = transfer(led, until, heir);
+        driven.step();
+        let beside = change(led, until, MemberChange::Remove(4));
+        driven.step();
+        assert!(matches!(
+            beside.try_recv().unwrap(),
+            Err(Refusal::Unavailable(why)) if why.contains("under way")
+        ));
+        let clock = driven.clock(leader);
+        set(&clock, driven.base, until);
+        driven.step();
+        assert_eq!(handing.try_recv().unwrap(), Err(Refusal::UnknownOutcome));
+        pump.lost.clear();
+
+        let until = driven.until();
+        assert!(matches!(
+            driven.answer(&mut pump, &transfer(led, until, 4)),
+            Err(Refusal::Invalid { what, .. }) if what == "lead transfer"
+        ));
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
     fn unchanged(db: &mut Db) -> anyhow::Result<Vec<u8>> {
         let mut value = Vec::new();
         db.query("SELECT value FROM baseline_items WHERE id = 1", [], |row| {

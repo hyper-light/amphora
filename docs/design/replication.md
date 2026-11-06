@@ -184,67 +184,89 @@ Falsified by:
 ## Membership (2026-11-03)
 
 kiln makes every node it installs a member of its one replication group (kiln plan
-01a1a283e14c75eb8a28a9347287e4c5, step 1): a node that joins is added as a learner, and one that
-is deleted is removed. Amphora fixed its members when a replica opened (`ReplicaConfig`) and gave
-no way to change them. `ReplicaHandle::change` now takes one `MemberChange`: add a learner, promote
-a learner to voter, demote a voter to learner, or remove a member. `ReplicaHandle::status` reads
-the configuration the replica has applied (`voters`, `learners`, and `voters_outgoing`, the voters
-a joint configuration leaves, empty outside one). `ReplicaHandle::transfer` hands the lead to a
-voter.
+01a1a283e14c75eb8a28a9347287e4c5, step 1): a node that joins is added as a learner, and one that is
+deleted is removed. Amphora fixed its members when a replica opened (`ReplicaConfig`) and gave no
+way to change them. `ReplicaHandle::change` now takes one `MemberChange`: add a learner, promote a
+learner to voter, demote a voter to learner, or remove a member. `ReplicaHandle::status` reads the
+configuration the replica has applied (`voters`, `learners`, and `voters_outgoing`, the voters a
+joint configuration leaves, empty outside one). `ReplicaHandle::transfer` hands the lead to a voter.
 
 - Only the leader takes a change. Another member refuses it as `NotLeader`, naming the leader it
   knows, so the host takes it there. A write is different: a follower's or a learner's call passes
   the leader's ReadIndex and its proposal is forwarded, as before, and applies only once committed.
-- One change at a time, in a slot of its own beside the write under way (`Changing`); neither
-  waits for the other. A second change, or one asked while the core still holds a change it has not
-  applied, is refused as `Unavailable`. So is one asked while the group takes its seed.
+- One change at a time, in a slot of its own beside the write under way (`Changing`); neither waits
+  for the other. A second change, or a hand-off beside one, is refused as `Unavailable`, at
+  admission. So is one asked while the core's configuration is joint ("the group is leaving a joint
+  configuration") or the core holds a change it has not applied (`has_pending_conf`), and one asked
+  while the group takes its seed. A hand-off admitted while joint would lose its election for
+  nothing: its voter lacks the way out the others hold.
 - A change first passes a ReadIndex barrier, as a call does. A leader confirms reads only once it
-  has committed in its term, and releases one only once it has applied through it. So the change
-  is judged against a configuration that is current, and an election's conservative pending mark
-  (the core's `pending_conf_index`, set to its last index when it becomes leader) is applied.
+  has committed in its term, and releases one only once it has applied through it. So the change is
+  judged against a configuration that is current, and an election's conservative pending mark (the
+  core's `pending_conf_index`, set to its last index when it becomes leader) is applied.
 - Two phases (Ongaro and Ousterhout 2014, section 6): the change is proposed into a joint
   configuration (`ConfChangeTransition::Implicit`), and the leader proposes the way out by itself
-  once that entry commits. The owner answers once its entry is applied in the term it proposed it
-  in and the configuration applied is no longer joint. A change the configuration already shows
-  proposes nothing and answers at once. A change the core would refuse when applied (one that
+  once that entry commits (hyper-raft's `leave_joint_when_committed`, raft.rs, appends the way out
+  when the joint entry commits, not when it applies). The owner answers once its entry is applied in
+  the term it proposed it in and the configuration applied is no longer joint, with one exception
+  below: a deadline once the joint configuration is applied. A change the configuration already
+  shows proposes nothing and answers at once. A change the core would refuse when applied (one that
   leaves no voter) is refused before it is proposed, by applying hyper-raft's own `Plan` to the
   configuration, so it is never committed as a change that changes nothing. The same check refuses
   one past the members a group may have (`TooLarge`, `MEMBERS` and the core's `Limits::members`).
-  The leader neither demotes nor removes itself (`Invalid`): it hands its lead to another voter
-  with `transfer` (hyper-durable's `Replica::transfer`, Raft's leadership transfer, Ongaro's
-  dissertation, section 3.10), and that voter, once leading, changes it. `transfer` is taken only by the leader,
-  never beside a change or the group's seed, and answers once this member follows the voter it
-  named. The core gives up a hand-off its voter did not take within an election timeout; that is
-  refused `Unavailable`, a lead that went to another `NotLeader` naming it, and a deadline passed
-  first `UnknownOutcome`. A hand-off to a member that does not vote, which the core would drop
-  saying nothing, is refused `Invalid`.
+  The leader neither demotes nor removes itself (`Invalid`): it hands its lead to another voter with
+  `transfer` (hyper-durable's `Replica::transfer`, Raft's leadership transfer, Ongaro's
+  dissertation, section 3.10), and that voter, once leading, changes it. `transfer` is taken only by
+  the leader, never beside a change, a joint configuration or the group's seed, and answers once
+  this member follows the voter it named. The core gives up a hand-off its voter did not take within
+  an election timeout; that is refused `Unavailable`, a lead that went to another `NotLeader` naming
+  it, and a deadline passed first `UnknownOutcome`. A hand-off to a member that does not vote, which
+  the core would drop saying nothing, is refused `Invalid`.
 - A joiner is limited by the snapshot ceiling. It catches up from the leader's log, or by the
   leader's image once the log no longer reaches back, and an image holds at most `SNAPSHOT_BYTES`
-  (256 MiB) until streaming snapshots exist. So a learner is added only while the database is
-  within that ceiling: past it the change is refused `TooLarge` before it is proposed, never added
-  to fall behind, and never left to make the leader build an image it can't. The database can still
-  grow past the ceiling after a joiner is added; that database fences at its next image, as any does
-  past the ceiling (the snapshot limit above).
+  (256 MiB) until streaming snapshots exist. So a learner is added only while the database is within
+  that ceiling: past it the change is refused `TooLarge` before it is proposed, never added to fall
+  behind, and never left to make the leader build an image it can't. The database can still grow
+  past the ceiling after a joiner is added; that database fences at its next image, as any does past
+  the ceiling (the snapshot limit above).
 - The core takes a change by marking its entry as its pending change. The owner reads that mark
   before and after proposing, so an entry the core kept in place stating nothing is answered
   `Unavailable`, never awaited.
 - Once proposed, a change whose lead moves or whose deadline passes before it is seen applied
-  answers `UnknownOutcome`: the caller reads the configuration before trying again. Once applied it
-  is committed; a new leader leaves the joint configuration by itself, and a deadline then answers
-  the status applied.
-- A wire record's sender is checked against the members the core counts by: the newest
-  configuration its log states, applied or not (hyper-raft's `Raft::configuration`, docs/raft.md
-  §3.4). It was checked against the configuration applied, which lags: a leader sends to a member
-  it adds from the moment it appends the change, and refused that member's answers until it
-  applied it. A removed member's records are refused from the moment the leader appends the
-  removal, which is also when it stops sending to it. A change that is appended but never committed
-  is not final: a new leader's entry can replace it, and the core then takes back the configuration
-  it stated (hyper-raft's `refresh_configuration`, from `conf_before`), so that member's records
-  count again.
-- A member to be added opens as the learner it is to be: the group's voters and itself as a
-  learner. It campaigns for nothing, and catches up from the leader's log or a snapshot once added.
-  Replaying the log from its start under that configuration converges on the leader's: adding a
-  learner that is one already changes nothing (hyper-raft's `Configuration::change`).
+  answers `UnknownOutcome`: the caller reads the configuration before trying again. Once its joint
+  configuration is applied it is committed, and a deadline then answers Ok with the status applied,
+  which may still be joint (`voters_outgoing` non-empty): the third outcome. The leader, this one or
+  the next, leaves the joint configuration by itself, and no change or hand-off is admitted until it
+  has.
+- A wire record's sender is checked against the members the core counts by: the newest configuration
+  its log states, applied or not (hyper-raft's `Raft::configuration`, raft.rs; "each server always
+  uses the latest configuration found in its log", Ongaro's dissertation, section 4.1). In a joint
+  configuration that is both halves, so the outgoing voters are heard throughout it. It was checked
+  against the configuration applied, which lags: a leader sends to a member it adds from the moment
+  it appends the change, and refused that member's answers until it applied it. A removed member's
+  records are refused from the moment the leader appends the removal, which is also when it stops
+  sending to it. A change that is appended but never committed is not final: a new leader's entry
+  can replace it, and the core then takes back the configuration it stated (hyper-raft's
+  `refresh_configuration`, from `conf_before`), so that member's records count again.
+- The caveat of that check. The dissertation (section 4.1) has a server accept AppendEntries "from a
+  leader that is not part of the server's latest configuration". This check doesn't: a leader that
+  is only an outgoing voter (elected during a joint configuration that removes it) is refused by
+  each follower from the moment that follower appends the way out, so it can't commit it, and the
+  group waits for an election among the members that remain. That costs liveness, not safety: no
+  entry is accepted that Raft would refuse. A leader never removes itself here (it hands on its lead
+  first, as the dissertation's section 4.2.3 recommends), so the case is a lead lost mid-change.
+- A member to be added opens as the learner it is to be: the group's voters and itself as a learner.
+  It campaigns for nothing, and catches up from the leader's log or a snapshot once added. Replaying
+  the log from its start under that configuration converges on the leader's: adding a learner that
+  is one already changes nothing (hyper-raft's `Configuration::change`).
+
+Decided by amphora-seam-owner, which holds Codex's role on Ada's word (2026-11-06):
+- No `Busy` or `Unknown` variants on `Refusal`. It is a wire enum kiln matches on, changed
+  append-only, and `Unavailable` or `Invalid` with their text say what. Variants are added only when
+  kiln shows a caller that must branch on them.
+- A follower's write with no leader known keeps waiting to its deadline (`Timeout`). An election in
+  progress usually ends inside it, and an immediate `NotLeader { leader: None }` would only make
+  callers spin.
 
 Evidence: Raft's configuration changes in two phases, with new servers joining as non-voting
 members first ([Ongaro and Ousterhout 2014](https://raft.github.io/raft.pdf), section 6); etcd's
@@ -271,13 +293,20 @@ The tests: `a_learner_added_has_every_write_and_once_removed_receives_none`,
 `a_change_another_lead_wrote_over_is_never_answered_done`,
 `a_change_holds_through_an_election_at_each_stage`,
 `the_leader_is_removed_once_it_has_handed_on_its_lead`,
-`a_joiner_to_a_database_past_the_snapshot_ceiling_is_refused_before_it_is_proposed` and
-`a_removal_another_lead_wrote_over_gives_the_member_back`.
+`a_joiner_to_a_database_past_the_snapshot_ceiling_is_refused_before_it_is_proposed`,
+`a_removal_another_lead_wrote_over_gives_the_member_back`,
+`a_change_or_hand_off_is_refused_while_the_group_leaves_a_joint_configuration`,
+`a_hand_off_the_core_gives_up_is_refused_and_the_lead_stays`,
+`a_hand_off_whose_lead_goes_to_a_third_member_is_refused_naming_it`,
+`a_hand_off_past_its_deadline_answers_unknown_outcome` and
+`a_hand_off_is_refused_beside_a_change_and_to_a_learner`. Requirements: AC-T1.8.M1 to M3 and
+T-T1.8.M1 to M5 (docs/requirements.toml).
 
 Falsified by: a change answered Ok whose configuration the replica has not applied; a change that
 commits as one changing nothing; two changes in flight on one leader; a learner missing a write
 made before or after it was added; any record sent to a member after its removal was answered; a
 removed member applying a write of its own; a member's answers refused while the leader counts it;
-a removal written over whose member's records are still refused; a leader that can't be removed
+a removal written over whose member's records are still refused; a change or a hand-off admitted
+while the core is joint or has a change to apply; a leader that can't be removed
 once it has handed on its lead; a transfer answered Ok while this member follows another; a
 learner added while the database is past the snapshot ceiling.
