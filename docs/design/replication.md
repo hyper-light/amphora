@@ -183,9 +183,8 @@ Falsified by:
 ## The leader's quorum patience (2026-11-06)
 
 Kiln goal 6b112f14729c899e826452260ca618c1, step 2, decided on step 1's record of the owners'
-stalls (`docs/research/owner-stalls.md`; per run and member, and per host and condition at best,
-median and max, in `bench/records/2026-11-06-owner-stalls.jsonl`, made from it by
-`bench/owner_stalls.py`). Every number quoted here from a run is in that record;
+stalls (`docs/research/owner-stalls.md`, a measurement's record, where the falsifier's runs go
+too). Every number quoted here from a run is in that record;
 `database::replicated::tests::the_decisions_numbers_are_step_ones_or_its_own` holds it.
 
 ### What the record shows
