@@ -183,7 +183,9 @@ Falsified by:
 ## The leader's quorum patience (2026-11-06)
 
 Kiln goal 6b112f14729c899e826452260ca618c1, step 2, decided on step 1's record of the owners'
-stalls (`docs/research/owner-stalls.md`). Every number quoted here from a run is in that record.
+stalls (`docs/research/owner-stalls.md`; per run and member, and per host and condition at best,
+median and max, in `bench/records/2026-11-06-owner-stalls.jsonl`, made from it by
+`bench/owner_stalls.py`). Every number quoted here from a run is in that record.
 
 ### What the record shows
 
@@ -263,10 +265,25 @@ leader, so a dead leader is replaced as fast as before.
 - **A member's own patience** (`Raft::set_patience`) stays zero: its own stalls already count one
   tick, so they never run its election timer, and a patience for its leader's stalls would delay
   replacing a dead leader.
+- **The flush stays where it is.** The patience covers a voter's answer gaps whatever holds them,
+  its owner's blocked steps among them (step gaps reached 9477.636 ms on adacachy and 7206.711 ms
+  on jupiter). Moving the flush off the owner thread is t1/fast-ack's Flushing driver, the one flush
+  driver: it would shorten the gaps this window measures and change nothing in this rule.
+- **Where it lives**: under "The owner's time", it reads no time at all, only the owner's ticks,
+  one per `TICK` of `at` with no catch-up, so the Driven shell reproduces a stall by holding answers
+  while it moves the leader's clock, and production runs the same step. It changes two of the
+  owner's functions: `Actor::run_step` sets the patience before each tick, and `Actor::step` counts
+  a voter's message in the term the owner leads. The measure is a pure core
+  (`database::patience`).
+- **Metrics**: none in this change. The names proposed, for Kiln Metrics' agreement, are
+  `amphora_replica_quorum_patience_seconds` (a gauge: the patience in force) and
+  `amphora_replica_answer_gaps_refused_total` (gaps past the ceiling).
 
-Codex owns `replicated.rs`. Its agent has ended, so this decision, the commits, the tests and the
-gates' verdicts went to it as a notice (kiln goal 6b112f14729c899e826452260ca618c1, step 4) and
-were not agreed with it.
+`replicated.rs` is Codex's. Codex's agent has ended, and its role is held by amphora-seam-owner
+(kiln agent 01a1b152d389767493f79adff5245f64, on Ada's word), whose agreement stands for Codex's.
+This decision was sent to it under the keys amphora-disk-stalls-quorum-patience-decision-20261106
+and amphora-disk-stalls-decision-split-20261106, and its answer is recorded here when given. No
+step 3 code lands before it.
 
 Evidence: step 1's record (`docs/research/owner-stalls.md`); Raft's timing requirement and its
 check of the quorum (Ongaro's dissertation §3.4 and §6.2, https://raft.github.io/raft.pdf; Ongaro
