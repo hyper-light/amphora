@@ -3132,6 +3132,17 @@ impl Database {
         )
     }
 
+    /// Amphora: the log's last committed frame and how many of its frames are copied into the
+    /// file (its backfill), as checkpoints of this process left them. Amphora's checkpointer
+    /// copies only once enough wait (`docs/design/store.md`, decision 35).
+    pub fn wal_backfill(&self) -> (u64, u64) {
+        let shared = self.shared_wal.read();
+        (
+            shared.metadata.max_frame.load(Ordering::Acquire),
+            shared.metadata.nbackfills.load(Ordering::Acquire),
+        )
+    }
+
     /// Amphora: every frame up to `frame` of the log's generation `generation` is durable: a flush
     /// begun after [`Database::wal_end`] answered them has ended. A checkpoint of frames within it
     /// flushes no log of its own. A generation the log has since left is ignored (a restart holds

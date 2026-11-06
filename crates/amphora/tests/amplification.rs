@@ -314,6 +314,10 @@ impl Engine for Postings {
         reader.checkpoint()
     }
 
+    fn uncopied(reader: &mut Db) -> anyhow::Result<Option<Checkpointed>> {
+        Ok(Some(reader.uncopied()))
+    }
+
     fn restart_log(&mut self) -> anyhow::Result<bool> {
         self.db.restart_log()
     }

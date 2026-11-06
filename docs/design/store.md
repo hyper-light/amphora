@@ -88,8 +88,8 @@ tests), or a read that waits for another key's write.
 
 **Decision.** The writer never checkpoints (`wal_autocheckpoint = 0`). A checkpointer with a
 connection of its own copies the log into the file every `Config::checkpoint_every` (25 ms) without
-waiting for anyone (passive). A log only starts again once nothing reads from it, which readers that
-never pause prevent: so once the log holds more than `Config::log_frames` (131,072 frames, 512 MiB
+waiting for anyone (passive); since decision 35, only once `Config::copy_after` frames wait. A log
+only starts again once nothing reads from it, which readers that never pause prevent: so once the log holds more than `Config::log_frames` (131,072 frames, 512 MiB
 of 4 KiB pages), the checkpointer copies without pausing until less than a 64th of the bound is left,
 and the writer then starts the log again between commits, holding the readers and the
 checkpointer back for the moment it takes (what little is left, and a flush of the file). The
@@ -1301,3 +1301,91 @@ refused, and the table stayed at 2 (adas-mac-studio-3, 2026-11-01).
 
 **Falsified by.** A query that waits behind the writer or a flush (the test above), one that writes,
 or one that sees a commit made after it began.
+
+## 35. Small commits: the checkpoint copies a page once for many commits
+
+**Decision.** While the log is within its bound, the checkpointer looks at it every period
+(`Config::checkpoint_every`, 25 ms) and copies it into the file only once `Config::copy_after`
+(8,192) of its frames aren't there yet, or once the log has passed its bound (decision 4's drain,
+unchanged): `Engine::uncopied`, `Db::uncopied`, the engine's `Database::wal_backfill`. A page that
+many small commits change is copied into the file once for all of them, not once for each period's
+commits. What the log records for a commit is unchanged in this step: each page the commit touched,
+whole (SQLite's frame, a 24-byte header and the 4 KiB page; decision 30 for spills).
+
+**Why.** The unify audit's batched leg (kiln's log index, 128 grams a durable call, kiln goal
+60805ec4) wrote 616-626 times its 1 MiB of log text to a quiet Mac's disks
+(`bench/records/2026-11-06-studio3-wal-regression.md`). Counted where Amphora writes
+(`crates/amphora/tests/amplification.rs`: the leg's statements and shape on a disk that counts each
+write and takes 3 ms a flush; fedora, 2026-11-06), its 1,884 calls committed 13.97 MiB of rows and
+wrote 231.8 MiB of log (16.6 bytes a byte of rows: about 31 page frames a call) and 145.5 MiB into
+the file (10.4): the checkpointer, every 25 ms, copied the pages two or three commits had touched,
+and the next pass copied most of them again, with a flush of the file each time (359). The file the
+leg builds is about 1,000 pages; a page dirtied k times between copies costs one copy, not k.
+
+**The plan, by what each step cuts** (the same leg, bytes written a byte of rows, log and file;
+adas-mac-studio-3, 2026-11-06, `docs/research/small-commits.md`):
+
+| step | log | file | all |
+|---|---|---|---|
+| before (a copy every period, page frames) | 16.6 | 9.9 | 26.4 |
+| 1. this decision | 16.6 | 0.7 | 17.3 |
+| 2. commits as changes: the packed log's deltas (decision 17) | 3.0 | 0.2 | 3.3 |
+| 3. a row's change logged once (CP-T1.3, engine.md decision 6) | the rows | the pages | |
+
+Step 1 is built here: it needs no change on disk and cuts the file's share 15-fold. Step 2 cuts the
+log's fivefold, but the packed log can't be made the default as it is. Its spills append (decision
+30 covers the page-a-frame log only), which would grow a big transaction's log back toward
+decision 30's gigabytes. Its pages aren't shared (decisions 20 and 26 refuse a packed log). And it
+cost the comprehensive bench's bulk statements a wait not yet found (decision 16). The follow-up is
+a log of both kinds of slot, under a new header format value (an append-only change: generations
+written before read as ever): a spill writes whole page frames over the transaction's own frames, as
+decision 30 does, and a commit writes packed records with deltas, their first slot's page field
+marked apart from a page number; with the records' pages shared, and the bulk statements measured
+against page-a-frame. Step 3 is CP-T1.3's storage.
+
+**The bound.** Within the log's bound, the file is written at most once for each `copy_after` frames
+of log, and each time with at most the pages those frames hold: the bytes the checkpoint writes are
+never more than the log's (a page is in the log before it is copied), and at most the log's times
+W / `copy_after` for commits that touch a working set of W pages. For the batched leg (W about
+1,000) the checkpoint writes at most a quarter of the log's bytes, where it wrote 60%
+(`small_commits_copy_their_pages_once_for_many_commits`), and the leg's bytes a byte of rows fall
+from 26.4 to at most 16.6 x 1.25 = 20.8. Commits that touch pages nothing touches again (random
+writes over a database many times the window) gain nothing: as in any B-tree updated in place, each
+such page costs its frame and its copy.
+
+On a Mac's disks a durable flush (`F_FULLFSYNC`, decision 13) costs about 107 KiB beyond what it
+makes durable (measured on adas-mac-studio-3's APFS: 4 KiB written and flushed 1,000 times wrote
+113.4 KiB a write; 128 KiB written 1,000 times and flushed once, 126.5 KiB). A caller that waits for
+each call, as kiln's indexer does, pays a flush a call, and no format of the log removes that: only
+more rows a call do. So the bound for the audit's leg, a MiB of text on a quiet Mac: its log (232
+MiB), at most a quarter of that copied (58 MiB), and 107 KiB for each of its 1,822 calls' flushes
+and the checkpoints' few (191 MiB): at most 481 MiB, where 616-626 were written.
+
+**Sources.** sqlite.org/wal.html, "Automatic Checkpoint": "By default, SQLite does a checkpoint
+automatically when the WAL file reaches a threshold size of 1000 pages"; checkpoints follow the
+log's growth, not a clock. PostgreSQL's documentation, "WAL Configuration"
+(`wal-configuration.html`): checkpoints come every `checkpoint_timeout` or `max_wal_size` of log;
+"Reducing checkpoint_timeout and/or max_wal_size causes checkpoints to occur more often. This allows
+faster after-crash recovery, since less work will need to be redone. However, one must balance this
+against the increased cost of flushing dirty data pages more often". Here recovery reads the whole
+log whatever was copied (Turso's recovery rebuilds the frame index from every frame of the
+generation, and a reopened log is copied again from its first frame), so copying more often buys no
+faster recovery. ARIES (Mohan et al., TODS 17(1), 1992): pages are written to their place
+independently of the log, which needs only that a page's log records be durable before it is
+(decision 15's mark, unchanged). The 8,192: what a 25 ms pass copied at 32 writers (decision 4: about
+73 frames a commit, about 5,000 commits a second, about 9,000 frames a period), so no pass copies
+more pages, or flushes the file over more, than passes did under that load, and that load's
+checkpoints are as before.
+
+**Evidence.** `crates/amphora/tests/amplification.rs`,
+`small_commits_copy_their_pages_once_for_many_commits`: the batched leg's statements, as kiln's
+indexer calls them one durable call at a time, each document read back whole after; the checkpoint
+must write at most a quarter of the log's bytes. Red at 13e385d. What `copy_after` buys
+(adas-mac-studio-3, bytes into the file a byte of rows, and its flushes): every period 9.9 (270),
+1,024 frames 3.7 (53), 2,048 2.2 (28), 8,192 0.7 (7), 32,768 0.2 (1).
+
+**Falsified by.** The checkpoint writing more than a quarter of the log's bytes on the batched leg
+(the test above); a reader reading a page other than as committed while copies wait, or an
+acknowledged batch lost by a power cut with frames left uncopied across commits (`tests/crash.rs`,
+whose seeds copy after 0 to 7 frames); at 32 writers and more, commits slower or their tails longer
+than with a copy at every period (decision 4's bench).

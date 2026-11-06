@@ -481,6 +481,10 @@ impl Engine for Events {
         reader.checkpoint()
     }
 
+    fn uncopied(reader: &mut Db) -> anyhow::Result<Option<Checkpointed>> {
+        Ok(Some(reader.uncopied()))
+    }
+
     fn restart_log(&mut self) -> anyhow::Result<bool> {
         self.db.restart_log()
     }
@@ -616,6 +620,9 @@ fn one_seed(seed: u64) -> Result<Seen, String> {
     let config = Config {
         log_frames: 16,
         checkpoint_every: Duration::from_millis(1),
+        // Each seed's checkpointer copies once its own count of frames wait (none: at every
+        // period), so cuts land with frames left uncopied across commits (decision 35).
+        copy_after: seed % 8,
         ..Config::default()
     };
     let store = Store::start(Events { db }, config).map_err(|e| format!("start: {e:#}"))?;

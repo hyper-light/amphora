@@ -411,6 +411,17 @@ impl Db {
         }
     }
 
+    /// What a checkpoint would find, copying nothing: the frames the log holds and those of them
+    /// not yet in the file.
+    #[must_use]
+    pub fn uncopied(&self) -> Checkpointed {
+        let (log, backfilled) = self.db.wal_backfill();
+        Checkpointed {
+            log,
+            left: log.saturating_sub(backfilled),
+        }
+    }
+
     /// With no reader reading (the store holds them back), copies what remains, flushes the file,
     /// and starts the log from its beginning: whether it did. The log's file keeps its length
     /// (decision 13), unless it holds room for more frames than [`Db::keep_log`] keeps: then it is

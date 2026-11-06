@@ -79,6 +79,13 @@ pub trait Engine: Send + 'static {
         Ok(Checkpointed::default())
     }
 
+    /// What a checkpoint would find, copying nothing: the frames its log holds and those not yet in
+    /// its file (None: it can't tell, and the checkpointer copies at every period).
+    fn uncopied(reader: &mut Self::Reader) -> anyhow::Result<Option<Checkpointed>> {
+        let _ = reader;
+        Ok(None)
+    }
+
     /// Copies the rest of the log into the file and starts it again, with no reader reading (the
     /// store holds them back meanwhile): whether it did (not: something was in the way).
     fn restart_log(&mut self) -> anyhow::Result<bool> {
@@ -130,8 +137,12 @@ pub struct Config {
     pub commit_rows: usize,
     /// Reading connections, at most.
     pub readers: usize,
-    /// How often the checkpointer copies the log into the file while the log is within its bound.
+    /// How often the checkpointer looks at the log while the log is within its bound.
     pub checkpoint_every: Duration,
+    /// Frames of the log not yet in the file that make the checkpointer copy them while the log is
+    /// within its bound: fewer wait in the log, so a page changed by many commits is copied once
+    /// for them all (decision 35).
+    pub copy_after: u64,
     /// The log's bound, in frames: past it the checkpointer copies without pausing, and once
     /// little is left (a 64th of the bound) the writer starts the log again. The log stops at
     /// twice its bound: the writer starts it again then, however much is left.
@@ -154,6 +165,10 @@ impl Default for Config {
             commit_rows: 512,
             readers: 4,
             checkpoint_every: Duration::from_millis(25),
+            // What a period's pass copied at 32 writers, whose commits wrote about 73 frames each,
+            // about 5,000 a second (decision 4: about 9,000 frames in 25 ms), so no pass copies
+            // more than passes did under that load; a 16th of the log's bound (32 MiB of pages).
+            copy_after: 8_192,
             // Each restart of the log holds the writer for 10-14 ms (on fedora's btrfs: what is
             // left copied, the file flushed, a new header synced). At 32 writers, whose commits
             // write about 73 frames each, a bound of 16,384 restarted 27 times in 20 s, and the
@@ -770,6 +785,30 @@ fn flusher(sends: &Sends, flush: &Flush, meter: &Meter) {
     }
 }
 
+/// How a store's checkpointer copies its engine's log into its file.
+struct Checkpointing<R> {
+    copy: fn(&mut R) -> anyhow::Result<Checkpointed>,
+    uncopied: fn(&mut R) -> anyhow::Result<Option<Checkpointed>>,
+    /// How often it looks while the log is within its bound.
+    every: Duration,
+    /// The log's bound, in frames.
+    bound: u64,
+    /// Frames waiting that make it copy within the bound.
+    after: u64,
+}
+
+impl<R> Checkpointing<R> {
+    fn of<E: Engine<Reader = R>>(config: &Config) -> Self {
+        Self {
+            copy: E::checkpoint,
+            uncopied: E::uncopied,
+            every: config.checkpoint_every,
+            bound: config.log_frames,
+            after: config.copy_after,
+        }
+    }
+}
+
 /// The readers: connections of their own for reading, which a read takes from the pool and uses on
 /// its own thread (no thread between a read and its answer), opened as reads want them, up to the
 /// store's bound. None while the engine replaces its file: reads go to the writer then.
@@ -816,15 +855,15 @@ impl<R: Send + 'static> Readers<R> {
         }
     }
 
-    /// Reads with `open`, and a checkpointer every `every` while the log is within `bound` frames.
-    fn start(
-        &self,
-        open: Opener<R>,
-        checkpoint: fn(&mut R) -> anyhow::Result<Checkpointed>,
-        every: Duration,
-        bound: u64,
-        sends: Arc<Sends>,
-    ) {
+    /// Reads with `open`, and a checkpointer as `checkpointing` says.
+    fn start(&self, open: Opener<R>, checkpointing: Checkpointing<R>, sends: Arc<Sends>) {
+        let Checkpointing {
+            copy,
+            uncopied,
+            every,
+            bound,
+            after,
+        } = checkpointing;
         *locked(&self.open) = Some(open.clone());
         let checkpointer = match open() {
             Ok(mut reader) => {
@@ -860,9 +899,20 @@ impl<R: Send + 'static> Readers<R> {
                             ) {
                                 break;
                             }
+                            // Within its bound, the log is copied once `after` of its frames wait
+                            // (decision 35). An engine that can't tell, or fails to, is copied, and
+                            // the copy says why it fails.
+                            if !draining
+                                && matches!(
+                                    uncopied(&mut reader),
+                                    Ok(Some(c)) if c.left < after && c.log <= bound
+                                )
+                            {
+                                continue;
+                            }
                             let _copying = gate.read().unwrap_or_else(PoisonError::into_inner);
                             let began = Instant::now();
-                            let copied = checkpoint(&mut reader);
+                            let copied = copy(&mut reader);
                             meter.checkpointed(began.elapsed());
                             match copied {
                                 Ok(c) => {
@@ -1032,13 +1082,7 @@ impl<E: Engine> Store<E> {
         let readers: Arc<Readers<E::Reader>> =
             Arc::new(Readers::new(config.readers, meter.clone()));
         if let Some(open) = engine.opener() {
-            readers.start(
-                open,
-                E::checkpoint,
-                config.checkpoint_every,
-                config.log_frames,
-                sends.clone(),
-            );
+            readers.start(open, Checkpointing::of::<E>(&config), sends.clone());
         }
         match flush.or_else(|| engine.flusher()) {
             Some(flush) => {
@@ -1446,13 +1490,7 @@ fn writer<E: Engine>(
                     ForReaders::Release => readers.release(),
                     ForReaders::Again => {
                         if let Some(open) = engine.opener() {
-                            readers.start(
-                                open,
-                                E::checkpoint,
-                                config.checkpoint_every,
-                                config.log_frames,
-                                sends.clone(),
-                            );
+                            readers.start(open, Checkpointing::of::<E>(config), sends.clone());
                         }
                     }
                 }
