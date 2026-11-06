@@ -248,10 +248,6 @@ pub fn translate_analyze(
     });
 
     for (target_table, target_index) in analyze_targets {
-        if !target_table.has_rowid {
-            bail_parse_error!("ANALYZE on tables without rowid is not supported");
-        }
-
         // Remove existing stat rows for this target before inserting fresh ones.
         let rewind_done = program.allocate_label();
         program.emit_insn(Insn::Rewind {
@@ -349,12 +345,6 @@ pub fn translate_analyze(
         });
         program.preassign_label_to_next_insn(rewind_done);
 
-        let target_cursor = program.alloc_cursor_id(CursorType::BTreeTable(target_table.clone()));
-        program.emit_insn(Insn::OpenRead {
-            cursor_id: target_cursor,
-            root_page: target_table.root_page,
-            db: database_id,
-        });
         let tablename_reg = program.alloc_register();
         program.emit_insn(Insn::String8 {
             value: target_table.name.to_string(),
@@ -365,18 +355,39 @@ pub fn translate_analyze(
         let is_specific_index_target = target_index.is_some();
         let indexes: Vec<Arc<Index>> = match target_index {
             Some(idx) => vec![idx],
-            None => resolver.with_schema(database_id, |s| {
-                s.get_indices(&target_table.name)
-                    .filter(|idx| idx.index_method.is_none()) // skip custom for now
-                    .cloned()
-                    .collect()
-            }),
+            None => {
+                // Amphora: a WITHOUT ROWID table's primary key is its B-tree, which the schema's
+                // indexes leave out (docs/design/planner.md decision 15). SQLite counts it as an
+                // index named after its table, as the key's descriptor is (bug 5adc6889).
+                let primary = if target_table.has_rowid {
+                    None
+                } else {
+                    Some(Arc::new(Index::without_rowid_primary_key(&target_table)?))
+                };
+                resolver.with_schema(database_id, |s| {
+                    primary
+                        .into_iter()
+                        .chain(
+                            s.get_indices(&target_table.name)
+                                .filter(|idx| idx.index_method.is_none()) // skip custom for now
+                                .cloned(),
+                        )
+                        .collect()
+                })
+            }
         };
         // Match SQLite: emit the table-level sqlite_stat1 row only when ANALYZE
         // targets a table and there are no non-partial indexes contributing stats.
         let emit_table_stat =
             !is_specific_index_target && !indexes.iter().any(|index| index.where_clause.is_none());
         if emit_table_stat {
+            let target_cursor =
+                program.alloc_cursor_id(CursorType::BTreeTable(target_table.clone()));
+            program.emit_insn(Insn::OpenRead {
+                cursor_id: target_cursor,
+                root_page: target_table.root_page,
+                db: database_id,
+            });
             let indexname_reg = program.alloc_register();
             let stat_text_reg = program.alloc_register();
             let record_reg = program.alloc_register();

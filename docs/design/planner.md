@@ -66,8 +66,8 @@ SQLite's, the table in rowid order. The rest is the engine's speed through rows,
 
 **Falsified by.** A query where a candidate the model now prefers for its order does more work in
 measurement than the sorted alternative it beat. The model has no notion of a sort spilling. It
-has a notion of a LIMIT stopping an ordered scan early only for a one-table read under a literal
-LIMIT (decision 16).
+has a notion of a LIMIT stopping an ordered scan early only for a one-table read (decisions 16
+and 17).
 
 ## 3. A GLOB's literal prefix is a range of the index; a BLOB matches no GLOB or LIKE
 
@@ -634,9 +634,8 @@ What it leaves to the cost model and the filter, unlike SQLite: an automatic ind
 keep the bound on the first column, and the rowid is not one of an index's columns here (SQLite's
 `nColumn` counts it). A page that reads columns the index lacks seeks once ANALYZE has counted the
 table (4,000 versions: SQLite's search). Without statistics it seeks too under a literal LIMIT,
-whose rows stop the read (decision 16). Under a LIMIT that is a parameter it is a scan and a sort,
-where SQLite seeks: the cost model takes the table at a million rows whose pages the cache can't
-hold and prices each lookup a page read (decisions 5 and 11). The lexicographic OR chain (`a > ?1 OR (a = ?1 AND b > ?2) OR ...`) stays a filter,
+whose rows stop the read (decision 16), and under a LIMIT that is a parameter, costed to the
+q-middle of its rows (decision 17). The lexicographic OR chain (`a > ?1 OR (a = ?1 AND b > ?2) OR ...`) stays a filter,
 as it does in SQLite: a keyset is written as the row value, its first page apart.
 
 **Why.** The unify audit's finding 3 (kiln goal 59833ddf373583f4ba3a6d9e4844f1a8): keyset
@@ -773,8 +772,8 @@ pays for its whole read and its sort.
 The goal holds only when every WHERE term left to evaluate is one of the table's constraints, whose
 selectivity the model knows. A term it can't estimate could make the read reach its goal late or
 never, the trap a row goal sets in PostgreSQL, so such a read keeps the whole range's cost.
-`LIMIT ?` and `OFFSET ?` give no goal, and neither does a join, whose fan-out the goal doesn't
-measure.
+A join gives no goal, since the goal doesn't measure its fan-out. A `LIMIT ?` or `OFFSET ?` gives
+the goal of decision 17.
 
 **Why.** The unify audit's E5 (kiln goal c64d544897cf8adca2c153ed05e2c528). On a rowid table keyed
 by (family, key, rev), through its primary key's autoindex or an explicit index on those columns,
@@ -817,3 +816,97 @@ engine's library tests pass unchanged.
 than the scan and sort it beat. That happens if a constraint's selectivity is far from its rows,
 for instance one correlated with the index's order, so that the read passes far more rows than its
 goal before it fills the LIMIT.
+
+## 17. An ordered read under a LIMIT known only as it runs stops at the q-middle of its rows
+
+**Decision.** A read of one table that decision 16 would give a row goal, but whose LIMIT or OFFSET
+is not a literal (a bound parameter, as kiln writes every LIMIT: `LIMIT ?`), has a row goal too
+(`limit_row_goal`, `cost.rs`'s `RowGoal::AtLeast`). How many rows the statement keeps is not known
+at prepare, only the fewest:
+- one row, plus a literal OFFSET's, under a LIMIT that is a parameter;
+- a literal LIMIT's under an OFFSET that is one.
+The most is all the read keeps: its range's rows over what its remaining terms keep. An index read
+in the query's order is costed to the q-middle of the two, the square root of their product, never
+fewer than the fewest. An unordered candidate pays for its whole read and its sort, as under
+decision 16, and the goal holds under the same conditions. A negative literal LIMIT is still no
+limit, and a negative literal OFFSET still leaves no goal.
+
+**Why.** The unify audit's E5 (kiln goal c64d544897cf8adca2c153ed05e2c528), checked again at main
+29be700 (`docs/research/parameter-limit.md`). Every keyset page under a literal LIMIT planned as
+SQLite 3.54.0 plans it, through a rowid table's autoindex, an explicit index and a WITHOUT ROWID
+key, but kiln writes no literal LIMIT: it binds each one (`crates/kiln/src/records.rs`, `ORDER BY
+v.key LIMIT ?6`). Under `LIMIT ?` ten of the probe's reads still planned as SCAN + USE SORTER FOR
+ORDER BY where SQLite searches or scans the index:
+- past a row value, without statistics;
+- past the first column, and from the start, with or without them.
+So did kiln's conversation feed on kiln's own DDL, `rev > ?1 ORDER BY rev LIMIT ?2` through
+`records_by_rev` (`crates/kiln/src/convo/sql.rs`): each feed page read and sorted every record
+line. With no goal, an ordered read was costed for its whole range, a page read for each lookup of
+the million fallback rows: about 371,709 past a bound against 37,888 for a scan and a sort.
+
+The other engines' ways don't fit:
+- Plans here are made at prepare and kept: "new statistics and a parameter's value never re-plan
+  it" (`bench/planner/audit/08-fixed-at-prepare.sql`). So PostgreSQL's custom plans from bound
+  values would not be what EXPLAIN QUERY PLAN shows for the statement kiln prepares.
+- PostgreSQL's 10% of the result still leaves the read from the start a scan and a sort in this
+  model: 100,000 lookups, about 92,000 against 62,863. Past a bound it wins by about 2%.
+- SQLite's weights price a lookup near a row of a scan, where decision 5 measured it as a page
+  read.
+The q-middle takes no constant. Whatever value is bound, the rows the read keeps lie between the
+fewest and all its range keeps. The q-middle is off from them by a factor of at most the square
+root of their ratio, where 10% of the read is off by a tenth of its rows for a page of one row.
+
+**Sources.** SQLite 3.54.0 (github.com/sqlite/sqlite, tag `version-3.54.0`):
+- `src/select.c`, `computeLimitRegisters` (lines 2603-2611) takes a LIMIT into the estimates only
+  as an integer literal: `if( sqlite3ExprIsInteger(pLimit->pLeft, &n, pParse, 0) ){` sets
+  `nSelectRow` and `SF_FixedLimit`, and `assert( WHERE_USE_LIMIT==SF_FixedLimit );` (line 8436).
+- Under `LIMIT ?` it still reads the index in order, because its weights make a full scan 3.0×N:
+  "The 3.0 factor is an extra cost designed to discourage the use of full table scans, since index
+  lookups have better worst-case performance if our stat guesses are wrong" (`src/where.c`, lines
+  4158-4161).
+
+PostgreSQL (`00d33e82bbb087d0f77fb5f49475885db62d1e37`):
+- `src/backend/optimizer/plan/planner.c`, `preprocess_limit` (lines 2946-2954): "However, if it's
+  not a constant LIMIT then we have to guess; for lack of a better idea, assume 10% of the plan's
+  result is wanted."
+- `src/backend/utils/cache/plancache.c`, `choose_custom_plan` (line 1211): "Generate custom plans
+  until we have done at least 5 (arbitrary)".
+
+Moerkotte, Neumann and Steidl, "Preventing Bad Plans by Bounding the Impact of Cardinality
+Estimation Errors", PVLDB 2(1):982-993, 2009, section 2: the q-error, which is "multiplicative in
+nature", and the q-middle, the square root of a set's least times its greatest, of which "the
+q-middle minimizes the q-error".
+
+**Evidence.** `crates/engine/tests/rowid_index_order.rs`, three tests that failed at 432a2ab and
+pass with the change:
+- `an_ordered_read_under_a_parameter_limit_uses_a_rowid_tables_index`: decision 16's six reads with
+  their LIMIT and bounds bound. They plan as SQLite 3.54.0 does, word for word, where 432a2ab
+  planned `SCAN rp` and `USE SORTER FOR ORDER BY`. Each reads at most 16 rows for its 8, and
+  answers as the same read NOT INDEXED.
+- `a_keyset_pass_with_a_bound_limit_reads_each_row_once`: a pass over 4,000 rows in pages of 8,
+  one statement re-bound for every page, forwards and backwards. Every row comes once, in order,
+  and each page reads at most LIMIT + 2 rows, where 432a2ab read 4,000 for a page.
+- `kilns_feed_pages_search_records_by_rev`: kiln's feed pages search `records_by_rev` as SQLite
+  does, where 432a2ab planned `SCAN records` and a sort.
+
+The probe of `docs/research/parameter-limit.md`, run again with the change (studio-3, 2026-11-01):
+of its 60 reads SQLite 3.54.0 plans the same way, 54 plan word for word as SQLite does, against 44
+at 29be700. The 6 left are the whole-range reads without a LIMIT, which stay as decision 5 measured
+them, and none is under `LIMIT ?`. The planner's other tests pass unchanged:
+- `planner.rs`, `records_plans.rs`, `row_value_seek.rs`;
+- `without_rowid_seek.rs`, `without_rowid_dml.rs`, `implicit_rowid_seek.rs`;
+- `top_n.rs`, `glob_range.rs`, `skip_scan.rs`, `row_counts.rs`, `in_subquery.rs`;
+- `oracle_findings.rs`, with each CERT cause's test;
+- the engine's 2,660 library tests.
+
+The bench suite's 52 statements (`amphora-bench --suite --target amphora --explain`, release builds of
+432a2ab and 110ad12 on jupiter, 2026-11-02, the bench given the root's patches as bug c7af55d0 asks):
+every plan the same before and after. `offset_deep`, the one whose OFFSET is a parameter (`LIMIT 20
+OFFSET ?`), stays a scan of items in rowid order, the order its ORDER BY asks.
+
+**Falsified by.** A statement whose bound LIMIT routinely asks for most of a large range, where the
+ordered read, a lookup for each row, does more work than the scan and sort it beat. Decision 5
+measured that at about 3.4× for a whole 200,000-row table. Or one whose remaining terms keep far
+fewer rows than their estimates, so the read passes far more rows than its goal (decision 16's
+falsifier). The cure then is planning with the bound values, as PostgreSQL's custom plans do, not
+another constant.
