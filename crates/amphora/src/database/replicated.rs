@@ -7344,6 +7344,14 @@ mod tests {
         settled(&mut driven, &mut pump, 3, &[4]);
         let added = joined(&mut driven, leader, 4);
         assert!(added > 0, "4 has no join at the leader");
+        // 4 applies the change in its own time: wait on that, then read its row.
+        let at = driven.owner(leader).replica.applied().index;
+        reach(
+            &mut driven,
+            &mut pump,
+            "4 applying its addition",
+            |driven| driven.owner(3).replica.applied().index >= at,
+        );
         assert_eq!(joined(&mut driven, 3, 4), added);
 
         clients[3].handle().attest(kiln(7)).unwrap();
