@@ -177,6 +177,41 @@ mod tests {
         assert_eq!(witnesses.next(), (0, true));
     }
 
+    /// CP-T1.5 (U05), local-owner-transport.md "Owner guards": the group drops once the last
+    /// holder of the lease in this process has, whatever another process shares. Do: a guarded
+    /// owner; a child process given a copy of its lease's descriptor, as a child this process
+    /// forks has one until it execs; every handle dropped. Expect: the group dropped with no
+    /// holder of the lease left in this process, though the child still holds the lock.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_sharing_the_lease_does_not_hold_the_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let witnesses = Witnesses::new();
+        let owner =
+            Database::open_guarded(&path, witnesses.guards(1, 0, Some(&path)), until()).unwrap();
+        let shared = {
+            let owners = OWNERS.get_or_init(Mutex::default).lock().unwrap();
+            let lease = owners
+                .get(&path.canonicalize().unwrap())
+                .unwrap()
+                .lease
+                .upgrade()
+                .unwrap();
+            lease.try_clone().unwrap()
+        };
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdin(std::process::Stdio::from(shared))
+            .spawn()
+            .unwrap();
+        drop(owner);
+        let dropped = witnesses.next();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(dropped, (0, true));
+    }
+
     #[test]
     fn guarded_opens_refuse_a_live_owner_they_cant_reuse_before_any_effect() {
         // CP-T1.5 (U05), local-owner-transport.md "Owner guards": other guards, an unguarded
