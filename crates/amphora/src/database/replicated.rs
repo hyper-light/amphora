@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
-use crate::meter::{ReplicaCounters, ReplicaMeter};
+use crate::meter::{FloorCounters, FloorMeter, FloorRefusal, ReplicaCounters, ReplicaMeter};
 use api::replication::{Durability, MemberChange, Outbound, ReplicaConfig, ReplicaStatus, Verdict};
 use hyper_block::block::BlockFile;
 use hyper_block::file::{CachingRequest, DeviceFile};
@@ -115,6 +115,9 @@ struct Control {
     // The floor in force at the applied index last published, so a bind below it is refused
     // without asking the owner.
     floor: Mutex<Option<crate::database::Application>>,
+    // What floor_status answers: the floor and each member against it, at that same index.
+    floor_status: Mutex<amphora_api::replication::FloorStatus>,
+    floor_meter: FloorMeter,
     outgoing: Mutex<Outgoing>,
     status: Mutex<Result<ReplicaStatus, Refusal>>,
     meter: Arc<ReplicaMeter>,
@@ -262,6 +265,8 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     floor_inflight: bool,
     floor_ended: u64,
     floor_failures: u64,
+    // The floor version this owner last published, none before its first: a raise is it rising.
+    floor_published: Option<u32>,
     // At most COMMANDS admitted operations wait behind the sole prepared transaction.
     waiting: VecDeque<Envelope>,
     serial: u64,
@@ -347,6 +352,17 @@ fn fenced(reason: impl std::fmt::Display) -> Refusal {
 }
 fn unknown() -> Refusal {
     Refusal::UnknownOutcome
+}
+/// Counts a refusal the floor made and says so on its target (replication.md, "Metrics").
+fn floor_refused(control: &Control, reason: FloorRefusal, refusal: &Refusal) {
+    control.floor_meter.refused(reason);
+    tracing::info!(
+        target: "amphora.floor",
+        event = "floor.refused",
+        reason = reason.reason(),
+        error = %refusal,
+        "the application floor refused a request"
+    );
 }
 fn raft_error(error: hyper_durable::ReplicaError) -> Refusal {
     match error {
@@ -573,13 +589,15 @@ impl ReplicaHandle {
             && floor.name == application.name
             && application.version < floor.version
         {
-            return Err(api::invalid(
+            let refusal = api::invalid(
                 "application floor",
                 &format!(
                     "this binary runs up to {}; the group's floor is {}",
                     application.version, floor.version
                 ),
-            ));
+            );
+            floor_refused(&self.shared, FloorRefusal::BelowFloor, &refusal);
+            return Err(refusal);
         }
         let mut attesting = locked(&self.shared.attesting)?;
         if attesting.as_ref() == Some(&application) {
@@ -628,6 +646,23 @@ impl ReplicaHandle {
     /// read without asking the owner, and no wire type.
     pub fn counters(&self) -> ReplicaCounters {
         self.shared.meter.counters()
+    }
+
+    /// The application floor's counters (`crate::meter::FLOOR_METRICS`), for the host to export:
+    /// read without asking the owner.
+    pub fn floor_counters(&self) -> FloorCounters {
+        self.shared.floor_meter.counters()
+    }
+
+    /// The floor and each member against it, as the owner published them at its last applied
+    /// index (replication.md, "The seam"), without asking it.
+    pub fn floor_status(&self) -> Result<amphora_api::replication::FloorStatus, Refusal> {
+        Ok(locked(&self.shared.floor_status)?.clone())
+    }
+
+    /// Counts a refusal the floor made outside the owner (a raise the stale-base rule caught).
+    pub(crate) fn floor_refused(&self, reason: FloorRefusal, refusal: &Refusal) {
+        floor_refused(&self.shared, reason, refusal);
     }
 
     /// Tells the owner what the host's node-level failure detector concluded of a member's node
@@ -776,6 +811,8 @@ fn open_on<F: BlockFile + 'static>(
         admitted: AtomicUsize::new(0),
         attesting: Mutex::new(None),
         floor: Mutex::new(None),
+        floor_status: Mutex::default(),
+        floor_meter: FloorMeter::default(),
         outgoing: Mutex::default(),
         status: Mutex::new(Ok(status(&replica))),
         meter,
@@ -802,6 +839,7 @@ fn open_on<F: BlockFile + 'static>(
         floor_inflight: false,
         floor_ended: 0,
         floor_failures: 0,
+        floor_published: None,
         waiting: VecDeque::new(),
         serial: 0,
         transferred: None,
@@ -996,10 +1034,62 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.published = self.replica.applied().index;
             return Ok(());
         }
-        let floor = self.replica.machine_mut().read_db(|db| {
+        let configuration_at = self.replica.machine().configuration_at();
+        let configuration = self.replica.configuration().clone();
+        let (floor, members) = self.replica.machine_mut().read_db(|db| {
             reload_changed(db, &self.changed)?;
-            super::application::policy(db)
+            let floor = super::application::policy(db)?;
+            let mut members = Vec::new();
+            for member in crate::replication::floor::members(&configuration) {
+                let attested = match &floor {
+                    Some(floor) => crate::replication::floor::current(
+                        db,
+                        member,
+                        &floor.name,
+                        configuration_at,
+                    )?
+                    .map(|attested| attested.highest),
+                    None => None,
+                };
+                members.push(amphora_api::replication::MemberFloor {
+                    member,
+                    voter: configuration.voters.contains(&member)
+                        || configuration.voters_outgoing.contains(&member),
+                    attested,
+                });
+            }
+            Ok((floor, members))
         })?;
+        let version = floor.as_ref().map_or(0, |floor| floor.version);
+        let unattested = if floor.is_some() {
+            members
+                .iter()
+                .filter(|member| !matches!(member.attested, Some(highest) if highest >= version))
+                .count()
+        } else {
+            0
+        };
+        // A raise is the floor rising past the one this owner already published; the first
+        // publication after it opens is where it starts, not a raise.
+        if let Some(before) = self.floor_published
+            && version > before
+        {
+            self.control.floor_meter.raised();
+            tracing::info!(
+                target: "amphora.floor",
+                event = "floor.raised",
+                version,
+                from = before,
+                "the application floor was raised"
+            );
+        }
+        self.floor_published = Some(version);
+        self.control.floor_meter.applied(version, unattested);
+        *locked(&self.control.floor_status)? = amphora_api::replication::FloorStatus {
+            application: floor.as_ref().map(|floor| floor.name.clone()),
+            version,
+            members,
+        };
         *locked(&self.control.floor)? = floor;
         self.published = self.replica.applied().index;
         Ok(())
@@ -1334,7 +1424,12 @@ impl<F: BlockFile + 'static> Actor<F> {
                         Err(error) => Err(raft_error(error)),
                     }
                 }
-                Err(refusal) => Err(refusal),
+                Err(refusal) => {
+                    if let Some(reason) = super::application::floor_reason(&refusal) {
+                        floor_refused(&self.control, reason, &refusal);
+                    }
+                    Err(refusal)
+                }
             }
         };
         answer(changing.response, result);
@@ -2040,16 +2135,20 @@ impl<F: BlockFile + 'static> Actor<F> {
         }
         self.floor_checked = applied;
         match self.floor_pass(configuration_at) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.control.floor_meter.kept(false);
+                Ok(())
+            }
             Err(Refusal::Fenced(reason)) => Err(Refusal::Fenced(reason)),
             Err(refusal) => {
                 tracing::warn!(
-                    target: "amphora.replication",
-                    event = "floor_keeper_failed",
+                    target: "amphora.floor",
+                    event = "floor.keeper_failed",
                     error = %refusal,
                     "the floor's keeper looks again on its next pass"
                 );
                 self.floor_failures = self.floor_failures.saturating_add(1);
+                self.control.floor_meter.kept(true);
                 Ok(())
             }
         }
@@ -2251,6 +2350,9 @@ impl<F: BlockFile + 'static> Actor<F> {
                         super::application::check(db, application.as_ref(), &operation)
                     })
                 {
+                    if let Some(reason) = super::application::floor_reason(&refusal) {
+                        floor_refused(&self.control, reason, &refusal);
+                    }
                     if let Some(response) = pending.response.take() {
                         answer(response, Err(refusal));
                     }
@@ -2318,6 +2420,11 @@ impl<F: BlockFile + 'static> Actor<F> {
                 error
             }),
         };
+        if let Err(refusal) = &result
+            && let Some(reason) = super::application::floor_reason(refusal)
+        {
+            floor_refused(&self.control, reason, refusal);
+        }
         if let Some(response) = pending.response.take() {
             answer(response, result);
         }
@@ -7013,6 +7120,9 @@ mod tests {
             driven.owner_mut(leader).floor_failures > 0,
             "the keeper never failed"
         );
+        let counters = clients[leader].handle().floor_counters();
+        assert!(counters.keeper_failures > 0, "{counters:?}");
+        assert_eq!(counters.keeper_failing, 1, "{counters:?}");
         write(&mut driven, &mut pump, &clients[leader], 1);
         for client in &clients {
             assert_eq!(client.handle().status().unwrap().fenced, None);
@@ -8197,6 +8307,94 @@ mod tests {
         });
         assert_eq!(lower, Ok(7));
         assert_eq!(last(&driven), before);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// CP-T1.8 on driven time (replication.md, "Metrics", "The seam"; CLAUDE.md section 10): the
+    /// floor's metrics and floor_status say what happened. Do, in a group of three voters bound to
+    /// kiln.host-store 7 with joins tracked: read every member's counters; raise to 7; add learner
+    /// 4, never bound; then a raise to 8, a write as 6, a write with no claim and 4's promotion,
+    /// each refused. Expect: before, every count 0; after the raise, version 7, one raise and no
+    /// member unattested on every voter; with 4 added, one unattested and floor_status naming 4 a
+    /// learner with no attestation, the voters at 7; each refusal counted under its reason at the
+    /// member that made it; the keeper not failing.
+    #[test]
+    fn the_floors_metrics_and_status_say_what_happened() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        let leader = tracked_group(&mut driven, &mut pump, &clients);
+        for client in &clients[..3] {
+            assert_eq!(
+                client.handle().floor_counters(),
+                crate::meter::FloorCounters::default()
+            );
+        }
+        assert_eq!(raise(&mut driven, &mut pump, &clients[leader], 7), Ok(7));
+        for _ in 0..ROUNDS {
+            if clients[..3]
+                .iter()
+                .all(|client| client.handle().floor_counters().version == 7)
+            {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        for client in &clients[..3] {
+            let counters = client.handle().floor_counters();
+            assert_eq!(
+                (
+                    counters.version,
+                    counters.raises,
+                    counters.unattested_members
+                ),
+                (7, 1, 0)
+            );
+        }
+        let until = driven.until();
+        driven
+            .answer(
+                &mut pump,
+                &change(&clients[leader], until, MemberChange::AddLearner(4)),
+            )
+            .unwrap();
+        settled(&mut driven, &mut pump, 3, &[4]);
+        let led = clients[leader].handle();
+        assert_eq!(led.floor_counters().unattested_members, 1);
+        let status = led.floor_status().unwrap();
+        assert_eq!(
+            (status.application.as_deref(), status.version),
+            (Some("kiln.host-store"), 7)
+        );
+        for member in &status.members {
+            let expected = if member.member == 4 {
+                (false, None)
+            } else {
+                (true, Some(7))
+            };
+            assert_eq!((member.voter, member.attested), expected, "{member:?}");
+        }
+        assert_eq!(status.members.len(), 4);
+
+        assert!(raise(&mut driven, &mut pump, &clients[leader], 8).is_err());
+        assert!(write_as(&mut driven, &mut pump, &clients[leader], 6).is_err());
+        let unclaimed = submit(&clients[leader], driven.until(), |db| {
+            db.exec("CREATE TABLE IF NOT EXISTS floor_items(version)")?;
+            Ok(Vec::new())
+        });
+        assert!(driven.answer(&mut pump, &unclaimed).is_err());
+        assert!(promote(&mut driven, &mut pump, &clients[leader]).is_err());
+        let counters = led.floor_counters();
+        assert_eq!(counters.refused(FloorRefusal::Unproven), 2, "{counters:?}");
+        assert_eq!(
+            counters.refused(FloorRefusal::BelowFloor),
+            1,
+            "{counters:?}"
+        );
+        assert_eq!(counters.refused(FloorRefusal::NoClaim), 1, "{counters:?}");
+        assert_eq!(counters.keeper_failing, 0);
         driven.drain(&mut pump);
         pump.finish();
     }

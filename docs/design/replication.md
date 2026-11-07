@@ -1062,11 +1062,16 @@ adds `db` and its machine's.
 - `amphora_floor_unattested_members` (gauge): members of the configuration in force with no attestation at the floor
   under their current join. Every member reports it, from its own applied state, which is the same on every member,
   so dashboards take `max` by `db`.
+- `amphora_floor_keeper_failures_total` (counter) and `amphora_floor_keeper_failing` (gauge, 1 while the keeper's last
+  pass failed, 0 once one succeeds), agreed under amphora-membership-floor/names/v1-keeper: the keeper looks again only
+  when the applied index moves, so on an idle database the counter stands still while the gauge shows it stuck.
 - Events go on target `amphora.floor` with an `event` field named in kiln's dotted style (`floor.raised`,
-  `floor.refused`); spans stay off that target, as kiln makes `kiln.<span>` metrics of a listed target's spans.
+  `floor.refused` with its `reason`, `floor.keeper_failed`); spans stay off that target, as kiln makes `kiln.<span>`
+  metrics of a listed target's spans.
 - Dashboard rows, a group "Amphora application floor" on kiln's built-in Stores dashboard and the same in PromQL in
-  kiln-overview.json: floor version by database, raises, refusals by reason, members unattested, and floor events. A
-  monitor: unattested above 0 for 15 minutes. kiln's side (`TARGETS`, exports, the group) is kiln's change, merged on
+  kiln-overview.json: floor version by database, raises, refusals by reason, members unattested, keeper failures
+  (bars) and keeper failing (max by `db`), and floor events. Monitors: unattested above 0 for 15 minutes; the keeper
+  failing at 1 for 15 minutes. kiln's side (`TARGETS`, exports, the group) is kiln's change, merged on
   Ada's word.
 
 **The upgrade that introduces the join rows** (decided by amphora-seam-owner, 2026-11-06). While members run binaries

@@ -4,6 +4,7 @@
 //! transaction boundary.
 
 use super::*;
+use crate::meter::FloorRefusal;
 use serde::{Deserialize, Serialize};
 
 // Created by the first raise, inside its own session, never with the product schema: a replica
@@ -124,13 +125,31 @@ impl Database {
         let floor = database
             .call_db(until, move |db| raise(db, wanted, replicated))
             .map_err(|refusal| {
-                if replicated {
-                    overtaken(refusal)
-                } else {
-                    refusal
+                let Writer::Replicated { client, .. } = &self.shared.writer else {
+                    return refusal;
+                };
+                let refusal = overtaken(refusal);
+                // The owner counted the raise's other refusals where it made them; this one it
+                // answered as any stale write.
+                if floor_reason(&refusal) == Some(FloorRefusal::StaleBase) {
+                    client
+                        .handle()
+                        .floor_refused(FloorRefusal::StaleBase, &refusal);
                 }
+                refusal
             })?;
         Ok(WriterBoundary { database, floor })
+    }
+
+    /// The application floor and each member of the group against it, as this replica's owner
+    /// published them at its last applied index (replication.md, "The seam"); read without a
+    /// claim, so an application below the floor can see it and stand down. A replicated
+    /// database's alone.
+    pub fn floor_status(&self) -> Result<amphora_api::replication::FloorStatus, Refusal> {
+        let Writer::Replicated { client, .. } = &self.shared.writer else {
+            return Err(api::invalid("floor status", "a replicated database's"));
+        };
+        client.handle().floor_status()
     }
 }
 
@@ -172,6 +191,46 @@ pub(super) fn raise(
         name: wanted.name,
         version,
     })
+}
+
+/// Which of `amphora_floor_refusals_total`'s reasons a refusal is, if the floor made it: matched on
+/// the floor's own texts, so a membership or write refusal worded alike is never counted.
+pub(super) fn floor_reason(refusal: &Refusal) -> Option<FloorRefusal> {
+    match refusal {
+        Refusal::Fenced(why) => match why.as_str() {
+            "application writer contract required" => Some(FloorRefusal::NoClaim),
+            "application writer contract is for another application than the installed floor"
+            | "another application's writer floor is installed" => {
+                Some(FloorRefusal::OtherApplication)
+            }
+            "application writer contract is older than the installed floor" => {
+                Some(FloorRefusal::BelowFloor)
+            }
+            _ => None,
+        },
+        Refusal::Invalid { what, .. } if what == "application floor" => {
+            Some(FloorRefusal::BelowFloor)
+        }
+        Refusal::Unavailable(why) => {
+            if why == "joins aren't tracked yet; every member must attest first"
+                || (why.starts_with("members [") && why.contains(" have not attested "))
+                || (why.starts_with("learner ") && why.contains(" has not attested "))
+            {
+                Some(FloorRefusal::Unproven)
+            } else if why
+                == "the group is leaving a joint configuration; raise the floor once it has"
+                || why.starts_with("the log runs to ")
+            {
+                Some(FloorRefusal::Busy)
+            } else if why.starts_with("the database advanced since preparation: the group changed")
+            {
+                Some(FloorRefusal::StaleBase)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// What a replicated raise answers when the stale-base rule refuses it: the group changed
@@ -286,4 +345,80 @@ pub(super) fn claim_holds(db: &Db, claim: Option<&Application>) -> anyhow::Resul
         .into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CP-T1.8 (replication.md, "Metrics"): each of the floor's refusals is counted under its
+    /// reason, and nothing else is. Do: classify every text the floor refuses with, a stale write's
+    /// refusal and a membership refusal worded alike. Expect: each floor text its reason, the
+    /// stale-base one only once mapped for a raise, and the others none.
+    #[test]
+    fn each_floor_refusal_is_counted_under_its_reason_and_nothing_else() {
+        let stale = api::invalid(
+            "prepared transaction",
+            "the database advanced since preparation",
+        );
+        for (refusal, reason) in [
+            (Refusal::Fenced("application writer contract required".into()), Some(FloorRefusal::NoClaim)),
+            (
+                Refusal::Fenced("application writer contract is for another application than the installed floor".into()),
+                Some(FloorRefusal::OtherApplication),
+            ),
+            (
+                Refusal::Fenced("another application's writer floor is installed".into()),
+                Some(FloorRefusal::OtherApplication),
+            ),
+            (
+                Refusal::Fenced("application writer contract is older than the installed floor".into()),
+                Some(FloorRefusal::BelowFloor),
+            ),
+            (
+                api::invalid("application floor", "this binary runs up to 6; the group's floor is 7"),
+                Some(FloorRefusal::BelowFloor),
+            ),
+            (
+                Refusal::Unavailable("joins aren't tracked yet; every member must attest first".into()),
+                Some(FloorRefusal::Unproven),
+            ),
+            (
+                Refusal::Unavailable(
+                    "members [4] have not attested kiln.host-store at version 7 or above".into(),
+                ),
+                Some(FloorRefusal::Unproven),
+            ),
+            (
+                Refusal::Unavailable(
+                    "learner 4 has not attested kiln.host-store under its current join; the group's floor is 7"
+                        .into(),
+                ),
+                Some(FloorRefusal::Unproven),
+            ),
+            (
+                Refusal::Unavailable(
+                    "the group is leaving a joint configuration; raise the floor once it has".into(),
+                ),
+                Some(FloorRefusal::Busy),
+            ),
+            (
+                Refusal::Unavailable(
+                    "the log runs to 9 and 8 is applied; promote once the tail is applied".into(),
+                ),
+                Some(FloorRefusal::Busy),
+            ),
+            (overtaken(stale.clone()), Some(FloorRefusal::StaleBase)),
+            (stale, None),
+            (
+                Refusal::Unavailable(
+                    "the group is leaving a joint configuration; try again once it has".into(),
+                ),
+                None,
+            ),
+            (Refusal::Fenced("replica owner stopped".into()), None),
+        ] {
+            assert_eq!(floor_reason(&refusal), reason, "{refusal:?}");
+        }
+    }
 }
