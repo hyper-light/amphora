@@ -962,7 +962,10 @@ changes before proposing them.
 
 **The seam.** The replicated `Database` gains:
 - `raise_floor(application, version, until) -> WriterBoundary`;
-- `floor_status(until)`: the floor and each member's role and attested highest.
+- `floor_status(until)`: the floor and each member's role and attested highest, read without a claim so an
+  application below the floor can see it and stand down. A replica answers what its owner published at its last
+  applied index, at once; a standalone database reads its floor on a reader by `until` and names no members, being no
+  group. The same call in both modes (CLAUDE.md section 8).
 
 Attestation is the owner's own act when a handle binds, so it has no call of its own. The standalone `writer_floor`
 stays as it is, the same proof over one member. New rows ride in resolved pages, and the origin check reads context
@@ -1101,8 +1104,12 @@ would corrupt. So:
    pass (a new applied index while it has nothing else in hand), through the same barrier and proposal as a call with
    its own deadline, and a refusal (a stale base, an election) is tried again on its next pass, never in a loop. Members
    attesting at once make each other's sessions stale; each round of that contention applies at least one, so the
-   retries end once every member is current, and a settled group proposes nothing. Any change during the upgrade sends
-   every member back to attest; that lasts only until J.
+   retries end once every member is current, and a settled group proposes nothing. The leader's request is the same
+   counted retry: written once, its session may be refused by the stale-base rule when members' attestation sessions
+   prepared at the same base commit first, and is proposed again on the leader's next pass, so its proposals are at
+   most one more than those refusals, each of which needs a session committed in between (at most one attestation per
+   member per request), and none once the request is applied. Any change during the upgrade sends every member back to
+   attest; that lasts only until J.
 3. J's session is written only when every member of the configuration in force has an attestation committed after the
    last change. At J, the members then present get rows at 0, so their attestations stay valid and nobody attests
    again at J; after it, only changes write rows.

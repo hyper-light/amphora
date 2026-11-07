@@ -265,6 +265,11 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     floor_inflight: bool,
     floor_ended: u64,
     floor_failures: u64,
+    // Whether the floor session in hand is a request to attest again, and how this owner's
+    // requests ended: applied, or refused by the stale-base rule and proposed again on a later pass.
+    floor_requesting: bool,
+    floor_requests_applied: u64,
+    floor_requests_stale: u64,
     // The floor version this owner last published, none before its first: a raise is it rising.
     floor_published: Option<u32>,
     // At most COMMANDS admitted operations wait behind the sole prepared transaction.
@@ -839,6 +844,9 @@ fn open_on<F: BlockFile + 'static>(
         floor_inflight: false,
         floor_ended: 0,
         floor_failures: 0,
+        floor_requesting: false,
+        floor_requests_applied: 0,
+        floor_requests_stale: 0,
         floor_published: None,
         waiting: VecDeque::new(),
         serial: 0,
@@ -1424,12 +1432,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                         Err(error) => Err(raft_error(error)),
                     }
                 }
-                Err(refusal) => {
-                    if let Some(reason) = super::application::floor_reason(&refusal) {
-                        floor_refused(&self.control, reason, &refusal);
-                    }
-                    Err(refusal)
-                }
+                Err(refusal) => Err(refusal),
             }
         };
         answer(changing.response, result);
@@ -1801,25 +1804,38 @@ impl<F: BlockFile + 'static> Actor<F> {
             .log()
             .last_index()
             .map_err(unavailable)?;
-        if applied != last {
-            return Err(unavailable(format!(
-                "the log runs to {last} and {applied} is applied; promote once the tail is applied"
-            )));
-        }
-        match attested {
-            None => Err(unavailable(format!(
-                "learner {member} has not attested {} under its current join; the group's floor is {}",
-                floor.name, floor.version
-            ))),
-            Some(attested) if attested.highest < floor.version => Err(api::invalid(
-                "application floor",
-                &format!(
-                    "learner {member} runs {} up to {}; the group's floor is {}",
-                    floor.name, attested.highest, floor.version
+        let refused = if applied != last {
+            (
+                FloorRefusal::Busy,
+                unavailable(format!(
+                    "the log runs to {last} and {applied} is applied; promote once the tail is applied"
+                )),
+            )
+        } else {
+            match attested {
+                None => (
+                    FloorRefusal::Unproven,
+                    unavailable(format!(
+                        "learner {member} has not attested {} under its current join; the group's floor is {}",
+                        floor.name, floor.version
+                    )),
                 ),
-            )),
-            Some(_) => Ok(()),
-        }
+                Some(attested) if attested.highest < floor.version => (
+                    FloorRefusal::BelowFloor,
+                    api::invalid(
+                        "application floor",
+                        &format!(
+                            "learner {member} runs {} up to {}; the group's floor is {}",
+                            floor.name, attested.highest, floor.version
+                        ),
+                    ),
+                ),
+                Some(_) => return Ok(()),
+            }
+        };
+        let (reason, refusal) = refused;
+        floor_refused(&self.control, reason, &refusal);
+        Err(refusal)
     }
     fn step(&mut self, from: u64, bytes: &[u8]) -> Result<(), Refusal> {
         #[cfg(test)]
@@ -1937,6 +1953,21 @@ impl<F: BlockFile + 'static> Actor<F> {
                         Err(error) => Err(error),
                     },
                 };
+                // A request to attest again, applied or refused by the stale-base rule (another
+                // floor session at the same base committed first): the keeper's counted retry.
+                if matches!(pending.author, Author::Owner) && self.floor_requesting {
+                    self.floor_requesting = false;
+                    match &result {
+                        Ok(_) => {
+                            self.floor_requests_applied =
+                                self.floor_requests_applied.saturating_add(1);
+                        }
+                        Err(Refusal::Invalid { what, .. }) if what == "prepared transaction" => {
+                            self.floor_requests_stale = self.floor_requests_stale.saturating_add(1);
+                        }
+                        Err(_) => {}
+                    }
+                }
                 if let Some(response) = pending.response.take() {
                     answer(response, result);
                 }
@@ -2208,11 +2239,15 @@ impl<F: BlockFile + 'static> Actor<F> {
             return Ok(());
         }
         self.floor_requests = self.floor_requests.saturating_add(1);
-        self.submit_floor(Box::new(move |db| floor::request(db, configuration_at)))
+        self.submit_floor(Box::new(move |db| floor::request(db, configuration_at)))?;
+        self.floor_requesting = true;
+        Ok(())
     }
     /// One of the floor's own sessions, through the same barrier and proposal as a call; it has no
     /// caller, and one that ends without applying is made again on the keeper's next pass.
     fn submit_floor(&mut self, session: FloorSession) -> Result<(), Refusal> {
+        // Each floor session is the next one in hand; a request marks itself after this.
+        self.floor_requesting = false;
         let context = self.context()?;
         self.replica.read(context.clone()).map_err(raft_error)?;
         let until = self
@@ -2341,51 +2376,55 @@ impl<F: BlockFile + 'static> Actor<F> {
             Author::Application(application) => Some(application.clone()),
             Author::Owner => None,
         };
-        let prepared =
-            if let Operation::Mutation(Mutation::CompactStep { before, .. }) = &operation {
-                // The claim's refusal is its caller's answer: the poison rule below is for
-                // prepare_compaction's own failures, never a writer the floor refuses.
-                if let Some(application) = &claim
-                    && let Err(refusal) = self.replica.machine_mut().read_db(|db| {
-                        super::application::check(db, application.as_ref(), &operation)
-                    })
-                {
-                    if let Some(reason) = super::application::floor_reason(&refusal) {
-                        floor_refused(&self.control, reason, &refusal);
-                    }
-                    if let Some(response) = pending.response.take() {
-                        answer(response, Err(refusal));
-                    }
-                    return Ok(());
+        // The claim is checked at the base the session prepares at (nothing applies between),
+        // and its refusal is its caller's answer, counted under its reason: never the poison rule
+        // below, which is for a compaction's own failures.
+        if let Some(application) = &claim {
+            let checked = self.replica.machine_mut().read_db(|db| {
+                super::application::claim_refused(db, application.as_ref(), &operation)
+            });
+            let refusal = match checked {
+                Ok(None) => None,
+                Ok(Some(refused)) => {
+                    floor_refused(&self.control, refused.reason, &refused.refusal);
+                    Some(refused.refusal)
                 }
-                let room = self.entry_room(pending.context.len())?;
-                self.replica
-                    .machine_mut()
-                    .prepare_compaction(&pending.namespace, *before, pending.until, room)
-                    .map(|(prepared, progress)| (prepared, Answer::Compacted(progress)))
-            } else {
-                let clock = Arc::clone(&self.clock);
-                self.replica.machine_mut().prepare_db(|db| {
-                    // The guard ends with application evaluation, before prepare_pages rolls back its
-                    // speculative transaction. Cleanup must run even after the SQL deadline elapsed.
-                    let _deadline = db.deadline_on(pending.until, move || clock());
-                    if restore::incomplete(db)? {
-                        return Err(api::invalid("database", "restore is incomplete").into());
-                    }
-                    if let Some(application) = &claim {
-                        super::application::check(db, application.as_ref(), &operation)?;
-                    }
-                    match &operation {
-                        Operation::Call(call) => {
-                            let call = locked(call)?
-                                .take()
-                                .ok_or_else(|| unavailable("SQL session already executed"))?;
-                            call(db).map(Answer::Called)
-                        }
-                        other => apply(db, &pending.namespace, other)?.map_err(Into::into),
-                    }
-                })
+                Err(refusal) => Some(refusal),
             };
+            if let Some(refusal) = refusal {
+                if let Some(response) = pending.response.take() {
+                    answer(response, Err(refusal));
+                }
+                return Ok(());
+            }
+        }
+        let prepared = if let Operation::Mutation(Mutation::CompactStep { before, .. }) = &operation
+        {
+            let room = self.entry_room(pending.context.len())?;
+            self.replica
+                .machine_mut()
+                .prepare_compaction(&pending.namespace, *before, pending.until, room)
+                .map(|(prepared, progress)| (prepared, Answer::Compacted(progress)))
+        } else {
+            let clock = Arc::clone(&self.clock);
+            self.replica.machine_mut().prepare_db(|db| {
+                // The guard ends with application evaluation, before prepare_pages rolls back its
+                // speculative transaction. Cleanup must run even after the SQL deadline elapsed.
+                let _deadline = db.deadline_on(pending.until, move || clock());
+                if restore::incomplete(db)? {
+                    return Err(api::invalid("database", "restore is incomplete").into());
+                }
+                match &operation {
+                    Operation::Call(call) => {
+                        let call = locked(call)?
+                            .take()
+                            .ok_or_else(|| unavailable("SQL session already executed"))?;
+                        call(db).map(Answer::Called)
+                    }
+                    other => apply(db, &pending.namespace, other)?.map_err(Into::into),
+                }
+            })
+        };
         // The preparation ran the caller's work, which takes time of its own: its deadline is
         // judged at the clock's reading after it, never at the step's start.
         self.at = (self.clock)();
@@ -2420,11 +2459,6 @@ impl<F: BlockFile + 'static> Actor<F> {
                 error
             }),
         };
-        if let Err(refusal) = &result
-            && let Some(reason) = super::application::floor_reason(refusal)
-        {
-            floor_refused(&self.control, reason, refusal);
-        }
         if let Some(response) = pending.response.take() {
             answer(response, result);
         }
@@ -3151,6 +3185,7 @@ mod tests {
         /// Rounds, time standing still, until every owner follows one leader with at least
         /// `applied` applied. Returns the leader's index.
         fn follow(&mut self, pump: &mut Pump<'_>, clients: &[Client], applied: u64) -> usize {
+            let mut last = Vec::new();
             for _ in 0..ROUNDS {
                 self.round(pump);
                 let states: Vec<_> = clients
@@ -3165,8 +3200,9 @@ mod tests {
                 {
                     return usize::try_from(leader - 1).unwrap();
                 }
+                last = states;
             }
-            panic!("no leader followed in {ROUNDS} driven rounds");
+            panic!("no leader followed in {ROUNDS} driven rounds: {last:?}");
         }
         /// The lead moves from owner `from` to owner `to` now (`Replica::transfer`, which no lease
         /// refuses), every clock standing still; rounds go on until every owner follows `to`.
@@ -7532,8 +7568,11 @@ mod tests {
     /// asks every member to attest again once, each attests again once, and joins are tracked. Do,
     /// in a group of three voters: two bind kiln.host-store 7 and attest; a write; the leader opens
     /// again (its configuration_at becomes its applied point); the third binds. Expect: J on every
-    /// voter; the request row written once; each attesting member's row changed once more, the
-    /// third's once; and the keeper's proposals bounded, never a loop.
+    /// voter; the request row applied once, its session proposed at most once more than the
+    /// stale-base rule refused it (members' attestation sessions at the same base committing
+    /// first; the keeper proposes it again on its next pass), those refusals no more than the
+    /// attestations applied; each attesting member's row changed once more, the third's once; and
+    /// the keeper's proposals bounded, never a loop.
     #[test]
     fn a_leader_restarted_before_joins_asks_every_member_to_attest_again_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -7569,6 +7608,10 @@ mod tests {
             })
             .collect();
         let requests = driven.owner_mut(leader).floor_requests;
+        let (applied_before, stale_before) = {
+            let owner = driven.owner(leader);
+            (owner.floor_requests_applied, owner.floor_requests_stale)
+        };
 
         driven
             .owner_mut(leader)
@@ -7606,7 +7649,32 @@ mod tests {
             1,
             "requests: {requested:?}"
         );
-        assert_eq!(driven.owner_mut(leader).floor_requests - requests, 1);
+        // The request row is written once. Its session may be proposed again: members'
+        // attestation sessions prepared at the same base commit first and the stale-base rule
+        // refuses it, and the keeper proposes it again on its next pass. Each refusal needs a
+        // session committed in between, so the retries are bounded by the attestations applied.
+        let (proposed, applied, stale) = {
+            let owner = driven.owner(leader);
+            (
+                owner.floor_requests - requests,
+                owner.floor_requests_applied - applied_before,
+                owner.floor_requests_stale - stale_before,
+            )
+        };
+        assert_eq!(applied, 1, "requests applied");
+        assert!(
+            proposed <= 1 + stale,
+            "{proposed} proposed, {stale} refused stale"
+        );
+        let attestations_applied: usize = seen
+            .iter()
+            .zip(&before)
+            .map(|(rows, (was, _))| rows.len() - was.len())
+            .sum();
+        assert!(
+            stale <= u64::try_from(attestations_applied).unwrap(),
+            "{stale} stale requests, {attestations_applied} attestations applied"
+        );
         for owner in [leader, other] {
             assert_eq!(
                 seen[owner].len(),
@@ -7627,9 +7695,14 @@ mod tests {
             })
             .collect();
         for (owner, proposed) in proposed.iter().enumerate() {
+            let keeper = driven.owner(owner);
             assert!(
                 (1..=8).contains(proposed),
-                "owner {owner} proposed {proposed} attestations"
+                "owner {owner} proposed {proposed} attestations (sessions ended {}, keeper failures {}, applied {}, seen {:?})",
+                keeper.floor_ended,
+                keeper.floor_failures,
+                keeper.replica.applied().index,
+                seen[owner]
             );
         }
         let settled_requests = driven.owner_mut(leader).floor_requests;
@@ -7686,8 +7759,18 @@ mod tests {
         client: &Client,
         version: u32,
     ) -> Result<u32, Refusal> {
-        call_as(driven, pump, client, kiln(version), move |db| {
-            crate::database::application::raise(db, kiln(version), true).map(|floor| floor.version)
+        // As writer_floor answers it: a refusal counted under its reason, then answered.
+        let outcome = call_as(driven, pump, client, kiln(version), move |db| {
+            Ok(
+                crate::database::application::raise(db, kiln(version), true)?
+                    .map(|floor| floor.version),
+            )
+        })?;
+        outcome.map_err(|refused| {
+            client
+                .handle()
+                .floor_refused(refused.reason, &refused.refusal);
+            refused.refusal
         })
     }
     /// A write into floor_items by a handle bound to kiln.host-store at `version`.
@@ -7836,7 +7919,8 @@ mod tests {
         let until = driven.until();
         let added = change(&clients[leader], until, MemberChange::AddLearner(5));
         let operation = Operation::Call(Mutex::new(Some(Box::new(move |db: &mut Db| {
-            let floor = crate::database::application::raise(db, kiln(7), true)?;
+            let floor = crate::database::application::raise(db, kiln(7), true)?
+                .map_err(|refused| anyhow::Error::from(refused.refusal))?;
             // The configuration at the raise's base, which the stale-base rule makes its own at apply.
             let learners = crate::replication::floor::configuration(db)?.learners;
             Ok(Box::new((floor.version, learners)) as Box<dyn Any + Send>)
@@ -8103,6 +8187,14 @@ mod tests {
                 "the log runs to {last} and {applied} is applied; promote once the tail is applied"
             )))
         );
+        assert_eq!(
+            clients[leader]
+                .handle()
+                .floor_counters()
+                .refused(FloorRefusal::Busy),
+            1,
+            "a tail's refusal counted as busy"
+        );
         // Nothing proposed: the change slot's mark unmoved, and 4 still a learner.
         assert_eq!(pending_change(&driven, leader), proposed);
         let configuration = applied_configuration(&driven, leader);
@@ -8171,7 +8263,8 @@ mod tests {
     /// without waiting.
     fn raise_at(client: &Client, until: Instant) -> mpsc::Receiver<Result<Answer, Refusal>> {
         let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
-            let floor = crate::database::application::raise(db, kiln(7), true)?;
+            let floor = crate::database::application::raise(db, kiln(7), true)?
+                .map_err(|refused| anyhow::Error::from(refused.refusal))?;
             Ok(Box::new(floor.version) as Box<dyn Any + Send>)
         }))));
         let (response, raised) = mpsc::sync_channel(1);
@@ -8303,7 +8396,9 @@ mod tests {
         let before = last(&driven);
         assert_eq!(raise(&mut driven, &mut pump, &clients[leader], 7), Ok(7));
         let lower = call_as(&mut driven, &mut pump, &clients[leader], kiln(7), |db| {
-            crate::database::application::raise(db, kiln(6), true).map(|floor| floor.version)
+            crate::database::application::raise(db, kiln(6), true)?
+                .map(|floor| floor.version)
+                .map_err(|refused| anyhow::Error::from(refused.refusal))
         });
         assert_eq!(lower, Ok(7));
         assert_eq!(last(&driven), before);
@@ -8378,22 +8473,120 @@ mod tests {
         }
         assert_eq!(status.members.len(), 4);
 
-        assert!(raise(&mut driven, &mut pump, &clients[leader], 8).is_err());
-        assert!(write_as(&mut driven, &mut pump, &clients[leader], 6).is_err());
+        // Each refusal site counts its own reason, once, where it refuses (amphora-seam-owner's
+        // review of efc1248): what each moved, and nothing else.
+        let moved = |before: &FloorCounters, after: &FloorCounters| -> Vec<(FloorRefusal, u64)> {
+            FloorRefusal::ALL
+                .into_iter()
+                .filter(|reason| after.refused(*reason) != before.refused(*reason))
+                .map(|reason| (reason, after.refused(reason) - before.refused(reason)))
+                .collect()
+        };
+        let follower = (leader + 1) % 3;
+        let mut sites: Vec<(&str, usize, FloorRefusal, bool)> = Vec::new();
+        let before = led.floor_counters();
+        let refused = raise(&mut driven, &mut pump, &clients[leader], 8).is_err();
+        sites.push(("the raise's proof", leader, FloorRefusal::Unproven, refused));
+        assert_eq!(
+            moved(&before, &led.floor_counters()),
+            vec![(FloorRefusal::Unproven, 1)]
+        );
+        let before = led.floor_counters();
+        let refused = write_as(&mut driven, &mut pump, &clients[leader], 6).is_err();
+        assert_eq!(
+            moved(&before, &led.floor_counters()),
+            vec![(FloorRefusal::BelowFloor, 1)]
+        );
+        sites.push((
+            "a write below the floor",
+            leader,
+            FloorRefusal::BelowFloor,
+            refused,
+        ));
+        let before = led.floor_counters();
         let unclaimed = submit(&clients[leader], driven.until(), |db| {
             db.exec("CREATE TABLE IF NOT EXISTS floor_items(version)")?;
             Ok(Vec::new())
         });
-        assert!(driven.answer(&mut pump, &unclaimed).is_err());
-        assert!(promote(&mut driven, &mut pump, &clients[leader]).is_err());
-        let counters = led.floor_counters();
-        assert_eq!(counters.refused(FloorRefusal::Unproven), 2, "{counters:?}");
+        let refused = driven.answer(&mut pump, &unclaimed).is_err();
         assert_eq!(
-            counters.refused(FloorRefusal::BelowFloor),
-            1,
-            "{counters:?}"
+            moved(&before, &led.floor_counters()),
+            vec![(FloorRefusal::NoClaim, 1)]
         );
-        assert_eq!(counters.refused(FloorRefusal::NoClaim), 1, "{counters:?}");
+        sites.push(("an unclaimed write", leader, FloorRefusal::NoClaim, refused));
+        let before = led.floor_counters();
+        let other = crate::database::Application {
+            name: "another.app".into(),
+            version: 9,
+        };
+        let refused = call_as(&mut driven, &mut pump, &clients[leader], other, |db| {
+            db.exec("CREATE TABLE IF NOT EXISTS floor_items(version)")?;
+            Ok(())
+        })
+        .is_err();
+        assert_eq!(
+            moved(&before, &led.floor_counters()),
+            vec![(FloorRefusal::OtherApplication, 1)]
+        );
+        sites.push((
+            "another application's write",
+            leader,
+            FloorRefusal::OtherApplication,
+            refused,
+        ));
+        let before = led.floor_counters();
+        let compaction = enqueue(
+            &clients[leader],
+            driven.until(),
+            "gc",
+            Operation::Mutation(Mutation::CompactStep {
+                namespace: "gc".into(),
+                before: 2,
+            }),
+        );
+        let refused = driven.answer(&mut pump, &compaction).is_err();
+        assert_eq!(
+            moved(&before, &led.floor_counters()),
+            vec![(FloorRefusal::NoClaim, 1)]
+        );
+        sites.push((
+            "an unclaimed compaction",
+            leader,
+            FloorRefusal::NoClaim,
+            refused,
+        ));
+        let before = led.floor_counters();
+        let refused = promote(&mut driven, &mut pump, &clients[leader]).is_err();
+        assert_eq!(
+            moved(&before, &led.floor_counters()),
+            vec![(FloorRefusal::Unproven, 1)]
+        );
+        sites.push((
+            "the promotion guard",
+            leader,
+            FloorRefusal::Unproven,
+            refused,
+        ));
+        let bound = clients[follower].handle();
+        let before = bound.floor_counters();
+        let refused = bound.attest(kiln(6)).is_err();
+        assert_eq!(
+            moved(&before, &bound.floor_counters()),
+            vec![(FloorRefusal::BelowFloor, 1)]
+        );
+        sites.push((
+            "a bind below the floor",
+            follower,
+            FloorRefusal::BelowFloor,
+            refused,
+        ));
+        for (site, owner, reason, refused) in &sites {
+            assert!(
+                refused,
+                "{site} at owner {owner} was not refused ({reason:?})"
+            );
+        }
+        let counters = led.floor_counters();
         assert_eq!(counters.keeper_failing, 0);
         driven.drain(&mut pump);
         pump.finish();
@@ -8521,6 +8714,11 @@ mod tests {
         assert!(
             matches!(&refused, Err(Refusal::Unavailable(why)) if why.contains("leaving a joint configuration")),
             "{refused:?}"
+        );
+        assert_eq!(
+            led.handle().floor_counters().refused(FloorRefusal::Busy),
+            1,
+            "a joint base's refusal counted as busy"
         );
         assert!(
             !applied_configuration(&driven, leader)

@@ -34,12 +34,14 @@ fn count(database: &Database) -> i64 {
         .unwrap()
 }
 
-/// U05 on the standalone owner. Do: write unclaimed; raise the floor to 7 through a handle
+/// U05 on the standalone owner. Do: read the floor's status; write unclaimed; raise the floor to 7
+/// through a handle
 /// bound to version 7; write through it, through a handle of version 6, through an unclaimed
 /// handle and through another application's; raise to 5. Expect: the unclaimed write before
 /// the floor applies; after it, only the version-7 write applies and each other is refused
 /// Fenced inside its transaction; the raise to 5 answers the floor still at 7, and version 6
-/// is still refused.
+/// is still refused; floor_status reads no floor before and 7 for kiln.host-store after, through a
+/// handle below it too, naming no members.
 #[test]
 fn a_write_below_the_standalone_floor_is_refused_and_the_floor_never_falls() {
     let dir = tempfile::tempdir().unwrap();
@@ -52,8 +54,25 @@ fn a_write_below_the_standalone_floor_is_refused_and_the_floor_never_falls() {
         .unwrap();
     insert(&database, 1).unwrap();
 
+    let none = database.floor_status(until()).unwrap();
+    assert_eq!((none.application, none.version), (None, 0));
+
     let current = database.for_application("kiln.host-store", 7).unwrap();
     let boundary = current.writer_floor("kiln.host-store", 7, until()).unwrap();
+    // The floor, read the same way a replica's is, by any handle, a stale one included.
+    let status = database
+        .for_application("kiln.host-store", 6)
+        .unwrap()
+        .floor_status(until())
+        .unwrap();
+    assert_eq!(
+        (
+            status.application.as_deref(),
+            status.version,
+            status.members.len()
+        ),
+        (Some("kiln.host-store"), 7, 0)
+    );
     assert_eq!(boundary.version(), 7);
     boundary.require(&current).unwrap();
     insert(&current, 2).unwrap();
