@@ -2714,6 +2714,8 @@ mod tests {
         bytes: usize,
         proposal: bool,
         from: u64,
+        // The record, as its type and its wire sender and recipient, for a failure to name.
+        record: String,
     }
     enum PumpPhase {
         Relay,
@@ -2806,7 +2808,10 @@ mod tests {
                     continue;
                 }
                 // Admission was not an ACK: expiry, validation and fencing must fail the test.
-                assert_eq!(result.unwrap(), Some(()));
+                match result {
+                    Ok(answered) => assert_eq!(answered, Some(())),
+                    Err(refusal) => panic!("{} refused: {refusal:?}", pending.record),
+                }
             }
         }
         fn admit(&mut self, packet: PumpPacket) {
@@ -2815,8 +2820,17 @@ mod tests {
                 .get(usize::try_from(packet.message.to - 1).unwrap())
                 .unwrap();
             let bytes = packet.message.bytes.len();
-            let proposal = Message::decode(&packet.message.bytes).unwrap().msg_type
-                == hyper_raft::proto::MessageType::MsgPropose;
+            let decoded = Message::decode(&packet.message.bytes).unwrap();
+            let proposal = decoded.msg_type == hyper_raft::proto::MessageType::MsgPropose;
+            let record = format!(
+                "{:?} from {} (wire {}) to {} (wire {}), term {}",
+                decoded.msg_type,
+                packet.from,
+                decoded.from,
+                packet.message.to,
+                decoded.to,
+                decoded.term
+            );
             *self.delivered.entry(packet.message.to).or_default() += 1;
             let receipt = peer
                 .handle()
@@ -2832,6 +2846,7 @@ mod tests {
                 bytes,
                 proposal,
                 from: packet.from,
+                record,
             });
         }
         /// One relay round, each record admitted with `until` as its receive deadline.
@@ -3091,6 +3106,41 @@ mod tests {
             .unwrap();
             self.owners.push(Some((actor, receiver)));
             self.clocks.push(reading);
+            client
+        }
+        /// Member `owner`'s crash: its owner dropped mid-run, and opened again on its own files,
+        /// its clock running on, as a restarted process is. `voters` and `learners` are only what
+        /// a fresh member would start with; a member with state keeps its own. Returns the
+        /// reopened member's client.
+        fn restart(
+            &mut self,
+            dir: &Path,
+            owner: usize,
+            voters: Vec<u64>,
+            learners: Vec<u64>,
+        ) -> Client {
+            drop(self.owners.get_mut(owner).unwrap().take());
+            let node_id = u64::try_from(owner + 1).unwrap();
+            let path = dir.join(format!("state-{node_id}.db"));
+            let lease = Owned::new(lease(&path), None);
+            let (base, read) = (self.base, Arc::clone(self.clocks.get(owner).unwrap()));
+            let (client, actor, receiver) = super::open(
+                &path,
+                &dir.join(format!("raft-{node_id}.log")),
+                ReplicaConfig {
+                    node_id,
+                    voters,
+                    learners,
+                    bootstrap: None,
+                },
+                Durability::Persisted,
+                Arc::new(Changed::default()),
+                lease,
+                self.until(),
+                Arc::new(move || base + offset(&read)),
+            )
+            .unwrap();
+            *self.owners.get_mut(owner).unwrap() = Some((actor, receiver));
             client
         }
     }
@@ -8598,6 +8648,628 @@ mod tests {
         assert_eq!(counters.keeper_failing, 0);
         driven.drain(&mut pump);
         pump.finish();
+    }
+
+    /// How often T-T1.8.A6 reached each falsifier's situation, over all its runs (non-vacuity):
+    /// each must be above 0, else that falsifier was asserted over nothing.
+    #[derive(Debug, Default)]
+    struct Reached {
+        below_floor_write_refused: u64,
+        write_at_floor_applied: u64,
+        raise_applied: u64,
+        raise_refused_unproven: u64,
+        floor_checked_on_every_member: u64,
+        promotion_applied: u64,
+        promotion_refused: u64,
+        bind_below_floor_refused: u64,
+        hostile_forward_refused: u64,
+        earlier_join_held_a_raise: u64,
+        join_rows_compared: u64,
+        tail_refused_at_once: u64,
+        raise_before_joins_refused: u64,
+        digests_compared: u64,
+        stale_attestation_held_joins: u64,
+        leader_crashed: u64,
+        lead_handed_off: u64,
+        records_lost: u64,
+    }
+    impl Reached {
+        fn unreached(&self) -> Vec<&'static str> {
+            [
+                ("below_floor_write_refused", self.below_floor_write_refused),
+                ("write_at_floor_applied", self.write_at_floor_applied),
+                ("raise_applied", self.raise_applied),
+                ("raise_refused_unproven", self.raise_refused_unproven),
+                (
+                    "floor_checked_on_every_member",
+                    self.floor_checked_on_every_member,
+                ),
+                ("promotion_applied", self.promotion_applied),
+                ("promotion_refused", self.promotion_refused),
+                ("bind_below_floor_refused", self.bind_below_floor_refused),
+                ("hostile_forward_refused", self.hostile_forward_refused),
+                ("earlier_join_held_a_raise", self.earlier_join_held_a_raise),
+                ("join_rows_compared", self.join_rows_compared),
+                ("tail_refused_at_once", self.tail_refused_at_once),
+                (
+                    "raise_before_joins_refused",
+                    self.raise_before_joins_refused,
+                ),
+                ("digests_compared", self.digests_compared),
+                (
+                    "stale_attestation_held_joins",
+                    self.stale_attestation_held_joins,
+                ),
+                ("leader_crashed", self.leader_crashed),
+                ("lead_handed_off", self.lead_handed_off),
+                ("records_lost", self.records_lost),
+            ]
+            .into_iter()
+            .filter(|(_, count)| *count == 0)
+            .map(|(name, _)| name)
+            .collect()
+        }
+    }
+
+    /// Rounds until every voter of the group's applied configuration is out of any joint
+    /// configuration with no change of members still to apply.
+    fn calm(driven: &mut Driven, pump: &mut Pump<'_>, owners: usize) {
+        reach(driven, pump, "the group calm", |driven| {
+            (0..owners).all(|owner| {
+                let applied = applied_configuration(driven, owner);
+                applied.voters_outgoing.is_empty()
+                    && applied.learners_next.is_empty()
+                    && !driven.owner(owner).replica.core().raft.has_pending_conf()
+            })
+        });
+    }
+    /// The member the group follows, as owner `asked` sees it, by its index; None while it knows
+    /// none.
+    fn leading(clients: &[Client], asked: usize) -> Option<usize> {
+        let leader = clients[asked].handle().status().ok()?.leader;
+        if leader == 0 {
+            None
+        } else {
+            Some(usize::try_from(leader - 1).unwrap())
+        }
+    }
+    /// Time passes, every clock alike, until the first three members name one leader and it
+    /// leads; its index. What follows an election or an outage, as real time would bring it.
+    fn settle_lead(driven: &mut Driven, pump: &mut Pump<'_>, clients: &[Client]) -> usize {
+        for _ in 0..ROUNDS {
+            let named: Vec<Option<usize>> = (0..3).map(|owner| leading(clients, owner)).collect();
+            if let Some(Some(leader)) = named.first()
+                && named.iter().all(|seen| *seen == Some(*leader))
+                && leading(clients, *leader) == Some(*leader)
+            {
+                return *leader;
+            }
+            for owner in 0..4 {
+                driven.advance(owner, TICK);
+            }
+            driven.round(pump);
+        }
+        panic!("no lead settled in {ROUNDS} driven rounds");
+    }
+    /// A write into a6_items at `client` by a handle bound to kiln.host-store at `version`,
+    /// recording the floor at the session's base beside it.
+    fn write_recording_floor(
+        driven: &mut Driven,
+        pump: &mut Pump<'_>,
+        client: &Client,
+        version: u32,
+    ) -> Result<(), Refusal> {
+        call_as(driven, pump, client, kiln(version), move |db| {
+            let floor = crate::database::installed_floor(db)?.map_or(0, |floor| floor.version);
+            db.exec("CREATE TABLE IF NOT EXISTS a6_items(version, floor)")?;
+            db.exec(&format!("INSERT INTO a6_items VALUES({version}, {floor})"))?;
+            Ok(())
+        })
+    }
+    /// Every (version, floor at its base) row owner `owner` holds in a6_items.
+    fn recorded_writes(driven: &mut Driven, owner: usize) -> Vec<(u32, u32)> {
+        driven
+            .owner_mut(owner)
+            .replica
+            .machine_mut()
+            .read_db(|db| {
+                let mut present = false;
+                db.query(
+                    "SELECT 1 FROM sqlite_schema WHERE name = 'a6_items'",
+                    [],
+                    |_| {
+                        present = true;
+                        Ok(false)
+                    },
+                )?;
+                let mut rows = Vec::new();
+                if present {
+                    db.query("SELECT version, floor FROM a6_items", [], |row| {
+                        rows.push((
+                            u32::try_from(row.get::<i64>(0).map_err(unavailable)?)?,
+                            u32::try_from(row.get::<i64>(1).map_err(unavailable)?)?,
+                        ));
+                        Ok(true)
+                    })?;
+                }
+                Ok(rows)
+            })
+            .unwrap()
+    }
+    /// Forwards to `leader` a proposal `from` prepared, its context naming `named`; answers the
+    /// leader's admission.
+    fn forward_naming(
+        driven: &mut Driven,
+        clients: &[Client],
+        leader: usize,
+        from: usize,
+        named: usize,
+    ) -> Result<(), Refusal> {
+        let id = |owner: usize| u64::try_from(owner + 1).unwrap();
+        // The leader refuses it on its context, before its data: an opaque payload, which no
+        // member could apply, would fail the run loudly if one were taken.
+        let mut context = id(named).to_le_bytes().to_vec();
+        context.extend_from_slice(&[7; 24]);
+        let mut record =
+            hyper_raft::proto::message(id(leader), hyper_raft::proto::MessageType::MsgPropose);
+        record.from = id(from);
+        record.entries = vec![hyper_raft::proto::Entry {
+            data: b"hostile".to_vec(),
+            context,
+            ..hyper_raft::proto::Entry::default()
+        }];
+        let mut bytes = Vec::new();
+        record.encode(&mut bytes);
+        let mut receipt = clients[leader]
+            .handle()
+            .admit_receive(id(from), bytes, driven.until())
+            .unwrap();
+        for _ in 0..ROUNDS {
+            driven.step();
+            match receipt.try_result() {
+                Ok(None) => {}
+                Ok(Some(())) => return Ok(()),
+                Err(refusal) => return Err(refusal),
+            }
+        }
+        panic!("the forward was never answered");
+    }
+
+    /// AC-T1.8.A1, T-T1.8.A6 (CP-T1.8) under a nemesis (replication.md, "The application floor,
+    /// replicated", its falsifiers): every falsifier of the floor, as an assertion over every run,
+    /// over many seeds. Do, per seed, in a group of three voters and member 4: before joins are
+    /// tracked, a raise, and member 4 attesting, removed and added again while unbound, the voters
+    /// binding; then 4 binding, which lets J through. Then seeded steps: writes as 6 to 9 at a
+    /// voter, recording the floor at their base; raises; binds at 6 to 9; 4 added, promoted,
+    /// demoted, removed and added again; forwards naming another member; under elections (the
+    /// lead handed to another voter), records to a follower lost, and once the leader's crash and
+    /// restart. Last, a promotion beside a write in flight. Expect, against each falsifier: no
+    /// write below the floor at its base applied anywhere; no raise applied while a member of the
+    /// configuration lacks an attestation at its version; no member's floor falling, and members'
+    /// image digests equal at every applied index they share (so their floors and join rows too);
+    /// no promotion without an attestation at the floor; no bind below the floor; no forward naming
+    /// another member taken; a member added again holding raises back until it attests under its new
+    /// join; members' join rows equal once calm; the tail refused at once naming both indexes; before
+    /// J, no join rows, a raise refused, and a member's attestation from before its re-add not
+    /// letting J through. And every situation reached at least once over the runs.
+    #[test]
+    fn every_falsifier_of_the_floor_holds_under_a_nemesis() {
+        const SEEDS: u64 = 12;
+        const STEPS: u64 = 28;
+        let mut reached = Reached::default();
+        for seed in 1..=SEEDS {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let dir = tempfile::tempdir().unwrap();
+            let mut driven = Driven::new();
+            let mut clients = three_and_a_learner(&mut driven, dir.path());
+            for owner in 0..4 {
+                driven
+                    .owner_mut(owner)
+                    .replica
+                    .machine_mut()
+                    .record_digests();
+            }
+            let mut pump = Pump::new(&clients);
+            // Elections drop proposals in flight to a leader handing its lead over; counted, not
+            // failed (as in T-T1.8.A2).
+            pump.refusals = Some(0);
+            let mut leader = driven.elect(&mut pump, &clients[..3], 0, 1);
+            let id = |owner: usize| u64::try_from(owner + 1).unwrap();
+
+            // Before J. A raise is refused, and no member holds join rows.
+            let early = raise(&mut driven, &mut pump, &clients[leader], 7);
+            assert!(
+                matches!(&early, Err(Refusal::Unavailable(why)) if why.starts_with("joins aren't tracked")),
+                "seed {seed}: {early:?}"
+            );
+            reached.raise_before_joins_refused += 1;
+            // 4 joins and attests, then is removed and added again while no longer bound: its
+            // attestation predates the last change, and must not let J through.
+            let until = driven.until();
+            driven
+                .answer(
+                    &mut pump,
+                    &change(&clients[leader], until, MemberChange::AddLearner(4)),
+                )
+                .unwrap();
+            calm(&mut driven, &mut pump, 3);
+            let joined_first = driven.owner(leader).replica.applied().index;
+            clients[3].handle().attest(kiln(7)).unwrap();
+            for _ in 0..ROUNDS {
+                if attested(&mut driven, leader, 4).is_some() {
+                    break;
+                }
+                driven.round(&mut pump);
+            }
+            pump.departed.push(4);
+            let until = driven.until();
+            driven
+                .answer(
+                    &mut pump,
+                    &change(&clients[leader], until, MemberChange::Remove(4)),
+                )
+                .unwrap();
+            calm(&mut driven, &mut pump, 3);
+            driven.owner_mut(3).attesting = None;
+            clients[3].handle.shared.attesting.lock().unwrap().take();
+            pump.departed.clear();
+            let until = driven.until();
+            driven
+                .answer(
+                    &mut pump,
+                    &change(&clients[leader], until, MemberChange::AddLearner(4)),
+                )
+                .unwrap();
+            calm(&mut driven, &mut pump, 3);
+            let mut voters_bound = [0usize, 1, 2];
+            for i in 0..3 {
+                let j = usize::try_from(rng.below(3)).unwrap();
+                voters_bound.swap(i, j);
+            }
+            for owner in voters_bound {
+                clients[owner].handle().attest(kiln(7)).unwrap();
+                for _ in 0..=rng.below(40) {
+                    driven.round(&mut pump);
+                }
+            }
+            for _ in 0..200 {
+                driven.round(&mut pump);
+            }
+            for owner in 0..4 {
+                assert_eq!(
+                    tracked(&mut driven, owner),
+                    None,
+                    "seed {seed}: J with 4 stale"
+                );
+                assert!(
+                    !floor_rows(&mut driven, owner)
+                        .iter()
+                        .any(|row| row.starts_with("M ")),
+                    "seed {seed}: a join row before J on owner {owner}"
+                );
+            }
+            reached.stale_attestation_held_joins += 1;
+            clients[3].handle().attest(kiln(7)).unwrap();
+            joins_tracked(&mut driven, &mut pump, &[0, 1, 2, 3]);
+            reached.digests_compared += u64::try_from(digests_agree(
+                &driven,
+                &[(0, 0), (1, 0), (2, 0), (3, joined_first)],
+            ))
+            .unwrap();
+
+            // After J: the nemesis.
+            let mut floors = [0u32; 4];
+            let mut crashed = false;
+            let mut four = Some(false); // None: not a member; Some(false): learner; Some(true): voter
+            let mut four_attested = true;
+            for step in 0..STEPS {
+                leader = settle_lead(&mut driven, &mut pump, &clients);
+                let voter = usize::try_from(rng.below(3)).unwrap();
+                let floor_at =
+                    |driven: &mut Driven, owner: usize| floor_version(driven, owner).unwrap_or(0);
+                let action = rng.below(8);
+                match action {
+                    0 | 1 => {
+                        let version = u32::try_from(6 + rng.below(4)).unwrap();
+                        let before = floor_at(&mut driven, voter);
+                        match write_recording_floor(
+                            &mut driven,
+                            &mut pump,
+                            &clients[voter],
+                            version,
+                        ) {
+                            Ok(()) => {
+                                assert!(
+                                    version >= before,
+                                    "seed {seed} step {step}: {version} below {before} applied"
+                                );
+                                reached.write_at_floor_applied += 1;
+                            }
+                            Err(Refusal::Fenced(why))
+                                if why.contains("older than the installed floor") =>
+                            {
+                                reached.below_floor_write_refused += 1;
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    2 => {
+                        let version = u32::try_from(7 + rng.below(3)).unwrap();
+                        let before = floor_at(&mut driven, voter);
+                        match raise(&mut driven, &mut pump, &clients[voter], version) {
+                            // At or below the floor in force it answers that floor, writing
+                            // nothing: no floor entry applies, so there is nothing to prove.
+                            Ok(raised) if raised <= before => {}
+                            Ok(raised) => {
+                                quiet(&mut driven, &mut pump);
+                                let status = clients[voter].handle().floor_status().unwrap();
+                                for member in &status.members {
+                                    assert!(
+                                        member.attested.is_some_and(|highest| highest >= raised),
+                                        "seed {seed} step {step}: raised to {raised} past {member:?}"
+                                    );
+                                }
+                                reached.raise_applied += 1;
+                            }
+                            Err(Refusal::Unavailable(why)) if why.starts_with("members [") => {
+                                reached.raise_refused_unproven += 1;
+                                if four.is_some() && !four_attested && why.contains('4') {
+                                    reached.earlier_join_held_a_raise += 1;
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    3 => {
+                        let owner = usize::try_from(rng.below(4)).unwrap();
+                        let version = u32::try_from(6 + rng.below(4)).unwrap();
+                        let published = clients[owner].handle().floor_counters().version;
+                        let bound = clients[owner].handle().attest(kiln(version));
+                        if u64::from(version) < published {
+                            assert!(
+                                matches!(&bound, Err(Refusal::Invalid { what, .. }) if what == "application floor"),
+                                "seed {seed} step {step}: bound {version} below {published}: {bound:?}"
+                            );
+                            reached.bind_below_floor_refused += 1;
+                        } else if owner == 3 && bound.is_ok() {
+                            four_attested = true;
+                        }
+                    }
+                    4 => {
+                        if leader == 3 {
+                            continue;
+                        }
+                        let until = driven.until();
+                        let asked = match four {
+                            None => MemberChange::AddLearner(4),
+                            Some(false) if rng.below(2) == 0 => MemberChange::Promote(4),
+                            Some(false) => MemberChange::Remove(4),
+                            Some(true) => MemberChange::Demote(4),
+                        };
+                        if matches!(asked, MemberChange::Remove(4)) {
+                            pump.departed.push(4);
+                        }
+                        let answered =
+                            driven.answer(&mut pump, &change(&clients[leader], until, asked));
+                        calm(&mut driven, &mut pump, 3);
+                        let configuration = applied_configuration(&driven, leader);
+                        four = if configuration.voters.contains(&4) {
+                            Some(true)
+                        } else if configuration.learners.contains(&4) {
+                            Some(false)
+                        } else {
+                            None
+                        };
+                        match (asked, &answered) {
+                            (MemberChange::Promote(_), Ok(_)) if four == Some(true) => {
+                                let status = clients[leader].handle().floor_status().unwrap();
+                                let fourth = status.members.iter().find(|m| m.member == 4).unwrap();
+                                assert!(
+                                    status.version == 0
+                                        || fourth
+                                            .attested
+                                            .is_some_and(|highest| highest >= status.version),
+                                    "seed {seed} step {step}: promoted {fourth:?} under {}",
+                                    status.version
+                                );
+                                reached.promotion_applied += 1;
+                            }
+                            (MemberChange::Promote(_), Err(_)) => reached.promotion_refused += 1,
+                            (MemberChange::Remove(_), _) if four.is_none() => {
+                                driven.owner_mut(3).attesting = None;
+                                clients[3].handle.shared.attesting.lock().unwrap().take();
+                                four_attested = false;
+                            }
+                            _ => {}
+                        }
+                        // What 4 sends counts only while it is a member.
+                        pump.departed.clear();
+                        if four.is_none() {
+                            pump.departed.push(4);
+                        }
+                    }
+                    5 => {
+                        let follower = (leader + 1 + usize::try_from(rng.below(2)).unwrap()) % 3;
+                        let other = (0..3).find(|o| *o != leader && *o != follower).unwrap();
+                        if leader < 3 {
+                            let forwarded =
+                                forward_naming(&mut driven, &clients, leader, follower, other);
+                            assert!(
+                                forwarded.is_err(),
+                                "seed {seed} step {step}: a forward naming {other} taken"
+                            );
+                            reached.hostile_forward_refused += 1;
+                        }
+                    }
+                    6 => {
+                        let to = (leader + 1 + usize::try_from(rng.below(2)).unwrap()) % 3;
+                        if leader < 3 && to != leader {
+                            leader = driven.hand_off(&mut pump, &clients[..3], leader, to);
+                            reached.lead_handed_off += 1;
+                        }
+                    }
+                    _ => {
+                        if !crashed && leader < 3 && rng.below(2) == 0 {
+                            driven.drain(&mut pump);
+                            pump.finish();
+                            let configuration = applied_configuration(&driven, leader);
+                            let restarted = driven.restart(
+                                dir.path(),
+                                leader,
+                                configuration.voters.clone(),
+                                configuration.learners.clone(),
+                            );
+                            *clients.get_mut(leader).unwrap() = restarted;
+                            driven
+                                .owner_mut(leader)
+                                .replica
+                                .machine_mut()
+                                .record_digests();
+                            pump = Pump::new(&clients);
+                            pump.refusals = Some(0);
+                            if four.is_none() {
+                                pump.departed.push(4);
+                            }
+                            // Time passes, as it does after a crash: the others' leases on the old
+                            // lead run out, and the group elects among its voters, four or three.
+                            leader = settle_lead(&mut driven, &mut pump, &clients);
+                            crashed = true;
+                            reached.leader_crashed += 1;
+                        } else {
+                            let follower = (leader + 1) % 3;
+                            pump.lost.push(id(follower));
+                            for _ in 0..=rng.below(20) {
+                                driven.round(&mut pump);
+                            }
+                            pump.lost.clear();
+                            // Time passes, as it does after an outage: a session whose records
+                            // were lost ends at its deadline, and its owner tries again.
+                            for _ in 0..ROUNDS {
+                                if (0..4).all(|owner| driven.owner(owner).pending.is_none()) {
+                                    break;
+                                }
+                                for owner in 0..4 {
+                                    driven.advance(owner, TICK);
+                                }
+                                driven.round(&mut pump);
+                            }
+                            reached.records_lost += 1;
+                        }
+                    }
+                }
+                for (owner, seen) in floors.iter_mut().enumerate().take(3) {
+                    let floor = floor_version(&mut driven, owner).unwrap_or(0);
+                    assert!(
+                        floor >= *seen,
+                        "seed {seed} step {step}: owner {owner}'s floor fell from {seen} to {floor}"
+                    );
+                    *seen = floor;
+                }
+                reached.floor_checked_on_every_member += 1;
+            }
+
+            // Calm: join rows equal, every write recorded at or above the floor at its base, and
+            // members' digests equal at every applied index they share.
+            quiet(&mut driven, &mut pump);
+            calm(&mut driven, &mut pump, 3);
+            let rows = floor_rows(&mut driven, 0);
+            for owner in 1..3 {
+                assert_eq!(
+                    floor_rows(&mut driven, owner),
+                    rows,
+                    "seed {seed}: owner {owner}'s rows"
+                );
+            }
+            reached.join_rows_compared += 1;
+            for owner in 0..3 {
+                for (version, floor) in recorded_writes(&mut driven, owner) {
+                    assert!(
+                        version >= floor,
+                        "seed {seed}: owner {owner} applied {version} under {floor}"
+                    );
+                }
+            }
+            reached.digests_compared +=
+                u64::try_from(digests_agree(&driven, &[(0, 0), (1, 0), (2, 0)])).unwrap();
+
+            // Last, a promotion beside a write in flight is refused at once, naming both indexes.
+            if four.is_none() && leader < 3 {
+                let until = driven.until();
+                let _ = driven.answer(
+                    &mut pump,
+                    &change(&clients[leader], until, MemberChange::AddLearner(4)),
+                );
+                calm(&mut driven, &mut pump, 3);
+                four = Some(false);
+            }
+            let mut in_flight = false;
+            if four == Some(false) && leader < 3 && floor_version(&mut driven, leader).is_some() {
+                quiet(&mut driven, &mut pump);
+                pump.appends_lost = true;
+                // Claimed at 9, the highest floor a run raises, so only the tail holds it back.
+                let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
+                    db.exec("CREATE TABLE IF NOT EXISTS in_flight(x)")?;
+                    Ok(Box::new(()) as Box<dyn Any + Send>)
+                }))));
+                let (response, written) = mpsc::sync_channel(1);
+                clients[leader]
+                    .handle
+                    .enqueue(
+                        Input::Submit {
+                            namespace: String::new(),
+                            operation,
+                            application: Some(kiln(9)),
+                            until: driven.until(),
+                            response,
+                        },
+                        api::REQUEST_MAX,
+                    )
+                    .unwrap();
+                let tail = |driven: &Driven| {
+                    let replica = &driven.owner(leader).replica;
+                    (
+                        replica.applied().index,
+                        replica.core().raft.log().last_index().unwrap(),
+                    )
+                };
+                reach(&mut driven, &mut pump, "the write appended", |driven| {
+                    let (applied, last) = tail(driven);
+                    last > applied
+                });
+                let (applied, last) = tail(&driven);
+                // At once, Unavailable, naming both indexes as the guard read them: the log past
+                // what is applied, and no shorter than when the write was seen appended.
+                let refused = promote(&mut driven, &mut pump, &clients[leader]);
+                let named = match &refused {
+                    Err(Refusal::Unavailable(why)) => why
+                        .strip_prefix("the log runs to ")
+                        .and_then(|rest| {
+                            rest.strip_suffix(" is applied; promote once the tail is applied")
+                        })
+                        .and_then(|rest| rest.split_once(" and "))
+                        .and_then(|(l, a)| Some((l.parse::<u64>().ok()?, a.parse::<u64>().ok()?))),
+                    _ => None,
+                };
+                assert!(
+                    named.is_some_and(|(l, a)| l > a && l >= last && a >= applied),
+                    "seed {seed}: {refused:?} (seen appended at {last}, applied {applied})"
+                );
+                reached.tail_refused_at_once += 1;
+                // The write stays in flight: its appends went nowhere, and nothing ticks to send
+                // them again. The run ends here, as the step-5 test does.
+                drop(written);
+                in_flight = true;
+            }
+            if !in_flight {
+                driven.drain(&mut pump);
+            }
+            pump.finish();
+        }
+        let unreached = reached.unreached();
+        assert!(
+            unreached.is_empty(),
+            "situations never reached: {unreached:?} in {reached:?}"
+        );
     }
 
     /// AC-T1.8.A1, T-T1.8.A2 (CP-T1.8) on driven time (replication.md, "Raising the floor", b;
