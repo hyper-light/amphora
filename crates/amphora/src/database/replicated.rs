@@ -268,8 +268,9 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     // Whether the floor session in hand is a request to attest again, and how this owner's
     // requests ended: applied, or refused by the stale-base rule and proposed again on a later pass.
     floor_requesting: bool,
-    // A floor session past its barrier, waiting for this member to apply its own whole log.
-    floor_tail: bool,
+    // A floor session past its barrier, waiting for this member to apply its own log up to the
+    // last index it held as the barrier passed.
+    floor_tail: Option<u64>,
     floor_requests_applied: u64,
     floor_requests_stale: u64,
     // The floor version this owner last published, none before its first: a raise is it rising.
@@ -847,7 +848,7 @@ fn open_on<F: BlockFile + 'static>(
         floor_ended: 0,
         floor_failures: 0,
         floor_requesting: false,
-        floor_tail: false,
+        floor_tail: None,
         floor_requests_applied: 0,
         floor_requests_stale: 0,
         floor_published: None,
@@ -1236,7 +1237,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         self.settle_change();
         self.settle_transfer();
         self.bootstrap()?;
-        if self.floor_tail {
+        if self.floor_tail.is_some() {
             self.prepare()?;
         }
         self.keep_floor()?;
@@ -2252,8 +2253,10 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// One of the floor's own sessions, through the same barrier and proposal as a call; it has no
     /// caller, and one that ends without applying is made again on the keeper's next pass.
     fn submit_floor(&mut self, session: FloorSession) -> Result<(), Refusal> {
-        // Each floor session is the next one in hand; a request marks itself after this.
+        // Each floor session is the next one in hand; a request marks itself after this, and its
+        // wait for the log takes its own target.
         self.floor_requesting = false;
+        self.floor_tail = None;
         let context = self.context()?;
         self.replica.read(context.clone()).map_err(raft_error)?;
         let until = self
@@ -2326,24 +2329,30 @@ impl<F: BlockFile + 'static> Actor<F> {
         // would make its base stale, and followers out of phase would keep missing each other
         // (amphora-seam-owner's ruling on the keeper's livelock, b'). Local, bounded by the
         // session's own deadline; the run loop asks again each step.
-        self.floor_tail = false;
+        // The target is this member's last log index as its barrier passed, fixed then: entries
+        // appended after it never move it, so the session neither waits out its deadline nor
+        // holds the write slot through others' writes (amphora-seam-owner's review of 392902d).
         if matches!(pending.author, Author::Owner)
             && matches!(pending.phase, Phase::Barrier(Some(_)))
             && !self.replica.machine().bootstrap_pending()
         {
-            let last = self
-                .replica
-                .core()
-                .raft
-                .log()
-                .last_index()
-                .map_err(unavailable)?;
-            if self.replica.applied().index < last {
-                self.floor_tail = true;
+            let target = match self.floor_tail {
+                Some(target) => target,
+                None => self
+                    .replica
+                    .core()
+                    .raft
+                    .log()
+                    .last_index()
+                    .map_err(unavailable)?,
+            };
+            if self.replica.applied().index < target {
+                self.floor_tail = Some(target);
                 self.pending = Some(pending);
                 return Ok(());
             }
         }
+        self.floor_tail = None;
         let Phase::Barrier(operation) = pending.phase else {
             self.pending = Some(pending);
             return Ok(());
@@ -8754,6 +8763,109 @@ mod tests {
             1,
             "the follower's attestation was proposed again: its base missed the write ahead of it"
         );
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.A1 (CP-T1.8) on driven time (amphora-seam-owner's review of 392902d): a floor
+    /// session's wait for its member's log has a target fixed when its barrier passes, so an entry
+    /// appended after that never moves it, and the session never waits out its deadline holding
+    /// the member's write slot through others' writes. Do, in a group of three voters bound to
+    /// kiln.host-store 7 with joins tracked: followers' durable answers kept back, a write at the
+    /// leader appended on every member and committed nowhere; a follower binds kiln.host-store 8,
+    /// its session waiting for its log with that write ahead, its target the write's index; then
+    /// its target set to what it has applied, as a barrier that passed with nothing ahead and an
+    /// entry appended since would leave it; one step. Expect: the target the write's index while
+    /// it waits; after the step, the session prepared and proposed though its log still runs past
+    /// what it has applied, and its wait cleared.
+    #[test]
+    fn a_floor_session_waits_for_its_log_as_it_was_not_for_writes_behind_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        let leader = tracked_group(&mut driven, &mut pump, &clients);
+        quiet(&mut driven, &mut pump);
+        let follower = (leader + 1) % 3;
+        let member = u64::try_from(follower + 1).unwrap();
+        let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
+            db.exec("CREATE TABLE IF NOT EXISTS ahead(x)")?;
+            Ok(Box::new(()) as Box<dyn Any + Send>)
+        }))));
+        let (response, written) = mpsc::sync_channel(1);
+        clients[leader]
+            .handle
+            .enqueue(
+                Input::Submit {
+                    namespace: String::new(),
+                    operation,
+                    application: Some(kiln(7)),
+                    until: driven.until(),
+                    response,
+                },
+                api::REQUEST_MAX,
+            )
+            .unwrap();
+        pump.hold_durable();
+        let tail = |driven: &Driven| {
+            let replica = &driven.owner(follower).replica;
+            (
+                replica.applied().index,
+                replica.core().raft.log().last_index().unwrap(),
+            )
+        };
+        reach(
+            &mut driven,
+            &mut pump,
+            "the write appended ahead",
+            |driven| {
+                let (applied, last) = tail(driven);
+                last > applied
+            },
+        );
+        let (_, ahead) = tail(&driven);
+        let proposed = driven.owner(follower).floor_attestations;
+        clients[follower].handle().attest(kiln(8)).unwrap();
+        reach(
+            &mut driven,
+            &mut pump,
+            "the follower's session waiting for its log",
+            |driven| driven.owner(follower).floor_tail.is_some(),
+        );
+        assert_eq!(driven.owner(follower).floor_tail, Some(ahead));
+        let (applied, last) = tail(&driven);
+        assert!(last > applied, "the write ahead already applied");
+        driven.owner_mut(follower).floor_tail = Some(applied);
+        driven.step();
+        let owner = driven.owner(follower);
+        assert_eq!(
+            owner.floor_tail, None,
+            "the session still waits: its target moved"
+        );
+        assert!(
+            owner.floor_attestations > proposed
+                || matches!(
+                    owner.pending.as_ref().map(|pending| &pending.phase),
+                    Some(Phase::Proposed(_))
+                ),
+            "the session did not prepare at its target"
+        );
+        let (applied, last) = tail(&driven);
+        assert!(
+            last > applied,
+            "it prepared only once the log behind was applied"
+        );
+        pump.let_durable();
+        for _ in 0..ROUNDS {
+            if attested(&mut driven, leader, member).is_some_and(|attested| attested.highest == 8) {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        // Its attestation, prepared at a base the write behind it moves past, may be refused by
+        // the stale-base rule and made again; it applies all the same.
+        assert_eq!(attested(&mut driven, leader, member).unwrap().highest, 8);
+        let _ = driven.answer(&mut pump, &written);
         driven.drain(&mut pump);
         pump.finish();
     }
