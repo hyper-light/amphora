@@ -101,7 +101,10 @@ pub(super) fn publish(database: &Database, path: &Path) -> Result<(), Refusal> {
     if service.is_none() {
         let weak = Arc::downgrade(&database.shared);
         *service = Some(crate::transport::Owner::start(path, move || {
-            weak.upgrade().map(|shared| Database { shared })
+            weak.upgrade().map(|shared| Database {
+                shared,
+                application: None,
+            })
         })?);
     }
     Ok(())
@@ -137,6 +140,7 @@ pub(super) fn attach(
         },
     };
     Ok(Database {
+        application: None,
         shared: Arc::new(Shared {
             transport: Mutex::new(None),
             path: OnceLock::new(),
@@ -318,7 +322,10 @@ impl Database {
                     Writer::Client(backend) => match validate(&backend.client, expected, until) {
                         Ok(_) => {
                             backend.configure(expected)?;
-                            return Ok(Some(Self { shared }));
+                            return Ok(Some(Self {
+                                shared,
+                                application: None,
+                            }));
                         }
                         Err(
                             Refusal::Unavailable(_) | Refusal::Timeout | Refusal::UnknownOutcome,
@@ -331,7 +338,10 @@ impl Database {
                         durability: acknowledged,
                         ..
                     } if log_path == &log && current == &config && acknowledged == &durability => {
-                        return Ok(Some(Self { shared }));
+                        return Ok(Some(Self {
+                            shared,
+                            application: None,
+                        }));
                     }
                     _ => {
                         return Err(api::invalid(
@@ -378,10 +388,12 @@ impl Database {
     }
 
     pub(super) fn resolve(&self, until: Instant) -> Result<Database, Refusal> {
-        match &self.shared.writer {
+        let mut database = match &self.shared.writer {
             Writer::Client(backend) => backend.resolve(until),
             _ => Ok(self.clone()),
-        }
+        }?;
+        database.application = self.application.clone();
+        Ok(database)
     }
     /// Selects the current host owner before carrying replication messages. A standby returns
     /// None; after its predecessor releases ownership this handle starts the same configured
@@ -427,9 +439,11 @@ impl Database {
             durability,
         })
     }
-    pub(super) fn remote_client(&self) -> Option<&crate::transport::Client> {
+    pub(super) fn remote_client(&self) -> Option<crate::transport::Client> {
         match &self.shared.writer {
-            Writer::Client(backend) => Some(&backend.client),
+            Writer::Client(backend) => {
+                Some(backend.client.for_application(self.application.clone()))
+            }
             _ => None,
         }
     }

@@ -21,6 +21,7 @@ use crate::db::Db;
 
 pub use crate::database::replicated::{ReceiveReceipt, ReplicaHandle};
 pub mod bootstrap;
+pub(crate) mod floor;
 
 const BASELINE_DELTA: &[u8] = b"amphora.delta.v1\0";
 const BASELINE_SNAPSHOT: &[u8] = b"amphora.snapshot.v1\0";
@@ -149,7 +150,34 @@ pub struct Machine {
     baseline: bootstrap::Baseline,
     // The largest image this machine makes or installs: SNAPSHOT_BYTES, lowered only by a test.
     snapshot_bytes: usize,
+    // The index of the last configuration change applied, or more: the change's own index when
+    // this machine applied it, the applied point when it opened or installed an image. The floor's
+    // proof counts an attestation before marker J only if it was made at or after it, so an
+    // overestimate only delays J (replication.md, "The upgrade that introduces the join rows").
+    configuration_at: u64,
+    // A test's stand-in for a member running a binary from before the floor: it writes no join
+    // rows, as such a binary doesn't.
+    #[cfg(test)]
+    floor_aware: bool,
+    // A test's record of this member's image digest at each applied index.
+    #[cfg(test)]
+    digests: Option<Vec<(u64, u64)>>,
     _owner: crate::database::Owned,
+}
+
+/// A floor this group's members didn't prove never enters replicated mode: one a standalone
+/// owner installed, held where joins aren't tracked, is refused at open, at the seed and at an
+/// image's install (replication.md, "Raising the floor", d). A floor raised on proof always has
+/// joins tracked.
+fn unproven_floor(db: &Db) -> anyhow::Result<()> {
+    if crate::database::installed_floor(db)?.is_some() && floor::tracked(db)?.is_none() {
+        return Err(Refusal::Fenced(
+            "a floor not proven by this group's members; raise it again once joins are tracked"
+                .into(),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn unavailable(e: impl std::fmt::Display) -> Refusal {
@@ -256,6 +284,8 @@ impl Machine {
         }
         let mut db = open(&owner)?;
         db.hold_owner(owner.clone());
+        // Check before retaining a baseline image or writing a replica marker.
+        unproven_floor(&db).map_err(|e| crate::database::refused(&e))?;
         let mut marked = false;
         db.query(
             "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '__amphora_replica'",
@@ -343,6 +373,11 @@ impl Machine {
             configuration,
             baseline,
             snapshot_bytes: SNAPSHOT_BYTES,
+            configuration_at: point.index,
+            #[cfg(test)]
+            floor_aware: true,
+            #[cfg(test)]
+            digests: None,
             _owner: owner,
         })
     }
@@ -363,6 +398,57 @@ impl Machine {
         self.snapshot_bytes = bytes;
     }
 
+    /// The last configuration change's index as this machine knows it, or more.
+    pub(crate) fn configuration_at(&self) -> u64 {
+        self.configuration_at
+    }
+    /// What opening this machine again does to `configuration_at`: it starts at the applied
+    /// point, as the machine no longer knows the last change's own index.
+    #[cfg(test)]
+    pub(crate) fn reopen_configuration_at(&mut self) {
+        self.configuration_at = self.point.index;
+    }
+    #[cfg(test)]
+    pub(crate) fn set_floor_aware(&mut self, aware: bool) {
+        self.floor_aware = aware;
+    }
+    #[cfg(test)]
+    fn writes_joins(&self) -> bool {
+        self.floor_aware
+    }
+    #[cfg(not(test))]
+    fn writes_joins(&self) -> bool {
+        true
+    }
+    #[cfg(test)]
+    pub(crate) fn record_digests(&mut self) {
+        self.digests = Some(Vec::new());
+    }
+    #[cfg(test)]
+    pub(crate) fn digests(&self) -> &[(u64, u64)] {
+        self.digests.as_deref().unwrap_or_default()
+    }
+    #[cfg(test)]
+    fn record_digest(&mut self, at: u64) -> Result<(), Fatal> {
+        use std::hash::{Hash, Hasher};
+        if self.digests.is_none() {
+            return Ok(());
+        }
+        let pages = self.db.image_pages(self.snapshot_bytes).map_err(failed)?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for (id, page) in &pages {
+            // A page's last eight bytes are the engine's checksum of the rest, written when the
+            // page is written out (engine storage/checksum.rs); whether a read sees it before or
+            // after that is timing, not content. The digest is of the content.
+            id.hash(&mut hasher);
+            page.get(..page.len().saturating_sub(8)).hash(&mut hasher);
+        }
+        if let Some(digests) = self.digests.as_mut() {
+            digests.push((at, hasher.finish()));
+        }
+        Ok(())
+    }
+
     pub(crate) fn bootstrap_pending(&self) -> bool {
         self.baseline.pending()
     }
@@ -370,6 +456,7 @@ impl Machine {
         self.baseline.source()
     }
     pub(crate) fn prepare_bootstrap(&self, entry_room: usize) -> Result<Option<Vec<u8>>, Refusal> {
+        unproven_floor(&self.db).map_err(|e| crate::database::refused(&e))?;
         self.baseline.proposal(entry_room)
     }
     fn require_baseline(&self) -> Result<(), Refusal> {
@@ -389,7 +476,10 @@ impl Machine {
         self.require_baseline()?;
         let (answer, pages) = self
             .db
-            .prepare_pages(COMMAND_BYTES, f)
+            .prepare_pages(COMMAND_BYTES, |db| {
+                let answer = f(db)?;
+                Ok(answer)
+            })
             .map_err(|e| crate::database::refused(&e))?;
         validate_pages(&pages, COMMAND_BYTES)?;
         Ok((
@@ -509,8 +599,23 @@ impl Machine {
         configuration: &ConfState,
         flush: bool,
     ) -> Result<(), Fatal> {
+        self.advance_with(at, pages, configuration, flush, |_| Ok(()))
+    }
+
+    /// Applies `pages` and the applied marker, and `also` in the same transaction.
+    fn advance_with(
+        &mut self,
+        at: Point,
+        pages: &[(u32, Vec<u8>)],
+        configuration: &ConfState,
+        flush: bool,
+        also: impl FnOnce(&mut Db) -> anyhow::Result<()>,
+    ) -> Result<(), Fatal> {
         self.db
-            .apply_pages(pages, |db| marker(db, at, configuration))
+            .apply_pages(pages, |db| {
+                marker(db, at, configuration)?;
+                also(db)
+            })
             .map_err(failed)?;
         if flush {
             self.db.flusher()().map_err(failed)?;
@@ -518,6 +623,8 @@ impl Machine {
         }
         self.point = at;
         self.configuration = configuration.clone();
+        #[cfg(test)]
+        self.record_digest(at.index)?;
         Ok(())
     }
 
@@ -610,7 +717,17 @@ impl StateMachine for Machine {
         _: &ConfChangeV2,
         configuration: &ConfState,
     ) -> Result<(), Fatal> {
-        self.advance(at, &[], configuration, true)
+        if self.writes_joins() {
+            // The join rows go with the change in its own transaction (replication.md, "Joins"):
+            // a change another lead replaces is never applied, so it writes nothing.
+            self.advance_with(at, &[], configuration, true, |db| {
+                floor::apply_joins(db, at.index, configuration)
+            })?;
+        } else {
+            self.advance(at, &[], configuration, true)?;
+        }
+        self.configuration_at = at.index;
+        Ok(())
     }
     fn durable(&self) -> Point {
         self.flushed
@@ -680,6 +797,8 @@ impl StateMachine for Machine {
         }
         self.db
             .apply_pages(&pages, |db| {
+                // Inside the image's transaction: a refusal rolls it back before its marker.
+                unproven_floor(db)?;
                 db.exec(META)?;
                 marker(db, at, configuration)?;
                 self.baseline.completed_marker(db)
@@ -689,7 +808,10 @@ impl StateMachine for Machine {
         self.point = at;
         self.flushed = at;
         self.configuration = configuration.clone();
+        self.configuration_at = at.index;
         self.baseline.completed();
+        #[cfg(test)]
+        self.record_digest(at.index)?;
         Ok(())
     }
     fn persist(&mut self) -> Result<(), Fatal> {

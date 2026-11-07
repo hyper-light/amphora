@@ -858,3 +858,292 @@ Falsified by:
   the same load, in which a member's quorum-check step-downs in a run are not fewer than the fewest
   at fixed ticks (63): then the step-downs are not the followers' tails this patience covers. Its
   runs are recorded beside step 1's in `docs/research/owner-stalls.md`.
+
+## The application floor, replicated (proposed 2026-11-01; a to d decided and agreed 2026-11-06)
+
+Built on t1/floor (kiln plan 01a1b1d7b7fe7497afcf0d665327364a, steps 1 to 5); its metrics, events and T-T1.8.A6 are
+step 6, still to come. Kiln goal d8362e1ea15980ce84da0b168a93bc8a: Codex asked Amphora to own this seam. amphora-seam-owner,
+which holds Codex's role on Ada's word, agreed the contract on 2026-11-06 subject to three changes, written in below:
+attestations bound to a member's join, the membership guard's place and its typed refusal, and the tests and metrics.
+Its standing constraint holds throughout: agreement proven by the members and the log, never a caller's integer or a
+Ready answer, one SDK seam, no second controller. Source notes: docs/research/application-floor.md.
+
+**Today.** Kiln's U05 patch gives the standalone owner an application floor.
+- `for_application(name, version)` binds a handle's claim.
+- `writer_floor` raises the floor in the original local writer, monotonically, and returns a `WriterBoundary` once the
+  raise is durable.
+- `application::check` refuses, inside every application transaction, a claim older than the floor.
+
+Replicated mode refuses any database with a floor installed (`require_replication`). No member has proven what it runs,
+so a floor there would only be one member's word.
+
+**What the replicated floor promises:**
+1. No application writer older than the floor commits a write, on any member, at any index after the floor's.
+2. The floor is raised only when every member of the configuration in force at the raise's index (voters and learners)
+   has attested that its application runs the floor's version.
+3. The floor never falls.
+4. It all happens in the existing replicated owner: no second controller, no new entry type, no wire change.
+
+**Joins.** hyper-raft's configuration (`ConfState`: voters, learners, voters_outgoing, learners_next, auto_leave)
+carries no index at which a member joined. Amphora's machine records one: `apply_change` writes
+`__amphora_members(member, joined)` in the same WAL transaction as the configuration marker it already writes. A member
+that the change names in any of the configuration's four sets, and that has no row, gets `joined` = the change's index.
+A member with a row that the change leaves in none of them loses it in that same transaction. Promotion and demotion
+keep it. Marker J writes a row at 0 for every member then present; before J no member has a row, and every member
+joined at 0. The rows, not the member's own configuration before the change, decide who joins: a member to be added
+opens with the configuration it is to have, so its own "before" already names it, and comparing against that would
+leave it without the row every other member writes (found by T-T1.8.A5's added-after-J case). The rows and the
+configuration after the change are the same on every member at the same index, so every member holds the same rows; a
+snapshot carries them as rows of its image. A change whose entry another lead replaces never applies, so it writes
+nothing.
+
+**Attestation.**
+- When a member's application binds its handle (`for_application(name, highest)`), its owner proposes a resolved
+  transaction writing that member's row in a reserved table, `__amphora_attestations(member, joined, application,
+  highest)`, keyed by member and the join it holds in its own applied state. It does this after applying up to the
+  commit index it learned at start, so it binds against the floor and its join as committed.
+- A proof counts a member's attestation only when its `joined` is the member's current join. A row from an earlier
+  join never vouches, so no row is ever deleted to keep a proof honest, and none blocks a member's return: a member
+  removed and added again joins at a new index and attests again.
+- Public SQL can't name an `__amphora_*` table (`sql::validate_reserved_sql`), so only this path writes the rows.
+- Under Raft's crash-fault model, a member runs Amphora's own code, which writes only its own row.
+- `step` gains one check: a forwarded proposal whose entries' contexts name a member other than the authenticated sender
+  is refused, typed, and applies nowhere. That keeps a mis-addressed record from being taken for another member's,
+  attestation and answer alike. One hop is enough because nothing re-forwards a proposal: a member that receives a
+  forward it can't lead refuses it, and the receiver re-forwarding it was rejected (t1/election-flake, "A forward that
+  meets an election"). So a forward's authenticated sender is always its origin.
+
+**Raising the floor.** `raise_floor(application, version, until) -> WriterBoundary` on the replicated `Database`.
+- The owner prepares one session. At its base, it reads the configuration in force, every member's attestation and
+  the floor.
+- A raise to the floor in force or below answers the floor in force at once, writing nothing: the floor never
+  falls, and a caller asking for an older contract (kiln's `writer_boundary(required)`) is served by the newer one in
+  force. A raise for another application than the floor's is refused.
+- Above the floor, it writes the new floor only if every member, voter or learner, has an attestation for the
+  application at or above the version, under its current join.
+- Otherwise it refuses, typed, naming the members short of the version, a learner that has not attested among them.
+- The stale-base rule makes the proof hold at apply. The entry applies only if nothing committed after the base the
+  session read. Configuration changes are included: `apply_change` advances the point too.
+- The answer comes once the entry has applied on the proposing member, like any replicated write. The `WriterBoundary`
+  it returns rests on that apply.
+
+This closes the race CockroachDB's automatic finalization leaves as future work, a node with an old binary joining just
+before the bump. Here the proof and the bump are one transaction, which can't apply past a configuration change it
+didn't see.
+
+**Writers.**
+- In replicated mode, every application session's preparation runs `application::check` with its handle's claim,
+  against the floor at its base. This replaces `require_replication`'s blanket refusal.
+- A claim below the floor is refused before proposal.
+- A session prepared before a raise that commits first is refused at apply, by the stale-base rule.
+- The claim needs no field in the entry, and every member decides alike.
+
+**Membership.** A configuration change is a hyper-raft entry. The machine can't refuse one (`apply_change` fails only
+fatally), and a configuration is in force from its append, not its commit (raft.pdf p. 11). So the owner guards
+changes before proposing them.
+- It adds a voter, or promotes a learner, only when that member's attestation under its current join is at or above the
+  floor and the owner's tail is quiescent: its applied index is its last log index. A tail that isn't is answered at
+  once, `Unavailable`, naming both indexes; the guard never waits.
+- With a quiescent tail, every raise is wholly before the change, and the guard reads its floor, or wholly after it,
+  and its proof reads the new configuration.
+- A new member joins as a learner (raft.pdf section 6), catches up, attests, and is then promoted.
+- A learner without an attestation at a version blocks raises to that version until it attests or is removed.
+- Removing a member needs nothing more: its join row goes with the change's apply, and its attestation, keyed by that
+  join, never vouches again. There is no window between a change and a cleanup for a crash to fall into.
+- Safety doesn't rest on this guard. A member whose application is older than the floor has every write refused by
+  `check`. The guard keeps such a member from becoming a voter.
+
+**Start.**
+- A member's application handle binds only after its owner has applied up to the commit index it learned at start.
+- If the committed floor for its application is above its highest, binding fails closed, with a typed refusal naming
+  both. CockroachDB's node exits the same way on a persisted version its binary can't support.
+- Snapshots carry the floor and the attestations as rows of the image, beside the configuration (raft.pdf p. 12). A
+  member installed from one holds the same proof.
+
+**The seam.** The replicated `Database` gains:
+- `raise_floor(application, version, until) -> WriterBoundary`;
+- `floor_status(until)`: the floor and each member's role and attested highest.
+
+Attestation is the owner's own act when a handle binds, so it has no call of its own. The standalone `writer_floor`
+stays as it is, the same proof over one member. New rows ride in resolved pages, and the origin check reads context
+bytes that already exist, so no wire format changes.
+
+**Decided (2026-11-06), a to d.** Codex's agent ended before it answered, so Amphora's membership-floor agent
+decided them from the sources below and the code, and amphora-seam-owner agreed each (its record:
+codex-notices/OWNER.md, section 7).
+- a) **Crash-fault trust, no signatures.** The authenticated origin, bound by `step`'s sender check and the new
+  context check, is enough. Raft promises safety only under non-Byzantine conditions, and Amphora's replication
+  already trusts each leader with every entry's resolved pages and every snapshot's image: a member able to lie
+  could write any row, a floor and attestations included, so a signature on an attestation would guard nothing that
+  member could not already write. A proof that verifies from a snapshot alone needs a Byzantine model for the whole
+  log, not for one table. The origin check is a single hop because nothing re-forwards (Attestation, above).
+  Falsified by: a deployment that must hold the floor against a member running modified code, which needs Byzantine
+  replication first; or a forward applied whose context names a member other than its sender.
+- b) **Learners count, and so does every member of a joint configuration.** The members a raise's proof covers are
+  all of the configuration applied at its base: `voters`, `learners`, `voters_outgoing` and `learners_next`, the
+  set `step` takes records from. A learner applies every entry and forwards writes, and is a promotion away from
+  voting; etcd and CockroachDB call a cluster upgraded only once every member runs the version. A raise is a session,
+  and its proof reads the configuration at its base: a joint one is refused `Unavailable` ("the group is leaving a
+  joint configuration") before it proposes. A change appended but not applied at its base is not visible there; a
+  raise beside it applies only if no change applied between its base and its index, since the stale-base rule
+  refuses it otherwise, so it is never applied while a member it did not prove belongs to the configuration
+  (T-T1.8.A2). `writer_floor` answers that refusal `Unavailable`, the retry class, "the database advanced since
+  preparation: the group changed while the raise was proven; raise again"; a raise whose entry another lead replaces
+  stays `UnknownOutcome`. A learner that has not attested blocks a
+  raise, and the refusal names it. Falsified by: a floor applied while a learner of the configuration at its index had
+  no attestation at its version under its current join.
+- c) **One `u32`, the highest version the binary runs.** It is the claim U05's standalone floor already carries
+  (`Application::version: u32`). The floor is a lower bound on writers and only rises, so the lowest version a binary
+  runs is never asked: a rollback below the floor is refused by design, as CockroachDB refuses downgrades once its
+  version is bumped. An application that can't run on a floor as old as the one committed reads `floor_status` at
+  bind and refuses itself; that is the application's compatibility, not the floor's promise. A lowest version is added
+  when an application declares one, as a start check beside the attestation that doesn't change it; today it would be
+  speculative (CLAUDE.md section 13). Falsified by: a promise that needs a ceiling on writers (no writer newer than N),
+  which a range would carry and this does not.
+- d) **The proof replaces `require_replication` in replicated mode, and fail-closed stays.** In replicated mode,
+  `application::check` runs in every preparation against the floor at its base, in place of the blanket refusal.
+  Still refused, `Fenced`: a handle with no claim on a database with a floor, a claim for another application, and a
+  claim below the floor; a raise without proof is refused typed, naming the members short. The bind of a member whose
+  highest is below the committed floor fails closed at once, `Invalid` ("application floor": "this binary runs up to
+  3; the group's floor is 4"), with no wait and nothing proposed: a binary can't raise its highest by waiting, so the
+  host must replace the binary. The owner publishes the floor in force at each applied index it refreshes, and the
+  bind reads that; a bind racing a raise not yet applied there passes, and its writes are then `Fenced` at
+  preparation, so nothing below the floor applies either way. A floor this group's members didn't prove never enters replicated
+  mode: one held where joins aren't tracked (a standalone owner's `writer_floor`) is refused `Fenced` at open, at the
+  seed and at an image's install, "a floor not proven by this group's members; raise it again once joins are tracked".
+  A raise to the floor in force or below answers that floor at once, proving and writing nothing (promise 3; a caller
+  asking for an older contract is served by the newer one, as kiln's `writer_boundary` asks). A read is checked against
+  the floor as a write is, standalone and replicated alike. The remote owner's takeover stays refused by `writer_floor`
+  ("original non-restoring owner required"), which this proof does not cover (U05: "Replication and remote-owner takeover need
+  their own application-floor proof"); `require_replication`, the blanket refusal, is gone.
+  Falsified by: a replicated write applied with a claim below the floor in force at its index.
+
+**How it composes with membership changes (t1/membership-fixes, 065fdb3 and 49bf342).** One owner, one slot for a
+change (`Changing`), one guard:
+- `ReplicaHandle::change` admits a change at its ReadIndex barrier in `member_change`, which already refuses a change
+  while another is pending or the configuration is joint. The floor's guard goes there, beside `admits_joiner`, in the
+  same admission: `Promote` needs the learner's attestation of the floor's application under its current join at or
+  above the floor, read on a quiescent tail (the applied index is the last), so what it reads is the state at the
+  change's index. A tail still to apply is refused at once, `Unavailable` ("the log runs to L and A is applied"); a
+  learner with no such attestation, `Unavailable` (it may yet attest), naming the learner and the floor; one attested
+  below it, `Invalid` ("application floor": "learner 4 runs kiln.host-store up to 6; the group's floor is 7"), since
+  waiting can't raise a binary's highest. A group with no floor promotes as before. `AddLearner` needs no attestation, only the snapshot ceiling `admits_joiner` already checks: a
+  learner joins, catches up, binds and attests. `Demote` and `Remove` need none.
+- `ReplicaHandle::transfer` hands the lead only to a voter, and every voter passed the guard or a raise's proof, so a
+  transfer needs no check of its own. The leader is demoted or removed only after it has handed its lead on.
+- `raise_floor` is a replicated write in the write slot (`Pending`), never the change slot. Beside a change, it holds
+  by its base and the stale-base rule (b, above); a raise forwarded to a leader that is handing its lead over is
+  dropped by the core as any proposal is (`Dropped::Transferring`), and its origin answers its caller.
+- A change appended and then replaced by another lead's entry gives back the configuration before it (Ongaro's
+  dissertation, section 4.1), and with it the members a raise must cover; a replaced change never applies, so it
+  writes no join row; the stale-base rule refuses a raise whose base saw either.
+
+**Tests, before code.** Deterministic simulation on driven time with a nemesis (elections at each step, a leader's
+crash, lost records), each citing its ID in docs/requirements.toml:
+- AC-T1.8.A1, T-T1.8.A1: the CockroachDB race. An old-binary learner is added just before a raise; the raise is
+  refused naming it, or the learner's promotion is refused; never both through.
+- T-T1.8.A2: a leader crashes between a change and a raise; whoever leads next, the floor's proof covers the
+  configuration in force at the raise's index, or the raise is refused.
+- T-T1.8.A3: a member installed from a snapshot holds the floor, the join rows and the attestations, and its proof and
+  its refusals are the leader's.
+- T-T1.8.A4: hostile input: a forwarded proposal whose context names a third member is refused, typed, and applies on
+  no member.
+- T-T1.8.A5: a member removed and added again attests under its new join; its old row never vouches and blocks nothing.
+- T-T1.8.A6: every falsifier below, as an assertion over every run.
+- T-T1.8.A7: the upgrade, as written below; and a leader restarted before J asks once, and each member attests once.
+
+**Metrics** (agreed with kiln's Observe owner, the Kiln Metrics agent, under amphora-membership-floor/names/v1,
+2026-11-06; CLAUDE.md section 10). Amphora adds one label, `reason` on the refusals counter; the host
+adds `db` and its machine's.
+- `amphora_floor_version` (gauge): the committed floor, 0 for none.
+- `amphora_floor_raises_total` (counter): raises applied.
+- `amphora_floor_refusals_total{reason}` (counter): `reason` is one of `unproven`, `stale_base`, `below_floor`,
+  `no_claim`, `other_application`, `busy`. The set is closed: a seventh value is agreed first.
+- `amphora_floor_unattested_members` (gauge): members of the configuration in force with no attestation at the floor
+  under their current join. Every member reports it, from its own applied state, which is the same on every member,
+  so dashboards take `max` by `db`.
+- Events go on target `amphora.floor` with an `event` field named in kiln's dotted style (`floor.raised`,
+  `floor.refused`); spans stay off that target, as kiln makes `kiln.<span>` metrics of a listed target's spans.
+- Dashboard rows, a group "Amphora application floor" on kiln's built-in Stores dashboard and the same in PromQL in
+  kiln-overview.json: floor version by database, raises, refusals by reason, members unattested, and floor events. A
+  monitor: unattested above 0 for 15 minutes. kiln's side (`TARGETS`, exports, the group) is kiln's change, merged on
+  Ada's word.
+
+**The upgrade that introduces the join rows** (decided by amphora-seam-owner, 2026-11-06). While members run binaries
+from before and after the floor's, a new binary that wrote join rows an old one doesn't would make their pages differ,
+and replicas apply resolved pages and must stay byte-identical: the next resolved page applied over a differing one
+would corrupt. So:
+1. A marker J (`joins tracked from index J`) is written by a resolved session, so it reaches every member as pages.
+   Until J is in a member's applied state, `apply_change` writes no join rows.
+2. Before J, an attestation counts only if it committed after the last configuration change. The machine's configuration
+   marker rewrites its point on every entry, and hyper-raft keeps the newest change's index privately and resets it to
+   the applied point on restore, so neither says which index that was. The machine keeps `configuration_at` in memory
+   instead: the change's own index when it applies one, the applied point when it opens or installs an image. That is
+   never below the true index, so it can only delay J, never let a stale attestation count. Each attestation row carries
+   `seen`, the applied index at its session's base, and counts before J only if `seen` is at or above both the prover's
+   `configuration_at` and the last request's `at`, and only for the application it names. (This replaces an earlier
+   wording that took the index from the configuration marker's point; that point moves with every entry.) It is sound:
+   `configuration_at` is never below the true last change's index; a member removed and re-added gets a new change
+   index, so its old attestation's `seen` is below it and never counts; an overestimate only excludes valid
+   attestations, costing liveness, never safety; the proof is decided once, by the leader, in a resolved session whose
+   pages the members apply without judging, so the leader's local estimate diverges nothing; a change after the
+   session's base is refused by the stale-base rule, and a pending one by the pending-or-joint refusal. While J waits on
+   any member without an attestation that counts (one never made, or one made before the leader's estimate, as after a
+   restart), the leader writes `__amphora_attest_requested(at)` by a resolved session, and each member's owner, seeing
+   it in its applied state, attests again. Both are bounded: a leader writes a request only while one at or past its
+   `configuration_at` is not already written, so at most once per value it holds; a member's keeper attests only when
+   its own row is missing or stale (a new join, a change it applied, a request it applied), proposes at most once per
+   pass (a new applied index while it has nothing else in hand), through the same barrier and proposal as a call with
+   its own deadline, and a refusal (a stale base, an election) is tried again on its next pass, never in a loop. Members
+   attesting at once make each other's sessions stale; each round of that contention applies at least one, so the
+   retries end once every member is current, and a settled group proposes nothing. Any change during the upgrade sends
+   every member back to attest; that lasts only until J.
+3. J's session is written only when every member of the configuration in force has an attestation committed after the
+   last change. At J, the members then present get rows at 0, so their attestations stay valid and nobody attests
+   again at J; after it, only changes write rows.
+4. A raise is refused, typed, until J is committed: "joins aren't tracked yet; every member must attest first".
+5. T-T1.8.A7: a group of mixed binaries through the upgrade, a member removed and re-added before J. Expected: no raise
+   through until J, the re-added member's old attestation never counting, and every member's image digest identical
+   at every applied index.
+
+What this does not cover: a member running a binary from before the floor that joins after J applies later changes
+without writing join rows, and its pages diverge. The floor can't refuse it from inside that old binary; the host
+installs every member that joins with the current one. What bounds the harm: such a member can't attest, so the
+membership guard never promotes it and it never counts in a quorum; and `floor_status` shows it unattested, which
+`amphora_floor_unattested_members` above 0 for 15 minutes alerts on. Every table above is created by a resolved session,
+never locally, so before J an old binary applies exactly what a new one does. Members must hold content-identical pages,
+the checksum trailer aside: a page's last eight bytes are the engine's checksum of the rest, written when the page is
+written out (`crates/engine/storage/checksum.rs`), so whether a read sees it depends on that timing, while the content
+is what members must agree on. A test's image digest is of each page's content without that trailer.
+
+Evidence:
+- Raft's catch-up as non-voting members, a configuration in force from its append, and snapshots carrying the
+  configuration (Ongaro and Ousterhout 2014, sections 6 and 7).
+- CockroachDB's cluster version: a monotonic promise that no old binary runs, and a node that exits on a version it can't
+  support (RFC 20170815_version_migration). Its automatic finalization checks every live node first and leaves the join
+  race open (RFC 20180411, #24670).
+- etcd: "The cluster is only considered upgraded once all of its members are upgraded" (etcd.io, upgrade_3_1).
+- The code at 29be700: the stale-base rule in `Machine::apply`, `apply_change`'s point and configuration, `step`'s
+  authenticated sender, `context()`, `validate_reserved_sql`. Kiln's U05 patch at kiln f77518103a.
+- For a to d: Raft's safety holds "under all non-Byzantine conditions" (raft.pdf, section 2); U05's claim is one `u32`
+  (`Application::version`) and its `require_replication` names remote-owner takeover as needing its own proof;
+  CockroachDB has "no support for downgrades once the version setting has been bumped" (RFC 20170815); a server
+  "must be prepared to fall back to the previous configuration in its log" when a change's entry is removed, and a
+  leader to be removed transfers its lead first (Ongaro's dissertation, sections 4.1 and 3.10). The membership code
+  at t1/membership-fixes 49bf342: `member_change`, `ReplicaHandle::transfer`, `Machine::admits_joiner`, and the
+  test `a_removal_another_lead_wrote_over_gives_the_member_back`. The single hop: t1/election-flake 27d8ff8,
+  docs/design/replication.md, "A forward that meets an election" (re-forwarding rejected).
+
+Falsified by:
+- a write prepared with a claim below the floor that applies on any member at an index after the floor's;
+- a floor entry applied while a member of the configuration in force at its index had no attestation at its version;
+- a floor that falls, or two members holding different floors at the same applied index;
+- a voter added, or a learner promoted, without an attestation at or above the floor at its change's index;
+- an application handle bound on a member whose highest is below the committed floor;
+- a forwarded proposal applied with a context naming a member other than its authenticated sender;
+- a proof that counts an attestation made under a member's earlier join;
+- two members holding different join rows at the same applied index;
+- a membership guard that waits, or a non-quiescent tail answered other than `Unavailable` naming both indexes;
+- a join row written before J is applied, a raise applied before J, or two members' image digests differing at one
+  applied index through the upgrade;
+- before J, an attestation counted that committed before the last configuration change.

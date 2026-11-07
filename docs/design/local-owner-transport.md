@@ -131,6 +131,10 @@ checked"). Version 3: `ReplicaStatus` gained `voters_outgoing` (replication.md, 
 already added `bootstrapping` without a bump; a version-2 client of an owner with that field would
 have failed the same way. The test: `a_peer_of_another_version_is_refused_at_the_greeting`.
 
+Version 5: `Request` gained `Application` (the application floor, replication.md), a client's bound
+claim sent once after the greeting and before its ordinary request. The owner validates its shape and
+answers Ready; only the owner's own floor, checked inside the writer's transaction, grants admission.
+
 Evidence: postcard's wire format: "A struct is encoded as the elements that comprise it, in their
 order of definition", and "their length and field names are not encoded on the wire"
 ([postcard's wire format, section 28](https://postcard.jamesmunns.com/wire-format.html)), so a
