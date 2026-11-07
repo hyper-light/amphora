@@ -258,6 +258,23 @@ joint configuration leaves, empty outside one). `ReplicaHandle::transfer` hands 
   It campaigns for nothing, and catches up from the leader's log or a snapshot once added. Replaying
   the log from its start under that configuration converges on the leader's: adding a learner that
   is one already changes nothing (hyper-raft's `Configuration::change`).
+- The leader says how far each learner has caught up (2026-11-06), so that its host promotes only
+  a learner that won't stall commits: kiln chooses its voters itself (kiln plan 01a1a283e14c, its
+  `docs/p2p.md` P3, kiln's Amphora patch 0003). `ReplicaHandle::catch_up` answers, for each
+  learner of the configuration applied, where catching it up stands (`CatchUp`), as hyper-raft's
+  rounds judge it (`Raft::catch_up`, the dissertation's section 4.2.1): each round sends what the
+  leader held as it began. Asked first, a learner is staged; asked again, it is judged as an
+  election timeout passes: `Ready` once a round ended within one, `Aborted` once its lag didn't
+  shrink over one (staged afresh when asked again), else `Pending`. A new leader stages afresh, and
+  a learner whose removal the core has appended but not applied is left out. Only the leader
+  answers, as only it tracks each learner's progress; another member refuses `NotLeader`, naming
+  the leader it knows. A request whose deadline passed before the owner took it answers `Timeout`
+  and stages nothing, so a stale request never starts a learner's round. It is answered at once,
+  beside the write under way, charged as a change is
+  at admission, and bounded by the configuration's learners (hyper-raft keeps one staging a
+  learner). Promoting is the host's change to make (`MemberChange::Promote`), and nothing promotes
+  by itself. A fatal error from the core while judging fences the owner, as a wire record's does;
+  kiln's patch answered it and went on. No wire format, log entry or state-machine change.
 
 Decided by amphora-seam-owner, which holds Codex's role on Ada's word (2026-11-06):
 - No `Busy` or `Unknown` variants on `Refusal`. It is a wire enum kiln matches on, changed
@@ -281,6 +298,16 @@ hyper-raft's `handle_transfer_leader` ignores a target that does not vote and cl
 `lead_transferee` when it gives up. A server's configuration is the latest in its log, committed or
 not, and a log truncated past a configuration entry falls back to the one before (the dissertation,
 section 4.1); hyper-raft keeps that one in `conf_before` and restores it in `refresh_configuration`.
+A new server is caught up in rounds, each replicating "all the log entries present in the leader's
+log at the start of the round"; "if the last round lasts less than an election timeout, then the
+leader adds the new server", it aborts for one "that will never catch up", and "the caller may always
+try again" (the dissertation, section 4.2.1, `membership/availability.tex`); hyper-raft's
+`catchup.rs` builds that rule, giving a learner up once its lag didn't shrink over an election
+rather than after a count of rounds. etcd promotes a learner only once "its log has caught up to
+leader's" ([etcd's learner design](https://etcd.io/docs/v3.5/learning/design-learner/)), judged on
+the leader alone: "only raft leader has information on whether the to-be-promoted learner node is
+ready" (etcd `server/etcdserver/server.go` at d622ec57, line 1454; its measure is a ratio,
+`readyPercentThreshold = 0.9`, line 113, where Raft's is a round against an election timeout).
 The image's ceiling is `SNAPSHOT_BYTES` (`crates/amphora/src/replication.rs`), checked by the
 bytes `Db::image_bytes` counts, the same count `Db::image_pages` refuses past.
 The tests: `a_learner_added_has_every_write_and_once_removed_receives_none`,
@@ -298,7 +325,9 @@ The tests: `a_learner_added_has_every_write_and_once_removed_receives_none`,
 `a_hand_off_the_core_gives_up_is_refused_and_the_lead_stays`,
 `a_hand_off_whose_lead_goes_to_a_third_member_is_refused_naming_it`,
 `a_hand_off_past_its_deadline_answers_unknown_outcome` and
-`a_hand_off_is_refused_beside_a_change_and_to_a_learner`. Requirements: AC-T1.8.M1 to M3 and
+`a_hand_off_is_refused_beside_a_change_and_to_a_learner`,
+`the_leader_judges_a_learners_catch_up_in_rounds` and
+`a_learner_that_never_answers_is_given_up_after_an_election_timeout`. Requirements: AC-T1.8.M1 to M3 and
 T-T1.8.M1 to M5 (docs/requirements.toml).
 
 Falsified by: a change answered Ok whose configuration the replica has not applied; a change that
@@ -308,7 +337,10 @@ removed member applying a write of its own; a member's answers refused while the
 a removal written over whose member's records are still refused; a change or a hand-off admitted
 while the core is joint or has a change to apply; a leader that can't be removed
 once it has handed on its lead; a transfer answered Ok while this member follows another; a
-learner added while the database is past the snapshot ceiling.
+learner added while the database is past the snapshot ceiling; a learner judged `Ready` whose last
+round lasted an election timeout or more, or one never judged `Aborted` whose lag didn't shrink over
+one; `catch_up` answered with anything but `NotLeader` off the leader; a learner of the
+configuration applied left out of its answer while the core still counts it.
 
 ## A forward that meets an election (2026-11-06)
 
