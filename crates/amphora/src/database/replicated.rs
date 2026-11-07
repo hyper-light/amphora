@@ -268,6 +268,8 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     // Whether the floor session in hand is a request to attest again, and how this owner's
     // requests ended: applied, or refused by the stale-base rule and proposed again on a later pass.
     floor_requesting: bool,
+    // A floor session past its barrier, waiting for this member to apply its own whole log.
+    floor_tail: bool,
     floor_requests_applied: u64,
     floor_requests_stale: u64,
     // The floor version this owner last published, none before its first: a raise is it rising.
@@ -845,6 +847,7 @@ fn open_on<F: BlockFile + 'static>(
         floor_ended: 0,
         floor_failures: 0,
         floor_requesting: false,
+        floor_tail: false,
         floor_requests_applied: 0,
         floor_requests_stale: 0,
         floor_published: None,
@@ -1233,6 +1236,9 @@ impl<F: BlockFile + 'static> Actor<F> {
         self.settle_change();
         self.settle_transfer();
         self.bootstrap()?;
+        if self.floor_tail {
+            self.prepare()?;
+        }
         self.keep_floor()?;
         if !self.replica.machine().bootstrap_pending()
             && self.pending.is_none()
@@ -2314,6 +2320,29 @@ impl<F: BlockFile + 'static> Actor<F> {
         {
             self.requeue(pending);
             return Ok(());
+        }
+        // A floor session prepares only once this member has applied its own whole log: its
+        // barrier covers what was committed, and an entry appended ahead of it, not yet committed,
+        // would make its base stale, and followers out of phase would keep missing each other
+        // (amphora-seam-owner's ruling on the keeper's livelock, b'). Local, bounded by the
+        // session's own deadline; the run loop asks again each step.
+        self.floor_tail = false;
+        if matches!(pending.author, Author::Owner)
+            && matches!(pending.phase, Phase::Barrier(Some(_)))
+            && !self.replica.machine().bootstrap_pending()
+        {
+            let last = self
+                .replica
+                .core()
+                .raft
+                .log()
+                .last_index()
+                .map_err(unavailable)?;
+            if self.replica.applied().index < last {
+                self.floor_tail = true;
+                self.pending = Some(pending);
+                return Ok(());
+            }
         }
         let Phase::Barrier(operation) = pending.phase else {
             self.pending = Some(pending);
@@ -7742,9 +7771,9 @@ mod tests {
             );
         }
         assert_eq!(seen[late].len(), 1, "the third attested {:?}", seen[late]);
-        // A session another member's makes stale is proposed again on a later pass, and each
-        // round of contention applies at least one, so every member's proposals are bounded by
-        // the sessions contending; once settled, none at all.
+        // A session another member's makes stale is proposed again on a later pass; prepared on
+        // its member's whole log, each refusal needs another member's session committed first,
+        // so every member's proposals are bounded by the members; once settled, none at all.
         let proposed: Vec<u64> = before
             .iter()
             .enumerate()
@@ -7754,8 +7783,11 @@ mod tests {
             .collect();
         for (owner, proposed) in proposed.iter().enumerate() {
             let keeper = driven.owner(owner);
+            // Bounded by the members (amphora-seam-owner's ruling on the keeper's livelock, b'):
+            // a floor session prepares on its member's whole log, so each refusal needs another
+            // member's session committed first, at most one each.
             assert!(
-                (1..=8).contains(proposed),
+                (1..=3).contains(proposed),
                 "owner {owner} proposed {proposed} attestations (sessions ended {}, keeper failures {}, applied {}, seen {:?})",
                 keeper.floor_ended,
                 keeper.floor_failures,
@@ -8646,6 +8678,82 @@ mod tests {
         }
         let counters = led.floor_counters();
         assert_eq!(counters.keeper_failing, 0);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.A1, T-T1.8.A7 (CP-T1.8) on driven time (replication.md, "The upgrade that
+    /// introduces the join rows", point 2; amphora-seam-owner's ruling on the keeper's livelock,
+    /// b'): a floor session prepares only once its member has applied its own whole log, so an
+    /// entry appended ahead of it, not yet committed when its barrier passed, never makes it stale.
+    /// Do, in a group of three voters bound to kiln.host-store 7 with joins tracked: every
+    /// follower's durable answer to an append kept back, so a write at the leader is appended on
+    /// every member and committed nowhere; a follower binds kiln.host-store 8, its keeper's barrier
+    /// passing on heartbeats; then the answers let through. Expect: the follower's attestation of
+    /// 8 applied, proposed once, never refused as stale.
+    #[test]
+    fn a_floor_session_waits_for_its_members_own_log_before_it_prepares() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        let leader = tracked_group(&mut driven, &mut pump, &clients);
+        quiet(&mut driven, &mut pump);
+        let follower = (leader + 1) % 3;
+        let member = u64::try_from(follower + 1).unwrap();
+        let proposed = driven.owner(follower).floor_attestations;
+        pump.hold_durable();
+        let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
+            db.exec("CREATE TABLE IF NOT EXISTS ahead(x)")?;
+            Ok(Box::new(()) as Box<dyn Any + Send>)
+        }))));
+        let (response, written) = mpsc::sync_channel(1);
+        clients[leader]
+            .handle
+            .enqueue(
+                Input::Submit {
+                    namespace: String::new(),
+                    operation,
+                    application: Some(kiln(7)),
+                    until: driven.until(),
+                    response,
+                },
+                api::REQUEST_MAX,
+            )
+            .unwrap();
+        reach(
+            &mut driven,
+            &mut pump,
+            "the write appended on the follower",
+            |driven| {
+                let replica = &driven.owner(follower).replica;
+                replica.core().raft.log().last_index().unwrap() > replica.applied().index
+            },
+        );
+        clients[follower].handle().attest(kiln(8)).unwrap();
+        reach(
+            &mut driven,
+            &mut pump,
+            "the follower's keeper with a session in hand",
+            |driven| driven.owner(follower).floor_inflight,
+        );
+        for _ in 0..64 {
+            driven.round(&mut pump);
+        }
+        pump.let_durable();
+        for _ in 0..ROUNDS {
+            if attested(&mut driven, leader, member).is_some_and(|attested| attested.highest == 8) {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        assert_eq!(attested(&mut driven, leader, member).unwrap().highest, 8);
+        assert!(driven.answer(&mut pump, &written).is_ok());
+        assert_eq!(
+            driven.owner(follower).floor_attestations - proposed,
+            1,
+            "the follower's attestation was proposed again: its base missed the write ahead of it"
+        );
         driven.drain(&mut pump);
         pump.finish();
     }
