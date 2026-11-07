@@ -5376,13 +5376,7 @@ mod tests {
     }
     /// The ticks owner 0's core waits, at least, before it campaigns: an election timeout.
     fn leader_core_election_tick(driven: &Driven) -> usize {
-        driven.owners[0]
-            .0
-            .replica
-            .core()
-            .raft
-            .config()
-            .election_tick
+        driven.owner(0).replica.core().raft.config().election_tick
     }
 
     /// AC-T1.8.M1 (CP-T1.8) on driven time (replication.md, "Membership"; kiln plan 01a1a283e14c,
