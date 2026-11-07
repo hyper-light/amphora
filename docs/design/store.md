@@ -1382,7 +1382,11 @@ checkpoints are as before.
 indexer calls them one durable call at a time, each document read back whole after; the checkpoint
 must write at most a quarter of the log's bytes. Red at 13e385d. What `copy_after` buys
 (adas-mac-studio-3, bytes into the file a byte of rows, and its flushes): every period 9.9 (270),
-1,024 frames 3.7 (53), 2,048 2.2 (28), 8,192 0.7 (7), 32,768 0.2 (1).
+1,024 frames 3.7 (53), 2,048 2.2 (28), 8,192 0.7 (7), 32,768 0.2 (1). On a quiet Mac (adas-mac-studio-3,
+2026-11-07, `bench/records/2026-11-07-studio3-small-commits.md`) the audit's batched leg wrote
+427-442 MiB to the disks for its MiB of text, within the bound of 481, where 13e385d wrote 599-624;
+its 1, 4 and 8 MiB legs took 1.20, 6.40 and 14.61 s, best of 2, against 13e385d's 1.24, 6.99 and
+15.20 s.
 
 **Falsified by.** The checkpoint writing more than a quarter of the log's bytes on the batched leg
 (the test above); a reader reading a page other than as committed while copies wait, or an
