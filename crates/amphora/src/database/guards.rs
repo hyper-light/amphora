@@ -67,11 +67,13 @@ mod tests {
         }
     }
 
-    /// Says when it drops, and whether the database's lease was free then: a group dropped with
-    /// the lease free outlived every holder of the lease.
+    /// Says when it drops, and whether the owner's lease was free then: no holder of it left in
+    /// this process, the drain the owner table decides by (local-owner-transport.md, "Owner
+    /// guards"). A group dropped with the lease free outlived every holder of the lease. The lock
+    /// itself is no witness: a child this process forks shares it until its exec.
     struct Witness {
         id: usize,
-        lease: Option<PathBuf>,
+        lease: Option<Arc<Mutex<Weak<File>>>>,
         dropped: Sender<(usize, bool)>,
     }
     impl Drop for Witness {
@@ -79,7 +81,7 @@ mod tests {
             let free = self
                 .lease
                 .as_ref()
-                .is_some_and(|path| crate::transport::try_lease(path).unwrap().is_some());
+                .is_some_and(|lease| lease.lock().unwrap().strong_count() == 0);
             self.dropped.send((self.id, free)).unwrap();
         }
     }
@@ -87,22 +89,38 @@ mod tests {
     struct Witnesses {
         sender: Sender<(usize, bool)>,
         dropped: Receiver<(usize, bool)>,
+        lease: Arc<Mutex<Weak<File>>>,
     }
     impl Witnesses {
         fn new() -> Self {
             let (sender, dropped) = channel();
-            Self { sender, dropped }
+            Self {
+                sender,
+                dropped,
+                lease: Arc::default(),
+            }
         }
-        /// Guards of `key` whose witness `id` probes `lease` as it drops.
-        fn guards(&self, key: u8, id: usize, lease: Option<&Path>) -> Guards {
+        /// Guards of `key` whose witness `id`, if it `watches`, says as it drops whether the lease
+        /// [`Witnesses::watch`] took is free.
+        fn guards(&self, key: u8, id: usize, watches: bool) -> Guards {
             Guards::new(
                 [key; 32],
                 Arc::new(Witness {
                     id,
-                    lease: lease.map(Path::to_path_buf),
+                    lease: watches.then(|| Arc::clone(&self.lease)),
                     dropped: self.sender.clone(),
                 }),
             )
+        }
+        /// The lease of the owner at `path`, for the watching witnesses.
+        fn watch(&self, path: &Path) {
+            let owners = OWNERS.get_or_init(Mutex::default).lock().unwrap();
+            let owner = owners.get(&path.canonicalize().unwrap()).unwrap();
+            assert!(
+                owner.lease.strong_count() > 0,
+                "no owner holds a lease to watch"
+            );
+            *self.lease.lock().unwrap() = owner.lease.clone();
         }
         /// The witnesses dropped so far, in order.
         fn so_far(&self) -> Vec<usize> {
@@ -137,8 +155,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let witnesses = Witnesses::new();
-        let first =
-            Database::open_guarded(&path, witnesses.guards(1, 0, Some(&path)), until()).unwrap();
+        let first = Database::open_guarded(&path, witnesses.guards(1, 0, true), until()).unwrap();
+        witnesses.watch(&path);
         first
             .execute(
                 vec![Statement {
@@ -151,7 +169,7 @@ mod tests {
         let mut handles = vec![first.clone()];
         for id in 1..=16 {
             let again =
-                Database::open_guarded(&path, witnesses.guards(1, id, None), until()).unwrap();
+                Database::open_guarded(&path, witnesses.guards(1, id, false), until()).unwrap();
             assert!(Arc::ptr_eq(&again.shared, &first.shared));
             assert_eq!(witnesses.so_far(), vec![id], "open {id} kept its group");
             handles.push(again);
@@ -181,25 +199,25 @@ mod tests {
     /// holder of the lease in this process has, whatever another process shares. Do: a guarded
     /// owner; a child process given a copy of its lease's descriptor, as a child this process
     /// forks has one until it execs; every handle dropped. Expect: the group dropped with no
-    /// holder of the lease left in this process, though the child still holds the lock.
+    /// holder of the lease left in this process, though the child still holds the lock. Then a
+    /// second owner whose lease the test keeps past every handle: its group is seen dropping with
+    /// the lease held.
     #[cfg(unix)]
     #[test]
     fn a_child_sharing_the_lease_does_not_hold_the_group() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let witnesses = Witnesses::new();
-        let owner =
-            Database::open_guarded(&path, witnesses.guards(1, 0, Some(&path)), until()).unwrap();
-        let shared = {
-            let owners = OWNERS.get_or_init(Mutex::default).lock().unwrap();
-            let lease = owners
-                .get(&path.canonicalize().unwrap())
-                .unwrap()
-                .lease
-                .upgrade()
-                .unwrap();
-            lease.try_clone().unwrap()
-        };
+        let owner = Database::open_guarded(&path, witnesses.guards(1, 0, true), until()).unwrap();
+        witnesses.watch(&path);
+        let shared = witnesses
+            .lease
+            .lock()
+            .unwrap()
+            .upgrade()
+            .unwrap()
+            .try_clone()
+            .unwrap();
         let mut child = std::process::Command::new("sleep")
             .arg("60")
             .stdin(std::process::Stdio::from(shared))
@@ -210,6 +228,15 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert_eq!(dropped, (0, true));
+
+        // The witness still sees a holder in this process: the lease kept past every handle.
+        let witnesses = Witnesses::new();
+        let owner = Database::open_guarded(&path, witnesses.guards(1, 1, true), until()).unwrap();
+        witnesses.watch(&path);
+        let kept = witnesses.lease.lock().unwrap().upgrade().unwrap();
+        drop(owner);
+        assert_eq!(witnesses.next(), (1, false));
+        drop(kept);
     }
 
     #[test]
@@ -222,10 +249,10 @@ mod tests {
 
         let guarded = dir.path().join("guarded");
         let owner =
-            Database::open_guarded(&guarded, witnesses.guards(1, 0, None), until()).unwrap();
+            Database::open_guarded(&guarded, witnesses.guards(1, 0, false), until()).unwrap();
         let why = reason(Database::open_guarded(
             &guarded,
-            witnesses.guards(2, 1, None),
+            witnesses.guards(2, 1, false),
             until(),
         ));
         assert!(why.contains("other guards"), "{why}");
@@ -236,7 +263,7 @@ mod tests {
         let plain = Database::open(&unguarded, until()).unwrap();
         let why = reason(Database::open_guarded(
             &unguarded,
-            witnesses.guards(1, 2, None),
+            witnesses.guards(1, 2, false),
             until(),
         ));
         assert!(why.contains("unguarded"), "{why}");
@@ -255,7 +282,7 @@ mod tests {
         }
         let why = reason(Database::open_guarded(
             &guarded,
-            witnesses.guards(1, 3, None),
+            witnesses.guards(1, 3, false),
             until(),
         ));
         assert!(why.contains("not the live owner's file"), "{why}");
@@ -263,7 +290,7 @@ mod tests {
             &guarded,
             &dir.path().join("log"),
             config(),
-            witnesses.guards(1, 4, None),
+            witnesses.guards(1, 4, false),
             until(),
         ));
         assert!(why.contains("not the live owner's file"), "{why}");
@@ -297,7 +324,7 @@ mod tests {
         let missing = dir.path().join("missing");
         let why = reason(Database::open_guarded(
             &missing.join("db"),
-            witnesses.guards(1, 0, None),
+            witnesses.guards(1, 0, false),
             until(),
         ));
         assert!(why.contains("parent directory does not exist"), "{why}");
@@ -307,7 +334,7 @@ mod tests {
             &path,
             &log,
             config(),
-            witnesses.guards(1, 1, None),
+            witnesses.guards(1, 1, false),
             until(),
         ));
         assert!(why.contains("parent directory does not exist"), "{why}");
@@ -315,7 +342,7 @@ mod tests {
             &path,
             &log,
             config(),
-            witnesses.guards(1, 2, None),
+            witnesses.guards(1, 2, false),
             until(),
         ));
         assert!(why.contains("parent directory does not exist"), "{why}");
@@ -338,7 +365,7 @@ mod tests {
             &path,
             &log,
             config(),
-            witnesses.guards(1, 0, None),
+            witnesses.guards(1, 0, false),
             until(),
         )
         .unwrap();
@@ -347,15 +374,16 @@ mod tests {
             &path,
             &log,
             config(),
-            witnesses.guards(1, 1, Some(&path)),
+            witnesses.guards(1, 1, true),
             until(),
         )
         .unwrap();
+        witnesses.watch(&path);
         let again = Database::open_replicated_guarded(
             &path,
             &log,
             config(),
-            witnesses.guards(1, 2, None),
+            witnesses.guards(1, 2, false),
             until(),
         )
         .unwrap();
@@ -364,7 +392,7 @@ mod tests {
             &path,
             &log,
             config(),
-            witnesses.guards(1, 3, None),
+            witnesses.guards(1, 3, false),
             until(),
         )
         .unwrap()
@@ -374,7 +402,7 @@ mod tests {
             &path,
             &log,
             config(),
-            witnesses.guards(2, 4, None),
+            witnesses.guards(2, 4, false),
             until(),
         ));
         assert!(why.contains("other guards"), "{why}");
@@ -480,7 +508,7 @@ mod tests {
         let witnesses = Witnesses::new();
         let why = reason(Database::open_guarded(
             &path,
-            witnesses.guards(1, 0, None),
+            witnesses.guards(1, 0, false),
             until(),
         ));
         assert!(why.contains("another process owns"), "{why}");
@@ -488,7 +516,7 @@ mod tests {
             &path,
             &dir.path().join("log"),
             config(),
-            witnesses.guards(1, 1, None),
+            witnesses.guards(1, 1, false),
             until(),
         ));
         assert!(why.contains("another process owns"), "{why}");
@@ -497,7 +525,7 @@ mod tests {
         drop(child.stdin.take());
         assert!(child.wait().unwrap().success());
         // With the other process gone, the guarded open owns.
-        let owner = Database::open_guarded(&path, witnesses.guards(1, 2, None), until()).unwrap();
+        let owner = Database::open_guarded(&path, witnesses.guards(1, 2, false), until()).unwrap();
         assert_eq!(owner_key(&path), Some(Some([1; 32])));
         drop(owner);
         assert_eq!(witnesses.next().0, 2);

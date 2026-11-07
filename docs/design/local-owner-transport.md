@@ -302,7 +302,11 @@ additive constructors carry them, and the existing ones keep their behavior:
 
 Evidence: `database::guards::tests` with a Drop witness: sixteen same-key opens and an unguarded
 one keep one group, which outlives every `Database` clone and drops with the lease free (after the
-writer, readers and flusher drained); other guards, an unguarded owner, another file at the path
+writer, readers and flusher drained); "free" is the owner table's own drain, no holder of the lease
+left in this process, not the lock: a child this process forks shares the lock's open file
+description until its exec, so a probe of the lock found it held for microseconds while other
+tests spawned children, and the witness failed 2 times in 273 loaded runs (2026-11-07, fedora;
+`a_child_sharing_the_lease_does_not_hold_the_group`, red against the lock probe); other guards, an unguarded owner, another file at the path
 and another process's owner are each refused with the incoming group dropped at once and the live
 owner untouched; a missing parent is refused with nothing made, and a parent removed after resolution
 is refused by each later step and not made again; the replicated owner is reused and
