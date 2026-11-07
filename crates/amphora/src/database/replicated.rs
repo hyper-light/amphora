@@ -2795,6 +2795,9 @@ mod tests {
         // Every MsgAppend lost while heartbeats go on: a configuration's way out appended stays
         // uncommitted while a ReadIndex still completes.
         appends_lost: bool,
+        // Every answer to an append lost, held or durable, while heartbeats and reads go on: an
+        // entry appended on the followers commits nowhere.
+        answers_lost: bool,
     }
     impl<'a> Pump<'a> {
         fn new(clients: &'a [Client]) -> Self {
@@ -2813,6 +2816,7 @@ mod tests {
                 durable: None,
                 held: Vec::new(),
                 appends_lost: false,
+                answers_lost: false,
             }
         }
         fn reap(&mut self) {
@@ -2921,6 +2925,9 @@ mod tests {
                             || (self.appends_lost
                                 && Message::decode(&message.bytes).unwrap().msg_type
                                     == hyper_raft::proto::MessageType::MsgAppend)
+                            || (self.answers_lost
+                                && Message::decode(&message.bytes).unwrap().msg_type
+                                    == hyper_raft::proto::MessageType::MsgAppendResponse)
                         {
                             continue;
                         }
@@ -8775,15 +8782,17 @@ mod tests {
     /// leader appended on every member and committed nowhere; a follower binds kiln.host-store 8,
     /// its session waiting for its log with that write ahead, its target the write's index; then
     /// its target set to what it has applied, as a barrier that passed with nothing ahead and an
-    /// entry appended since would leave it; one step. Expect: the target the write's index while
-    /// it waits; after the step, the session prepared and proposed though its log still runs past
-    /// what it has applied, and its wait cleared.
+    /// entry appended since would leave it, its log running past what it has applied; one step.
+    /// Expect: the target the write's index while it waits; after the step, the session prepared
+    /// and proposed, its wait cleared.
     #[test]
     fn a_floor_session_waits_for_its_log_as_it_was_not_for_writes_behind_it() {
         let dir = tempfile::tempdir().unwrap();
         let mut driven = Driven::new();
         let clients = three_and_a_learner(&mut driven, dir.path());
         let mut pump = Pump::new(&clients);
+        // The lost answers may cost the lead; proposals dropped in that election are counted.
+        pump.refusals = Some(0);
         let leader = tracked_group(&mut driven, &mut pump, &clients);
         quiet(&mut driven, &mut pump);
         let follower = (leader + 1) % 3;
@@ -8806,7 +8815,7 @@ mod tests {
                 api::REQUEST_MAX,
             )
             .unwrap();
-        pump.hold_durable();
+        pump.answers_lost = true;
         let tail = |driven: &Driven| {
             let replica = &driven.owner(follower).replica;
             (
@@ -8842,6 +8851,11 @@ mod tests {
             owner.floor_tail, None,
             "the session still waits: its target moved"
         );
+        let (applied, last) = tail(&driven);
+        assert!(
+            last > applied,
+            "the write ahead applied: it was meant to commit nowhere"
+        );
         assert!(
             owner.floor_attestations > proposed
                 || matches!(
@@ -8850,22 +8864,24 @@ mod tests {
                 ),
             "the session did not prepare at its target"
         );
-        let (applied, last) = tail(&driven);
-        assert!(
-            last > applied,
-            "it prepared only once the log behind was applied"
-        );
-        pump.let_durable();
+        // Time passes, as after an outage: what was lost is sent again or the group elects, and
+        // the follower's attestation applies.
+        pump.answers_lost = false;
+        let led = settle_lead(&mut driven, &mut pump, &clients);
         for _ in 0..ROUNDS {
-            if attested(&mut driven, leader, member).is_some_and(|attested| attested.highest == 8) {
+            if attested(&mut driven, led, member).is_some_and(|attested| attested.highest == 8) {
                 break;
+            }
+            for owner in 0..3 {
+                driven.advance(owner, TICK);
             }
             driven.round(&mut pump);
         }
         // Its attestation, prepared at a base the write behind it moves past, may be refused by
         // the stale-base rule and made again; it applies all the same.
-        assert_eq!(attested(&mut driven, leader, member).unwrap().highest, 8);
-        let _ = driven.answer(&mut pump, &written);
+        assert_eq!(attested(&mut driven, led, member).unwrap().highest, 8);
+        // The write ahead is answered as the group decided: applied, or unknown after a new lead.
+        drop(written);
         driven.drain(&mut pump);
         pump.finish();
     }
