@@ -2764,6 +2764,8 @@ mod tests {
             want: usize,
         },
     }
+    /// Says whether the pump loses a record, given the member that sent it.
+    type Losing = Box<dyn Fn(u64, &Message) -> bool>;
     /// CP-T1.8: mirror the carrier's bounded admission and observe every processed receipt.
     /// Admission never waits for another owner. All records, including retained proposals,
     /// share COMMANDS/QUEUED_BYTES bounds; each keeps its first absolute receive deadline.
@@ -2795,9 +2797,8 @@ mod tests {
         // Every MsgAppend lost while heartbeats go on: a configuration's way out appended stays
         // uncommitted while a ReadIndex still completes.
         appends_lost: bool,
-        // Every answer to an append lost, held or durable, while heartbeats and reads go on: an
-        // entry appended on the followers commits nowhere.
-        answers_lost: bool,
+        // The records the test loses, by the member that sent them and what they are.
+        losing: Option<Losing>,
     }
     impl<'a> Pump<'a> {
         fn new(clients: &'a [Client]) -> Self {
@@ -2816,7 +2817,7 @@ mod tests {
                 durable: None,
                 held: Vec::new(),
                 appends_lost: false,
-                answers_lost: false,
+                losing: None,
             }
         }
         fn reap(&mut self) {
@@ -2925,9 +2926,9 @@ mod tests {
                             || (self.appends_lost
                                 && Message::decode(&message.bytes).unwrap().msg_type
                                     == hyper_raft::proto::MessageType::MsgAppend)
-                            || (self.answers_lost
-                                && Message::decode(&message.bytes).unwrap().msg_type
-                                    == hyper_raft::proto::MessageType::MsgAppendResponse)
+                            || self.losing.as_ref().is_some_and(|losing| {
+                                losing(from, &Message::decode(&message.bytes).unwrap())
+                            })
                         {
                             continue;
                         }
@@ -8776,27 +8777,48 @@ mod tests {
 
     /// AC-T1.8.A1 (CP-T1.8) on driven time (amphora-seam-owner's review of 392902d): a floor
     /// session's wait for its member's log has a target fixed when its barrier passes, so an entry
-    /// appended after that never moves it, and the session never waits out its deadline holding
-    /// the member's write slot through others' writes. Do, in a group of three voters bound to
-    /// kiln.host-store 7 with joins tracked: followers' durable answers kept back, a write at the
-    /// leader appended on every member and committed nowhere; a follower binds kiln.host-store 8,
-    /// its session waiting for its log with that write ahead, its target the write's index; then
-    /// its target set to what it has applied, as a barrier that passed with nothing ahead and an
-    /// entry appended since would leave it, its log running past what it has applied; one step.
-    /// Expect: the target the write's index while it waits; after the step, the session prepared
-    /// and proposed, its wait cleared.
+    /// appended after that never moves it, and the session never waits out its deadline holding the
+    /// member's write slot through others' writes. Do, in a group of three voters bound to
+    /// kiln.host-store 7 with joins tracked: a write at the leader appended on it and a follower
+    /// and committed nowhere, the other voter's appends and every answer that would count the
+    /// follower as holding it lost; the follower binds kiln.host-store 8, its session waiting for
+    /// its log with that write ahead, its target the write's index; then its target set to what it
+    /// has applied, as a barrier that passed with nothing ahead and an entry appended since would
+    /// leave it, its log running past what it has applied; one step. Expect: the target the write's
+    /// index while it waits; then the session prepared and proposed, its wait cleared; after an
+    /// outage's time, the attestation applied.
     #[test]
     fn a_floor_session_waits_for_its_log_as_it_was_not_for_writes_behind_it() {
         let dir = tempfile::tempdir().unwrap();
         let mut driven = Driven::new();
         let clients = three_and_a_learner(&mut driven, dir.path());
         let mut pump = Pump::new(&clients);
-        // The lost answers may cost the lead; proposals dropped in that election are counted.
+        // The lost records may cost the lead; proposals dropped in that election are counted.
         pump.refusals = Some(0);
         let leader = tracked_group(&mut driven, &mut pump, &clients);
         quiet(&mut driven, &mut pump);
         let follower = (leader + 1) % 3;
         let member = u64::try_from(follower + 1).unwrap();
+        let other = u64::try_from((leader + 2) % 3 + 1).unwrap();
+        let tail = |driven: &Driven| {
+            let replica = &driven.owner(follower).replica;
+            (
+                replica.applied().index,
+                replica.core().raft.log().last_index().unwrap(),
+            )
+        };
+        // The write ahead commits nowhere: the other voter never holds it, and no answer says the
+        // follower does (a heartbeat's answer saying where its log ends counts as an append's).
+        // The other voter's answers still confirm the follower's barrier.
+        let (_, before) = tail(&driven);
+        pump.losing = Some(Box::new(move |from, record| match record.msg_type {
+            hyper_raft::proto::MessageType::MsgAppend => record.to == other,
+            hyper_raft::proto::MessageType::MsgAppendResponse => true,
+            hyper_raft::proto::MessageType::MsgHeartbeatResponse => {
+                from == member && record.index > before
+            }
+            _ => false,
+        }));
         let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
             db.exec("CREATE TABLE IF NOT EXISTS ahead(x)")?;
             Ok(Box::new(()) as Box<dyn Any + Send>)
@@ -8815,14 +8837,6 @@ mod tests {
                 api::REQUEST_MAX,
             )
             .unwrap();
-        pump.answers_lost = true;
-        let tail = |driven: &Driven| {
-            let replica = &driven.owner(follower).replica;
-            (
-                replica.applied().index,
-                replica.core().raft.log().last_index().unwrap(),
-            )
-        };
         reach(
             &mut driven,
             &mut pump,
@@ -8852,10 +8866,7 @@ mod tests {
             "the session still waits: its target moved"
         );
         let (applied, last) = tail(&driven);
-        assert!(
-            last > applied,
-            "the write ahead applied: it was meant to commit nowhere"
-        );
+        assert!(last > applied, "the write ahead applied");
         assert!(
             owner.floor_attestations > proposed
                 || matches!(
@@ -8866,7 +8877,7 @@ mod tests {
         );
         // Time passes, as after an outage: what was lost is sent again or the group elects, and
         // the follower's attestation applies.
-        pump.answers_lost = false;
+        pump.losing = None;
         let led = settle_lead(&mut driven, &mut pump, &clients);
         for _ in 0..ROUNDS {
             if attested(&mut driven, led, member).is_some_and(|attested| attested.highest == 8) {
