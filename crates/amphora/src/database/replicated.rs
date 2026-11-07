@@ -9265,6 +9265,8 @@ mod tests {
             }
             pump.finish();
         }
+        // The run's record: how often each falsifier's situation was reached (non-vacuity).
+        eprintln!("T-T1.8.A6 over {SEEDS} seeds of {STEPS} steps reached: {reached:#?}");
         let unreached = reached.unreached();
         assert!(
             unreached.is_empty(),
