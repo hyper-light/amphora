@@ -1399,7 +1399,8 @@ than with a copy at every period (decision 4's bench).
 **Decision.** A new generation of the log is mixed (its header's file format
 `packed::MIXED_FORMAT`, `0x414d5003`; Amphora's default, `Db::open`): a commit writes its pages as
 packed records (decision 16), each page a delta against its version the log already holds where one
-saves half the page (decision 17), else its image; a spill or a cache flush writes whole page frames,
+saves half the page (decision 17), else its image, a record compressed only when it carries a delta
+(a record of images alone, a big transaction's pages new to the generation, is stored as it is); a spill or a cache flush writes whole page frames,
 over the transaction's own frames as decision 30 has it, and the commit chains them again before its
 records. A slot is told by its page field: a page number below `0x8000_0000` is a page frame, a
 record's first slot carries `0x8000_0000` with its slot count, and its other slots the continuation

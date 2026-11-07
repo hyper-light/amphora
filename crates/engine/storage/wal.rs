@@ -4121,7 +4121,14 @@ impl WalFile {
             let held = entries
                 .get(cut.clone())
                 .ok_or_else(|| LimboError::InternalError("a record past its entries".into()))?;
-            let (payload, record) = packed::encode(held, page_size)?;
+            // A mixed generation stores a record of images alone as it is: its pages are new to
+            // the generation (a big transaction's, mostly), and compressing them costs the commit
+            // more than writing them (decision 37). Packed records are compressed as ever.
+            let compress = Self::format(header) != LogFormat::Mixed
+                || held
+                    .iter()
+                    .any(|(_, body)| matches!(body, packed::Body::Delta { .. }));
+            let (payload, record) = packed::encode(held, page_size, compress)?;
             let slots = packed::slots(payload.len(), page_size)?;
             // A packed generation's first slot carries the count, a mixed one's marks it apart
             // from page numbers (decision 37).

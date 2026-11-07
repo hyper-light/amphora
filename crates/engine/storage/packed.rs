@@ -202,11 +202,16 @@ fn raw_len_bound(page_size: usize) -> Result<usize> {
 }
 
 /// A record's payload for `entries` (each page once, an image a page long): [stored length][raw
-/// length][the raw bytes compressed], or, where LZ4 doesn't make them smaller, stored length 0 and
-/// the raw bytes as they are (an LZ4 block of anything is never empty). The raw bytes are [entry
+/// length][the raw bytes compressed], or, where LZ4 doesn't make them smaller or `compress` says
+/// not to try, stored length 0 and the raw bytes as they are (an LZ4 block of anything is never
+/// empty). The raw bytes are [entry
 /// count] then each entry's header ([page][kind][depth][0u16][body length]) then the bodies, in
 /// order, integers big-endian. With it, the record as a read decodes it.
-pub(crate) fn encode(entries: &[(u32, Body<'_>)], page_size: usize) -> Result<(Vec<u8>, Record)> {
+pub(crate) fn encode(
+    entries: &[(u32, Body<'_>)],
+    page_size: usize,
+    compress: bool,
+) -> Result<(Vec<u8>, Record)> {
     if entries.is_empty() || entries.len() > MOST_PAGES {
         return Err(corrupt("a record holds 1 to 1024 pages"));
     }
@@ -238,8 +243,12 @@ pub(crate) fn encode(entries: &[(u32, Body<'_>)], page_size: usize) -> Result<(V
     for (_, body) in entries {
         raw.extend_from_slice(body.bytes());
     }
-    let compressed = lz4_flex::block::compress(&raw);
-    let (stored_len, stored) = if compressed.len() < raw.len() {
+    let compressed = if compress {
+        lz4_flex::block::compress(&raw)
+    } else {
+        Vec::new()
+    };
+    let (stored_len, stored) = if compress && compressed.len() < raw.len() {
         let n = u32::try_from(compressed.len()).map_err(|_| corrupt("record too large"))?;
         (n, compressed.as_slice())
     } else {
@@ -698,7 +707,7 @@ mod tests {
     fn a_record_decodes_to_the_pages_it_was_made_of() {
         let size = 4096;
         let (a, b, c) = (page(1, size), page(2, size), vec![0u8; size]);
-        let payload = encode(&images(&[(7, &a), (3, &b), (900, &c)]), size)
+        let payload = encode(&images(&[(7, &a), (3, &b), (900, &c)]), size, true)
             .unwrap()
             .0;
         assert!(payload.len() < 3 * size, "the record didn't compress");
@@ -714,7 +723,7 @@ mod tests {
     fn padding_after_a_payload_is_ignored() {
         let size = 1024;
         let a = page(9, size);
-        let mut payload = encode(&images(&[(1, &a)]), size).unwrap().0;
+        let mut payload = encode(&images(&[(1, &a)]), size, true).unwrap().0;
         let n = slots(payload.len(), size).unwrap() as usize;
         payload.resize(n * size, 0);
         let record = Record::decode(&payload, size).unwrap();
@@ -747,7 +756,7 @@ mod tests {
                 },
             ),
         ];
-        let (payload, made) = encode(&entries, size).unwrap();
+        let (payload, made) = encode(&entries, size, true).unwrap();
         assert_eq!(made.pages().collect::<Vec<_>>(), vec![5, 6]);
         // Cut short anywhere, or its lengths or bytes damaged: an error, never a panic.
         for cut in 0..payload.len() {
@@ -781,8 +790,8 @@ mod tests {
     fn a_record_holds_one_to_1024_entries_each_well_formed() {
         let size = 512;
         let a = page(1, size);
-        assert!(encode(&[], size).is_err());
-        assert!(encode(&[(1, Body::Image(&a[..100]))], size).is_err());
+        assert!(encode(&[], size, true).is_err());
+        assert!(encode(&[(1, Body::Image(&a[..100]))], size, true).is_err());
         assert!(encode(
             &[(
                 1,
@@ -791,7 +800,8 @@ mod tests {
                     runs: &[]
                 }
             )],
-            size
+            size,
+            true
         )
         .is_err());
         let too_deep = MOST_DELTAS + 1;
@@ -803,14 +813,15 @@ mod tests {
                     runs: &[]
                 }
             )],
-            size
+            size,
+            true
         )
         .is_err());
         let many: Vec<(u32, &[u8])> = (1..=1025u32).map(|p| (p, &a[..])).collect();
-        assert!(encode(&images(&many), size).is_err());
-        assert!(encode(&images(&many[..1024]), size).is_ok());
+        assert!(encode(&images(&many), size, true).is_err());
+        assert!(encode(&images(&many[..1024]), size, true).is_ok());
         assert!(
-            encode(&images(&[(3, &a[..]), (3, &a[..])]), size).is_err(),
+            encode(&images(&[(3, &a[..]), (3, &a[..])]), size, true).is_err(),
             "a page twice"
         );
     }
@@ -828,7 +839,7 @@ mod tests {
                 x as u8
             })
             .collect();
-        let payload = encode(&images(&[(2, &noise)]), size).unwrap().0;
+        let payload = encode(&images(&[(2, &noise)]), size, true).unwrap().0;
         assert_eq!(&payload[..4], &[0, 0, 0, 0], "stored, not compressed");
         let record = Record::decode(&payload, size).unwrap();
         assert_eq!(image_of(&record, 2).unwrap(), noise);
@@ -918,7 +929,7 @@ mod tests {
         let size = 1024;
         let a = page(3, size);
         let pages: Vec<(u32, &[u8])> = (1..=9u32).map(|p| (p, &a[..])).collect();
-        let payload = encode(&images(&pages), size).unwrap().0;
+        let payload = encode(&images(&pages), size, true).unwrap().0;
         let n = slots(payload.len(), size).unwrap() as usize;
         let frame = WAL_FRAME_HEADER_SIZE + size;
         let mut log = vec![0xffu8; n * frame];
@@ -955,7 +966,7 @@ mod tests {
         let size = 4096;
         let a = page(1, size);
         let pages: Vec<(u32, &[u8])> = (1..=256u32).map(|p| (p, &a[..])).collect();
-        let big = Arc::new(encode(&images(&pages), size).unwrap().1);
+        let big = Arc::new(encode(&images(&pages), size, true).unwrap().1);
         let mut records = Records::default();
         for head in 1..=40u64 {
             records.publish(head * 10, 3);

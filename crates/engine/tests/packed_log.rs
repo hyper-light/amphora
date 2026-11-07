@@ -174,8 +174,17 @@ fn reads_back_through_every_path(format: LogFormat, file_format: u32) {
                 u32::from_be_bytes(wal[at..at + 4].try_into().unwrap())
             })
             .collect();
-        assert!(stored.iter().any(|n| *n > 0), "no record compressed");
-        assert!(stored.contains(&0), "no record stored as it is: {stored:?}");
+        if format == LogFormat::Packed {
+            assert!(stored.iter().any(|n| *n > 0), "no record compressed");
+            assert!(stored.contains(&0), "no record stored as it is: {stored:?}");
+        } else {
+            // A mixed generation stores a record of images alone as it is (decision 37): new rows'
+            // pages are images; the records whose pages were logged before carry deltas.
+            assert!(
+                stored.contains(&0),
+                "no record of images stored as it is: {stored:?}"
+            );
+        }
 
         // A connection with nothing cached reads every page from the log's records.
         assert_eq!(table(&connect(&db)), want);
@@ -311,6 +320,15 @@ fn deltas_read_back(format: LogFormat) {
             entries.len()
         );
         assert_eq!(deepest, 8, "chains run to the most allowed, and no further");
+        // Records that carry deltas are compressed, in either format.
+        let compressed = records(&wal)
+            .iter()
+            .filter(|(head, _)| {
+                let at = head + FRAME_HEADER;
+                u32::from_be_bytes(wal[at..at + 4].try_into().unwrap()) > 0
+            })
+            .count();
+        assert!(compressed > 0, "no record of deltas compressed");
         integrity(&connect(&db));
         truncate(&conn);
         assert_eq!(table(&connect(&db)), want);
