@@ -10284,8 +10284,8 @@ mod tests {
         }
     }
 
-    /// CP-T1.10, Amphora goal 13f90c05 (replication.md, "A local read on a replica"), on driven
-    /// time: a local read answers with the leader gone. Do: a voter and its learner, 1 and 2
+    /// AC-T1.10.L1, T-T1.10.L1, Amphora goal 13f90c05 (replication.md, "A local read on a
+    /// replica"), on driven time: a local read answers with the leader gone. Do: a voter and its learner, 1 and 2
     /// written and caught up; then the voter is gone (nothing relayed, its owner never stepped
     /// again); the learner reads its own state. Expect: 1 and 2.
     #[test]
@@ -10315,6 +10315,314 @@ mod tests {
 
         let until = driven.until();
         assert_eq!(read_here(&mut driven, 1, learner, until), Ok(vec![1, 2]));
+    }
+
+    /// Before the local read (Amphora goal 13f90c05), a replica reads only through its leader:
+    /// the tests below ask a read the replica has no way to answer on its own.
+    impl Client {
+        fn read_local<R>(
+            &self,
+            _until: Instant,
+            _f: impl FnOnce(&mut Db) -> anyhow::Result<R>,
+        ) -> Result<R, Refusal> {
+            Err(unavailable("a replica reads only through its leader"))
+        }
+    }
+
+    /// A local read's own budget in these tests, on the real clock: a hang guard, never a verdict.
+    const HANG_READ: Duration = Duration::from_secs(60);
+
+    /// AC-T1.10.L1, T-T1.10.L2 (replication.md, "A local read on a replica"; kiln plan
+    /// 01a1a283e14c, step 4), on driven time: a local read sees only what the group committed and
+    /// its owner applied. Do: three voters, 1 written; the leader prepares 2 beside thousands of
+    /// pages (past its writer's cache, which spills them), reading locally within that
+    /// preparation; once the write is proposed, nothing is relayed, and every owner reads locally;
+    /// then relaying resumes. Expect: the read within the preparation sees 1 alone; while the
+    /// write is proposed and not committed, every owner's read sees 1 alone; once it is answered,
+    /// the leader's sees 1 and 2, and each follower's once it has caught up.
+    #[test]
+    #[ignore = "red until the local read (Amphora goal 13f90c05)"]
+    fn a_local_read_never_sees_what_the_group_has_not_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let origin = clients.get(leader).unwrap();
+        write(&mut driven, &mut pump, origin, 1);
+        for owner in 0..3 {
+            catch_up(&mut driven, &mut pump, &clients, leader, owner);
+        }
+
+        let within = Arc::new(Mutex::new(None));
+        let (probe, seen) = (origin.clone(), Arc::clone(&within));
+        let until = driven.until();
+        let answer = submit(origin, until, move |db| {
+            db.exec("CREATE TABLE spilled(data)")?;
+            db.exec("INSERT INTO spilled SELECT zeroblob(4000) FROM (WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<2000) SELECT x FROM n)")?;
+            db.exec("INSERT INTO member_items VALUES(2)")?;
+            *seen.lock().unwrap() = Some(probe.read_local(Instant::now() + HANG_READ, values)?);
+            Ok(Vec::new())
+        });
+        let proposed = |driven: &Driven| {
+            driven
+                .owner(leader)
+                .pending
+                .as_ref()
+                .is_some_and(|pending| matches!(pending.phase, Phase::Proposed(_)))
+        };
+        for _ in 0..ROUNDS {
+            if proposed(&driven) {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        assert!(proposed(&driven), "the write was never proposed");
+        assert_eq!(within.lock().unwrap().take(), Some(vec![1]));
+        for client in &clients {
+            assert_eq!(
+                client
+                    .read_local(Instant::now() + HANG_READ, values)
+                    .unwrap(),
+                vec![1]
+            );
+        }
+        assert!(matches!(answer.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        assert_eq!(driven.settle(&mut pump, &answer).unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            origin
+                .read_local(Instant::now() + HANG_READ, values)
+                .unwrap(),
+            vec![1, 2]
+        );
+        for owner in 0..3 {
+            catch_up(&mut driven, &mut pump, &clients, leader, owner);
+            let client = clients.get(owner).unwrap();
+            assert_eq!(
+                client
+                    .read_local(Instant::now() + HANG_READ, values)
+                    .unwrap(),
+                vec![1, 2]
+            );
+        }
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.10.L1, T-T1.10.L3 (replication.md, "A local read on a replica"; kiln plan
+    /// 01a1a283e14c, step 4): a member that hasn't taken its group's first image has no state of
+    /// the group's to read. Do: open a learner declared to take its first image from member 1,
+    /// which never sends it; read locally. Expect: refused (Unavailable), saying why.
+    #[test]
+    #[ignore = "red until the local read (Amphora goal 13f90c05)"]
+    fn a_local_read_waits_for_the_groups_first_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let declared = api::replication::Bootstrap {
+            source_node: 1,
+            source_id: [7; 32],
+        };
+        let learner = driven.open_member(dir.path(), 2, vec![1], vec![2], Some(declared));
+        assert!(learner.handle().status().unwrap().bootstrapping);
+        let refused = learner.read_local(Instant::now() + HANG_READ, values);
+        assert!(
+            matches!(&refused, Err(Refusal::Unavailable(why)) if why.contains("first image")),
+            "{refused:?}"
+        );
+    }
+
+    /// How long the fifth local read waits in the test below: its own deadline, the thing under
+    /// test, so that it is refused Timeout when it passes.
+    const FIFTH_WAIT: Duration = Duration::from_millis(100);
+
+    /// A local read of `values` on its own thread that, once it has its reader, says so on
+    /// `entered` and holds the reader until its release is sent or dropped.
+    fn held_read(
+        client: &Client,
+        entered: &mpsc::Sender<()>,
+    ) -> (
+        mpsc::Sender<()>,
+        std::thread::JoinHandle<Result<Vec<u8>, Refusal>>,
+    ) {
+        let (release, released) = mpsc::channel::<()>();
+        let (client, entered) = (client.clone(), entered.clone());
+        let read = std::thread::spawn(move || {
+            client.read_local(Instant::now() + HANG_READ, move |db| {
+                entered.send(()).unwrap();
+                let _ = released.recv();
+                values(db)
+            })
+        });
+        (release, read)
+    }
+
+    /// AC-T1.10.L2, T-T1.10.L5 (replication.md, "A local read on a replica", amendment 2), on
+    /// driven time: at most four local readers at once, and a fifth waits on its caller's thread
+    /// up to its own deadline. Do: one voter, 1 written; four local reads held open on four
+    /// threads; a fifth asked on a thread of its own, its deadline FIFTH_WAIT away, while the
+    /// owner answers a call; one of the four let go and a read asked; a fourth held again and a
+    /// read waiting with a long deadline; the owner dropped without its loop's end. Expect: the
+    /// call answered while four are out; the fifth refused Timeout no sooner than its deadline;
+    /// the read after the let-go answers 1; the waiting read refused Fenced once the owner is gone.
+    #[test]
+    #[ignore = "red until the local read (Amphora goal 13f90c05)"]
+    fn a_fifth_local_read_waits_for_a_reader_and_is_refused_timeout_at_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = vec![driven.open(dir.path(), 1, vec![1], None)];
+        let mut pump = Pump::new(&clients);
+        let client = clients.first().unwrap();
+        driven.elect(&mut pump, &clients, 0, 1);
+        write(&mut driven, &mut pump, client, 1);
+
+        let (entered, entering) = mpsc::channel();
+        let mut held: Vec<_> = (0..4).map(|_| held_read(client, &entered)).collect();
+        for _ in 0..4 {
+            assert!(
+                entering.recv_timeout(HANG_READ).is_ok(),
+                "a held read never had its reader"
+            );
+        }
+        let asked = Instant::now();
+        let fifth = {
+            let client = client.clone();
+            std::thread::spawn(move || client.read_local(asked + FIFTH_WAIT, values))
+        };
+        // The owner answers while four readers are out and a fifth waits: it waits on its own
+        // thread, never the owner's.
+        assert_eq!(driven.call(&mut pump, client, values).unwrap(), vec![1]);
+        let refused = fifth.join().unwrap();
+        assert!(matches!(refused, Err(Refusal::Timeout)), "{refused:?}");
+        assert!(asked.elapsed() >= FIFTH_WAIT, "the fifth was refused early");
+
+        let (release, read) = held.pop().unwrap();
+        release.send(()).unwrap();
+        assert_eq!(read.join().unwrap(), Ok(vec![1]));
+        assert_eq!(
+            client.read_local(Instant::now() + HANG_READ, values),
+            Ok(vec![1])
+        );
+
+        held.push(held_read(client, &entered));
+        assert!(
+            entering.recv_timeout(HANG_READ).is_ok(),
+            "a held read never had its reader"
+        );
+        let waiting = {
+            let client = client.clone();
+            std::thread::spawn(move || client.read_local(Instant::now() + HANG_READ, values))
+        };
+        drop(driven.owners.get_mut(0).unwrap().take());
+        let ended = waiting.join().unwrap();
+        assert!(matches!(ended, Err(Refusal::Fenced(_))), "{ended:?}");
+        for (release, read) in held {
+            release.send(()).unwrap();
+            read.join().unwrap().unwrap();
+        }
+    }
+
+    /// AC-T1.10.L1, T-T1.10.L6 (replication.md, "A local read on a replica", amendment 4): across
+    /// a power cut a local read can go back, never past the replica's last finished flush. Do:
+    /// three voters of three fates, two to span, every database flush held; 1 written and flushed
+    /// on a follower, then 2 written and applied there unflushed, and read locally; the
+    /// follower's power cut, its database losing what it hadn't synced, and the member restarted;
+    /// a local read before it steps; then rounds until it has caught up. Expect: 1 and 2 before
+    /// the cut; 1 alone after it, the state its last flush made durable and never less; 1 and 2
+    /// once caught up.
+    #[test]
+    #[ignore = "red until the local read (Amphora goal 13f90c05)"]
+    fn a_local_read_after_a_power_cut_is_no_older_than_its_last_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let durability = Durability::Replicated(api::replication::Fates {
+            of: vec![(1, 10), (2, 20), (3, 30)],
+            spanning: 2,
+        });
+        let voters = vec![1, 2, 3];
+        let mut power: Vec<Power> = (1..=3u64).map(Power::new).collect();
+        let mut driven = Driven::powered();
+        let mut clients: Vec<Client> = (0..3)
+            .map(|at| {
+                driven.open_power(
+                    dir.path(),
+                    u64::try_from(at + 1).unwrap(),
+                    voters.clone(),
+                    durability.clone(),
+                    power.get(at).unwrap(),
+                )
+            })
+            .collect();
+        for owner in 0..3 {
+            driven.hold_flushes(owner);
+        }
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let follower = (leader + 1) % 3;
+        let insert = |value: u8| {
+            move |db: &mut Db| {
+                db.exec("CREATE TABLE IF NOT EXISTS member_items(value)")?;
+                db.exec(&format!("INSERT INTO member_items VALUES({value})"))?;
+                Ok(Vec::new())
+            }
+        };
+        // Rounds, the leader's clock moving a tick each, until the follower has applied all the
+        // leader has.
+        let caught_up = |driven: &mut Driven<hyper_block::sim::SimHandle>,
+                         pump: &mut Pump<'_>,
+                         clients: &[Client]| {
+            let applied = |n: usize| clients[n].handle().status().unwrap().applied;
+            (0..ROUNDS).any(|_| {
+                driven.advance(leader, TICK);
+                driven.round(pump);
+                applied(follower) >= applied(leader)
+            })
+        };
+        driven.call(&mut pump, &clients[leader], insert(1)).unwrap();
+        assert!(caught_up(&mut driven, &mut pump, &clients));
+        driven.flush(follower);
+        driven.call(&mut pump, &clients[leader], insert(2)).unwrap();
+        assert!(caught_up(&mut driven, &mut pump, &clients));
+        assert!(
+            driven
+                .owner(follower)
+                .replica
+                .machine()
+                .unflushed()
+                .is_some(),
+            "the follower's last write was flushed"
+        );
+        assert_eq!(
+            clients[follower].read_local(Instant::now() + HANG_READ, values),
+            Ok(vec![1, 2])
+        );
+        driven.drain(&mut pump);
+        pump.finish();
+
+        clients[follower] = driven.power_cut(
+            dir.path(),
+            follower,
+            voters.clone(),
+            durability.clone(),
+            &mut power[follower],
+        );
+        driven.hold_flushes(follower);
+        assert_eq!(
+            clients[follower].read_local(Instant::now() + HANG_READ, values),
+            Ok(vec![1])
+        );
+        let mut pump = Pump::new(&clients);
+        assert!(
+            caught_up(&mut driven, &mut pump, &clients),
+            "the restarted follower never caught up"
+        );
+        assert_eq!(
+            clients[follower].read_local(Instant::now() + HANG_READ, values),
+            Ok(vec![1, 2])
+        );
+        driven.drain(&mut pump);
+        pump.finish();
     }
 
     mod receive_receipts {
