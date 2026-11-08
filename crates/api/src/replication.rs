@@ -102,3 +102,25 @@ pub struct ReplicaStatus {
     #[serde(default)]
     pub voters_outgoing: Vec<u64>,
 }
+
+/// The application floor a replica applied, and where each member of its configuration stands
+/// against it (replication.md, "The seam": `floor_status`). Read from what the owner published at
+/// its last applied index, without asking it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FloorStatus {
+    /// The floor's application, none before a floor is raised.
+    pub application: Option<String>,
+    /// The floor, 0 for none.
+    pub version: u32,
+    /// Every member of the configuration in force, by identity.
+    pub members: Vec<MemberFloor>,
+}
+
+/// One member against the floor: whether it votes, and the highest version of the floor's
+/// application it attested under its current join, if it has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberFloor {
+    pub member: u64,
+    pub voter: bool,
+    pub attested: Option<u32>,
+}

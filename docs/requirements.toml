@@ -121,6 +121,8 @@ criteria = [
   { id = "AC-T1.8.M1", text = "A group changes its members at runtime through a joint configuration: a change answers Ok only once committed, and one change or hand-off at a time, none while joint" },
   { id = "AC-T1.8.M2", text = "The leader hands on its lead before it is demoted or removed, and a hand-off answers only as its outcome shows" },
   { id = "AC-T1.8.M3", text = "A learner is added only while the database is within the snapshot ceiling; past it the change is refused TooLarge before it is proposed" },
+  # Amphora's own: the replicated application floor (docs/design/replication.md, "The application floor, replicated").
+  { id = "AC-T1.8.A1", text = "writes applied with an application claim below the floor in force at their index is exactly 0, on any member, measured by the floor's simulation with a nemesis" },
 ]
 tests = [
   { id = "T-T1.8.1", text = "A laptop offline writes to its outbox, then reconnects — passes when every write commits, in order, with no duplicate" },
@@ -132,6 +134,14 @@ tests = [
   { id = "T-T1.8.M5", text = "A joiner to a database past the snapshot ceiling is refused before the change is proposed" },
   # Amphora's own: the replicated class (docs/design/replication.md, "Fates and durability checked").
   { id = "T-T1.8.C1", text = "An attachment whose durability differs from its owner's is refused, typed; the same fates in another order are taken; a process stating no replica restarts in the owner's class" },
+  # Amphora's own: the replicated application floor (docs/design/replication.md, "The application floor, replicated").
+  { id = "T-T1.8.A1", text = "An old-binary learner added just before a floor raise: the raise is refused naming it, or the promotion is refused; never both through" },
+  { id = "T-T1.8.A2", text = "A leader crashes between a membership change and a floor raise: the raise's proof covers the configuration in force at its index, or the raise is refused" },
+  { id = "T-T1.8.A3", text = "A member installed from a snapshot holds the floor, the join rows and the attestations, and proves and refuses as the leader does" },
+  { id = "T-T1.8.A4", text = "A forwarded proposal whose context names a third member is refused, typed, and applies on no member" },
+  { id = "T-T1.8.A5", text = "A member removed and added again attests under its new join; its old attestation never vouches and blocks nothing" },
+  { id = "T-T1.8.A6", text = "Every falsifier of the replicated floor holds as an assertion over every simulated run" },
+  { id = "T-T1.8.A7", text = "A mixed-binary group through the upgrade that introduces join rows, a member removed and re-added before J: no raise through until J, the stale attestation never counts, image digests identical at every applied index" },
 ]
 
 [[goal]]

@@ -367,6 +367,166 @@ impl ReplicaMeter {
     }
 }
 
+/// The replicated application floor's metrics, as their host exports them: name, type and help,
+/// in the order of [`FloorCounters`]' fields (docs/design/replication.md, "The application floor,
+/// replicated", "Metrics"; agreed with Kiln Metrics under amphora-membership-floor/names/v1 and
+/// v1-keeper).
+pub const FLOOR_METRICS: [(&str, &str, &str); 6] = [
+    (
+        "amphora_floor_version",
+        "gauge",
+        "The application floor committed at this member's applied index, 0 for none.",
+    ),
+    (
+        "amphora_floor_raises_total",
+        "counter",
+        "Raises of the application floor this member applied.",
+    ),
+    (
+        "amphora_floor_refusals_total",
+        "counter",
+        "Requests the application floor refused at this member, by reason (unproven, stale_base, below_floor, no_claim, other_application, busy).",
+    ),
+    (
+        "amphora_floor_unattested_members",
+        "gauge",
+        "Members of the configuration in force with no attestation at the floor under their current join; every member reports it, so take max by db.",
+    ),
+    (
+        "amphora_floor_keeper_failures_total",
+        "counter",
+        "Passes of this member's floor keeper that failed for a reason other than fencing; it looks again when the applied index moves.",
+    ),
+    (
+        "amphora_floor_keeper_failing",
+        "gauge",
+        "1 while this member's floor keeper's last pass failed, 0 once a pass succeeds; a stuck keeper on an idle database shows here.",
+    ),
+];
+
+/// Why the floor refused a request: `amphora_floor_refusals_total`'s `reason`, a closed set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloorRefusal {
+    /// A raise or a promotion some member's attestation doesn't prove.
+    Unproven,
+    /// A raise the stale-base rule refused: the group changed while it was proven.
+    StaleBase,
+    /// A claim, a bind or a learner below the floor.
+    BelowFloor,
+    /// A handle with no claim on a database with a floor.
+    NoClaim,
+    /// A claim for another application than the floor's.
+    OtherApplication,
+    /// A raise or a promotion the group can't take now: joint, or a tail still to apply.
+    Busy,
+}
+
+impl FloorRefusal {
+    pub const ALL: [Self; 6] = [
+        Self::Unproven,
+        Self::StaleBase,
+        Self::BelowFloor,
+        Self::NoClaim,
+        Self::OtherApplication,
+        Self::Busy,
+    ];
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Unproven => "unproven",
+            Self::StaleBase => "stale_base",
+            Self::BelowFloor => "below_floor",
+            Self::NoClaim => "no_claim",
+            Self::OtherApplication => "other_application",
+            Self::Busy => "busy",
+        }
+    }
+    fn index(self) -> usize {
+        match self {
+            Self::Unproven => 0,
+            Self::StaleBase => 1,
+            Self::BelowFloor => 2,
+            Self::NoClaim => 3,
+            Self::OtherApplication => 4,
+            Self::Busy => 5,
+        }
+    }
+}
+
+/// A replica owner's floor counters, bumped by its owner and its handles, read by its host at any
+/// time without asking the owner.
+#[derive(Default)]
+pub struct FloorMeter {
+    version: AtomicU64,
+    raises: AtomicU64,
+    refusals: [AtomicU64; 6],
+    unattested: AtomicU64,
+    keeper_failures: AtomicU64,
+    keeper_failing: AtomicU64,
+}
+
+/// What a replica owner's floor counters say now ([`FLOOR_METRICS`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FloorCounters {
+    pub version: u64,
+    pub raises: u64,
+    /// By [`FloorRefusal::ALL`]'s order.
+    pub refusals: [u64; 6],
+    pub unattested_members: u64,
+    pub keeper_failures: u64,
+    pub keeper_failing: u64,
+}
+
+impl FloorCounters {
+    /// The refusals counted for `reason`.
+    #[must_use]
+    pub fn refused(&self, reason: FloorRefusal) -> u64 {
+        self.refusals.get(reason.index()).copied().unwrap_or(0)
+    }
+}
+
+impl FloorMeter {
+    /// The floor and the members short of it at the applied index the owner just published.
+    pub fn applied(&self, version: u32, unattested: usize) {
+        self.version.store(u64::from(version), Ordering::Relaxed);
+        self.unattested.store(
+            u64::try_from(unattested).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+    pub fn raised(&self) {
+        self.raises.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn refused(&self, reason: FloorRefusal) {
+        if let Some(count) = self.refusals.get(reason.index()) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    /// The keeper's pass: a failure counts and holds the gauge at 1; a success clears it.
+    pub fn kept(&self, failed: bool) {
+        if failed {
+            self.keeper_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        self.keeper_failing
+            .store(u64::from(failed), Ordering::Relaxed);
+    }
+    #[must_use]
+    pub fn counters(&self) -> FloorCounters {
+        FloorCounters {
+            version: self.version.load(Ordering::Relaxed),
+            raises: self.raises.load(Ordering::Relaxed),
+            refusals: std::array::from_fn(|i| {
+                self.refusals
+                    .get(i)
+                    .map_or(0, |c| c.load(Ordering::Relaxed))
+            }),
+            unattested_members: self.unattested.load(Ordering::Relaxed),
+            keeper_failures: self.keeper_failures.load(Ordering::Relaxed),
+            keeper_failing: self.keeper_failing.load(Ordering::Relaxed),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,5 +579,26 @@ mod tests {
             .collect();
         let code = REPLICA_METRICS.iter().map(|(name, _, _)| *name).collect();
         assert_eq!(named, code);
+    }
+
+    /// CP-T1.8, doc truth (CLAUDE.md sections 6 and 10): the floor's metrics and their refusal
+    /// reasons are the ones its design names. Do: read docs/design/replication.md. Expect: every
+    /// `amphora_floor_` name there is in [`FLOOR_METRICS`] and every one of those is there; every
+    /// reason in [`FloorRefusal::ALL`] is named there.
+    #[test]
+    fn the_floor_metrics_are_the_ones_the_design_names() {
+        let design = include_str!("../../../docs/design/replication.md");
+        let named: std::collections::BTreeSet<&str> = design
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|word| word.starts_with("amphora_floor_"))
+            .collect();
+        let code = FLOOR_METRICS.iter().map(|(name, _, _)| *name).collect();
+        assert_eq!(named, code);
+        for reason in FloorRefusal::ALL {
+            assert!(
+                design.contains(&format!("`{}`", reason.reason())),
+                "{reason:?}"
+            );
+        }
     }
 }

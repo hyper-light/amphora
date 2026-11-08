@@ -25,6 +25,15 @@ use amphora_engine_parser::{
 use crate::db::Db;
 use crate::store::{self, Checkpointed, Engine, Flush, Opener, Store};
 
+mod application;
+pub(crate) use application::Application;
+
+/// The application floor installed in `db`, if any.
+pub(crate) fn installed_floor(db: &Db) -> anyhow::Result<Option<Application>> {
+    application::policy(db)
+}
+pub use application::WriterBoundary;
+
 pub(crate) mod compaction;
 mod guards;
 mod import;
@@ -70,6 +79,7 @@ impl Drop for Admission {
 #[derive(Clone)]
 pub struct Database {
     shared: Arc<Shared>,
+    application: Option<Application>,
 }
 
 struct Shared {
@@ -163,6 +173,7 @@ enum Answer {
 type Reply = Arc<Mutex<Option<Result<Answer, Refusal>>>>;
 struct Command {
     namespace: String,
+    application: Option<Application>,
     operation: Operation,
     answer: Reply,
     publication: Arc<Mutex<Option<BTreeMap<String, Published>>>>,
@@ -372,7 +383,12 @@ pub(crate) fn refused(error: &anyhow::Error) -> Refusal {
 }
 /// A query's session on `db`, a reader or the writer between its commits: once, before its
 /// deadline, never on a database whose restore is unfinished.
-fn run_query<R, F>(db: &mut Db, until: Instant, session: &Mutex<Option<F>>) -> anyhow::Result<R>
+fn run_query<R, F>(
+    db: &mut Db,
+    until: Instant,
+    claim: Option<&Application>,
+    session: &Mutex<Option<F>>,
+) -> anyhow::Result<R>
 where
     F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R>,
 {
@@ -387,6 +403,8 @@ where
     }
     let done = db.query_transaction(|db| {
         let _deadline = db.deadline(until);
+        // As a replicated query is, run as a call: the handle's claim against the floor it reads.
+        application::claim_holds(db, claim)?;
         let mut connection = crate::sql::Connection::new(db);
         let value = f(&mut connection)?;
         connection.finish()?;
@@ -579,7 +597,10 @@ impl Database {
                         match remote::validate(&backend.client, replica, until) {
                             Ok(_) => {
                                 backend.configure(replica)?;
-                                return Ok(Self { shared });
+                                return Ok(Self {
+                                    shared,
+                                    application: None,
+                                });
                             }
                             // Identity probes cannot submit application work. Only a successful
                             // OS lease below permits starting the predecessor's replacement.
@@ -609,9 +630,15 @@ impl Database {
                                 ));
                             }
                         }
-                        return Ok(Self { shared });
+                        return Ok(Self {
+                            shared,
+                            application: None,
+                        });
                     } else {
-                        return Ok(Self { shared });
+                        return Ok(Self {
+                            shared,
+                            application: None,
+                        });
                     }
                 }
                 // Store shutdown is asynchronous. Its engine/readers/flusher still retain the
@@ -788,6 +815,7 @@ impl Database {
                     until,
                 )?;
                 Ok(Self {
+                    application: None,
                     shared: Arc::new(Shared {
                         transport: Mutex::new(None),
                         path: OnceLock::new(),
@@ -861,6 +889,7 @@ impl Database {
         let changed = Changed::default();
         *locked(&changed.published)? = read_published(&db)?;
         let database = Self {
+            application: None,
             shared: Arc::new(Shared {
                 transport: Mutex::new(None),
                 path: OnceLock::new(),
@@ -938,11 +967,15 @@ impl Database {
         // The store runs the session on a reader, or on the writer while it has none to lend.
         let session = Arc::new(Mutex::new(Some(f)));
         let on_writer = Arc::clone(&session);
+        let claim = database.application.clone();
+        let on_writer_claim = claim.clone();
         store
             .read_committed(
                 until,
-                |reader| run_query(reader, until, &session),
-                move |engine| run_query(&mut engine.db, until, &on_writer),
+                |reader| run_query(reader, until, claim.as_ref(), &session),
+                move |engine| {
+                    run_query(&mut engine.db, until, on_writer_claim.as_ref(), &on_writer)
+                },
             )
             .map_err(|e| refused(&e))
     }
@@ -1009,11 +1042,21 @@ impl Database {
         }
         let store = match &self.shared.writer {
             Writer::Replicated { client, .. } => {
-                return client.submit(namespace.to_owned(), operation, until);
+                return client.submit(
+                    namespace.to_owned(),
+                    operation,
+                    self.application.clone(),
+                    until,
+                );
             }
             Writer::Local(store) => store,
             Writer::Client(backend) => {
-                return remote::submit(&backend.client, namespace, operation, until);
+                return remote::submit(
+                    &backend.client.for_application(self.application.clone()),
+                    namespace,
+                    operation,
+                    until,
+                );
             }
         };
         let admission = Admission::reserve(&self.shared.admitted)?;
@@ -1050,6 +1093,7 @@ impl Database {
             .put_then(
                 vec![Command {
                     namespace: namespace.to_owned(),
+                    application: self.application.clone(),
                     operation,
                     answer: Arc::clone(&answer),
                     publication: Arc::clone(&publication),
@@ -1385,6 +1429,12 @@ impl Engine for Local {
         }) {
             for row in rows {
                 if let Operation::Mutation(Mutation::CompactStep { before, .. }) = &row.operation {
+                    if let Err(error) =
+                        application::check(&self.db, row.application.as_ref(), &row.operation)
+                    {
+                        *locked(&row.answer)? = Some(Err(refused(&error)));
+                        continue;
+                    }
                     let result = compaction::local(
                         &mut self.db,
                         &row.namespace,
@@ -1403,6 +1453,7 @@ impl Engine for Local {
                             return Err(Refusal::Timeout.into());
                         }
                         let _deadline = db.deadline(row.until);
+                        application::check(db, row.application.as_ref(), &row.operation)?;
                         if !restoring && restore::incomplete(db)? {
                             return Err(api::invalid("database", "restore is incomplete").into());
                         }
@@ -1437,6 +1488,7 @@ impl Engine for Local {
                         return Err(Refusal::Timeout.into());
                     }
                     let _deadline = db.deadline(r.until);
+                    application::check(db, r.application.as_ref(), &r.operation)?;
                     let result = apply(db, &r.namespace, &r.operation);
                     if result.is_err() && Instant::now() >= r.until {
                         return Err(Refusal::Timeout.into());

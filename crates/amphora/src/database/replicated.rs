@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
-use crate::meter::{ReplicaCounters, ReplicaMeter};
+use crate::meter::{FloorCounters, FloorMeter, FloorRefusal, ReplicaCounters, ReplicaMeter};
 use api::replication::{
     CatchUp, Durability, MemberChange, Outbound, ReplicaConfig, ReplicaStatus, Verdict,
 };
@@ -37,7 +37,13 @@ const DRIVE_QUANTUM: usize = 32;
 // The admission charge of a change of members or a hand-off of the lead: policy, not a measured
 // size. Each is a few bytes; the charge holds its place in the queue's byte budget.
 const CHANGE_BYTES: usize = 1024;
+// The lease of one of the floor keeper's own sessions: policy, not a measured number, the same
+// finite lease the seed's internal attempt has (`bootstrap`); a session past it ends unapplied and
+// is made again.
+const FLOOR_SESSION: Duration = Duration::from_secs(60);
 
+/// One of the floor's own sessions: the work it does on the database at its base.
+type FloorSession = Box<dyn FnOnce(&mut Db) -> anyhow::Result<()> + Send>;
 type Durable<F = DeviceFile> = Replica<GroupStore<F>, crate::replication::Machine, Bytes>;
 type Response<T> = mpsc::SyncSender<Result<T, Refusal>>;
 
@@ -95,9 +101,10 @@ impl Client {
         &self,
         namespace: String,
         operation: Operation,
+        application: Option<crate::database::Application>,
         until: Instant,
     ) -> Result<Answer, Refusal> {
-        self.handle.submit(namespace, operation, until)
+        self.handle.submit(namespace, operation, application, until)
     }
     pub(super) fn handle(&self) -> ReplicaHandle {
         self.handle.clone()
@@ -105,6 +112,14 @@ impl Client {
 }
 struct Control {
     admitted: AtomicUsize,
+    // The application this member's handles last bound, so that binding it again asks nothing.
+    attesting: Mutex<Option<crate::database::Application>>,
+    // The floor in force at the applied index last published, so a bind below it is refused
+    // without asking the owner.
+    floor: Mutex<Option<crate::database::Application>>,
+    // What floor_status answers: the floor and each member against it, at that same index.
+    floor_status: Mutex<amphora_api::replication::FloorStatus>,
+    floor_meter: FloorMeter,
     outgoing: Mutex<Outgoing>,
     status: Mutex<Result<ReplicaStatus, Refusal>>,
     meter: Arc<ReplicaMeter>,
@@ -133,6 +148,8 @@ enum Input {
     Submit {
         namespace: String,
         operation: Operation,
+        // The handle's application claim, checked against the floor at the session's base.
+        application: Option<crate::database::Application>,
         until: Instant,
         response: Response<Answer>,
     },
@@ -162,6 +179,11 @@ enum Input {
     CatchUp {
         until: Instant,
         response: Response<Vec<(u64, CatchUp)>>,
+    },
+    /// The application bound on this member, which its owner attests (replication.md,
+    /// "Attestation"). It has no answer: an attestation not yet made only holds a raise back.
+    Attest {
+        application: crate::database::Application,
     },
 }
 /// The hand-off of the lead under way (replication.md, "Membership"): asked of the leader in
@@ -193,12 +215,21 @@ enum Stage {
     /// Applied: the group is in the joint configuration, or has left it.
     Applied,
 }
+/// Whose session a pending one is, for the application floor's check at its preparation
+/// (replication.md, "Writers").
+enum Author {
+    /// A caller's, with its handle's application claim.
+    Application(Option<crate::database::Application>),
+    /// The owner's own: the seed, and the floor's attestations, marker J and requests.
+    Owner,
+}
 struct Pending {
     context: Vec<u8>,
     term: u64,
     leader: u64,
     until: Instant,
     namespace: String,
+    author: Author,
     response: Option<Response<Answer>>,
     phase: Phase,
     // Keep admission charged while its command is in flight, not just while queued.
@@ -227,6 +258,31 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     pending: Option<Pending>,
     changing: Option<Changing>,
     transferring: Option<Transferring>,
+    // The application this member's handles are bound to, which it keeps attested.
+    attesting: Option<crate::database::Application>,
+    // The applied index the floor's keeper last looked at, and the configuration_at at which it
+    // found nothing left to do (joins tracked, and this member's attestation current).
+    floor_checked: u64,
+    floor_settled: Option<u64>,
+    // What the keeper proposed, counted: this member's attestations, and as leader its requests
+    // that every member attest again. Read by tests as non-vacuity counters.
+    floor_attestations: u64,
+    floor_requests: u64,
+    // Whether one of the keeper's sessions is in flight; how many ended, applied or not; and how
+    // many passes failed short of fencing. Counters read by tests.
+    floor_inflight: bool,
+    floor_ended: u64,
+    floor_failures: u64,
+    // Whether the floor session in hand is a request to attest again, and how this owner's
+    // requests ended: applied, or refused by the stale-base rule and proposed again on a later pass.
+    floor_requesting: bool,
+    // A floor session past its barrier, waiting for this member to apply its own log up to the
+    // last index it held as the barrier passed.
+    floor_tail: Option<u64>,
+    floor_requests_applied: u64,
+    floor_requests_stale: u64,
+    // The floor version this owner last published, none before its first: a raise is it rising.
+    floor_published: Option<u32>,
     // At most COMMANDS admitted operations wait behind the sole prepared transaction.
     waiting: VecDeque<Envelope>,
     serial: u64,
@@ -313,6 +369,17 @@ fn fenced(reason: impl std::fmt::Display) -> Refusal {
 fn unknown() -> Refusal {
     Refusal::UnknownOutcome
 }
+/// Counts a refusal the floor made and says so on its target (replication.md, "Metrics").
+fn floor_refused(control: &Control, reason: FloorRefusal, refusal: &Refusal) {
+    control.floor_meter.refused(reason);
+    tracing::info!(
+        target: "amphora.floor",
+        event = "floor.refused",
+        reason = reason.reason(),
+        error = %refusal,
+        "the application floor refused a request"
+    );
+}
 fn raft_error(error: hyper_durable::ReplicaError) -> Refusal {
     match error {
         hyper_durable::ReplicaError::Fenced(cause) => fenced(cause),
@@ -391,6 +458,7 @@ impl ReplicaHandle {
         &self,
         namespace: String,
         operation: Operation,
+        application: Option<crate::database::Application>,
         until: Instant,
     ) -> Result<Answer, Refusal> {
         if Instant::now() >= until {
@@ -401,6 +469,7 @@ impl ReplicaHandle {
             Input::Submit {
                 namespace,
                 operation,
+                application,
                 until,
                 response,
             },
@@ -529,6 +598,40 @@ impl ReplicaHandle {
             })?
     }
 
+    /// Keeps `application` attested on this member (replication.md, "Attestation"): its owner
+    /// proposes the member's attestation once it has applied what the group had committed, and
+    /// again whenever a change or a request makes it stale. Nothing is answered.
+    pub(crate) fn attest(&self, application: crate::database::Application) -> Result<(), Refusal> {
+        application.validate()?;
+        // A binary can't raise its highest by waiting: a bind below the floor fails closed now.
+        if let Some(floor) = locked(&self.shared.floor)?.as_ref()
+            && floor.name == application.name
+            && application.version < floor.version
+        {
+            let refusal = api::invalid(
+                "application floor",
+                &format!(
+                    "this binary runs up to {}; the group's floor is {}",
+                    application.version, floor.version
+                ),
+            );
+            floor_refused(&self.shared, FloorRefusal::BelowFloor, &refusal);
+            return Err(refusal);
+        }
+        let mut attesting = locked(&self.shared.attesting)?;
+        if attesting.as_ref() == Some(&application) {
+            return Ok(());
+        }
+        self.enqueue(
+            Input::Attest {
+                application: application.clone(),
+            },
+            CHANGE_BYTES,
+        )?;
+        *attesting = Some(application);
+        Ok(())
+    }
+
     /// Hands the lead to the voter `to` (replication.md, "Membership"), so that the leader can then
     /// be demoted or removed by its successor. Only the leader takes one, and not while a change of
     /// members, a joint configuration or the group's seed is under way. It answers its status once
@@ -562,6 +665,23 @@ impl ReplicaHandle {
     /// read without asking the owner, and no wire type.
     pub fn counters(&self) -> ReplicaCounters {
         self.shared.meter.counters()
+    }
+
+    /// The application floor's counters (`crate::meter::FLOOR_METRICS`), for the host to export:
+    /// read without asking the owner.
+    pub fn floor_counters(&self) -> FloorCounters {
+        self.shared.floor_meter.counters()
+    }
+
+    /// The floor and each member against it, as the owner published them at its last applied
+    /// index (replication.md, "The seam"), without asking it.
+    pub fn floor_status(&self) -> Result<amphora_api::replication::FloorStatus, Refusal> {
+        Ok(locked(&self.shared.floor_status)?.clone())
+    }
+
+    /// Counts a refusal the floor made outside the owner (a raise the stale-base rule caught).
+    pub(crate) fn floor_refused(&self, reason: FloorRefusal, refusal: &Refusal) {
+        floor_refused(&self.shared, reason, refusal);
     }
 
     /// Tells the owner what the host's node-level failure detector concluded of a member's node
@@ -729,6 +849,10 @@ fn open_on<F: BlockFile + 'static>(
         Replica::open(&settings, group, machine, Bytes::new(512 << 20)).map_err(unavailable)?;
     let control = Arc::new(Control {
         admitted: AtomicUsize::new(0),
+        attesting: Mutex::new(None),
+        floor: Mutex::new(None),
+        floor_status: Mutex::default(),
+        floor_meter: FloorMeter::default(),
         outgoing: Mutex::default(),
         status: Mutex::new(Ok(status(&replica))),
         meter,
@@ -747,6 +871,19 @@ fn open_on<F: BlockFile + 'static>(
         pending: None,
         changing: None,
         transferring: None,
+        attesting: None,
+        floor_checked: 0,
+        floor_settled: None,
+        floor_attestations: 0,
+        floor_requests: 0,
+        floor_inflight: false,
+        floor_ended: 0,
+        floor_failures: 0,
+        floor_requesting: false,
+        floor_tail: None,
+        floor_requests_applied: 0,
+        floor_requests_stale: 0,
+        floor_published: None,
         waiting: VecDeque::new(),
         serial: 0,
         transferred: None,
@@ -941,9 +1078,63 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.published = self.replica.applied().index;
             return Ok(());
         }
-        self.replica
-            .machine_mut()
-            .read_db(|db| reload_changed(db, &self.changed).map_err(Into::into))?;
+        let configuration_at = self.replica.machine().configuration_at();
+        let configuration = self.replica.configuration().clone();
+        let (floor, members) = self.replica.machine_mut().read_db(|db| {
+            reload_changed(db, &self.changed)?;
+            let floor = super::application::policy(db)?;
+            let mut members = Vec::new();
+            for member in crate::replication::floor::members(&configuration) {
+                let attested = match &floor {
+                    Some(floor) => crate::replication::floor::current(
+                        db,
+                        member,
+                        &floor.name,
+                        configuration_at,
+                    )?
+                    .map(|attested| attested.highest),
+                    None => None,
+                };
+                members.push(amphora_api::replication::MemberFloor {
+                    member,
+                    voter: configuration.voters.contains(&member)
+                        || configuration.voters_outgoing.contains(&member),
+                    attested,
+                });
+            }
+            Ok((floor, members))
+        })?;
+        let version = floor.as_ref().map_or(0, |floor| floor.version);
+        let unattested = if floor.is_some() {
+            members
+                .iter()
+                .filter(|member| !matches!(member.attested, Some(highest) if highest >= version))
+                .count()
+        } else {
+            0
+        };
+        // A raise is the floor rising past the one this owner already published; the first
+        // publication after it opens is where it starts, not a raise.
+        if let Some(before) = self.floor_published
+            && version > before
+        {
+            self.control.floor_meter.raised();
+            tracing::info!(
+                target: "amphora.floor",
+                event = "floor.raised",
+                version,
+                from = before,
+                "the application floor was raised"
+            );
+        }
+        self.floor_published = Some(version);
+        self.control.floor_meter.applied(version, unattested);
+        *locked(&self.control.floor_status)? = amphora_api::replication::FloorStatus {
+            application: floor.as_ref().map(|floor| floor.name.clone()),
+            version,
+            members,
+        };
+        *locked(&self.control.floor)? = floor;
         self.published = self.replica.applied().index;
         Ok(())
     }
@@ -997,6 +1188,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                     answer(response, Err(reason.clone()))
                 }
                 Input::CatchUp { response, .. } => answer(response, Err(reason.clone())),
+                Input::Attest { .. } => (),
             }
         }
     }
@@ -1078,6 +1270,10 @@ impl<F: BlockFile + 'static> Actor<F> {
         self.settle_change();
         self.settle_transfer();
         self.bootstrap()?;
+        if self.floor_tail.is_some() {
+            self.prepare()?;
+        }
+        self.keep_floor()?;
         if !self.replica.machine().bootstrap_pending()
             && self.pending.is_none()
             && self.replica.leader() != 0
@@ -1217,6 +1413,11 @@ impl<F: BlockFile + 'static> Actor<F> {
         let Phase::Barrier(Some(operation)) = pending.phase else {
             return;
         };
+        // The owner's own sessions answer no caller: the floor's keeper and the seed make theirs
+        // again on a later pass. Only a caller's moves back, with its claim.
+        let Author::Application(application) = pending.author else {
+            return;
+        };
         let Some(response) = pending.response.take() else {
             return;
         };
@@ -1229,6 +1430,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 command: Input::Submit {
                     namespace: pending.namespace,
                     operation,
+                    application,
                     until: pending.until,
                     response,
                 },
@@ -1362,6 +1564,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             Input::Submit {
                 namespace,
                 operation,
+                application,
                 until,
                 response,
             } => {
@@ -1378,6 +1581,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                             command: Input::Submit {
                                 namespace,
                                 operation,
+                                application,
                                 until,
                                 response,
                             },
@@ -1400,6 +1604,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                                 leader: self.replica.leader(),
                                 until,
                                 namespace,
+                                author: Author::Application(application),
                                 response: Some(response),
                                 phase: Phase::Barrier(Some(operation)),
                                 _reservation,
@@ -1443,6 +1648,14 @@ impl<F: BlockFile + 'static> Actor<F> {
                         }
                         Err(error) => answer(response, Err(raft_error(error))),
                     }
+                }
+            }
+            Input::Attest { application } => {
+                // A bind of the application already attested changes nothing.
+                if self.attesting.as_ref() != Some(&application) {
+                    self.attesting = Some(application);
+                    self.floor_settled = None;
+                    self.floor_checked = 0;
                 }
             }
             Input::Transfer {
@@ -1637,10 +1850,68 @@ impl<F: BlockFile + 'static> Actor<F> {
         )?;
         // A joiner catches up by the leader's image once the log no longer reaches back: past
         // the image's ceiling it never could, so it is refused here, not added to fall behind.
-        if matches!(change, MemberChange::AddLearner(_)) {
-            self.replica.machine_mut().admits_joiner()?;
+        match change {
+            MemberChange::AddLearner(_) => self.replica.machine_mut().admits_joiner()?,
+            MemberChange::Promote(member) => self.admits_voter(member)?,
+            MemberChange::Demote(_) | MemberChange::Remove(_) => (),
         }
         Ok(Some(proposal))
+    }
+    /// A learner becomes a voter only on its attestation of the floor in force, under its current
+    /// join, at or above it (replication.md, "How it composes with membership changes"). It is read
+    /// on a quiescent tail, so the state read is the state at the change's index; a tail still to
+    /// apply is answered at once, never waited on. A group with no floor promotes as before.
+    fn admits_voter(&mut self, member: u64) -> Result<(), Refusal> {
+        let (floor, attested) = self.replica.machine_mut().read_db(|db| {
+            let Some(floor) = super::application::policy(db)? else {
+                return Ok((None, None));
+            };
+            let attested = crate::replication::floor::current(db, member, &floor.name, 0)?;
+            Ok((Some(floor), attested))
+        })?;
+        let Some(floor) = floor else {
+            return Ok(());
+        };
+        let applied = self.replica.applied().index;
+        let last = self
+            .replica
+            .core()
+            .raft
+            .log()
+            .last_index()
+            .map_err(unavailable)?;
+        let refused = if applied != last {
+            (
+                FloorRefusal::Busy,
+                unavailable(format!(
+                    "the log runs to {last} and {applied} is applied; promote once the tail is applied"
+                )),
+            )
+        } else {
+            match attested {
+                None => (
+                    FloorRefusal::Unproven,
+                    unavailable(format!(
+                        "learner {member} has not attested {} under its current join; the group's floor is {}",
+                        floor.name, floor.version
+                    )),
+                ),
+                Some(attested) if attested.highest < floor.version => (
+                    FloorRefusal::BelowFloor,
+                    api::invalid(
+                        "application floor",
+                        &format!(
+                            "learner {member} runs {} up to {}; the group's floor is {}",
+                            floor.name, attested.highest, floor.version
+                        ),
+                    ),
+                ),
+                Some(_) => return Ok(()),
+            }
+        };
+        let (reason, refusal) = refused;
+        floor_refused(&self.control, reason, &refusal);
+        Err(refusal)
     }
     fn step(&mut self, from: u64, bytes: &[u8]) -> Result<(), Refusal> {
         #[cfg(test)]
@@ -1664,6 +1935,20 @@ impl<F: BlockFile + 'static> Actor<F> {
             return Err(api::invalid(
                 "replica sender",
                 "sender is not a current member",
+            ));
+        }
+        // A forwarded proposal's entries name their origin in their contexts (`context`). Nothing
+        // re-forwards a proposal, so its origin is its authenticated sender: one naming another
+        // member is refused here and applies nowhere (replication.md, "Attestation").
+        if message.msg_type == hyper_raft::proto::MessageType::MsgPropose
+            && message
+                .entries
+                .iter()
+                .any(|entry| entry.context.get(..8) != Some(from.to_le_bytes().as_slice()))
+        {
+            return Err(api::invalid(
+                "replica sender",
+                "a forwarded proposal names another member as its origin",
             ));
         }
         if self.replica.is_leader()
@@ -1744,6 +2029,21 @@ impl<F: BlockFile + 'static> Actor<F> {
                         Err(error) => Err(error),
                     },
                 };
+                // A request to attest again, applied or refused by the stale-base rule (another
+                // floor session at the same base committed first): the keeper's counted retry.
+                if matches!(pending.author, Author::Owner) && self.floor_requesting {
+                    self.floor_requesting = false;
+                    match &result {
+                        Ok(_) => {
+                            self.floor_requests_applied =
+                                self.floor_requests_applied.saturating_add(1);
+                        }
+                        Err(Refusal::Invalid { what, .. }) if what == "prepared transaction" => {
+                            self.floor_requests_stale = self.floor_requests_stale.saturating_add(1);
+                        }
+                        Err(_) => {}
+                    }
+                }
                 if let Some(response) = pending.response.take() {
                     answer(response, result);
                 }
@@ -1901,6 +2201,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             leader: self.replica.leader(),
             until,
             namespace: String::new(),
+            author: Author::Owner,
             response: None,
             phase: Phase::Barrier(None),
             _reservation: Reservation {
@@ -1908,6 +2209,148 @@ impl<F: BlockFile + 'static> Actor<F> {
                 bytes: 0,
             },
         });
+        Ok(())
+    }
+    /// The floor's keeper (replication.md, "Attestation" and "The upgrade that introduces the join
+    /// rows"), when this owner has nothing else in hand and something was applied since it last
+    /// looked, or one of its sessions ended: this member attests when its attestation of the
+    /// application it is bound to is missing or stale; the leader writes marker J once every
+    /// member's attestation of its own application counts, or asks them all to attest again when
+    /// its own knowledge of the last change is above theirs. Only a fenced machine ends the owner:
+    /// any other failure is reported and the keeper looks again on its next pass.
+    fn keep_floor(&mut self) -> Result<(), Refusal> {
+        // A floor session that ended, applied or refused or dropped, is looked at again at once,
+        // so a quiet group never leaves one lost.
+        if self.floor_inflight && self.pending.is_none() {
+            self.floor_inflight = false;
+            self.floor_checked = 0;
+            self.floor_ended = self.floor_ended.saturating_add(1);
+        }
+        let applied = self.replica.applied().index;
+        let configuration_at = self.replica.machine().configuration_at();
+        if self.pending.is_some()
+            || !self.waiting.is_empty()
+            || self.changing.is_some()
+            || self.transferring.is_some()
+            || self.replica.leader() == 0
+            || self.replica.machine().bootstrap_pending()
+            || applied == self.floor_checked
+            || self.floor_settled == Some(configuration_at)
+            || (self.attesting.is_none() && !self.replica.is_leader())
+        {
+            return Ok(());
+        }
+        self.floor_checked = applied;
+        match self.floor_pass(configuration_at) {
+            Ok(()) => {
+                self.control.floor_meter.kept(false);
+                Ok(())
+            }
+            Err(Refusal::Fenced(reason)) => Err(Refusal::Fenced(reason)),
+            Err(refusal) => {
+                tracing::warn!(
+                    target: "amphora.floor",
+                    event = "floor.keeper_failed",
+                    error = %refusal,
+                    "the floor's keeper looks again on its next pass"
+                );
+                self.floor_failures = self.floor_failures.saturating_add(1);
+                self.control.floor_meter.kept(true);
+                Ok(())
+            }
+        }
+    }
+    fn floor_pass(&mut self, configuration_at: u64) -> Result<(), Refusal> {
+        use crate::replication::floor;
+        let me = self.replica.id();
+        let members = floor::members(self.replica.configuration());
+        let leads = self.replica.is_leader() && !self.replica.core().raft.has_pending_conf();
+        let attesting = self.attesting.clone();
+        let (mine, tracked, all, requested, any) = self.replica.machine_mut().read_db(|db| {
+            let (mine, mut all) = match &attesting {
+                Some(application) => {
+                    let mine = floor::current(db, me, &application.name, configuration_at)?
+                        .is_some_and(|attested| attested.highest == application.version);
+                    (mine, true)
+                }
+                None => (true, false),
+            };
+            if let Some(application) = &attesting {
+                for member in &members {
+                    all &=
+                        floor::current(db, *member, &application.name, configuration_at)?.is_some();
+                }
+            }
+            let tracked = floor::tracked(db)?.is_some();
+            let requested = floor::requested(db)?;
+            let any = floor::any_attested(db)?;
+            Ok((mine, tracked, all, requested, any))
+        })?;
+        if !mine && let Some(application) = attesting.clone() {
+            self.floor_attestations = self.floor_attestations.saturating_add(1);
+            return self.submit_floor(Box::new(move |db| {
+                floor::attest(db, me, &application.name, application.version)
+            }));
+        }
+        if tracked {
+            self.floor_settled = Some(configuration_at);
+            return Ok(());
+        }
+        // A group where nobody has bound an application has nothing to prove, and a leader bound
+        // to none has none to prove: the leader writes nothing for the floor until then.
+        let Some(application) = attesting.filter(|_| leads && any) else {
+            return Ok(());
+        };
+        let configuration = self.replica.configuration().clone();
+        if all {
+            return self.submit_floor(Box::new(move |db| {
+                floor::track_joins(db, &configuration, &application.name, configuration_at)
+                    .map(|_| ())
+            }));
+        }
+        // While any member lacks an attestation that counts, at most one request for each
+        // configuration_at this leader holds: one already at or past it is outstanding, and every
+        // member's keeper answers it once.
+        if requested >= configuration_at {
+            return Ok(());
+        }
+        self.floor_requests = self.floor_requests.saturating_add(1);
+        self.submit_floor(Box::new(move |db| floor::request(db, configuration_at)))?;
+        self.floor_requesting = true;
+        Ok(())
+    }
+    /// One of the floor's own sessions, through the same barrier and proposal as a call; it has no
+    /// caller, and one that ends without applying is made again on the keeper's next pass.
+    fn submit_floor(&mut self, session: FloorSession) -> Result<(), Refusal> {
+        // Each floor session is the next one in hand; a request marks itself after this, and its
+        // wait for the log takes its own target.
+        self.floor_requesting = false;
+        self.floor_tail = None;
+        let context = self.context()?;
+        self.replica.read(context.clone()).map_err(raft_error)?;
+        let until = self
+            .at
+            .checked_add(FLOOR_SESSION)
+            .ok_or_else(|| fenced("floor session deadline overflow"))?;
+        let call: Call = Box::new(move |db| {
+            session(db)?;
+            Ok(Box::new(()) as Box<dyn Any + Send>)
+        });
+        self.pending = Some(Pending {
+            context,
+            term: self.replica.term(),
+            leader: self.replica.leader(),
+            until,
+            namespace: String::new(),
+            author: Author::Owner,
+            response: None,
+            phase: Phase::Barrier(Some(Operation::Call(Mutex::new(Some(call))))),
+            _reservation: Reservation {
+                control: Arc::clone(&self.control),
+                bytes: 0,
+            },
+        });
+        self.floor_inflight = true;
         Ok(())
     }
     fn entry_room(&self, context: usize) -> Result<usize, Refusal> {
@@ -1950,6 +2393,35 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.requeue(pending);
             return Ok(());
         }
+        // A floor session prepares only once this member has applied its own whole log: its
+        // barrier covers what was committed, and an entry appended ahead of it, not yet committed,
+        // would make its base stale, and followers out of phase would keep missing each other
+        // (amphora-seam-owner's ruling on the keeper's livelock, b'). Local, bounded by the
+        // session's own deadline; the run loop asks again each step.
+        // The target is this member's last log index as its barrier passed, fixed then: entries
+        // appended after it never move it, so the session neither waits out its deadline nor
+        // holds the write slot through others' writes (amphora-seam-owner's review of 392902d).
+        if matches!(pending.author, Author::Owner)
+            && matches!(pending.phase, Phase::Barrier(Some(_)))
+            && !self.replica.machine().bootstrap_pending()
+        {
+            let target = match self.floor_tail {
+                Some(target) => target,
+                None => self
+                    .replica
+                    .core()
+                    .raft
+                    .log()
+                    .last_index()
+                    .map_err(unavailable)?,
+            };
+            if self.replica.applied().index < target {
+                self.floor_tail = Some(target);
+                self.pending = Some(pending);
+                return Ok(());
+            }
+        }
+        self.floor_tail = None;
         let Phase::Barrier(operation) = pending.phase else {
             self.pending = Some(pending);
             return Ok(());
@@ -2005,6 +2477,34 @@ impl<F: BlockFile + 'static> Actor<F> {
             &operation,
             Operation::Mutation(Mutation::CompactStep { .. })
         );
+        // A caller's session runs only if its handle's claim holds against the floor at this
+        // session's base; the stale-base rule refuses it at apply if a raise commits first.
+        let claim = match &pending.author {
+            Author::Application(application) => Some(application.clone()),
+            Author::Owner => None,
+        };
+        // The claim is checked at the base the session prepares at (nothing applies between),
+        // and its refusal is its caller's answer, counted under its reason: never the poison rule
+        // below, which is for a compaction's own failures.
+        if let Some(application) = &claim {
+            let checked = self.replica.machine_mut().read_db(|db| {
+                super::application::claim_refused(db, application.as_ref(), &operation)
+            });
+            let refusal = match checked {
+                Ok(None) => None,
+                Ok(Some(refused)) => {
+                    floor_refused(&self.control, refused.reason, &refused.refusal);
+                    Some(refused.refusal)
+                }
+                Err(refusal) => Some(refusal),
+            };
+            if let Some(refusal) = refusal {
+                if let Some(response) = pending.response.take() {
+                    answer(response, Err(refusal));
+                }
+                return Ok(());
+            }
+        }
         let prepared = if let Operation::Mutation(Mutation::CompactStep { before, .. }) = &operation
         {
             let room = self.entry_room(pending.context.len())?;
@@ -2176,6 +2676,7 @@ mod tests {
                 Input::Submit {
                     namespace: String::new(),
                     operation,
+                    application: None,
                     until,
                     response,
                 },
@@ -2320,6 +2821,8 @@ mod tests {
         bytes: usize,
         proposal: bool,
         from: u64,
+        // The record, as its type and its wire sender and recipient, for a failure to name.
+        record: String,
     }
     enum PumpPhase {
         Relay,
@@ -2330,6 +2833,8 @@ mod tests {
             want: usize,
         },
     }
+    /// Says whether the pump loses a record, given the member that sent it.
+    type Losing = Box<dyn Fn(u64, &Message) -> bool>;
     /// CP-T1.8: mirror the carrier's bounded admission and observe every processed receipt.
     /// Admission never waits for another owner. All records, including retained proposals,
     /// share COMMANDS/QUEUED_BYTES bounds; each keeps its first absolute receive deadline.
@@ -2358,6 +2863,11 @@ mod tests {
         // Owners whose records stay in their own queues, untaken: a follower whose answers are
         // held, as its own slow write holds them (kiln goal 6b112f14).
         held: Vec<usize>,
+        // Every MsgAppend lost while heartbeats go on: a configuration's way out appended stays
+        // uncommitted while a ReadIndex still completes.
+        appends_lost: bool,
+        // The records the test loses, by the member that sent them and what they are.
+        losing: Option<Losing>,
     }
     impl<'a> Pump<'a> {
         fn new(clients: &'a [Client]) -> Self {
@@ -2375,6 +2885,8 @@ mod tests {
                 lost: Vec::new(),
                 durable: None,
                 held: Vec::new(),
+                appends_lost: false,
+                losing: None,
             }
         }
         fn reap(&mut self) {
@@ -2408,7 +2920,10 @@ mod tests {
                     continue;
                 }
                 // Admission was not an ACK: expiry, validation and fencing must fail the test.
-                assert_eq!(result.unwrap(), Some(()));
+                match result {
+                    Ok(answered) => assert_eq!(answered, Some(())),
+                    Err(refusal) => panic!("{} refused: {refusal:?}", pending.record),
+                }
             }
         }
         fn admit(&mut self, packet: PumpPacket) {
@@ -2417,8 +2932,17 @@ mod tests {
                 .get(usize::try_from(packet.message.to - 1).unwrap())
                 .unwrap();
             let bytes = packet.message.bytes.len();
-            let proposal = Message::decode(&packet.message.bytes).unwrap().msg_type
-                == hyper_raft::proto::MessageType::MsgPropose;
+            let decoded = Message::decode(&packet.message.bytes).unwrap();
+            let proposal = decoded.msg_type == hyper_raft::proto::MessageType::MsgPropose;
+            let record = format!(
+                "{:?} from {} (wire {}) to {} (wire {}), term {}",
+                decoded.msg_type,
+                packet.from,
+                decoded.from,
+                packet.message.to,
+                decoded.to,
+                decoded.term
+            );
             *self.delivered.entry(packet.message.to).or_default() += 1;
             let receipt = peer
                 .handle()
@@ -2434,6 +2958,7 @@ mod tests {
                 bytes,
                 proposal,
                 from: packet.from,
+                record,
             });
         }
         /// One relay round, each record admitted with `until` as its receive deadline.
@@ -2466,7 +2991,14 @@ mod tests {
                     }
                     for message in self.clients.get(index).unwrap().handle().drain(1).unwrap() {
                         drained = true;
-                        if self.lost.contains(&message.to) {
+                        if self.lost.contains(&message.to)
+                            || (self.appends_lost
+                                && Message::decode(&message.bytes).unwrap().msg_type
+                                    == hyper_raft::proto::MessageType::MsgAppend)
+                            || self.losing.as_ref().is_some_and(|losing| {
+                                losing(from, &Message::decode(&message.bytes).unwrap())
+                            })
+                        {
                             continue;
                         }
                         api::bound("fixture wire record", message.bytes.len(), WIRE_BYTES).unwrap();
@@ -2691,6 +3223,41 @@ mod tests {
             self.clocks.push(reading);
             client
         }
+        /// Member `owner`'s crash: its owner dropped mid-run, and opened again on its own files,
+        /// its clock running on, as a restarted process is. `voters` and `learners` are only what
+        /// a fresh member would start with; a member with state keeps its own. Returns the
+        /// reopened member's client.
+        fn restart(
+            &mut self,
+            dir: &Path,
+            owner: usize,
+            voters: Vec<u64>,
+            learners: Vec<u64>,
+        ) -> Client {
+            drop(self.owners.get_mut(owner).unwrap().take());
+            let node_id = u64::try_from(owner + 1).unwrap();
+            let path = dir.join(format!("state-{node_id}.db"));
+            let lease = Owned::new(lease(&path), None);
+            let (base, read) = (self.base, Arc::clone(self.clocks.get(owner).unwrap()));
+            let (client, actor, receiver) = super::open(
+                &path,
+                &dir.join(format!("raft-{node_id}.log")),
+                ReplicaConfig {
+                    node_id,
+                    voters,
+                    learners,
+                    bootstrap: None,
+                },
+                Durability::Persisted,
+                Arc::new(Changed::default()),
+                lease,
+                self.until(),
+                Arc::new(move || base + offset(&read)),
+            )
+            .unwrap();
+            *self.owners.get_mut(owner).unwrap() = Some((actor, receiver));
+            client
+        }
     }
     impl<F: BlockFile + 'static> Driven<F> {
         fn empty() -> Self {
@@ -2783,6 +3350,7 @@ mod tests {
         /// Rounds, time standing still, until every owner follows one leader with at least
         /// `applied` applied. Returns the leader's index.
         fn follow(&mut self, pump: &mut Pump<'_>, clients: &[Client], applied: u64) -> usize {
+            let mut last = Vec::new();
             for _ in 0..ROUNDS {
                 self.round(pump);
                 let states: Vec<_> = clients
@@ -2797,8 +3365,9 @@ mod tests {
                 {
                     return usize::try_from(leader - 1).unwrap();
                 }
+                last = states;
             }
-            panic!("no leader followed in {ROUNDS} driven rounds");
+            panic!("no leader followed in {ROUNDS} driven rounds: {last:?}");
         }
         /// The lead moves from owner `from` to owner `to` now (`Replica::transfer`, which no lease
         /// refuses), every clock standing still; rounds go on until every owner follows `to`.
@@ -3999,6 +4568,7 @@ mod tests {
                 Input::Submit {
                     namespace: namespace.into(),
                     operation,
+                    application: None,
                     until,
                     response,
                 },
@@ -5163,10 +5733,14 @@ mod tests {
     #[test]
     fn the_decisions_numbers_are_step_ones_or_its_own() {
         let design = include_str!("../../../../docs/design/replication.md");
+        // The decision's own section, up to the next one.
         let decision = design
             .split_once("## The leader's quorum patience")
             .unwrap()
-            .1;
+            .1
+            .split("\n## ")
+            .next()
+            .unwrap();
         let record = numbers(include_str!("../../../../docs/research/owner-stalls.md"));
         let requirements = include_str!("../../../../docs/requirements.toml");
         let election = settings(1, &Durability::Persisted)
@@ -5849,11 +6423,12 @@ mod tests {
     /// AC-T1.8.M1, T-T1.8.M3 (CP-T1.8) on driven time (replication.md, "Membership"): a change past
     /// its deadline answers what its stage knows. In a group of three voters, the relay held so
     /// that nothing moves on: Do: a change's deadline passes at its barrier; then, relayed to its
-    /// proposal, another's; then, relayed until the joint configuration it made is applied, a
-    /// third's. Expect: Timeout, with nothing proposed; UnknownOutcome, and with the relay back it
-    /// applies all the same, as reading the configuration shows; while the joint configuration is
-    /// applied, the status names its outgoing voters (`voters_outgoing`), and the deadline answers
-    /// the status applied; with the relay back the group leaves it.
+    /// proposal, another's; then, relayed until the joint configuration it made is applied with its
+    /// way out held from committing, a third's. Expect: Timeout, with nothing proposed;
+    /// UnknownOutcome, and with the relay back it applies all the same, as reading the
+    /// configuration shows; while the joint configuration is applied, the status names its outgoing
+    /// voters (`voters_outgoing`), and the deadline answers the status applied; with the relay back
+    /// and the leader's clock moving, the group leaves it.
     #[test]
     fn a_change_past_its_deadline_answers_what_its_stage_knows() {
         let dir = tempfile::tempdir().unwrap();
@@ -5901,10 +6476,24 @@ mod tests {
         assert_eq!(led.handle().status().unwrap().learners, vec![4]);
 
         pump.departed.push(4);
+        let configured = pending_change(&driven, leader);
         let until = deadline(&clock, driven.base);
         let asked = change(led, until, MemberChange::Remove(4));
-        // Each round ends with what the leader has applied published, the joint configuration
-        // too: its way out comes only after the joint one is committed.
+        reach(&mut driven, &mut pump, "the joint proposal", |driven| {
+            pending_change(driven, leader) > configured
+        });
+        // The way out is proposed once the joint configuration applies, and can commit in the same
+        // round, so the joint one would never be seen applied: no answer that a member holds past
+        // the joint entry is heard until the deadline has answered (a heartbeat's answer saying
+        // where a log ends counts as an append's).
+        let joint_at = pending_change(&driven, leader);
+        pump.losing = Some(Box::new(move |_, record| {
+            matches!(
+                record.msg_type,
+                hyper_raft::proto::MessageType::MsgAppendResponse
+                    | hyper_raft::proto::MessageType::MsgHeartbeatResponse
+            ) && record.index > joint_at
+        }));
         reach(
             &mut driven,
             &mut pump,
@@ -5923,16 +6512,23 @@ mod tests {
         assert!(matches!(asked.try_recv(), Err(mpsc::TryRecvError::Empty)));
         set(&clock, driven.base, until);
         driven.step();
-        // The status applied: still joint, or out of it if the way out had committed while the
-        // leader's disk held back the joint configuration's apply.
+        // The status applied, still joint: its way out cannot have committed.
         let answered = asked.try_recv().unwrap().unwrap();
         assert_eq!(
             (answered.voters_outgoing, answered.learners),
-            (
-                applied_configuration(&driven, leader).voters_outgoing,
-                vec![]
-            )
+            (vec![1, 2, 3], vec![])
         );
+        // What was lost is made good by the leader's next heartbeat, which only its ticks send.
+        pump.losing = None;
+        for _ in 0..ROUNDS {
+            if applied_configuration(&driven, leader)
+                .voters_outgoing
+                .is_empty()
+            {
+                break;
+            }
+            driven.tick(&mut pump, leader);
+        }
         settled(&mut driven, &mut pump, 3, &[]);
         write(&mut driven, &mut pump, led, 1);
         driven.drain(&mut pump);
@@ -6600,6 +7196,2735 @@ mod tests {
             driven.answer(&mut pump, &transfer(led, until, 4)),
             Err(Refusal::Invalid { what, .. }) if what == "lead transfer"
         ));
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// The application the floor's tests bind members to.
+    fn kiln(version: u32) -> crate::database::Application {
+        crate::database::Application {
+            name: "kiln.host-store".into(),
+            version,
+        }
+    }
+    /// The attestation that counts for `member` as owner `owner`'s applied state proves it.
+    fn attested(
+        driven: &mut Driven,
+        owner: usize,
+        member: u64,
+    ) -> Option<crate::replication::floor::Attested> {
+        let machine = driven.owner_mut(owner).replica.machine_mut();
+        let last = machine.configuration_at();
+        machine
+            .read_db(|db| crate::replication::floor::current(db, member, "kiln.host-store", last))
+            .unwrap()
+    }
+    /// Marker J as owner `owner` has applied it.
+    fn tracked(driven: &mut Driven, owner: usize) -> Option<u64> {
+        driven
+            .owner_mut(owner)
+            .replica
+            .machine_mut()
+            .read_db(|db| crate::replication::floor::tracked(db))
+            .unwrap()
+    }
+    /// Member `member`'s join as owner `owner` has applied it.
+    fn joined(driven: &mut Driven, owner: usize, member: u64) -> u64 {
+        driven
+            .owner_mut(owner)
+            .replica
+            .machine_mut()
+            .read_db(|db| crate::replication::floor::joined(db, member))
+            .unwrap()
+    }
+    /// The floor's rows owner `owner` holds: joins tracked, join rows, and attestations.
+    fn floor_rows(driven: &mut Driven, owner: usize) -> Vec<String> {
+        driven.owner_mut(owner)
+            .replica
+            .machine_mut()
+            .read_db(|db| {
+                let mut rows = Vec::new();
+                for (table, query) in [
+                    (
+                        "__amphora_joins",
+                        "SELECT 'J ' || tracked FROM __amphora_joins",
+                    ),
+                    (
+                        "__amphora_members",
+                        "SELECT 'M ' || member || ' ' || joined FROM __amphora_members ORDER BY member",
+                    ),
+                    (
+                        "__amphora_attestations",
+                        "SELECT 'A ' || member || ' ' || joined || ' ' || application || ' ' || highest || ' ' || seen FROM __amphora_attestations ORDER BY member, joined",
+                    ),
+                ] {
+                    let mut present = false;
+                    db.query(
+                        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                        [amphora_engine::Value::from_text(table.to_string())],
+                        |_| {
+                            present = true;
+                            Ok(false)
+                        },
+                    )?;
+                    if present {
+                        db.query(query, [], |row| {
+                            rows.push(row.get::<String>(0).map_err(unavailable)?);
+                            Ok(true)
+                        })?;
+                    }
+                }
+                Ok(rows)
+            })
+            .unwrap()
+    }
+    /// No two of `owners` recorded different image digests at one applied index, each from the
+    /// index given with it: a member to be added opens with the configuration it is to have, so
+    /// its applied marker differs from the group's until it applies the change that adds it
+    /// (replication.md, "Membership"). Answers how many digests it compared.
+    fn digests_agree(driven: &Driven, owners: &[(usize, u64)]) -> usize {
+        let mut compared = 0;
+        let mut by_index: BTreeMap<u64, u64> = BTreeMap::new();
+        for (owner, from) in owners {
+            for (index, digest) in driven
+                .owner(*owner)
+                .replica
+                .machine()
+                .digests()
+                .iter()
+                .filter(|(index, _)| index >= from)
+            {
+                match by_index.get(index) {
+                    Some(seen) => {
+                        assert_eq!(
+                            seen, digest,
+                            "owner {owner} differs at applied index {index}"
+                        );
+                        compared += 1;
+                    }
+                    None => {
+                        by_index.insert(*index, *digest);
+                    }
+                }
+            }
+        }
+        compared
+    }
+
+    /// AC-T1.8.A1, T-T1.8.A4 (CP-T1.8) on driven time (replication.md, "Attestation"): a forwarded
+    /// proposal whose context names a member other than its authenticated sender is refused and
+    /// applies nowhere. Do, in a group of three voters: a follower prepares a write creating a table,
+    /// and forwards it to the leader with contexts naming the third member, empty, four bytes long,
+    /// and two entries of which only the second names the third; then once naming the follower
+    /// itself, as an owner of either binary makes it. Expect: each hostile forward refused Invalid at
+    /// the leader's step, and the table on no member after the group goes quiet; the last taken.
+    #[test]
+    fn a_forward_naming_another_member_as_its_origin_is_refused_and_applies_nowhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let (follower, third) = ((leader + 1) % 3, (leader + 2) % 3);
+        let id = |owner: usize| u64::try_from(owner + 1).unwrap();
+        driven.drain(&mut pump);
+        let (prepared, ()) = driven
+            .owner_mut(follower)
+            .replica
+            .machine_mut()
+            .prepare_db(|db| {
+                db.exec("CREATE TABLE hostile(x)")?;
+                Ok(())
+            })
+            .unwrap();
+        let data = prepared.encode().unwrap();
+        // A context as the owner makes one (`context()`): the origin, then term, incarnation and
+        // serial. A binary from before the check makes it the same way.
+        let context = |origin: u64| {
+            let mut context = origin.to_le_bytes().to_vec();
+            context.extend_from_slice(&[7; 24]);
+            context
+        };
+        let forward_contexts = |driven: &mut Driven, contexts: Vec<Vec<u8>>| {
+            let mut record =
+                hyper_raft::proto::message(id(leader), hyper_raft::proto::MessageType::MsgPropose);
+            record.from = id(follower);
+            record.entries = contexts
+                .into_iter()
+                .map(|context| hyper_raft::proto::Entry {
+                    data: data.clone(),
+                    context,
+                    ..hyper_raft::proto::Entry::default()
+                })
+                .collect();
+            let mut bytes = Vec::new();
+            record.encode(&mut bytes);
+            let mut receipt = clients[leader]
+                .handle()
+                .admit_receive(id(follower), bytes, driven.until())
+                .unwrap();
+            driven.step();
+            receipt.try_result()
+        };
+        let named_another = Err(api::invalid(
+            "replica sender",
+            "a forwarded proposal names another member as its origin",
+        ));
+        for hostile in [
+            vec![context(id(third))],
+            vec![Vec::new()],
+            vec![id(follower).to_le_bytes()[..4].to_vec()],
+            vec![context(id(follower)), context(id(third))],
+        ] {
+            assert_eq!(
+                forward_contexts(&mut driven, hostile.clone()),
+                named_another,
+                "{hostile:?}"
+            );
+        }
+        quiet(&mut driven, &mut pump);
+        for owner in 0..3 {
+            let present = driven
+                .owner_mut(owner)
+                .replica
+                .machine_mut()
+                .read_db(|db| {
+                    let mut present = false;
+                    db.query(
+                        "SELECT 1 FROM sqlite_schema WHERE name = 'hostile'",
+                        [],
+                        |_| {
+                            present = true;
+                            Ok(false)
+                        },
+                    )?;
+                    Ok(present)
+                })
+                .unwrap();
+            assert!(!present, "owner {owner} applied the hostile forward");
+        }
+        assert_eq!(
+            forward_contexts(&mut driven, vec![context(id(follower))]),
+            Ok(Some(()))
+        );
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// T-T1.8.A5 (CP-T1.8) on driven time (replication.md, "Attestation"; amphora-seam-owner's review
+    /// of 7096916, D1): an attestation counts only for its own application. Do, in a group of three
+    /// voters bound to kiln.host-store 7 with joins tracked: a follower binds other.app 1. Expect:
+    /// its other.app attestation applied; it alone holds one; every member's kiln.host-store one
+    /// still counts; and its keeper's proposals stop once it has attested, none in 200 rounds after.
+    #[test]
+    fn an_attestation_counts_only_for_its_own_application() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        for client in &clients {
+            client.handle().attest(kiln(7)).unwrap();
+        }
+        joins_tracked(&mut driven, &mut pump, &[0, 1, 2]);
+        let other = (leader + 1) % 3;
+        let id = |owner: usize| u64::try_from(owner + 1).unwrap();
+        let before = driven.owner_mut(other).floor_attestations;
+        clients[other]
+            .handle()
+            .attest(crate::database::Application {
+                name: "other.app".into(),
+                version: 1,
+            })
+            .unwrap();
+        let current = |driven: &mut Driven, member: u64, application: &'static str| {
+            driven
+                .owner_mut(leader)
+                .replica
+                .machine_mut()
+                .read_db(move |db| crate::replication::floor::current(db, member, application, 0))
+                .unwrap()
+        };
+        for _ in 0..ROUNDS {
+            if current(&mut driven, id(other), "other.app").is_some() {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        assert_eq!(
+            current(&mut driven, id(other), "other.app")
+                .unwrap()
+                .highest,
+            1
+        );
+        for owner in 0..3 {
+            assert_eq!(
+                current(&mut driven, id(owner), "kiln.host-store")
+                    .unwrap()
+                    .highest,
+                7
+            );
+            if owner != other {
+                assert_eq!(current(&mut driven, id(owner), "other.app"), None);
+            }
+        }
+        let proposed = driven.owner_mut(other).floor_attestations - before;
+        for _ in 0..200 {
+            driven.round(&mut pump);
+        }
+        assert_eq!(
+            driven.owner_mut(other).floor_attestations - before,
+            proposed,
+            "the keeper kept proposing"
+        );
+        assert!((1..=3).contains(&proposed), "{proposed} proposals");
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// CP-T1.8 on driven time (replication.md, "Attestation"; amphora-seam-owner's review of
+    /// 7096916, D2): a keeper that can't read its rows reports it and leaves the owner serving. Do,
+    /// in a group of three voters: write an attestation row for the leader whose highest is past a
+    /// u32; then the leader binds kiln.host-store 7, and the group writes. Expect: the leader's
+    /// keeper fails its passes, counted; no owner fenced; the write applied.
+    #[test]
+    fn a_keeper_that_cannot_read_its_rows_leaves_the_owner_serving() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let me = u64::try_from(leader + 1).unwrap();
+        driven
+            .call(&mut pump, &clients[leader], move |db| {
+                crate::replication::floor::attest(db, me, "kiln.host-store", 7)?;
+                db.exec("UPDATE __amphora_attestations SET highest = 1099511627776")?;
+                Ok(Vec::new())
+            })
+            .unwrap();
+        clients[leader].handle().attest(kiln(7)).unwrap();
+        for _ in 0..64 {
+            driven.round(&mut pump);
+        }
+        assert!(
+            driven.owner_mut(leader).floor_failures > 0,
+            "the keeper never failed"
+        );
+        let counters = clients[leader].handle().floor_counters();
+        assert!(counters.keeper_failures > 0, "{counters:?}");
+        assert_eq!(counters.keeper_failing, 1, "{counters:?}");
+        write(&mut driven, &mut pump, &clients[leader], 1);
+        for client in &clients {
+            assert_eq!(client.handle().status().unwrap().fenced, None);
+        }
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// CP-T1.8 on driven time (replication.md, "Attestation"; amphora-seam-owner's review of
+    /// 7096916, D3): a floor session that ends without applying is made again, in a group where
+    /// nothing else applies. Do, in a group of three voters: a follower binds kiln.host-store 7;
+    /// once its keeper has a session in hand, drop it, as one lost at its barrier is; then rounds.
+    /// Expect: the session counted as ended, and the follower's attestation applied all the same.
+    #[test]
+    fn a_floor_session_lost_before_it_applies_is_made_again_in_a_quiet_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let follower = (leader + 1) % 3;
+        quiet(&mut driven, &mut pump);
+        clients[follower].handle().attest(kiln(7)).unwrap();
+        for _ in 0..ROUNDS {
+            if driven.owner_mut(follower).floor_inflight {
+                break;
+            }
+            driven.step();
+        }
+        assert!(driven.owner_mut(follower).floor_inflight);
+        assert!(
+            matches!(
+                driven
+                    .owner_mut(follower)
+                    .pending
+                    .as_ref()
+                    .map(|p| &p.phase),
+                Some(Phase::Barrier(_))
+            ),
+            "the session left its barrier"
+        );
+        driven.owner_mut(follower).pending = None;
+        let ended = driven.owner_mut(follower).floor_ended;
+        let member = u64::try_from(follower + 1).unwrap();
+        for _ in 0..ROUNDS {
+            if attested(&mut driven, leader, member).is_some() {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        assert!(driven.owner_mut(follower).floor_ended > ended);
+        assert_eq!(attested(&mut driven, leader, member).unwrap().highest, 7);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// Rounds, time standing still, until every one of `owners` has marker J applied.
+    fn joins_tracked(driven: &mut Driven, pump: &mut Pump<'_>, owners: &[usize]) {
+        for _ in 0..ROUNDS {
+            if owners.iter().all(|owner| tracked(driven, *owner).is_some()) {
+                return;
+            }
+            driven.round(pump);
+        }
+        panic!("joins were not tracked in {ROUNDS} driven rounds");
+    }
+
+    /// AC-T1.8.A1, T-T1.8.A5 (CP-T1.8) on driven time (replication.md, "Joins", "Attestation"): a
+    /// member removed and added again after marker J attests under its new join, and its old
+    /// attestation never vouches nor blocks. Do, in a group of three voters and learner 4: every
+    /// member binds kiln.host-store 7 and the group tracks joins; remove 4 and, its owner no longer
+    /// attesting, add it again; then let it attest. Expect: J on every voter with 4 joined at 0 and
+    /// attested; the re-add answered Ok, 4 joined at the change's index on every voter, its old
+    /// row still there but no attestation counting; once it attests, its new one counts.
+    #[test]
+    fn a_member_added_again_after_joins_are_tracked_attests_under_its_new_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients[..3], 0, 1);
+        let until = driven.until();
+        driven
+            .answer(
+                &mut pump,
+                &change(&clients[leader], until, MemberChange::AddLearner(4)),
+            )
+            .unwrap();
+        settled(&mut driven, &mut pump, 3, &[4]);
+        for client in &clients {
+            client.handle().attest(kiln(7)).unwrap();
+        }
+        joins_tracked(&mut driven, &mut pump, &[0, 1, 2, 3]);
+        assert_eq!(joined(&mut driven, leader, 4), 0);
+        assert_eq!(attested(&mut driven, leader, 4).unwrap().highest, 7);
+
+        pump.departed.push(4);
+        let until = driven.until();
+        driven
+            .answer(
+                &mut pump,
+                &change(&clients[leader], until, MemberChange::Remove(4)),
+            )
+            .unwrap();
+        settled(&mut driven, &mut pump, 3, &[]);
+        driven.owner_mut(3).attesting = None;
+        clients[3].handle.shared.attesting.lock().unwrap().take();
+        pump.departed.clear();
+        let until = driven.until();
+        let added = driven
+            .answer(
+                &mut pump,
+                &change(&clients[leader], until, MemberChange::AddLearner(4)),
+            )
+            .unwrap();
+        assert_eq!(added.learners, vec![4]);
+        settled(&mut driven, &mut pump, 3, &[4]);
+        let rejoined = joined(&mut driven, leader, 4);
+        assert!(rejoined > 0, "4 has no new join");
+        for owner in 0..3 {
+            assert_eq!(joined(&mut driven, owner, 4), rejoined, "owner {owner}");
+            assert_eq!(attested(&mut driven, owner, 4), None, "owner {owner}");
+            assert!(
+                floor_rows(&mut driven, owner)
+                    .iter()
+                    .any(|row| row.starts_with("A 4 0 ")),
+                "owner {owner} lost the old row"
+            );
+        }
+
+        clients[3].handle().attest(kiln(7)).unwrap();
+        for _ in 0..ROUNDS {
+            if attested(&mut driven, leader, 4).is_some() {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        let again = attested(&mut driven, leader, 4).unwrap();
+        assert_eq!(again.highest, 7);
+        assert!(
+            floor_rows(&mut driven, leader)
+                .iter()
+                .any(|row| row.starts_with(&format!("A 4 {rejoined} ")))
+        );
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.A1, T-T1.8.A5 (CP-T1.8) on driven time (replication.md, "Joins"): a member added
+    /// after marker J holds the join rows every voter holds, though it opens with the
+    /// configuration it is to have, and its attestation counts. Do, in a group of three voters and
+    /// member 4 opened as a learner: the voters bind kiln.host-store 7 and the group tracks joins;
+    /// add learner 4; then 4 binds kiln.host-store 7. Expect: on 4 the same floor rows as on the
+    /// leader, 4 joined at the change's index on both, 4's attestation counting at the leader, and
+    /// every member's image digest the same at every applied index from 4's join (T-T1.8.A7).
+    #[test]
+    fn a_member_added_after_joins_are_tracked_holds_the_join_rows_every_voter_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        for owner in 0..4 {
+            driven
+                .owner_mut(owner)
+                .replica
+                .machine_mut()
+                .record_digests();
+        }
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients[..3], 0, 1);
+        for client in &clients[..3] {
+            client.handle().attest(kiln(7)).unwrap();
+        }
+        joins_tracked(&mut driven, &mut pump, &[0, 1, 2]);
+        let until = driven.until();
+        driven
+            .answer(
+                &mut pump,
+                &change(&clients[leader], until, MemberChange::AddLearner(4)),
+            )
+            .unwrap();
+        settled(&mut driven, &mut pump, 3, &[4]);
+        let added = joined(&mut driven, leader, 4);
+        assert!(added > 0, "4 has no join at the leader");
+        // 4 applies the change in its own time: wait on that, then read its row.
+        let at = driven.owner(leader).replica.applied().index;
+        reach(
+            &mut driven,
+            &mut pump,
+            "4 applying its addition",
+            |driven| driven.owner(3).replica.applied().index >= at,
+        );
+        assert_eq!(joined(&mut driven, 3, 4), added);
+
+        clients[3].handle().attest(kiln(7)).unwrap();
+        for _ in 0..ROUNDS {
+            if attested(&mut driven, leader, 4).is_some() && attested(&mut driven, 3, 4).is_some() {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        assert_eq!(attested(&mut driven, leader, 4).unwrap().highest, 7);
+        assert_eq!(floor_rows(&mut driven, 3), floor_rows(&mut driven, leader));
+        // A7's guard against divergence covers this member too: every image digest the same from
+        // its join on.
+        let from = [(0, added), (1, added), (2, added), (3, added)];
+        assert!(digests_agree(&driven, &from) > 0, "no digest compared");
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.A1, T-T1.8.A7 (CP-T1.8) on driven time (replication.md, "The upgrade that
+    /// introduces the join rows"): a group with a member on a binary from before the floor
+    /// never tracks joins, keeps every member's pages identical, and counts no stale
+    /// attestation; once that member runs the floor's binary, joins are tracked. Do: voters 1,
+    /// 2 and 3, 3 standing in for the old binary (no join rows, no attestation); learner 4
+    /// added; 1, 2 and 4 bind kiln.host-store 7; remove 4 and, its owner no longer attesting,
+    /// add it again; then 4 attests, then 3 runs the floor's binary and attests; finally 4 is
+    /// removed after J. Expect: no J while 3 is old; after the re-add, 4's old attestation
+    /// counts on no voter until it attests again; J once 3 attests; join rows after it; and at
+    /// every applied index every member's image digest the same.
+    #[test]
+    fn a_group_upgrading_to_the_floor_tracks_joins_only_once_every_member_attests() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        for owner in 0..4 {
+            driven
+                .owner_mut(owner)
+                .replica
+                .machine_mut()
+                .record_digests();
+        }
+        driven
+            .owner_mut(2)
+            .replica
+            .machine_mut()
+            .set_floor_aware(false);
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients[..3], 0, 1);
+        assert_ne!(leader, 2, "the old member leads");
+        let until = driven.until();
+        let added = driven
+            .answer(
+                &mut pump,
+                &change(&clients[leader], until, MemberChange::AddLearner(4)),
+            )
+            .unwrap()
+            .applied;
+        settled(&mut driven, &mut pump, 3, &[4]);
+        for owner in [0, 1, 3] {
+            clients[owner].handle().attest(kiln(7)).unwrap();
+        }
+        for _ in 0..ROUNDS {
+            if [1, 2, 4]
+                .iter()
+                .all(|member| attested(&mut driven, leader, *member).is_some())
+            {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        for _ in 0..64 {
+            driven.round(&mut pump);
+        }
+        assert_eq!(tracked(&mut driven, leader), None, "J with an old member");
+
+        pump.departed.push(4);
+        let until = driven.until();
+        driven
+            .answer(
+                &mut pump,
+                &change(&clients[leader], until, MemberChange::Remove(4)),
+            )
+            .unwrap();
+        settled(&mut driven, &mut pump, 3, &[]);
+        driven.owner_mut(3).attesting = None;
+        clients[3].handle.shared.attesting.lock().unwrap().take();
+        pump.departed.clear();
+        let until = driven.until();
+        driven
+            .answer(
+                &mut pump,
+                &change(&clients[leader], until, MemberChange::AddLearner(4)),
+            )
+            .unwrap();
+        settled(&mut driven, &mut pump, 3, &[4]);
+        for owner in [0, 1] {
+            assert_eq!(attested(&mut driven, owner, 4), None, "owner {owner}");
+        }
+        clients[3].handle().attest(kiln(7)).unwrap();
+        for _ in 0..ROUNDS {
+            if attested(&mut driven, leader, 4).is_some() {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        assert!(attested(&mut driven, leader, 4).is_some());
+        assert_eq!(tracked(&mut driven, leader), None, "J with an old member");
+
+        driven
+            .owner_mut(2)
+            .replica
+            .machine_mut()
+            .set_floor_aware(true);
+        clients[2].handle().attest(kiln(7)).unwrap();
+        joins_tracked(&mut driven, &mut pump, &[0, 1, 2, 3]);
+        pump.departed.push(4);
+        let until = driven.until();
+        driven
+            .answer(
+                &mut pump,
+                &change(&clients[leader], until, MemberChange::Remove(4)),
+            )
+            .unwrap();
+        settled(&mut driven, &mut pump, 3, &[]);
+        let rows = floor_rows(&mut driven, leader);
+        for owner in 0..3 {
+            assert_eq!(floor_rows(&mut driven, owner), rows, "owner {owner}");
+        }
+        let compared = digests_agree(&driven, &[(0, 0), (1, 0), (2, 0), (3, added)]);
+        assert!(compared > 0, "no digests compared");
+        pump.departed.clear();
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.A1, T-T1.8.A3 (CP-T1.8) on driven time (replication.md, "Start"): a member installed
+    /// from a snapshot holds the floor's rows and proves as the leader does. Do, in a group of
+    /// three voters that has tracked joins with every member attested: compact the leader's log,
+    /// then add learner 4, which can only catch up by the leader's image. Expect: 4's first applied
+    /// index is the image's, beyond the change that added it; its floor rows and every member's
+    /// attestation as it proves them equal the leader's; its digest at that index the leader's.
+    #[test]
+    fn a_member_installed_from_a_snapshot_holds_the_floors_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        for owner in 0..4 {
+            driven
+                .owner_mut(owner)
+                .replica
+                .machine_mut()
+                .record_digests();
+        }
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients[..3], 0, 1);
+        for client in &clients[..3] {
+            client.handle().attest(kiln(7)).unwrap();
+        }
+        joins_tracked(&mut driven, &mut pump, &[0, 1, 2]);
+        write(&mut driven, &mut pump, &clients[leader], 1);
+        quiet(&mut driven, &mut pump);
+        let compacted = {
+            let owner = &mut driven.owner_mut(leader);
+            let now = owner.now().unwrap();
+            owner
+                .replica
+                .compact(0, now, std::task::Waker::noop())
+                .unwrap();
+            owner.replica.applied().index
+        };
+        for _ in 0..64 {
+            driven.round(&mut pump);
+        }
+        let until = driven.until();
+        driven
+            .answer(
+                &mut pump,
+                &change(&clients[leader], until, MemberChange::AddLearner(4)),
+            )
+            .unwrap();
+        catch_up(&mut driven, &mut pump, &clients, leader, 3);
+        let first = driven
+            .owner_mut(3)
+            .replica
+            .machine()
+            .digests()
+            .first()
+            .copied();
+        let (installed, _) = first.expect("4 recorded nothing");
+        assert!(
+            installed >= compacted,
+            "4 replayed the log from {installed}, not the image at {compacted}"
+        );
+        quiet(&mut driven, &mut pump);
+        assert_eq!(floor_rows(&mut driven, 3), floor_rows(&mut driven, leader));
+        for member in [1, 2, 3] {
+            assert_eq!(
+                attested(&mut driven, 3, member),
+                attested(&mut driven, leader, member)
+            );
+        }
+        assert!(digests_agree(&driven, &[(0, 0), (1, 0), (2, 0), (3, 0)]) > 0);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// The `seen` of each attestation row of member `member` owner `owner` holds.
+    fn seen_rows(driven: &mut Driven, owner: usize, member: u64) -> Vec<u64> {
+        floor_rows(driven, owner)
+            .iter()
+            .filter_map(|row| {
+                let fields: Vec<&str> = row.split(' ').collect();
+                (fields.first() == Some(&"A")
+                    && fields.get(1) == Some(&member.to_string().as_str()))
+                .then(|| fields.last().unwrap().parse().unwrap())
+            })
+            .collect()
+    }
+
+    /// AC-T1.8.A1, T-T1.8.A7 (CP-T1.8) on driven time (replication.md, "The upgrade that introduces
+    /// the join rows", point 2): a leader whose knowledge of the last change is reset by a restart
+    /// asks every member to attest again once, each attests again once, and joins are tracked. Do,
+    /// in a group of three voters: two bind kiln.host-store 7 and attest; a write; the leader opens
+    /// again (its configuration_at becomes its applied point); the third binds. Expect: J on every
+    /// voter; the request row applied once, its session proposed at most once more than the
+    /// stale-base rule refused it (members' attestation sessions at the same base committing
+    /// first; the keeper proposes it again on its next pass), those refusals no more than the
+    /// attestations applied; each attesting member's row changed once more, the third's once; and
+    /// the keeper's proposals bounded, never a loop.
+    #[test]
+    fn a_leader_restarted_before_joins_asks_every_member_to_attest_again_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let (other, late) = ((leader + 1) % 3, (leader + 2) % 3);
+        let id = |owner: usize| u64::try_from(owner + 1).unwrap();
+        for owner in [leader, other] {
+            clients[owner].handle().attest(kiln(7)).unwrap();
+        }
+        for _ in 0..ROUNDS {
+            if [leader, other]
+                .iter()
+                .all(|owner| attested(&mut driven, leader, id(*owner)).is_some())
+            {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        write(&mut driven, &mut pump, &clients[leader], 1);
+        quiet(&mut driven, &mut pump);
+        assert_eq!(tracked(&mut driven, leader), None);
+        let before: Vec<(Vec<u64>, u64)> = (0..3)
+            .map(|owner| {
+                (
+                    seen_rows(&mut driven, leader, id(owner)),
+                    driven.owner_mut(owner).floor_attestations,
+                )
+            })
+            .collect();
+        let requests = driven.owner_mut(leader).floor_requests;
+        let (applied_before, stale_before) = {
+            let owner = driven.owner(leader);
+            (owner.floor_requests_applied, owner.floor_requests_stale)
+        };
+
+        driven
+            .owner_mut(leader)
+            .replica
+            .machine_mut()
+            .reopen_configuration_at();
+        driven.owner_mut(leader).floor_settled = None;
+        driven.owner_mut(leader).floor_checked = 0;
+        clients[late].handle().attest(kiln(7)).unwrap();
+        let mut seen: Vec<std::collections::BTreeSet<u64>> = before
+            .iter()
+            .map(|(rows, _)| rows.iter().copied().collect())
+            .collect();
+        let mut requested = std::collections::BTreeSet::new();
+        for _ in 0..ROUNDS {
+            for (owner, rows) in seen.iter_mut().enumerate() {
+                rows.extend(seen_rows(&mut driven, leader, id(owner)));
+            }
+            requested.insert(
+                driven
+                    .owner_mut(leader)
+                    .replica
+                    .machine_mut()
+                    .read_db(|db| crate::replication::floor::requested(db))
+                    .unwrap(),
+            );
+            if (0..3).all(|owner| tracked(&mut driven, owner).is_some()) {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        joins_tracked(&mut driven, &mut pump, &[0, 1, 2]);
+        assert_eq!(
+            requested.iter().filter(|at| **at > 0).count(),
+            1,
+            "requests: {requested:?}"
+        );
+        // The request row is written once. Its session may be proposed again: members'
+        // attestation sessions prepared at the same base commit first and the stale-base rule
+        // refuses it, and the keeper proposes it again on its next pass. Each refusal needs a
+        // session committed in between, so the retries are bounded by the attestations applied.
+        let (proposed, applied, stale) = {
+            let owner = driven.owner(leader);
+            (
+                owner.floor_requests - requests,
+                owner.floor_requests_applied - applied_before,
+                owner.floor_requests_stale - stale_before,
+            )
+        };
+        assert_eq!(applied, 1, "requests applied");
+        assert!(
+            proposed <= 1 + stale,
+            "{proposed} proposed, {stale} refused stale"
+        );
+        let attestations_applied: usize = seen
+            .iter()
+            .zip(&before)
+            .map(|(rows, (was, _))| rows.len() - was.len())
+            .sum();
+        assert!(
+            stale <= u64::try_from(attestations_applied).unwrap(),
+            "{stale} stale requests, {attestations_applied} attestations applied"
+        );
+        for owner in [leader, other] {
+            assert_eq!(
+                seen[owner].len(),
+                2,
+                "owner {owner} attested {:?}",
+                seen[owner]
+            );
+        }
+        assert_eq!(seen[late].len(), 1, "the third attested {:?}", seen[late]);
+        // A session another member's makes stale is proposed again on a later pass; prepared on
+        // its member's whole log, each refusal needs another member's session committed first,
+        // so every member's proposals are bounded by the members; once settled, none at all.
+        let proposed: Vec<u64> = before
+            .iter()
+            .enumerate()
+            .map(|(owner, (_, attestations))| {
+                driven.owner_mut(owner).floor_attestations - attestations
+            })
+            .collect();
+        for (owner, proposed) in proposed.iter().enumerate() {
+            let keeper = driven.owner(owner);
+            // Bounded by the members (amphora-seam-owner's ruling on the keeper's livelock, b'):
+            // a floor session prepares on its member's whole log, so each refusal needs another
+            // member's session committed first, at most one each.
+            assert!(
+                (1..=3).contains(proposed),
+                "owner {owner} proposed {proposed} attestations (sessions ended {}, keeper failures {}, applied {}, seen {:?})",
+                keeper.floor_ended,
+                keeper.floor_failures,
+                keeper.replica.applied().index,
+                seen[owner]
+            );
+        }
+        let settled_requests = driven.owner_mut(leader).floor_requests;
+        for _ in 0..200 {
+            driven.round(&mut pump);
+        }
+        for (owner, proposed) in proposed.iter().enumerate() {
+            assert_eq!(
+                driven.owner_mut(owner).floor_attestations - before[owner].1,
+                *proposed,
+                "owner {owner} kept attesting once settled"
+            );
+        }
+        assert_eq!(driven.owner_mut(leader).floor_requests, settled_requests);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// Runs `f` at `client` as a session of a handle bound to `application`, rounds until it is
+    /// answered.
+    fn call_as<R: Send + 'static>(
+        driven: &mut Driven,
+        pump: &mut Pump<'_>,
+        client: &Client,
+        application: crate::database::Application,
+        f: impl FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
+    ) -> Result<R, Refusal> {
+        let operation = Operation::Call(Mutex::new(Some(Box::new(move |db| {
+            Ok(Box::new(f(db)?) as Box<dyn Any + Send>)
+        }))));
+        let (response, receiver) = mpsc::sync_channel(1);
+        client
+            .handle
+            .enqueue(
+                Input::Submit {
+                    namespace: String::new(),
+                    operation,
+                    application: Some(application),
+                    until: driven.until(),
+                    response,
+                },
+                api::REQUEST_MAX,
+            )
+            .unwrap();
+        driven.answer(pump, &receiver).map(|answer| match answer {
+            Answer::Called(value) => *value.downcast::<R>().unwrap(),
+            _ => panic!("wrong actor reply"),
+        })
+    }
+    /// A raise of kiln.host-store's floor to `version` at `client`, by a handle bound to it.
+    fn raise(
+        driven: &mut Driven,
+        pump: &mut Pump<'_>,
+        client: &Client,
+        version: u32,
+    ) -> Result<u32, Refusal> {
+        // As writer_floor answers it: a refusal counted under its reason, then answered.
+        let outcome = call_as(driven, pump, client, kiln(version), move |db| {
+            Ok(
+                crate::database::application::raise(db, kiln(version), true)?
+                    .map(|floor| floor.version),
+            )
+        })?;
+        outcome.map_err(|refused| {
+            client
+                .handle()
+                .floor_refused(refused.reason, &refused.refusal);
+            refused.refusal
+        })
+    }
+    /// A write into floor_items by a handle bound to kiln.host-store at `version`.
+    fn write_as(
+        driven: &mut Driven,
+        pump: &mut Pump<'_>,
+        client: &Client,
+        version: u32,
+    ) -> Result<(), Refusal> {
+        call_as(driven, pump, client, kiln(version), move |db| {
+            db.exec("CREATE TABLE IF NOT EXISTS floor_items(version)")?;
+            db.exec(&format!("INSERT INTO floor_items VALUES({version})"))?;
+            Ok(())
+        })
+    }
+    /// The versions written into floor_items that owner `owner` holds.
+    fn floor_items(driven: &mut Driven, owner: usize) -> Vec<u32> {
+        driven
+            .owner_mut(owner)
+            .replica
+            .machine_mut()
+            .read_db(|db| {
+                let mut present = false;
+                db.query(
+                    "SELECT 1 FROM sqlite_schema WHERE name = 'floor_items'",
+                    [],
+                    |_| {
+                        present = true;
+                        Ok(false)
+                    },
+                )?;
+                let mut versions = Vec::new();
+                if present {
+                    db.query(
+                        "SELECT version FROM floor_items ORDER BY version",
+                        [],
+                        |row| {
+                            versions.push(u32::try_from(row.get::<i64>(0).map_err(unavailable)?)?);
+                            Ok(true)
+                        },
+                    )?;
+                }
+                Ok(versions)
+            })
+            .unwrap()
+    }
+    /// Three voters bound to kiln.host-store 7, joins tracked; the leader's index.
+    fn tracked_group(driven: &mut Driven, pump: &mut Pump<'_>, clients: &[Client]) -> usize {
+        let leader = driven.elect(pump, &clients[..3], 0, 1);
+        for client in &clients[..3] {
+            client.handle().attest(kiln(7)).unwrap();
+        }
+        joins_tracked(driven, pump, &[0, 1, 2]);
+        leader
+    }
+
+    /// AC-T1.8.A1, T-T1.8.A1 (CP-T1.8) on driven time (replication.md, "Raising the floor"): the
+    /// race CockroachDB's automatic finalization leaves open, a member on an old binary added just
+    /// before the floor is raised. Do, in a group of three voters bound to kiln.host-store 7 with
+    /// joins tracked: add learner 4, bound to version 6; raise the floor to 7; remove 4 and raise
+    /// again; then write as 6 and as 7 at the leader and at a follower. Expect: the first raise
+    /// refused Unavailable naming member 4 alone, no floor installed; the second raised to 7; the
+    /// writes as 6 refused Fenced and the writes as 7 applied, so on every voter no write below
+    /// the floor applied.
+    #[test]
+    fn a_raise_is_refused_while_a_member_on_an_older_binary_belongs_to_the_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        let leader = tracked_group(&mut driven, &mut pump, &clients);
+        let follower = (leader + 1) % 3;
+        let until = driven.until();
+        driven
+            .answer(
+                &mut pump,
+                &change(&clients[leader], until, MemberChange::AddLearner(4)),
+            )
+            .unwrap();
+        settled(&mut driven, &mut pump, 3, &[4]);
+        clients[3].handle().attest(kiln(6)).unwrap();
+        for _ in 0..ROUNDS {
+            if attested(&mut driven, leader, 4).is_some() {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        assert_eq!(attested(&mut driven, leader, 4).unwrap().highest, 6);
+
+        let refused = raise(&mut driven, &mut pump, &clients[leader], 7);
+        assert!(
+            matches!(&refused, Err(Refusal::Unavailable(why)) if why.contains("members [4]")),
+            "{refused:?}"
+        );
+
+        pump.departed.push(4);
+        let until = driven.until();
+        driven
+            .answer(
+                &mut pump,
+                &change(&clients[leader], until, MemberChange::Remove(4)),
+            )
+            .unwrap();
+        settled(&mut driven, &mut pump, 3, &[]);
+        assert_eq!(raise(&mut driven, &mut pump, &clients[leader], 7), Ok(7));
+        for client in [leader, follower] {
+            assert!(matches!(
+                write_as(&mut driven, &mut pump, &clients[client], 6),
+                Err(Refusal::Fenced(_))
+            ));
+            write_as(&mut driven, &mut pump, &clients[client], 7).unwrap();
+        }
+        // Each voter applies both writes in its own time: wait on that, then read what it holds.
+        for _ in 0..ROUNDS {
+            if (0..3).all(|owner| floor_items(&mut driven, owner).len() >= 2) {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        for owner in 0..3 {
+            assert_eq!(floor_items(&mut driven, owner), vec![7, 7], "owner {owner}");
+        }
+        pump.departed.clear();
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.A1, T-T1.8.A2 (CP-T1.8) under a nemesis (replication.md, "Raising the floor"): the
+    /// lead is lost between a change of members and a raise. Do, in a group of three voters bound
+    /// to kiln.host-store 7 with joins tracked: ask the leader to add learner 5 (never running,
+    /// never attesting) and to raise the floor to 7; once both are in its log, hand the lead to a
+    /// follower; then raise again at the new leader. Expect: the first raise applied on every voter
+    /// exactly when its entry precedes the change's in the log and on none otherwise, never
+    /// answered as raised past the change; the second the floor in force if the first applied,
+    /// else refused naming member 5.
+    #[test]
+    fn a_raise_beside_a_change_holds_through_a_lost_lead() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        pump.refusals = Some(0);
+        // Learner 5 never runs: every record to it is lost.
+        pump.lost.push(5);
+        let leader = tracked_group(&mut driven, &mut pump, &clients);
+        let until = driven.until();
+        let added = change(&clients[leader], until, MemberChange::AddLearner(5));
+        let operation = Operation::Call(Mutex::new(Some(Box::new(move |db: &mut Db| {
+            let floor = crate::database::application::raise(db, kiln(7), true)?
+                .map_err(|refused| anyhow::Error::from(refused.refusal))?;
+            // The configuration at the raise's base, which the stale-base rule makes its own at apply.
+            let learners = crate::replication::floor::configuration(db)?.learners;
+            Ok(Box::new((floor.version, learners)) as Box<dyn Any + Send>)
+        }))));
+        let (response, raised) = mpsc::sync_channel(1);
+        clients[leader]
+            .handle
+            .enqueue(
+                Input::Submit {
+                    namespace: String::new(),
+                    operation,
+                    application: Some(kiln(7)),
+                    until,
+                    response,
+                },
+                api::REQUEST_MAX,
+            )
+            .unwrap();
+        // The lead is lost once both are in the leader's log, the change's entry and the raise's.
+        for _ in 0..ROUNDS {
+            let owner = &driven.owner_mut(leader);
+            if owner.replica.core().raft.has_pending_conf()
+                && matches!(
+                    owner.pending.as_ref().map(|pending| &pending.phase),
+                    Some(Phase::Proposed(_))
+                )
+            {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        let owner = &driven.owner_mut(leader);
+        assert!(
+            owner.replica.core().raft.has_pending_conf(),
+            "the change was never proposed"
+        );
+        assert!(
+            matches!(
+                owner.pending.as_ref().map(|pending| &pending.phase),
+                Some(Phase::Proposed(_))
+            ),
+            "the raise was never proposed"
+        );
+        // Where each sits in the leader's log: the stale-base rule lets the raise apply only if
+        // it comes before the change, its base having not seen it.
+        let change_index = owner.replica.core().raft.pending_conf_index();
+        let context = owner.pending.as_ref().unwrap().context.clone();
+        let raise_index = owner
+            .replica
+            .core()
+            .raft
+            .log()
+            .entries(owner.replica.applied().index + 1, u64::MAX, 64)
+            .unwrap()
+            .iter()
+            .find(|entry| entry.context == context)
+            .unwrap()
+            .index;
+        let raised_first = raise_index < change_index;
+        let led = driven.hand_off(&mut pump, &clients[..3], leader, (leader + 1) % 3);
+        let first = driven.answer(&mut pump, &raised);
+        let _ = driven.answer(&mut pump, &added);
+        settled(&mut driven, &mut pump, 3, &[5]);
+        match &first {
+            Ok(Answer::Called(value)) => {
+                let (version, learners) = value.downcast_ref::<(u32, Vec<u64>)>().unwrap();
+                assert_eq!(*version, 7);
+                assert!(!learners.contains(&5), "raised while 5 was a member");
+                assert!(
+                    raised_first,
+                    "raised at {raise_index}, past the change at {change_index}"
+                );
+            }
+            Ok(_) => panic!("wrong actor reply"),
+            Err(_) => {}
+        }
+        // Applied on every voter exactly when it came first; never past the change.
+        for owner in 0..3 {
+            assert_eq!(
+                floor_version(&mut driven, owner),
+                if raised_first { Some(7) } else { None },
+                "owner {owner}: raise at {raise_index}, change at {change_index}"
+            );
+        }
+        // Raised again at the new leader: the floor in force at once if the first applied, else
+        // a proof that now covers 5, which never attests.
+        let again = raise(&mut driven, &mut pump, &clients[led], 7);
+        if raised_first {
+            assert_eq!(again, Ok(7));
+        } else {
+            assert!(
+                matches!(&again, Err(Refusal::Unavailable(why)) if why.contains("members [5]")),
+                "{again:?}"
+            );
+        }
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// Three voters bound to kiln.host-store 7, joins tracked and the floor raised to 7, then
+    /// learner 4 added (not bound); the leader's index.
+    fn floor_and_a_learner(driven: &mut Driven, pump: &mut Pump<'_>, clients: &[Client]) -> usize {
+        let leader = tracked_group(driven, pump, clients);
+        assert_eq!(raise(driven, pump, &clients[leader], 7), Ok(7));
+        let until = driven.until();
+        driven
+            .answer(
+                pump,
+                &change(&clients[leader], until, MemberChange::AddLearner(4)),
+            )
+            .unwrap();
+        settled(driven, pump, 3, &[4]);
+        leader
+    }
+    /// A promotion of learner 4 at `client`, answered.
+    fn promote(
+        driven: &mut Driven,
+        pump: &mut Pump<'_>,
+        client: &Client,
+    ) -> Result<ReplicaStatus, Refusal> {
+        let until = driven.until();
+        driven.answer(pump, &change(client, until, MemberChange::Promote(4)))
+    }
+
+    /// AC-T1.8.A1, T-T1.8.A1 (CP-T1.8) on driven time (replication.md, "How it composes with
+    /// membership changes"): a learner that has not attested is not promoted. Do, in a group with
+    /// the floor at kiln.host-store 7: add learner 4, never bound; promote it. Expect: Unavailable,
+    /// naming the learner, the application and the floor; 4 still a learner.
+    #[test]
+    fn an_unattested_learner_is_not_promoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        let leader = floor_and_a_learner(&mut driven, &mut pump, &clients);
+        let refused = promote(&mut driven, &mut pump, &clients[leader]);
+        assert_eq!(
+            refused,
+            Err(Refusal::Unavailable(
+                "learner 4 has not attested kiln.host-store under its current join; the group's floor is 7"
+                    .into()
+            ))
+        );
+        assert_eq!(applied_configuration(&driven, leader).learners, vec![4]);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.A1 (CP-T1.8) on driven time (replication.md, "How it composes with membership
+    /// changes"): a learner attested below the floor is not promoted. Do, in a group with the floor
+    /// at kiln.host-store 7: add learner 4, and write its attestation at 6 under its join (as a
+    /// bind racing the raise could); promote it. Expect: Invalid, "application floor", naming 6
+    /// and 7; 4 still a learner.
+    #[test]
+    fn a_learner_attested_below_the_floor_is_not_promoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        let leader = floor_and_a_learner(&mut driven, &mut pump, &clients);
+        call_as(&mut driven, &mut pump, &clients[leader], kiln(7), |db| {
+            crate::replication::floor::attest(db, 4, "kiln.host-store", 6)
+        })
+        .unwrap();
+        let refused = promote(&mut driven, &mut pump, &clients[leader]);
+        assert_eq!(
+            refused,
+            Err(Refusal::Invalid {
+                what: "application floor".into(),
+                why: "learner 4 runs kiln.host-store up to 6; the group's floor is 7".into(),
+            })
+        );
+        assert_eq!(applied_configuration(&driven, leader).learners, vec![4]);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.A1 (CP-T1.8) on driven time (replication.md, "How it composes with membership
+    /// changes"): a learner attested at the floor is promoted. Do, in a group with the floor at
+    /// kiln.host-store 7: add learner 4; it binds kiln.host-store 7; promote it. Expect: Ok, with 4
+    /// among the voters.
+    #[test]
+    fn a_learner_attested_at_the_floor_is_promoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        let leader = floor_and_a_learner(&mut driven, &mut pump, &clients);
+        clients[3].handle().attest(kiln(7)).unwrap();
+        for _ in 0..ROUNDS {
+            if attested(&mut driven, leader, 4).is_some() {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        assert_eq!(attested(&mut driven, leader, 4).unwrap().highest, 7);
+        let promoted = promote(&mut driven, &mut pump, &clients[leader]).unwrap();
+        assert_eq!(promoted.voters, vec![1, 2, 3, 4]);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.A1 (CP-T1.8) on driven time (replication.md, "How it composes with membership
+    /// changes"): a promotion is admitted only on a quiescent tail, so the attestation it reads is
+    /// the one in force at its change's index, and is answered at once otherwise. Do, in a group
+    /// with the floor at kiln.host-store 7 and learner 4 attested at 7: every append lost while
+    /// heartbeats go on, a write appended at the leader; promote 4. Expect: Unavailable naming the
+    /// last index and the applied index, and nothing proposed: 4 still a learner.
+    #[test]
+    fn a_promotion_beside_a_write_in_flight_is_refused_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        let leader = floor_and_a_learner(&mut driven, &mut pump, &clients);
+        clients[3].handle().attest(kiln(7)).unwrap();
+        for _ in 0..ROUNDS {
+            if attested(&mut driven, leader, 4).is_some() && driven.owner_mut(3).pending.is_none() {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        pump.appends_lost = true;
+        let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
+            db.exec("CREATE TABLE IF NOT EXISTS floor_items(version)")?;
+            db.exec("INSERT INTO floor_items VALUES(7)")?;
+            Ok(Box::new(()) as Box<dyn Any + Send>)
+        }))));
+        let (response, written) = mpsc::sync_channel(1);
+        clients[leader]
+            .handle
+            .enqueue(
+                Input::Submit {
+                    namespace: String::new(),
+                    operation,
+                    application: Some(kiln(7)),
+                    until: driven.until(),
+                    response,
+                },
+                api::REQUEST_MAX,
+            )
+            .unwrap();
+        let tail = |driven: &Driven| {
+            let replica = &driven.owner(leader).replica;
+            (
+                replica.applied().index,
+                replica.core().raft.log().last_index().unwrap(),
+            )
+        };
+        for _ in 0..ROUNDS {
+            let (applied, last) = tail(&driven);
+            if last > applied {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        let (applied, last) = tail(&driven);
+        assert!(last > applied, "the write was never appended");
+        let proposed = pending_change(&driven, leader);
+        let refused = promote(&mut driven, &mut pump, &clients[leader]);
+        assert_eq!(
+            refused,
+            Err(Refusal::Unavailable(format!(
+                "the log runs to {last} and {applied} is applied; promote once the tail is applied"
+            )))
+        );
+        assert_eq!(
+            clients[leader]
+                .handle()
+                .floor_counters()
+                .refused(FloorRefusal::Busy),
+            1,
+            "a tail's refusal counted as busy"
+        );
+        // Nothing proposed: the change slot's mark unmoved, and 4 still a learner.
+        assert_eq!(pending_change(&driven, leader), proposed);
+        let configuration = applied_configuration(&driven, leader);
+        assert_eq!(
+            (configuration.voters, configuration.learners),
+            (vec![1, 2, 3], vec![4])
+        );
+        drop(written);
+        pump.finish();
+    }
+
+    /// AC-T1.8.A1 (CP-T1.8) on driven time (replication.md, "Raising the floor", d): binding below
+    /// the committed floor fails closed at once. Do, in a group of three voters bound to
+    /// kiln.host-store 7 with joins tracked: raise the floor to 7; then a follower binds
+    /// kiln.host-store 6. Expect: Invalid at once, naming the binary's highest and the floor; no
+    /// proposal made, and the follower's attestation still 7 on every voter.
+    #[test]
+    fn a_bind_below_the_committed_floor_is_refused_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        let leader = tracked_group(&mut driven, &mut pump, &clients);
+        assert_eq!(raise(&mut driven, &mut pump, &clients[leader], 7), Ok(7));
+        let follower = (leader + 1) % 3;
+        for _ in 0..ROUNDS {
+            if (0..3).all(|owner| floor_version(&mut driven, owner) == Some(7)) {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        let member = u64::try_from(follower + 1).unwrap();
+        let proposed = driven.owner_mut(follower).floor_attestations;
+
+        let refused = clients[follower].handle().attest(kiln(6));
+        assert_eq!(
+            refused,
+            Err(Refusal::Invalid {
+                what: "application floor".into(),
+                why: "this binary runs up to 6; the group's floor is 7".into(),
+            })
+        );
+        for _ in 0..64 {
+            driven.round(&mut pump);
+        }
+        assert_eq!(driven.owner_mut(follower).floor_attestations, proposed);
+        for owner in 0..3 {
+            assert_eq!(attested(&mut driven, owner, member).unwrap().highest, 7);
+        }
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// The floor's version owner `owner` holds, if one is installed.
+    fn floor_version(driven: &mut Driven, owner: usize) -> Option<u32> {
+        driven
+            .owner_mut(owner)
+            .replica
+            .machine_mut()
+            .read_db(|db| crate::database::application::policy(db))
+            .unwrap()
+            .map(|floor| floor.version)
+    }
+
+    /// Enqueues a raise of kiln.host-store's floor to 7 at `client`, by a handle bound to it,
+    /// without waiting.
+    fn raise_at(client: &Client, until: Instant) -> mpsc::Receiver<Result<Answer, Refusal>> {
+        let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
+            let floor = crate::database::application::raise(db, kiln(7), true)?
+                .map_err(|refused| anyhow::Error::from(refused.refusal))?;
+            Ok(Box::new(floor.version) as Box<dyn Any + Send>)
+        }))));
+        let (response, raised) = mpsc::sync_channel(1);
+        client
+            .handle
+            .enqueue(
+                Input::Submit {
+                    namespace: String::new(),
+                    operation,
+                    application: Some(kiln(7)),
+                    until,
+                    response,
+                },
+                api::REQUEST_MAX,
+            )
+            .unwrap();
+        raised
+    }
+
+    /// AC-T1.8.A1 (CP-T1.8) on driven time (replication.md, "Raising the floor", b;
+    /// amphora-seam-owner's ruling on step 4, a): a raise another lead's entry writes over is
+    /// answered UnknownOutcome, which writer_floor passes on as it is, and applies nowhere. Do, in
+    /// a group of three voters bound to kiln.host-store 7 with joins tracked: the leader proposes
+    /// a raise to 7 whose records are lost; the other two, their clocks past an election timeout,
+    /// elect one of them; then the new leader raises to 7. Expect: UnknownOutcome; no floor on any
+    /// voter; the new leader's raise Ok(7).
+    #[test]
+    fn a_raise_another_lead_wrote_over_is_answered_unknown_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        let leader = tracked_group(&mut driven, &mut pump, &clients);
+        driven.drain(&mut pump);
+        let raised = raise_at(&clients[leader], driven.until());
+        reach(&mut driven, &mut pump, "the raise proposed", |driven| {
+            matches!(
+                driven
+                    .owner(leader)
+                    .pending
+                    .as_ref()
+                    .map(|pending| &pending.phase),
+                Some(Phase::Proposed(_))
+            )
+        });
+        // What goes on is what the proposal's round hadn't sent: its entry is lost with this.
+        clients[leader].handle().drain(OUTGOING_MESSAGES).unwrap();
+        let others: Vec<usize> = (0..3).filter(|owner| *owner != leader).collect();
+        let answered = (0..ROUNDS)
+            .find_map(|_| {
+                for owner in &others {
+                    driven.advance(*owner, TICK);
+                }
+                driven.round(&mut pump);
+                raised.try_recv().ok()
+            })
+            .unwrap();
+        let refusal = answered.err().unwrap();
+        assert_eq!(refusal, Refusal::UnknownOutcome);
+        assert_eq!(
+            crate::database::application::overtaken(refusal),
+            Refusal::UnknownOutcome
+        );
+        settled(&mut driven, &mut pump, 3, &[]);
+        for owner in 0..3 {
+            assert_eq!(floor_version(&mut driven, owner), None, "owner {owner}");
+        }
+        let status = clients[others[0]].handle().status().unwrap();
+        let led = usize::try_from(status.leader - 1).unwrap();
+        assert_eq!(raise(&mut driven, &mut pump, &clients[led], 7), Ok(7));
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.A1 (CP-T1.8) on driven time (amphora-seam-owner's review of step 4, D1): a
+    /// compaction the floor refuses is answered to its caller and the owner keeps serving. Do, in
+    /// a group of three voters with the floor at kiln.host-store 7: a compaction step from a
+    /// handle with no claim; then a write as 7. Expect: Fenced, "application writer contract
+    /// required"; the write applied; no member fenced.
+    #[test]
+    fn a_compaction_the_floor_refuses_leaves_the_owner_serving() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        let leader = tracked_group(&mut driven, &mut pump, &clients);
+        assert_eq!(raise(&mut driven, &mut pump, &clients[leader], 7), Ok(7));
+        let step = Operation::Mutation(Mutation::CompactStep {
+            namespace: "gc".into(),
+            before: 2,
+        });
+        let answer = enqueue(&clients[leader], driven.until(), "gc", step);
+        let refused = driven.answer(&mut pump, &answer).err().unwrap();
+        assert_eq!(
+            refused,
+            Refusal::Fenced("application writer contract required".into())
+        );
+        write_as(&mut driven, &mut pump, &clients[leader], 7).unwrap();
+        for client in &clients[..3] {
+            assert_eq!(client.handle().status().unwrap().fenced, None);
+        }
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.A1 (CP-T1.8) on driven time (replication.md, promise 3; amphora-seam-owner's
+    /// review of step 4, D5): a raise to the floor in force or below answers it at once, with
+    /// nothing to prove and nothing proposed. Do, in a group with the floor at kiln.host-store 7
+    /// and learner 4 added, never attesting: raise to 7, then to 6. Expect: Ok(7) both times, and
+    /// the leader's log no longer than before.
+    #[test]
+    fn a_raise_to_the_floor_or_below_answers_the_floor_in_force_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        let leader = floor_and_a_learner(&mut driven, &mut pump, &clients);
+        quiet(&mut driven, &mut pump);
+        let last = |driven: &Driven| {
+            driven
+                .owner(leader)
+                .replica
+                .core()
+                .raft
+                .log()
+                .last_index()
+                .unwrap()
+        };
+        let before = last(&driven);
+        assert_eq!(raise(&mut driven, &mut pump, &clients[leader], 7), Ok(7));
+        let lower = call_as(&mut driven, &mut pump, &clients[leader], kiln(7), |db| {
+            crate::database::application::raise(db, kiln(6), true)?
+                .map(|floor| floor.version)
+                .map_err(|refused| anyhow::Error::from(refused.refusal))
+        });
+        assert_eq!(lower, Ok(7));
+        assert_eq!(last(&driven), before);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// CP-T1.8 on driven time (replication.md, "Metrics", "The seam"; CLAUDE.md section 10): the
+    /// floor's metrics and floor_status say what happened. Do, in a group of three voters bound to
+    /// kiln.host-store 7 with joins tracked: read every member's counters; raise to 7; add learner
+    /// 4, never bound; then a raise to 8, a write as 6, a write with no claim and 4's promotion,
+    /// each refused. Expect: before, every count 0; after the raise, version 7, one raise and no
+    /// member unattested on every voter; with 4 added, one unattested and floor_status naming 4 a
+    /// learner with no attestation, the voters at 7; each refusal counted under its reason at the
+    /// member that made it; the keeper not failing.
+    #[test]
+    fn the_floors_metrics_and_status_say_what_happened() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        let leader = tracked_group(&mut driven, &mut pump, &clients);
+        for client in &clients[..3] {
+            assert_eq!(
+                client.handle().floor_counters(),
+                crate::meter::FloorCounters::default()
+            );
+        }
+        assert_eq!(raise(&mut driven, &mut pump, &clients[leader], 7), Ok(7));
+        for _ in 0..ROUNDS {
+            if clients[..3]
+                .iter()
+                .all(|client| client.handle().floor_counters().version == 7)
+            {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        for client in &clients[..3] {
+            let counters = client.handle().floor_counters();
+            assert_eq!(
+                (
+                    counters.version,
+                    counters.raises,
+                    counters.unattested_members
+                ),
+                (7, 1, 0)
+            );
+        }
+        let until = driven.until();
+        driven
+            .answer(
+                &mut pump,
+                &change(&clients[leader], until, MemberChange::AddLearner(4)),
+            )
+            .unwrap();
+        settled(&mut driven, &mut pump, 3, &[4]);
+        let led = clients[leader].handle();
+        assert_eq!(led.floor_counters().unattested_members, 1);
+        let status = led.floor_status().unwrap();
+        assert_eq!(
+            (status.application.as_deref(), status.version),
+            (Some("kiln.host-store"), 7)
+        );
+        for member in &status.members {
+            let expected = if member.member == 4 {
+                (false, None)
+            } else {
+                (true, Some(7))
+            };
+            assert_eq!((member.voter, member.attested), expected, "{member:?}");
+        }
+        assert_eq!(status.members.len(), 4);
+
+        // Each refusal site counts its own reason, once, where it refuses (amphora-seam-owner's
+        // review of efc1248): what each moved, and nothing else.
+        let moved = |before: &FloorCounters, after: &FloorCounters| -> Vec<(FloorRefusal, u64)> {
+            FloorRefusal::ALL
+                .into_iter()
+                .filter(|reason| after.refused(*reason) != before.refused(*reason))
+                .map(|reason| (reason, after.refused(reason) - before.refused(reason)))
+                .collect()
+        };
+        let follower = (leader + 1) % 3;
+        let mut sites: Vec<(&str, usize, FloorRefusal, bool)> = Vec::new();
+        let before = led.floor_counters();
+        let refused = raise(&mut driven, &mut pump, &clients[leader], 8).is_err();
+        sites.push(("the raise's proof", leader, FloorRefusal::Unproven, refused));
+        assert_eq!(
+            moved(&before, &led.floor_counters()),
+            vec![(FloorRefusal::Unproven, 1)]
+        );
+        let before = led.floor_counters();
+        let refused = write_as(&mut driven, &mut pump, &clients[leader], 6).is_err();
+        assert_eq!(
+            moved(&before, &led.floor_counters()),
+            vec![(FloorRefusal::BelowFloor, 1)]
+        );
+        sites.push((
+            "a write below the floor",
+            leader,
+            FloorRefusal::BelowFloor,
+            refused,
+        ));
+        let before = led.floor_counters();
+        let unclaimed = submit(&clients[leader], driven.until(), |db| {
+            db.exec("CREATE TABLE IF NOT EXISTS floor_items(version)")?;
+            Ok(Vec::new())
+        });
+        let refused = driven.answer(&mut pump, &unclaimed).is_err();
+        assert_eq!(
+            moved(&before, &led.floor_counters()),
+            vec![(FloorRefusal::NoClaim, 1)]
+        );
+        sites.push(("an unclaimed write", leader, FloorRefusal::NoClaim, refused));
+        let before = led.floor_counters();
+        let other = crate::database::Application {
+            name: "another.app".into(),
+            version: 9,
+        };
+        let refused = call_as(&mut driven, &mut pump, &clients[leader], other, |db| {
+            db.exec("CREATE TABLE IF NOT EXISTS floor_items(version)")?;
+            Ok(())
+        })
+        .is_err();
+        assert_eq!(
+            moved(&before, &led.floor_counters()),
+            vec![(FloorRefusal::OtherApplication, 1)]
+        );
+        sites.push((
+            "another application's write",
+            leader,
+            FloorRefusal::OtherApplication,
+            refused,
+        ));
+        let before = led.floor_counters();
+        let compaction = enqueue(
+            &clients[leader],
+            driven.until(),
+            "gc",
+            Operation::Mutation(Mutation::CompactStep {
+                namespace: "gc".into(),
+                before: 2,
+            }),
+        );
+        let refused = driven.answer(&mut pump, &compaction).is_err();
+        assert_eq!(
+            moved(&before, &led.floor_counters()),
+            vec![(FloorRefusal::NoClaim, 1)]
+        );
+        sites.push((
+            "an unclaimed compaction",
+            leader,
+            FloorRefusal::NoClaim,
+            refused,
+        ));
+        let before = led.floor_counters();
+        let refused = promote(&mut driven, &mut pump, &clients[leader]).is_err();
+        assert_eq!(
+            moved(&before, &led.floor_counters()),
+            vec![(FloorRefusal::Unproven, 1)]
+        );
+        sites.push((
+            "the promotion guard",
+            leader,
+            FloorRefusal::Unproven,
+            refused,
+        ));
+        let bound = clients[follower].handle();
+        let before = bound.floor_counters();
+        let refused = bound.attest(kiln(6)).is_err();
+        assert_eq!(
+            moved(&before, &bound.floor_counters()),
+            vec![(FloorRefusal::BelowFloor, 1)]
+        );
+        sites.push((
+            "a bind below the floor",
+            follower,
+            FloorRefusal::BelowFloor,
+            refused,
+        ));
+        for (site, owner, reason, refused) in &sites {
+            assert!(
+                refused,
+                "{site} at owner {owner} was not refused ({reason:?})"
+            );
+        }
+        let counters = led.floor_counters();
+        assert_eq!(counters.keeper_failing, 0);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.A1, T-T1.8.A7 (CP-T1.8) on driven time (replication.md, "The upgrade that
+    /// introduces the join rows", point 2; amphora-seam-owner's ruling on the keeper's livelock,
+    /// b'): a floor session prepares only once its member has applied its own whole log, so an
+    /// entry appended ahead of it, not yet committed when its barrier passed, never makes it stale.
+    /// Do, in a group of three voters bound to kiln.host-store 7 with joins tracked: every
+    /// follower's durable answer to an append kept back, so a write at the leader is appended on
+    /// every member and committed nowhere; a follower binds kiln.host-store 8, its keeper's barrier
+    /// passing on heartbeats; then the answers let through. Expect: the follower's attestation of
+    /// 8 applied, proposed once, never refused as stale.
+    #[test]
+    fn a_floor_session_waits_for_its_members_own_log_before_it_prepares() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        let leader = tracked_group(&mut driven, &mut pump, &clients);
+        quiet(&mut driven, &mut pump);
+        let follower = (leader + 1) % 3;
+        let member = u64::try_from(follower + 1).unwrap();
+        let proposed = driven.owner(follower).floor_attestations;
+        pump.hold_durable();
+        let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
+            db.exec("CREATE TABLE IF NOT EXISTS ahead(x)")?;
+            Ok(Box::new(()) as Box<dyn Any + Send>)
+        }))));
+        let (response, written) = mpsc::sync_channel(1);
+        clients[leader]
+            .handle
+            .enqueue(
+                Input::Submit {
+                    namespace: String::new(),
+                    operation,
+                    application: Some(kiln(7)),
+                    until: driven.until(),
+                    response,
+                },
+                api::REQUEST_MAX,
+            )
+            .unwrap();
+        reach(
+            &mut driven,
+            &mut pump,
+            "the write appended on the follower",
+            |driven| {
+                let replica = &driven.owner(follower).replica;
+                replica.core().raft.log().last_index().unwrap() > replica.applied().index
+            },
+        );
+        clients[follower].handle().attest(kiln(8)).unwrap();
+        reach(
+            &mut driven,
+            &mut pump,
+            "the follower's keeper with a session in hand",
+            |driven| driven.owner(follower).floor_inflight,
+        );
+        for _ in 0..64 {
+            driven.round(&mut pump);
+        }
+        pump.let_durable();
+        for _ in 0..ROUNDS {
+            if attested(&mut driven, leader, member).is_some_and(|attested| attested.highest == 8) {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        assert_eq!(attested(&mut driven, leader, member).unwrap().highest, 8);
+        assert!(driven.answer(&mut pump, &written).is_ok());
+        assert_eq!(
+            driven.owner(follower).floor_attestations - proposed,
+            1,
+            "the follower's attestation was proposed again: its base missed the write ahead of it"
+        );
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.A1 (CP-T1.8) on driven time (amphora-seam-owner's review of 392902d): a floor
+    /// session's wait for its member's log has a target fixed when its barrier passes, so an entry
+    /// appended after that never moves it, and the session never waits out its deadline holding the
+    /// member's write slot through others' writes. Do, in a group of three voters bound to
+    /// kiln.host-store 7 with joins tracked: a write at the leader appended on it and a follower
+    /// and committed nowhere, the other voter's appends and every answer that would count the
+    /// follower as holding it lost; the follower binds kiln.host-store 8, its session waiting for
+    /// its log with that write ahead, its target the write's index; then its target set to what it
+    /// has applied, as a barrier that passed with nothing ahead and an entry appended since would
+    /// leave it, its log running past what it has applied; one step. Expect: the target the write's
+    /// index while it waits; then the session prepared and proposed, its wait cleared; after an
+    /// outage's time, the attestation applied.
+    #[test]
+    fn a_floor_session_waits_for_its_log_as_it_was_not_for_writes_behind_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        // The lost records may cost the lead; proposals dropped in that election are counted.
+        pump.refusals = Some(0);
+        let leader = tracked_group(&mut driven, &mut pump, &clients);
+        quiet(&mut driven, &mut pump);
+        let follower = (leader + 1) % 3;
+        let member = u64::try_from(follower + 1).unwrap();
+        let other = u64::try_from((leader + 2) % 3 + 1).unwrap();
+        let tail = |driven: &Driven| {
+            let replica = &driven.owner(follower).replica;
+            (
+                replica.applied().index,
+                replica.core().raft.log().last_index().unwrap(),
+            )
+        };
+        // The write ahead commits nowhere: the other voter never holds it, and no answer says the
+        // follower does (a heartbeat's answer saying where its log ends counts as an append's).
+        // The other voter's answers still confirm the follower's barrier.
+        let (_, before) = tail(&driven);
+        pump.losing = Some(Box::new(move |from, record| match record.msg_type {
+            hyper_raft::proto::MessageType::MsgAppend => record.to == other,
+            hyper_raft::proto::MessageType::MsgAppendResponse => true,
+            hyper_raft::proto::MessageType::MsgHeartbeatResponse => {
+                from == member && record.index > before
+            }
+            _ => false,
+        }));
+        let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
+            db.exec("CREATE TABLE IF NOT EXISTS ahead(x)")?;
+            Ok(Box::new(()) as Box<dyn Any + Send>)
+        }))));
+        let (response, written) = mpsc::sync_channel(1);
+        clients[leader]
+            .handle
+            .enqueue(
+                Input::Submit {
+                    namespace: String::new(),
+                    operation,
+                    application: Some(kiln(7)),
+                    until: driven.until(),
+                    response,
+                },
+                api::REQUEST_MAX,
+            )
+            .unwrap();
+        reach(
+            &mut driven,
+            &mut pump,
+            "the write appended ahead",
+            |driven| {
+                let (applied, last) = tail(driven);
+                last > applied
+            },
+        );
+        let (_, ahead) = tail(&driven);
+        let proposed = driven.owner(follower).floor_attestations;
+        clients[follower].handle().attest(kiln(8)).unwrap();
+        reach(
+            &mut driven,
+            &mut pump,
+            "the follower's session waiting for its log",
+            |driven| driven.owner(follower).floor_tail.is_some(),
+        );
+        assert_eq!(driven.owner(follower).floor_tail, Some(ahead));
+        let (applied, last) = tail(&driven);
+        assert!(last > applied, "the write ahead already applied");
+        driven.owner_mut(follower).floor_tail = Some(applied);
+        driven.step();
+        let owner = driven.owner(follower);
+        assert_eq!(
+            owner.floor_tail, None,
+            "the session still waits: its target moved"
+        );
+        let (applied, last) = tail(&driven);
+        assert!(last > applied, "the write ahead applied");
+        assert!(
+            owner.floor_attestations > proposed
+                || matches!(
+                    owner.pending.as_ref().map(|pending| &pending.phase),
+                    Some(Phase::Proposed(_))
+                ),
+            "the session did not prepare at its target"
+        );
+        // Time passes, as after an outage: what was lost is sent again or the group elects, and
+        // the follower's attestation applies.
+        pump.losing = None;
+        let led = settle_lead(&mut driven, &mut pump, &clients);
+        for _ in 0..ROUNDS {
+            if attested(&mut driven, led, member).is_some_and(|attested| attested.highest == 8) {
+                break;
+            }
+            for owner in 0..3 {
+                driven.advance(owner, TICK);
+            }
+            driven.round(&mut pump);
+        }
+        // Its attestation, prepared at a base the write behind it moves past, may be refused by
+        // the stale-base rule and made again; it applies all the same.
+        assert_eq!(attested(&mut driven, led, member).unwrap().highest, 8);
+        // The write ahead is answered as the group decided: applied, or unknown after a new lead.
+        drop(written);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// How often T-T1.8.A6 reached each falsifier's situation, over all its runs (non-vacuity):
+    /// each must be above 0, else that falsifier was asserted over nothing.
+    #[derive(Debug, Default)]
+    struct Reached {
+        below_floor_write_refused: u64,
+        write_at_floor_applied: u64,
+        raise_applied: u64,
+        raise_refused_unproven: u64,
+        floor_checked_on_every_member: u64,
+        promotion_applied: u64,
+        promotion_refused: u64,
+        bind_below_floor_refused: u64,
+        hostile_forward_refused: u64,
+        earlier_join_held_a_raise: u64,
+        join_rows_compared: u64,
+        tail_refused_at_once: u64,
+        raise_before_joins_refused: u64,
+        digests_compared: u64,
+        stale_attestation_held_joins: u64,
+        leader_crashed: u64,
+        lead_handed_off: u64,
+        records_lost: u64,
+    }
+    impl Reached {
+        fn unreached(&self) -> Vec<&'static str> {
+            [
+                ("below_floor_write_refused", self.below_floor_write_refused),
+                ("write_at_floor_applied", self.write_at_floor_applied),
+                ("raise_applied", self.raise_applied),
+                ("raise_refused_unproven", self.raise_refused_unproven),
+                (
+                    "floor_checked_on_every_member",
+                    self.floor_checked_on_every_member,
+                ),
+                ("promotion_applied", self.promotion_applied),
+                ("promotion_refused", self.promotion_refused),
+                ("bind_below_floor_refused", self.bind_below_floor_refused),
+                ("hostile_forward_refused", self.hostile_forward_refused),
+                ("earlier_join_held_a_raise", self.earlier_join_held_a_raise),
+                ("join_rows_compared", self.join_rows_compared),
+                ("tail_refused_at_once", self.tail_refused_at_once),
+                (
+                    "raise_before_joins_refused",
+                    self.raise_before_joins_refused,
+                ),
+                ("digests_compared", self.digests_compared),
+                (
+                    "stale_attestation_held_joins",
+                    self.stale_attestation_held_joins,
+                ),
+                ("leader_crashed", self.leader_crashed),
+                ("lead_handed_off", self.lead_handed_off),
+                ("records_lost", self.records_lost),
+            ]
+            .into_iter()
+            .filter(|(_, count)| *count == 0)
+            .map(|(name, _)| name)
+            .collect()
+        }
+    }
+
+    /// Rounds until every voter of the group's applied configuration is out of any joint
+    /// configuration with no change of members still to apply.
+    fn calm(driven: &mut Driven, pump: &mut Pump<'_>, owners: usize) {
+        reach(driven, pump, "the group calm", |driven| {
+            (0..owners).all(|owner| {
+                let applied = applied_configuration(driven, owner);
+                applied.voters_outgoing.is_empty()
+                    && applied.learners_next.is_empty()
+                    && !driven.owner(owner).replica.core().raft.has_pending_conf()
+            })
+        });
+    }
+    /// The member the group follows, as owner `asked` sees it, by its index; None while it knows
+    /// none.
+    fn leading(clients: &[Client], asked: usize) -> Option<usize> {
+        let leader = clients[asked].handle().status().ok()?.leader;
+        if leader == 0 {
+            None
+        } else {
+            Some(usize::try_from(leader - 1).unwrap())
+        }
+    }
+    /// Time passes, every clock alike, until the first three members name one leader and it
+    /// leads; its index. What follows an election or an outage, as real time would bring it.
+    fn settle_lead(driven: &mut Driven, pump: &mut Pump<'_>, clients: &[Client]) -> usize {
+        for _ in 0..ROUNDS {
+            let named: Vec<Option<usize>> = (0..3).map(|owner| leading(clients, owner)).collect();
+            if let Some(Some(leader)) = named.first()
+                && named.iter().all(|seen| *seen == Some(*leader))
+                && leading(clients, *leader) == Some(*leader)
+            {
+                return *leader;
+            }
+            for owner in 0..4 {
+                driven.advance(owner, TICK);
+            }
+            driven.round(pump);
+        }
+        panic!("no lead settled in {ROUNDS} driven rounds");
+    }
+    /// A write into a6_items at `client` by a handle bound to kiln.host-store at `version`,
+    /// recording the floor at the session's base beside it.
+    fn write_recording_floor(
+        driven: &mut Driven,
+        pump: &mut Pump<'_>,
+        client: &Client,
+        version: u32,
+    ) -> Result<(), Refusal> {
+        call_as(driven, pump, client, kiln(version), move |db| {
+            let floor = crate::database::installed_floor(db)?.map_or(0, |floor| floor.version);
+            db.exec("CREATE TABLE IF NOT EXISTS a6_items(version, floor)")?;
+            db.exec(&format!("INSERT INTO a6_items VALUES({version}, {floor})"))?;
+            Ok(())
+        })
+    }
+    /// Every (version, floor at its base) row owner `owner` holds in a6_items.
+    fn recorded_writes(driven: &mut Driven, owner: usize) -> Vec<(u32, u32)> {
+        driven
+            .owner_mut(owner)
+            .replica
+            .machine_mut()
+            .read_db(|db| {
+                let mut present = false;
+                db.query(
+                    "SELECT 1 FROM sqlite_schema WHERE name = 'a6_items'",
+                    [],
+                    |_| {
+                        present = true;
+                        Ok(false)
+                    },
+                )?;
+                let mut rows = Vec::new();
+                if present {
+                    db.query("SELECT version, floor FROM a6_items", [], |row| {
+                        rows.push((
+                            u32::try_from(row.get::<i64>(0).map_err(unavailable)?)?,
+                            u32::try_from(row.get::<i64>(1).map_err(unavailable)?)?,
+                        ));
+                        Ok(true)
+                    })?;
+                }
+                Ok(rows)
+            })
+            .unwrap()
+    }
+    /// Forwards to `leader` a proposal `from` prepared, its context naming `named`; answers the
+    /// leader's admission.
+    fn forward_naming(
+        driven: &mut Driven,
+        clients: &[Client],
+        leader: usize,
+        from: usize,
+        named: usize,
+    ) -> Result<(), Refusal> {
+        let id = |owner: usize| u64::try_from(owner + 1).unwrap();
+        // The leader refuses it on its context, before its data: an opaque payload, which no
+        // member could apply, would fail the run loudly if one were taken.
+        let mut context = id(named).to_le_bytes().to_vec();
+        context.extend_from_slice(&[7; 24]);
+        let mut record =
+            hyper_raft::proto::message(id(leader), hyper_raft::proto::MessageType::MsgPropose);
+        record.from = id(from);
+        record.entries = vec![hyper_raft::proto::Entry {
+            data: b"hostile".to_vec(),
+            context,
+            ..hyper_raft::proto::Entry::default()
+        }];
+        let mut bytes = Vec::new();
+        record.encode(&mut bytes);
+        let mut receipt = clients[leader]
+            .handle()
+            .admit_receive(id(from), bytes, driven.until())
+            .unwrap();
+        for _ in 0..ROUNDS {
+            driven.step();
+            match receipt.try_result() {
+                Ok(None) => {}
+                Ok(Some(())) => return Ok(()),
+                Err(refusal) => return Err(refusal),
+            }
+        }
+        panic!("the forward was never answered");
+    }
+
+    /// AC-T1.8.A1, T-T1.8.A6 (CP-T1.8) under a nemesis (replication.md, "The application floor,
+    /// replicated", its falsifiers): every falsifier of the floor, as an assertion over every run,
+    /// over many seeds. Do, per seed, in a group of three voters and member 4: before joins are
+    /// tracked, a raise, and member 4 attesting, removed and added again while unbound, the voters
+    /// binding; then 4 binding, which lets J through. Then seeded steps: writes as 6 to 9 at a
+    /// voter, recording the floor at their base; raises; binds at 6 to 9; 4 added, promoted,
+    /// demoted, removed and added again; forwards naming another member; under elections (the
+    /// lead handed to another voter), records to a follower lost, and once the leader's crash and
+    /// restart. Last, a promotion beside a write in flight. Expect, against each falsifier: no
+    /// write below the floor at its base applied anywhere; no raise applied while a member of the
+    /// configuration lacks an attestation at its version; no member's floor falling, and members'
+    /// image digests equal at every applied index they share (so their floors and join rows too);
+    /// no promotion without an attestation at the floor; no bind below the floor; no forward naming
+    /// another member taken; a member added again holding raises back until it attests under its new
+    /// join; members' join rows equal once calm; the tail refused at once naming both indexes; before
+    /// J, no join rows, a raise refused, and a member's attestation from before its re-add not
+    /// letting J through. And every situation reached at least once over the runs.
+    #[test]
+    fn every_falsifier_of_the_floor_holds_under_a_nemesis() {
+        const SEEDS: u64 = 12;
+        const STEPS: u64 = 28;
+        let mut reached = Reached::default();
+        for seed in 1..=SEEDS {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let dir = tempfile::tempdir().unwrap();
+            let mut driven = Driven::new();
+            let mut clients = three_and_a_learner(&mut driven, dir.path());
+            for owner in 0..4 {
+                driven
+                    .owner_mut(owner)
+                    .replica
+                    .machine_mut()
+                    .record_digests();
+            }
+            let mut pump = Pump::new(&clients);
+            // Elections drop proposals in flight to a leader handing its lead over; counted, not
+            // failed (as in T-T1.8.A2).
+            pump.refusals = Some(0);
+            let mut leader = driven.elect(&mut pump, &clients[..3], 0, 1);
+            let id = |owner: usize| u64::try_from(owner + 1).unwrap();
+
+            // Before J. A raise is refused, and no member holds join rows.
+            let early = raise(&mut driven, &mut pump, &clients[leader], 7);
+            assert!(
+                matches!(&early, Err(Refusal::Unavailable(why)) if why.starts_with("joins aren't tracked")),
+                "seed {seed}: {early:?}"
+            );
+            reached.raise_before_joins_refused += 1;
+            // 4 joins and attests, then is removed and added again while no longer bound: its
+            // attestation predates the last change, and must not let J through.
+            let until = driven.until();
+            driven
+                .answer(
+                    &mut pump,
+                    &change(&clients[leader], until, MemberChange::AddLearner(4)),
+                )
+                .unwrap();
+            calm(&mut driven, &mut pump, 3);
+            let joined_first = driven.owner(leader).replica.applied().index;
+            clients[3].handle().attest(kiln(7)).unwrap();
+            for _ in 0..ROUNDS {
+                if attested(&mut driven, leader, 4).is_some() {
+                    break;
+                }
+                driven.round(&mut pump);
+            }
+            pump.departed.push(4);
+            let until = driven.until();
+            driven
+                .answer(
+                    &mut pump,
+                    &change(&clients[leader], until, MemberChange::Remove(4)),
+                )
+                .unwrap();
+            calm(&mut driven, &mut pump, 3);
+            driven.owner_mut(3).attesting = None;
+            clients[3].handle.shared.attesting.lock().unwrap().take();
+            pump.departed.clear();
+            let until = driven.until();
+            driven
+                .answer(
+                    &mut pump,
+                    &change(&clients[leader], until, MemberChange::AddLearner(4)),
+                )
+                .unwrap();
+            calm(&mut driven, &mut pump, 3);
+            let mut voters_bound = [0usize, 1, 2];
+            for i in 0..3 {
+                let j = usize::try_from(rng.below(3)).unwrap();
+                voters_bound.swap(i, j);
+            }
+            for owner in voters_bound {
+                clients[owner].handle().attest(kiln(7)).unwrap();
+                for _ in 0..=rng.below(40) {
+                    driven.round(&mut pump);
+                }
+            }
+            for _ in 0..200 {
+                driven.round(&mut pump);
+            }
+            for owner in 0..4 {
+                assert_eq!(
+                    tracked(&mut driven, owner),
+                    None,
+                    "seed {seed}: J with 4 stale"
+                );
+                assert!(
+                    !floor_rows(&mut driven, owner)
+                        .iter()
+                        .any(|row| row.starts_with("M ")),
+                    "seed {seed}: a join row before J on owner {owner}"
+                );
+            }
+            reached.stale_attestation_held_joins += 1;
+            clients[3].handle().attest(kiln(7)).unwrap();
+            joins_tracked(&mut driven, &mut pump, &[0, 1, 2, 3]);
+            reached.digests_compared += u64::try_from(digests_agree(
+                &driven,
+                &[(0, 0), (1, 0), (2, 0), (3, joined_first)],
+            ))
+            .unwrap();
+
+            // After J: the nemesis.
+            let mut floors = [0u32; 4];
+            let mut crashed = false;
+            let mut four = Some(false); // None: not a member; Some(false): learner; Some(true): voter
+            let mut four_attested = true;
+            for step in 0..STEPS {
+                leader = settle_lead(&mut driven, &mut pump, &clients);
+                let voter = usize::try_from(rng.below(3)).unwrap();
+                let floor_at =
+                    |driven: &mut Driven, owner: usize| floor_version(driven, owner).unwrap_or(0);
+                let action = rng.below(8);
+                match action {
+                    0 | 1 => {
+                        let version = u32::try_from(6 + rng.below(4)).unwrap();
+                        let before = floor_at(&mut driven, voter);
+                        match write_recording_floor(
+                            &mut driven,
+                            &mut pump,
+                            &clients[voter],
+                            version,
+                        ) {
+                            Ok(()) => {
+                                assert!(
+                                    version >= before,
+                                    "seed {seed} step {step}: {version} below {before} applied"
+                                );
+                                reached.write_at_floor_applied += 1;
+                            }
+                            Err(Refusal::Fenced(why))
+                                if why.contains("older than the installed floor") =>
+                            {
+                                reached.below_floor_write_refused += 1;
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    2 => {
+                        let version = u32::try_from(7 + rng.below(3)).unwrap();
+                        let before = floor_at(&mut driven, voter);
+                        match raise(&mut driven, &mut pump, &clients[voter], version) {
+                            // At or below the floor in force it answers that floor, writing
+                            // nothing: no floor entry applies, so there is nothing to prove.
+                            Ok(raised) if raised <= before => {}
+                            Ok(raised) => {
+                                quiet(&mut driven, &mut pump);
+                                let status = clients[voter].handle().floor_status().unwrap();
+                                for member in &status.members {
+                                    assert!(
+                                        member.attested.is_some_and(|highest| highest >= raised),
+                                        "seed {seed} step {step}: raised to {raised} past {member:?}"
+                                    );
+                                }
+                                reached.raise_applied += 1;
+                            }
+                            Err(Refusal::Unavailable(why)) if why.starts_with("members [") => {
+                                reached.raise_refused_unproven += 1;
+                                if four.is_some() && !four_attested && why.contains('4') {
+                                    reached.earlier_join_held_a_raise += 1;
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    3 => {
+                        let owner = usize::try_from(rng.below(4)).unwrap();
+                        let version = u32::try_from(6 + rng.below(4)).unwrap();
+                        let published = clients[owner].handle().floor_counters().version;
+                        let bound = clients[owner].handle().attest(kiln(version));
+                        if u64::from(version) < published {
+                            assert!(
+                                matches!(&bound, Err(Refusal::Invalid { what, .. }) if what == "application floor"),
+                                "seed {seed} step {step}: bound {version} below {published}: {bound:?}"
+                            );
+                            reached.bind_below_floor_refused += 1;
+                        } else if owner == 3 && bound.is_ok() {
+                            four_attested = true;
+                        }
+                    }
+                    4 => {
+                        if leader == 3 {
+                            continue;
+                        }
+                        let until = driven.until();
+                        let asked = match four {
+                            None => MemberChange::AddLearner(4),
+                            Some(false) if rng.below(2) == 0 => MemberChange::Promote(4),
+                            Some(false) => MemberChange::Remove(4),
+                            Some(true) => MemberChange::Demote(4),
+                        };
+                        if matches!(asked, MemberChange::Remove(4)) {
+                            pump.departed.push(4);
+                        }
+                        let answered =
+                            driven.answer(&mut pump, &change(&clients[leader], until, asked));
+                        calm(&mut driven, &mut pump, 3);
+                        let configuration = applied_configuration(&driven, leader);
+                        four = if configuration.voters.contains(&4) {
+                            Some(true)
+                        } else if configuration.learners.contains(&4) {
+                            Some(false)
+                        } else {
+                            None
+                        };
+                        match (asked, &answered) {
+                            (MemberChange::Promote(_), Ok(_)) if four == Some(true) => {
+                                let status = clients[leader].handle().floor_status().unwrap();
+                                let fourth = status.members.iter().find(|m| m.member == 4).unwrap();
+                                assert!(
+                                    status.version == 0
+                                        || fourth
+                                            .attested
+                                            .is_some_and(|highest| highest >= status.version),
+                                    "seed {seed} step {step}: promoted {fourth:?} under {}",
+                                    status.version
+                                );
+                                reached.promotion_applied += 1;
+                            }
+                            (MemberChange::Promote(_), Err(_)) => reached.promotion_refused += 1,
+                            (MemberChange::Remove(_), _) if four.is_none() => {
+                                driven.owner_mut(3).attesting = None;
+                                clients[3].handle.shared.attesting.lock().unwrap().take();
+                                four_attested = false;
+                            }
+                            _ => {}
+                        }
+                        // What 4 sends counts only while it is a member.
+                        pump.departed.clear();
+                        if four.is_none() {
+                            pump.departed.push(4);
+                        }
+                    }
+                    5 => {
+                        let follower = (leader + 1 + usize::try_from(rng.below(2)).unwrap()) % 3;
+                        let other = (0..3).find(|o| *o != leader && *o != follower).unwrap();
+                        if leader < 3 {
+                            let forwarded =
+                                forward_naming(&mut driven, &clients, leader, follower, other);
+                            assert!(
+                                forwarded.is_err(),
+                                "seed {seed} step {step}: a forward naming {other} taken"
+                            );
+                            reached.hostile_forward_refused += 1;
+                        }
+                    }
+                    6 => {
+                        let to = (leader + 1 + usize::try_from(rng.below(2)).unwrap()) % 3;
+                        if leader < 3 && to != leader {
+                            leader = driven.hand_off(&mut pump, &clients[..3], leader, to);
+                            reached.lead_handed_off += 1;
+                        }
+                    }
+                    _ => {
+                        if !crashed && leader < 3 && rng.below(2) == 0 {
+                            driven.drain(&mut pump);
+                            pump.finish();
+                            let configuration = applied_configuration(&driven, leader);
+                            let restarted = driven.restart(
+                                dir.path(),
+                                leader,
+                                configuration.voters.clone(),
+                                configuration.learners.clone(),
+                            );
+                            *clients.get_mut(leader).unwrap() = restarted;
+                            driven
+                                .owner_mut(leader)
+                                .replica
+                                .machine_mut()
+                                .record_digests();
+                            pump = Pump::new(&clients);
+                            pump.refusals = Some(0);
+                            if four.is_none() {
+                                pump.departed.push(4);
+                            }
+                            // Time passes, as it does after a crash: the others' leases on the old
+                            // lead run out, and the group elects among its voters, four or three.
+                            leader = settle_lead(&mut driven, &mut pump, &clients);
+                            crashed = true;
+                            reached.leader_crashed += 1;
+                        } else {
+                            let follower = (leader + 1) % 3;
+                            pump.lost.push(id(follower));
+                            for _ in 0..=rng.below(20) {
+                                driven.round(&mut pump);
+                            }
+                            pump.lost.clear();
+                            // Time passes, as it does after an outage: a session whose records
+                            // were lost ends at its deadline, and its owner tries again.
+                            for _ in 0..ROUNDS {
+                                if (0..4).all(|owner| driven.owner(owner).pending.is_none()) {
+                                    break;
+                                }
+                                for owner in 0..4 {
+                                    driven.advance(owner, TICK);
+                                }
+                                driven.round(&mut pump);
+                            }
+                            reached.records_lost += 1;
+                        }
+                    }
+                }
+                for (owner, seen) in floors.iter_mut().enumerate().take(3) {
+                    let floor = floor_version(&mut driven, owner).unwrap_or(0);
+                    assert!(
+                        floor >= *seen,
+                        "seed {seed} step {step}: owner {owner}'s floor fell from {seen} to {floor}"
+                    );
+                    *seen = floor;
+                }
+                reached.floor_checked_on_every_member += 1;
+            }
+
+            // Calm: join rows equal, every write recorded at or above the floor at its base, and
+            // members' digests equal at every applied index they share.
+            quiet(&mut driven, &mut pump);
+            calm(&mut driven, &mut pump, 3);
+            let rows = floor_rows(&mut driven, 0);
+            for owner in 1..3 {
+                assert_eq!(
+                    floor_rows(&mut driven, owner),
+                    rows,
+                    "seed {seed}: owner {owner}'s rows"
+                );
+            }
+            reached.join_rows_compared += 1;
+            for owner in 0..3 {
+                for (version, floor) in recorded_writes(&mut driven, owner) {
+                    assert!(
+                        version >= floor,
+                        "seed {seed}: owner {owner} applied {version} under {floor}"
+                    );
+                }
+            }
+            reached.digests_compared +=
+                u64::try_from(digests_agree(&driven, &[(0, 0), (1, 0), (2, 0)])).unwrap();
+
+            // Last, a promotion beside a write in flight is refused at once, naming both indexes.
+            if four.is_none() && leader < 3 {
+                let until = driven.until();
+                let _ = driven.answer(
+                    &mut pump,
+                    &change(&clients[leader], until, MemberChange::AddLearner(4)),
+                );
+                calm(&mut driven, &mut pump, 3);
+                four = Some(false);
+            }
+            let mut in_flight = false;
+            if four == Some(false) && leader < 3 && floor_version(&mut driven, leader).is_some() {
+                quiet(&mut driven, &mut pump);
+                pump.appends_lost = true;
+                // Claimed at 9, the highest floor a run raises, so only the tail holds it back.
+                let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
+                    db.exec("CREATE TABLE IF NOT EXISTS in_flight(x)")?;
+                    Ok(Box::new(()) as Box<dyn Any + Send>)
+                }))));
+                let (response, written) = mpsc::sync_channel(1);
+                clients[leader]
+                    .handle
+                    .enqueue(
+                        Input::Submit {
+                            namespace: String::new(),
+                            operation,
+                            application: Some(kiln(9)),
+                            until: driven.until(),
+                            response,
+                        },
+                        api::REQUEST_MAX,
+                    )
+                    .unwrap();
+                let tail = |driven: &Driven| {
+                    let replica = &driven.owner(leader).replica;
+                    (
+                        replica.applied().index,
+                        replica.core().raft.log().last_index().unwrap(),
+                    )
+                };
+                reach(&mut driven, &mut pump, "the write appended", |driven| {
+                    let (applied, last) = tail(driven);
+                    last > applied
+                });
+                let (applied, last) = tail(&driven);
+                // At once, Unavailable, naming both indexes as the guard read them: the log past
+                // what is applied, and no shorter than when the write was seen appended.
+                let refused = promote(&mut driven, &mut pump, &clients[leader]);
+                let named = match &refused {
+                    Err(Refusal::Unavailable(why)) => why
+                        .strip_prefix("the log runs to ")
+                        .and_then(|rest| {
+                            rest.strip_suffix(" is applied; promote once the tail is applied")
+                        })
+                        .and_then(|rest| rest.split_once(" and "))
+                        .and_then(|(l, a)| Some((l.parse::<u64>().ok()?, a.parse::<u64>().ok()?))),
+                    _ => None,
+                };
+                assert!(
+                    named.is_some_and(|(l, a)| l > a && l >= last && a >= applied),
+                    "seed {seed}: {refused:?} (seen appended at {last}, applied {applied})"
+                );
+                reached.tail_refused_at_once += 1;
+                // The write stays in flight: its appends went nowhere, and nothing ticks to send
+                // them again. The run ends here, as the step-5 test does.
+                drop(written);
+                in_flight = true;
+            }
+            if !in_flight {
+                driven.drain(&mut pump);
+            }
+            pump.finish();
+        }
+        // The run's record: how often each falsifier's situation was reached (non-vacuity).
+        eprintln!("T-T1.8.A6 over {SEEDS} seeds of {STEPS} steps reached: {reached:#?}");
+        let unreached = reached.unreached();
+        assert!(
+            unreached.is_empty(),
+            "situations never reached: {unreached:?} in {reached:?}"
+        );
+    }
+
+    /// AC-T1.8.A1, T-T1.8.A2 (CP-T1.8) on driven time (replication.md, "Raising the floor", b;
+    /// amphora-seam-owner's ruling on step 4, a): a raise a change overtakes is refused, typed, by
+    /// the stale-base rule, never answered UnknownOutcome. Do, in a group of three voters bound to
+    /// kiln.host-store 7 with joins tracked: the leader appends the addition of learner 5 (never
+    /// running), every append lost while heartbeats go on, so the change can't commit; a follower
+    /// raises the floor to 7, prepared at a base without the change and forwarded; then the appends
+    /// go again. Expect: the raise Invalid, "prepared transaction", "the database advanced since
+    /// preparation", which writer_floor answers Unavailable, to be asked again; the change
+    /// applied; and no floor on any voter.
+    #[test]
+    fn a_raise_a_change_overtakes_is_refused_by_the_stale_base_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        pump.lost.push(5);
+        let leader = tracked_group(&mut driven, &mut pump, &clients);
+        let follower = (leader + 1) % 3;
+        let proposed = pending_change(&driven, leader);
+        let until = driven.until();
+        let added = change(&clients[leader], until, MemberChange::AddLearner(5));
+        reach(&mut driven, &mut pump, "the change appended", |driven| {
+            pending_change(driven, leader) > proposed
+        });
+        pump.appends_lost = true;
+        let raised = raise_at(&clients[follower], driven.until());
+        for _ in 0..ROUNDS {
+            if matches!(
+                driven
+                    .owner_mut(follower)
+                    .pending
+                    .as_ref()
+                    .map(|pending| &pending.phase),
+                Some(Phase::Proposed(_))
+            ) {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        assert!(
+            matches!(
+                driven
+                    .owner_mut(follower)
+                    .pending
+                    .as_ref()
+                    .map(|pending| &pending.phase),
+                Some(Phase::Proposed(_))
+            ),
+            "the raise was never forwarded"
+        );
+        assert!(applied_configuration(&driven, follower).learners.is_empty());
+
+        pump.appends_lost = false;
+        let refused = driven.answer(&mut pump, &raised).err().unwrap();
+        assert_eq!(
+            refused,
+            Refusal::Invalid {
+                what: "prepared transaction".into(),
+                why: "the database advanced since preparation".into(),
+            }
+        );
+        // What writer_floor answers its caller for it: ask again.
+        assert_eq!(
+            crate::database::application::overtaken(refused),
+            Refusal::Unavailable(
+                "the database advanced since preparation: the group changed while the raise was proven; raise again".into()
+            )
+        );
+
+        driven.answer(&mut pump, &added).unwrap();
+        settled(&mut driven, &mut pump, 3, &[5]);
+        for owner in 0..3 {
+            assert_eq!(floor_version(&mut driven, owner), None, "owner {owner}");
+        }
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.A1 (CP-T1.8) on driven time (replication.md, "Raising the floor", b): a raise whose
+    /// base holds a joint configuration is refused before it proposes. Do, in a group of three
+    /// voters bound to kiln.host-store 7 with joins tracked: add learner 4, and once the leader has
+    /// applied the joint entry, lose every append so its way out can't commit while heartbeats
+    /// go on; raise the floor to 7 at the leader; then let the appends through and raise again.
+    /// Expect: the first refused Unavailable, saying the group is leaving a joint configuration;
+    /// the second refused naming member 4, which has not attested.
+    #[test]
+    fn a_raise_whose_base_is_joint_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        let leader = tracked_group(&mut driven, &mut pump, &clients);
+        let led = &clients[leader];
+        let until = driven.until();
+        let proposed = pending_change(&driven, leader);
+        let _asked = change(led, until, MemberChange::AddLearner(4));
+        reach(&mut driven, &mut pump, "the joint entry", |driven| {
+            pending_change(driven, leader) > proposed
+        });
+        let joint = pending_change(&driven, leader);
+        reach(&mut driven, &mut pump, "the way out appended", |driven| {
+            pending_change(driven, leader) > joint
+        });
+        pump.appends_lost = true;
+        for _ in 0..ROUNDS {
+            if !applied_configuration(&driven, leader)
+                .voters_outgoing
+                .is_empty()
+            {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        assert_eq!(
+            applied_configuration(&driven, leader).voters_outgoing,
+            vec![1, 2, 3]
+        );
+
+        let refused = raise(&mut driven, &mut pump, led, 7);
+        assert!(
+            matches!(&refused, Err(Refusal::Unavailable(why)) if why.contains("leaving a joint configuration")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            led.handle().floor_counters().refused(FloorRefusal::Busy),
+            1,
+            "a joint base's refusal counted as busy"
+        );
+        assert!(
+            !applied_configuration(&driven, leader)
+                .voters_outgoing
+                .is_empty()
+        );
+        pump.appends_lost = false;
+        settled(&mut driven, &mut pump, 3, &[4]);
+        let again = raise(&mut driven, &mut pump, led, 7);
+        assert!(
+            matches!(&again, Err(Refusal::Unavailable(why)) if why.contains("members [4]")),
+            "{again:?}"
+        );
         driven.drain(&mut pump);
         pump.finish();
     }

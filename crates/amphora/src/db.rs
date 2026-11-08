@@ -1151,6 +1151,53 @@ mod tests {
                 .query("SELECT value FROM original", [], |_| Ok(false))
                 .is_err()
         );
+        // U05, CP-T1.8 (replication.md, "Raising the floor", d): a floor this group's members
+        // didn't prove never enters replicated mode. An image carrying one where joins aren't
+        // tracked is refused at install, rolled back before its marker; a database holding one
+        // is refused as a replica at open.
+        crate::database::bootstrap_db(&source).unwrap();
+        source
+            .exec("CREATE TABLE __amphora_application_floor (singleton INTEGER PRIMARY KEY, application TEXT NOT NULL, version INTEGER NOT NULL)")
+            .unwrap();
+        source
+            .exec("INSERT INTO __amphora_application_floor VALUES(1, 'kiln.host-store', 6)")
+            .unwrap();
+        source.flusher()().unwrap();
+        let floor_image = postcard::to_allocvec(&source.image_pages(1 << 20).unwrap()).unwrap();
+        let mut replica = crate::replication::Machine::open(
+            &dir.path().join("replica.db"),
+            hyper_raft::proto::ConfState::default(),
+        )
+        .unwrap();
+        let before = hyper_durable::StateMachine::durable(&replica);
+        assert!(
+            hyper_durable::StateMachine::install(
+                &mut replica,
+                &floor_image,
+                hyper_durable::Point { index: 2, term: 1 },
+                &hyper_raft::proto::ConfState::default(),
+            )
+            .is_err()
+        );
+        assert_eq!(hyper_durable::StateMachine::durable(&replica), before);
+        assert_eq!(
+            replica
+                .read_db(|db| crate::database::installed_floor(db))
+                .unwrap(),
+            None
+        );
+        drop(replica);
+        drop(source);
+        let refusal = crate::replication::Machine::open(
+            &dir.path().join("source.db"),
+            hyper_raft::proto::ConfState::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(&refusal, amphora_api::Refusal::Fenced(reason) if reason == "a floor not proven by this group's members; raise it again once joins are tracked"),
+            "{refusal:?}"
+        );
     }
 
     /// U05/U15, bug 68a308b7: Db::exec of a statement its deadline interrupts reports the
