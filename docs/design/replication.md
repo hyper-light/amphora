@@ -1245,10 +1245,80 @@ Against `Consistency`:
   without voting; etcd's learners serve serializable reads only);
 - refused, typed, while the replica has not taken its group's first image (its state is no group's yet), once its
   owner has ended, and while it is fenced;
-- standalone, it is `Database::query`; an attached client's runs on its owner's state, asked only once the owner says
-  it can.
+- standalone, it is `Database::query`; an attached client's runs on its owner's state (the wire, below);
+- it runs as `Database::query`'s session does (`run_query`): one read transaction, a restore under way refused, and the
+  handle's application claim held against the floor its state holds. It asks nothing of the member's own attestation:
+  a member below the floor runs a binary from before it, never this code, so such a check would protect nothing.
 Its readers are bounded: at most four at once, each its own connection with its own pages; a read waits for one up to
 its deadline and is refused Timeout past it.
+
+### Amendments before code (2026-11-07, amphora-seam-owner's four additions)
+
+The seam owner agreed the decision above with four additions to settle before code (key
+amphora-owner-t1-replica-local-read-b40f41d-20261106).
+
+**1. During an image's install: never half an image.** A replica that installs its group's image writes the image's
+pages and its applied marker as one transaction of the database's log (`Db::apply_pages`: `wal_insert_begin`, a frame
+per page, the marker, `wal_insert_end`). The frames carry no commit until the last, so a reader's snapshot, the last
+commit in the log when its read began (sqlite.org/wal.html, "it first remembers the location of the last valid
+commit record"; Turso's `begin_read_tx`), holds either none of them or all. A local read is one read transaction
+(`Db::query_transaction`, a deferred `BEGIN`), so every statement in it sees the same side: the state before the image,
+whole, if it began before the image committed, or the image, whole, if after. A reader open across the install keeps
+its old state to its end, and the schema published with the image (`publish_schema_after_external_restore`) is the
+next transaction's. Nothing waits for that reader: the replica's database is never checkpointed or restarted while it
+is open (`wal_autocheckpoint = 0`, and no checkpointer runs on a replica's database), so the install doesn't wait on it,
+and the reader doesn't block the install. Falsified by: a local read whose statements see two states, part from before
+an image and part from it; or a read begun after the install that sees any of the state before it. The test:
+`a_local_read_open_across_an_image_install_sees_one_side_whole` (a learner's read transaction open while the leader's
+image installs under it).
+
+**2. The four readers, and the fifth.** Four is policy, stated as the standalone store's: `store::Config::readers`
+defaults to 4, and its pool has this rule (store.md, decision 3). It is not a measured number for this path. Each
+reader keeps `db::READER_PAGES` (2,000 pages, 8 MiB, Turso's own default; store.md, decision 5), so a replica's local
+reads hold at most 32 MiB of pages. A fifth read takes the first reader given back. It holds no reader, page or queue
+slot while it waits, only its caller's thread, and it waits no later than its own deadline: past it, it is refused
+`Refusal::Timeout`, typed, never answered late (CLAUDE.md section 2: the wait's bound is the caller's deadline, its
+overflow a typed refusal). A read that can't wait asks with a deadline that is already near. Once the owner ends,
+waiting reads are woken and refused `Fenced("replica owner ended")`. Falsified by: five local reads at once on one
+replica; a waiting read answered past its deadline, or answered anything but Timeout or Fenced while all four are out.
+The test: `a_fifth_local_read_waits_for_a_reader_and_is_refused_timeout_at_its_deadline`.
+
+**3. The wire.** An attached client's local read is a new request, `Request::LocalSession`, appended (its variant last),
+whose session runs the same commands as `Request::Session`. The owner runs it with `Database::query_local` and the
+session read-only. Appending a variant changes the protocol, so `wire::VERSION` goes from 5 to 6, with its line under
+local-owner-transport.md, "Versions". An owner advertises `CAP_LOCAL_READ = 2` in its capabilities (bit 2, which
+Amphora reserved for it, `CAP_BOUNDED_COMPACTION` being 1; kiln's 0003 uses 2). The client doesn't probe for it before
+asking. The greeting refuses a peer of another version before any request, so a version-6 client only ever meets an
+owner that takes `LocalSession`, and a fallback to `Database::call` for an owner without it could never run (CLAUDE.md
+section 13). Kiln's 0003 probed and fell back. That was written before the version gate counted appended requests.
+Falsified by: a version-5 peer admitted by a version-6 owner, or a `LocalSession` that writes.
+
+**4. Monotonic across a restart, and where it isn't.** Within one opening of a replica, local reads never go back: each
+begins on the last commit in its database's log, and the owner's commits only add to it. Across a restart, what the
+replica reopens with is what its database's log holds, and that depends on how the replica stopped:
+- after a clean close, the owner flushes everything applied (`StateMachine::persist`), so the restart opens where the
+  last read saw. Monotonic.
+- after the process dies with the machine running, a commit's frames were written to the file before any reader could
+  see them, and the OS keeps written data that no sync covers yet, so the restart opens no earlier than the last read.
+  Monotonic.
+- after a power cut (or the OS's crash), the database keeps what its last finished flush made durable (`durable()`), and
+  a read can have seen more than that. In the persisted class, at most the one entry whose flush was under way:
+  the machine applies and flushes each entry before it applies the next. In the replicated class, every entry applied
+  since the last flush that finished, which the class leaves to its flushing thread ("Fast acknowledgement", point 4).
+  Until the restarted replica applies them again, from its own log or its group's, a local read there can see an older
+  state than one before the cut. It is never older than the state the last finished flush made durable, and it is
+  always a prefix of the group's committed history.
+This is a stated limit, not a guarantee: "never older than a local read before it on the same replica" holds within one
+opening and across a clean close or a process crash, not across a power cut. A caller that must never see a state go
+back across a power cut reads through `Database::query`, the leader's ReadIndex. etcd's serializable reads promise no
+more. They are "served locally by any member" and "may be stale" (etcd API guarantees, "Serializable"). Falsified by: a
+local read after a clean close or a process crash that sees an older state than one before it; after a power cut, one
+older than the replica's last finished flush. The test: `a_local_read_after_a_power_cut_is_no_older_than_its_last_flush`
+(replicated class: a write read locally, its flush held, the member's power cut; the restarted member's read sees the
+state before it, never less, and the write once it has caught up).
+
+**Withdrawn:** the floor binding (no local read on a member that hasn't attested). A member below the floor runs a
+binary from before the floor, which doesn't have this code.
 
 Evidence and sources: the resolved-transaction design above (only committed entries apply); Ongaro's dissertation
 §4.2.1, §6.4 and §6.4.1 (https://raft.github.io/raft.pdf); hyper-raft's `read.rs`; etcd's API reference
