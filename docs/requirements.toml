@@ -166,9 +166,21 @@ criteria = [
   { id = "AC-T1.10.3", text = "follower read p99 is at most 2 ms, measured by bench amphora_read" },
   { id = "AC-T1.10.4", text = "search p50 over 1,000,000 events on 3 nodes is at most 30 ms, measured by bench amphora_search" },
   { id = "AC-T1.10.5", text = "anomalies across groups is exactly 0, measured by an Elle-style check over 10,000 seeds" },
+  # Amphora's own: a local read on a replica (docs/design/replication.md, "A local read on a replica").
+  { id = "AC-T1.10.L1", text = "A local read on a replica answers from its own applied state, asking no leader: a prefix of the group's committed history, never older than a local read before it in the same opening, nor after a clean close or a process crash; refused before the group's first image, once its owner ended, and while fenced" },
+  { id = "AC-T1.10.L2", text = "At most four local readers at once on one replica; a fifth waits on its caller's thread, never the owner's, until its deadline, and is refused Timeout, or Fenced once the owner ends" },
+  { id = "AC-T1.10.L3", text = "An attached client's local read is Request::LocalSession at wire version 6, run read-only on its owner's state: a write in it is refused and nothing of it stays" },
 ]
 tests = [
   { id = "T-T1.10.1", text = "A coordinator crash at every step of a cross-group transaction, then recovery — passes when it ends committed or aborted everywhere" },
+  # Amphora's own: a local read on a replica (docs/design/replication.md, "A local read on a replica").
+  { id = "T-T1.10.L1", text = "A learner of a voter that is then gone reads locally — passes when it answers what was written and caught up, while a call waits for the leader" },
+  { id = "T-T1.10.L2", text = "Local reads within a preparation and while a write is proposed and uncommitted — passes when each sees only what was committed, and the write once applied" },
+  { id = "T-T1.10.L3", text = "A local read on a member that hasn't taken its group's first image — passes when it is refused Unavailable, saying why" },
+  { id = "T-T1.10.L4", text = "A local read held open while its replica installs an image, with a checkpoint and a log restart tried meanwhile — passes when it sees the state before the image, whole, and a read after sees the image, whole" },
+  { id = "T-T1.10.L5", text = "Four local reads held open and a fifth asked — passes when the fifth is refused Timeout at its deadline while the owner's actor steps, and answers once one is given back" },
+  { id = "T-T1.10.L6", text = "A write read locally under the replicated class, its flush held, the member's power cut — passes when the restarted member's read is never older than its last finished flush, and sees the write once caught up" },
+  { id = "T-T1.10.L7", text = "An attached client's local read that writes — passes when it is refused, nothing of it stays, and the client is never promoted" },
 ]
 
 [[goal]]
