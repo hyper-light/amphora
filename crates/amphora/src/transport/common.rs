@@ -424,8 +424,35 @@ impl Client {
     where
         F: FnOnce(&mut sql::Connection<'_>) -> anyhow::Result<R>,
     {
+        self.session(Request::Session, until, f, || Error::UnknownOutcome)
+    }
+    /// [`Client::call`] as a local read (replication.md, "A local read on a replica"): the owner
+    /// runs the session read-only on its own state, asking no leader. Every owner this client can
+    /// greet takes it (wire version 6), so it is asked without a probe.
+    pub fn query_local<R, F>(&self, until: Instant, f: F) -> Result<R, Error>
+    where
+        F: FnOnce(&mut sql::Connection<'_>) -> anyhow::Result<R>,
+    {
+        // A read changed nothing whatever its end: a lost answer is a failed read, not an
+        // unknown outcome.
+        self.session(Request::LocalSession, until, f, || {
+            unavailable("the local read's end was not answered").into()
+        })
+    }
+    /// One SQL session asked with `request`: `unanswered` is what a session whose end isn't
+    /// answered was.
+    fn session<R, F>(
+        &self,
+        request: Request,
+        until: Instant,
+        f: F,
+        unanswered: fn() -> Error,
+    ) -> Result<R, Error>
+    where
+        F: FnOnce(&mut sql::Connection<'_>) -> anyhow::Result<R>,
+    {
         let mut stream = self.stream(until)?;
-        write(&mut stream, &Request::Session, until)?;
+        write(&mut stream, &request, until)?;
         match read::<Response>(&mut stream, until)?? {
             Answer::Ready => (),
             _ => return Err(unavailable("session not ready").into()),
@@ -448,14 +475,14 @@ impl Client {
                 let _abort = session.exchange(Command::Abort);
                 return Err(match result {
                     Err(error) => Error::Refused(crate::database::refused(&error)),
-                    Ok(_) => Error::UnknownOutcome,
+                    Ok(_) => unanswered(),
                 });
             }
         };
         match session.exchange(Command::Commit) {
             Ok(Answer::Done) => Ok(value),
             Err(error) => Err(error),
-            _ => Err(Error::UnknownOutcome),
+            _ => Err(unanswered()),
         }
     }
 }
@@ -640,6 +667,61 @@ fn compact_step_on(
     }
 }
 
+/// One SQL session's commands from `stream`, run on `connection` until the client commits or
+/// aborts it.
+fn session(
+    connection: &mut crate::sql::Connection<'_>,
+    stream: &mut Stream,
+    until: Instant,
+) -> anyhow::Result<()> {
+    write(stream, &Ok::<_, Refusal>(Answer::Ready), until)?;
+    for _ in 0..COMMAND_MAX {
+        let command: Command = read(stream, until)?;
+        let response = match command {
+            Command::Commit => {
+                remaining(until)?;
+                return Ok(());
+            }
+            Command::Abort => {
+                return Err(anyhow::anyhow!("client aborted SQL session"));
+            }
+            Command::Batch(sql) => connection.execute_batch(&sql).and_then(|()| {
+                Ok(Answer::Rows {
+                    rows: Vec::new(),
+                    changes: i64::try_from(connection.changes()).map_err(sql_error)?,
+                    rowid: connection.last_insert_rowid(),
+                })
+            }),
+            Command::Columns(sql) => connection
+                .prepare(&sql)
+                .map(|s| Answer::Columns(s.column_count())),
+            Command::Query(sql, params, first) => query(connection, &sql, params, first),
+            Command::RecordsGet(namespace, family, key) => connection
+                .records_get(&namespace, &family, &key)
+                .and_then(|row| {
+                    Ok(Answer::SessionRow {
+                        row,
+                        changes: i64::try_from(connection.changes()).map_err(sql_error)?,
+                        rowid: connection.last_insert_rowid(),
+                    })
+                }),
+            Command::RecordsCommit(namespace, tx) => {
+                connection.records_commit(&namespace, tx).and_then(|rev| {
+                    Ok(Answer::SessionRev {
+                        rev,
+                        changes: i64::try_from(connection.changes()).map_err(sql_error)?,
+                        rowid: connection.last_insert_rowid(),
+                    })
+                })
+            }
+        };
+        let response = sql_response(response);
+        write(stream, &response, until)?;
+        // SQL errors can be handled by application savepoints; transport failures abort.
+    }
+    Err(anyhow::anyhow!("SQL session command budget exhausted"))
+}
+
 fn serve(
     mut stream: Stream,
     token: [u8; 32],
@@ -717,62 +799,20 @@ fn serve(
     if let Some(application) = application {
         database = database.for_application(&application.name, application.version)?;
     }
-    if matches!(request, Request::Session) {
+    if matches!(request, Request::Session | Request::LocalSession) {
+        let local = matches!(request, Request::LocalSession);
         let mut final_stream = stream.try_clone().map_err(unavailable)?;
-        let result = database
-            .call(until, move |connection| {
-                write(&mut stream, &Ok::<_, Refusal>(Answer::Ready), until)?;
-                for _ in 0..COMMAND_MAX {
-                    let command: Command = read(&mut stream, until)?;
-                    let response = match command {
-                        Command::Commit => {
-                            remaining(until)?;
-                            return Ok(());
-                        }
-                        Command::Abort => {
-                            return Err(anyhow::anyhow!("client aborted SQL session"));
-                        }
-                        Command::Batch(sql) => connection.execute_batch(&sql).and_then(|()| {
-                            Ok(Answer::Rows {
-                                rows: Vec::new(),
-                                changes: i64::try_from(connection.changes()).map_err(sql_error)?,
-                                rowid: connection.last_insert_rowid(),
-                            })
-                        }),
-                        Command::Columns(sql) => connection
-                            .prepare(&sql)
-                            .map(|s| Answer::Columns(s.column_count())),
-                        Command::Query(sql, params, first) => {
-                            query(connection, &sql, params, first)
-                        }
-                        Command::RecordsGet(namespace, family, key) => connection
-                            .records_get(&namespace, &family, &key)
-                            .and_then(|row| {
-                                Ok(Answer::SessionRow {
-                                    row,
-                                    changes: i64::try_from(connection.changes())
-                                        .map_err(sql_error)?,
-                                    rowid: connection.last_insert_rowid(),
-                                })
-                            }),
-                        Command::RecordsCommit(namespace, tx) => {
-                            connection.records_commit(&namespace, tx).and_then(|rev| {
-                                Ok(Answer::SessionRev {
-                                    rev,
-                                    changes: i64::try_from(connection.changes())
-                                        .map_err(sql_error)?,
-                                    rowid: connection.last_insert_rowid(),
-                                })
-                            })
-                        }
-                    };
-                    let response = sql_response(response);
-                    write(&mut stream, &response, until)?;
-                    // SQL errors can be handled by application savepoints; transport failures abort.
-                }
-                Err(anyhow::anyhow!("SQL session command budget exhausted"))
-            })
-            .map(|()| Answer::Done);
+        let run = move |connection: &mut crate::sql::Connection<'_>| {
+            session(connection, &mut stream, until)
+        };
+        // A local read runs read-only on this owner's own state, asking no leader (replication.md,
+        // "A local read on a replica"); a session otherwise is a call on its writer.
+        let result = if local {
+            database.query_local(until, run)
+        } else {
+            database.call(until, run)
+        }
+        .map(|()| Answer::Done);
         return write(&mut final_stream, &result, until);
     }
     let watch_batch = matches!(&request, Request::WatchBatch(_));
@@ -820,9 +860,11 @@ fn serve(
                 Record::ImportState => Answer::ImportState(ns.import_state(until)?),
             })
         })(),
-        Request::Session | Request::Probe | Request::Capabilities | Request::Application(_) => {
-            Err(unavailable("unexpected session"))
-        }
+        Request::Session
+        | Request::LocalSession
+        | Request::Probe
+        | Request::Capabilities
+        | Request::Application(_) => Err(unavailable("unexpected session")),
     };
     if watch_batch {
         let encoded = match encode(&result, WATCH_REPLY_MAX) {

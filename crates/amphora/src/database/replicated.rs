@@ -109,6 +109,30 @@ impl Client {
     pub(super) fn handle(&self) -> ReplicaHandle {
         self.handle.clone()
     }
+    /// `f` on this owner's own applied state, on the caller's thread, asking the group's leader
+    /// nothing (replication.md, "A local read on a replica"): it answers with the leader gone or
+    /// out of reach, and sees only entries the group committed and this owner applied, never a
+    /// preparation, which rolls back without a commit. Refused while this owner hasn't taken its
+    /// group's first image (its state is no group's yet), once it ended, and while it is fenced.
+    pub(super) fn read_local<R>(
+        &self,
+        until: Instant,
+        f: impl FnOnce(&mut Db) -> anyhow::Result<R>,
+    ) -> Result<R, Refusal> {
+        if Instant::now() >= until {
+            return Err(Refusal::Timeout);
+        }
+        let status = locked(&self.handle.shared.status)?.clone()?;
+        if let Some(reason) = status.fenced {
+            return Err(fenced(reason));
+        }
+        if status.bootstrapping {
+            return Err(unavailable(
+                "this replica hasn't taken its group's first image yet; it reads once it has",
+            ));
+        }
+        self.handle.shared.local.with(until, f)
+    }
 }
 struct Control {
     admitted: AtomicUsize,
@@ -123,6 +147,99 @@ struct Control {
     outgoing: Mutex<Outgoing>,
     status: Mutex<Result<ReplicaStatus, Refusal>>,
     meter: Arc<ReplicaMeter>,
+    local: Local,
+}
+/// The readers of a replica's local reads (replication.md, "A local read on a replica"):
+/// connections of their own on the machine's database, each on what the machine committed when
+/// its read began. At most `READERS` read at once; one given back is kept for the next read.
+struct Local {
+    /// Opens a reader; none once the owner ended, so that no reader holds its lease past the reads
+    /// under way then.
+    open: Mutex<Option<crate::store::Opener<Db>>>,
+    pool: Mutex<Readers>,
+    returned: std::sync::Condvar,
+}
+#[derive(Default)]
+struct Readers {
+    idle: Vec<Db>,
+    out: usize,
+}
+/// Readers at once: policy, the standalone store's (`store::Config::readers`; store.md, decision
+/// 3), each keeping `db::READER_PAGES` of its own. A read past them waits for one given back, up
+/// to its deadline (replication.md, "A local read on a replica", amendment 2).
+const READERS: usize = 4;
+impl Local {
+    fn new(open: crate::store::Opener<Db>) -> Self {
+        Self {
+            open: Mutex::new(Some(open)),
+            pool: Mutex::new(Readers::default()),
+            returned: std::sync::Condvar::new(),
+        }
+    }
+    /// `f` on a reader: an idle one, one opened now, or the first given back before `until`.
+    fn with<R>(
+        &self,
+        until: Instant,
+        f: impl FnOnce(&mut Db) -> anyhow::Result<R>,
+    ) -> Result<R, Refusal> {
+        let mut reader = {
+            let mut pool = locked(&self.pool)?;
+            loop {
+                if let Some(reader) = pool.idle.pop() {
+                    pool.out = pool.out.saturating_add(1);
+                    break reader;
+                }
+                let open = locked(&self.open)?
+                    .clone()
+                    .ok_or_else(|| fenced("replica owner ended"))?;
+                if pool.out < READERS {
+                    pool.out = pool.out.saturating_add(1);
+                    drop(pool);
+                    match open() {
+                        Ok(reader) => break reader,
+                        Err(error) => {
+                            self.give_back(None);
+                            return Err(refused(&error));
+                        }
+                    }
+                }
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(Refusal::Timeout);
+                }
+                pool = self
+                    .returned
+                    .wait_timeout(pool, left)
+                    .map_err(|_| unavailable("a replica's reader lock was poisoned"))?
+                    .0;
+            }
+        };
+        let answer = f(&mut reader).map_err(|error| refused(&error));
+        self.give_back(Some(reader));
+        answer
+    }
+    /// A reader given back, kept for the next read while the owner runs. `out` never falls below
+    /// none: each give-back follows one taken.
+    fn give_back(&self, reader: Option<Db>) {
+        let live = self.open.lock().is_ok_and(|open| open.is_some());
+        if let Ok(mut pool) = self.pool.lock() {
+            pool.out = pool.out.saturating_sub(1);
+            if let Some(reader) = reader.filter(|_| live) {
+                pool.idle.push(reader);
+            }
+        }
+        self.returned.notify_all();
+    }
+    /// The owner ended: no reader opens again, the idle ones go, and reads waiting are refused.
+    fn release(&self) {
+        if let Ok(mut open) = self.open.lock() {
+            *open = None;
+        }
+        if let Ok(mut pool) = self.pool.lock() {
+            pool.idle.clear();
+        }
+        self.returned.notify_all();
+    }
 }
 #[derive(Default)]
 struct Outgoing {
@@ -817,6 +934,7 @@ fn open_on<F: BlockFile + 'static>(
     let settings = settings(config.node_id, &durability)?;
     let meter = Arc::new(ReplicaMeter::default());
     let flushing = Flushing::start(&durability, machine.log_flusher(), Arc::clone(&meter))?;
+    let reader = machine.reader();
     let log_config = hyper_log::Config {
         segment_bytes: 64 << 20,
         max_segments: 16,
@@ -856,6 +974,7 @@ fn open_on<F: BlockFile + 'static>(
         outgoing: Mutex::default(),
         status: Mutex::new(Ok(status(&replica))),
         meter,
+        local: Local::new(reader),
     });
     let (sender, receiver) = mpsc::sync_channel(COMMANDS);
     let at = clock();
@@ -1068,6 +1187,13 @@ fn status<F: BlockFile + 'static>(replica: &Durable<F>) -> ReplicaStatus {
     }
 }
 
+/// An owner dropped without its loop's end, as a crash or a test's cut drops it, ends its local
+/// reads all the same: no reader holds its lease past it (kiln 289db3175f3's fix to its 0003).
+impl<F: BlockFile + 'static> Drop for Actor<F> {
+    fn drop(&mut self) {
+        self.control.local.release();
+    }
+}
 impl<F: BlockFile + 'static> Actor<F> {
     fn now(&self) -> Result<u64, Refusal> {
         u64::try_from(self.at.saturating_duration_since(self.started).as_nanos())
@@ -1166,6 +1292,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         if let Ok(mut status) = self.control.status.lock() {
             *status = Err(reason.clone());
         }
+        // Local reads end with the owner: none opens again, and the idle readers let its lease go.
+        self.control.local.release();
         for _ in 0..COMMANDS {
             let Some(envelope) = self.waiting.pop_front() else {
                 break;
@@ -10265,31 +10393,13 @@ mod tests {
             actor.run_step(None).unwrap();
         }
     }
-    /// A read of `values` on owner `owner`'s own state (replication.md, "A local read on a
-    /// replica"). Before the local read, the only read a replica has is a call, which crosses
-    /// its leader's ReadIndex: with nothing relayed, it is unanswered.
-    fn read_here(
-        driven: &mut Driven,
-        owner: usize,
-        client: &Client,
-        until: Instant,
-    ) -> Result<Vec<u8>, Refusal> {
-        let asked = submit(client, until, values);
-        step_alone(driven, owner, 64);
-        match asked.try_recv() {
-            Ok(answer) => answer.map(called),
-            Err(_) => Err(Refusal::Unavailable(
-                "a read on this replica waits for its leader".into(),
-            )),
-        }
-    }
-
     /// AC-T1.10.L1, T-T1.10.L1, Amphora goal 13f90c05 (replication.md, "A local read on a
-    /// replica"), on driven time: a local read answers with the leader gone. Do: a voter and its learner, 1 and 2
-    /// written and caught up; then the voter is gone (nothing relayed, its owner never stepped
-    /// again); the learner reads its own state. Expect: 1 and 2.
+    /// replica"), on driven time: a local read answers with the leader gone. Do: a voter and its
+    /// learner, 1 and 2 written and caught up; then the voter is gone (nothing relayed, its owner
+    /// never stepped again); the learner asks a call, which needs the leader's ReadIndex, and
+    /// reads locally. Expect: the call waits and is refused once its deadline passes, never
+    /// evaluated; the local read answers 1 and 2 meanwhile and after.
     #[test]
-    #[ignore = "red until the local read (Amphora goal 13f90c05)"]
     fn a_local_read_answers_with_the_leader_gone() {
         let dir = tempfile::tempdir().unwrap();
         let mut driven = Driven::new();
@@ -10314,19 +10424,26 @@ mod tests {
         pump.finish();
 
         let until = driven.until();
-        assert_eq!(read_here(&mut driven, 1, learner, until), Ok(vec![1, 2]));
-    }
-
-    /// Before the local read (Amphora goal 13f90c05), a replica reads only through its leader:
-    /// the tests below ask a read the replica has no way to answer on its own.
-    impl Client {
-        fn read_local<R>(
-            &self,
-            _until: Instant,
-            _f: impl FnOnce(&mut Db) -> anyhow::Result<R>,
-        ) -> Result<R, Refusal> {
-            Err(unavailable("a replica reads only through its leader"))
-        }
+        let evaluated = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&evaluated);
+        let asked = submit(learner, until, move |db| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            values(db)
+        });
+        step_alone(&mut driven, 1, 64);
+        assert!(
+            matches!(asked.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "a call was answered without its leader"
+        );
+        assert_eq!(learner.read_local(until, values), Ok(vec![1, 2]));
+        set(&driven.clock(1), driven.base, until);
+        step_alone(&mut driven, 1, 1);
+        assert!(matches!(asked.try_recv(), Ok(Err(Refusal::Timeout))));
+        assert_eq!(evaluated.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            learner.read_local(Instant::now() + HANG_READ, values),
+            Ok(vec![1, 2])
+        );
     }
 
     /// A local read's own budget in these tests, on the real clock: a hang guard, never a verdict.
@@ -10341,7 +10458,6 @@ mod tests {
     /// write is proposed and not committed, every owner's read sees 1 alone; once it is answered,
     /// the leader's sees 1 and 2, and each follower's once it has caught up.
     #[test]
-    #[ignore = "red until the local read (Amphora goal 13f90c05)"]
     fn a_local_read_never_sees_what_the_group_has_not_committed() {
         let dir = tempfile::tempdir().unwrap();
         let mut driven = Driven::new();
@@ -10417,7 +10533,6 @@ mod tests {
     /// the group's to read. Do: open a learner declared to take its first image from member 1,
     /// which never sends it; read locally. Expect: refused (Unavailable), saying why.
     #[test]
-    #[ignore = "red until the local read (Amphora goal 13f90c05)"]
     fn a_local_read_waits_for_the_groups_first_image() {
         let dir = tempfile::tempdir().unwrap();
         let mut driven = Driven::new();
@@ -10468,7 +10583,6 @@ mod tests {
     /// call answered while four are out; the fifth refused Timeout no sooner than its deadline;
     /// the read after the let-go answers 1; the waiting read refused Fenced once the owner is gone.
     #[test]
-    #[ignore = "red until the local read (Amphora goal 13f90c05)"]
     fn a_fifth_local_read_waits_for_a_reader_and_is_refused_timeout_at_its_deadline() {
         let dir = tempfile::tempdir().unwrap();
         let mut driven = Driven::new();
@@ -10533,7 +10647,6 @@ mod tests {
     /// the cut; 1 alone after it, the state its last flush made durable and never less; 1 and 2
     /// once caught up.
     #[test]
-    #[ignore = "red until the local read (Amphora goal 13f90c05)"]
     fn a_local_read_after_a_power_cut_is_no_older_than_its_last_flush() {
         let dir = tempfile::tempdir().unwrap();
         let durability = Durability::Replicated(api::replication::Fates {
@@ -10623,6 +10736,141 @@ mod tests {
         );
         driven.drain(&mut pump);
         pump.finish();
+    }
+    /// AC-T1.10.L1, T-T1.10.L4 (replication.md, "A local read on a replica", amendment 1), on
+    /// driven time: a local read open across an image's install sees one side of it, whole. Do: a
+    /// voter, 1 and 2 written beside a table of many pages, its log compacted; a learner added,
+    /// which can catch up only by the voter's image; a local read on the learner that, within one
+    /// read transaction, reads, lets the learner catch up, runs a checkpoint and a log restart on
+    /// the learner's database from a second reader, and reads again; then a read after it.
+    /// Expect: the learner installed the image; both of the open read's views are the state
+    /// before it (no table), the restart didn't go through; the read after sees 1 and 2 and every
+    /// page of the image.
+    #[test]
+    #[ignore = "red: an open read adopts an installed image's schema mid-transaction (replication.md, amendment 1, found 2026-11-07)"]
+    fn a_local_read_open_across_an_image_install_sees_one_side_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = vec![
+            driven.open(dir.path(), 1, vec![1], None),
+            driven.open_member(dir.path(), 2, vec![1], vec![2], None),
+        ];
+        driven.owner_mut(1).replica.machine_mut().record_digests();
+        let mut pump = Pump::new(&clients);
+        let (voter, learner) = (&clients[0], &clients[1]);
+        driven.elect(&mut pump, &clients[..1], 0, 1);
+        write(&mut driven, &mut pump, voter, 1);
+        write(&mut driven, &mut pump, voter, 2);
+        driven
+            .call(&mut pump, voter, |db| {
+                db.exec("CREATE TABLE spread(data)")?;
+                db.exec("INSERT INTO spread SELECT zeroblob(3000) FROM (WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<200) SELECT x FROM n)")?;
+                Ok(Vec::new())
+            })
+            .unwrap();
+        quiet(&mut driven, &mut pump);
+        let compacted = {
+            let owner = driven.owner_mut(0);
+            let now = owner.now().unwrap();
+            owner
+                .replica
+                .compact(0, now, std::task::Waker::noop())
+                .unwrap();
+            owner.replica.applied().index
+        };
+        for _ in 0..64 {
+            driven.round(&mut pump);
+        }
+        let until = driven.until();
+        driven
+            .answer(
+                &mut pump,
+                &change(voter, until, MemberChange::AddLearner(2)),
+            )
+            .unwrap();
+
+        // What one read transaction sees: member_items' values and the pages of spread.
+        let seen = |db: &mut Db| -> anyhow::Result<(Vec<u8>, i64)> {
+            let mut tables = 0;
+            db.query(
+                "SELECT count(*) FROM sqlite_schema WHERE name='spread'",
+                [],
+                |row| {
+                    tables = row.get::<i64>(0).map_err(unavailable)?;
+                    Ok(false)
+                },
+            )?;
+            let mut spread = 0;
+            if tables == 1 {
+                db.query("SELECT count(*) FROM spread", [], |row| {
+                    spread = row.get::<i64>(0).map_err(unavailable)?;
+                    Ok(false)
+                })?;
+            }
+            Ok((values(db)?, spread))
+        };
+        let (before, across, restarted) = learner
+            .read_local(Instant::now() + HANG_READ, |db| {
+                db.query_transaction(|db| {
+                    let before = seen(db)?;
+                    catch_up(&mut driven, &mut pump, &clients, 0, 1);
+                    // A second reader of the learner's database copies what it may of the log
+                    // into the file, and tries to start the log again, while this read is open.
+                    let restarted = learner
+                        .read_local(Instant::now() + HANG_READ, |other| {
+                            other.checkpoint()?;
+                            Ok(other.restart_log())
+                        })
+                        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                    Ok((before, seen(db)?, restarted))
+                })
+            })
+            .unwrap();
+        let installed = driven.owner(1).replica.machine().digests().first().copied();
+        let (installed, _) = installed.expect("the learner recorded nothing");
+        assert!(
+            installed >= compacted,
+            "the learner replayed the log from {installed}, not the image at {compacted}"
+        );
+        assert_eq!(before, (Vec::new(), 0));
+        assert_eq!(across, before, "the open read saw part of the image");
+        assert!(
+            !matches!(restarted, Ok(true)),
+            "the log started again under an open read"
+        );
+        assert_eq!(
+            learner.read_local(Instant::now() + HANG_READ, |db| db.query_transaction(seen)),
+            Ok((vec![1, 2], 200))
+        );
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.10.L1 (replication.md, "A local read on a replica"; kiln 289db3175f3's fix to its
+    /// 0003): an owner dropped without its loop's end, as a crash drops it, gives back its lease,
+    /// though its local readers held its database. Do: one voter, 1 written, a local read, which
+    /// leaves its reader idle in the pool; the owner dropped mid-run and the member opened again
+    /// on its own files. Expect: it opens, and reads 1 locally.
+    #[test]
+    fn a_dropped_owner_gives_back_its_lease_through_its_local_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = vec![driven.open(dir.path(), 1, vec![1], None)];
+        let mut pump = Pump::new(&clients);
+        driven.elect(&mut pump, &clients, 0, 1);
+        write(&mut driven, &mut pump, &clients[0], 1);
+        assert_eq!(
+            clients[0].read_local(Instant::now() + HANG_READ, values),
+            Ok(vec![1])
+        );
+        driven.drain(&mut pump);
+        pump.finish();
+
+        let restarted = driven.restart(dir.path(), 0, vec![1], Vec::new());
+        assert_eq!(
+            restarted.read_local(Instant::now() + HANG_READ, values),
+            Ok(vec![1])
+        );
     }
 
     mod receive_receipts {

@@ -1059,6 +1059,32 @@ impl Database {
             .map_err(|e| refused(&e))
     }
 
+    /// Runs one read-only SQL session on this node's own state: a local read (replication.md, "A
+    /// local read on a replica"). Standalone, it is [`Database::query`]. On a replica it runs on a
+    /// reader of the owner's applied state, asking the group's leader nothing, so it answers with
+    /// the leader gone or out of reach: a prefix of the group's committed history, maybe behind
+    /// it, never ahead of it. An attached client's runs the same way on its owner's state.
+    /// Refused while a replica hasn't taken its group's first image, once its owner ended, and
+    /// while it is fenced.
+    pub fn query_local<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
+    {
+        let database = self.resolve(until)?;
+        if let Some(client) = database.remote_client() {
+            return client.query_local(until, f).map_err(Refusal::from);
+        }
+        match &database.shared.writer {
+            Writer::Replicated { client, .. } => {
+                let session = Mutex::new(Some(f));
+                let claim = database.application.as_ref();
+                client.read_local(until, |reader| run_query(reader, until, claim, &session))
+            }
+            Writer::Local(_) | Writer::Client(_) => database.query(until, f),
+        }
+    }
+
     /// One atomic batch, including SELECT or DML RETURNING results. Parameters and SQL are owned;
     /// transaction-control, connection PRAGMAs and ATTACH are refused before anything is submitted.
     pub fn execute(

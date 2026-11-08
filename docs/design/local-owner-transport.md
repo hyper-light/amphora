@@ -135,6 +135,11 @@ Version 5: `Request` gained `Application` (the application floor, replication.md
 claim sent once after the greeting and before its ordinary request. The owner validates its shape and
 answers Ready; only the owner's own floor, checked inside the writer's transaction, grants admission.
 
+Version 6: `Request` gained `LocalSession` (replication.md, "A local read on a replica"), a session
+the owner runs read-only on its own state, asking no leader. A client asks it without probing the
+owner's capabilities: every owner it can greet takes it. No capability is advertised for it, and the
+value 2 (bit 1), which kiln's 0003 gave `CAP_LOCAL_READ`, stays unassigned.
+
 Evidence: postcard's wire format: "A struct is encoded as the elements that comprise it, in their
 order of definition", and "their length and field names are not encoded on the wire"
 ([postcard's wire format, section 28](https://postcard.jamesmunns.com/wire-format.html)), so a

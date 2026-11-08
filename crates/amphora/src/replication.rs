@@ -525,6 +525,13 @@ impl Machine {
         Ok((prepared, answer))
     }
 
+    /// Opens connections of their own on this machine's database, from any thread: a local read
+    /// sees what the machine committed, which is what it applied (replication.md, "A local read on
+    /// a replica").
+    pub(crate) fn reader(&self) -> crate::store::Opener<Db> {
+        self.db.opener()
+    }
+
     pub(crate) fn read_db<R>(
         &mut self,
         f: impl FnOnce(&mut Db) -> anyhow::Result<R>,

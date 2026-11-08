@@ -17,8 +17,9 @@ pub(super) const GREETING_MAX: std::time::Duration = std::time::Duration::from_s
 pub(super) const CAP_BOUNDED_COMPACTION: u64 = 1;
 /// The protocol both ends speak. Postcard is not self-describing, so a field added to any message
 /// changes it (local-owner-transport.md, "Versions"). 3: ReplicaStatus gained voters_outgoing; 4: the owner's Identity gained durability.
-/// 5: Request gained Application, the client's claim before its ordinary request.
-pub(super) const VERSION: u32 = 5;
+/// 5: Request gained Application, the client's claim before its ordinary request. 6: Request gained
+/// LocalSession, a local read.
+pub(super) const VERSION: u32 = 6;
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Hello {
@@ -51,6 +52,9 @@ pub(super) enum Request {
     // Appended: one bounded claim before the existing ordinary request. It
     // declares a client format; only the actual owner's floor grants admission.
     Application(crate::database::Application),
+    // Appended: a session read-only on the owner's own state, asking no leader (replication.md,
+    // "A local read on a replica").
+    LocalSession,
 }
 #[derive(Serialize, Deserialize)]
 pub(super) enum Record {
