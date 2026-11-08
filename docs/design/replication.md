@@ -1345,6 +1345,27 @@ readers' bound and the fifth), AC-T1.10.L3 (the wire). Their tests: T-T1.10.L1
 T-T1.10.L3 `a_local_read_waits_for_the_groups_first_image`, and T-T1.10.L4 to L7 above. Its latency (AC-T1.10.3,
 follower read p99 at most 2 ms) is measured by bench amphora_read, not by this change.
 
+**Metrics** (CLAUDE.md section 10), agreed with Kiln Metrics under `amphora-local-read/names/v1`, in the replica
+meter (`meter::REPLICA_METRICS`, read through `ReplicaHandle::counters`):
+- `amphora_replica_local_reads_total`, a counter: local reads this replica's own readers ran;
+- `amphora_replica_local_reads_refused_total`, a counter, by `reason`, a closed set (`meter::LocalRefusal`):
+  `timeout` (no reader before its deadline, or the deadline already past), `fenced` (the owner ended or is
+  fenced), `bootstrapping` (no first image yet). A fourth reason is agreed with Kiln Metrics first;
+- `amphora_replica_local_readers_in_use`, a gauge: readers reading now, 0 to 4. The bound is a constant
+  (`READERS`), so it is not exported.
+No other labels from Amphora; kiln adds `db` and its machine labels. Dashboard rows, in the group **Amphora
+replicated class**:
+
+| panel | PromQL | kiln |
+|---|---|---|
+| Local reads/s | `sum by (db) (rate(amphora_replica_local_reads_total[5m]))` | `sum:amphora_replica_local_reads_total{$host} by {db}` |
+| Local reads refused, by reason, stacked | `sum by (db, reason) (rate(amphora_replica_local_reads_refused_total[5m]))` | `sum:amphora_replica_local_reads_refused_total{$host} by {db,reason}.as_count()` |
+| Local readers in use, against 4 | `max by (instance, db) (amphora_replica_local_readers_in_use)` | `max:amphora_replica_local_readers_in_use{$host} by {host,db}` |
+
+Tested by `a_fifth_local_read_waits_for_a_reader_and_is_refused_timeout_at_its_deadline` (the gauge, the reads run,
+timeout and fenced) and `a_local_read_waits_for_the_groups_first_image` (bootstrapping), and the names by
+`the_replica_metrics_are_the_ones_the_design_names`.
+
 **Found beside it: a replica's database log is never copied back.** Nothing checkpoints a replica's database. Its
 writer runs with `wal_autocheckpoint = 0` (`Db::open`), and only a standalone store runs a checkpointer
 (`Store`'s `Readers::start`, `Engine::checkpoint` for `Local`). The machine's code only flushes (`Machine::advance`,

@@ -8,7 +8,9 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
-use crate::meter::{FloorCounters, FloorMeter, FloorRefusal, ReplicaCounters, ReplicaMeter};
+use crate::meter::{
+    FloorCounters, FloorMeter, FloorRefusal, LocalRefusal, ReplicaCounters, ReplicaMeter,
+};
 use api::replication::{
     CatchUp, Durability, MemberChange, Outbound, ReplicaConfig, ReplicaStatus, Verdict,
 };
@@ -119,14 +121,24 @@ impl Client {
         until: Instant,
         f: impl FnOnce(&mut Db) -> anyhow::Result<R>,
     ) -> Result<R, Refusal> {
+        let meter = &self.handle.shared.meter;
         if Instant::now() >= until {
+            meter.local_refused(LocalRefusal::Timeout);
             return Err(Refusal::Timeout);
         }
-        let status = locked(&self.handle.shared.status)?.clone()?;
+        let status = match locked(&self.handle.shared.status)?.clone() {
+            Ok(status) => status,
+            Err(ended) => {
+                meter.local_refused(LocalRefusal::Fenced);
+                return Err(ended);
+            }
+        };
         if let Some(reason) = status.fenced {
+            meter.local_refused(LocalRefusal::Fenced);
             return Err(fenced(reason));
         }
         if status.bootstrapping {
+            meter.local_refused(LocalRefusal::Bootstrapping);
             return Err(unavailable(
                 "this replica hasn't taken its group's first image yet; it reads once it has",
             ));
@@ -158,6 +170,8 @@ struct Local {
     open: Mutex<Option<crate::store::Opener<Db>>>,
     pool: Mutex<Readers>,
     returned: std::sync::Condvar,
+    /// Counts the reads and refusals, and the readers out (`amphora_replica_local_*`).
+    meter: Arc<ReplicaMeter>,
 }
 #[derive(Default)]
 struct Readers {
@@ -169,11 +183,12 @@ struct Readers {
 /// to its deadline (replication.md, "A local read on a replica", amendment 2).
 const READERS: usize = 4;
 impl Local {
-    fn new(open: crate::store::Opener<Db>) -> Self {
+    fn new(open: crate::store::Opener<Db>, meter: Arc<ReplicaMeter>) -> Self {
         Self {
             open: Mutex::new(Some(open)),
             pool: Mutex::new(Readers::default()),
             returned: std::sync::Condvar::new(),
+            meter,
         }
     }
     /// `f` on a reader: an idle one, one opened now, or the first given back before `until`.
@@ -187,13 +202,16 @@ impl Local {
             loop {
                 if let Some(reader) = pool.idle.pop() {
                     pool.out = pool.out.saturating_add(1);
+                    self.meter.readers_in_use(pool.out);
                     break reader;
                 }
-                let open = locked(&self.open)?
-                    .clone()
-                    .ok_or_else(|| fenced("replica owner ended"))?;
+                let Some(open) = locked(&self.open)?.clone() else {
+                    self.meter.local_refused(LocalRefusal::Fenced);
+                    return Err(fenced("replica owner ended"));
+                };
                 if pool.out < READERS {
                     pool.out = pool.out.saturating_add(1);
+                    self.meter.readers_in_use(pool.out);
                     drop(pool);
                     match open() {
                         Ok(reader) => break reader,
@@ -205,6 +223,7 @@ impl Local {
                 }
                 let left = until.saturating_duration_since(Instant::now());
                 if left.is_zero() {
+                    self.meter.local_refused(LocalRefusal::Timeout);
                     return Err(Refusal::Timeout);
                 }
                 pool = self
@@ -214,6 +233,7 @@ impl Local {
                     .0;
             }
         };
+        self.meter.local_read();
         let answer = f(&mut reader).map_err(|error| refused(&error));
         self.give_back(Some(reader));
         answer
@@ -224,6 +244,7 @@ impl Local {
         let live = self.open.lock().is_ok_and(|open| open.is_some());
         if let Ok(mut pool) = self.pool.lock() {
             pool.out = pool.out.saturating_sub(1);
+            self.meter.readers_in_use(pool.out);
             if let Some(reader) = reader.filter(|_| live) {
                 pool.idle.push(reader);
             }
@@ -965,6 +986,7 @@ fn open_on<F: BlockFile + 'static>(
     let group = GroupStore::claim(&log, 1).map_err(unavailable)?;
     let replica =
         Replica::open(&settings, group, machine, Bytes::new(512 << 20)).map_err(unavailable)?;
+    let local = Local::new(reader, Arc::clone(&meter));
     let control = Arc::new(Control {
         admitted: AtomicUsize::new(0),
         attesting: Mutex::new(None),
@@ -974,7 +996,7 @@ fn open_on<F: BlockFile + 'static>(
         outgoing: Mutex::default(),
         status: Mutex::new(Ok(status(&replica))),
         meter,
-        local: Local::new(reader),
+        local,
     });
     let (sender, receiver) = mpsc::sync_channel(COMMANDS);
     let at = clock();
@@ -10531,7 +10553,8 @@ mod tests {
     /// AC-T1.10.L1, T-T1.10.L3 (replication.md, "A local read on a replica"; kiln plan
     /// 01a1a283e14c, step 4): a member that hasn't taken its group's first image has no state of
     /// the group's to read. Do: open a learner declared to take its first image from member 1,
-    /// which never sends it; read locally. Expect: refused (Unavailable), saying why.
+    /// which never sends it; read locally. Expect: refused (Unavailable), saying why, and counted
+    /// as refused bootstrapping.
     #[test]
     fn a_local_read_waits_for_the_groups_first_image() {
         let dir = tempfile::tempdir().unwrap();
@@ -10546,6 +10569,13 @@ mod tests {
         assert!(
             matches!(&refused, Err(Refusal::Unavailable(why)) if why.contains("first image")),
             "{refused:?}"
+        );
+        assert_eq!(
+            learner
+                .handle()
+                .counters()
+                .local_refused(LocalRefusal::Bootstrapping),
+            1
         );
     }
 
@@ -10581,7 +10611,9 @@ mod tests {
     /// owner answers a call; one of the four let go and a read asked; a fourth held again and a
     /// read waiting with a long deadline; the owner dropped without its loop's end. Expect: the
     /// call answered while four are out; the fifth refused Timeout no sooner than its deadline;
-    /// the read after the let-go answers 1; the waiting read refused Fenced once the owner is gone.
+    /// the read after the let-go answers 1; the waiting read refused Fenced once the owner is gone;
+    /// the meter counting four readers in use while they are held, six reads run, one refused
+    /// timeout and one fenced, and none in use at the end.
     #[test]
     fn a_fifth_local_read_waits_for_a_reader_and_is_refused_timeout_at_its_deadline() {
         let dir = tempfile::tempdir().unwrap();
@@ -10600,6 +10632,7 @@ mod tests {
                 "a held read never had its reader"
             );
         }
+        assert_eq!(client.handle().counters().local_readers_in_use, 4);
         let asked = Instant::now();
         let fifth = {
             let client = client.clone();
@@ -10611,6 +10644,13 @@ mod tests {
         let refused = fifth.join().unwrap();
         assert!(matches!(refused, Err(Refusal::Timeout)), "{refused:?}");
         assert!(asked.elapsed() >= FIFTH_WAIT, "the fifth was refused early");
+        assert_eq!(
+            client
+                .handle()
+                .counters()
+                .local_refused(LocalRefusal::Timeout),
+            1
+        );
 
         let (release, read) = held.pop().unwrap();
         release.send(()).unwrap();
@@ -10636,6 +10676,13 @@ mod tests {
             release.send(()).unwrap();
             read.join().unwrap().unwrap();
         }
+        // Every read that had a reader counted, the two turned away by their reasons, and none
+        // out now (amphora_replica_local_*).
+        let counted = client.handle().counters();
+        assert_eq!(counted.local_reads, 6);
+        assert_eq!(counted.local_refused(LocalRefusal::Timeout), 1);
+        assert_eq!(counted.local_refused(LocalRefusal::Fenced), 1);
+        assert_eq!(counted.local_readers_in_use, 0);
     }
 
     /// AC-T1.10.L1, T-T1.10.L6 (replication.md, "A local read on a replica", amendment 4): across

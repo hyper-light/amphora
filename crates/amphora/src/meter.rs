@@ -264,7 +264,7 @@ pub fn flush_bucket(d: Duration) -> usize {
 
 /// The replicated class's metrics, as their host exports them: name, type and help, in the
 /// order of [`ReplicaCounters`]' fields (docs/design/replication.md, "Metrics").
-pub const REPLICA_METRICS: [(&str, &str, &str); 5] = [
+pub const REPLICA_METRICS: [(&str, &str, &str); 8] = [
     (
         "amphora_replica_flush_backlog_entries",
         "gauge",
@@ -292,7 +292,55 @@ pub const REPLICA_METRICS: [(&str, &str, &str); 5] = [
         "counter",
         "Answer gaps a leading replica refused to learn for its quorum patience, because they passed its ceiling.",
     ),
+    // Local reads (replication.md, "A local read on a replica"), as Kiln Metrics agreed them
+    // (amphora-local-read/names/v1).
+    (
+        "amphora_replica_local_reads_total",
+        "counter",
+        "Local reads this replica's own readers ran (Database::query_local), asking no leader.",
+    ),
+    (
+        "amphora_replica_local_reads_refused_total",
+        "counter",
+        "Local reads this replica turned away, by reason (timeout: no reader before its deadline; fenced: the owner ended or is fenced; bootstrapping: no first image yet).",
+    ),
+    (
+        "amphora_replica_local_readers_in_use",
+        "gauge",
+        "This replica's local readers reading now, 0 to 4.",
+    ),
 ];
+
+/// Why a local read was turned away: `amphora_replica_local_reads_refused_total`'s `reason`, a
+/// closed set (amphora-local-read/names/v1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalRefusal {
+    /// No reader came free before the read's deadline, or the deadline had passed.
+    Timeout,
+    /// The owner ended or is fenced.
+    Fenced,
+    /// The replica hasn't taken its group's first image.
+    Bootstrapping,
+}
+
+impl LocalRefusal {
+    pub const ALL: [Self; 3] = [Self::Timeout, Self::Fenced, Self::Bootstrapping];
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Fenced => "fenced",
+            Self::Bootstrapping => "bootstrapping",
+        }
+    }
+    fn index(self) -> usize {
+        match self {
+            Self::Timeout => 0,
+            Self::Fenced => 1,
+            Self::Bootstrapping => 2,
+        }
+    }
+}
 
 /// A replica owner's counters for the replicated class, bumped by its owner and its flushing
 /// thread, read by its host at any time without asking the owner.
@@ -305,6 +353,9 @@ pub struct ReplicaMeter {
     classic: AtomicU64,
     patience_us: AtomicU64,
     refused: AtomicU64,
+    local_reads: AtomicU64,
+    local_refused: [AtomicU64; 3],
+    readers_in_use: AtomicU64,
 }
 
 /// What a replica owner's counters say now ([`REPLICA_METRICS`]).
@@ -324,6 +375,23 @@ pub struct ReplicaCounters {
     pub quorum_patience: Duration,
     /// Answer gaps refused for the patience because they passed its ceiling.
     pub quorum_patience_refused: u64,
+    /// Local reads run on this replica's readers, and those turned away by
+    /// [`LocalRefusal::ALL`]'s order.
+    pub local_reads: u64,
+    pub local_reads_refused: [u64; 3],
+    /// Local readers reading now.
+    pub local_readers_in_use: u64,
+}
+
+impl ReplicaCounters {
+    /// The local reads turned away for `reason`.
+    #[must_use]
+    pub fn local_refused(&self, reason: LocalRefusal) -> u64 {
+        self.local_reads_refused
+            .get(reason.index())
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 impl ReplicaMeter {
@@ -351,6 +419,24 @@ impl ReplicaMeter {
         self.refused.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A local read ran on one of this replica's readers.
+    pub fn local_read(&self) {
+        self.local_reads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A local read turned away, for `reason`.
+    pub fn local_refused(&self, reason: LocalRefusal) {
+        if let Some(count) = self.local_refused.get(reason.index()) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The local readers reading now, set under the pool's lock as each is taken or given back.
+    pub fn readers_in_use(&self, out: usize) {
+        self.readers_in_use
+            .store(u64::try_from(out).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
     #[must_use]
     pub fn counters(&self) -> ReplicaCounters {
         ReplicaCounters {
@@ -363,6 +449,13 @@ impl ReplicaMeter {
             commits_classic: self.classic.load(Ordering::Relaxed),
             quorum_patience: Duration::from_micros(self.patience_us.load(Ordering::Relaxed)),
             quorum_patience_refused: self.refused.load(Ordering::Relaxed),
+            local_reads: self.local_reads.load(Ordering::Relaxed),
+            local_reads_refused: std::array::from_fn(|i| {
+                self.local_refused
+                    .get(i)
+                    .map_or(0, |count| count.load(Ordering::Relaxed))
+            }),
+            local_readers_in_use: self.readers_in_use.load(Ordering::Relaxed),
         }
     }
 }
@@ -568,7 +661,8 @@ mod tests {
     /// CP-T1.8, doc truth (CLAUDE.md sections 6 and 10): the replicated class's metrics are the
     /// ones its design names. Do: read docs/design/replication.md. Expect: every
     /// `amphora_replica_` name there (a histogram's `_bucket` series as the histogram) is in
-    /// [`REPLICA_METRICS`], and every name there is in the design.
+    /// [`REPLICA_METRICS`], and every name there is in the design; every local read refusal
+    /// reason in [`LocalRefusal::ALL`] is named there (AC-T1.10.L2).
     #[test]
     fn the_replica_metrics_are_the_ones_the_design_names() {
         let design = include_str!("../../../docs/design/replication.md");
@@ -579,6 +673,12 @@ mod tests {
             .collect();
         let code = REPLICA_METRICS.iter().map(|(name, _, _)| *name).collect();
         assert_eq!(named, code);
+        for reason in LocalRefusal::ALL {
+            assert!(
+                design.contains(&format!("`{}`", reason.reason())),
+                "{reason:?}"
+            );
+        }
     }
 
     /// CP-T1.8, doc truth (CLAUDE.md sections 6 and 10): the floor's metrics and their refusal
