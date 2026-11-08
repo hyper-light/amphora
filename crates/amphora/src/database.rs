@@ -113,6 +113,18 @@ struct Owner {
     key: Option<[u8; 32]>,
 }
 static OWNERS: OnceLock<Mutex<BTreeMap<PathBuf, Owner>>> = OnceLock::new();
+/// The paths whose owner this process drained, the latest last. A lease there may still read held
+/// for a moment: a child this process forked shares it until its exec (local-owner-transport.md,
+/// "Owner guards", J1). At most `DRAINED_MAX`, the oldest evicted first; a path's mark goes once
+/// this process takes its lease again.
+static DRAINED: OnceLock<Mutex<std::collections::VecDeque<PathBuf>>> = OnceLock::new();
+/// The owner table's own bound (`open database owners`): no more paths can have drained at once.
+const DRAINED_MAX: usize = 4096;
+/// The first pause before a drained path's lease is probed again: the measured window, 62.8 µs
+/// on fedora (t1/guards-flake), rounded down. Each pause doubles, up to `LONGEST_PAUSE`.
+const FIRST_PAUSE: std::time::Duration = std::time::Duration::from_micros(50);
+/// The drain wait's own park: no probe waits longer between looks.
+const LONGEST_PAUSE: std::time::Duration = std::time::Duration::from_millis(1);
 
 #[derive(Default)]
 pub(crate) struct Changed {
@@ -325,6 +337,60 @@ fn admit_guarded(
 
 /// Another process owns the database. Its identity can't show which files it opened, so a guarded
 /// open neither attaches to it as a client nor takes its place.
+/// Forgets the owners that have drained, marking the paths whose lease this process held. A
+/// client's entry never held one (its lease is `Weak::new()`).
+fn forget_drained(owners: &mut BTreeMap<PathBuf, Owner>) -> Result<(), Refusal> {
+    let gone: Vec<PathBuf> = owners
+        .iter()
+        .filter(|(_, owner)| {
+            owner.shared.strong_count() == 0
+                && owner.lease.strong_count() == 0
+                && !owner.lease.ptr_eq(&Weak::new())
+        })
+        .map(|(path, _)| path.clone())
+        .collect();
+    owners.retain(|_, owner| owner.shared.strong_count() > 0 || owner.lease.strong_count() > 0);
+    if gone.is_empty() {
+        return Ok(());
+    }
+    let mut drained = locked(DRAINED.get_or_init(Mutex::default))?;
+    for path in gone {
+        drained.retain(|marked| *marked != path);
+        if drained.len() >= DRAINED_MAX {
+            drained.pop_front();
+        }
+        drained.try_reserve(1).map_err(unavailable)?;
+        drained.push_back(path);
+    }
+    Ok(())
+}
+
+/// Whether this process drained the owner at `path` and has not owned it since.
+fn drained_here(path: &Path) -> Result<bool, Refusal> {
+    Ok(locked(DRAINED.get_or_init(Mutex::default))?
+        .iter()
+        .any(|marked| marked == path))
+}
+
+/// This process holds `path`'s lease again: its mark goes.
+fn owned_again(path: &Path) -> Result<(), Refusal> {
+    locked(DRAINED.get_or_init(Mutex::default))?.retain(|marked| marked != path);
+    Ok(())
+}
+
+/// The deadline passed waiting for a lease this process drained: logged with the reason, since
+/// the Timeout itself carries none (an operator tells it from a slow open by this event).
+fn lease_held_since_drain(path: &Path) {
+    tracing::warn!(target: "amphora.records", event = "records.lease_held_since_drain", path = %path.display(), "the lease is still held since this process drained it: a child this process forked may share it until its exec");
+}
+
+/// Parks before the next probe of a drained path's lease, no later than `until`, and doubles
+/// `pause` up to `LONGEST_PAUSE`.
+fn pause_for_lease(pause: &mut std::time::Duration, until: Instant) {
+    std::thread::park_timeout(until.saturating_duration_since(Instant::now()).min(*pause));
+    *pause = pause.saturating_mul(2).min(LONGEST_PAUSE);
+}
+
 fn remote_owner() -> Refusal {
     api::invalid(
         "database ownership",
@@ -570,14 +636,17 @@ impl Database {
             // Its parent is made by the lease, past every refusal before it.
             None => resolved_path(path)?,
         };
+        let mut pause = FIRST_PAUSE;
+        let mut waited = false;
         loop {
             if Instant::now() >= until {
+                if waited {
+                    lease_held_since_drain(&path);
+                }
                 return Err(Refusal::Timeout);
             }
             let mut owners = locked_until(OWNERS.get_or_init(Mutex::default), until)?;
-            owners.retain(|_, owner| {
-                owner.shared.strong_count() > 0 || owner.lease.strong_count() > 0
-            });
+            forget_drained(&mut owners)?;
             let identity = file_identity(&path)?;
             if let Some(owner) = owners.get(&path).or_else(|| {
                 identity.and_then(|id| owners.values().find(|owner| owner.identity == Some(id)))
@@ -660,6 +729,15 @@ impl Database {
                 None => try_exclusive_file(&path)?,
             };
             let Some(lease) = lease else {
+                // This process drained the owner here: a child it forked may share the lease until
+                // its exec, so the lease is waited for, to the deadline, never refused as another
+                // process's. An unguarded open waits as a client, below.
+                if (guards.is_some() || restoring) && drained_here(&path)? {
+                    drop(owners);
+                    waited = true;
+                    pause_for_lease(&mut pause, until);
+                    continue;
+                }
                 if guards.is_some() {
                     return Err(remote_owner());
                 }
@@ -694,6 +772,7 @@ impl Database {
                     Err(error) => return Err(error),
                 }
             };
+            owned_again(&path)?;
             let key = guards.as_ref().map(Guards::key);
             let owner = Owned::new(Arc::new(lease), guards);
             let database = create(&path, owner.clone())?;

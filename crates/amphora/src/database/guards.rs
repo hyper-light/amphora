@@ -530,4 +530,163 @@ mod tests {
         drop(owner);
         assert_eq!(witnesses.next().0, 2);
     }
+
+    /// A child holding a copy of the lease of the owner at `path`, as a child this process forks
+    /// holds it from its fork until its exec (flock(2): a lock belongs to the open file
+    /// description). Returns it and the lease, to wait on this process's drain of it.
+    #[cfg(unix)]
+    fn sharer(path: &Path) -> (std::process::Child, Weak<File>) {
+        let lease = {
+            let owners = OWNERS.get_or_init(Mutex::default).lock().unwrap();
+            let owner = owners.get(&path.canonicalize().unwrap()).unwrap();
+            owner.lease.upgrade().unwrap()
+        };
+        let child = std::process::Command::new("sleep")
+            .arg("600")
+            .stdin(std::process::Stdio::from(lease.try_clone().unwrap()))
+            .spawn()
+            .unwrap();
+        (child, Arc::downgrade(&lease))
+    }
+
+    /// Waits until no holder of `lease` is left in this process: the owner table's drain.
+    #[cfg(unix)]
+    fn drained(lease: &Weak<File>) {
+        let until = until();
+        while lease.strong_count() > 0 {
+            assert!(Instant::now() < until, "the owner never drained");
+            std::thread::park_timeout(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[cfg(unix)]
+    fn release(mut child: std::process::Child) {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn free(path: &Path) -> bool {
+        crate::transport::try_lease(path).unwrap().is_some()
+    }
+
+    #[cfg(unix)]
+    fn soon() -> Instant {
+        Instant::now() + std::time::Duration::from_millis(200)
+    }
+
+    #[cfg(unix)]
+    fn group() -> Guards {
+        Guards::new([1; 32], Arc::new(()))
+    }
+
+    /// CP-T1.5 (U05), local-owner-transport.md "Owner guards": the rig. Do: a guarded owner; a
+    /// child given a copy of its lease; every handle dropped and drained. Expect: the lease held
+    /// while the child lives, though no holder is left in this process, and free once it is gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_sharing_the_lease_holds_it_past_this_processs_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let owner = Database::open_guarded(&path, group(), until()).unwrap();
+        let (child, lease) = sharer(&path);
+        drop(owner);
+        drained(&lease);
+        assert!(!free(&path), "the child's copy did not hold the lease");
+        release(child);
+        assert!(free(&path), "the lease stayed held with the child gone");
+    }
+
+    /// CP-T1.5 (U05), local-owner-transport.md "Owner guards", J1: a guarded reopen right after
+    /// this process drained the path, while a forked child still shares the lease. Do: open
+    /// guarded, a sharing child, drain, open guarded again with a deadline. Expect: Timeout at
+    /// the deadline, never Invalid ("another process owns this database"): no other owner exists.
+    #[cfg(unix)]
+    #[test]
+    fn a_guarded_reopen_beside_a_child_sharing_the_drained_lease_times_out() {
+        // In a process of its own: the deadline then bounds this wait alone, never another
+        // test's hold of the owner table.
+        if !in_child(
+            "database::guards::tests::a_guarded_reopen_beside_a_child_sharing_the_drained_lease_times_out",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let owner = Database::open_guarded(&path, group(), until()).unwrap();
+        let (child, lease) = sharer(&path);
+        drop(owner);
+        drained(&lease);
+        let reopened = Database::open_guarded(&path, group(), soon()).map(drop);
+        release(child);
+        assert!(matches!(reopened, Err(Refusal::Timeout)), "{reopened:?}");
+    }
+
+    /// J1, the guarded attach. Do: a replicated guarded owner, a sharing child, drain, attach
+    /// guarded with a deadline. Expect: Timeout, never Invalid.
+    #[cfg(unix)]
+    #[test]
+    fn a_guarded_attach_beside_a_child_sharing_the_drained_lease_times_out() {
+        // In a process of its own: the deadline then bounds this wait alone, never another
+        // test's hold of the owner table.
+        if !in_child(
+            "database::guards::tests::a_guarded_attach_beside_a_child_sharing_the_drained_lease_times_out",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (path, log) = (dir.path().join("db"), dir.path().join("log"));
+        let owner =
+            Database::open_replicated_guarded(&path, &log, config(), group(), until()).unwrap();
+        let (child, lease) = sharer(&path);
+        drop(owner);
+        drained(&lease);
+        let attached =
+            Database::attach_replicated_guarded(&path, &log, config(), group(), soon()).map(drop);
+        release(child);
+        assert!(matches!(attached, Err(Refusal::Timeout)), "{attached:?}");
+    }
+
+    /// J1, a restore. Do: an owner, a sharing child, drain, a restore onto the path with a
+    /// deadline. Expect: Timeout, never Invalid ("another process owns the destination").
+    #[cfg(unix)]
+    #[test]
+    fn a_restore_beside_a_child_sharing_the_drained_lease_times_out() {
+        // In a process of its own: the deadline then bounds this wait alone, never another
+        // test's hold of the owner table.
+        if !in_child(
+            "database::guards::tests::a_restore_beside_a_child_sharing_the_drained_lease_times_out",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let owner = Database::open(&path, until()).unwrap();
+        let (child, lease) = sharer(&path);
+        drop(owner);
+        drained(&lease);
+        let restored = Restore::open(&path, "source", soon()).map(drop);
+        release(child);
+        assert!(matches!(restored, Err(Refusal::Timeout)), "{restored:?}");
+    }
+
+    /// J1, the child letting go. Do: a guarded owner, a sharing child, drain; a guarded reopen with
+    /// a long deadline begun on a thread; the child ended. Expect: the reopen owns the database,
+    /// whichever comes first, the child's end or the reopen's first probe.
+    #[cfg(unix)]
+    #[test]
+    fn a_guarded_reopen_owns_the_database_once_the_sharing_child_lets_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let owner = Database::open_guarded(&path, group(), until()).unwrap();
+        let (child, lease) = sharer(&path);
+        drop(owner);
+        drained(&lease);
+        let again = path.clone();
+        let reopen =
+            std::thread::spawn(move || Database::open_guarded(&again, group(), until()).map(drop));
+        release(child);
+        let reopened = reopen.join().unwrap();
+        assert!(reopened.is_ok(), "{reopened:?}");
+    }
 }

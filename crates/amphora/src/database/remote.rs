@@ -306,7 +306,7 @@ impl Database {
         let durability = canonical(durability);
         let expected = Some((log.as_path(), &config, &durability));
         let mut owners = locked_until(OWNERS.get_or_init(Mutex::default), until)?;
-        owners.retain(|_, owner| owner.shared.strong_count() > 0 || owner.lease.strong_count() > 0);
+        forget_drained(&mut owners)?;
         let identity = file_identity(&path)?;
         if let Some(owner) = owners.get(&path).or_else(|| {
             identity.and_then(|id| owners.values().find(|owner| owner.identity == Some(id)))
@@ -372,7 +372,24 @@ impl Database {
             return Ok(None);
         }
         if guards.is_some() {
-            return Err(remote_owner());
+            if !drained_here(&path)? {
+                return Err(remote_owner());
+            }
+            // This process drained the owner here: a child it forked may share the lease until its
+            // exec. Wait for it to the deadline; once free, no owner holds it.
+            drop(owners);
+            let mut pause = FIRST_PAUSE;
+            loop {
+                if Instant::now() >= until {
+                    lease_held_since_drain(&path);
+                    return Err(Refusal::Timeout);
+                }
+                pause_for_lease(&mut pause, until);
+                if let Some(lease) = crate::transport::try_lease(&path)? {
+                    drop(lease);
+                    return Ok(None);
+                }
+            }
         }
         let database = attach(&path, expected, until)?;
         owners.insert(
