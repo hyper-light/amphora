@@ -6181,11 +6181,12 @@ mod tests {
     /// AC-T1.8.M1, T-T1.8.M3 (CP-T1.8) on driven time (replication.md, "Membership"): a change past
     /// its deadline answers what its stage knows. In a group of three voters, the relay held so
     /// that nothing moves on: Do: a change's deadline passes at its barrier; then, relayed to its
-    /// proposal, another's; then, relayed until the joint configuration it made is applied, a
-    /// third's. Expect: Timeout, with nothing proposed; UnknownOutcome, and with the relay back it
-    /// applies all the same, as reading the configuration shows; while the joint configuration is
-    /// applied, the status names its outgoing voters (`voters_outgoing`), and the deadline answers
-    /// the status applied; with the relay back the group leaves it.
+    /// proposal, another's; then, relayed until the joint configuration it made is applied with its
+    /// way out held from committing, a third's. Expect: Timeout, with nothing proposed;
+    /// UnknownOutcome, and with the relay back it applies all the same, as reading the
+    /// configuration shows; while the joint configuration is applied, the status names its outgoing
+    /// voters (`voters_outgoing`), and the deadline answers the status applied; with the relay back
+    /// and the leader's clock moving, the group leaves it.
     #[test]
     fn a_change_past_its_deadline_answers_what_its_stage_knows() {
         let dir = tempfile::tempdir().unwrap();
@@ -6233,10 +6234,24 @@ mod tests {
         assert_eq!(led.handle().status().unwrap().learners, vec![4]);
 
         pump.departed.push(4);
+        let configured = pending_change(&driven, leader);
         let until = deadline(&clock, driven.base);
         let asked = change(led, until, MemberChange::Remove(4));
-        // Each round ends with what the leader has applied published, the joint configuration
-        // too: its way out comes only after the joint one is committed.
+        reach(&mut driven, &mut pump, "the joint proposal", |driven| {
+            pending_change(driven, leader) > configured
+        });
+        // The way out is proposed once the joint configuration applies, and can commit in the same
+        // round, so the joint one would never be seen applied: no answer that a member holds past
+        // the joint entry is heard until the deadline has answered (a heartbeat's answer saying
+        // where a log ends counts as an append's).
+        let joint_at = pending_change(&driven, leader);
+        pump.losing = Some(Box::new(move |_, record| {
+            matches!(
+                record.msg_type,
+                hyper_raft::proto::MessageType::MsgAppendResponse
+                    | hyper_raft::proto::MessageType::MsgHeartbeatResponse
+            ) && record.index > joint_at
+        }));
         reach(
             &mut driven,
             &mut pump,
@@ -6255,16 +6270,23 @@ mod tests {
         assert!(matches!(asked.try_recv(), Err(mpsc::TryRecvError::Empty)));
         set(&clock, driven.base, until);
         driven.step();
-        // The status applied: still joint, or out of it if the way out had committed while the
-        // leader's disk held back the joint configuration's apply.
+        // The status applied, still joint: its way out cannot have committed.
         let answered = asked.try_recv().unwrap().unwrap();
         assert_eq!(
             (answered.voters_outgoing, answered.learners),
-            (
-                applied_configuration(&driven, leader).voters_outgoing,
-                vec![]
-            )
+            (vec![1, 2, 3], vec![])
         );
+        // What was lost is made good by the leader's next heartbeat, which only its ticks send.
+        pump.losing = None;
+        for _ in 0..ROUNDS {
+            if applied_configuration(&driven, leader)
+                .voters_outgoing
+                .is_empty()
+            {
+                break;
+            }
+            driven.tick(&mut pump, leader);
+        }
         settled(&mut driven, &mut pump, 3, &[]);
         write(&mut driven, &mut pump, led, 1);
         driven.drain(&mut pump);
