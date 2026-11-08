@@ -370,7 +370,7 @@ fn owned_again(path: &Path) -> Result<(), Refusal> {
 /// The deadline passed waiting for a lease this process drained: logged with the reason, since
 /// the Timeout itself carries none (an operator tells it from a slow open by this event).
 fn lease_held_since_drain(path: &Path) {
-    tracing::warn!(target: "amphora.records", event = "lease_held_since_drain", path = %path.display(), "the lease is still held since this process drained it: a child this process forked may share it until its exec");
+    tracing::warn!(target: "amphora.records", event = "records.lease_held_since_drain", path = %path.display(), "the lease is still held since this process drained it: a child this process forked may share it until its exec");
 }
 
 /// Parks before the next probe of a drained path's lease, no later than `until`, and doubles

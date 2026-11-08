@@ -328,8 +328,9 @@ additive constructors carry them, and the existing ones keep their behavior:
     rather than the at-once Invalid, until this process owns it again or the mark is evicted. Both
     are typed; Timeout says try again. Refusal's Timeout carries no text (a wire enum, changed
     append-only), so at a marked path's deadline the owner logs the reason, event
-    `lease_held_since_drain` on `amphora.records`: "the lease is still held since this process
-    drained it", which an operator tells from a slow open.
+    `records.lease_held_since_drain` on `amphora.records` (warn; agreed by Kiln Metrics,
+    `amphora-replicated-line/events/v1`): "the lease is still held since this process drained
+    it", which an operator tells from a slow open.
   - Windows has no fork: a child gets only the handles it is given, so the window is Unix's
     (Linux and macOS), and the wait is the same code on every platform.
   - Tests: `a_child_sharing_the_lease_holds_it_past_this_processs_drain` (the rig),
