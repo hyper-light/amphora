@@ -1103,13 +1103,21 @@ would corrupt. So:
    its own row is missing or stale (a new join, a change it applied, a request it applied), proposes at most once per
    pass (a new applied index while it has nothing else in hand), through the same barrier and proposal as a call with
    its own deadline, and a refusal (a stale base, an election) is tried again on its next pass, never in a loop. Members
-   attesting at once make each other's sessions stale; each round of that contention applies at least one, so the
-   retries end once every member is current, and a settled group proposes nothing. The leader's request is the same
-   counted retry: written once, its session may be refused by the stale-base rule when members' attestation sessions
-   prepared at the same base commit first, and is proposed again on the leader's next pass, so its proposals are at
-   most one more than those refusals, each of which needs a session committed in between (at most one attestation per
-   member per request), and none once the request is applied. Any change during the upgrade sends every member back to
-   attest; that lasts only until J.
+   attesting at once make each other's sessions stale. A floor session (a keeper's attestation, the leader's request)
+   therefore prepares at its member's log tail: past its ReadIndex barrier, it waits until its member has applied its
+   own last log index as it stood when the barrier passed, then prepares. The member's log already holds what the leader
+   appended to it, other members' forwarded attestations included, so contenders share a base; a session prepared at
+   what was only committed sits behind entries already in its own log, is stale when it arrives, and two followers out
+   of phase keep missing each other (39 proposals for one applied attestation in the restart test before this rule). The
+   target is fixed when the barrier passes, so writes appended after it never move it and the session never waits out
+   its deadline holding its member's write slot; the wait is bounded by that deadline, a tail a new leader truncates is
+   followed by the applied index, and it is local, with no protocol change. So each round of contention applies at least
+   one, a member proposes at most `members` attestations per `configuration_at`, the retries end once every member is
+   current, and a settled group proposes nothing. The leader's request is the same counted retry: written once, its
+   session may be refused by the stale-base rule when members' attestation sessions prepared at the same base commit
+   first, and is proposed again on the leader's next pass, so its proposals are at most one more than those refusals,
+   each of which needs a session committed in between (at most one attestation per member per request), and none once
+   the request is applied. Any change during the upgrade sends every member back to attest; that lasts only until J.
 3. J's session is written only when every member of the configuration in force has an attestation committed after the
    last change. At J, the members then present get rows at 0, so their attestations stay valid and nobody attests
    again at J; after it, only changes write rows.
