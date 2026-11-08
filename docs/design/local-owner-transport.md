@@ -300,6 +300,44 @@ additive constructors carry them, and the existing ones keep their behavior:
   into the database before the log is held, an effect on the database itself, and the fence can't
   be decided earlier, since it needs the machine's durable index.
 
+- A reopen beside a child that shares a drained lease (J1, 2026-11-07, decided with
+  amphora-seam-owner). On Unix the lease is a `flock` (std's `File::try_lock`: "This function
+  currently corresponds to the flock function on Unix with the LOCK_EX and LOCK_NB flags"), and a
+  flock belongs to the open file description: "duplicate file descriptors (created by, for example,
+  fork(2) or dup(2)) refer to the same lock", released only "when all such file descriptors have
+  been closed" (flock(2)). A forked child holds copies of every descriptor (fork(2)) until its exec
+  closes the close-on-exec ones (execve(2)). So when this process drains an owner while it, or a
+  library in it, forks, the lease can read held for a moment after the last holder here let go:
+  62.8 µs, measured on fedora during t1/guards-flake. A guarded open, a guarded attach and a restore
+  answered that moment with an Invalid naming another process's owner, which tells the host not to
+  retry, though no other owner existed.
+  - The owner table remembers the paths it drained, read before its retain forgets them: at most
+    4,096 (the owner bound), the oldest evicted first, and a path's mark cleared once this process
+    takes its lease again.
+  - A guarded open, a guarded attach or a restore that finds the lease held at a path this process
+    drained waits for it within the caller's deadline, re-probing after 50 µs, doubling to at most
+    1 ms (the measured window, and the drain wait's own 1 ms park), with the owner table unlocked
+    between probes; at the deadline it answers `Refusal::Timeout`. A path with no drain of this
+    process behind it keeps the at-once refusal (`remote_owner()`, the restore's "another process
+    owns the destination"). An unguarded open already waits: it attaches as a client, the drained
+    owner answers nothing, and the open retries the client's `Unavailable` to its deadline.
+  - Why this is not the retry CLAUDE.md section 4 forbids: it is the wait on the fact the call needs
+    (the lease free), at the cause found (a sharer outside this process that lets go at its exec),
+    with the bound section 2 asks, and it fixes no test by waiting longer. The cost: a path this
+    process drained that another process then owns for good is answered `Timeout` at the deadline
+    rather than the at-once Invalid, until this process owns it again or the mark is evicted. Both
+    are typed; Timeout says try again.
+  - Windows has no fork: a child gets only the handles it is given, so the window is Unix's
+    (Linux and macOS), and the wait is the same code on every platform.
+  - Tests: `a_child_sharing_the_lease_holds_it_past_this_processs_drain` (the rig),
+    `a_guarded_reopen_beside_a_child_sharing_the_drained_lease_times_out`,
+    `a_guarded_attach_beside_a_child_sharing_the_drained_lease_times_out`,
+    `a_restore_beside_a_child_sharing_the_drained_lease_times_out` and
+    `a_guarded_reopen_owns_the_database_once_the_sharing_child_lets_go`, red at main f99b758.
+  - Falsified by: an Invalid answered at a path this process drained while no other owner exists;
+    a wait past the caller's deadline; a wait at a path this process never drained; more than 4,096
+    marks held.
+
 Evidence: `database::guards::tests` with a Drop witness: sixteen same-key opens and an unguarded
 one keep one group, which outlives every `Database` clone and drops with the lease free (after the
 writer, readers and flusher drained); other guards, an unguarded owner, another file at the path
