@@ -467,8 +467,9 @@ fn an_attached_clients_local_read_writes_nothing() {
     // AC-T1.10.L3, T-T1.10.L7 (replication.md, "A local read on a replica", amendment 3): an
     // attached client's local read runs on its owner's own state, read-only. Do: a client attached
     // to an owner another process holds, standalone and replicated; a local read of the count; a
-    // local read that inserts; the count read again. Expect: the count 1; the insert refused;
-    // the count still 1, and the client never promoted.
+    // local read that inserts; the count read again; a local read that commits records. Expect:
+    // the count 1; the insert refused; the count still 1; the records commit refused and the
+    // namespace's head unchanged; the client never promoted.
     for replicated in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
@@ -489,6 +490,24 @@ fn an_attached_clients_local_read_writes_nothing() {
             "{wrote:?}"
         );
         assert_eq!(attached.query_local(until(), count).unwrap(), 1);
+        // The records path writes through its own code: a commit in a local read is refused too.
+        let ns = attached.namespace("ledger").unwrap();
+        let head = ns.head(until()).unwrap();
+        let committed = attached.query_local(until(), |db| {
+            Ok(db.records_commit(
+                "ledger",
+                api::Tx {
+                    conds: vec![],
+                    writes: vec![api::Write::Put {
+                        family: "work".into(),
+                        key: vec![9],
+                        value: b"local".to_vec(),
+                    }],
+                },
+            )?)
+        });
+        assert!(committed.is_err(), "{committed:?}");
+        assert_eq!(ns.head(until()).unwrap(), head);
         assert!(
             attached.replica().is_none(),
             "a local read must not promote an attached client"

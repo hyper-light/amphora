@@ -1072,16 +1072,18 @@ impl Database {
         F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
     {
         let database = self.resolve(until)?;
-        if let Some(client) = database.remote_client() {
-            return client.query_local(until, f).map_err(Refusal::from);
-        }
         match &database.shared.writer {
             Writer::Replicated { client, .. } => {
                 let session = Mutex::new(Some(f));
                 let claim = database.application.as_ref();
                 client.read_local(until, |reader| run_query(reader, until, claim, &session))
             }
-            Writer::Local(_) | Writer::Client(_) => database.query(until, f),
+            Writer::Client(backend) => backend
+                .client
+                .for_application(database.application.clone())
+                .query_local(until, f)
+                .map_err(Refusal::from),
+            Writer::Local(_) => database.query(until, f),
         }
     }
 
