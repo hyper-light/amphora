@@ -10791,8 +10791,9 @@ mod tests {
     /// up only by the voter's image) and caught up, runs a checkpoint and a log restart on the
     /// learner's database from a second reader, and reads again; then a read after it.
     /// Expect: the learner installed the image; both of the open read's views are the state
-    /// before it (no table), the restart didn't go through; the read after sees 1 and 2 and every
-    /// page of the image.
+    /// before it (no table), while the second reader, at the same time, sees the image whole (1
+    /// and 2, and all 200 rows of spread); the restart answered Ok(false), not gone through; the
+    /// read after sees the image whole.
     #[test]
     fn a_local_read_open_across_an_image_install_sees_one_side_whole() {
         let dir = tempfile::tempdir().unwrap();
@@ -10848,7 +10849,7 @@ mod tests {
             }
             Ok((values(db)?, spread))
         };
-        let (before, across, restarted) = learner
+        let (before, across, (restarted, beside)) = learner
             .read_local(Instant::now() + HANG_READ, |db| {
                 db.query_transaction(|db| {
                     let before = seen(db)?;
@@ -10863,13 +10864,16 @@ mod tests {
                     catch_up(&mut driven, &mut pump, &clients, 0, 1);
                     // A second reader of the learner's database copies what it may of the log
                     // into the file, and tries to start the log again, while this read is open.
-                    let restarted = learner
+                    // It reads the image whole while this read is open, so the install committed
+                    // under this read and this read didn't hold it off.
+                    let beside = learner
                         .read_local(Instant::now() + HANG_READ, |other| {
                             other.checkpoint()?;
-                            Ok(other.restart_log())
+                            let restarted = other.restart_log();
+                            Ok((restarted, other.query_transaction(|db| seen(db))?))
                         })
                         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-                    Ok((before, seen(db)?, restarted))
+                    Ok((before, seen(db)?, beside))
                 })
             })
             .unwrap();
@@ -10881,9 +10885,14 @@ mod tests {
         );
         assert_eq!(before, (Vec::new(), 0));
         assert_eq!(across, before, "the open read saw part of the image");
+        assert_eq!(
+            beside,
+            (vec![1, 2], 200),
+            "the image wasn't committed beside the open read"
+        );
         assert!(
-            !matches!(restarted, Ok(true)),
-            "the log started again under an open read"
+            matches!(restarted, Ok(false)),
+            "the log restart under an open read: {restarted:?}"
         );
         assert_eq!(
             learner.read_local(Instant::now() + HANG_READ, |db| db.query_transaction(seen)),
