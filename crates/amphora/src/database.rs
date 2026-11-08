@@ -367,6 +367,12 @@ fn owned_again(path: &Path) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// The deadline passed waiting for a lease this process drained: logged with the reason, since
+/// the Timeout itself carries none (an operator tells it from a slow open by this event).
+fn lease_held_since_drain(path: &Path) {
+    tracing::warn!(target: "amphora.records", event = "lease_held_since_drain", path = %path.display(), "the lease is still held since this process drained it: a child this process forked may share it until its exec");
+}
+
 /// Parks before the next probe of a drained path's lease, no later than `until`, and doubles
 /// `pause` up to `LONGEST_PAUSE`.
 fn pause_for_lease(pause: &mut std::time::Duration, until: Instant) {
@@ -613,8 +619,12 @@ impl Database {
             None => resolved_path(path)?,
         };
         let mut pause = FIRST_PAUSE;
+        let mut waited = false;
         loop {
             if Instant::now() >= until {
+                if waited {
+                    lease_held_since_drain(&path);
+                }
                 return Err(Refusal::Timeout);
             }
             let mut owners = locked_until(OWNERS.get_or_init(Mutex::default), until)?;
@@ -697,6 +707,7 @@ impl Database {
                 // process's. An unguarded open waits as a client, below.
                 if (guards.is_some() || restoring) && drained_here(&path)? {
                     drop(owners);
+                    waited = true;
                     pause_for_lease(&mut pause, until);
                     continue;
                 }

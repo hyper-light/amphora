@@ -371,6 +371,7 @@ impl Database {
             let mut pause = FIRST_PAUSE;
             loop {
                 if Instant::now() >= until {
+                    lease_held_since_drain(&path);
                     return Err(Refusal::Timeout);
                 }
                 pause_for_lease(&mut pause, until);

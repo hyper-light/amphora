@@ -326,7 +326,10 @@ additive constructors carry them, and the existing ones keep their behavior:
     with the bound section 2 asks, and it fixes no test by waiting longer. The cost: a path this
     process drained that another process then owns for good is answered `Timeout` at the deadline
     rather than the at-once Invalid, until this process owns it again or the mark is evicted. Both
-    are typed; Timeout says try again.
+    are typed; Timeout says try again. Refusal's Timeout carries no text (a wire enum, changed
+    append-only), so at a marked path's deadline the owner logs the reason, event
+    `lease_held_since_drain` on `amphora.records`: "the lease is still held since this process
+    drained it", which an operator tells from a slow open.
   - Windows has no fork: a child gets only the handles it is given, so the window is Unix's
     (Linux and macOS), and the wait is the same code on every platform.
   - Tests: `a_child_sharing_the_lease_holds_it_past_this_processs_drain` (the rig),
