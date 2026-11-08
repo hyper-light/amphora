@@ -10739,15 +10739,14 @@ mod tests {
     }
     /// AC-T1.10.L1, T-T1.10.L4 (replication.md, "A local read on a replica", amendment 1), on
     /// driven time: a local read open across an image's install sees one side of it, whole. Do: a
-    /// voter, 1 and 2 written beside a table of many pages, its log compacted; a learner added,
-    /// which can catch up only by the voter's image; a local read on the learner that, within one
-    /// read transaction, reads, lets the learner catch up, runs a checkpoint and a log restart on
-    /// the learner's database from a second reader, and reads again; then a read after it.
+    /// voter, 1 and 2 written beside a table of many pages, its log compacted; a local read on its
+    /// learner-to-be that, within one read transaction, reads, has the learner added (it can catch
+    /// up only by the voter's image) and caught up, runs a checkpoint and a log restart on the
+    /// learner's database from a second reader, and reads again; then a read after it.
     /// Expect: the learner installed the image; both of the open read's views are the state
     /// before it (no table), the restart didn't go through; the read after sees 1 and 2 and every
     /// page of the image.
     #[test]
-    #[ignore = "red: an open read adopts an installed image's schema mid-transaction (replication.md, amendment 1, found 2026-11-07)"]
     fn a_local_read_open_across_an_image_install_sees_one_side_whole() {
         let dir = tempfile::tempdir().unwrap();
         let mut driven = Driven::new();
@@ -10781,13 +10780,6 @@ mod tests {
         for _ in 0..64 {
             driven.round(&mut pump);
         }
-        let until = driven.until();
-        driven
-            .answer(
-                &mut pump,
-                &change(voter, until, MemberChange::AddLearner(2)),
-            )
-            .unwrap();
 
         // What one read transaction sees: member_items' values and the pages of spread.
         let seen = |db: &mut Db| -> anyhow::Result<(Vec<u8>, i64)> {
@@ -10813,6 +10805,14 @@ mod tests {
             .read_local(Instant::now() + HANG_READ, |db| {
                 db.query_transaction(|db| {
                     let before = seen(db)?;
+                    // The learner is added only now, so its image installs under this read.
+                    let until = driven.until();
+                    driven
+                        .answer(
+                            &mut pump,
+                            &change(voter, until, MemberChange::AddLearner(2)),
+                        )
+                        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
                     catch_up(&mut driven, &mut pump, &clients, 0, 1);
                     // A second reader of the learner's database copies what it may of the log
                     // into the file, and tries to start the log again, while this read is open.
