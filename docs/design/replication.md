@@ -1432,9 +1432,17 @@ that. The change path is a superseding entry, held to one rule: compatibility.
   stated class must be compatible with the record. If it isn't, the member fences at apply, or is refused
   `Invalid` at open. A leader whose conflicting entry went inert is refused by that same rule, when it applies its
   own entry.
-- **Who proposes.** A leader whose stated class differs from the record but is compatible with it proposes its
-  own. That is the joiner's procedure unchanged: the members reopen stating the joiner's fate, and the first of
-  them to lead records it. A leader with no class recorded proposes as before.
+- **Who proposes: the record only grows between changes of members** (the seam owner's refinement, key
+  amphora-owner-t1-class-and-readers-4cfb126-20261109). A leader proposes the record joined with its own stated fates,
+  restricted to the members its configuration names, voters and learners (`class::joined`), and only when that differs
+  from the record (`Machine::class_proposal`). So:
+  - a fate is added only for a member that has none recorded;
+  - a fate leaves the record only once its member has left the configuration;
+  - a leader whose stated class names fewer members than the record proposes nothing for them.
+  Without this, a leader stating a subset would drop a sitting voter's fate, and two leaders stating different
+  compatible subsets would flip the record each term: churn, and a held quorum lost for no reason. The joiner's
+  procedure is unchanged: a member reopens stating the joiner's fate, and once it leads, its entry records it. A
+  leader with no class recorded proposes its own, restricted the same way.
 - **What can't change in place.** `spanning`, the kind (persisted or replicated), and a sitting member's fate. A
   member that moves to another fate is removed, then the group's class is recorded without it (a reopening leader
   proposes that), and then it is added again under its new fate. Changing the kind or `spanning` takes a new group
@@ -1447,10 +1455,15 @@ that. The change path is a superseding entry, held to one rule: compatibility.
   (`held_half`).
 - **Q1 accepted** (an older binary fences, typed, on a class entry): on T-T1.8.A7's terms, as a stated limit, and
   told to Duplicate Systems for kiln's rollout.
-- **Tests added:** `a_joiners_fate_is_recorded_by_a_compatible_class_entry` (T-T1.8.C5). Three voters record a
-  class. A fourth member is added. The three reopen stating its fate too. The class is then recorded with it, and
-  held answers count it. In the same test, a leader opened stating a conflicting map has its entry go inert, and is
-  fenced.
+- **Tests added:**
+  - `a_joiners_fate_is_recorded_by_a_compatible_class_entry` (T-T1.8.C5): three voters record a class, and a fourth
+    member is added as a learner. A follower reopens stating its fate too, and is handed the lead. Every voter then
+    records the wider class, and none gates held answers. The lead then passes three times between that member and
+    one stating the narrower class, with a write in each lead: no leader proposes, and the record changed twice in
+    all, never back.
+  - `a_class_entry_survives_an_image_and_a_restart` (T-T1.8.C4): an incompatible entry is inert; an image's record
+    refuses a member stating another class; a reopening under another class is refused `Invalid`.
+  - `classes_are_compatible_only_on_every_member_both_name`: the compatibility and the join.
 
 **What it costs.** A class entry moves the applied point, as every entry does. So a write prepared before it, at any
 member, is refused at apply as "the database advanced since preparation": the same typed refusal a concurrent writer
