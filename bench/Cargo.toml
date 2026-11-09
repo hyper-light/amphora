@@ -34,14 +34,6 @@ anyhow = "1"
 # float_roundtrip: the planner bench keeps estimates exactly as EXPLAIN QUERY PLAN FORMAT=JSON gives them.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 
-# The hyper-light crates Amphora links, patched to its vendored copies as its workspace patches them
-# (../Cargo.toml): this workspace of its own doesn't inherit that [patch].
-[patch.crates-io]
-hyper-durable = { path = "../vendor/hyper-raft/crates/hyper-durable" }
-hyper-raft = { path = "../vendor/hyper-raft/crates/hyper-raft" }
-hyper-log = { path = "../vendor/hyper-raft/crates/hyper-log" }
-hyper-block = { path = "../vendor/hyper-raft/crates/hyper-block" }
-
 # AMPHORA_PROFILE (Unix only): a sampling profile of the mixed phase (a timer signal and backtraces: no root, no
 # perf), written as a flamegraph and the hottest frames.
 [target.'cfg(unix)'.dependencies]
