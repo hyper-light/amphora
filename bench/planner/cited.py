@@ -204,6 +204,9 @@ def compute(kind, args, lines):
     if kind == "total":  # engine: its time summed over every query
         (engine,) = args
         return sum(l["ms"][engine] for l in lines.values())
+    if kind == "medtime":  # engine: the median of its best times over the queries it ran (repeat.py's)
+        (engine,) = args
+        return statistics.median(l["ms"][engine] for l in lines.values() if l["ms"].get(engine) is not None)
     raise ValueError(f"no such kind: {kind}")
 
 

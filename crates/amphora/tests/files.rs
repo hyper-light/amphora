@@ -60,8 +60,9 @@ fn log_bytes(path: &std::path::Path) -> u64 {
     std::fs::metadata(wal).map_or(0, |m| m.len())
 }
 
-/// Do: with a log kept to 64 frames across restarts, commit 500 rows of a page each (more than 500
-/// frames of log), start the log again (every frame copied into the file, no reader reading), commit
+/// Do: with a log kept to 64 frames across restarts, commit 500 rows of a page each, their bodies
+/// random so that a commit's records (decision 37) don't compress them (more than 500 frames of
+/// log), start the log again (every frame copied into the file, no reader reading), commit
 /// one row, and start it again. Expect: the first restart cuts the log's file, past its bound, to
 /// nothing; the row's commit grows it again to a few frames; the second restart, of a log within its
 /// bound, keeps its file's length (decision 13); and every row reads back after opening the database
@@ -78,7 +79,7 @@ fn a_restart_cuts_a_log_past_its_bound_to_nothing_and_keeps_one_within_it() {
         db.transaction(|db| {
             for n in 0..500 {
                 db.query(
-                    "INSERT INTO t (n, body) VALUES (?1, zeroblob(4000))",
+                    "INSERT INTO t (n, body) VALUES (?1, randomblob(4000))",
                     [Value::from_i64(n)],
                     |_| Ok(true),
                 )?;
@@ -122,7 +123,8 @@ fn a_restart_cuts_a_log_past_its_bound_to_nothing_and_keeps_one_within_it() {
 type Times = (std::time::Duration, std::time::Duration);
 
 /// A database whose log's file was grown to 1 GiB, the bound past which a restart cuts it by
-/// default (rows of a page, in transactions of 64 MiB), all of it copied into the file and the log
+/// default (rows of a page of random bytes, which a commit's records don't compress, in
+/// transactions of 64 MiB), all of it copied into the file and the log
 /// started again with its file kept; then three times a row committed and the log restarted
 /// keeping its file, and once a row committed and the log restarted cutting it, each restart timed
 /// and then a commit of 4 MiB and a flush of the log after it: the times kept, and the time cut.
@@ -137,7 +139,7 @@ fn restarts_kept_then_cut() -> (Vec<Times>, Times) {
         db.transaction(|db| {
             for _ in 0..rows {
                 db.query(
-                    "INSERT INTO t (n, body) VALUES (?1, zeroblob(4000))",
+                    "INSERT INTO t (n, body) VALUES (?1, randomblob(4000))",
                     [Value::from_i64(next)],
                     |_| Ok(true),
                 )?;

@@ -829,27 +829,29 @@ finished, under 1 when the engine was faster; and on how many it was the faster)
 |---|---:|---:|---:|---:|
 | JOB (113) | 1.101, 63 faster | 1.013, 64 faster | 0.435, 75 faster | 0.354, 83 faster |
 | TPC-H SF 1 (22) | 1.417, 12 faster | 0.481, 16 faster | 0.126, 20 faster | 0.535, 19 faster |
-| TPC-H SF 10 (22) | 1.198 (21 of 22), 13 faster | 0.289, 16 faster | 0.021, 22 faster | 0.329, 20 faster |
+| TPC-H SF 10 (22) | 1.198 (21 of 22), 13 faster | 0.289, 16 faster | 0.021, 22 faster | 0.328, 20 faster |
 
 JOB's and SF 1's times are their second passes', timed by fresh processes on loaded data: the first
 passes, timed by the process that had just loaded them, ran slower (DuckDB on all 32 threads
 throughout, the others over JOB's first hour and a half), and `record.sh` now loads in a process of
 its own (c652376). SF 10's are the best of its passes a, b and c, each query's fastest. PostgreSQL
-ran in Docker Desktop, which stopped twice; its SF 10 and JOB times are passes of its own (JOB's
-right after loading it), and it has no time in SF 10's passes b and c. Every engine counted the same
+ran in Docker Desktop, which stopped three times; its JOB times are a pass of its own, right after
+loading it, and its SF 10 times the best of a pass of its own and its shares of passes b and c. Every engine counted the same
 rows for every query; SQLite passed the 600 s deadline on SF 10's q07 in every pass. The record says
 what each left out and why.
 
 **The repeat** (the plan's test: two passes of one build on one machine record the same estimates,
 and median run times within 5%): every pair of passes recorded the same estimates and counts (0 of
-JOB's 1,090 counters and 0 of TPC-H's 135 differ, at SF 1 and at SF 10). Timed alike by fresh
-processes, with the records that ran beside other work on jupiter run again (a monitor's samples and
-`bench/planner/disturbed.py` name them), TPC-H SF 10's passes b and c are within 5% for every engine
-(Amphora 1.006, SQLite 0.990, DuckDB 1.037, on all 32 threads 1.001), and JOB's passes b and d for
-Amphora (0.973), SQLite (0.982) and DuckDB (0.959) but not DuckDB on all 32 threads (1.155 by the
-median of its best times, 1.033 by the median of its queries' ratios). PostgreSQL's 51 undisturbed
-queries of the 54 it ran in JOB's pass d are within 5% of its own earlier pass (0.967); Docker
-Desktop stopped before its other 59 and before SF 10's passes b and c.
+JOB's 1,090 counters and 0 of TPC-H's 135 differ, at SF 1 and at SF 10). Timed alike on a quiet
+machine, with the records that ran beside other work on jupiter left out or run again (a monitor's
+samples and `bench/planner/disturbed.py` name them), every engine is within 5%: TPC-H SF 10's passes
+b and c (Amphora 1.006, SQLite 0.990, DuckDB 1.037, on all 32 threads 1.001, PostgreSQL's shares
+1.013), SF 1's passes d and e (0.983, 0.982, 0.986 and 1.002), and JOB's passes e and f (0.992,
+0.977, 1.000 and 0.994; PostgreSQL's own pass against its share of pass d 0.984). DuckDB on all 32
+threads runs slower the older the process timing it: JOB's 16a, 16c, 17a and 32b took 2.4 to 4.9
+times as long late in a pass as in a process started for them, so JOB's passes are compared only
+when each was timed by one process from start to end, and b against d, resumed part way, set it at
+1.155.
 
 **The counters off** (the step's fourth criterion: the bench suite's statements with the row
 counters off within 2% of the change's parent, best of 3): 9cfc8b9's record left 56 of its 104
@@ -877,7 +879,7 @@ measurement. Each number taken from step 3 is as
 `bench/planner/cited.tsv` lists every one with its records and how it is computed;
 `bench/planner/cited.py` recomputes each by `summary.py`'s definitions, and with `--job` the counts
 this section takes from JOB's text (gregrahn/join-order-benchmark at a396036):
-`python3 -I bench/planner/cited.py --job DIR` ends "cited.py: 84 numbers from step 3's records, 0
+`python3 -I bench/planner/cited.py --job DIR` ends "cited.py: 91 numbers from step 3's records, 0
 differ; 5 from JOB's text, 0 differ".
 
 Step 3 measured f734df4's estimator. Decision 13 (step 4, d762dc2) and step 5 (10f2461) have changed
@@ -885,6 +887,19 @@ the estimates since, so a change is measured by `record.sh` on the change and on
 machine, each run begun at a load under 2 (CLAUDE.md §7): step 3's numbers set the targets, and the
 parent's pass says what the change itself moved. The first such pass is of this branch, before rank
 1.
+
+Ada's ask of 2026-10-29 sets the bar above these targets: JOB's median best query time from 784.2 ms
+to 78.4 ms or less and TPC-H SF 10's from 23,287.8 ms to 2,328.8 ms or less, every answer unchanged
+(the goal that follows this plan). The changes ranked here are the planner's share of it, and step
+3's records say the planner can't carry it alone. PostgreSQL, on one thread with hash joins, runs
+JOB's median query in 259.1 ms, and DuckDB on all 32 threads in 332.8 ms, 3.3 and 4.2 times the
+target; at SF 10 PostgreSQL's median is 5,218 ms. SF 10's median queries read lineitem or orders
+whole whatever the join order (Amphora's q06 2.215e+04 ms, q12 2.440e+04), so a better plan barely
+moves that median. The rest is execution, which this list doesn't rank: no hash join is weighed where
+the table joined has any seek (`rhs_has_selective_seek`, `optimizer/join.rs` lines 457 to 467 and
+706), so none ran on JOB's or TPC-H's indexed keys; each `Column` decodes its record from the first
+column (`vdbe/execute.rs` line 2188); a scan reads one page at a time; and a query runs on one
+thread. The goal that follows plans those, with these ranks inside it.
 
 Step 3's records say where the gain is. Of JOB's 113 queries, the 52 whose largest intermediate
 result is misestimated by 1,000 times or more (the factor every estimator routinely erred by, f11)
@@ -1126,7 +1141,7 @@ value (rank 12).
   (f33). A filter only drops rows no join would keep; its false positives go on to the search.
 - **From step 3.** At SF 10 q09 reads lineitem first and searches part for each of its 59,986,052
   rows, of which 3,261,613 pass part's filter: 1.585e+05 ms where PostgreSQL takes 2.380e+04. q05
-  takes 1.634e+04 against 8.15e+03, q08 3.112e+04 against 2.19e+03.
+  takes 1.634e+04 against 8.05e+03, q08 3.112e+04 against 2.19e+03.
 - **Findings.** f33 (A): LIP, predicate transfer (3.3 times over Bloom join on TPC-H, its join phase
   robust to the order), POLAR and diamond-hardened joins; f32 (A).
 - **Audit rows.** 13, the Bloom filters.

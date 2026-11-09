@@ -2,19 +2,23 @@
 //! what a packed log holds, whole images and deltas, reads back the same through each way the
 //! engine reads its log (a connection with nothing cached, the checkpoint, recovery on open), whole
 //! commits or none survive a cut, and a record whose checksums hold but that doesn't decode is
-//! refused rather than read (AC-T1.4.4, AC-T1.3.1).
+//! refused rather than read (AC-T1.4.4, AC-T1.3.1). The same of a mixed log (decision 37), whose
+//! spills are page frames written over and whose commits are records.
 
 use amphora_engine::{
-    CheckpointMode, ConnectOpts, Connection, Database, DatabaseOpts, LimboError, Numeric,
-    OpenOptions, PlatformIO, SqliteDialect, Value,
+    CheckpointMode, ConnectOpts, Connection, Database, DatabaseOpts, LimboError, LogFormat,
+    Numeric, OpenOptions, PlatformIO, SqliteDialect, Value,
 };
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// The log header's file format for a packed generation, and for SQLite's one page a frame.
+/// The log header's file format for a packed generation, a mixed one and SQLite's one page a frame.
 const PACKED_FORMAT: u32 = 0x414d_5002;
+const MIXED_FORMAT: u32 = 0x414d_5003;
 const PAGE_FORMAT: u32 = 3_007_000;
+/// A mixed generation's mark of a record's first slot.
+const RECORD_HEAD: u32 = 0x8000_0000;
 const HEADER: usize = 32;
 const FRAME_HEADER: usize = 24;
 const PAGE: usize = 4096;
@@ -137,12 +141,22 @@ fn truncate(conn: &Arc<Connection>) {
 /// written each time, and a database that checks whole.
 #[test]
 fn what_a_packed_log_holds_reads_back_through_every_path() {
+    reads_back_through_every_path(LogFormat::Packed, PACKED_FORMAT);
+}
+
+/// The same of a mixed log (decision 37), whose commits are records too.
+#[test]
+fn what_a_mixed_log_holds_reads_back_through_every_path() {
+    reads_back_through_every_path(LogFormat::Mixed, MIXED_FORMAT);
+}
+
+fn reads_back_through_every_path(format: LogFormat, file_format: u32) {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("packed.db");
+    let path = dir.path().join("records.db");
     let mut want = Vec::new();
     {
         let db = open(&path);
-        db.wal_pack(true).unwrap();
+        db.wal_format(format).unwrap();
         let conn = connect(&db);
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)")
             .unwrap();
@@ -151,7 +165,7 @@ fn what_a_packed_log_holds_reads_back_through_every_path() {
         want.extend(insert(&conn, 400..1600, 3000, true));
         // Rows of 600 KB: records of nothing but their overflow pages, which don't compress.
         want.extend(insert(&conn, 1600..1602, 600_000, true));
-        assert_eq!(wal_format(&path), PACKED_FORMAT);
+        assert_eq!(wal_format(&path), file_format);
         let wal = std::fs::read(wal_path(&path)).unwrap();
         let stored: Vec<u32> = records(&wal)
             .iter()
@@ -160,18 +174,27 @@ fn what_a_packed_log_holds_reads_back_through_every_path() {
                 u32::from_be_bytes(wal[at..at + 4].try_into().unwrap())
             })
             .collect();
-        assert!(stored.iter().any(|n| *n > 0), "no record compressed");
-        assert!(stored.contains(&0), "no record stored as it is: {stored:?}");
+        if format == LogFormat::Packed {
+            assert!(stored.iter().any(|n| *n > 0), "no record compressed");
+            assert!(stored.contains(&0), "no record stored as it is: {stored:?}");
+        } else {
+            // A mixed generation stores a record of images alone as it is (decision 37): new rows'
+            // pages are images; the records whose pages were logged before carry deltas.
+            assert!(
+                stored.contains(&0),
+                "no record of images stored as it is: {stored:?}"
+            );
+        }
 
         // A connection with nothing cached reads every page from the log's records.
         assert_eq!(table(&connect(&db)), want);
         integrity(&connect(&db));
 
-        // The checkpoint reads the records too, and the next generation is packed as well.
+        // The checkpoint reads the records too, and the next generation takes the format as well.
         truncate(&conn);
         assert_eq!(table(&connect(&db)), want);
         want.extend(insert(&conn, 2000..2100, 3000, false));
-        assert_eq!(wal_format(&path), PACKED_FORMAT);
+        assert_eq!(wal_format(&path), file_format);
         assert_eq!(table(&connect(&db)), want);
     }
     // Opened again: recovery reads the log record by record.
@@ -191,7 +214,7 @@ fn a_database_opened_on_a_packed_log_doesnt_share_its_pages() {
     let path = dir.path().join("packed.db");
     let want = {
         let db = open(&path);
-        db.wal_pack(true).unwrap();
+        db.wal_format(LogFormat::Packed).unwrap();
         let conn = connect(&db);
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)")
             .unwrap();
@@ -245,12 +268,22 @@ fn entries(wal: &[u8]) -> Vec<(u8, u8)> {
 /// and never past it, and every row as last written each time.
 #[test]
 fn pages_changed_again_and_again_are_logged_as_deltas_and_read_back() {
+    deltas_read_back(LogFormat::Packed);
+}
+
+/// The same in a mixed log (decision 37).
+#[test]
+fn pages_changed_again_and_again_in_a_mixed_log_are_logged_as_deltas() {
+    deltas_read_back(LogFormat::Mixed);
+}
+
+fn deltas_read_back(format: LogFormat) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("deltas.db");
     let mut want: Vec<(i64, Vec<u8>)>;
     {
         let db = open(&path);
-        db.wal_pack(true).unwrap();
+        db.wal_format(format).unwrap();
         let conn = connect(&db);
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)")
             .unwrap();
@@ -287,6 +320,15 @@ fn pages_changed_again_and_again_are_logged_as_deltas_and_read_back() {
             entries.len()
         );
         assert_eq!(deepest, 8, "chains run to the most allowed, and no further");
+        // Records that carry deltas are compressed, in either format.
+        let compressed = records(&wal)
+            .iter()
+            .filter(|(head, _)| {
+                let at = head + FRAME_HEADER;
+                u32::from_be_bytes(wal[at..at + 4].try_into().unwrap()) > 0
+            })
+            .count();
+        assert!(compressed > 0, "no record of deltas compressed");
         integrity(&connect(&db));
         truncate(&conn);
         assert_eq!(table(&connect(&db)), want);
@@ -333,14 +375,14 @@ fn run(conn: &Arc<Connection>, sql: &str, params: Vec<Value>) {
 /// delta).
 #[test]
 fn savepoints_rolled_back_amid_spills_keep_exactly_what_was_kept() {
-    for pack in [false, true] {
+    for format in [LogFormat::Pages, LogFormat::Packed, LogFormat::Mixed] {
         for seed in 1..=8u64 {
-            savepoints_amid_spills(pack, seed);
+            savepoints_amid_spills(format, seed);
         }
     }
 }
 
-fn savepoints_amid_spills(pack: bool, seed: u64) {
+fn savepoints_amid_spills(format: LogFormat, seed: u64) {
     {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("savepoints.db");
@@ -348,7 +390,7 @@ fn savepoints_amid_spills(pack: bool, seed: u64) {
         let mut model: std::collections::BTreeMap<i64, Vec<u8>> = Default::default();
         {
             let db = open(&path);
-            db.wal_pack(pack).unwrap();
+            db.wal_format(format).unwrap();
             let conn = connect(&db);
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)")
                 .unwrap();
@@ -408,7 +450,7 @@ fn savepoints_amid_spills(pack: bool, seed: u64) {
                 assert_eq!(
                     table(&connect(&db)),
                     want,
-                    "pack {pack}, seed {seed}, transaction {txn}"
+                    "{format:?}, seed {seed}, transaction {txn}"
                 );
             }
             integrity(&connect(&db));
@@ -418,7 +460,7 @@ fn savepoints_amid_spills(pack: bool, seed: u64) {
         assert_eq!(
             table(&connect(&db)),
             want,
-            "pack {pack}, seed {seed}, opened again"
+            "{format:?}, seed {seed}, opened again"
         );
     }
 }
@@ -434,7 +476,7 @@ fn a_transaction_spilled_into_a_packed_log_commits_or_rolls_back_whole() {
     let mut want = Vec::new();
     {
         let db = open(&path);
-        db.wal_pack(true).unwrap();
+        db.wal_format(LogFormat::Packed).unwrap();
         let conn = connect(&db);
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)")
             .unwrap();
@@ -477,7 +519,7 @@ fn a_log_keeps_the_format_its_generation_began_with() {
             .unwrap();
         want.extend(insert(&conn, 0..100, 3000, false));
         assert_eq!(wal_format(&path), PAGE_FORMAT);
-        db.wal_pack(true).unwrap();
+        db.wal_format(LogFormat::Packed).unwrap();
         want.extend(insert(&conn, 100..200, 3000, false));
         assert_eq!(
             wal_format(&path),
@@ -525,20 +567,34 @@ fn checksum(bytes: &[u8], seed: (u32, u32), big_endian: bool) -> (u32, u32) {
     (s0, s1)
 }
 
-/// The first slot of each record in a packed log, with its slot count, in order.
+/// The first slot of each record in a packed or mixed log with no restart behind it, with its slot
+/// count, in order; a mixed log's page frames are passed over.
 fn records(wal: &[u8]) -> Vec<(usize, u32)> {
+    records_and_frames(wal).0
+}
+
+/// A packed or mixed log's records, as [`records`], and how many page frames it holds.
+fn records_and_frames(wal: &[u8]) -> (Vec<(usize, u32)>, usize) {
+    let mixed = u32::from_be_bytes(wal[4..8].try_into().unwrap()) == MIXED_FORMAT;
     let mut found = Vec::new();
+    let mut frames = 0;
     let mut at = HEADER;
     while at + FRAME_HEADER + PAGE <= wal.len() {
         let field = u32::from_be_bytes(wal[at..at + 4].try_into().unwrap());
         assert!(
             field != 0 && field != CONTINUATION,
-            "a record begins at {at}"
+            "a record or page frame begins at {at}"
         );
-        found.push((at, field));
-        at += field as usize * (FRAME_HEADER + PAGE);
+        if mixed && field & RECORD_HEAD == 0 {
+            frames += 1;
+            at += FRAME_HEADER + PAGE;
+            continue;
+        }
+        let slots = if mixed { field & !RECORD_HEAD } else { field };
+        found.push((at, slots));
+        at += slots as usize * (FRAME_HEADER + PAGE);
     }
-    found
+    (found, frames)
 }
 
 /// Do: open a packed log whose last record's checksums are recomputed after its payload was
@@ -550,7 +606,7 @@ fn a_record_whose_checksums_hold_but_that_doesnt_decode_is_refused() {
     let path = dir.path().join("damaged.db");
     {
         let db = open(&path);
-        db.wal_pack(true).unwrap();
+        db.wal_format(LogFormat::Packed).unwrap();
         let conn = connect(&db);
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)")
             .unwrap();
@@ -607,7 +663,7 @@ fn a_record_cut_short_takes_only_its_own_commit() {
     let kept;
     {
         let db = open(&path);
-        db.wal_pack(true).unwrap();
+        db.wal_format(LogFormat::Packed).unwrap();
         let conn = connect(&db);
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)")
             .unwrap();
@@ -624,4 +680,103 @@ fn a_record_cut_short_takes_only_its_own_commit() {
     let conn = connect(&db);
     assert_eq!(table(&conn), kept);
     integrity(&conn);
+}
+
+/// Do: in a mixed log (decision 37), with a connection cache of 16 pages, insert rows of a page each
+/// and change them again in one transaction, so its pages spill into the log and spill again, then
+/// commit; read the rows on a fresh connection, after opening the database again, and through the
+/// shared pages. Expect: the log holds page frames (the spills, each page's written over) and the
+/// commit's records, marked apart from them; every row as written each time; and a database opened
+/// on a mixed log shares its pages, where one on a packed log refuses (decisions 20 and 26).
+#[test]
+fn a_mixed_log_holds_its_spills_as_pages_and_its_commits_as_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed.db");
+    let mut want;
+    {
+        let db = open(&path);
+        db.wal_format(LogFormat::Mixed).unwrap();
+        let conn = connect(&db);
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)")
+            .unwrap();
+        conn.execute("PRAGMA cache_size = 16").unwrap();
+        truncate(&conn);
+        conn.execute("BEGIN").unwrap();
+        want = insert_in(&conn, 0..200, 3000, false);
+        let mut update = conn.prepare("UPDATE t SET body = ? WHERE id = ?").unwrap();
+        for row in want.iter_mut().step_by(3) {
+            row.1[0] ^= 0xff;
+            update.reset().unwrap();
+            update
+                .bind_at(NonZero::new(1).unwrap(), Value::from_slice(&row.1).unwrap())
+                .unwrap();
+            update
+                .bind_at(NonZero::new(2).unwrap(), Value::from_i64(row.0))
+                .unwrap();
+            update.run_ignore_rows().unwrap();
+        }
+        drop(update);
+        let dirtied = conn.dirty_pages();
+        conn.execute("COMMIT").unwrap();
+        assert_eq!(wal_format(&path), MIXED_FORMAT);
+        let wal = std::fs::read(wal_path(&path)).unwrap();
+        let (records, frames) = records_and_frames(&wal);
+        assert!(frames > 0, "no spill wrote a page frame");
+        assert!(
+            frames <= dirtied,
+            "{frames} page frames for the {dirtied} pages the transaction dirtied"
+        );
+        assert!(!records.is_empty(), "the commit wrote no record");
+        let last = records.last().unwrap();
+        let end = last.0 + last.1 as usize * (FRAME_HEADER + PAGE);
+        assert_eq!(end, wal.len(), "the commit's records end the log");
+        assert_eq!(table(&connect(&db)), want);
+        integrity(&connect(&db));
+    }
+    // Opened again: recovery reads page frames and records side by side, and the pages are shared.
+    let db = open(&path);
+    db.share_pages(1024).unwrap();
+    let readers: Vec<_> = (0..2).map(|_| connect(&db)).collect();
+    for reader in &readers {
+        assert_eq!(table(reader), want);
+    }
+    let shared = db.shared_page_counts().unwrap();
+    assert!(
+        shared.hits > 0,
+        "no page was read from the shared pages: {shared:?}"
+    );
+    integrity(&readers[0]);
+}
+
+/// Do: open a database whose log's header names a format this engine doesn't write (its
+/// checksum made to hold). Expect: the database is refused as corrupt, not its log read as page
+/// frames (decision 37: an older binary reading a newer generation would map records' slots to pages
+/// that aren't there).
+#[test]
+fn a_log_of_a_format_not_known_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unknown.db");
+    {
+        let db = open(&path);
+        db.wal_format(LogFormat::Mixed).unwrap();
+        let conn = connect(&db);
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)")
+            .unwrap();
+        insert(&conn, 0..20, 3000, false);
+    }
+    let mut wal = std::fs::read(wal_path(&path)).unwrap();
+    let big_endian = u32::from_be_bytes(wal[0..4].try_into().unwrap()) & 1 == 1;
+    wal[4..8].copy_from_slice(&0x414d_5004u32.to_be_bytes());
+    let (c1, c2) = checksum(&wal[0..24], (0, 0), big_endian);
+    wal[24..28].copy_from_slice(&c1.to_be_bytes());
+    wal[28..32].copy_from_slice(&c2.to_be_bytes());
+    std::fs::write(wal_path(&path), &wal).unwrap();
+
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
+    match Database::open(io, path.to_str().unwrap(), options) {
+        Err(LimboError::Corrupt(why)) => assert!(why.contains("isn't known"), "{why}"),
+        Err(other) => panic!("refused, but not as corrupt: {other}"),
+        Ok(_) => panic!("a log of a format not known was opened"),
+    }
 }

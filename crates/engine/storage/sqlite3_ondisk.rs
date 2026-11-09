@@ -55,7 +55,7 @@ use pack1::{I32BE, U16BE, U32BE};
 use tracing::{instrument, Level};
 
 use super::changes::ChangeLog;
-use super::packed::{self, Record, Records};
+use super::packed::{self, LogFormat, Record, Records};
 use super::pager::PageRef;
 pub use super::pager::{PageContent, PageInner};
 use super::wal::{OverflowFallbackCoverage, TursoRwLock, WalSharedMetadata, WalSharedRuntime};
@@ -1600,7 +1600,7 @@ impl BuildSharedWal {
                 )),
                 durable: SpinLock::new(None),
                 legacy_durable_allowed: true,
-                pack: AtomicBool::new(false),
+                format: AtomicU32::new(packed::PAGE_FORMAT),
                 records: Arc::new(SpinLock::new(Records::default())),
                 changes: SpinLock::new(ChangeLog::default()),
                 #[cfg(test)]
@@ -1696,10 +1696,11 @@ impl BuildSharedWal {
                     }
                 }
                 BuildSharedWalPhase::Done => {
-                    // Amphora: a packed record checksummed whole that doesn't decode is no torn
-                    // write: the log is refused, not cut short there.
+                    // Amphora: a record checksummed whole that doesn't decode is no torn write,
+                    // nor is a header of a format this engine doesn't write: the log is refused,
+                    // not cut short there.
                     if let Some(why) = self.reader.as_ref().and_then(|r| r.corrupt()) {
-                        return Err(LimboError::Corrupt(format!("packed log: {why}")).into());
+                        return Err(LimboError::Corrupt(format!("the log: {why}")).into());
                     }
                     return Ok(IOResult::Done(self.wal_file_shared.clone()));
                 }
@@ -1740,8 +1741,8 @@ struct StreamingState {
     page_size: usize,
     use_native_endian: bool,
     header_valid: bool,
-    /// Amphora: the generation is packed (its header's format, `packed.rs`).
-    packed: bool,
+    /// Amphora: the generation's format (its header's, `packed::LogFormat`).
+    format: LogFormat,
     /// Amphora: the most slots a record takes (`packed::most_slots`).
     most_slots: u32,
     /// Amphora: the packed record being read: its first slot, its slots, its payload so far.
@@ -1776,7 +1777,7 @@ impl StreamingWalReader {
                 page_size: 0,
                 use_native_endian: false,
                 header_valid: false,
-                packed: false,
+                format: LogFormat::Pages,
                 most_slots: 0,
                 record: None,
                 pending_records: Vec::new(),
@@ -1894,8 +1895,14 @@ impl StreamingWalReader {
             st.cumulative_checksum = (c1, c2);
             st.last_valid_checksum = (c1, c2);
             st.header_valid = true;
-            st.packed = format == packed::PACKED_FORMAT;
-            if st.packed {
+            // A format this engine doesn't write is refused, never read as page frames: an older
+            // binary reading a newer generation would map its records' slots to pages that aren't
+            // there (decision 37).
+            match LogFormat::of(format) {
+                Some(known) => st.format = known,
+                None => st.corrupt = Some(format!("the log's format {format:#x} isn't known")),
+            }
+            if st.format.holds_records() {
                 match usize::try_from(page_sz)
                     .map_err(|_| LimboError::IntegerOverflow)
                     .and_then(packed::most_slots)
@@ -1987,7 +1994,20 @@ impl StreamingWalReader {
             }
 
             st.cumulative_checksum = calc;
-            if st.packed {
+            // Amphora: a slot of a record (in a packed generation, every slot; in a mixed one, a
+            // record's first slot and those after it until it ends), or a page frame. In a mixed
+            // generation a page frame's page number is below `packed::RECORD_HEAD`, and one that
+            // isn't, or that comes inside a record, ends the log there (decision 37).
+            let slot = match st.format {
+                LogFormat::Pages => false,
+                LogFormat::Packed => true,
+                LogFormat::Mixed => {
+                    st.record.is_some()
+                        || page_no == packed::CONTINUATION
+                        || page_no >= packed::RECORD_HEAD
+                }
+            };
+            if slot {
                 if !self.take_slot(&mut st, page_no, db_size, page) {
                     break;
                 }
@@ -2016,20 +2036,23 @@ impl StreamingWalReader {
         pos
     }
 
-    /// Amphora: takes a slot of a packed generation, its salts and checksum already checked: its
+    /// Amphora: takes a slot of a record, its salts and checksum already checked: its
     /// frame header's page field and database size, and its page body. False when the log ends
     /// before it, at a slot out of a record's order. A record whose slots all hold but that
     /// doesn't decode ends it too, kept in `corrupt` so the log is refused.
     fn take_slot(&self, st: &mut StreamingState, field: u32, db_size: u32, body: &[u8]) -> bool {
         let frame = st.frame_idx;
         let (head, slots, mut payload) = match st.record.take() {
-            None if packed::is_first_slot(field) && field <= st.most_slots => {
-                let capacity = usize::try_from(field)
-                    .ok()
-                    .and_then(|slots| slots.checked_mul(body.len()))
-                    .unwrap_or(0);
-                (frame, field, Vec::with_capacity(capacity))
-            }
+            None => match st.format.head_slots(field) {
+                Some(slots) if slots <= st.most_slots => {
+                    let capacity = usize::try_from(slots)
+                        .ok()
+                        .and_then(|slots| slots.checked_mul(body.len()))
+                        .unwrap_or(0);
+                    (frame, slots, Vec::with_capacity(capacity))
+                }
+                _ => return false,
+            },
             Some(record) if field == packed::CONTINUATION => record,
             _ => return false,
         };

@@ -202,7 +202,7 @@ impl Amphora {
         let groups = Groups::start(groups, config, |g| {
             let db = Db::open_sharing(&dir.join(format!("bench-{g}.db")), &sharing)?;
             if pack_log {
-                db.pack_log(true)?;
+                db.log_format(amphora::db::LogFormat::Packed)?;
             }
             for s in schema::SCHEMA {
                 db.exec(s)?;

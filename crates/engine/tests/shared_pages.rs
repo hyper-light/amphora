@@ -5,7 +5,7 @@
 //! written over, not a frame of a write rolled back (AC-T1.1.1, AC-T1.1.6).
 
 use amphora_engine::{
-    ConnectOpts, Connection, Database, DatabaseOpts, Numeric, OpenOptions, PlatformIO,
+    ConnectOpts, Connection, Database, DatabaseOpts, LogFormat, Numeric, OpenOptions, PlatformIO,
     SqliteDialect, Value,
 };
 use std::collections::BTreeMap;
@@ -325,9 +325,10 @@ fn body(id: i64, version: u64, len: usize) -> String {
 /// transactions of one row to hundreds and
 /// rolls some back; checkpoints of every mode run; a random reader reads the table or rows by key,
 /// each read checked against a model.
-fn model(seed: u64) {
+fn model(seed: u64, format: LogFormat) {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), true);
+    db.wal_format(format).unwrap();
     let writer = connect(&db);
     writer.execute("PRAGMA cache_size = 200").unwrap();
     writer
@@ -440,7 +441,16 @@ fn model(seed: u64) {
 #[test]
 fn readers_sharing_pages_never_read_a_version_they_dont_see() {
     for seed in 0..16 {
-        model(seed);
+        model(seed, LogFormat::Pages);
+    }
+}
+
+/// The same on a mixed log (decision 37): pages read from its records, the writer's spills and
+/// rollbacks among page frames, shared as a page frame's are.
+#[test]
+fn readers_sharing_a_mixed_logs_pages_never_read_a_version_they_dont_see() {
+    for seed in 0..16 {
+        model(seed, LogFormat::Mixed);
     }
 }
 

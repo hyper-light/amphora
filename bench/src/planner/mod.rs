@@ -5,8 +5,11 @@
 //! planner's estimate of them (`Connection::set_row_counters`); every engine's runs are timed,
 //! best of `--runs`, each begun once the load average is under `--max-load`. Each line of
 //! `--out` is a JSON record: the run's hardware, commit, date and engines first, then one a
-//! table loaded and one a query and engine. bench/planner/summary.py reads them.
+//! table loaded and one a query and engine. bench/planner/summary.py reads them. With
+//! `--answers <dir>`, each query's first timed run on each engine writes its whole answer there
+//! (`answers.rs`), which bench/planner/answers.py compares.
 
+mod answers;
 mod data;
 mod engines;
 
@@ -14,6 +17,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use answers::{Answer, Refusal};
 use data::Format;
 use engines::{for_dialect, Amphora, Count, Duck, Outcome, Postgres, Sqlite, Target};
 
@@ -34,6 +38,7 @@ struct Opts {
     load_wait: Duration,
     out: PathBuf,
     resume: bool,
+    answers: Option<PathBuf>,
 }
 
 fn opts() -> anyhow::Result<Opts> {
@@ -54,6 +59,7 @@ fn opts() -> anyhow::Result<Opts> {
         load_wait: Duration::from_secs(3600),
         out: PathBuf::new(),
         resume: false,
+        answers: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -76,7 +82,8 @@ fn opts() -> anyhow::Result<Opts> {
             "--load-wait-s" => o.load_wait = Duration::from_secs(v()?.parse()?),
             "--out" => o.out = v()?.into(),
             "--resume" => o.resume = true,
-            other => anyhow::bail!("unknown argument {other} (--planner takes --bench job|tpch, --data, --queries, --sf, --dir, --targets, --runs, --timeout-s, --count-timeout-s, --dsn, --cache-mib, --only, --max-load, --load-wait-s, --out, --resume)"),
+            "--answers" => o.answers = Some(v()?.into()),
+            other => anyhow::bail!("unknown argument {other} (--planner takes --bench job|tpch, --data, --queries, --sf, --dir, --targets, --runs, --timeout-s, --count-timeout-s, --dsn, --cache-mib, --only, --max-load, --load-wait-s, --out, --resume, --answers)"),
         }
     }
     anyhow::ensure!(matches!(o.bench.as_str(), "job" | "tpch"), "--bench is job or tpch");
@@ -207,20 +214,29 @@ fn host(dir: &Path) -> serde_json::Value {
     })
 }
 
-/// The time now, UTC, to the second: `YYYY-MM-DDTHH:MM:SSZ` (Hinnant's civil-from-days).
+/// The time now, UTC, to the second: `YYYY-MM-DDTHH:MM:SSZ`.
 fn utc_now() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
+    let (year, month, day) = civil(days).unwrap_or((1970, 1, 1));
     format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rest / 3600, rest % 3600 / 60, rest % 60)
+}
+
+/// The proleptic Gregorian year, month and day `days` after 1970-01-01 (Hinnant's
+/// civil_from_days, http://howardhinnant.github.io/date_algorithms.html); None where the arithmetic
+/// would pass `i64`.
+fn civil(days: i64) -> Option<(i64, i64, i64)> {
+    let z = days.checked_add(719_468)?;
+    // 400-year eras of 146,097 days; the day and year of the era are bounded by them.
+    let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
+    let yoe = doe.checked_sub(doe / 1460)?.checked_add(doe / 36_524)?.checked_sub(doe / 146_096)? / 365;
+    let doy = doe.checked_sub(yoe.checked_mul(365)?.checked_add(yoe / 4)?.checked_sub(yoe / 100)?)?;
+    // Months from March, so February's leap day falls last.
+    let mp = doy.checked_mul(5)?.checked_add(2)? / 153;
+    let day = doy.checked_sub(mp.checked_mul(153)?.checked_add(2)? / 5)?.checked_add(1)?;
+    let month = if mp < 10 { mp.checked_add(3)? } else { mp.checked_sub(9)? };
+    let year = era.checked_mul(400)?.checked_add(yoe)?.checked_add(i64::from(month <= 2))?;
+    Some((year, month, day))
 }
 
 #[cfg(not(windows))]
@@ -337,10 +353,14 @@ pub fn main() -> anyhow::Result<()> {
         "max_load": o.max_load,
         "engines": engines,
     }))?;
+    // --answers: a directory for the benchmark (TPC-H's named with its scale factor, tpch-sf1, as
+    // record.sh names its benchmarks), and in it one for each query.
+    let answers_root = o.answers.as_ref().map(|dir| dir.join(if o.bench == "tpch" { format!("tpch-sf{}", o.sf) } else { o.bench.clone() }));
     for (name, sql) in &b.queries {
         if !o.only.is_empty() && !o.only.contains(name) {
             continue;
         }
+        let answers_dir = answers_root.as_ref().map(|root| answers::query_dir(root, name, sql)).transpose()?;
         for target in &mut targets {
             if done.contains(&(name.clone(), target.name())) {
                 continue;
@@ -357,12 +377,29 @@ pub fn main() -> anyhow::Result<()> {
                 record["counted"] = outcome_json(&outcome, load);
                 record["counts"] = counts_json(&counts);
             }
+            // Under --answers the first timed run writes its rows; the runs after it are timed as
+            // without.
+            let mut answer = answers_dir.as_ref().map(|_| Answer::new(answers::MAX_ROWS, answers::MAX_BYTES));
             let mut runs = Vec::new();
             for _ in 0..o.runs {
                 let load = quiet(o.max_load, o.load_wait);
-                let outcome = target.run(&sql, o.timeout);
+                let mut capture = answer.take();
+                let outcome = target.run(&sql, o.timeout, capture.as_mut());
                 let stop = !matches!(outcome, Outcome::Done(_));
-                runs.push(outcome_json(&outcome, load));
+                let mut run = outcome_json(&outcome, load);
+                if let (Some(capture), Some(dir)) = (capture, &answers_dir) {
+                    // This run's time holds the writing of its rows.
+                    if let Some(fields) = run.as_object_mut() {
+                        fields.insert("captured".into(), true.into());
+                    }
+                    let path = dir.join(format!("{}.tsv", target.name()));
+                    match &outcome {
+                        Outcome::Done(_) => capture.write(&path)?,
+                        Outcome::TimedOut => answers::write_refusal(&path, &Refusal::TimedOut)?,
+                        Outcome::Failed(e) => answers::write_refusal(&path, &Refusal::Failed(e.clone()))?,
+                    }
+                }
+                runs.push(run);
                 // A query that timed out or failed once does so again: one is its record.
                 if stop {
                     break;
@@ -374,4 +411,23 @@ pub fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Do: turn days after 1970-01-01 into dates, two of them the DATEs DuckDB gave TPC-H's q03 and
+    /// q18 (Date32 9194 and 8862) where PostgreSQL's text for the same rows reads 1995-03-05 and
+    /// 1994-04-07 (the 2026-10-26 jupiter baseline, SF 1). Expect: those dates, and None where the
+    /// arithmetic would overflow.
+    #[test]
+    fn days_are_their_dates() {
+        assert_eq!(civil(0), Some((1970, 1, 1)));
+        assert_eq!(civil(9194), Some((1995, 3, 5)));
+        assert_eq!(civil(8862), Some((1994, 4, 7)));
+        assert_eq!(civil(-1), Some((1969, 12, 31)));
+        assert_eq!(civil(11_016), Some((2000, 2, 29)));
+        assert_eq!(civil(i64::MAX), None);
+    }
 }
