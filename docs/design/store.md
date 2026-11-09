@@ -1090,7 +1090,10 @@ the retained Arc and exact Weak owner keep those allocations alive until cleanup
 
 **Decision.** A page a write transaction already wrote into the log past its committed end is
 written back over that frame when it spills again, or a cache flush writes it again, not appended
-(`WalFile::append_frames_vectored`, `write_over`; frames next to each other in one write). The
+(`WalFile::append_frames_vectored`, `write_over`; frames next to each other in one write). A frame
+written over holds no checksum until its commit (`prepare_unchained_frame`): the commit computes
+every frame's from the first one written over, so one computed at the spill would be thrown away,
+and a transaction that spills heavily writes its pages over again many times. The
 frame keeps its page, so the frame cache, the list of changed pages (decision 18) and readers, who
 see frames only up to the committed end, are untouched. The first frame written over is noted: its
 checksum, and every later frame's, no longer chain. Before a commit prepares its frames,
@@ -1160,6 +1163,14 @@ makes Amphora's, 50.3 s against c87e332's 76.9 s (frames written one at a time, 
 s); in a copy-on-write directory with compression, 59.6 s against 39.5 s, every frame written over
 there a new extent.
 
+On a quiet Mac (adas-mac-studio-3, M4 Max, APFS; `bench/records/2026-11-06-studio3-wal-regression.md`)
+the audit's legs, one call each, took the same time as on 542f5a9, before this decision, while the
+disks wrote 13-16 times less. With checksums computed at each write over (521e4bc), 4 MiB took
+6.49 s against 6.39 s, 1.6% longer. A spill that writes over now computes none
+(`a_frame_a_spill_writes_over_holds_no_checksum_until_its_commit`, red before), and best of 2
+against 542f5a9: 1 MiB 1.19 s against 1.18 s, 4 MiB 6.39 s against 6.45 s, 8 MiB 14.16 s against
+15.11 s, the disks writing 658-786 MiB against 10.1 GB.
+
 **Falsified by.** A transaction whose log holds more frames past the last commit than the pages it
 dirtied before its commit, or more than twice them after (`spilled_log.rs`); a row read back other
 than as committed, on a fresh connection or after opening again (the models); a power cut that
@@ -1219,3 +1230,167 @@ outgrown twice its bound, so that is paid once for each such log, not at every r
 (`files.rs`); an acknowledged write lost, or a database refused, after a power cut around a restart
 that cut the log (`tests/crash.rs`); a restart that cuts the log holding the writer much longer than
 one that keeps it, or the commits after it slower than after a restart that keeps the file.
+
+## 32. A batch that wrote nothing is durable as the last flush left it
+
+**Decision.** A batch whose commit wrote nothing, a session that only read, waits for no flush of
+its own. Its ticket waits for a flush, like every batch's (decision 15). That flush finds the log
+where the last flush left it, so it returns without syncing, and the batch is told durable at once.
+If an earlier commit's flush is still to come, the batch waits for it: every commit the batch could
+have seen is durable before it is answered, so its answer rests only on durable writes. Writes keep
+their rule: one is acknowledged only once a flush that began after its commit ends (AC-T1.4.4).
+
+**Why.** kiln's W24-AC10 lookups on 29be700 took about 92 ms each on adacachy (load 40-90), and
+that was read as read-only calls each waiting for a fresh fsync (kiln goal f4b650c4). They don't.
+A read-only `Database::call` writes no frames and waits for no fsync (docs/research/read-only-calls.md).
+Those lookups write a hit count on every hit, and a write waits for its flush.
+
+**Sources.** A read-only transaction that depends on commits not yet durable must wait for them,
+and only for them. Kimura, Graefe and Kuno ("Efficient Locking Techniques for Databases on Modern
+Hardware", ADMS 2012, §5.3): a read-only transaction "immediately exits if the maximum tag is
+already durable. Otherwise, it wakes up the log flusher and waits until the LSN becomes durable."
+Aether (Johnson et al., PVLDB 3(1), 2010, §3.1): a transaction that read a pre-committed
+transaction's data "must not be allowed to return results to the user until both their own and
+their predecessor's log records have reached the disk". Engines skip the flush for a transaction
+that wrote nothing. PostgreSQL's `RecordTransactionCommit` (`xact.c`, REL_18_0) writes no commit
+record without a transaction ID, and SQLite's `sqlite3PagerCommitPhaseOne` (3.54.1) returns early
+"If no database changes have been made".
+
+**Evidence.** `crates/amphora/tests/crash.rs`,
+`a_batch_that_wrote_nothing_is_durable_with_every_flush_held`: on the simulated disk with every
+flush held, a batch that only reads is told durable at once, with no flush held, and a write's
+flush stays held until let go. It passes at 29be700, and a mutant whose flusher syncs even with
+nothing new in the log fails it (its 30 s hang guard; adas-mac-studio-3, 2026-11-01). The probe in
+docs/research/read-only-calls.md: 1,500 read-only calls left the log at 791,072 bytes, p50 about
+78 µs.
+
+**Falsified by.** A batch that wrote nothing waiting for a flush that syncs (the test above), or
+answered before an earlier commit it could have seen is durable.
+
+## 33. A query runs beside the writer, on a reader, and writes nothing
+
+**Decision.** `Database::query` runs a read-only SQL session on one of the store's readers, on its
+caller's thread, the readers beside the writer this store already keeps. It runs on the writer
+only when the store has no reader to lend (while its file is replaced), between commits. It sees
+what was committed when it began, one snapshot (a deferred `BEGIN`), and waits for neither the
+writer's queue nor a flush. It writes nothing: the engine's `query_only` refuses every statement
+that writes, and the session ends rolled back. A remote or replicated database runs a query as a
+call.
+
+**Why.** Commands go to the one writer and queries to its readers (CQRS; Ada, 2026-11-01, kiln goal
+f4b650c4). A read-only session through `Database::call` waits behind the writer: behind every batch
+handed over before it, and, while a session holds the writer, until that session ends.
+
+**What it sees.** What is committed, as the store's record reads see it (`Store::read_committed`).
+So a query can see a commit that is not yet durable, which a power cut could take back, though no
+writer was acknowledged for it (decision 15). A session whose answer must rest only on durable
+writes goes through `Database::call` (decision 32).
+
+**Sources.** SQLite's write-ahead log (sqlite.org/wal.html): "A COMMIT occurs when a special record
+indicating a commit is appended to the WAL", and "When a read operation begins on a WAL-mode
+database, it first remembers the location of the last valid commit record in the WAL": a reader
+reads committed frames and never waits on the writer. The engine refuses writing statements under
+`query_only` (`crates/engine/translate/mod.rs`: "Cannot execute write statement in query_only mode").
+
+**Evidence.** `crates/amphora/tests/database.rs`,
+`a_query_answers_beside_a_held_writer_and_writes_nothing`. A session held the writer with its insert
+uncommitted, and a query answered with the committed count (1) in 0.07 s. With `query` taking
+`call`'s path, as before this decision, the query waited behind the writer until its 30 s deadline
+and failed with Timeout. Once the writer went, a query saw the insert (2). A query that wrote was
+refused, and the table stayed at 2 (adas-mac-studio-3, 2026-11-01).
+
+**Falsified by.** A query that waits behind the writer or a flush (the test above), one that writes,
+or one that sees a commit made after it began.
+
+## 34. A prepared statement is validated once and held between executes
+
+**Decision.** The public SQL API's `Statement` (`crates/api/src/sql.rs`) holds what
+`Session::prepare` gave it, and each execute runs that. The local session (`crates/amphora/src/sql.rs`,
+`Db`) validates the text once there and holds its engine statement, taken out of Db's statement
+cache or prepared (`Db::cached`, `Db::prepare_held`): an execute neither parses the text nor looks it up. Validation
+reads the text alone (the whole statement parsed, its tokens walked for reserved names, transaction
+and connection control refused), so its answer can't change between executes. A held statement is
+prepared again only when the schema changed since it was (`Db::run_held`, by the cache's own test of
+the schema), and dropped, it goes back to the cache, kept while that schema stands
+(`Db::give_back`), reset with its bindings cleared. While it's held, the same text is prepared anew
+for anyone else: a statement in use is never handed out twice. A call given text
+(`Connection::execute`, `query_row`) validates unless its cache entry carries decision 36's mark,
+`execute_batch` every time, and a session that says nothing (`Session::prepare`'s default, the remote client's, whose owner validates
+what it receives) keeps the text and validates it on every execute; no wire format changes.
+
+The cache (`db/cache.rs`) keeps at most `TX_MAX` (1,000) statements and `SQL_MAX` (1 MiB) of their
+text, and evicts the least recently used until both hold. Its recency order is a list linked
+through its map by the statements' text, so taking, returning and evicting a statement each cost a
+few map operations; the order was a queue searched end to end on every take and every return.
+
+**Why.** The unify audit's finding 4: every execute of a prepared statement parsed its SQL again to
+validate it, 1,001 parses for 1,000 executes, though Db's statement cache spared the engine's own
+prepare. On kiln's hot statements at e2e67247 that validation was 27% of a REAPI digest's CPU time
+(2,891 of 10,729 ns: memo.rs `missing`'s EXISTS, cas.rs `object`'s SELECT and UPDATE), 35% of a log
+search page's (15,269 of 43,175 ns) and 17% of a posting INSERT's (649 of 3,756 ns), by
+`amphora-bench --sql-api --shapes parse` beside each shape, the writer thread's CPU time, best of 3,
+on adacachy at load 15 to 22: an estimate beside production, not a recorded run.
+
+**Sources.** sqlite.org/c3ref/stmt.html: "The original SQL text is source code. A prepared statement
+object is the compiled object code", and its life-cycle prepares once, then binds, steps and resets
+it again and again ("Reset the prepared statement using sqlite3_reset() then go back to step 2. Do
+this zero or more times"). The plan's research `01a18d12143072d5992fe36a5f3b2ccb` keeps the notes.
+
+**Evidence.** `crates/amphora/src/sql.rs`, `a_prepared_statement_is_parsed_once_however_often_it_runs`:
+1,000 executes of one `prepare_cached` INSERT and 1,000 runs of log search's next page (kiln's
+`ci/logsearch.rs` at r80, three correlated subqueries) through one `prepare_cached` statement. At
+e2e67247 the INSERT parsed 1,001 times (the test failed there, its pages already right); with this
+decision each text parsed once, every page's rows the same as e2e67247's (blocks 2 and 1 of leg l1,
+then 7 of l0), and the same INSERT given as text parsed again.
+`a_held_statement_follows_the_schema_and_is_never_handed_out_twice`: a held `SELECT * FROM held`
+read one column, then two after `ALTER TABLE held ADD COLUMN c`, as a new one did; one INSERT
+prepared twice gave two statements, which wrote ten rows in turn. `db/cache.rs`,
+`a_full_cache_evicts_its_least_recently_used_statement`: a cache at its own bounds given `TX_MAX` + 1
+statements, the first taken and returned before the last, evicted the second-oldest, kept the first
+and held `TX_MAX`.
+
+**Falsified by.** A prepared statement that runs what validation refuses (its text can't change, so
+this would be a fault in `prepare`); a text call that runs without validation; or, at plan step 3,
+the parser above 1% of a prepared statement's hot loop.
+
+## 36. A validated text is marked on its statement-cache entry
+
+**Decision.** Db's statement-cache entry (`db/cache.rs`) carries whether the session's
+one-statement validation, `validate(sql, false)` in `crates/amphora/src/sql.rs`, accepted its text.
+Every Session path that runs or prepares one statement (`query`, a text call's and a remote
+client's Query; `column_count`; `prepare`, which `prepare_cached` and the owner's answer to a remote
+Columns use) takes the entry with its mark (`Db::cached`): a marked hit runs without a parse, a
+miss or an unmarked hit is validated before it is prepared or stepped, and only that validation's
+success marks it (`Held::mark`). A refused text is never marked, and an unmarked hit it refused goes
+back as it was. Db's private SQL (`query_owned`, `column_count`) keeps an entry's mark and never
+sets one, so an entry the product cached for itself is validated on its first Session use. The mark
+lives in the entry and goes with it: an eviction, a replacement (`put` gives the new statement the
+putter's mark), a schema change and a restore (`Cache::schema`, `Cache::clear`) drop it. A statement
+held by a `Statement` is out of the cache, so the same text given meanwhile is prepared and
+validated anew. `execute_batch` (`validate(sql, true)`) and the database's `execute`/`migrate`
+validators are unchanged and keep no mark. Nothing crosses the wire, and there is no second set
+of texts.
+
+**Why.** Decision 34 made a held statement's executes parse nothing, but each `prepare_cached`
+validated its text again, and so did every text call: kiln prepares per request (log search's page,
+memo.rs `missing`) and runs text calls in its hot paths, so each still parsed once per request. The
+mark is sound for the reason decision 34's hold is: validation reads the text alone, and the
+entry's key is that text.
+
+**Sources.** Decision 34's: SQLite compiles a statement once from its text (sqlite.org/c3ref/stmt.html).
+
+**Evidence.** `crates/amphora/src/sql.rs`, `a_validated_text_keeps_its_mark_until_its_cache_entry_goes`:
+an INSERT run as text three times and a SELECT prepared anew three times parsed once each, and no
+more in a second `Database::call`; `BEGIN` and a reserved name, each run twice, were refused and
+parsed both times; after `CREATE TABLE`, the SELECT parsed once more.
+`a_privately_cached_or_evicted_text_is_validated_again`: a text Db's private path cached was not
+parsed there, then parsed once on its first prepare and not on its second; a text evicted by
+`TX_MAX` newer ones parsed again. `a_session_mark_never_widens_database_execute`: `SAVEPOINT s` and `RELEASE s`, run
+twice each as Session text calls, parsed once each, marked; `Database::execute` still refused both
+("connection and transaction control belongs to Amphora"): its validator reads no mark. Decision
+34's tests pass unchanged.
+
+**Falsified by.** A Session path that runs a text no validation accepted while its entry stood: a
+private-SQL entry run unvalidated, a refused text run on its second call, or a mark that survives
+its entry's eviction, replacement, schema change or restore; or `Database::execute` or
+`migrate` accepting a text because a session marked it.

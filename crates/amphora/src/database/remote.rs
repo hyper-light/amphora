@@ -5,25 +5,37 @@ use serde::{Deserialize, Serialize};
 pub(super) struct Backend {
     pub(super) client: crate::transport::Client,
     path: PathBuf,
-    restart: Mutex<Option<(PathBuf, api::replication::ReplicaConfig)>>,
+    restart: Mutex<
+        Option<(
+            PathBuf,
+            api::replication::ReplicaConfig,
+            api::replication::Durability,
+        )>,
+    >,
     promoted: Mutex<Option<Database>>,
 }
 impl Backend {
     pub(super) fn configure(
         &self,
-        replica: Option<(&Path, &api::replication::ReplicaConfig)>,
+        replica: Option<(
+            &Path,
+            &api::replication::ReplicaConfig,
+            &api::replication::Durability,
+        )>,
     ) -> Result<(), Refusal> {
-        if let Some((path, config)) = replica {
+        if let Some((path, config, durability)) = replica {
             let mut restart = locked(&self.restart)?;
             match restart.as_ref() {
-                Some((existing, current)) if existing != path || current != config => {
+                Some((existing, current, acknowledged))
+                    if existing != path || current != config || acknowledged != durability =>
+                {
                     return Err(api::invalid(
                         "replica ownership",
                         "client has different reopening configuration",
                     ));
                 }
                 Some(_) => (),
-                None => *restart = Some((path.to_path_buf(), config.clone())),
+                None => *restart = Some((path.to_path_buf(), config.clone(), durability.clone())),
             }
         }
         Ok(())
@@ -37,7 +49,9 @@ impl Backend {
         // FnOnce is submitted until selection finishes, so this cannot replay an unknown write.
         let restart = locked(&self.restart)?.clone();
         let database = match restart {
-            Some((log, config)) => Database::open_replicated(&self.path, &log, config, until)?,
+            Some((log, config, durability)) => {
+                Database::open_replicated_with(&self.path, &log, config, durability, until)?
+            }
             None => Database::open(&self.path, until)?,
         };
         if !matches!(&database.shared.writer, Writer::Client(_)) {
@@ -58,6 +72,9 @@ impl Backend {
 pub(crate) struct Identity {
     pub restoring: bool,
     pub replica: Option<(String, api::replication::ReplicaConfig)>,
+    /// A replicated owner's durability, its fates in member order (replication.md, "Fates and
+    /// durability checked"); added at wire::VERSION 4.
+    pub durability: Option<api::replication::Durability>,
 }
 
 pub(super) fn publish(database: &Database, path: &Path) -> Result<(), Refusal> {
@@ -84,7 +101,10 @@ pub(super) fn publish(database: &Database, path: &Path) -> Result<(), Refusal> {
     if service.is_none() {
         let weak = Arc::downgrade(&database.shared);
         *service = Some(crate::transport::Owner::start(path, move || {
-            weak.upgrade().map(|shared| Database { shared })
+            weak.upgrade().map(|shared| Database {
+                shared,
+                application: None,
+            })
         })?);
     }
     Ok(())
@@ -92,18 +112,35 @@ pub(super) fn publish(database: &Database, path: &Path) -> Result<(), Refusal> {
 
 pub(super) fn attach(
     path: &Path,
-    replica: Option<(&Path, &api::replication::ReplicaConfig)>,
+    replica: Option<(
+        &Path,
+        &api::replication::ReplicaConfig,
+        &api::replication::Durability,
+    )>,
     until: Instant,
 ) -> Result<Database, Refusal> {
     let client = crate::transport::Client::connect(path, until)?;
     let identity = validate(&client, replica, until)?;
+    // A client that stated no replica reopens one in the class its owner names.
     let restart = match replica {
-        Some((path, config)) => Some((path.to_path_buf(), config.clone())),
-        None => identity
-            .replica
-            .map(|(path, config)| (PathBuf::from(path), config)),
+        Some((path, config, durability)) => {
+            Some((path.to_path_buf(), config.clone(), durability.clone()))
+        }
+        None => match (identity.replica, identity.durability) {
+            (Some((path, config)), Some(durability)) => {
+                Some((PathBuf::from(path), config, durability))
+            }
+            (Some(_), None) => {
+                return Err(api::invalid(
+                    "replica ownership",
+                    "the active owner names no durability",
+                ));
+            }
+            (None, _) => None,
+        },
     };
     Ok(Database {
+        application: None,
         shared: Arc::new(Shared {
             transport: Mutex::new(None),
             path: OnceLock::new(),
@@ -123,7 +160,11 @@ pub(super) fn attach(
 
 pub(super) fn validate(
     client: &crate::transport::Client,
-    replica: Option<(&Path, &api::replication::ReplicaConfig)>,
+    replica: Option<(
+        &Path,
+        &api::replication::ReplicaConfig,
+        &api::replication::Durability,
+    )>,
     until: Instant,
 ) -> Result<Identity, Refusal> {
     let identity = client
@@ -135,7 +176,7 @@ pub(super) fn validate(
     if identity.restoring {
         return Err(api::invalid("database owner", "restore is incomplete"));
     }
-    if let Some((path, config)) = replica {
+    if let Some((path, config, durability)) = replica {
         let matches = identity
             .replica
             .as_ref()
@@ -144,6 +185,12 @@ pub(super) fn validate(
             return Err(api::invalid(
                 "replica ownership",
                 "the active owner has different replication configuration",
+            ));
+        }
+        if identity.durability.as_ref() != Some(durability) {
+            return Err(api::invalid(
+                "replica ownership",
+                "the active owner acknowledges writes under a different durability",
             ));
         }
     }
@@ -195,21 +242,79 @@ impl Database {
         config: api::replication::ReplicaConfig,
         until: Instant,
     ) -> Result<Option<Self>, Refusal> {
+        Self::attach_owner(
+            path,
+            log_path,
+            config,
+            api::replication::Durability::Persisted,
+            None,
+            until,
+        )
+    }
+
+    /// [`Database::attach_replicated`], reopening as `durability` says if this client takes the
+    /// owner's place.
+    pub fn attach_replicated_with(
+        path: &Path,
+        log_path: &Path,
+        config: api::replication::ReplicaConfig,
+        durability: api::replication::Durability,
+        until: Instant,
+    ) -> Result<Option<Self>, Refusal> {
+        Self::attach_owner(path, log_path, config, durability, None, until)
+    }
+
+    /// [`Database::attach_replicated`] for a host that owns with `guards`
+    /// ([`Database::open_replicated_guarded`]): it makes no directory and never attaches as a
+    /// client. It answers this process's live owner opened at this file with guards of the same
+    /// key and this configuration, or None when no owner holds the lease; an unguarded owner,
+    /// other guards, another file at the path, or another process's owner is refused.
+    pub fn attach_replicated_guarded(
+        path: &Path,
+        log_path: &Path,
+        config: api::replication::ReplicaConfig,
+        guards: Guards,
+        until: Instant,
+    ) -> Result<Option<Self>, Refusal> {
+        Self::attach_owner(
+            path,
+            log_path,
+            config,
+            api::replication::Durability::Persisted,
+            Some(guards),
+            until,
+        )
+    }
+
+    fn attach_owner(
+        path: &Path,
+        log_path: &Path,
+        config: api::replication::ReplicaConfig,
+        durability: api::replication::Durability,
+        guards: Option<Guards>,
+        until: Instant,
+    ) -> Result<Option<Self>, Refusal> {
         if Instant::now() >= until {
             return Err(Refusal::Timeout);
         }
-        let path = canonical_path(path)?;
-        let log = canonical_path(log_path)?;
+        let (path, log) = match guards {
+            Some(_) => (existing_path(path)?, existing_path(log_path)?),
+            None => (resolved_path(path)?, resolved_path(log_path)?),
+        };
         log.to_str()
             .ok_or_else(|| api::invalid("replica path", "not UTF-8"))?;
-        let expected = Some((log.as_path(), &config));
+        let durability = canonical(durability);
+        let expected = Some((log.as_path(), &config, &durability));
         let mut owners = locked_until(OWNERS.get_or_init(Mutex::default), until)?;
-        owners.retain(|_, owner| owner.shared.strong_count() > 0 || owner.lease.strong_count() > 0);
+        forget_drained(&mut owners)?;
         let identity = file_identity(&path)?;
         if let Some(owner) = owners.get(&path).or_else(|| {
             identity.and_then(|id| owners.values().find(|owner| owner.identity == Some(id)))
         }) {
             if let Some(shared) = owner.shared.upgrade() {
+                if let Some(guards) = &guards {
+                    admit_guarded(owner, &shared, identity, guards)?;
+                }
                 if shared.restoring.load(Ordering::Acquire) {
                     return Err(api::invalid("replica ownership", "restore is incomplete"));
                 }
@@ -217,7 +322,10 @@ impl Database {
                     Writer::Client(backend) => match validate(&backend.client, expected, until) {
                         Ok(_) => {
                             backend.configure(expected)?;
-                            return Ok(Some(Self { shared }));
+                            return Ok(Some(Self {
+                                shared,
+                                application: None,
+                            }));
                         }
                         Err(
                             Refusal::Unavailable(_) | Refusal::Timeout | Refusal::UnknownOutcome,
@@ -227,9 +335,13 @@ impl Database {
                     Writer::Replicated {
                         log_path,
                         config: current,
+                        durability: acknowledged,
                         ..
-                    } if log_path == &log && current == &config => {
-                        return Ok(Some(Self { shared }));
+                    } if log_path == &log && current == &config && acknowledged == &durability => {
+                        return Ok(Some(Self {
+                            shared,
+                            application: None,
+                        }));
                     }
                     _ => {
                         return Err(api::invalid(
@@ -243,11 +355,42 @@ impl Database {
                 return Err(unavailable("previous database owner is draining"));
             }
         }
-        if let Some(lease) = try_exclusive_file(&path)? {
+        // Admission before the probe: a probe makes the endpoint directory and takes the lease,
+        // which a full table would refuse to anyone who went on to open.
+        api::bound("open database owners", owners.len().saturating_add(1), 4096)?;
+        // No owner holds a lease under a directory that doesn't exist; attach makes no directory.
+        if !parent(&path).try_exists().map_err(unavailable)? {
+            return Ok(None);
+        }
+        let lease = match guards {
+            // The path is canonical and its parent exists: the probe makes no directory above.
+            Some(_) => crate::transport::try_lease(&path)?,
+            None => try_exclusive_file(&path)?,
+        };
+        if let Some(lease) = lease {
             drop(lease);
             return Ok(None);
         }
-        api::bound("open database owners", owners.len().saturating_add(1), 4096)?;
+        if guards.is_some() {
+            if !drained_here(&path)? {
+                return Err(remote_owner());
+            }
+            // This process drained the owner here: a child it forked may share the lease until its
+            // exec. Wait for it to the deadline; once free, no owner holds it.
+            drop(owners);
+            let mut pause = FIRST_PAUSE;
+            loop {
+                if Instant::now() >= until {
+                    lease_held_since_drain(&path);
+                    return Err(Refusal::Timeout);
+                }
+                pause_for_lease(&mut pause, until);
+                if let Some(lease) = crate::transport::try_lease(&path)? {
+                    drop(lease);
+                    return Ok(None);
+                }
+            }
+        }
         let database = attach(&path, expected, until)?;
         owners.insert(
             path,
@@ -255,16 +398,19 @@ impl Database {
                 shared: Arc::downgrade(&database.shared),
                 lease: Weak::new(),
                 identity,
+                key: None,
             },
         );
         Ok(Some(database))
     }
 
     pub(super) fn resolve(&self, until: Instant) -> Result<Database, Refusal> {
-        match &self.shared.writer {
+        let mut database = match &self.shared.writer {
             Writer::Client(backend) => backend.resolve(until),
             _ => Ok(self.clone()),
-        }
+        }?;
+        database.application = self.application.clone();
+        Ok(database)
     }
     /// Selects the current host owner before carrying replication messages. A standby returns
     /// None; after its predecessor releases ownership this handle starts the same configured
@@ -280,17 +426,23 @@ impl Database {
         })
     }
     pub(crate) fn transport_identity(&self) -> Result<Identity, Refusal> {
-        let replica = match &self.shared.writer {
+        let (replica, durability) = match &self.shared.writer {
             Writer::Replicated {
-                log_path, config, ..
-            } => Some((
-                log_path
-                    .to_str()
-                    .ok_or_else(|| api::invalid("replica path", "not UTF-8"))?
-                    .to_owned(),
-                config.clone(),
-            )),
-            Writer::Local(_) => None,
+                log_path,
+                config,
+                durability,
+                ..
+            } => (
+                Some((
+                    log_path
+                        .to_str()
+                        .ok_or_else(|| api::invalid("replica path", "not UTF-8"))?
+                        .to_owned(),
+                    config.clone(),
+                )),
+                Some(durability.clone()),
+            ),
+            Writer::Local(_) => (None, None),
             Writer::Client(_) => {
                 return Err(api::invalid(
                     "database owner",
@@ -301,11 +453,14 @@ impl Database {
         Ok(Identity {
             restoring: self.shared.restoring.load(Ordering::Acquire),
             replica,
+            durability,
         })
     }
-    pub(super) fn remote_client(&self) -> Option<&crate::transport::Client> {
+    pub(super) fn remote_client(&self) -> Option<crate::transport::Client> {
         match &self.shared.writer {
-            Writer::Client(backend) => Some(&backend.client),
+            Writer::Client(backend) => {
+                Some(backend.client.for_application(self.application.clone()))
+            }
             _ => None,
         }
     }
@@ -372,5 +527,307 @@ pub(super) fn submit(
         Operation::Call(_) | Operation::Mutation(Mutation::Sql(_) | Mutation::Migrate(_)) => {
             Err(api::invalid("client operation", "unexpected dispatch"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn until() -> Instant {
+        Instant::now() + crate::transport::HANG
+    }
+
+    fn config() -> api::replication::ReplicaConfig {
+        api::replication::ReplicaConfig {
+            node_id: 1,
+            voters: vec![1],
+            learners: vec![],
+            bootstrap: None,
+        }
+    }
+
+    /// The entries of `dir`, to compare before and after an open.
+    fn entries(dir: &Path) -> Vec<std::ffi::OsString> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn refused_replicated_opens_leave_no_directory_they_made() {
+        // CP-T1.5 (U05), local-owner-transport.md "Owner guards": an unguarded open_replicated
+        // or attach_replicated refused by the owner table or by its configuration makes no
+        // directory first, and an attach that finds no owner makes none either.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let owner =
+            Database::open_replicated(&path, &dir.path().join("log"), config(), until()).unwrap();
+        let before = entries(dir.path());
+        let elsewhere = dir.path().join("new").join("log");
+        let refused = Database::open_replicated(&path, &elsewhere, config(), until());
+        assert!(
+            matches!(refused, Err(Refusal::Invalid { .. })),
+            "{:?}",
+            refused.err()
+        );
+        let refused = Database::attach_replicated(&path, &elsewhere, config(), until());
+        assert!(
+            matches!(refused, Err(Refusal::Invalid { .. })),
+            "{:?}",
+            refused.err()
+        );
+        let invalid = api::replication::ReplicaConfig {
+            node_id: 0,
+            ..config()
+        };
+        let (missing_db, missing_log) = (
+            dir.path().join("a").join("db"),
+            dir.path().join("b").join("log"),
+        );
+        let refused = Database::open_replicated(&missing_db, &missing_log, invalid, until());
+        assert!(
+            matches!(refused, Err(Refusal::Invalid { .. })),
+            "{:?}",
+            refused.err()
+        );
+        let attached = Database::attach_replicated(&missing_db, &missing_log, config(), until());
+        assert!(
+            matches!(attached, Ok(None)),
+            "{:?}",
+            attached.map(|d| d.is_some())
+        );
+        assert_eq!(
+            entries(dir.path()),
+            before,
+            "a refused open made a directory"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn a_replicated_open_refused_for_its_durability_makes_no_directory() {
+        // CP-T1.5 (U05) and CP-T1.8, local-owner-transport.md "Owner guards": a durability the
+        // configuration can't take (one fate asked, below the two a held quorum needs) is refused
+        // with the configuration's other refusals, before the log's lease makes a directory.
+        let dir = tempfile::tempdir().unwrap();
+        let before = entries(dir.path());
+        let one_fate = api::replication::Durability::Replicated(api::replication::Fates {
+            of: vec![(1, 1)],
+            spanning: 1,
+        });
+        let refused = Database::open_replicated_with(
+            &dir.path().join("a").join("db"),
+            &dir.path().join("b").join("log"),
+            config(),
+            one_fate,
+            until(),
+        );
+        assert!(
+            matches!(&refused, Err(Refusal::Invalid { what, .. }) if what == "replicated class"),
+            "{:?}",
+            refused.err()
+        );
+        assert_eq!(
+            entries(dir.path()),
+            before,
+            "a refused open made a directory"
+        );
+    }
+
+    #[test]
+    fn opens_refused_at_the_owner_bound_make_no_directory() {
+        // CP-T1.5 (U05): with the owner table full, open, open_replicated and attach_replicated
+        // under directories that don't exist are refused at the bound and make none of them.
+        if !in_child("database::remote::tests::opens_refused_at_the_owner_bound_make_no_directory")
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let held = Arc::new(File::create(dir.path().join("held")).unwrap());
+        {
+            let mut owners = OWNERS.get_or_init(Mutex::default).lock().unwrap();
+            for n in 0..4096 {
+                owners.insert(
+                    dir.path().join(format!("full-{n}")),
+                    Owner {
+                        shared: Weak::new(),
+                        lease: Arc::downgrade(&held),
+                        identity: None,
+                        key: None,
+                    },
+                );
+            }
+        }
+        let before = entries(dir.path());
+        let (db, log) = (
+            dir.path().join("a").join("db"),
+            dir.path().join("b").join("log"),
+        );
+        let full = |refused: Result<(), Refusal>| {
+            assert!(
+                matches!(refused, Err(Refusal::TooLarge { limit: 4096, .. })),
+                "{refused:?}"
+            );
+        };
+        full(Database::open(&db, until()).map(drop));
+        full(Database::open_replicated(&db, &log, config(), until()).map(drop));
+        full(Database::attach_replicated(&db, &log, config(), until()).map(drop));
+        assert_eq!(
+            entries(dir.path()),
+            before,
+            "a refused open made a directory"
+        );
+    }
+
+    #[test]
+    fn attach_refuses_at_the_owner_bound_before_it_touches_the_lease() {
+        // CP-T1.5 (U05): attach with the owner table full, on a database no process owns, is
+        // refused at the bound and leaves no endpoint directory or lease behind.
+        if !in_child(
+            "database::remote::tests::attach_refuses_at_the_owner_bound_before_it_touches_the_lease",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let held = Arc::new(File::create(dir.path().join("held")).unwrap());
+        {
+            let mut owners = OWNERS.get_or_init(Mutex::default).lock().unwrap();
+            for n in 0..4096 {
+                owners.insert(
+                    dir.path().join(format!("full-{n}")),
+                    Owner {
+                        shared: Weak::new(),
+                        lease: Arc::downgrade(&held),
+                        identity: None,
+                        key: None,
+                    },
+                );
+            }
+        }
+        let path = dir.path().join("db");
+        let config = api::replication::ReplicaConfig {
+            node_id: 1,
+            voters: vec![1],
+            learners: vec![],
+            bootstrap: None,
+        };
+        let attached = Database::attach_replicated(&path, &dir.path().join("log"), config, until());
+        assert!(
+            matches!(attached, Err(Refusal::TooLarge { limit: 4096, .. })),
+            "attach at the bound: {:?}",
+            attached.map(|d| d.is_some())
+        );
+        let mut sidecar = path.into_os_string();
+        sidecar.push(".client");
+        assert!(
+            !Path::new(&sidecar).exists(),
+            "the refused attach made the endpoint directory"
+        );
+    }
+
+    #[test]
+    fn a_guarded_owner_refuses_a_replicated_open_or_attach_in_this_process() {
+        // CP-T1.8 (AC-T1.8.3), replication.md "What it guarantees": guarded opens are persisted,
+        // so an open or attach stating the replicated class at a guarded owner in this process is
+        // refused, typed, as a different live owner, never answered persisted in its place. A
+        // persisted attach reuses the owner.
+        let dir = tempfile::tempdir().unwrap();
+        let (path, log) = (dir.path().join("db"), dir.path().join("log"));
+        let config = api::replication::ReplicaConfig {
+            voters: vec![1, 2],
+            ..config()
+        };
+        let owner = Database::open_replicated_guarded(
+            &path,
+            &log,
+            config.clone(),
+            Guards::new([1; 32], Arc::new(())),
+            until(),
+        )
+        .unwrap();
+        // Two members of two fates: a class the configuration can span.
+        let replicated = api::replication::Durability::Replicated(api::replication::Fates {
+            of: vec![(1, 1), (2, 2)],
+            spanning: 2,
+        });
+        let different = |refused: Result<(), Refusal>| {
+            assert!(
+                matches!(
+                    &refused,
+                    Err(Refusal::Invalid { what, why })
+                        if what == "replica ownership" && why.contains("different live owner")
+                ),
+                "{refused:?}"
+            );
+        };
+        different(
+            Database::attach_replicated_with(
+                &path,
+                &log,
+                config.clone(),
+                replicated.clone(),
+                until(),
+            )
+            .map(drop),
+        );
+        different(
+            Database::open_replicated_with(&path, &log, config.clone(), replicated, until())
+                .map(drop),
+        );
+        let attached = Database::attach_replicated(&path, &log, config, until()).unwrap();
+        assert!(attached.is_some(), "the persisted attach found no owner");
+        drop(owner);
+    }
+
+    /// The owner's identity at wire::VERSION 3, before it named a durability.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Before {
+        restoring: bool,
+        replica: Option<(String, api::replication::ReplicaConfig)>,
+    }
+
+    /// CP-T1.5 and CP-T1.8 (AC-T1.8.5), why the identity's durability is wire::VERSION 4 (replication.md, "Fates and
+    /// durability checked"; local-owner-transport.md, "Versions"). Do: encode an identity naming a
+    /// durability and read it as version 3's; encode one of version 3 and read it as today's.
+    /// Expect: version 3's reader takes the frame without its durability, silently, so the two
+    /// can't share a version and the greeting refuses the other; today's refuses the shorter frame
+    /// rather than reading a durability into it.
+    #[test]
+    fn the_identitys_durability_is_a_new_version() {
+        let config = api::replication::ReplicaConfig {
+            node_id: 1,
+            voters: vec![1, 2, 3],
+            learners: Vec::new(),
+            bootstrap: None,
+        };
+        let replica = Some(("raft.log".to_owned(), config));
+        let named = Identity {
+            restoring: false,
+            replica: replica.clone(),
+            durability: Some(api::replication::Durability::Replicated(
+                api::replication::Fates {
+                    of: vec![(1, 10), (2, 20), (3, 30)],
+                    spanning: 2,
+                },
+            )),
+        };
+        let bytes = postcard::to_allocvec(&named).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<Before>(&bytes).unwrap(),
+            Before {
+                restoring: false,
+                replica: replica.clone(),
+            }
+        );
+        let before = postcard::to_allocvec(&Before {
+            restoring: false,
+            replica,
+        })
+        .unwrap();
+        assert!(postcard::from_bytes::<Identity>(&before).is_err());
     }
 }

@@ -152,7 +152,7 @@ fn bench(o: &Opts) -> anyhow::Result<Bench> {
 
 /// Linux's one-minute load average.
 #[cfg(not(windows))]
-fn load_average() -> Option<f64> {
+pub(crate) fn load_average() -> Option<f64> {
     std::fs::read_to_string("/proc/loadavg").ok()?.split_whitespace().next()?.parse().ok()
 }
 
@@ -160,7 +160,7 @@ fn load_average() -> Option<f64> {
 /// core, as cores) and the threads waiting for one (`Processor Queue Length`), averaged over
 /// three one-second samples, the running and runnable threads Linux's load counts.
 #[cfg(windows)]
-fn load_average() -> Option<f64> {
+pub(crate) fn load_average() -> Option<f64> {
     let cores = std::thread::available_parallelism().map(usize::from).ok()? as f64;
     let out = powershell("$s = Get-Counter '\\Processor(_Total)\\% Processor Time','\\System\\Processor Queue Length' -SampleInterval 1 -MaxSamples 3; $busy = ($s | ForEach-Object { $_.CounterSamples[0].CookedValue } | Measure-Object -Average).Average; $queue = ($s | ForEach-Object { $_.CounterSamples[1].CookedValue } | Measure-Object -Average).Average; \"$busy $queue\"");
     let mut parts = out.split_whitespace().filter_map(|v| v.parse::<f64>().ok());

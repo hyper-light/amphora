@@ -852,9 +852,8 @@ impl Statement {
                     self.pager.io.step()?
                 }
                 vdbe::StepResult::Row => continue,
-                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy)
-                }
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy),
             }
         }
     }
@@ -871,9 +870,8 @@ impl Statement {
                     values.push(self.row().unwrap().get_values().cloned().collect());
                     continue;
                 }
-                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy)
-                }
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy),
             }
         }
     }

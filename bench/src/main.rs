@@ -26,6 +26,7 @@ mod pool;
 mod probe;
 mod query;
 mod schema;
+mod sqlapi;
 mod store;
 mod suite;
 mod suite_db;
@@ -501,6 +502,10 @@ fn main() -> anyhow::Result<()> {
     // A SQL script's plans: the planner audit's demonstrations (`eqp.rs`).
     if std::env::args().any(|a| a == "--eqp") {
         return eqp::main();
+    }
+    // kiln's hot statements through Amphora's public SQL API, timed per execute (`sqlapi.rs`).
+    if std::env::args().any(|a| a == "--sql-api") {
+        return sqlapi::main();
     }
     // The versioned storage's B-link tree on its own (`blink.rs`).
     if std::env::args().any(|a| a == "--blink") {
