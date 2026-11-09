@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::answers::Answer;
 use super::data::{Format, Records};
 
 /// How a query ended.
@@ -71,7 +72,10 @@ pub trait Target {
     fn analyze(&mut self) -> anyhow::Result<()>;
     /// Whether `table` holds rows already (a database loaded before).
     fn loaded(&mut self, table: &str) -> anyhow::Result<bool>;
-    fn run(&mut self, sql: &str, deadline: Duration) -> Outcome;
+    /// One timed run of `sql`. `answer`, the first timed run's under `--answers`, gets each row as
+    /// the engine returns it; without one nothing is added to what is timed, the row callback a
+    /// no-op the compiler inlines away.
+    fn run(&mut self, sql: &str, deadline: Duration, answer: Option<&mut Answer>) -> Outcome;
     /// Amphora, whose runs are counted too.
     fn amphora(&mut self) -> Option<&mut Amphora> {
         None
@@ -193,7 +197,8 @@ impl Amphora {
         }
     }
 
-    fn run_on(&mut self, counted: bool, sql: &str, deadline: Duration) -> (Outcome, Vec<Count>) {
+    /// One run, each row to `each` as well.
+    fn run_on(&mut self, counted: bool, sql: &str, deadline: Duration, mut each: impl FnMut(&amphora_engine::Row)) -> (Outcome, Vec<Count>) {
         let conn = if counted { self.counted.clone() } else { self.conn.clone() };
         conn.set_query_timeout(deadline);
         let began = Instant::now();
@@ -208,6 +213,7 @@ impl Amphora {
                 first = Some(first_row(row.get_values().map(|v| v.to_string())));
             }
             rows += 1;
+            each(row);
         });
         let done = Instant::now();
         conn.set_query_timeout(Duration::ZERO);
@@ -238,7 +244,7 @@ impl Amphora {
 
     /// One run on the counting connection: how it ended and each counter's estimate and rows.
     pub fn counted(&mut self, sql: &str, deadline: Duration) -> (Outcome, Vec<Count>) {
-        self.run_on(true, sql, deadline)
+        self.run_on(true, sql, deadline, |_| ())
     }
 
     /// EXPLAIN QUERY PLAN FORMAT=JSON's plan of `sql`.
@@ -321,8 +327,11 @@ impl Target for Amphora {
         Ok(found)
     }
 
-    fn run(&mut self, sql: &str, deadline: Duration) -> Outcome {
-        self.run_on(false, sql, deadline).0
+    fn run(&mut self, sql: &str, deadline: Duration, answer: Option<&mut Answer>) -> Outcome {
+        match answer {
+            Some(answer) => self.run_on(false, sql, deadline, |row| answer.amphora(row)).0,
+            None => self.run_on(false, sql, deadline, |_| ()).0,
+        }
     }
 
     fn amphora(&mut self) -> Option<&mut Amphora> {
@@ -411,7 +420,17 @@ impl Target for Sqlite {
         Ok(self.conn.query_row(&format!("SELECT 1 FROM {table} LIMIT 1"), [], |_| Ok(())).is_ok())
     }
 
-    fn run(&mut self, sql: &str, deadline: Duration) -> Outcome {
+    fn run(&mut self, sql: &str, deadline: Duration, answer: Option<&mut Answer>) -> Outcome {
+        match answer {
+            Some(answer) => self.timed(sql, deadline, |row| answer.sqlite(row)),
+            None => self.timed(sql, deadline, |_| ()),
+        }
+    }
+}
+
+impl Sqlite {
+    /// One timed run, each row to `each` as well.
+    fn timed(&mut self, sql: &str, deadline: Duration, mut each: impl FnMut(&rusqlite::Row<'_>)) -> Outcome {
         let handle = self.conn.get_interrupt_handle();
         let (stop, stopped) = std::sync::mpsc::channel::<()>();
         let watchdog = std::thread::spawn(move || {
@@ -438,6 +457,7 @@ impl Target for Sqlite {
                     }).unwrap_or_default())));
                 }
                 n += 1;
+                each(r);
             }
             Ok(Run { rows: n, first, prepare_ms: ms(prepared - began), exec_ms: ms(prepared.elapsed()) })
         })();
@@ -511,7 +531,17 @@ impl Target for Duck {
         Ok(self.conn.query_row(&format!("SELECT 1 FROM {table} LIMIT 1"), [], |_| Ok(())).is_ok())
     }
 
-    fn run(&mut self, sql: &str, deadline: Duration) -> Outcome {
+    fn run(&mut self, sql: &str, deadline: Duration, answer: Option<&mut Answer>) -> Outcome {
+        match answer {
+            Some(answer) => self.timed(sql, deadline, |row| answer.duckdb(row)),
+            None => self.timed(sql, deadline, |_| ()),
+        }
+    }
+}
+
+impl Duck {
+    /// One timed run, each row to `each` as well.
+    fn timed(&mut self, sql: &str, deadline: Duration, mut each: impl FnMut(&duckdb::Row<'_>)) -> Outcome {
         let sql = &quote_at(sql);
         let handle = self.conn.interrupt_handle();
         let (stop, stopped) = std::sync::mpsc::channel::<()>();
@@ -532,6 +562,7 @@ impl Target for Duck {
                     first = Some(first_row((0..columns).map(|i| r.get_ref(i).map(|v| format!("{:?}", v.to_owned())).unwrap_or_default())));
                 }
                 n += 1;
+                each(r);
             }
             Ok(Run { rows: n, first, prepare_ms: ms(prepared - began), exec_ms: ms(prepared.elapsed()) })
         })();
@@ -584,6 +615,56 @@ mod tests {
             quote_at("SELECT MIN(at.title) FROM aka_title AS at WHERE at.movie_id = t.id AND t.note LIKE '%at%' AND rating > 2"),
             "SELECT MIN(\"at\".title) FROM aka_title AS \"at\" WHERE \"at\".movie_id = t.id AND t.note LIKE '%at%' AND rating > 2"
         );
+    }
+
+    /// An answer as a pass under `--answers` makes one.
+    fn writer() -> Answer {
+        use crate::planner::answers::{MAX_BYTES, MAX_ROWS};
+        Answer::new(MAX_ROWS, MAX_BYTES)
+    }
+
+    /// A row of each kind of value TPC-H and JOB give, in the dialect Amphora and SQLite share, and
+    /// the answer it is: each REAL its double's shortest text, as the writer writes it.
+    const LITE_ROW: &str = "SELECT -2, 0.1 + 0.2, 323.0, 'a' || char(9) || 'b\\c', NULL, ''";
+    const LITE_ANSWER: &[u8] = b"-2\t0.30000000000000004\t323.0\ta\\tb\\\\c\t\\N\t\n";
+
+    /// Do: run a query on Amphora writing its answer (kiln plan 01a188991617756c84d73f0e9e100330,
+    /// step 1 (f)). Expect: each value as the writer writes it, the run's rows counted as without.
+    #[test]
+    fn amphora_writes_its_answer() {
+        use amphora_engine::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenOptions, SqliteDialect};
+        let io: Arc<dyn amphora_engine::IO> = Arc::new(MemoryIO::new());
+        let db = Database::open(io.clone(), &format!("planner-answers-{}.db", std::process::id()), OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new())).unwrap();
+        let (conn, counted) = (db.connect(ConnectOpts::new()).unwrap(), db.connect(ConnectOpts::new()).unwrap());
+        let mut amphora = Amphora { io, _db: db, conn, counted, cache_kib: 0 };
+        let mut answer = writer();
+        assert!(matches!(amphora.run(LITE_ROW, Duration::from_secs(60), Some(&mut answer)), Outcome::Done(Run { rows: 1, .. })));
+        assert_eq!(answer.finish(), LITE_ANSWER);
+    }
+
+    /// Do: run the same query on SQLite writing its answer. Expect: Amphora's answer.
+    #[test]
+    fn sqlite_writes_its_answer() {
+        let mut sqlite = Sqlite { conn: rusqlite::Connection::open_in_memory().unwrap(), cache_kib: 0 };
+        let mut answer = writer();
+        assert!(matches!(sqlite.run(LITE_ROW, Duration::from_secs(60), Some(&mut answer)), Outcome::Done(Run { rows: 1, .. })));
+        assert_eq!(answer.finish(), LITE_ANSWER);
+    }
+
+    /// Do: run on DuckDB a query giving the kinds TPC-H gives there (DECIMAL, DATE, a sum's
+    /// HUGEINT, DOUBLE, text, NULL), then a TIMESTAMP. Expect: the decimal's digits, the date as
+    /// Amphora and SQLite keep it, the rest as their answers have them; the TIMESTAMP refused by its
+    /// type's name.
+    #[test]
+    fn duckdb_writes_its_answer() {
+        let mut duck = Duck { conn: duckdb::Connection::open_in_memory().unwrap(), threads: Some(1) };
+        let mut answer = writer();
+        let sql = "SELECT CAST(406181.0111 AS DECIMAL(38, 4)), DATE '1995-03-05', SUM(x), CAST(0.1 AS DOUBLE) + CAST(0.2 AS DOUBLE), 'a' || chr(9) || 'b', CAST(NULL AS INTEGER) FROM (VALUES (1), (2)) AS t(x)";
+        assert!(matches!(duck.run(sql, Duration::from_secs(60), Some(&mut answer)), Outcome::Done(Run { rows: 1, .. })));
+        assert_eq!(answer.finish(), b"406181.0111\t1995-03-05\t3\t0.30000000000000004\ta\\tb\t\\N\n");
+        let mut answer = writer();
+        assert!(matches!(duck.run("SELECT TIMESTAMP '1995-03-05 10:00:00'", Duration::from_secs(60), Some(&mut answer)), Outcome::Done(_)));
+        assert_eq!(answer.finish(), b"\\!unwritten_value a Timestamp value, which the answer writer has no text for\n");
     }
 }
 
@@ -656,7 +737,7 @@ impl Target for Postgres {
         Ok(self.client.query_opt(&format!("SELECT 1 FROM {table} LIMIT 1"), &[]).ok().flatten().is_some())
     }
 
-    fn run(&mut self, sql: &str, deadline: Duration) -> Outcome {
+    fn run(&mut self, sql: &str, deadline: Duration, mut answer: Option<&mut Answer>) -> Outcome {
         if let Err(e) = self.client.batch_execute(&format!("SET statement_timeout = {}", deadline.as_millis())) {
             return Outcome::Failed(e.to_string());
         }
@@ -673,6 +754,10 @@ impl Target for Postgres {
                             first = Some(first_row((0..r.len()).map(|i| r.get(i).unwrap_or("NULL").to_owned())));
                         }
                         n += 1;
+                        // Every row came before `took` was read: the answer costs the run nothing.
+                        if let Some(answer) = answer.as_deref_mut() {
+                            answer.postgres(&r);
+                        }
                     }
                 }
                 // The simple protocol plans and runs in one message: its time is all run.

@@ -910,3 +910,98 @@ measured that at about 3.4× for a whole 200,000-row table. Or one whose remaini
 fewer rows than their estimates, so the read passes far more rows than its goal (decision 16's
 falsifier). The cure then is planning with the bound values, as PostgreSQL's custom plans do, not
 another constant.
+
+## 18. A join's rows divide once for each column its equivalence classes join
+
+**Decision.** PL.1 (docs/research/planner.md section 9, rank 1). The `=` terms between two inner
+tables' plain columns, from WHERE or an inner join's ON, put those columns in equivalence classes
+(`optimizer/cardinality.rs`, `JoinedSetRows`). A set's rows are its tables' rows after their own
+filters, divided by each class's divisor over the set's columns the set's terms join: the
+product of the class's domains, all but one. However many terms state a class, a term it already
+holds divides nothing more, and every order and access path of a set still gets one estimate
+(decision 13): the classes are a union-find over the set's terms, rebuilt for each set the memo
+computes.
+
+A column's domain is a count where one is kept: a unique key's rows (the rowid, a primary key of
+one column, a unique index of one column and no WHERE), else the distinct values `sqlite_stat1`
+gives where an index without a WHERE leads it, at most its table's rows. Otherwise its table's
+rows stand in for one, the column taken for a key. Which domain the divisor leaves out:
+- A class of counts leaves out its smallest. Under containment the smallest domain's values lie in
+  every other's, so each of them meets its share of every table's rows once: the product of the
+  rows over the product of the other domains. For two columns that is PostgreSQL's and SQL
+  Server's division by the larger distinct count.
+- A class with a column of no count leaves out the largest such: a foreign key with no statistics
+  joins its table's rows to the key's table about once each, as Ebergen's rule assumes the
+  lowest-cardinality column a key.
+
+An `=` of two tables' columns no class takes (an outer join's ON term, a term reading a LEFT
+JOIN's right table, any such term of a query with a RIGHT or FULL JOIN, whose barrier decision 13
+keeps) counts as before but at its pair's divisor, never `sel_eq_unindexed`'s 0.1. A term reading
+a semi or anti join's table multiplies by 1, as decision 13 has it.
+
+A unique key of more than one column (a primary key, a unique index without a WHERE), each of its
+columns in a class with another table's column, caps its set: each row of the rest meets at most
+one of its rows. So the set has at most the rest's rows times the share of the key's table its
+own filters keep. A key of one column needs no cap: its domain is its table's rows, so its class
+never divides by less.
+
+No added term raises an estimate, as CERT requires. Each domain is at least one and fixed by its
+column, not by the class. A column joining a class multiplies its divisor by at least one: by
+itself, or by the domain it replaces as the one left out. Merging two classes multiplies the
+product of their divisors by the smaller of their left-out domains. A cap is the rest's estimate,
+which no term raises either.
+
+**Why.** Every join term multiplied in its own selectivity (row 8 of the audit, section 7), so the
+terms JOB writes to state each class whole divided again and again. 26c equates five `movie_id`
+columns by ten terms where four connect them. 17a fell from 456,178 rows to 1.57 at its third
+table while its counted rows grew from 41,840 to 148,552. Down the long chains 343 of JOB's 977
+prefixes were estimated below one row while counting 1,000 or more. A join on a column no index
+leads took 0.1 whatever the tables' sizes.
+
+Ebergen's rule as published takes the class's largest known count, else its smallest table's rows.
+That is not monotone. A smaller table's column joining a class of columns without counts lowers
+the domain for all of them, and raises the estimate: `a.x = b.y` over two 1,000-row tables with a
+10-row `c` beside them gives 10,000 rows, and adding `c.z = a.x` gives 100,000. Leaving out one
+domain per class keeps Ebergen's answer for a foreign key to its key and PostgreSQL's for two
+counted columns, and stays monotone.
+
+**Sources.**
+- Ebergen, "Join Order Optimization with (Almost) No Statistics", MSc thesis, CWI and VU Amsterdam
+  (`https://blobs.duckdb.org/papers/tom-ebergen-msc-thesis-join-order-optimization-with-almost-no-statistics.pdf`;
+  f39, A): "By assuming all joins are foreign-key primary-key joins"; section 3.1, "the cardinality
+  is also represented as a set of relations"; section 3.2, "then the column with the lowest
+  cardinality in the equivalence set is assumed to be a primary key". On JOB it took 66% and 95% of
+  the intermediate tuples off, and 18% and 25% of the time.
+- DuckDB, `src/optimizer/join_order/cardinality_estimator.cpp` at 1641475e (f15, A), above
+  `EstimateCardinalityWithSet`: "The estimator starts with base relation cardinalities and divides
+  by a denominator assembled from predicate domain groups. INNER equality predicates use transitive
+  equality classes, composite same-pair equalities can apply an FK/PK cap". `DomainEstimate::Update`
+  keeps the largest of a class's HyperLogLog or exact counts and, for columns without one,
+  `fallback_distinct_count = MinValue(distinct_count.distinct_count, fallback_distinct_count);`.
+- PostgreSQL, `src/backend/utils/adt/selfuncs.c` at 126976a8, `eqjoinsel_inner`: "Estimate the
+  join selectivity as MIN(1/nd1,1/nd2)*(1-nullfrac1)*(1-nullfrac2). This is plausible if we assume
+  that the join operator is strict and the non-null values are about equally distributed", then
+  `if (nd1 > nd2) selec /= nd1; else selec /= nd2;`.
+- SQL Server's containment assumption (f43, A): "Users query for data that exists".
+- CERT (Ba and Rigger, ICSE 2024, arXiv 2306.00355; f21, A): "CERT derives a more restrictive
+  query (e.g., by replacing a LEFT JOIN with an INNER JOIN) whose estimated number of rows should
+  not exceed the estimated number of rows for the original query."
+
+**Evidence.** `crates/engine/tests/planner.rs`:
+- `a_join_term_its_class_already_holds_divides_nothing_more`: title and three `movie_id` tables
+  joined by JOB's six terms and by the three that connect them. One estimate, within 1.5 of the
+  12,000 rows counted.
+- `a_chain_of_key_joins_is_estimated_near_its_count`: each prefix of the chain within 1.5.
+- `an_outer_joins_column_equality_takes_its_domain`: a LEFT JOIN on an unindexed column, within 1.5
+  of its 1,000 rows, where 0.1 gave ten times that.
+- `an_added_term_never_raises_a_joins_estimate` (T-PL.1.1): 600 random joins of the order tables,
+  with statistics and without, each given one more `=`, range or filter. None rises, and more than
+  200 fall.
+- Decision 13's tests pass unchanged.
+
+**Falsified by.**
+- JOB's 343 prefixes below a row not halving.
+- JOB no faster where its estimates come near the counts: its geometric mean over the parent at 1
+  or more.
+- A CERT or order-check failure the change brings.
+- A class whose estimate rises with an added term.

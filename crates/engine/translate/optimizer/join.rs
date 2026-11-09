@@ -1170,6 +1170,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         base_table_rows,
         initial_input_cardinality,
         params,
+        schema,
     );
     let set_rows = &mut set_rows;
     if num_tables > GREEDY_JOIN_THRESHOLD {

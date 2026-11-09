@@ -572,3 +572,194 @@ fn an_on_term_and_a_where_term_give_one_estimate() {
         }
     }
 }
+
+/// The rows `sql` returns, counted.
+fn count(conn: &Arc<Connection>, sql: &str) -> f64 {
+    let mut stmt = conn
+        .prepare(format!("SELECT count(*) FROM ({sql})"))
+        .unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    let n = rows[0][0]
+        .as_int()
+        .unwrap_or_else(|| panic!("{sql}: count {:?}", rows[0][0]));
+    n as f64
+}
+
+/// max(est/act, act/est), each at least one row (Moerkotte et al.), as the planner bench reads it.
+fn q_error(estimated: f64, counted: f64) -> f64 {
+    let (e, c) = (estimated.max(1.0), counted.max(1.0));
+    (e / c).max(c / e)
+}
+
+/// JOB's shape at a small scale: a title table keyed by its rowid and three tables of movie_id
+/// rows, each with an index on movie_id as JOB's fkindexes.sql gives it: mc two rows for each of
+/// movies 1 to 1,000, mk three for each of 1 to 2,000, mi four for each of 1 to 500.
+fn movie_tables(dir: &Path, analyze: bool) -> Arc<Connection> {
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
+    let db = Database::open(io, dir.join("movies.db").to_str().unwrap(), options).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE title (id INTEGER PRIMARY KEY, kind INTEGER)")
+        .unwrap();
+    let titles: Vec<String> = (1..=2000).map(|i| format!("({i}, {})", i % 7)).collect();
+    conn.execute(format!("INSERT INTO title VALUES {}", titles.join(", ")))
+        .unwrap();
+    for (table, movies, each) in [("mc", 1000, 2), ("mk", 2000, 3), ("mi", 500, 4)] {
+        conn.execute(format!(
+            "CREATE TABLE {table} (id INTEGER PRIMARY KEY, movie_id INTEGER, note INTEGER)"
+        ))
+        .unwrap();
+        let rows: Vec<String> = (0..movies * each)
+            .map(|i| format!("({}, {})", 1 + i / each, i % 11))
+            .collect();
+        conn.execute(format!(
+            "INSERT INTO {table} (movie_id, note) VALUES {}",
+            rows.join(", ")
+        ))
+        .unwrap();
+        conn.execute(format!("CREATE INDEX {table}_movie ON {table} (movie_id)"))
+            .unwrap();
+    }
+    if analyze {
+        conn.execute("ANALYZE").unwrap();
+    }
+    conn
+}
+
+/// Do: join title and its three movie_id tables with JOB's terms, which state each class whole
+/// (every pair of the four columns equated, where three terms connect them), and the same join by
+/// three terms. Expect: one estimate for both, a term its class already holds dividing nothing
+/// more, and that estimate within 1.5 of the rows counted (12,000), where each surplus term divided
+/// again on the parent (planner.md decision 18; T-PL.1.1, AC-PL.1.1).
+#[test]
+fn a_join_term_its_class_already_holds_divides_nothing_more() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = movie_tables(dir.path(), true);
+    let from = "SELECT t.kind FROM title AS t, mc, mk, mi WHERE";
+    let connected =
+        format!("{from} t.id = mc.movie_id AND t.id = mk.movie_id AND t.id = mi.movie_id");
+    let whole = format!(
+        "{connected} AND mc.movie_id = mk.movie_id AND mc.movie_id = mi.movie_id AND mk.movie_id = mi.movie_id"
+    );
+    let (c, w) = (estimate(&conn, &connected), estimate(&conn, &whole));
+    assert!(same_estimate(c, w), "{connected}: {c}; stated whole: {w}");
+    let counted = count(&conn, &whole);
+    assert_eq!(counted, 12_000.0);
+    assert!(
+        q_error(w, counted) <= 1.5,
+        "{whole}: estimated {w}, counted {counted}"
+    );
+}
+
+/// Do: each prefix of JOB's chain (title, then mc, mk and mi in turn, every pair of the set's
+/// movie_id columns equated) with statistics. Expect: every prefix within 1.5 of its rows counted,
+/// never below one row while counting thousands, as 343 of JOB's 977 prefixes were at step 3
+/// (decision 18; AC-PL.1.1, AC-PL.1.2).
+#[test]
+fn a_chain_of_key_joins_is_estimated_near_its_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = movie_tables(dir.path(), true);
+    let all = ["t.id", "mc.movie_id", "mk.movie_id", "mi.movie_id"];
+    let names = ["title AS t", "mc", "mk", "mi"];
+    for n in 2..=4 {
+        let mut terms = Vec::new();
+        for i in 0..n {
+            for j in i + 1..n {
+                terms.push(format!("{} = {}", all[i], all[j]));
+            }
+        }
+        let sql = format!(
+            "SELECT t.kind FROM {} WHERE {}",
+            names[..n].join(", "),
+            terms.join(" AND ")
+        );
+        let (e, c) = (estimate(&conn, &sql), count(&conn, &sql));
+        assert!(q_error(e, c) <= 1.5, "{sql}: estimated {e}, counted {c}");
+    }
+}
+
+/// Do: a LEFT JOIN whose ON term equates the right table's column, which no index leads, to the
+/// left table's key, with statistics: 100 keys, 1,000 right rows, ten for each key. Expect: the
+/// estimate within 1.5 of the 1,000 rows counted: the term's selectivity is its pair's domain, one
+/// in 100, where a fixed 0.1 gave ten times the rows (decision 18; AC-PL.1.2).
+#[test]
+fn an_outer_joins_column_equality_takes_its_domain() {
+    let dir = tempfile::tempdir().unwrap();
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
+    let db = Database::open(io, dir.path().join("left.db").to_str().unwrap(), options).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE b (x INTEGER, y INTEGER)")
+        .unwrap();
+    let keys: Vec<String> = (1..=100).map(|i| format!("({i})")).collect();
+    conn.execute(format!("INSERT INTO a VALUES {}", keys.join(", ")))
+        .unwrap();
+    let rows: Vec<String> = (0..1000)
+        .map(|i| format!("({}, {i})", 1 + i % 100))
+        .collect();
+    conn.execute(format!("INSERT INTO b VALUES {}", rows.join(", ")))
+        .unwrap();
+    conn.execute("ANALYZE").unwrap();
+    let sql = "SELECT a.id, b.y FROM a LEFT JOIN b ON b.x = a.id";
+    let (e, c) = (estimate(&conn, sql), count(&conn, sql));
+    assert_eq!(c, 1000.0);
+    assert!(q_error(e, c) <= 1.5, "{sql}: estimated {e}, counted {c}");
+}
+
+/// Do: random inner joins of two to five of the order tables, with statistics and without, each
+/// planned and then planned again with one more term: an `=` of two of its columns (which may
+/// merge two classes, join a column of no count, or equate two columns of one table), a range
+/// between columns, or a filter. Expect: the added term never raises the estimate (CERT, Ba and
+/// Rigger, ICSE 2024), and it lowers it in some of the cases, so the check is not vacuous
+/// (decision 18; T-PL.1.1).
+#[test]
+fn an_added_term_never_raises_a_joins_estimate() {
+    let mut lowered = 0;
+    let mut checked = 0;
+    for analyze in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = order_tables(dir.path(), analyze);
+        let mut r = Rng(0xC0FF_EE00_D15E_A5E5 ^ u64::from(analyze));
+        for _ in 0..300 {
+            let n = 2 + r.below(4);
+            let from: Vec<String> = (0..n).map(|i| format!("t{} AS x{i}", r.below(6))).collect();
+            let col =
+                |r: &mut Rng, i: usize| format!("x{i}.{}", ["a", "b", "c", "rowid"][r.below(4)]);
+            let mut terms = Vec::new();
+            for _ in 0..r.below(2 * n) {
+                let (i, j) = (r.below(n), r.below(n));
+                terms.push(format!("{} = {}", col(&mut r, i), col(&mut r, j)));
+            }
+            let (i, j) = (r.below(n), r.below(n));
+            let more = match r.below(4) {
+                0 | 1 => format!("{} = {}", col(&mut r, i), col(&mut r, j)),
+                2 => format!("{} < {}", col(&mut r, i), col(&mut r, j)),
+                _ => format!("{} = {}", col(&mut r, i), r.below(20)),
+            };
+            let sql = |terms: &[String]| {
+                let wh = if terms.is_empty() {
+                    String::new()
+                } else {
+                    format!(" WHERE {}", terms.join(" AND "))
+                };
+                format!("SELECT x0.a FROM {}{wh}", from.join(", "))
+            };
+            let before = estimate(&conn, &sql(&terms));
+            terms.push(more);
+            let restricted = sql(&terms);
+            let after = estimate(&conn, &restricted);
+            assert!(
+                after <= before * (1.0 + 1e-9),
+                "analyze {analyze}: {restricted} estimated {after}, {before} without its last term"
+            );
+            checked += 1;
+            if after < before * (1.0 - 1e-9) {
+                lowered += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 600);
+    assert!(lowered > 200, "{lowered} of {checked} lowered");
+}

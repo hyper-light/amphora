@@ -12,6 +12,9 @@
 //!
 //! Each run prints one JSON line: throughput and latency percentiles of each part.
 
+// Tests may unwrap, assert and index (CLAUDE.md §1): clippy reads the workspace's clippy.toml here.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::disallowed_macros))]
+
 mod blink;
 mod clickhouse;
 mod eqp;
