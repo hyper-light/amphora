@@ -1471,9 +1471,17 @@ or a configuration change gets, which its caller prepares again. This happens at
 group's first leader, and under the leader that records a joiner's fate. A leader holds its own writes back while
 its class entry is in flight (`class_in_flight`), so only a write prepared at a follower in that window meets it.
 
+**The gate, exactly** (the code review at 552c0a1). A member counts held answers only once every fate it states for
+a member of its configuration is in the record, the same kind and span: stated ∩ configuration ⊆ record
+(`class::recorded_all`). Compatibility alone isn't enough. Two members stating different fates for a joiner not yet
+recorded are each compatible with the record, and each would count by its own. Until the record holds its fates, a
+member holds every other member suspected. Test: `a_fate_not_yet_recorded_opens_no_held_count`.
+
 **Formats.** The log gains one entry kind under a prefix of its own, which is how the seed (`amphora.seed.v1`)
 and the baseline delta were added: append-only, no existing entry read differently. The database gains one
-table. The owner transport's wire doesn't change: the entry travels in raft's log, which the host carries
+table. `api::replication::Durability` and `Fates` become a frozen format: their postcard encoding is the class entry's
+payload and the table's row, so their variants and fields are only ever appended, never reordered or retyped (their
+doc comments say so). The owner transport's wire doesn't change: the entry travels in raft's log, which the host carries
 (VERSION stays 6). An older binary meets the entry as a command it can't decode, and fences, typed, naming it.
 So a group is upgraded member by member before a member running this code leads. That is the same order the
 floor's join rows asked for ("The application floor, replicated", T-T1.8.A7). Kiln's own rollout states it.

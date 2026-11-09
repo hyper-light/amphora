@@ -80,6 +80,23 @@ pub(crate) fn joined(
     }
 }
 
+/// Whether `record` holds every fate `stated` gives a member of `named`: the same kind and
+/// span, and each such fate recorded (replication.md, "The class stated once per group").
+pub(crate) fn recorded_all(record: &Durability, stated: &Durability, named: &[u64]) -> bool {
+    match (record, stated) {
+        (Durability::Persisted, Durability::Persisted) => true,
+        (Durability::Replicated(record), Durability::Replicated(stated)) => {
+            record.spanning == stated.spanning
+                && stated
+                    .of
+                    .iter()
+                    .filter(|(member, _)| named.contains(member))
+                    .all(|fate| record.of.contains(fate))
+        }
+        _ => false,
+    }
+}
+
 /// The log entry that states `durability` for the group.
 pub(crate) fn entry(durability: &Durability) -> Result<Vec<u8>, Refusal> {
     let mut bytes = PREFIX.to_vec();
@@ -277,5 +294,43 @@ mod tests {
             Ok(_) => panic!("a member opened stating another class than its group's"),
         }
         assert!(open("first.db", &group).unwrap().class_agreed());
+    }
+
+    /// AC-T1.8.5 (replication.md, "The class stated once per group", the code review at 552c0a1):
+    /// a member counts held answers only once every fate it states for a member of its
+    /// configuration is the record's. Do: a machine of voters 1 to 3 and learner 4 records the
+    /// three voters' fates; it states those and a fate for 4; then an entry recording 4's fate
+    /// too. Expect: not agreed while 4's fate is its own alone (another member may state another
+    /// fate for 4, and each would count by its own); agreed once the record holds it.
+    #[test]
+    fn a_fate_not_yet_recorded_opens_no_held_count() {
+        use hyper_durable::{EntryRef, StateMachine};
+        use hyper_raft::proto::{ConfState, EntryType};
+        let dir = tempfile::tempdir().unwrap();
+        let conf = ConfState {
+            voters: vec![1, 2, 3],
+            learners: vec![4],
+            ..ConfState::default()
+        };
+        let three = class(vec![(1, 10), (2, 20), (3, 30)], 2);
+        let four = class(vec![(1, 10), (2, 20), (3, 30), (4, 40)], 2);
+        let mut machine = super::super::Machine::open(&dir.path().join("state.db"), conf).unwrap();
+        machine.state_class(&four).unwrap();
+        for (index, recorded, agreed) in [(1, &three, false), (2, &four, true)] {
+            let data = entry(recorded).unwrap();
+            machine
+                .apply(
+                    &EntryRef {
+                        index,
+                        term: 1,
+                        kind: EntryType::EntryNormal,
+                        context: b"class",
+                        data: &data,
+                    },
+                    &mut Vec::new(),
+                )
+                .unwrap();
+            assert_eq!(machine.class_agreed(), agreed, "after entry {index}");
+        }
     }
 }

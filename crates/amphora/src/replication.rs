@@ -439,9 +439,25 @@ impl Machine {
     pub(crate) fn class_changes(&self) -> u64 {
         self.class_changes
     }
-    /// Whether this member may count held answers: the group's recorded class is its own.
+    /// Whether this member may count held answers: every fate it states for a member its
+    /// configuration names is the record's. Compatible alone isn't enough: two members stating
+    /// different fates for a joiner not yet recorded would each count by their own.
     pub(crate) fn class_agreed(&self) -> bool {
-        matches!((&self.stated, &self.class), (Some(stated), Some(record)) if class::compatible(stated, record))
+        let (Some(stated), Some(record)) = (&self.stated, &self.class) else {
+            return false;
+        };
+        class::compatible(stated, record) && class::recorded_all(record, stated, &self.named())
+    }
+    /// The members this machine's configuration names, voters and learners, both halves.
+    fn named(&self) -> Vec<u64> {
+        let conf = &self.configuration;
+        conf.voters
+            .iter()
+            .chain(&conf.learners)
+            .chain(&conf.voters_outgoing)
+            .chain(&conf.learners_next)
+            .copied()
+            .collect()
     }
     /// The class entry this member would propose leading: the group's record joined with its own
     /// class, to the members its configuration names, when that changes the record
@@ -449,15 +465,7 @@ impl Machine {
     /// between changes of members, whichever compatible member leads.
     pub(crate) fn class_proposal(&self) -> Option<api::replication::Durability> {
         let stated = self.stated.as_ref()?;
-        let conf = &self.configuration;
-        let named: Vec<u64> = conf
-            .voters
-            .iter()
-            .chain(&conf.learners)
-            .chain(&conf.voters_outgoing)
-            .chain(&conf.learners_next)
-            .copied()
-            .collect();
+        let named = self.named();
         let proposal = match &self.class {
             Some(record) if !class::compatible(record, stated) => return None,
             record => class::joined(record.as_ref(), stated, &named),

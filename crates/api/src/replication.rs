@@ -32,6 +32,10 @@ pub enum MemberChange {
 
 /// When a replicated database acknowledges a write (docs/design/replication.md, "Fast acknowledgement:
 /// the replicated class").
+///
+/// A frozen format: its postcard encoding is written into a group's log (the class entry) and into
+/// each member's database (`__amphora_class`; replication.md, "The class stated once per group").
+/// Variants and fields are only ever appended, and none is reordered or retyped.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Durability {
     /// Once a quorum's disks hold it and the proposer's own log is flushed.
@@ -44,6 +48,9 @@ pub enum Durability {
 }
 
 /// What each member fails with, and how many distinct fates a write's holders must span.
+///
+/// A frozen format, as [`Durability`] is: its postcard encoding is in a group's log and its members'
+/// databases, so its fields are only ever appended.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fates {
     /// Each member and its fate: the operator's number for what it fails with, its host and its
