@@ -25,13 +25,26 @@ use amphora_engine_parser::{
 use crate::db::Db;
 use crate::store::{self, Checkpointed, Engine, Flush, Opener, Store};
 
+mod application;
+pub(crate) use application::Application;
+
+/// The application floor installed in `db`, if any.
+pub(crate) fn installed_floor(db: &Db) -> anyhow::Result<Option<Application>> {
+    application::policy(db)
+}
+pub use application::WriterBoundary;
+
 pub(crate) mod compaction;
+mod guards;
 mod import;
+mod patience;
 pub(crate) mod remote;
 pub(crate) mod replicated;
 mod restore;
 pub(crate) mod session;
 mod watch;
+pub use guards::Guards;
+pub(crate) use guards::Owned;
 pub use restore::Restore;
 pub use watch::Watch;
 
@@ -66,6 +79,7 @@ impl Drop for Admission {
 #[derive(Clone)]
 pub struct Database {
     shared: Arc<Shared>,
+    application: Option<Application>,
 }
 
 struct Shared {
@@ -77,7 +91,7 @@ struct Shared {
     restoring: AtomicBool,
     admitted: Arc<AtomicUsize>,
     // The engine, readers and flusher retain the same lease until asynchronous drain ends.
-    _owner: Option<Arc<File>>,
+    _owner: Option<Owned>,
 }
 
 enum Writer {
@@ -88,14 +102,29 @@ enum Writer {
         log_path: PathBuf,
         node_id: u64,
         config: api::replication::ReplicaConfig,
+        durability: api::replication::Durability,
     },
 }
 struct Owner {
     shared: Weak<Shared>,
     lease: Weak<File>,
     identity: Option<amphora_engine::io::FileId>,
+    // The key of the guards this owner was opened with; None for an unguarded owner or a client.
+    key: Option<[u8; 32]>,
 }
 static OWNERS: OnceLock<Mutex<BTreeMap<PathBuf, Owner>>> = OnceLock::new();
+/// The paths whose owner this process drained, the latest last. A lease there may still read held
+/// for a moment: a child this process forked shares it until its exec (local-owner-transport.md,
+/// "Owner guards", J1). At most `DRAINED_MAX`, the oldest evicted first; a path's mark goes once
+/// this process takes its lease again.
+static DRAINED: OnceLock<Mutex<std::collections::VecDeque<PathBuf>>> = OnceLock::new();
+/// The owner table's own bound (`open database owners`): no more paths can have drained at once.
+const DRAINED_MAX: usize = 4096;
+/// The first pause before a drained path's lease is probed again: the measured window, 62.8 µs
+/// on fedora (t1/guards-flake), rounded down. Each pause doubles, up to `LONGEST_PAUSE`.
+const FIRST_PAUSE: std::time::Duration = std::time::Duration::from_micros(50);
+/// The drain wait's own park: no probe waits longer between looks.
+const LONGEST_PAUSE: std::time::Duration = std::time::Duration::from_millis(1);
 
 #[derive(Default)]
 pub(crate) struct Changed {
@@ -156,6 +185,7 @@ enum Answer {
 type Reply = Arc<Mutex<Option<Result<Answer, Refusal>>>>;
 struct Command {
     namespace: String,
+    application: Option<Application>,
     operation: Operation,
     answer: Reply,
     publication: Arc<Mutex<Option<BTreeMap<String, Published>>>>,
@@ -183,22 +213,189 @@ fn admission_refusal(error: store::Refused) -> Refusal {
     }
 }
 
+/// A durability with its fates in member order, so that two statements of one class compare equal
+/// wherever the owner's is checked (replication.md, "Fates and durability checked").
+fn canonical(durability: api::replication::Durability) -> api::replication::Durability {
+    match durability {
+        api::replication::Durability::Replicated(mut fates) => {
+            fates.of.sort_unstable();
+            api::replication::Durability::Replicated(fates)
+        }
+        persisted @ api::replication::Durability::Persisted => persisted,
+    }
+}
+
+fn parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// `path` made canonical, its parent directory made first if it is missing.
 fn canonical_path(path: &Path) -> Result<PathBuf, Refusal> {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) && !path.exists() {
+        return Err(api::invalid("database path", "dangling symlink"));
+    }
+    if !path.try_exists().map_err(unavailable)? {
+        std::fs::create_dir_all(parent(path)).map_err(unavailable)?;
+    }
+    existing_path(path)
+}
+
+/// `path` made canonical without making anything, as it will be once the directories it names are
+/// made: the deepest of its ancestors that exists made canonical, then the names below it. An
+/// unguarded open decides every refusal on this path before the step that needs its directory
+/// makes it (local-owner-transport.md, "Owner guards").
+fn resolved_path(path: &Path) -> Result<PathBuf, Refusal> {
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) && !path.exists() {
         return Err(api::invalid("database path", "dangling symlink"));
     }
     if path.try_exists().map_err(unavailable)? {
         return path.canonicalize().map_err(unavailable);
     }
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent).map_err(unavailable)?;
+    let mut missing = vec![
+        path.file_name()
+            .ok_or_else(|| api::invalid("database path", "no file name"))?,
+    ];
+    let mut ancestor = parent(path);
+    loop {
+        // The transport's bound on a database path's depth (endpoint.rs).
+        api::bound("database directory depth", missing.len(), 256)?;
+        match ancestor.canonicalize() {
+            Ok(mut resolved) => {
+                while let Some(name) = missing.pop() {
+                    resolved.push(name);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(ancestor.file_name().ok_or_else(|| {
+                    api::invalid(
+                        "database path",
+                        "it names a missing directory by `..`, which can't be resolved before it is made",
+                    )
+                })?);
+                ancestor = parent(ancestor);
+            }
+            Err(error) => return Err(unavailable(error)),
+        }
+    }
+}
+
+/// `path` made canonical without making anything: a guarded open's parent directory exists, or it
+/// is refused (local-owner-transport.md, "Owner guards").
+fn existing_path(path: &Path) -> Result<PathBuf, Refusal> {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) && !path.exists() {
+        return Err(api::invalid("database path", "dangling symlink"));
+    }
+    if path.try_exists().map_err(unavailable)? {
+        return path.canonicalize().map_err(unavailable);
+    }
     let name = path
         .file_name()
         .ok_or_else(|| api::invalid("database path", "no file name"))?;
-    Ok(parent.canonicalize().map_err(unavailable)?.join(name))
+    match parent(path).canonicalize() {
+        Ok(parent) => Ok(parent.join(name)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(api::invalid(
+            "database path",
+            "its parent directory does not exist, and a guarded open makes none",
+        )),
+        Err(error) => Err(unavailable(error)),
+    }
+}
+
+/// A guarded open's admission to a live owner, under the owner table's lock and before any
+/// endpoint or lease effect (local-owner-transport.md, "Owner guards"): the owner is this
+/// process's, the file at the path now is the file it opened, and it holds guards of the same key.
+fn admit_guarded(
+    owner: &Owner,
+    shared: &Shared,
+    identity: Option<amphora_engine::io::FileId>,
+    guards: &Guards,
+) -> Result<(), Refusal> {
+    if matches!(shared.writer, Writer::Client(_)) {
+        return Err(remote_owner());
+    }
+    if owner.identity.is_none() || owner.identity != identity {
+        return Err(api::invalid(
+            "database ownership",
+            "the file at this path is not the live owner's file: the live owner must drain first",
+        ));
+    }
+    match owner.key {
+        Some(key) if key == guards.key() => Ok(()),
+        Some(_) => Err(api::invalid(
+            "database ownership",
+            "the live owner holds other guards: it must drain first",
+        )),
+        None => Err(api::invalid(
+            "database ownership",
+            "the live owner is unguarded: it must drain first",
+        )),
+    }
+}
+
+/// Another process owns the database. Its identity can't show which files it opened, so a guarded
+/// open neither attaches to it as a client nor takes its place.
+/// Forgets the owners that have drained, marking the paths whose lease this process held. A
+/// client's entry never held one (its lease is `Weak::new()`).
+fn forget_drained(owners: &mut BTreeMap<PathBuf, Owner>) -> Result<(), Refusal> {
+    let gone: Vec<PathBuf> = owners
+        .iter()
+        .filter(|(_, owner)| {
+            owner.shared.strong_count() == 0
+                && owner.lease.strong_count() == 0
+                && !owner.lease.ptr_eq(&Weak::new())
+        })
+        .map(|(path, _)| path.clone())
+        .collect();
+    owners.retain(|_, owner| owner.shared.strong_count() > 0 || owner.lease.strong_count() > 0);
+    if gone.is_empty() {
+        return Ok(());
+    }
+    let mut drained = locked(DRAINED.get_or_init(Mutex::default))?;
+    for path in gone {
+        drained.retain(|marked| *marked != path);
+        if drained.len() >= DRAINED_MAX {
+            drained.pop_front();
+        }
+        drained.try_reserve(1).map_err(unavailable)?;
+        drained.push_back(path);
+    }
+    Ok(())
+}
+
+/// Whether this process drained the owner at `path` and has not owned it since.
+fn drained_here(path: &Path) -> Result<bool, Refusal> {
+    Ok(locked(DRAINED.get_or_init(Mutex::default))?
+        .iter()
+        .any(|marked| marked == path))
+}
+
+/// This process holds `path`'s lease again: its mark goes.
+fn owned_again(path: &Path) -> Result<(), Refusal> {
+    locked(DRAINED.get_or_init(Mutex::default))?.retain(|marked| marked != path);
+    Ok(())
+}
+
+/// The deadline passed waiting for a lease this process drained: logged with the reason, since
+/// the Timeout itself carries none (an operator tells it from a slow open by this event).
+fn lease_held_since_drain(path: &Path) {
+    tracing::warn!(target: "amphora.records", event = "records.lease_held_since_drain", path = %path.display(), "the lease is still held since this process drained it: a child this process forked may share it until its exec");
+}
+
+/// Parks before the next probe of a drained path's lease, no later than `until`, and doubles
+/// `pause` up to `LONGEST_PAUSE`.
+fn pause_for_lease(pause: &mut std::time::Duration, until: Instant) {
+    std::thread::park_timeout(until.saturating_duration_since(Instant::now()).min(*pause));
+    *pause = pause.saturating_mul(2).min(LONGEST_PAUSE);
+}
+
+fn remote_owner() -> Refusal {
+    api::invalid(
+        "database ownership",
+        "another process owns this database, and a guarded open must own it: that owner must drain first",
+    )
 }
 
 fn file_identity(path: &Path) -> Result<Option<amphora_engine::io::FileId>, Refusal> {
@@ -221,6 +418,26 @@ pub(crate) fn exclusive_file(path: &Path) -> Result<File, Refusal> {
     try_exclusive_file(path)?
         .ok_or_else(|| unavailable("database ownership is held by another owner"))
 }
+
+/// [`exclusive_file`] for `owner`'s files: a guarded owner's makes no parent directory, and a
+/// parent removed since its open resolved it is refused, never made again: the host's guards
+/// protect the directory that was there (local-owner-transport.md, "Owner guards").
+pub(crate) fn exclusive_file_of(path: &Path, owner: &Owned) -> Result<File, Refusal> {
+    if !owner.guarded() {
+        return exclusive_file(path);
+    }
+    crate::transport::try_lease(&existing_path(path)?)?
+        .ok_or_else(|| unavailable("database ownership is held by another owner"))
+}
+
+/// The database at `path` for `owner`, as [`exclusive_file_of`] makes its directories.
+pub(crate) fn open_db(path: &Path, owner: &Owned) -> Result<Db, Refusal> {
+    if !owner.guarded() {
+        return Db::open(path).map_err(unavailable);
+    }
+    let path = existing_path(path)?;
+    Db::open_made(&path, &crate::db::Sharing::Off).map_err(unavailable)
+}
 pub(crate) fn refused(error: &anyhow::Error) -> Refusal {
     if let Some(refusal) = error.downcast_ref::<Refusal>() {
         return refusal.clone();
@@ -229,6 +446,40 @@ pub(crate) fn refused(error: &anyhow::Error) -> Refusal {
         return refusal.clone();
     }
     unavailable(format!("{error:#}"))
+}
+/// A query's session on `db`, a reader or the writer between its commits: once, before its
+/// deadline, never on a database whose restore is unfinished.
+fn run_query<R, F>(
+    db: &mut Db,
+    until: Instant,
+    claim: Option<&Application>,
+    session: &Mutex<Option<F>>,
+) -> anyhow::Result<R>
+where
+    F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R>,
+{
+    let f = locked(session)?
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("SQL query was already executed"))?;
+    if Instant::now() >= until {
+        return Err(Refusal::Timeout.into());
+    }
+    if restore::incomplete(db)? {
+        return Err(api::invalid("database", "restore is incomplete").into());
+    }
+    let done = db.query_transaction(|db| {
+        let _deadline = db.deadline(until);
+        // As a replicated query is, run as a call: the handle's claim against the floor it reads.
+        application::claim_holds(db, claim)?;
+        let mut connection = crate::sql::Connection::new(db);
+        let value = f(&mut connection)?;
+        connection.finish()?;
+        Ok(value)
+    });
+    if done.is_err() && Instant::now() >= until {
+        return Err(Refusal::Timeout.into());
+    }
+    done
 }
 fn locked<T>(m: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, Refusal> {
     m.lock()
@@ -357,11 +608,12 @@ impl Database {
         path: &Path,
         until: Instant,
         restoring: bool,
+        guards: Option<Guards>,
         initialize: impl FnOnce(&mut Db) -> Result<(), Refusal>,
     ) -> Result<Self, Refusal> {
-        Self::owner(path, until, restoring, None, |path, owner| {
-            let mut db = Db::open(path).map_err(unavailable)?;
-            db.hold_owner(Arc::clone(&owner));
+        Self::owner(path, until, restoring, None, guards, |path, owner| {
+            let mut db = open_db(path, &owner)?;
+            db.hold_owner(owner.clone());
             initialize(&mut db)?;
             Self::from_db_mode(db, until, restoring, Some(owner))
         })
@@ -371,23 +623,39 @@ impl Database {
         path: &Path,
         until: Instant,
         restoring: bool,
-        replica: Option<(&Path, &api::replication::ReplicaConfig)>,
-        create: impl FnOnce(&Path, Arc<File>) -> Result<Self, Refusal>,
+        replica: Option<(
+            &Path,
+            &api::replication::ReplicaConfig,
+            &api::replication::Durability,
+        )>,
+        guards: Option<Guards>,
+        create: impl FnOnce(&Path, Owned) -> Result<Self, Refusal>,
     ) -> Result<Self, Refusal> {
-        let path = canonical_path(path)?;
+        let path = match guards {
+            Some(_) => existing_path(path)?,
+            // Its parent is made by the lease, past every refusal before it.
+            None => resolved_path(path)?,
+        };
+        let mut pause = FIRST_PAUSE;
+        let mut waited = false;
         loop {
             if Instant::now() >= until {
+                if waited {
+                    lease_held_since_drain(&path);
+                }
                 return Err(Refusal::Timeout);
             }
             let mut owners = locked_until(OWNERS.get_or_init(Mutex::default), until)?;
-            owners.retain(|_, owner| {
-                owner.shared.strong_count() > 0 || owner.lease.strong_count() > 0
-            });
+            forget_drained(&mut owners)?;
             let identity = file_identity(&path)?;
             if let Some(owner) = owners.get(&path).or_else(|| {
                 identity.and_then(|id| owners.values().find(|owner| owner.identity == Some(id)))
             }) {
                 if let Some(shared) = owner.shared.upgrade() {
+                    // A reused owner keeps its own group; the incoming guards are dropped.
+                    if let Some(guards) = &guards {
+                        admit_guarded(owner, &shared, identity, guards)?;
+                    }
                     if restoring || shared.restoring.load(Ordering::Acquire) {
                         return Err(api::invalid(
                             "database ownership",
@@ -398,7 +666,10 @@ impl Database {
                         match remote::validate(&backend.client, replica, until) {
                             Ok(_) => {
                                 backend.configure(replica)?;
-                                return Ok(Self { shared });
+                                return Ok(Self {
+                                    shared,
+                                    application: None,
+                                });
                             }
                             // Identity probes cannot submit application work. Only a successful
                             // OS lease below permits starting the predecessor's replacement.
@@ -409,16 +680,18 @@ impl Database {
                             ) => (),
                             Err(error) => return Err(error),
                         }
-                    } else if let Some((log_path, config)) = replica {
+                    } else if let Some((log_path, config, durability)) = replica {
                         match &shared.writer {
                             Writer::Replicated {
                                 log_path: existing,
                                 node_id: id,
                                 config: current,
+                                durability: acknowledged,
                                 ..
                             } if existing == log_path
                                 && *id == config.node_id
-                                && current == config => {}
+                                && current == config
+                                && acknowledged == durability => {}
                             _ => {
                                 return Err(api::invalid(
                                     "replica ownership",
@@ -426,9 +699,15 @@ impl Database {
                                 ));
                             }
                         }
-                        return Ok(Self { shared });
+                        return Ok(Self {
+                            shared,
+                            application: None,
+                        });
                     } else {
-                        return Ok(Self { shared });
+                        return Ok(Self {
+                            shared,
+                            application: None,
+                        });
                     }
                 }
                 // Store shutdown is asynchronous. Its engine/readers/flusher still retain the
@@ -444,7 +723,24 @@ impl Database {
                 }
             }
             api::bound("open database owners", owners.len().saturating_add(1), 4096)?;
-            let Some(lease) = try_exclusive_file(&path)? else {
+            let lease = match guards {
+                // The path is canonical and its parent exists: the lease makes no directory above.
+                Some(_) => crate::transport::try_lease(&path)?,
+                None => try_exclusive_file(&path)?,
+            };
+            let Some(lease) = lease else {
+                // This process drained the owner here: a child it forked may share the lease until
+                // its exec, so the lease is waited for, to the deadline, never refused as another
+                // process's. An unguarded open waits as a client, below.
+                if (guards.is_some() || restoring) && drained_here(&path)? {
+                    drop(owners);
+                    waited = true;
+                    pause_for_lease(&mut pause, until);
+                    continue;
+                }
+                if guards.is_some() {
+                    return Err(remote_owner());
+                }
                 if restoring {
                     return Err(api::invalid(
                         "restore",
@@ -459,6 +755,7 @@ impl Database {
                                 shared: Arc::downgrade(&database.shared),
                                 lease: Weak::new(),
                                 identity,
+                                key: None,
                             },
                         );
                         return Ok(database);
@@ -475,16 +772,19 @@ impl Database {
                     Err(error) => return Err(error),
                 }
             };
-            let owner = Arc::new(lease);
-            let database = create(&path, Arc::clone(&owner))?;
+            owned_again(&path)?;
+            let key = guards.as_ref().map(Guards::key);
+            let owner = Owned::new(Arc::new(lease), guards);
+            let database = create(&path, owner.clone())?;
             remote::publish(&database, &path)?;
             let identity = file_identity(&path)?;
             owners.insert(
                 path,
                 Owner {
                     shared: Arc::downgrade(&database.shared),
-                    lease: Arc::downgrade(&owner),
+                    lease: Arc::downgrade(owner.lease()),
                     identity,
+                    key,
                 },
             );
             return Ok(database);
@@ -492,7 +792,17 @@ impl Database {
     }
 
     pub fn open(path: &Path, until: Instant) -> Result<Self, Refusal> {
-        Self::open_owned(path, until, false, |_| Ok(()))
+        Self::open_owned(path, until, false, None, |_| Ok(()))
+    }
+
+    /// [`Database::open`], this process owning the database with `guards` kept beside its lease
+    /// until the owner has drained (local-owner-transport.md, "Owner guards"). It makes no
+    /// directory: a missing parent is refused. A live owner in this process is reused only if
+    /// it was opened at this file with guards of the same key, and then keeps its own group; an
+    /// unguarded owner, other guards, another file at the path, or another process's owner is
+    /// refused before any endpoint or lease effect, until that owner drains.
+    pub fn open_guarded(path: &Path, guards: Guards, until: Instant) -> Result<Self, Refusal> {
+        Self::open_owned(path, until, false, Some(guards), |_| Ok(()))
     }
 
     /// Opens the one product-owned hyper-durable writer. The host carries authenticated wire
@@ -503,27 +813,88 @@ impl Database {
         config: api::replication::ReplicaConfig,
         until: Instant,
     ) -> Result<Self, Refusal> {
-        let log_path = canonical_path(log_path)?;
+        Self::replicated(
+            path,
+            log_path,
+            config,
+            api::replication::Durability::Persisted,
+            None,
+            until,
+        )
+    }
+
+    /// [`Database::open_replicated`] with `guards`, as [`Database::open_guarded`] keeps them; the
+    /// log's parent directory must exist too.
+    pub fn open_replicated_guarded(
+        path: &Path,
+        log_path: &Path,
+        config: api::replication::ReplicaConfig,
+        guards: Guards,
+        until: Instant,
+    ) -> Result<Self, Refusal> {
+        Self::replicated(
+            path,
+            log_path,
+            config,
+            api::replication::Durability::Persisted,
+            Some(guards),
+            until,
+        )
+    }
+
+    /// [`Database::open_replicated`], its writes acknowledged as `durability` says: the replicated
+    /// class answers once members spanning the fates asked hold a write (docs/design/replication.md,
+    /// "Fast acknowledgement: the replicated class"). A configuration whose voters span fewer fates
+    /// is refused, typed.
+    pub fn open_replicated_with(
+        path: &Path,
+        log_path: &Path,
+        config: api::replication::ReplicaConfig,
+        durability: api::replication::Durability,
+        until: Instant,
+    ) -> Result<Self, Refusal> {
+        Self::replicated(path, log_path, config, durability, None, until)
+    }
+
+    fn replicated(
+        path: &Path,
+        log_path: &Path,
+        config: api::replication::ReplicaConfig,
+        durability: api::replication::Durability,
+        guards: Option<Guards>,
+        until: Instant,
+    ) -> Result<Self, Refusal> {
+        // The log's parent is made by its lease, once this process owns the database.
+        let log_path = match guards {
+            Some(_) => existing_path(log_path)?,
+            None => resolved_path(log_path)?,
+        };
         log_path
             .to_str()
             .ok_or_else(|| api::invalid("replica path", "not UTF-8"))?;
+        replicated::validate(&config)?;
+        let durability = canonical(durability);
+        replicated::validate_durability(&config, &durability)?;
         let node_id = config.node_id;
         Self::owner(
             path,
             until,
             false,
-            Some((&log_path, &config)),
+            Some((&log_path, &config, &durability)),
+            guards,
             |path, owner| {
                 let changed = Arc::new(Changed::default());
                 let client = replicated::start(
                     path,
                     &log_path,
                     config.clone(),
+                    durability.clone(),
                     Arc::clone(&changed),
-                    Arc::clone(&owner),
+                    owner.clone(),
                     until,
                 )?;
                 Ok(Self {
+                    application: None,
                     shared: Arc::new(Shared {
                         transport: Mutex::new(None),
                         path: OnceLock::new(),
@@ -532,6 +903,7 @@ impl Database {
                             log_path: log_path.clone(),
                             node_id,
                             config: config.clone(),
+                            durability: durability.clone(),
                         },
                         changed,
                         restoring: AtomicBool::new(false),
@@ -568,7 +940,7 @@ impl Database {
         db: Db,
         until: Instant,
         restoring: bool,
-        owner: Option<Arc<File>>,
+        owner: Option<Owned>,
     ) -> Result<Self, Refusal> {
         bootstrap_db(&db)?;
         let mut replicated = false;
@@ -596,6 +968,7 @@ impl Database {
         let changed = Changed::default();
         *locked(&changed.published)? = read_published(&db)?;
         let database = Self {
+            application: None,
             shared: Arc::new(Shared {
                 transport: Mutex::new(None),
                 path: OnceLock::new(),
@@ -654,6 +1027,63 @@ impl Database {
                 .map(|v| *v)
                 .map_err(|_| unavailable("wrong SQL session answer")),
             _ => Err(unavailable("wrong SQL session answer")),
+        }
+    }
+
+    /// Runs one read-only SQL session on a reader beside the writer (docs/design/store.md,
+    /// decision 33): it sees what was committed when it began, waits for neither the writer nor a
+    /// flush, and writes nothing, its writing statements refused. A remote or replicated database
+    /// runs it as a [`Database::call`].
+    pub fn query<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
+    {
+        let database = self.resolve(until)?;
+        let Writer::Local(store) = &database.shared.writer else {
+            return database.call(until, f);
+        };
+        // The store runs the session on a reader, or on the writer while it has none to lend.
+        let session = Arc::new(Mutex::new(Some(f)));
+        let on_writer = Arc::clone(&session);
+        let claim = database.application.clone();
+        let on_writer_claim = claim.clone();
+        store
+            .read_committed(
+                until,
+                |reader| run_query(reader, until, claim.as_ref(), &session),
+                move |engine| {
+                    run_query(&mut engine.db, until, on_writer_claim.as_ref(), &on_writer)
+                },
+            )
+            .map_err(|e| refused(&e))
+    }
+
+    /// Runs one read-only SQL session on this node's own state: a local read (replication.md, "A
+    /// local read on a replica"). Standalone, it is [`Database::query`]. On a replica it runs on a
+    /// reader of the owner's applied state, asking the group's leader nothing, so it answers with
+    /// the leader gone or out of reach: a prefix of the group's committed history, maybe behind
+    /// it, never ahead of it. An attached client's runs the same way on its owner's state.
+    /// Refused while a replica hasn't taken its group's first image, once its owner ended, and
+    /// while it is fenced.
+    pub fn query_local<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
+    {
+        let database = self.resolve(until)?;
+        match &database.shared.writer {
+            Writer::Replicated { client, .. } => {
+                let session = Mutex::new(Some(f));
+                let claim = database.application.as_ref();
+                client.read_local(until, |reader| run_query(reader, until, claim, &session))
+            }
+            Writer::Client(backend) => backend
+                .client
+                .for_application(database.application.clone())
+                .query_local(until, f)
+                .map_err(Refusal::from),
+            Writer::Local(_) => database.query(until, f),
         }
     }
 
@@ -719,11 +1149,21 @@ impl Database {
         }
         let store = match &self.shared.writer {
             Writer::Replicated { client, .. } => {
-                return client.submit(namespace.to_owned(), operation, until);
+                return client.submit(
+                    namespace.to_owned(),
+                    operation,
+                    self.application.clone(),
+                    until,
+                );
             }
             Writer::Local(store) => store,
             Writer::Client(backend) => {
-                return remote::submit(&backend.client, namespace, operation, until);
+                return remote::submit(
+                    &backend.client.for_application(self.application.clone()),
+                    namespace,
+                    operation,
+                    until,
+                );
             }
         };
         let admission = Admission::reserve(&self.shared.admitted)?;
@@ -760,6 +1200,7 @@ impl Database {
             .put_then(
                 vec![Command {
                     namespace: namespace.to_owned(),
+                    application: self.application.clone(),
                     operation,
                     answer: Arc::clone(&answer),
                     publication: Arc::clone(&publication),
@@ -1095,6 +1536,12 @@ impl Engine for Local {
         }) {
             for row in rows {
                 if let Operation::Mutation(Mutation::CompactStep { before, .. }) = &row.operation {
+                    if let Err(error) =
+                        application::check(&self.db, row.application.as_ref(), &row.operation)
+                    {
+                        *locked(&row.answer)? = Some(Err(refused(&error)));
+                        continue;
+                    }
                     let result = compaction::local(
                         &mut self.db,
                         &row.namespace,
@@ -1113,6 +1560,7 @@ impl Engine for Local {
                             return Err(Refusal::Timeout.into());
                         }
                         let _deadline = db.deadline(row.until);
+                        application::check(db, row.application.as_ref(), &row.operation)?;
                         if !restoring && restore::incomplete(db)? {
                             return Err(api::invalid("database", "restore is incomplete").into());
                         }
@@ -1147,6 +1595,7 @@ impl Engine for Local {
                         return Err(Refusal::Timeout.into());
                     }
                     let _deadline = db.deadline(r.until);
+                    application::check(db, r.application.as_ref(), &r.operation)?;
                     let result = apply(db, &r.namespace, &r.operation);
                     if result.is_err() && Instant::now() >= r.until {
                         return Err(Refusal::Timeout.into());
@@ -1552,4 +2001,22 @@ fn successor(prefix: &[u8]) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+/// Whether this is the copy of the test binary that runs `test` alone, in a process of its own: a
+/// test that fills or reads the process's owner table can't share it with the tests beside it. The
+/// parent runs the child and checks that it passed.
+#[cfg(test)]
+pub(crate) fn in_child(test: &str) -> bool {
+    const CHILD: &str = "AMPHORA_DATABASE_CHILD";
+    if std::env::var_os(CHILD).is_some_and(|name| name == test) {
+        return true;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env(CHILD, test)
+        .status()
+        .unwrap();
+    assert!(status.success(), "{test} in a child process: {status}");
+    false
 }

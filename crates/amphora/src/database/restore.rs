@@ -56,7 +56,7 @@ impl Restore {
             return Err(api::invalid("restore source", "empty"));
         }
         api::bound("restore source", source.len(), 256)?;
-        let database = Database::open_owned(path, until, true, |db| {
+        let database = Database::open_owned(path, until, true, None, |db| {
             db.exec(super::SCHEMA).map_err(unavailable)?;
             db.exec(SCHEMA).map_err(unavailable)?;
             db.transaction(|db| {
