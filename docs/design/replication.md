@@ -670,7 +670,7 @@ map of fates. What one node states isn't checked against another's here: the raf
 the host, and the configuration both come from is the host's. A member that states the persisted class answers
 nothing held, so that disagreement only loses speed. Fates that disagree across nodes would let a leader count a held
 quorum within one real fate. Closing that needs the class stated once for the group: in its log at bootstrap, each
-member refusing an entry that states another. That is not built.
+member refusing an entry that states another. Decided in "The class stated once per group" below.
 
 **2. A write made at a follower is answered on the leader's commit.** Today a follower answers when it applies the
 write, and hyper-durable applies at a follower only what its own log holds durably (item 6). Under the replicated
@@ -1386,3 +1386,127 @@ Falsified by:
 - a local read answered before its replica took its group's first image, or once its owner ended or was fenced;
 - a `Database::query` on a replica answered without the leader's ReadIndex;
 - more than four readers at once on one replica, or a read that waits past its deadline.
+
+## The class stated once per group (proposed 2026-11-09, Amphora goal 11209e8d)
+
+"Across nodes" above left this open. Each member's owner states its own class, and a leader counts held answers
+by the fates it was given. If two nodes were given different fates, whichever leads counts by its own map, and a
+held quorum can then sit within one real fate.
+
+**The decision.** The class is stated once, in the group's log, and every member holds itself to it:
+- **The entry.** A class entry is a log entry of its own kind: the prefix `amphora.class.v1\0`, then the postcard
+  encoding of the class as `api::replication::Durability`, its fates in canonical order (`database::canonical`,
+  sorted by member). A leader proposes it in its term whenever its machine records no class: at bootstrap that is
+  the group's first leader; for a group from before this change, the first leader that runs it. Two leaders may
+  each propose one. A second entry stating the same class applies as nothing.
+- **Recorded with the state.** A member applies the entry in one transaction with its applied marker. That
+  transaction writes the class into its database (`__amphora_class`, one row), so an image carries it and
+  `install` takes it.
+- **Refused, typed, at apply.** A member whose own stated class differs from the entry's fences. Its owner ends
+  `Refusal::Fenced("the group states another class: ...")`, naming both classes, and its status shows the reason.
+  A committed entry can't be skipped by one member: the log is the group's, so the member that disagrees is the
+  one that stops. This is also why the rule holds whichever member leads first: whoever's entry commits first is
+  the class, and every member stating another is refused.
+- **Refused, typed, at open.** A member whose database already records a class refuses to open stating another:
+  `Refusal::Invalid { what: "replicated class", why: "the group's log states another class" }`. The same fates
+  in another order are the same class.
+- **No held quorum until the class is the member's own.** A member counts held answers only once it has applied
+  a class entry equal to its own, or opened on a database that records it. Until then it counts as the persisted
+  class does: its owner tells the core that every other member is suspected (`Replica::suspect_held`, vendor
+  change 0005, already used by the suspicion feed). Once the class is applied, it trusts every member the host's
+  detector doesn't suspect. The detector's verdicts and the class gate are kept apart: a member is held-counted
+  only when neither suspects it. The class entry itself commits classically, on durable answers.
+
+**Formats.** The log gains one entry kind under a prefix of its own, which is how the seed (`amphora.seed.v1`)
+and the baseline delta were added: append-only, no existing entry read differently. The database gains one
+table. The owner transport's wire doesn't change: the entry travels in raft's log, which the host carries
+(VERSION stays 6). An older binary meets the entry as a command it can't decode, and fences, typed, naming it.
+So a group is upgraded member by member before a member running this code leads. That is the same order the
+floor's join rows asked for ("The application floor, replicated", T-T1.8.A7). Kiln's own rollout states it.
+
+**Sources.** Raft keeps the group's configuration as log entries, so that every member takes it from the log and
+not from its own flags (Ongaro, "Consensus: Bridging Theory and Practice", 2014, §4.1; https://raft.github.io/raft.pdf
+Figure 3 and §5.3, Log Matching; §5.4, Leader Completeness). A class entry is that rule for the class. Once
+committed, it is in every later leader's log (Leader Completeness), and a member applies it before any entry after
+it. Schneider ("Implementing Fault-Tolerant Services Using the State Machine Approach", ACM Computing Surveys
+22(4), 1990, §3): replicas agree only if every input that decides their behaviour is ordered by the protocol.
+Flexible Paxos (Howard, Malkhi, Spiegelman, OPODIS 2016, §3): a quorum system is safe only if every participant
+uses the same intersecting quorums. Fates that differ across members are two quorum systems.
+
+**Evidence (tests, failing first).**
+- `two_members_stating_different_classes_the_second_is_refused_typed` (T-T1.8.C2): three voters, two stating one
+  map of fates and the third another. Once the leader's class entry commits, the third's owner is fenced, naming
+  the class. Reopened stating its own map, it is refused `Invalid`; reopened stating the group's, it opens and
+  catches up. Also: a member stating the persisted class in a replicated group is refused the same way.
+- `no_held_quorum_is_counted_before_the_class_entry_applies` (T-T1.8.C3): durable answers are held from the start.
+  No write is answered on held answers alone until the class entry has committed. Once it applies, with durable
+  answers held again, a write is answered on held ones.
+- `a_class_entry_survives_an_image_and_a_restart` (T-T1.8.C4): a learner installed from an image records the class
+  and refuses another at open.
+
+**Falsified by:** a held commit counted by a member before it applied the group's class, or by one that stated a
+different class; a member that applies a class entry differing from its own and keeps running; a database that
+records one class opening under another; an older entry read differently.
+
+## A replica's local readers bounded by derivation (proposed 2026-11-09, Amphora goal 314d704a)
+
+Amendment 2 above made four readers policy, borrowed from the standalone store's default. kiln's rule is no picked
+numbers (Duplicate Systems, kiln agent 01a1b1935e17). The two things readers cost are what bound them, so the
+bound is derived from those.
+
+**What a reader costs.**
+- **No file descriptor.** A reader is a connection on the machine's engine `Database`. `Database::connect` makes a
+  pager on the database's file and shared log, which it already holds (`init_pager`, crates/engine/database.rs:
+  `self.db_file.clone()`, `self.shared_wal`). So the process's descriptor limit (`RLIMIT_NOFILE`, POSIX
+  `getrlimit`) doesn't bound readers.
+- **Its pages.** `READER_PAGES`, 8 MiB (store.md, decision 5, measured), kept while it is idle.
+- **A caller.** A reader is in use only while a read runs on its caller's thread.
+
+**The decision.**
+1. **Count: at most `CONNECTION_MAX` readers out at once on one replica.** That is the transport's bound on attached
+   clients (32, `transport::wire`). Each client's connection is one worker running one session at a time, so no
+   more readers than that can be in use for clients. In-process callers past it wait, as the fifth waits today: on
+   their own thread, until their deadline, then `Timeout`. Nothing else here is a stated number.
+2. **Pages: every reader is charged to the process's page budget.** Its `READER_PAGES` are charged to the process's
+   shared page pool (`db::process_pages()`, a quarter of the memory the process may use; store.md, decision 26).
+   The charge is taken when a reader opens and returned when it closes. While charged, the pool keeps that many
+   fewer pages: `SharedPages::charge`, an engine change recorded in ORIGIN.md. Insertions into a shard keep it under
+   `per_shard - ceil(charged / SHARDS)`, evicting by CLOCK. So the readers' caches and the pool's shared pages
+   together never pass the pool's budget, and the count across all of a process's replicas is derived from its
+   memory: on a 16 GiB machine, 4 GiB, 1,048,576 pages, 524 readers; where the system doesn't say, 32; at the floor
+   (16 MiB), 2.
+3. **Idle readers.** They live in one process-wide account, so one replica's idle readers never starve another's
+   reads. A read takes, in order:
+   - an idle reader of its own replica;
+   - a new one, if the charge is granted;
+   - a new one after closing another replica's idle reader, oldest given back first, which returns its charge;
+   - the first reader given back or charge returned, before its deadline.
+   Past the deadline it is refused `Timeout`, typed, and its replica is counted under the existing `timeout` reason
+   (no new metric name). A waiter waits on the account's condition variable, with a generation count against lost
+   wakeups, and holds nothing while it waits. Once a replica's owner ends, its idle readers close, its waiting reads
+   are refused `Fenced`, and none opens again.
+- AC-T1.10.L2 becomes: at most `CONNECTION_MAX` local readers out on one replica, and their pages within the
+  process's page budget. A read past either waits on its caller's thread until its deadline, then is refused
+  Timeout, or Fenced once its owner ends.
+
+**Sources.** PostgreSQL bounds backends by `max_connections` and their shared cache by `shared_buffers`
+(documentation, "Connections and Authentication", "Resource Consumption"). These are the two dimensions here: the
+callers bound the count and memory bounds the pages. Store.md decisions 5, 20 and 26 measured the reader's 8 MiB
+and the pool's budget. CLOCK eviction (Corbató, 1968), as decision 20. The engine's `connect` (above) shows readers
+take no descriptor.
+
+**Evidence (tests, failing first).**
+- `local_readers_are_bounded_by_the_transport_not_four` (T-T1.10.L8): `CONNECTION_MAX` reads held open on one replica
+  all run. One more waits and is refused `Timeout` at its deadline while the actor steps, then answers once one is
+  given back. It is red at four today.
+- `local_readers_past_the_process_page_budget_wait_and_reclaim_idle_ones` (T-T1.10.L9): an account of two readers'
+  pages and two replicas. Replica A's read leaves an idle reader. B's two reads run, the second closing A's idle
+  reader. A's next read waits and is refused `Timeout`. The charge never passes the budget, and once all are given
+  back it is the idle readers' alone.
+- Engine, `a_charge_shrinks_what_the_pool_keeps`: a pool of `n` pages charged `c` keeps at most `n - c` after
+  inserts, and keeps `n` again once the charge is returned.
+- T-T1.10.L5 (the fifth read) is rewritten as T-T1.10.L8.
+
+**Falsified by:** more than `CONNECTION_MAX` readers out on one replica; readers' charged pages plus the pool's kept
+pages above the pool's budget; a read refused while an idle reader of another replica held the charge it needed;
+a read answered past its deadline.
