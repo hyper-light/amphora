@@ -407,18 +407,18 @@ struct ColumnBounds {
 
 /// The fraction of rows `constraints` keep together. A column bounded from both sides keeps
 /// `sel_closed_range` in place of its bounds' product, as a seek's range does
-/// ([range_selectivity]). The table's own filters but its equalities, and `sampled` (what its
-/// sample gives the terms it ran, decision 21), combine by exponential backoff
+/// ([range_selectivity]). The table's own filters but its equalities, and `sampled` (the shares
+/// its sample gives the terms it ran, decision 21), combine by exponential backoff
 /// ([super::sample_filter::backoff]). Equalities and IN lists multiply, as a term that reads
 /// another table does: their selectivities come from `sqlite_stat1`'s index prefixes and the
 /// sketches' distinct counts, by which a whole key's equalities give its one row.
 pub(crate) fn constraints_selectivity<'a>(
     constraints: impl Iterator<Item = &'a Constraint>,
-    sampled: Option<f64>,
+    sampled: &[f64],
     params: &CostModelParams,
 ) -> f64 {
     let mut multiplied = 1.0;
-    let mut factors: SmallVec<[f64; 8]> = sampled.into_iter().collect();
+    let mut factors: SmallVec<[f64; 8]> = sampled.iter().copied().collect();
     let mut columns: SmallVec<[ColumnBounds; 4]> = SmallVec::new();
     for constraint in constraints {
         // Amphora: an implied bound filters nothing its term doesn't (decision 3).

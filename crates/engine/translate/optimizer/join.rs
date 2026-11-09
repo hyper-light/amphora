@@ -96,7 +96,7 @@ fn constraint_output_multipliers(
                 && !skipped_where_terms.get(constraint.where_clause_pos.0)
                 && !where_clause[constraint.where_clause_pos.0].consumed
         }),
-        None,
+        &[],
         params,
     )
 }

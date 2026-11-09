@@ -252,3 +252,84 @@ fn a_filter_made_more_restrictive_never_raises_its_estimate() {
     assert_eq!(checked, 400);
     assert!(lowered > 200, "only {lowered} of {checked} lowered");
 }
+
+/// Do: ANALYZE small tables, then estimate joins whose filter stands in an inner join's ON and,
+/// again, in WHERE, as the oracles' order check states them (seed 11's findings at a6a5fb0: 0.25
+/// rows against 0.005, 1,000 against 200). Expect: one estimate for both, the ON term run on the
+/// sample as the WHERE term is (decisions 13 and 21).
+#[test]
+fn an_inner_joins_on_term_and_a_where_term_give_one_estimate() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open(dir.path());
+    conn.execute("CREATE TABLE t1 (c0 NUMERIC)").unwrap();
+    conn.execute("INSERT INTO t1 VALUES (7), (3), (5), (9)")
+        .unwrap();
+    lineitem(&conn);
+    conn.execute("ANALYZE").unwrap();
+    for (on, wh) in [
+        (
+            "SELECT 1 FROM t1 AS a0 JOIN t1 AS a1 ON (3 BETWEEN a0.c0 AND a0.c0)",
+            "SELECT 1 FROM t1 AS a0, t1 AS a1 WHERE (3 BETWEEN a0.c0 AND a0.c0)",
+        ),
+        (
+            "SELECT 1 FROM t1 AS a0, lineitem AS l JOIN t1 AS a2 ON (l.comment GLOB '*final*')",
+            "SELECT 1 FROM t1 AS a0, lineitem AS l, t1 AS a2 WHERE (l.comment GLOB '*final*')",
+        ),
+    ] {
+        let (a, b) = (estimate(&conn, on), estimate(&conn, wh));
+        assert!(
+            (a - b).abs() <= 1e-9 * a.abs().max(b.abs()),
+            "{on}: {a}; {wh}: {b}"
+        );
+    }
+}
+
+/// Do: ANALYZE, then estimate outer joins whose right table has a sampled ON term and a WHERE term
+/// of its own, and the inner joins they restrict to, as CERT states them (seed 11's finding at
+/// a6a5fb0 with the ON terms sampled apart: the inner join at 1 row, the RIGHT JOIN at 0.967).
+/// Expect: no inner join estimated above its outer join, the ON and WHERE terms read from the
+/// sample together in both (decision 21; T-PL.4.1).
+#[test]
+fn an_outer_join_with_sampled_terms_is_estimated_at_least_its_inner_join() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open(dir.path());
+    conn.execute("CREATE TABLE t0 (c0 REAL, c1 INT NOT NULL)")
+        .unwrap();
+    conn.execute("INSERT INTO t0 VALUES (NULL, -2.5), (9007199254740993, 2)")
+        .unwrap();
+    lineitem(&conn);
+    conn.execute("ANALYZE").unwrap();
+    for (from, on, wh) in [
+        (
+            "t0 AS a0 {} t0 AS a1",
+            "NOT (a1.c0 GLOB 'a%')",
+            "a1.c1 >= 3",
+        ),
+        (
+            "t0 AS a0 {} lineitem AS a1",
+            "a1.comment LIKE '%final%'",
+            "a1.quantity < 20",
+        ),
+        (
+            "t0 AS a0 {} lineitem AS a1",
+            "a1.quantity > 10 OR a1.discount < 0.02",
+            "a1.quantity < 30",
+        ),
+    ] {
+        let sql = |join: &str| {
+            format!(
+                "SELECT 1 FROM {} ON ({on}) WHERE ({wh})",
+                from.replace("{}", join)
+            )
+        };
+        let inner = estimate(&conn, &sql("JOIN"));
+        for outer in ["LEFT JOIN", "RIGHT JOIN", "FULL JOIN"] {
+            let e = estimate(&conn, &sql(outer));
+            assert!(
+                inner <= e * (1.0 + 1e-9),
+                "{}: {e}, below its inner join's {inner}",
+                sql(outer)
+            );
+        }
+    }
+}

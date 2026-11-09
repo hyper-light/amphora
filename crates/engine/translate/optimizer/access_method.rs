@@ -313,7 +313,7 @@ pub(super) fn choose_best_btree_candidate(
             });
             let rows = input_cardinality.max(1.0)
                 * *base_row_count
-                * constraints_selectivity(ready, None, params);
+                * constraints_selectivity(ready, &[], params);
             // Amphora: a sort, or a GROUP BY's probes and groups (`docs/design/planner.md`,
             // decision 7).
             crate::translate::optimizer::cost::order_cost(target, rows, params)

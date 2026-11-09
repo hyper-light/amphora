@@ -148,8 +148,21 @@ struct Table {
     keys: SmallVec<[usize; 2]>,
     /// A join's right table with an ON term no row passes: it matches no row.
     matches_none: bool,
-    /// The filter terms its sample ran and the share of the sample they keep (decision 21).
+    /// Its filter terms its sample ran and the share of the sample they keep (decision 21).
     sampled: Option<Sampled>,
+    /// The same for the ON terms of its own outer join, and for those and its filters together:
+    /// an outer join's matches that its filters keep then read the sample as the inner join it
+    /// restricts to reads it for the same terms (CERT).
+    sampled_on: Option<Sampled>,
+    sampled_both: Option<Sampled>,
+}
+
+/// Which of a table's terms its sample runs: its filters, or its own outer join's ON terms.
+#[derive(Clone, Copy)]
+enum Which {
+    Filter,
+    On,
+    Both,
 }
 
 /// A table's WHERE terms run over its sample together (decision 21).
@@ -379,17 +392,63 @@ impl<'a> JoinedSetRows<'a> {
                         .is_some_and(|origin| origin.right_table() == joined.internal_id)
                         && never_true(&term.expr)
                 });
-            let sampled = if kind == Kind::Inner {
-                sampled_filters(
-                    joined,
-                    table_idx,
-                    table_constraints,
-                    where_clause,
-                    &homes,
-                    schema,
-                )
+            // A term whose constraint counts as other than a filter (`IS NULL` of a column no
+            // row of the table holds NULL) keeps its class's count.
+            let not_a_filter = |pos: usize| {
+                counted.iter().any(|c: &Counted| {
+                    c.class != Class::Filter
+                        && c.class != Class::On
+                        && table_constraints
+                            .get(c.constraint)
+                            .is_some_and(|c| c.where_clause_pos.0 == pos)
+                })
+            };
+            let (sampled, sampled_on, sampled_both) = if kind == Kind::SemiOrAnti {
+                (None, None, None)
             } else {
-                None
+                let filter = |pos: usize| {
+                    let term = where_clause.get(pos)?;
+                    let home = homes(pos);
+                    (!not_a_filter(pos)
+                        && matches!(
+                            term.origin,
+                            WhereTermOrigin::Where | WhereTermOrigin::Join(_)
+                        )
+                        && !term.origin.is_outer_join()
+                        && home.is_none_or(|home| home == table_idx))
+                    .then_some(home.is_some())
+                };
+                let on = |pos: usize| {
+                    let term = where_clause.get(pos)?;
+                    (term.origin.is_outer_join()
+                        && term
+                            .origin
+                            .join_origin()
+                            .is_some_and(|origin| origin.right_table() == joined.internal_id))
+                    .then_some(false)
+                };
+                let sample = |which| {
+                    sampled_filters(
+                        joined,
+                        table_constraints,
+                        where_clause,
+                        &|pos| match which {
+                            Which::Filter => filter(pos),
+                            Which::On => on(pos),
+                            Which::Both => filter(pos).or_else(|| on(pos)),
+                        },
+                        schema,
+                    )
+                };
+                let on_terms = where_clause
+                    .iter()
+                    .enumerate()
+                    .any(|(pos, _)| on(pos).is_some());
+                (
+                    sample(Which::Filter),
+                    sample(Which::On),
+                    on_terms.then(|| sample(Which::Both)).flatten(),
+                )
             };
             tables.push(Table {
                 kind,
@@ -398,6 +457,8 @@ impl<'a> JoinedSetRows<'a> {
                 keys,
                 matches_none,
                 sampled,
+                sampled_on,
+                sampled_both,
             });
         }
         // A WHERE term no row passes (`WHERE NULL`) leaves no rows in any set, whether or not
@@ -575,19 +636,31 @@ impl<'a> JoinedSetRows<'a> {
             .map(|(c, pair)| pair.unwrap_or(c.selectivity))
             .product();
         // The terms its sample ran count once, together (decision 21).
-        let sampled = t
-            .sampled
-            .as_ref()
-            .filter(|_| classes.contains(&Class::Filter));
-        let in_sampled =
-            |c: &Constraint| sampled.is_some_and(|s| s.terms.contains(&c.where_clause_pos.0));
+        let (on, filter) = (
+            classes.contains(&Class::On),
+            classes.contains(&Class::Filter),
+        );
+        let sampled: SmallVec<[&Sampled; 2]> = match (on, filter) {
+            (true, true) if t.sampled_both.is_some() => t.sampled_both.iter().collect(),
+            _ => [(filter, t.sampled.as_ref()), (on, t.sampled_on.as_ref())]
+                .into_iter()
+                .filter(|(asked, _)| *asked)
+                .filter_map(|(_, sampled)| sampled)
+                .collect(),
+        };
+        let in_sampled = |c: &Constraint| {
+            sampled
+                .iter()
+                .any(|s| s.terms.contains(&c.where_clause_pos.0))
+        };
+        let shares: SmallVec<[f64; 2]> = sampled.iter().map(|s| s.selectivity).collect();
         alone
             * constraints_selectivity(
                 counted
                     .filter(|c| !reads_a_table(c))
                     .map(|(constraint, _)| constraint)
                     .filter(|constraint| !in_sampled(constraint)),
-                sampled.map(|s| s.selectivity),
+                &shares,
                 self.params,
             )
     }
@@ -773,24 +846,23 @@ fn column_equality(
     (a.0 != b.0).then_some((a, b))
 }
 
-/// The WHERE terms of `table` its sample runs, and the share of the sample they keep together
-/// (docs/design/planner.md, decision 21; PL.4): each term of the table's own WHERE whose only
-/// columns are the table's sampled ones, but for an `=` or IN list its column statistics
-/// estimate (decision 20), compiled once and run on each sample row within
-/// [SAMPLE_STEPS] steps for the table. Where at least [SAMPLE_HITS] rows pass them all, their share
-/// of the sample; where fewer do, the share of half a row or of the rows that pass, but no more
-/// than the terms' own estimates give by exponential backoff, so a rare value keeps its distinct
-/// count's estimate (decision 20). Each part falls as a term is added, so the whole never rises
-/// (CERT). `None` where the table has no sample or no term runs on it.
+/// The terms of `joined` its sample runs, those `takes` names, and the share of the sample they
+/// keep together (docs/design/planner.md, decision 21; PL.4): each whose only columns are the
+/// table's sampled ones, but for an `=` or IN list its column statistics estimate (decision 20),
+/// compiled once and run on each sample row within [SAMPLE_STEPS] steps for the table. Where at
+/// least [SAMPLE_HITS] rows pass them all, their share of the sample; where fewer do, the share of
+/// half a row or of the rows that pass, but no more than the terms' own estimates give by
+/// exponential backoff, so a rare value keeps its distinct count's estimate. Each part falls as a
+/// term is added, so the whole never rises (CERT). `None` where the table has no sample or no
+/// term runs on it.
 ///
 /// [SAMPLE_STEPS]: super::sample_filter::SAMPLE_STEPS
 /// [SAMPLE_HITS]: crate::column_stats::SAMPLE_HITS
 fn sampled_filters(
     joined: &JoinedTable,
-    table_idx: usize,
     constraints: &[Constraint],
     where_clause: &[WhereTerm],
-    homes: &impl Fn(usize) -> Option<usize>,
+    takes: &impl Fn(usize) -> Option<bool>,
     schema: &Schema,
 ) -> Option<Sampled> {
     let btree = joined.table.btree()?;
@@ -818,15 +890,15 @@ fn sampled_filters(
     let mut own: SmallVec<[f64; 8]> = SmallVec::new();
     let mut passing: Vec<bool> = vec![true; n];
     for (pos, term) in where_clause.iter().enumerate() {
-        // A term no constraint homes (an OR of conjunctions, say) is this table's when it reads
-        // only this table's columns, which its program then holds.
-        let home = homes(pos);
-        if term.consumed
-            || !matches!(term.origin, WhereTermOrigin::Where)
-            || home.is_some_and(|home| home != table_idx)
-        {
+        // `takes` says whether the term is one of those sampled here, and whether a constraint
+        // homes it; one no constraint homes (an OR of conjunctions, say) is this table's when it
+        // reads only this table's columns, which its program then holds.
+        if term.consumed {
             continue;
         }
+        let Some(homed) = takes(pos) else {
+            continue;
+        };
         // An `=` or IN list of constants on a column with a sketch keeps the estimate its column
         // statistics give it (decision 20), which tells a common value from a rare one where a
         // sample of 1,024 rows only counts it.
@@ -851,7 +923,7 @@ fn sampled_filters(
         }
         let Some(program) = target
             .compile(&term.expr)
-            .filter(|program| home.is_some() || program.reads_a_column())
+            .filter(|program| homed || program.reads_a_column())
         else {
             continue;
         };

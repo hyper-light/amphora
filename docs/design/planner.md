@@ -1107,7 +1107,11 @@ set (`cardinality.rs`, `JoinedSetRows`), each inner table with a sample (decisio
 WHERE terms over the sample, once a prepare (`sampled_filters`). The share of the sample's rows
 that pass them all is their selectivity together: ranges, LIKE and GLOB, ORs of conjunctions,
 IS NULL and correlated columns at once. A term takes part when it reads only this table's
-sampled columns and constants. The evaluator (`optimizer/sample_filter.rs`) runs comparisons,
+sampled columns and constants: a WHERE term or an inner join's ON term, which the order check
+holds to one estimate, including an OR that no constraint homes. The ON terms of the table's own
+outer join run apart, and again together with its filters. Outer joins size their matches from
+`sel(ON and filters) / sel(ON)`, so an outer join reads the sample for the same terms as the inner
+join it restricts to (CERT). The evaluator (`optimizer/sample_filter.rs`) runs comparisons,
 BETWEEN, IN lists, LIKE and GLOB, IS NULL, AND, OR and NOT, with SQLite's comparison affinity
 and the BINARY, NOCASE and RTRIM collations. An `=` or IN list of constants on a column with a
 sketch keeps its column statistics' estimate (decision 20), which tells a common value from a
@@ -1169,6 +1173,12 @@ independent; an OR no constraint takes was not counted at all.
   with the sample and without statistics, each given one more term. None rises, and more than 200
   fall.
 - `backoff_never_rises_with_an_added_selectivity` (unit, T-PL.4.1).
+- `an_inner_joins_on_term_and_a_where_term_give_one_estimate` and
+  `an_outer_join_with_sampled_terms_is_estimated_at_least_its_inner_join` hold the oracles'
+  findings on seed 11. With only WHERE terms sampled there were 30 order-check findings (an
+  inner join's ON term against the same WHERE term). With ON terms sampled but an outer join's
+  apart from its filters there were 21 CERT findings, then one. With the joint sample, seeds 11
+  and 12 at 300 s each found none in 855,783 checks.
 - Decision 20's tests and `records_plans`' whole-key lookup pass, the latter because equalities
   multiply.
 
