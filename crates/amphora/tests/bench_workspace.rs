@@ -68,3 +68,17 @@ fn the_bench_workspace_patches_every_crate_the_root_patches() {
         "bench/Cargo.toml lacks the root's patches {missing:?}; it has {bench:?}"
     );
 }
+
+/// AC-T1.2.1. Do: count the `[patch.crates-io]` tables in the bench's manifest. Expect: exactly one. Cargo refuses a
+/// manifest that names a table twice (a duplicate key), and the bench then doesn't build; merge 2472173 left two.
+#[test]
+fn the_bench_manifest_names_its_patches_once() {
+    let tables = include_str!("../../../bench/Cargo.toml")
+        .lines()
+        .filter(|line| line.trim() == "[patch.crates-io]")
+        .count();
+    assert_eq!(
+        tables, 1,
+        "bench/Cargo.toml has {tables} [patch.crates-io] tables"
+    );
+}
