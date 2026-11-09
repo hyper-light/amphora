@@ -1496,6 +1496,7 @@ pub fn constraints_from_where_clause(
             }
         }
 
+        apply_column_stats(&mut cs.constraints, table_reference, where_clause, schema);
         for candidate in cs.candidates.iter_mut() {
             // Sort by index_col_pos, ascending -- index columns must be consumed in contiguous order.
             candidate.refs.sort_by_key(|cref| cref.index_col_pos);
@@ -2688,4 +2689,182 @@ fn find_best_index_for_constraint(
     }
 
     (None, vec![])
+}
+
+/// Amphora (docs/design/planner.md, decision 20; PL.2): each `=` and IN list of `table`'s columns
+/// against constants takes ANALYZE's column statistics where it kept them. A value the sample
+/// holds as a common one ([common_kept]) takes its share of the sample; another takes the share
+/// the common values leave of the column's non-NULL rows, over the distinct values they leave
+/// (PostgreSQL's `var_eq_const`), at most the least common value's; a bound parameter's value,
+/// unknown at prepare, and a column of a collation other than BINARY, the share of the non-NULL
+/// rows over the distinct count. An IN list takes the sum of its values', at most one. A unique
+/// key keeps its one row a value, a join term its equivalence class (decision 18), and every
+/// other constraint what it had.
+fn apply_column_stats(
+    constraints: &mut [Constraint],
+    table: &JoinedTable,
+    where_clause: &[WhereTerm],
+    schema: &Schema,
+) {
+    let Some(stats) = schema.analyze_stats.table_stats(table.table.get_name()) else {
+        return;
+    };
+    let single_key = table
+        .table
+        .btree()
+        .is_some_and(|t| t.primary_key_columns.len() == 1);
+    for constraint in constraints.iter_mut() {
+        if constraint.implied || constraint.null_matching || !constraint.lhs_mask.is_empty() {
+            continue;
+        }
+        let Some(column) = constraint
+            .table_col_pos
+            .and_then(|pos| table.table.get_column_at(pos))
+        else {
+            continue;
+        };
+        if column.is_rowid_alias() || (column.primary_key() && single_key) || column.unique() {
+            continue;
+        }
+        let Some(name) = column.name.as_deref().map(crate::util::normalize_ident) else {
+            continue;
+        };
+        let Some(counted) = stats.columns.get(&name) else {
+            continue;
+        };
+        let Some(term) = where_clause.get(constraint.where_clause_pos.0) else {
+            continue;
+        };
+        let rows = counted.non_null.saturating_add(counted.nulls);
+        if rows == 0 {
+            continue;
+        }
+        let non_null = counted.non_null as f64 / rows as f64;
+        let per_distinct = non_null / counted.distinct.max(1.0);
+        let binary = matches!(column.collation(), CollationSeq::Binary);
+        let nulls = counted.nulls as f64 / rows as f64;
+        let sample = stats
+            .sample
+            .as_deref()
+            .filter(|sample| binary && !sample.rows.is_empty())
+            .and_then(|sample| {
+                let at = sample.columns.iter().position(|c| *c == name)?;
+                let n = sample.rows.len() as f64;
+                let common = sample.common.get(at)?;
+                let kept = common_kept(common, n, rows as f64, counted.distinct, nulls);
+                Some((n, common.get(..kept)?))
+            });
+        // The share of a value no common one is: what the common values leave, over the
+        // distinct values they leave, and never above the least common one's.
+        let rare = sample.map_or(per_distinct, |(n, common)| {
+            let hits: usize = common.iter().map(|(_, hits)| *hits).sum();
+            let left = (non_null - hits as f64 / n).max(0.0);
+            let least = common.iter().map(|(_, hits)| *hits).min();
+            let share = left / (counted.distinct - common.len() as f64).max(1.0);
+            least.map_or(share, |least| share.min(least as f64 / n))
+        });
+        let share = |value: Option<crate::Value>| -> f64 {
+            let (Some(value), Some((n, common))) = (value, sample) else {
+                return per_distinct;
+            };
+            let value = match column.affinity().convert_for_compare(&value) {
+                Some(either::Either::Left(converted)) => match converted.to_owned() {
+                    Ok(converted) => converted,
+                    Err(_) => return per_distinct,
+                },
+                Some(either::Either::Right(converted)) => converted,
+                None => value,
+            };
+            let Some(h) = crate::column_stats::value_hash(&value) else {
+                return 0.0;
+            };
+            common
+                .iter()
+                .find(|(hash, _)| *hash == h)
+                .map_or(rare, |(_, hits)| *hits as f64 / n)
+        };
+        let selectivity = match (constraint.operator, &term.expr) {
+            (
+                ConstraintOperator::AstNativeOperator(ast::Operator::Equals),
+                ast::Expr::Binary(lhs, _, rhs),
+            ) => {
+                // The side the constraint names is the constraining one.
+                let other = if constraint.where_clause_pos.1 == BinaryExprSide::Lhs {
+                    lhs
+                } else {
+                    rhs
+                };
+                share(literal_value(other))
+            }
+            (ConstraintOperator::In { not: false, .. }, ast::Expr::InList { rhs, .. }) => rhs
+                .iter()
+                .map(|value| share(literal_value(value)))
+                .sum::<f64>()
+                .min(1.0),
+            _ => continue,
+        };
+        constraint.selectivity = selectivity;
+    }
+}
+
+/// How many of a column's `common` values, the most common first, stand apart from the rest
+/// (PostgreSQL's `analyze_mcv_list`, `src/backend/commands/analyze.c` at 6a3da13d376f): the least
+/// common is dropped while its `n`-row sample count is within two standard errors and a half of
+/// the count the values left would give it (the hypergeometric distribution's of a `total`-row
+/// table), so a column whose values are about equally common keeps none and its estimates its
+/// distinct count's, the same for every table that holds those values. The loop is bounded by
+/// `common`, at most a tenth of the sample.
+fn common_kept(common: &[(u64, usize)], n: f64, total: f64, distinct: f64, nulls: f64) -> usize {
+    if n >= total {
+        return common.len();
+    }
+    let mut kept = common.len();
+    let mut sum: f64 = common
+        .iter()
+        .take(kept.saturating_sub(1))
+        .map(|(_, hits)| *hits as f64)
+        .sum();
+    while let Some(last) = kept.checked_sub(1) {
+        let Some((_, hits)) = common.get(last) else {
+            break;
+        };
+        let hits = *hits as f64;
+        let mut share = (1.0 - sum / n - nulls).clamp(0.0, 1.0);
+        let other = distinct - last as f64;
+        if other > 1.0 {
+            share /= other;
+        }
+        let k = total * hits / n;
+        let variance = n * k * (total - k) * (total - n) / (total * total * (total - 1.0));
+        if hits > share * n + 2.0 * variance.max(0.0).sqrt() + 0.5 {
+            break;
+        }
+        kept = last;
+        let Some(before) = last.checked_sub(1) else {
+            break;
+        };
+        sum -= common.get(before).map_or(0.0, |(_, hits)| *hits as f64);
+    }
+    kept
+}
+
+/// The value a literal is, `None` for anything else (a parameter, a column, an expression).
+fn literal_value(expr: &ast::Expr) -> Option<crate::Value> {
+    match expr {
+        ast::Expr::Literal(ast::Literal::Numeric(n)) => {
+            if let Ok(i) = n.parse::<i64>() {
+                Some(crate::Value::from_i64(i))
+            } else {
+                n.parse::<f64>().ok().map(crate::Value::from_f64)
+            }
+        }
+        ast::Expr::Literal(ast::Literal::String(s)) => Some(crate::Value::build_text(
+            crate::translate::expr::sanitize_string(s),
+        )),
+        ast::Expr::Parenthesized(exprs) => match exprs.as_slice() {
+            [only] => literal_value(only),
+            _ => None,
+        },
+        _ => None,
+    }
 }

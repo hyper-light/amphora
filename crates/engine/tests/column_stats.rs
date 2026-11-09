@@ -57,8 +57,10 @@ fn q_error(estimated: f64, counted: f64) -> f64 {
 
 /// JOB's keyword table at a tenth of its rows: each keyword distinct, no index on it.
 fn keywords(conn: &Arc<Connection>) {
-    conn.execute("CREATE TABLE keyword (id INTEGER PRIMARY KEY, keyword TEXT NOT NULL, phonetic_code TEXT)")
-        .unwrap();
+    conn.execute(
+        "CREATE TABLE keyword (id INTEGER PRIMARY KEY, keyword TEXT NOT NULL, phonetic_code TEXT)",
+    )
+    .unwrap();
     let rows: Vec<String> = (1..=13_417)
         .map(|i| format!("({i}, 'keyword-{i}', 'P{}')", i % 900))
         .collect();
@@ -171,9 +173,15 @@ fn a_statement_prepared_before_analyze_plans_again_after_it() {
     let kept = json["output_rows"].as_f64().unwrap();
     assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 1);
     let fresh = estimate(&conn, sql);
-    assert_eq!(kept, fresh, "{sql}: prepared before ANALYZE {kept}, after {fresh}");
+    assert_eq!(
+        kept, fresh,
+        "{sql}: prepared before ANALYZE {kept}, after {fresh}"
+    );
     let counted = count(&conn, sql);
-    assert!(q_error(fresh, counted) <= 1.25, "{sql}: estimated {fresh}, counted {counted}");
+    assert!(
+        q_error(fresh, counted) <= 1.25,
+        "{sql}: estimated {fresh}, counted {counted}"
+    );
 }
 
 /// Do: ANALYZE a table of 3,000 rows of two KiB each, six times the sample's 1 MiB bound, whose
@@ -195,9 +203,36 @@ fn a_table_past_the_samples_bound_keeps_its_distinct_counts() {
         .prepare("SELECT count(*) FROM __turso_internal_column_stats WHERE tbl = 'wide' AND kind = 'sample' AND data IS NULL")
         .unwrap();
     let rows = stmt.run_collect_rows().unwrap();
-    assert_eq!(rows[0][0].as_int(), Some(1), "the sample past its bound is kept");
+    assert_eq!(
+        rows[0][0].as_int(),
+        Some(1),
+        "the sample past its bound is kept"
+    );
     let sql = "SELECT id FROM wide WHERE g = 17";
     let (e, c) = (estimate(&conn, sql), count(&conn, sql));
     assert_eq!(c, 10.0);
+    assert!(q_error(e, c) <= 1.25, "{sql}: estimated {e}, counted {c}");
+}
+
+/// Do: ANALYZE a WITHOUT ROWID table of 5,000 rows keyed by a unique id, its column v holding 50
+/// values of 100 rows each and stored after the key in its records, then estimate an equality on
+/// v. Expect: within 1.25 of the 100 rows counted, so ANALYZE sketched v and not the key (whose
+/// 5,000 distinct values would give one row; decision 15's records, decision 20).
+#[test]
+fn a_without_rowid_tables_columns_are_sketched_as_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let options = OpenOptions::new(Arc::new(SqliteDialect))
+        .db_opts(DatabaseOpts::new().with_without_rowid(true));
+    let db = Database::open(io, dir.path().join("w.db").to_str().unwrap(), options).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE w (v INTEGER, id INTEGER NOT NULL, PRIMARY KEY (id)) WITHOUT ROWID")
+        .unwrap();
+    let rows: Vec<String> = (0..5_000).map(|i| format!("({}, {i})", i % 50)).collect();
+    insert(&conn, "w", &rows);
+    conn.execute("ANALYZE").unwrap();
+    let sql = "SELECT id FROM w WHERE v = 17";
+    let (e, c) = (estimate(&conn, sql), count(&conn, sql));
+    assert_eq!(c, 100.0);
     assert!(q_error(e, c) <= 1.25, "{sql}: estimated {e}, counted {c}");
 }

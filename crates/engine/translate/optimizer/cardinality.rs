@@ -744,8 +744,8 @@ fn column_equality(
 
 /// A column's domain, at least one and at most its table's `rows`, and whether it is a count: a
 /// unique key's rows (the rowid, a primary key of one column, a unique index of one column and no
-/// WHERE), else the distinct values `sqlite_stat1` gives where an index without a WHERE leads it;
-/// else the table's rows, its column taken for a key.
+/// WHERE), else the distinct values `sqlite_stat1` gives where an index without a WHERE leads it,
+/// else its sketch's (decision 20); else the table's rows, its column taken for a key.
 fn column_domain(
     joined_tables: &[JoinedTable],
     table: usize,
@@ -793,7 +793,13 @@ fn column_domain(
             );
         distinct = distinct.or(counted);
     }
-    match distinct {
+    // Where no index leads it, the column's sketch (decision 20).
+    let sketched = || {
+        let column = joined.table.get_column_at(column)?.name.as_deref()?;
+        let counted = stats?.columns.get(&crate::util::normalize_ident(column))?;
+        (counted.non_null > 0).then_some(counted.distinct)
+    };
+    match distinct.or_else(sketched) {
         Some(values) => (values.clamp(1.0, rows), true),
         None => (rows, false),
     }

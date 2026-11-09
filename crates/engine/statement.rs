@@ -638,6 +638,10 @@ impl Statement {
                 tracing::warn!("Failed to refresh analyze stats after ANALYZE: {err}");
             }
         }
+        // Amphora (docs/design/planner.md, decision 20; AC-PL.2.3): the connection's statements
+        // plan again at their next run, on the statistics ANALYZE kept, as SQLite's ANALYZE ends
+        // with OP_Expire.
+        self.program.connection.bump_prepare_context_generation();
         self.analyze_refresh = None;
         self.busy = false;
         Ok(StepResult::Done)

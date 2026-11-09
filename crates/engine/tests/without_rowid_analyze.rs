@@ -88,9 +88,11 @@ fn analyze_counts_a_without_rowid_tables_key_as_sqlite_does() {
     }
 }
 
-/// Do: ANALYZE a WITHOUT ROWID table keyed by (a, b, c) and a rowid table with the same rows and an index on (a, b), then
-/// estimate a read of one value of `a` from each. Expect: the two estimates the same, the statistics' 572 rows a value,
-/// so the row ANALYZE wrote for the key reaches the plans that read it, as the index's row does.
+/// Do: ANALYZE a WITHOUT ROWID table keyed by (a, b, c), a rowid table with the same rows and an index on (a, b), and a
+/// table of 70 values of `a`, then estimate the join of each on `a`. Expect: the two estimates the same, `a`'s domain
+/// the statistics' 572 rows a value, so the row ANALYZE wrote for the key reaches the plans that read it, as the index's
+/// row does. A join's domain reads them (decision 18); an equality on `a` reads each table's own sample, which two
+/// tables draw apart (decision 20).
 #[test]
 fn a_without_rowid_keys_statistics_reach_the_planner() {
     let conn = open();
@@ -98,15 +100,23 @@ fn a_without_rowid_keys_statistics_reach_the_planner() {
         "CREATE TABLE w(a TEXT NOT NULL, b BLOB NOT NULL, c INTEGER NOT NULL, v BLOB, PRIMARY KEY (a, b, c)) WITHOUT ROWID",
         "CREATE TABLE r(a TEXT NOT NULL, b BLOB NOT NULL, c INTEGER NOT NULL, v BLOB)",
         "CREATE INDEX r_ab ON r(a, b)",
+        "CREATE TABLE j(k TEXT NOT NULL)",
     ] {
         conn.execute(sql).unwrap();
     }
     conn.execute(format!("{FILL} INSERT INTO w(a, b, c, v) SELECT 'f' || (x / 3 % 7), CAST('k' || (1000000 + x / 3) AS BLOB), x % 3, zeroblob(16) FROM s")).unwrap();
     conn.execute("INSERT INTO r SELECT * FROM w").unwrap();
-    let before = estimate(&conn, "SELECT * FROM w WHERE a = 'f3'");
+    conn.execute("INSERT INTO j SELECT DISTINCT a FROM w")
+        .unwrap();
+    for _ in 0..4 {
+        conn.execute("INSERT INTO j SELECT * FROM j").unwrap();
+    }
+    conn.execute("DELETE FROM j WHERE rowid > 70").unwrap();
+    let join = |table: &str| format!("SELECT * FROM j JOIN {table} ON {table}.a = j.k");
+    let before = estimate(&conn, &join("w"));
     conn.execute("ANALYZE").unwrap();
-    let keyed = estimate(&conn, "SELECT * FROM w WHERE a = 'f3'");
-    let indexed = estimate(&conn, "SELECT * FROM r WHERE a = 'f3'");
+    let keyed = estimate(&conn, &join("w"));
+    let indexed = estimate(&conn, &join("r"));
     assert!(
         (keyed - indexed).abs() <= 1e-9 * indexed.abs().max(1.0),
         "the key's estimate {keyed} is not the index's {indexed} (before ANALYZE: {before})"
