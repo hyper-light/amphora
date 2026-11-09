@@ -38,6 +38,9 @@ pub const COMMAND_BYTES: usize = api::REQUEST_MAX;
 /// Images are bounded until streaming snapshots are implemented; compaction refuses larger ones.
 pub const SNAPSHOT_BYTES: usize = 256 << 20;
 const ENVELOPE_BYTES: usize = 1 << 20;
+/// The database log's bound, in frames (512 MiB of 4 KiB pages): the standalone store's, measured
+/// on fedora 2026-10-20 (docs/design/store.md, decision 4; `store::Config::log_frames`).
+pub const LOG_FRAMES: u64 = 131_072;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Prepared {
@@ -158,6 +161,8 @@ pub struct Machine {
     class_changes: u64,
     // The largest image this machine makes or installs: SNAPSHOT_BYTES, lowered only by a test.
     snapshot_bytes: usize,
+    // The database log's bound, in frames: LOG_FRAMES, lowered only by a test.
+    log_bound: u64,
     // The index of the last configuration change applied, or more: the change's own index when
     // this machine applied it, the applied point when it opened or installed an image. The floor's
     // proof counts an attestation before marker J only if it was made at or after it, so an
@@ -170,7 +175,54 @@ pub struct Machine {
     // A test's record of this member's image digest at each applied index.
     #[cfg(test)]
     digests: Option<Vec<(u64, u64)>>,
+    // A test's hold on this machine's flushes of its database's log.
+    #[cfg(test)]
+    flush_gate: std::sync::Arc<FlushGate>,
     _owner: crate::database::Owned,
+}
+
+/// A test's hold on a machine's flushes: while held, a flush waits for the test to open it, unless
+/// it runs on the thread the test holds it from (the owner's, in a driven test), where it counts
+/// that it got there and goes on, so that a test finds an owner that would stand behind it.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct FlushGate {
+    state: std::sync::Mutex<GateState>,
+    opened: std::sync::Condvar,
+}
+#[cfg(test)]
+#[derive(Default)]
+struct GateState {
+    held: bool,
+    from: Option<std::thread::ThreadId>,
+    reached_from: u64,
+}
+#[cfg(test)]
+impl FlushGate {
+    /// Holds every flush from now, from this thread.
+    pub(crate) fn hold(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.held = true;
+        state.from = Some(std::thread::current().id());
+    }
+    pub(crate) fn open(&self) {
+        self.state.lock().unwrap().held = false;
+        self.opened.notify_all();
+    }
+    /// Flushes that reached the hold on the thread it was held from.
+    pub(crate) fn reached_from_holder(&self) -> u64 {
+        self.state.lock().unwrap().reached_from
+    }
+    fn pass(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.held && state.from == Some(std::thread::current().id()) {
+            state.reached_from += 1;
+            return;
+        }
+        while state.held {
+            state = self.opened.wait(state).unwrap();
+        }
+    }
 }
 
 /// A floor this group's members didn't prove never enters replicated mode: one a standalone
@@ -386,11 +438,14 @@ impl Machine {
             #[cfg(test)]
             class_changes: 0,
             snapshot_bytes: SNAPSHOT_BYTES,
+            log_bound: LOG_FRAMES,
             configuration_at: point.index,
             #[cfg(test)]
             floor_aware: true,
             #[cfg(test)]
             digests: None,
+            #[cfg(test)]
+            flush_gate: std::sync::Arc::default(),
             _owner: owner,
         })
     }
@@ -405,6 +460,10 @@ impl Machine {
             size,
             self.snapshot_bytes,
         )
+    }
+    #[cfg(test)]
+    pub(crate) fn set_log_bound(&mut self, frames: u64) {
+        self.log_bound = frames;
     }
     #[cfg(test)]
     pub(crate) fn set_snapshot_bytes(&mut self, bytes: usize) {
@@ -721,7 +780,7 @@ impl Machine {
             })
             .map_err(failed)?;
         if flush {
-            self.db.flusher()().map_err(failed)?;
+            self.log_flusher()().map_err(failed)?;
             self.flushed = at;
         }
         self.point = at;
@@ -749,7 +808,25 @@ impl Machine {
     /// A flush of the database's log, to run on the owner's flushing thread: what was committed
     /// before it began is durable once it ends (`Db::flusher`).
     pub(crate) fn log_flusher(&self) -> crate::store::Flush {
-        self.db.flusher()
+        let flush = self.db.flusher();
+        #[cfg(test)]
+        let flush: crate::store::Flush = {
+            let gate = std::sync::Arc::clone(&self.flush_gate);
+            Box::new(move || {
+                gate.pass();
+                flush()
+            })
+        };
+        flush
+    }
+    #[cfg(test)]
+    pub(crate) fn flush_gate(&self) -> std::sync::Arc<FlushGate> {
+        std::sync::Arc::clone(&self.flush_gate)
+    }
+    /// The frames the database's log holds now.
+    #[cfg(test)]
+    pub(crate) fn log_frames(&self) -> anyhow::Result<u64> {
+        self.db.log_frames_in_use()
     }
 
     /// A flush begun once `at` was applied has finished: a restart opens with `at` applied.
@@ -943,7 +1020,7 @@ impl StateMachine for Machine {
         Ok(())
     }
     fn persist(&mut self) -> Result<(), Fatal> {
-        self.db.flusher()().map_err(failed)?;
+        self.log_flusher()().map_err(failed)?;
         self.flushed = self.point;
         Ok(())
     }

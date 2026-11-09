@@ -455,6 +455,12 @@ impl Db {
         }
     }
 
+    /// The frames the log holds now, as this connection last saw it.
+    #[cfg(test)]
+    pub(crate) fn log_frames_in_use(&self) -> anyhow::Result<u64> {
+        Ok(self.conn.wal_state().map_err(fail)?.max_frame)
+    }
+
     /// The frames of log a restart keeps the log's file for: past them, it cuts the file to nothing
     /// (decision 31). By default twice the store's default bound. A caller using a nondefault
     /// `Config::log_frames` may pass twice that bound here; changing Config alone does not set it.

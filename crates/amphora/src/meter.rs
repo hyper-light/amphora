@@ -356,6 +356,10 @@ pub struct ReplicaMeter {
     local_reads: AtomicU64,
     local_refused: [AtomicU64; 3],
     readers_in_use: AtomicU64,
+    checkpoints: [AtomicU64; FLUSH_BUCKETS],
+    checkpoint_us: AtomicU64,
+    restarts: AtomicU64,
+    log_bytes: AtomicU64,
 }
 
 /// What a replica owner's counters say now ([`REPLICA_METRICS`]).
@@ -381,6 +385,13 @@ pub struct ReplicaCounters {
     pub local_reads_refused: [u64; 3],
     /// Local readers reading now.
     pub local_readers_in_use: u64,
+    /// The flushing thread's checkpoint passes, by [`flush_bucket`], and how long they took in all.
+    pub checkpoints: [u64; FLUSH_BUCKETS],
+    pub checkpoint_time: Duration,
+    /// Times the owner started the database's log again.
+    pub log_restarts: u64,
+    /// The database log's length as the last checkpoint pass found it, in bytes.
+    pub database_log_bytes: u64,
 }
 
 impl ReplicaCounters {
@@ -437,6 +448,21 @@ impl ReplicaMeter {
             .store(u64::try_from(out).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
+    /// A checkpoint pass that took `took` found the database's log `log_bytes` long.
+    pub fn checkpointed(&self, took: Duration, log_bytes: u64) {
+        if let Some(b) = self.checkpoints.get(flush_bucket(took)) {
+            b.fetch_add(1, Ordering::Relaxed);
+        }
+        self.checkpoint_us.fetch_add(micros(took), Ordering::Relaxed);
+        self.log_bytes.store(log_bytes, Ordering::Relaxed);
+    }
+
+    /// The owner started the database's log again: it is empty.
+    pub fn restarted(&self) {
+        self.restarts.fetch_add(1, Ordering::Relaxed);
+        self.log_bytes.store(0, Ordering::Relaxed);
+    }
+
     #[must_use]
     pub fn counters(&self) -> ReplicaCounters {
         ReplicaCounters {
@@ -456,6 +482,12 @@ impl ReplicaMeter {
                     .map_or(0, |count| count.load(Ordering::Relaxed))
             }),
             local_readers_in_use: self.readers_in_use.load(Ordering::Relaxed),
+            checkpoints: std::array::from_fn(|i| {
+                self.checkpoints.get(i).map_or(0, |b| b.load(Ordering::Relaxed))
+            }),
+            checkpoint_time: Duration::from_micros(self.checkpoint_us.load(Ordering::Relaxed)),
+            log_restarts: self.restarts.load(Ordering::Relaxed),
+            database_log_bytes: self.log_bytes.load(Ordering::Relaxed),
         }
     }
 }
