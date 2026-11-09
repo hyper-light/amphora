@@ -5,7 +5,7 @@
 
 use super::*;
 use std::collections::VecDeque;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::Duration;
 
 use crate::meter::{
@@ -163,44 +163,80 @@ struct Control {
 }
 /// The readers of a replica's local reads (replication.md, "A local read on a replica"):
 /// connections of their own on the machine's database, each on what the machine committed when
-/// its read began. At most `READERS` read at once; one given back is kept for the next read.
+/// its read began. At most `CONNECTION_MAX` out at once, each charged to the process's page
+/// budget; one given back waits in the process's account for the next read (replication.md, "A
+/// replica's local readers bounded by derivation").
 struct Local {
     /// Opens a reader; none once the owner ended, so that no reader holds its lease past the reads
     /// under way then.
     open: Mutex<Option<crate::store::Opener<Db>>>,
-    pool: Mutex<Readers>,
-    returned: std::sync::Condvar,
+    /// This replica's number in the account.
+    id: u64,
     /// Counts the reads and refusals, and the readers out (`amphora_replica_local_*`).
     meter: Arc<ReplicaMeter>,
     /// The process's readers and the page budget they are charged to.
     account: Arc<Account>,
 }
+/// Readers out at once on one replica: policy, the transport's bound on attached clients, each a
+/// connection running one session at a time (`transport::CONNECTION_MAX`), so more readers than
+/// that can't be used by them; a caller in the process past it waits.
+const READERS: usize = crate::transport::CONNECTION_MAX;
 /// Every replica's local readers in the process, and the page budget they are charged to
 /// (replication.md, "A replica's local readers bounded by derivation").
 struct Account {
     pool: Arc<crate::db::SharedPages>,
+    ledger: Mutex<Ledger>,
+    /// Told whenever a reader is given back or a charge returned.
+    freed: std::sync::Condvar,
+    /// The number the next replica takes.
+    next: AtomicU64,
+}
+/// The account's readers: those given back, oldest first, and how many each replica has out.
+/// Its idle readers are at most what the budget charges (each holds `db::READER_PAGES`), and it
+/// names a replica only while that replica's readers are out.
+#[derive(Default)]
+struct Ledger {
+    idle: VecDeque<Idle>,
+    out: std::collections::BTreeMap<u64, usize>,
+}
+struct Idle {
+    replica: u64,
+    reader: Db,
+    charge: crate::db::Charge,
 }
 impl Account {
     fn new(pool: Arc<crate::db::SharedPages>) -> Arc<Self> {
-        Arc::new(Self { pool })
+        Arc::new(Self {
+            pool,
+            ledger: Mutex::new(Ledger::default()),
+            freed: std::sync::Condvar::new(),
+            next: AtomicU64::new(0),
+        })
+    }
+    /// Tells the waiting reads that a reader or a charge is free: under the ledger's lock, so a
+    /// read that found none and is about to wait can't miss it.
+    fn free(&self) {
+        let ledger = self.ledger.lock();
+        self.freed.notify_all();
+        drop(ledger);
     }
 }
-/// The process's account, over its page pool (`db::process_pages`).
+/// The process's account, over its page pool (`db::process_pages`); a test's own, where it set
+/// one for the owners it opens on its thread.
 fn account() -> Arc<Account> {
+    #[cfg(test)]
+    if let Some(account) = tests::ACCOUNT.with(|account| account.borrow().clone()) {
+        return account;
+    }
     static ACCOUNT: std::sync::OnceLock<Arc<Account>> = std::sync::OnceLock::new();
     ACCOUNT
         .get_or_init(|| Account::new(crate::db::process_pages()))
         .clone()
 }
-#[derive(Default)]
-struct Readers {
-    idle: Vec<Db>,
-    out: usize,
+/// The pages a reader is charged: what it keeps of its own (`db::READER_PAGES`).
+fn reader_pages() -> Result<usize, Refusal> {
+    usize::try_from(crate::db::READER_PAGES).map_err(unavailable)
 }
-/// Readers at once: policy, the standalone store's (`store::Config::readers`; store.md, decision
-/// 3), each keeping `db::READER_PAGES` of its own. A read past them waits for one given back, up
-/// to its deadline (replication.md, "A local read on a replica", amendment 2).
-const READERS: usize = 4;
 impl Local {
     fn new(
         open: crate::store::Opener<Db>,
@@ -209,81 +245,134 @@ impl Local {
     ) -> Self {
         Self {
             open: Mutex::new(Some(open)),
-            pool: Mutex::new(Readers::default()),
-            returned: std::sync::Condvar::new(),
+            id: account.next.fetch_add(1, Ordering::Relaxed),
             meter,
             account,
         }
     }
-    /// `f` on a reader: an idle one, one opened now, or the first given back before `until`.
+    /// `f` on a reader: this replica's idle one, one opened now on a charge, one opened after
+    /// another replica's idle reader closed for its charge, or the first that comes free before
+    /// `until`.
     fn with<R>(
         &self,
         until: Instant,
         f: impl FnOnce(&mut Db) -> anyhow::Result<R>,
     ) -> Result<R, Refusal> {
-        let mut reader = {
-            let mut pool = locked(&self.pool)?;
-            loop {
-                if let Some(reader) = pool.idle.pop() {
-                    pool.out = pool.out.saturating_add(1);
-                    self.meter.readers_in_use(pool.out);
-                    break reader;
+        let pages = reader_pages()?;
+        let taken = loop {
+            let Some(open) = locked(&self.open)?.clone() else {
+                self.meter.local_refused(LocalRefusal::Fenced);
+                return Err(fenced("replica owner ended"));
+            };
+            let mut ledger = locked(&self.account.ledger)?;
+            let own = ledger.idle.iter().position(|idle| idle.replica == self.id);
+            if let Some(idle) = own.and_then(|at| ledger.idle.remove(at)) {
+                self.took(&mut ledger)?;
+                break (Some(idle.reader), idle.charge, open);
+            }
+            if ledger.out.get(&self.id).copied().unwrap_or(0) < READERS {
+                if let Some(charge) = self.account.pool.charge(pages) {
+                    self.took(&mut ledger)?;
+                    break (None, charge, open);
                 }
-                let Some(open) = locked(&self.open)?.clone() else {
-                    self.meter.local_refused(LocalRefusal::Fenced);
-                    return Err(fenced("replica owner ended"));
-                };
-                if pool.out < READERS {
-                    pool.out = pool.out.saturating_add(1);
-                    self.meter.readers_in_use(pool.out);
-                    drop(pool);
-                    match open() {
-                        Ok(reader) => break reader,
-                        Err(error) => {
-                            self.give_back(None);
-                            return Err(refused(&error));
-                        }
-                    }
+                let other = ledger.idle.iter().position(|idle| idle.replica != self.id);
+                if let Some(closed) = other.and_then(|at| ledger.idle.remove(at)) {
+                    // Closed outside the lock; its charge, given back, is this read's next try.
+                    drop(ledger);
+                    drop(closed);
+                    continue;
                 }
-                let left = until.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    self.meter.local_refused(LocalRefusal::Timeout);
-                    return Err(Refusal::Timeout);
-                }
-                pool = self
-                    .returned
-                    .wait_timeout(pool, left)
-                    .map_err(|_| unavailable("a replica's reader lock was poisoned"))?
-                    .0;
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                self.meter.local_refused(LocalRefusal::Timeout);
+                return Err(Refusal::Timeout);
+            }
+            drop(
+                self.account
+                    .freed
+                    .wait_timeout(ledger, left)
+                    .map_err(|_| unavailable("the local readers' account lock was poisoned"))?,
+            );
+        };
+        // A reader given back, or one opened now on the charge taken for it.
+        let (reader, charge, open) = taken;
+        let mut reader = match reader.map_or_else(|| open(), Ok) {
+            Ok(reader) => reader,
+            Err(error) => {
+                drop(charge);
+                self.give_back(None);
+                return Err(refused(&error));
             }
         };
         self.meter.local_read();
         let answer = f(&mut reader).map_err(|error| refused(&error));
-        self.give_back(Some(reader));
+        self.give_back(Some((reader, charge)));
         answer
     }
-    /// A reader given back, kept for the next read while the owner runs. `out` never falls below
-    /// none: each give-back follows one taken.
-    fn give_back(&self, reader: Option<Db>) {
-        let live = self.open.lock().is_ok_and(|open| open.is_some());
-        if let Ok(mut pool) = self.pool.lock() {
-            pool.out = pool.out.saturating_sub(1);
-            self.meter.readers_in_use(pool.out);
-            if let Some(reader) = reader.filter(|_| live) {
-                pool.idle.push(reader);
-            }
-        }
-        self.returned.notify_all();
+    /// One more reader out on this replica, under the ledger's lock.
+    fn took(&self, ledger: &mut Ledger) -> Result<(), Refusal> {
+        let out = ledger.out.entry(self.id).or_default();
+        *out = out
+            .checked_add(1)
+            .ok_or_else(|| fenced("a replica's readers out overflowed"))?;
+        self.meter.readers_in_use(*out);
+        Ok(())
     }
-    /// The owner ended: no reader opens again, the idle ones go, and reads waiting are refused.
+    /// A reader given back: kept in the account for the next read while the owner runs, closed
+    /// (outside the lock) once it ended. `out` never falls below none: each give-back follows
+    /// one taken.
+    fn give_back(&self, reader: Option<(Db, crate::db::Charge)>) {
+        let live = self.open.lock().is_ok_and(|open| open.is_some());
+        let closed = match self.account.ledger.lock() {
+            Ok(mut ledger) => {
+                let out = ledger
+                    .out
+                    .get(&self.id)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(1);
+                if out == 0 {
+                    ledger.out.remove(&self.id);
+                } else {
+                    ledger.out.insert(self.id, out);
+                }
+                self.meter.readers_in_use(out);
+                match reader {
+                    Some((reader, charge)) if live => {
+                        ledger.idle.push_back(Idle {
+                            replica: self.id,
+                            reader,
+                            charge,
+                        });
+                        None
+                    }
+                    reader => reader,
+                }
+            }
+            Err(_) => reader,
+        };
+        drop(closed);
+        self.account.free();
+    }
+    /// The owner ended: no reader opens again, its idle ones close, and reads waiting are refused.
     fn release(&self) {
         if let Ok(mut open) = self.open.lock() {
             *open = None;
         }
-        if let Ok(mut pool) = self.pool.lock() {
-            pool.idle.clear();
-        }
-        self.returned.notify_all();
+        let closed: VecDeque<Idle> = match self.account.ledger.lock() {
+            Ok(mut ledger) => {
+                let (mine, others): (VecDeque<Idle>, VecDeque<Idle>) =
+                    std::mem::take(&mut ledger.idle)
+                        .into_iter()
+                        .partition(|idle| idle.replica == self.id);
+                ledger.idle = others;
+                mine
+            }
+            Err(_) => VecDeque::new(),
+        };
+        drop(closed);
+        self.account.free();
     }
 }
 #[derive(Default)]
@@ -464,6 +553,14 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     // A measurement's record of this owner's stalls (kiln goal 6b112f14, step 1): test-only.
     #[cfg(test)]
     stalls: Option<Arc<Mutex<tests::Stalls>>>,
+    // The replicated class's gate on held answers (replication.md, "The class stated once per
+    // group"): the members the host's detector suspects, and those this owner holds suspected
+    // only until its group's recorded class is its own. A member is counted held when neither
+    // suspects it. Each is at most the members a configuration names (`MEMBERS`).
+    detected: std::collections::BTreeSet<u64>,
+    gated: std::collections::BTreeSet<u64>,
+    // The term this owner proposed its class entry in, once taken: one a term.
+    class_proposed: Option<u64>,
     // While set, this owner proposes no class entry (replication.md, "The class stated once per
     // group"): a test's group from before the class was stated.
     #[cfg(test)]
@@ -980,6 +1077,8 @@ fn open_on<F: BlockFile + 'static>(
     until: Instant,
     clock: Clock,
 ) -> Result<(Client, Actor<F>, mpsc::Receiver<Envelope>), Refusal> {
+    let mut machine = machine;
+    machine.state_class(&durability)?;
     let settings = settings(config.node_id, &durability)?;
     let meter = Arc::new(ReplicaMeter::default());
     let flushing = Flushing::start(&durability, machine.log_flusher(), Arc::clone(&meter))?;
@@ -1061,12 +1160,16 @@ fn open_on<F: BlockFile + 'static>(
         stalls: None,
         #[cfg(test)]
         class_held: false,
+        detected: std::collections::BTreeSet::new(),
+        gated: std::collections::BTreeSet::new(),
+        class_proposed: None,
         clock,
         started: at,
         ticked: at,
         at,
     };
     actor.refresh()?;
+    actor.keep_class_gate()?;
     if Instant::now() >= until {
         return Err(Refusal::Timeout);
     }
@@ -1450,6 +1553,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         self.settle_change();
         self.settle_transfer();
         self.bootstrap()?;
+        self.propose_class()?;
+        self.keep_class_gate()?;
         if self.floor_tail.is_some() {
             self.prepare()?;
         }
@@ -1457,6 +1562,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         if !self.replica.machine().bootstrap_pending()
             && self.pending.is_none()
             && self.replica.leader() != 0
+            && !self.class_in_flight()
             && let Some(envelope) = self.waiting.pop_front()
         {
             self.receive(envelope)?;
@@ -1753,6 +1859,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 } else if self.replica.leader() == 0
                     || self.pending.is_some()
                     || self.replica.machine().bootstrap_pending()
+                    || self.class_in_flight()
                 {
                     if self.waiting.len() >= COMMANDS {
                         answer(response, Err(Refusal::Full { limit: COMMANDS }));
@@ -2165,10 +2272,93 @@ impl<F: BlockFile + 'static> Actor<F> {
             ));
         }
         match verdict {
-            Verdict::Suspected(_) => self.replica.suspect_held(member),
-            Verdict::Trusted(_) => self.replica.trust_held(member),
+            Verdict::Suspected(_) => {
+                self.detected.insert(member);
+                self.replica.suspect_held(member)
+            }
+            Verdict::Trusted(_) => {
+                self.detected.remove(&member);
+                if self.gated.contains(&member) {
+                    return Ok(());
+                }
+                self.replica.trust_held(member)
+            }
         }
         .map_err(raft_error)
+    }
+    /// The class's gate on held answers: until this member's recorded class is its own, every
+    /// other member it names is held suspected; once it is, each is trusted again unless the
+    /// detector suspects it (replication.md, "The class stated once per group").
+    fn keep_class_gate(&mut self) -> Result<(), Refusal> {
+        if !self.replica.machine().is_replicated() {
+            return Ok(());
+        }
+        let conf = self.replica.configuration();
+        let named: std::collections::BTreeSet<u64> = conf
+            .voters
+            .iter()
+            .chain(&conf.learners)
+            .chain(&conf.voters_outgoing)
+            .chain(&conf.learners_next)
+            .copied()
+            .filter(|member| *member != self.replica.id())
+            .collect();
+        if self.replica.machine().class_agreed() {
+            for member in std::mem::take(&mut self.gated) {
+                if named.contains(&member) && !self.detected.contains(&member) {
+                    self.replica.trust_held(member).map_err(raft_error)?;
+                }
+            }
+            return Ok(());
+        }
+        self.gated.retain(|member| named.contains(member));
+        for member in named {
+            if !self.gated.contains(&member) {
+                self.replica.suspect_held(member).map_err(raft_error)?;
+                self.gated.insert(member);
+            }
+        }
+        Ok(())
+    }
+    /// Whether this leader's class entry is proposed and its group's record not yet its own:
+    /// no write is prepared meanwhile, as its entry would move the point under it.
+    fn class_in_flight(&self) -> bool {
+        self.class_proposed == Some(self.replica.term())
+            && self.replica.is_leader()
+            && self.replica.machine().class_proposal().is_some()
+    }
+    /// A leader whose group records no class, or one its own supersedes, proposes its own, once a
+    /// term and never beside a write or a change under way.
+    fn propose_class(&mut self) -> Result<(), Refusal> {
+        #[cfg(test)]
+        if self.class_held {
+            return Ok(());
+        }
+        if !self.replica.is_leader()
+            || self.replica.machine().bootstrap_pending()
+            || self.pending.is_some()
+            || self.changing.is_some()
+            || self.class_proposed == Some(self.replica.term())
+        {
+            return Ok(());
+        }
+        let Some(class) = self.replica.machine().class_proposal() else {
+            return Ok(());
+        };
+        let bytes = crate::replication::class::entry(&class)?;
+        let context = self.context()?;
+        match self.propose(&context, bytes) {
+            Ok(()) => {
+                self.class_proposed = Some(self.replica.term());
+                Ok(())
+            }
+            Err(fenced @ Refusal::Fenced(_)) => Err(fenced),
+            // Not taken in this term (a lead lost, a proposal refused): the next lead proposes it.
+            Err(refusal) => {
+                tracing::debug!(target: "amphora.replication", event = "class_not_proposed", ?refusal);
+                Ok(())
+            }
+        }
     }
     fn release(&mut self, output: Output<crate::replication::Applied>) -> Result<(), Refusal> {
         // Publish durable follower and leader state before releasing any result or read.
@@ -2757,6 +2947,13 @@ impl<F: BlockFile + 'static> Actor<F> {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
+
+    thread_local! {
+        /// The account the owners a test opens on its thread charge their readers to, in place of
+        /// the process's (`account`), so that other tests' readers don't share its budget.
+        pub(super) static ACCOUNT: std::cell::RefCell<Option<Arc<Account>>> =
+            const { std::cell::RefCell::new(None) };
+    }
 
     fn value(db: &mut Db) -> anyhow::Result<Vec<u8>> {
         let mut value = Vec::new();
@@ -3542,7 +3739,10 @@ mod tests {
             self.follow(pump, clients, applied)
         }
         /// Rounds, time standing still, until every owner follows one leader with at least
-        /// `applied` applied. Returns the leader's index.
+        /// `applied` applied, and each of them past its seed records a class its leader has
+        /// nothing to add to (a class entry moves the point, so a write prepared beside it would
+        /// be refused).
+        /// Returns the leader's index.
         fn follow(&mut self, pump: &mut Pump<'_>, clients: &[Client], applied: u64) -> usize {
             let mut last = Vec::new();
             for _ in 0..ROUNDS {
@@ -3552,7 +3752,17 @@ mod tests {
                     .map(|c| c.handle().status().unwrap())
                     .collect();
                 let leader = states.first().unwrap().leader;
+                let named: Vec<u64> = states.iter().map(|s| s.node_id).collect();
+                let settled = self.owners.iter().flatten().all(|(owner, _)| {
+                    let machine = owner.replica.machine();
+                    !named.contains(&owner.replica.id())
+                        || owner.class_held
+                        || machine.bootstrap_pending()
+                        || (machine.class().is_some()
+                            && (!owner.replica.is_leader() || machine.class_proposal().is_none()))
+                });
                 if leader != 0
+                    && settled
                     && states
                         .iter()
                         .all(|s| s.leader == leader && s.applied >= applied)
@@ -3701,6 +3911,8 @@ mod tests {
     struct PowerDisk {
         id: u64,
         files: Mutex<std::collections::HashMap<String, Arc<PowerFile>>>,
+        // Every open asked of it, of a file it has or a new one.
+        opened: AtomicUsize,
     }
     /// A file of a [`PowerDisk`]: what its syncs made durable, and what a reader sees.
     #[derive(Default)]
@@ -3721,6 +3933,7 @@ mod tests {
             Arc::new(Self {
                 id: POWER_DISKS.fetch_add(1, Ordering::Relaxed),
                 files: Mutex::new(files),
+                opened: AtomicUsize::new(0),
             })
         }
         /// The power cut: what each file's syncs made durable.
@@ -3840,6 +4053,7 @@ mod tests {
             flags: amphora_engine::OpenFlags,
             _direct: bool,
         ) -> amphora_engine::Result<Arc<dyn amphora_engine::File>> {
+            self.opened.fetch_add(1, Ordering::Relaxed);
             let mut files = self.files.lock().unwrap();
             if let Some(file) = files.get(path) {
                 return Ok(file.clone());
@@ -5442,7 +5656,10 @@ mod tests {
         };
         match reopen(&driven, other) {
             Err(Refusal::Invalid { what, why }) => {
-                assert!(what.contains("class") || why.contains("class"), "{what}: {why}");
+                assert!(
+                    what.contains("class") || why.contains("class"),
+                    "{what}: {why}"
+                );
             }
             Err(refusal) => panic!("refused, but not Invalid: {refusal:?}"),
             Ok(_) => panic!("the member opened stating another class than its group's"),
@@ -5455,9 +5672,20 @@ mod tests {
             client,
         ];
         let mut pump = Pump::new(&clients);
-        driven.follow(&mut pump, &clients, 2);
-        let caught_up = clients.get(2).unwrap().read_local(driven.until(), values);
-        assert_eq!(caught_up, Ok(vec![1]));
+        let reopened = clients.get(2).unwrap();
+        let mut caught_up = Ok(Vec::new());
+        for _ in 0..ROUNDS {
+            driven.round(&mut pump);
+            caught_up = reopened.read_local(driven.until(), values);
+            if caught_up == Ok(vec![1]) {
+                break;
+            }
+        }
+        assert_eq!(
+            caught_up,
+            Ok(vec![1]),
+            "the reopened member never caught up"
+        );
         driven.drain(&mut pump);
         pump.finish();
     }
@@ -5548,6 +5776,131 @@ mod tests {
         });
         assert_eq!(driven.settle(&mut pump, &second), Ok(b"second".to_vec()));
         pump.let_durable();
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.5, T-T1.8.C5 (replication.md, "The class stated once per group", the amendment), on
+    /// driven time: a joiner's fate is recorded by a compatible class entry, the procedure
+    /// "A member added or removed" states, member by member. Do: three voters of three fates
+    /// record their class; a fourth member added as a learner (not running); a follower reopened
+    /// stating the joiner's fate too, and handed the lead; rounds until each records a class;
+    /// then the lead handed between the narrower-stating member and the wider three times, a
+    /// write in each lead. Expect: the addition answered; the follower opens under the wider
+    /// class beside the group's record; every voter records the wider class, the others'
+    /// narrower one compatible with it, and none gates held answers after; no leader after
+    /// proposes a class, and the record changed twice in all (the group's class, the joiner's
+    /// fate), never back: it only grows between changes of members.
+    #[test]
+    fn a_joiners_fate_is_recorded_by_a_compatible_class_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open_with(dir.path(), n, vec![1, 2, 3], None, three_fates()))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        pump.lost.push(4);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        write(&mut driven, &mut pump, clients.get(leader).unwrap(), 1);
+        let added = change(
+            clients.get(leader).unwrap(),
+            driven.until(),
+            MemberChange::AddLearner(4),
+        );
+        assert!(driven.answer(&mut pump, &added).is_ok());
+        driven.drain(&mut pump);
+        pump.finish();
+
+        // The procedure, member by member: a follower reopened stating the joiner's fate too,
+        // then handed the lead.
+        let wider = Durability::Replicated(api::replication::Fates {
+            of: vec![(1, 10), (2, 20), (3, 30), (4, 40)],
+            spanning: 2,
+        });
+        let follower = (leader + 1) % 3;
+        let node = u64::try_from(follower + 1).unwrap();
+        drop(driven.owners.get_mut(follower).unwrap().take());
+        let path = dir.path().join(format!("state-{node}.db"));
+        let (_, clock) = driven.reading();
+        let (client, actor, receiver) = super::open(
+            &path,
+            &dir.path().join(format!("raft-{node}.log")),
+            ReplicaConfig {
+                node_id: node,
+                voters: vec![1, 2, 3],
+                learners: vec![4],
+                bootstrap: None,
+            },
+            wider.clone(),
+            Arc::new(Changed::default()),
+            Owned::new(lease(&path), None),
+            driven.until(),
+            clock,
+        )
+        .unwrap();
+        *driven.owners.get_mut(follower).unwrap() = Some((actor, receiver));
+        let mut clients = clients;
+        *clients.get_mut(follower).unwrap() = client;
+        let mut pump = Pump::new(&clients);
+        pump.lost.push(4);
+        // A write at the leader, whose append tells the reopened follower who leads.
+        write(&mut driven, &mut pump, clients.get(leader).unwrap(), 2);
+        driven.follow(&mut pump, &clients, 1);
+        driven.transfer(&mut pump, &clients, leader, follower);
+        let recorded = |driven: &Driven| {
+            (0..3).all(|owner| driven.owner(owner).replica.machine().class() == Some(&wider))
+        };
+        for _ in 0..ROUNDS {
+            if recorded(&driven) {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        let seen: Vec<_> = (0..3)
+            .map(|owner| {
+                let actor = driven.owner(owner);
+                (
+                    actor.replica.is_leader(),
+                    actor.replica.term(),
+                    actor.replica.applied().index,
+                    actor.class_proposed,
+                    actor.replica.machine().class().cloned(),
+                )
+            })
+            .collect();
+        assert!(
+            recorded(&driven),
+            "the joiner's fate was never recorded: {seen:?}"
+        );
+        for owner in 0..3 {
+            let actor = driven.owner(owner);
+            assert!(actor.replica.machine().class_agreed());
+            assert!(
+                actor.gated.is_empty(),
+                "owner {owner} still gates held answers"
+            );
+        }
+
+        // Leaders stating the narrower class and the wider in turn: the record changes no more.
+        let changes = driven.owner(leader).replica.machine().class_changes();
+        assert_eq!(changes, 2, "the group's class, then the joiner's fate");
+        for (from, to) in [(follower, leader), (leader, follower), (follower, leader)] {
+            driven.transfer(&mut pump, &clients, from, to);
+            write(&mut driven, &mut pump, clients.get(to).unwrap(), 3);
+            let term = driven.owner(to).replica.term();
+            assert_ne!(
+                driven.owner(to).class_proposed,
+                Some(term),
+                "owner {to} proposed a class leading"
+            );
+            for owner in 0..3 {
+                assert_eq!(driven.owner(owner).replica.machine().class(), Some(&wider));
+            }
+            assert_eq!(
+                driven.owner(leader).replica.machine().class_changes(),
+                changes
+            );
+        }
         driven.drain(&mut pump);
         pump.finish();
     }
@@ -10373,6 +10726,8 @@ mod tests {
                 .iter()
                 .all(|c| c.handle().status().unwrap().leader == 3)
         );
+        // The class recorded once the seed is in, before the write beside it.
+        driven.follow(&mut pump, &clients, 0);
         driven
             .call(&mut pump, clients.get(1).unwrap(), |db| {
                 db.exec("UPDATE baseline_items SET value=x'03' WHERE id=2")?;
@@ -10476,6 +10831,8 @@ mod tests {
                 .unwrap(),
             original
         );
+        // The class recorded once the seed is in, before the delta beside it.
+        driven.follow(&mut pump, &clients, 0);
         // The delta goes in from n2 while the lead moves from the seed's source to n1.
         let delta = submit(clients.get(1).unwrap(), driven.until(), |db| {
             db.exec("UPDATE baseline_items SET value=x'03' WHERE id=2")?;
@@ -10866,6 +11223,14 @@ mod tests {
     #[test]
     fn local_readers_are_bounded_by_the_transport_not_four() {
         let dir = tempfile::tempdir().unwrap();
+        let most = crate::transport::CONNECTION_MAX;
+        // An account of the test's own, with room for one reader more than the bound, so the
+        // count is what holds the one more back, never the budget (or another test's readers).
+        let reader = usize::try_from(crate::db::READER_PAGES).unwrap();
+        let pages = ((most + 1) * reader + 64).div_ceil(64) * 64;
+        ACCOUNT.with(|account| {
+            *account.borrow_mut() = Some(Account::new(Arc::new(crate::db::SharedPages::new(pages))))
+        });
         let mut driven = Driven::new();
         let clients = vec![driven.open(dir.path(), 1, vec![1], None)];
         let mut pump = Pump::new(&clients);
@@ -10874,7 +11239,6 @@ mod tests {
         write(&mut driven, &mut pump, client, 1);
 
         let (entered, entering) = mpsc::channel();
-        let most = crate::transport::CONNECTION_MAX;
         let mut held: Vec<_> = (0..most).map(|_| held_read(client, &entered)).collect();
         for _ in 0..most {
             assert!(
@@ -10951,11 +11315,12 @@ mod tests {
     fn local_readers_past_the_process_page_budget_wait_and_reclaim_idle_ones() {
         let dir = tempfile::tempdir().unwrap();
         let reader = usize::try_from(crate::db::READER_PAGES).unwrap();
-        // 63 pages a shard: room for two readers' 2,000 pages, not three.
-        let account = Account::new(Arc::new(crate::db::SharedPages::new(64 * 63)));
+        // 64 pages a shard, of which a charge leaves one: room for two readers' 2,000 pages, not
+        // three.
+        let account = Account::new(Arc::new(crate::db::SharedPages::new(64 * 64)));
         let pool = Arc::clone(&account.pool);
         let replica = |name: &str| {
-            let mut db = Db::open(&dir.path().join(name)).unwrap();
+            let db = Db::open(&dir.path().join(name)).unwrap();
             db.exec("CREATE TABLE member_items(value); INSERT INTO member_items VALUES (1)")
                 .unwrap();
             let local = Arc::new(Local::new(
@@ -10988,7 +11353,11 @@ mod tests {
         assert_eq!(pool.charged(), 2 * reader);
         let second = held(&b, &entered);
         entering.recv_timeout(HANG_READ).unwrap();
-        assert_eq!(pool.charged(), 2 * reader, "A's idle reader was closed for B's");
+        assert_eq!(
+            pool.charged(),
+            2 * reader,
+            "A's idle reader was closed for B's"
+        );
 
         let asked = Instant::now();
         let refused = a.with(asked + FIFTH_WAIT, values);
@@ -10999,14 +11368,44 @@ mod tests {
         release.send(()).unwrap();
         assert_eq!(read.join().unwrap(), Ok(vec![1]));
         assert_eq!(a.with(far(), values), Ok(vec![1]));
-        assert_eq!(pool.charged(), 2 * reader, "B's idle reader was closed for A's");
+        assert_eq!(
+            pool.charged(),
+            2 * reader,
+            "B's idle reader was closed for A's"
+        );
         let (release, read) = second;
         release.send(()).unwrap();
         assert_eq!(read.join().unwrap(), Ok(vec![1]));
         assert_eq!(pool.charged(), 2 * reader, "the idle readers alone");
         a.release();
         b.release();
-        assert_eq!(pool.charged(), 0, "an ended replica's readers give their charge back");
+        assert_eq!(
+            pool.charged(),
+            0,
+            "an ended replica's readers give their charge back"
+        );
+    }
+
+    /// AC-T1.10.L2 (replication.md, "A replica's local readers bounded by derivation", the
+    /// amendment): a reader takes no file of its own, so the process's descriptor limit doesn't
+    /// bound readers. Do: a database on a disk that counts the opens asked of it, written once;
+    /// eight readers opened on it and each read. Expect: every reader reads the row, and no open
+    /// asked of the disk past those the database's own open asked.
+    #[test]
+    fn a_local_reader_opens_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = PowerDisk::new(std::collections::HashMap::new());
+        let io: Arc<dyn amphora_engine::IO> = disk.clone();
+        let db = Db::open_with(&dir.path().join("state.db"), io).unwrap();
+        db.exec("CREATE TABLE member_items(value); INSERT INTO member_items VALUES (1)")
+            .unwrap();
+        let opened = disk.opened.load(Ordering::Relaxed);
+        let open = db.opener();
+        let mut readers: Vec<Db> = (0..8).map(|_| open().unwrap()).collect();
+        for reader in &mut readers {
+            assert_eq!(values(reader).unwrap(), vec![1]);
+        }
+        assert_eq!(disk.opened.load(Ordering::Relaxed), opened);
     }
 
     /// AC-T1.10.L1, T-T1.10.L6 (replication.md, "A local read on a replica", amendment 4): across

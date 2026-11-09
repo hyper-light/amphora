@@ -135,6 +135,10 @@ tests = [
   # Amphora's own: the replicated class (docs/design/replication.md, "Fates and durability checked").
   { id = "T-T1.8.C1", text = "An attachment whose durability differs from its owner's is refused, typed; the same fates in another order are taken; a process stating no replica restarts in the owner's class" },
   # Amphora's own: the replicated application floor (docs/design/replication.md, "The application floor, replicated").
+  { id = "T-T1.8.C2", text = "Two members stating different classes — passes when, once the group's class entry commits, the member stating the other is fenced naming the class, refused Invalid reopening under it, and opens and catches up under the group's" },
+  { id = "T-T1.8.C3", text = "Durable answers held before a group's class entry applies — passes when no write is answered on held answers alone until the class applies, and one is after" },
+  { id = "T-T1.8.C4", text = "A class entry, then an incompatible one, then an image — passes when the second is inert, a member installing the image under the same class agrees, one under another is refused, and a reopening under another is refused Invalid" },
+  { id = "T-T1.8.C5", text = "A joiner added and the voters reopened stating its fate — passes when a compatible class entry records it on every voter and none gates held answers after" },
   { id = "T-T1.8.A1", text = "An old-binary learner added just before a floor raise: the raise is refused naming it, or the promotion is refused; never both through" },
   { id = "T-T1.8.A2", text = "A leader crashes between a membership change and a floor raise: the raise's proof covers the configuration in force at its index, or the raise is refused" },
   { id = "T-T1.8.A3", text = "A member installed from a snapshot holds the floor, the join rows and the attestations, and proves and refuses as the leader does" },
@@ -168,7 +172,7 @@ criteria = [
   { id = "AC-T1.10.5", text = "anomalies across groups is exactly 0, measured by an Elle-style check over 10,000 seeds" },
   # Amphora's own: a local read on a replica (docs/design/replication.md, "A local read on a replica").
   { id = "AC-T1.10.L1", text = "A local read on a replica answers from its own applied state, asking no leader: a prefix of the group's committed history, never older than a local read before it in the same opening, nor after a clean close or a process crash; refused before the group's first image, once its owner ended, and while fenced" },
-  { id = "AC-T1.10.L2", text = "At most four local readers at once on one replica; a fifth waits on its caller's thread, never the owner's, until its deadline, and is refused Timeout, or Fenced once the owner ends" },
+  { id = "AC-T1.10.L2", text = "At most CONNECTION_MAX local readers out at once on one replica, every replica's readers charged to the process's page budget; a read past either waits on its caller's thread, never the owner's, until its deadline, and is refused Timeout, or Fenced once the owner ends" },
   { id = "AC-T1.10.L3", text = "An attached client's local read is Request::LocalSession at wire version 6, run read-only on its owner's state: a write in it is refused and nothing of it stays" },
 ]
 tests = [
@@ -178,8 +182,10 @@ tests = [
   { id = "T-T1.10.L2", text = "Local reads within a preparation and while a write is proposed and uncommitted — passes when each sees only what was committed, and the write once applied" },
   { id = "T-T1.10.L3", text = "A local read on a member that hasn't taken its group's first image — passes when it is refused Unavailable, saying why" },
   { id = "T-T1.10.L4", text = "A local read held open while its replica installs an image, with a checkpoint and a log restart tried meanwhile — passes when it sees the state before the image, whole, and a read after sees the image, whole" },
-  { id = "T-T1.10.L5", text = "Four local reads held open and a fifth asked — passes when the fifth is refused Timeout at its deadline while the owner's actor steps, and answers once one is given back" },
+  { id = "T-T1.10.L5", text = "Superseded by T-T1.10.L8 (2026-11-09, the readers bounded by derivation): four local reads held open and a fifth asked — passed when the fifth was refused Timeout at its deadline while the owner's actor stepped, and answered once one was given back" },
   { id = "T-T1.10.L6", text = "A write read locally under the replicated class, its flush held, the member's power cut — passes when the restarted member's read is never older than its last finished flush, and sees the write once caught up" },
+  { id = "T-T1.10.L8", text = "CONNECTION_MAX local reads held open on one replica and one more asked — passes when every held read has its reader, the one more is refused Timeout at its deadline while the owner's actor steps, and a read answers once one is given back" },
+  { id = "T-T1.10.L9", text = "Two replicas' readers over a budget of two readers' pages — passes when an idle reader of one replica is closed for the other's read, a read past the budget is refused Timeout at its deadline, and the charge never passes the budget" },
   { id = "T-T1.10.L7", text = "An attached client's local read that writes — passes when it is refused, nothing of it stays, and the client is never promoted" },
 ]
 

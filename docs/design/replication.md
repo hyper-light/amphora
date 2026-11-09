@@ -1452,6 +1452,12 @@ that. The change path is a superseding entry, held to one rule: compatibility.
   held answers count it. In the same test, a leader opened stating a conflicting map has its entry go inert, and is
   fenced.
 
+**What it costs.** A class entry moves the applied point, as every entry does. So a write prepared before it, at any
+member, is refused at apply as "the database advanced since preparation": the same typed refusal a concurrent writer
+or a configuration change gets, which its caller prepares again. This happens at most once per recording: under the
+group's first leader, and under the leader that records a joiner's fate. A leader holds its own writes back while
+its class entry is in flight (`class_in_flight`), so only a write prepared at a follower in that window meets it.
+
 **Formats.** The log gains one entry kind under a prefix of its own, which is how the seed (`amphora.seed.v1`)
 and the baseline delta were added: append-only, no existing entry read differently. The database gains one
 table. The owner transport's wire doesn't change: the entry travels in raft's log, which the host carries
@@ -1538,8 +1544,8 @@ bound is derived from those.
   `READER_PAGES`). Each replica's `out` is at most `CONNECTION_MAX`. Replicas are registered by id and removed when
   their owner ends. A reader that closes, for an account reclaiming it or for an owner that ended, is dropped after
   the account's lock is let go.
-- **The charge is shown.** `amphora_replica_local_reader_charge_bytes` is a gauge of the bytes charged to the
-  process's pool by every replica's readers. It is proposed to Kiln Metrics, and the dashboard row reads "against
+- **The charge is shown.** A gauge of the bytes charged to the
+  process's pool by every replica's readers, its name proposed to Kiln Metrics and wired once agreed; the dashboard row reads "against
   32".
 
 **Sources.** PostgreSQL bounds backends by `max_connections` and their shared cache by `shared_buffers`

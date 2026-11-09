@@ -21,7 +21,7 @@ use crate::store::{Checkpointed, Config, Flush, Opener};
 mod cache;
 
 /// The pages a process's databases share (docs/design/store.md, decision 20).
-pub use amphora_engine::storage::shared_pages::SharedPages;
+pub use amphora_engine::storage::shared_pages::{Charge, SharedPages};
 
 /// How long opening waits for another process's hold on the file to go.
 const LOCK_WAIT: Duration = Duration::from_secs(15);
