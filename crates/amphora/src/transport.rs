@@ -9,6 +9,7 @@ mod watch;
 mod wire;
 pub use common::{Client, Namespace, Owner};
 pub(crate) use endpoint::try_lease;
+pub(crate) use wire::CONNECTION_MAX;
 pub use watch::Watch;
 
 /// The transport tests' hang guard, measured: twenty times the slowest whole run of any transport

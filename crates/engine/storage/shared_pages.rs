@@ -18,7 +18,7 @@
 //! file's pages leave with it when its database closes.
 
 use crate::io::Buffer;
-use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::{Arc, RwLock};
 use rustc_hash::FxHashMap;
 
@@ -89,6 +89,21 @@ pub struct SharedPages {
     per_shard: usize,
     /// The number the next file to join gets.
     files: AtomicU64,
+    /// Pages charged to this pool's budget by memory kept outside it ([`SharedPages::charge`]).
+    charged: AtomicUsize,
+}
+
+/// Pages charged to a pool's budget while it is held ([`SharedPages::charge`]), given back when
+/// it drops.
+pub struct Charge {
+    pool: Arc<SharedPages>,
+    pages: usize,
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        self.pool.charged.fetch_sub(self.pages, Ordering::AcqRel);
+    }
 }
 
 impl SharedPages {
@@ -99,7 +114,30 @@ impl SharedPages {
             shards: (0..SHARDS).map(|_| ShardCell::default()).collect(),
             per_shard,
             files: AtomicU64::new(0),
+            charged: AtomicUsize::new(0),
         }
+    }
+
+    /// Charges `pages` to this pool's budget, for memory kept beside it (Amphora's
+    /// `docs/design/replication.md`, "A replica's local readers bounded by derivation": a reader's
+    /// own cache): the pool keeps that many fewer while the charge is held. None, charging nothing,
+    /// when the charges held and `pages` would pass its capacity.
+    pub fn charge(self: &Arc<Self>, pages: usize) -> Option<Charge> {
+        let capacity = self.capacity();
+        self.charged
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
+                charged.checked_add(pages).filter(|after| *after <= capacity)
+            })
+            .ok()?;
+        Some(Charge {
+            pool: Arc::clone(self),
+            pages,
+        })
+    }
+
+    /// Pages charged to this pool's budget now.
+    pub fn charged(&self) -> usize {
+        self.charged.load(Ordering::Acquire)
     }
 
     /// A number for one more database file reading through these pages, its keys' `file`: every
@@ -518,5 +556,30 @@ mod tests {
         assert_eq!(pool.get(&b_key).unwrap().as_slice()[0], 3);
         drop(b);
         assert!(pool.is_empty());
+    }
+
+    /// Amphora's replication.md, "A replica's local readers bounded by derivation" (AC-T1.10.L2):
+    /// what is charged to a pool's budget it doesn't keep. Do: a pool of 256 pages (4 a shard)
+    /// charged 128, then 256 pages inserted; a charge past what is left asked; the charge given
+    /// back and 256 more inserted. Expect: at most 128 kept while charged; the charge past the
+    /// capacity refused, charging nothing; 256 kept once it is given back.
+    #[test]
+    fn a_charge_shrinks_what_the_pool_keeps() {
+        let pool = Arc::new(SharedPages::new(256));
+        let charge = pool.charge(128).unwrap();
+        for page in 1..=256 {
+            pool.insert(file(page), buffer(1));
+        }
+        assert!(pool.len() <= 128, "{} kept beside 128 charged", pool.len());
+        assert!(pool.charge(129).is_none());
+        assert_eq!(pool.charged(), 128);
+        let rest = pool.charge(128).unwrap();
+        assert_eq!(pool.charged(), 256);
+        drop((charge, rest));
+        assert_eq!(pool.charged(), 0);
+        for page in 257..=512 {
+            pool.insert(file(page), buffer(2));
+        }
+        assert_eq!(pool.len(), 256);
     }
 }
