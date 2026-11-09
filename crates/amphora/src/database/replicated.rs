@@ -11,6 +11,7 @@ use std::time::Duration;
 use crate::meter::{
     FloorCounters, FloorMeter, FloorRefusal, LocalRefusal, ReplicaCounters, ReplicaMeter,
 };
+use crate::store::Checkpointed;
 use api::replication::{
     CatchUp, Durability, MemberChange, Outbound, ReplicaConfig, ReplicaStatus, Verdict,
 };
@@ -165,7 +166,8 @@ struct Control {
 /// connections of their own on the machine's database, each on what the machine committed when
 /// its read began. At most `CONNECTION_MAX` out at once, each charged to the process's page
 /// budget; one given back waits in the process's account for the next read (replication.md, "A
-/// replica's local readers bounded by derivation").
+/// replica's local readers bounded by derivation"). While the owner waits to start the database's
+/// log again, no read of this replica begins (replication.md, "A replica's database log").
 struct Local {
     /// Opens a reader; none once the owner ended, so that no reader holds its lease past the reads
     /// under way then.
@@ -193,11 +195,13 @@ struct Account {
 }
 /// The account's readers: those given back, oldest first, and how many each replica has out.
 /// Its idle readers are at most what the budget charges (each holds `db::READER_PAGES`), and it
-/// names a replica only while that replica's readers are out.
+/// names a replica only while that replica's readers are out, or while its owner holds its reads
+/// back to start its database's log again (`restarting`, at most one entry a replica).
 #[derive(Default)]
 struct Ledger {
     idle: VecDeque<Idle>,
     out: std::collections::BTreeMap<u64, usize>,
+    restarting: std::collections::BTreeSet<u64>,
 }
 struct Idle {
     replica: u64,
@@ -265,12 +269,17 @@ impl Local {
                 return Err(fenced("replica owner ended"));
             };
             let mut ledger = locked(&self.account.ledger)?;
-            let own = ledger.idle.iter().position(|idle| idle.replica == self.id);
+            let held = ledger.restarting.contains(&self.id);
+            let own = ledger
+                .idle
+                .iter()
+                .position(|idle| idle.replica == self.id)
+                .filter(|_| !held);
             if let Some(idle) = own.and_then(|at| ledger.idle.remove(at)) {
                 self.took(&mut ledger)?;
                 break (Some(idle.reader), idle.charge, open);
             }
-            if ledger.out.get(&self.id).copied().unwrap_or(0) < READERS {
+            if !held && ledger.out.get(&self.id).copied().unwrap_or(0) < READERS {
                 if let Some(charge) = self.account.pool.charge(pages) {
                     self.took(&mut ledger)?;
                     break (None, charge, open);
@@ -355,6 +364,29 @@ impl Local {
         drop(closed);
         self.account.free();
     }
+    /// The owner is to start the database's log again: no read of this replica begins until it
+    /// has.
+    fn hold_reads(&self) -> Result<(), Refusal> {
+        locked(&self.account.ledger)?.restarting.insert(self.id);
+        Ok(())
+    }
+    /// `restart`, once no read of this replica is out, its reads held back while it runs: none
+    /// while one is out. Reads begin again once it started the log (`Ok(true)`).
+    fn restart_unread(
+        &self,
+        restart: impl FnOnce() -> anyhow::Result<bool>,
+    ) -> Result<Option<bool>, Refusal> {
+        if locked(&self.account.ledger)?.out.contains_key(&self.id) {
+            return Ok(None);
+        }
+        // No read of this replica begins while it is restarting, so none is out meanwhile.
+        let restarted = restart().map_err(|error| refused(&error))?;
+        if restarted {
+            locked(&self.account.ledger)?.restarting.remove(&self.id);
+            self.account.free();
+        }
+        Ok(Some(restarted))
+    }
     /// The owner ended: no reader opens again, its idle ones close, and reads waiting are refused.
     fn release(&self) {
         if let Ok(mut open) = self.open.lock() {
@@ -367,6 +399,7 @@ impl Local {
                         .into_iter()
                         .partition(|idle| idle.replica == self.id);
                 ledger.idle = others;
+                ledger.restarting.remove(&self.id);
                 mine
             }
             Err(_) => VecDeque::new(),
@@ -567,46 +600,105 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     class_held: bool,
 }
 
-/// The replicated class's flushes of the machine's log (docs/design/replication.md, "Fast
-/// acknowledgement"): one out at a time, off the owner's step. The owner hands each the point it had
-/// applied, and takes the point back once the flush has made it durable.
+/// The flushes of the machine's database log, in every class (docs/design/replication.md, "Fast
+/// acknowledgement" and "A replica's database log"): one out at a time, off the owner's step. The
+/// owner hands each the point it had applied, and takes the point back once the flush has made it
+/// durable, with what the checkpoint pass after it left in the log.
 enum Flushing {
-    /// Outside the class: the machine flushes with each entry it applies.
-    Inline,
-    /// The owner's flushing thread, and whether a flush is out.
+    /// The owner's flushing thread; whether a flush is out; what the last checkpoint pass left.
     Thread {
-        ask: mpsc::SyncSender<Point>,
-        done: mpsc::Receiver<Result<Point, String>>,
+        ask: mpsc::SyncSender<Ask>,
+        done: mpsc::Receiver<Result<Flushed, String>>,
         out: bool,
+        log: Checkpointed,
     },
     /// A test's: the log is flushed when the test says so (`Driven::flush`).
     #[cfg(test)]
     Held,
 }
 
+/// What the owner asks of its flushing thread: a flush of what was applied through `at`, and
+/// whether a checkpoint pass follows it at once (`copy`: the log is past its bound as its writer
+/// counts it, or the owner holds reads for a restart and waits for a pass to leave little).
+struct Ask {
+    at: Point,
+    copy: bool,
+}
+/// A flush done, and what its checkpoint pass left in the log, if one ran.
+struct Flushed {
+    at: Point,
+    copied: Option<Checkpointed>,
+}
+
+/// How often a checkpoint pass follows a flush while the log is within its bound: the standalone
+/// store's checkpoint period, measured on fedora 2026-10-20 (docs/design/store.md, decision 4).
+const CHECKPOINT_EVERY: Duration = Duration::from_millis(25);
+/// A frame of the database's log: a 4 KiB page (the page every replicated delta and image holds,
+/// `replication::validate_pages`) and its 24-byte header (sqlite.org/fileformat.html, "WAL File
+/// Format").
+const FRAME_BYTES: u64 = 4096 + 24;
+
+/// Whether the owner holds local reads back for a restart of the database's log (docs/design/
+/// store.md, decision 4): past its bound once the last checkpoint pass left at most a 64th of it
+/// to copy, or past twice its bound however much is left. `frames` is the log's length as its
+/// writer counts it now: a read that began on a log wholly copied reads the file alone and holds
+/// every pass off (a passive checkpoint is busy beside it, as SQLite's is: wal.c,
+/// `walCheckpoint`'s `WAL_READ_LOCK(0)`), so only holding reads back lets the passes copy again.
+fn hold_due(log: Checkpointed, frames: u64, bound: u64) -> bool {
+    frames > bound.saturating_mul(2) || restart_ready(log, bound)
+}
+
+/// Whether the owner may start the log again now: a pass left at most a 64th of the bound to
+/// copy, so that the restart's own copy, on the owner's thread, stays that small whatever the
+/// log's length (store.md, decision 4: 10-14 ms on fedora).
+fn restart_ready(log: Checkpointed, bound: u64) -> bool {
+    log.log > bound && log.left <= (bound / 64).max(1)
+}
+
 impl Flushing {
-    /// The flushing for `durability`: in the replicated class, a thread that runs `flush` for each
-    /// point it's handed, and counts each it finishes in `meter`.
+    /// A thread that flushes `machine`'s log for each point it's handed, then copies what the
+    /// flush made durable into the database's file on a connection of its own (a passive
+    /// checkpoint, which never copies past a reader's mark), and counts each in `meter`.
     fn start(
-        durability: &Durability,
-        flush: crate::store::Flush,
+        machine: &crate::replication::Machine,
         meter: Arc<ReplicaMeter>,
     ) -> Result<Self, Refusal> {
-        if matches!(durability, Durability::Persisted) {
-            return Ok(Self::Inline);
-        }
-        let (ask, asked) = mpsc::sync_channel::<Point>(1);
+        let flush = machine.log_flusher();
+        let mut copier = machine.reader()().map_err(|error| refused(&error))?;
+        let (ask, asked) = mpsc::sync_channel::<Ask>(1);
         let (finished, done) = mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("amphora.replica.flush".into())
             .spawn(move || {
-                for at in asked {
+                let mut copied_at: Option<Instant> = None;
+                for Ask { at, copy } in asked {
                     // The disk's time, not the owner's: a flush is real I/O however its owner's
                     // clock runs.
                     let began = Instant::now();
-                    let result = flush().map(|()| at).map_err(|e| e.to_string());
+                    let mut result = flush()
+                        .map(|()| Flushed { at, copied: None })
+                        .map_err(|e| e.to_string());
                     if result.is_ok() {
                         meter.flushed(began.elapsed());
+                    }
+                    let due =
+                        copy || copied_at.is_none_or(|then| then.elapsed() >= CHECKPOINT_EVERY);
+                    if let Ok(flushed) = result.as_mut()
+                        && due
+                    {
+                        let began = Instant::now();
+                        copied_at = Some(began);
+                        match copier.checkpoint() {
+                            // A busy pass copied nothing and says nothing of the log: neither
+                            // counted nor reported.
+                            Ok(copied) if copied == Checkpointed::default() => {}
+                            Ok(copied) => {
+                                meter.checkpointed(began.elapsed());
+                                flushed.copied = Some(copied);
+                            }
+                            // The file's state is unknown after a failed copy: the owner fences.
+                            Err(e) => result = Err(format!("a checkpoint failed: {e:#}")),
+                        }
                     }
                     if finished.send(result).is_err() {
                         return;
@@ -618,6 +710,7 @@ impl Flushing {
             ask,
             done,
             out: false,
+            log: Checkpointed::default(),
         })
     }
 }
@@ -1081,7 +1174,7 @@ fn open_on<F: BlockFile + 'static>(
     machine.state_class(&durability)?;
     let settings = settings(config.node_id, &durability)?;
     let meter = Arc::new(ReplicaMeter::default());
-    let flushing = Flushing::start(&durability, machine.log_flusher(), Arc::clone(&meter))?;
+    let flushing = Flushing::start(&machine, Arc::clone(&meter))?;
     let reader = machine.reader();
     let log_config = hyper_log::Config {
         segment_bytes: 64 << 20,
@@ -1598,17 +1691,25 @@ impl<F: BlockFile + 'static> Actor<F> {
         );
         Ok(())
     }
-    /// The replicated class's flushing: takes what a finished flush made durable, and hands the
-    /// flushing thread the point applied when none is out. A failed flush leaves the log's state
-    /// unknown, so the owner fences.
+    /// The flushing: takes what a finished flush made durable and what its checkpoint pass left,
+    /// starts the database's log again when it is due and no flush or read is out, and hands the
+    /// flushing thread the point applied when none is out. A failed flush or checkpoint leaves
+    /// the log's state unknown, so the owner fences.
     fn flush(&mut self) -> Result<(), Refusal> {
         match &mut self.flushing {
-            Flushing::Inline => Ok(()),
-            Flushing::Thread { ask, done, out } => {
+            Flushing::Thread {
+                ask,
+                done,
+                out,
+                log,
+            } => {
                 match done.try_recv() {
-                    Ok(Ok(at)) => {
-                        self.replica.machine_mut().flushed_through(at);
+                    Ok(Ok(flushed)) => {
+                        self.replica.machine_mut().flushed_through(flushed.at);
                         *out = false;
+                        if let Some(copied) = flushed.copied {
+                            *log = copied;
+                        }
                     }
                     Ok(Err(error)) => {
                         return Err(fenced(format!(
@@ -1620,9 +1721,51 @@ impl<F: BlockFile + 'static> Actor<F> {
                         return Err(fenced("the replica's flushing thread ended"));
                     }
                 }
-                if !*out && let Some(at) = self.replica.machine().unflushed() {
-                    ask.try_send(at)
-                        .map_err(|_| fenced("the replica's flushing thread took no flush"))?;
+                let bound = self.replica.machine().log_bound();
+                let frames = self
+                    .replica
+                    .machine()
+                    .log_frames()
+                    .map_err(|error| refused(&error))?;
+                self.control
+                    .meter
+                    // A gauge: past u64's range it says the most it can.
+                    .log_bytes(frames.saturating_mul(FRAME_BYTES));
+                let hold = hold_due(*log, frames, bound);
+                if hold {
+                    self.control.local.hold_reads()?;
+                }
+                if hold && !*out && restart_ready(*log, bound) {
+                    let machine = self.replica.machine_mut();
+                    if self
+                        .control
+                        .local
+                        .restart_unread(|| machine.restart_log())?
+                        == Some(true)
+                    {
+                        *log = Checkpointed::default();
+                        self.control.meter.restarted();
+                    }
+                }
+                // While reads are held, a pass is asked even with nothing to flush: the restart
+                // waits for one that leaves little to copy.
+                let hold = hold_due(*log, frames, bound);
+                let next = match self.replica.machine().unflushed() {
+                    Some(at) => Some(at),
+                    None if hold => Some(self.replica.machine().applied()),
+                    None => None,
+                };
+                if !*out && let Some(at) = next {
+                    let frames = self
+                        .replica
+                        .machine()
+                        .log_frames()
+                        .map_err(|error| refused(&error))?;
+                    ask.try_send(Ask {
+                        at,
+                        copy: frames > bound || hold,
+                    })
+                    .map_err(|_| fenced("the replica's flushing thread took no flush"))?;
                     *out = true;
                 }
                 Ok(())
@@ -4738,18 +4881,15 @@ mod tests {
         unflushed_leader: usize,
     }
 
-    /// One seed: three voters in three fates, two to span, their flushes held and let go at random;
-    /// rounds of writes at the leader, each round ending in one member's power cut and restart, and
-    /// a leader elected among the members that ran on when the cut one led. Every acknowledged
-    /// write must be read back at the end.
-    fn power_seed(seed: u64) -> Cuts {
+    /// One seed: three voters of `durability`, their flushes held and let go at random; rounds of
+    /// writes at the leader, each round ending in one member's power cut and restart, and a leader
+    /// elected among the members that ran on when the cut one led. Every acknowledged write must
+    /// be read back at the end.
+    fn power_seed(seed: u64, durability: &Durability) -> Cuts {
         const ROUNDS_PER_SEED: u64 = 3;
         let dir = tempfile::tempdir().unwrap();
         let mut rng = Rng(seed | 1);
-        let durability = Durability::Replicated(api::replication::Fates {
-            of: vec![(1, 10), (2, 20), (3, 30)],
-            spanning: 2,
-        });
+        let durability = durability.clone();
         let voters = vec![1, 2, 3];
         let mut power: Vec<Power> = (0..3u64).map(|n| Power::new(seed * 4 + n)).collect();
         let mut driven = Driven::powered();
@@ -4812,12 +4952,24 @@ mod tests {
             driven.hold_flushes(victim);
             done.cuts += 1;
             pump = Pump::new(&clients);
-            let candidate = if victim == leader {
-                (victim + 1) % 3
+            if victim == leader {
+                leader = driven.elect(&mut pump, &clients, (victim + 1) % 3, 1);
             } else {
-                leader
-            };
-            leader = driven.elect(&mut pump, &clients, candidate, 1);
+                // The leader ran on. A member restarted with all it had applied durable (the
+                // persisted class's) is sent no entry, so only a heartbeat tells it who leads:
+                // the leader's clock alone moves, so no follower's election timer does.
+                let id = u64::try_from(leader + 1).unwrap();
+                for _ in 0..ROUNDS {
+                    if clients
+                        .iter()
+                        .all(|c| c.handle().status().unwrap().leader == id)
+                    {
+                        break;
+                    }
+                    driven.tick(&mut pump, leader);
+                }
+                driven.follow(&mut pump, &clients, 1);
+            }
         }
         let read = driven
             .call(&mut pump, clients.get(leader).unwrap(), |db| {
@@ -4844,9 +4996,10 @@ mod tests {
         done
     }
 
-    /// Runs seeds `from..from + n` of the power-cut nemesis on `workers` threads. Every seed runs,
-    /// and the run fails naming each failing seed with its account, whatever panicked in it.
-    fn power_seeds(n: u64, from: u64, workers: usize) {
+    /// Runs seeds `from..from + n` of the power-cut nemesis on `workers` threads, its members of
+    /// `durability`. Every seed runs, and the run fails naming each failing seed with its account,
+    /// whatever panicked in it.
+    fn power_seeds(n: u64, from: u64, workers: usize, durability: &Durability) {
         let next = AtomicU64::new(from);
         let total = Mutex::new(Cuts::default());
         let failed = Mutex::new(Vec::new());
@@ -4858,7 +5011,7 @@ mod tests {
                         if seed >= from + n {
                             return;
                         }
-                        match std::panic::catch_unwind(|| power_seed(seed)) {
+                        match std::panic::catch_unwind(|| power_seed(seed, durability)) {
                             Ok(done) => {
                                 let mut total = total.lock().unwrap();
                                 total.acknowledged += done.acknowledged;
@@ -4949,7 +5102,18 @@ mod tests {
     /// with cuts of leaders holding writes unflushed among them.
     #[test]
     fn a_member_power_cut_loses_no_acknowledged_replicated_write() {
-        power_seeds(12, 0, 4);
+        power_seeds(12, 0, 4, &three_fates());
+    }
+
+    /// AC-T1.8.D2 (AC-T1.8.5), the persisted class under the same nemesis (replication.md, "A
+    /// replica's database log": its database's log flushed off the owner, a restart applying again
+    /// from the raft log what the database lost). Do: 12 seeds, three persisted voters, the
+    /// database flushes held and let go at random, each round ending in one member's power cut.
+    /// Expect: every acknowledged write read back, with cuts of leaders holding writes unflushed
+    /// among them.
+    #[test]
+    fn a_member_power_cut_loses_no_acknowledged_persisted_write() {
+        power_seeds(12, 0, 4, &Durability::Persisted);
     }
 
     /// The same nemesis over 10,000 seeds, the plan's measure, run by hand or nightly. A machine can
@@ -4959,7 +5123,12 @@ mod tests {
     fn a_member_power_cut_loses_no_acknowledged_replicated_write_over_10000_seeds() {
         let share = std::env::var("AMPHORA_POWER_SEEDS").unwrap_or_else(|_| "0:10000".into());
         let (from, count) = share.split_once(':').unwrap();
-        power_seeds(count.parse().unwrap(), from.parse().unwrap(), 8);
+        power_seeds(
+            count.parse().unwrap(),
+            from.parse().unwrap(),
+            8,
+            &three_fates(),
+        );
     }
 
     /// Enqueues `operation` at `client` without waiting: its answer comes on the returned receiver.
@@ -5191,8 +5360,8 @@ mod tests {
     /// span, the leader's flushes held; a write at the leader; its flush; then a write with the
     /// flushing thread's. Expect: the leader's backlog counts the write until its flush and is 0
     /// after, each entry it committed is counted once, by its quorum, and the thread's flush is
-    /// counted in a bucket and in the time; a persisted member counts no backlog, no flush and no
-    /// held commit.
+    /// counted in a bucket and in the time; a persisted member, whose flushing thread flushes too
+    /// (AC-T1.8.D2), counts its backlog to 0 and its flushes, and no held commit.
     #[test]
     fn the_replicated_class_counts_its_backlog_flushes_and_commits() {
         let dir = tempfile::tempdir().unwrap();
@@ -5230,12 +5399,8 @@ mod tests {
         assert_eq!(handle.counters().flush_backlog, 0);
 
         let owner = driven.owner(leader);
-        let thread = Flushing::start(
-            &durability,
-            owner.replica.machine().log_flusher(),
-            Arc::clone(&owner.control.meter),
-        )
-        .unwrap();
+        let thread =
+            Flushing::start(owner.replica.machine(), Arc::clone(&owner.control.meter)).unwrap();
         driven.owner_mut(leader).flushing = thread;
         let answer = driven.call(&mut pump, clients.get(leader).unwrap(), |db| {
             db.exec("INSERT INTO counted VALUES (1)")?;
@@ -5271,10 +5436,17 @@ mod tests {
             Ok(Vec::new())
         });
         assert_eq!(answer, Ok(Vec::new()));
-        persisted.step();
-        let counted = single.first().unwrap().handle().counters();
-        assert_eq!(counted.flush_backlog, 0);
-        assert_eq!(counted.flushes, [0; crate::meter::FLUSH_BUCKETS]);
+        let handle = single.first().unwrap().handle();
+        let mut counted = handle.counters();
+        for _ in 0..ROUNDS {
+            if counted.flush_backlog == 0 && counted.flushes.iter().sum::<u64>() >= 1 {
+                break;
+            }
+            persisted.round(&mut pump);
+            counted = handle.counters();
+        }
+        assert_eq!(counted.flush_backlog, 0, "{counted:?}");
+        assert!(counted.flushes.iter().sum::<u64>() >= 1, "{counted:?}");
         assert_eq!(counted.commits_held, 0);
         assert!(counted.commits_classic >= 2, "{counted:?}");
         persisted.drain(&mut pump);
@@ -5284,11 +5456,11 @@ mod tests {
     /// AC-T1.8.D2, T-T1.8.D2 (replication.md, "A replica's database log"): the persisted class's
     /// owner never flushes its database's log on its own thread, so a flush that stands still
     /// stands none of the owner's steps still. Do: three persisted voters; the leader's flushes
-    /// held from the test's thread, which steps every owner; a write at the leader, then rounds,
-    /// every clock a tick a round, for four election timeouts; then the hold opened. Expect: no
-    /// flush reached the hold on the owners' thread; the write answered Ok while its flush was
-    /// held, the leader's backlog counting it; the term and the leader unchanged; the backlog 0
-    /// once the hold opens.
+    /// held from the test's thread, which steps every owner; a write at the leader, answered;
+    /// then four election timeouts of ticks, every clock a tick and the group quiet after each;
+    /// then the hold opened. Expect: no flush reached the hold on the owners' thread; the write
+    /// answered Ok while its flush was held, the leader's backlog counting it; the term and the
+    /// leader unchanged; the backlog 0 once the hold opens.
     #[test]
     fn a_held_database_flush_stalls_no_persisted_owner_step() {
         let dir = tempfile::tempdir().unwrap();
@@ -5301,22 +5473,25 @@ mod tests {
         let term = driven.owner(leader).replica.term();
         let gate = driven.owner(leader).replica.machine().flush_gate();
         gate.hold();
-        let answer = submit(clients.get(leader).unwrap(), driven.until(), |db| {
+        let answered = driven.call(&mut pump, clients.get(leader).unwrap(), |db| {
             db.exec("CREATE TABLE held_flush(value)")?;
             Ok(b"answered".to_vec())
         });
-        let election = driven.owner(leader).replica.core().raft.config().election_tick;
-        let mut answered = None;
+        let election = driven
+            .owner(leader)
+            .replica
+            .core()
+            .raft
+            .config()
+            .election_tick;
+        // Four election timeouts on ticks, each tick on every clock and the group quiet after it,
+        // so that only the owners' steps, not the disk's pace, decide who campaigns.
         for _ in 0..election * 4 {
             for owner in 0..clients.len() {
                 driven.advance(owner, TICK);
             }
-            driven.round(&mut pump);
-            if answered.is_none()
-                && let Ok(result) = answer.try_recv()
-            {
-                answered = Some(result.map(called));
-            }
+            driven.step();
+            driven.quiet(&mut pump);
         }
         let held = clients.get(leader).unwrap().handle().counters();
         assert_eq!(
@@ -5324,7 +5499,7 @@ mod tests {
             0,
             "the leader's owner flushed its database's log on its own thread"
         );
-        assert_eq!(answered, Some(Ok(b"answered".to_vec())));
+        assert_eq!(answered, Ok(b"answered".to_vec()));
         assert!(held.flush_backlog >= 1, "{held:?}");
         assert_eq!(driven.owner(leader).replica.term(), term);
         let id = u64::try_from(leader + 1).unwrap();
@@ -11481,11 +11656,22 @@ mod tests {
     /// once caught up.
     #[test]
     fn a_local_read_after_a_power_cut_is_no_older_than_its_last_flush() {
+        local_read_across_a_power_cut(&three_fates());
+    }
+
+    /// AC-T1.10.L1, T-T1.10.L6, AC-T1.8.D2 (replication.md, "A local read on a replica",
+    /// amendment 4, and "A replica's database log"): the persisted class, whose database flushes
+    /// are its flushing thread's too, goes back across a power cut no further than its last
+    /// finished flush, and applies again from its own raft log what it lost. Do and expect: as in
+    /// `a_local_read_after_a_power_cut_is_no_older_than_its_last_flush`, three persisted voters.
+    #[test]
+    fn a_persisted_local_read_after_a_power_cut_is_no_older_than_its_last_flush() {
+        local_read_across_a_power_cut(&Durability::Persisted);
+    }
+
+    fn local_read_across_a_power_cut(durability: &Durability) {
         let dir = tempfile::tempdir().unwrap();
-        let durability = Durability::Replicated(api::replication::Fates {
-            of: vec![(1, 10), (2, 20), (3, 30)],
-            spanning: 2,
-        });
+        let durability = durability.clone();
         let voters = vec![1, 2, 3];
         let mut power: Vec<Power> = (1..=3u64).map(Power::new).collect();
         let mut driven = Driven::powered();
@@ -11726,12 +11912,13 @@ mod tests {
 
     /// AC-T1.8.D1, T-T1.8.D1 (replication.md, "A replica's database log"): a replica's database
     /// log is copied into its file and started again, so it stays within its bound however many
-    /// entries the replica applies. Do: a voter and its learner, the learner's log bound lowered
-    /// to 64 frames; 300 writes of a 3,000-byte row each at the voter, each followed by rounds
-    /// until the learner applied and flushed it; then the learner restarted on its files. Expect:
-    /// after each write the learner's log holds at most twice its bound; its log was started
-    /// again and checkpoint passes counted; every row read back locally on it, and from its own
-    /// state once restarted.
+    /// entries the replica applies, on a learner and on its leader. Do: a voter and its learner,
+    /// both logs' bounds lowered to 64 frames; 300 writes of a 3,000-byte row each at the voter,
+    /// each followed by rounds until the learner applied and flushed it and the voter flushed it;
+    /// then the learner restarted on its files. Expect: after each write each log holds at most
+    /// twice its bound; the learner's log was started again by its owner and checkpoint passes
+    /// counted; every row read back locally on the learner, and from its own state once
+    /// restarted.
     #[test]
     fn a_replicas_database_log_stays_within_its_bound() {
         const BOUND: u64 = 64;
@@ -11739,31 +11926,51 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut driven = Driven::new();
         let clients = voter_and_learner(&mut driven, dir.path());
-        driven
-            .owner_mut(1)
-            .replica
-            .machine_mut()
-            .set_log_bound(BOUND);
+        for owner in 0..2 {
+            driven
+                .owner_mut(owner)
+                .replica
+                .machine_mut()
+                .set_log_bound(BOUND);
+        }
         let mut pump = Pump::new(&clients);
-        let mut longest = 0;
+        let (mut longest, mut leaders) = (0, 0);
+        let voter = clients[0].handle();
         for n in 0..WRITES {
             driven
                 .call(&mut pump, &clients[0], move |db| {
                     db.exec("CREATE TABLE IF NOT EXISTS bounded(n, body)")?;
-                    db.exec(&format!("INSERT INTO bounded VALUES ({n}, randomblob(3000))"))?;
+                    db.exec(&format!(
+                        "INSERT INTO bounded VALUES ({n}, randomblob(3000))"
+                    ))?;
                     Ok(Vec::new())
                 })
                 .unwrap();
             settle_log(&mut driven, &mut pump, &clients);
+            for _ in 0..ROUNDS {
+                if voter.counters().flush_backlog == 0 {
+                    break;
+                }
+                driven.round(&mut pump);
+            }
             longest = longest.max(driven.owner(1).replica.machine().log_frames().unwrap());
+            leaders = leaders.max(driven.owner(0).replica.machine().log_frames().unwrap());
         }
+        assert!(
+            leaders <= 2 * BOUND,
+            "the leader's log held {leaders} frames, past twice its bound of {BOUND}"
+        );
         let counted = clients[1].handle().counters();
         assert!(
             longest <= 2 * BOUND,
             "the log held {longest} frames, past twice its bound of {BOUND}: {counted:?}"
         );
-        assert!(counted.log_restarts >= 1, "{counted:?}");
+        assert!(counted.database_log_restarts >= 1, "{counted:?}");
         assert!(counted.checkpoints.iter().sum::<u64>() >= 1, "{counted:?}");
+        assert!(
+            counted.database_log_bytes <= 2 * BOUND * FRAME_BYTES,
+            "{counted:?}"
+        );
         fn count(db: &mut Db) -> anyhow::Result<i64> {
             let mut rows = 0;
             db.query("SELECT count(*) FROM bounded", [], |row| {
@@ -11811,7 +12018,7 @@ mod tests {
         let handle = learner.handle();
         write(&mut driven, &mut pump, voter, 1);
         settle_log(&mut driven, &mut pump, &clients);
-        let restarts = handle.counters().log_restarts;
+        let restarts = handle.counters().database_log_restarts;
         let (first, second, frames, held_off, waited) = learner
             .read_local(Instant::now() + HANG_READ, |db| {
                 db.query_transaction(|db| {
@@ -11821,25 +12028,28 @@ mod tests {
                         settle_log(&mut driven, &mut pump, &clients);
                     }
                     let frames = driven.owner(1).replica.machine().log_frames()?;
-                    let held_off = handle.counters().log_restarts == restarts;
+                    let held_off = handle.counters().database_log_restarts == restarts;
                     let waited =
                         learner.read_local(Instant::now() + Duration::from_millis(50), values);
                     Ok((first, values(db)?, frames, held_off, waited))
                 })
             })
             .unwrap();
-        assert!(frames > BOUND, "the log held {frames} frames, within its bound");
+        assert!(
+            frames > BOUND,
+            "the log held {frames} frames, within its bound"
+        );
         assert!(held_off, "the log restarted under an open read");
         assert_eq!(waited, Err(Refusal::Timeout));
         assert_eq!((first, second), (vec![1], vec![1]));
         for _ in 0..ROUNDS {
-            if handle.counters().log_restarts > restarts {
+            if handle.counters().database_log_restarts > restarts {
                 break;
             }
             driven.round(&mut pump);
         }
         assert!(
-            handle.counters().log_restarts > restarts,
+            handle.counters().database_log_restarts > restarts,
             "{:?}",
             handle.counters()
         );
@@ -11849,6 +12059,207 @@ mod tests {
         );
         driven.drain(&mut pump);
         pump.finish();
+    }
+
+    /// AC-T1.8.D1, T-T1.8.D1 (replication.md, "A replica's database log"; store.md, decision 15):
+    /// a checkpoint pass copies only what a finished flush made durable. Do: a voter and its
+    /// learner, the learner's flushes held; 1 written and the learner's log flushed; 2 to 5
+    /// written and applied there unflushed; a checkpoint pass on a connection of the learner's
+    /// own. Expect: the pass copied the log through the frame the flush covered and no further.
+    #[test]
+    fn a_checkpoint_pass_copies_no_frame_past_the_last_finished_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = voter_and_learner(&mut driven, dir.path());
+        driven.hold_flushes(1);
+        let mut pump = Pump::new(&clients);
+        write(&mut driven, &mut pump, &clients[0], 1);
+        catch_up(&mut driven, &mut pump, &clients, 0, 1);
+        driven.flush(1);
+        let flushed = driven.owner(1).replica.machine().log_frames().unwrap();
+        for value in 2..=5 {
+            write(&mut driven, &mut pump, &clients[0], value);
+        }
+        catch_up(&mut driven, &mut pump, &clients, 0, 1);
+        let machine = driven.owner(1).replica.machine();
+        assert!(machine.unflushed().is_some());
+        let log = machine.log_frames().unwrap();
+        assert!(log > flushed, "nothing was written past the flush");
+        let copied = machine.reader()().unwrap().checkpoint().unwrap();
+        assert_eq!(copied.log, log);
+        assert_eq!(
+            copied.log - copied.left,
+            flushed,
+            "the pass copied through another frame than the flush covered: {copied:?}"
+        );
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.D1, T-T1.8.D1 (replication.md, "A replica's database log", point 4): a restart
+    /// that falls due while a local read is out waits for that read, and so no longer than the
+    /// read's deadline. Do: a voter and its learner, the learner's log bound lowered to 16 frames;
+    /// a local read on the learner, on a thread of its own, running a query with no end under a
+    /// deadline on a clock the test moves (as `Database::query_local` puts one on every read);
+    /// once it reads, 2 to 40 written at the voter, each applied and flushed by the learner; then
+    /// rounds; then the read's deadline passed, and rounds until a restart is counted. Expect: the
+    /// learner's log past twice its bound and no restart while the read runs; the read refused at
+    /// its deadline; a restart after it.
+    #[test]
+    fn a_restart_due_waits_for_a_reads_deadline_and_no_longer() {
+        const BOUND: u64 = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = voter_and_learner(&mut driven, dir.path());
+        driven
+            .owner_mut(1)
+            .replica
+            .machine_mut()
+            .set_log_bound(BOUND);
+        let mut pump = Pump::new(&clients);
+        let (voter, learner) = (&clients[0], &clients[1]);
+        let handle = learner.handle();
+        write(&mut driven, &mut pump, voter, 1);
+        settle_log(&mut driven, &mut pump, &clients);
+        let restarts = handle.counters().database_log_restarts;
+        let passed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            let read = {
+                let passed = Arc::clone(&passed);
+                scope.spawn(move || {
+                    learner.read_local(Instant::now() + HANG_READ, move |db| {
+                        let until = Instant::now() + HANG_READ;
+                        let _deadline = db.deadline_on(until, move || {
+                            if passed.load(Ordering::Acquire) {
+                                until
+                            } else {
+                                Instant::now()
+                            }
+                        });
+                        db.query(
+                            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n) SELECT count(*) FROM n",
+                            [],
+                            |_| Ok(false),
+                        )?;
+                        Ok(())
+                    })
+                })
+            };
+            for _ in 0..ROUNDS {
+                if handle.counters().local_readers_in_use == 1 {
+                    break;
+                }
+                std::thread::park_timeout(POLL);
+            }
+            assert_eq!(handle.counters().local_readers_in_use, 1);
+            for value in 2..=40 {
+                write(&mut driven, &mut pump, voter, value);
+                settle_log(&mut driven, &mut pump, &clients);
+            }
+            let frames = driven.owner(1).replica.machine().log_frames().unwrap();
+            assert!(frames > 2 * BOUND, "the log held {frames} frames");
+            for _ in 0..64 {
+                driven.round(&mut pump);
+            }
+            assert_eq!(
+                handle.counters().database_log_restarts,
+                restarts,
+                "a restart under a read"
+            );
+            passed.store(true, Ordering::Release);
+            let answer = read.join().unwrap();
+            assert!(
+                answer.is_err(),
+                "the read ran past its deadline: {answer:?}"
+            );
+        });
+        for _ in 0..ROUNDS {
+            if handle.counters().database_log_restarts > restarts {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        assert!(
+            handle.counters().database_log_restarts > restarts,
+            "{:?}",
+            handle.counters()
+        );
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.D1, T-T1.8.D1 (replication.md, "A replica's database log", point 3): a local read
+    /// begun on a log wholly copied reads the file alone and holds every checkpoint pass off, so
+    /// the restart rule reads the writer's own count. Do: a voter and its learner, the learner's
+    /// bound lowered to 16 frames; 1 written, flushed and wholly copied by a pass; a local read
+    /// opened on the learner; within it, 2 to 40 written, each applied and flushed, a pass
+    /// on a connection of the learner's own, a round, then a second local read with 50 ms to
+    /// run. Expect: the first pass left nothing to copy; the pass under the read busy (it copied
+    /// nothing and said nothing: the default); the log past twice its bound; the second read
+    /// refused Timeout, as the restart fell due by the writer's count alone.
+    #[test]
+    fn a_read_on_a_wholly_copied_log_holds_passes_off_and_the_restart_still_falls_due() {
+        const BOUND: u64 = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = voter_and_learner(&mut driven, dir.path());
+        driven
+            .owner_mut(1)
+            .replica
+            .machine_mut()
+            .set_log_bound(BOUND);
+        let mut pump = Pump::new(&clients);
+        let (voter, learner) = (&clients[0], &clients[1]);
+        write(&mut driven, &mut pump, voter, 1);
+        settle_log(&mut driven, &mut pump, &clients);
+        let mut copier = driven.owner(1).replica.machine().reader()().unwrap();
+        let whole = copier.checkpoint().unwrap();
+        assert_eq!(whole.left, 0, "{whole:?}");
+        let (busy, frames, waited) = learner
+            .read_local(Instant::now() + HANG_READ, |db| {
+                db.query_transaction(|db| {
+                    values(db)?;
+                    for value in 2..=40 {
+                        write(&mut driven, &mut pump, voter, value);
+                        settle_log(&mut driven, &mut pump, &clients);
+                    }
+                    let busy = copier.checkpoint()?;
+                    let frames = driven.owner(1).replica.machine().log_frames()?;
+                    // The owner's step finds the restart due and holds reads back.
+                    driven.round(&mut pump);
+                    let waited =
+                        learner.read_local(Instant::now() + Duration::from_millis(50), values);
+                    Ok((busy, frames, waited))
+                })
+            })
+            .unwrap();
+        assert_eq!(
+            busy,
+            Checkpointed::default(),
+            "a pass copied beside the read"
+        );
+        assert!(frames > 2 * BOUND, "the log held {frames} frames");
+        assert_eq!(waited, Err(Refusal::Timeout));
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.D1, T-T1.8.D1 (replication.md, "A replica's database log", point 3; the owner at
+    /// 92c5a9e): reads are held past twice the bound however much is left, but the log is started
+    /// again only once a pass left at most a 64th of the bound, so the owner's restart never copies
+    /// more. Do: the rule on a bound of 64 frames, at the log's states it meets. Expect: past twice
+    /// the bound with much left, reads held and no restart; the same log once a pass copied it,
+    /// both; within the bound, neither; past it with little left, both.
+    #[test]
+    fn the_owner_holds_reads_past_twice_the_bound_and_restarts_only_on_little_left() {
+        let pass = |log, left| Checkpointed { log, left };
+        let rule = |log, frames| (hold_due(log, frames, 64), restart_ready(log, 64));
+        assert_eq!(rule(pass(200, 150), 200), (true, false));
+        assert_eq!(rule(Checkpointed::default(), 200), (true, false));
+        assert_eq!(rule(pass(200, 1), 200), (true, true));
+        assert_eq!(rule(pass(60, 0), 60), (false, false));
+        assert_eq!(rule(pass(100, 30), 100), (false, false));
+        assert_eq!(rule(pass(100, 1), 100), (true, true));
     }
 
     /// AC-T1.10.L1 (replication.md, "A local read on a replica"; kiln 289db3175f3's fix to its

@@ -264,7 +264,7 @@ pub fn flush_bucket(d: Duration) -> usize {
 
 /// The replicated class's metrics, as their host exports them: name, type and help, in the
 /// order of [`ReplicaCounters`]' fields (docs/design/replication.md, "Metrics").
-pub const REPLICA_METRICS: [(&str, &str, &str); 8] = [
+pub const REPLICA_METRICS: [(&str, &str, &str); 11] = [
     (
         "amphora_replica_flush_backlog_entries",
         "gauge",
@@ -273,7 +273,7 @@ pub const REPLICA_METRICS: [(&str, &str, &str); 8] = [
     (
         "amphora_replica_flush_seconds",
         "histogram",
-        "Each flush of the database's log the replicated class's flushing thread completed; a failed flush fences the owner.",
+        "Each flush of the database's log the owner's flushing thread completed; a failed flush fences the owner.",
     ),
     (
         "amphora_replica_commits_total",
@@ -308,6 +308,23 @@ pub const REPLICA_METRICS: [(&str, &str, &str); 8] = [
         "amphora_replica_local_readers_in_use",
         "gauge",
         "This replica's local readers reading now, 0 to 4.",
+    ),
+    // The database's log (replication.md, "A replica's database log"), as Kiln Metrics agreed
+    // them (amphora-replica-log/names/v1): the histogram's count stands for the passes.
+    (
+        "amphora_replica_checkpoint_seconds",
+        "histogram",
+        "Each checkpoint pass's time on the flushing thread; a failed pass fences the owner, so none is counted.",
+    ),
+    (
+        "amphora_replica_database_log_restarts_total",
+        "counter",
+        "Times the owner started the database's log again from its beginning.",
+    ),
+    (
+        "amphora_replica_database_log_bytes",
+        "gauge",
+        "The database log's length as the owner last counted it, in bytes (frames x 4,120).",
     ),
 ];
 
@@ -365,8 +382,7 @@ pub struct ReplicaMeter {
 /// What a replica owner's counters say now ([`REPLICA_METRICS`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReplicaCounters {
-    /// Entries applied and not yet flushed: 0 outside the replicated class, which flushes each
-    /// entry as it applies it.
+    /// Entries applied and not yet flushed by the owner's flushing thread.
     pub flush_backlog: u64,
     /// The flushing thread's flushes, by [`flush_bucket`], and how long they took in all.
     pub flushes: [u64; FLUSH_BUCKETS],
@@ -389,8 +405,8 @@ pub struct ReplicaCounters {
     pub checkpoints: [u64; FLUSH_BUCKETS],
     pub checkpoint_time: Duration,
     /// Times the owner started the database's log again.
-    pub log_restarts: u64,
-    /// The database log's length as the last checkpoint pass found it, in bytes.
+    pub database_log_restarts: u64,
+    /// The database log's length as the owner last counted it, in bytes.
     pub database_log_bytes: u64,
 }
 
@@ -448,13 +464,18 @@ impl ReplicaMeter {
             .store(u64::try_from(out).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
-    /// A checkpoint pass that took `took` found the database's log `log_bytes` long.
-    pub fn checkpointed(&self, took: Duration, log_bytes: u64) {
+    /// A checkpoint pass took `took`.
+    pub fn checkpointed(&self, took: Duration) {
         if let Some(b) = self.checkpoints.get(flush_bucket(took)) {
             b.fetch_add(1, Ordering::Relaxed);
         }
-        self.checkpoint_us.fetch_add(micros(took), Ordering::Relaxed);
-        self.log_bytes.store(log_bytes, Ordering::Relaxed);
+        self.checkpoint_us
+            .fetch_add(micros(took), Ordering::Relaxed);
+    }
+
+    /// The database's log is `bytes` long, as the owner counted it at its step.
+    pub fn log_bytes(&self, bytes: u64) {
+        self.log_bytes.store(bytes, Ordering::Relaxed);
     }
 
     /// The owner started the database's log again: it is empty.
@@ -483,10 +504,12 @@ impl ReplicaMeter {
             }),
             local_readers_in_use: self.readers_in_use.load(Ordering::Relaxed),
             checkpoints: std::array::from_fn(|i| {
-                self.checkpoints.get(i).map_or(0, |b| b.load(Ordering::Relaxed))
+                self.checkpoints
+                    .get(i)
+                    .map_or(0, |b| b.load(Ordering::Relaxed))
             }),
             checkpoint_time: Duration::from_micros(self.checkpoint_us.load(Ordering::Relaxed)),
-            log_restarts: self.restarts.load(Ordering::Relaxed),
+            database_log_restarts: self.restarts.load(Ordering::Relaxed),
             database_log_bytes: self.log_bytes.load(Ordering::Relaxed),
         }
     }
@@ -692,16 +715,20 @@ mod tests {
 
     /// CP-T1.8, doc truth (CLAUDE.md sections 6 and 10): the replicated class's metrics are the
     /// ones its design names. Do: read docs/design/replication.md. Expect: every
-    /// `amphora_replica_` name there (a histogram's `_bucket` series as the histogram) is in
-    /// [`REPLICA_METRICS`], and every name there is in the design; every local read refusal
-    /// reason in [`LocalRefusal::ALL`] is named there (AC-T1.10.L2).
+    /// `amphora_replica_` name there (a histogram's `_bucket` and `_count` series as the
+    /// histogram) is in [`REPLICA_METRICS`], and every name there is in the design; every local
+    /// read refusal reason in [`LocalRefusal::ALL`] is named there (AC-T1.10.L2).
     #[test]
     fn the_replica_metrics_are_the_ones_the_design_names() {
         let design = include_str!("../../../docs/design/replication.md");
         let named: std::collections::BTreeSet<&str> = design
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .filter(|word| word.starts_with("amphora_replica_"))
-            .map(|word| word.strip_suffix("_bucket").unwrap_or(word))
+            .map(|word| {
+                word.strip_suffix("_bucket")
+                    .or_else(|| word.strip_suffix("_count"))
+                    .unwrap_or(word)
+            })
             .collect();
         let code = REPLICA_METRICS.iter().map(|(name, _, _)| *name).collect();
         assert_eq!(named, code);

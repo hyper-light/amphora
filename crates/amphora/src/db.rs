@@ -455,8 +455,7 @@ impl Db {
         }
     }
 
-    /// The frames the log holds now, as this connection last saw it.
-    #[cfg(test)]
+    /// The frames the log holds now, as this connection last saw it: for a writer, all of them.
     pub(crate) fn log_frames_in_use(&self) -> anyhow::Result<u64> {
         Ok(self.conn.wal_state().map_err(fail)?.max_frame)
     }

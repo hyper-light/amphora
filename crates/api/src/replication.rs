@@ -38,7 +38,9 @@ pub enum MemberChange {
 /// Variants and fields are only ever appended, and none is reordered or retyped.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Durability {
-    /// Once a quorum's disks hold it and the proposer's own log is flushed.
+    /// Once a quorum's disks hold it and the proposer's own log is flushed. Each member flushes its
+    /// database's log behind its owner, and a restart applies again from its own raft log what that
+    /// flush hadn't covered (docs/design/replication.md, "A replica's database log").
     #[default]
     Persisted,
     /// Once members spanning `spanning` distinct fates hold it, in memory or on disk. Losing every

@@ -525,7 +525,7 @@ goes, and its host reads the counts through `ReplicaHandle::counters`, a plain s
 
 | metric | type | what it counts |
 |---|---|---|
-| `amphora_replica_flush_backlog_entries` | gauge | entries the member applied that its database's log hasn't flushed: what a whole-site power cut can take; 0 in the persisted class, which flushes each entry it applies |
+| `amphora_replica_flush_backlog_entries` | gauge | entries the member applied that its database's log hasn't flushed: what a whole-site power cut can take in the replicated class; in the persisted class, what a restart applies again from the raft log ("A replica's database log") |
 | `amphora_replica_flush_seconds` | histogram | each flush the flushing thread completed, timed on that thread (a failed flush fences the owner, so none is counted); buckets of at most 62.5 µs · 2^i, 62.5 µs to 16.384 s (19 bounds), then the rest |
 | `amphora_replica_commits_total{quorum}` | counter | entries the member committed as leader, by the quorum that committed each first: `held` or `classic`; leader only, so a follower's stays at 0 |
 
@@ -559,8 +559,8 @@ in its Grafana overview (deploy/grafana/dashboards/kiln-overview.json):
 | Quorum patience (seconds), the leader's ("The leader's quorum patience") | `max by (instance, db) (amphora_replica_quorum_patience_seconds)` | `max:amphora_replica_quorum_patience_seconds{$host} by {host,db}` |
 | Answer gaps refused past the patience's ceiling | `sum by (db) (rate(amphora_replica_quorum_patience_refused_total[5m]))` | `sum:amphora_replica_quorum_patience_refused_total{$host} by {db}.as_count()` |
 
-Its tests: the counts a host reads, through a held flush and the flushing thread's, and none in the persisted
-class (`the_replicated_class_counts_its_backlog_flushes_and_commits`); the buckets
+Its tests: the counts a host reads, through a held flush and the flushing thread's, and in the persisted class its
+own thread's flushes and no held commit (`the_replicated_class_counts_its_backlog_flushes_and_commits`); the buckets
 (`flushes_count_in_the_first_bucket_whose_bound_holds_them`); the names here equal to the code's
 (`the_replica_metrics_are_the_ones_the_design_names`); the core's count
 (`a_leader_counts_each_commit_by_the_quorum_that_made_it_first`, in hyper-raft).
@@ -1322,11 +1322,12 @@ replica reopens with is what its database's log holds, and that depends on how t
   see them, and the OS keeps written data that no sync covers yet, so the restart opens no earlier than the last read.
   Monotonic.
 - after a power cut (or the OS's crash), the database keeps what its last finished flush made durable (`durable()`), and
-  a read can have seen more than that. In the persisted class, at most the one entry whose flush was under way:
-  the machine applies and flushes each entry before it applies the next. In the replicated class, every entry applied
-  since the last flush that finished, which the class leaves to its flushing thread ("Fast acknowledgement", point 4).
-  Until the restarted replica applies them again, from its own log or its group's, a local read there can see an older
-  state than one before the cut. It is never older than the state the last finished flush made durable, and it is
+  a read can have seen more than that: every entry applied since the last flush that finished, in either class, as
+  both leave their database's flushes to the owner's flushing thread ("Fast acknowledgement", point 4; "A replica's
+  database log", 2026-11-09, which moved the persisted class's there too: before it, the persisted machine flushed each
+  entry before it applied the next, so at most one). Until the restarted replica applies them again, from its own log
+  (the persisted class's raft log holds each durably before it applies) or its group's, a local read there can see an
+  older state than one before the cut. It is never older than the state the last finished flush made durable, and it is
   always a prefix of the group's committed history.
 This is a stated limit, not a guarantee: "never older than a local read before it on the same replica" holds within one
 opening and across a clean close or a process crash, not across a power cut. A caller that must never see a state go
@@ -1336,7 +1337,8 @@ Falsified by: a local read after a clean close or a process crash that sees an o
 power cut, one older than the replica's last finished flush. The test:
 `a_local_read_after_a_power_cut_is_no_older_than_its_last_flush` (T-T1.10.L6). Replicated class: a write read
 locally, its flush held, the member's power cut. The restarted member's read sees the state before the write, never
-less, and the write once it has caught up.
+less, and the write once it has caught up. The persisted class, the same:
+`a_persisted_local_read_after_a_power_cut_is_no_older_than_its_last_flush`.
 
 **Requirements.** CP-T1.10 names follower reads but no criterion of what one returns. Amphora's own are registered
 beside it (docs/requirements.toml): AC-T1.10.L1 (what a local read returns, and when it is refused), AC-T1.10.L2 (its
@@ -1370,7 +1372,8 @@ timeout and fenced) and `a_local_read_waits_for_the_groups_first_image` (bootstr
 writer runs with `wal_autocheckpoint = 0` (`Db::open`), and only a standalone store runs a checkpointer
 (`Store`'s `Readers::start`, `Engine::checkpoint` for `Local`). The machine's code only flushes (`Machine::advance`,
 `persist`, the replicated class's flushing thread). So the log grows with every entry applied, which breaks CLAUDE.md
-section 2. It is its own goal, not this change. Amendment 1 holds once it is closed.
+section 2. It is its own goal, not this change. Amendment 1 holds once it is closed. Closed by "A replica's database
+log: copied, bounded, and flushed off the owner" below.
 
 **Withdrawn:** the floor binding (no local read on a member that hasn't attested). A member below the floor runs a
 binary from before the floor, which doesn't have this code.
@@ -1590,3 +1593,143 @@ take no descriptor.
 **Falsified by:** more than `CONNECTION_MAX` readers out on one replica; readers' charged pages plus the pool's kept
 pages above the pool's budget; a read refused while an idle reader of another replica held the charge it needed;
 a read answered past its deadline.
+
+## A replica's database log: copied, bounded, and flushed off the owner (2026-11-09)
+
+Amphora goals 7582f00a and aa81fbbf, one design because both are the replica's database-log I/O. Requirements:
+AC-T1.8.D1 and AC-T1.8.D2, tests T-T1.8.D1 and T-T1.8.D2 (docs/requirements.toml).
+
+### What was wrong
+
+- **The log grew without bound** (CLAUDE.md section 2). A replica's database is opened by `Db::open` with
+  `wal_autocheckpoint = 0`. Only a standalone store runs a checkpointer (store.md, decision 4). Nothing on the
+  replicated path ran `Db::checkpoint` or `Db::restart_log`, so a replica's `-wal` file took every entry it applied:
+  1,526 frames for 300 entries on a learner in the red run of T-T1.8.D1. A leader's own log was started again now
+  and then only by accident: each preparation is a write transaction, and the engine starts a wholly copied log
+  again when a write transaction begins (`try_restart_log_before_write`). No pass ever copied it wholly. A follower
+  or learner prepares nothing.
+- **The persisted class flushed on its owner's thread.** `Machine::apply` flushed the database's log for each entry
+  (`advance(.., flush = !replicated)`), so a flush that stood still stood the owner still. Followers heard nothing,
+  campaigned, and terms moved 169 to 171 times in 1,800 s under load (docs/research/owner-stalls.md, "An open
+  liveness cost"; step gaps to 3.2 s). Only the replicated class had a flushing thread ("Fast acknowledgement").
+
+### The decision
+
+1. **Every class flushes on the owner's flushing thread** (AC-T1.8.D2). `Flushing::start` spawns
+   `amphora.replica.flush` in both classes, and `Machine::apply` flushes no ordinary entry in either. The owner hands
+   the thread the point it applied, one flush out at a time, and takes the point back once the flush made it durable
+   (`flushed_through`); `durable()` stays at what a finished flush covers. Still flushed inline, all rare:
+   `apply_change` (its join rows ride it), `install` (durable before it returns: durable.md, I8), the seed, `open`,
+   and `persist`, which hyper-durable's compaction asks before it moves the raft log's start (I8).
+   It is safe for the persisted class because `acts_at_start` stays true for each of its entries. hyper-durable
+   applies such an entry only once this member's own raft log holds it durably (durable.md §4.1, I5), and an answer
+   leaves only after that apply. A power cut that loses the database log's unflushed tail reopens at `durable()`, the
+   last flushed marker, which is in the same transaction as its pages. `Replica::open` then applies the rest again
+   from the raft log (`keep_after(durable.index)`, §4.3). A compaction never passes `durable()` (I8). So what changes
+   is when the database's file catches up, not what is acknowledged. A local read after a power cut is never older
+   than the last finished flush, as "A local read on a replica" already states for every class.
+2. **The flushing thread copies the log into the file** (AC-T1.8.D1). After a flush it runs a checkpoint pass on a
+   connection of its own (`Db::checkpoint`, passive), bounded by the frame the flush made durable (store.md, decision
+   15). A passive checkpoint never copies past the oldest reader's mark, so a local read's view stays whole
+   (sqlite.org/wal.html, "Checkpointing"). While the log is within its bound, a pass follows a flush at most every
+   25 ms, the store's measured period (store.md, decision 4). Past the bound, as the writer counts its frames, a pass
+   follows every flush. A pass that copied nothing new waits for the next flush, which on this thread is automatic
+   (store.md, decision 25).
+3. **The owner starts the log again.** The bound is `replication::LOG_FRAMES`, 131,072 frames (512 MiB of 4 KiB
+   pages), the store's measured default (store.md, decision 4, fedora 2026-10-20). Reads are held back once a pass
+   left at most a 64th of the bound to copy with the log past it, or once the writer counts more than twice the
+   bound however much is left; the restart itself waits for a pass that left at most that 64th. The owner restarts
+   on the machine's own connection between steps, as the store's writer does (`Db::restart_log`: Restart, or Truncate past `keep_log`, store.md decision 31).
+   It is the owner's because a restart takes the engine's write lock. On another connection it would make the
+   owner's next `wal_insert_begin` busy, and a failed apply fences. The owner never waits for a reader. With a flush
+   (and so a pass) or a local read out, it tries again at its next step. Reads and the restart are two rules
+   (`hold_due`, `restart_ready`; amphora-seam-owner at 92c5a9e). Past twice the bound, or past it with little left,
+   no local read begins: a read waits up to its own deadline, then is refused `Timeout` (counted as `timeout`).
+   Passes go on meanwhile, one after every flush, and one each step with nothing to flush, so that the reads out
+   end and the passes copy what they held off. The owner restarts only once a pass left at most a 64th of the
+   bound, so the restart's own copy on the owner's thread stays that small however long the log grew. A read that began on a log wholly copied reads the file alone and holds read-mark 0, which makes a
+   passive pass busy, as SQLite's is (wal.c, `walCheckpoint` takes `WAL_READ_LOCK(0)`). So the rule also reads the
+   writer's own count of frames, kept in memory, rather than waiting on a pass to report (tested:
+   `a_read_on_a_wholly_copied_log_holds_passes_off_and_the_restart_still_falls_due`).
+   A leader's log is also started again by the engine itself: a preparation is a write transaction, and the engine
+   restarts the log at a write's begin when every frame is copied and no reader reads from the log
+   (`try_restart_log_before_write`; SQLite's `walRestartLog` does the same, wal.c). That is safe beside this rule:
+   it discards no frame that isn't in the file, it needs no reader in the log, as the owner's restart does, and the
+   preparation's rollback writes nothing into the restarted log. The flusher's durable prefix is taken against the
+   log's generation, which a restart moves (store.md, decision 15), so neither restart makes the other's state wrong.
+   The leader's log stays within its bound in the test as the learner's does.
+4. **The bound, stated.** The log holds at most twice `LOG_FRAMES`, plus what the group commits while the local reads
+   out when the restart fell due finish. Each of those reads is bounded by its caller's deadline (`run_query`'s
+   progress handler), and no new one begins. So the restart waits for no longer than the longest deadline of the
+   reads out when it fell due (tested). A restart's own time on the owner is what is left (at most a 64th of the bound)
+   and a flush of the file: 10-14 ms on fedora (store.md, decision 4), once per 131,072 frames.
+5. **Disk, per replica.** A replica's database log uses at most twice `LOG_FRAMES` frames of 4,120 bytes, 1.08 GB,
+   plus what point 4's reads let past it. A restart keeps the file's length up to `Db::keep_log`, twice the store's
+   bound (262,144 frames, the same 1.08 GB), and cuts a longer file to nothing (store.md, decisions 13 and 31). So a
+   node holds about 1.08 GB of database log for each replicated group it is a member of, and no more while no read
+   outlasts a restart's due point. This is a bound per replica, not a charge to a process-wide disk budget: Amphora
+   has no disk budget yet, and adding one (CLAUDE.md section 2, "memory and disk are charged to budgets") is a
+   change of its own, across the store and the replica.
+6. **Busy is a skip; only I/O fences.** A checkpoint pass that finds the log busy copies nothing and reports nothing:
+   its `Checkpointed` is the default, and the owner keeps what the last real pass said. A restart that finds the log
+   busy (`Db::restart_log`'s `Ok(false)`) is tried again at the next step. A pass or a restart that fails for any
+   other reason fences the owner, as a failed flush does: the file's state is unknown after it (store.md, decision 9's
+   argument), so the failure is typed and reported, never silent.
+7. **The local reads' pool.** The restart reaches the readers through two calls on `Local`: `hold_reads` (no read
+   begins on this replica until the restart) and `restart_unread` (the restart, run only while no read of this replica
+   is out). Whatever the pool becomes (amphora-class-and-readers' goal 314d704a, one account across replicas), it
+   keeps those two per replica.
+
+### Evidence
+
+- T-T1.8.D1 `a_replicas_database_log_stays_within_its_bound`: a voter and its learner, the learner's bound lowered to
+  64 frames; 300 writes of a 3,000-byte row. Red on main: 1,526 frames, no pass. With the change, at most twice the
+  bound after every write, restarts and passes counted, every row read back locally and after a restart.
+- T-T1.8.D1 `a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it`: a local read open across 39 writes
+  on a learner with a 16-frame bound. No restart under it, and its view stays whole. A read that came while the
+  restart was due was refused `Timeout` (red on main: it answered at once). A restart once it ended.
+- T-T1.8.D2 `a_held_database_flush_stalls_no_persisted_owner_step`: three persisted voters, the leader's flushes held,
+  rounds for four election timeouts at least. Red on main: the leader's owner reached the held flush on its own
+  thread. With the change it never did. The write was answered with its flush held, and the term and the leader
+  didn't move.
+- T-T1.8.D1 `a_checkpoint_pass_copies_no_frame_past_the_last_finished_flush`: a learner's flushes held, 1 flushed,
+  2 to 5 applied unflushed. A pass copies through the frame the flush covered, and no further (store.md, decision 15).
+- T-T1.8.D1 `a_restart_due_waits_for_a_reads_deadline_and_no_longer`: a local read with no end, under a deadline on a
+  clock the test moves, out while the learner's log passes twice its bound. No restart while it runs. It is refused
+  at its deadline, and the restart follows.
+- T-T1.8.D2 `a_member_power_cut_loses_no_acknowledged_persisted_write`: the power-cut nemesis on three persisted
+  voters, 12 seeds: 92 writes acknowledged, 36 cuts, 16 of them of a leader holding writes unflushed, none lost. And
+  `a_persisted_local_read_after_a_power_cut_is_no_older_than_its_last_flush` (T-T1.10.L6 in the persisted class).
+- The terms moved under load, before and after, are measured with step 1's measurement
+  (`production_owner_stalls_measured_on_this_host`) and recorded in docs/research/owner-stalls.md. That is a
+  measurement of the owner's liveness under a load the run makes, recorded as such: not a performance claim and not
+  a CLAUDE.md section 7 benchmark.
+
+### Metrics
+
+In the replica meter (`meter::REPLICA_METRICS`), as Kiln Metrics agreed them under `amphora-replica-log/names/v1`
+(it dropped a separate passes counter, as the histogram's count gives it, and named the restarts after the database's
+log, a replica having two logs):
+- `amphora_replica_checkpoint_seconds`, a histogram on the flush's buckets: each checkpoint pass the flushing thread
+  completed that copied, and its time; its `_count` is those passes. A busy pass (a reader on read-mark 0 beside it)
+  copies nothing and is not counted;
+- `amphora_replica_database_log_restarts_total`, a counter: times the owner started the database's log again;
+- `amphora_replica_database_log_bytes`, a gauge: the database log's length as the owner last counted it
+  (frames × 4,120).
+`amphora_replica_flush_backlog_entries` and `amphora_replica_flush_seconds` now count the persisted class too.
+
+| panel | PromQL | kiln |
+|---|---|---|
+| Database log (bytes), against its bound (2 × 131,072 × 4,120) | `max by (instance, db) (amphora_replica_database_log_bytes)` | `max:amphora_replica_database_log_bytes{$host} by {host,db}` |
+| Checkpoint seconds p50 / p99 | `histogram_quantile(0.5 / 0.99, sum by (le, db) (rate(amphora_replica_checkpoint_seconds_bucket[5m])))` | `p50:` and `p99:amphora_replica_checkpoint_seconds{$host} by {db}` |
+| Checkpoints/s | `sum by (db) (rate(amphora_replica_checkpoint_seconds_count[5m]))` | `count:amphora_replica_checkpoint_seconds{$host} by {db}` |
+| Database log restarts/s, bars | `sum by (db) (rate(amphora_replica_database_log_restarts_total[5m]))` | `sum:amphora_replica_database_log_restarts_total{$host} by {db}.as_count()` |
+
+### Falsified by
+
+- a replica's database log holding more than twice `LOG_FRAMES` while no local read was out when its restart fell due;
+- a checkpoint pass that changed what an open local read sees;
+- a log restart while a local read was out, or a local read that began while a restart was due;
+- a persisted owner that flushes an ordinary entry's database log on its own thread, or an acknowledged write lost
+  after a power cut in the persisted class (the power-cut nemesis);
+- terms that move as often under the same load after the change as before.

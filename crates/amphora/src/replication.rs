@@ -3,10 +3,12 @@
 //! The designated local owner evaluates SQL once after a quorum read fence, including for
 //! follower-origin requests, then rolls back its speculative transaction after capture. Only
 //! resolved page deltas enter Raft: defaults, random functions and adaptive reads never run again
-//! during application. Applied index, term and membership share the deltas' atomic WAL commit and
-//! actual disk flush. The product Database actor drives ReadIndex, elections and durability through
-//! hyper-durable, which owns quorum decisions, commit fencing, recovery and snapshots; its
-//! GroupStore uses hyper-log. The host only carries authenticated replication messages.
+//! during application. Applied index, term and membership share the deltas' atomic WAL commit; the
+//! owner's flushing thread flushes that log behind the owner, and copies it into the database's
+//! file (replication.md, "A replica's database log"). The product Database actor drives
+//! ReadIndex, elections and durability through hyper-durable, which owns quorum decisions, commit
+//! fencing, recovery and snapshots; its GroupStore uses hyper-log. The host only carries
+//! authenticated replication messages.
 
 use std::path::Path;
 
@@ -131,7 +133,9 @@ pub(crate) fn verdict(data: &[u8], before: Point) -> Result<Result<(), Refusal>,
     Ok(on_base(base.base_index, base.base_term, before))
 }
 
-/// A local apply result is released only after both Raft commitment and the real state flush.
+/// A local apply result is released only once its entry is committed: in the persisted class once
+/// this member's raft log holds it durably, so a restart that finds the database's log behind it
+/// applies it again from the raft log (durable.md §4.1, §4.3).
 #[derive(Debug)]
 pub struct Applied {
     pub index: u64,
@@ -790,7 +794,12 @@ impl Machine {
         Ok(())
     }
 
-    /// The last entry applied that no finished flush covers yet: in the replicated class only.
+    /// The last entry applied.
+    pub(crate) fn applied(&self) -> Point {
+        self.point
+    }
+
+    /// The last entry applied that no finished flush covers yet.
     pub(crate) fn unflushed(&self) -> Option<Point> {
         if self.point.index > self.flushed.index {
             Some(self.point)
@@ -803,6 +812,17 @@ impl Machine {
     /// covers more than was applied.
     pub(crate) fn flush_backlog(&self) -> u64 {
         self.point.index.saturating_sub(self.flushed.index)
+    }
+
+    /// The database log's bound, in frames.
+    pub(crate) fn log_bound(&self) -> u64 {
+        self.log_bound
+    }
+
+    /// Starts the database's log again on the machine's own connection, with no reader reading
+    /// (its owner holds them back): whether it did (`Db::restart_log`).
+    pub(crate) fn restart_log(&mut self) -> anyhow::Result<bool> {
+        self.db.restart_log()
     }
 
     /// A flush of the database's log, to run on the owner's flushing thread: what was committed
@@ -823,8 +843,7 @@ impl Machine {
     pub(crate) fn flush_gate(&self) -> std::sync::Arc<FlushGate> {
         std::sync::Arc::clone(&self.flush_gate)
     }
-    /// The frames the database's log holds now.
-    #[cfg(test)]
+    /// The frames the database's log holds now: its writer's own count, read from memory.
     pub(crate) fn log_frames(&self) -> anyhow::Result<u64> {
         self.db.log_frames_in_use()
     }
@@ -903,7 +922,9 @@ impl StateMachine for Machine {
                 pages = prepared.pages;
             }
         }
-        self.advance(at, &pages, &self.configuration.clone(), !self.replicated)?;
+        // Its flush is the owner's flushing thread's, in every class (replication.md, "A
+        // replica's database log"): durable() stays at what a finished flush covers.
+        self.advance(at, &pages, &self.configuration.clone(), false)?;
         if !entry.data.is_empty() {
             answers.push(Applied {
                 index: entry.index,
