@@ -1417,6 +1417,41 @@ held quorum can then sit within one real fate.
   detector doesn't suspect. The detector's verdicts and the class gate are kept apart: a member is held-counted
   only when neither suspects it. The class entry itself commits classically, on durable answers.
 
+**Amendment (2026-11-09, amphora-seam-owner's answer at fb18105): how the class changes, and a second entry.** The
+seam owner agreed the direction, and blocked on one point: the class needs a way to change. The procedure above
+("A member added or removed") has members reopen stating the joiner's fate. A class fixed in the log would refuse
+that. The change path is a superseding entry, held to one rule: compatibility.
+- **Compatible.** Two classes are compatible when they are the same kind (both persisted, or both replicated with
+  the same `spanning`) and give the same fate to every member both name. A member named by only one is free. That
+  is a joiner's fate added, or a departed member's dropped.
+- **The record is the last compatible entry.** A class entry compatible with the recorded class supersedes it: its
+  map becomes the record. An entry incompatible with the recorded class is inert. Every member applies it as an
+  entry that changes nothing: it moves the applied point and records nothing. It is deterministic on every member,
+  because it depends only on the log. So a leader stating a conflicting map can never overwrite the group's class.
+- **Each member holds itself to the record.** After every class entry it applies, and at open, a member's own
+  stated class must be compatible with the record. If it isn't, the member fences at apply, or is refused
+  `Invalid` at open. A leader whose conflicting entry went inert is refused by that same rule, when it applies its
+  own entry.
+- **Who proposes.** A leader whose stated class differs from the record but is compatible with it proposes its
+  own. That is the joiner's procedure unchanged: the members reopen stating the joiner's fate, and the first of
+  them to lead records it. A leader with no class recorded proposes as before.
+- **What can't change in place.** `spanning`, the kind (persisted or replicated), and a sitting member's fate. A
+  member that moves to another fate is removed, then the group's class is recorded without it (a reopening leader
+  proposes that), and then it is added again under its new fate. Changing the kind or `spanning` takes a new group
+  (an export and an import). It is a stated limit: a group's quorum system changes only through members added and
+  removed, which is what Flexible Paxos's intersection argument covers.
+- **Why it is safe.** A held count counts a member by its fate. Every member that runs agrees with the record on
+  every member the record names, and so with every other running member on every member they both name. So no
+  two leaders count one member under two fates. A member that only the leader names (a joiner not yet recorded) is
+  counted by the operator's statement, as today. hyper-raft counts no held answer from a voter without a stated fate
+  (`held_half`).
+- **Q1 accepted** (an older binary fences, typed, on a class entry): on T-T1.8.A7's terms, as a stated limit, and
+  told to Duplicate Systems for kiln's rollout.
+- **Tests added:** `a_joiners_fate_is_recorded_by_a_compatible_class_entry` (T-T1.8.C5). Three voters record a
+  class. A fourth member is added. The three reopen stating its fate too. The class is then recorded with it, and
+  held answers count it. In the same test, a leader opened stating a conflicting map has its entry go inert, and is
+  fenced.
+
 **Formats.** The log gains one entry kind under a prefix of its own, which is how the seed (`amphora.seed.v1`)
 and the baseline delta were added: append-only, no existing entry read differently. The database gains one
 table. The owner transport's wire doesn't change: the entry travels in raft's log, which the host carries
@@ -1488,6 +1523,24 @@ bound is derived from those.
 - AC-T1.10.L2 becomes: at most `CONNECTION_MAX` local readers out on one replica, and their pages within the
   process's page budget. A read past either waits on its caller's thread until its deadline, then is refused
   Timeout, or Fenced once its owner ends.
+
+**Amendment (2026-11-09, amphora-seam-owner's answer at fb18105).**
+- **`CONNECTION_MAX` is policy.** It is the transport's stated bound on attached clients, and the reader count
+  borrows it. No measurement made 32. What is derived is that more readers than callers who can use them buy
+  nothing.
+- **The no-descriptor claim is tested.** `a_local_reader_opens_no_file` counts this process's open descriptors
+  (`/dev/fd`, on Unix) before and after eight readers open on one database, and expects the same count.
+- **The pool's floor under charge.** A charge is refused once it would leave the pool fewer than one page a shard
+  (`SHARDS`, 64). So the pool always keeps a page in every shard, and a charge past it waits like any other.
+- **The engine's charge follows CLAUDE.md section 1.** Checked arithmetic, no panics. It is recorded in the engine's
+  ORIGIN.md, and the ratchet's counts don't rise.
+- **The process-wide account is bounded.** Its idle readers are at most what the charge holds (budget ÷
+  `READER_PAGES`). Each replica's `out` is at most `CONNECTION_MAX`. Replicas are registered by id and removed when
+  their owner ends. A reader that closes, for an account reclaiming it or for an owner that ended, is dropped after
+  the account's lock is let go.
+- **The charge is shown.** `amphora_replica_local_reader_charge_bytes` is a gauge of the bytes charged to the
+  process's pool by every replica's readers. It is proposed to Kiln Metrics, and the dashboard row reads "against
+  32".
 
 **Sources.** PostgreSQL bounds backends by `max_connections` and their shared cache by `shared_buffers`
 (documentation, "Connections and Authentication", "Resource Consumption"). These are the two dimensions here: the
