@@ -120,8 +120,9 @@ revision of each (kiln's docs/vendoring.md). No package takes the name of a crat
 Every push to main passes these on its final tree. Work lands in batches: finished branches merge
 into one integration branch, and the gates run once on the batch's merged tree before main moves; a
 failure is traced to the branch that caused it, which is fixed at its cause or left out of the batch.
-While working, run the tests your change touches, and record a new test's red run once in its commit;
-the full gates belong to the batch, not to each step or branch. `bash scripts/gates.sh` runs them in
+An agent's change ends with its unit tests and light integration tests passing and a handoff for
+merge (a new test's red run recorded once in its commit); the full gates, the heavier integration and
+end-to-end runs, and the benchmarks belong to the batch, run by whoever merges it, who fixes as it goes. `bash scripts/gates.sh` runs them in
 order and stops at the first failure; kiln CI runs it on every push and pull request (`.kiln/ci.yaml`).
 
 ```
