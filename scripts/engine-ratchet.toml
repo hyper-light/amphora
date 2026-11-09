@@ -4,15 +4,15 @@
 # the engine became Amphora's own (Rust 1.99.1).
 [left.x86_64-unknown-linux-gnu]
 "clippy::panic" = 201
-"clippy::unwrap_used" = 452
-"clippy::expect_used" = 873
+"clippy::unwrap_used" = 451
+"clippy::expect_used" = 871
 "clippy::unreachable" = 463
 "clippy::todo" = 11
 "clippy::unimplemented" = 0
 "clippy::indexing_slicing" = 3214
-"clippy::arithmetic_side_effects" = 3406
+"clippy::arithmetic_side_effects" = 3401
 "clippy::string_slice" = 101
-"clippy::cast_possible_truncation" = 560
+"clippy::cast_possible_truncation" = 559
 "clippy::cast_sign_loss" = 254
 "clippy::cast_possible_wrap" = 688
 "clippy::disallowed_macros" = 782
