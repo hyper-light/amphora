@@ -5,8 +5,8 @@
 //! statements change those pages (AC-T1.1.1).
 
 use amphora_engine::{
-    CheckpointMode, ConnectOpts, Connection, Database, DatabaseOpts, Numeric, OpenOptions,
-    PlatformIO, SqliteDialect, Statement, Value,
+    CheckpointMode, ConnectOpts, Connection, Database, DatabaseOpts, LogFormat, Numeric,
+    OpenOptions, PlatformIO, SqliteDialect, Statement, Value,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZero;
@@ -108,12 +108,24 @@ fn gram(rng: &mut Rng, grams: u64) -> i64 {
 /// database again.
 #[test]
 fn a_transactions_log_is_bounded_by_the_pages_it_dirtied_not_its_statements() {
+    bounded_by_its_pages(LogFormat::Pages);
+}
+
+/// The same in a mixed log (decision 37): its spills are page frames written over as above, and its
+/// commit's records take no more slots than its pages.
+#[test]
+fn a_transactions_mixed_log_is_bounded_by_the_pages_it_dirtied() {
+    bounded_by_its_pages(LogFormat::Mixed);
+}
+
+fn bounded_by_its_pages(format: LogFormat) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("spill.db");
     let mut postings: BTreeSet<(i64, i64)> = BTreeSet::new();
     let mut terms: BTreeMap<i64, i64> = BTreeMap::new();
     {
         let db = open(&path);
+        db.wal_format(format).unwrap();
         let conn = connect(&db);
         conn.execute(
             "CREATE TABLE grams (gram INTEGER NOT NULL, doc INTEGER NOT NULL, PRIMARY KEY (gram, doc))",

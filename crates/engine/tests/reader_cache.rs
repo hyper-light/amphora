@@ -7,7 +7,7 @@
 //! what each commit writes. Every read is checked against a model (AC-T1.1.1, AC-T1.1.6).
 
 use amphora_engine::{
-    ConnectOpts, Connection, Database, DatabaseOpts, Numeric, OpenOptions, PlatformIO,
+    ConnectOpts, Connection, Database, DatabaseOpts, LogFormat, Numeric, OpenOptions, PlatformIO,
     SqliteDialect, Value,
 };
 use std::collections::BTreeMap;
@@ -53,14 +53,12 @@ fn rows(conn: &Arc<Connection>, sql: &str) -> Vec<(i64, String)> {
         .collect()
 }
 
-fn run(seed: u64, packed: bool, reader_pages: i64) {
+fn run(seed: u64, format: LogFormat, reader_pages: i64) {
     let dir = tempfile::tempdir().unwrap();
     let io = Arc::new(PlatformIO::new().unwrap());
     let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
     let db = Database::open(io, dir.path().join("cache.db").to_str().unwrap(), options).unwrap();
-    if packed {
-        db.wal_pack(true).unwrap();
-    }
+    db.wal_format(format).unwrap();
     let writer = db.connect(ConnectOpts::new()).unwrap();
     writer.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
     let reader = db.connect(ConnectOpts::new()).unwrap();
@@ -146,7 +144,7 @@ fn run(seed: u64, packed: bool, reader_pages: i64) {
                     let got = rows(&reader, "SELECT id, body FROM t ORDER BY id");
                     let want: Vec<(i64, String)> =
                         model.iter().map(|(k, v)| (*k, v.clone())).collect();
-                    assert!(got == want, "seed {seed} packed {packed} pages {reader_pages} step {step}: the table read {} rows, the model has {}", got.len(), want.len());
+                    assert!(got == want, "seed {seed} {format:?} pages {reader_pages} step {step}: the table read {} rows, the model has {}", got.len(), want.len());
                 } else {
                     for _ in 0..5 {
                         let id = 1 + rng.below(next_id as u64) as i64;
@@ -156,7 +154,10 @@ fn run(seed: u64, packed: bool, reader_pages: i64) {
                             .map(|b| (id, b.clone()))
                             .into_iter()
                             .collect();
-                        assert_eq!(got, want, "seed {seed} packed {packed} pages {reader_pages} step {step}: row {id}");
+                        assert_eq!(
+                            got, want,
+                            "seed {seed} {format:?} pages {reader_pages} step {step}: row {id}"
+                        );
                     }
                 }
             }
@@ -171,7 +172,7 @@ fn run(seed: u64, packed: bool, reader_pages: i64) {
 #[test]
 fn a_small_cache_never_reads_a_row_from_before_a_commit_it_follows() {
     for seed in 0..12 {
-        run(seed, false, 200);
+        run(seed, LogFormat::Pages, 200);
     }
 }
 
@@ -179,7 +180,7 @@ fn a_small_cache_never_reads_a_row_from_before_a_commit_it_follows() {
 #[test]
 fn a_large_cache_never_reads_a_row_from_before_a_commit_it_follows() {
     for seed in 0..12 {
-        run(seed, false, 2000);
+        run(seed, LogFormat::Pages, 2000);
     }
 }
 
@@ -187,7 +188,7 @@ fn a_large_cache_never_reads_a_row_from_before_a_commit_it_follows() {
 #[test]
 fn a_small_cache_on_a_packed_log_never_reads_a_stale_row() {
     for seed in 0..12 {
-        run(seed, true, 200);
+        run(seed, LogFormat::Packed, 200);
     }
 }
 
@@ -195,6 +196,23 @@ fn a_small_cache_on_a_packed_log_never_reads_a_stale_row() {
 #[test]
 fn a_large_cache_on_a_packed_log_never_reads_a_stale_row() {
     for seed in 0..12 {
-        run(seed, true, 2000);
+        run(seed, LogFormat::Packed, 2000);
+    }
+}
+
+/// The same in a mixed log (decision 37): its records listed at their first slots, its spills'
+/// page frames at theirs.
+#[test]
+fn a_small_cache_on_a_mixed_log_never_reads_a_stale_row() {
+    for seed in 0..12 {
+        run(seed, LogFormat::Mixed, 200);
+    }
+}
+
+/// The same in a mixed log, with a reader that caches 2,000 pages.
+#[test]
+fn a_large_cache_on_a_mixed_log_never_reads_a_stale_row() {
+    for seed in 0..12 {
+        run(seed, LogFormat::Mixed, 2000);
     }
 }
