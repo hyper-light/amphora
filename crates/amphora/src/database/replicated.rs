@@ -6143,6 +6143,138 @@ mod tests {
         pump.finish();
     }
 
+    /// AC-T1.8.5, T-T1.8.C6 (replication.md, "The class stated once per group", the amendment;
+    /// amphora-seam-owner, amphora-owner-t1-class-and-readers-8d4c05b-20261109), on driven time: a
+    /// joiner whose fate the group recorded, once promoted to voter, counts in a held quorum. Do:
+    /// three voters of fates 10, 20 and 30 and a learner of fate 40, two to span, all four
+    /// stating the class of all four; the class recorded; a write, the learner caught up and
+    /// promoted, and four writes more; then, every clock still, every durable answer held, one
+    /// follower's answers to appends lost (its heartbeats' pass), the joiner's records kept in its
+    /// queue, and a write at the leader; rounds; then the joiner's records let through. Expect: the promotion answered
+    /// with 4 a voter; the write uncommitted while only the leader and the other follower hold
+    /// it (two of four voters); once the joiner holds it, answered on held answers alone, the
+    /// joiner's held mark at its index, and the leader's held commits counted up.
+    #[test]
+    fn a_promoted_joiner_counts_in_a_held_quorum() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let four = Durability::Replicated(api::replication::Fates {
+            of: vec![(1, 10), (2, 20), (3, 30), (4, 40)],
+            spanning: 2,
+        });
+        let clients: Vec<Client> = (1..=4)
+            .map(|n| driven.member(dir.path(), n, vec![1, 2, 3], vec![4], None, four.clone()))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients[..3], 0, 1);
+        let at = clients.get(leader).unwrap();
+        write(&mut driven, &mut pump, at, 1);
+        for _ in 0..ROUNDS {
+            if (0..4).all(|owner| driven.owner(owner).replica.machine().class() == Some(&four)) {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        for owner in 0..4 {
+            assert_eq!(driven.owner(owner).replica.machine().class(), Some(&four));
+        }
+        catch_up(&mut driven, &mut pump, &clients, leader, 3);
+        let promoted = promote(&mut driven, &mut pump, at).unwrap();
+        assert_eq!(
+            (promoted.voters, promoted.learners),
+            (vec![1, 2, 3, 4], vec![])
+        );
+        // Writes before the test's, so that each voter, the joiner among them, states a durable
+        // promise and answers held at once (hyper-raft R-8).
+        for value in 2..6 {
+            write(&mut driven, &mut pump, at, value);
+        }
+        catch_up(&mut driven, &mut pump, &clients, leader, 3);
+
+        let id = u64::try_from(leader + 1).unwrap();
+        let cut = (1..=3).find(|member| *member != id).unwrap();
+        let term = driven.owner(leader).replica.term();
+        let held_before = clients[leader].handle().counters().commits_held;
+        // One follower's answers to appends are lost, its heartbeats' pass, so the write's read
+        // fence has its quorum. The joiner's records stay in its own queue until let through. No
+        // clock moves: a heartbeat's answer stating a member's position counts as an append's
+        // (hyper-raft's handle_heartbeat_response), which would pass the durable hold.
+        pump.losing = Some(Box::new(move |from, message: &Message| {
+            from == cut && message.msg_type == hyper_raft::proto::MessageType::MsgAppendResponse
+        }));
+        pump.held.push(3);
+        pump.hold_durable();
+        let last = |driven: &Driven| {
+            driven
+                .owner(leader)
+                .replica
+                .core()
+                .raft
+                .log()
+                .last_index()
+                .unwrap()
+        };
+        let before = last(&driven);
+        let answer = submit(at, driven.until(), |db| {
+            db.exec("INSERT INTO member_items VALUES (6)")?;
+            Ok(b"held".to_vec())
+        });
+        for _ in 0..ROUNDS {
+            if last(&driven) > before {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        let index = last(&driven);
+        assert!(index > before, "the leader never appended the write");
+        for _ in 0..100 {
+            driven.round(&mut pump);
+        }
+        let committed = driven.owner(leader).replica.core().raft.log().committed();
+        assert!(
+            committed < index && matches!(answer.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "two of four voters committed {index} (committed {committed})"
+        );
+
+        // The joiner's records let through: its held answer passes, its durable one is kept back.
+        pump.held.retain(|owner| *owner != 3);
+        let mut answered = None;
+        for _ in 0..ROUNDS {
+            match answer.try_recv() {
+                Ok(result) => {
+                    answered = Some(result.map(called));
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(error) => panic!("owner ended: {error}"),
+            }
+            driven.round(&mut pump);
+        }
+        assert_eq!(answered, Some(Ok(b"held".to_vec())));
+        let raft = &driven.owner(leader).replica.core().raft;
+        let seen: Vec<_> = (1..=4)
+            .map(|member| {
+                let progress = raft.tracker().get(member).unwrap();
+                (member, progress.matched, progress.held)
+            })
+            .collect();
+        assert!(
+            raft.tracker().get(4).unwrap().held >= index,
+            "term {} (was {term}), index {index}, committed {}, members (matched, held) {seen:?}",
+            driven.owner(leader).replica.term(),
+            raft.log().committed()
+        );
+        assert!(
+            clients[leader].handle().counters().commits_held > held_before,
+            "{:?}",
+            clients[leader].handle().counters()
+        );
+        pump.losing = None;
+        pump.let_durable();
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
     /// U15/CP-T1.8 on driven time (replication.md, "The owner's time"): follower calls use the
     /// real leader's ReadIndex and proposal forwarding, and no election happens during the scenario.
     #[test]

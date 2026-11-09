@@ -142,6 +142,7 @@ tests = [
   { id = "T-T1.8.C3", text = "Durable answers held before a group's class entry applies — passes when no write is answered on held answers alone until the class applies, and one is after" },
   { id = "T-T1.8.C4", text = "A class entry, then an incompatible one, then an image — passes when the second is inert, a member installing the image under the same class agrees, one under another is refused, and a reopening under another is refused Invalid" },
   { id = "T-T1.8.C5", text = "A joiner added and the voters reopened stating its fate — passes when a compatible class entry records it on every voter and none gates held answers after" },
+  { id = "T-T1.8.C6", text = "A joiner of a recorded fate promoted to voter, durable answers held, one follower cut off and the joiner's answers to appends lost — passes when the write stays uncommitted without the joiner and is answered once the joiner holds it, counted as a held commit" },
   { id = "T-T1.8.A1", text = "An old-binary learner added just before a floor raise: the raise is refused naming it, or the promotion is refused; never both through" },
   { id = "T-T1.8.A2", text = "A leader crashes between a membership change and a floor raise: the raise's proof covers the configuration in force at its index, or the raise is refused" },
   { id = "T-T1.8.A3", text = "A member installed from a snapshot holds the floor, the join rows and the attestations, and proves and refuses as the leader does" },
