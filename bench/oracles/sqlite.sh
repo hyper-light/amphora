@@ -31,7 +31,8 @@ if [ ! -f "$LIB" ]; then
   mkdir -p "$DIR/dl" "$DIR/src"
   ZIP=$DIR/dl/$NAME.zip
   [ -f "$ZIP" ] || curl -sSf -o "$ZIP" "$URL"
-  got=$(openssl dgst -sha3-256 -r "$ZIP" | cut -d' ' -f1)
+  # Python's hashlib, which every platform's python3 has: macOS's openssl (LibreSSL) has no SHA3.
+  got=$(python3 -I -c 'import hashlib, sys; print(hashlib.sha3_256(open(sys.argv[1], "rb").read()).hexdigest())' "$ZIP")
   [ "$got" = "$SHA3" ] || { echo "sqlite.sh: $ZIP has SHA3-256 $got, not $SHA3" >&2; exit 1; }
   python3 -I -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$ZIP" "$DIR/src"
   nice -n 19 cc -O2 -fPIC -shared "${OPTIONS[@]}" -o "$LIB.tmp" "$DIR/src/$NAME/sqlite3.c" -lm -lpthread
