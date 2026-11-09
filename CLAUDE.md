@@ -117,8 +117,12 @@ revision of each (kiln's docs/vendoring.md). No package takes the name of a crat
 
 ## Gates
 
-Every commit passes these on its final tree. `bash scripts/gates.sh` runs them in order and stops at
-the first failure; kiln CI runs it on every push and pull request (`.kiln/ci.yaml`).
+Every push to main passes these on its final tree. Work lands in batches: finished branches merge
+into one integration branch, and the gates run once on the batch's merged tree before main moves; a
+failure is traced to the branch that caused it, which is fixed at its cause or left out of the batch.
+While working, run the tests your change touches, and record a new test's red run once in its commit;
+the full gates belong to the batch, not to each step or branch. `bash scripts/gates.sh` runs them in
+order and stops at the first failure; kiln CI runs it on every push and pull request (`.kiln/ci.yaml`).
 
 ```
 cargo fmt --all --check
