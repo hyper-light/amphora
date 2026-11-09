@@ -5971,14 +5971,20 @@ pub fn op_program(
                                 return Ok(state.suspend_on_io(io));
                             }
                             StepResult::Row => continue,
-                            StepResult::Interrupt | StepResult::Busy => {
+                            step @ (StepResult::Interrupt | StepResult::Busy) => {
                                 *state.active_op_state.program() = OpProgramState::Step {
                                     is_trigger,
                                     statement,
                                     saved_last_insert_rowid,
                                     saved_changes_value: saved_last_changes_value,
                                 };
-                                return Err(LimboError::Busy.into());
+                                // An interrupt is the caller's own; busy is another connection's.
+                                let error = if matches!(step, StepResult::Interrupt) {
+                                    LimboError::Interrupt
+                                } else {
+                                    LimboError::Busy
+                                };
+                                return Err(error.into());
                             }
                         },
                         Err(LimboError::Constraint(constraint_err)) => {
@@ -20107,9 +20113,11 @@ mod tests {
     }
 
     /// test to check that vacuum into connection state is reset if it is
-    /// interrupted mid way
+    /// interrupted mid way. The interrupt is the caller's own, so it surfaces as one, not as busy,
+    /// which is another connection's activity (Amphora bug 68a308b7; sqlite.org/rescode.html:
+    /// SQLITE_INTERRUPT, SQLITE_BUSY).
     #[test]
-    fn test_vacuum_into_busy_after_source_begin_rolls_back_source_txn() {
+    fn test_vacuum_into_interrupted_after_source_begin_rolls_back_source_txn() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -20148,12 +20156,12 @@ mod tests {
         let dest_path = dest_dir.path().join("busy_vacuum.db");
         let dest_path = dest_path.to_str().expect("temp path should be UTF-8");
         let mut stmt = conn.prepare(format!("VACUUM INTO '{dest_path}'")).unwrap();
-        let step = stmt.step().unwrap();
+        let step = stmt.step();
         conn.set_progress_handler(0, None);
 
         assert!(
-            matches!(step, StepResult::Busy),
-            "progress interruption inside VACUUM INTO should surface as Busy, got {step:?}"
+            matches!(step, Err(LimboError::Interrupt)),
+            "progress interruption inside VACUUM INTO should surface as an interrupt, got {step:?}"
         );
         assert!(
             source_txn_progress_calls.load(Ordering::SeqCst) > 10,
@@ -20165,11 +20173,11 @@ mod tests {
         );
         assert!(
             conn.get_auto_commit(),
-            "Busy cleanup should roll back the source transaction before returning"
+            "the interrupt's cleanup should roll back the source transaction before returning"
         );
     }
 
-    /// same like `test_vacuum_into_busy_after_source_begin_rolls_back_source_txn`
+    /// same like `test_vacuum_into_interrupted_after_source_begin_rolls_back_source_txn`
     /// but for attached dbs
     #[test]
     fn test_cleanup_vacuum_into_rolls_back_attached_only_source_txn() {
@@ -20305,8 +20313,10 @@ mod tests {
         assert!(!pager.holds_write_lock());
     }
 
+    /// An in-place VACUUM interrupted before its copy-back surfaces the interrupt, not busy (Amphora
+    /// bug 68a308b7), and restores the source transaction's state.
     #[test]
-    fn test_in_place_vacuum_busy_before_copyback_restores_source_txn() {
+    fn test_in_place_vacuum_interrupted_before_copyback_restores_source_txn() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -20339,12 +20349,12 @@ mod tests {
         );
 
         let mut stmt = conn.prepare("VACUUM").unwrap();
-        let step = stmt.step().unwrap();
+        let step = stmt.step();
         conn.set_progress_handler(0, None);
 
         assert!(
-            matches!(step, StepResult::Busy),
-            "progress interruption inside in-place VACUUM should surface as Busy, got {step:?}"
+            matches!(step, Err(LimboError::Interrupt)),
+            "progress interruption inside in-place VACUUM should surface as an interrupt, got {step:?}"
         );
         assert!(
             did_interrupt.load(Ordering::SeqCst),
@@ -20352,7 +20362,7 @@ mod tests {
         );
         assert!(
             conn.get_auto_commit(),
-            "Busy cleanup should restore auto-commit before returning"
+            "the interrupt's cleanup should restore auto-commit before returning"
         );
         let pager = conn.pager.load();
         assert!(!pager.holds_read_lock());

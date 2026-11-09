@@ -1316,7 +1316,8 @@ impl IncrementalView {
                                 continue 'outer;
                             }
 
-                            crate::vdbe::StepResult::Interrupt | crate::vdbe::StepResult::Busy => {
+                            step @ (crate::vdbe::StepResult::Interrupt
+                            | crate::vdbe::StepResult::Busy) => {
                                 // Save state before returning error
                                 self.populate_state = PopulateState::ProcessingOneTable {
                                     queries,
@@ -1325,7 +1326,13 @@ impl IncrementalView {
                                     rows_processed,
                                     pending_row: None, // No pending row when interrupted between rows
                                 };
-                                return Err(LimboError::Busy.into());
+                                // An interrupt is the caller's own; busy is another connection's.
+                                let error = if matches!(step, crate::vdbe::StepResult::Interrupt) {
+                                    LimboError::Interrupt
+                                } else {
+                                    LimboError::Busy
+                                };
+                                return Err(error.into());
                             }
 
                             crate::vdbe::StepResult::IO

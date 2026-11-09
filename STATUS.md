@@ -118,7 +118,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   every row as SQLite's does. So a keyset page, `WHERE (family, key, rev) > (?1, ?2, ?3) ORDER BY
   family, key, rev LIMIT 8`, reads from the cursor and stops at its LIMIT, and a pass is linear in
   its rows where it was quadratic. A page reading columns the index lacks seeks once ANALYZE has
-  counted the table; the OR chain spelling of a keyset stays a scan, as in SQLite.
+  counted the table, or under a LIMIT (decisions 16 and 17); the OR chain spelling of a keyset stays a
+  scan, as in SQLite.
+- **An ordered read under a LIMIT stops at its rows, a bound LIMIT too** (docs/design/planner.md
+  decisions 16 and 17, `crates/engine/tests/rowid_index_order.rs`): a one-table read in an index's
+  order is costed to the rows a literal LIMIT keeps, and under a LIMIT bound as a parameter, as kiln
+  binds every LIMIT, to the q-middle of the fewest and all the read keeps. Keyset pages and kiln's
+  conversation feed (`records_by_rev`) search the index as SQLite 3.54.0 does, reading at most
+  LIMIT + 2 rows a page, where they scanned and sorted the whole table.
 - **Readers keep their pages across commits** (docs/design/store.md decision 18,
   `crates/engine/storage/changes.rs`): a connection starting a read transaction forgets only the
   pages written since its last one, where SQLite and Turso forget its whole cache; it forgets
@@ -352,6 +359,24 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Next
 
+- **The replicated class** (docs/design/replication.md, "Fast acknowledgement"; Ada's word 2026-11-01): built on
+  t1/replicated-line, not on main (fast-ack, class-metrics, class-quorum and disk-stalls, merged in that order). A
+  replicated database opened with `Durability::Replicated(Fates)` answers a write once members spanning the fates
+  asked hold it (hyper-raft R-8), before its leader flushes its own log. One member's power cut loses nothing
+  acknowledged: the nemesis cuts and restarts a member at the end of each round of writes. Its metrics (flush
+  backlog, flush seconds, commits by quorum; replication.md, "Metrics") are exported by `ReplicaHandle::counters`;
+  their core count is upstream in hyper-raft (`d5d5f8f`, vendored). Also on the line:
+  - the suspicion feed: the host's hyper-liveness verdicts, told through `ReplicaHandle::verdict`, leave a suspected
+    member out of held quorums until trusted (vendor patch 0005, offered upstream on Ada's word);
+  - the owner's identity naming its durability (transport version 4), so an attachment in another class is refused,
+    typed;
+  - a write made at a follower answered on its group's commit, before its own log write, kept until it applies;
+  - the leader's quorum patience (replication.md, "The leader's quorum patience"): on fedora's own load its own
+    checks stepped members down 5-8 times in 1,800 s against 43-63 at fixed ticks (docs/research/owner-stalls.md).
+
+  Left: the host running hyper-liveness and telling its verdicts; the class stated once for a group across its
+  nodes; the quorum patience's two metrics exported (names agreed); a member's fate carried by its change; the terms
+  that still move on a leader's own stalls (owner-stalls.md).
 - **What the language matrix found** (`bench/corpus/matrix.md`): the IN operator's collation is
   fixed (the oracles' cause E); left, from a failing test, `index_xinfo`'s NULL; then the missing
   features by how often users reach them (ORDER BY in aggregates, median and percentiles, the JSON

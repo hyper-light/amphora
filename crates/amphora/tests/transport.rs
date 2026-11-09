@@ -32,6 +32,19 @@ fn replica_config() -> api::replication::ReplicaConfig {
         bootstrap: None,
     }
 }
+/// Three voters, of which this process is the first: a configuration that can span the
+/// replicated class's fates. Nothing here elects in it.
+fn class_config() -> api::replication::ReplicaConfig {
+    api::replication::ReplicaConfig {
+        node_id: 1,
+        voters: vec![1, 2, 3],
+        learners: vec![],
+        bootstrap: None,
+    }
+}
+fn class(of: Vec<(u64, u64)>, spanning: u32) -> api::replication::Durability {
+    api::replication::Durability::Replicated(api::replication::Fates { of, spanning })
+}
 fn known_leader(database: &Database) {
     let deadline = until();
     loop {
@@ -122,6 +135,20 @@ fn transport_child() {
         .unwrap()
         .as_str()
     {
+        "hold_class" => {
+            let database = Database::open_replicated_with(
+                path,
+                &path.with_extension("log"),
+                class_config(),
+                class(vec![(1, 10), (2, 20), (3, 30)], 2),
+                until(),
+            )
+            .unwrap();
+            std::io::stdout().write_all(b"\nowner-ready\n").unwrap();
+            std::io::stdout().flush().unwrap();
+            let _ = std::io::stdin().read_exact(&mut [0]);
+            drop(database);
+        }
         mode @ ("hold_owner" | "hold_replica") => {
             let database = if mode == "hold_replica" {
                 let database = Database::open_replicated(
@@ -148,6 +175,27 @@ fn transport_child() {
             std::io::stdout().flush().unwrap();
             let _ = std::io::stdin().read_exact(&mut [0]);
             drop(database);
+        }
+        "application" => {
+            let database = Database::open(path, until())
+                .unwrap()
+                .for_application("kiln.host-store", 6)
+                .unwrap();
+            assert!(
+                matches!(
+                    database.writer_floor("kiln.host-store", 6, until()),
+                    // The exact refusal kiln's Store classifies as an unsupported owner mode.
+                    Err(api::Refusal::Invalid { what, why })
+                        if what == "writer boundary" && why == "original non-restoring owner required"
+                ),
+                "an attached client cannot mint original owner custody"
+            );
+            database
+                .call(until(), |db| {
+                    db.execute("INSERT INTO items VALUES(4)", [])?;
+                    Ok(())
+                })
+                .unwrap();
         }
         "owner" => {
             let database = Database::open(path, until()).unwrap();
@@ -226,54 +274,121 @@ fn transport_child() {
     }
 }
 
+/// CP-T1.8 (AC-T1.8.5, T-T1.8.C1) and CP-T1.5, the replicated class checked at the transport
+/// (replication.md, "Fates and durability checked"): the owner's identity names its durability.
+/// Do: an owner process in the replicated class (three fates, two to span); attach stating the
+/// persisted class, then other fates; then the same fates in another order; then open stating no
+/// replica, let the owner exit and take its place. Expect: the first two refused, typed; the third
+/// taken; the member reopened in the owner's class, so that an attachment stating persisted is
+/// still refused and one stating its fates taken.
+#[test]
+fn an_attachment_whose_durability_differs_from_its_owners_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let log = path.with_extension("log");
+    let mut predecessor = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "transport_child", "--nocapture"])
+        .env("AMPHORA_TRANSPORT_TEST_PATH", &path)
+        .env("AMPHORA_TRANSPORT_TEST_MODE", "hold_class")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(predecessor.stdout.take().unwrap());
+    let mut ready = String::new();
+    use std::io::BufRead;
+    loop {
+        ready.clear();
+        assert_ne!(stdout.read_line(&mut ready).unwrap(), 0);
+        if ready.trim() == "owner-ready" {
+            break;
+        }
+    }
+    let attach = |durability| {
+        Database::attach_replicated_with(&path, &log, class_config(), durability, until())
+    };
+    let refused = |result: Result<Option<Database>, api::Refusal>| match result {
+        Err(api::Refusal::Invalid { what, why }) => format!("{what}: {why}"),
+        Err(other) => panic!("refused untyped: {other:?}"),
+        Ok(_) => panic!("attached with another durability than its owner's"),
+    };
+    let persisted = refused(attach(api::replication::Durability::Persisted));
+    assert!(persisted.contains("durability"), "{persisted}");
+    refused(attach(class(vec![(1, 10), (2, 20), (3, 30)], 3)));
+    refused(attach(class(vec![(1, 10), (2, 20), (3, 10)], 2)));
+    let reordered = attach(class(vec![(3, 30), (1, 10), (2, 20)], 2))
+        .unwrap()
+        .expect("the owner is live");
+    drop(reordered);
+
+    let plain = Database::open(&path, until()).unwrap();
+    predecessor.stdin.take().unwrap().write_all(b"x").unwrap();
+    assert!(predecessor.wait().unwrap().success());
+    assert!(plain.ensure_owner(until()).unwrap().is_some());
+    refused(attach(api::replication::Durability::Persisted));
+    attach(class(vec![(2, 20), (3, 30), (1, 10)], 2))
+        .unwrap()
+        .expect("the reopened owner is live");
+    drop(plain);
+}
+
+/// An owner held by a child process of this test (a replicated one if `replicated`), and a
+/// client attached to it at `path`: the child ends once a byte is written to its stdin.
+fn held_owner(path: &std::path::Path, replicated: bool) -> (std::process::Child, Database) {
+    let mut predecessor = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "transport_child", "--nocapture"])
+        .env("AMPHORA_TRANSPORT_TEST_PATH", path)
+        .env(
+            "AMPHORA_TRANSPORT_TEST_MODE",
+            if replicated {
+                "hold_replica"
+            } else {
+                "hold_owner"
+            },
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The test harness writes a prefix first. Read through the explicit owner-ready line.
+    let mut stdout = std::io::BufReader::new(predecessor.stdout.take().unwrap());
+    let mut ready = String::new();
+    use std::io::BufRead;
+    loop {
+        ready.clear();
+        assert_ne!(stdout.read_line(&mut ready).unwrap(), 0);
+        if ready.trim() == "owner-ready" {
+            break;
+        }
+    }
+    // The child's later output still has somewhere to go.
+    predecessor.stdout = Some(stdout.into_inner());
+    let attached = if replicated {
+        // Attachment must happen before the host tries any exclusive bootstrap inspection.
+        let database = Database::attach_replicated(
+            path,
+            &path.with_extension("log"),
+            replica_config(),
+            until(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(database.replica().is_none());
+        assert!(database.ensure_owner(until()).unwrap().is_none());
+        database
+    } else {
+        Database::open(path, until()).unwrap()
+    };
+    (predecessor, attached)
+}
+
 #[test]
 fn sdk_client_keeps_ledger_and_becomes_owner_after_predecessor_exits() {
     // CP-T1.5/U16: blue/green overlap retains the same durable SQL and Records after old exits.
     for replicated in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
-        let mut predecessor = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "transport_child", "--nocapture"])
-            .env("AMPHORA_TRANSPORT_TEST_PATH", &path)
-            .env(
-                "AMPHORA_TRANSPORT_TEST_MODE",
-                if replicated {
-                    "hold_replica"
-                } else {
-                    "hold_owner"
-                },
-            )
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        // The test harness writes a prefix first. Read through the explicit owner-ready line.
-        let mut stdout = std::io::BufReader::new(predecessor.stdout.take().unwrap());
-        let mut ready = String::new();
-        use std::io::BufRead;
-        loop {
-            ready.clear();
-            assert_ne!(stdout.read_line(&mut ready).unwrap(), 0);
-            if ready.trim() == "owner-ready" {
-                break;
-            }
-        }
-        let successor = if replicated {
-            // Attachment must happen before the host tries any exclusive bootstrap inspection.
-            let database = Database::attach_replicated(
-                &path,
-                &path.with_extension("log"),
-                replica_config(),
-                until(),
-            )
-            .unwrap()
-            .unwrap();
-            assert!(database.replica().is_none());
-            assert!(database.ensure_owner(until()).unwrap().is_none());
-            database
-        } else {
-            Database::open(&path, until()).unwrap()
-        };
+        let (mut predecessor, successor) = held_owner(&path, replicated);
         assert!(matches!(
             successor.replica_status(Instant::now()),
             Err(api::Refusal::Timeout)
@@ -344,6 +459,62 @@ fn sdk_client_keeps_ledger_and_becomes_owner_after_predecessor_exits() {
                 .unwrap(),
             2
         );
+    }
+}
+
+#[test]
+fn an_attached_clients_local_read_writes_nothing() {
+    // AC-T1.10.L3, T-T1.10.L7 (replication.md, "A local read on a replica", amendment 3): an
+    // attached client's local read runs on its owner's own state, read-only. Do: a client attached
+    // to an owner another process holds, standalone and replicated; a local read of the count; a
+    // local read that inserts; the count read again; a local read that commits records. Expect:
+    // the count 1; the insert refused; the count still 1; the records commit refused and the
+    // namespace's head unchanged; the client never promoted.
+    for replicated in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (mut predecessor, attached) = held_owner(&path, replicated);
+        let count = |db: &mut amphora::sql::Connection<'_>| -> anyhow::Result<i64> {
+            Ok(db.query_row("SELECT count(*) FROM items", [], |r| r.get::<_, i64>(0))?)
+        };
+        assert_eq!(attached.query_local(until(), count).unwrap(), 1);
+        let wrote = attached.query_local(until(), |db| {
+            db.execute("INSERT INTO items VALUES(9)", [])?;
+            Ok(())
+        });
+        assert!(
+            matches!(
+                wrote,
+                Err(api::Refusal::Invalid { .. } | api::Refusal::Unavailable(_))
+            ),
+            "{wrote:?}"
+        );
+        assert_eq!(attached.query_local(until(), count).unwrap(), 1);
+        // The records path writes through its own code: a commit in a local read is refused too.
+        let ns = attached.namespace("ledger").unwrap();
+        let head = ns.head(until()).unwrap();
+        let committed = attached.query_local(until(), |db| {
+            Ok(db.records_commit(
+                "ledger",
+                api::Tx {
+                    conds: vec![],
+                    writes: vec![api::Write::Put {
+                        family: "work".into(),
+                        key: vec![9],
+                        value: b"local".to_vec(),
+                    }],
+                },
+            )?)
+        });
+        assert!(committed.is_err(), "{committed:?}");
+        assert_eq!(ns.head(until()).unwrap(), head);
+        assert!(
+            attached.replica().is_none(),
+            "a local read must not promote an attached client"
+        );
+        drop(attached);
+        predecessor.stdin.take().unwrap().write_all(b"x").unwrap();
+        assert!(predecessor.wait().unwrap().success());
     }
 }
 
@@ -534,6 +705,73 @@ fn independent_processes_share_cas_and_adaptive_sql_and_abort_disconnect() {
     assert_eq!(
         client.namespace("ledger").unwrap().head(until()).unwrap(),
         2
+    );
+    // U05: the durable floor serializes behind prior adaptive sessions. Existing
+    // untagged attachments cannot bypass it; a new tagged SDK client can use the
+    // SAME actual owner without opening a second engine.
+    let application = clone.for_application("kiln.host-store", 6).unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let old_client = client.clone();
+    let old = std::thread::spawn(move || {
+        old_client.call(until(), move |db| {
+            db.execute("INSERT INTO items VALUES(5)", [])?;
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            Ok(())
+        })
+    });
+    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let installing = application.clone();
+    let floor = std::thread::spawn(move || installing.writer_floor("kiln.host-store", 6, until()));
+    // Entry, not a thread-start or guessed delay, is the old transaction proof.
+    // The receipt is returned only after this original session settles.
+    release_tx.send(()).unwrap();
+    old.join().unwrap().unwrap();
+    let boundary = floor.join().unwrap().unwrap();
+    boundary.require(&application).unwrap();
+    assert_eq!(boundary.version(), 6);
+    let old: Result<(), _> = client.call(until(), |db| {
+        db.execute("INSERT INTO items VALUES(100)", [])?;
+        Ok(())
+    });
+    assert!(matches!(
+        old,
+        Err(amphora::transport::Error::Refused(api::Refusal::Fenced(_)))
+    ));
+    assert!(matches!(
+        ns.commit(
+            api::Tx {
+                conds: vec![],
+                writes: vec![api::Write::Delete {
+                    family: "work".into(),
+                    key: b"one".to_vec()
+                }]
+            },
+            until()
+        ),
+        Err(api::Refusal::Fenced(_))
+    ));
+    assert!(child(&path, "application").success());
+    assert_eq!(
+        application
+            .call(until(), |db| Ok(db.query_row(
+                "SELECT count(*) FROM items",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?))
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        application
+            .namespace("ledger")
+            .unwrap()
+            .get("work", b"one", api::Consistency::Linearizable, until())
+            .unwrap()
+            .unwrap()
+            .value,
+        b"child_claimed"
     );
     drop(clone);
 }

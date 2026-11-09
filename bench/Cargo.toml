@@ -12,6 +12,10 @@ description = "Amphora against vanilla Turso, SQLite and clustered MySQL (Vitess
 
 [dependencies]
 amphora = { path = "../crates/amphora" }
+# The public SQL API's values (`--sql-api`).
+amphora-api = { path = "../crates/api" }
+# What the session's validate does to a statement on every execute (`--sql-api --shapes parse`).
+amphora-engine-parser = { path = "../crates/engine-parser" }
 amphora-engine = { path = "../crates/engine", default-features = false, features = ["fs", "json", "pure-rust-crypto", "checksum"] }
 # Vanilla Turso: upstream at the revision Amphora's engine was taken from, none of Amphora's changes.
 turso_core = { git = "https://github.com/tursodatabase/turso", rev = "3e09a82750d8290ef96e3830896e7205b7c0b9e6", default-features = false, features = ["fs", "json", "pure-rust-crypto"] }
@@ -30,6 +34,14 @@ anyhow = "1"
 # float_roundtrip: the planner bench keeps estimates exactly as EXPLAIN QUERY PLAN FORMAT=JSON gives them.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 
+# The hyper-light crates Amphora links, patched to its vendored copies as its workspace patches them
+# (../Cargo.toml): this workspace of its own doesn't inherit that [patch].
+[patch.crates-io]
+hyper-durable = { path = "../vendor/hyper-raft/crates/hyper-durable" }
+hyper-raft = { path = "../vendor/hyper-raft/crates/hyper-raft" }
+hyper-log = { path = "../vendor/hyper-raft/crates/hyper-log" }
+hyper-block = { path = "../vendor/hyper-raft/crates/hyper-block" }
+
 # AMPHORA_PROFILE (Unix only): a sampling profile of the mixed phase (a timer signal and backtraces: no root, no
 # perf), written as a flamegraph and the hottest frames.
 [target.'cfg(unix)'.dependencies]
@@ -38,8 +50,8 @@ pprof = { version = "0.14", default-features = false, features = ["flamegraph"] 
 [profile.release]
 debug = "line-tables-only"
 
-# The vendored hyper-light crates, as the workspace's root patches them (vendor/MANIFEST.toml): the
-# bench is a workspace of its own, and amphora's replication depends on them by name.
+# The bench is a workspace of its own, which the root's [patch.crates-io] doesn't reach: the same vendored copies,
+# named here (crates/amphora/tests/bench_workspace.rs checks that the two agree).
 [patch.crates-io]
 hyper-durable = { path = "../vendor/hyper-raft/crates/hyper-durable" }
 hyper-raft = { path = "../vendor/hyper-raft/crates/hyper-raft" }

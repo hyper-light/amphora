@@ -117,9 +117,31 @@ criteria = [
   { id = "AC-T1.8.4", text = "leader failover p99 is at most 1000 ms, measured by a kill -9 bench" },
   { id = "AC-T1.8.5", text = "acknowledged writes lost under kill -9 of any node is exactly 0, measured by the simulator over 10,000 seeds and a three-machine lab" },
   { id = "AC-T1.8.6", text = "The same differential suite passes at 1 node and 3 nodes: one code path" },
+  # Amphora's own: membership changes (docs/design/replication.md, "Membership").
+  { id = "AC-T1.8.M1", text = "A group changes its members at runtime through a joint configuration: a change answers Ok only once committed, and one change or hand-off at a time, none while joint" },
+  { id = "AC-T1.8.M2", text = "The leader hands on its lead before it is demoted or removed, and a hand-off answers only as its outcome shows" },
+  { id = "AC-T1.8.M3", text = "A learner is added only while the database is within the snapshot ceiling; past it the change is refused TooLarge before it is proposed" },
+  # Amphora's own: the replicated application floor (docs/design/replication.md, "The application floor, replicated").
+  { id = "AC-T1.8.A1", text = "writes applied with an application claim below the floor in force at their index is exactly 0, on any member, measured by the floor's simulation with a nemesis" },
 ]
 tests = [
   { id = "T-T1.8.1", text = "A laptop offline writes to its outbox, then reconnects — passes when every write commits, in order, with no duplicate" },
+  # Amphora's own: membership changes (docs/design/replication.md, "Membership").
+  { id = "T-T1.8.M1", text = "One voter adds a learner: writes before and after reach it within 5 s, none after its removal" },
+  { id = "T-T1.8.M2", text = "Changes are refused off the leader, at once, when impossible, past the most members, beside another change and while joint" },
+  { id = "T-T1.8.M3", text = "A change holds through a deadline, an election and a restart at each stage, and a change another lead replaces gives the member back" },
+  { id = "T-T1.8.M4", text = "The leader is removed once it has handed on its lead, and each way a hand-off ends answers as it should" },
+  { id = "T-T1.8.M5", text = "A joiner to a database past the snapshot ceiling is refused before the change is proposed" },
+  # Amphora's own: the replicated class (docs/design/replication.md, "Fates and durability checked").
+  { id = "T-T1.8.C1", text = "An attachment whose durability differs from its owner's is refused, typed; the same fates in another order are taken; a process stating no replica restarts in the owner's class" },
+  # Amphora's own: the replicated application floor (docs/design/replication.md, "The application floor, replicated").
+  { id = "T-T1.8.A1", text = "An old-binary learner added just before a floor raise: the raise is refused naming it, or the promotion is refused; never both through" },
+  { id = "T-T1.8.A2", text = "A leader crashes between a membership change and a floor raise: the raise's proof covers the configuration in force at its index, or the raise is refused" },
+  { id = "T-T1.8.A3", text = "A member installed from a snapshot holds the floor, the join rows and the attestations, and proves and refuses as the leader does" },
+  { id = "T-T1.8.A4", text = "A forwarded proposal whose context names a third member is refused, typed, and applies on no member" },
+  { id = "T-T1.8.A5", text = "A member removed and added again attests under its new join; its old attestation never vouches and blocks nothing" },
+  { id = "T-T1.8.A6", text = "Every falsifier of the replicated floor holds as an assertion over every simulated run" },
+  { id = "T-T1.8.A7", text = "A mixed-binary group through the upgrade that introduces join rows, a member removed and re-added before J: no raise through until J, the stale attestation never counts, image digests identical at every applied index" },
 ]
 
 [[goal]]
@@ -144,9 +166,21 @@ criteria = [
   { id = "AC-T1.10.3", text = "follower read p99 is at most 2 ms, measured by bench amphora_read" },
   { id = "AC-T1.10.4", text = "search p50 over 1,000,000 events on 3 nodes is at most 30 ms, measured by bench amphora_search" },
   { id = "AC-T1.10.5", text = "anomalies across groups is exactly 0, measured by an Elle-style check over 10,000 seeds" },
+  # Amphora's own: a local read on a replica (docs/design/replication.md, "A local read on a replica").
+  { id = "AC-T1.10.L1", text = "A local read on a replica answers from its own applied state, asking no leader: a prefix of the group's committed history, never older than a local read before it in the same opening, nor after a clean close or a process crash; refused before the group's first image, once its owner ended, and while fenced" },
+  { id = "AC-T1.10.L2", text = "At most four local readers at once on one replica; a fifth waits on its caller's thread, never the owner's, until its deadline, and is refused Timeout, or Fenced once the owner ends" },
+  { id = "AC-T1.10.L3", text = "An attached client's local read is Request::LocalSession at wire version 6, run read-only on its owner's state: a write in it is refused and nothing of it stays" },
 ]
 tests = [
   { id = "T-T1.10.1", text = "A coordinator crash at every step of a cross-group transaction, then recovery — passes when it ends committed or aborted everywhere" },
+  # Amphora's own: a local read on a replica (docs/design/replication.md, "A local read on a replica").
+  { id = "T-T1.10.L1", text = "A learner of a voter that is then gone reads locally — passes when it answers what was written and caught up, while a call waits for the leader" },
+  { id = "T-T1.10.L2", text = "Local reads within a preparation and while a write is proposed and uncommitted — passes when each sees only what was committed, and the write once applied" },
+  { id = "T-T1.10.L3", text = "A local read on a member that hasn't taken its group's first image — passes when it is refused Unavailable, saying why" },
+  { id = "T-T1.10.L4", text = "A local read held open while its replica installs an image, with a checkpoint and a log restart tried meanwhile — passes when it sees the state before the image, whole, and a read after sees the image, whole" },
+  { id = "T-T1.10.L5", text = "Four local reads held open and a fifth asked — passes when the fifth is refused Timeout at its deadline while the owner's actor steps, and answers once one is given back" },
+  { id = "T-T1.10.L6", text = "A write read locally under the replicated class, its flush held, the member's power cut — passes when the restarted member's read is never older than its last finished flush, and sees the write once caught up" },
+  { id = "T-T1.10.L7", text = "An attached client's local read that writes — passes when it is refused, nothing of it stays, and the client is never promoted" },
 ]
 
 [[goal]]

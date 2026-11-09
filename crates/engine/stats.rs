@@ -267,9 +267,15 @@ fn load_sqlite_stat1_row(
         return Ok(());
     }
 
-    // Index-level entry: only keep if the index exists on this table.
+    // Index-level entry: only keep if the index exists on this table, or names the table itself: a
+    // WITHOUT ROWID table's primary key, as SQLite's analysisLoader takes it ("sqlite3_stricmp(argv[0],
+    // argv[1])==0"), which the planner finds by its descriptor's name, the table's (bug 5adc6889).
     let idx_name = normalize_ident(idx_name.unwrap());
-    if schema.get_index(table_name, &idx_name).is_none() {
+    let names_primary_key = idx_name.eq_ignore_ascii_case(table_name)
+        && schema
+            .get_btree_table(table_name)
+            .is_some_and(|table| !table.has_rowid);
+    if !names_primary_key && schema.get_index(table_name, &idx_name).is_none() {
         return Ok(());
     }
 

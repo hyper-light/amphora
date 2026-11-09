@@ -46,6 +46,8 @@ rustix = { version = "1.1", features = ["fs", "process"] }
 winapi-util = "0.1"
 
 [dev-dependencies]
+# The replicated class's power-cut tests: a member's log on hyper-block's simulated device.
+hyper-block = { version = "0.1.0", features = ["sim"] }
 tempfile = "3"
 tracing-subscriber.workspace = true
 

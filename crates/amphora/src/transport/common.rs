@@ -288,12 +288,14 @@ impl Drop for Owner {
 #[derive(Clone)]
 pub struct Client {
     pub(super) path: PathBuf,
+    application: Option<crate::database::Application>,
 }
 impl Client {
     pub fn connect(path: &Path, until: Instant) -> Result<Self, Refusal> {
         remaining(until)?;
         let client = Self {
             path: path.canonicalize().map_err(unavailable)?,
+            application: None,
         };
         // Authenticate now, without creating a writer session or replaying any command.
         let mut stream = client.stream(until)?;
@@ -304,6 +306,14 @@ impl Client {
             _ => return Err(unavailable("unexpected owner probe response")),
         }
         Ok(client)
+    }
+    pub(crate) fn for_application(
+        &self,
+        application: Option<crate::database::Application>,
+    ) -> Self {
+        let mut client = self.clone();
+        client.application = application;
+        client
     }
     pub(super) fn stream(&self, until: Instant) -> Result<Stream, Refusal> {
         remaining(until)?;
@@ -316,7 +326,7 @@ impl Client {
         let millis =
             u64::try_from(remaining(until)?.min(SESSION_MAX).as_millis()).map_err(unavailable)?;
         let hello = Hello {
-            version: 2,
+            version: VERSION,
             nonce: auth::nonce()?,
             millis,
         };
@@ -326,9 +336,22 @@ impl Client {
         let proof = auth::proof(&token, false, &hello, &challenge.nonce)?;
         write_auth(&mut stream, &proof, auth_until)?;
         match read_limit::<Response>(&mut stream, auth_until, 256)?? {
-            Answer::Ready => Ok(stream),
-            _ => Err(unavailable("unexpected owner greeting")),
+            Answer::Ready => (),
+            _ => return Err(unavailable("unexpected owner greeting")),
         }
+        if let Some(application) = &self.application {
+            application.validate()?;
+            send(
+                &mut stream,
+                &encode(&Request::Application(application.clone()), 256)?,
+                until,
+            )?;
+            match read_limit::<Response>(&mut stream, until, 256)?? {
+                Answer::Ready => (),
+                _ => return Err(unavailable("application declaration refused")),
+            }
+        }
+        Ok(stream)
     }
     pub(super) fn request(&self, request: Request, until: Instant) -> Result<Answer, Error> {
         let encoded = encode(&request, FRAME_MAX)?;
@@ -401,8 +424,35 @@ impl Client {
     where
         F: FnOnce(&mut sql::Connection<'_>) -> anyhow::Result<R>,
     {
+        self.session(Request::Session, until, f, || Error::UnknownOutcome)
+    }
+    /// [`Client::call`] as a local read (replication.md, "A local read on a replica"): the owner
+    /// runs the session read-only on its own state, asking no leader. Every owner this client can
+    /// greet takes it (wire version 6), so it is asked without a probe.
+    pub fn query_local<R, F>(&self, until: Instant, f: F) -> Result<R, Error>
+    where
+        F: FnOnce(&mut sql::Connection<'_>) -> anyhow::Result<R>,
+    {
+        // A read changed nothing whatever its end: a lost answer is a failed read, not an
+        // unknown outcome.
+        self.session(Request::LocalSession, until, f, || {
+            unavailable("the local read's end was not answered").into()
+        })
+    }
+    /// One SQL session asked with `request`: `unanswered` is what a session whose end isn't
+    /// answered was.
+    fn session<R, F>(
+        &self,
+        request: Request,
+        until: Instant,
+        f: F,
+        unanswered: fn() -> Error,
+    ) -> Result<R, Error>
+    where
+        F: FnOnce(&mut sql::Connection<'_>) -> anyhow::Result<R>,
+    {
         let mut stream = self.stream(until)?;
-        write(&mut stream, &Request::Session, until)?;
+        write(&mut stream, &request, until)?;
         match read::<Response>(&mut stream, until)?? {
             Answer::Ready => (),
             _ => return Err(unavailable("session not ready").into()),
@@ -425,14 +475,14 @@ impl Client {
                 let _abort = session.exchange(Command::Abort);
                 return Err(match result {
                     Err(error) => Error::Refused(crate::database::refused(&error)),
-                    Ok(_) => Error::UnknownOutcome,
+                    Ok(_) => unanswered(),
                 });
             }
         };
         match session.exchange(Command::Commit) {
             Ok(Answer::Done) => Ok(value),
             Err(error) => Err(error),
-            _ => Err(Error::UnknownOutcome),
+            _ => Err(unanswered()),
         }
     }
 }
@@ -617,6 +667,61 @@ fn compact_step_on(
     }
 }
 
+/// One SQL session's commands from `stream`, run on `connection` until the client commits or
+/// aborts it.
+fn session(
+    connection: &mut crate::sql::Connection<'_>,
+    stream: &mut Stream,
+    until: Instant,
+) -> anyhow::Result<()> {
+    write(stream, &Ok::<_, Refusal>(Answer::Ready), until)?;
+    for _ in 0..COMMAND_MAX {
+        let command: Command = read(stream, until)?;
+        let response = match command {
+            Command::Commit => {
+                remaining(until)?;
+                return Ok(());
+            }
+            Command::Abort => {
+                return Err(anyhow::anyhow!("client aborted SQL session"));
+            }
+            Command::Batch(sql) => connection.execute_batch(&sql).and_then(|()| {
+                Ok(Answer::Rows {
+                    rows: Vec::new(),
+                    changes: i64::try_from(connection.changes()).map_err(sql_error)?,
+                    rowid: connection.last_insert_rowid(),
+                })
+            }),
+            Command::Columns(sql) => connection
+                .prepare(&sql)
+                .map(|s| Answer::Columns(s.column_count())),
+            Command::Query(sql, params, first) => query(connection, &sql, params, first),
+            Command::RecordsGet(namespace, family, key) => connection
+                .records_get(&namespace, &family, &key)
+                .and_then(|row| {
+                    Ok(Answer::SessionRow {
+                        row,
+                        changes: i64::try_from(connection.changes()).map_err(sql_error)?,
+                        rowid: connection.last_insert_rowid(),
+                    })
+                }),
+            Command::RecordsCommit(namespace, tx) => {
+                connection.records_commit(&namespace, tx).and_then(|rev| {
+                    Ok(Answer::SessionRev {
+                        rev,
+                        changes: i64::try_from(connection.changes()).map_err(sql_error)?,
+                        rowid: connection.last_insert_rowid(),
+                    })
+                })
+            }
+        };
+        let response = sql_response(response);
+        write(stream, &response, until)?;
+        // SQL errors can be handled by application savepoints; transport failures abort.
+    }
+    Err(anyhow::anyhow!("SQL session command budget exhausted"))
+}
+
 fn serve(
     mut stream: Stream,
     token: [u8; 32],
@@ -627,9 +732,18 @@ fn serve(
     let started = Instant::now();
     let greeting_until = started.checked_add(greeting).ok_or(Refusal::Timeout)?;
     let hello: Hello = read_limit(&mut stream, greeting_until, 256)?;
-    if hello.version != 2 || hello.millis == 0 || Duration::from_millis(hello.millis) > SESSION_MAX
-    {
-        return Err(api::invalid("owner greeting", "version or deadline"));
+    // A peer of another version is refused here, before any frame whose shape differs.
+    if hello.version != VERSION {
+        return Err(api::invalid(
+            "owner greeting",
+            &format!(
+                "the peer speaks version {}, this owner speaks {VERSION}",
+                hello.version
+            ),
+        ));
+    }
+    if hello.millis == 0 || Duration::from_millis(hello.millis) > SESSION_MAX {
+        return Err(api::invalid("owner greeting", "deadline"));
     }
     let nonce = auth::nonce()?;
     write_auth(
@@ -647,6 +761,16 @@ fn serve(
         .ok_or(Refusal::Timeout)?;
     write(&mut stream, &Ok::<_, Refusal>(Answer::Ready), until)?;
     let mut request: Request = read(&mut stream, until)?;
+    let application = if let Request::Application(application) = request {
+        application.validate()?;
+        // This ACK is schema acceptance only, before any application effect.
+        // Admission is checked again by the actual serialized SQL writer.
+        write(&mut stream, &Ok::<_, Refusal>(Answer::Ready), until)?;
+        request = read(&mut stream, until)?;
+        Some(application)
+    } else {
+        None
+    };
     if matches!(request, Request::Capabilities) {
         write(
             &mut stream,
@@ -671,63 +795,24 @@ fn serve(
     if matches!(request, Request::Probe) {
         return write(&mut stream, &Ok::<_, Refusal>(Answer::Done), until);
     }
-    let database = acquire().ok_or_else(|| unavailable("owner is draining"))?;
-    if matches!(request, Request::Session) {
+    let mut database = acquire().ok_or_else(|| unavailable("owner is draining"))?;
+    if let Some(application) = application {
+        database = database.for_application(&application.name, application.version)?;
+    }
+    if matches!(request, Request::Session | Request::LocalSession) {
+        let local = matches!(request, Request::LocalSession);
         let mut final_stream = stream.try_clone().map_err(unavailable)?;
-        let result = database
-            .call(until, move |connection| {
-                write(&mut stream, &Ok::<_, Refusal>(Answer::Ready), until)?;
-                for _ in 0..COMMAND_MAX {
-                    let command: Command = read(&mut stream, until)?;
-                    let response = match command {
-                        Command::Commit => {
-                            remaining(until)?;
-                            return Ok(());
-                        }
-                        Command::Abort => {
-                            return Err(anyhow::anyhow!("client aborted SQL session"));
-                        }
-                        Command::Batch(sql) => connection.execute_batch(&sql).and_then(|()| {
-                            Ok(Answer::Rows {
-                                rows: Vec::new(),
-                                changes: i64::try_from(connection.changes()).map_err(sql_error)?,
-                                rowid: connection.last_insert_rowid(),
-                            })
-                        }),
-                        Command::Columns(sql) => connection
-                            .prepare(&sql)
-                            .map(|s| Answer::Columns(s.column_count())),
-                        Command::Query(sql, params, first) => {
-                            query(connection, &sql, params, first)
-                        }
-                        Command::RecordsGet(namespace, family, key) => connection
-                            .records_get(&namespace, &family, &key)
-                            .and_then(|row| {
-                                Ok(Answer::SessionRow {
-                                    row,
-                                    changes: i64::try_from(connection.changes())
-                                        .map_err(sql_error)?,
-                                    rowid: connection.last_insert_rowid(),
-                                })
-                            }),
-                        Command::RecordsCommit(namespace, tx) => {
-                            connection.records_commit(&namespace, tx).and_then(|rev| {
-                                Ok(Answer::SessionRev {
-                                    rev,
-                                    changes: i64::try_from(connection.changes())
-                                        .map_err(sql_error)?,
-                                    rowid: connection.last_insert_rowid(),
-                                })
-                            })
-                        }
-                    };
-                    let response = sql_response(response);
-                    write(&mut stream, &response, until)?;
-                    // SQL errors can be handled by application savepoints; transport failures abort.
-                }
-                Err(anyhow::anyhow!("SQL session command budget exhausted"))
-            })
-            .map(|()| Answer::Done);
+        let run = move |connection: &mut crate::sql::Connection<'_>| {
+            session(connection, &mut stream, until)
+        };
+        // A local read runs read-only on this owner's own state, asking no leader (replication.md,
+        // "A local read on a replica"); a session otherwise is a call on its writer.
+        let result = if local {
+            database.query_local(until, run)
+        } else {
+            database.call(until, run)
+        }
+        .map(|()| Answer::Done);
         return write(&mut final_stream, &result, until);
     }
     let watch_batch = matches!(&request, Request::WatchBatch(_));
@@ -775,9 +860,11 @@ fn serve(
                 Record::ImportState => Answer::ImportState(ns.import_state(until)?),
             })
         })(),
-        Request::Session | Request::Probe | Request::Capabilities => {
-            Err(unavailable("unexpected session"))
-        }
+        Request::Session
+        | Request::LocalSession
+        | Request::Probe
+        | Request::Capabilities
+        | Request::Application(_) => Err(unavailable("unexpected session")),
     };
     if watch_batch {
         let encoded = match encode(&result, WATCH_REPLY_MAX) {
@@ -1233,6 +1320,49 @@ mod tests {
         fake.join().unwrap();
     }
 
+    /// CP-T1.8 (local-owner-transport.md, "Versions"): a peer of another protocol version is
+    /// refused at the greeting, typed, naming both versions, before any challenge or database.
+    /// Do: a client greets with the version before this one. Expect: Invalid naming it and this
+    /// owner's version, no challenge sent, nothing acquired.
+    #[test]
+    fn a_peer_of_another_version_is_refused_at_the_greeting() {
+        let (mut client, server) = pair();
+        let accessed = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&accessed);
+        let task = thread::spawn(move || {
+            serve(
+                server,
+                [1; 32],
+                &|| {
+                    observed.fetch_add(1, Ordering::AcqRel);
+                    None
+                },
+                &Arc::new(AtomicUsize::new(0)),
+                HANG,
+            )
+        });
+        let previous = VERSION - 1;
+        let hello = Hello {
+            version: previous,
+            nonce: [2; 32],
+            millis: 1000,
+        };
+        write(&mut client, &hello, until()).unwrap();
+        let refused = task.join().unwrap();
+        assert!(
+            matches!(
+                &refused,
+                Err(Refusal::Invalid { what, why })
+                    if what == "owner greeting"
+                        && why.contains(&format!("version {previous}"))
+                        && why.contains(&format!("speaks {VERSION}"))
+            ),
+            "{refused:?}"
+        );
+        assert!(read::<Challenge>(&mut client, until()).is_err());
+        assert_eq!(accessed.load(Ordering::Acquire), 0);
+    }
+
     #[test]
     fn wrong_capability_never_acquires_database() {
         // U05/U06: authentication precedes writer/Records access.
@@ -1256,7 +1386,7 @@ mod tests {
         write(
             &mut client,
             &Hello {
-                version: 2,
+                version: VERSION,
                 nonce: [2; 32],
                 millis,
             },
@@ -1265,7 +1395,7 @@ mod tests {
         .unwrap();
         let challenge: Challenge = read(&mut client, until()).unwrap();
         let hello = Hello {
-            version: 2,
+            version: VERSION,
             nonce: [2; 32],
             millis,
         };
@@ -1295,7 +1425,7 @@ mod tests {
                 )
             });
             let hello = Hello {
-                version: 2,
+                version: VERSION,
                 nonce: [2; 32],
                 millis,
             };

@@ -147,11 +147,20 @@ pub struct Db {
     conn: Arc<Connection>,
     path: PathBuf,
     statements: cache::Cache,
-    owner: Option<Arc<std::fs::File>>,
+    // After the engine's handles, so dropped after them: the lease and its guards outlive them.
+    owner: Option<crate::database::Owned>,
     // Shared by this owner's readers: a failed rollback may never be reused as clean state.
     fenced: Arc<AtomicBool>,
     /// The frames of log a restart keeps the log's file for ([`Db::keep_log`]).
     log_kept: u64,
+}
+
+/// What a reader's opener and the flusher keep of their database: the engine's handles, then the
+/// owner lease and its guards, which drop after them.
+struct EngineHandles {
+    io: Arc<dyn IO>,
+    db: Arc<Database>,
+    owner: Option<crate::database::Owned>,
 }
 
 pub(crate) struct Deadline {
@@ -243,6 +252,11 @@ impl Db {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        Self::open_made(path, sharing)
+    }
+
+    /// [`Db::open_sharing`] in a directory that exists: it makes none.
+    pub(crate) fn open_made(path: &Path, sharing: &Sharing) -> anyhow::Result<Self> {
         in_place(path);
         in_place(&wal_path(path));
         Self::open_with_sharing(path, Arc::new(PlatformIO::new().map_err(fail)?), sharing)
@@ -338,19 +352,25 @@ impl Db {
     /// Opens readers on this database from any thread.
     #[must_use]
     pub fn opener(&self) -> Opener<Self> {
-        let (io, db, path) = (self.io.clone(), self.db.clone(), self.path.clone());
-        let owner = self.owner.clone();
+        let held = EngineHandles {
+            io: self.io.clone(),
+            db: self.db.clone(),
+            owner: self.owner.clone(),
+        };
+        let path = self.path.clone();
         let fenced = Arc::clone(&self.fenced);
         let log_kept = self.log_kept;
         Arc::new(move || {
+            // The whole of `held` is captured, so its fields drop in their declared order.
+            let held = &held;
             Self::check_fence(&fenced)?;
             let r = Self {
-                io: io.clone(),
-                db: db.clone(),
-                conn: db.connect(ConnectOpts::new()).map_err(fail)?,
+                io: held.io.clone(),
+                db: held.db.clone(),
+                conn: held.db.connect(ConnectOpts::new()).map_err(fail)?,
                 path: path.clone(),
                 statements: cache::Cache::default(),
-                owner: owner.clone(),
+                owner: held.owner.clone(),
                 fenced: Arc::clone(&fenced),
                 log_kept,
             };
@@ -365,10 +385,14 @@ impl Db {
     /// [`Db::keep_log`]), so once it has been as long as it gets, a flush writes no metadata.
     pub fn flusher(&self) -> Flush {
         let wal = format!("{}-wal", self.path.display());
-        let (io, db) = (self.io.clone(), self.db.clone());
-        let owner = self.owner.clone();
+        let held = EngineHandles {
+            io: self.io.clone(),
+            db: self.db.clone(),
+            owner: self.owner.clone(),
+        };
         Box::new(move || {
-            let _lease = &owner;
+            // The whole of `held` is captured, so its fields drop in their declared order.
+            let EngineHandles { io, db, .. } = &held;
             // Where the log ends before the flush begins: every frame up to it is durable once
             // the flush ends, and the checkpointer copies those without a flush of its own.
             let prefix = db.wal_prefix();
@@ -480,7 +504,7 @@ impl Db {
         &self.path
     }
 
-    pub(crate) fn hold_owner(&mut self, owner: Arc<std::fs::File>) {
+    pub(crate) fn hold_owner(&mut self, owner: crate::database::Owned) {
         self.owner = Some(owner);
     }
 
@@ -525,6 +549,7 @@ impl Db {
     }
 
     /// Owned/dynamic SQL without an unbounded statement cache (U05). The caller bounds results.
+    /// It keeps its cache entry's validation mark and never sets one: only the session validates.
     pub fn query_owned(
         &self,
         sql: &str,
@@ -534,17 +559,17 @@ impl Db {
         self.ensure_unfenced()?;
         let schema = self.conn.current_schema();
         self.statements.schema(Arc::clone(&schema))?;
-        let mut stmt = match self.statements.take(sql)? {
-            Some(stmt) => stmt,
-            None => self.conn.prepare(sql).map_err(fail)?,
+        let (mut stmt, marked) = match self.statements.take(sql)? {
+            Some(taken) => taken,
+            None => (self.conn.prepare(sql).map_err(fail)?, false),
         };
         step(self.io.as_ref(), &mut stmt, params, each)?;
         let current = self.conn.current_schema();
         self.statements.schema(Arc::clone(&current))?;
         // A callback can change schema and run another query. Never return this checked-out
         // statement under that later schema's cache identity.
-        if Arc::ptr_eq(&schema, &current) && schema.schema_version == current.schema_version {
-            self.statements.put(sql, stmt)?;
+        if same_schema(&schema, &current) {
+            self.statements.put(sql, stmt, marked)?;
         }
         Ok(())
     }
@@ -553,16 +578,79 @@ impl Db {
         self.conn.changes()
     }
 
+    /// Keeps its cache entry's validation mark and never sets one, as [`Db::query_owned`].
     pub fn column_count(&self, sql: &str) -> anyhow::Result<usize> {
         self.ensure_unfenced()?;
         self.statements.schema(self.conn.current_schema())?;
-        let stmt = match self.statements.take(sql)? {
-            Some(stmt) => stmt,
-            None => self.conn.prepare(sql).map_err(fail)?,
+        let (stmt, marked) = match self.statements.take(sql)? {
+            Some(taken) => taken,
+            None => (self.conn.prepare(sql).map_err(fail)?, false),
         };
         let columns = stmt.num_columns();
-        self.statements.put(sql, stmt)?;
+        self.statements.put(sql, stmt, marked)?;
         Ok(columns)
+    }
+
+    /// Takes `sql`'s statement out of the cache, with its validation mark, for a caller that runs
+    /// it again and again with [`Db::run_held`] until [`Db::give_back`] returns it
+    /// (docs/design/store.md, decisions 34 and 36). While it's held, the same text is prepared
+    /// anew for anyone else.
+    pub(crate) fn cached(&self, sql: &str) -> anyhow::Result<Option<Held>> {
+        self.ensure_unfenced()?;
+        let schema = self.conn.current_schema();
+        self.statements.schema(Arc::clone(&schema))?;
+        Ok(self
+            .statements
+            .take(sql)?
+            .map(|(statement, validated)| Held {
+                sql: sql.to_owned(),
+                statement,
+                schema,
+                validated,
+            }))
+    }
+
+    /// Prepares `sql` for a caller that holds it as [`Db::cached`] says, unmarked.
+    pub(crate) fn prepare_held(&self, sql: &str) -> anyhow::Result<Held> {
+        self.ensure_unfenced()?;
+        let schema = self.conn.current_schema();
+        self.statements.schema(Arc::clone(&schema))?;
+        Ok(Held {
+            sql: sql.to_owned(),
+            statement: self.conn.prepare(sql).map_err(fail)?,
+            schema,
+            validated: false,
+        })
+    }
+
+    /// Runs a held statement as [`Db::query_owned`] runs one, preparing it again first if the
+    /// schema changed since it was prepared.
+    pub(crate) fn run_held(
+        &self,
+        held: &mut Held,
+        params: impl IntoIterator<Item = Value>,
+        each: impl FnMut(&Row) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<()> {
+        self.ensure_unfenced()?;
+        let schema = self.conn.current_schema();
+        self.statements.schema(Arc::clone(&schema))?;
+        if !same_schema(&held.schema, &schema) {
+            held.statement = self.conn.prepare(&held.sql).map_err(fail)?;
+            held.schema = schema;
+        }
+        step(self.io.as_ref(), &mut held.statement, params, each)
+    }
+
+    /// Returns a held statement to the cache with its mark, kept for the next caller while the
+    /// schema is the one it was prepared under.
+    pub(crate) fn give_back(&self, held: Held) -> anyhow::Result<()> {
+        let current = self.conn.current_schema();
+        self.statements.schema(Arc::clone(&current))?;
+        if same_schema(&held.schema, &current) {
+            self.statements
+                .put(&held.sql, held.statement, held.validated)?;
+        }
+        Ok(())
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
@@ -707,20 +795,35 @@ impl Db {
         result
     }
 
+    /// The pages an image of this database holds now, and their bytes.
+    fn image_extent(&self) -> anyhow::Result<(u32, usize)> {
+        let pager = self.conn.get_pager();
+        let count = self
+            .io
+            .block(|| pager.with_header(|h| h.database_size.get()))?;
+        let page_size = usize::try_from(self.conn.get_page_size().get())?;
+        let size = usize::try_from(count)?
+            .checked_mul(page_size)
+            .ok_or_else(|| anyhow::anyhow!("snapshot size overflow"))?;
+        Ok((count, size))
+    }
+
+    /// The bytes an image of this database would hold now, as `image_pages` counts them.
+    pub(crate) fn image_bytes(&mut self) -> anyhow::Result<usize> {
+        self.exec("BEGIN")?;
+        let result = self.image_extent().map(|(_, size)| size);
+        self.exec("ROLLBACK")?;
+        result
+    }
+
     pub(crate) fn image_pages(&mut self, max_bytes: usize) -> anyhow::Result<Pages> {
         self.exec("BEGIN")?;
         let result = (|| {
-            let pager = self.conn.get_pager();
-            let count = self
-                .io
-                .block(|| pager.with_header(|h| h.database_size.get()))?;
-            let page_size = usize::try_from(self.conn.get_page_size().get())?;
-            let size = usize::try_from(count)?
-                .checked_mul(page_size)
-                .ok_or_else(|| anyhow::anyhow!("snapshot size overflow"))?;
+            let (count, size) = self.image_extent()?;
             if size > max_bytes {
                 anyhow::bail!("snapshot exceeds its byte budget");
             }
+            let pager = self.conn.get_pager();
             let mut pages = Vec::with_capacity(usize::try_from(count)?);
             for id in 1..=count {
                 let (page, completion) = self.io.block(|| pager.read_page(i64::from(id)))?;
@@ -873,6 +976,38 @@ impl Db {
     }
 }
 
+/// A statement held by its caller between executes: its text, the schema it was prepared under,
+/// and whether the session's validation accepted the text.
+pub(crate) struct Held {
+    sql: String,
+    statement: Statement,
+    schema: Arc<amphora_engine::schema::Schema>,
+    validated: bool,
+}
+
+impl Held {
+    pub(crate) fn columns(&self) -> usize {
+        self.statement.num_columns()
+    }
+
+    pub(crate) fn validated(&self) -> bool {
+        self.validated
+    }
+
+    /// The session's validation accepted the text: only `sql::validate`'s success calls this.
+    pub(crate) fn mark(&mut self) {
+        self.validated = true;
+    }
+}
+
+/// The same schema, not another at the same address: the cache's own test (`cache::Cache::schema`).
+fn same_schema(
+    held: &Arc<amphora_engine::schema::Schema>,
+    current: &Arc<amphora_engine::schema::Schema>,
+) -> bool {
+    Arc::ptr_eq(held, current) && held.schema_version == current.schema_version
+}
+
 /// Runs `stmt` with `params` to its end, handing each row to `each` until it says stop (false).
 pub fn step(
     io: &dyn IO,
@@ -908,7 +1043,7 @@ pub fn step(
                 }
                 pause(BUSY_WAIT);
             }
-            StepResult::Interrupt => anyhow::bail!("a statement was interrupted"),
+            StepResult::Interrupt => return Err(fail(LimboError::Interrupt)),
         }
     }
 }
@@ -916,6 +1051,56 @@ pub fn step(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Says, as it drops, how many strong handles its engine still has.
+    struct EngineWitness {
+        engine: std::sync::Weak<Database>,
+        dropped: std::sync::mpsc::Sender<usize>,
+    }
+    impl Drop for EngineWitness {
+        fn drop(&mut self) {
+            self.dropped.send(self.engine.strong_count()).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_owner_guards_drop_after_the_engine_in_every_holder() {
+        // CP-T1.5 (U05), local-owner-transport.md "Owner guards": a reader, a reader's opener
+        // and the flusher each keep the owner's guards until they drop, and drop the engine's
+        // handles before them. Each holder is made the last, then dropped: the guards drop
+        // then, with no engine handle left.
+        type Holder = Box<dyn FnOnce(&Db) -> Box<dyn std::any::Any>>;
+        let holders: [(&str, Holder); 3] = [
+            ("reader", Box::new(|db| Box::new(db.reader().unwrap()))),
+            ("opener", Box::new(|db| Box::new(db.opener()))),
+            ("flusher", Box::new(|db| Box::new(db.flusher()))),
+        ];
+        for (name, hold) in holders {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = Db::open(&dir.path().join("db")).unwrap();
+            let (sender, dropped) = std::sync::mpsc::channel();
+            let witness = EngineWitness {
+                engine: Arc::downgrade(&db.db),
+                dropped: sender,
+            };
+            db.hold_owner(crate::database::Owned::new(
+                Arc::new(std::fs::File::create(dir.path().join("lease")).unwrap()),
+                Some(crate::database::Guards::new([7; 32], Arc::new(witness))),
+            ));
+            let holder = hold(&db);
+            drop(db);
+            assert!(
+                dropped.try_recv().is_err(),
+                "{name}: the guards dropped early"
+            );
+            drop(holder);
+            assert_eq!(
+                dropped.try_recv().unwrap(),
+                0,
+                "{name}: the guards dropped before the engine's handles"
+            );
+        }
+    }
 
     /// U15/CP-T1.8: failure after raw pages and schema refresh must expose neither the imported
     /// catalog nor its rows. A later successful apply persists both through the real flusher.
@@ -981,6 +1166,102 @@ mod tests {
                 .query("SELECT value FROM original", [], |_| Ok(false))
                 .is_err()
         );
+        // U05, CP-T1.8 (replication.md, "Raising the floor", d): a floor this group's members
+        // didn't prove never enters replicated mode. An image carrying one where joins aren't
+        // tracked is refused at install, rolled back before its marker; a database holding one
+        // is refused as a replica at open.
+        crate::database::bootstrap_db(&source).unwrap();
+        source
+            .exec("CREATE TABLE __amphora_application_floor (singleton INTEGER PRIMARY KEY, application TEXT NOT NULL, version INTEGER NOT NULL)")
+            .unwrap();
+        source
+            .exec("INSERT INTO __amphora_application_floor VALUES(1, 'kiln.host-store', 6)")
+            .unwrap();
+        source.flusher()().unwrap();
+        let floor_image = postcard::to_allocvec(&source.image_pages(1 << 20).unwrap()).unwrap();
+        let mut replica = crate::replication::Machine::open(
+            &dir.path().join("replica.db"),
+            hyper_raft::proto::ConfState::default(),
+        )
+        .unwrap();
+        let before = hyper_durable::StateMachine::durable(&replica);
+        assert!(
+            hyper_durable::StateMachine::install(
+                &mut replica,
+                &floor_image,
+                hyper_durable::Point { index: 2, term: 1 },
+                &hyper_raft::proto::ConfState::default(),
+            )
+            .is_err()
+        );
+        assert_eq!(hyper_durable::StateMachine::durable(&replica), before);
+        assert_eq!(
+            replica
+                .read_db(|db| crate::database::installed_floor(db))
+                .unwrap(),
+            None
+        );
+        drop(replica);
+        drop(source);
+        let refusal = crate::replication::Machine::open(
+            &dir.path().join("source.db"),
+            hyper_raft::proto::ConfState::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(&refusal, amphora_api::Refusal::Fenced(reason) if reason == "a floor not proven by this group's members; raise it again once joins are tracked"),
+            "{refusal:?}"
+        );
+    }
+
+    /// U05/U15, bug 68a308b7: Db::exec of a statement its deadline interrupts reports the
+    /// engine's interrupt, never busy, which is another connection's activity
+    /// (sqlite.org/rescode.html: SQLITE_INTERRUPT, SQLITE_BUSY). Do: exec a long insert under a
+    /// deadline already past, then the same through Db::query's own runner. Expect:
+    /// LimboError::Interrupt from both, nothing of either inserted, and the writer usable after.
+    #[test]
+    fn exec_and_query_report_a_deadline_interrupt_as_an_interrupt() {
+        let mut db = Db::open_with(
+            Path::new(":memory:interrupt"),
+            Arc::new(amphora_engine::MemoryIO::new()),
+        )
+        .unwrap();
+        db.exec("CREATE TABLE numbers(n)").unwrap();
+        const LONG: &str = "INSERT INTO numbers WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < 10000000) SELECT x FROM n";
+        let exec = db.transaction(|db| {
+            let _deadline = db.deadline(Instant::now());
+            db.exec(LONG)
+        });
+        let error = exec.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<LimboError>(),
+                Some(LimboError::Interrupt)
+            ),
+            "{error:#}"
+        );
+        let query = db.transaction(|db| {
+            let _deadline = db.deadline(Instant::now());
+            db.query(LONG, [], |_| Ok(true))
+        });
+        let error = query.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<LimboError>(),
+                Some(LimboError::Interrupt)
+            ),
+            "{error:#}"
+        );
+        db.transaction(|db| db.exec("INSERT INTO numbers VALUES (1)"))
+            .unwrap();
+        let mut count = 0;
+        db.query("SELECT count(*) FROM numbers", [], |row| {
+            count = row.get::<i64>(0).unwrap();
+            Ok(false)
+        })
+        .unwrap();
+        assert_eq!(count, 1);
     }
 
     /// U05/U15: an expired SQL VM is interrupted and the guard clears before rollback,

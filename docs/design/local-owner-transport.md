@@ -113,6 +113,39 @@ handle-relative operations, validation and refusal semantics. [RFC 2104](https:/
 specifies the HMAC construction; direction/domain labels and nonce binding are this protocol's
 choice, falsified by a reflected or replayed proof authenticating a new connection.
 
+## Versions (2026-11-06)
+
+The greeting carries the protocol version (`wire::VERSION`), and the owner refuses a peer of any
+other version at once, `Invalid`, naming both versions, before a challenge and before any frame
+whose shape differs. Postcard is not self-describing: a field added to a message is not filled by
+`#[serde(default)]` on decode, so a client reading an older owner's longer or shorter record gets a
+decode error mid-session, `Unavailable`, not the default. So every change to any message's fields
+bumps the version, and an owner and its clients change version together across a drain: stop the
+clients, replace the owner and the clients, start again. Nothing decodes another version's records.
+The owner's refusal is its own result, never a frame: it writes nothing and closes the connection,
+so a client of another version sees the connection closed before any challenge, whatever shape its
+frames have.
+
+Version 4: the owner's `Identity` gained `durability` (replication.md, "Fates and durability
+checked"). Version 3: `ReplicaStatus` gained `voters_outgoing` (replication.md, "Membership"). Version 2 had
+already added `bootstrapping` without a bump; a version-2 client of an owner with that field would
+have failed the same way. The test: `a_peer_of_another_version_is_refused_at_the_greeting`.
+
+Version 5: `Request` gained `Application` (the application floor, replication.md), a client's bound
+claim sent once after the greeting and before its ordinary request. The owner validates its shape and
+answers Ready; only the owner's own floor, checked inside the writer's transaction, grants admission.
+
+Version 6: `Request` gained `LocalSession` (replication.md, "A local read on a replica"), a session
+the owner runs read-only on its own state, asking no leader. A client asks it without probing the
+owner's capabilities: every owner it can greet takes it. No capability is advertised for it, and the
+value 2 (bit 1), which kiln's 0003 gave `CAP_LOCAL_READ`, stays unassigned.
+
+Evidence: postcard's wire format: "A struct is encoded as the elements that comprise it, in their
+order of definition", and "their length and field names are not encoded on the wire"
+([postcard's wire format, section 28](https://postcard.jamesmunns.com/wire-format.html)), so a
+decoder can't tell a missing trailing field from a short frame. Falsified by: a session that decodes a
+record of another version, or a refusal of another version that comes after the greeting.
+
 ## The tests' budgets (2026-10-31)
 
 None of the transport tests is about latency. Their budgets were real-clock guesses, and a loaded
@@ -193,3 +226,156 @@ Falsified by:
 - a transport test whose outcome changes with the machine's load;
 - a measured whole run past a twentieth of `HANG`. That last one calls for measuring again, not for
   a larger guard.
+
+## Owner guards (2026-11-06)
+
+kiln's Windows host store keeps handles that pin its database's files and directories (its
+"guards") and must hold them as long as Amphora has those files open. Codex proposed the hook
+(kiln-unify proposal sha256 6e2e9c80, 2026-10-30); the Amphora agent decided its rules the same day
+(the decisions sent to Codex as amphora-reply-codex-keepalive-decisions-2026-10-30). Three
+additive constructors carry them, and the existing ones keep their behavior:
+`Database::open_guarded`, `Database::open_replicated_guarded` and
+`Database::attach_replicated_guarded`, each taking a `Guards::new(key, keep)`.
+
+- `keep` is held, never read. `key` is the host's assertion that two groups protect the same files;
+  Amphora compares it and does not verify it. No token type, serialization or wire change.
+- The owner lease and the guards travel together as one `Owned`, cloned wherever the lease is held:
+  the `Db` (and each reader), a reader's opener, the flusher, `Shared`, the replicated actor and its
+  `Machine`. The owner table still holds a `Weak` of the lease alone, so drain is decided as before:
+  the last holder of the lease has dropped. `Owned` declares the lease before the guards, so the
+  group outlives the lease it came with.
+- The engine's handles drop before the lease and its guards in every holder. `Db` declares its owner
+  after its engine fields; the opener and the flusher capture one `EngineHandles` (engine IO,
+  database, then owner) as a whole. Before this, the flusher captured the lease as its own
+  variable, and the Reference leaves the drop order of a closure's moved captures unspecified;
+  measured at this change, rustc dropped the lease while the flusher's engine handle was still alive
+  (`db::tests::the_owner_guards_drop_after_the_engine_in_every_holder` failed with one engine
+  handle left, and passes with `EngineHandles`).
+- A guarded open makes no directory: its database and log paths are made canonical without
+  creating a parent (`existing_path`), and a missing parent is refused before the owner table, the
+  endpoint or the lease is touched. The lease then makes only the database's own `.client`
+  endpoint directory, as every owner's does. The steps after resolution make nothing either: a
+  guarded owner's engine opens without `create_dir_all` (`open_db`, for the local writer and the
+  replicated machine), and its log's lease resolves its path the same way (`exclusive_file_of`).
+  A parent removed after the open resolved it is refused with the same error, never made again: a
+  remade directory is another directory (the host binds its group to the parent's file identity),
+  and the host's guards would protect nothing, with nobody told. A parent removed in the narrow
+  window between that resolution and the engine's or the lease's open ends as an I/O error
+  (`Refusal::Unavailable`), not this typed refusal; nothing is made there either. Asked by
+  amphora-seam-owner, in Codex's place, on 2026-11-06.
+- Under the owner table's lock, before any endpoint or lease effect, a guarded open meeting a live
+  owner in this process admits it only if that owner is not a client, the file at the path now is
+  the file it stored (its identity), and it holds guards of the same key. Then the incoming guards
+  are dropped and the owner keeps its own group: one group per owner, never accumulated. An
+  unguarded owner, other guards, or another file at the path is refused with
+  `Refusal::Invalid` ("database ownership"): that owner must drain first. An unguarded open may
+  reuse a guarded owner, whose group stays.
+- Another process's owner is refused: its identity can't show which files it opened, so there is
+  no guarded client and no guarded promotion. Guarded means this process is or becomes the
+  owner. The refusal follows the failed lease attempt, the only way to learn of that owner, which
+  changes nothing.
+- Guarded opens are persisted: no guarded constructor takes a durability (replication.md, "Fast
+  acknowledgement: the replicated class"), since no host asks for one; a guarded host that wants the
+  replicated class gets it through a later additive constructor. An open or attach in this process
+  that states the replicated class at a guarded owner is refused `Refusal::Invalid` ("replica
+  ownership", a different live owner), never answered persisted in its place
+  (`database::remote::tests::a_guarded_owner_refuses_a_replicated_open_or_attach_in_this_process`).
+  Another process's attach stating it is refused the same way at the transport: the owner's
+  identity names its durability (version 4), and a different one is refused, typed (replication.md,
+  "Fates and durability checked"). Agreed by amphora-seam-owner, 2026-11-06.
+- `attach_replicated` now checks the owner bound before it probes the lease. The probe makes the
+  endpoint directory and holds the lease for an instant; at a full table attach answered "no
+  owner" after those effects, and the open that followed was refused at the same bound
+  (`database::remote::tests::attach_refuses_at_the_owner_bound_before_it_touches_the_lease`,
+  failing before the fix). `Database::owner` already bounded first.
+
+- The unguarded opens decide their refusals before they make a directory too (kiln goal 017b5e3d,
+  reported to Codex's role as a side effect before a refusal). They resolve paths with
+  `resolved_path`: the deepest existing ancestor made canonical, then the missing names below it,
+  as `create_dir_all` will make them. The database's parent is made by its lease, after the owner
+  table's refusals and bound; the log's by its own lease, once this process owns the database; the
+  replica configuration is checked before either. `attach_replicated` makes no directory at all: no
+  owner can hold a lease under a directory that doesn't exist, so it answers None. A missing
+  directory named by `..` can't be resolved before it is made, and is refused.
+- What remains, decided (amphora-seam-owner, in Codex's place, 2026-11-06): the refusals that need
+  the database's contents come after the log's lease. `replicated::open` takes the log's lease
+  first, which makes the log's parent directory and its `<log>.client` endpoint at the log path
+  given. Then `Machine::open_with_owner`'s refusals (such as an unfinished restore, a baseline
+  declaration whose source isn't an initial voter, a replica table without its applied marker)
+  leave those behind. Then the log file is made, and the fence "state exists but its replication log is
+  missing" (an empty log beside a database whose durable index isn't zero) leaves an empty log
+  file as well. Each is a typed, fail-closed refusal, and nothing in the database changes. They
+  aren't moved before the log's lease: opening the machine first would write its applied marker
+  into the database before the log is held, an effect on the database itself, and the fence can't
+  be decided earlier, since it needs the machine's durable index.
+
+- A reopen beside a child that shares a drained lease (J1, 2026-11-07, decided with
+  amphora-seam-owner). On Unix the lease is a `flock` (std's `File::try_lock`: "This function
+  currently corresponds to the flock function on Unix with the LOCK_EX and LOCK_NB flags"), and a
+  flock belongs to the open file description: "duplicate file descriptors (created by, for example,
+  fork(2) or dup(2)) refer to the same lock", released only "when all such file descriptors have
+  been closed" (flock(2)). A forked child holds copies of every descriptor (fork(2)) until its exec
+  closes the close-on-exec ones (execve(2)). So when this process drains an owner while it, or a
+  library in it, forks, the lease can read held for a moment after the last holder here let go:
+  62.8 µs, measured on fedora during t1/guards-flake. A guarded open, a guarded attach and a restore
+  answered that moment with an Invalid naming another process's owner, which tells the host not to
+  retry, though no other owner existed.
+  - The owner table remembers the paths it drained, read before its retain forgets them: at most
+    4,096 (the owner bound), the oldest evicted first, and a path's mark cleared once this process
+    takes its lease again.
+  - A guarded open, a guarded attach or a restore that finds the lease held at a path this process
+    drained waits for it within the caller's deadline, re-probing after 50 µs, doubling to at most
+    1 ms (the measured window, and the drain wait's own 1 ms park), with the owner table unlocked
+    between probes; at the deadline it answers `Refusal::Timeout`. A path with no drain of this
+    process behind it keeps the at-once refusal (`remote_owner()`, the restore's "another process
+    owns the destination"). An unguarded open already waits: it attaches as a client, the drained
+    owner answers nothing, and the open retries the client's `Unavailable` to its deadline.
+  - Why this is not the retry CLAUDE.md section 4 forbids: it is the wait on the fact the call needs
+    (the lease free), at the cause found (a sharer outside this process that lets go at its exec),
+    with the bound section 2 asks, and it fixes no test by waiting longer. The cost: a path this
+    process drained that another process then owns for good is answered `Timeout` at the deadline
+    rather than the at-once Invalid, until this process owns it again or the mark is evicted. Both
+    are typed; Timeout says try again. Refusal's Timeout carries no text (a wire enum, changed
+    append-only), so at a marked path's deadline the owner logs the reason, event
+    `records.lease_held_since_drain` on `amphora.records` (warn; agreed by Kiln Metrics,
+    `amphora-replicated-line/events/v1`): "the lease is still held since this process drained
+    it", which an operator tells from a slow open.
+  - Windows has no fork: a child gets only the handles it is given, so the window is Unix's
+    (Linux and macOS), and the wait is the same code on every platform.
+  - Tests: `a_child_sharing_the_lease_holds_it_past_this_processs_drain` (the rig),
+    `a_guarded_reopen_beside_a_child_sharing_the_drained_lease_times_out`,
+    `a_guarded_attach_beside_a_child_sharing_the_drained_lease_times_out`,
+    `a_restore_beside_a_child_sharing_the_drained_lease_times_out` and
+    `a_guarded_reopen_owns_the_database_once_the_sharing_child_lets_go`, red at main f99b758.
+  - Falsified by: an Invalid answered at a path this process drained while no other owner exists;
+    a wait past the caller's deadline; a wait at a path this process never drained; more than 4,096
+    marks held.
+
+Evidence: `database::guards::tests` with a Drop witness: sixteen same-key opens and an unguarded
+one keep one group, which outlives every `Database` clone and drops with the lease free (after the
+writer, readers and flusher drained); "free" is the owner table's own drain, no holder of the lease
+left in this process, not the lock: a child this process forks shares the lock's open file
+description until its exec, so a probe of the lock found it held for microseconds while other
+tests spawned children, and the witness failed 2 times in 273 loaded runs (2026-11-07, fedora;
+`a_child_sharing_the_lease_does_not_hold_the_group`, red against the lock probe); other guards, an unguarded owner, another file at the path
+and another process's owner are each refused with the incoming group dropped at once and the live
+owner untouched; a missing parent is refused with nothing made, and a parent removed after resolution
+is refused by each later step and not made again; the replicated owner is reused and
+attached by the same key. Removing the admission, or resolving guarded paths with
+`canonical_path`, fails these tests. They show Amphora's side on each platform; whether the host's
+handles protect a Windows path is the host's own test.
+
+Sources: the Rust Reference, "Destructors"
+(doc.rust-lang.org/reference/destructors.html, read 2026-11-06): "The fields of a struct are
+dropped in declaration order", and "The variables that a closure captures by move are dropped in
+an unspecified order". Rust's `File::try_lock` (cited above) for the lease's release on the last
+handle's close.
+
+Falsified by: a group dropped while a reader, opener, flusher, actor or machine of its owner still
+holds an engine handle; two groups alive for one owner after a same-key reopen; a guarded open
+that makes a parent directory (at resolution or after it), reuses an unguarded, differently keyed or remote owner, or reuses
+an owner whose stored file identity differs from the file at the path; or attach making the
+endpoint directory at a full owner table, or an unguarded open refused by the owner table, its
+bound or its configuration having made a directory
+(`database::remote::tests::refused_replicated_opens_leave_no_directory_they_made`,
+`opens_refused_at_the_owner_bound_make_no_directory`).
