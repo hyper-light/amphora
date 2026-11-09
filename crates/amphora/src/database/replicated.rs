@@ -3380,6 +3380,14 @@ mod tests {
         lost: Vec<u64>,
         // While some, the durable answers to appends, kept back in order: held answers pass, so
         // only a held quorum can commit (the suspicion feed's test). Counted in `records`.
+        // This holds answers in transit, not the member's disk: a heartbeat's answer stating
+        // the member's log position passes it, and the leader counts that position toward
+        // `matched` as an append's answer (hyper-raft's handle_heartbeat_response). That is
+        // sound, since a member that doesn't lead sends it only once its log is durable
+        // (hyper-durable's persisted messages), but it means a held test that moves the
+        // leader's clock lets durable progress through. To model a disk that hasn't finished, a
+        // test holds every persisted message, heartbeat answers included, or moves no clock
+        // (as a_promoted_joiner_counts_in_a_held_quorum does).
         durable: Option<Vec<PumpPacket>>,
         // Owners whose records stay in their own queues, untaken: a follower whose answers are
         // held, as its own slow write holds them (kiln goal 6b112f14).
