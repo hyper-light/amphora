@@ -18,7 +18,7 @@
 //! file's pages leave with it when its database closes.
 
 use crate::io::Buffer;
-use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::{Arc, RwLock};
 use rustc_hash::FxHashMap;
 
@@ -89,6 +89,21 @@ pub struct SharedPages {
     per_shard: usize,
     /// The number the next file to join gets.
     files: AtomicU64,
+    /// Pages charged to this pool's budget by memory kept outside it ([`SharedPages::charge`]).
+    charged: AtomicUsize,
+}
+
+/// Pages charged to a pool's budget while it is held ([`SharedPages::charge`]), given back when
+/// it drops.
+pub struct Charge {
+    pool: Arc<SharedPages>,
+    pages: usize,
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        self.pool.charged.fetch_sub(self.pages, Ordering::AcqRel);
+    }
 }
 
 impl SharedPages {
@@ -99,7 +114,30 @@ impl SharedPages {
             shards: (0..SHARDS).map(|_| ShardCell::default()).collect(),
             per_shard,
             files: AtomicU64::new(0),
+            charged: AtomicUsize::new(0),
         }
+    }
+
+    /// Charges `pages` to this pool's budget, for memory kept beside it (Amphora's
+    /// `docs/design/replication.md`, "A replica's local readers bounded by derivation": a reader's
+    /// own cache): the pool keeps that many fewer while the charge is held. None, charging nothing,
+    /// when the charges held and `pages` would leave it less than a page a shard.
+    pub fn charge(self: &Arc<Self>, pages: usize) -> Option<Charge> {
+        let most = self.capacity().saturating_sub(SHARDS);
+        self.charged
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
+                charged.checked_add(pages).filter(|after| *after <= most)
+            })
+            .ok()?;
+        Some(Charge {
+            pool: Arc::clone(self),
+            pages,
+        })
+    }
+
+    /// Pages charged to this pool's budget now.
+    pub fn charged(&self) -> usize {
+        self.charged.load(Ordering::Acquire)
     }
 
     /// A number for one more database file reading through these pages, its keys' `file`: every
@@ -150,16 +188,28 @@ impl SharedPages {
         let Some(cell) = self.shard(key.page) else {
             return;
         };
+        // What a shard keeps while pages are charged: its slice of the bound less its slice of
+        // the charge, never under one (a charge leaves a page a shard; `charge`).
+        let limit = self
+            .per_shard
+            .saturating_sub(self.charged().div_ceil(SHARDS))
+            .max(1);
         let mut shard = cell.shard.write();
         if let Some(entry) = shard.map.get(&key) {
             entry.visited.store(true, Ordering::Relaxed);
             return;
         }
-        let at = if shard.ring.len() < self.per_shard {
+        let at = if shard.map.len() < limit && shard.ring.len() < self.per_shard {
             shard.ring.push(None);
             shard.ring.len().checked_sub(1)
         } else {
-            Self::victim(&mut shard)
+            let freed = Self::victim(&mut shard);
+            // A shard over its limit (a charge taken since it filled) evicts and keeps nothing
+            // new, so it shrinks to the limit as pages come.
+            if shard.map.len() >= limit {
+                return;
+            }
+            freed
         };
         let Some(at) = at else {
             return;
@@ -518,5 +568,35 @@ mod tests {
         assert_eq!(pool.get(&b_key).unwrap().as_slice()[0], 3);
         drop(b);
         assert!(pool.is_empty());
+    }
+
+    /// Amphora's replication.md, "A replica's local readers bounded by derivation" (AC-T1.10.L2):
+    /// what is charged to a pool's budget it doesn't keep. Do: a pool of 256 pages (4 a shard)
+    /// charged 128, then 256 pages inserted; a charge past what is left asked; the rest charged,
+    /// and 256 more inserted; the charges given back and 256 more inserted. Expect: at most 128
+    /// kept while 128 are charged; a charge leaving less than a page a shard refused, charging
+    /// nothing; a page a shard kept at the most charge; 256 kept once it is given back.
+    #[test]
+    fn a_charge_shrinks_what_the_pool_keeps() {
+        let pool = Arc::new(SharedPages::new(256));
+        let charge = pool.charge(128).unwrap();
+        for page in 1..=256 {
+            pool.insert(file(page), buffer(1));
+        }
+        assert!(pool.len() <= 128, "{} kept beside 128 charged", pool.len());
+        assert!(pool.charge(65).is_none());
+        assert_eq!(pool.charged(), 128);
+        let rest = pool.charge(64).unwrap();
+        assert_eq!(pool.charged(), 192);
+        for page in 1001..=1256 {
+            pool.insert(file(page), buffer(3));
+        }
+        assert!(pool.len() <= 64, "{} kept at the most charge", pool.len());
+        drop((charge, rest));
+        assert_eq!(pool.charged(), 0);
+        for page in 257..=512 {
+            pool.insert(file(page), buffer(2));
+        }
+        assert_eq!(pool.len(), 256);
     }
 }

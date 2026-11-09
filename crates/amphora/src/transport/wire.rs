@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub(super) const FRAME_MAX: usize = amphora_api::RESULT_MAX + (1 << 20);
 pub(super) const COMMAND_MAX: usize = 4096;
-pub(super) const CONNECTION_MAX: usize = 32;
+pub(crate) const CONNECTION_MAX: usize = 32;
 pub(super) const WAIT_MAX: usize = 8;
 pub(super) const WATCH_BATCH_MAX: usize = 64;
 pub(super) const WATCH_REPLY_MAX: usize = 64 << 10;

@@ -21,6 +21,7 @@ use crate::db::Db;
 
 pub use crate::database::replicated::{ReceiveReceipt, ReplicaHandle};
 pub mod bootstrap;
+pub(crate) mod class;
 pub(crate) mod floor;
 
 const BASELINE_DELTA: &[u8] = b"amphora.delta.v1\0";
@@ -148,6 +149,13 @@ pub struct Machine {
     replicated: bool,
     configuration: ConfState,
     baseline: bootstrap::Baseline,
+    /// The group's class as its log recorded it last (replication.md, "The class stated once per
+    /// group"), and the class this member's owner stated: the two must stay compatible.
+    class: Option<api::replication::Durability>,
+    stated: Option<api::replication::Durability>,
+    // A test's count of the class entries this machine applied that changed its record.
+    #[cfg(test)]
+    class_changes: u64,
     // The largest image this machine makes or installs: SNAPSHOT_BYTES, lowered only by a test.
     snapshot_bytes: usize,
     // The index of the last configuration change applied, or more: the change's own index when
@@ -362,6 +370,7 @@ impl Machine {
             ));
         }
         let (point, configuration) = state.unwrap_or((Point::default(), initial));
+        let recorded = class::recorded(&db).map_err(unavailable)?;
         db.transaction(|db| marker(db, point, &configuration))
             .map_err(unavailable)?;
         db.flusher()().map_err(unavailable)?;
@@ -372,6 +381,10 @@ impl Machine {
             replicated,
             configuration,
             baseline,
+            class: recorded,
+            stated: None,
+            #[cfg(test)]
+            class_changes: 0,
             snapshot_bytes: SNAPSHOT_BYTES,
             configuration_at: point.index,
             #[cfg(test)]
@@ -396,6 +409,85 @@ impl Machine {
     #[cfg(test)]
     pub(crate) fn set_snapshot_bytes(&mut self, bytes: usize) {
         self.snapshot_bytes = bytes;
+    }
+
+    /// The class this member's owner states, held to the group's record from now on: refused,
+    /// typed, if the database records a class it isn't compatible with (replication.md, "The
+    /// class stated once per group").
+    pub(crate) fn state_class(
+        &mut self,
+        durability: &api::replication::Durability,
+    ) -> Result<(), Refusal> {
+        let stated = class::canonical(durability);
+        if let Some(record) = &self.class
+            && !class::compatible(&stated, record)
+        {
+            return Err(api::invalid(
+                "replicated class",
+                "the group's log states another class than this member's",
+            ));
+        }
+        self.stated = Some(stated);
+        Ok(())
+    }
+    /// The group's class as this machine recorded it last.
+    #[cfg(test)]
+    pub(crate) fn class(&self) -> Option<&api::replication::Durability> {
+        self.class.as_ref()
+    }
+    #[cfg(test)]
+    pub(crate) fn class_changes(&self) -> u64 {
+        self.class_changes
+    }
+    /// Whether this member may count held answers: every fate it states for a member its
+    /// configuration names is the record's. Compatible alone isn't enough: two members stating
+    /// different fates for a joiner not yet recorded would each count by their own.
+    pub(crate) fn class_agreed(&self) -> bool {
+        let (Some(stated), Some(record)) = (&self.stated, &self.class) else {
+            return false;
+        };
+        class::compatible(stated, record) && class::recorded_all(record, stated, &self.named())
+    }
+    /// The members this machine's configuration names, voters and learners, both halves.
+    fn named(&self) -> Vec<u64> {
+        let conf = &self.configuration;
+        conf.voters
+            .iter()
+            .chain(&conf.learners)
+            .chain(&conf.voters_outgoing)
+            .chain(&conf.learners_next)
+            .copied()
+            .collect()
+    }
+    /// The class entry this member would propose leading: the group's record joined with its own
+    /// class, to the members its configuration names, when that changes the record
+    /// (replication.md, "The class stated once per group", the amendment). The record only grows
+    /// between changes of members, whichever compatible member leads.
+    pub(crate) fn class_proposal(&self) -> Option<api::replication::Durability> {
+        let stated = self.stated.as_ref()?;
+        let named = self.named();
+        let proposal = match &self.class {
+            Some(record) if !class::compatible(record, stated) => return None,
+            record => class::joined(record.as_ref(), stated, &named),
+        };
+        if self.class.as_ref() == Some(&proposal) {
+            None
+        } else {
+            Some(proposal)
+        }
+    }
+    /// The class this member's owner stated, against the group's record: a member whose class
+    /// isn't compatible with it stops (replication.md, "The class stated once per group").
+    fn hold_to_class(&self) -> Result<(), Fatal> {
+        if let (Some(stated), Some(record)) = (&self.stated, &self.class)
+            && !class::compatible(stated, record)
+        {
+            tracing::error!(target: "amphora.replication", event = "class_refused", stated = ?stated, recorded = ?record);
+            return Err(Fatal(
+                "the group's log states another replicated class than this member's",
+            ));
+        }
+        Ok(())
     }
 
     /// The last configuration change's index as this machine knows it, or more.
@@ -449,6 +541,10 @@ impl Machine {
         Ok(())
     }
 
+    /// Whether this machine applies in the replicated class.
+    pub(crate) fn is_replicated(&self) -> bool {
+        self.replicated
+    }
     pub(crate) fn bootstrap_pending(&self) -> bool {
         self.baseline.pending()
     }
@@ -694,6 +790,29 @@ impl StateMachine for Machine {
             });
             return Ok(());
         }
+        if class::is_class(entry.data) {
+            // The last compatible entry is the record; one that isn't changes nothing, on every
+            // member alike, as it depends on the log alone.
+            let stated = class::decode(entry.data).map_err(failed)?;
+            let supersedes = self
+                .class
+                .as_ref()
+                .is_none_or(|record| class::compatible(record, &stated));
+            let configuration = self.configuration.clone();
+            if supersedes {
+                self.advance_with(at, &[], &configuration, !self.replicated, |db| {
+                    class::record(db, &stated)
+                })?;
+                #[cfg(test)]
+                if self.class.as_ref() != Some(&stated) {
+                    self.class_changes = self.class_changes.saturating_add(1);
+                }
+                self.class = Some(stated);
+            } else {
+                self.advance(at, &[], &configuration, !self.replicated)?;
+            }
+            return self.hold_to_class();
+        }
         let mut result = Ok(());
         let mut pages = Vec::new();
         if !entry.data.is_empty() {
@@ -817,6 +936,8 @@ impl StateMachine for Machine {
         self.configuration = configuration.clone();
         self.configuration_at = at.index;
         self.baseline.completed();
+        self.class = class::recorded(&self.db).map_err(failed)?;
+        self.hold_to_class()?;
         #[cfg(test)]
         self.record_digest(at.index)?;
         Ok(())
