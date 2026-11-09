@@ -7,7 +7,7 @@ use crate::translate::plan::JoinedTable;
 use amphora_engine_parser::ast;
 use smallvec::SmallVec;
 
-use super::constraints::Constraint;
+use super::constraints::{Constraint, ConstraintOperator};
 use super::cost_params::CostModelParams;
 
 /// A simple newtype wrapper over a f64 that represents the cost of an operation.
@@ -405,18 +405,35 @@ struct ColumnBounds {
     product: f64,
 }
 
-/// The fraction of rows `constraints` keep together: the product of their selectivities, except
-/// that a column bounded from both sides keeps `sel_closed_range` in place of its bounds' product,
-/// as a seek's range does ([range_selectivity]).
+/// The fraction of rows `constraints` keep together. A column bounded from both sides keeps
+/// `sel_closed_range` in place of its bounds' product, as a seek's range does
+/// ([range_selectivity]). The table's own filters but its equalities, and `sampled` (what its
+/// sample gives the terms it ran, decision 21), combine by exponential backoff
+/// ([super::sample_filter::backoff]). Equalities and IN lists multiply, as a term that reads
+/// another table does: their selectivities come from `sqlite_stat1`'s index prefixes and the
+/// sketches' distinct counts, by which a whole key's equalities give its one row.
 pub(crate) fn constraints_selectivity<'a>(
     constraints: impl Iterator<Item = &'a Constraint>,
+    sampled: Option<f64>,
     params: &CostModelParams,
 ) -> f64 {
-    let mut fraction = 1.0;
+    let mut multiplied = 1.0;
+    let mut factors: SmallVec<[f64; 8]> = sampled.into_iter().collect();
     let mut columns: SmallVec<[ColumnBounds; 4]> = SmallVec::new();
     for constraint in constraints {
         // Amphora: an implied bound filters nothing its term doesn't (decision 3).
         if constraint.implied {
+            continue;
+        }
+        let equality = matches!(
+            constraint.operator,
+            ConstraintOperator::AstNativeOperator(ast::Operator::Equals)
+                | ConstraintOperator::In { not: false, .. }
+        ) || (constraint.operator
+            == ConstraintOperator::AstNativeOperator(ast::Operator::Is)
+            && !constraint.null_matching);
+        if !constraint.lhs_mask.is_empty() || equality {
+            multiplied *= constraint.selectivity;
             continue;
         }
         let (lower, upper) = match constraint.operator.as_ast_operator() {
@@ -426,7 +443,7 @@ pub(crate) fn constraints_selectivity<'a>(
         };
         // A bound on an expression stands alone: two need not bound the same expression.
         if !(lower || upper) || (constraint.table_col_pos.is_none() && !constraint.is_rowid) {
-            fraction *= constraint.selectivity;
+            factors.push(constraint.selectivity);
             continue;
         }
         let key = (constraint.table_col_pos, constraint.is_rowid);
@@ -445,13 +462,13 @@ pub(crate) fn constraints_selectivity<'a>(
         }
     }
     for column in columns {
-        fraction *= if column.lower && column.upper {
+        factors.push(if column.lower && column.upper {
             params.sel_closed_range
         } else {
             column.product
-        };
+        });
     }
-    fraction
+    multiplied * super::sample_filter::backoff(&mut factors)
 }
 
 pub(crate) fn estimate_rows_per_seek(

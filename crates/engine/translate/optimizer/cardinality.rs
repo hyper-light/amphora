@@ -12,7 +12,7 @@ use smallvec::SmallVec;
 use amphora_engine_parser::ast::{self, Operator};
 
 use super::{
-    constraints::{Constraint, TableConstraints},
+    constraints::{Constraint, ConstraintOperator, TableConstraints},
     cost::{constraints_selectivity, RowCountEstimate},
     cost_params::CostModelParams,
 };
@@ -148,6 +148,15 @@ struct Table {
     keys: SmallVec<[usize; 2]>,
     /// A join's right table with an ON term no row passes: it matches no row.
     matches_none: bool,
+    /// The filter terms its sample ran and the share of the sample they keep (decision 21).
+    sampled: Option<Sampled>,
+}
+
+/// A table's WHERE terms run over its sample together (decision 21).
+struct Sampled {
+    /// The terms' places in the WHERE clause.
+    terms: SmallVec<[usize; 8]>,
+    selectivity: f64,
 }
 
 pub(super) struct JoinedSetRows<'a> {
@@ -370,12 +379,25 @@ impl<'a> JoinedSetRows<'a> {
                         .is_some_and(|origin| origin.right_table() == joined.internal_id)
                         && never_true(&term.expr)
                 });
+            let sampled = if kind == Kind::Inner {
+                sampled_filters(
+                    joined,
+                    table_idx,
+                    table_constraints,
+                    where_clause,
+                    &homes,
+                    schema,
+                )
+            } else {
+                None
+            };
             tables.push(Table {
                 kind,
                 rows,
                 counted,
                 keys,
                 matches_none,
+                sampled,
             });
         }
         // A WHERE term no row passes (`WHERE NULL`) leaves no rows in any set, whether or not
@@ -552,11 +574,20 @@ impl<'a> JoinedSetRows<'a> {
             .filter(reads_a_table)
             .map(|(c, pair)| pair.unwrap_or(c.selectivity))
             .product();
+        // The terms its sample ran count once, together (decision 21).
+        let sampled = t
+            .sampled
+            .as_ref()
+            .filter(|_| classes.contains(&Class::Filter));
+        let in_sampled =
+            |c: &Constraint| sampled.is_some_and(|s| s.terms.contains(&c.where_clause_pos.0));
         alone
             * constraints_selectivity(
                 counted
                     .filter(|c| !reads_a_table(c))
-                    .map(|(constraint, _)| constraint),
+                    .map(|(constraint, _)| constraint)
+                    .filter(|constraint| !in_sampled(constraint)),
+                sampled.map(|s| s.selectivity),
                 self.params,
             )
     }
@@ -740,6 +771,124 @@ fn column_equality(
     };
     let (a, b) = (column(lhs)?, column(rhs)?);
     (a.0 != b.0).then_some((a, b))
+}
+
+/// The WHERE terms of `table` its sample runs, and the share of the sample they keep together
+/// (docs/design/planner.md, decision 21; PL.4): each term of the table's own WHERE whose only
+/// columns are the table's sampled ones, but for an `=` or IN list its column statistics
+/// estimate (decision 20), compiled once and run on each sample row within
+/// [SAMPLE_STEPS] steps for the table. Where at least [SAMPLE_HITS] rows pass them all, their share
+/// of the sample; where fewer do, the share of half a row or of the rows that pass, but no more
+/// than the terms' own estimates give by exponential backoff, so a rare value keeps its distinct
+/// count's estimate (decision 20). Each part falls as a term is added, so the whole never rises
+/// (CERT). `None` where the table has no sample or no term runs on it.
+///
+/// [SAMPLE_STEPS]: super::sample_filter::SAMPLE_STEPS
+/// [SAMPLE_HITS]: crate::column_stats::SAMPLE_HITS
+fn sampled_filters(
+    joined: &JoinedTable,
+    table_idx: usize,
+    constraints: &[Constraint],
+    where_clause: &[WhereTerm],
+    homes: &impl Fn(usize) -> Option<usize>,
+    schema: &Schema,
+) -> Option<Sampled> {
+    let btree = joined.table.btree()?;
+    let stats = schema.analyze_stats.table_stats(&btree.name)?;
+    let sample = stats.sample.as_deref()?;
+    let n = sample.rows.len();
+    if n == 0 {
+        return None;
+    }
+    let columns = joined.table.columns();
+    let in_sample: SmallVec<[Option<usize>; 16]> = columns
+        .iter()
+        .map(|c| {
+            let name = crate::util::normalize_ident(c.name.as_deref()?);
+            sample.columns.iter().position(|s| *s == name)
+        })
+        .collect();
+    let target = super::sample_filter::Target {
+        table: joined.internal_id,
+        columns,
+        in_sample: &in_sample,
+    };
+    let mut budget = super::sample_filter::SAMPLE_STEPS;
+    let mut terms: SmallVec<[usize; 8]> = SmallVec::new();
+    let mut own: SmallVec<[f64; 8]> = SmallVec::new();
+    let mut passing: Vec<bool> = vec![true; n];
+    for (pos, term) in where_clause.iter().enumerate() {
+        // A term no constraint homes (an OR of conjunctions, say) is this table's when it reads
+        // only this table's columns, which its program then holds.
+        let home = homes(pos);
+        if term.consumed
+            || !matches!(term.origin, WhereTermOrigin::Where)
+            || home.is_some_and(|home| home != table_idx)
+        {
+            continue;
+        }
+        // An `=` or IN list of constants on a column with a sketch keeps the estimate its column
+        // statistics give it (decision 20), which tells a common value from a rare one where a
+        // sample of 1,024 rows only counts it.
+        let by_column_stats = constraints.iter().any(|c| {
+            c.where_clause_pos.0 == pos
+                && c.lhs_mask.is_empty()
+                && matches!(
+                    c.operator,
+                    ConstraintOperator::AstNativeOperator(ast::Operator::Equals)
+                        | ConstraintOperator::In { not: false, .. }
+                )
+                && c.table_col_pos
+                    .and_then(|at| columns.get(at)?.name.as_deref())
+                    .is_some_and(|name| {
+                        stats
+                            .columns
+                            .contains_key(&crate::util::normalize_ident(name))
+                    })
+        });
+        if by_column_stats {
+            continue;
+        }
+        let Some(program) = target
+            .compile(&term.expr)
+            .filter(|program| home.is_some() || program.reads_a_column())
+        else {
+            continue;
+        };
+        let mut passes: Vec<bool> = Vec::with_capacity(n);
+        for row in &sample.rows {
+            match program.passes(row, &mut budget) {
+                Some(pass) => passes.push(pass),
+                None => break,
+            }
+        }
+        if passes.len() != n {
+            continue;
+        }
+        let hits = passes.iter().filter(|p| **p).count();
+        // The term's own estimate: its constraints' where it gives any, else its sample share.
+        let constrained = constraints
+            .iter()
+            .filter(|c| c.where_clause_pos.0 == pos && c.lhs_mask.is_empty() && !c.implied)
+            .map(|c| c.selectivity)
+            .reduce(f64::min);
+        own.push(constrained.unwrap_or_else(|| (hits as f64).max(0.5) / n as f64));
+        for (all, pass) in passing.iter_mut().zip(passes) {
+            *all &= pass;
+        }
+        terms.push(pos);
+    }
+    if terms.is_empty() {
+        return None;
+    }
+    let hits = passing.iter().filter(|p| **p).count();
+    let share = (hits as f64).max(0.5) / n as f64;
+    let selectivity = if hits >= crate::column_stats::SAMPLE_HITS {
+        share
+    } else {
+        share.min(super::sample_filter::backoff(&mut own))
+    };
+    Some(Sampled { terms, selectivity })
 }
 
 /// A column's domain, at least one and at most its table's `rows`, and whether it is a count: a

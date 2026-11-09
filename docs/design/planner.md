@@ -1099,3 +1099,84 @@ for the same name, uniform within 40 rows a tenth, and none past its byte bound.
 - A plan the new estimates move running slower than its parent's beyond the passes' spread.
 - ANALYZE of JOB's or TPC-H SF 10's database taking more than twice its parent's time, measured
   on the bench.
+
+## 21. A table's filters are estimated together on its sample, and otherwise combine by backoff
+
+**Decision.** PL.4 (docs/research/planner.md section 9, rank 4). When the planner sizes a joined
+set (`cardinality.rs`, `JoinedSetRows`), each inner table with a sample (decision 20) runs its own
+WHERE terms over the sample, once a prepare (`sampled_filters`). The share of the sample's rows
+that pass them all is their selectivity together: ranges, LIKE and GLOB, ORs of conjunctions,
+IS NULL and correlated columns at once. A term takes part when it reads only this table's
+sampled columns and constants. The evaluator (`optimizer/sample_filter.rs`) runs comparisons,
+BETWEEN, IN lists, LIKE and GLOB, IS NULL, AND, OR and NOT, with SQLite's comparison affinity
+and the BINARY, NOCASE and RTRIM collations. An `=` or IN list of constants on a column with a
+sketch keeps its column statistics' estimate (decision 20), which tells a common value from a
+rare one; the sample would only count it. So does any other term: a parameter, a function, a
+subquery, another table's column, or a term that raises an error on a sample row.
+
+Each term is compiled once into a flat program of at most 64 operations (a loop over an explicit
+stack, CLAUDE.md §11). Each table's terms run within 1,048,576 steps, an operation on a row each
+(§2); a term the budget no longer covers is left to the other estimates.
+
+Where at least ten sample rows pass the terms together, their share of the sample is the
+selectivity. Where fewer do, it is the share of the rows that pass, at least half a row's, but no
+more than the terms' own estimates combined by backoff. So a conjunction no sample row passes
+still takes its terms' statistics, and a rare value keeps its distinct count's estimate.
+
+A table's filters then combine by exponential backoff (`cost.rs`, `constraints_selectivity`), in
+place of their product: the sampled share, each range (a column bounded from both sides counts
+once, as `sel_closed_range`), each LIKE and each other filter. The most selective counts whole,
+the next at its square root, then its fourth root and its eighth; the rest are taken as correlated
+with these. Equalities, IN lists and terms that read another table still multiply: their
+selectivities come from `sqlite_stat1`'s prefixes and the sketches' distinct counts, by which a
+whole key's equalities give its one row.
+
+No added term raises an estimate, as CERT requires. A term's treatment depends on its own form,
+not on the others. A term added to the sampled ones passes no row the others don't, so their share
+falls; across the ten-row line it falls below ten rows' share. Backoff never rises with an added
+selectivity: placed k-th, it multiplies by s^(e_k), and each selectivity it moves down a place,
+none more selective than it, by at most s raised to the exponent that one loses; those losses sum
+to at most e_k (`backoff`'s unit test). The other estimates multiply.
+
+**Why.** At step 3, TPC-H SF 10's q19 part, an OR of three conjunctions, was estimated at 1.2
+rows against 239,849, and q06's lineitem, three ranges, was off by 1.9e+03. With its keyword
+prefixes exact, JOB's first tables kept a q-error p95 of 66.3 from their LIKE and range filters.
+Each range took a fixed 0.4, a closed range 0.005 and a LIKE 0.2, all multiplied as if
+independent; an OR no constraint takes was not counted at all.
+
+**Sources.**
+- Microsoft Learn, Cardinality Estimation (SQL Server), on CE 120 and higher: "Partially
+  correlated (default for CE120 and higher), where cardinality is calculated using a variation on
+  exponential backoff, ordering the selectivities from most to the least selective predicate"
+  (f17, A). The exponents 1, 1/2, 1/4 and 1/8 over the four most selective are those
+  docs/research/planner.md rank 4 gives for CE 120. They were not checked against Microsoft's own
+  text here, and the bench is what tests them.
+- Oracle's dynamic statistics (f13, D: graded for Han et al.'s counterclaim on sampling across
+  joins, which this sample of one table is not): "The database uses recursive SQL to scan a small
+  random sample of table blocks", at parse time, for the same conjunctions.
+- CERT (Ba and Rigger, ICSE 2024; f21, A): a more restrictive query's estimate should not exceed
+  the original's.
+
+**Evidence.** `crates/engine/tests/sample_filters.rs`, red at 885bda9 and green with the change:
+- `q06s_ranges_are_estimated_together_on_the_sample` (AC-PL.4.2): 0.2 estimated against 339 counted
+  on the parent; within 2 with the change.
+- `a_like_is_estimated_on_the_sample` (AC-PL.4.2): 1,600 against 2,494 on the parent; within 1.5.
+- `correlated_columns_are_estimated_together` (audit row 5): 1,600 against 5,000 on the parent;
+  within 1.25.
+- `q19s_or_of_conjunctions_is_estimated_on_the_sample` (AC-PL.4.1): 4,627.7 against 611 on the
+  parent; within 2.
+- `a_filter_made_more_restrictive_never_raises_its_estimate` (T-PL.4.1): 400 random conjunctions,
+  with the sample and without statistics, each given one more term. None rises, and more than 200
+  fall.
+- `backoff_never_rises_with_an_added_selectivity` (unit, T-PL.4.1).
+- Decision 20's tests and `records_plans`' whole-key lookup pass, the latter because equalities
+  multiply.
+
+**Falsified by.**
+- q19's part off by more than 10 at SF 10, or q19 no faster once its part's estimate is near its
+  count.
+- q06's lineitem off by more than 2.
+- JOB's first tables' q-error p95 not under 20.
+- JOB's median planning time over twice step 3's 1.9 ms (the sample's run, at most 1,048,576 steps
+  a table, is the cost to watch).
+- A CERT failure in the oracles.
