@@ -490,6 +490,8 @@ struct Against {
     generation: u32,
     upto: u64,
     most: usize,
+    /// Deltas in a row the generation's format allows (`packed::most_deltas`).
+    deepest: u8,
 }
 
 /// Amphora: a read of pages from packed records (`WalFile::begin_read_record`): each page's
@@ -4054,6 +4056,7 @@ impl WalFile {
             generation: header.checkpoint_seq,
             upto: self.max_frame.load(Ordering::Acquire),
             most: page_size,
+            deepest: packed::most_deltas(header.file_format),
         };
         let len = pages
             .len()
@@ -4197,7 +4200,9 @@ impl WalFile {
     /// it, and the chain's deltas, this one included, take less than the page (`against.most`,
     /// decision 17). Past that the image costs the log less than the deltas a read would apply;
     /// within it a read applies less than a page of deltas to the image, so it decodes under
-    /// twice an image's bytes. The depth field's width (`packed::MOST_DELTAS`) bounds it besides.
+    /// twice an image's bytes. The generation's format bounds the depth besides
+    /// (`packed::most_deltas`: 8 in a generation begun before 2026-11-11, which older binaries
+    /// read, else the depth field's width).
     fn delta(
         &self,
         page: u32,
@@ -4207,7 +4212,7 @@ impl WalFile {
         tail: usize,
         against: &Against,
     ) -> Option<(u8, u32, Vec<u8>)> {
-        if version.generation != against.generation || version.depth == packed::MOST_DELTAS {
+        if version.generation != against.generation || version.depth >= against.deepest {
             return None;
         }
         if self

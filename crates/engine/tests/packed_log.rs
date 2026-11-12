@@ -14,8 +14,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// The log header's file format for a packed generation, a mixed one and SQLite's one page a frame.
-const PACKED_FORMAT: u32 = 0x414d_5002;
-const MIXED_FORMAT: u32 = 0x414d_5003;
+const PACKED_FORMAT: u32 = 0x414d_5004;
+const MIXED_FORMAT: u32 = 0x414d_5005;
+/// The packed format whose chains end at 8 deltas in a row, as binaries before 2026-11-11 begin
+/// generations (decision 17).
+const PACKED_EIGHT_FORMAT: u32 = 0x414d_5002;
 const PAGE_FORMAT: u32 = 3_007_000;
 /// A mixed generation's mark of a record's first slot.
 const RECORD_HEAD: u32 = 0x8000_0000;
@@ -618,6 +621,76 @@ fn records_and_frames(wal: &[u8]) -> (Vec<(usize, u32)>, usize) {
     (found, frames)
 }
 
+/// Stamps the log at `path` with `format` in its header, and chains the header's and every
+/// frame's checksums again from it, as a binary that began the generation so would have written
+/// them.
+fn restamp(path: &Path, format: u32) {
+    let mut wal = std::fs::read(wal_path(path)).unwrap();
+    let big_endian = u32::from_be_bytes(wal[0..4].try_into().unwrap()) & 1 == 1;
+    wal[4..8].copy_from_slice(&format.to_be_bytes());
+    let mut seed = checksum(&wal[0..24], (0, 0), big_endian);
+    wal[24..28].copy_from_slice(&seed.0.to_be_bytes());
+    wal[28..32].copy_from_slice(&seed.1.to_be_bytes());
+    let frame = FRAME_HEADER + PAGE;
+    let mut at = HEADER;
+    while at + frame <= wal.len() {
+        let header = checksum(&wal[at..at + 8], seed, big_endian);
+        seed = checksum(&wal[at + FRAME_HEADER..at + frame], header, big_endian);
+        wal[at + 16..at + 20].copy_from_slice(&seed.0.to_be_bytes());
+        wal[at + 20..at + 24].copy_from_slice(&seed.1.to_be_bytes());
+        at += frame;
+    }
+    std::fs::write(wal_path(path), &wal).unwrap();
+}
+
+/// Do: begin a packed generation; then stamp a log's header with the format of 8 deltas in a row
+/// (0x414d_5002, as a binary before 2026-11-11 began it), reopen it, change a byte of the same
+/// rows thirty times, and read them back. Expect: a generation begun now takes 0x414d_5004, so an
+/// older binary refuses it as a format it doesn't know, naming the value, never as corrupt; the
+/// restamped generation keeps its format and its chains end at 8, so an older binary still reads
+/// it; every row as last written (decisions 16 and 17, 2026-11-11; AC-T1.4.4).
+#[test]
+fn a_generation_keeps_the_chain_bound_of_the_format_it_began_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("eight.db");
+    let mut want;
+    {
+        let db = open(&path);
+        db.wal_format(LogFormat::Packed).unwrap();
+        let conn = connect(&db);
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)")
+            .unwrap();
+        want = insert(&conn, 0..300, 500, false);
+        assert_eq!(wal_format(&path), PACKED_FORMAT);
+    }
+    restamp(&path, PACKED_EIGHT_FORMAT);
+    let db = open(&path);
+    let conn = connect(&db);
+    assert_eq!(table(&conn), want);
+    let mut update = conn.prepare("UPDATE t SET body = ? WHERE id = ?").unwrap();
+    for round in 0..30u8 {
+        conn.execute("BEGIN").unwrap();
+        for row in want.iter_mut().filter(|(id, _)| *id % 3 == i64::from(round % 3)) {
+            row.1[usize::from(round) * 7 % 500] = round;
+            update.reset().unwrap();
+            update
+                .bind_at(NonZero::new(1).unwrap(), Value::from_slice(&row.1).unwrap())
+                .unwrap();
+            update
+                .bind_at(NonZero::new(2).unwrap(), Value::from_i64(row.0))
+                .unwrap();
+            update.run_ignore_rows().unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+    }
+    assert_eq!(wal_format(&path), PACKED_EIGHT_FORMAT, "the generation kept its format");
+    let entries = entries(&std::fs::read(wal_path(&path)).unwrap());
+    let deepest = entries.iter().map(|(_, _, depth, _)| *depth).max().unwrap();
+    assert!(deepest >= 2, "deltas at all: {deepest}");
+    assert!(deepest <= 8, "a chain of {deepest} in a generation of 8 at most");
+    assert_eq!(table(&connect(&db)), want);
+}
+
 /// Do: open a packed log whose last record's checksums are recomputed after its payload was
 /// damaged, so they hold but it doesn't decode. Expect: the database is refused as corrupt, not
 /// opened with that commit (or any) quietly dropped.
@@ -787,7 +860,7 @@ fn a_log_of_a_format_not_known_is_refused() {
     }
     let mut wal = std::fs::read(wal_path(&path)).unwrap();
     let big_endian = u32::from_be_bytes(wal[0..4].try_into().unwrap()) & 1 == 1;
-    wal[4..8].copy_from_slice(&0x414d_5004u32.to_be_bytes());
+    wal[4..8].copy_from_slice(&0x414d_5006u32.to_be_bytes());
     let (c1, c2) = checksum(&wal[0..24], (0, 0), big_endian);
     wal[24..28].copy_from_slice(&c1.to_be_bytes());
     wal[28..32].copy_from_slice(&c2.to_be_bytes());

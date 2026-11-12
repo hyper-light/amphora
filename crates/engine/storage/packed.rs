@@ -27,12 +27,35 @@ use crate::Result;
 /// The log header's file format for a generation of one page a frame (SQLite's).
 pub(crate) const PAGE_FORMAT: u32 = 3_007_000;
 
-/// The log header's file format for a packed generation.
+/// The log header's file format for a packed generation whose chains end at [`EIGHT_DELTAS`] in a
+/// row (decision 17, to 2026-11-11): read as ever, and written so while a generation begun so
+/// goes on, so a binary from before reads it.
 pub(crate) const PACKED_FORMAT: u32 = 0x414d_5002;
 
 /// The log header's file format for a mixed generation: page frames and records side by side
-/// (Amphora's docs/design/store.md, decision 37).
+/// (Amphora's docs/design/store.md, decision 37), its chains ending at [`EIGHT_DELTAS`].
 pub(crate) const MIXED_FORMAT: u32 = 0x414d_5003;
+
+/// The packed format whose chains end where their bytes reach a page (decision 17, 2026-11-11):
+/// what a generation begins with now. A binary from before refuses it as a format it doesn't
+/// know, naming the value, never reads it as corrupt.
+pub(crate) const PACKED_CHAINS_FORMAT: u32 = 0x414d_5004;
+
+/// The mixed format whose chains end where their bytes reach a page (decision 17, 2026-11-11).
+pub(crate) const MIXED_CHAINS_FORMAT: u32 = 0x414d_5005;
+
+/// Deltas in a row at most in a generation of [`PACKED_FORMAT`] or [`MIXED_FORMAT`]: those
+/// formats' bound, to which binaries from before 2026-11-11 hold what they read.
+pub(crate) const EIGHT_DELTAS: u8 = 8;
+
+/// Deltas in a row at most in a generation of `file_format`: [`EIGHT_DELTAS`] in the formats of
+/// before, the depth field's width ([`MOST_DELTAS`]) in those of chains ended by their bytes.
+pub(crate) fn most_deltas(file_format: u32) -> u8 {
+    match file_format {
+        PACKED_FORMAT | MIXED_FORMAT => EIGHT_DELTAS,
+        _ => MOST_DELTAS,
+    }
+}
 
 /// The page-number field of a record's slots after its first.
 pub(crate) const CONTINUATION: u32 = u32::MAX;
@@ -55,18 +78,18 @@ impl LogFormat {
     pub(crate) fn of(file_format: u32) -> Option<Self> {
         match file_format {
             PAGE_FORMAT => Some(Self::Pages),
-            PACKED_FORMAT => Some(Self::Packed),
-            MIXED_FORMAT => Some(Self::Mixed),
+            PACKED_FORMAT | PACKED_CHAINS_FORMAT => Some(Self::Packed),
+            MIXED_FORMAT | MIXED_CHAINS_FORMAT => Some(Self::Mixed),
             _ => None,
         }
     }
 
-    /// The log header's file format for this format.
+    /// The log header's file format a generation of this format begins with.
     pub(crate) fn file_format(self) -> u32 {
         match self {
             Self::Pages => PAGE_FORMAT,
-            Self::Packed => PACKED_FORMAT,
-            Self::Mixed => MIXED_FORMAT,
+            Self::Packed => PACKED_CHAINS_FORMAT,
+            Self::Mixed => MIXED_CHAINS_FORMAT,
         }
     }
 
@@ -1032,6 +1055,12 @@ mod tests {
         for format in [LogFormat::Pages, LogFormat::Packed, LogFormat::Mixed] {
             assert_eq!(LogFormat::of(format.file_format()), Some(format));
         }
-        assert_eq!(LogFormat::of(0x414d_5004), None);
+        assert_eq!(LogFormat::of(PACKED_FORMAT), Some(LogFormat::Packed));
+        assert_eq!(LogFormat::of(MIXED_FORMAT), Some(LogFormat::Mixed));
+        assert_eq!(most_deltas(PACKED_FORMAT), EIGHT_DELTAS);
+        assert_eq!(most_deltas(MIXED_FORMAT), EIGHT_DELTAS);
+        assert_eq!(most_deltas(PACKED_CHAINS_FORMAT), MOST_DELTAS);
+        assert_eq!(most_deltas(MIXED_CHAINS_FORMAT), MOST_DELTAS);
+        assert_eq!(LogFormat::of(0x414d_5006), None);
     }
 }

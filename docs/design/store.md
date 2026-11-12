@@ -455,7 +455,9 @@ commit; the slots' checksums chain as frames' do, and every page of a record map
 slot, so frame numbers keep their meaning for read marks, backfill, the durable mark (decision 15)
 and restarts. The log header's file format says which a generation is, and a generation keeps the
 format it began with, so a log is always read as it was written and a page-a-frame log from before
-reads as ever. Records are kept decoded (4 MiB a database, the oldest dropped first past that; the
+reads as ever. Packed generations begun since 2026-11-11 carry 0x414d_5004, mixed ones 0x414d_5005
+(decision 17's chains ended by their bytes); 0x414d_5002 and 0x414d_5003 are read and continued as
+before, and an older binary refuses the new values by name; to downgrade, checkpoint first. Records are kept decoded (4 MiB a database, the oldest dropped first past that; the
 writer keeps those it writes), the checkpoint reads a record once for all the pages it copies from
 it, and recovery reads record by record: a record whose slots don't all hold ends the log there, as
 a torn frame does; one whose slots all hold but that doesn't decode refuses the log, since no torn
@@ -571,6 +573,17 @@ packed above the generation in `PageInner::logged_as`). The engine's test
 (`packed_log.rs`, `pages_changed_again_and_again_*`) makes the same rows change a byte thirty times
 and checks the log holds chains deeper than 8 (red at the old bound: "chains of small deltas end at
 8") whose deltas' bytes, page by page, stay under a page.
+
+Chains past 8 come with new header format values (Amphora agent, 2026-11-12; CLAUDE.md §3, formats
+change append-only): a generation begun now is `packed::PACKED_CHAINS_FORMAT` (0x414d_5004) or
+`MIXED_CHAINS_FORMAT` (0x414d_5005). A generation begun under 0x414d_5002 or 0x414d_5003 keeps its
+format, and its chains keep that format's bound of 8 (`packed::most_deltas`), so a binary from
+before still reads it. A binary from before refuses a log of the new values as a format it doesn't
+know, naming the value ("the log's format 0x414d5004 isn't known"), never as corrupt. The remedy for
+that refusal, a downgrade, is a checkpoint that empties the log on the newer binary first.
+`a_generation_keeps_the_chain_bound_of_the_format_it_began_with`: a generation begun now takes
+0x414d_5004 (red: 0x414d_5002), and one restamped 0x414d_5002 keeps its format, with chains of at most
+8.
 
 What the bytes rule doesn't price is the number of records a cold read decodes: a chain of small
 deltas may reach 255 records back, each read once and kept decoded (decision 16's 4 MiB). If a
