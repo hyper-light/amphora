@@ -1852,7 +1852,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                     .log_bytes(frames.saturating_mul(log_bound::FRAME_BYTES));
                 self.control
                     .meter
-                    .log_bound_bytes(pass.room.saturating_mul(log_bound::FRAME_BYTES));
+                    .log_limit_bytes(pass.room.saturating_mul(log_bound::FRAME_BYTES));
                 let past = frames > pass.room;
                 let due = past || (frames > 0 && self.spacing.due()?);
                 if hold_due(pass, due, past) {
@@ -12214,7 +12214,7 @@ mod tests {
     }
     /// The frames owner `owner`'s database log may hold, as it last learned them.
     fn room(clients: &[Client], owner: usize) -> u64 {
-        clients[owner].handle().counters().database_log_bound_bytes / log_bound::FRAME_BYTES
+        clients[owner].handle().counters().database_log_limit_bytes / log_bound::FRAME_BYTES
     }
 
     /// AC-T1.8.D1, T-T1.8.D1 (replication.md, "A replica's database log bounded by what it

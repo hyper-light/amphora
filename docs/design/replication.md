@@ -1703,7 +1703,7 @@ log, a replica having two logs):
 
 | panel | PromQL | kiln |
 |---|---|---|
-| Database log (bytes), against its bound (the next section) | `max by (instance, db) (amphora_replica_database_log_bytes)` and `max by (instance, db) (amphora_replica_database_log_bound_bytes)` | `max:amphora_replica_database_log_bytes{$host} by {host,db}` and `max:amphora_replica_database_log_bound_bytes{$host} by {host,db}` |
+| Database log against its limit (bytes; the next section) | `max by (instance, db) (amphora_replica_database_log_bytes)` and `max by (instance, db) (amphora_replica_database_log_limit_bytes)` | `max:amphora_replica_database_log_bytes{$host} by {host,db}` and `max:amphora_replica_database_log_limit_bytes{$host} by {host,db}` |
 | Checkpoint seconds p50 / p99 | `histogram_quantile(0.5 / 0.99, sum by (le, db) (rate(amphora_replica_checkpoint_seconds_bucket[5m])))` | `p50:` and `p99:amphora_replica_checkpoint_seconds{$host} by {db}` |
 | Checkpoints/s | `sum by (db) (rate(amphora_replica_checkpoint_seconds_count[5m]))` | `count:amphora_replica_checkpoint_seconds{$host} by {db}` |
 | Database log restarts/s, bars | `sum by (db) (rate(amphora_replica_database_log_restarts_total[5m]))` | `sum:amphora_replica_database_log_restarts_total{$host} by {db}.as_count()` |
@@ -1880,9 +1880,11 @@ On adas-mac-studio.local-2 (macOS aarch64), 2026-11-11; the core's tests in `dat
 
 ### Metrics
 
-One gauge more in the replica meter (`meter::REPLICA_METRICS`), asked of Kiln Metrics under
-`amphora-log-bound/names/v1`: `amphora_replica_database_log_bound_bytes`, the room H as the owner last learned it, in
-bytes (frames × 4,120). The dashboard's "Database log against its bound" row plots it beside
+One gauge more in the replica meter (`meter::REPLICA_METRICS`), agreed by Kiln Metrics under
+`amphora-log-bound/names/v1` (2026-11-12): `amphora_replica_database_log_limit_bytes`, the room H as the owner last
+learned it, in bytes (frames × 4,120). It is the name amphora-replica-log/names/v1 reserved for an exported bound,
+`_limit` as Kiln Metrics names the set's other bound. The dashboard's "Database log against its limit" row (unit B) plots it
+beside
 `amphora_replica_database_log_bytes` (the table above). Restart spacing reads from
 `amphora_replica_database_log_restarts_total`'s rate.
 
