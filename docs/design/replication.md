@@ -1733,3 +1733,135 @@ log, a replica having two logs):
 - a persisted owner that flushes an ordinary entry's database log on its own thread, or an acknowledged write lost
   after a power cut in the persisted class (the power-cut nemesis);
 - terms that move as often under the same load after the change as before.
+
+## A follower's write under steady leader writes: the write slot (decided 2026-11-12, Amphora goal 9c63f7d4)
+
+Ada's word (2026-11-12, through the Amphora agent): G now, and D later as a goal of its own on G's slot. Design
+agreed by amphora-seam-owner-2 under `amphora-owner-t1-g-slot-design-20261111`, which kept the previous owner's four
+points (`amphora-owner-t1-write-starve-044c44f-20261109`) and ruled on three more. Sources:
+docs/research/follower-write-starvation.md (f1 to f21). The A/B, made on t1/write-starve at 044c44f with the
+prototypes that stay there: bench/records/2026-11-07-write-starve-model.md (a model, simulated time),
+2026-11-09-write-starve-driven.md (the prototypes on the driven harness), 2026-11-09-write-starve-kiln-leg.md (kiln's
+real-process promotion test, debug). The Amphora agent's release leg (kiln 7ad48c5, cec37f60, five interleaved
+rounds): today's rule promoted no runner of 5, `write_again` 64 to 256; the prototype of G promoted 5 of 5 with no
+unknown outcome, but each runner's `write_again` still reached 4 to 8.
+
+**The finding.** A prepared write applies only if the entry before it is its base (`replication::on_base`, f1). A
+follower's write reaches the leader's log a ReadIndex round, its preparation and half a round trip after the leader's
+own would, so under steady leader writes it is refused round after round, and kiln re-runs it until its deadline
+(f3).
+
+**The rule.** The kind of slot Kung and Robinson prescribe for a transaction that keeps failing validation (f6), as
+the fallback of an optimistic rule, MOCC-style (f7). Once one of a member's writes is refused, that member is queued,
+and its next barrier (its ReadIndex) waits at the leader for its slot. While a member holds the slot, the leader
+appends nothing of its own and holds the other members' forwards, until the holder's next forward arrives or the
+slot's length passes. Today's exact base stays the only admission rule: no entry format, wire or engine change. The
+pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `start_slot`, `step_forward`,
+`step_ready`).
+- *When a member is queued.* At the leader's append of its refused entry, not at that entry's commit or apply. The
+  verdict is a function of the entry and the entry before it (`replication::verdict`), so the append decides the
+  refusal its commit will decide. A leader never displaces an entry of its own term (Raft's Leader Append-Only
+  property, Ongaro and Ousterhout, USENIX ATC 2014, figure 3), and the queue dies with the term, so no displaced entry
+  queues a member (the ruling's Q2 a). The leader's apply can lag its commit (hyper-durable's R-6 isn't built), so the
+  prototype, which held its slot from its apply, could let the leader's next write in ahead of the retry.
+- *When a slot starts.* When the queued member's next barrier arrives and its turn comes, not at the refusal. This
+  departs from the agreed design, which started the slot at the refusal's commit; the code notice asks for the
+  ruling. A slot started at the refusal holds the leader for a member that may never come back: a caller that
+  doesn't retry, or a floor keeper that retries only once the applied index moves, which a held leader stops. Such a
+  slot can only expire, and the late retry it then measures teaches a longer slot, feeding back toward the ceiling.
+  Started at the barrier, a member that never comes back never holds the leader, and the measured gap is the retry
+  alone: from its barrier's start to its forward. The holder's second barrier before any forward means its slot's
+  work was no write (a read, or a write that prepared nothing), and the slot ends `released`.
+- *What a slot holds* (Q1). Everything the leader would append between the holder's base and its retry: its own
+  writes and floor sessions (`prepare` defers them, `slot_deferred`), its class entry (`propose_class`), and other
+  members' forwarded proposals, held after the sender and origin checks. A change of members or a hand-off ends the
+  slot `released`, since membership doesn't wait on one member's retry; no slot starts while either, or a bootstrap,
+  is under way. The forwards stepped at a slot's end were mostly prepared on an older base, and are refused: correct,
+  since each such member then joins the queue (Q1 d).
+- *The holder's barrier* (Q2 b). A ReadIndex answers the leader's commit, not its last index, and a follower whose
+  progress is probing or paused may not have been sent the entries between. So the leader steps the holder's
+  ReadIndex only once its commit reaches the last index it had as the slot began. It appends nothing after that, so
+  the commit gets there. Every write a follower makes then prepares at its log tail: the floor session's rule, now a
+  follower's every write's (`Actor::tail`). The leader's own writes keep today's rule. With the tail rule at the
+  leader too, the driven runs refuse the leader's writes at most once in a row (against up to 8 without it), and the
+  tail rule alone keeps W1's follower to one refusal in a row. But two floor tests,
+  `a_raise_beside_a_change_holds_through_a_lost_lead` and `a_raise_whose_base_is_joint_is_refused`, rest on a
+  leader write prepared beside an entry in flight, and the change is beyond what G was agreed to change. It stays a
+  question for its own decision.
+- *More than one starving member* (point 2). A queue, each member at most once; slots go to the queued members in
+  the order their barriers arrive, each barrier waiting at the leader until its turn. Between two slots the leader
+  gets its own turn: one preparation, if it has a write to prepare, before the next slot starts. So the leader waits
+  at most one slot between its writes, and a member's barrier waits at most (members − 1) slots. A second forward from a member
+  whose first is held ends the slot `released`, and both are stepped in order (Q1 a), since stepping only the first
+  would append an entry ahead of the holder's retry. It is a new write: each owner forwards one at a time, so the
+  first one's caller has been answered by then.
+- *Elections and members* (point 1). Slots are leader-local and belong to one term. When the term changes or the lead
+  is lost, the slot ends `released`, its holds and the waiting barriers step into the core as they would have on
+  arrival (today's "A forward that meets an election"), and the queue is forgotten. A change of members or a hand-off
+  does the same within the term. A member that leaves the configuration, or that the host's detector suspects,
+  leaves the queue, its waiting barrier steps, and its slot ends `released`.
+
+**The slot's length is learned, not picked** (Q3; Ada's rule, 2026-11-11). It is learned the way the quorum patience
+learns quorum gaps (`patience`), and adds no number. For each member, the leader measures the gap from the start of
+that member's slot to its next forward, and keeps the longest gap of this generation and of the one before
+(`patience::GENERATION`, 30 s). A member's slot is the larger of those two. A retry that arrives after its slot expired
+is still measured, so an expiry teaches the next slot rather than censoring it. Before a member's first measured gap,
+its slot is the core's election timeout in the owner's ticks (`election_tick × TICK`), the derived first value. A gap
+past `patience::QUORUM_CEILING` (owner-stalls.md's measured quorum tail) is refused, typed (`slot::Unmeasured`), and
+not learned: a member that slow is gone, not slow. TICK and the twenty-tick election timeout are the pinned core's
+documented tick mode, not measured. They are noted for amphora-constants, and the slot inherits them only as its
+first value.
+
+**Why the prototype's runners still retried 4 to 8 times.** (a) It had a single slot, which the last refused member
+overwrote, and nothing held the other members' forwards, so kiln's two runners refused each other in turn. (b) Its
+length was a fixed 200 ms. (c) It held the slot from the leader's apply. The queue and held forwards close (a), the
+learned length closes (b), and the queue at append with the held barrier closes (c). The `ended` label tells (a) and
+(b) apart in a run: a slot lost to time ends `expired`.
+
+**Bounds.** The queue, the waiting barriers, the learned gaps and the held forwards are each at most one per member
+of the configuration (at most `MEMBERS`): the owner keeps them to its members each step (`Slots::keep`), and a second
+barrier from a member whose first still waits steps the first. The held messages number at most (members − 1)
+forwards plus one ReadIndex per member. Each keeps its admission reservation, so its
+bytes, at most `MESSAGE_BYTES` each, stay charged to the inbound queue (`QUEUED_BYTES`) until stepped. The `ready`
+queue holds what one end released and is drained in the same step.
+
+**Metrics** (CLAUDE.md section 10), in the replica meter (`meter::REPLICA_METRICS`), names sent to Kiln Metrics under
+`g-slot-metric-names-v2-20261111`:
+- `amphora_replica_write_slot_holds_total`, a counter, by `ended`, a closed set (`meter::SlotEnd`): `forwarded` (the
+  holder's next forward arrived and was stepped first), `expired` (its learned length passed first), `released` (the
+  lead or term ended, the member left or was suspected, a change or a hand-off began, or a held member forwarded
+  again);
+- `amphora_replica_write_slot_held_seconds_total`, a counter: the seconds the leader's own writes were held for
+  slots;
+- `amphora_replica_write_slot_seconds`, a gauge: the length of the slot the leader last began.
+Each end is an event on `amphora.replication`, `event = "write_slot"` (debug), with the member, how it ended and
+`held_ms`. Dashboard rows, in the group **Amphora replicated class**:
+
+| panel | PromQL | kiln |
+|---|---|---|
+| Write slots/s, by how each ended, stacked | `sum by (db, ended) (rate(amphora_replica_write_slot_holds_total[5m]))` | `sum:amphora_replica_write_slot_holds_total{$host} by {db,ended}.as_count()` |
+| The leader's share of time held for slots | `sum by (db) (rate(amphora_replica_write_slot_held_seconds_total[5m]))` | `sum:amphora_replica_write_slot_held_seconds_total{$host} by {db}.as_rate()` |
+| The learned slot length | `max by (instance, db) (amphora_replica_write_slot_seconds)` | `max:amphora_replica_write_slot_seconds{$host} by {host,db}` |
+
+**Requirements and tests.** AC-T1.8.W1 (docs/requirements.toml):
+- T-T1.8.W1, `a_refused_follower_write_lands_on_its_next_try_under_the_slot`;
+- T-T1.8.W2, `two_followers_and_a_leader_writing_steadily_all_commit_within_their_deadlines`;
+- T-T1.8.W3, `a_follower_retry_racing_the_slots_start_lands_on_its_next_try`, red with the tail rule alone;
+- T-T1.8.W4, the core's own tests in `database::slot` (the queue and turn, the held forwards, a second forward, expiry
+  and a late retry learned, the ceiling, generations, the term and members, the held barrier).
+W1 and W2 run Elle's list-append checks (f21) on every history: replicas equal, each list its serial replay, and no
+G0, G1c or G2 cycle.
+
+Falsified by:
+- a non-serializable history under the slot, on the driven harness or in kiln;
+- a follower's write refused more than (members − 1) times in a row under steady writes, or kiln's `write_again`
+  above that, once the learned length has a generation of measurements;
+- an `expired` share of a member's slots above 1/(n + 1) beyond its binomial 99% interval, where n is the number of
+  that member's retries measured in the generations its length rests on. The longest of n exchangeable gaps is
+  exceeded by the next with probability 1/(n + 1) (the rank of a new draw among n + 1 is uniform; David and
+  Nagaraja, *Order Statistics*, 3rd ed., Wiley, 2003), so a higher share means the retries aren't exchangeable
+  across a generation and the learned length doesn't fit them;
+- the leader's held seconds, as a share of its time, costing it more of its write rate than the model's 0.32 for G
+  (bench/records/2026-11-07-write-starve-model.md) at the release benchmarks' rates and round trips;
+- a leader that holds its writes past a member's learned length for a write that never comes, or at all for a
+  member that never comes back after its refusal.

@@ -42,6 +42,7 @@ pub(crate) mod remote;
 pub(crate) mod replicated;
 mod restore;
 pub(crate) mod session;
+mod slot;
 mod watch;
 pub use guards::Guards;
 pub(crate) use guards::Owned;

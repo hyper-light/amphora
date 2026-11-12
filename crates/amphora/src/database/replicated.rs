@@ -560,15 +560,21 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     // Whether the floor session in hand is a request to attest again, and how this owner's
     // requests ended: applied, or refused by the stale-base rule and proposed again on a later pass.
     floor_requesting: bool,
-    // A floor session past its barrier, waiting for this member to apply its own log up to the
-    // last index it held as the barrier passed.
-    floor_tail: Option<u64>,
+    // A floor session, or a follower's write, past its barrier, waiting for this member to apply
+    // its own log up to the last index it held as the barrier passed.
+    tail: Option<u64>,
     floor_requests_applied: u64,
     floor_requests_stale: u64,
     // The floor version this owner last published, none before its first: a raise is it rising.
     floor_published: Option<u32>,
     // At most COMMANDS admitted operations wait behind the sole prepared transaction.
     waiting: VecDeque<Envelope>,
+    // The leader's write slot (replication.md, "A follower's write under steady leader writes"):
+    // the members whose writes it refused, queued, and the forwards and barrier it holds, each
+    // still charged to the inbound queue by its reservation; and whether this leader's own
+    // preparation waits on a slot.
+    slots: super::slot::Slots<(Message, Reservation)>,
+    slot_deferred: bool,
     serial: u64,
     // Every time this owner reads comes from this clock (replication.md, "The owner's time").
     clock: Clock,
@@ -1159,6 +1165,23 @@ fn open(
     )
 }
 
+/// The write slot's bounds, stated from the quorum patience's (`patience`), so the slot adds no
+/// number of its own: a member's first slot is the core's election timeout in this owner's ticks,
+/// a retry slower than the patience's measured ceiling is not learned, and a learned gap is
+/// believed for the patience's generations.
+fn slot_bounds(election_tick: usize) -> Result<super::slot::Bounds, Refusal> {
+    let ticks = |count: Option<u32>| {
+        count
+            .and_then(|count| TICK.checked_mul(count))
+            .ok_or_else(|| fenced("the write slot's bounds overflowed"))
+    };
+    Ok(super::slot::Bounds {
+        election: ticks(u32::try_from(election_tick).ok())?,
+        ceiling: ticks(u32::try_from(super::patience::QUORUM_CEILING).ok())?,
+        generation: ticks(u32::try_from(super::patience::GENERATION).ok())?,
+    })
+}
+
 /// [`open`] past its machine and its log's device: `file` is the system's device file, or a
 /// test's simulated one (hyper-block's `SimHandle`), whose power the test can cut.
 #[allow(clippy::too_many_arguments)]
@@ -1221,6 +1244,7 @@ fn open_on<F: BlockFile + 'static>(
         meter,
         local,
     });
+    let slots = super::slot::Slots::new(slot_bounds(replica.core().raft.config().election_tick)?);
     let (sender, receiver) = mpsc::sync_channel(COMMANDS);
     let at = clock();
     let mut actor = Actor {
@@ -1244,11 +1268,13 @@ fn open_on<F: BlockFile + 'static>(
         floor_ended: 0,
         floor_failures: 0,
         floor_requesting: false,
-        floor_tail: None,
+        tail: None,
         floor_requests_applied: 0,
         floor_requests_stale: 0,
         floor_published: None,
         waiting: VecDeque::new(),
+        slots,
+        slot_deferred: false,
         serial: 0,
         transferred: None,
         answers: patience::Answers::default(),
@@ -1653,7 +1679,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         self.bootstrap()?;
         self.propose_class()?;
         self.keep_class_gate()?;
-        if self.floor_tail.is_some() {
+        self.keep_slots()?;
+        if self.tail.is_some() || self.slot_deferred {
             self.prepare()?;
         }
         self.keep_floor()?;
@@ -1957,7 +1984,7 @@ impl<F: BlockFile + 'static> Actor<F> {
     fn receive(&mut self, envelope: Envelope) -> Result<(), Refusal> {
         let Envelope {
             command,
-            _reservation,
+            _reservation: reservation,
         } = envelope;
         match command {
             Input::Receive {
@@ -1969,7 +1996,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 let result = if self.at >= until {
                     Err(Refusal::Timeout)
                 } else {
-                    self.step(from, &bytes)
+                    self.step(from, &bytes, reservation)
                 };
                 let fatal = matches!(&result, Err(Refusal::Fenced(_)));
                 let error = result.as_ref().err().cloned();
@@ -2020,7 +2047,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                                 until,
                                 response,
                             },
-                            _reservation,
+                            _reservation: reservation,
                         });
                     }
                 } else {
@@ -2042,7 +2069,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                                 author: Author::Application(application),
                                 response: Some(response),
                                 phase: Phase::Barrier(Some(operation)),
-                                _reservation,
+                                _reservation: reservation,
                             })
                         }
                         Err(error) => answer(response, Err(raft_error(error))),
@@ -2078,7 +2105,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                                 change,
                                 stage: Stage::Barrier,
                                 response,
-                                _reservation,
+                                _reservation: reservation,
                             })
                         }
                         Err(error) => answer(response, Err(raft_error(error))),
@@ -2118,7 +2145,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                                 term: self.replica.term(),
                                 until,
                                 response,
-                                _reservation,
+                                _reservation: reservation,
                             })
                         }
                         Err(error) => answer(response, Err(raft_error(error))),
@@ -2348,7 +2375,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         floor_refused(&self.control, reason, &refusal);
         Err(refusal)
     }
-    fn step(&mut self, from: u64, bytes: &[u8]) -> Result<(), Refusal> {
+    fn step(&mut self, from: u64, bytes: &[u8], reservation: Reservation) -> Result<(), Refusal> {
         #[cfg(test)]
         if let Some(stalls) = &self.stalls
             && self.replica.leader() == self.replica.id()
@@ -2396,7 +2423,172 @@ impl<F: BlockFile + 'static> Actor<F> {
             }
             tracing::warn!(target: "amphora.replica", event = "quorum_patience_refused", error = %unmeasured, "an answer gap was not learned for the leader's quorum patience");
         }
+        // The write slot holds what would refuse its member's retry, past the sender's checks.
+        if self.replica.is_leader() && !self.slot_off() {
+            match message.msg_type {
+                hyper_raft::proto::MessageType::MsgPropose => {
+                    let forward = self.slots.forward(from, self.at, (message, reservation));
+                    if let Some(unmeasured) = forward.unmeasured {
+                        tracing::warn!(target: "amphora.replication", event = "write_slot_unmeasured", error = %unmeasured, "a retry's gap was not learned for the write slot");
+                    }
+                    self.slot_ended(forward.ended);
+                    let stepped = match forward.step {
+                        Some((message, _reservation)) => self.step_forward(from, message),
+                        None => Ok(()),
+                    };
+                    self.step_ready()?;
+                    return stepped;
+                }
+                hyper_raft::proto::MessageType::MsgReadIndex => {
+                    let read = self.slots.read(from, self.at, (message, reservation));
+                    self.slot_ended(read.ended);
+                    let stepped = match read.step {
+                        Some((message, _reservation)) => {
+                            self.replica.step(message).map_err(raft_error)
+                        }
+                        None => Ok(()),
+                    };
+                    self.start_slot()?;
+                    self.step_ready()?;
+                    return stepped;
+                }
+                _ => {}
+            }
+        }
         self.replica.step(message).map_err(raft_error)
+    }
+    /// Steps a member's forwarded proposal into the leading core, and tells the slot what it
+    /// appended: each entry's verdict is decided from the entry before it, as its apply will
+    /// decide (`replication::verdict`), and a write refused as stale queues its member for a
+    /// slot. A leader never displaces an entry of its own term (Raft's Leader Append-Only
+    /// property, Ongaro and Ousterhout, USENIX ATC 2014, figure 3) and the slots die with the
+    /// term, so the refusal seen at the append is the one the commit decides; seen here, it
+    /// comes before any member can learn of it (amphora-seam-owner-2's ruling, Q2).
+    fn step_forward(&mut self, from: u64, message: Message) -> Result<(), Refusal> {
+        let log = self.replica.core().raft.log();
+        let last = log.last_index().map_err(unavailable)?;
+        let mut before = Point {
+            index: last,
+            term: log.term(last).map_err(unavailable)?,
+        };
+        let term = self.replica.term();
+        let mut refused = false;
+        for entry in &message.entries {
+            if let Ok(Err(Refusal::Invalid { what, .. })) =
+                crate::replication::verdict(&entry.data, before)
+                && what == "prepared transaction"
+            {
+                refused = true;
+            }
+            let Some(index) = before.index.checked_add(1) else {
+                break;
+            };
+            before = Point { index, term };
+        }
+        let entries = u64::try_from(message.entries.len()).ok();
+        self.replica.step(message).map_err(raft_error)?;
+        let appended = self
+            .replica
+            .core()
+            .raft
+            .log()
+            .last_index()
+            .map_err(unavailable)?;
+        if refused && appended.checked_sub(last) == entries {
+            self.slots.refused(from);
+        }
+        Ok(())
+    }
+    /// Steps what the write slot released, in the order it arrived: a forward the leader still
+    /// leads for as [`Actor::step_forward`] does, anything else into the core as it would have
+    /// stepped on arrival. Its sender was answered on admission, so a refusal here is logged,
+    /// typed, and its write ends as one forwarded into an election does.
+    fn step_ready(&mut self) -> Result<(), Refusal> {
+        while let Some((from, (message, _reservation))) = self.slots.ready() {
+            let stepped = if message.msg_type == hyper_raft::proto::MessageType::MsgPropose
+                && self.replica.is_leader()
+            {
+                self.step_forward(from, message)
+            } else {
+                self.replica.step(message).map_err(raft_error)
+            };
+            match stepped {
+                Err(fenced @ Refusal::Fenced(_)) => return Err(fenced),
+                Err(refusal) => {
+                    tracing::warn!(target: "amphora.replication", event = "write_slot_step_refused", from, ?refusal, "a message the write slot held was refused as it was stepped");
+                }
+                Ok(()) => {}
+            }
+        }
+        Ok(())
+    }
+    /// A write slot that ended, counted and told.
+    fn slot_ended(&self, ended: Option<super::slot::Ended>) {
+        if let Some(ended) = ended {
+            self.control.meter.slot_ended(ended.how, ended.held);
+            let held_ms = u64::try_from(ended.held.as_millis()).unwrap_or(u64::MAX);
+            tracing::debug!(target: "amphora.replication", event = "write_slot", member = ended.member, ended = ended.how.ended(), held_ms, "a write slot ended");
+        }
+    }
+    /// The write slot at this step: the term it belongs to, the members it keeps, its expiry, the
+    /// commit a held barrier waits on, a change of members or a hand-off (each releases it), and
+    /// the next slot's start; then what any of them released steps (replication.md, "A
+    /// follower's write under steady leader writes: the write slot").
+    fn keep_slots(&mut self) -> Result<(), Refusal> {
+        let at = self.at;
+        let leading = (self.replica.is_leader() && !self.slot_off()).then(|| self.replica.term());
+        let ended = self.slots.lead(leading, at);
+        self.slot_ended(ended);
+        if leading.is_some() {
+            let configuration = self.replica.core().raft.configuration();
+            let detected = &self.detected;
+            let ended = self.slots.keep(
+                at,
+                |member| configuration.contains(member),
+                |member| detected.contains(&member),
+            );
+            self.slot_ended(ended);
+            let ended = self.slots.expire(at);
+            self.slot_ended(ended);
+            self.slots
+                .committed(self.replica.core().raft.log().committed());
+            if self.changing.is_some() || self.transferring.is_some() {
+                let ended = self.slots.release(at);
+                self.slot_ended(ended);
+            }
+            self.start_slot()?;
+        }
+        self.step_ready()
+    }
+    /// Begins the next write slot if a barrier waits for one and none is held; none while this
+    /// member doesn't lead, or a change of members, a hand-off or a bootstrap is under way.
+    fn start_slot(&mut self) -> Result<(), Refusal> {
+        if !self.replica.is_leader()
+            || self.slot_off()
+            || self.changing.is_some()
+            || self.transferring.is_some()
+            || self.replica.machine().bootstrap_pending()
+        {
+            return Ok(());
+        }
+        let log = self.replica.core().raft.log();
+        let (last, commit) = (log.last_index().map_err(unavailable)?, log.committed());
+        let own = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| matches!(pending.phase, Phase::Barrier(_)));
+        if let Some((_, length)) = self.slots.start(self.at, last, commit, own) {
+            self.control.meter.slot_began(length);
+        }
+        Ok(())
+    }
+    /// Whether a test's control has turned the write slot off.
+    fn slot_off(&self) -> bool {
+        #[cfg(test)]
+        let off = self.slot_off;
+        #[cfg(not(test))]
+        let off = false;
+        off
     }
     /// The host's detector's verdict, for the held count alone (hyper-raft R-8): Amphora elects on
     /// ticks, and its elections take no detector's word.
@@ -2486,6 +2678,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             || self.replica.machine().bootstrap_pending()
             || self.pending.is_some()
             || self.changing.is_some()
+            || self.slots.holds()
             || self.class_proposed == Some(self.replica.term())
         {
             return Ok(());
@@ -2843,7 +3036,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         // Each floor session is the next one in hand; a request marks itself after this, and its
         // wait for the log takes its own target.
         self.floor_requesting = false;
-        self.floor_tail = None;
+        self.tail = None;
         let context = self.context()?;
         self.replica.read(context.clone()).map_err(raft_error)?;
         let until = self
@@ -2911,19 +3104,28 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.requeue(pending);
             return Ok(());
         }
-        // A floor session prepares only once this member has applied its own whole log: its
-        // barrier covers what was committed, and an entry appended ahead of it, not yet committed,
-        // would make its base stale, and followers out of phase would keep missing each other
-        // (amphora-seam-owner's ruling on the keeper's livelock, b'). Local, bounded by the
-        // session's own deadline; the run loop asks again each step.
+        // A leader holding a write slot for a member prepares nothing of its own until the slot
+        // ends; its run loop asks again each step.
+        self.slot_deferred = false;
+        if self.replica.is_leader() && self.slots.holds() {
+            self.slot_deferred = true;
+            self.pending = Some(pending);
+            return Ok(());
+        }
+        // A floor session, and since the write slot every write a follower makes, prepares only
+        // once this member has applied its own whole log: its barrier covers what was committed,
+        // and an entry appended ahead of it, not yet committed, would make its base stale, and
+        // members out of phase would keep missing each other (amphora-seam-owner's ruling on the
+        // keeper's livelock, b'; a slot's holder's retry prepares on the leader's tail).
+        // Local, bounded by the write's own deadline; the run loop asks again each step.
         // The target is this member's last log index as its barrier passed, fixed then: entries
-        // appended after it never move it, so the session neither waits out its deadline nor
+        // appended after it never move it, so the write neither waits out its deadline nor
         // holds the write slot through others' writes (amphora-seam-owner's review of 392902d).
-        if matches!(pending.author, Author::Owner)
+        if (matches!(pending.author, Author::Owner) || !self.replica.is_leader())
             && matches!(pending.phase, Phase::Barrier(Some(_)))
             && !self.replica.machine().bootstrap_pending()
         {
-            let target = match self.floor_tail {
+            let target = match self.tail {
                 Some(target) => target,
                 None => self
                     .replica
@@ -2934,12 +3136,12 @@ impl<F: BlockFile + 'static> Actor<F> {
                     .map_err(unavailable)?,
             };
             if self.replica.applied().index < target {
-                self.floor_tail = Some(target);
+                self.tail = Some(target);
                 self.pending = Some(pending);
                 return Ok(());
             }
         }
-        self.floor_tail = None;
+        self.tail = None;
         let Phase::Barrier(operation) = pending.phase else {
             self.pending = Some(pending);
             return Ok(());
@@ -3070,6 +3272,9 @@ impl<F: BlockFile + 'static> Actor<F> {
                         .and_then(|bytes| self.propose(&pending.context, bytes))
                     {
                         Ok(()) => {
+                            if self.replica.is_leader() {
+                                self.slots.took_turn();
+                            }
                             pending.phase = Phase::Proposed(value);
                             self.pending = Some(pending);
                             return Ok(());
@@ -4835,7 +5040,8 @@ mod tests {
     /// CP-T1.8 (AC-T1.8.5), the replicated class's answer for a write made at a follower
     /// (replication.md, "A write made at a follower is answered on the leader's commit"). Do: three
     /// voters of three fates, two to span; writes at the leader that every member applies; then a
-    /// write at a follower and one at the leader, both prepared on one base; the follower's log
+    /// write at a follower and one at the leader, both prepared on one base (the follower's
+    /// forward held until the leader's own is appended); the follower's log
     /// flushes held once its write is in the leader's log. Expect: the follower's answer while it
     /// hasn't applied its write; of the two writes one taken and the other refused as its apply
     /// refuses it; once the flushes go, the follower applies as it answered and reads the write
@@ -4890,8 +5096,35 @@ mod tests {
                 Ok(vec![made])
             }
         };
+        // Both prepared on one base: the follower's forward is held until the leader has appended
+        // its own, as each prepares on its log's tail.
+        pump.begin_captures(leader, 1);
         let at_follower = submit(clients.get(follower).unwrap(), driven.until(), write(1));
+        for _ in 0..ROUNDS {
+            if pump.captures_ready() {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        let last = |driven: &Driven<Gated>| {
+            driven
+                .owner(leader)
+                .replica
+                .core()
+                .raft
+                .log()
+                .last_index()
+                .unwrap()
+        };
+        let before = last(&driven);
         let at_leader = submit(clients.get(leader).unwrap(), driven.until(), write(2));
+        for _ in 0..ROUNDS {
+            if last(&driven) > before {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        pump.release_captures();
         // Rounds until the follower's write is in the leader's log: its proposal has left it, and
         // the leader's append of it is still to be relayed.
         let index = (0..ROUNDS)
@@ -10316,16 +10549,16 @@ mod tests {
             &mut driven,
             &mut pump,
             "the follower's session waiting for its log",
-            |driven| driven.owner(follower).floor_tail.is_some(),
+            |driven| driven.owner(follower).tail.is_some(),
         );
-        assert_eq!(driven.owner(follower).floor_tail, Some(ahead));
+        assert_eq!(driven.owner(follower).tail, Some(ahead));
         let (applied, last) = tail(&driven);
         assert!(last > applied, "the write ahead already applied");
-        driven.owner_mut(follower).floor_tail = Some(applied);
+        driven.owner_mut(follower).tail = Some(applied);
         driven.step();
         let owner = driven.owner(follower);
         assert_eq!(
-            owner.floor_tail, None,
+            owner.tail, None,
             "the session still waits: its target moved"
         );
         let (applied, last) = tail(&driven);
@@ -12940,7 +13173,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     /// One list-append transaction of the write slot's isolation checks (Elle's list-append,
-    /// Kingsbury and Alvaro, VLDB 2020): it read `key`'s and `other`'s lists and appended
+    /// Kingsbury and Alvaro, PVLDB 14(3), 2021): it read `key`'s and `other`'s lists and appended
     /// `element` to `key`'s.
     struct Append {
         element: String,
@@ -13002,7 +13235,9 @@ mod tests {
             .call(&mut pump, &clients[leader], move |db| {
                 db.exec("CREATE TABLE lists(k INTEGER PRIMARY KEY, v TEXT NOT NULL, pad BLOB)")?;
                 for k in 1..=keys {
-                    db.exec(&format!("INSERT INTO lists VALUES ({k}, '', zeroblob(1800))"))?;
+                    db.exec(&format!(
+                        "INSERT INTO lists VALUES ({k}, '', zeroblob(1800))"
+                    ))?;
                 }
                 Ok(Vec::new())
             })
@@ -13136,7 +13371,10 @@ mod tests {
         for op in history.iter().filter(|op| op.outcome == Outcome::Committed) {
             let list = at(op.key);
             let Some(position) = list.iter().position(|e| *e == op.element) else {
-                out.push(format!("{} committed but lost from list {}", op.element, op.key));
+                out.push(format!(
+                    "{} committed but lost from list {}",
+                    op.element, op.key
+                ));
                 continue;
             };
             let (a, b) = op.read.as_ref().unwrap();
@@ -13149,7 +13387,10 @@ mod tests {
                 ));
             }
             if !at(op.other).starts_with(b) {
-                out.push(format!("{} read list {} as {b:?}, no prefix of it", op.element, op.other));
+                out.push(format!(
+                    "{} read list {} as {b:?}, no prefix of it",
+                    op.element, op.other
+                ));
             }
         }
         // Elle's dependency graph over committed writes; Kahn's algorithm finds a cycle.
@@ -13219,8 +13460,9 @@ mod tests {
     /// each append 15 times to two hot lists, then to 32 spread over pages, every record delayed
     /// up to three relay rounds, three seeds each. Expect: no follower write refused twice in a
     /// row, every write committed, none unknown, and the history serializable (replicas equal,
-    /// each list its serial replay, no G0, G1c or G2 cycle). Control, today's rule alone (the
-    /// slot off): the follower refused more than once in a row in some run (non-vacuity).
+    /// each list its serial replay, no G0, G1c or G2 cycle). Control, the slot off (the
+    /// follower's tail rule kept): the follower refused more than once in a row in some run
+    /// (non-vacuity).
     #[test]
     fn a_refused_follower_write_lands_on_its_next_try_under_the_slot() {
         let mut starved = 0;
@@ -13231,9 +13473,17 @@ mod tests {
                     "slot keys {keys} seed {seed}: committed {:?} refused {:?} in a row {:?}",
                     run.committed, run.refused, run.streak
                 );
-                assert!(run.violations.is_empty(), "keys {keys} seed {seed}: {:?}", run.violations);
+                assert!(
+                    run.violations.is_empty(),
+                    "keys {keys} seed {seed}: {:?}",
+                    run.violations
+                );
                 assert_eq!(run.unknown, 0, "keys {keys} seed {seed}");
-                assert!(run.streak[1] <= 1, "keys {keys} seed {seed}: {:?}", run.streak);
+                assert!(
+                    run.streak[1] <= 1,
+                    "keys {keys} seed {seed}: {:?}",
+                    run.streak
+                );
                 let control = list_append_run(&[0, 1], true, seed, keys, 15);
                 assert!(control.violations.is_empty(), "{:?}", control.violations);
                 if control.streak[1] > 1 {
@@ -13241,7 +13491,10 @@ mod tests {
                 }
             }
         }
-        assert!(starved > 0, "today's rule never refused the follower twice in a row");
+        assert!(
+            starved > 0,
+            "today's rule never refused the follower twice in a row"
+        );
     }
 
     /// T-T1.8.W2 (AC-T1.8.W1): two followers and a leader all writing steadily, none missing.
@@ -13258,10 +13511,106 @@ mod tests {
                     "keys {keys} seed {seed}: committed {:?} refused {:?} in a row {:?}",
                     run.committed, run.refused, run.streak
                 );
-                assert!(run.violations.is_empty(), "keys {keys} seed {seed}: {:?}", run.violations);
+                assert!(
+                    run.violations.is_empty(),
+                    "keys {keys} seed {seed}: {:?}",
+                    run.violations
+                );
                 assert_eq!(run.unknown, 0, "keys {keys} seed {seed}");
-                assert!(run.streak[1..].iter().all(|s| *s <= 2), "keys {keys} seed {seed}: {:?}", run.streak);
+                assert!(
+                    run.streak[1..].iter().all(|s| *s <= 2),
+                    "keys {keys} seed {seed}: {:?}",
+                    run.streak
+                );
             }
         }
+    }
+
+    /// T-T1.8.W3 (AC-T1.8.W1; amphora-seam-owner-2's ruling, Q2 b): a follower's retry racing its
+    /// slot's start lands on its next try. Do: the leader appends a write of its own, W, with one
+    /// follower's answers held and its appends to the other, the slot's holder, lost, so W is
+    /// neither committed nor sent to the holder; then the holder, queued by a refusal, writes,
+    /// its barrier beginning its slot with W the leader's last entry. Expect: its barrier held
+    /// while W is uncommitted, and its write, prepared on W once answers and appends flow again,
+    /// applied; W too. With the tail rule alone (the barrier answered at the older commit) the holder's
+    /// write was refused: the commit's red run.
+    #[test]
+    fn a_follower_retry_racing_the_slots_start_lands_on_its_next_try() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        assert_eq!(leader, 0);
+        driven
+            .call(&mut pump, &clients[0], |db| {
+                db.exec("CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)")?;
+                Ok(Vec::new())
+            })
+            .unwrap();
+        driven.tick(&mut pump, leader);
+        let holder = 3;
+        pump.held = vec![1];
+        pump.losing = Some(Box::new(move |from, message| {
+            from == 1
+                && message.to == holder
+                && message.msg_type == hyper_raft::proto::MessageType::MsgAppend
+        }));
+        let last = |driven: &Driven| {
+            driven
+                .owner(0)
+                .replica
+                .core()
+                .raft
+                .log()
+                .last_index()
+                .unwrap()
+        };
+        let before = last(&driven);
+        let own = submit(&clients[0], driven.until(), |db| {
+            db.exec("INSERT INTO t VALUES (1, 'leader')")?;
+            Ok(Vec::new())
+        });
+        for _ in 0..ROUNDS {
+            if last(&driven) > before {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        let w = last(&driven);
+        assert!(w > before, "the leader's write was never appended");
+        assert!(driven.owner(0).replica.core().raft.log().committed() < w);
+        // The holder's earlier write refused: it is queued, and its next barrier begins its slot.
+        driven.owner_mut(0).slots.refused(holder);
+        let retry = submit(&clients[2], driven.until(), |db| {
+            db.exec("INSERT INTO t VALUES (2, 'holder')")?;
+            Ok(Vec::new())
+        });
+        let mut held = false;
+        for _ in 0..ROUNDS {
+            held = driven.owner(0).slots.holds_read();
+            if held || last(&driven) > w {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        pump.held.clear();
+        pump.losing = None;
+        assert_eq!(
+            driven.settle(&mut pump, &retry),
+            Ok(Vec::new()),
+            "the holder's write"
+        );
+        assert_eq!(
+            driven.settle(&mut pump, &own),
+            Ok(Vec::new()),
+            "the leader's write"
+        );
+        assert!(held, "the holder's barrier was never held");
+        driven.quiet(&mut pump);
+        driven.drain(&mut pump);
+        pump.finish();
     }
 }
