@@ -1406,7 +1406,11 @@ held quorum can then sit within one real fate.
 **The decision.** The class is stated once, in the group's log, and every member holds itself to it:
 - **The entry.** A class entry is a log entry of its own kind: the prefix `amphora.class.v1\0`, then the postcard
   encoding of the class as `api::replication::Durability`, its fates in canonical order (`database::canonical`,
-  sorted by member). A leader proposes it in its term whenever its machine records no class: at bootstrap that is
+  sorted by member). It holds at most what the largest class encodes to (`ENTRY_BYTES`, 2026-11-11, in place of a
+  picked 64 KiB): postcard's varints (postcard.jamesmunns.com, "Wire Format": a tag or u32 at most 5 bytes, a length
+  or u64 at most 10) for the tag, the fates' length, two u64s for each of the most members (`replicated::MEMBERS`)
+  and the span: 1,317 bytes with the 17-byte prefix; a class past the members is refused
+  (`a_class_entry_holds_the_most_members_and_no_more`). A leader proposes it in its term whenever its machine records no class: at bootstrap that is
   the group's first leader; for a group from before this change, the first leader that runs it. Two leaders may
   each propose one. A second entry stating the same class applies as nothing.
 - **Recorded with the state.** A member applies the entry in one transaction with its applied marker. That
