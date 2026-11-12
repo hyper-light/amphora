@@ -14,6 +14,12 @@
 //! A mixed generation ([`MIXED_FORMAT`], decision 37) holds page frames and records side by side:
 //! spills write page frames (over the transaction's own, decision 30), commits write records. A
 //! record's first slot carries [`RECORD_HEAD`] with its slot count, apart from page numbers.
+//!
+//! A mixed generation of [`MIXED_FRAMES_FORMAT`] (decision 39) writes a commit's pages by what a
+//! read of them needs: a page the log can't chain from is a page frame, as page-a-frame writes it;
+//! the entries of chains (deltas, and the images that end a chain) are packed into records of one
+//! slot each ([`one_slot_records`]), and a chain may begin at a page frame. A read past the cache
+//! then reads one frame for each entry of its page's chain.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -33,6 +39,19 @@ pub(crate) const PACKED_FORMAT: u32 = 0x414d_5002;
 /// The log header's file format for a mixed generation: page frames and records side by side
 /// (Amphora's docs/design/store.md, decision 37).
 pub(crate) const MIXED_FORMAT: u32 = 0x414d_5003;
+
+/// The log header's file format for a mixed generation whose images of pages new to a chain are
+/// page frames, a chain's entries records of one slot, and whose chains may begin at a page frame
+/// (decision 39): what a mixed generation begins with now. A binary that knows only
+/// [`MIXED_FORMAT`] refuses it by name rather than misread a chain that begins at a page frame.
+pub(crate) const MIXED_FRAMES_FORMAT: u32 = 0x414d_5007;
+
+/// Whether a generation of `file_format` writes its pages new to a chain as page frames and its
+/// chains' entries as records of one slot (decision 39); a generation of another format is written
+/// as it began.
+pub(crate) fn images_as_frames(file_format: u32) -> bool {
+    file_format == MIXED_FRAMES_FORMAT
+}
 
 /// The page-number field of a record's slots after its first.
 pub(crate) const CONTINUATION: u32 = u32::MAX;
@@ -56,17 +75,17 @@ impl LogFormat {
         match file_format {
             PAGE_FORMAT => Some(Self::Pages),
             PACKED_FORMAT => Some(Self::Packed),
-            MIXED_FORMAT => Some(Self::Mixed),
+            MIXED_FORMAT | MIXED_FRAMES_FORMAT => Some(Self::Mixed),
             _ => None,
         }
     }
 
-    /// The log header's file format for this format.
+    /// The log header's file format a generation of this format begins with.
     pub(crate) fn file_format(self) -> u32 {
         match self {
             Self::Pages => PAGE_FORMAT,
             Self::Packed => PACKED_FORMAT,
-            Self::Mixed => MIXED_FORMAT,
+            Self::Mixed => MIXED_FRAMES_FORMAT,
         }
     }
 
@@ -270,6 +289,88 @@ pub(crate) fn encode(
     payload.extend_from_slice(stored);
     drop(compressed);
     Ok((payload, Record::parse(raw, page_size)?))
+}
+
+/// What [`one_slot_records`] made of a commit's entries of chains: each record's entries (indexes
+/// into the entries it was given), its payload and the record as a read decodes it; and the images
+/// that take more than a slot alone, which the caller writes as page frames.
+pub(crate) struct OneSlot {
+    pub(crate) records: Vec<(Vec<usize>, Vec<u8>, Record)>,
+    pub(crate) frames: Vec<usize>,
+}
+
+/// A commit's entries of chains (deltas, and the images that end a chain) as records of one slot
+/// each (decision 39), so a read past the cache reads one slot for each entry of its page's chain
+/// where a record of many slots had it read them all. Entries go largest first, each into the
+/// first record with room left for it (first-fit decreasing, which takes at most 11/9 of the fewest
+/// records and one more: Dósa, ESCAPE 2007), an image sized by what LZ4 makes of it alone and a
+/// delta by its bytes. Each record is then LZ4'd where that makes it smaller; an entry its record
+/// can't hold once encoded moves to a record of its own. An image LZ4 can't fit in a slot is left
+/// for a page frame; a delta too large for a slot takes the slots it needs, in a record of its own.
+pub(crate) fn one_slot_records(entries: &[(u32, Body<'_>)], page_size: usize) -> Result<OneSlot> {
+    if entries.len() > MOST_PAGES {
+        return Err(corrupt("a record holds 1 to 1024 pages"));
+    }
+    let fixed = PAYLOAD_HEADER
+        .checked_add(4)
+        .ok_or_else(|| corrupt("record too large"))?;
+    let mut sized = Vec::with_capacity(entries.len());
+    let mut frames = Vec::new();
+    for (index, (_, body)) in entries.iter().enumerate() {
+        let len = match body {
+            Body::Image(image) => lz4_flex::block::compress(image).len().min(image.len()),
+            Body::Delta { runs, .. } => runs.len(),
+        };
+        let size = ENTRY_HEADER
+            .checked_add(len)
+            .ok_or_else(|| corrupt("entry too large"))?;
+        let alone = fixed
+            .checked_add(size)
+            .ok_or_else(|| corrupt("entry too large"))?;
+        if alone > page_size && matches!(body, Body::Image(_)) {
+            frames.push(index);
+        } else {
+            sized.push((index, size, alone));
+        }
+    }
+    sized.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    // Each record's entries and the bytes they take with its header.
+    let mut bins: Vec<(Vec<usize>, usize)> = Vec::new();
+    for (index, size, alone) in sized {
+        let room = bins.iter_mut().find_map(|(held, used)| {
+            let after = used.checked_add(size).filter(|&n| n <= page_size)?;
+            Some((held, used, after))
+        });
+        match room {
+            Some((held, used, after)) => {
+                held.push(index);
+                *used = after;
+            }
+            None => bins.push((vec![index], alone)),
+        }
+    }
+    let mut records = Vec::with_capacity(bins.len());
+    let mut queue: VecDeque<Vec<usize>> = bins.into_iter().map(|(held, _)| held).collect();
+    // Each pass encodes a record or moves one entry out of it: at most twice the entries.
+    while let Some(mut held) = queue.pop_front() {
+        let part: Vec<(u32, Body<'_>)> = held
+            .iter()
+            .map(|&index| {
+                entries
+                    .get(index)
+                    .copied()
+                    .ok_or_else(|| corrupt("an entry past the commit's"))
+            })
+            .collect::<Result<_>>()?;
+        let (payload, record) = encode(&part, page_size, true)?;
+        if payload.len() <= page_size || held.len() == 1 {
+            records.push((held, payload, record));
+        } else if let Some(moved) = held.pop() {
+            queue.push_front(held);
+            queue.push_back(vec![moved]);
+        }
+    }
+    Ok(OneSlot { records, frames })
 }
 
 /// Byte ranges of `new` that differ from `base` closer than this are one run: a run's header costs
@@ -595,16 +696,20 @@ impl Record {
     }
 }
 
-/// Bytes the decoded records may hold, the oldest going first past it. The writer keeps each record
-/// it publishes, and reads (a reader's miss, the checkpoint's copies, a page's chain back to its
-/// image) mostly want recent ones: a chain of a page changed at every commit reaches back
-/// [`MOST_DELTAS`] commits, a few hundred KiB at 10,000 writers. Chosen, a group's share of the
-/// memory, not yet measured; a record not kept is read and decoded again.
-pub(crate) const DECODED_BUDGET: usize = 4 << 20;
+/// Bytes the decoded records may hold, the oldest going first past it: what a connection's page
+/// cache holds by default (`page_cache::DEFAULT_PAGE_CACHE_SIZE_IN_PAGES` pages of `page_size`, the
+/// budget Amphora's readers keep, decision 5). A decoded record stands for the pages reads rebuild
+/// from it, so the records kept take no more than the pages a cache keeps (decision 39). The writer
+/// keeps each record it publishes, and reads (a miss's chain, the checkpoint's copies) mostly want
+/// recent ones; a record not kept is read again, a slot (decision 39) or the record it was.
+pub(crate) fn decoded_budget(page_size: usize) -> usize {
+    // A budget past what memory can address is all of it.
+    crate::storage::page_cache::DEFAULT_PAGE_CACHE_SIZE_IN_PAGES.saturating_mul(page_size)
+}
 
 /// What the shared log keeps of its packed records: each record's slot count by its first slot
 /// (written before any page maps to the record), and records decoded, keyed by the log's
-/// generation (its header's checkpoint sequence) and first slot, within [`DECODED_BUDGET`].
+/// generation (its header's checkpoint sequence) and first slot, within [`decoded_budget`].
 #[derive(Debug, Default)]
 pub(crate) struct Records {
     slots: FxHashMap<u64, u32>,
@@ -643,13 +748,21 @@ impl Records {
         self.decoded.get(&(generation, head)).cloned()
     }
 
-    /// Keeps a decoded record, the oldest kept going first past the budget.
-    pub(crate) fn keep(&mut self, generation: u32, head: u64, record: Arc<Record>) {
+    /// Keeps a decoded record of a log of `page_size` pages, the oldest kept going first past the
+    /// budget ([`decoded_budget`]).
+    pub(crate) fn keep(
+        &mut self,
+        generation: u32,
+        head: u64,
+        record: Arc<Record>,
+        page_size: usize,
+    ) {
+        let budget = decoded_budget(page_size);
         let size = record.size();
-        if size > DECODED_BUDGET || self.decoded.contains_key(&(generation, head)) {
+        if size > budget || self.decoded.contains_key(&(generation, head)) {
             return;
         }
-        while self.bytes.saturating_add(size) > DECODED_BUDGET {
+        while self.bytes.saturating_add(size) > budget {
             let Some(oldest) = self.order.pop_front() else {
                 break;
             };
@@ -979,11 +1092,11 @@ mod tests {
         let mut records = Records::default();
         for head in 1..=40u64 {
             records.publish(head * 10, 3);
-            records.keep(1, head * 10, big.clone());
-            assert!(records.bytes <= DECODED_BUDGET);
+            records.keep(1, head * 10, big.clone(), size);
+            assert!(records.bytes <= decoded_budget(size));
         }
         assert!(
-            big.size() * 2 < DECODED_BUDGET,
+            big.size() * 2 < decoded_budget(size),
             "the test keeps two or more"
         );
         assert!(records.decoded(1, 400).is_some(), "the newest is kept");
@@ -1044,6 +1157,166 @@ mod tests {
         for format in [LogFormat::Pages, LogFormat::Packed, LogFormat::Mixed] {
             assert_eq!(LogFormat::of(format.file_format()), Some(format));
         }
+        // A mixed generation begins with page frames for images new to a chain (decision 39); one
+        // begun before keeps its format, read as ever and written as it began.
+        assert_eq!(LogFormat::Mixed.file_format(), MIXED_FRAMES_FORMAT);
+        assert_eq!(LogFormat::of(MIXED_FORMAT), Some(LogFormat::Mixed));
+        assert!(images_as_frames(MIXED_FRAMES_FORMAT));
+        for older in [PAGE_FORMAT, PACKED_FORMAT, MIXED_FORMAT] {
+            assert!(!images_as_frames(older), "{older:#x}");
+        }
         assert_eq!(LogFormat::of(0x414d_5004), None);
+    }
+
+    /// The records `packed` holds, decoded, with what each holds; every entry once in all.
+    fn unpacked(packed: &OneSlot, entries: &[(u32, Body<'_>)], size: usize) -> Vec<u32> {
+        let mut seen: Vec<usize> = packed.frames.clone();
+        for (held, payload, record) in &packed.records {
+            let decoded = Record::decode(payload, size).unwrap();
+            for &index in held {
+                let (page, body) = entries[index];
+                let got = decoded
+                    .body(page)
+                    .expect("a record holds what it was given");
+                assert_eq!(got.depth(), body.depth());
+                assert_eq!(got.bytes(), body.bytes());
+                assert!(record.body(page).is_some());
+            }
+            assert_eq!(decoded.pages().count(), held.len());
+            seen.extend(held);
+        }
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0..entries.len()).collect::<Vec<_>>(),
+            "each entry once"
+        );
+        packed
+            .records
+            .iter()
+            .map(|(_, payload, _)| slots(payload.len(), size).unwrap())
+            .collect()
+    }
+
+    /// Do: pack a commit's entries of chains (images that LZ4 halves, deltas of a few hundred
+    /// bytes) into records of one slot (decision 39). Expect: every record one slot, each entry in
+    /// one record and decoding as it went in, and no more records than first-fit decreasing's
+    /// bound over the bytes (11/9 of a slot's worth and one more).
+    #[test]
+    fn a_chains_entries_pack_into_records_of_one_slot() {
+        let size = 4096;
+        // Compressible images: a run of zeros past a patterned half.
+        let image = |fill: u8| {
+            let mut p = page(fill, size);
+            p[size / 2..].fill(0);
+            p
+        };
+        let images: Vec<Vec<u8>> = (0..6u8).map(image).collect();
+        let runs: Vec<Vec<u8>> = (0..40u16)
+            .map(|k| {
+                let len = 100 + usize::from(k) * 9;
+                let mut r = Vec::with_capacity(len + 4);
+                r.extend_from_slice(&(k * 10).to_be_bytes());
+                r.extend_from_slice(&u16::try_from(len - 1).unwrap().to_be_bytes());
+                r.extend((0..len).map(|i| (i as u8) ^ (k as u8)));
+                r
+            })
+            .collect();
+        let mut entries: Vec<(u32, Body<'_>)> = images
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (u32::try_from(i).unwrap() + 1, Body::Image(p)))
+            .collect();
+        entries.extend(runs.iter().enumerate().map(|(i, r)| {
+            (
+                u32::try_from(i).unwrap() + 100,
+                Body::Delta {
+                    depth: 1 + (i % 8) as u8,
+                    runs: r,
+                },
+            )
+        }));
+        let packed = one_slot_records(&entries, size).unwrap();
+        assert!(
+            packed.frames.is_empty(),
+            "every image fits a slot once LZ4'd"
+        );
+        let slots = unpacked(&packed, &entries, size);
+        assert!(
+            slots.iter().all(|&s| s == 1),
+            "records of one slot: {slots:?}"
+        );
+        let bytes: usize = images
+            .iter()
+            .map(|p| lz4_flex::block::compress(p).len() + ENTRY_HEADER)
+            .chain(runs.iter().map(|r| r.len() + ENTRY_HEADER))
+            .sum();
+        let fewest = bytes.div_ceil(size - PAYLOAD_HEADER - 4);
+        assert!(
+            packed.records.len() * 9 <= fewest * 11 + 9,
+            "{} records where the bytes take {fewest} slots",
+            packed.records.len()
+        );
+    }
+
+    /// Do: pack an image LZ4 can't shrink below a slot, and a delta near a page long, beside
+    /// small deltas. Expect: the image left for a page frame, the delta in a record of its own of
+    /// the slots it needs, the rest in records of one slot.
+    #[test]
+    fn an_entry_that_fits_no_slot_takes_a_frame_or_a_record_of_its_own() {
+        let size = 4096;
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let noise: Vec<u8> = (0..size)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let mut long = Vec::new();
+        long.extend_from_slice(&0u16.to_be_bytes());
+        long.extend_from_slice(&u16::try_from(size - 8 - 1).unwrap().to_be_bytes());
+        long.extend_from_slice(&noise[..size - 8]);
+        let small: Vec<u8> = [0u8, 5, 0, 2, 1, 2, 3].to_vec();
+        let entries: Vec<(u32, Body<'_>)> = vec![
+            (1, Body::Image(&noise)),
+            (
+                2,
+                Body::Delta {
+                    depth: 1,
+                    runs: &long,
+                },
+            ),
+            (
+                3,
+                Body::Delta {
+                    depth: 2,
+                    runs: &small,
+                },
+            ),
+            (
+                4,
+                Body::Delta {
+                    depth: 1,
+                    runs: &small,
+                },
+            ),
+        ];
+        let packed = one_slot_records(&entries, size).unwrap();
+        assert_eq!(packed.frames, vec![0], "the image a page frame");
+        let slots = unpacked(&packed, &entries, size);
+        let alone = packed
+            .records
+            .iter()
+            .position(|(held, _, _)| held.contains(&1))
+            .unwrap();
+        assert_eq!(packed.records[alone].0, vec![1], "the long delta alone");
+        assert_eq!(slots[alone], 2);
+        for (at, s) in slots.iter().enumerate() {
+            if at != alone {
+                assert_eq!(*s, 1);
+            }
+        }
     }
 }

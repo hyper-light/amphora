@@ -3,19 +3,26 @@
 //! engine reads its log (a connection with nothing cached, the checkpoint, recovery on open), whole
 //! commits or none survive a cut, and a record whose checksums hold but that doesn't decode is
 //! refused rather than read (AC-T1.4.4, AC-T1.3.1). The same of a mixed log (decision 37), whose
-//! spills are page frames written over and whose commits are records.
+//! spills are page frames written over and whose commits are records; and of decision 39's, whose
+//! images of pages new to a chain are page frames and whose chains' entries are records of one
+//! slot, so a read past the cache reads one frame for each entry of its page's chain.
 
+use amphora_engine::io::{FileId, FileSyncType};
 use amphora_engine::{
-    CheckpointMode, ConnectOpts, Connection, Database, DatabaseOpts, LimboError, LogFormat,
-    Numeric, OpenOptions, PlatformIO, SqliteDialect, Value,
+    Buffer, CheckpointMode, Clock, Completion, ConnectOpts, Connection, Database, DatabaseOpts,
+    File, LimboError, LogFormat, MonotonicInstant, Numeric, OpenFlags, OpenOptions, PlatformIO,
+    SqliteDialect, Value, WallClockInstant, IO,
 };
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// The log header's file format for a packed generation, a mixed one and SQLite's one page a frame.
+/// The log header's file format for a packed generation, a mixed one begun now (decision 39), a
+/// mixed one begun before it (decision 37) and SQLite's one page a frame.
 const PACKED_FORMAT: u32 = 0x414d_5002;
-const MIXED_FORMAT: u32 = 0x414d_5003;
+const MIXED_FORMAT: u32 = 0x414d_5007;
+const MIXED_RECORDS_FORMAT: u32 = 0x414d_5003;
 const PAGE_FORMAT: u32 = 3_007_000;
 /// A mixed generation's mark of a record's first slot.
 const RECORD_HEAD: u32 = 0x8000_0000;
@@ -178,11 +185,14 @@ fn reads_back_through_every_path(format: LogFormat, file_format: u32) {
             assert!(stored.iter().any(|n| *n > 0), "no record compressed");
             assert!(stored.contains(&0), "no record stored as it is: {stored:?}");
         } else {
-            // A mixed generation stores a record of images alone as it is (decision 37): new rows'
-            // pages are images; the records whose pages were logged before carry deltas.
+            // A mixed generation writes new rows' pages, new to the log's chains, as page frames,
+            // and the changes to pages logged before (the schema's, the tree's inner pages) as
+            // records of one slot (decision 39).
+            let (records, frames) = records_and_frames(&wal);
+            assert!(frames > 1600, "{frames} page frames for 1,602 rows' pages");
             assert!(
-                stored.contains(&0),
-                "no record of images stored as it is: {stored:?}"
+                records.iter().all(|&(_, slots)| slots == 1),
+                "records of more than one slot: {records:?}"
             );
         }
 
@@ -575,7 +585,8 @@ fn records(wal: &[u8]) -> Vec<(usize, u32)> {
 
 /// A packed or mixed log's records, as [`records`], and how many page frames it holds.
 fn records_and_frames(wal: &[u8]) -> (Vec<(usize, u32)>, usize) {
-    let mixed = u32::from_be_bytes(wal[4..8].try_into().unwrap()) == MIXED_FORMAT;
+    let format = u32::from_be_bytes(wal[4..8].try_into().unwrap());
+    let mixed = format == MIXED_FORMAT || format == MIXED_RECORDS_FORMAT;
     let mut found = Vec::new();
     let mut frames = 0;
     let mut at = HEADER;
@@ -684,10 +695,13 @@ fn a_record_cut_short_takes_only_its_own_commit() {
 
 /// Do: in a mixed log (decision 37), with a connection cache of 16 pages, insert rows of a page each
 /// and change them again in one transaction, so its pages spill into the log and spill again, then
-/// commit; read the rows on a fresh connection, after opening the database again, and through the
-/// shared pages. Expect: the log holds page frames (the spills, each page's written over) and the
-/// commit's records, marked apart from them; every row as written each time; and a database opened
-/// on a mixed log shares its pages, where one on a packed log refuses (decisions 20 and 26).
+/// commit; then change a byte of some rows in a transaction of their own; read the rows on a fresh
+/// connection, after opening the database again, and through the shared pages. Expect: the log
+/// holds page frames (the spills, each page's written over, and the commit's pages new to the
+/// log's chains: at most two frames a page dirtied, decision 39) and, for the changes, records of
+/// one slot, marked apart from them, that end the log; every row as written each time; and a
+/// database opened on a mixed log shares its pages, where one on a packed log refuses (decisions
+/// 20 and 26).
 #[test]
 fn a_mixed_log_holds_its_spills_as_pages_and_its_commits_as_records() {
     let dir = tempfile::tempdir().unwrap();
@@ -720,16 +734,43 @@ fn a_mixed_log_holds_its_spills_as_pages_and_its_commits_as_records() {
         conn.execute("COMMIT").unwrap();
         assert_eq!(wal_format(&path), MIXED_FORMAT);
         let wal = std::fs::read(wal_path(&path)).unwrap();
-        let (records, frames) = records_and_frames(&wal);
-        assert!(frames > 0, "no spill wrote a page frame");
+        let (_, frames) = records_and_frames(&wal);
+        assert!(frames > 0, "no page frame");
         assert!(
-            frames <= dirtied,
+            frames <= 2 * dirtied,
             "{frames} page frames for the {dirtied} pages the transaction dirtied"
         );
-        assert!(!records.is_empty(), "the commit wrote no record");
+        // Pages a commit logged and left in the connection's cache change as deltas against what
+        // it logged: the first round's pages come back from the log (new to the chains, page
+        // frames), the second round's are deltas against the first's.
+        conn.execute("PRAGMA cache_size = 2000").unwrap();
+        for round in 1..=2usize {
+            conn.execute("BEGIN").unwrap();
+            let mut update = conn.prepare("UPDATE t SET body = ? WHERE id = ?").unwrap();
+            for row in want.iter_mut().step_by(7) {
+                row.1[round] ^= 0xff;
+                update.reset().unwrap();
+                update
+                    .bind_at(NonZero::new(1).unwrap(), Value::from_slice(&row.1).unwrap())
+                    .unwrap();
+                update
+                    .bind_at(NonZero::new(2).unwrap(), Value::from_i64(row.0))
+                    .unwrap();
+                update.run_ignore_rows().unwrap();
+            }
+            drop(update);
+            conn.execute("COMMIT").unwrap();
+        }
+        let wal = std::fs::read(wal_path(&path)).unwrap();
+        let (records, _) = records_and_frames(&wal);
+        assert!(!records.is_empty(), "the changes wrote no record");
+        assert!(
+            records.iter().all(|&(_, slots)| slots == 1),
+            "records of more than one slot: {records:?}"
+        );
         let last = records.last().unwrap();
         let end = last.0 + last.1 as usize * (FRAME_HEADER + PAGE);
-        assert_eq!(end, wal.len(), "the commit's records end the log");
+        assert_eq!(end, wal.len(), "the changes' records end the log");
         assert_eq!(table(&connect(&db)), want);
         integrity(&connect(&db));
     }
@@ -779,4 +820,334 @@ fn a_log_of_a_format_not_known_is_refused() {
         Err(other) => panic!("refused, but not as corrupt: {other}"),
         Ok(_) => panic!("a log of a format not known was opened"),
     }
+}
+
+/// What a database's connections read from its log: the reads, their bytes, and the most one read
+/// took.
+#[derive(Default)]
+struct LogReads {
+    reads: AtomicU64,
+    bytes: AtomicU64,
+    largest: AtomicU64,
+}
+
+impl LogReads {
+    fn take(&self) -> (u64, u64, u64) {
+        (
+            self.reads.swap(0, Ordering::Relaxed),
+            self.bytes.swap(0, Ordering::Relaxed),
+            self.largest.swap(0, Ordering::Relaxed),
+        )
+    }
+}
+
+/// The system's files, each read of a log counted.
+struct Counting {
+    inner: Arc<PlatformIO>,
+    reads: Arc<LogReads>,
+}
+
+struct CountedFile {
+    inner: Arc<dyn File>,
+    log: bool,
+    reads: Arc<LogReads>,
+}
+
+impl File for CountedFile {
+    fn lock_file(&self, exclusive: bool) -> amphora_engine::Result<()> {
+        self.inner.lock_file(exclusive)
+    }
+
+    fn unlock_file(&self) -> amphora_engine::Result<()> {
+        self.inner.unlock_file()
+    }
+
+    fn pread(&self, pos: u64, c: Completion) -> amphora_engine::Result<Completion> {
+        if self.log {
+            let n = c.as_read().buf().len() as u64;
+            self.reads.reads.fetch_add(1, Ordering::Relaxed);
+            self.reads.bytes.fetch_add(n, Ordering::Relaxed);
+            self.reads.largest.fetch_max(n, Ordering::Relaxed);
+        }
+        self.inner.pread(pos, c)
+    }
+
+    fn pwrite(
+        &self,
+        pos: u64,
+        buffer: Arc<Buffer>,
+        c: Completion,
+    ) -> amphora_engine::Result<Completion> {
+        self.inner.pwrite(pos, buffer, c)
+    }
+
+    fn pwritev(
+        &self,
+        pos: u64,
+        buffers: Vec<Arc<Buffer>>,
+        c: Completion,
+    ) -> amphora_engine::Result<Completion> {
+        self.inner.pwritev(pos, buffers, c)
+    }
+
+    fn sync(&self, c: Completion, sync_type: FileSyncType) -> amphora_engine::Result<Completion> {
+        self.inner.sync(c, sync_type)
+    }
+
+    fn size(&self) -> amphora_engine::Result<u64> {
+        self.inner.size()
+    }
+
+    fn truncate(&self, len: u64, c: Completion) -> amphora_engine::Result<Completion> {
+        self.inner.truncate(len, c)
+    }
+}
+
+impl Clock for Counting {
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl IO for Counting {
+    fn open_file(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        direct: bool,
+    ) -> amphora_engine::Result<Arc<dyn File>> {
+        Ok(Arc::new(CountedFile {
+            inner: self.inner.open_file(path, flags, direct)?,
+            log: path.ends_with("-wal"),
+            reads: self.reads.clone(),
+        }))
+    }
+
+    fn remove_file(&self, path: &str) -> amphora_engine::Result<()> {
+        self.inner.remove_file(path)
+    }
+
+    fn step(&self) -> amphora_engine::Result<()> {
+        self.inner.step()
+    }
+
+    fn file_id(&self, path: &str) -> amphora_engine::Result<FileId> {
+        self.inner.file_id(path)
+    }
+}
+
+/// The database at `path`, its reads of its log counted in `reads`.
+fn open_counted(path: &Path, reads: &Arc<LogReads>) -> Arc<Database> {
+    let io = Arc::new(Counting {
+        inner: Arc::new(PlatformIO::new().unwrap()),
+        reads: reads.clone(),
+    });
+    let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
+    Database::open(io, path.to_str().unwrap(), options).unwrap()
+}
+
+/// Row `id`'s body, looked up by its id.
+fn row(conn: &Arc<Connection>, id: i64) -> Vec<u8> {
+    let mut stmt = conn.prepare("SELECT body FROM t WHERE id = ?").unwrap();
+    stmt.bind_at(NonZero::new(1).unwrap(), Value::from_i64(id))
+        .unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 1, "row {id}");
+    rows[0][0].to_blob().unwrap().to_vec()
+}
+
+/// A log's frame: its header and a page.
+const FRAME: u64 = (FRAME_HEADER + PAGE) as u64;
+
+/// Do: in a mixed log, commit 300 rows of 3,000 bytes (a leaf page each, new to the log) in one
+/// transaction, open the database again (nothing decoded, nothing cached) and look up rows by
+/// their ids, one at a time on fresh connections. Expect: every read of the log takes at most one
+/// frame (decision 39: a page new to the log's chains is a page frame, read as page-a-frame reads
+/// it), where decision 37's log read the whole record of up to 64 pages that held the page; each
+/// row as written; and the lookups read the log (the test isn't vacuous).
+#[test]
+fn a_page_new_to_the_log_is_read_in_one_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cold.db");
+    let reads = Arc::new(LogReads::default());
+    let want = {
+        let db = open_counted(&path, &reads);
+        db.wal_format(LogFormat::Mixed).unwrap();
+        let conn = connect(&db);
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)")
+            .unwrap();
+        insert(&conn, 0..300, 3000, false)
+    };
+    let db = open_counted(&path, &reads);
+    reads.take();
+    let mut read = 0;
+    for &(id, ref body) in want.iter().step_by(37) {
+        assert_eq!(&row(&connect(&db), id), body, "row {id}");
+        let (n, bytes, largest) = reads.take();
+        assert!(
+            largest <= FRAME,
+            "looking up row {id} read {bytes} bytes of the log in {n} reads, {largest} at once"
+        );
+        read += n;
+    }
+    assert!(read > 0, "no lookup read the log");
+}
+
+/// Do: in a mixed log, commit 300 rows, then change two bytes of every third row in each of 12
+/// transactions (the rows' pages stay in the writer's cache, so each change is a delta against
+/// the page's last version, decision 17, and a chain runs to its bound and begins again), open the
+/// database again and read every row, then look rows up one at a time. Expect: every read of the
+/// log takes at most one frame (decision 39: a chain's entries are records of one slot, and a
+/// chain may begin at a page frame), where decision 37's log read a whole record for each entry of
+/// a page's chain; every row as last written; deltas in the log, and reads of it.
+#[test]
+fn a_pages_chain_is_read_one_frame_an_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hot.db");
+    let reads = Arc::new(LogReads::default());
+    let mut want;
+    {
+        let db = open_counted(&path, &reads);
+        db.wal_format(LogFormat::Mixed).unwrap();
+        let conn = connect(&db);
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)")
+            .unwrap();
+        want = insert(&conn, 0..300, 3000, false);
+        let mut update = conn.prepare("UPDATE t SET body = ? WHERE id = ?").unwrap();
+        for round in 0..12usize {
+            conn.execute("BEGIN").unwrap();
+            for row in want.iter_mut().step_by(3) {
+                row.1[round * 11] ^= 0x5a;
+                row.1[2000 + round] ^= 0xa5;
+                update.reset().unwrap();
+                update
+                    .bind_at(NonZero::new(1).unwrap(), Value::from_slice(&row.1).unwrap())
+                    .unwrap();
+                update
+                    .bind_at(NonZero::new(2).unwrap(), Value::from_i64(row.0))
+                    .unwrap();
+                update.run_ignore_rows().unwrap();
+            }
+            conn.execute("COMMIT").unwrap();
+        }
+        let wal = std::fs::read(wal_path(&path)).unwrap();
+        let deltas = entries(&wal).iter().filter(|(kind, _)| *kind == 1).count();
+        // Eleven rounds of twelve at least: a chain that reaches its bound begins again with the
+        // page's image.
+        assert!(
+            deltas >= 100 * 11,
+            "{deltas} deltas for 100 rows changed 12 times"
+        );
+    }
+    let db = open_counted(&path, &reads);
+    reads.take();
+    assert_eq!(table(&connect(&db)), want);
+    let (n, bytes, largest) = reads.take();
+    assert!(n > 0, "reading the table read nothing of the log");
+    assert!(
+        largest <= FRAME,
+        "reading the table read {bytes} bytes of the log in {n} reads, {largest} at once"
+    );
+    for &(id, ref body) in want.iter().step_by(31) {
+        assert_eq!(&row(&connect(&db), id), body, "row {id}");
+        let (n, bytes, largest) = reads.take();
+        assert!(
+            largest <= FRAME,
+            "looking up row {id} read {bytes} bytes of the log in {n} reads, {largest} at once"
+        );
+    }
+}
+
+/// `wal`'s header stamped `format` and its checksum and every frame's chained again, as a
+/// binary that began the generation with that format would have written them.
+fn restamp(wal: &mut [u8], format: u32) {
+    let big_endian = u32::from_be_bytes(wal[0..4].try_into().unwrap()) & 1 == 1;
+    wal[4..8].copy_from_slice(&format.to_be_bytes());
+    let (c1, c2) = checksum(&wal[0..24], (0, 0), big_endian);
+    wal[24..28].copy_from_slice(&c1.to_be_bytes());
+    wal[28..32].copy_from_slice(&c2.to_be_bytes());
+    let frame = FRAME_HEADER + PAGE;
+    let mut seed = (c1, c2);
+    let mut at = HEADER;
+    while at + frame <= wal.len() {
+        let header = checksum(&wal[at..at + 8], seed, big_endian);
+        seed = checksum(&wal[at + FRAME_HEADER..at + frame], header, big_endian);
+        wal[at + 16..at + 20].copy_from_slice(&seed.0.to_be_bytes());
+        wal[at + 20..at + 24].copy_from_slice(&seed.1.to_be_bytes());
+        at += frame;
+    }
+}
+
+/// Do: begin a mixed log's generation as a binary of decision 37 began it (its header restamped
+/// 0x414d_5003 over a first commit of new pages, its checksums chained again), open it, commit
+/// rows and change them, read them back, then start the log again (a truncating checkpoint) and
+/// commit more. Expect: the generation keeps 0x414d_5003, its commits written as decision 37 wrote
+/// them (records, none past its first commit's page frames: no chain begins at a page frame, which
+/// a binary of 0x414d_5003 couldn't read); every row reads back, also after opening it again; and
+/// the next generation begins 0x414d_5007.
+#[test]
+fn a_mixed_generation_begun_before_keeps_its_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("before.db");
+    {
+        let db = open(&path);
+        db.wal_format(LogFormat::Mixed).unwrap();
+        let conn = connect(&db);
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)")
+            .unwrap();
+    }
+    let mut wal = std::fs::read(wal_path(&path)).unwrap();
+    let (records, first) = records_and_frames(&wal);
+    assert!(
+        records.is_empty() && first > 0,
+        "a first commit of page frames"
+    );
+    restamp(&mut wal, MIXED_RECORDS_FORMAT);
+    std::fs::write(wal_path(&path), &wal).unwrap();
+    let mut want;
+    {
+        let db = open(&path);
+        db.wal_format(LogFormat::Mixed).unwrap();
+        let conn = connect(&db);
+        want = insert(&conn, 0..200, 3000, false);
+        let mut update = conn.prepare("UPDATE t SET body = ? WHERE id = ?").unwrap();
+        for round in 0..4usize {
+            conn.execute("BEGIN").unwrap();
+            for row in want.iter_mut().step_by(5) {
+                row.1[round] ^= 0xff;
+                update.reset().unwrap();
+                update
+                    .bind_at(NonZero::new(1).unwrap(), Value::from_slice(&row.1).unwrap())
+                    .unwrap();
+                update
+                    .bind_at(NonZero::new(2).unwrap(), Value::from_i64(row.0))
+                    .unwrap();
+                update.run_ignore_rows().unwrap();
+            }
+            conn.execute("COMMIT").unwrap();
+        }
+        drop(update);
+        assert_eq!(wal_format(&path), MIXED_RECORDS_FORMAT);
+        let wal = std::fs::read(wal_path(&path)).unwrap();
+        let (records, frames) = records_and_frames(&wal);
+        assert_eq!(frames, first, "page frames past the first commit");
+        assert!(
+            records.iter().any(|&(_, slots)| slots > 1),
+            "no record of many slots: {records:?}"
+        );
+        assert_eq!(table(&connect(&db)), want);
+    }
+    let db = open(&path);
+    db.wal_format(LogFormat::Mixed).unwrap();
+    let conn = connect(&db);
+    assert_eq!(table(&conn), want);
+    integrity(&conn);
+    truncate(&conn);
+    want.extend(insert(&conn, 200..250, 3000, false));
+    assert_eq!(wal_format(&path), MIXED_FORMAT);
+    assert_eq!(table(&connect(&db)), want);
 }
