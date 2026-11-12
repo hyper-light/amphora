@@ -1573,7 +1573,8 @@ page-a-frame at 13e385d.
 `packed::MIXED_FRAMES_FORMAT`, `0x414d5007`; what `Db::open` begins) lays a commit's pages out by what
 a read of them will need (`WalFile::lay_out`). A page the log can't chain from (new to the
 generation, read back past the cache, renumbered, or whose latest frame isn't the version its buffer
-holds: `Logging::New`) is written as a page frame, whole and as it is, as page-a-frame writes it. A
+holds: `Logging::New`) is written as a page frame, whole and as it is, transformed straight into its
+frame as page-a-frame writes it. A
 page whose latest frame in the generation is the version its buffer holds is a delta (decision 17)
 or, where the chain's bound ends the chain, its image (`Logging::Ends`); these entries of chains are
 packed into records of one slot each (`packed::one_slot_records`): largest first, each into the first
@@ -1638,7 +1639,19 @@ keeps the bound, and packing them largest first leaves less of each slot unused 
 in order. A read past the cache reads at most one frame for each entry of its chain, and a chain
 holds at most `packed::MOST_DELTAS` deltas and its image.
 
-**Evidence.** `crates/engine/tests/packed_log.rs`: `a_page_new_to_the_log_is_read_in_one_frame` (300
+**Evidence.** On the batched leg the log takes 3.9 bytes a byte of rows (14,644,960 bytes of rows,
+56,967,240 of log; 3.0 at 930ac68), within the bound. The suite's bulk statements, a quick check on
+adas-mac-studio.local-2 (an M3 Ultra, 2026-11-12, at 443b174 against 13e385d, interleaved, best of 3,
+loads 1.6 to 7.9; not a record): `insert_batch_100` 92.0 against 83.6 a second at 1 client and
+411.6 against 446.0 at 32 (slower in every round); `delete_range_insert` 124.2 against 114.4 and
+2,191.6 against 2,288.2. At 930ac68 on the same host the same statements ran 65.2 and 76.6, 113.2
+and 822.4. A profile of `insert_batch_100` at 32 clients (AMPHORA_PROFILE, the writer's thread,
+samples a commit): 3.05 against base's 2.54. The reads past the cache took 1.94 against 1.81 (a
+page frame's 1.63, a chain's records 0.23), the commit 0.90 against 0.59: its preparing 0.32 against
+0.12, of which the deltas' diff 0.13 and the records' packing 0.07. What is left is what deltas
+cost the writer, making them and rebuilding pages from them, and no longer the reads of records.
+
+`crates/engine/tests/packed_log.rs`: `a_page_new_to_the_log_is_read_in_one_frame` (300
 rows of a page each committed at once, the database opened again, rows looked up: no read of the
 log takes more than a frame, and the lookups read it) and `a_pages_chain_is_read_one_frame_an_entry`
 (the same rows changed in 12 transactions, so chains run to their bound and begin again, read back
@@ -1648,8 +1661,9 @@ records and gets no page frame past its first commit, and the next generation be
 the mixed log's existing tests with the new layout's expectations (pages new to the log as page
 frames, records of one slot, spills written over, rows read back through every path and after
 recovery). `storage::packed`'s unit tests: a chain's entries pack into records of one slot within
-first-fit decreasing's bound, and an image that fits no slot is left for a page frame while a delta
-too large for one takes a record of its own.
+first-fit decreasing's bound; an image that fits no slot is left for a page frame while a delta too
+large for one takes a record of its own; and a delta found a cache line at a time rebuilds 400 pages
+changed at random, block edges and the carried tail among the changes.
 
 **Falsified by.** A read past the cache reading more than one frame for an entry of its chain (the
 tests above); the batched leg's log above 4 bytes a byte of rows; a row read back other than as
