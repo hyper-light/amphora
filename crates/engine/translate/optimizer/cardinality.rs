@@ -416,16 +416,20 @@ impl<'a> JoinedSetRows<'a> {
                         )
                         && !term.origin.is_outer_join()
                         && home.is_none_or(|home| home == table_idx))
-                    .then_some(home.is_some())
+                    .then(|| home.is_some())
                 };
                 let on = |pos: usize| {
                     let term = where_clause.get(pos)?;
-                    (term.origin.is_outer_join()
+                    if term.origin.is_outer_join()
                         && term
                             .origin
                             .join_origin()
-                            .is_some_and(|origin| origin.right_table() == joined.internal_id))
-                    .then_some(false)
+                            .is_some_and(|origin| origin.right_table() == joined.internal_id)
+                    {
+                        Some(false)
+                    } else {
+                        None
+                    }
                 };
                 let sample = |which| {
                     sampled_filters(
@@ -826,7 +830,7 @@ fn column_equality(
                 column,
                 is_rowid_alias,
                 ..
-            } => (*table, (!*is_rowid_alias).then_some(*column)),
+            } => (*table, if *is_rowid_alias { None } else { Some(*column) }),
             ast::Expr::RowId { table, .. } => (*table, None),
             _ => return None,
         };
@@ -843,7 +847,11 @@ fn column_equality(
         return None;
     };
     let (a, b) = (column(lhs)?, column(rhs)?);
-    (a.0 != b.0).then_some((a, b))
+    if a.0 != b.0 {
+        Some((a, b))
+    } else {
+        None
+    }
 }
 
 /// The terms of `joined` its sample runs, those `takes` names, and the share of the sample they
@@ -1018,7 +1026,11 @@ fn column_domain(
     let sketched = || {
         let column = joined.table.get_column_at(column)?.name.as_deref()?;
         let counted = stats?.columns.get(&crate::util::normalize_ident(column))?;
-        (counted.non_null > 0).then_some(counted.distinct)
+        if counted.non_null > 0 {
+            Some(counted.distinct)
+        } else {
+            None
+        }
     };
     match distinct.or_else(sketched) {
         Some(values) => (values.clamp(1.0, rows), true),
@@ -1041,11 +1053,15 @@ fn composite_keys(
             continue;
         }
         let place = |pos: usize| {
-            let column = joined
+            let column = if joined
                 .table
                 .get_column_at(pos)
                 .is_none_or(|c| !c.is_rowid_alias())
-                .then_some(pos);
+            {
+                Some(pos)
+            } else {
+                None
+            };
             columns
                 .iter()
                 .position(|d| d.table == table && d.column == column)
@@ -1068,7 +1084,13 @@ fn composite_keys(
             let key: Option<SmallVec<[usize; 4]>> = index
                 .columns
                 .iter()
-                .map(|c| c.expr.is_none().then_some(c.pos_in_table).and_then(place))
+                .map(|c| {
+                    if c.expr.is_none() {
+                        place(c.pos_in_table)
+                    } else {
+                        None
+                    }
+                })
                 .collect();
             found.extend(key);
         }

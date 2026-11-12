@@ -91,11 +91,20 @@ impl LogFormat {
     /// record's first slot (0, [`CONTINUATION`], or in a mixed generation a page number).
     pub(crate) fn head_slots(self, page_field: u32) -> Option<u32> {
         match self {
-            Self::Packed => is_first_slot(page_field).then_some(page_field),
+            Self::Packed => {
+                if is_first_slot(page_field) {
+                    Some(page_field)
+                } else {
+                    None
+                }
+            }
             Self::Mixed => {
                 let slots = page_field & !RECORD_HEAD;
-                (page_field != CONTINUATION && page_field & RECORD_HEAD != 0 && slots != 0)
-                    .then_some(slots)
+                if page_field != CONTINUATION && page_field & RECORD_HEAD != 0 && slots != 0 {
+                    Some(slots)
+                } else {
+                    None
+                }
             }
             Self::Pages => None,
         }

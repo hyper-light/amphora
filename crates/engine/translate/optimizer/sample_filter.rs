@@ -134,7 +134,7 @@ impl Target<'_> {
             collation,
             CollationSeq::Binary | CollationSeq::NoCase | CollationSeq::Rtrim
         )
-        .then_some(Compare {
+        .then(|| Compare {
             affinity,
             collation,
         })
@@ -273,7 +273,11 @@ impl Target<'_> {
                 _ => return None,
             }
         }
-        (ops.len() <= MAX_OPS).then_some(Program(ops))
+        if ops.len() <= MAX_OPS {
+            Some(Program(ops))
+        } else {
+            None
+        }
     }
 }
 

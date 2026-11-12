@@ -314,7 +314,11 @@ pub fn decode_sample(mut bytes: &[u8]) -> Option<Vec<&[u8]>> {
         rows.push(row);
         bytes = rest;
     }
-    bytes.is_empty().then_some(rows)
+    if bytes.is_empty() {
+        Some(rows)
+    } else {
+        None
+    }
 }
 
 /// ANALYZE's accumulator of a column's sketch: a value a step, its encoding at the end.
