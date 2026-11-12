@@ -3,11 +3,12 @@
 //! core: the owner tells it each step's entries and time, each tick and each restart, and the
 //! flushing thread gives it the filesystem's free bytes. Nothing in it is picked:
 //!
-//! - a restart holds the owner, and with it every entry the owner applies until its first idle
-//!   step after (held). One is due only while the entries held by restarts, the entries the
-//!   owner's own long steps already delayed past AC-T1.3.4's p99.9 (over), and the most one
-//!   restart held (next, for the restart about to come) stay strictly below the p99.9's tail of
-//!   the entries applied, over patience's window of two generations;
+//! - a restart holds the owner, and with it every entry the owner applies until the backlog it
+//!   made is gone: until a step begins with no more input queued than it found (held). One is
+//!   due only while the entries held by restarts, the entries the owner's own long steps already
+//!   delayed past AC-T1.3.4's p99.9 (over), and the most one restart held (next, for the restart
+//!   about to come) stay strictly below the p99.9's tail of the entries applied, over patience's
+//!   window of two generations;
 //! - the log may hold what its own file and an equal share, among the replica logs on its
 //!   filesystem, of what is free there less one snapshot's image, hold: each frame its own bytes
 //!   and the page its copy may add to the database's file ([`log_room`]).
@@ -33,12 +34,24 @@ pub(super) const FRAME_BYTES: u64 = 4096 + 24;
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Window {
     applied: u64,
-    /// Applied while a restart held the owner, or before its first idle step after.
+    /// Applied while a restart held the owner, or before the backlog it made was gone.
     held: u64,
     /// Applied, not held, by a step longer than [`COMMIT_TAIL`].
     over: u64,
     /// The most one restart held that ended its hold in this generation.
     most: u64,
+}
+
+/// A restart's hold on what the owner applies.
+#[derive(Debug, Clone, Copy)]
+struct Holding {
+    /// The entries it has held so far.
+    held: u64,
+    /// The input queued when it began, in the owner's admitted bytes: once a step begins with no
+    /// more, the backlog the restart made is gone.
+    found: u64,
+    /// No step has begun since it did: the step it ran in is held whatever its queue was.
+    fresh: bool,
 }
 
 /// An owner's count of what its restarts of the database's log held.
@@ -48,9 +61,7 @@ pub(super) struct Spacing {
     generation: u64,
     current: Window,
     before: Window,
-    /// The entries the restart under way has held so far: from its start to the owner's first
-    /// idle step after it.
-    holding: Option<u64>,
+    holding: Option<Holding>,
 }
 
 fn overflowed(what: &str) -> Refusal {
@@ -71,27 +82,44 @@ impl Spacing {
         Ok(())
     }
 
-    /// The owner started the log again: what it applies from now to its first idle step is held.
-    /// A restart within another's hold goes on counting into it.
-    pub(super) fn restarted(&mut self) {
-        self.holding = Some(self.holding.unwrap_or(0));
+    /// The owner started the log again with `queued` bytes of input admitted and not yet taken:
+    /// what it applies from now until a step begins with no more queued is held. A restart within
+    /// another's hold goes on counting into it, its backlog measured from the first.
+    pub(super) fn restarted(&mut self, queued: u64) {
+        let holding = self.holding.get_or_insert(Holding {
+            held: 0,
+            found: queued,
+            fresh: true,
+        });
+        holding.fresh = true;
     }
 
-    /// A step of the owner that applied `entries` and took `took` of its clock; `idle` when it
-    /// found no input waiting, which ends a restart's hold.
+    /// A step of the owner that began with `queued` bytes of input admitted and not yet taken,
+    /// applied `entries` and took `took` of its clock. A step that begins with no more queued than
+    /// a restart found ends its hold: the backlog it made is gone (an idle owner's step, none
+    /// queued, among them), and that step's entries waited for no restart.
     pub(super) fn stepped(
         &mut self,
         entries: u64,
         took: Duration,
-        idle: bool,
+        queued: u64,
     ) -> Result<(), Refusal> {
         let window = &mut self.current;
+        if let Some(holding) = self.holding
+            && !holding.fresh
+            && queued <= holding.found
+        {
+            self.holding = None;
+            window.most = window.most.max(holding.held);
+        }
         window.applied = window
             .applied
             .checked_add(entries)
             .ok_or_else(|| overflowed("entries applied"))?;
-        if let Some(held) = self.holding.as_mut() {
-            *held = held
+        if let Some(holding) = self.holding.as_mut() {
+            holding.fresh = false;
+            holding.held = holding
+                .held
                 .checked_add(entries)
                 .ok_or_else(|| overflowed("entries held"))?;
             window.held = window
@@ -103,9 +131,6 @@ impl Spacing {
                 .over
                 .checked_add(entries)
                 .ok_or_else(|| overflowed("entries over the tail"))?;
-        }
-        if idle && let Some(held) = self.holding.take() {
-            window.most = window.most.max(held);
         }
         Ok(())
     }
@@ -120,7 +145,10 @@ impl Spacing {
         let (current, before) = (&self.current, &self.before);
         let sum = |a: u64, b: u64, what| a.checked_add(b).ok_or_else(|| overflowed(what));
         let applied = sum(current.applied, before.applied, "entries applied")?;
-        let next = current.most.max(before.most).max(self.holding.unwrap_or(0));
+        let next = current
+            .most
+            .max(before.most)
+            .max(self.holding.map_or(0, |holding| holding.held));
         let spent = sum(
             sum(current.held, before.held, "entries held")?,
             sum(current.over, before.over, "entries over the tail")?,
@@ -169,7 +197,7 @@ mod tests {
     fn the_first_restart_is_free() {
         let mut spacing = Spacing::default();
         assert!(!spacing.due().unwrap(), "due with nothing applied");
-        spacing.stepped(1, QUICK, true).unwrap();
+        spacing.stepped(1, QUICK, 0).unwrap();
         assert!(spacing.due().unwrap());
     }
 
@@ -179,12 +207,12 @@ mod tests {
     #[test]
     fn a_restart_spends_what_it_held_and_spaces_the_next() {
         let mut spacing = Spacing::default();
-        spacing.restarted();
-        spacing.stepped(5, QUICK, false).unwrap();
-        spacing.stepped(0, QUICK, true).unwrap();
-        spacing.stepped(9_995, QUICK, true).unwrap();
+        spacing.restarted(0);
+        spacing.stepped(5, QUICK, 1).unwrap();
+        spacing.stepped(0, QUICK, 0).unwrap();
+        spacing.stepped(9_995, QUICK, 0).unwrap();
         assert!(!spacing.due().unwrap(), "due at 10,000 applied");
-        spacing.stepped(1, QUICK, true).unwrap();
+        spacing.stepped(1, QUICK, 0).unwrap();
         assert!(spacing.due().unwrap(), "not due at 10,001 applied");
     }
 
@@ -194,30 +222,38 @@ mod tests {
     #[test]
     fn long_steps_spend_the_tail_before_any_restart() {
         let mut spacing = Spacing::default();
-        spacing.stepped(3, Duration::from_millis(16), true).unwrap();
-        spacing.stepped(2_997, QUICK, true).unwrap();
+        spacing.stepped(3, Duration::from_millis(16), 0).unwrap();
+        spacing.stepped(2_997, QUICK, 0).unwrap();
         assert!(!spacing.due().unwrap(), "due at 3,000 applied with 3 over");
-        spacing.stepped(1, QUICK, true).unwrap();
+        spacing.stepped(1, QUICK, 0).unwrap();
         assert!(spacing.due().unwrap());
         assert_eq!(spacing.current.over, 3);
-        spacing.restarted();
-        spacing.stepped(4, Duration::from_millis(16), true).unwrap();
+        spacing.restarted(0);
+        spacing.stepped(4, Duration::from_millis(16), 0).unwrap();
         assert_eq!((spacing.current.over, spacing.current.held), (3, 4));
     }
 
     /// AC-T1.8.D1, T-T1.8.D3 (amphora-owner-t1-log-bound-4a274ec-20261111, point 1): an owner under
     /// steady load, never idle after a restart, still ends the restart's hold once its backlog is
-    /// gone. Do: a restart that held 5 entries, then a million steps of 1 entry each, every one
-    /// with input waiting. Expect: a restart due again by its share.
+    /// gone. Do: a restart that found 3 bytes queued and held 5 entries in its step, a step that
+    /// began with 9 queued applying 2, then a million steps of 1 entry each, every one beginning
+    /// with 3 queued. Expect: 7 held, the step with 9 queued among them, and a restart due again
+    /// by its share.
     #[test]
     fn a_restart_due_again_by_its_share_on_an_owner_never_idle() {
         let mut spacing = Spacing::default();
-        spacing.restarted();
-        spacing.stepped(5, QUICK, false).unwrap();
+        spacing.restarted(3);
+        spacing.stepped(5, QUICK, 3).unwrap();
+        spacing.stepped(2, QUICK, 9).unwrap();
         for _ in 0..1_000_000 {
-            spacing.stepped(1, QUICK, false).unwrap();
+            spacing.stepped(1, QUICK, 3).unwrap();
         }
-        assert!(spacing.due().unwrap(), "held for good: {:?}", spacing.current);
+        assert_eq!((spacing.current.held, spacing.current.most), (7, 7));
+        assert!(
+            spacing.due().unwrap(),
+            "held for good: {:?}",
+            spacing.current
+        );
     }
 
     /// AC-T1.8.D1, T-T1.8.D3: do a restart that held 50 entries, then two generations of ticks;
@@ -225,9 +261,9 @@ mod tests {
     #[test]
     fn the_window_forgets_after_two_generations() {
         let mut spacing = Spacing::default();
-        spacing.restarted();
-        spacing.stepped(50, QUICK, true).unwrap();
-        spacing.stepped(1, QUICK, true).unwrap();
+        spacing.restarted(0);
+        spacing.stepped(50, QUICK, 0).unwrap();
+        spacing.stepped(1, QUICK, 0).unwrap();
         assert!(!spacing.due().unwrap());
         for _ in 0..GENERATION {
             spacing.tick().unwrap();
@@ -236,7 +272,7 @@ mod tests {
         for _ in 0..GENERATION {
             spacing.tick().unwrap();
         }
-        spacing.stepped(1, QUICK, true).unwrap();
+        spacing.stepped(1, QUICK, 0).unwrap();
         assert!(spacing.due().unwrap());
     }
 
@@ -263,12 +299,12 @@ mod tests {
             } else {
                 QUICK
             };
-            spacing.stepped(1 + next() % 7, took, true).unwrap();
+            spacing.stepped(1 + next() % 7, took, 0).unwrap();
             if spacing.due().unwrap() {
-                spacing.restarted();
+                spacing.restarted(0);
                 let held = 1 + next() % 9;
-                spacing.stepped(held, QUICK, false).unwrap();
-                spacing.stepped(0, QUICK, true).unwrap();
+                spacing.stepped(held, QUICK, 1).unwrap();
+                spacing.stepped(0, QUICK, 0).unwrap();
                 restarts += 1;
                 if held > worst {
                     worst = held;

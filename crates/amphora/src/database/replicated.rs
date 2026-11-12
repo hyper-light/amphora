@@ -1687,8 +1687,9 @@ impl<F: BlockFile + 'static> Actor<F> {
     fn run_step(&mut self, input: Option<Envelope>) -> Result<(), Refusal> {
         let at = (self.clock)();
         self.at = at;
-        // A step that found nothing to take ends a restart's hold (`log_bound::Spacing`).
-        let idle = input.is_none() && self.waiting.is_empty();
+        // A step that begins with no more input queued than a restart found ends its hold
+        // (`log_bound::Spacing`).
+        let queued = self.queued();
         let applied = self.replica.applied().index;
         if let Some(envelope) = input {
             self.receive(envelope)?;
@@ -1793,7 +1794,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         // past where the step began.
         let entries = self.replica.applied().index.saturating_sub(applied);
         let took = (self.clock)().saturating_duration_since(at);
-        self.spacing.stepped(entries, took, idle)?;
+        self.spacing.stepped(entries, took, queued)?;
         *locked(&self.control.status)? = Ok(status(&self.replica));
         let commits = self.replica.core().raft.commit_stats();
         self.control.meter.stepped(
@@ -1853,6 +1854,8 @@ impl<F: BlockFile + 'static> Actor<F> {
                     self.control.local.hold_reads()?;
                 }
                 if due && pass.caught_up && !*out {
+                    let queued = u64::try_from(self.control.admitted.load(Ordering::Acquire))
+                        .unwrap_or(u64::MAX);
                     let machine = self.replica.machine_mut();
                     // The file keeps room for what the log needed, within what the disk allows.
                     machine.keep_log(frames.min(pass.room));
@@ -1864,7 +1867,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                     {
                         pass.caught_up = false;
                         pass.busy = false;
-                        self.spacing.restarted();
+                        self.spacing.restarted(queued);
                         self.control.meter.restarted();
                     }
                 }
@@ -1901,6 +1904,12 @@ impl<F: BlockFile + 'static> Actor<F> {
             #[cfg(test)]
             Flushing::Held => Ok(()),
         }
+    }
+    /// The bytes of input admitted to this owner and not yet taken: its channel's and those
+    /// waiting behind the prepared transaction, each envelope's reservation. Past u64's range it
+    /// says the most it can.
+    fn queued(&self) -> u64 {
+        u64::try_from(self.control.admitted.load(Ordering::Acquire)).unwrap_or(u64::MAX)
     }
     fn expire(&mut self) {
         // Expired callers relinquish queued operations even while a seed or proposal is held.
@@ -12526,10 +12535,7 @@ mod tests {
                     let busy = copier.checkpoint()?;
                     let frames = driven.owner(1).replica.machine().log_frames()?;
                     driven.owner_mut(1).spacing = log_bound::Spacing::default();
-                    driven
-                        .owner_mut(1)
-                        .spacing
-                        .stepped(1, Duration::ZERO, true)?;
+                    driven.owner_mut(1).spacing.stepped(1, Duration::ZERO, 0)?;
                     let mut waited = Ok(Vec::new());
                     for _ in 0..ROUNDS {
                         driven.round(&mut pump);
@@ -12610,9 +12616,9 @@ mod tests {
             handle.counters()
         );
         let spacing = &mut driven.owner_mut(1).spacing;
-        spacing.restarted();
-        spacing.stepped(1, Duration::ZERO, false).unwrap();
-        spacing.stepped(0, Duration::ZERO, true).unwrap();
+        spacing.restarted(0);
+        spacing.stepped(1, Duration::ZERO, 1).unwrap();
+        spacing.stepped(0, Duration::ZERO, 0).unwrap();
         let restarts = handle.counters().database_log_restarts;
         for value in 2..=21 {
             write(&mut driven, &mut pump, &clients[0], value);
@@ -12655,8 +12661,8 @@ mod tests {
         write(&mut driven, &mut pump, voter, 1);
         settle_log(&mut driven, &mut pump, &clients);
         let spacing = &mut driven.owner_mut(0).spacing;
-        spacing.restarted();
-        spacing.stepped(1_000_000, Duration::ZERO, true).unwrap();
+        spacing.restarted(0);
+        spacing.stepped(1_000_000, Duration::ZERO, 1).unwrap();
         driven
             .owner(0)
             .replica

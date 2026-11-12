@@ -1742,9 +1742,14 @@ flushing thread with what it reads after each pass. Nothing in it is picked.
 applies until it is idle again waits for it. The owner counts, in entries as this member applies them (every member
 applies every commit once, on a leader, a follower and a learner alike):
 - *applied*: every entry;
-- *held*: every entry applied from a restart's start until the owner's first idle step after it, a step whose input
-  wait ran out with nothing waiting. That covers what arrived during the restart, what queued behind its backlog, and
-  the commits in flight when it began. It overcounts, which is the conservative side;
+- *held*: every entry applied from a restart's start until the backlog it made is gone, the first step after it
+  that begins with no more input queued than the restart found. Queued input is the owner's own count of admitted
+  bytes not yet taken, its channel's and those waiting behind the prepared transaction (each envelope's
+  reservation). An idle step, with none queued, is one such step. That covers what arrived during the restart, what
+  queued behind its backlog, and the commits in flight when it began. It overcounts, which is the conservative side.
+  An owner under steady load, never idle, still ends the hold once its queue is back where it was (tested, and
+  red-first: ended only at an idle step, such an owner held every entry after its first restart for good, never
+  came due by share again, and its log grew to the room: amphora-owner-t1-log-bound-4a274ec-20261111);
 - *over*, the base tail: an entry applied, not held, by a step that took longer than AC-T1.3.4's bound on a
   commit's p99.9 (15 ms). This is a proxy: it is the delay the owner added itself, past the p99.9. A commit's
   quorum and network time aren't the owner's to see, and don't change with restarts;
@@ -1787,8 +1792,9 @@ reads:
 - *F*: the frames the log's file already holds room for, its length reused (store.md decision 13);
 - *N*: the replica logs on that filesystem, a live count on the process-wide local-reads `Account`, keyed by the
   filesystem's number. That is `st_dev` on Unix, and the volume serial on Windows (`GetFileInformationByHandle`,
-  through winapi-util). On any other platform every log counts as on one filesystem, an overcount, so each takes
-  less. A log is counted from its owner's flushing thread's start until the thread ends (`LogShare`). Every replica
+  through winapi-util). Two Windows volumes with the same serial count as one and undercount N, the unsafe side:
+  rare (serials are set at format), and stated. On any other platform every log counts as on one filesystem, an
+  overcount, so each takes less. A log is counted from its owner's flushing thread's start until the thread ends (`LogShare`). Every replica
   owner, of either class, runs one; a test's `Flushing::Held` doesn't count.
 
 The room, in frames: H = (F × 4,120 + (A - SNAPSHOT_BYTES) / N) / (4,120 + 4,096), with no share once A is below one
@@ -1807,7 +1813,11 @@ database's log holds {frames} frames, past the {H} it may hold: ...")`, typed an
 until kiln shows a caller that must branch on it, and `Refusal` is a wire enum. A follower can't refuse what its
 group committed, and the leader can't see a follower's disk without a wire change, so a follower past H applies on.
 If its disk then fills, the flush fails and the owner fences with the I/O error, typed, its image whole on reopen
-(tested). That is a limit of availability, not of safety. What a restart keeps of the file (`Db::keep_log`) is set
+(tested). A leader past H is the same: it refuses submits made at it, but the proposals its followers forward
+(`MsgPropose`) are stepped and applied, since dropping them would leave a request with no answer on the wire
+(CLAUDE.md section 3). Its log grows on, and on a full disk it fences the same way. The mechanism is the follower
+test's, a failed flush on the flushing thread fencing the owner whatever its role, so no test of its own. Both are
+limits of availability, not of safety. What a restart keeps of the file (`Db::keep_log`) is set
 at each restart to min(H, the log's length then). A file past what the log needed, or past what the disk allows, is
 cut (store.md decision 31).
 
@@ -1833,6 +1843,9 @@ On adas-mac-studio.local-2 (macOS aarch64), 2026-11-11; the core's tests in `dat
 `database::replicated`:
 - T-T1.8.D3 `the_first_restart_is_free`, `a_restart_spends_what_it_held_and_spaces_the_next` (held 5: due at 10,001
   applied, not 10,000), `long_steps_spend_the_tail_before_any_restart`, `the_window_forgets_after_two_generations`.
+- T-T1.8.D3 `a_restart_due_again_by_its_share_on_an_owner_never_idle`: a restart that found 3 bytes queued holds 7
+  entries until a step begins with 3, and through a million steps never idle a restart comes due again. Red on
+  4a274ec, whose hold ended only at an idle step: every one of 1,000,005 entries held.
 - T-T1.8.D3, the share: `restarts_made_when_due_keep_their_share_below_the_tail`. Four generations of steps of 1 to
   7 entries, a long one in 20,011, each restart made when due and holding 1 to 9. After every restart that held no
   more than the worst before it, held + over stays strictly below a thousandth of the entries applied over the
@@ -1882,4 +1895,7 @@ bytes (frames × 4,120). The dashboard's "Database log against its bound" row pl
   sharing one pool), so a filesystem may hold less than it said;
 - a restart that copied more than what was applied after the last caught-up pass's flush;
 - a snapshot install that met a full disk mid-image while its filesystem was within every log's room (several
-  installs at once on one filesystem are the stated exception).
+  installs at once on one filesystem are the stated exception);
+- a reopen too slow at a log near its room: a reopen reads the whole log to rebuild its index (wal.c,
+  `walIndexRecover`), and readers' wal-index lookups grow with it. The room bounds disk, not that time, so it is
+  measured in the batch's heavy runs.
