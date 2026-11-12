@@ -1088,3 +1088,188 @@ And tests of the walk itself, in `join.rs`:
 budget slower than its parent's plan; a query of 10 to 12 tables planned differently from the
 parent (the model test says none is); or a JOB query planned in more than 92.1 ms, which would
 say the budget is too large for this search's cost per subset.
+
+## 20. ANALYZE keeps each column's distinct count and a sample of each table
+
+**Decision.** PL.2 (docs/research/planner.md section 9, rank 2). ANALYZE, beside `sqlite_stat1`,
+reads each table once more and keeps, in `__turso_internal_column_stats(tbl, col, kind, data)`
+(the engine's reserved prefix, which SQLite and earlier builds never consult):
+- a HyperLogLog sketch of each stored column (`column_stats.rs`): 2,048 six-bit registers, 1,536
+  bytes, with the column's non-NULL and NULL values counted. A value hashes as SQLite compares it:
+  an integer within 2^53 as the real it equals, text and BLOB apart. The hash is a fixed function
+  (FNV-1a, then MurmurHash3's finalizer), the same on every platform.
+- a reservoir sample of each table's rows (Algorithm R): at most 1,024 rows and 1 MiB of their
+  records, chosen by splitmix64 seeded with the table's name, so two passes of one build keep the
+  same sample. A table whose sample would pass 1 MiB keeps none, its row's data NULL.
+
+The schema loads them with `sqlite_stat1` (`stats.rs`), each table's sample with its common
+values counted: those the sample holds at least ten times, the most common first. At planning, a
+column keeps as common only those that stand apart from the rest, as PostgreSQL's
+`analyze_mcv_list` decides (`common_kept`). The least common value is dropped while its sample
+count is within two standard errors and a half of what the values left would give it. So a
+column whose values are about equally common keeps none: its estimates are its distinct count's,
+the same in every table that holds those values, and no sample's noise moves them. The samples a schema loads stay within
+64 MiB of records; a table past it loads none and its estimates take its distinct counts, logged
+on `amphora.planner.stats` (`event = "sample_over_budget"`).
+
+An `=` or IN list of a column against constants (`constraints.rs`, `apply_column_stats`) then
+takes:
+- a common value: its share of the sample;
+- another value: the share of the column's non-NULL rows the common values leave, over the
+  distinct values they leave, at most the least common value's share (PostgreSQL's
+  `var_eq_const`);
+- a bound parameter, or a column whose collation is not BINARY: its non-NULL share over its
+  distinct count;
+- an IN list: the sum of its values' shares, at most one.
+
+A rowid, a one-column key and a unique column keep one row a value, and a join term keeps its
+equivalence class (decision 18). Where no index leads a join column, the sketch's distinct count
+is its domain (`cardinality.rs`, `column_domain`). When ANALYZE's statistics are loaded, the
+connection's prepared statements plan again at their next run (`statement.rs`), as SQLite's
+ANALYZE ends with `OP_Expire`. Other connections take the statistics when they next load the
+schema, as in SQLite.
+
+**Why.** At step 3, 16 of JOB's 113 first tables were off by 13,417 or more, 15 of them an
+equality on `keyword.keyword`, which no index covers: a tenth of the table estimated against one
+row counted. TPC-H SF 10's q16 took its IN list of eight sizes for eight rows (1.44 estimated,
+296,824 counted), and q12's two shipping modes for two. A statement prepared before ANALYZE kept
+the plan it was given without statistics (audit row `08-fixed-at-prepare`).
+
+**Sources.**
+- Flajolet, Fusy, Gandouet and Meunier, "HyperLogLog: the analysis of a near-optimal cardinality
+  estimation algorithm", AofA 2007: standard error 1.04/sqrt(m), 2.3% at m = 2,048; linear
+  counting below 5m/2 with a register empty. A 64-bit hash needs no large-range correction.
+- Freitag and Neumann, "Every Row Counts", CIDR 2019, and Umbra (f14, A): updatable HyperLogLog on
+  every column, about 2% in 1.5 KB, with a sample of every relation. DuckDB (f15, A) and
+  ClickHouse (f42, A) keep HyperLogLog distinct counts per column.
+- Vitter, "Random Sampling with a Reservoir", ACM TOMS 11(1), 1985: Algorithm R. Steele, Lea and
+  Flood, OOPSLA 2014: splitmix64. Lemire, ACM TOMACS 29(1), 2019: a bounded draw by multiply and
+  shift.
+- PostgreSQL, `src/backend/utils/adt/selfuncs.c` at 6a3da13d376f, `var_eq_const`: "We approximate
+  that all the not-common values share this remaining fraction equally, so we divide by the number
+  of other distinct values", then "selectivity shouldn't be estimated as more than the least
+  common \"most common value\"".
+- PostgreSQL, `src/backend/commands/analyze.c` at 6a3da13d376f, `analyze_mcv_list`: "Exclude the
+  least common values from the MCV list, if they are not significantly more common than the
+  estimated selectivity they would have if they weren't in the list", the test
+  `mcv_counts[num_mcv - 1] > selec * samplerows + 2 * stddev + 0.5`.
+- SQLite, `src/analyze.c` at 2a4fb6233696, `sqlite3Analyze`: `sqlite3VdbeAddOp0(v, OP_Expire);`.
+
+**Evidence.** `crates/engine/tests/column_stats.rs`, red on 8289870 and green with the change:
+- `an_equality_no_index_leads_is_estimated_from_its_distinct_count` (AC-PL.2.1): JOB's keyword
+  table at 13,417 rows, an equality on its keyword within 1.1 of the one row counted.
+- `a_frequent_value_takes_its_share_of_the_sample` (AC-PL.2.1): a code holding 8,000 of 20,000
+  rows and a rare one holding 60, each within 1.25.
+- `an_in_list_is_estimated_as_its_values_shares` (AC-PL.2.2): q16's eight sizes and q12's two
+  modes, each within 1.25.
+- `a_statement_prepared_before_analyze_plans_again_after_it` (AC-PL.2.3): prepared once again,
+  with the estimate a statement prepared afterwards gives.
+- `a_table_past_the_samples_bound_keeps_its_distinct_counts` (T-PL.2.1): a 6 MiB table keeps no
+  sample, and its equality is still within 1.25 from its sketch.
+
+`without_rowid_analyze.rs`'s `a_without_rowid_keys_statistics_reach_the_planner` (decision 15)
+now reads the key's `sqlite_stat1` row through a join's domain. That is where it still decides
+the estimate: an equality on the key's first column now reads each table's own sample, which a
+WITHOUT ROWID table and its rowid copy draw apart (570.5 against 555.5 rows on the same values).
+
+The unit tests in `column_stats.rs` (T-PL.2.1) check the sketch within three standard errors
+from 1 to 1,000,000 values, its encoding back to itself, and the reservoir: 1,024 rows, the same
+for the same name, uniform within 40 rows a tenth, and none past its byte bound.
+
+**Falsified by.**
+- A keyword prefix of JOB off by more than 1.1 after ANALYZE.
+- q16's part off by more than 10, or q12's lineitem by more than 100.
+- A plan the new estimates move running slower than its parent's beyond the passes' spread.
+- ANALYZE of JOB's or TPC-H SF 10's database taking more than twice its parent's time, measured
+  on the bench.
+
+## 21. A table's filters are estimated together on its sample, and otherwise combine by backoff
+
+**Decision.** PL.4 (docs/research/planner.md section 9, rank 4). When the planner sizes a joined
+set (`cardinality.rs`, `JoinedSetRows`), each inner table with a sample (decision 20) runs its own
+WHERE terms over the sample, once a prepare (`sampled_filters`). The share of the sample's rows
+that pass them all is their selectivity together: ranges, LIKE and GLOB, ORs of conjunctions,
+IS NULL and correlated columns at once. A term takes part when it reads only this table's
+sampled columns and constants: a WHERE term or an inner join's ON term, which the order check
+holds to one estimate, including an OR that no constraint homes. The ON terms of the table's own
+outer join run apart, and again together with its filters. Outer joins size their matches from
+`sel(ON and filters) / sel(ON)`, so an outer join reads the sample for the same terms as the inner
+join it restricts to (CERT). The evaluator (`optimizer/sample_filter.rs`) runs comparisons,
+BETWEEN, IN lists, LIKE and GLOB, IS NULL, AND, OR and NOT, with SQLite's comparison affinity
+and the BINARY, NOCASE and RTRIM collations. An `=` or IN list of constants on a column with a
+sketch keeps its column statistics' estimate (decision 20), which tells a common value from a
+rare one; the sample would only count it. So does any other term: a parameter, a function, a
+subquery, another table's column, or a term that raises an error on a sample row.
+
+Each term is compiled once into a flat program of at most 64 operations (a loop over an explicit
+stack, CLAUDE.md §11). Each table's terms run within 1,048,576 steps, an operation on a row each
+(§2); a term the budget no longer covers is left to the other estimates.
+
+Where at least ten sample rows pass the terms together, their share of the sample is the
+selectivity. Where fewer do, it is the share of the rows that pass, at least half a row's, but no
+more than the terms' own estimates combined by backoff. So a conjunction no sample row passes
+still takes its terms' statistics, and a rare value keeps its distinct count's estimate.
+
+A table's filters then combine by exponential backoff (`cost.rs`, `constraints_selectivity`), in
+place of their product: the sampled share, each range (a column bounded from both sides counts
+once, as `sel_closed_range`), each LIKE and each other filter. The most selective counts whole,
+the next at its square root, then its fourth root and its eighth; the rest are taken as correlated
+with these. Equalities, IN lists and terms that read another table still multiply: their
+selectivities come from `sqlite_stat1`'s prefixes and the sketches' distinct counts, by which a
+whole key's equalities give its one row.
+
+No added term raises an estimate, as CERT requires. A term's treatment depends on its own form,
+not on the others. A term added to the sampled ones passes no row the others don't, so their share
+falls; across the ten-row line it falls below ten rows' share. Backoff never rises with an added
+selectivity: placed k-th, it multiplies by s^(e_k), and each selectivity it moves down a place,
+none more selective than it, by at most s raised to the exponent that one loses; those losses sum
+to at most e_k (`backoff`'s unit test). The other estimates multiply.
+
+**Why.** At step 3, TPC-H SF 10's q19 part, an OR of three conjunctions, was estimated at 1.2
+rows against 239,849, and q06's lineitem, three ranges, was off by 1.9e+03. With its keyword
+prefixes exact, JOB's first tables kept a q-error p95 of 66.3 from their LIKE and range filters.
+Each range took a fixed 0.4, a closed range 0.005 and a LIKE 0.2, all multiplied as if
+independent; an OR no constraint takes was not counted at all.
+
+**Sources.**
+- Microsoft Learn, Cardinality Estimation (SQL Server), on CE 120 and higher: "Partially
+  correlated (default for CE120 and higher), where cardinality is calculated using a variation on
+  exponential backoff, ordering the selectivities from most to the least selective predicate"
+  (f17, A). The exponents 1, 1/2, 1/4 and 1/8 over the four most selective are those
+  docs/research/planner.md rank 4 gives for CE 120. They were not checked against Microsoft's own
+  text here, and the bench is what tests them.
+- Oracle's dynamic statistics (f13, D: graded for Han et al.'s counterclaim on sampling across
+  joins, which this sample of one table is not): "The database uses recursive SQL to scan a small
+  random sample of table blocks", at parse time, for the same conjunctions.
+- CERT (Ba and Rigger, ICSE 2024; f21, A): a more restrictive query's estimate should not exceed
+  the original's.
+
+**Evidence.** `crates/engine/tests/sample_filters.rs`, red at 885bda9 and green with the change:
+- `q06s_ranges_are_estimated_together_on_the_sample` (AC-PL.4.2): 0.2 estimated against 339 counted
+  on the parent; within 2 with the change.
+- `a_like_is_estimated_on_the_sample` (AC-PL.4.2): 1,600 against 2,494 on the parent; within 1.5.
+- `correlated_columns_are_estimated_together` (audit row 5): 1,600 against 5,000 on the parent;
+  within 1.25.
+- `q19s_or_of_conjunctions_is_estimated_on_the_sample` (AC-PL.4.1): 4,627.7 against 611 on the
+  parent; within 2.
+- `a_filter_made_more_restrictive_never_raises_its_estimate` (T-PL.4.1): 400 random conjunctions,
+  with the sample and without statistics, each given one more term. None rises, and more than 200
+  fall.
+- `backoff_never_rises_with_an_added_selectivity` (unit, T-PL.4.1).
+- `an_inner_joins_on_term_and_a_where_term_give_one_estimate` and
+  `an_outer_join_with_sampled_terms_is_estimated_at_least_its_inner_join` hold the oracles'
+  findings on seed 11. With only WHERE terms sampled there were 30 order-check findings (an
+  inner join's ON term against the same WHERE term). With ON terms sampled but an outer join's
+  apart from its filters there were 21 CERT findings, then one. With the joint sample, seeds 11
+  and 12 at 300 s each found none in 855,783 checks.
+- Decision 20's tests and `records_plans`' whole-key lookup pass, the latter because equalities
+  multiply.
+
+**Falsified by.**
+- q19's part off by more than 10 at SF 10, or q19 no faster once its part's estimate is near its
+  count.
+- q06's lineitem off by more than 2.
+- JOB's first tables' q-error p95 not under 20.
+- JOB's median planning time over twice step 3's 1.9 ms (the sample's run, at most 1,048,576 steps
+  a table, is the cost to watch).
+- A CERT failure in the oracles.

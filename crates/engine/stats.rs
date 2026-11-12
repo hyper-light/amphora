@@ -8,7 +8,11 @@ use crate::types::IOResult;
 use crate::util::normalize_ident;
 use crate::{Connection, Result, Statement, TransactionState, Value};
 pub const STATS_TABLE: &str = "sqlite_stat1";
-const STATS_QUERY: &str = "SELECT tbl, idx, stat FROM sqlite_stat1";
+const STATS_QUERY: &str = "SELECT 0, tbl, idx, stat, NULL FROM sqlite_stat1";
+/// `sqlite_stat1`'s rows and, where ANALYZE has kept them, its sketches and samples
+/// (docs/design/planner.md, decision 20), told apart by their first column.
+const STATS_AND_COLUMNS_QUERY: &str = "SELECT 0, tbl, idx, stat, NULL FROM sqlite_stat1 \
+     UNION ALL SELECT 1, tbl, col, kind, data FROM __turso_internal_column_stats";
 
 /// Statistics produced by ANALYZE for a single index.
 #[derive(Clone, Debug, Default)]
@@ -32,6 +36,56 @@ pub struct IndexStat {
     pub avg_rows_per_distinct_prefix: Vec<u64>,
 }
 
+/// A column's values as its sketch counted them (decision 20).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColumnStat {
+    /// Its distinct non-NULL values, at least one where it has any, within the sketch's error.
+    pub distinct: f64,
+    pub non_null: u64,
+    pub nulls: u64,
+}
+
+/// A table's sample (decision 20): at most [crate::column_stats::SAMPLE_ROWS] of its rows, each
+/// the values of `columns`, the table's columns ANALYZE read.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Sample {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Value>>,
+    /// For each of `columns`, the values the sample holds at least
+    /// [crate::column_stats::SAMPLE_HITS] times, the most common first: each value's hash
+    /// ([crate::column_stats::value_hash]) and its rows in the sample.
+    pub common: Vec<Vec<(u64, usize)>>,
+}
+
+impl Sample {
+    /// The sample of `rows`, each the values of `columns`, with each column's common values
+    /// counted: a loop over the rows a column, at most [crate::column_stats::SAMPLE_ROWS] each.
+    pub fn new(columns: Vec<String>, rows: Vec<Vec<Value>>) -> Self {
+        let common = (0..columns.len())
+            .map(|at| {
+                let mut hits: HashMap<u64, usize> = HashMap::default();
+                for value in rows.iter().filter_map(|row| row.get(at)) {
+                    if let Some(h) = crate::column_stats::value_hash(value) {
+                        let n = hits.entry(h).or_default();
+                        *n = n.saturating_add(1);
+                    }
+                }
+                let mut common: Vec<(u64, usize)> = hits
+                    .into_iter()
+                    .filter(|(_, n)| *n >= crate::column_stats::SAMPLE_HITS)
+                    .collect();
+                common.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                common
+            })
+            .collect();
+        Self {
+            columns,
+            rows,
+            common,
+        }
+    }
+}
+
 /// Statistics produced by ANALYZE for a single BTree table.
 #[derive(Clone, Debug, Default)]
 pub struct TableStat {
@@ -39,6 +93,10 @@ pub struct TableStat {
     pub row_count: Option<u64>,
     /// Per-index statistics keyed by normalized index name.
     pub index_stats: HashMap<String, IndexStat>,
+    /// Each column's sketched counts, keyed by its normalized name (decision 20).
+    pub columns: HashMap<String, ColumnStat>,
+    /// The table's sample; `None` where ANALYZE kept none, or its rows passed the sample's budget.
+    pub sample: Option<Arc<Sample>>,
 }
 
 impl TableStat {
@@ -54,6 +112,9 @@ impl TableStat {
 pub struct AnalyzeStats {
     /// Per-table statistics keyed by normalized table name.
     pub tables: HashMap<String, TableStat>,
+    /// The bytes of the samples loaded, their records' (decision 20), charged against
+    /// [crate::column_stats::LOADED_SAMPLE_BYTES].
+    pub sample_bytes: usize,
 }
 
 impl AnalyzeStats {
@@ -158,7 +219,15 @@ pub fn refresh_analyze_stats_nonblock(
                     return Ok(IOResult::Done(()));
                 }
                 let mv_tx = conn.get_mv_tx();
-                let mut stmt = conn.prepare(STATS_QUERY)?;
+                let query = if schema_snapshot
+                    .get_btree_table(crate::translate::analyze::COLUMN_STATS_TABLE)
+                    .is_some()
+                {
+                    STATS_AND_COLUMNS_QUERY
+                } else {
+                    STATS_QUERY
+                };
+                let mut stmt = conn.prepare(query)?;
                 stmt.set_mv_tx(mv_tx);
                 *st = RefreshAnalyzeStatsState::Running {
                     stmt: Box::new(stmt),
@@ -223,10 +292,96 @@ fn load_sqlite_stat1_rows_nonblock(
     schema: &Schema,
     stats: &mut AnalyzeStats,
 ) -> crate::types::IOResultOr<()> {
-    crate::return_if_io!(
-        stmt.run_with_row_callback_nonblock(|row| { load_sqlite_stat1_row(row, schema, stats) })
-    );
+    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+        if row.get::<i64>(0)? == 1 {
+            load_column_stats_row(row, schema, stats)
+        } else {
+            load_sqlite_stat1_row(row, schema, stats)
+        }
+    }));
     Ok(crate::types::IOResult::Done(()))
+}
+
+/// Apply a row of ANALYZE's sketches and samples (decision 20): `(1, tbl, col, 'sketch', its
+/// encoding)` or `(1, tbl, NULL, 'sample', its encoding or NULL)`. A row of a table or column the
+/// schema no longer holds, or that doesn't decode, is passed over: its estimates fall back to
+/// `sqlite_stat1` and the fixed selectivities, as before ANALYZE kept it.
+fn load_column_stats_row(
+    row: &crate::vdbe::Row,
+    schema: &Schema,
+    stats: &mut AnalyzeStats,
+) -> Result<()> {
+    let table_name = row.get::<&str>(1)?;
+    let Some(table) = schema.get_btree_table(table_name) else {
+        return Ok(());
+    };
+    let (Value::Text(kind), Value::Blob(data)) = (row.get::<&Value>(3)?, row.get::<&Value>(4)?)
+    else {
+        return Ok(());
+    };
+    match kind.as_str() {
+        "sketch" => {
+            let Value::Text(column) = row.get::<&Value>(2)? else {
+                return Ok(());
+            };
+            let Some(sketch) = crate::column_stats::Sketch::decode(data) else {
+                return Ok(());
+            };
+            if table.get_column(column.as_str()).is_none() {
+                return Ok(());
+            }
+            stats.table_stats_mut(table_name).columns.insert(
+                normalize_ident(column.as_str()),
+                ColumnStat {
+                    distinct: sketch.distinct(),
+                    non_null: sketch.non_null(),
+                    nulls: sketch.nulls(),
+                },
+            );
+        }
+        "sample" => {
+            // The samples loaded stay within their budget (CLAUDE.md §2): a table whose sample
+            // would pass it keeps none, its estimates the distinct counts', and says so.
+            let Some(charged) = stats
+                .sample_bytes
+                .checked_add(data.len())
+                .filter(|n| *n <= crate::column_stats::LOADED_SAMPLE_BYTES)
+            else {
+                tracing::warn!(
+                    target: "amphora.planner.stats",
+                    event = "sample_over_budget",
+                    table = table_name,
+                    bytes = data.len(),
+                    "a table's sample is not loaded: the samples loaded would pass their budget"
+                );
+                return Ok(());
+            };
+            let Some(records) = crate::column_stats::decode_sample(data) else {
+                return Ok(());
+            };
+            // The columns ANALYZE reads, as `emit_column_stats` chooses them.
+            let columns: Vec<String> = table
+                .columns()
+                .iter()
+                .filter(|c| !c.is_generated())
+                .filter_map(|c| c.name.as_deref().map(normalize_ident))
+                .collect();
+            let mut rows = Vec::with_capacity(records.len());
+            for record in records {
+                let values =
+                    crate::types::ImmutableRecordRef::from_bin_record(record).get_values_owned()?;
+                // A record of another shape was kept before the table's columns changed.
+                if values.len() != columns.len() {
+                    return Ok(());
+                }
+                rows.push(values);
+            }
+            stats.sample_bytes = charged;
+            stats.table_stats_mut(table_name).sample = Some(Arc::new(Sample::new(columns, rows)));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Apply a single `sqlite_stat1` row to the accumulating [`AnalyzeStats`].
@@ -236,9 +391,9 @@ fn load_sqlite_stat1_row(
     schema: &Schema,
     stats: &mut AnalyzeStats,
 ) -> Result<()> {
-    let table_name = row.get::<&str>(0)?;
-    let idx_value = row.get::<&Value>(1)?;
-    let stat_value = row.get::<&Value>(2)?;
+    let table_name = row.get::<&str>(1)?;
+    let idx_value = row.get::<&Value>(2)?;
+    let stat_value = row.get::<&Value>(3)?;
 
     let idx_name = match idx_value {
         Value::Null => None,
