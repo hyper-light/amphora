@@ -1020,10 +1020,16 @@ follower it is its election bound and its stall patience, (2 × election_tick + 
 a randomized timeout below twice election_tick, plus its patience (`tick_election`). Past either, the session's role
 has moved on, and it can't apply there. A live-quorum leader's session can still reach its lease, behind a slow flush
 or a ReadIndex backlog. It then ends unapplied: safe, since the stale-base rule refuses a late apply and the keeper
-makes it again. That is the falsifier's case, so each such end is logged with a running count: target
-`amphora.replica`, event `replica.own_session_expired`. The event is the record; a counter beside it
-(`amphora_replica_own_sessions_expired_total`) is offered to the Kiln Metrics agent, and both names wait for its word
-(CLAUDE.md section 10). The re-request period of a failed seed transfer is the election
+makes it again. That is the falsifier's case, so each such end is counted and logged, as Kiln Metrics agreed them
+(amphora-constants/names/v1): the counter `amphora_replica_own_sessions_expired_total` (no labels, one per replica
+owner), and the event `replica.own_session_expired` at info on target `amphora.replica`, with its term and the
+running count as fields. `amphora.replica` carries no spans, so kiln's observe can take it at INFO.
+
+| panel | PromQL | kiln |
+|---|---|---|
+| Own sessions expired (patience too short), bars, beside quorum patience | `sum by (db) (increase(amphora_replica_own_sessions_expired_total[15m]))` | `sum:amphora_replica_own_sessions_expired_total{$host} by {db}.as_count()` |
+
+Its monitor warns on any increase in 15 minutes: each one is a falsifier. The re-request period of a failed seed transfer is the election
 timeout read from the core, where it was a bare 20 ticks. `an_owners_session_lasts_its_roles_raft_timing`: a
 follower's and a leader's sessions take their role's lease (red at 490ea83: "left: 60s, right: 400ms"), and a
 stalled leader's ends within its lease. Falsified by a floor or seed session that would have applied ending
