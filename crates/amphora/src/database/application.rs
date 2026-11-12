@@ -12,9 +12,6 @@ use serde::{Deserialize, Serialize};
 // table, so its pages would differ (replication.md, "The upgrade that introduces the join rows").
 const FLOOR: &str = "CREATE TABLE IF NOT EXISTS __amphora_application_floor (singleton INTEGER PRIMARY KEY CHECK(singleton=1), application TEXT NOT NULL, version INTEGER NOT NULL CHECK(version>0))";
 
-// An application's name is a family-shaped identifier; this bounds it as admission policy, not
-// a measured size.
-const NAME_BYTES: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Application {
@@ -23,8 +20,8 @@ pub(crate) struct Application {
 }
 impl Application {
     pub(crate) fn validate(&self) -> Result<(), Refusal> {
+        // A family-shaped identifier, so its grammar bounds it: at most `api::FAMILY_MAX` bytes.
         api::family(&self.name)?;
-        api::bound("application identity", self.name.len(), NAME_BYTES)?;
         if self.version == 0 {
             return Err(api::invalid("application contract", "zero version"));
         }
