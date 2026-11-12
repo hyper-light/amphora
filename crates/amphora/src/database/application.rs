@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 // table, so its pages would differ (replication.md, "The upgrade that introduces the join rows").
 const FLOOR: &str = "CREATE TABLE IF NOT EXISTS __amphora_application_floor (singleton INTEGER PRIMARY KEY CHECK(singleton=1), application TEXT NOT NULL, version INTEGER NOT NULL CHECK(version>0))";
 
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Application {
     pub(crate) name: String,

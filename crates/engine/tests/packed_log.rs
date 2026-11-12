@@ -670,7 +670,10 @@ fn a_generation_keeps_the_chain_bound_of_the_format_it_began_with() {
     let mut update = conn.prepare("UPDATE t SET body = ? WHERE id = ?").unwrap();
     for round in 0..30u8 {
         conn.execute("BEGIN").unwrap();
-        for row in want.iter_mut().filter(|(id, _)| *id % 3 == i64::from(round % 3)) {
+        for row in want
+            .iter_mut()
+            .filter(|(id, _)| *id % 3 == i64::from(round % 3))
+        {
             row.1[usize::from(round) * 7 % 500] = round;
             update.reset().unwrap();
             update
@@ -683,11 +686,18 @@ fn a_generation_keeps_the_chain_bound_of_the_format_it_began_with() {
         }
         conn.execute("COMMIT").unwrap();
     }
-    assert_eq!(wal_format(&path), PACKED_EIGHT_FORMAT, "the generation kept its format");
+    assert_eq!(
+        wal_format(&path),
+        PACKED_EIGHT_FORMAT,
+        "the generation kept its format"
+    );
     let entries = entries(&std::fs::read(wal_path(&path)).unwrap());
     let deepest = entries.iter().map(|(_, _, depth, _)| *depth).max().unwrap();
     assert!(deepest >= 2, "deltas at all: {deepest}");
-    assert!(deepest <= 8, "a chain of {deepest} in a generation of 8 at most");
+    assert!(
+        deepest <= 8,
+        "a chain of {deepest} in a generation of 8 at most"
+    );
     assert_eq!(table(&connect(&db)), want);
 }
 
