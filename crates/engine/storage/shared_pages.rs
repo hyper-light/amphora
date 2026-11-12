@@ -122,10 +122,11 @@ impl SharedPages {
     /// `docs/design/replication.md`, "A replica's local readers bounded by derivation": a reader's
     /// own cache): the pool keeps that many fewer while the charge is held. None, charging nothing,
     /// when the charges held and `pages` would leave it less than a page a shard.
+    #[allow(deprecated)] // `fetch_update`: shuttle's atomics (`--cfg shuttle`) have no `try_update`
     pub fn charge(self: &Arc<Self>, pages: usize) -> Option<Charge> {
         let most = self.capacity().saturating_sub(SHARDS);
         self.charged
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
                 charged.checked_add(pages).filter(|after| *after <= most)
             })
             .ok()?;
