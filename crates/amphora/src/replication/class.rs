@@ -7,8 +7,17 @@ use amphora_api::{self as api, Refusal, replication::Durability};
 /// A class entry's prefix: a log entry kind of its own, as the seed's and the baseline delta's.
 const PREFIX: &[u8] = b"amphora.class.v1\0";
 const TABLE: &str = "CREATE TABLE IF NOT EXISTS __amphora_class (id INTEGER PRIMARY KEY CHECK(id = 1), class BLOB NOT NULL)";
-/// A class entry's bytes at most: a fate for each of hyper-raft's most members and its framing.
-const ENTRY_BYTES: usize = 64 << 10;
+/// A class entry's bytes at most: what the largest class a replica takes encodes to. Postcard's
+/// wire format (postcard.jamesmunns.com, "Wire Format") writes an enum's tag and a u32 as
+/// varints of at most 5 bytes, a length and a u64 of at most 10. So: the prefix, `Replicated`'s
+/// tag, the fates' length, a (member, fate) pair of two u64s for each of the most members
+/// (`replicated::MEMBERS`), and the span.
+const ENTRY_BYTES: usize = PREFIX
+    .len()
+    .saturating_add(5)
+    .saturating_add(10)
+    .saturating_add(5)
+    .saturating_add(crate::database::replicated::MEMBERS.saturating_mul(20));
 
 /// `durability` with its fates in member order: the same class stated in any order is one class.
 pub(crate) fn canonical(durability: &Durability) -> Durability {
@@ -332,5 +341,23 @@ mod tests {
                 .unwrap();
             assert_eq!(machine.class_agreed(), agreed, "after entry {index}");
         }
+    }
+
+    /// AC-T1.8.5: a class entry's bound is what the largest class encodes to. Do: encode a class of
+    /// the most members a replica takes, every id, fate and span at its type's largest, then one
+    /// member more. Expect: the first an entry read back as its class; the one more refused as a
+    /// class entry, where a picked 64 KiB took it (2026-11-11: no picked bounds).
+    #[test]
+    fn a_class_entry_holds_the_most_members_and_no_more() {
+        let most = crate::database::replicated::MEMBERS;
+        let wide = |members: usize| {
+            let of = (0..members)
+                .map(|m| (u64::MAX - m as u64, u64::MAX))
+                .collect();
+            class(of, u32::MAX)
+        };
+        let full = wide(most);
+        assert_eq!(decode(&entry(&full).unwrap()).unwrap(), canonical(&full));
+        assert!(entry(&wide(most + 1)).is_err(), "a class past the members");
     }
 }

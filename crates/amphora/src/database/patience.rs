@@ -17,7 +17,7 @@ pub(super) const QUORUM_CEILING: usize = 165;
 pub(super) const GENERATION: u64 = 3_000;
 
 /// Voters a leader measures at most: the replicated owner's member bound.
-const PEERS: usize = 64;
+const PEERS: usize = super::replicated::MEMBERS;
 
 /// An answer the window does not learn, and why.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

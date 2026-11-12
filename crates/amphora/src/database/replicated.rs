@@ -29,7 +29,7 @@ const COMMANDS: usize = 64;
 const QUEUED_BYTES: usize = 512 << 20;
 const OUTGOING_BYTES: usize = 512 << 20;
 const OUTGOING_MESSAGES: usize = 4096;
-const MEMBERS: usize = 64;
+pub(crate) const MEMBERS: usize = 64;
 const WIRE_BYTES: usize = crate::replication::SNAPSHOT_BYTES.saturating_add(2 << 20);
 const MESSAGE_BYTES: usize = crate::replication::COMMAND_BYTES.saturating_add(2 << 20);
 // Ticks are the pinned core's documented tick election mode (raft.rs, Elections::Ticks). Its
@@ -37,9 +37,10 @@ const MESSAGE_BYTES: usize = crate::replication::COMMAND_BYTES.saturating_add(2 
 const TICK: Duration = Duration::from_millis(10);
 const POLL: Duration = Duration::from_millis(1);
 const DRIVE_QUANTUM: usize = 32;
-// The admission charge of a change of members or a hand-off of the lead: policy, not a measured
-// size. Each is a few bytes; the charge holds its place in the queue's byte budget.
-const CHANGE_BYTES: usize = 1024;
+// The admission charge of a change of members, a hand-off of the lead, a catch-up or an
+// attestation: the bytes the queued input itself takes, its place in the queue's byte budget (an
+// attestation's name is charged beside it).
+const CHANGE_BYTES: usize = std::mem::size_of::<Input>();
 // The lease of one of the floor keeper's own sessions: policy, not a measured number, the same
 // finite lease the seed's internal attempt has (`bootstrap`); a session past it ends unapplied and
 // is made again.
@@ -1097,11 +1098,12 @@ impl ReplicaHandle {
         if attesting.as_ref() == Some(&application) {
             return Ok(());
         }
+        let charge = CHANGE_BYTES.saturating_add(application.name.len());
         self.enqueue(
             Input::Attest {
                 application: application.clone(),
             },
-            CHANGE_BYTES,
+            charge,
         )?;
         *attesting = Some(application);
         Ok(())
