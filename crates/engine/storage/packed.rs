@@ -395,6 +395,13 @@ pub(crate) fn one_slot_records(entries: &[(u32, Body<'_>)], page_size: usize) ->
 /// as much.
 const RUN_GAP: usize = RUN_HEADER;
 
+/// The bytes `diff` compares at once before it looks word by word: a cache line, which the core
+/// reads whole whichever of its words are compared. 64 bytes on x86-64 (Intel's 64 and IA-32
+/// Architectures Optimization Reference Manual), half of the 128 that adas-mac-studio.local-2's
+/// M3 Ultra reports (`sysctl hw.cachelinesize`, 2026-11-12): a page of 4 KiB in which nothing
+/// changed is 64 comparisons, not 512.
+const SAME_BLOCK: usize = 64;
+
 /// The runs that turn `base` into `new` (both a page long, at most 65,536 bytes), the last `tail`
 /// bytes always among them (a page checksum the page's buffer doesn't hold up to date), when they
 /// take fewer than `most` bytes; else none (the page is then written whole).
@@ -408,8 +415,20 @@ pub(crate) fn diff(base: &[u8], new: &[u8], tail: usize, most: usize) -> Option<
     // Runs are written as their ranges close: one buffer, taken at the most a delta may hold.
     let mut runs = Vec::with_capacity(most.min(new.len()));
     let mut open: Option<(usize, usize)> = None;
+    let mut skip = 0usize;
     for (word, (a, b)) in base.chunks(8).zip(new.chunks(8)).enumerate() {
         let at = word.checked_mul(8)?;
+        // A block of words that are all as they were, none of them carried, is passed in one
+        // comparison: a page's changes are a few runs in it (decision 17), so most blocks are.
+        if at.checked_rem(SAME_BLOCK) == Some(0) {
+            let block = at.checked_add(SAME_BLOCK)?.min(new.len());
+            if block <= carried && base.get(at..block)? == new.get(at..block)? {
+                skip = block;
+            }
+        }
+        if at < skip {
+            continue;
+        }
         let end = at.checked_add(a.len())?;
         let forced = (end > carried).then(|| carried.max(at).saturating_sub(at));
         if a == b && forced.is_none() {
@@ -1202,6 +1221,55 @@ mod tests {
             assert!(!images_as_frames(older), "{older:#x}");
         }
         assert_eq!(LogFormat::of(0x414d_5004), None);
+    }
+
+    /// Do: change pages of 4 KiB at random places (none, one byte, runs across the edges of the
+    /// blocks diff compares at once, the checksum's tail), diff them against the page before,
+    /// with a tail carried and without. Expect: the runs turn the page before into the page
+    /// after every time, the carried tail among them, and an unchanged page with nothing carried
+    /// gives no runs.
+    #[test]
+    fn a_delta_found_block_by_block_rebuilds_every_change() {
+        let size = 4096;
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let base = page(9, size);
+        assert_eq!(diff(&base, &base, 0, size), Some(Vec::new()));
+        for round in 0..400 {
+            let mut new = base.clone();
+            for _ in 0..(round % 7) {
+                let at = (next() as usize) % size;
+                let len = 1 + (next() as usize) % 90;
+                for b in new.iter_mut().skip(at).take(len) {
+                    *b = b.wrapping_add(1);
+                }
+            }
+            // Edges of the blocks compared at once.
+            if round % 5 == 0 {
+                let edge = SAME_BLOCK * (1 + (next() as usize) % (size / SAME_BLOCK - 1));
+                new[edge - 1] ^= 0x80;
+                new[edge] ^= 0x40;
+            }
+            for tail in [0usize, 8] {
+                let Some(runs) = diff(&base, &new, tail, size) else {
+                    continue;
+                };
+                let mut rebuilt = base.clone();
+                apply(&runs, &mut rebuilt).unwrap();
+                assert_eq!(rebuilt, new, "round {round}, tail {tail}");
+                if tail > 0 {
+                    let mut stale = new.clone();
+                    stale[size - tail..].copy_from_slice(&base[size - tail..]);
+                    apply(&runs, &mut stale).unwrap();
+                    assert_eq!(stale, new, "the tail carried, round {round}");
+                }
+            }
+        }
     }
 
     /// The records `packed` holds, decoded, with what each holds; every entry once in all.

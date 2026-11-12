@@ -4082,8 +4082,8 @@ impl WalFile {
     /// page's entry (a delta where its base is its latest version in this generation of the log,
     /// else its image), cut into records of up to `packed::RECORD_BYTES`, each laid in the slots
     /// it takes from frame `first`, the slots' checksums chained from `checksum`; the last slot
-    /// carries `db_size` (0 when no commit ends here). A generation that writes images new to a
-    /// chain as page frames (`packed::images_as_frames`) lays them out as `lay_out` does.
+    /// carries `db_size` (0 when no commit ends here). A generation that writes pages new to a
+    /// chain as page frames (`packed::images_as_frames`) is laid out by `lay_out`.
     fn prepare_records(
         &self,
         pages: &[PageRef],
@@ -4093,6 +4093,9 @@ impl WalFile {
         db_size: u32,
         epoch: u32,
     ) -> Result<PreparedFrames> {
+        if packed::images_as_frames(header.file_format) {
+            return self.lay_out(pages, header, (first, checksum), db_size, epoch);
+        }
         let page_size =
             usize::try_from(header.page_size).map_err(|_| LimboError::IntegerOverflow)?;
         let page_transform = self.io_ctx.read().page_transform().clone();
@@ -4152,14 +4155,6 @@ impl WalFile {
                 (*number, body)
             })
             .collect();
-        if packed::images_as_frames(header.file_format) {
-            let laid: Vec<(u32, packed::Body<'_>, bool)> = entries
-                .iter()
-                .zip(&logging)
-                .map(|((number, body), how)| (*number, *body, matches!(how, Logging::New)))
-                .collect();
-            return self.lay_out(pages, header, (first, checksum), db_size, epoch, &laid);
-        }
         // Records end where the next entry would take one past its bound.
         let mut cuts = Vec::new();
         let (mut from, mut size) = (0usize, 0usize);
@@ -4260,14 +4255,33 @@ impl WalFile {
         tail: usize,
         against: &Against,
     ) -> Logging {
-        if version.generation != against.generation
-            || self
-                .coordination
-                .latest_frame(u64::from(page), against.upto)
-                != Some(version.frame)
-        {
+        if !self.chains_from(page, version, against) {
             return Logging::New;
         }
+        Self::extend(version, base, image, tail, against)
+    }
+
+    /// Amphora: whether a commit can chain from `version` of `page`: it is of this generation of
+    /// the log and the page's latest frame in it (decision 17).
+    fn chains_from(&self, page: u32, version: Logged, against: &Against) -> bool {
+        version.generation == against.generation
+            && self
+                .coordination
+                .latest_frame(u64::from(page), against.upto)
+                == Some(version.frame)
+    }
+
+    /// Amphora: the entry of a page whose `version` the commit chains from (`base`, its bytes as
+    /// the page's buffer held them) now that it is `image`: the delta between them while the chain
+    /// is shorter than `packed::MOST_DELTAS` and the delta saves half the page, else its image,
+    /// ending the chain.
+    fn extend(
+        version: Logged,
+        base: &[u8],
+        image: &[u8],
+        tail: usize,
+        against: &Against,
+    ) -> Logging {
         if version.depth >= packed::MOST_DELTAS {
             return Logging::Ends;
         }
@@ -4280,12 +4294,12 @@ impl WalFile {
         }
     }
 
-    /// Amphora: a commit's `entries` (`pages`' as `prepare_records` made them: each page, its
-    /// entry, and whether it is new to the log's chains) laid out as decision 39 has it from
-    /// `at`'s frame, the checksums chained from `at`'s checksum: the images of pages new to the
-    /// log's chains as page frames, written as page-a-frame writes them, then the entries of chains
-    /// packed into records of one slot (`packed::one_slot_records`), an image too large for a slot
-    /// a page frame too. The last frame carries `db_size` (0 when no commit ends here).
+    /// Amphora: `pages` laid out from `at`'s frame as decision 39 has it, the checksums chained
+    /// from `at`'s checksum: a page new to the log's chains (`Logging::New`) transformed straight
+    /// into its page frame, as page-a-frame writes it; the entries of chains (a delta, or the image
+    /// that ends a chain) packed into records of one slot (`packed::one_slot_records`), an image
+    /// too large for a slot a page frame too. Page frames come first, in the commit's order, then
+    /// the records; the last frame carries `db_size` (0 when no commit ends here).
     fn lay_out(
         &self,
         pages: &[PageRef],
@@ -4293,38 +4307,113 @@ impl WalFile {
         at: (u64, (u32, u32)),
         db_size: u32,
         epoch: u32,
-        entries: &[(u32, packed::Body<'_>, bool)],
     ) -> Result<PreparedFrames> {
         let (first, mut checksum) = at;
         let page_size =
             usize::try_from(header.page_size).map_err(|_| LimboError::IntegerOverflow)?;
+        let page_transform = self.io_ctx.read().page_transform().clone();
+        // As `prepare_records`: a codec's output can't be compared, so under one no page chains.
+        let tail = match &page_transform {
+            PageTransform::None => Some(0),
+            PageTransform::Checksum(_) => Some(usize::from(CHECKSUM_REQUIRED_RESERVED_BYTES)),
+            PageTransform::Codec(_) => None,
+        };
+        let against = Against {
+            generation: header.checkpoint_seq,
+            upto: self.max_frame.load(Ordering::Acquire),
+            most: page_size.checked_div(2).unwrap_or(0),
+        };
         let past = || LimboError::InternalError("an entry past the commit's pages".into());
-        let chained: Vec<usize> = entries
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, _, new))| !new)
-            .map(|(index, _)| index)
-            .collect();
+        let unframed = || LimboError::InternalError("a log frame unlike its page's size".into());
+        // A page frame's page field tells it from a record's first slot (decision 37).
+        let frame_of = |number: u32| -> Result<Arc<Buffer>> {
+            if number >= packed::RECORD_HEAD {
+                return Err(LimboError::InvalidArgument(format!(
+                    "page {number} is past the pages a mixed log can hold"
+                )));
+            }
+            Ok(prepare_wal_frame_header(
+                &self.buffer_pool,
+                header,
+                number,
+                0,
+            ))
+        };
+        // Each page frame by its page's place in the commit; each entry of a chain with its page's
+        // place, number and logging, its image the next page of `images`.
+        let mut framed: Vec<(usize, Arc<Buffer>)> = Vec::with_capacity(pages.len());
+        let mut chained: Vec<(usize, u32, Logging)> = Vec::new();
+        let mut images: Vec<u8> = Vec::new();
+        for (index, page) in pages.iter().enumerate() {
+            let number = u32::try_from(page.get().id()).map_err(|_| LimboError::IntegerOverflow)?;
+            // The base is used up whatever is written, and the buffer holds no version of the log
+            // until this one is published.
+            let base = page.take_log_base();
+            let logged = page.logged();
+            page.clear_logged();
+            let chain = match (tail, base.as_deref(), logged) {
+                (Some(tail), Some(base), _) => Some((tail, base.version)),
+                // Spilled and unchanged since: the buffer is its base.
+                (Some(tail), None, Some(version)) => Some((tail, version)),
+                _ => None,
+            }
+            .filter(|&(_, version)| self.chains_from(number, version, &against));
+            let Some((tail, version)) = chain else {
+                let frame = frame_of(number)?;
+                let body = frame
+                    .as_mut_slice()
+                    .get_mut(WAL_FRAME_HEADER_SIZE..)
+                    .ok_or_else(unframed)?;
+                Self::transform_page(&page_transform, number, page.get_contents().as_ptr(), body)?;
+                framed.push((index, frame));
+                continue;
+            };
+            let from = images.len();
+            let to = from
+                .checked_add(page_size)
+                .ok_or(LimboError::IntegerOverflow)?;
+            images.resize(to, 0);
+            let image = images.get_mut(from..to).ok_or_else(past)?;
+            Self::transform_page(&page_transform, number, page.get_contents().as_ptr(), image)?;
+            let how = match base.as_deref() {
+                Some(base) => Self::extend(version, &base.image, image, tail, &against),
+                None => Self::extend(version, page.get_contents().as_ptr(), image, tail, &against),
+            };
+            chained.push((index, number, how));
+        }
         let chain = chained
             .iter()
-            .map(|&index| {
-                entries
-                    .get(index)
-                    .map(|(number, body, _)| (*number, *body))
-                    .ok_or_else(past)
+            .zip(images.chunks_exact(page_size))
+            .map(|((_, number, how), image)| {
+                let body = match how {
+                    Logging::Delta(depth, runs) => packed::Body::Delta {
+                        depth: *depth,
+                        runs,
+                    },
+                    Logging::Ends | Logging::New => packed::Body::Image(image),
+                };
+                (*number, body)
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
         let packing = packed::one_slot_records(&chain, page_size)?;
-        let mut framed: Vec<usize> = entries
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, _, new))| *new)
-            .map(|(index, _)| index)
-            .collect();
         for &at in &packing.frames {
-            framed.push(*chained.get(at).ok_or_else(past)?);
+            let (index, number, _) = chained.get(at).ok_or_else(past)?;
+            let (_, body) = chain.get(at).ok_or_else(past)?;
+            let packed::Body::Image(image) = body else {
+                return Err(LimboError::InternalError(
+                    "a delta laid out as a page frame".into(),
+                ));
+            };
+            let frame = frame_of(*number)?;
+            frame
+                .as_mut_slice()
+                .get_mut(WAL_FRAME_HEADER_SIZE..)
+                .filter(|body| body.len() == image.len())
+                .ok_or_else(unframed)?
+                .copy_from_slice(image);
+            framed.push((*index, frame));
         }
-        framed.sort_unstable();
+        framed.sort_unstable_by_key(|&(index, _)| index);
         let mut bufs = Vec::with_capacity(pages.len());
         let mut metadata = Vec::with_capacity(pages.len());
         let mut depths = Vec::with_capacity(pages.len());
@@ -4332,34 +4421,15 @@ impl WalFile {
         let mut decoded = Vec::with_capacity(packing.records.len());
         let mut next = first;
         let count = packing.records.len();
-        for (at, &index) in framed.iter().enumerate() {
-            let (number, body, _) = entries.get(index).ok_or_else(past)?;
-            let packed::Body::Image(image) = body else {
-                return Err(LimboError::InternalError(
-                    "a delta laid out as a page frame".into(),
-                ));
-            };
-            // A page frame's page field tells it from a record's first slot (decision 37).
-            if *number >= packed::RECORD_HEAD {
-                return Err(LimboError::InvalidArgument(format!(
-                    "page {number} is past the pages a mixed log can hold"
-                )));
+        let frames = framed.len();
+        for (at, (index, frame)) in framed.into_iter().enumerate() {
+            if count == 0 && at.checked_add(1) == Some(frames) {
+                frame
+                    .as_mut_slice()
+                    .get_mut(4..8)
+                    .ok_or_else(unframed)?
+                    .copy_from_slice(&db_size.to_be_bytes());
             }
-            let ends = count == 0 && at.checked_add(1) == Some(framed.len());
-            let frame = prepare_wal_frame_header(
-                &self.buffer_pool,
-                header,
-                *number,
-                if ends { db_size } else { 0 },
-            );
-            frame
-                .as_mut_slice()
-                .get_mut(WAL_FRAME_HEADER_SIZE..)
-                .filter(|body| body.len() == image.len())
-                .ok_or_else(|| {
-                    LimboError::InternalError("a log frame unlike its page's size".into())
-                })?
-                .copy_from_slice(image);
             checksum = recompute_wal_frame_checksum(frame.as_mut_slice(), header, checksum);
             bufs.push(frame);
             metadata.push((pages.get(index).ok_or_else(past)?.clone(), next, checksum));
@@ -4392,9 +4462,9 @@ impl WalFile {
                 bufs.push(frame);
             }
             for &k in &held {
-                let index = *chained.get(k).ok_or_else(past)?;
-                let (_, body, _) = entries.get(index).ok_or_else(past)?;
-                metadata.push((pages.get(index).ok_or_else(past)?.clone(), next, checksum));
+                let (index, _, _) = chained.get(k).ok_or_else(past)?;
+                let (_, body) = chain.get(k).ok_or_else(past)?;
+                metadata.push((pages.get(*index).ok_or_else(past)?.clone(), next, checksum));
                 depths.push(body.depth());
             }
             records.push((next, slots));
