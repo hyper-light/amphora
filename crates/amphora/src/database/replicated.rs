@@ -598,6 +598,9 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     // group"): a test's group from before the class was stated.
     #[cfg(test)]
     class_held: bool,
+    // While set, this leader holds no write slot: today's rule alone, a test's control.
+    #[cfg(test)]
+    slot_off: bool,
 }
 
 /// The flushes of the machine's database log, in every class (docs/design/replication.md, "Fast
@@ -1253,6 +1256,8 @@ fn open_on<F: BlockFile + 'static>(
         stalls: None,
         #[cfg(test)]
         class_held: false,
+        #[cfg(test)]
+        slot_off: false,
         detected: std::collections::BTreeSet::new(),
         gated: std::collections::BTreeSet::new(),
         class_proposed: None,
@@ -3397,6 +3402,39 @@ mod tests {
         appends_lost: bool,
         // The records the test loses, by the member that sent them and what they are.
         losing: Option<Losing>,
+        // While some, every record waits a seeded number of relay rounds before it is admitted,
+        // in order on each link: a network's round trips, in driven time (goal 9c63f7d4).
+        delay: Option<Delay>,
+    }
+    /// Records held back by [`Pump::delay`]: each with the relay round it is admitted at.
+    struct Delay {
+        mix: u64,
+        most: u64,
+        round: u64,
+        held: VecDeque<(u64, PumpPacket)>,
+        last: BTreeMap<(u64, u64), u64>,
+    }
+    impl Delay {
+        fn new(seed: u64, most: u64) -> Self {
+            Self {
+                mix: seed,
+                most,
+                round: 0,
+                held: VecDeque::new(),
+                last: BTreeMap::new(),
+            }
+        }
+        fn wait(&mut self) -> u64 {
+            mix(&mut self.mix) % (self.most + 1)
+        }
+    }
+    /// SplitMix64's step (Steele, Lea and Flood, OOPSLA 2014): a seeded test's draws.
+    fn mix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
     }
     impl<'a> Pump<'a> {
         fn new(clients: &'a [Client]) -> Self {
@@ -3416,6 +3454,15 @@ mod tests {
                 held: Vec::new(),
                 appends_lost: false,
                 losing: None,
+                delay: None,
+            }
+        }
+        /// Admits every record the delay holds, and holds no more.
+        fn undelay(&mut self) {
+            if let Some(delay) = self.delay.take() {
+                for (_, packet) in delay.held {
+                    self.admit(packet);
+                }
             }
         }
         fn reap(&mut self) {
@@ -3494,6 +3541,19 @@ mod tests {
         /// One relay round, each record admitted with `until` as its receive deadline.
         fn drive_until(&mut self, until: Instant) -> usize {
             self.reap();
+            let mut released = 0;
+            if let Some(delay) = self.delay.as_mut() {
+                delay.round += 1;
+                let round = delay.round;
+                let mut due = Vec::new();
+                while delay.held.front().is_some_and(|(at, _)| *at <= round) {
+                    due.push(delay.held.pop_front().unwrap().1);
+                }
+                for packet in due {
+                    self.admit(packet);
+                    released += 1;
+                }
+            }
             let first = self.next_source;
             self.next_source = (first + 1) % self.clients.len();
             let mut admitted = 0;
@@ -3551,6 +3611,17 @@ mod tests {
                                 continue;
                             }
                         }
+                        if let Some(delay) = self.delay.as_mut() {
+                            let link = (packet.from, packet.message.to);
+                            let at = (delay.round + 1 + delay.wait())
+                                .max(delay.last.get(&link).copied().unwrap_or(0));
+                            delay.last.insert(link, at);
+                            // Held in admission order; one due sooner waits behind it, as a later
+                            // record on its link does.
+                            delay.held.push_back((at, packet));
+                            admitted += 1;
+                            continue;
+                        }
                         if let Some(durable) = self.durable.as_mut() {
                             let record = Message::decode(&packet.message.bytes).unwrap();
                             if record.msg_type == hyper_raft::proto::MessageType::MsgAppendResponse
@@ -3570,7 +3641,7 @@ mod tests {
                 }
             }
             self.reap();
-            admitted
+            admitted + released
         }
         fn begin_captures(&mut self, leader: usize, want: usize) {
             assert!(matches!(self.phase, PumpPhase::Relay));
@@ -12864,5 +12935,333 @@ mod tests {
             "no leader counted an answer"
         );
         assert!(acknowledged > 0, "no write was acknowledged");
+    }
+
+    use std::collections::BTreeSet;
+
+    /// One list-append transaction of the write slot's isolation checks (Elle's list-append,
+    /// Kingsbury and Alvaro, VLDB 2020): it read `key`'s and `other`'s lists and appended
+    /// `element` to `key`'s.
+    struct Append {
+        element: String,
+        key: u64,
+        other: u64,
+        read: Option<(Vec<String>, Vec<String>)>,
+        outcome: Outcome,
+    }
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Outcome {
+        Pending,
+        Committed,
+        Refused,
+        Unknown,
+    }
+    /// What one list-append run left: its history's violations and, by writer, its counts.
+    struct ListRun {
+        violations: Vec<String>,
+        committed: Vec<u64>,
+        // Attempts refused as stale, and the most refused in a row before one committed.
+        refused: Vec<u64>,
+        streak: Vec<u64>,
+        unknown: u64,
+    }
+    type Answering = mpsc::Receiver<Result<Answer, Refusal>>;
+    fn list(db: &mut Db, key: u64) -> anyhow::Result<Vec<String>> {
+        let mut out = Vec::new();
+        db.query_owned(&format!("SELECT v FROM lists WHERE k = {key}"), [], |row| {
+            out = row
+                .get::<String>(0)?
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            Ok(false)
+        })?;
+        Ok(out)
+    }
+    /// Each owner in `writers` (the leader first) makes `ops` list-append writes over `keys`
+    /// lists, one at a time, a refused one made again as a new write, as kiln's `store::write`
+    /// evaluates its closure again; every record is delayed up to three relay rounds. Each list's
+    /// row is padded to half a page, so lists far apart sit on different pages. With `slot_off`,
+    /// the leader holds no write slot: today's rule alone.
+    fn list_append_run(
+        writers: &[usize],
+        slot_off: bool,
+        seed: u64,
+        keys: u64,
+        ops: u64,
+    ) -> ListRun {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        assert_eq!(leader, 0, "the run's writers name the leader as owner 0");
+        driven
+            .call(&mut pump, &clients[leader], move |db| {
+                db.exec("CREATE TABLE lists(k INTEGER PRIMARY KEY, v TEXT NOT NULL, pad BLOB)")?;
+                for k in 1..=keys {
+                    db.exec(&format!("INSERT INTO lists VALUES ({k}, '', zeroblob(1800))"))?;
+                }
+                Ok(Vec::new())
+            })
+            .unwrap();
+        driven.tick(&mut pump, leader);
+        driven.owner_mut(leader).slot_off = slot_off;
+        pump.delay = Some(Delay::new(seed, 3));
+        let mut state = seed;
+        let mut history: Vec<Append> = Vec::new();
+        let mut inflight: Vec<Option<(usize, Answering)>> = writers.iter().map(|_| None).collect();
+        let mut streaks = vec![0u64; writers.len()];
+        let mut run = ListRun {
+            violations: Vec::new(),
+            committed: vec![0; writers.len()],
+            refused: vec![0; writers.len()],
+            streak: vec![0; writers.len()],
+            unknown: 0,
+        };
+        let mut rounds = 0;
+        while run.committed.iter().any(|done| *done < ops) {
+            assert!(rounds < ROUNDS, "seed {seed}: hung");
+            for (w, &owner) in writers.iter().enumerate() {
+                if inflight[w].is_none() && run.committed[w] < ops {
+                    let key = 1 + mix(&mut state) % keys;
+                    let other = 1 + mix(&mut state) % keys;
+                    let element = format!("w{w}n{}", history.len());
+                    let appended = element.clone();
+                    let answer = submit(&clients[owner], driven.until(), move |db| {
+                        let (a, b) = (list(db, key)?, list(db, other)?);
+                        db.exec(&format!(
+                            "UPDATE lists SET v = v || ' {appended}' WHERE k = {key}"
+                        ))?;
+                        Ok(format!("{}|{}", a.join(" "), b.join(" ")).into_bytes())
+                    });
+                    history.push(Append {
+                        element,
+                        key,
+                        other,
+                        read: None,
+                        outcome: Outcome::Pending,
+                    });
+                    inflight[w] = Some((history.len() - 1, answer));
+                }
+                let Some((index, answer)) = inflight[w].take() else {
+                    continue;
+                };
+                match answer.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => inflight[w] = Some((index, answer)),
+                    Err(error) => panic!("owner ended: {error}"),
+                    Ok(Ok(answer)) => {
+                        let text = String::from_utf8(called(answer)).unwrap();
+                        let (a, b) = text.split_once('|').unwrap();
+                        let words = |s: &str| s.split_whitespace().map(str::to_string).collect();
+                        history[index].read = Some((words(a), words(b)));
+                        history[index].outcome = Outcome::Committed;
+                        run.committed[w] += 1;
+                        streaks[w] = 0;
+                    }
+                    Ok(Err(Refusal::Invalid { what, .. })) if what == "prepared transaction" => {
+                        history[index].outcome = Outcome::Refused;
+                        run.refused[w] += 1;
+                        streaks[w] += 1;
+                        run.streak[w] = run.streak[w].max(streaks[w]);
+                    }
+                    Ok(Err(_)) => {
+                        history[index].outcome = Outcome::Unknown;
+                        run.unknown += 1;
+                    }
+                }
+            }
+            driven.round(&mut pump);
+            rounds += 1;
+        }
+        pump.undelay();
+        driven.quiet(&mut pump);
+        driven.tick(&mut pump, leader);
+        driven.tick(&mut pump, leader);
+        let finals: Vec<Vec<Vec<String>>> = (0..3)
+            .map(|owner| {
+                driven
+                    .owner_mut(owner)
+                    .replica
+                    .machine_mut()
+                    .read_db(|db| (1..=keys).map(|k| list(db, k)).collect())
+                    .unwrap()
+            })
+            .collect();
+        run.violations = list_violations(&history, &finals);
+        driven.drain(&mut pump);
+        pump.finish();
+        run
+    }
+    /// The checks: every replica holds the same lists; each committed write's element appears
+    /// once, in its key's list, and a refused one's never; each committed write read its key's
+    /// list exactly as it stood before its element (the serial replay per key), and its other
+    /// key's as some prefix; and the dependency graph Elle infers (ww from each list's order, wr
+    /// from what was read, rw to the next element a read missed) has no cycle (Adya's G0, G1c and
+    /// G2).
+    fn list_violations(history: &[Append], finals: &[Vec<Vec<String>>]) -> Vec<String> {
+        let mut out = Vec::new();
+        for (owner, lists) in finals.iter().enumerate().skip(1) {
+            if *lists != finals[0] {
+                out.push(format!("replica {owner} differs from replica 0"));
+            }
+        }
+        let lists = &finals[0];
+        let by_element: BTreeMap<&str, usize> = history
+            .iter()
+            .enumerate()
+            .map(|(i, op)| (op.element.as_str(), i))
+            .collect();
+        let at = |key: u64| &lists[usize::try_from(key - 1).unwrap()];
+        for (k, list) in lists.iter().enumerate() {
+            let mut seen = BTreeSet::new();
+            for element in list {
+                if !seen.insert(element) {
+                    out.push(format!("{element} appears twice in list {}", k + 1));
+                }
+                match by_element.get(element.as_str()).map(|i| &history[*i]) {
+                    None => out.push(format!("{element} in list {} was never written", k + 1)),
+                    Some(op) if op.key != u64::try_from(k + 1).unwrap() => {
+                        out.push(format!("{element} is in list {}, not its own", k + 1))
+                    }
+                    Some(op) if op.outcome == Outcome::Refused => {
+                        out.push(format!("{element}, refused, is in list {}", k + 1))
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        for op in history.iter().filter(|op| op.outcome == Outcome::Committed) {
+            let list = at(op.key);
+            let Some(position) = list.iter().position(|e| *e == op.element) else {
+                out.push(format!("{} committed but lost from list {}", op.element, op.key));
+                continue;
+            };
+            let (a, b) = op.read.as_ref().unwrap();
+            if a.as_slice() != &list[..position] {
+                out.push(format!(
+                    "{} read list {} as {a:?}, not as it stood before it, {:?}",
+                    op.element,
+                    op.key,
+                    &list[..position]
+                ));
+            }
+            if !at(op.other).starts_with(b) {
+                out.push(format!("{} read list {} as {b:?}, no prefix of it", op.element, op.other));
+            }
+        }
+        // Elle's dependency graph over committed writes; Kahn's algorithm finds a cycle.
+        let committed: Vec<usize> = (0..history.len())
+            .filter(|i| history[*i].outcome == Outcome::Committed)
+            .collect();
+        let node: BTreeMap<usize, usize> =
+            committed.iter().enumerate().map(|(n, i)| (*i, n)).collect();
+        let writer = |element: &String| {
+            by_element
+                .get(element.as_str())
+                .and_then(|i| node.get(i).copied())
+        };
+        let mut edges: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); committed.len()];
+        for list in lists {
+            for pair in list.windows(2) {
+                if let (Some(from), Some(to)) = (writer(&pair[0]), writer(&pair[1])) {
+                    edges[from].insert(to);
+                }
+            }
+        }
+        for (n, i) in committed.iter().enumerate() {
+            let op = &history[*i];
+            let (a, b) = op.read.as_ref().unwrap();
+            for (key, read) in [(op.key, a), (op.other, b)] {
+                let list = at(key);
+                if let Some(from) = read.last().and_then(writer)
+                    && from != n
+                {
+                    edges[from].insert(n);
+                }
+                if let Some(to) = list.get(read.len()).and_then(writer)
+                    && to != n
+                {
+                    edges[n].insert(to);
+                }
+            }
+        }
+        let mut incoming = vec![0usize; committed.len()];
+        for targets in &edges {
+            for to in targets {
+                incoming[*to] += 1;
+            }
+        }
+        let mut ready: Vec<usize> = (0..committed.len()).filter(|n| incoming[*n] == 0).collect();
+        let mut sorted = 0;
+        while let Some(n) = ready.pop() {
+            sorted += 1;
+            for to in &edges[n] {
+                incoming[*to] -= 1;
+                if incoming[*to] == 0 {
+                    ready.push(*to);
+                }
+            }
+        }
+        if sorted != committed.len() {
+            out.push(format!(
+                "a dependency cycle among {} committed writes",
+                committed.len() - sorted
+            ));
+        }
+        out
+    }
+
+    /// T-T1.8.W1 (AC-T1.8.W1; replication.md, "A follower's write under steady leader writes"):
+    /// a refused write lands on its next try under the slot. Do: the leader and one follower
+    /// each append 15 times to two hot lists, then to 32 spread over pages, every record delayed
+    /// up to three relay rounds, three seeds each. Expect: no follower write refused twice in a
+    /// row, every write committed, none unknown, and the history serializable (replicas equal,
+    /// each list its serial replay, no G0, G1c or G2 cycle). Control, today's rule alone (the
+    /// slot off): the follower refused more than once in a row in some run (non-vacuity).
+    #[test]
+    fn a_refused_follower_write_lands_on_its_next_try_under_the_slot() {
+        let mut starved = 0;
+        for keys in [2, 32] {
+            for seed in 1..=3 {
+                let run = list_append_run(&[0, 1], false, seed, keys, 15);
+                eprintln!(
+                    "slot keys {keys} seed {seed}: committed {:?} refused {:?} in a row {:?}",
+                    run.committed, run.refused, run.streak
+                );
+                assert!(run.violations.is_empty(), "keys {keys} seed {seed}: {:?}", run.violations);
+                assert_eq!(run.unknown, 0, "keys {keys} seed {seed}");
+                assert!(run.streak[1] <= 1, "keys {keys} seed {seed}: {:?}", run.streak);
+                let control = list_append_run(&[0, 1], true, seed, keys, 15);
+                assert!(control.violations.is_empty(), "{:?}", control.violations);
+                if control.streak[1] > 1 {
+                    starved += 1;
+                }
+            }
+        }
+        assert!(starved > 0, "today's rule never refused the follower twice in a row");
+    }
+
+    /// T-T1.8.W2 (AC-T1.8.W1): two followers and a leader all writing steadily, none missing.
+    /// Do: the leader and both followers each append 15 times to two hot lists, then to 32,
+    /// every record delayed, three seeds each. Expect: every write committed within its
+    /// deadline (none unknown), no follower write refused more than the members ahead of it in
+    /// the slot's queue in a row (two), and the history serializable.
+    #[test]
+    fn two_followers_and_a_leader_writing_steadily_all_commit_within_their_deadlines() {
+        for keys in [2, 32] {
+            for seed in 1..=3 {
+                let run = list_append_run(&[0, 1, 2], false, seed, keys, 15);
+                eprintln!(
+                    "keys {keys} seed {seed}: committed {:?} refused {:?} in a row {:?}",
+                    run.committed, run.refused, run.streak
+                );
+                assert!(run.violations.is_empty(), "keys {keys} seed {seed}: {:?}", run.violations);
+                assert_eq!(run.unknown, 0, "keys {keys} seed {seed}");
+                assert!(run.streak[1..].iter().all(|s| *s <= 2), "keys {keys} seed {seed}: {:?}", run.streak);
+            }
+        }
     }
 }
