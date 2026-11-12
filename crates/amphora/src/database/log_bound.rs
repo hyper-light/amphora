@@ -205,6 +205,21 @@ mod tests {
         assert_eq!((spacing.current.over, spacing.current.held), (3, 4));
     }
 
+    /// AC-T1.8.D1, T-T1.8.D3 (amphora-owner-t1-log-bound-4a274ec-20261111, point 1): an owner under
+    /// steady load, never idle after a restart, still ends the restart's hold once its backlog is
+    /// gone. Do: a restart that held 5 entries, then a million steps of 1 entry each, every one
+    /// with input waiting. Expect: a restart due again by its share.
+    #[test]
+    fn a_restart_due_again_by_its_share_on_an_owner_never_idle() {
+        let mut spacing = Spacing::default();
+        spacing.restarted();
+        spacing.stepped(5, QUICK, false).unwrap();
+        for _ in 0..1_000_000 {
+            spacing.stepped(1, QUICK, false).unwrap();
+        }
+        assert!(spacing.due().unwrap(), "held for good: {:?}", spacing.current);
+    }
+
     /// AC-T1.8.D1, T-T1.8.D3: do a restart that held 50 entries, then two generations of ticks;
     /// expect it forgotten: a restart due again after one entry.
     #[test]
