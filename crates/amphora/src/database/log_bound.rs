@@ -135,6 +135,12 @@ impl Spacing {
         Ok(())
     }
 
+    /// Whether a restart's hold is under way.
+    #[cfg(test)]
+    pub(super) fn holding(&self) -> bool {
+        self.holding.is_some()
+    }
+
     /// Whether a restart is due by its share: the held, the over and the next restart's worst
     /// guess, against the entries applied over the window, strictly below the quantile's tail.
     pub(super) fn due(&self) -> Result<bool, Refusal> {

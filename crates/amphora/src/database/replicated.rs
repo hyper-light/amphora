@@ -12643,6 +12643,72 @@ mod tests {
     }
 
     /// AC-T1.8.D1, T-T1.8.D3 (replication.md, "A replica's database log bounded by what it
+    /// measures", A; amphora-owner-t1-log-bound-004f682-20261111): an owner kept busy at a steady
+    /// queue depth after a restart ends the restart's hold, its queue read on one basis at the
+    /// restart and at each step. Do: a voter and its learner, 1 written and flushed, the learner's
+    /// share spent, 2 written and flushed, then its count of restarts forgotten (a restart due by
+    /// its share, its log holding 2's frames); the learner stepped on
+    /// its own, each step taking one input with one more always waiting behind it, until it
+    /// restarts, then 8 steps more. Expect: a restart, and its hold ended.
+    #[test]
+    fn a_restart_hold_ends_on_an_owner_busy_at_a_steady_queue() {
+        own_account();
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = voter_and_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        write(&mut driven, &mut pump, &clients[0], 1);
+        settle_log(&mut driven, &mut pump, &clients);
+        // Its share spent, so the log holds 2's frames when the test makes a restart due.
+        let spacing = &mut driven.owner_mut(1).spacing;
+        spacing.restarted(0);
+        spacing.stepped(1_000_000, Duration::ZERO, 1).unwrap();
+        write(&mut driven, &mut pump, &clients[0], 2);
+        settle_log(&mut driven, &mut pump, &clients);
+        driven.drain(&mut pump);
+        pump.finish();
+        let handle = clients[1].handle();
+        assert!(driven.owner(1).replica.machine().log_frames().unwrap() > 0);
+        let restarts = handle.counters().database_log_restarts;
+        let (mut learner, inputs) = driven.owners.get_mut(1).unwrap().take().unwrap();
+        learner.spacing = log_bound::Spacing::default();
+        learner.spacing.stepped(1, Duration::ZERO, 0).unwrap();
+        let mut answers = Vec::new();
+        let mut ask = || {
+            let (response, answer) = mpsc::sync_channel(1);
+            handle
+                .enqueue(
+                    Input::CatchUp {
+                        until: Instant::now() + HANG_READ,
+                        response,
+                    },
+                    CHANGE_BYTES,
+                )
+                .unwrap();
+            answers.push(answer);
+        };
+        ask();
+        let mut after = None;
+        for _ in 0..ROUNDS {
+            ask();
+            learner.run_step(Some(inputs.try_recv().unwrap())).unwrap();
+            if after.is_none() && handle.counters().database_log_restarts > restarts {
+                after = Some(0);
+            }
+            if let Some(steps) = after.as_mut() {
+                *steps += 1;
+                if *steps > 8 {
+                    break;
+                }
+            }
+            std::thread::park_timeout(POLL);
+        }
+        assert!(after.is_some(), "no restart: {:?}", handle.counters());
+        assert!(!learner.spacing.holding(), "the hold never ended");
+        drop((learner, inputs, answers));
+    }
+
+    /// AC-T1.8.D1, T-T1.8.D3 (replication.md, "A replica's database log bounded by what it
     /// measures", C): past its room a replica refuses submits, typed, and a restart is due
     /// whatever its share says: disk before latency. Do: a voter and its learner; the voter's
     /// share spent (a restart that held a million entries) and its filesystem told it has nothing
