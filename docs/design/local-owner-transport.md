@@ -329,10 +329,14 @@ additive constructors carry them, and the existing ones keep their behavior:
     (2026-11-11; Ada: "We don't tolerate arbitrary constants, learned and stat derived values
     only"; they were 50 µs doubling to 1 ms). The first pause is the probe's own measured cost,
     so probing takes no more time than waiting. Each next pause is twice the last, at least the
-    probe's cost. It is capped at the window this process last waited out before taking a drained
-    lease (`DRAIN_WINDOW`, measured from the first probe to the lease taken), so a lease let go is
-    taken within one learned window of its release. Before any window is learned the pauses double
-    to the deadline, so a lease is taken within twice the wait. `database::drain_pause` tests the
+    probe's cost. It is capped at the larger of the window this process last waited out before
+    taking a drained lease (`DRAIN_WINDOW`, from the first probe to the lease taken: one last sample,
+    which bounds how late a probe is, never how long a wait lasts) and this wait so far. So a lease
+    let go within the learned window is taken within it, and a drain that outlasts the window (a
+    lease held to the deadline, K1) goes on doubling instead of probing at the window's pace, about
+    16,000 times a second at 62.8 µs (amphora-seam-owner-2,
+    amphora-owner-t1-constants-code-20261111). Before any window is learned the pauses double to the
+    deadline, so a lease is taken within twice the wait. `database::drain_pause` tests the
     pure core (`next_pause`). Falsified by a reopen after a drain answering later than one learned
     window past the lease's release, or probing for longer than it waits. A path with no drain of this
     process behind it keeps the at-once refusal (`remote_owner()`, the restore's "another process

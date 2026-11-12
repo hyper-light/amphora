@@ -126,7 +126,8 @@ static DRAINED: OnceLock<Mutex<std::collections::VecDeque<PathBuf>>> = OnceLock:
 pub(super) const OWNERS_MAX: usize = 4096;
 /// The window this process last waited out for a drained path's lease, from its first probe to
 /// taking it, in nanoseconds (0: none waited yet): how long a child it forked held the lease until
-/// its exec, learned (J1; 62.8 µs once measured on fedora, t1/guards-flake).
+/// its exec, learned (J1; 62.8 µs once measured on fedora, t1/guards-flake). One last sample: it
+/// bounds how late a probe is, never how long a wait lasts (the caller's deadline does).
 static DRAIN_WINDOW: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
@@ -389,27 +390,33 @@ fn lease_held_since_drain(path: &Path) {
 
 /// The pause before the next probe of a drained path's lease: the probe's own cost the first
 /// time, so probing takes at most as long as waiting; then twice the last (and never less than
-/// the probe), no longer than the
-/// window the last drain took (`window`), so a lease let go is taken within that window of its
-/// release. Before any window is known it doubles to the deadline: within twice the wait.
-fn next_pause(last: Option<Duration>, probe: Duration, window: Option<Duration>) -> Duration {
+/// the probe). It's no longer than the larger of the window the last drain took (`window`) and
+/// this wait so far (`waited`): a lease let go within the learned window is taken within it, and
+/// one held past it is taken within twice the wait, so a drain that outlasts the window doesn't
+/// spin at the window's pace. Before any window is known it doubles to the deadline.
+fn next_pause(
+    last: Option<Duration>,
+    probe: Duration,
+    window: Option<Duration>,
+    waited: Duration,
+) -> Duration {
     // A probe the clock can't see takes its least step, so the pauses still grow.
     let probe = probe.max(Duration::from_nanos(1));
     match last {
         None => probe,
         Some(last) => {
             let doubled = last.saturating_mul(2).max(probe);
-            window.map_or(doubled, |window| doubled.min(window.max(probe)))
+            window.map_or(doubled, |window| doubled.min(window.max(waited).max(probe)))
         }
     }
 }
 
 /// Parks before the next probe of a drained path's lease, no later than `until`, for
-/// [`next_pause`] after `pause`, given the probe began at `probed`.
-fn pause_for_lease(pause: &mut Option<Duration>, probed: Instant, until: Instant) {
+/// [`next_pause`] after `pause`, given the probe began at `probed` and the wait at `since`.
+fn pause_for_lease(pause: &mut Option<Duration>, probed: Instant, since: Instant, until: Instant) {
     let nanos = DRAIN_WINDOW.load(Ordering::Relaxed);
     let window = (nanos > 0).then(|| Duration::from_nanos(nanos));
-    let next = next_pause(*pause, probed.elapsed(), window);
+    let next = next_pause(*pause, probed.elapsed(), window, since.elapsed());
     *pause = Some(next);
     std::thread::park_timeout(until.saturating_duration_since(Instant::now()).min(next));
 }
@@ -768,8 +775,8 @@ impl Database {
                 // process's. An unguarded open waits as a client, below.
                 if (guards.is_some() || restoring) && drained_here(&path)? {
                     drop(owners);
-                    waited = waited.or(Some(probed));
-                    pause_for_lease(&mut pause, probed, until);
+                    let since = *waited.get_or_insert(probed);
+                    pause_for_lease(&mut pause, probed, since, until);
                     continue;
                 }
                 if guards.is_some() {
@@ -2077,23 +2084,49 @@ mod drain_pause {
     fn a_drained_lease_is_probed_from_its_probes_cost_to_the_learned_window() {
         let probe = Duration::from_micros(3);
         let window = Duration::from_micros(40);
-        assert_eq!(next_pause(None, probe, None), probe);
-        assert_eq!(next_pause(None, probe, Some(window)), probe);
+        let early = Duration::from_micros(10);
+        assert_eq!(next_pause(None, probe, None, early), probe);
+        assert_eq!(next_pause(None, probe, Some(window), early), probe);
         let mut pause = None;
         let mut seen = Vec::new();
         for _ in 0..6 {
-            let next = next_pause(pause, probe, Some(window));
+            let next = next_pause(pause, probe, Some(window), early);
             seen.push(next.as_micros());
             pause = Some(next);
         }
         assert_eq!(seen, [3, 6, 12, 24, 40, 40]);
         assert_eq!(
-            next_pause(Some(Duration::from_millis(8)), probe, None),
+            next_pause(Some(Duration::from_millis(8)), probe, None, early),
             Duration::from_millis(16)
         );
         let slow = Duration::from_micros(90);
-        assert_eq!(next_pause(Some(window), slow, Some(window)), slow);
-        let unseen = next_pause(None, Duration::ZERO, None);
-        assert!(next_pause(Some(unseen), Duration::ZERO, None) > unseen);
+        assert_eq!(next_pause(Some(window), slow, Some(window), early), slow);
+        let unseen = next_pause(None, Duration::ZERO, None, Duration::ZERO);
+        assert!(next_pause(Some(unseen), Duration::ZERO, None, Duration::ZERO) > unseen);
+    }
+
+    /// Do: ask the pauses of a wait that has outlasted the learned window: a lease held to the
+    /// deadline (K1) after a drain of 40 µs was learned. Expect: the pauses go on doubling past
+    /// the window, each at most the wait so far, so a second of waiting takes about twenty probes,
+    /// not the 25,000 a window's pace would (amphora-seam-owner-2's ruling,
+    /// amphora-owner-t1-constants-code-20261111; CP-T1.5 U05).
+    #[test]
+    fn a_wait_that_outlasts_the_learned_window_keeps_doubling() {
+        let probe = Duration::from_micros(3);
+        let window = Duration::from_micros(40);
+        let mut waited = Duration::ZERO;
+        let mut pause = None;
+        let mut probes = 0u32;
+        while waited < Duration::from_secs(1) {
+            let next = next_pause(pause, probe, Some(window), waited);
+            assert!(
+                next <= window.max(waited).max(probe),
+                "{next:?} at {waited:?}"
+            );
+            waited += next + probe;
+            pause = Some(next);
+            probes += 1;
+        }
+        assert!(probes < 40, "{probes} probes in a second");
     }
 }

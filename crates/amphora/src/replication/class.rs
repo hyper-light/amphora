@@ -11,7 +11,10 @@ const TABLE: &str = "CREATE TABLE IF NOT EXISTS __amphora_class (id INTEGER PRIM
 /// wire format (postcard.jamesmunns.com, "Wire Format") writes an enum's tag and a u32 as
 /// varints of at most 5 bytes, a length and a u64 of at most 10. So: the prefix, `Replicated`'s
 /// tag, the fates' length, a (member, fate) pair of two u64s for each of the most members
-/// (`replicated::MEMBERS`), and the span.
+/// (`replicated::MEMBERS`), and the span. No class names more: the record is restricted to the
+/// configuration, hyper-raft refuses a change whose configuration names more than
+/// `limits.members` (raft.rs:3633) and `Fates::validate` holds to the same limit (raft.rs:431),
+/// which the owner's settings set to `MEMBERS`.
 const ENTRY_BYTES: usize = PREFIX
     .len()
     .saturating_add(5)

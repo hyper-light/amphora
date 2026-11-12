@@ -389,7 +389,7 @@ impl Database {
                     lease_held_since_drain(&path);
                     return Err(Refusal::Timeout);
                 }
-                pause_for_lease(&mut pause, probed, until);
+                pause_for_lease(&mut pause, probed, since, until);
                 probed = Instant::now();
                 if let Some(lease) = crate::transport::try_lease(&path)? {
                     drop(lease);

@@ -39,7 +39,8 @@ const POLL: Duration = Duration::from_millis(1);
 const DRIVE_QUANTUM: usize = 32;
 // The admission charge of a change of members, a hand-off of the lead, a catch-up or an
 // attestation: the bytes the queued input itself takes, its place in the queue's byte budget (an
-// attestation's name is charged beside it).
+// attestation's name is charged beside it). The response channel's own allocation is charged for
+// no input, as before.
 const CHANGE_BYTES: usize = std::mem::size_of::<Input>();
 // The lease of one of the floor keeper's own sessions: policy, not a measured number, the same
 // finite lease the seed's internal attempt has (`bootstrap`); a session past it ends unapplied and
