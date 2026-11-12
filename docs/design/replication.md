@@ -1635,41 +1635,21 @@ AC-T1.8.D1 and AC-T1.8.D2, tests T-T1.8.D1 and T-T1.8.D2 (docs/requirements.toml
    25 ms, the store's measured period (store.md, decision 4). Past the bound, as the writer counts its frames, a pass
    follows every flush. A pass that copied nothing new waits for the next flush, which on this thread is automatic
    (store.md, decision 25).
-3. **The owner starts the log again.** The bound is `replication::LOG_FRAMES`, 131,072 frames (512 MiB of 4 KiB
-   pages), the store's measured default (store.md, decision 4, fedora 2026-10-20). Reads are held back once a pass
-   left at most a 64th of the bound to copy with the log past it, or once the writer counts more than twice the
-   bound however much is left; the restart itself waits for a pass that left at most that 64th. The owner restarts
-   on the machine's own connection between steps, as the store's writer does (`Db::restart_log`: Restart, or Truncate past `keep_log`, store.md decision 31).
-   It is the owner's because a restart takes the engine's write lock. On another connection it would make the
-   owner's next `wal_insert_begin` busy, and a failed apply fences. The owner never waits for a reader. With a flush
-   (and so a pass) or a local read out, it tries again at its next step. Reads and the restart are two rules
-   (`hold_due`, `restart_ready`; amphora-seam-owner at 92c5a9e). Past twice the bound, or past it with little left,
-   no local read begins: a read waits up to its own deadline, then is refused `Timeout` (counted as `timeout`).
-   Passes go on meanwhile, one after every flush, and one each step with nothing to flush, so that the reads out
-   end and the passes copy what they held off. The owner restarts only once a pass left at most a 64th of the
-   bound, so the restart's own copy on the owner's thread stays that small however long the log grew. A read that began on a log wholly copied reads the file alone and holds read-mark 0, which makes a
-   passive pass busy, as SQLite's is (wal.c, `walCheckpoint` takes `WAL_READ_LOCK(0)`). So the rule also reads the
-   writer's own count of frames, kept in memory, rather than waiting on a pass to report (tested:
-   `a_read_on_a_wholly_copied_log_holds_passes_off_and_the_restart_still_falls_due`).
-   A leader's log is also started again by the engine itself: a preparation is a write transaction, and the engine
-   restarts the log at a write's begin when every frame is copied and no reader reads from the log
-   (`try_restart_log_before_write`; SQLite's `walRestartLog` does the same, wal.c). That is safe beside this rule:
-   it discards no frame that isn't in the file, it needs no reader in the log, as the owner's restart does, and the
-   preparation's rollback writes nothing into the restarted log. The flusher's durable prefix is taken against the
-   log's generation, which a restart moves (store.md, decision 15), so neither restart makes the other's state wrong.
-   The leader's log stays within its bound in the test as the learner's does.
-4. **The bound, stated.** The log holds at most twice `LOG_FRAMES`, plus what the group commits while the local reads
-   out when the restart fell due finish. Each of those reads is bounded by its caller's deadline (`run_query`'s
-   progress handler), and no new one begins. So the restart waits for no longer than the longest deadline of the
-   reads out when it fell due (tested). A restart's own time on the owner is what is left (at most a 64th of the bound)
-   and a flush of the file: 10-14 ms on fedora (store.md, decision 4), once per 131,072 frames.
-5. **Disk, per replica.** A replica's database log uses at most twice `LOG_FRAMES` frames of 4,120 bytes, 1.08 GB,
-   plus what point 4's reads let past it. A restart keeps the file's length up to `Db::keep_log`, twice the store's
-   bound (262,144 frames, the same 1.08 GB), and cuts a longer file to nothing (store.md, decisions 13 and 31). So a
-   node holds about 1.08 GB of database log for each replicated group it is a member of, and no more while no read
-   outlasts a restart's due point. This is a bound per replica, not a charge to a process-wide disk budget: Amphora
-   has no disk budget yet, and adding one (CLAUDE.md section 2, "memory and disk are charged to budgets") is a
-   change of its own, across the store and the replica.
+3. **The owner starts the log again**, on the machine's own connection between steps, as the store's writer does
+   (`Db::restart_log`: Restart, or Truncate past `keep_log`, store.md decision 31). It is the owner's because a
+   restart takes the engine's write lock: on another connection it would make the owner's next `wal_insert_begin`
+   busy, and a failed apply fences. The owner never waits for a reader: with a flush or a local read out, it tries
+   again at its next step. When a restart is due, when reads are held for it, and how far the log may grow are
+   "A replica's database log bounded by what it measures" (2026-11-11), below, which replaces this point's picked
+   bound (`LOG_FRAMES`, 131,072 frames, and a 64th of it) and points 4 and 5. A leader's log is also started again
+   by the engine itself: a preparation is a write transaction, and the engine restarts the log at a write's begin
+   when every frame is copied and no reader reads from the log (`try_restart_log_before_write`; SQLite's
+   `walRestartLog` does the same, wal.c). That is safe beside the owner's restart: it discards no frame that isn't
+   in the file, it needs no reader in the log, as the owner's does, and the preparation's rollback writes nothing
+   into the restarted log. The flusher's durable prefix is taken against the log's generation, which a restart
+   moves (store.md, decision 15), so neither restart makes the other's state wrong.
+4. *(Replaced, 2026-11-11: the bound is stated in "A replica's database log bounded by what it measures", D.)*
+5. *(Replaced, 2026-11-11: the disk a log takes is that section's C.)*
 6. **Busy is a skip; only I/O fences.** A checkpoint pass that finds the log busy copies nothing and reports nothing:
    its `Checkpointed` is the default, and the owner keeps what the last real pass said. A restart that finds the log
    busy (`Db::restart_log`'s `Ok(false)`) is tried again at the next step. A pass or a restart that fails for any
@@ -1681,6 +1661,9 @@ AC-T1.8.D1 and AC-T1.8.D2, tests T-T1.8.D1 and T-T1.8.D2 (docs/requirements.toml
    keeps those two per replica.
 
 ### Evidence
+
+As of 2026-11-09. The D1 tests below were rewritten on 2026-11-11's rule (next section), which replaced their
+lowered bounds with a lowered room.
 
 - T-T1.8.D1 `a_replicas_database_log_stays_within_its_bound`: a voter and its learner, the learner's bound lowered to
   64 frames; 300 writes of a 3,000-byte row. Red on main: 1,526 frames, no pass. With the change, at most twice the
@@ -1720,16 +1703,205 @@ log, a replica having two logs):
 
 | panel | PromQL | kiln |
 |---|---|---|
-| Database log (bytes), against its bound (2 × 131,072 × 4,120) | `max by (instance, db) (amphora_replica_database_log_bytes)` | `max:amphora_replica_database_log_bytes{$host} by {host,db}` |
+| Database log against its limit (bytes; the next section) | `max by (instance, db) (amphora_replica_database_log_bytes)` and `max by (instance, db) (amphora_replica_database_log_limit_bytes)` | `max:amphora_replica_database_log_bytes{$host} by {host,db}` and `max:amphora_replica_database_log_limit_bytes{$host} by {host,db}` |
 | Checkpoint seconds p50 / p99 | `histogram_quantile(0.5 / 0.99, sum by (le, db) (rate(amphora_replica_checkpoint_seconds_bucket[5m])))` | `p50:` and `p99:amphora_replica_checkpoint_seconds{$host} by {db}` |
 | Checkpoints/s | `sum by (db) (rate(amphora_replica_checkpoint_seconds_count[5m]))` | `count:amphora_replica_checkpoint_seconds{$host} by {db}` |
 | Database log restarts/s, bars | `sum by (db) (rate(amphora_replica_database_log_restarts_total[5m]))` | `sum:amphora_replica_database_log_restarts_total{$host} by {db}.as_count()` |
 
 ### Falsified by
 
-- a replica's database log holding more than twice `LOG_FRAMES` while no local read was out when its restart fell due;
+- (the bound's falsifiers are the next section's);
 - a checkpoint pass that changed what an open local read sees;
 - a log restart while a local read was out, or a local read that began while a restart was due;
 - a persisted owner that flushes an ordinary entry's database log on its own thread, or an acknowledged write lost
   after a power cut in the persisted class (the power-cut nemesis);
 - terms that move as often under the same load after the change as before.
+
+## A replica's database log bounded by what it measures (2026-11-11)
+
+Amphora goal 7582f00a's bound, redone on Ada's word (2026-11-11): "We don't tolerate arbitrary constants, learned
+and stat derived values only." Requirements: AC-T1.8.D1, tests T-T1.8.D1 and T-T1.8.D3 (docs/requirements.toml).
+Agreed by amphora-seam-owner-2 before code (amphora-owner-t1-log-bound-design-20261111 and
+amphora-owner-t1-log-bound-rev1-20261111; codex-notices/t1-log-bound.md).
+
+### What was wrong
+
+The 2026-11-09 decision (above, point 3) bounded a replica's log at twice `replication::LOG_FRAMES` (131,072
+frames: about 1.08 GB a replica a group) and restarted it once a pass left at most a 64th of that. Neither was
+derived. `LOG_FRAMES` is the standalone store's default, the better of two candidates (16,384 and 131,072) at one
+load on one host (store.md, decision 4: fedora 2026-10-20, 32 writers), and the 64th is a fraction picked to keep
+the restart's own copy small. The one number served two purposes that want two rules: how often the owner may stop
+to restart (a latency question) and how much disk the log may take (a resource question).
+
+### The decision
+
+A pure core, `database::log_bound` (CLAUDE.md section 9), which the owner drives with each step and tick, and the
+flushing thread with what it reads after each pass. Nothing in it is picked.
+
+**A. A restart spends a share of the commit tail, counted.** A restart holds the owner, and every entry the owner
+applies until it is idle again waits for it. The owner counts, in entries as this member applies them (every member
+applies every commit once, on a leader, a follower and a learner alike):
+- *applied*: every entry;
+- *held*: every entry applied from a restart's start until the backlog it made is gone, the first step after it
+  that begins with no more input queued than the restart found. Queued input is the owner's own count of admitted
+  bytes not yet taken, its channel's and those waiting behind the prepared transaction (each envelope's
+  reservation). It is read once, as each step begins, with the step's own input still reserved, and a restart takes
+  the reading of the step it runs in, so both are on one basis. Read inside the restart instead, after the step's
+  input was dropped, a steady backlog read one envelope more at every later step and the hold never ended (red
+  first: `a_restart_hold_ends_on_an_owner_busy_at_a_steady_queue`, amphora-owner-t1-log-bound-004f682-20261111).
+  An idle step, with none queued, is one such step. That covers what arrived during the restart, what
+  queued behind its backlog, and the commits in flight when it began. It overcounts, which is the conservative side.
+  An owner under steady load, never idle, still ends the hold once its queue is back where it was (tested, and
+  red-first: ended only at an idle step, such an owner held every entry after its first restart for good, never
+  came due by share again, and its log grew to the room: amphora-owner-t1-log-bound-4a274ec-20261111);
+- *over*, the base tail: an entry applied, not held, by a step that took longer than AC-T1.3.4's bound on a
+  commit's p99.9 (15 ms). This is a proxy: it is the delay the owner added itself, past the p99.9. A commit's
+  quorum and network time aren't the owner's to see, and don't change with restarts;
+- *next*: the most one restart held, the restart about to come guessed by the worst seen.
+
+A restart is due when (held + over + next) / applied < 1 - q, all over patience's window (the current and previous
+generation of `patience::GENERATION` ticks, 30 to 60 s; its derivation is there). Here q = 0.999 is the highest
+quantile the registry holds a commit's latency to (AC-T1.3.4's p99.9, and AC-T1.4.3's). The code keeps q as the
+fraction 999/1,000 and compares cross-multiplied, with checked arithmetic. The comparison is strict, net of the
+measured base tail, and counts the coming restart, so a restart that holds no more than the worst seen leaves the
+restarts' share of the tail below 1 - q. The first restart is free: nothing is held yet. A restart at low load that
+holds nothing costs nothing. One that holds some is spaced by the count, and at least once a window once the window
+forgets. The growth rate cancels. As reasoning only: with R a restart's time, restarts at least R / (1 - q) apart
+hold at most 1 - q of the time, and arrivals that see time averages (PASTA, Wolff 1982, Operations Research 30(2))
+would make that the share of commits. R = 12 ms gives 12 s, which falls between store.md decision 4's two runs:
+131,072 frames restarted every 5 to 7 s with p99.9 untouched, and 16,384 every 0.74 s with p99.9 up 3 to 5 ms. The
+counting needs no arrival assumption, and bursty arrivals are what it counts.
+
+What the rule holds and what it can't: it keeps the owner's own delays past the p99.9 within its tail by
+construction. With h of the tail held, the p99.9 becomes the base's quantile at 1 - (0.001 - h), and what the owner
+can't see (quorum, network) can move that by more than AC-T1.4.3's 1 ms. That 1 ms is held by the batch's
+benchmark, restarts on against off, not by this rule.
+
+**B. A restart waits for a pass that copied every durable frame.** It is ready when it is due, no flush and no read
+is out, and the last pass caught up: it copied through the frame the flush before it made durable (its cap, store.md
+decision 15; the flushing thread reports `backfilled >= durable`, or nothing left). What the restart then copies on
+the owner is only what the owner applied since that flush was asked, at most one flush's growth, the least any rule
+can leave. This replaces "a 64th left". Reads are held (`hold_due`) when a restart is due and the last pass either
+caught up (the restart waits only for the reads out) or found the log busy: a read that began on a log wholly copied
+holds read-mark 0, and a passive pass is busy beside it (wal.c, `walCheckpoint` takes `WAL_READ_LOCK(0)`). The
+flushing thread now reports a busy pass instead of dropping it, and a busy pass is the fact that "twice the bound
+however much is left" guessed at. While a restart is due, every flush is followed by a pass, and one is asked even
+with nothing to flush.
+
+**C. The log's room, from the filesystem, at each pass.** After each pass the flushing thread (never the owner)
+reads:
+- *A*: the bytes the filesystem holding the database has available to the process: statvfs's `f_bavail` × `f_frsize`
+  on Unix (POSIX `statvfs`), `GetDiskFreeSpaceExW`'s caller-available bytes on Windows, through fs4 0.13.1 (already in
+  Cargo.lock through tantivy);
+- *F*: the frames the log's file already holds room for, its length reused (store.md decision 13);
+- *N*: the replica logs on that filesystem, a live count on the process-wide local-reads `Account`, keyed by the
+  filesystem's number. That is `st_dev` on Unix, and the volume serial on Windows (`GetFileInformationByHandle`,
+  through winapi-util). Two Windows volumes with the same serial count as one and undercount N, the unsafe side:
+  rare (serials are set at format), and stated. On any other platform every log counts as on one filesystem, an
+  overcount, so each takes less. A log is counted from its owner's flushing thread's start until the thread ends (`LogShare`). Every replica
+  owner, of either class, runs one; a test's `Flushing::Held` doesn't count.
+
+The room, in frames: H = (F × 4,120 + (A - SNAPSHOT_BYTES) / N) / (4,120 + 4,096), with no share once A is below one
+image. Each frame takes its own bytes and the page its copy may add to the database's file: a log must leave room for
+its own copy, or it can't be drained. One image is kept back, so a snapshot install has room. The free bytes are
+shared equally among the logs that may grow into them. Counted in bytes, a frame the log grows by moves bytes from A
+to its file, so the room holds still for one log, and for more grows by less than half a frame per frame, the
+others' growth seen at the next pass. Free bytes that can't be read give no share (H = what the file holds), and
+the refusal says why. A file whose length can't be read fails the pass, and the owner fences, as any failed pass
+does.
+
+Past H, on every member, a restart is due whatever the share says, and it counts as held: disk before latency.
+Without that, an owner whose own base tail has spent the share would never restart, its log would stay past H, and
+its submits would be refused for good. Reads are held. New submits are refused `Refusal::Unavailable("the
+database's log holds {frames} frames, past the {H} it may hold: ...")`, typed and retryable. No new variant: none
+until kiln shows a caller that must branch on it, and `Refusal` is a wire enum. A follower can't refuse what its
+group committed, and the leader can't see a follower's disk without a wire change, so a follower past H applies on.
+If its disk then fills, the flush fails and the owner fences with the I/O error, typed, its image whole on reopen
+(tested). A leader past H is the same: it refuses submits made at it, but the proposals its followers forward
+(`MsgPropose`) are stepped and applied, since dropping them would leave a request with no answer on the wire
+(CLAUDE.md section 3). Its log grows on, and on a full disk it fences the same way. The mechanism is the follower
+test's, a failed flush on the flushing thread fencing the owner whatever its role, so no test of its own. Both are
+limits of availability, not of safety. What a restart keeps of the file (`Db::keep_log`) is set
+at each restart to min(H, the log's length then). A file past what the log needed, or past what the disk allows, is
+cut (store.md decision 31).
+
+Not seen by this rule except through A shrinking at the next pass: the raft log (hyper-durable), standalone stores'
+logs, the database file's own growth, and other processes. H is the replica logs' share of the process disk budget
+once that budget exists (the goal the previous owner asked for, amphora-owner-disk-budget-goal-20261109). Its hook
+is `log_bound::log_room(available, logs, kept)`: the budget passes its room for replica logs as `available`. One
+registry, not a second budget beside it. One image is kept back per filesystem, not per group: several groups
+installing at once (a node rejoining behind on all its groups) can still meet a full disk mid-image, and fence
+typed. `SNAPSHOT_BYTES` (256 MiB, "until streaming snapshots") is itself picked, noted to amphora-constants.
+
+**D. The bound, stated.** A replica's database log holds at most min(H, what its group commits between restarts
+due by their share + what it commits while the local reads out at the due point finish). Each of those reads is
+bounded by its caller's deadline (`run_query`'s progress handler), and no new one begins. Past H no new submit is
+taken on that member. Restarts spend at most 1 - q of the entries, net of the owner's base tail.
+
+How often each value is computed: A, F and N after every checkpoint pass, at most one a flush (one statvfs a pass);
+the counts at each owner step and tick; the restart's held at each step until idle.
+
+### Evidence
+
+On adas-mac-studio.local-2 (macOS aarch64), 2026-11-11; the core's tests in `database::log_bound`, the owner's in
+`database::replicated`:
+- T-T1.8.D3 `the_first_restart_is_free`, `a_restart_spends_what_it_held_and_spaces_the_next` (held 5: due at 10,001
+  applied, not 10,000), `long_steps_spend_the_tail_before_any_restart`, `the_window_forgets_after_two_generations`.
+- T-T1.8.D3 `a_restart_due_again_by_its_share_on_an_owner_never_idle`: a restart that found 3 bytes queued holds 7
+  entries until a step begins with 3, and through a million steps never idle a restart comes due again. Red on
+  4a274ec, whose hold ended only at an idle step: every one of 1,000,005 entries held.
+- T-T1.8.D3, the share: `restarts_made_when_due_keep_their_share_below_the_tail`. Four generations of steps of 1 to
+  7 entries, a long one in 20,011, each restart made when due and holding 1 to 9. After every restart that held no
+  more than the worst before it, held + over stays strictly below a thousandth of the entries applied over the
+  window.
+- T-T1.8.D3 `a_log_takes_its_file_and_an_equal_share_of_what_is_free_past_one_image`: the room at its edges, and a
+  frame grown from free bytes into the file leaves one log's room where it was.
+- T-T1.8.D3 `the_first_restart_is_free_and_the_next_waits_on_its_share`: a learner restarts after its first write
+  (on b151af0 none, its bound being 131,072 frames). Told of a restart that held one entry, it makes none while 20
+  more apply, and makes one once two generations passed.
+- T-T1.8.D3 `past_its_room_a_replica_refuses_submits_and_restarts_whatever_its_share`: a voter whose share is spent
+  (a million held) and whose filesystem has nothing free past one image. With a local read held open, a write is
+  refused `Unavailable` naming the frames past the room, and no restart is made. Once the read ends a restart
+  follows, and the next write is taken.
+- T-T1.8.D3 `a_follower_past_its_room_applies_on_and_fences_when_its_disk_fills`: a learner past its room refusing
+  submits applies 6 to 10. Its flushes then fail as a full disk's do (`StorageFull`), it fences ("failed a flush"),
+  and reopened on its files it holds 1 to 10.
+- T-T1.8.D3 `a_dropped_replica_leaves_its_filesystems_room_to_the_others`: two logs counted on a tempdir's
+  filesystem, then one once an owner dropped and its flushing thread ended.
+- T-T1.8.D1, rewritten on the room:
+  - `a_replicas_database_log_stays_within_its_room`: 300 writes, both logs at room for 64 frames each; each within
+    its room plus what two writes grow it;
+  - `a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it` and
+    `a_restart_due_waits_for_a_reads_deadline_and_no_longer`: past a room of 16, no restart under a read, one after
+    it;
+  - `a_read_on_a_wholly_copied_log_holds_passes_off_and_a_busy_pass_holds_reads`: a restart due by its share, a busy
+    pass, reads held, the log within its room;
+  - `the_owner_holds_reads_past_the_room_or_once_a_due_restart_can_go`: the rule at each state.
+
+### Metrics
+
+One gauge more in the replica meter (`meter::REPLICA_METRICS`), agreed by Kiln Metrics under
+`amphora-log-bound/names/v1` (2026-11-12): `amphora_replica_database_log_limit_bytes`, the room H as the owner last
+learned it, in bytes (frames × 4,120). It is the name amphora-replica-log/names/v1 reserved for an exported bound,
+`_limit` as Kiln Metrics names the set's other bound. The dashboard's "Database log against its limit" row (unit B) plots it
+beside
+`amphora_replica_database_log_bytes` (the table above). Restart spacing reads from
+`amphora_replica_database_log_restarts_total`'s rate.
+
+### Falsified by
+
+- restarts whose held and the base tail, counted over the window, reach a thousandth of the entries applied after a
+  restart that held no more than the worst before it (the share test);
+- a commit p99.9 that rises with restarts on against off, at a load where restarts are due by their share (the
+  batch's benchmark: AC-T1.4.3's 1 ms is its to hold);
+- a submit taken on a member whose log was past its room; a restart not made past the room once no read was out
+  and a pass had caught up;
+- a disk filled by replica logs while each was within its room. statvfs's `f_bavail` is an estimate on btrfs
+  (compression, and space its allocator still holds) and on APFS (purgeable space counted free, and containers
+  sharing one pool), so a filesystem may hold less than it said;
+- a restart that copied more than what was applied after the last caught-up pass's flush;
+- a snapshot install that met a full disk mid-image while its filesystem was within every log's room (several
+  installs at once on one filesystem are the stated exception);
+- a reopen too slow at a log near its room: a reopen reads the whole log to rebuild its index (wal.c,
+  `walIndexRecover`), and readers' wal-index lookups grow with it. The room bounds disk, not that time, so it is
+  measured in the batch's heavy runs.

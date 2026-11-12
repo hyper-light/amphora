@@ -264,7 +264,7 @@ pub fn flush_bucket(d: Duration) -> usize {
 
 /// The replicated class's metrics, as their host exports them: name, type and help, in the
 /// order of [`ReplicaCounters`]' fields (docs/design/replication.md, "Metrics").
-pub const REPLICA_METRICS: [(&str, &str, &str); 11] = [
+pub const REPLICA_METRICS: [(&str, &str, &str); 12] = [
     (
         "amphora_replica_flush_backlog_entries",
         "gauge",
@@ -326,6 +326,12 @@ pub const REPLICA_METRICS: [(&str, &str, &str); 11] = [
         "gauge",
         "The database log's length as the owner last counted it, in bytes (frames x 4,120).",
     ),
+    // Kiln Metrics agreed it under amphora-log-bound/names/v1 (2026-11-12), named as amphora-replica-log/names/v1 reserved.
+    (
+        "amphora_replica_database_log_limit_bytes",
+        "gauge",
+        "The most the database's log may hold as its owner last learned it, in bytes (frames x 4,120): an equal share of its filesystem's free bytes among the replica logs there, past one snapshot's image.",
+    ),
 ];
 
 /// Why a local read was turned away: `amphora_replica_local_reads_refused_total`'s `reason`, a
@@ -377,6 +383,7 @@ pub struct ReplicaMeter {
     checkpoint_us: AtomicU64,
     restarts: AtomicU64,
     log_bytes: AtomicU64,
+    log_limit_bytes: AtomicU64,
 }
 
 /// What a replica owner's counters say now ([`REPLICA_METRICS`]).
@@ -408,6 +415,8 @@ pub struct ReplicaCounters {
     pub database_log_restarts: u64,
     /// The database log's length as the owner last counted it, in bytes.
     pub database_log_bytes: u64,
+    /// The most the database's log may hold as its owner last learned it, in bytes.
+    pub database_log_limit_bytes: u64,
 }
 
 impl ReplicaCounters {
@@ -478,6 +487,11 @@ impl ReplicaMeter {
         self.log_bytes.store(bytes, Ordering::Relaxed);
     }
 
+    /// The database's log may hold `bytes`, as the owner last learned it.
+    pub fn log_limit_bytes(&self, bytes: u64) {
+        self.log_limit_bytes.store(bytes, Ordering::Relaxed);
+    }
+
     /// The owner started the database's log again: it is empty.
     pub fn restarted(&self) {
         self.restarts.fetch_add(1, Ordering::Relaxed);
@@ -511,6 +525,7 @@ impl ReplicaMeter {
             checkpoint_time: Duration::from_micros(self.checkpoint_us.load(Ordering::Relaxed)),
             database_log_restarts: self.restarts.load(Ordering::Relaxed),
             database_log_bytes: self.log_bytes.load(Ordering::Relaxed),
+            database_log_limit_bytes: self.log_limit_bytes.load(Ordering::Relaxed),
         }
     }
 }

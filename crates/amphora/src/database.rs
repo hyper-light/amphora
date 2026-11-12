@@ -37,6 +37,7 @@ pub use application::WriterBoundary;
 pub(crate) mod compaction;
 mod guards;
 mod import;
+mod log_bound;
 mod patience;
 pub(crate) mod remote;
 pub(crate) mod replicated;

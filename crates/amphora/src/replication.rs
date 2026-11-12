@@ -40,9 +40,10 @@ pub const COMMAND_BYTES: usize = api::REQUEST_MAX;
 /// Images are bounded until streaming snapshots are implemented; compaction refuses larger ones.
 pub const SNAPSHOT_BYTES: usize = 256 << 20;
 const ENVELOPE_BYTES: usize = 1 << 20;
-/// The database log's bound, in frames (512 MiB of 4 KiB pages): the standalone store's, measured
-/// on fedora 2026-10-20 (docs/design/store.md, decision 4; `store::Config::log_frames`).
-pub const LOG_FRAMES: u64 = 131_072;
+/// What the filesystem holding a machine's database has free for this process, in bytes: read on
+/// its owner's flushing thread after each checkpoint pass (replication.md, "A replica's database
+/// log bounded by what it measures").
+pub(crate) type FreeSpace = Box<dyn FnMut() -> std::io::Result<u64> + Send>;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Prepared {
@@ -165,8 +166,12 @@ pub struct Machine {
     class_changes: u64,
     // The largest image this machine makes or installs: SNAPSHOT_BYTES, lowered only by a test.
     snapshot_bytes: usize,
-    // The database log's bound, in frames: LOG_FRAMES, lowered only by a test.
-    log_bound: u64,
+    // A test's stand-in for the filesystem's free bytes, read in place of the filesystem's own.
+    #[cfg(test)]
+    free_bytes: std::sync::Arc<std::sync::Mutex<Option<u64>>>,
+    // A test's stand-in for the filesystem's number, for a database on a simulated disk.
+    #[cfg(test)]
+    filesystem: Option<u64>,
     // The index of the last configuration change applied, or more: the change's own index when
     // this machine applied it, the applied point when it opened or installed an image. The floor's
     // proof counts an attestation before marker J only if it was made at or after it, so an
@@ -200,6 +205,8 @@ struct GateState {
     held: bool,
     from: Option<std::thread::ThreadId>,
     reached_from: u64,
+    // Every flush from now fails as a full disk's does.
+    full: bool,
 }
 #[cfg(test)]
 impl FlushGate {
@@ -213,19 +220,27 @@ impl FlushGate {
         self.state.lock().unwrap().held = false;
         self.opened.notify_all();
     }
+    /// Fails every flush from now with the error a full disk gives (`ENOSPC`).
+    pub(crate) fn fill(&self) {
+        self.state.lock().unwrap().full = true;
+    }
     /// Flushes that reached the hold on the thread it was held from.
     pub(crate) fn reached_from_holder(&self) -> u64 {
         self.state.lock().unwrap().reached_from
     }
-    fn pass(&self) {
+    fn pass(&self) -> std::io::Result<()> {
         let mut state = self.state.lock().unwrap();
         if state.held && state.from == Some(std::thread::current().id()) {
             state.reached_from += 1;
-            return;
+            return Ok(());
         }
         while state.held {
             state = self.opened.wait(state).unwrap();
         }
+        if state.full {
+            return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        }
+        Ok(())
     }
 }
 
@@ -442,7 +457,10 @@ impl Machine {
             #[cfg(test)]
             class_changes: 0,
             snapshot_bytes: SNAPSHOT_BYTES,
-            log_bound: LOG_FRAMES,
+            #[cfg(test)]
+            free_bytes: std::sync::Arc::default(),
+            #[cfg(test)]
+            filesystem: None,
             configuration_at: point.index,
             #[cfg(test)]
             floor_aware: true,
@@ -465,9 +483,11 @@ impl Machine {
             self.snapshot_bytes,
         )
     }
+    /// Makes the filesystem's free bytes read `bytes` from now, as its owner's flushing thread
+    /// reads them.
     #[cfg(test)]
-    pub(crate) fn set_log_bound(&mut self, frames: u64) {
-        self.log_bound = frames;
+    pub(crate) fn set_free_bytes(&self, bytes: u64) {
+        *self.free_bytes.lock().unwrap() = Some(bytes);
     }
     #[cfg(test)]
     pub(crate) fn set_snapshot_bytes(&mut self, bytes: usize) {
@@ -814,9 +834,66 @@ impl Machine {
         self.point.index.saturating_sub(self.flushed.index)
     }
 
-    /// The database log's bound, in frames.
-    pub(crate) fn log_bound(&self) -> u64 {
-        self.log_bound
+    /// Makes the database's filesystem `filesystem` with `free` bytes free, for a database on a
+    /// simulated disk, which no filesystem holds.
+    #[cfg(test)]
+    pub(crate) fn stand_in_filesystem(&mut self, filesystem: u64, free: u64) {
+        self.filesystem = Some(filesystem);
+        self.set_free_bytes(free);
+    }
+
+    /// The directory holding the database's files, whose filesystem its log grows on.
+    fn directory(&self) -> std::path::PathBuf {
+        match self.db.path().parent() {
+            Some(directory) if !directory.as_os_str().is_empty() => directory.to_path_buf(),
+            _ => std::path::PathBuf::from("."),
+        }
+    }
+
+    /// The filesystem's free bytes for this process, as statvfs's `f_bavail` (Unix) or
+    /// `GetDiskFreeSpaceExW` (Windows) say them (fs4): for the flushing thread, never the owner's.
+    pub(crate) fn free_space(&self) -> FreeSpace {
+        let directory = self.directory();
+        #[cfg(test)]
+        let set = std::sync::Arc::clone(&self.free_bytes);
+        Box::new(move || {
+            #[cfg(test)]
+            if let Some(bytes) = *set.lock().unwrap() {
+                return Ok(bytes);
+            }
+            fs4::available_space(&directory)
+        })
+    }
+
+    /// The filesystem the database's log grows on, as a number the replica logs on it share: its
+    /// device on Unix (`st_dev`), its volume's serial on Windows (`GetFileInformationByHandle`,
+    /// through winapi-util). On any other platform every log counts as on one filesystem, an
+    /// overcount of the logs that share one, so each takes less.
+    pub(crate) fn filesystem(&self) -> std::io::Result<u64> {
+        #[cfg(test)]
+        if let Some(filesystem) = self.filesystem {
+            return Ok(filesystem);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(std::fs::metadata(self.directory())?.dev())
+        }
+        #[cfg(windows)]
+        {
+            let directory = winapi_util::Handle::from_path_any(self.directory())?;
+            Ok(winapi_util::file::information(&directory)?.volume_serial_number())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Ok(0)
+        }
+    }
+
+    /// The frames of the database's log its next restart keeps the file's room for: past them,
+    /// the restart cuts the file to nothing (`Db::keep_log`, store.md decision 31).
+    pub(crate) fn keep_log(&mut self, frames: u64) {
+        self.db.keep_log(frames);
     }
 
     /// Starts the database's log again on the machine's own connection, with no reader reading
@@ -833,7 +910,7 @@ impl Machine {
         let flush: crate::store::Flush = {
             let gate = std::sync::Arc::clone(&self.flush_gate);
             Box::new(move || {
-                gate.pass();
+                gate.pass()?;
                 flush()
             })
         };

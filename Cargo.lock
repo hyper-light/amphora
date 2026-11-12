@@ -76,6 +76,7 @@ dependencies = [
  "amphora-engine",
  "amphora-engine-parser",
  "anyhow",
+ "fs4",
  "getrandom 0.4.3",
  "hmac",
  "hyper-block",
