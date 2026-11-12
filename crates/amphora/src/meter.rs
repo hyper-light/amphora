@@ -327,11 +327,11 @@ pub const REPLICA_METRICS: [(&str, &str, &str); 14] = [
         "The database log's length as the owner last counted it, in bytes (frames x 4,120).",
     ),
     // The leader's write slot (replication.md, "A follower's write under steady leader writes"),
-    // as Kiln Metrics agreed them (g-slot-metric-names).
+    // as Kiln Metrics agreed them (amphora-g-slot/names/v2).
     (
         "amphora_replica_write_slot_holds_total",
         "counter",
-        "Write slots this replica held while it led, a member's refused write given the next turn, by how each ended (ended: forwarded, expired, released).",
+        "Write slots this replica held while it led, a member's refused write given the next turn, by how each came out (outcome: forwarded, expired, released).",
     ),
     (
         "amphora_replica_write_slot_held_seconds_total",
@@ -339,13 +339,13 @@ pub const REPLICA_METRICS: [(&str, &str, &str); 14] = [
         "Seconds this replica, while it led, held its own writes for members' write slots; its rate is the leader's share of time held.",
     ),
     (
-        "amphora_replica_write_slot_seconds",
+        "amphora_replica_write_slot_length_seconds",
         "gauge",
         "The length of the write slot this replica last began while it led, learned from its members' retries, in seconds; zero before its first.",
     ),
 ];
 
-/// How a write slot ended: `amphora_replica_write_slot_holds_total`'s `ended`, a closed set.
+/// How a write slot ended: `amphora_replica_write_slot_holds_total`'s `outcome`, a closed set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotEnd {
     /// The member's next forward arrived, and the leader stepped it first.
@@ -360,7 +360,7 @@ pub enum SlotEnd {
 impl SlotEnd {
     pub const ALL: [Self; 3] = [Self::Forwarded, Self::Expired, Self::Released];
     #[must_use]
-    pub fn ended(self) -> &'static str {
+    pub fn outcome(self) -> &'static str {
         match self {
             Self::Forwarded => "forwarded",
             Self::Expired => "expired",
@@ -463,7 +463,7 @@ pub struct ReplicaCounters {
     /// writes were held for them in all; and the length of the slot it last began.
     pub write_slot_holds: [u64; 3],
     pub write_slot_held: Duration,
-    pub write_slot: Duration,
+    pub write_slot_length: Duration,
 }
 
 impl ReplicaCounters {
@@ -592,7 +592,7 @@ impl ReplicaMeter {
                     .map_or(0, |count| count.load(Ordering::Relaxed))
             }),
             write_slot_held: Duration::from_micros(self.slot_held_us.load(Ordering::Relaxed)),
-            write_slot: Duration::from_micros(self.slot_us.load(Ordering::Relaxed)),
+            write_slot_length: Duration::from_micros(self.slot_us.load(Ordering::Relaxed)),
         }
     }
 }
@@ -821,7 +821,7 @@ mod tests {
             );
         }
         for how in SlotEnd::ALL {
-            assert!(design.contains(&format!("`{}`", how.ended())), "{how:?}");
+            assert!(design.contains(&format!("`{}`", how.outcome())), "{how:?}");
         }
     }
 

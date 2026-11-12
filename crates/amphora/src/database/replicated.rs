@@ -2578,8 +2578,8 @@ impl<F: BlockFile + 'static> Actor<F> {
     fn slot_ended(&self, ended: Option<super::slot::Ended>) {
         if let Some(ended) = ended {
             self.control.meter.slot_ended(ended.how, ended.held);
-            let held_ms = u64::try_from(ended.held.as_millis()).unwrap_or(u64::MAX);
-            tracing::debug!(target: "amphora.replication", event = "write_slot", member = ended.member, ended = ended.how.ended(), held_ms, "a write slot ended");
+            let held_seconds = ended.held.as_secs_f64();
+            tracing::debug!(target: "amphora.replication", event = "replication.write_slot", member = ended.member, outcome = ended.how.outcome(), held_seconds, "a write slot ended");
         }
     }
     /// The write slot at this step: the term it belongs to, the members it keeps, its expiry, the

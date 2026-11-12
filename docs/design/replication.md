@@ -1833,7 +1833,7 @@ first value.
 **Why the prototype's runners still retried 4 to 8 times.** (a) It had a single slot, which the last refused member
 overwrote, and nothing held the other members' forwards, so kiln's two runners refused each other in turn. (b) Its
 length was a fixed 200 ms. (c) It held the slot from the leader's apply. The queue and held forwards close (a), the
-learned length closes (b), and the queue at append with the held barrier closes (c). The `ended` label tells (a) and
+learned length closes (b), and the queue at append with the held barrier closes (c). The `outcome` label tells (a) and
 (b) apart in a run: a slot lost to time ends `expired`.
 
 **Bounds.** The queue, the waiting barriers, the learned gaps and the held forwards are each at most one per member
@@ -1845,22 +1845,25 @@ bytes, at most `MESSAGE_BYTES` each, stay charged to the inbound queue (`QUEUED_
 queue holds what one end released and is drained in the same step.
 
 **Metrics** (CLAUDE.md section 10), in the replica meter (`meter::REPLICA_METRICS`), names sent to Kiln Metrics under
-`g-slot-metric-names-v2-20261111`:
-- `amphora_replica_write_slot_holds_total`, a counter, by `ended`, a closed set (`meter::SlotEnd`): `forwarded` (the
+`amphora-g-slot/names/v2`:
+- `amphora_replica_write_slot_holds_total`, a counter, by `outcome`, a closed set (`meter::SlotEnd`): `forwarded` (the
   holder's next forward arrived and was stepped first), `expired` (its learned length passed first), `released` (the
   lead or term ended, the member left or was suspected, a change or a hand-off began, or a held member forwarded
   again);
 - `amphora_replica_write_slot_held_seconds_total`, a counter: the seconds the leader's own writes were held for
   slots;
-- `amphora_replica_write_slot_seconds`, a gauge: the length of the slot the leader last began.
-Each end is an event on `amphora.replication`, `event = "write_slot"` (debug), with the member, how it ended and
-`held_ms`. Dashboard rows, in the group **Amphora replicated class**:
+- `amphora_replica_write_slot_length_seconds`, a gauge, leader only: the learned length of the slot the leader last
+  began, 0 before its first; it sits beside `amphora_replica_quorum_patience_seconds`, learned the same way.
+No labels from Amphora besides `outcome`; kiln adds `db` and its machine labels. Each end is an event on
+`amphora.replication`, `event = "replication.write_slot"` (debug), with the fields `member`, `outcome` and
+`held_seconds`, attributes and never tags; kiln takes `amphora.replication` at WARN, so it stays a plain log line.
+Dashboard rows, in the group **Amphora replicated class**:
 
 | panel | PromQL | kiln |
 |---|---|---|
-| Write slots/s, by how each ended, stacked | `sum by (db, ended) (rate(amphora_replica_write_slot_holds_total[5m]))` | `sum:amphora_replica_write_slot_holds_total{$host} by {db,ended}.as_count()` |
-| The leader's share of time held for slots | `sum by (db) (rate(amphora_replica_write_slot_held_seconds_total[5m]))` | `sum:amphora_replica_write_slot_held_seconds_total{$host} by {db}.as_rate()` |
-| The learned slot length | `max by (instance, db) (amphora_replica_write_slot_seconds)` | `max:amphora_replica_write_slot_seconds{$host} by {host,db}` |
+| Write-slot holds, by outcome, stacked bars | `sum by (db, outcome) (rate(amphora_replica_write_slot_holds_total[5m]))` | `sum:amphora_replica_write_slot_holds_total{$host} by {db,outcome}.as_count()` |
+| Time held (share), % | `100 * sum by (db) (rate(amphora_replica_write_slot_held_seconds_total[5m]))` | `100 * sum:amphora_replica_write_slot_held_seconds_total{$host} by {db}` |
+| Learned slot length, s | `max by (instance, db) (amphora_replica_write_slot_length_seconds)` | `max:amphora_replica_write_slot_length_seconds{$host} by {host,db}` |
 
 **Requirements and tests.** AC-T1.8.W1 (docs/requirements.toml):
 - T-T1.8.W1, `a_refused_follower_write_lands_on_its_next_try_under_the_slot`;
