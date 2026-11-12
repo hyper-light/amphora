@@ -1201,9 +1201,16 @@ sketch keeps its column statistics' estimate (decision 20), which tells a common
 rare one; the sample would only count it. So does any other term: a parameter, a function, a
 subquery, another table's column, or a term that raises an error on a sample row.
 
-Each term is compiled once into a flat program of at most 64 operations (a loop over an explicit
-stack, CLAUDE.md §11). Each table's terms run within 1,048,576 steps, an operation on a row each
-(§2); a term the budget no longer covers is left to the other estimates.
+Each term is compiled once into a flat program, an operation for each node it holds (a loop over
+an explicit stack, CLAUDE.md §11). Each runs once on each sample row (§2), so a table's terms take
+their length times the sample's rows. The sample's rows are no more than the table's, so that is
+never more than a scan of the table takes to run the same terms. Until 2026-11-11 a term was held
+to 64 operations and a table's terms to 1,048,576 steps (64 × 1,024 × 16). Both counts were picked
+(Ada, 2026-11-11: "We don't tolerate arbitrary constants, learned and stat derived values only") and
+are gone; the parser's bound on a tree's height (`MAX_EXPR_DEPTH`) bounds the one walk down
+parentheses and COLLATEs. `a_long_term_is_estimated_on_the_sample`: an OR of 25 one-value BETWEENs,
+124 operations, was estimated at 20,000 rows against 10,000 counted (red at 490ea83, local-2); run on
+the sample it is within 1.25.
 
 Where at least ten sample rows pass the terms together, their share of the sample is the
 selectivity. Where fewer do, it is the share of the rows that pass, at least half a row's, but no
@@ -1270,6 +1277,9 @@ independent; an OR no constraint takes was not counted at all.
   count.
 - q06's lineitem off by more than 2.
 - JOB's first tables' q-error p95 not under 20.
-- JOB's median planning time over twice step 3's 1.9 ms (the sample's run, at most 1,048,576 steps
-  a table, is the cost to watch).
+- JOB's median planning time over twice step 3's 1.9 ms (the sample's run, a table's terms'
+  length times its sample's rows, is the cost to watch).
+- A statement whose terms' run on the sample takes longer than the statement's own execution
+  (the bound above assumes the scan runs the same operations the sample does; an IN list the
+  executor probes through an index and the sample walks value by value breaks it).
 - A CERT failure in the oracles.

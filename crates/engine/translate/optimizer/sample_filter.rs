@@ -1,8 +1,9 @@
 //! Amphora (docs/design/planner.md, decision 21; PL.4): a table's filter terms run over its sample
 //! (decision 20), so ranges, LIKE, ORs and correlated columns are estimated together, by the share
 //! of the sample's rows that pass them all. A pure core: each term is compiled once into a flat
-//! program (a loop over an explicit stack, CLAUDE.md §11), then run a row at a time within a
-//! counted budget of steps (§2). A term this evaluator doesn't run (a parameter, a function, a
+//! program (a loop over an explicit stack, CLAUDE.md §11), then run a row at a time (§2: an
+//! operation for each node of the term, on each of the sample's rows, so the work is the term's
+//! length times the sample's rows, never more than a scan of the table runs the term). A term this evaluator doesn't run (a parameter, a function, a
 //! subquery, another table's column) or that raises an error on a sample row is left to the
 //! planner's other estimates.
 
@@ -14,14 +15,6 @@ use crate::vdbe::affinity::Affinity;
 use crate::Value;
 use amphora_engine_parser::ast::{self, TableInternalId};
 use std::cmp::Ordering;
-
-/// A term's operations at most: past it the term isn't run on the sample.
-const MAX_OPS: usize = 64;
-
-/// The steps a table's terms take on its sample at most, an operation on a row each (CLAUDE.md
-/// §2): 64 operations on each of the sample's 1,024 rows, sixteen times over. A term the budget no
-/// longer covers is left to the planner's other estimates.
-pub(crate) const SAMPLE_STEPS: usize = MAX_OPS * crate::column_stats::SAMPLE_ROWS * 16;
 
 #[derive(Clone, Copy)]
 enum Cmp {
@@ -86,10 +79,10 @@ enum Visit<'a> {
 }
 
 /// `expr` with its parentheses of one expression and its COLLATE taken off, and the collation
-/// named by the outermost COLLATE, if any.
+/// named by the outermost COLLATE, if any: at most as many as the parser lets a tree be high.
 fn operand(mut expr: &ast::Expr) -> (&ast::Expr, Option<&ast::Name>) {
     let mut collate = None;
-    for _ in 0..MAX_OPS {
+    for _ in 0..amphora_engine_parser::MAX_EXPR_DEPTH {
         match expr {
             ast::Expr::Parenthesized(exprs) => match exprs.as_slice() {
                 [only] => expr = only,
@@ -141,14 +134,12 @@ impl Target<'_> {
     }
 
     /// `expr` compiled into a program over the sample's rows, `None` where it reads anything but
-    /// this table's sampled columns and constants, or is longer than [MAX_OPS].
+    /// this table's sampled columns and constants. Each node of the term is entered once and
+    /// emits at most one operation, so the loop ends within the term's nodes.
     pub(crate) fn compile(&self, expr: &ast::Expr) -> Option<Program> {
         let mut ops = Vec::new();
         let mut stack = vec![Visit::Enter(expr)];
         while let Some(visit) = stack.pop() {
-            if ops.len() > MAX_OPS || stack.len() > MAX_OPS {
-                return None;
-            }
             let expr = match visit {
                 Visit::Emit(op) => {
                     ops.push(op);
@@ -273,11 +264,7 @@ impl Target<'_> {
                 _ => return None,
             }
         }
-        if ops.len() <= MAX_OPS {
-            Some(Program(ops))
-        } else {
-            None
-        }
+        Some(Program(ops))
     }
 }
 
@@ -341,12 +328,10 @@ impl Program {
     }
 
     /// Whether `row` passes the term: `Some(true)` where it's true, `Some(false)` where it's false
-    /// or NULL, `None` where it raised an error. Each operation takes a step from `budget`;
-    /// `None` too where the budget ran out.
-    pub(crate) fn passes(&self, row: &[Value], budget: &mut usize) -> Option<bool> {
+    /// or NULL, `None` where it raised an error.
+    pub(crate) fn passes(&self, row: &[Value]) -> Option<bool> {
         let mut stack: Vec<Value> = Vec::with_capacity(self.0.len());
         for op in &self.0 {
-            *budget = budget.checked_sub(1)?;
             let value =
                 match op {
                     Op::Value(v) => v.clone(),
