@@ -226,8 +226,14 @@ impl<T> Slots<T> {
         commit: u64,
         own: bool,
     ) -> Option<(u64, Duration)> {
-        if self.term.is_none() || self.holding.is_some() || (self.turn && own) {
+        if self.term.is_none() || self.holding.is_some() {
             return None;
+        }
+        if self.turn {
+            if own {
+                return None;
+            }
+            self.took_turn();
         }
         let (member, barrier) = self.waiting.pop_front()?;
         let length = self.length(member);
@@ -235,7 +241,6 @@ impl<T> Slots<T> {
             self.waiting.push_front((member, barrier));
             return None;
         };
-        self.turn = false;
         self.holding = Some(Holding {
             member,
             since: at,
@@ -279,15 +284,23 @@ impl<T> Slots<T> {
         self.holding.is_some()
     }
 
-    /// The leader appended a write of its own: its turn is taken.
+    /// Whether the leader's own turn is owed: a slot ended, and the leader has not written since.
+    pub(super) fn turn(&self) -> bool {
+        self.turn
+    }
+
+    /// The leader appended a write of its own, or has none to make: its turn is taken, and the
+    /// forwards held through it are ready.
     pub(super) fn took_turn(&mut self) {
         self.turn = false;
+        self.ready.extend(self.forwards.drain(..));
     }
 
     /// The leader ends the slot it holds at `at`, released, and lets the barriers waiting step and
     /// the queue go: a change of members or a hand-off of its lead waits on no member's retry.
     pub(super) fn release(&mut self, at: Instant) -> Option<Ended> {
         let ended = self.end(at, SlotEnd::Released);
+        self.took_turn();
         self.ready.extend(self.waiting.drain(..));
         self.queue.clear();
         ended
@@ -316,15 +329,29 @@ impl<T> Slots<T> {
     }
 
     /// A forward from `member` at `at`, past its sender's checks. The holder's is stepped and ends
-    /// its slot; another member's is held while a slot is. A second from a member already held is
-    /// a new write (the first's caller was answered: each owner forwards one write at a time), and
-    /// stepping the first would append an entry before the holder's retry and refuse it, so the
-    /// slot ends released and both are ready, in order.
+    /// its slot; another member's is held while a slot is, and through the leader's turn after
+    /// it, so the leader's write in its turn follows the holder's entry and nothing else
+    /// (amphora-owner-t1-g-slot-878285a-20261111). A second from a member already held is a new
+    /// write (the first's caller was answered: each owner forwards one write at a time), and
+    /// stepping the first would append an entry before the holder's retry, or the leader's turn,
+    /// and refuse it, so the slot or the turn ends, and both are ready, in order.
     pub(super) fn forward(&mut self, member: u64, at: Instant, message: T) -> Taken<T> {
         let unmeasured = self.learn(member, at).err();
         let Some(holder) = self.holding.as_ref().map(|holding| holding.member) else {
+            if !self.turn {
+                return Taken {
+                    step: Some(message),
+                    ended: None,
+                    unmeasured,
+                };
+            }
+            let again = self.forwards.iter().any(|(held, _)| *held == member);
+            self.forwards.push_back((member, message));
+            if again {
+                self.took_turn();
+            }
             return Taken {
-                step: Some(message),
+                step: None,
                 ended: None,
                 unmeasured,
             };
@@ -361,6 +388,12 @@ impl<T> Slots<T> {
         {
             self.ready.push_back(read);
         }
+    }
+
+    /// When the slot held ends by its length, if one is held: a test's view.
+    #[cfg(test)]
+    pub(super) fn until(&self) -> Option<Instant> {
+        self.holding.as_ref().map(|holding| holding.until)
     }
 
     /// Whether the holder's barrier is held: a test's view.
@@ -510,6 +543,40 @@ mod tests {
         assert_eq!(slots.start(t, 5, 5, false), None, "nothing waits");
     }
 
+    /// T-T1.8.W4 (amphora-owner-t1-g-slot-878285a-20261111): do end member 2's slot, then forward
+    /// from member 3 in the leader's turn; expect 3's forward held through the turn, ready once
+    /// the leader's own write is appended, and held again only by a slot; and a turn the leader
+    /// has no write for given up at the next start, its holds ready.
+    #[test]
+    fn forwards_wait_through_the_leaders_turn() {
+        let t = Instant::now();
+        let mut slots = leading(t);
+        slots.refused(2);
+        waits(&mut slots, 2, t);
+        slots.start(t, 1, 1, false);
+        drained(&mut slots);
+        slots.forward(2, t, "two");
+        assert!(slots.turn());
+        assert!(
+            slots.forward(3, t, "three").step.is_none(),
+            "held through the turn"
+        );
+        assert!(drained(&mut slots).is_empty());
+        slots.took_turn();
+        assert_eq!(drained(&mut slots), vec![(3, "three")]);
+        assert_eq!(slots.forward(3, t, "free").step, Some("free"));
+
+        slots.refused(2);
+        waits(&mut slots, 2, t);
+        slots.start(t, 2, 2, false);
+        drained(&mut slots);
+        slots.forward(2, t, "two");
+        slots.forward(3, t, "three");
+        assert_eq!(slots.start(t, 3, 3, false), None, "nothing waits");
+        assert!(!slots.turn(), "a turn with no write is given up");
+        assert_eq!(drained(&mut slots), vec![(3, "three")]);
+    }
+
     /// T-T1.8.W4 (amphora-seam-owner-2, Q1 a): do forward twice from member 3 during member 2's
     /// slot; expect the slot ended released, and both of 3's forwards ready in arrival order.
     #[test]
@@ -551,8 +618,8 @@ mod tests {
     }
 
     /// T-T1.8.W4 (Q3): do let a slot pass its length, then the member's retry arrive late; expect
-    /// it ended expired only once past its length, the late retry learned (no censoring), and the
-    /// next slot as long as that retry took.
+    /// it ended expired only once past its length, the late retry held through the leader's turn
+    /// but learned (no censoring), and the next slot as long as that retry took.
     #[test]
     fn an_expired_slot_teaches_the_next_its_late_retry() {
         let t = Instant::now();
@@ -567,7 +634,11 @@ mod tests {
         );
         let ended = slots.expire(t + BOUNDS.election + MS).unwrap();
         assert_eq!(ended.how, SlotEnd::Expired);
-        assert!(slots.forward(2, t + 300 * MS, "late").step.is_some());
+        let late = slots.forward(2, t + 300 * MS, "late");
+        assert!(
+            late.step.is_none(),
+            "held through the leader's turn after the slot"
+        );
         assert_eq!(slots.length(2), 300 * MS);
     }
 

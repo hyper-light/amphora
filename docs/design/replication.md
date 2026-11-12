@@ -383,12 +383,20 @@ refuses a client's request, and the client retries at another server (Ongaro's d
 section 6.2). A request whose answer is lost may be applied only once (section 6.3), so Amphora
 answers UnknownOutcome instead of replaying it. Source notes: docs/research/forwarded-proposals.md.
 
+A forward the leader's write slot holds (below, "the write slot") can outlive its holder's lead. Its receipt is
+answered only as the forward is stepped, so a member that no longer leads when the slot releases it doesn't step it:
+its core would forward it again under its sender's name. It refuses it as the core refuses a forward it can't take,
+`Dropped::NoLeader` while it knows no leader, and `NotLeader` naming the leader it knows (no `Dropped` cause says
+that). A barrier the slot held is answered there as `drop_read` answers a read it can't forward. The test relay
+tolerates the `NotLeader` refusal of a proposal as it tolerates the two causes.
+
 Falsified by:
 - a receipt refused NoLeader by a member that knows a leader in its term;
 - a dropped forward whose origin's caller is answered Ok, or whose row appears on any replica;
 - a dropped forward whose origin's caller is answered anything but UnknownOutcome, Timeout past its
   deadline, or a refusal given before proposing;
-- a relay tolerance that admits a Dropped cause other than Transferring and NoLeader.
+- a relay tolerance that admits a Dropped cause other than Transferring and NoLeader, or a NotLeader refusal of
+  anything but a proposal a write slot held.
 
 ## Fast acknowledgement: the replicated class (approved 2026-11-01, being built)
 
@@ -1771,7 +1779,10 @@ pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `star
   slot can only expire, and the late retry it then measures teaches a longer slot, feeding back toward the ceiling.
   Started at the barrier, a member that never comes back never holds the leader, and the measured gap is the retry
   alone: from its barrier's start to its forward. The holder's second barrier before any forward means its slot's
-  work was no write (a read, or a write that prepared nothing), and the slot ends `released`.
+  work was no write (a read, or a write that prepared nothing), and the slot ends `released`. A queued member whose
+  next command is a read, and then nothing, holds the leader once, until its learned slot expires: one slot, counted
+  `expired`, and it teaches nothing, since no forward follows (amphora-owner-t1-g-slot-878285a-20261111). Agreed
+  there, as better than the ruling it departs from.
 - *What a slot holds* (Q1). Everything the leader would append between the holder's base and its retry: its own
   writes and floor sessions (`prepare` defers them, `slot_deferred`), its class entry (`propose_class`), and other
   members' forwarded proposals, held after the sender and origin checks. A change of members or a hand-off ends the
@@ -1782,12 +1793,19 @@ pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `star
   progress is probing or paused may not have been sent the entries between. So the leader steps the holder's
   ReadIndex only once its commit reaches the last index it had as the slot began. It appends nothing after that, so
   the commit gets there. Every write a follower makes then prepares at its log tail: the floor session's rule, now a
-  follower's every write's (`Actor::tail`). The leader's own writes keep today's rule. With the tail rule at the
-  leader too, the driven runs refuse the leader's writes at most once in a row (against up to 8 without it), and the
-  tail rule alone keeps W1's follower to one refusal in a row. But two floor tests,
-  `a_raise_beside_a_change_holds_through_a_lost_lead` and `a_raise_whose_base_is_joint_is_refused`, rest on a
-  leader write prepared beside an entry in flight, and the change is beyond what G was agreed to change. It stays a
-  question for its own decision.
+  follower's every write's (`Actor::tail`).
+- *The leader's turn* (amphora-owner-t1-g-slot-878285a-20261111). A turn whose write is refused is a turn in name
+  only: without the rule below, every write the driven runs made in the leader's turn was refused (29 of 29 in W2's
+  first seed), which inverts the starvation onto the leader. So in its turn after a slot, the leader prepares only
+  once it has applied its own log through the last index it held as its barrier passed. That index is the holder's
+  entry and the forwards stepped at the slot's end. Other members' forwards stay held through the turn, until the
+  leader's own write is appended, or until the next start finds it has none to make. A second forward from a member
+  held in the turn ends the turn. So the turn's write follows those entries and nothing else, and none was refused
+  in any W2 run. Outside a turn the leader's writes keep today's rule. A general tail rule at the leader is a
+  separate question: in the driven runs it refused the leader at most once in a row, against up to 8 without it.
+  But two floor tests, `a_raise_beside_a_change_holds_through_a_lost_lead` and
+  `a_raise_whose_base_is_joint_is_refused`, rest on a leader write prepared beside an entry in flight, and the
+  change is beyond G's. It is raised as a finding, not decided here.
 - *More than one starving member* (point 2). A queue, each member at most once; slots go to the queued members in
   the order their barriers arrive, each barrier waiting at the leader until its turn. Between two slots the leader
   gets its own turn: one preparation, if it has a write to prepare, before the next slot starts. So the leader waits
@@ -1819,8 +1837,9 @@ learned length closes (b), and the queue at append with the held barrier closes 
 (b) apart in a run: a slot lost to time ends `expired`.
 
 **Bounds.** The queue, the waiting barriers, the learned gaps and the held forwards are each at most one per member
-of the configuration (at most `MEMBERS`): the owner keeps them to its members each step (`Slots::keep`), and a second
-barrier from a member whose first still waits steps the first. The held messages number at most (members − 1)
+of the configuration (at most `MEMBERS`): the owner keeps them to its members each step (`Slots::keep`). A second
+barrier from a member whose first still waits steps the first, and a second forward from a held member ends the slot
+or the turn. The held messages number at most (members − 1)
 forwards plus one ReadIndex per member. Each keeps its admission reservation, so its
 bytes, at most `MESSAGE_BYTES` each, stay charged to the inbound queue (`QUEUED_BYTES`) until stepped. The `ready`
 queue holds what one end released and is drained in the same step.
@@ -1845,7 +1864,8 @@ Each end is an event on `amphora.replication`, `event = "write_slot"` (debug), w
 
 **Requirements and tests.** AC-T1.8.W1 (docs/requirements.toml):
 - T-T1.8.W1, `a_refused_follower_write_lands_on_its_next_try_under_the_slot`;
-- T-T1.8.W2, `two_followers_and_a_leader_writing_steadily_all_commit_within_their_deadlines`;
+- T-T1.8.W2, `two_followers_and_a_leader_writing_steadily_all_commit_within_their_deadlines`, which also asserts that
+  no write the leader made in its turn after a slot was refused, and that it took some;
 - T-T1.8.W3, `a_follower_retry_racing_the_slots_start_lands_on_its_next_try`, red with the tail rule alone;
 - T-T1.8.W4, the core's own tests in `database::slot` (the queue and turn, the held forwards, a second forward, expiry
   and a late retry learned, the ceiling, generations, the term and members, the held barrier).

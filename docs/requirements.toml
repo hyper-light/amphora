@@ -140,7 +140,7 @@ tests = [
   # Amphora's own: the replicated class (docs/design/replication.md, "Fates and durability checked").
   # Amphora's own: the leader's write slot.
   { id = "T-T1.8.W1", text = "The leader and one follower writing steadily, records delayed - passes when no follower write is refused twice in a row and the history is serializable, where today's rule refuses it many times in a row" },
-  { id = "T-T1.8.W2", text = "Two followers and the leader writing steadily - passes when every write commits within its deadline, no follower write is refused more than twice in a row, and the history is serializable" },
+  { id = "T-T1.8.W2", text = "Two followers and the leader writing steadily - passes when every write commits within its deadline, no follower write is refused more than twice in a row, no write the leader makes in its turn after a slot is refused, and the history is serializable" },
   { id = "T-T1.8.W3", text = "A follower's retry racing its slot's start, the leader's last entry neither committed nor sent to it - passes when its barrier waits for that entry's commit and its write applies" },
   { id = "T-T1.8.W4", text = "The write slot's pure core: its queue and the leader's turn, held forwards, a second forward, expiry and a late retry learned, the ceiling, generations, the term and members, and the held barrier" },
   { id = "T-T1.8.C1", text = "An attachment whose durability differs from its owner's is refused, typed; the same fates in another order are taken; a process stating no replica restarts in the owner's class" },
