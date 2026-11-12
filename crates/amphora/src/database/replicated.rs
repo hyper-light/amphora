@@ -599,7 +599,8 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     floor_inflight: bool,
     floor_ended: u64,
     // The owner's own sessions that reached their lease at their barrier while this member stayed
-    // leader in their term (`Actor::own_session_lease`'s falsifier: a patience too short).
+    // leader in their term (`Actor::own_session_lease`'s falsifier: a patience too short). The
+    // record is the `replica.own_session_expired` event, which carries this running count.
     own_sessions_expired: u64,
     floor_failures: u64,
     // Whether the floor session in hand is a request to attest again, and how this owner's
@@ -2015,7 +2016,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                         && self.replica.is_leader()
                     {
                         self.own_sessions_expired = self.own_sessions_expired.saturating_add(1);
-                        tracing::info!(target: "amphora.replica", event = "own_session_expired", term = self.replica.term(), expired = self.own_sessions_expired, "an owner's session reached its lease at its barrier while this member led its term");
+                        tracing::info!(target: "amphora.replica", event = "replica.own_session_expired", term = self.replica.term(), expired = self.own_sessions_expired, "an owner's session reached its lease at its barrier while this member led its term");
                     }
                 } else {
                     self.requeue(pending);

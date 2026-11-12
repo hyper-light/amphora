@@ -1020,12 +1020,14 @@ follower it is its election bound and its stall patience, (2 × election_tick + 
 a randomized timeout below twice election_tick, plus its patience (`tick_election`). Past either, the session's role
 has moved on, and it can't apply there. A live-quorum leader's session can still reach its lease, behind a slow flush
 or a ReadIndex backlog. It then ends unapplied: safe, since the stale-base rule refuses a late apply and the keeper
-makes it again. That is the falsifier's case, so each such end is counted (`own_sessions_expired`) and logged
-(`amphora.replica`, event `own_session_expired`). The re-request period of a failed seed transfer is the election
+makes it again. That is the falsifier's case, so each such end is logged with a running count: target
+`amphora.replica`, event `replica.own_session_expired`. The event is the record; a counter beside it
+(`amphora_replica_own_sessions_expired_total`) is offered to the Kiln Metrics agent, and both names wait for its word
+(CLAUDE.md section 10). The re-request period of a failed seed transfer is the election
 timeout read from the core, where it was a bare 20 ticks. `an_owners_session_lasts_its_roles_raft_timing`: a
 follower's and a leader's sessions take their role's lease (red at 490ea83: "left: 60s, right: 400ms"), and a
 stalled leader's ends within its lease. Falsified by a floor or seed session that would have applied ending
-unapplied again and again under a loaded but live quorum: many `own_session_expired` events in one term mean the
+unapplied again and again under a loaded but live quorum: many `replica.own_session_expired` events in one term mean the
 patience is too short, and the fix belongs there.
 
 **Decided (2026-11-06), a to d.** Codex's agent ended before it answered, so Amphora's membership-floor agent
