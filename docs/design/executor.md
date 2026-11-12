@@ -263,11 +263,16 @@ write through the cursor, every saved position: `forget_noted_payload`), and whe
 payload is noted.
 
 A page-cache hit takes the cache's shared lock, not its exclusive one (`PageCache::get_shared`,
-`Pager::cache_lookup`). Each entry's reference count is an atomic: a hit adds one, up to the
-count's cap of 3, with a load and a store; the eviction sweep, which takes one off, holds the
-exclusive lock, so a hit never races the sweep, and two hits at once on one page may count as one.
-The one case a lookup changes the cache, a page an aborted read left neither loaded nor locked,
-takes the exclusive lock and deletes it, as before.
+`Pager::cache_lookup`), and reads only what the cache's map owns: each page's slot in the map
+holds a `Weak` handle to the page beside the pointer to its queue entry, and the page's reference
+count, an atomic. A hit upgrades the handle (the entry holds the page until both leave the map,
+under the exclusive lock) and adds one to the count, up to its cap of 3, with a load and a store;
+no `unsafe` is added for it (CLAUDE.md §12), the shared path reaching no entry. The eviction sweep,
+which takes one off, holds the exclusive lock and reads the count from the slot by the entry's key,
+one map lookup for each entry it examines; so a hit never races the sweep, and two hits at once on
+one page may count as one. A `Weak` leaves the page's count of holders as it was, which is what
+`evictable` reads. The one case a lookup changes the cache, a page an aborted read left neither
+loaded nor locked, takes the exclusive lock and deletes it, as before.
 
 On a loop over a non-covering index, whose table row a deferred seek fetches only when a column the
 index doesn't hold is read, the WHERE terms that read the loop's table only through the index (its
