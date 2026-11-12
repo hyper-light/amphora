@@ -234,7 +234,8 @@ fn raw_len_bound(page_size: usize) -> Result<usize> {
 /// not to try, stored length 0 and the raw bytes as they are (an LZ4 block of anything is never
 /// empty). The raw bytes are [entry
 /// count] then each entry's header ([page][kind][depth][0u16][body length]) then the bodies, in
-/// order, integers big-endian. With it, the record as a read decodes it.
+/// order, integers big-endian. With it, the record as a read decodes it, built from the entries
+/// it was made of rather than parsed again (each was checked as it was laid in).
 pub(crate) fn encode(
     entries: &[(u32, Body<'_>)],
     page_size: usize,
@@ -250,6 +251,12 @@ pub(crate) fn encode(
         .ok_or_else(|| corrupt("record too large"))?;
     let mut raw = Vec::with_capacity(len);
     raw.extend_from_slice(&count.to_be_bytes());
+    let mut made = Vec::with_capacity(entries.len());
+    let mut body_at = entries
+        .len()
+        .checked_mul(ENTRY_HEADER)
+        .and_then(|n| n.checked_add(4))
+        .ok_or_else(|| corrupt("entry headers overflow"))?;
     for (page, body) in entries {
         let (kind, ok) = match body {
             Body::Image(image) => (IMAGE, image.len() == page_size),
@@ -267,6 +274,17 @@ pub(crate) fn encode(
         raw.extend_from_slice(&page.to_be_bytes());
         raw.extend_from_slice(&[kind, body.depth(), 0, 0]);
         raw.extend_from_slice(&body_len.to_be_bytes());
+        let end = body_at
+            .checked_add(body.bytes().len())
+            .ok_or_else(|| corrupt("entry length overflows"))?;
+        made.push(Entry {
+            page: *page,
+            kind,
+            depth: body.depth(),
+            start: body_at,
+            end,
+        });
+        body_at = end;
     }
     for (_, body) in entries {
         raw.extend_from_slice(body.bytes());
@@ -288,7 +306,7 @@ pub(crate) fn encode(
     payload.extend_from_slice(&raw_len.to_be_bytes());
     payload.extend_from_slice(stored);
     drop(compressed);
-    Ok((payload, Record::parse(raw, page_size)?))
+    Ok((payload, Record::index(made, raw)?))
 }
 
 /// What [`one_slot_records`] made of a commit's entries of chains: each record's entries (indexes
@@ -351,17 +369,17 @@ pub(crate) fn one_slot_records(entries: &[(u32, Body<'_>)], page_size: usize) ->
     }
     let mut records = Vec::with_capacity(bins.len());
     let mut queue: VecDeque<Vec<usize>> = bins.into_iter().map(|(held, _)| held).collect();
+    let mut part: Vec<(u32, Body<'_>)> = Vec::with_capacity(entries.len());
     // Each pass encodes a record or moves one entry out of it: at most twice the entries.
     while let Some(mut held) = queue.pop_front() {
-        let part: Vec<(u32, Body<'_>)> = held
-            .iter()
-            .map(|&index| {
-                entries
-                    .get(index)
-                    .copied()
-                    .ok_or_else(|| corrupt("an entry past the commit's"))
-            })
-            .collect::<Result<_>>()?;
+        part.clear();
+        for &index in &held {
+            let entry = entries
+                .get(index)
+                .copied()
+                .ok_or_else(|| corrupt("an entry past the commit's"))?;
+            part.push(entry);
+        }
         let (payload, record) = encode(&part, page_size, true)?;
         if payload.len() <= page_size || held.len() == 1 {
             records.push((held, payload, record));
@@ -387,7 +405,9 @@ pub(crate) fn diff(base: &[u8], new: &[u8], tail: usize, most: usize) -> Option<
     // The tail counts as changed byte by byte: where the buffer's stale copy happens to equal the
     // new one, the log's copy can still differ.
     let carried = new.len().saturating_sub(tail);
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    // Runs are written as their ranges close: one buffer, taken at the most a delta may hold.
+    let mut runs = Vec::with_capacity(most.min(new.len()));
+    let mut open: Option<(usize, usize)> = None;
     for (word, (a, b)) in base.chunks(8).zip(new.chunks(8)).enumerate() {
         let at = word.checked_mul(8)?;
         let end = at.checked_add(a.len())?;
@@ -411,27 +431,37 @@ pub(crate) fn diff(base: &[u8], new: &[u8], tail: usize, most: usize) -> Option<
             at.checked_add(first)?,
             at.checked_add(last)?.checked_add(1)?,
         );
-        match ranges.last_mut() {
-            Some(prev) if start <= prev.1.saturating_add(RUN_GAP) => {
-                prev.0 = prev.0.min(start);
-                prev.1 = prev.1.max(stop);
+        open = match open {
+            Some((from, to)) if start <= to.saturating_add(RUN_GAP) => {
+                Some((from.min(start), to.max(stop)))
             }
-            _ => ranges.push((start, stop)),
-        }
+            Some(closed) => {
+                put_run(&mut runs, new, closed, most)?;
+                Some((start, stop))
+            }
+            None => Some((start, stop)),
+        };
     }
-    let mut runs = Vec::new();
-    for (start, end) in ranges {
-        let len = end.checked_sub(start)?;
-        let offset = u16::try_from(start).ok()?;
-        let less_one = u16::try_from(len.checked_sub(1)?).ok()?;
-        runs.extend_from_slice(&offset.to_be_bytes());
-        runs.extend_from_slice(&less_one.to_be_bytes());
-        runs.extend_from_slice(new.get(start..end)?);
-        if runs.len() >= most {
-            return None;
-        }
+    if let Some(closed) = open {
+        put_run(&mut runs, new, closed, most)?;
     }
     Some(runs)
+}
+
+/// Writes the run of `new`'s bytes `range` covers into `runs`: none (the page is then written
+/// whole) once they take `most` bytes or more.
+fn put_run(runs: &mut Vec<u8>, new: &[u8], range: (usize, usize), most: usize) -> Option<()> {
+    let (start, end) = range;
+    let len = end.checked_sub(start)?;
+    let offset = u16::try_from(start).ok()?;
+    let less_one = u16::try_from(len.checked_sub(1)?).ok()?;
+    runs.extend_from_slice(&offset.to_be_bytes());
+    runs.extend_from_slice(&less_one.to_be_bytes());
+    runs.extend_from_slice(new.get(start..end)?);
+    if runs.len() >= most {
+        return None;
+    }
+    Some(())
 }
 
 /// Applies a delta's runs to `image`, which they turn into the page's next version.
@@ -646,6 +676,12 @@ impl Record {
         if body_at != raw.len() {
             return Err(corrupt("bytes after the last entry"));
         }
+        Self::index(entries, raw)
+    }
+
+    /// A record of `entries` (each its body's place in `raw`), each found by its page; a page
+    /// twice in it is refused.
+    fn index(entries: Vec<Entry>, raw: Vec<u8>) -> Result<Self> {
         let mut by_page: Vec<(u32, usize)> = entries
             .iter()
             .enumerate()
