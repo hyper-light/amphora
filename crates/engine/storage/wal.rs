@@ -476,9 +476,10 @@ pub struct PreparedFrames {
     /// Amphora: the packed records the frames are, as (first slot, slots), in order; each holds the
     /// pages of `metadata` that map to its first slot. Empty when each frame is a page.
     pub records: Vec<(u64, u32)>,
-    /// Amphora: for packed records, each page's depth in its record (as `metadata`), the records
+    /// Amphora: for packed records, each page's depth in its record and its chain's delta bytes
+    /// (as `metadata`), the records
     /// decoded (as `records`), and the log's generation they were made in.
-    pub(crate) depths: Vec<u8>,
+    pub(crate) depths: Vec<(u8, u32)>,
     pub(crate) decoded: Vec<Arc<Record>>,
     pub(crate) generation: u32,
 }
@@ -4052,7 +4053,7 @@ impl WalFile {
         let against = Against {
             generation: header.checkpoint_seq,
             upto: self.max_frame.load(Ordering::Acquire),
-            most: page_size.checked_div(2).unwrap_or(0),
+            most: page_size,
         };
         let len = pages
             .len()
@@ -4089,7 +4090,7 @@ impl WalFile {
             .zip(&deltas)
             .map(|((number, image), delta)| {
                 let body = match delta {
-                    Some((depth, runs)) => packed::Body::Delta {
+                    Some((depth, _, runs)) => packed::Body::Delta {
                         depth: *depth,
                         runs,
                     },
@@ -4117,6 +4118,10 @@ impl WalFile {
         let mut records = Vec::with_capacity(count);
         let mut decoded = Vec::with_capacity(count);
         let mut next = first;
+        let chains: Vec<u32> = deltas
+            .iter()
+            .map(|delta| delta.as_ref().map_or(0, |(_, chain, _)| *chain))
+            .collect();
         for (index, cut) in cuts.into_iter().enumerate() {
             let held = entries
                 .get(cut.clone())
@@ -4155,12 +4160,15 @@ impl WalFile {
                 checksum = recompute_wal_frame_checksum(frame.as_mut_slice(), header, checksum);
                 bufs.push(frame);
             }
+            let held_chains = chains
+                .get(cut.clone())
+                .ok_or_else(|| LimboError::InternalError("a record past its pages".into()))?;
             let held_pages = pages
                 .get(cut)
                 .ok_or_else(|| LimboError::InternalError("a record past its pages".into()))?;
-            for (page, (_, body)) in held_pages.iter().zip(held) {
+            for ((page, (_, body)), chain) in held_pages.iter().zip(held).zip(held_chains) {
                 metadata.push((page.clone(), next, checksum));
-                depths.push(body.depth());
+                depths.push((body.depth(), *chain));
             }
             records.push((next, slots));
             decoded.push(Arc::new(record));
@@ -4184,9 +4192,12 @@ impl WalFile {
     }
 
     /// Amphora: the delta that turns `version` of a page (`base`, its bytes as the page's buffer
-    /// held them) into `image` (as the log will hold it), as (its depth, its runs): only while
-    /// `version` is of this generation of the log and the page's latest in it, fewer than
-    /// `packed::MOST_DELTAS` deltas from its image, and the delta saves half the page.
+    /// held them) into `image` (as the log will hold it), as (its depth, its chain's delta bytes,
+    /// its runs): only while `version` is of this generation of the log and the page's latest in
+    /// it, and the chain's deltas, this one included, take less than the page (`against.most`,
+    /// decision 17). Past that the image costs the log less than the deltas a read would apply;
+    /// within it a read applies less than a page of deltas to the image, so it decodes under
+    /// twice an image's bytes. The depth field's width (`packed::MOST_DELTAS`) bounds it besides.
     fn delta(
         &self,
         page: u32,
@@ -4195,7 +4206,7 @@ impl WalFile {
         image: &[u8],
         tail: usize,
         against: &Against,
-    ) -> Option<(u8, Vec<u8>)> {
+    ) -> Option<(u8, u32, Vec<u8>)> {
         if version.generation != against.generation || version.depth >= packed::MOST_DELTAS {
             return None;
         }
@@ -4206,8 +4217,12 @@ impl WalFile {
         {
             return None;
         }
-        let runs = packed::diff(base, image, tail, against.most)?;
-        Some((version.depth.checked_add(1)?, runs))
+        let left = against
+            .most
+            .checked_sub(usize::try_from(version.chain).ok()?)?;
+        let runs = packed::diff(base, image, tail, left)?;
+        let chain = u32::try_from(runs.len()).ok()?.checked_add(version.chain)?;
+        Some((version.depth.checked_add(1)?, chain, runs))
     }
 
     /// Amphora: reads `readers`' pages as of the packed record at `head`, each a page the record
@@ -4348,7 +4363,7 @@ impl WalFile {
                 tracing::error!("packed log: a spill wrote {written} of {total} bytes");
                 return;
             }
-            for ((page, frame, _), depth) in metadata.iter().zip(&depths) {
+            for ((page, frame, _), &(depth, chain)) in metadata.iter().zip(&depths) {
                 // A page changed while its write was under way holds what it wrote no longer.
                 let kept = !page.changed_since_write_began();
                 page.set_wal_tag(*frame, epoch);
@@ -4356,7 +4371,8 @@ impl WalFile {
                     page.set_logged(Logged {
                         frame: *frame,
                         generation,
-                        depth: *depth,
+                        depth,
+                        chain,
                     });
                 }
             }
@@ -5926,11 +5942,12 @@ impl Wal for WalFile {
                 page.set_wal_tag(*frame_id, batch.epoch);
             }
             // Amphora: a packed batch's pages hold what the log now holds.
-            for ((page, frame, _), depth) in batch.metadata.iter().zip(&batch.depths) {
+            for ((page, frame, _), &(depth, chain)) in batch.metadata.iter().zip(&batch.depths) {
                 page.set_logged(Logged {
                     frame: *frame,
                     generation: batch.generation,
-                    depth: *depth,
+                    depth,
+                    chain,
                 });
             }
         }

@@ -232,9 +232,9 @@ fn a_database_opened_on_a_packed_log_doesnt_share_its_pages() {
     assert_eq!(table(&connect(&db)), want);
 }
 
-/// The entries of every record in a packed log with no restart behind it, as (kind, depth): 0 an
-/// image, 1 a delta.
-fn entries(wal: &[u8]) -> Vec<(u8, u8)> {
+/// The entries of every record in a packed log with no restart behind it, in log order, as (page,
+/// kind, depth, body bytes): kind 0 an image, 1 a delta.
+fn entries(wal: &[u8]) -> Vec<(u32, u8, u8, usize)> {
     let frame = FRAME_HEADER + PAGE;
     let mut found = Vec::new();
     for (head, slots) in records(wal) {
@@ -256,16 +256,19 @@ fn entries(wal: &[u8]) -> Vec<(u8, u8)> {
         let count = u32::from_be_bytes(raw[0..4].try_into().unwrap()) as usize;
         for e in 0..count {
             let at = 4 + e * 12;
-            found.push((raw[at + 4], raw[at + 5]));
+            let page = u32::from_be_bytes(raw[at..at + 4].try_into().unwrap());
+            let len = u32::from_be_bytes(raw[at + 8..at + 12].try_into().unwrap()) as usize;
+            found.push((page, raw[at + 4], raw[at + 5], len));
         }
     }
     found
 }
 
-/// Do: in a packed log, change a few bytes of the same rows commit after commit, more times than
-/// a page's deltas may run in a row; read the rows on a fresh connection, after a checkpoint and
-/// after opening the database again. Expect: deltas in the log, at depths up to the most allowed
-/// and never past it, and every row as last written each time.
+/// Do: in a packed log, change a few bytes of the same rows commit after commit, thirty times;
+/// read the rows on a fresh connection, after a checkpoint and after opening the database again.
+/// Expect: deltas in the log, a page's chain running past eight deltas while its deltas' bytes stay
+/// under a page and never reaching one (decision 17: the chain ends where its bytes would pass an
+/// image's, no count of deltas), and every row as last written each time (AC-T1.4.4).
 #[test]
 fn pages_changed_again_and_again_are_logged_as_deltas_and_read_back() {
     deltas_read_back(LogFormat::Packed);
@@ -312,14 +315,32 @@ fn deltas_read_back(format: LogFormat) {
         }
         let wal = std::fs::read(wal_path(&path)).unwrap();
         let entries = entries(&wal);
-        let deltas = entries.iter().filter(|(kind, _)| *kind == 1).count();
-        let deepest = entries.iter().map(|(_, depth)| *depth).max().unwrap();
+        let deltas = entries.iter().filter(|(_, kind, _, _)| *kind == 1).count();
+        let deepest = entries.iter().map(|(_, _, depth, _)| *depth).max().unwrap();
         assert!(
             deltas * 2 > entries.len(),
             "{deltas} deltas of {} entries",
             entries.len()
         );
-        assert_eq!(deepest, 8, "chains run to the most allowed, and no further");
+        assert!(deepest > 8, "chains of small deltas end at {deepest}");
+        // Each page's chain, in log order: its depths count up from its image, its deltas' bytes
+        // stay under a page.
+        let mut chains: std::collections::HashMap<u32, (u8, usize)> = Default::default();
+        for (page, kind, depth, len) in &entries {
+            let chain = chains.entry(*page).or_default();
+            *chain = match kind {
+                0 => (0, 0),
+                _ => {
+                    assert_eq!(*depth, chain.0 + 1, "page {page}'s depths");
+                    (*depth, chain.1 + len)
+                }
+            };
+            assert!(
+                chain.1 < PAGE,
+                "page {page}'s deltas took {} bytes",
+                chain.1
+            );
+        }
         // Records that carry deltas are compressed, in either format.
         let compressed = records(&wal)
             .iter()

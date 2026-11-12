@@ -512,9 +512,10 @@ default, fewer writes a second or longer tails packed than page-a-frame on the c
 
 **Decision.** In a packed log (opt-in, decision 16) a page whose last version is in the log's
 current generation is written as the bytes that changed since (a delta: runs of offset, length and
-bytes, runs closer than a run's header merged), at most 8 deltas in a row (`packed::MOST_DELTAS`)
-before its next whole image, and only where the delta takes less than half a page; otherwise its
-image. The base
+bytes, runs closer than a run's header merged) while the deltas since its last whole image, this
+one included, take less than a page; otherwise its image (2026-11-11: this rule replaces a picked
+8 deltas in a row and a picked half a page a delta). The depth field's width, 255
+(`packed::MOST_DELTAS`), is the format's bound beside it. The base
 is what the page's buffer held when the page was last made dirty: `Pager::add_dirty` keeps a copy
 while the buffer holds a version as written to the log (`Page::logged`, set when a commit or a
 spill is published), and the delta is made only while that version is still the page's latest
@@ -541,7 +542,7 @@ are carried whole even where the buffer's stale copy matches the new one (a test
 a run merged with the carried tail had dropped its first byte, and the page's checksum refused the
 rebuilt page), chains of up to 8 deltas rebuild every version, damaged records are refused, and
 (`packed_log.rs`) rows changed commit after commit are logged mostly as deltas, at depths up to 8
-and never past it, and read back on fresh connections, after a checkpoint and after recovery. A
+and never past it (to 2026-11-11; the chain's bytes bound it since, below), and read back on fresh connections, after a checkpoint and after recovery. A
 model test there (random inserts, changes and deletes with savepoints rolled back amid spills, 8
 seeds, both formats) found that a balance renumbers its siblings' page objects, so one could carry
 another page's logged version: every page of a record shares its frame, so the check that the
@@ -557,9 +558,30 @@ frame removed, no test fails: no path found leaves a page holding a version that
 the check stays as a guard. The log's bytes a row and what reads pay for chains: to be measured
 beside decision 16's.
 
-**Falsified by.** A page read back other than as written; a chain longer than 8; an acknowledged
-batch lost or torn by a power cut; writes or reads slower with deltas than with compressed whole
-pages at any writer count.
+**Where a chain ends (2026-11-11).** Ada: "We don't tolerate arbitrary constants, learned and stat
+derived values only." The chain had ended at a picked 8 deltas, each delta at a picked half page.
+It now ends where its own bytes say. Each further delta is a choice between renting and buying, the
+ski-rental problem (Karlin, Manasse, Rudolph and Sleator, "Competitive snoopy caching",
+Algorithmica 3, 1988). A delta costs the log its runs, and each later read of the page applies them
+again. An image costs a page once and resets the chain. Buying when the rented bytes would reach the
+purchase is the deterministic rule whose cost is within twice the best in hindsight, with no
+constant in it. The reader then applies under a page of deltas to an image, so a rebuild decodes
+less than twice an image's bytes. The writer keeps a chain's bytes beside its depth (`Logged::chain`,
+packed above the generation in `PageInner::logged_as`). The engine's test
+(`packed_log.rs`, `pages_changed_again_and_again_*`) makes the same rows change a byte thirty times
+and checks the log holds chains deeper than 8 (red at the old bound: "chains of small deltas end at
+8") whose deltas' bytes, page by page, stay under a page.
+
+What the bytes rule doesn't price is the number of records a cold read decodes: a chain of small
+deltas may reach 255 records back, each read once and kept decoded (decision 16's 4 MiB). If a
+cold read's latency on such a chain beats the image's bytes as the cost, the rule must count
+records too.
+
+**Falsified by.** A page read back other than as written; a chain whose deltas take a page or more,
+or deeper than 255; an acknowledged batch lost or torn by a power cut; writes or reads slower with
+deltas than with compressed whole pages at any writer count; a cold read of a page at the end of a
+long chain of small deltas slower than its read with chains cut at 8 (the record count, not the
+bytes, then being the cost).
 
 ## 18. A reader forgets only what was written since it last read
 
