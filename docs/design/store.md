@@ -1537,6 +1537,25 @@ doesn't hold, and a commit valid only once a frame with its database size follow
 sqlite.org/wal.html: frames past the last commit stand for nothing, which is what lets a spill's
 frames be written over (decision 30). The LZ4 block format (decision 16).
 
+**Evidence.** On Mac Studios, with the load gate off (Ada, 2026-11-11):
+- The audit's batched leg had the disks write 217-218 MiB for its MiB of text (adas-mac-studio-3,
+  `bench/records/2026-11-12-studio3-small-commits-step2.md`). That is within the 261 MiB that
+  decision 35's figures give for at most 4 bytes of log a byte of rows. 13e385d wrote 595-633 MiB,
+  and the log ended at 24 MiB against 208.
+- Interleaved with 13e385d, best of 3 (adas-mac-studio.local,
+  `bench/records/2026-11-12-studio-local-small-commits-step2-interleaved.md`):
+  - The 8 MiB leg is no slower: 14.25 s against 14.28 s.
+  - The comprehensive bench's bulk statements are slower: `insert_batch_100` 80.0 against 125.4 a
+    second at 1 client and 92.8 against 544.2 at 32, and `delete_range_insert` 974.4 against 3,082.6
+    at 32. The falsifier below holds for them.
+  - The cost is the writer's, not the flush's. Step 2's writer spent 12.6-22.4 ms a commit on
+    `insert_batch_100` against 2.7-3.7, while it flushed less.
+  - In its profile, 72-83% of the writer's samples are a page read past the page cache from a
+    record (`begin_read_record`). Nearly all of that is `pread`: in a mixed log such a read reads the
+    whole record that holds the page (`RecordRead::issue`), where a page frame's read reads its one
+    frame. Another 13-25% is the commit packing its records (`prepare_records`), against 0.2-1.6% for
+    page frames.
+
 **Falsified by.** The batched leg's log above 4 bytes a byte of rows (the test above); a row read back
 other than as committed, on a fresh connection, after a checkpoint, after recovery or through the
 shared pages, in a mixed log (`crates/engine/tests/packed_log.rs`, `shared_pages.rs`,
