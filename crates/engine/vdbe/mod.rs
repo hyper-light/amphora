@@ -38,6 +38,7 @@ pub mod metrics;
 #[cfg(test)]
 mod native_extension_tests;
 pub mod row_counts;
+pub mod row_header;
 pub mod rowset;
 pub mod sorter;
 #[cfg(test)]

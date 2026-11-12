@@ -380,3 +380,25 @@ criteria = [
 tests = [
   { id = "T-PL.13.1", text = "A join whose build side outgrows its estimate mid-query — passes when it switches method within its memory bound and its answer is unchanged" },
 ]
+
+# Amphora's own IDs for its query time (Amphora goal 7788ef29, kiln plan
+# 01a188991617756c84d73f0e9e100330, research 01a18899161c76c2a7ada520473008e5): the plan's execution
+# steps, QT.n for its step n, each measured by bench/planner/record.sh on jupiter on the change and
+# its parent, best of 3, each run begun at a load under 2.
+
+[[own]]
+id = "QT.3"
+title = "Per-row execution: a row's column offsets parsed once, cache hits without the write lock, filters before the row fetch (query-time step 3)"
+criteria = [
+  { id = "AC-QT.3.1", text = "q06 at SF 1 in cache is at most 68 ns a lineitem row, by its best time over 6,001,215 rows" },
+  { id = "AC-QT.3.2", text = "JOB 5a and 5b's movie_companies scans are at most 40 ns a row, by their best times over 2,609,129 rows" },
+  { id = "AC-QT.3.3", text = "JOB's median best time over the parent's is at most 0.5" },
+  { id = "AC-QT.3.4", text = "TPC-H SF 10's median best time is at most 4,192 ms" },
+]
+tests = [
+  { id = "T-QT.3.1", text = "Random records (NULLs, every serial type, overflow pages, records shorter than the schema with defaults) read column by column in random order, through the parse cache and through the header walk — passes when identical values" },
+  { id = "T-QT.3.2", text = "The cursor moves between Column instructions: next, seek, a deferred seek, a write to the row — passes when the parse cache is dropped and every value is the new row's" },
+  { id = "T-QT.3.3", text = "Concurrent hits, insertions and evictions on the page cache under shuttle — passes when no held page is evicted, no hit counts none, and no data race" },
+  { id = "T-QT.3.4", text = "A loop over a non-covering index with a term on the index's columns and one on the table's — passes when the answer is unchanged and the table rows fetched are only those the index's term keeps, whatever order the terms are written in" },
+  { id = "T-QT.3.5", text = "scripts/check-production.sh after the change — passes when it passes, with the ratchet's counts lowered by what the change removed" },
+]

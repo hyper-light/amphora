@@ -2167,33 +2167,39 @@ fn op_column_fetch(
     dest: usize,
     default: &Option<Value>,
 ) -> InsnResult {
-    let cursor = match state
-        .cursors
-        .get_mut(cursor_id)
-        .unwrap_or_else(|| panic!("cursor id {cursor_id} out of bounds"))
-    {
-        Some(Cursor::BTree(cursor, ..)) => cursor,
-        Some(Cursor::Pseudo(pseudo)) => {
+    let cursor = match state.cursors.get_mut(cursor_id) {
+        Some(Some(Cursor::BTree(cursor, ..))) => cursor,
+        Some(Some(Cursor::Pseudo(pseudo))) => {
             let content_reg = pseudo.content_reg();
             return op_column_fetch_pseudo(state, content_reg, column, dest);
         }
-        _ => return op_column_fetch_other(program, state, cursor_id, column, dest, default),
+        Some(_) => return op_column_fetch_other(program, state, cursor_id, column, dest, default),
+        None => return Err(cursor_out_of_range("Column", cursor_id).into()),
     };
-    let Some(payload) = return_if_io!(state, cursor.record_payload()) else {
+    let dest_reg = state
+        .registers
+        .get_mut(dest)
+        .ok_or_else(|| register_out_of_range("Column", dest))?;
+    let Some((payload, header)) = return_if_io!(state, cursor.record_payload_with_header()) else {
         // A null-row cursor, or one that is not positioned on a valid row
         // (e.g., empty table). Return NULL, not the column's default value.
-        state.registers[dest].set_null();
+        dest_reg.set_null();
         return Ok(InsnFunctionStepResult::Step);
     };
-    match ValueIterator::new(payload)?.nth_into_register(column, &mut state.registers[dest]) {
-        Some(result) => result?,
-        None => {
-            branches::mark_unlikely();
-            // The record has fewer columns than expected.
-            apply_column_default(default, &mut state.registers[dest])?;
-        }
+    if !header.column_into_register(payload, column, dest_reg)? {
+        branches::mark_unlikely();
+        // The record has fewer columns than expected.
+        apply_column_default(default, dest_reg)?;
     }
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn cursor_out_of_range(insn: &str, cursor_id: usize) -> LimboError {
+    LimboError::InternalError(format!("{insn}: cursor id {cursor_id} out of bounds"))
+}
+
+fn register_out_of_range(insn: &str, register: usize) -> LimboError {
+    LimboError::InternalError(format!("{insn}: register {register} out of bounds"))
 }
 
 /// Column for a pseudo cursor: decodes the record in its content register.
@@ -2378,37 +2384,36 @@ fn op_column_range_fetch(
     dest: usize,
     defaults: &[Option<Value>],
 ) -> InsnResult {
-    let count = defaults.len();
-    let Some(Cursor::BTree(cursor, ..)) = state
-        .cursors
-        .get_mut(cursor_id)
-        .unwrap_or_else(|| panic!("cursor id {cursor_id} out of bounds"))
-    else {
-        return op_column_range_fetch_other(
-            program,
-            state,
-            cursor_id,
-            start_column,
-            dest,
-            defaults,
-        );
-    };
-    let Some(payload) = return_if_io!(state, cursor.record_payload()) else {
-        for reg in &mut state.registers[dest..dest + count] {
-            reg.set_null();
+    let cursor = match state.cursors.get_mut(cursor_id) {
+        Some(Some(Cursor::BTree(cursor, ..))) => cursor,
+        Some(_) => {
+            return op_column_range_fetch_other(
+                program,
+                state,
+                cursor_id,
+                start_column,
+                dest,
+                defaults,
+            )
         }
+        None => return Err(cursor_out_of_range("ColumnRange", cursor_id).into()),
+    };
+    let dest_regs = dest
+        .checked_add(defaults.len())
+        .and_then(|end| state.registers.get_mut(dest..end))
+        .ok_or_else(|| register_out_of_range("ColumnRange", dest))?;
+    let Some((payload, header)) = return_if_io!(state, cursor.record_payload_with_header()) else {
+        dest_regs.iter_mut().for_each(Register::set_null);
         return Ok(InsnFunctionStepResult::Step);
     };
-    let filled = ValueIterator::new(payload)?
-        .decode_into_registers_after(start_column, &mut state.registers[dest..dest + count])?;
-    if filled < count {
-        branches::mark_unlikely();
-        // The record has fewer columns than expected.
-        for (default, reg) in defaults[filled..]
-            .iter()
-            .zip(&mut state.registers[dest + filled..dest + count])
-        {
-            apply_column_default(default, reg)?;
+    let filled = header.columns_into_registers(payload, start_column, dest_regs)?;
+    if let Some(missing) = dest_regs.get_mut(filled..) {
+        if !missing.is_empty() {
+            branches::mark_unlikely();
+            // The record has fewer columns than expected.
+            for (default, reg) in defaults.iter().skip(filled).zip(missing) {
+                apply_column_default(default, reg)?;
+            }
         }
     }
     Ok(InsnFunctionStepResult::Step)

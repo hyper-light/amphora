@@ -40,7 +40,7 @@ use crate::{
         SeekResult,
     },
     util::IOExt,
-    vdbe::Register,
+    vdbe::{row_header::RowHeader, Register},
     Completion, MvStore,
 };
 use crate::{
@@ -908,6 +908,10 @@ pub struct BTreeCursor {
     /// wherever the reusable record is invalidated and before every write
     /// through the cursor, because it holds an offset into the page.
     noted_payload: NotedPayload,
+    /// The parse of the current row's record header that Column and ColumnRange read offsets
+    /// from (docs/design/executor.md, decision 7; QT.3). Dropped with `noted_payload`, which
+    /// every move, write and saved position clears, and whenever another payload is noted.
+    row_header: RowHeader,
     /// Information about the index key structure (sort order, collation, etc)
     pub index_info: Option<Arc<IndexInfo>>,
     /// Maintain count of the number of records in the btree. Used for the `Count` opcode
@@ -993,7 +997,7 @@ pub struct BTreeCursor {
 
 /// See [`BTreeCursor::noted_payload`]. A payload is never empty (its header
 /// takes at least one byte), so a size of 0 means nothing is noted.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct NotedPayload {
     start: u32,
     size: u32,
@@ -1001,6 +1005,15 @@ struct NotedPayload {
 
 impl NotedPayload {
     const NONE: Self = Self { start: 0, size: 0 };
+}
+
+/// Where `BTreeCursor::locate_payload` found the payload of the row under the cursor.
+#[derive(Clone, Copy)]
+enum PayloadAt {
+    /// On its page, which the cursor's stack keeps alive while it stays on the row.
+    Page(&'static [u8]),
+    /// In the cursor's reusable record, read from its overflow pages.
+    Record,
 }
 
 /// Records the in-flight descent for `iteration_pending_descent`. The direction
@@ -1202,7 +1215,7 @@ impl BTreeCursor {
     fn new_with_index_info(
         pager: Arc<Pager>,
         root_page: i64,
-        _num_columns: usize,
+        num_columns: usize,
         index_info: Option<Arc<IndexInfo>>,
     ) -> Self {
         let valid_state = if root_page == 1 && !pager.db_initialized() {
@@ -1229,6 +1242,7 @@ impl BTreeCursor {
             },
             reusable_immutable_record: None,
             noted_payload: NotedPayload::NONE,
+            row_header: RowHeader::new(num_columns),
             index_info,
             count: 0,
             context: None,
@@ -6439,7 +6453,7 @@ impl BTreeCursor {
     pub fn save_context(&mut self, cursor_context: CursorContext) {
         self.valid_state = CursorValidState::RequireSeek;
         self.context = Some(cursor_context);
-        self.noted_payload = NotedPayload::NONE;
+        self.forget_noted_payload();
         // The tree is about to change under this cursor (that is the only reason a
         // position ever gets saved), so cached payload offsets and overflow page
         // numbers must not survive: blob I/O through them would touch relocated or
@@ -6777,10 +6791,10 @@ impl CursorTrait for BTreeCursor {
             if contents.is_table() {
                 let cell_idx = self.stack.current_cell_index();
                 let cell = contents.cell_table_leaf_read_header(cell_idx as usize)?;
-                self.noted_payload = NotedPayload {
+                self.note_payload(NotedPayload {
                     start: cell.payload_start as u32,
                     size: u32::try_from(cell.payload_size).unwrap_or(0),
-                };
+                });
                 Ok(IOResult::Done(Some(cell.rowid)))
             } else {
                 index_rowid(self)
@@ -6887,51 +6901,18 @@ impl CursorTrait for BTreeCursor {
 
     #[inline(always)]
     fn record_payload(&mut self) -> IOResultOr<Option<&[u8]>> {
-        if self.needs_restore() {
-            return restore_record_payload(self);
-        }
-        if self.null_flag || !self.has_record() {
-            return Ok(IOResult::Done(None));
-        }
-        let noted = self.noted_payload;
-        if noted.size != 0 {
-            let size = noted.size as usize;
-            // A cell that keeps its whole payload on the page: the rowid
-            // read already found where it starts.
-            if size <= self.payload_limits.max_local_table {
-                let start = noted.start as usize;
-                let contents = self.stack.top_ref().get_contents();
-                if let Some(payload) = contents.payload_on_page(start, size) {
-                    return Ok(IOResult::Done(Some(payload)));
-                }
-            }
-        }
-        let contents = self.stack.top_ref().get_contents();
-        let cell_idx = self.stack.current_cell_index();
-        // Optimistically use a faster decoder that only handles leaf cells without overflow pages.
-        // If this fails, we'll degrade to the slower path.
-        if let Some((payload, start)) =
-            contents.decode_leaf_cell_without_overflow(cell_idx as usize, &self.payload_limits)
-        {
-            self.noted_payload = NotedPayload {
-                start: start as u32,
-                size: payload.len() as u32,
-            };
-            return Ok(IOResult::Done(Some(payload)));
-        }
-        return self.record_payload_general();
-
-        #[inline(never)]
-        fn restore_record_payload(cursor: &mut BTreeCursor) -> IOResultOr<Option<&[u8]>> {
-            return_if_io!(cursor.restore_context());
-            cursor.record_payload()
-        }
+        Ok(IOResult::Done(
+            match return_if_io!(self.record_payload_with_header()) {
+                Some((payload, _)) => Some(payload),
+                None => None,
+            },
+        ))
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn insert(&mut self, key: &BTreeKey) -> IOResultOr<()> {
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
-        self.noted_payload = NotedPayload::NONE;
+        self.forget_noted_payload();
         // saveAllCursors at the head of sqlite3BtreeInsert (btree.c:9348).
         return_if_io!(self.drive_pending_peer_save(key.maybe_rowid()));
         return_if_io!(self.insert_into_page(key));
@@ -6956,7 +6937,7 @@ impl CursorTrait for BTreeCursor {
     /// 9. SeekAfterBalancing -> adjust the cursor to a node that is closer to the deleted value. go to Finish
     /// 10. Finish -> Delete operation is done. Return CursorResult(Ok())
     fn delete(&mut self) -> IOResultOr<()> {
-        self.noted_payload = NotedPayload::NONE;
+        self.forget_noted_payload();
         if let CursorState::None = &self.state {
             // saveAllCursors at the head of sqlite3BtreeDelete (btree.c:9841). The
             // cursor is positioned on the row being deleted, so its rowid tells peer
@@ -7607,7 +7588,7 @@ impl CursorTrait for BTreeCursor {
 
     #[inline]
     fn invalidate_record(&mut self) {
-        self.noted_payload = NotedPayload::NONE;
+        self.forget_noted_payload();
         if let Some(record) = self.reusable_immutable_record.as_mut() {
             record.invalidate();
         }
@@ -7632,7 +7613,7 @@ impl CursorTrait for BTreeCursor {
     fn invalidate_btree_cache(&mut self) {
         self.stack.clear();
         self.has_record = false;
-        self.noted_payload = NotedPayload::NONE;
+        self.forget_noted_payload();
         self.move_to_right_state.1 = None;
         self.invalidate_count_cache();
         self.blob_cache.reset();
@@ -7846,22 +7827,104 @@ impl CursorTrait for BTreeCursor {
 }
 
 impl BTreeCursor {
+    /// The payload of the row under the cursor, as `record_payload` gives it, with the parse of
+    /// its header that Column reads offsets from (docs/design/executor.md, decision 7; QT.3).
+    #[inline(always)]
+    pub fn record_payload_with_header(&mut self) -> IOResultOr<Option<(&[u8], &mut RowHeader)>> {
+        let payload = match return_if_io!(self.locate_payload()) {
+            None => return Ok(IOResult::Done(None)),
+            Some(PayloadAt::Page(payload)) => payload,
+            Some(PayloadAt::Record) => self
+                .reusable_immutable_record
+                .as_ref()
+                .map(ImmutableRecord::get_payload)
+                .ok_or_else(|| {
+                    LimboError::InternalError("a record read through overflow was not kept".into())
+                })?,
+        };
+        Ok(IOResult::Done(Some((payload, &mut self.row_header))))
+    }
+
+    /// Finds where the payload of the row under the cursor is: on its page, or in the reusable
+    /// record when it spills to overflow pages. Kept apart from reading it so that the payload
+    /// and `row_header` can be lent together.
+    #[inline(always)]
+    fn locate_payload(&mut self) -> IOResultOr<Option<PayloadAt>> {
+        // Mirrors sqlite3BtreeRestoreCursorPosition called at btree read entry points.
+        if self.needs_restore() {
+            return_if_io!(self.restore_for_payload());
+        }
+        if self.null_flag || !self.has_record() {
+            return Ok(IOResult::Done(None));
+        }
+        let noted = self.noted_payload;
+        if noted.size != 0 {
+            let size = noted.size as usize;
+            // A cell that keeps its whole payload on the page: the rowid
+            // read already found where it starts.
+            if size <= self.payload_limits.max_local_table {
+                let start = noted.start as usize;
+                let contents = self.stack.top_ref().get_contents();
+                if let Some(payload) = contents.payload_on_page(start, size) {
+                    return Ok(IOResult::Done(Some(PayloadAt::Page(payload))));
+                }
+            }
+        }
+        let contents = self.stack.top_ref().get_contents();
+        let cell_idx = self.stack.current_cell_index();
+        // Optimistically use a faster decoder that only handles leaf cells without overflow pages.
+        // If this fails, we'll degrade to the slower path.
+        if let Some((payload, start)) =
+            contents.decode_leaf_cell_without_overflow(cell_idx as usize, &self.payload_limits)
+        {
+            self.note_payload(NotedPayload {
+                start: start as u32,
+                size: payload.len() as u32,
+            });
+            return Ok(IOResult::Done(Some(PayloadAt::Page(payload))));
+        }
+        self.locate_payload_general()
+    }
+
     #[inline(never)]
-    fn record_payload_general(&mut self) -> IOResultOr<Option<&[u8]>> {
+    fn restore_for_payload(&mut self) -> IOResultOr<()> {
+        self.restore_context()
+    }
+
+    #[inline(never)]
+    fn locate_payload_general(&mut self) -> IOResultOr<Option<PayloadAt>> {
         let page = self.stack.top_ref();
         let contents = page.get_contents();
         let cell_idx = self.stack.current_cell_index();
         let (payload, payload_start, _payload_size, first_overflow_page) =
             contents.cell_read_payload_at(cell_idx as usize, self.payload_limits)?;
         if first_overflow_page.is_none() {
-            self.noted_payload = NotedPayload {
+            self.note_payload(NotedPayload {
                 start: payload_start as u32,
                 size: payload.len() as u32,
-            };
-            return Ok(IOResult::Done(Some(payload)));
+            });
+            return Ok(IOResult::Done(Some(PayloadAt::Page(payload))));
         }
-        let record = return_if_io!(self.record());
-        Ok(IOResult::Done(record.map(ImmutableRecord::get_payload)))
+        Ok(IOResult::Done(
+            return_if_io!(self.record()).map(|_| PayloadAt::Record),
+        ))
+    }
+
+    /// Notes where the payload of the row under the cursor is. A payload other than the one
+    /// noted is another row's, or the same row rewritten: the parse of its header goes.
+    #[inline(always)]
+    fn note_payload(&mut self, noted: NotedPayload) {
+        if self.noted_payload != noted {
+            self.row_header.forget();
+        }
+        self.noted_payload = noted;
+    }
+
+    /// Forgets where the payload of the row under the cursor is, and the parse of its header.
+    #[inline(always)]
+    fn forget_noted_payload(&mut self) {
+        self.noted_payload = NotedPayload::NONE;
+        self.row_header.forget();
     }
 
     /// True when the next cell is on the same leaf page and no resumable
@@ -11647,6 +11710,76 @@ mod tests {
         let result = cursor.record()?;
         assert!(matches!(result, IOResult::Done(record) if record.is_none()));
         Ok(())
+    }
+
+    /// Reads column `column` of the row under `cursor` through its parsed header, as Column does.
+    fn parsed_column(cursor: &mut BTreeCursor, pager: &Pager, column: usize) -> Value {
+        loop {
+            match cursor.record_payload_with_header().unwrap() {
+                IOResult::Done(Some((payload, header))) => {
+                    let mut dest = Register::Value(Value::Null);
+                    assert!(header
+                        .column_into_register(payload, column, &mut dest)
+                        .unwrap());
+                    return dest.get_value().clone();
+                }
+                IOResult::Done(None) => panic!("no row under the cursor"),
+                IOResult::IO(io) => io.wait(&*pager.io).unwrap(),
+            }
+        }
+    }
+
+    /// A row whose third column sits after a text of `len` bytes.
+    fn row_of_width(len: usize, third: i64) -> ImmutableRecord {
+        let regs = &[
+            Register::Value(Value::from_i64(third * 1_000_003)),
+            Register::Value(Value::build_text("t".repeat(len))),
+            Register::Value(Value::from_i64(third)),
+        ];
+        ImmutableRecord::from_registers(regs, regs.len()).unwrap()
+    }
+
+    /// Do: read the third column of a row, then move the cursor by next, by seek, and overwrite
+    /// its row in place with another layout, reading the third column after each, and once on a
+    /// row that spills to overflow pages. Expect: every value is the new row's, the parse of the
+    /// old row's header dropped at each move (T-QT.3.2).
+    #[test]
+    fn a_cursor_reads_each_row_it_moves_to_from_its_own_header() {
+        let (pager, root_page, _, _) = empty_btree();
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 3);
+        let overflowing = pager.usable_space() * 2;
+        for (rowid, len, third) in [(1, 1, 11), (2, 40, 22), (3, 7, 33), (4, overflowing, 44)] {
+            run_until_done(
+                || cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }),
+                pager.deref(),
+            )
+            .unwrap();
+            let record = row_of_width(len, third);
+            let key = BTreeKey::new_table_rowid(rowid, Some(&record));
+            run_until_done(|| cursor.insert(&key), pager.deref()).unwrap();
+        }
+        run_until_done(|| cursor.rewind(), pager.deref()).unwrap();
+        assert_eq!(parsed_column(&mut cursor, &pager, 2), Value::from_i64(11));
+        run_until_done(|| cursor.next(), pager.deref()).unwrap();
+        assert_eq!(parsed_column(&mut cursor, &pager, 2), Value::from_i64(22));
+        run_until_done(
+            || cursor.seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true }),
+            pager.deref(),
+        )
+        .unwrap();
+        assert_eq!(parsed_column(&mut cursor, &pager, 2), Value::from_i64(33));
+        let rewritten = row_of_width(90, 77);
+        let key = BTreeKey::new_table_rowid(3, Some(&rewritten));
+        run_until_done(|| cursor.insert(&key), pager.deref()).unwrap();
+        assert_eq!(parsed_column(&mut cursor, &pager, 2), Value::from_i64(77));
+        assert_eq!(
+            parsed_column(&mut cursor, &pager, 0),
+            Value::from_i64(77 * 1_000_003)
+        );
+        run_until_done(|| cursor.next(), pager.deref()).unwrap();
+        assert_eq!(parsed_column(&mut cursor, &pager, 2), Value::from_i64(44));
+        run_until_done(|| cursor.prev(), pager.deref()).unwrap();
+        assert_eq!(parsed_column(&mut cursor, &pager, 2), Value::from_i64(77));
     }
 
     #[test]
