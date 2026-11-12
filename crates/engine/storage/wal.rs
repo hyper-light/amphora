@@ -4207,7 +4207,7 @@ impl WalFile {
         tail: usize,
         against: &Against,
     ) -> Option<(u8, u32, Vec<u8>)> {
-        if version.generation != against.generation || version.depth >= packed::MOST_DELTAS {
+        if version.generation != against.generation || version.depth == packed::MOST_DELTAS {
             return None;
         }
         if self
