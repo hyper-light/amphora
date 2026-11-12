@@ -183,3 +183,10 @@ twice base's load.
 Criteria 2 and 3 are conditions that decision 37's "Falsified by" names: the audit's legs, or the
 comprehensive bench's bulk statements, slower than page-a-frame at 13e385d. As measured here, both
 conditions hold. The run was not on a quiet host, and the suite was not best of N.
+
+## The interleaved rerun
+
+`bench/records/2026-11-12-studio-local-small-commits-step2-interleaved.md` reruns criteria 2 and 3,
+with the two trees interleaved and best of 3. The 8 MiB leg is no slower there (14.25 s against
+14.28 s), so criterion 2 is met at 8 MiB. The bulk statements' slowdown holds, so criterion 3 is not
+met. The single-row statements' speedups above don't hold.
