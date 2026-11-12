@@ -9369,6 +9369,43 @@ mod tests {
         pump.finish();
     }
 
+    /// CP-T1.8 (amphora-seam-owner-2, amphora-owner-t1-constants-721acf2-20261112): an owner's own
+    /// session that reaches its lease at its barrier while its member still leads its term is
+    /// counted. Do, in a group of three voters: the leader binds kiln.host-store 7 and its keeper
+    /// makes a session; bring its deadline to now, as a ReadIndex backlog behind a live quorum
+    /// would leave it, and step. Expect: that session ended (any in hand after is the keeper's next,
+    /// with a lease of its own), the leader still leading the same term, and
+    /// `amphora_replica_own_sessions_expired_total` at 1.
+    #[test]
+    fn a_live_leaders_session_past_its_lease_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        quiet(&mut driven, &mut pump);
+        clients[leader].handle().attest(kiln(7)).unwrap();
+        session_lease(&mut driven, leader);
+        let term = driven.owner(leader).replica.term();
+        assert_eq!(clients[leader].handle().counters().own_sessions_expired, 0);
+        let actor = driven.owner_mut(leader);
+        let now = actor.at;
+        actor.pending.as_mut().unwrap().until = now;
+        driven.step();
+        let actor = driven.owner(leader);
+        assert!(actor.replica.is_leader() && actor.replica.term() == term);
+        // Ended; the keeper may have made the next at once, with a lease of its own.
+        assert!(
+            actor.pending.as_ref().is_none_or(|p| p.until > now),
+            "the session past its lease ended"
+        );
+        assert_eq!(clients[leader].handle().counters().own_sessions_expired, 1);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
     /// Rounds, time standing still, until every one of `owners` has marker J applied.
     fn joins_tracked(driven: &mut Driven, pump: &mut Pump<'_>, owners: &[usize]) {
         for _ in 0..ROUNDS {

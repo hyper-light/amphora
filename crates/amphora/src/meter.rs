@@ -297,7 +297,7 @@ pub const REPLICA_METRICS: [(&str, &str, &str); 16] = [
     (
         "amphora_replica_own_sessions_expired_total",
         "counter",
-        "The owner's own sessions (a floor session, the seed's attempt) that reached their lease at their barrier while this member led their term; any is a sign the quorum patience is too short.",
+        "The owner's own sessions (a floor session, the seed's attempt) that reached their lease at their barrier while this member led their term; many in one term are a sign the quorum patience is too short (one can wait behind a slow flush).",
     ),
     // Local reads (replication.md, "A local read on a replica"), as Kiln Metrics agreed them
     // (amphora-local-read/names/v1).
