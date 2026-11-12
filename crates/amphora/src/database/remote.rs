@@ -357,7 +357,11 @@ impl Database {
         }
         // Admission before the probe: a probe makes the endpoint directory and takes the lease,
         // which a full table would refuse to anyone who went on to open.
-        api::bound("open database owners", owners.len().saturating_add(1), 4096)?;
+        api::bound(
+            "open database owners",
+            owners.len().saturating_add(1),
+            OWNERS_MAX,
+        )?;
         // No owner holds a lease under a directory that doesn't exist; attach makes no directory.
         if !parent(&path).try_exists().map_err(unavailable)? {
             return Ok(None);
@@ -378,15 +382,18 @@ impl Database {
             // This process drained the owner here: a child it forked may share the lease until its
             // exec. Wait for it to the deadline; once free, no owner holds it.
             drop(owners);
-            let mut pause = FIRST_PAUSE;
+            let (since, mut pause) = (Instant::now(), None);
+            let mut probed = since;
             loop {
                 if Instant::now() >= until {
                     lease_held_since_drain(&path);
                     return Err(Refusal::Timeout);
                 }
-                pause_for_lease(&mut pause, until);
+                pause_for_lease(&mut pause, probed, until);
+                probed = Instant::now();
                 if let Some(lease) = crate::transport::try_lease(&path)? {
                     drop(lease);
+                    drain_window_taken(since);
                     return Ok(None);
                 }
             }

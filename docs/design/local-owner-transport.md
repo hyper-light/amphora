@@ -324,9 +324,17 @@ additive constructors carry them, and the existing ones keep their behavior:
     4,096 (the owner bound), the oldest evicted first, and a path's mark cleared once this process
     takes its lease again.
   - A guarded open, a guarded attach or a restore that finds the lease held at a path this process
-    drained waits for it within the caller's deadline, re-probing after 50 µs, doubling to at most
-    1 ms (the measured window, and the drain wait's own 1 ms park), with the owner table unlocked
-    between probes; at the deadline it answers `Refusal::Timeout`. A path with no drain of this
+    drained waits for it within the caller's deadline, with the owner table unlocked between
+    probes; at the deadline it answers `Refusal::Timeout`. Its pauses are learned, not picked
+    (2026-11-11; Ada: "We don't tolerate arbitrary constants, learned and stat derived values
+    only"; they were 50 µs doubling to 1 ms). The first pause is the probe's own measured cost,
+    so probing takes no more time than waiting. Each next pause is twice the last, at least the
+    probe's cost. It is capped at the window this process last waited out before taking a drained
+    lease (`DRAIN_WINDOW`, measured from the first probe to the lease taken), so a lease let go is
+    taken within one learned window of its release. Before any window is learned the pauses double
+    to the deadline, so a lease is taken within twice the wait. `database::drain_pause` tests the
+    pure core (`next_pause`). Falsified by a reopen after a drain answering later than one learned
+    window past the lease's release, or probing for longer than it waits. A path with no drain of this
     process behind it keeps the at-once refusal (`remote_owner()`, the restore's "another process
     owns the destination"). An unguarded open already waits: it attaches as a client, the drained
     owner answers nothing, and the open retries the client's `Unavailable` to its deadline.
