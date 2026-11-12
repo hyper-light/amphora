@@ -399,11 +399,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 - **The planner** (docs/research/planner.md; plan 01a16eab7f457673b4cf9933adacfc4d). Today it orders joins
   left-deep, by a dynamic program over its connected subsets, a size at a time on a worklist, while
   they number 10,000 or fewer, and past that by a greedy search that adds the table of fewest joined
-  rows (decision 19, built on t1/planner-search; JOB's measurement against its parent waits on
-  jupiter); it
-  estimates from `sqlite_stat1`'s index prefixes, with fixed selectivities where no index leads,
-  one estimate per joined set whatever the order (decision 13); it weighs a hash join only where the
-  table joined has no seek, so JOB and TPC-H run index nested loops; it plans once, at prepare; CERT
+  rows (decision 19, built on t1/planner-search; JOB's measurement against its parent waits on the
+  batch's bench); it estimates from `sqlite_stat1`'s index prefixes and, for an equality or IN list of
+  constants, from each column's distinct count and each table's sample that ANALYZE keeps beside it
+  (decision 20, built on t1/planner-stats; its JOB and TPC-H measurement waits on the batch's bench); a
+  table's other filters run together on its sample, and combine by exponential backoff where it has
+  none (decision 21, the same branch and wait); one estimate per joined set whatever the order
+  (decision 13); it weighs a hash join only where the table joined has no seek, so JOB and TPC-H run
+  index nested loops; it plans at prepare, and again after ANALYZE; CERT
   and the order check are clean (step 5). Step 3's baseline (`bench/records/2026-10-26-jupiter-
   planner-baseline.md`) has every JOB and TPC-H query's estimates against the rows counted, and their
   run times beside SQLite, DuckDB and PostgreSQL. What is open, each closed by its goal in kiln, in
@@ -412,8 +415,8 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   can't give: the page-miss path, per-row execution, hash joins where a seek exists, parallel
   execution); then the ranked changes of section 9, measured as `docs/requirements.toml`'s PL.1 to
   PL.13 say: join sizes from equivalence classes (PL.1, goal b4c804c3), distinct counts and a sample
-  per table (PL.2, 3492da3a), the join search above 12 tables (PL.3, f692c137: built and tested, its JOB measurement open), each table's filters
-  estimated together (PL.4, 210578d2), Bloom filters to a star join's fact table (PL.5, 96c74342), no
+  per table (PL.2, 3492da3a: built and tested, its measurement open), the join search above 12 tables (PL.3, f692c137: built and tested, its JOB measurement open), each table's filters
+  estimated together (PL.4, 210578d2: built and tested, its measurement open), Bloom filters to a star join's fact table (PL.5, 96c74342), no
   index-less nested loop beneath an unbounded outer (PL.6, 5e23ff8b), the cost model against time
   (PL.7, e0e7a1df), bushy plans with CD-C (PL.8, c837cde3), statistics kept as rows change (PL.9,
   26302efe), unnesting by dependent joins (PL.10, 61c79bd1), upper bounds as a guard (PL.11,

@@ -2,7 +2,8 @@ use crate::sync::Arc;
 
 use crate::{
     bail_parse_error,
-    function::{Func, FuncCtx, ScalarFunc},
+    column_stats::{SampleFunction, SketchFunction},
+    function::{AccumulatorFunc, AggFunc, ExtFunc, Func, FuncCtx, ScalarFunc},
     schema::{BTreeTable, Index, RESERVED_TABLE_PREFIXES},
     storage::pager::CreateBTreeFlags,
     translate::{
@@ -13,7 +14,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorType, ProgramBuilder},
-        insn::{to_u32, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
+        insn::{to_u32, AggStepData, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
     Result,
 };
@@ -159,93 +160,20 @@ pub fn translate_analyze(
         dest_end: None,
     });
 
-    // After preparing/creating sqlite_stat1, we need to OpenWrite it, and how we acquire
-    // the necessary BTreeTable for cursor creation and root page for the instruction changes
-    // depending on which path we take.
-    let sqlite_stat1_btreetable: Arc<BTreeTable>;
-    let sqlite_stat1_source: RegisterOrLiteral<_>;
-
-    let stat1_table: Option<Arc<BTreeTable>> =
-        resolver.with_schema(database_id, |s| s.get_btree_table("sqlite_stat1"));
-    if let Some(sqlite_stat1) = stat1_table {
-        sqlite_stat1_btreetable = sqlite_stat1.clone();
-        sqlite_stat1_source = RegisterOrLiteral::Literal(sqlite_stat1.root_page);
-    } else {
-        // FIXME: Emit ReadCookie 0 3 2
-        // FIXME: Emit If 3 +2 0
-        // FIXME: Emit SetCookie 0 2 4
-        // FIXME: Emit SetCookie 0 5 1
-
-        // See the large comment in schema.rs:translate_create_table about
-        // deviating from SQLite codegen, as the same deviation is being done
-        // here.
-
-        // TODO: this code half-copies translate_create_table, because there's
-        // no way to get the table_root_reg back out, and it's needed for later
-        // codegen to open the table we just created.  It's worth a future
-        // refactoring to remove the duplication one the rest of ANALYZE is
-        // implemented.
-        let table_root_reg = program.alloc_register();
-        program.emit_insn(Insn::CreateBtree {
-            db: database_id,
-            root: table_root_reg,
-            flags: CreateBTreeFlags::new_table(),
-        });
-        let sql = "CREATE TABLE sqlite_stat1(tbl,idx,stat)";
-        // The root_page==0 is false, but we don't rely on it, and there's no
-        // way to initialize it with a correct value.
-        sqlite_stat1_btreetable = Arc::new(BTreeTable::from_sql(sql, 0)?);
-        sqlite_stat1_source = RegisterOrLiteral::Register(table_root_reg);
-
-        let table = resolver
-            .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
-            .unwrap();
-        let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id: sqlite_schema_cursor_id,
-            root_page: 1i64.into(),
-            db: database_id,
-        });
-
-        // Add the table entry to sqlite_schema
-        emit_schema_entry(
-            program,
-            resolver,
-            sqlite_schema_cursor_id,
-            None,
-            SchemaEntryType::Table,
-            "sqlite_stat1",
-            "sqlite_stat1",
-            table_root_reg,
-            Some(sql.to_string()),
-        )?;
-
-        let parse_schema_where_clause =
-            "tbl_name = 'sqlite_stat1' AND type != 'trigger'".to_string();
-        program.emit_insn(Insn::ParseSchema {
-            db: database_id,
-            where_clause: Some(parse_schema_where_clause),
-            trigger_target_database_id: None,
-        });
-
-        // Bump schema cookie so subsequent statements reparse schema.
-        let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
-        program.emit_insn(Insn::SetCookie {
-            db: database_id,
-            cookie: Cookie::SchemaVersion,
-            value: schema_version as i32 + 1,
-            p5: 0,
-        });
-    };
-
-    // Count the number of rows in the target table(s), and insert into sqlite_stat1.
-    let sqlite_stat1 = sqlite_stat1_btreetable;
-    let stat_cursor = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_stat1));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: stat_cursor,
-        root_page: sqlite_stat1_source,
-        db: database_id,
-    });
+    let stat_cursor = open_stats_table(
+        program,
+        resolver,
+        database_id,
+        STAT1_TABLE,
+        "CREATE TABLE sqlite_stat1(tbl,idx,stat)",
+    )?;
+    let column_stats_cursor = open_stats_table(
+        program,
+        resolver,
+        database_id,
+        COLUMN_STATS_TABLE,
+        COLUMN_STATS_SQL,
+    )?;
 
     for (target_table, target_index) in analyze_targets {
         // Remove existing stat rows for this target before inserting fresh ones.
@@ -444,11 +372,318 @@ pub fn translate_analyze(
         for index in indexes {
             emit_index_stats(program, stat_cursor, &target_table, &index, database_id);
         }
+        if !is_specific_index_target {
+            emit_column_stats(program, column_stats_cursor, &target_table, database_id)?;
+        }
     }
 
     // FIXME: Emit LoadAnalysis
-    // FIXME: Emit Expire
     Ok(())
+}
+
+/// The table ANALYZE keeps its sketches and samples in (docs/design/planner.md, decision 20): an
+/// internal table of the engine's reserved prefix, which SQLite and earlier builds read as any
+/// other table and never consult.
+pub(crate) const COLUMN_STATS_TABLE: &str = "__turso_internal_column_stats";
+const COLUMN_STATS_SQL: &str = "CREATE TABLE __turso_internal_column_stats(tbl,col,kind,data)";
+const STAT1_TABLE: &str = "sqlite_stat1";
+
+/// The register `at` places past `start`, of a block `alloc_registers` gave.
+fn register(start: usize, at: usize) -> Result<usize> {
+    start
+        .checked_add(at)
+        .ok_or_else(|| crate::LimboError::InternalError("ANALYZE ran out of registers".into()))
+}
+
+/// Opens the statistics table `name` for writing, creating it by `sql` first where the schema
+/// has none, as SQLite creates `sqlite_stat1`: a B-tree, its schema row, the schema parsed again
+/// and its cookie moved on. Returns its cursor.
+fn open_stats_table(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+    name: &str,
+    sql: &str,
+) -> Result<usize> {
+    let existing: Option<Arc<BTreeTable>> =
+        resolver.with_schema(database_id, |s| s.get_btree_table(name));
+    let (table, root) = if let Some(table) = existing {
+        let root = RegisterOrLiteral::Literal(table.root_page);
+        (table, root)
+    } else {
+        let table_root_reg = program.alloc_register();
+        program.emit_insn(Insn::CreateBtree {
+            db: database_id,
+            root: table_root_reg,
+            flags: CreateBTreeFlags::new_table(),
+        });
+        // The root page 0 is never read: the cursor opens the register's root.
+        let table = Arc::new(BTreeTable::from_sql(sql, 0)?);
+        let schema_table = resolver
+            .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
+            .ok_or_else(|| crate::LimboError::InternalError("no sqlite_schema".into()))?;
+        let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: sqlite_schema_cursor_id,
+            root_page: 1i64.into(),
+            db: database_id,
+        });
+        emit_schema_entry(
+            program,
+            resolver,
+            sqlite_schema_cursor_id,
+            None,
+            SchemaEntryType::Table,
+            name,
+            name,
+            table_root_reg,
+            Some(sql.to_string()),
+        )?;
+        program.emit_insn(Insn::ParseSchema {
+            db: database_id,
+            where_clause: Some(format!("tbl_name = '{name}' AND type != 'trigger'")),
+            trigger_target_database_id: None,
+        });
+        let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
+        let next = i32::try_from(schema_version)
+            .ok()
+            .and_then(|v| v.checked_add(1))
+            .ok_or_else(|| crate::LimboError::InternalError("schema cookie overflow".into()))?;
+        program.emit_insn(Insn::SetCookie {
+            db: database_id,
+            cookie: Cookie::SchemaVersion,
+            value: next,
+            p5: 0,
+        });
+        (table, RegisterOrLiteral::Register(table_root_reg))
+    };
+    let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: cursor,
+        root_page: root,
+        db: database_id,
+    });
+    Ok(cursor)
+}
+
+/// Emits one scan of `table` that sketches each of its columns and samples its rows (decision
+/// 20), after deleting the rows the statistics table holds for it; then a row a column, `(tbl,
+/// col, 'sketch', the sketch's encoding)`, and one `(tbl, NULL, 'sample', the sample's encoding)`,
+/// its data NULL where the table's rows passed the sample's byte budget. The scan's loop is the
+/// table's rows; its body is bounded by the table's columns.
+fn emit_column_stats(
+    program: &mut ProgramBuilder,
+    stats_cursor: usize,
+    table: &Arc<BTreeTable>,
+    database_id: usize,
+) -> Result<()> {
+    emit_delete_rows_of(program, stats_cursor, &table.name);
+    let columns: Vec<(usize, String)> = table
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.is_generated())
+        .filter_map(|(i, c)| c.name.clone().map(|name| (i, name)))
+        .collect();
+    let count = columns.len();
+    if count == 0 {
+        return Ok(());
+    }
+    let sketch = AggFunc::External(Arc::new(ExtFunc::NativeAggregate {
+        argc: 1,
+        function: Arc::new(SketchFunction),
+    }));
+    let sample = AggFunc::External(Arc::new(ExtFunc::NativeAggregate {
+        argc: 1,
+        function: Arc::new(SampleFunction {
+            table: table.name.clone(),
+        }),
+    }));
+    let accumulators = program.alloc_registers(count);
+    let sample_acc = program.alloc_register();
+    let values = program.alloc_registers(count);
+    let record = program.alloc_register();
+    for at in 0..count {
+        program.emit_insn(Insn::Null {
+            dest: register(accumulators, at)?,
+            dest_end: None,
+        });
+    }
+    program.emit_insn(Insn::Null {
+        dest: sample_acc,
+        dest_end: None,
+    });
+    let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: cursor,
+        root_page: table.root_page,
+        db: database_id,
+    });
+    let done = program.allocate_label();
+    let next_row = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: cursor,
+        pc_if_empty: done,
+    });
+    program.preassign_label_to_next_insn(next_row);
+    for (at, (column, _)) in columns.iter().enumerate() {
+        let value = register(values, at)?;
+        program.emit_column_or_rowid(cursor, *column, value);
+        program.emit_insn(Insn::AggStep {
+            data: Box::new(AggStepData {
+                acc_reg: register(accumulators, at)?,
+                col: value,
+                delimiter: 0,
+                func: AccumulatorFunc::Agg(sketch.clone()),
+                comparator: None,
+                collation: None,
+            }),
+        });
+    }
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(values),
+        count: to_u32(count),
+        dest_reg: to_u32(record),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::AggStep {
+        data: Box::new(AggStepData {
+            acc_reg: sample_acc,
+            col: record,
+            delimiter: 0,
+            func: AccumulatorFunc::Agg(sample.clone()),
+            comparator: None,
+            collation: None,
+        }),
+    });
+    program.emit_insn(Insn::Next {
+        cursor_id: cursor,
+        pc_if_next: next_row,
+        fullscan: true,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(done);
+    let row = program.alloc_registers(4);
+    let (tbl, col, kind, data) = (row, register(row, 1)?, register(row, 2)?, register(row, 3)?);
+    program.emit_insn(Insn::String8 {
+        value: table.name.to_string(),
+        dest: tbl,
+    });
+    let insert = |program: &mut ProgramBuilder| {
+        let record = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(row),
+            count: to_u32(4),
+            dest_reg: to_u32(record),
+            index_name: None,
+            affinity_str: None,
+        });
+        let rowid = program.alloc_register();
+        program.emit_insn(Insn::NewRowid {
+            cursor: stats_cursor,
+            rowid_reg: rowid,
+            prev_largest_reg: 0,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: stats_cursor,
+            key_reg: rowid,
+            record_reg: record,
+            flag: Default::default(),
+            table_name: COLUMN_STATS_TABLE.to_string(),
+        });
+    };
+    for (at, (_, name)) in columns.iter().enumerate() {
+        let acc = register(accumulators, at)?;
+        program.emit_insn(Insn::AggFinal {
+            register: acc,
+            func: AccumulatorFunc::Agg(sketch.clone()),
+        });
+        program.emit_insn(Insn::String8 {
+            value: name.clone(),
+            dest: col,
+        });
+        program.emit_insn(Insn::String8 {
+            value: "sketch".to_string(),
+            dest: kind,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: acc,
+            dst_reg: data,
+            extra_amount: 0,
+        });
+        insert(program);
+    }
+    program.emit_insn(Insn::AggFinal {
+        register: sample_acc,
+        func: AccumulatorFunc::Agg(sample),
+    });
+    program.emit_insn(Insn::Null {
+        dest: col,
+        dest_end: None,
+    });
+    program.emit_insn(Insn::String8 {
+        value: "sample".to_string(),
+        dest: kind,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: sample_acc,
+        dst_reg: data,
+        extra_amount: 0,
+    });
+    insert(program);
+    Ok(())
+}
+
+/// Emits a pass over the statistics table at `cursor` that deletes each row whose first column
+/// is `table`.
+fn emit_delete_rows_of(program: &mut ProgramBuilder, cursor: usize, table: &str) {
+    let done = program.allocate_label();
+    let top = program.allocate_label();
+    let skip = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: cursor,
+        pc_if_empty: done,
+    });
+    program.preassign_label_to_next_insn(top);
+    let tbl = program.alloc_register();
+    program.emit_insn(Insn::Column {
+        cursor_id: cursor,
+        column: 0,
+        dest: tbl,
+        default: None,
+    });
+    let name = program.alloc_register();
+    program.emit_insn(Insn::String8 {
+        value: table.to_string(),
+        dest: name,
+    });
+    program.emit_insn(Insn::Ne {
+        lhs: tbl,
+        rhs: name,
+        target_pc: skip,
+        flags: Default::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::Delete {
+        cursor_id: cursor,
+        table_name: COLUMN_STATS_TABLE.to_string(),
+        is_part_of_update: false,
+    });
+    program.emit_insn(Insn::Next {
+        cursor_id: cursor,
+        pc_if_next: top,
+        fullscan: false,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(skip);
+    program.emit_insn(Insn::Next {
+        cursor_id: cursor,
+        pc_if_next: top,
+        fullscan: false,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(done);
 }
 
 /// Emit VDBE code to gather and insert statistics for a single index.

@@ -49,6 +49,7 @@ pub(crate) mod sync;
 pub(crate) mod thread;
 
 mod assert;
+mod column_stats;
 mod connection;
 mod database;
 pub mod dialect;

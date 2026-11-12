@@ -94,6 +94,7 @@ pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
 pub(crate) mod order;
 mod row_value;
+mod sample_filter;
 pub(crate) mod unnest;
 
 #[derive(Debug, Default)]
