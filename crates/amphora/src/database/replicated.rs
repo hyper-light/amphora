@@ -629,6 +629,9 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     spacing: log_bound::Spacing,
     // While the database's log is past its room: why, for the submits this member refuses.
     log_full: Option<String>,
+    // The input queued as this step began, its own envelope among it: what a restart in the
+    // step found, on the basis each later step reads its queue.
+    step_queued: u64,
     // What this owner measured of its voters' answers while it led: its quorum patience
     // (replication.md, "The leader's quorum patience").
     answers: patience::Answers,
@@ -1351,6 +1354,7 @@ fn open_on<F: BlockFile + 'static>(
         transferred: None,
         spacing: log_bound::Spacing::default(),
         log_full: None,
+        step_queued: 0,
         answers: patience::Answers::default(),
         #[cfg(test)]
         stalls: None,
@@ -1690,6 +1694,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         // A step that begins with no more input queued than a restart found ends its hold
         // (`log_bound::Spacing`).
         let queued = self.queued();
+        self.step_queued = queued;
         let applied = self.replica.applied().index;
         if let Some(envelope) = input {
             self.receive(envelope)?;
@@ -1854,8 +1859,8 @@ impl<F: BlockFile + 'static> Actor<F> {
                     self.control.local.hold_reads()?;
                 }
                 if due && pass.caught_up && !*out {
-                    let queued = u64::try_from(self.control.admitted.load(Ordering::Acquire))
-                        .unwrap_or(u64::MAX);
+                    // The queue as this step began, on the basis each later step reads it.
+                    let queued = self.step_queued;
                     let machine = self.replica.machine_mut();
                     // The file keeps room for what the log needed, within what the disk allows.
                     machine.keep_log(frames.min(pass.room));

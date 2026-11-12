@@ -1745,7 +1745,11 @@ applies every commit once, on a leader, a follower and a learner alike):
 - *held*: every entry applied from a restart's start until the backlog it made is gone, the first step after it
   that begins with no more input queued than the restart found. Queued input is the owner's own count of admitted
   bytes not yet taken, its channel's and those waiting behind the prepared transaction (each envelope's
-  reservation). An idle step, with none queued, is one such step. That covers what arrived during the restart, what
+  reservation). It is read once, as each step begins, with the step's own input still reserved, and a restart takes
+  the reading of the step it runs in, so both are on one basis. Read inside the restart instead, after the step's
+  input was dropped, a steady backlog read one envelope more at every later step and the hold never ended (red
+  first: `a_restart_hold_ends_on_an_owner_busy_at_a_steady_queue`, amphora-owner-t1-log-bound-004f682-20261111).
+  An idle step, with none queued, is one such step. That covers what arrived during the restart, what
   queued behind its backlog, and the commits in flight when it began. It overcounts, which is the conservative side.
   An owner under steady load, never idle, still ends the hold once its queue is back where it was (tested, and
   red-first: ended only at an idle step, such an owner held every entry after its first restart for good, never
