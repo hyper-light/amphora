@@ -42,10 +42,6 @@ const DRIVE_QUANTUM: usize = 32;
 // attestation's name is charged beside it). The response channel's own allocation is charged for
 // no input, as before.
 const CHANGE_BYTES: usize = std::mem::size_of::<Input>();
-// The lease of one of the floor keeper's own sessions: policy, not a measured number, the same
-// finite lease the seed's internal attempt has (`bootstrap`); a session past it ends unapplied and
-// is made again.
-const FLOOR_SESSION: Duration = Duration::from_secs(60);
 
 /// One of the floor's own sessions: the work it does on the database at its base.
 type FloorSession = Box<dyn FnOnce(&mut Db) -> anyhow::Result<()> + Send>;
@@ -602,6 +598,9 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     // many passes failed short of fencing. Counters read by tests.
     floor_inflight: bool,
     floor_ended: u64,
+    // The owner's own sessions that reached their lease at their barrier while this member stayed
+    // leader in their term (`Actor::own_session_lease`'s falsifier: a patience too short).
+    own_sessions_expired: u64,
     floor_failures: u64,
     // Whether the floor session in hand is a request to attest again, and how this owner's
     // requests ended: applied, or refused by the stale-base rule and proposed again on a later pass.
@@ -1379,6 +1378,7 @@ fn open_on<F: BlockFile + 'static>(
         floor_requests: 0,
         floor_inflight: false,
         floor_ended: 0,
+        own_sessions_expired: 0,
         floor_failures: 0,
         floor_requesting: false,
         tail: None,
@@ -2009,6 +2009,13 @@ impl<F: BlockFile + 'static> Actor<F> {
                 if expired {
                     if let Some(response) = pending.response.take() {
                         answer(response, Err(Refusal::Timeout));
+                    }
+                    if matches!(pending.author, Author::Owner)
+                        && !changed_term
+                        && self.replica.is_leader()
+                    {
+                        self.own_sessions_expired = self.own_sessions_expired.saturating_add(1);
+                        tracing::info!(target: "amphora.replica", event = "own_session_expired", term = self.replica.term(), expired = self.own_sessions_expired, "an owner's session reached its lease at its barrier while this member led its term");
                     }
                 } else {
                     self.requeue(pending);
@@ -3064,10 +3071,11 @@ impl<F: BlockFile + 'static> Actor<F> {
             .bootstrap_source()
             .ok_or_else(|| fenced("pending bootstrap has no designated source"))?;
         if source != self.replica.id() || !self.replica.is_leader() {
-            // A failed transfer can be requested again after the core's twenty-tick election
-            // period. At most one such request is made per period, never a host election.
-            let period = TICK
-                .checked_mul(20)
+            // A failed transfer can be requested again after the core's election timeout. At most
+            // one such request is made per period, never a host election.
+            let period = u32::try_from(self.replica.core().raft.config().election_tick)
+                .ok()
+                .and_then(|ticks| TICK.checked_mul(ticks))
                 .ok_or_else(|| fenced("tick period overflow"))?;
             let due = self.transferred.is_none_or(|(term, at)| {
                 term != self.replica.term() || self.at.saturating_duration_since(at) >= period
@@ -3083,11 +3091,12 @@ impl<F: BlockFile + 'static> Actor<F> {
         }
         let context = self.context()?;
         self.replica.read(context.clone()).map_err(raft_error)?;
-        // One internal attempt has a finite lease; committed chunk progress survives its expiry.
-        // User requests retain their own deadlines in the bounded waiting queue throughout.
+        // One internal attempt has a finite lease, its role's (`own_session_lease`); committed
+        // chunk progress survives its expiry. User requests retain their own deadlines in the
+        // bounded waiting queue throughout.
         let until = self
             .at
-            .checked_add(Duration::from_secs(60))
+            .checked_add(self.own_session_lease()?)
             .ok_or_else(|| fenced("bootstrap deadline overflow"))?;
         self.pending = Some(Pending {
             context,
@@ -3213,6 +3222,36 @@ impl<F: BlockFile + 'static> Actor<F> {
         self.floor_requesting = true;
         Ok(())
     }
+    /// The lease of one of the owner's own sessions (a floor session, the seed's attempt), read
+    /// from its role's raft timing when it is made (replication.md, "Attestation";
+    /// amphora-seam-owner-2, amphora-owner-t1-constants-floor-session-20261111). A leader's is two
+    /// of its quorum checks, 2 × (election_tick + quorum_patience) ticks: the check runs on its own
+    /// counter and clears the answers' marks only when it runs, so a stall that begins just after
+    /// an answer passes the next check and steps the leader down at the one after (raft.rs,
+    /// `quorum_due`, `tick_heartbeat`). A follower's is its own election bound and stall
+    /// patience, (2 × election_tick + patience) ticks: it campaigns within a randomized timeout
+    /// below twice election_tick, plus its patience (`tick_election`). Past it a session is in a
+    /// role that has moved on, where it can't apply. A live-quorum leader's session can still
+    /// reach it, behind a slow flush or a ReadIndex backlog, and then ends unapplied: safe, since
+    /// the stale-base rule refuses a late apply and the keeper makes it again. Those are counted
+    /// (`own_sessions_expired`), since many would mean the patience is too short.
+    fn own_session_lease(&self) -> Result<Duration, Refusal> {
+        let raft = &self.replica.core().raft;
+        let election = raft.config().election_tick;
+        let ticks = if self.replica.is_leader() {
+            election
+                .checked_add(raft.quorum_patience())
+                .and_then(|due| due.checked_mul(2))
+        } else {
+            election
+                .checked_mul(2)
+                .and_then(|bound| bound.checked_add(raft.patience()))
+        };
+        ticks
+            .and_then(|ticks| u32::try_from(ticks).ok())
+            .and_then(|ticks| TICK.checked_mul(ticks))
+            .ok_or_else(|| fenced("own session lease overflow"))
+    }
     /// One of the floor's own sessions, through the same barrier and proposal as a call; it has no
     /// caller, and one that ends without applying is made again on the keeper's next pass.
     fn submit_floor(&mut self, session: FloorSession) -> Result<(), Refusal> {
@@ -3224,7 +3263,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         self.replica.read(context.clone()).map_err(raft_error)?;
         let until = self
             .at
-            .checked_add(FLOOR_SESSION)
+            .checked_add(self.own_session_lease()?)
             .ok_or_else(|| fenced("floor session deadline overflow"))?;
         let call: Call = Box::new(move |db| {
             session(db)?;
@@ -9255,6 +9294,74 @@ mod tests {
         }
         assert!(driven.owner_mut(follower).floor_ended > ended);
         assert_eq!(attested(&mut driven, leader, member).unwrap().highest, 7);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// The floor session `owner`'s keeper has in hand at its barrier, after rounds: its deadline
+    /// less the owner's time when it was made.
+    fn session_lease(driven: &mut Driven, owner: usize) -> Duration {
+        for _ in 0..ROUNDS {
+            if driven.owner_mut(owner).floor_inflight {
+                break;
+            }
+            driven.step();
+        }
+        let actor = driven.owner_mut(owner);
+        let pending = actor.pending.as_ref().expect("a floor session in hand");
+        assert!(
+            matches!(pending.phase, Phase::Barrier(_)),
+            "the session left its barrier"
+        );
+        pending.until.saturating_duration_since(actor.at)
+    }
+
+    /// CP-T1.8 (replication.md, "Attestation"; amphora-seam-owner-2,
+    /// amphora-owner-t1-constants-floor-session-20261111): an owner's own session lasts what its
+    /// role's raft timing says, read when it is made, not a picked 60 s. Do, in a group of three
+    /// voters: a follower binds kiln.host-store 7 and its keeper makes a session; then the
+    /// leader binds it and its keeper makes one; then the leader's voters stall (nothing relayed)
+    /// while its clock moves a tick at a time. Expect: the follower's lease is its election bound
+    /// and stall patience, (2 x election_tick + patience) ticks; the leader's two quorum checks,
+    /// 2 x (election_tick + quorum_patience) ticks; and under the stall the leader's session ends
+    /// within its lease.
+    #[test]
+    fn an_owners_session_lasts_its_roles_raft_timing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let follower = (leader + 1) % 3;
+        quiet(&mut driven, &mut pump);
+        let ticks = |n: usize| TICK * u32::try_from(n).unwrap();
+
+        clients[follower].handle().attest(kiln(7)).unwrap();
+        let lease = session_lease(&mut driven, follower);
+        let raft = &driven.owner(follower).replica.core().raft;
+        let want = ticks(2 * raft.config().election_tick + raft.patience());
+        assert_eq!(lease, want, "the follower's session lease");
+        for _ in 0..ROUNDS {
+            if attested(&mut driven, leader, u64::try_from(follower + 1).unwrap()).is_some() {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+
+        clients[leader].handle().attest(kiln(7)).unwrap();
+        let lease = session_lease(&mut driven, leader);
+        let raft = &driven.owner(leader).replica.core().raft;
+        let want = ticks(2 * (raft.config().election_tick + raft.quorum_patience()));
+        assert_eq!(lease, want, "the leader's session lease");
+        let mut waited = Duration::ZERO;
+        while driven.owner_mut(leader).pending.is_some() {
+            assert!(waited <= lease, "a stalled leader's session past its lease");
+            driven.advance(leader, TICK);
+            waited += TICK;
+            driven.step();
+        }
         driven.drain(&mut pump);
         pump.finish();
     }
