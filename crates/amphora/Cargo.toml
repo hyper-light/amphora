@@ -36,6 +36,9 @@ hyper-durable = "0.1.0"
 hyper-raft = "0.1.0"
 hyper-log = "0.1.0"
 hyper-block = "0.1.0"
+# The filesystem's free bytes a replica's database log may grow into (statvfs, GetDiskFreeSpaceExW):
+# the version tantivy already brings.
+fs4 = { version = "=0.13.1", default-features = false, features = ["sync"] }
 
 [target.'cfg(unix)'.dependencies]
 # Safe filesystem identity and process access (also used by private filesystem validation).

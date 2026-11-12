@@ -124,7 +124,7 @@ criteria = [
   # Amphora's own: the replicated application floor (docs/design/replication.md, "The application floor, replicated").
   { id = "AC-T1.8.A1", text = "writes applied with an application claim below the floor in force at their index is exactly 0, on any member, measured by the floor's simulation with a nemesis" },
   # Amphora's own: a replica's database log (docs/design/replication.md, "A replica's database log").
-  { id = "AC-T1.8.D1", text = "A replica's database log holds at most twice its bound (131,072 frames) while no local read is out: copied by passive checkpoints and started again by its owner, a local read's view whole throughout" },
+  { id = "AC-T1.8.D1", text = "A replica's database log holds at most the room its filesystem's free bytes give it (an equal share among the replica logs there, past one snapshot's image), plus what the local reads out at its restart's due point let past it: copied by passive checkpoints and started again by its owner when its restarts' counted share of the p99.9 tail allows or past its room, refusing submits past its room, a local read's view whole throughout" },
   { id = "AC-T1.8.D2", text = "No class's owner flushes an ordinary entry's database log on its own thread: a flush that stands still stands no owner step still" },
 ]
 tests = [
@@ -150,8 +150,9 @@ tests = [
   { id = "T-T1.8.A5", text = "A member removed and added again attests under its new join; its old attestation never vouches and blocks nothing" },
   { id = "T-T1.8.A6", text = "Every falsifier of the replicated floor holds as an assertion over every simulated run" },
   # Amphora's own: a replica's database log (docs/design/replication.md, "A replica's database log").
-  { id = "T-T1.8.D1", text = "A learner applying 300 entries keeps its log within twice a lowered bound; a local read open holds the restart off, sees its view whole, and a read after it waits for it" },
+  { id = "T-T1.8.D1", text = "A learner applying 300 entries keeps its log within a lowered room; a local read open holds the restart off, sees its view whole, and a read after it waits for it" },
   { id = "T-T1.8.D2", text = "A persisted leader's held database flush: no flush on its owner's thread, the write answered, the term and the leader unchanged" },
+  { id = "T-T1.8.D3", text = "A replica's log restarts are spaced by the entries they held against a thousandth of those applied (the first free, the window forgetting); past its learned room a member refuses submits and restarts whatever the share; a follower past its room applies on and fences typed when its disk fills; a dropped replica's share returns to the others" },
   { id = "T-T1.8.A7", text = "A mixed-binary group through the upgrade that introduces join rows, a member removed and re-added before J: no raise through until J, the stale attestation never counts, image digests identical at every applied index" },
 ]
 

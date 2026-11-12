@@ -39,7 +39,7 @@ pub const READER_PAGES: i64 = 2000;
 
 /// The bytes of a page of Amphora's databases (the engine's default page size): what a pool's page
 /// budget is counted in.
-const PAGE_BYTES: u64 = 4096;
+pub(crate) const PAGE_BYTES: u64 = 4096;
 /// The process's pool takes up to this part of the memory the process may use (decision 26):
 /// PostgreSQL's documentation advises a quarter of a dedicated server's memory for its shared
 /// buffers ("Resource Consumption", `shared_buffers`); CedarDB's buffer pool takes up to 45% and
@@ -482,8 +482,14 @@ impl Db {
         self.log_kept = frames;
     }
 
+    /// The last frame of the log a flush made durable in its current generation, if any: what a
+    /// pass copies through ([`Db::checkpoint`]).
+    pub(crate) fn durable_frame(&self) -> Option<u64> {
+        self.db.wal_durable_frame()
+    }
+
     /// The frames the log's file holds room for: none without a log.
-    fn log_frames(&self) -> anyhow::Result<u64> {
+    pub(crate) fn log_frames(&self) -> anyhow::Result<u64> {
         let wal = format!("{}-wal", self.path.display());
         let bytes = match self.io.open_file(&wal, OpenFlags::NoLock, false) {
             Ok(file) => file.size().map_err(fail)?,
