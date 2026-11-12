@@ -1378,9 +1378,10 @@ the parser above 1% of a prepared statement's hot loop.
 ## 35. Small commits: the checkpoint copies a page once for many commits
 
 **Decision.** While the log is within its bound, the checkpointer looks at it every period
-(`Config::checkpoint_every`, 25 ms) and copies it into the file only once `Config::copy_after`
-(8,192) of its frames aren't there yet, or once the log has passed its bound (decision 4's drain,
-unchanged): `Engine::uncopied`, `Db::uncopied`, the engine's `Database::wal_backfill`. A page that
+(`Config::checkpoint_every`, 25 ms) and leaves it uncopied; it copies once the log has passed its
+bound (decision 4's drain, unchanged). From 2026-11-06 to 2026-11-11 it copied once
+`Config::copy_after` (8,192) of its frames weren't in the file yet; that count was picked and is
+gone (below, "No count of frames"). It reads the log through `Engine::uncopied`, `Db::uncopied`, the engine's `Database::wal_backfill`. A page that
 many small commits change is copied into the file once for all of them, not once for each period's
 commits. What the log records for a commit is unchanged in this step: each page the commit touched,
 whole (SQLite's frame, a 24-byte header and the 4 KiB page; decision 30 for spills).
@@ -1416,10 +1417,10 @@ decision 30 does, and a commit writes packed records with deltas, their first sl
 marked apart from a page number; with the records' pages shared, and the bulk statements measured
 against page-a-frame. Step 3 is CP-T1.3's storage.
 
-**The bound.** Within the log's bound, the file is written at most once for each `copy_after` frames
-of log, and each time with at most the pages those frames hold: the bytes the checkpoint writes are
-never more than the log's (a page is in the log before it is copied), and at most the log's times
-W / `copy_after` for commits that touch a working set of W pages. For the batched leg (W about
+**The bound.** The file is written at most once for each generation of the log (the bound's frames,
+`copy_after` until 2026-11-11), and each time with at most the pages those frames hold: the bytes the
+checkpoint writes are never more than the log's (a page is in the log before it is copied), and at
+most the log's times W / the bound for commits that touch a working set of W pages. For the batched leg (W about
 1,000) the checkpoint writes at most a quarter of the log's bytes, where it wrote 60%
 (`small_commits_copy_their_pages_once_for_many_commits`), and the leg's bytes a byte of rows fall
 from 26.4 to at most 16.6 x 1.25 = 20.8. Commits that touch pages nothing touches again (random
@@ -1445,7 +1446,7 @@ log whatever was copied (Turso's recovery rebuilds the frame index from every fr
 generation, and a reopened log is copied again from its first frame), so copying more often buys no
 faster recovery. ARIES (Mohan et al., TODS 17(1), 1992): pages are written to their place
 independently of the log, which needs only that a page's log records be durable before it is
-(decision 15's mark, unchanged). The 8,192: what a 25 ms pass copied at 32 writers (decision 4: about
+(decision 15's mark, unchanged). The 8,192 (to 2026-11-11, now removed): what a 25 ms pass copied at 32 writers (decision 4: about
 73 frames a commit, about 5,000 commits a second, about 9,000 frames a period), so no pass copies
 more pages, or flushes the file over more, than passes did under that load, and that load's
 checkpoints are as before.
@@ -1461,8 +1462,26 @@ must write at most a quarter of the log's bytes. Red at 13e385d. What `copy_afte
 its 1, 4 and 8 MiB legs took 1.20, 6.40 and 14.61 s, best of 2, against 13e385d's 1.24, 6.99 and
 15.20 s.
 
+**No count of frames (2026-11-11).** Ada: "We don't tolerate arbitrary constants, learned and stat
+derived values only." The 8,192 was one load's pass size (32 writers on fedora), a 16th of the
+bound. No measured quantity calls for it. Copying a frame within the bound buys nothing this store
+can use: recovery reads the whole log whatever was copied (Sources, above), and a restart, the only
+thing that needs the log copied, comes past the bound, where the drain copies it anyway. Waiting
+only makes the copy smaller: a page changed by k commits within a generation is copied once, not
+up to k times. The table above already shows the trend: 32,768 frames copied 0.2 bytes a byte of
+rows with one flush. So the derived threshold is the bound itself, and `copy_after` is removed.
+What a pass then copies is the generation's distinct pages, at most the smaller of the database and
+the bound. The open question is decision 4's, not this one's: whether one pass of that size, with
+its flush of the file, lengthens the writers' tails at 32 writers and more against passes of 8,192
+frames. The falsifier below names that run. `crates/amphora/tests/store.rs`,
+`a_log_within_its_bound_is_not_copied`: a log of bound 12,288 holding 10,240 frames saw no pass (red
+before, adas-mac-studio.local-2: "passes with 10242 frames in a log of bound 12288"), then passes
+once past its bound, every row read back. The crash seeds (`tests/crash.rs`) copied after 0 to 7
+frames; they now take bounds of 8 to 23 frames, so cuts still land with frames left uncopied across
+commits.
+
 **Falsified by.** The checkpoint writing more than a quarter of the log's bytes on the batched leg
-(the test above); a reader reading a page other than as committed while copies wait, or an
+(the test above); a pass within the log's bound; a reader reading a page other than as committed while copies wait, or an
 acknowledged batch lost by a power cut with frames left uncopied across commits (`tests/crash.rs`,
 whose seeds copy after 0 to 7 frames); at 32 writers and more, commits slower or their tails longer
 than with a copy at every period (decision 4's bench).
