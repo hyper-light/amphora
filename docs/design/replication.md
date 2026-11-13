@@ -2029,7 +2029,12 @@ No labels from Amphora besides `outcome`; kiln adds `db` and its machine labels.
 `amphora.replication`, `event = "replication.write_slot"` (debug), with the fields `member`, `outcome` and
 `held_seconds`, attributes and never tags; kiln takes `amphora.replication` at WARN, so it stays a plain log line.
 What a slot held and a lost lead discarded is the event `replication.write_slot_discarded` (warn), with the counts
-`forwards` and `barriers` (amphora-owner-t1-g-slot-fc28e2d-20261112; the name sent to Kiln Metrics).
+`forwards` and `barriers` (amphora-owner-t1-g-slot-fc28e2d-20261112). A held record the core refuses as it is finally
+stepped is `replication.write_slot_step_refused` (warn), with `from` and `refusal`. Both are warn, with no counter,
+because the Ok a held record's receipt gets says only that its owner processed the wire record. It never tells the
+origin's caller that its write was taken: that caller is answered by the write's apply, or UnknownOutcome at its
+term change or deadline, so neither event hides an acknowledged write. Agreed with Kiln Metrics under
+`amphora-g-slot/events/v1`.
 Dashboard rows, in the group **Amphora replicated class**:
 
 | panel | PromQL | kiln |
