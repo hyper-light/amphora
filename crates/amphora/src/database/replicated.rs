@@ -1904,8 +1904,10 @@ impl<F: BlockFile + 'static> Actor<F> {
                     // The queue as this step began, on the basis each later step reads it.
                     let queued = self.step_queued;
                     let machine = self.replica.machine_mut();
-                    // The file keeps room for what the log needed, within what the disk allows.
-                    machine.keep_log(frames.min(pass.room));
+                    // The file keeps its length up to what the disk allows, and is cut only past
+                    // it: cutting costs a restart and the commits after it more than reusing the
+                    // file (store.md decision 31's measurement).
+                    machine.keep_log(pass.room);
                     if self
                         .control
                         .local
@@ -13192,12 +13194,13 @@ mod tests {
     /// committed, and a disk that then fills fences it, typed, its database whole on reopen. Do: a
     /// voter and its learner, 1 to 5 written and flushed; the learner told it has nothing free
     /// past one image; a local read held open on the learner (so no restart brings it back within
-    /// its room), within it 6 written and flushed, then the learner's flushing thread's flushes
-    /// held and 7 to 10 written at the voter and applied by the learner; the read ended and the
-    /// relay finished; the learner's disk made full (its flushes fail as a full disk fails them)
-    /// and its flushes let go, the learner stepped on its own until it ends; the learner opened
-    /// again on its files. Expect: the learner past its room, refusing submits, yet applying 7 to
-    /// 10; then fenced, saying its flush failed; reopened, it holds 1 to 10.
+    /// its room), within it 6 on written and flushed until the learner is past its room, then the
+    /// learner's flushing thread's flushes held and 4 more written at the voter and applied by the
+    /// learner; the read ended and the relay finished; the learner's disk made full (its flushes
+    /// fail as a full disk fails them) and its flushes let go, the learner stepped on its own until
+    /// it ends; the learner opened again on its files. Expect: the learner past its room, refusing
+    /// submits, yet applying the 4; then fenced, saying its flush failed; reopened, it holds every
+    /// value written.
     #[test]
     fn a_follower_past_its_room_applies_on_and_fences_when_its_disk_fills() {
         own_account();
@@ -13215,25 +13218,25 @@ mod tests {
             .replica
             .machine()
             .set_free_bytes(free_for(0, 2));
-        let full = clients[1]
+        // Its room is about half what its log's file holds: written to under the read, which
+        // holds every restart off, the log outgrows it.
+        let (full, last) = clients[1]
             .read_local(Instant::now() + HANG_READ, |db| {
                 db.query_transaction(|db| {
                     values(db)?;
-                    write(&mut driven, &mut pump, &clients[0], 6);
-                    settle_log(&mut driven, &mut pump, &clients);
-                    for _ in 0..ROUNDS {
-                        if driven.owner(1).log_full.is_some() {
-                            break;
-                        }
-                        driven.round(&mut pump);
+                    let mut value = 5;
+                    while driven.owner(1).log_full.is_none() && value < u8::MAX - 4 {
+                        value += 1;
+                        write(&mut driven, &mut pump, &clients[0], value);
+                        settle_log(&mut driven, &mut pump, &clients);
                     }
                     let full = driven.owner(1).log_full.clone();
                     gate.hold();
-                    for value in 7..=10 {
-                        write(&mut driven, &mut pump, &clients[0], value);
+                    for more in 1..=4 {
+                        write(&mut driven, &mut pump, &clients[0], value + more);
                     }
                     catch_up(&mut driven, &mut pump, &clients, 0, 1);
-                    Ok(full)
+                    Ok((full, value + 4))
                 })
             })
             .unwrap();
@@ -13263,7 +13266,7 @@ mod tests {
         drop((learner, inputs));
 
         driven.restart(dir.path(), 1, vec![1], vec![2]);
-        assert_eq!(held(&mut driven, 1), (1..=10).collect::<Vec<u8>>());
+        assert_eq!(held(&mut driven, 1), (1..=last).collect::<Vec<u8>>());
     }
 
     /// AC-T1.8.D1, T-T1.8.D3 (replication.md, "A replica's database log bounded by what it
