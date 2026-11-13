@@ -264,7 +264,7 @@ pub fn flush_bucket(d: Duration) -> usize {
 
 /// The replicated class's metrics, as their host exports them: name, type and help, in the
 /// order of [`ReplicaCounters`]' fields (docs/design/replication.md, "Metrics").
-pub const REPLICA_METRICS: [(&str, &str, &str); 12] = [
+pub const REPLICA_METRICS: [(&str, &str, &str); 15] = [
     (
         "amphora_replica_flush_backlog_entries",
         "gauge",
@@ -331,8 +331,55 @@ pub const REPLICA_METRICS: [(&str, &str, &str); 12] = [
         "amphora_replica_database_log_limit_bytes",
         "gauge",
         "The most the database's log may hold as its owner last learned it, in bytes (frames x 4,120): an equal share of its filesystem's free bytes among the replica logs there, past one snapshot's image.",
+    // The leader's write slot (replication.md, "A follower's write under steady leader writes"),
+    // as Kiln Metrics agreed them (amphora-g-slot/names/v2).
+    (
+        "amphora_replica_write_slot_holds_total",
+        "counter",
+        "Write slots this replica held while it led, a member's refused write given the next turn, by how each came out (outcome: forwarded, expired, released).",
+    ),
+    (
+        "amphora_replica_write_slot_held_seconds_total",
+        "counter",
+        "Seconds this replica, while it led, held its own writes for members' write slots; its rate is the leader's share of time held.",
+    ),
+    (
+        "amphora_replica_write_slot_length_seconds",
+        "gauge",
+        "The length of the write slot this replica last began while it led, learned from its members' retries, in seconds; zero before its first.",
     ),
 ];
+
+/// How a write slot ended: `amphora_replica_write_slot_holds_total`'s `outcome`, a closed set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotEnd {
+    /// The member's next forward arrived, and the leader stepped it first.
+    Forwarded,
+    /// The slot's learned length passed first.
+    Expired,
+    /// The lead or its term ended, the member left or was suspected, a change of members or a
+    /// hand-off began, or a held member forwarded again.
+    Released,
+}
+
+impl SlotEnd {
+    pub const ALL: [Self; 3] = [Self::Forwarded, Self::Expired, Self::Released];
+    #[must_use]
+    pub fn outcome(self) -> &'static str {
+        match self {
+            Self::Forwarded => "forwarded",
+            Self::Expired => "expired",
+            Self::Released => "released",
+        }
+    }
+    fn index(self) -> usize {
+        match self {
+            Self::Forwarded => 0,
+            Self::Expired => 1,
+            Self::Released => 2,
+        }
+    }
+}
 
 /// Why a local read was turned away: `amphora_replica_local_reads_refused_total`'s `reason`, a
 /// closed set (amphora-local-read/names/v1).
@@ -384,6 +431,9 @@ pub struct ReplicaMeter {
     restarts: AtomicU64,
     log_bytes: AtomicU64,
     log_limit_bytes: AtomicU64,
+    slot_holds: [AtomicU64; 3],
+    slot_held_us: AtomicU64,
+    slot_us: AtomicU64,
 }
 
 /// What a replica owner's counters say now ([`REPLICA_METRICS`]).
@@ -417,6 +467,11 @@ pub struct ReplicaCounters {
     pub database_log_bytes: u64,
     /// The most the database's log may hold as its owner last learned it, in bytes.
     pub database_log_limit_bytes: u64,
+    /// Write slots held while leading, by [`SlotEnd::ALL`]'s order; the time the leader's own
+    /// writes were held for them in all; and the length of the slot it last began.
+    pub write_slot_holds: [u64; 3],
+    pub write_slot_held: Duration,
+    pub write_slot_length: Duration,
 }
 
 impl ReplicaCounters {
@@ -427,6 +482,12 @@ impl ReplicaCounters {
             .get(reason.index())
             .copied()
             .unwrap_or(0)
+    }
+
+    /// The write slots that ended `how`.
+    #[must_use]
+    pub fn write_slot_ended(&self, how: SlotEnd) -> u64 {
+        self.write_slot_holds.get(how.index()).copied().unwrap_or(0)
     }
 }
 
@@ -490,6 +551,17 @@ impl ReplicaMeter {
     /// The database's log may hold `bytes`, as the owner last learned it.
     pub fn log_limit_bytes(&self, bytes: u64) {
         self.log_limit_bytes.store(bytes, Ordering::Relaxed);
+    /// A write slot of this leader's ended `how`, its own writes held `held` for it.
+    pub fn slot_ended(&self, how: SlotEnd, held: Duration) {
+        if let Some(count) = self.slot_holds.get(how.index()) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        self.slot_held_us.fetch_add(micros(held), Ordering::Relaxed);
+    }
+
+    /// This leader began a write slot `length` long.
+    pub fn slot_began(&self, length: Duration) {
+        self.slot_us.store(micros(length), Ordering::Relaxed);
     }
 
     /// The owner started the database's log again: it is empty.
@@ -526,6 +598,13 @@ impl ReplicaMeter {
             database_log_restarts: self.restarts.load(Ordering::Relaxed),
             database_log_bytes: self.log_bytes.load(Ordering::Relaxed),
             database_log_limit_bytes: self.log_limit_bytes.load(Ordering::Relaxed),
+            write_slot_holds: std::array::from_fn(|i| {
+                self.slot_holds
+                    .get(i)
+                    .map_or(0, |count| count.load(Ordering::Relaxed))
+            }),
+            write_slot_held: Duration::from_micros(self.slot_held_us.load(Ordering::Relaxed)),
+            write_slot_length: Duration::from_micros(self.slot_us.load(Ordering::Relaxed)),
         }
     }
 }
@@ -752,6 +831,9 @@ mod tests {
                 design.contains(&format!("`{}`", reason.reason())),
                 "{reason:?}"
             );
+        }
+        for how in SlotEnd::ALL {
+            assert!(design.contains(&format!("`{}`", how.outcome())), "{how:?}");
         }
     }
 

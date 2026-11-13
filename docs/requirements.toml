@@ -125,6 +125,8 @@ criteria = [
   { id = "AC-T1.8.A1", text = "writes applied with an application claim below the floor in force at their index is exactly 0, on any member, measured by the floor's simulation with a nemesis" },
   # Amphora's own: a replica's database log (docs/design/replication.md, "A replica's database log").
   { id = "AC-T1.8.D1", text = "A replica's database log holds at most the room its filesystem's free bytes give it (an equal share among the replica logs there, past one snapshot's image), plus what the local reads out at its restart's due point let past it: copied by passive checkpoints and started again by its owner when its restarts' counted share of the p99.9 tail allows or past its room, refusing submits past its room, a local read's view whole throughout" },
+  # Amphora's own: the leader's write slot (docs/design/replication.md, "A follower's write under steady leader writes: the write slot").
+  { id = "AC-T1.8.W1", text = "Under steady leader writes, a member's write refused as stale lands on its next try under the leader's write slot, a member waits at most (members - 1) slots, the leader gets a turn between two slots, and the slot's length is learned from its members' retries" },
   { id = "AC-T1.8.D2", text = "No class's owner flushes an ordinary entry's database log on its own thread: a flush that stands still stands no owner step still" },
 ]
 tests = [
@@ -136,6 +138,11 @@ tests = [
   { id = "T-T1.8.M4", text = "The leader is removed once it has handed on its lead, and each way a hand-off ends answers as it should" },
   { id = "T-T1.8.M5", text = "A joiner to a database past the snapshot ceiling is refused before the change is proposed" },
   # Amphora's own: the replicated class (docs/design/replication.md, "Fates and durability checked").
+  # Amphora's own: the leader's write slot.
+  { id = "T-T1.8.W1", text = "The leader and one follower writing steadily, records delayed - passes when no follower write is refused twice in a row and the history is serializable, where today's rule refuses it many times in a row" },
+  { id = "T-T1.8.W2", text = "Two followers and the leader writing steadily - passes when every write commits within its deadline, no follower write is refused more than twice in a row, no write the leader makes in its turn after a slot is refused, and the history is serializable" },
+  { id = "T-T1.8.W3", text = "A follower's retry racing its slot's start, the leader's last entry neither committed nor sent to it - passes when its barrier waits for that entry's commit and its write applies" },
+  { id = "T-T1.8.W4", text = "The write slot's pure core: its queue and the leader's turn, held forwards, a second forward, expiry and a late retry learned, the ceiling, generations, the term and members, and the held barrier" },
   { id = "T-T1.8.C1", text = "An attachment whose durability differs from its owner's is refused, typed; the same fates in another order are taken; a process stating no replica restarts in the owner's class" },
   # Amphora's own: the replicated application floor (docs/design/replication.md, "The application floor, replicated").
   { id = "T-T1.8.C2", text = "Two members stating different classes — passes when, once the group's class entry commits, the member stating the other is fenced naming the class, refused Invalid reopening under it, and opens and catches up under the group's" },
