@@ -573,7 +573,7 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     // the members whose writes it refused, queued, and the forwards and barrier it holds, each
     // still charged to the inbound queue by its reservation; and whether this leader's own
     // preparation waits on a slot.
-    slots: super::slot::Slots<(Message, Reservation, Response<()>)>,
+    slots: super::slot::Slots<(Message, Reservation)>,
     slot_deferred: bool,
     serial: u64,
     // Every time this owner reads comes from this clock (replication.md, "The owner's time").
@@ -2003,10 +2003,16 @@ impl<F: BlockFile + 'static> Actor<F> {
                 until,
                 response,
             } => {
-                if self.at >= until {
-                    answer(response, Err(Refusal::Timeout));
+                let result = if self.at >= until {
+                    Err(Refusal::Timeout)
                 } else {
-                    self.step(from, &bytes, reservation, response)?;
+                    self.step(from, &bytes, reservation)
+                };
+                let fatal = matches!(&result, Err(Refusal::Fenced(_)));
+                let error = result.as_ref().err().cloned();
+                answer(response, result);
+                if fatal && let Some(error) = error {
+                    return Err(error);
                 }
             }
             Input::Verdict {
@@ -2379,33 +2385,10 @@ impl<F: BlockFile + 'static> Actor<F> {
         floor_refused(&self.control, reason, &refusal);
         Err(refusal)
     }
-    /// Steps a wire record from `from` and answers its receipt, unless the write slot holds it,
-    /// whose receipt is answered as it is stepped or refused; returns only a fencing refusal.
-    fn step(
-        &mut self,
-        from: u64,
-        bytes: &[u8],
-        reservation: Reservation,
-        response: Response<()>,
-    ) -> Result<(), Refusal> {
-        let mut receipt = Some(response);
-        let result = self.step_checked(from, bytes, reservation, &mut receipt);
-        let fatal = match &result {
-            Err(fatal @ Refusal::Fenced(_)) => Some(fatal.clone()),
-            _ => None,
-        };
-        if let Some(receipt) = receipt {
-            answer(receipt, result);
-        }
-        fatal.map_or(Ok(()), Err)
-    }
-    fn step_checked(
-        &mut self,
-        from: u64,
-        bytes: &[u8],
-        reservation: Reservation,
-        receipt: &mut Option<Response<()>>,
-    ) -> Result<(), Refusal> {
+    /// Steps a wire record from `from`. One the write slot holds is processed as held: its receipt
+    /// is answered Ok, as admission's is ("not a durability ACK"), so no host waits on a slot
+    /// (amphora-owner-t1-g-slot-fc28e2d-20261112).
+    fn step(&mut self, from: u64, bytes: &[u8], reservation: Reservation) -> Result<(), Refusal> {
         #[cfg(test)]
         if let Some(stalls) = &self.stalls
             && self.replica.leader() == self.replica.id()
@@ -2457,37 +2440,23 @@ impl<F: BlockFile + 'static> Actor<F> {
         if self.replica.is_leader() && !self.slot_off() {
             match message.msg_type {
                 hyper_raft::proto::MessageType::MsgPropose => {
-                    let response = receipt
-                        .take()
-                        .ok_or_else(|| fenced("a wire record's receipt was taken twice"))?;
-                    let forward =
-                        self.slots
-                            .forward(from, self.at, (message, reservation, response));
+                    let forward = self.slots.forward(from, self.at, (message, reservation));
                     if let Some(unmeasured) = forward.unmeasured {
                         tracing::warn!(target: "amphora.replication", event = "write_slot_unmeasured", error = %unmeasured, "a retry's gap was not learned for the write slot");
                     }
                     self.slot_ended(forward.ended);
                     let stepped = match forward.step {
-                        Some((message, _reservation, response)) => {
-                            *receipt = Some(response);
-                            self.step_forward(from, message)
-                        }
+                        Some((message, _reservation)) => self.step_forward(from, message),
                         None => Ok(()),
                     };
                     self.step_ready()?;
                     return stepped;
                 }
                 hyper_raft::proto::MessageType::MsgReadIndex => {
-                    let response = receipt
-                        .take()
-                        .ok_or_else(|| fenced("a wire record's receipt was taken twice"))?;
-                    let read = self
-                        .slots
-                        .read(from, self.at, (message, reservation, response));
+                    let read = self.slots.read(from, self.at, (message, reservation));
                     self.slot_ended(read.ended);
                     let stepped = match read.step {
-                        Some((message, _reservation, response)) => {
-                            *receipt = Some(response);
+                        Some((message, _reservation)) => {
                             self.replica.step(message).map_err(raft_error)
                         }
                         None => Ok(()),
@@ -2543,34 +2512,38 @@ impl<F: BlockFile + 'static> Actor<F> {
         }
         Ok(())
     }
-    /// Steps what the write slot released, in the order it arrived, and answers each receipt
-    /// with what stepping it gave. At a member that no longer leads, none is stepped: the core
-    /// would forward it again under its sender's name, which nothing does (replication.md, "A
-    /// forward that meets an election"). A forward is refused there as the core refuses one it
-    /// can't take, `Dropped::NoLeader` while no leader is known and `NotLeader` naming the one
-    /// that is; a barrier is answered as the core's `drop_read` answers a read it can't forward.
-    /// Either way the origin answers its own caller on the term or leader change.
+    /// Steps what the write slot released, in the order it arrived. At a member that no longer
+    /// leads, none is stepped: its core would forward it again under its sender's name, which
+    /// nothing does (replication.md, "A forward that meets an election"). What was held is
+    /// discarded there, counted in an event, as the core at a non-leader drops a proposal
+    /// (`Dropped`): its receipt was answered as it was held, and its origin answers its own caller
+    /// on the term or leader change (amphora-owner-t1-g-slot-fc28e2d-20261112).
     fn step_ready(&mut self) -> Result<(), Refusal> {
-        while let Some((from, (message, _reservation, response))) = self.slots.ready() {
+        let (mut forwards, mut barriers) = (0u64, 0u64);
+        while let Some((from, (message, _reservation))) = self.slots.ready() {
             let proposal = message.msg_type == hyper_raft::proto::MessageType::MsgPropose;
             let stepped = if !self.replica.is_leader() {
-                match (proposal, self.replica.leader()) {
-                    (false, _) => Ok(()),
-                    (true, 0) => Err(unavailable(hyper_raft::Error::ProposalDropped(
-                        hyper_raft::Dropped::NoLeader,
-                    ))),
-                    (true, leader) => Err(not_leader(leader)),
+                if proposal {
+                    forwards = forwards.saturating_add(1);
+                } else {
+                    barriers = barriers.saturating_add(1);
                 }
+                Ok(())
             } else if proposal {
                 self.step_forward(from, message)
             } else {
                 self.replica.step(message).map_err(raft_error)
             };
-            let fatal = matches!(&stepped, Err(Refusal::Fenced(_)));
-            answer(response, stepped.clone());
-            if fatal {
-                return stepped;
+            match stepped {
+                Err(fenced @ Refusal::Fenced(_)) => return Err(fenced),
+                Err(refusal) => {
+                    tracing::warn!(target: "amphora.replication", event = "replication.write_slot_step_refused", from, ?refusal, "a record the write slot held was refused as it was stepped");
+                }
+                Ok(()) => {}
             }
+        }
+        if forwards > 0 || barriers > 0 {
+            tracing::warn!(target: "amphora.replication", event = "replication.write_slot_discarded", forwards, barriers, "records the write slot held were discarded at the end of this member's lead; their origins answer their callers on the term change");
         }
         Ok(())
     }
@@ -3763,15 +3736,6 @@ mod tests {
                     *refusals += 1;
                     continue;
                 }
-                // A forward a write slot held, refused by a member that stopped leading while it
-                // held it and knows who leads (replication.md, "A forward that meets an
-                // election").
-                if let (Some(refusals), true, Err(Refusal::NotLeader { leader: Some(_) })) =
-                    (self.refusals.as_mut(), pending.proposal, &result)
-                {
-                    *refusals += 1;
-                    continue;
-                }
                 if let Err(Refusal::Invalid { why, .. }) = &result
                     && why == "sender is not a current member"
                     && self.departed.contains(&pending.from)
@@ -4022,6 +3986,8 @@ mod tests {
         base: Instant,
         // Each owner's clock: the nanoseconds it reads past `base`.
         clocks: Vec<Arc<AtomicU64>>,
+        // Clock moves made for a write slot's end (`Driven::lapse_slots`), each asserted to end it.
+        lapses: u64,
     }
     /// The time a driven clock reads past its shell's base.
     fn offset(clock: &AtomicU64) -> Duration {
@@ -4161,6 +4127,7 @@ mod tests {
                 owners: Vec::new(),
                 base: Instant::now() + Duration::from_secs(3600),
                 clocks: Vec::new(),
+                lapses: 0,
             }
         }
         /// A call's or a record's budget on these clocks: it runs out only if the test moves a
@@ -4374,14 +4341,29 @@ mod tests {
             if !quiet {
                 return;
             }
-            for (index, owner) in self.owners.iter().enumerate() {
-                let Some(until) = owner.as_ref().and_then(|(owner, _)| owner.slots.until()) else {
-                    continue;
-                };
+            let held: Vec<(usize, Instant)> = self
+                .owners
+                .iter()
+                .enumerate()
+                .filter_map(|(index, owner)| {
+                    owner
+                        .as_ref()
+                        .and_then(|(owner, _)| owner.slots.until())
+                        .map(|until| (index, until))
+                })
+                .collect();
+            for (index, until) in held {
                 let clock = self.clocks.get(index).unwrap();
                 if self.base + offset(clock) <= until {
                     set(clock, self.base, until + Duration::from_nanos(1));
                 }
+                self.step();
+                assert_ne!(
+                    self.owner(index).slots.until(),
+                    Some(until),
+                    "owner {index}'s clock moved past its slot's end and the slot held on"
+                );
+                self.lapses += 1;
             }
         }
         /// Rounds, time standing still, until the call's `answer` comes.

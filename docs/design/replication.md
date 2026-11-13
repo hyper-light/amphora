@@ -383,20 +383,19 @@ refuses a client's request, and the client retries at another server (Ongaro's d
 section 6.2). A request whose answer is lost may be applied only once (section 6.3), so Amphora
 answers UnknownOutcome instead of replaying it. Source notes: docs/research/forwarded-proposals.md.
 
-A forward the leader's write slot holds (below, "the write slot") can outlive its holder's lead. Its receipt is
-answered only as the forward is stepped, so a member that no longer leads when the slot releases it doesn't step it:
-its core would forward it again under its sender's name. It refuses it as the core refuses a forward it can't take,
-`Dropped::NoLeader` while it knows no leader, and `NotLeader` naming the leader it knows (no `Dropped` cause says
-that). A barrier the slot held is answered there as `drop_read` answers a read it can't forward. The test relay
-tolerates the `NotLeader` refusal of a proposal as it tolerates the two causes.
+A forward the leader's write slot holds (below, "the write slot") can outlive its holder's lead. Holding it is
+processing it: its receipt is answered Ok as it is held, as admission's is, so no host's `receive` waits on a slot.
+A member that no longer leads when the slot releases it doesn't step it, since its core would forward it again under
+its sender's name. It discards it, counted in the event `replication.write_slot_discarded`, as the core at a
+non-leader drops a proposal; the origin's caller is answered on its term change, as above
+(amphora-owner-t1-g-slot-fc28e2d-20261112).
 
 Falsified by:
 - a receipt refused NoLeader by a member that knows a leader in its term;
 - a dropped forward whose origin's caller is answered Ok, or whose row appears on any replica;
 - a dropped forward whose origin's caller is answered anything but UnknownOutcome, Timeout past its
   deadline, or a refusal given before proposing;
-- a relay tolerance that admits a Dropped cause other than Transferring and NoLeader, or a NotLeader refusal of
-  anything but a proposal a write slot held.
+- a relay tolerance that admits a Dropped cause other than Transferring and NoLeader.
 
 ## Fast acknowledgement: the replicated class (approved 2026-11-01, being built)
 
@@ -1857,6 +1856,8 @@ queue holds what one end released and is drained in the same step.
 No labels from Amphora besides `outcome`; kiln adds `db` and its machine labels. Each end is an event on
 `amphora.replication`, `event = "replication.write_slot"` (debug), with the fields `member`, `outcome` and
 `held_seconds`, attributes and never tags; kiln takes `amphora.replication` at WARN, so it stays a plain log line.
+What a slot held and a lost lead discarded is the event `replication.write_slot_discarded` (warn), with the counts
+`forwards` and `barriers` (amphora-owner-t1-g-slot-fc28e2d-20261112; the name sent to Kiln Metrics).
 Dashboard rows, in the group **Amphora replicated class**:
 
 | panel | PromQL | kiln |
