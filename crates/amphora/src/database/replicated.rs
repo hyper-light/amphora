@@ -13558,12 +13558,13 @@ mod tests {
     /// each append 15 times to two hot lists, then to 32 spread over pages, every record delayed
     /// up to three relay rounds, three seeds each. Expect: no follower write refused twice in a
     /// row, every write committed, none unknown, and the history serializable (replicas equal,
-    /// each list its serial replay, no G0, G1c or G2 cycle). Control, the slot off (the
-    /// follower's tail rule kept): the follower refused more than once in a row in some run
-    /// (non-vacuity).
+    /// each list its serial replay, no G0, G1c or G2 cycle). Its control is
+    /// `todays_rule_refuses_a_follower_twice_in_a_row_where_the_slot_lands_its_retry`: this
+    /// run's interleaving follows the log's own I/O threads, so whether today's rule starves
+    /// the follower here is the host's timing, never the seed's (the Linux gate at load 25 to 50
+    /// found it didn't).
     #[test]
     fn a_refused_follower_write_lands_on_its_next_try_under_the_slot() {
-        let mut starved = 0;
         for keys in [2, 32] {
             for seed in 1..=3 {
                 let run = list_append_run(&[0, 1], false, seed, keys, 15);
@@ -13582,17 +13583,99 @@ mod tests {
                     "keys {keys} seed {seed}: {:?}",
                     run.streak
                 );
-                let control = list_append_run(&[0, 1], true, seed, keys, 15);
-                assert!(control.violations.is_empty(), "{:?}", control.violations);
-                if control.streak[1] > 1 {
-                    starved += 1;
-                }
             }
         }
-        assert!(
-            starved > 0,
-            "today's rule never refused the follower twice in a row"
-        );
+    }
+
+    /// T-T1.8.W1's control (non-vacuity), an interleaving the test makes itself. Do, with the slot
+    /// off and then on: the follower's write forwarded and held in transit while the leader
+    /// appends a write of its own on the same base, then let through; the follower's write made
+    /// again, its forward held the same way while the leader is asked for a second write, then let
+    /// through. Expect, with the slot off: the follower refused both times, stale. With the slot
+    /// on: refused once, then applied on its next try, the leader's second write held until it
+    /// lands and then applied too.
+    #[test]
+    fn todays_rule_refuses_a_follower_twice_in_a_row_where_the_slot_lands_its_retry() {
+        for slot_off in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut driven = Driven::new();
+            let clients: Vec<Client> = (1..=3)
+                .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+                .collect();
+            let mut pump = Pump::new(&clients);
+            let leader = driven.elect(&mut pump, &clients, 0, 1);
+            assert_eq!(leader, 0);
+            driven
+                .call(&mut pump, &clients[0], |db| {
+                    db.exec("CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)")?;
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            driven.tick(&mut pump, leader);
+            driven.owner_mut(leader).slot_off = slot_off;
+            let last = |driven: &Driven| {
+                driven
+                    .owner(0)
+                    .replica
+                    .core()
+                    .raft
+                    .log()
+                    .last_index()
+                    .unwrap()
+            };
+            let mut outcomes = Vec::new();
+            for attempt in 0..2u64 {
+                pump.begin_captures(leader, 1);
+                let follower = submit(&clients[1], driven.until(), move |db| {
+                    db.exec(&format!(
+                        "INSERT INTO t VALUES ({}, 'follower')",
+                        10 + attempt
+                    ))?;
+                    Ok(Vec::new())
+                });
+                for _ in 0..ROUNDS {
+                    if pump.captures_ready() {
+                        break;
+                    }
+                    driven.round(&mut pump);
+                }
+                assert!(
+                    pump.captures_ready(),
+                    "slot off {slot_off} attempt {attempt}"
+                );
+                let before = last(&driven);
+                let own = submit(&clients[0], driven.until(), move |db| {
+                    db.exec(&format!(
+                        "INSERT INTO t VALUES ({}, 'leader')",
+                        20 + attempt
+                    ))?;
+                    Ok(Vec::new())
+                });
+                for _ in 0..ROUNDS {
+                    if last(&driven) > before || driven.owner(0).slots.holds() {
+                        break;
+                    }
+                    driven.round(&mut pump);
+                }
+                pump.release_captures();
+                outcomes.push(driven.settle(&mut pump, &follower));
+                assert_eq!(
+                    driven.settle(&mut pump, &own),
+                    Ok(Vec::new()),
+                    "slot off {slot_off} attempt {attempt}: the leader's write"
+                );
+            }
+            let stale = |outcome: &Result<Vec<u8>, Refusal>| matches!(outcome, Err(Refusal::Invalid { what, .. }) if what == "prepared transaction");
+            if slot_off {
+                assert!(outcomes.iter().all(stale), "today's rule: {outcomes:?}");
+            } else {
+                assert!(stale(&outcomes[0]), "the slot: {outcomes:?}");
+                assert_eq!(outcomes[1], Ok(Vec::new()), "the slot: {outcomes:?}");
+            }
+            driven.quiet(&mut pump);
+            driven.drain(&mut pump);
+            pump.finish();
+        }
     }
 
     /// T-T1.8.W2 (AC-T1.8.W1): two followers and a leader all writing steadily, none missing.
