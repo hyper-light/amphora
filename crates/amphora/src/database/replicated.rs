@@ -1904,9 +1904,10 @@ impl<F: BlockFile + 'static> Actor<F> {
                     // The queue as this step began, on the basis each later step reads it.
                     let queued = self.step_queued;
                     let machine = self.replica.machine_mut();
-                    // The file keeps its length up to what the disk allows, and is cut only past
-                    // it: cutting costs a restart and the commits after it more than reusing the
-                    // file (store.md decision 31's measurement).
+                    // The file keeps its length up to what the disk allows, and is cut (to nothing)
+                    // only past it: a cut costs a restart and the commit after it more than reusing
+                    // the file (store.md decision 31: files.rs what_cutting_the_log_costs_its_writer,
+                    // adacachy 2026-10-29, a check rather than a recorded run).
                     machine.keep_log(pass.room);
                     if self
                         .control
