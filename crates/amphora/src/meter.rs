@@ -331,6 +331,7 @@ pub const REPLICA_METRICS: [(&str, &str, &str); 15] = [
         "amphora_replica_database_log_limit_bytes",
         "gauge",
         "The most the database's log may hold as its owner last learned it, in bytes (frames x 4,120): an equal share of its filesystem's free bytes among the replica logs there, past one snapshot's image.",
+    ),
     // The leader's write slot (replication.md, "A follower's write under steady leader writes"),
     // as Kiln Metrics agreed them (amphora-g-slot/names/v2).
     (
@@ -551,6 +552,8 @@ impl ReplicaMeter {
     /// The database's log may hold `bytes`, as the owner last learned it.
     pub fn log_limit_bytes(&self, bytes: u64) {
         self.log_limit_bytes.store(bytes, Ordering::Relaxed);
+    }
+
     /// A write slot of this leader's ended `how`, its own writes held `held` for it.
     pub fn slot_ended(&self, how: SlotEnd, held: Duration) {
         if let Some(count) = self.slot_holds.get(how.index()) {
