@@ -12417,11 +12417,12 @@ mod tests {
     /// that read, and so no longer than the read's deadline. Do: a voter and its learner on one
     /// filesystem, the learner told it has room for 16 frames past its own file; a local read on
     /// the learner, on a thread of its own, running a query with no end under a deadline on a
-    /// clock the test moves (as `Database::query_local` puts one on every read); once it reads, 2
+    /// clock the test moves (as `Database::query_local` puts one on every read), standing at the
+    /// read's start until the test passes it, so no wall-clock window decides it; once it reads, 2
     /// to 40 written at the voter, each applied and flushed by the learner; then rounds; then the
-    /// read's deadline passed, and rounds until a restart is counted. Expect: the learner's log
-    /// past its room and no restart while the read runs; the read refused at its deadline; a
-    /// restart after it.
+    /// read's deadline passed, and rounds until a restart is counted. Expect: the read still out
+    /// after the writes; the learner's log past its room and no restart while the read runs; the
+    /// read refused at its deadline; a restart after it.
     #[test]
     fn a_restart_due_waits_for_a_reads_deadline_and_no_longer() {
         own_account();
@@ -12445,12 +12446,16 @@ mod tests {
                 let passed = Arc::clone(&passed);
                 scope.spawn(move || {
                     learner.read_local(Instant::now() + HANG_READ, move |db| {
-                        let until = Instant::now() + HANG_READ;
+                        // The read's clock stands at its start until the test passes its
+                        // deadline: on the real clock a slow host's writes outlast any window,
+                        // and the read ends before the test means it to.
+                        let began = Instant::now();
+                        let until = began + HANG_READ;
                         let _deadline = db.deadline_on(until, move || {
                             if passed.load(Ordering::Acquire) {
                                 until
                             } else {
-                                Instant::now()
+                                began
                             }
                         });
                         db.query(
@@ -12473,6 +12478,11 @@ mod tests {
                 write(&mut driven, &mut pump, voter, value);
                 settle_log(&mut driven, &mut pump, &clients);
             }
+            assert_eq!(
+                handle.counters().local_readers_in_use,
+                1,
+                "the read ended before its deadline was passed"
+            );
             let frames = driven.owner(1).replica.machine().log_frames().unwrap();
             let room = room(&clients, 1);
             assert!(frames > room, "the log held {frames} frames, room {room}");
