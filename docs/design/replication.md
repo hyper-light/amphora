@@ -2044,7 +2044,12 @@ Dashboard rows, in the group **Amphora replicated class**:
 | Learned slot length, s | `max by (instance, db) (amphora_replica_write_slot_length_seconds)` | `max:amphora_replica_write_slot_length_seconds{$host} by {host,db}` |
 
 **Requirements and tests.** AC-T1.8.W1 (docs/requirements.toml):
-- T-T1.8.W1, `a_refused_follower_write_lands_on_its_next_try_under_the_slot`;
+- T-T1.8.W1, `a_refused_follower_write_lands_on_its_next_try_under_the_slot`, with its control
+  `todays_rule_refuses_a_follower_twice_in_a_row_where_the_slot_lands_its_retry`, an interleaving the test builds with
+  held forwards. The randomized run can't be its own control: its interleaving follows the log's own I/O threads, so
+  whether today's rule starves its follower is the host's timing, not the seed's. With each write taking a
+  millisecond of real time, the same seeds gave different counts in 9 runs of 9, and the Linux gate at load 25 to 50
+  found no starvation;
 - T-T1.8.W2, `two_followers_and_a_leader_writing_steadily_all_commit_within_their_deadlines`, which also asserts that
   no write the leader made in its turn after a slot was refused, and that it took some;
 - T-T1.8.W3, `a_follower_retry_racing_the_slots_start_lands_on_its_next_try`, red with the tail rule alone;
