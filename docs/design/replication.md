@@ -1822,8 +1822,10 @@ If its disk then fills, the flush fails and the owner fences with the I/O error,
 (CLAUDE.md section 3). Its log grows on, and on a full disk it fences the same way. The mechanism is the follower
 test's, a failed flush on the flushing thread fencing the owner whatever its role, so no test of its own. Both are
 limits of availability, not of safety. What a restart keeps of the file (`Db::keep_log`) is set
-at each restart to min(H, the log's length then). A file past what the log needed, or past what the disk allows, is
-cut (store.md decision 31).
+at each restart to H. A file past what the disk allows is cut (store.md decision 31); one within it is kept. Cutting
+costs more than reusing the file: a restart 66.0 against 42.4 ms on a 1 GiB log, and the commit and flush after it
+79.7 against 36.0 ms (decision 31's measurement). It was min(H, the log's length) until 2026-11-12, which cut the file at most
+restarts and paid that cost each time.
 
 Not seen by this rule except through A shrinking at the next pass: the raft log (hyper-durable), standalone stores'
 logs, the database file's own growth, and other processes. H is the replica logs' share of the process disk budget
