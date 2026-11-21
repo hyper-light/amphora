@@ -949,6 +949,31 @@ mod tests {
         assert_eq!(db.cost_fit.weights(), None);
     }
 
+    /// Do: give the planner's parameters fitted weights with a page read, then with no page read
+    /// but a row visit, then none. Expect: each fitted weight in page reads (its ratio to the page
+    /// read, or to the row visit times the row's weight in pages); each unfitted one as it stood;
+    /// none, the parameters unchanged (T-PL.7.3: the planner reads the fit through one hook).
+    #[test]
+    fn t_pl_7_3_the_planner_reads_fitted_weights_in_page_reads() {
+        let base = super::super::cost_params::CostModelParams::new();
+        let mut nanos = [None; TERMS];
+        nanos[Term::Row.slot()] = Some(5.0);
+        nanos[Term::Seek.slot()] = Some(50.0);
+        nanos[Term::PageRead.slot()] = Some(1000.0);
+        let with_page = base.with_fitted(Some(FittedWeights { nanos }));
+        assert!((with_page.cpu_cost_per_row - 0.005).abs() < 1e-12);
+        assert!((with_page.cpu_cost_per_seek - 0.05).abs() < 1e-12);
+        assert_eq!(with_page.sort_cpu_per_row, base.sort_cpu_per_row);
+        assert_eq!(with_page.hash_insert_cost, base.hash_insert_cost);
+        nanos[Term::PageRead.slot()] = None;
+        let without_page = base.with_fitted(Some(FittedWeights { nanos }));
+        assert_eq!(without_page.cpu_cost_per_row, base.cpu_cost_per_row);
+        assert!((without_page.cpu_cost_per_seek - base.cpu_cost_per_row * 10.0).abs() < 1e-12);
+        let none = base.with_fitted(None);
+        assert_eq!(none.cpu_cost_per_seek, base.cpu_cost_per_seek);
+        assert_eq!(none.cpu_cost_per_row, base.cpu_cost_per_row);
+    }
+
     /// Do: measure a clock read. Expect: a finite, non-negative time (T-PL.7.5).
     #[test]
     fn t_pl_7_5_clock_read_is_measured() {
