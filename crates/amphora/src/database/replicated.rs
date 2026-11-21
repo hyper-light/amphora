@@ -143,6 +143,82 @@ impl Client {
         }
         self.handle.shared.local.with(until, f)
     }
+    /// Waits until this replica's published closed time is at least `at_least` and past `seen`
+    /// (the time a read found too old, if one did), on the caller's thread, until `until`
+    /// (replication.md, "Follower reads at a closed time"). Refused Timeout at the deadline, and
+    /// Fenced once the owner ended or is fenced.
+    fn wait_closed(&self, at_least: u64, seen: Option<u64>, until: Instant) -> Result<(), Refusal> {
+        let shared = &self.handle.shared;
+        let mut closed = locked(&shared.closed)?;
+        loop {
+            if locked(&shared.local.open)?.is_none() {
+                shared.meter.local_refused(LocalRefusal::Fenced);
+                return Err(fenced("replica owner ended"));
+            }
+            match &*locked(&shared.status)? {
+                Err(ended) => {
+                    shared.meter.local_refused(LocalRefusal::Fenced);
+                    return Err(ended.clone());
+                }
+                Ok(status) => {
+                    if let Some(reason) = &status.fenced {
+                        shared.meter.local_refused(LocalRefusal::Fenced);
+                        return Err(fenced(reason));
+                    }
+                }
+            }
+            if closed
+                .time
+                .is_some_and(|time| time >= at_least && seen.is_none_or(|seen| time > seen))
+            {
+                return Ok(());
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                shared.meter.local_refused(LocalRefusal::Timeout);
+                return Err(Refusal::Timeout);
+            }
+            closed = shared
+                .moved
+                .wait_timeout(closed, left)
+                .map_err(|_| unavailable("the closed time's lock was poisoned"))?
+                .0;
+        }
+    }
+    /// `read` on a reader once this replica's closed time is at least `at_least` (replication.md,
+    /// "Follower reads at a closed time"): `read` takes its transaction's time first and answers
+    /// `Err` with it (none before the group's first stamped entry) if that is earlier, and the
+    /// next try waits for a later one. Each turn waits for the owner's next time, so the turns are
+    /// bounded by the deadline.
+    pub(super) fn read_closed<R>(
+        &self,
+        at_least: u64,
+        until: Instant,
+        mut read: impl FnMut(&mut Db) -> anyhow::Result<Result<R, Option<u64>>>,
+    ) -> Result<R, Refusal> {
+        let mut seen = None;
+        loop {
+            self.wait_closed(at_least, seen, until)?;
+            match self.read_local(until, &mut read)? {
+                Ok(answer) => return Ok(answer),
+                Err(found) => seen = found.or(Some(0)),
+            }
+        }
+    }
+    /// The lag this replica measured between its closed time and its clock, if it has measured
+    /// any: a read asked that far behind now finds its time here at least 99 times in 100.
+    pub(super) fn closed_lag(&self) -> Result<Option<u64>, Refusal> {
+        Ok(locked(&self.handle.shared.closed)?.lag)
+    }
+}
+/// The wall clock now, in microseconds since the Unix epoch: where an owner's stamps start
+/// (replication.md, "Follower reads at a closed time").
+pub(super) fn wall_micros() -> Result<u64, Refusal> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| u64::try_from(since.as_micros()).ok())
+        .ok_or_else(|| unavailable("the wall clock reads before the Unix epoch or past u64"))
 }
 struct Control {
     admitted: AtomicUsize,
@@ -158,6 +234,17 @@ struct Control {
     status: Mutex<Result<ReplicaStatus, Refusal>>,
     meter: Arc<ReplicaMeter>,
     local: Local,
+    // This replica's closed time and measured lag, as its owner published them after its last
+    // step; told on `moved` whenever the time moves or the owner ends (replication.md, "Follower
+    // reads at a closed time").
+    closed: Mutex<Closed>,
+    moved: std::sync::Condvar,
+}
+/// What a replica's owner published of its closed time.
+#[derive(Debug, Clone, Copy, Default)]
+struct Closed {
+    time: Option<u64>,
+    lag: Option<u64>,
 }
 /// The readers of a replica's local reads (replication.md, "A local read on a replica"):
 /// connections of their own on the machine's database, each on what the machine committed when
@@ -629,6 +716,11 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     // Every time this owner reads comes from this clock (replication.md, "The owner's time").
     clock: Clock,
     started: Instant,
+    // The wall clock when this owner started, in microseconds since the Unix epoch: its stamps
+    // are this plus its own clock's time since (replication.md, "Follower reads at a closed time").
+    wall: u64,
+    // The delays this owner measured between its closed time and its own clock.
+    lag: crate::replication::closed::Lag,
     ticked: Instant,
     // Whether this step's drive left more to drive without waiting for the log
     // (`Driven::more`): the next step comes at once, without waiting for an input.
@@ -1379,6 +1471,11 @@ fn open_on<F: BlockFile + 'static>(
         status: Mutex::new(Ok(status(&replica))),
         meter,
         local,
+        closed: Mutex::new(Closed {
+            time: replica.machine().closed(),
+            lag: None,
+        }),
+        moved: std::sync::Condvar::new(),
     });
     let slots = super::slot::Slots::new(slot_bounds(replica.core().raft.config().election_tick)?);
     let (sender, receiver) = mpsc::sync_channel(COMMANDS);
@@ -1441,6 +1538,8 @@ fn open_on<F: BlockFile + 'static>(
         class_proposed: None,
         clock,
         started: at,
+        wall: wall_micros()?,
+        lag: crate::replication::closed::Lag::default(),
         ticked: at,
         driving: false,
         at,
@@ -1624,6 +1723,10 @@ fn status<F: BlockFile + 'static>(replica: &Durable<F>) -> ReplicaStatus {
 impl<F: BlockFile + 'static> Drop for Actor<F> {
     fn drop(&mut self) {
         self.control.local.release();
+        if let Ok(closed) = self.control.closed.lock() {
+            self.control.moved.notify_all();
+            drop(closed);
+        }
     }
 }
 impl<F: BlockFile + 'static> Actor<F> {
@@ -1726,6 +1829,11 @@ impl<F: BlockFile + 'static> Actor<F> {
         }
         // Local reads end with the owner: none opens again, and the idle readers let its lease go.
         self.control.local.release();
+        // Reads waiting for a closed time hear it ended (under the lock, so none misses it).
+        if let Ok(closed) = self.control.closed.lock() {
+            self.control.moved.notify_all();
+            drop(closed);
+        }
         for _ in 0..COMMANDS {
             let Some(envelope) = self.waiting.pop_front() else {
                 break;
@@ -1894,6 +2002,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         let took = (self.clock)().saturating_duration_since(at);
         self.spacing.stepped(entries, took, queued)?;
         *locked(&self.control.status)? = Ok(status(&self.replica));
+        self.publish_closed()?;
         let commits = self.replica.core().raft.commit_stats();
         self.control.meter.stepped(
             self.replica.machine().flush_backlog(),
@@ -3430,17 +3539,49 @@ impl<F: BlockFile + 'static> Actor<F> {
             .map_err(unavailable)?
             .checked_sub(hyper_durable::ENTRY_OVERHEAD)
             .and_then(|room| room.checked_sub(context))
+            .and_then(|room| room.checked_sub(crate::replication::closed::STAMP_BYTES))
             .ok_or_else(|| fenced("replication log cannot hold the proposal envelope"))
     }
+    /// Proposes `bytes`, stamped with this owner's clock (replication.md, "Follower reads at a
+    /// closed time"): every entry an owner proposes carries one, its room taken out of
+    /// [`Actor::entry_room`].
     fn propose(&mut self, context: &[u8], bytes: Vec<u8>) -> Result<(), Refusal> {
         api::bound(
             "replication log entry",
             bytes.len(),
             self.entry_room(context.len())?,
         )?;
+        let stamped = crate::replication::closed::stamp(self.wall_now()?, &bytes);
         self.replica
-            .propose(context.to_vec(), bytes)
+            .propose(context.to_vec(), stamped)
             .map_err(raft_error)
+    }
+    /// This owner's wall clock: the wall clock when it started, moved on by its own clock, in
+    /// microseconds since the Unix epoch.
+    fn wall_now(&self) -> Result<u64, Refusal> {
+        u64::try_from(self.at.saturating_duration_since(self.started).as_micros())
+            .ok()
+            .and_then(|since| self.wall.checked_add(since))
+            .ok_or_else(|| fenced("the owner's wall clock overflowed"))
+    }
+    /// Publishes this replica's closed time if it moved since the last step, with the lag it
+    /// measured, and tells the reads waiting for it.
+    fn publish_closed(&mut self) -> Result<(), Refusal> {
+        let time = self.replica.machine().closed();
+        let mut closed = locked(&self.control.closed)?;
+        if closed.time == time {
+            return Ok(());
+        }
+        if let Some(time) = time {
+            self.lag.moved(self.wall_now()?, time);
+        }
+        *closed = Closed {
+            time,
+            lag: self.lag.p99(),
+        };
+        drop(closed);
+        self.control.moved.notify_all();
+        Ok(())
     }
     fn prepare(&mut self) -> Result<(), Refusal> {
         let Some(mut pending) = self.pending.take() else {
@@ -3669,6 +3810,10 @@ impl<F: BlockFile + 'static> Actor<F> {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
+
+    // Follower reads at a closed time, under leader changes (replication.md, "Follower reads at a
+    // closed time"): in a file of its own, on this module's driven shell.
+    mod closed_reads;
 
     thread_local! {
         /// The account the owners a test opens on its thread charge their readers to, in place of
