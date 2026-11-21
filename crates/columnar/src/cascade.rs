@@ -549,7 +549,7 @@ fn choose(len: usize, rank: impl Fn(&[Range<usize>]) -> Vec<Scheme>) -> Result<V
     let mut best: Option<Scheme> = None;
     loop {
         let whole = count.saturating_mul(GROUP) >= len;
-        let ranges = if whole { vec![0..len] } else { strata(len, count)? };
+        let ranges = if whole { Vec::from([0..len]) } else { strata(len, count)? };
         let ranked = rank(&ranges);
         let first = ranked.first().copied();
         if whole || (best.is_some() && best == first) {
@@ -606,7 +606,7 @@ fn estimate(data: &Data, ranges: &[Range<usize>], n: usize, scheme: Scheme) -> O
             let all = || sample.iter().flat_map(|s| s.iter().map(|x| x.cast_signed()));
             match scheme {
                 Scheme::Raw => Some(64.0),
-                Scheme::One => one(all()).then(|| 0.0),
+                Scheme::One => if one(all()) { Some(0.0) } else { None },
                 Scheme::Packed => Some(span_bits(all())),
                 Scheme::Delta => {
                     // Row 0's deltas are zero (its values are the bases).
@@ -634,7 +634,7 @@ fn estimate(data: &Data, ranges: &[Range<usize>], n: usize, scheme: Scheme) -> O
             let all = || sample.iter().flat_map(|s| s.iter().map(|x| x.to_bits().cast_signed()));
             match scheme {
                 Scheme::Raw => Some(64.0),
-                Scheme::One => one(all()).then(|| 0.0),
+                Scheme::One => if one(all()) { Some(0.0) } else { None },
                 Scheme::Rle => {
                     let as_bits: Vec<Vec<u64>> = sample.iter().map(|s| s.iter().map(|x| x.to_bits()).collect()).collect();
                     let refs: Vec<&[u64]> = as_bits.iter().map(Vec::as_slice).collect();
@@ -675,7 +675,7 @@ fn estimate(data: &Data, ranges: &[Range<usize>], n: usize, scheme: Scheme) -> O
                 Scheme::Raw => Some(((total_bytes as f64) * 8.0 + nf * bits(max_len)) / nf),
                 Scheme::One => {
                     let first = entries().next();
-                    entries().all(|e| Some(e) == first).then(|| 0.0)
+                    if entries().all(|e| Some(e) == first) { Some(0.0) } else { None }
                 }
                 Scheme::Dict => {
                     let mut d: Vec<&[u8]> = entries().collect();
