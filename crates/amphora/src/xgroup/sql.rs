@@ -422,6 +422,68 @@ fn later(by: Duration) -> Instant {
     now.checked_add(by).unwrap_or(now)
 }
 
+/// The steps' observed times, learned as TCP learns a round trip's (RFC 6298 §2, after Jacobson,
+/// "Congestion Avoidance and Control", 1988): a smoothed mean and a smoothed mean deviation of each
+/// answered step's time from send to reply, and from them the time past which a step's reply is
+/// unlikely to come, mean + 4 × deviation. The gains 1/8 and 1/4 and the factor 4 are RFC 6298's;
+/// the first sample seeds the mean, and half of it the deviation (§2.2). Only steps answered at
+/// their first send are sampled (Karn's rule, §3): a step sent again can't say which send answered.
+#[derive(Debug, Default)]
+struct StepTimes {
+    mean: Option<Duration>,
+    deviation: Duration,
+}
+
+impl StepTimes {
+    fn observe(&mut self, took: Duration) {
+        let Some(mean) = self.mean else {
+            self.mean = Some(took);
+            self.deviation = took.checked_div(2).unwrap_or_default();
+            return;
+        };
+        let off = mean.abs_diff(took);
+        let eighth = |d: Duration| d.checked_div(8).unwrap_or_default();
+        let quarter = |d: Duration| d.checked_div(4).unwrap_or_default();
+        // deviation ← 3/4 deviation + 1/4 |mean − took|; mean ← 7/8 mean + 1/8 took.
+        self.deviation = self
+            .deviation
+            .saturating_sub(quarter(self.deviation))
+            .saturating_add(quarter(off));
+        self.mean = Some(mean.saturating_sub(eighth(mean)).saturating_add(eighth(took)));
+    }
+
+    /// The time a step is given before its reply counts as lost, doubled for each time the
+    /// transaction's resolution already lost one (RFC 6298 §5.5's back-off): none before a sample.
+    fn timeout(&self, lost: u32) -> Option<Duration> {
+        let mean = self.mean?;
+        let base = mean.saturating_add(self.deviation.saturating_mul(4));
+        // A back-off past the clock's range stays at the longest wait that fits it.
+        Some(
+            2u32.checked_pow(lost)
+                .and_then(|n| base.checked_mul(n))
+                .unwrap_or(Duration::MAX),
+        )
+    }
+}
+
+/// When a transaction's steps must be answered by.
+#[derive(Debug, Clone, Copy)]
+enum Deadline {
+    /// Until the client hears: its caller's own deadline; `lost`, its steps lost so far.
+    Caller { until: Instant, lost: u32 },
+    /// After it heard, its resolution: each step given the steps' learned timeout, backed off by
+    /// the resolution steps lost so far.
+    Resolving { lost: u32 },
+}
+
+impl Deadline {
+    fn lost(self) -> u32 {
+        match self {
+            Self::Caller { lost, .. } | Self::Resolving { lost } => lost,
+        }
+    }
+}
+
 fn stopped() -> Refusal {
     Refusal::Unavailable(
         "the cross-group coordinator stopped; open it again to finish what it left".into(),
@@ -480,6 +542,8 @@ impl Cluster {
             inputs: inputs.clone(),
             waiters: BTreeMap::new(),
             deadlines: BTreeMap::new(),
+            out: BTreeMap::new(),
+            times: StepTimes::default(),
             open_until: until,
             ready: Some(ready),
         };
@@ -532,9 +596,12 @@ struct Driver {
     coordinator: Coordinator,
     inputs: SyncSender<Input>,
     waiters: BTreeMap<TxnId, SyncSender<Result<Answer, Refusal>>>,
-    /// Each transaction's deadline and the budget its caller gave it: until answered, the caller's
-    /// own; then the same budget again from the answer for its resolution.
-    deadlines: BTreeMap<TxnId, (Instant, Duration)>,
+    /// Each running transaction's deadline.
+    deadlines: BTreeMap<TxnId, Deadline>,
+    /// Each step out: its transaction, when it was sent, and whether it is a first send (only those
+    /// are sampled, Karn's rule). At most the steps the coordinator has out.
+    out: BTreeMap<u64, (Option<TxnId>, Instant, bool)>,
+    times: StepTimes,
     open_until: Instant,
     ready: Option<SyncSender<Result<(), Refusal>>>,
 }
@@ -551,9 +618,8 @@ impl Driver {
                 Ok(Input::Begin { txn, until, answer }) => {
                     match self.coordinator.begin(txn, |key| (self.route)(key)) {
                         Ok((id, events)) => {
-                            let budget = until.saturating_duration_since(Instant::now());
                             self.waiters.insert(id, answer);
-                            self.deadlines.insert(id, (until, budget));
+                            self.deadlines.insert(id, Deadline::Caller { until, lost: 0 });
                             events
                         }
                         Err(refusal) => {
@@ -564,9 +630,39 @@ impl Driver {
                     }
                 }
                 Ok(Input::Reply { id, reply }) => {
+                    let (txn, sent_at, first) = match self.out.remove(&id) {
+                        Some((txn, at, first)) => (txn, Some(at), first),
+                        None => (None, None, false),
+                    };
                     let reply = match reply {
-                        Ok(reply) => Ok(reply),
-                        Err(refusal) if retryable(&refusal) => Err(Lost),
+                        Ok(reply) => {
+                            if let (Some(at), true) = (sent_at, first) {
+                                self.times.observe(at.elapsed());
+                            }
+                            Ok(reply)
+                        }
+                        Err(refusal) if retryable(&refusal) => {
+                            match txn.and_then(|txn| self.deadlines.get_mut(&txn)) {
+                                Some(Deadline::Caller { lost, .. }) => {
+                                    *lost = lost.saturating_add(1);
+                                }
+                                Some(Deadline::Resolving { lost }) => {
+                                    // The back-off doubles while the doubled wait still fits the
+                                    // clock's range; past it, it stays at the last that fit.
+                                    let more = lost.saturating_add(1);
+                                    let fits = self
+                                        .times
+                                        .timeout(more)
+                                        .and_then(|t| Instant::now().checked_add(t))
+                                        .is_some();
+                                    if fits {
+                                        *lost = more;
+                                    }
+                                }
+                                None => {}
+                            }
+                            Err(Lost)
+                        }
                         Err(refusal) => {
                             self.stop(&refusal);
                             return;
@@ -592,10 +688,18 @@ impl Driver {
         for event in events {
             match event {
                 Event::Send(send) => {
-                    let until = send
-                        .txn
-                        .and_then(|txn| self.deadlines.get(&txn))
-                        .map_or(self.open_until, |(until, _)| *until);
+                    let deadline = send.txn.and_then(|txn| self.deadlines.get(&txn)).copied();
+                    let until = match deadline {
+                        Some(Deadline::Caller { until, .. }) => until,
+                        // Resolving only once a step was timed: there is a sample.
+                        Some(Deadline::Resolving { lost }) => {
+                            self.times.timeout(lost).map_or(self.open_until, later)
+                        }
+                        None => self.open_until,
+                    };
+                    // After one of its steps was lost, a transaction's sends may be resends: not
+                    // sampled (Karn's rule).
+                    let first = deadline.is_none_or(|d| d.lost() == 0);
                     if Instant::now() >= until {
                         // A step that found no answer within its budget: this incarnation stops,
                         // as a crash would, and the next one's recovery finishes the transaction.
@@ -611,6 +715,7 @@ impl Driver {
                         })?;
                     let inputs = self.inputs.clone();
                     let (id, here, envelope) = (send.id, send.group, send.envelope);
+                    self.out.insert(id, (send.txn, Instant::now(), first));
                     std::thread::Builder::new()
                         .name("amphora-xgroup-step".into())
                         .spawn(move || {
@@ -629,8 +734,11 @@ impl Driver {
                         // A caller gone by now needs no answer.
                         let _ = waiter.send(Ok(answer));
                     }
-                    if let Some((until, budget)) = self.deadlines.get_mut(&txn) {
-                        *until = later(*budget);
+                    // Without a step timed yet (every step of it lost), the caller's deadline holds.
+                    if let Some(deadline) = self.deadlines.get_mut(&txn)
+                        && self.times.timeout(0).is_some()
+                    {
+                        *deadline = Deadline::Resolving { lost: 0 };
                     }
                 }
                 Event::Finished { txn, .. } => {
@@ -658,5 +766,36 @@ impl Driver {
         if let Some(ready) = self.ready.take() {
             let _ = ready.send(Err(refusal.clone()));
         }
+    }
+}
+
+#[cfg(test)]
+mod step_times {
+    use super::StepTimes;
+    use std::time::Duration;
+
+    #[test]
+    fn cp_t1_10_the_resolution_timeout_is_learned_from_the_steps_times() {
+        let ms = Duration::from_millis;
+        let mut times = StepTimes::default();
+        assert_eq!(times.timeout(0), None, "no timeout before a step was timed");
+        // The first sample seeds the mean and half of it the deviation: 10 + 4 × 5.
+        times.observe(ms(10));
+        assert_eq!(times.timeout(0), Some(ms(30)));
+        // Steady steps shrink the deviation toward none: the timeout falls toward the mean.
+        for _ in 0..200 {
+            times.observe(ms(10));
+        }
+        let steady = times.timeout(0).unwrap_or(Duration::MAX);
+        assert!(steady >= ms(10) && steady < ms(11), "steady: {steady:?}");
+        // Slower steps raise it: it follows where the steps run, not a number given it.
+        for _ in 0..200 {
+            times.observe(ms(40));
+        }
+        let slower = times.timeout(0).unwrap_or_default();
+        assert!(slower >= ms(40), "slower: {slower:?}");
+        // Each resolution step lost doubles it (RFC 6298 §5.5), and an overflow stays the longest.
+        assert_eq!(times.timeout(2), slower.checked_mul(4));
+        assert_eq!(times.timeout(200), Some(Duration::MAX));
     }
 }

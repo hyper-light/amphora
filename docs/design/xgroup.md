@@ -50,9 +50,13 @@ key-value space over the groups; SQL sessions across groups are not built (AC-T1
 `Cluster` runs one coordinator on a driver thread; the route from key to group is the caller's, so
 the routing lanes keep it. Values introduced: none tuned. Bounds are the API's own (`TX_MAX`,
 `KEY_MAX`, `VALUE_MAX`, `REQUEST_MAX`, `SCAN_MAX` for a scan page); the transactions in flight are
-the caller's (its threads calling `transact`); each step's deadline is the caller's budget for that
-transaction, given again from the answer for its resolution. A step past it stops the incarnation,
-as a crash would, and the next open finishes it.
+the caller's (its threads calling `transact`). Until the client hears, each step's deadline is the
+caller's for that transaction. After, each resolution step gets the steps' learned timeout: the
+driver times every step answered at its first send and keeps a smoothed mean and mean deviation as
+TCP keeps a round trip's (RFC 6298 §2; Karn's rule for resends), giving mean + 4 × deviation,
+doubled for each resolution step lost (RFC 6298 §5.5). It follows the groups where they run and as
+their load moves; nothing in it is tuned. A step past its deadline stops the incarnation, as a crash
+would, and the next open finishes it.
 
 ## Evidence so far
 
