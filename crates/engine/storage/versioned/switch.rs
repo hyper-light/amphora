@@ -97,6 +97,10 @@ pub struct Switch {
     /// The savepoints of the write statements under way in the transaction, newest last: one a
     /// statement, so bounded by the statements nested in one another.
     statements: Mutex<Vec<Savepoint>>,
+    /// Trees the transaction made, dropped if it rolls back, and trees it dropped, dropped once it
+    /// commits (making and dropping a tree is durable alone, decision 12): one a DDL statement.
+    made: Mutex<Vec<u64>>,
+    dropped: Mutex<Vec<u64>>,
     d: Mutex<Descender>,
 }
 
@@ -107,6 +111,8 @@ impl Switch {
             storage,
             txn: Mutex::new(None),
             statements: Mutex::new(Vec::new()),
+            made: Mutex::new(Vec::new()),
+            dropped: Mutex::new(Vec::new()),
             d: Mutex::new(Descender::new()),
         }
     }
@@ -163,15 +169,23 @@ impl Switch {
             orders.insert(id, slot);
             id
         };
+        self.made.lock().push(id);
         i64::try_from(id).map_err(|_| LimboError::IntegerOverflow)
     }
 
-    /// Drops the tree at `root_page` (DROP TABLE, DROP INDEX): durable before it returns, as
-    /// decision 12 makes it, not undone by a rollback.
+    /// Drops the tree at `root_page` (DROP TABLE, DROP INDEX) once the transaction commits, so a
+    /// rollback keeps it.
     pub fn drop_tree(&self, root_page: i64) -> Result<()> {
-        let tree = tree_of(root_page)?;
-        self.db.drop_tree(&mut self.d.lock(), tree)?;
-        self.storage.orders.lock().remove(&tree);
+        self.dropped.lock().push(tree_of(root_page)?);
+        Ok(())
+    }
+
+    /// Drops `trees` now, each durable before the next.
+    fn drop_now(&self, trees: Vec<u64>) -> Result<()> {
+        for tree in trees {
+            self.db.drop_tree(&mut self.d.lock(), tree)?;
+            self.storage.orders.lock().remove(&tree);
+        }
         Ok(())
     }
 
@@ -228,21 +242,21 @@ impl Switch {
 
     /// Ends the connection's transaction, if one is open: commits it (durable before it returns),
     /// or rolls it back. A cursor still holding it is refused its next write.
+    /// Trees the transaction made are dropped if it rolls back; trees it dropped, once it commits.
     pub fn finish(&self, rollback: bool) -> Result<()> {
         self.statements.lock().clear();
-        let Some(shared) = self.txn.lock().take() else {
-            return Ok(());
-        };
-        let Some(txn) = shared.lock().take() else {
-            return Ok(());
-        };
-        let mut d = self.d.lock();
-        if rollback {
-            self.db.abort(txn, &mut d)
-        } else {
-            self.db
-                .commit(txn, &mut d, self.db.lane(), true)
-                .map(|_| ())
+        let made = std::mem::take(&mut *self.made.lock());
+        let dropped = std::mem::take(&mut *self.dropped.lock());
+        let shared = self.txn.lock().take();
+        let txn = shared.and_then(|s| s.lock().take());
+        if let Some(txn) = txn {
+            let mut d = self.d.lock();
+            if rollback {
+                self.db.abort(txn, &mut d)?;
+            } else {
+                self.db.commit(txn, &mut d, self.db.lane(), true)?;
+            }
         }
+        self.drop_now(if rollback { made } else { dropped })
     }
 }

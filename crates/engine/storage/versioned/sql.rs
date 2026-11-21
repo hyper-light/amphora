@@ -204,3 +204,32 @@ fn t_ns_2_6_a_failed_statement_is_undone_alone() {
     assert_eq!(want.len(), 2);
     assert_eq!(rows(&versioned, q), want);
 }
+
+/// Do: in a transaction, drop a table and create another, then roll back; then drop the table and
+/// commit. Expect: the rollback keeps the dropped table's rows and leaves no new table, and the
+/// commit drops it, on both storages.
+#[test]
+fn t_ns_2_6_ddl_rolls_back_with_its_transaction() {
+    let (_pdb, pager) = connect(false);
+    let (_vdb, versioned) = connect(true);
+    let q = "SELECT a FROM t ORDER BY a";
+    for conn in [&pager, &versioned] {
+        run(conn, "CREATE TABLE t (a INTEGER PRIMARY KEY)");
+        run(conn, "INSERT INTO t VALUES (1), (2)");
+        run(conn, "BEGIN");
+        run(conn, "DROP TABLE t");
+        run(conn, "CREATE TABLE u (b)");
+        run(conn, "INSERT INTO u VALUES (1)");
+        run(conn, "ROLLBACK");
+        assert_eq!(rows(conn, q).len(), 2);
+        assert!(conn.prepare("SELECT b FROM u").is_err());
+        run(conn, "BEGIN");
+        run(conn, "DROP TABLE t");
+        run(conn, "COMMIT");
+        assert!(conn.prepare(q).is_err());
+        run(conn, "CREATE TABLE v (c)");
+        run(conn, "INSERT INTO v VALUES ('after')");
+    }
+    let q = "SELECT c FROM v";
+    assert_eq!(rows(&versioned, q), rows(&pager, q));
+}
