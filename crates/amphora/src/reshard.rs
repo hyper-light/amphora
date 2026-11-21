@@ -34,8 +34,8 @@ pub struct GroupId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub u64);
 
-/// An operation: a split, a merge or a move. Ids grow, and are never used again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// An operation: a split, a merge or a move. Ids grow from 1, and are never used again (0: none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct OpId(pub u64);
 
 /// `key`'s position.

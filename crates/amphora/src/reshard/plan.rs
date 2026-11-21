@@ -211,20 +211,16 @@ fn moves(
         else {
             return;
         };
-        let free = |node: NodeId, used: &BTreeSet<GroupId>| {
-            placed
-                .iter()
-                .filter(move |(g, n)| **n == node && !used.contains(*g))
-                .filter_map(|(g, _)| measured.get(g))
-        };
         // A node being removed gives up its groups first, whatever they weigh.
         let draining = at
             .iter()
-            .filter(|(id, n)| n.cores == 0 && free(**id, used).next().is_some())
+            .filter(|(id, n)| {
+                n.cores == 0 && free_on(&placed, measured, used, **id).next().is_some()
+            })
             .map(|(id, n)| (*id, *n))
             .next();
         let chosen = if let Some((hot, _)) = draining {
-            free(hot, used)
+            free_on(&placed, measured, used, hot)
                 .max_by_key(|m| {
                     (
                         m.load,
@@ -250,7 +246,7 @@ fn moves(
                 return;
             }
             // Never overshoot: after the move the cold node is no busier per core than the hot.
-            free(hot, used)
+            free_on(&placed, measured, used, hot)
                 .filter(|m| m.load > 0)
                 .filter(|m| {
                     let g = u128::from(m.load);
@@ -280,6 +276,19 @@ fn moves(
             to: cold,
         });
     }
+}
+
+/// The measured groups on `node` in no operation yet.
+fn free_on<'a>(
+    placed: &'a BTreeMap<GroupId, NodeId>,
+    measured: &'a BTreeMap<GroupId, GroupLoad>,
+    used: &'a BTreeSet<GroupId>,
+    node: NodeId,
+) -> impl Iterator<Item = &'a GroupLoad> + 'a {
+    placed
+        .iter()
+        .filter(move |(g, n)| **n == node && !used.contains(*g))
+        .filter_map(|(g, _)| measured.get(g))
 }
 
 #[cfg(test)]

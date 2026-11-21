@@ -397,7 +397,9 @@ impl Sim {
                 }
             }
             Do::Fence { group, span } => {
-                let g = self.groups.get_mut(&group).unwrap();
+                let Some(g) = self.groups.get_mut(&group) else {
+                    return Reply::Failed(Failure::NoGroup);
+                };
                 let next = g.head() + 1;
                 match g.holding.fence(op, span, next) {
                     Ok(Fenced::New(at)) => {
