@@ -305,8 +305,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   docs/design/reshard.md): a pure core: a directory of hash spans with every position in exactly one group,
   each group's own holding (fenced, stale actions refused), a planner deciding from measured load, bytes and
   cores, and a driver doing copy, catch-up in rounds and a fenced cutover. Tested in a deterministic
-  simulator (T-T1.9.S1). Left: the shell over Amphora's groups and replicated owners, `bench reshard`
-  (AC-T1.9.2) and the three-machine lab (AC-T1.9.3).
+  simulator (T-T1.9.S1). Connected (lane split-merge-4): the directory is a replicated group's state
+  (`reshard::replicated::DirectoryMachine`, a hyper-durable state machine of directory changes; its
+  leader runs the driver under its term), and `Groups` routes by the directory instead of `fnv % n`, each
+  group checking every write and read against its holding (`store::Refused::Away`) (T-T1.9.R1, R2).
+  Left: each group's holding kept durable in its own state with its rows (it is in the router's memory
+  now), rows indexed by position for copy and sweep, the old group's log held through the operation,
+  the shell carrying the driver's actions to groups, `bench reshard` (AC-T1.9.2) and the three-machine
+  lab (AC-T1.9.3).
 
 ## Measured
 

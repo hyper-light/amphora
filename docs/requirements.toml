@@ -497,6 +497,8 @@ criteria = [
 ]
 tests = [
   { id = "T-T1.9.S1", text = "Automatic splits, merges and moves in the simulator under writes, driver and group restarts and lost logs — passes when every key is in exactly one group, the directory's, and writes lost is 0" },
+  { id = "T-T1.9.R1", text = "A split carried through the directory group's replicated log while groups route by it — passes when every member holds the same directory, a write to the fenced range is refused typed, a router on the old directory is refused by the old group's holding after the flip, and once routed by the new directory the range is written to and read from the new group" },
+  { id = "T-T1.9.R2", text = "A refused directory change and a directory image — passes when the refusal is alike on every member and changes nothing, an image installs the same directory, and an image that doesn't decode is refused" },
 ]
 
 # lane qs5
