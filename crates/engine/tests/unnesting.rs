@@ -97,7 +97,12 @@ fn load(conn: &Arc<Connection>) {
         let customer = 1 + numbers.next(50);
         let status = ["F", "O", "P"][numbers.next(3) as usize];
         let price = numbers.next(10_000) as f64 / 10.0;
-        let date = format!("199{}-0{}-1{}", 3 + numbers.next(4), 1 + numbers.next(9), numbers.next(10));
+        let date = format!(
+            "199{}-0{}-1{}",
+            3 + numbers.next(4),
+            1 + numbers.next(9),
+            numbers.next(10)
+        );
         let reference = numbers.next(70);
         let reference = maybe_null(&mut numbers, reference, 5);
         conn.execute(format!(
@@ -122,7 +127,8 @@ fn load(conn: &Arc<Connection>) {
     for p in 1..=40 {
         let brand = format!("Brand#{}", 1 + numbers.next(5));
         let size = 1 + numbers.next(50);
-        let name = ["forest green", "lace blue", "forest red", "misty rose"][numbers.next(4) as usize];
+        let name =
+            ["forest green", "lace blue", "forest red", "misty rose"][numbers.next(4) as usize];
         conn.execute(format!(
             "INSERT INTO part VALUES ({p}, '{brand}', {size}, '{name}')"
         ))
@@ -138,7 +144,9 @@ fn load(conn: &Arc<Connection>) {
             }
         }
     }
-    let words = ["alpha", "Alpha", "ALPHA", "beta", "Beta", "gamma", "1", "01"];
+    let words = [
+        "alpha", "Alpha", "ALPHA", "beta", "Beta", "gamma", "1", "01",
+    ];
     for id in 1..=30 {
         let tag = words[numbers.next(words.len() as u64) as usize];
         let label = words[numbers.next(words.len() as u64) as usize];

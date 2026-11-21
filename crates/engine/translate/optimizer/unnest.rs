@@ -162,9 +162,9 @@ use crate::translate::{
         in_compares_as_equality, walk_expr, walk_expr_mut, WalkControl,
     },
     plan::{
-        outer_columns_read, plan_is_correlated, Distinctness, GroupBy, JoinInfo, JoinOrigin, JoinType, JoinedTable,
-        QueryDestination, ResultSetColumn, SelectPlan, SubqueryState, TableReferences, WhereTerm,
-        WhereTermOrigin,
+        outer_columns_read, plan_is_correlated, Distinctness, GroupBy, JoinInfo, JoinOrigin,
+        JoinType, JoinedTable, QueryDestination, ResultSetColumn, SelectPlan, SubqueryState,
+        TableReferences, WhereTerm, WhereTermOrigin,
     },
 };
 use crate::util::exprs_are_equivalent;
@@ -220,7 +220,11 @@ pub(crate) fn rewrite_correlated_subqueries(
     }
     let is_exists =
         |query_type: &ast::SubqueryType| matches!(query_type, ast::SubqueryType::Exists { .. });
-    let correlated = || plan.non_from_clause_subqueries.iter().filter(|s| s.correlated);
+    let correlated = || {
+        plan.non_from_clause_subqueries
+            .iter()
+            .filter(|s| s.correlated)
+    };
     let mut worklist: VecDeque<(TableInternalId, Step)> = correlated()
         .filter(|s| is_exists(&s.query_type))
         .map(|s| (s.internal_id, Step::Join))
@@ -348,7 +352,11 @@ fn queue_new_subqueries(
     worklist: &mut VecDeque<(TableInternalId, Step)>,
     seen: &mut Vec<TableInternalId>,
 ) {
-    for subquery in plan.non_from_clause_subqueries.iter().filter(|s| s.correlated) {
+    for subquery in plan
+        .non_from_clause_subqueries
+        .iter()
+        .filter(|s| s.correlated)
+    {
         if seen.contains(&subquery.internal_id) {
             continue;
         }

@@ -1032,8 +1032,7 @@ fn optimize_select_plan_with_cache(
     let mut patterns = None;
     if rewrites.general {
         let mut form = plan.clone();
-        if unnest::rewrite_correlated_subqueries(&mut form, resolver, unnest::Reach::Patterns)?
-            .any
+        if unnest::rewrite_correlated_subqueries(&mut form, resolver, unnest::Reach::Patterns)?.any
         {
             patterns = Some(form);
         }
