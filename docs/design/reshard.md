@@ -161,9 +161,20 @@ deterministic simulator:
    - the holding kept in the group's state machine, so it is replicated with its log;
    - the old group's log held from `P_1` until the operation ends.
 
-   The directory itself must be a replicated group's records, and the driver must run as that
-   group's leader, with its term as the driver's epoch. Until this shell exists, `Groups` keeps its
-   fixed `fnv % n`.
+   Built (lane split-merge-4): the directory is a replicated group's state,
+   `reshard::replicated::DirectoryMachine`, a hyper-durable state machine whose entries are the
+   directory's changes; like focal's control groups it keeps nothing durable of its own and is
+   replayed from the log, and every entry is acted on at start. Its leader runs the driver with its
+   term as the driver's epoch (`DirectoryMachine::lead`). `Groups` routes by the directory
+   (`Groups::route` takes a newer generation), and `Groups::start(n)` makes its `n` groups by
+   splits of the one group every database starts as. Each group checks every write and read
+   against its holding (`Groups::hold` carries out an action on it, under the route's write lock,
+   so every batch let in before a fence is queued before it); a refused key is
+   `store::Refused::Away`. Still left of this item: the holding is in the router's memory, not yet
+   durable in the group's own state with its rows; rows by position; the change feed; the old
+   group's log held from `P_1`; and the shell that carries the driver's actions to the groups. A
+   member that installs a directory image holds it in memory only, so it must be caught up again
+   from its leader after a restart: persisting images comes with the holding's durability.
 2. **Load measured from the store's meter.** The writer's busy time per window, a bounded sample
    of written positions for the load cut, and the size cut from the B-tree's middle key. The
    window is the time between planner runs, and shares don't depend on its length.

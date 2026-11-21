@@ -88,8 +88,9 @@ pub fn even(node: NodeId, n: usize) -> Result<Directory, reshard::Refused> {
     let n = u128::try_from(n.max(1)).map_err(|_| reshard::Refused::Invalid("too many groups"))?;
     let mut last = GroupId(0);
     for i in 1..n {
-        let at = (i << 64)
-            .checked_div(n)
+        let at = i
+            .checked_shl(64)
+            .and_then(|i| i.checked_div(n))
             .and_then(|at| Pos::try_from(at).ok())
             .ok_or(reshard::Refused::Invalid("a cut past the last position"))?;
         let begin = directory.propose(&Proposal::Split { group: last, at })?;
