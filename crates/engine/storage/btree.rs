@@ -949,6 +949,9 @@ pub struct BTreeCursor {
     /// Reusable buffer for cell payloads during insert/update operations.
     /// This avoids allocating a new Vec for each write operation.
     reusable_cell_payload: crate::alloc::Vec<u8>,
+    /// Amphora: whether this cursor searches pages by their key heads (`storage/key_heads.rs`,
+    /// PR.4): the prototype's switch, `AMPHORA_KEY_HEADS=1`.
+    key_heads: bool,
     /// Per-cell access cache for incremental blob I/O. Caches the leaf cell's payload
     /// layout, the overflow-page-number array (Turso's runtime reconstruction of
     /// SQLite's `aOverflow`), and the byte range of the most recently accessed column,
@@ -1259,6 +1262,7 @@ impl BTreeCursor {
             move_to_state: MoveToState::Start,
             skip_advance: false,
             reusable_cell_payload: crate::alloc::vec![],
+            key_heads: crate::storage::key_heads::switched_on(),
             blob_cache: BlobCellCache::default(),
             blob_pinned_rowid: None,
             blob_expired: false,
@@ -1341,6 +1345,99 @@ impl BTreeCursor {
     ) -> Result<Box<Self>> {
         let index_info = Arc::new(IndexInfo::new_from_index(index)?);
         Ok(Self::new_with_index_info(pager, root_page, num_columns, Some(index_info)).into_boxed())
+    }
+
+    /// Amphora (PR.4): a cursor on an index described by `index_info`, for the key heads' tests.
+    #[cfg(test)]
+    pub(crate) fn new_index_for_test(
+        pager: Arc<Pager>,
+        root_page: i64,
+        index_info: Arc<IndexInfo>,
+    ) -> Self {
+        let num_columns = index_info.num_cols;
+        Self::new_with_index_info(pager, root_page, num_columns, Some(index_info))
+    }
+
+    /// Amphora (PR.4): turns the key heads on or off for this cursor, whatever the switch says.
+    #[cfg(test)]
+    pub(crate) fn set_key_heads(&mut self, on: bool) {
+        self.key_heads = on;
+    }
+
+    /// Amphora (PR.4): where the cursor stands, page and cell at each level, for the key heads'
+    /// model test.
+    #[cfg(test)]
+    pub(crate) fn position(&self) -> Vec<(usize, i32)> {
+        (0..=self.stack.current())
+            .map(|level| {
+                (
+                    self.stack.stack[level].as_ref().unwrap().get().id(),
+                    self.stack.node_states[level].cell_idx,
+                )
+            })
+            .collect()
+    }
+
+    /// Amphora (PR.4): charges a search by `rowid` to the page at `level` and places it against
+    /// the page's key heads, once the page has them. None while the page is dirty: its bytes are
+    /// changing.
+    fn key_heads_rowid(
+        &self,
+        level: usize,
+        rowid: i64,
+    ) -> Option<crate::storage::key_heads::Probe> {
+        if !self.key_heads {
+            return None;
+        }
+        let page = self.stack.get_page_at_level(level)?;
+        if page.is_dirty() {
+            return None;
+        }
+        let inner = page.get();
+        let mut slot = std::mem::take(&mut inner.key_heads);
+        let probe = slot.probe_rowid(inner, rowid);
+        inner.key_heads = slot;
+        probe
+    }
+
+    /// Amphora (PR.4): as [`Self::key_heads_rowid`], for an index key whose first value is the
+    /// first of `key_values`.
+    fn key_heads_index(
+        &self,
+        level: usize,
+        key_values: &[ValueRef<'_>],
+    ) -> Option<crate::storage::key_heads::Probe> {
+        if !self.key_heads {
+            return None;
+        }
+        let key = self.index_info.as_deref()?.key_info.first()?;
+        let first = key_values.first()?;
+        let page = self.stack.get_page_at_level(level)?;
+        if page.is_dirty() {
+            return None;
+        }
+        let inner = page.get();
+        let mut slot = std::mem::take(&mut inner.key_heads);
+        let probe = slot.probe_index(inner, self.payload_limits, key, first);
+        inner.key_heads = slot;
+        probe
+    }
+
+    /// Amphora (PR.4): the cell at `cell` of the page at `level` against the key `probe` placed,
+    /// when the page's key heads decide it.
+    #[inline(always)]
+    fn key_heads_decide(
+        &self,
+        level: usize,
+        probe: Option<crate::storage::key_heads::Probe>,
+        cell: isize,
+    ) -> Option<Ordering> {
+        let probe = probe?;
+        let page = self.stack.get_page_at_level(level)?;
+        page.get()
+            .key_heads
+            .get()?
+            .decide(probe, usize::try_from(cell).ok()?)
     }
 
     /// Resets the cached count state so the next `count()` call re-traverses the
@@ -2040,11 +2137,13 @@ impl BTreeCursor {
         // go. The caller persists the state once afterwards, before the child
         // page read below, which is the only step here that can yield.
         {
+            let probe = self.key_heads_rowid(old_top_idx, rowid);
             let contents = self.stack.get_page_contents_at_level(old_top_idx).unwrap();
+            let heads = probe.and_then(|probe| Some((contents.key_heads.get()?, probe)));
             if matches!(seek_op, SeekOp::GE { .. } | SeekOp::LE { .. }) {
-                tablebtree_search_interior::<true>(contents, rowid, seek_op, state)?;
+                tablebtree_search_interior::<true>(contents, rowid, seek_op, state, heads)?;
             } else {
-                tablebtree_search_interior::<false>(contents, rowid, seek_op, state)?;
+                tablebtree_search_interior::<false>(contents, rowid, seek_op, state, heads)?;
             }
 
             #[inline]
@@ -2053,20 +2152,36 @@ impl BTreeCursor {
                 rowid: i64,
                 seek_op: SeekOp,
                 state: &mut InteriorPageBinarySearchState,
+                heads: Option<(
+                    &crate::storage::key_heads::KeyHeads,
+                    crate::storage::key_heads::Probe,
+                )>,
             ) -> Result<()> {
                 let mut min = state.min_cell_idx;
                 let mut max = state.max_cell_idx;
                 while min <= max {
                     let cur_cell_idx = (min + max) >> 1;
-                    let cell_rowid =
-                        contents.cell_table_interior_read_rowid(cur_cell_idx as usize)?;
-                    let is_on_left = if INCLUSIVE {
-                        cell_rowid >= rowid
-                    } else {
-                        match seek_op {
-                            SeekOp::GT => cell_rowid > rowid,
-                            SeekOp::GE { .. } | SeekOp::LE { .. } => cell_rowid >= rowid,
-                            SeekOp::LT => cell_rowid + 1 >= rowid,
+                    // Amphora (PR.4): a cell above the rowid is on the left for every
+                    // operation; one below is on the right except for LT, where a cell one
+                    // below is on the left, so LT reads it.
+                    let decided = heads.and_then(|(heads, probe)| {
+                        heads.decide(probe, usize::try_from(cur_cell_idx).ok()?)
+                    });
+                    let is_on_left = match decided {
+                        Some(Ordering::Greater) => true,
+                        Some(Ordering::Less) if !matches!(seek_op, SeekOp::LT) => false,
+                        _ => {
+                            let cell_rowid =
+                                contents.cell_table_interior_read_rowid(cur_cell_idx as usize)?;
+                            if INCLUSIVE {
+                                cell_rowid >= rowid
+                            } else {
+                                match seek_op {
+                                    SeekOp::GT => cell_rowid > rowid,
+                                    SeekOp::GE { .. } | SeekOp::LE { .. } => cell_rowid >= rowid,
+                                    SeekOp::LT => cell_rowid + 1 >= rowid,
+                                }
+                            }
                         }
                     };
                     if is_on_left {
@@ -2292,37 +2407,47 @@ impl BTreeCursor {
         // re-entry retries the same cell. The caller persists the state once
         // per call instead of once per compare.
         let payload_limits = self.payload_limits;
+        let probe = self.key_heads_index(old_top_idx, key_values);
         while state.min_cell_idx <= state.max_cell_idx {
             let cur_cell_idx = (state.min_cell_idx + state.max_cell_idx) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
             self.stack.set_cell_index(cur_cell_idx as i32);
 
-            let (payload, payload_size, first_overflow_page) = self
-                .stack
-                .get_page_contents_at_level(old_top_idx)
-                .unwrap()
-                .cell_read_payload_ptr(cur_cell_idx as usize, payload_limits)?;
-
-            let cell_payload: &[u8] = if let Some(next_page) = first_overflow_page {
-                let res = self.process_overflow_read(payload, next_page, payload_size)?;
-                if res.is_io() {
-                    return Ok(ControlFlow::Break(res));
-                }
-                self.get_immutable_record()
-                    .expect("the overflow read filled the reusable record")
-                    .get_payload()
-            } else {
-                payload
-            };
-
             let (target_leaf_page_is_in_left_subtree, is_eq) = {
-                let interior_cell_vs_index_key = record_comparer.compare_payload(
-                    cell_payload,
-                    key_values,
-                    self.index_info
-                        .as_ref()
-                        .expect("indexbtree_move_to: index_info required"),
-                    tie_breaker,
-                )?;
+                // Amphora (PR.4): the key heads order the cell when they can; a cell they
+                // order is never equal to the key.
+                let interior_cell_vs_index_key =
+                    match self.key_heads_decide(old_top_idx, probe, cur_cell_idx) {
+                        Some(decided) => decided,
+                        None => {
+                            let (payload, payload_size, first_overflow_page) = self
+                                .stack
+                                .get_page_contents_at_level(old_top_idx)
+                                .unwrap()
+                                .cell_read_payload_ptr(cur_cell_idx as usize, payload_limits)?;
+
+                            let cell_payload: &[u8] = if let Some(next_page) = first_overflow_page {
+                                let res =
+                                    self.process_overflow_read(payload, next_page, payload_size)?;
+                                if res.is_io() {
+                                    return Ok(ControlFlow::Break(res));
+                                }
+                                self.get_immutable_record()
+                                    .expect("the overflow read filled the reusable record")
+                                    .get_payload()
+                            } else {
+                                payload
+                            };
+
+                            record_comparer.compare_payload(
+                                cell_payload,
+                                key_values,
+                                self.index_info
+                                    .as_ref()
+                                    .expect("indexbtree_move_to: index_info required"),
+                                tie_breaker,
+                            )?
+                        }
+                    };
 
                 // in sqlite btrees left child pages have <= keys.
                 // in general, in forwards iteration we want to find the first key that matches the seek condition.
@@ -2497,12 +2622,10 @@ impl BTreeCursor {
         };
 
         let mut search = *state;
-        let outcome = Self::tablebtree_leaf_search(
-            rowid,
-            seek_op,
-            self.stack.top_ref().get_contents(),
-            &mut search,
-        )?;
+        let probe = self.key_heads_rowid(self.stack.current(), rowid);
+        let contents = self.stack.top_ref().get_contents();
+        let heads = probe.and_then(|probe| Some((contents.key_heads.get()?, probe)));
+        let outcome = Self::tablebtree_leaf_search(rowid, seek_op, contents, &mut search, heads)?;
         self.seek_state = CursorSeekState::LeafPageBinarySearch { state: search };
         self.stack.set_cell_index(outcome.cell_index);
         if let Some(has_record) = outcome.has_record {
@@ -2591,11 +2714,15 @@ impl BTreeCursor {
         seek_op: SeekOp,
         contents: &PageContent,
         state: &mut LeafPageBinarySearchState,
+        heads: Option<(
+            &crate::storage::key_heads::KeyHeads,
+            crate::storage::key_heads::Probe,
+        )>,
     ) -> Result<LeafSearchOutcome> {
         if matches!(seek_op, SeekOp::GE { eq_only: true }) {
-            return leaf_search::<true>(rowid, seek_op, contents, state);
+            return leaf_search::<true>(rowid, seek_op, contents, state, heads);
         } else {
-            return leaf_search::<false>(rowid, seek_op, contents, state);
+            return leaf_search::<false>(rowid, seek_op, contents, state, heads);
         }
 
         #[inline]
@@ -2604,6 +2731,10 @@ impl BTreeCursor {
             seek_op: SeekOp,
             contents: &PageContent,
             state: &mut LeafPageBinarySearchState,
+            heads: Option<(
+                &crate::storage::key_heads::KeyHeads,
+                crate::storage::key_heads::Probe,
+            )>,
         ) -> Result<LeafSearchOutcome> {
             let seek_op = if EXACT_FORWARD {
                 SeekOp::GE { eq_only: true }
@@ -2616,12 +2747,19 @@ impl BTreeCursor {
             while min <= max {
                 // Both indices are nonnegative. This avoids signed division for the midpoint.
                 let cur_cell_idx = (min + max) >> 1;
-                let cell_rowid = contents.cell_table_leaf_read_rowid(cur_cell_idx as usize)?;
-
-                let cmp = cell_rowid.cmp(&rowid);
+                // Amphora (PR.4): the key heads order the cell when they can.
+                let decided = heads.and_then(|(heads, probe)| {
+                    heads.decide(probe, usize::try_from(cur_cell_idx).ok()?)
+                });
+                let cmp = match decided {
+                    Some(cmp) => cmp,
+                    None => contents
+                        .cell_table_leaf_read_rowid(cur_cell_idx as usize)?
+                        .cmp(&rowid),
+                };
 
                 let found = if EXACT_FORWARD {
-                    cell_rowid == rowid
+                    cmp.is_eq()
                 } else {
                     match seek_op {
                         SeekOp::GT => cmp.is_gt(),
@@ -2884,6 +3022,7 @@ impl BTreeCursor {
         let iter_dir = seek_op.iteration_direction();
         let eq_seen = state.eq_seen;
         let payload_limits = self.payload_limits;
+        let probe = self.key_heads_index(old_top_idx, key_values);
         loop {
             let min = state.min_cell_idx;
             let max = state.max_cell_idx;
@@ -2919,33 +3058,39 @@ impl BTreeCursor {
             let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
             self.stack.set_cell_index(cur_cell_idx as i32);
 
-            let (payload, payload_size, first_overflow_page) = self
-                .stack
-                .get_page_contents_at_level(old_top_idx)
-                .unwrap()
-                .cell_read_payload_ptr(cur_cell_idx as usize, payload_limits)?;
+            // Amphora (PR.4): the key heads order the cell when they can.
+            let cmp = match self.key_heads_decide(old_top_idx, probe, cur_cell_idx) {
+                Some(decided) => decided,
+                None => {
+                    let (payload, payload_size, first_overflow_page) = self
+                        .stack
+                        .get_page_contents_at_level(old_top_idx)
+                        .unwrap()
+                        .cell_read_payload_ptr(cur_cell_idx as usize, payload_limits)?;
 
-            let cell_payload: &[u8] = if let Some(next_page) = first_overflow_page {
-                let res = self.process_overflow_read(payload, next_page, payload_size)?;
-                if let IOResult::IO(io) = res {
-                    return Ok(IOResult::IO(io));
+                    let cell_payload: &[u8] = if let Some(next_page) = first_overflow_page {
+                        let res = self.process_overflow_read(payload, next_page, payload_size)?;
+                        if let IOResult::IO(io) = res {
+                            return Ok(IOResult::IO(io));
+                        }
+                        self.get_immutable_record()
+                            .expect("the overflow read filled the reusable record")
+                            .get_payload()
+                    } else {
+                        payload
+                    };
+
+                    record_comparer.compare_payload(
+                        cell_payload,
+                        key_values,
+                        self.index_info
+                            .as_ref()
+                            .expect("indexbtree_seek: index_info required"),
+                        get_tie_breaker_from_seek_op(seek_op),
+                    )?
                 }
-                self.get_immutable_record()
-                    .expect("the overflow read filled the reusable record")
-                    .get_payload()
-            } else {
-                payload
             };
-
-            let (cmp, found) = compare_cell_with_key(
-                cell_payload,
-                key_values,
-                seek_op,
-                &record_comparer,
-                self.index_info
-                    .as_ref()
-                    .expect("indexbtree_seek: index_info required"),
-            )?;
+            let found = found_by(seek_op, cmp);
             if found {
                 state.nearest_matching_cell.replace(cur_cell_idx as usize);
                 match iter_dir {
@@ -2980,27 +3125,17 @@ impl BTreeCursor {
             }
         }
 
+        /// Whether a cell ordered `cmp` against the key satisfies the seek.
         #[inline(always)]
-        fn compare_cell_with_key(
-            payload: &[u8],
-            key_values: &[ValueRef],
-            seek_op: SeekOp,
-            record_comparer: &RecordCompare,
-            index_info: &IndexInfo,
-        ) -> Result<(Ordering, bool)> {
-            let tie_breaker = get_tie_breaker_from_seek_op(seek_op);
-            let cmp =
-                record_comparer.compare_payload(payload, key_values, index_info, tie_breaker)?;
-
-            let found = match seek_op {
+        fn found_by(seek_op: SeekOp, cmp: Ordering) -> bool {
+            match seek_op {
                 SeekOp::GT => cmp.is_gt(),
                 SeekOp::GE { eq_only: true } => cmp.is_eq(),
                 SeekOp::GE { eq_only: false } => cmp.is_ge(),
                 SeekOp::LE { eq_only: true } => cmp.is_eq(),
                 SeekOp::LE { eq_only: false } => cmp.is_le(),
                 SeekOp::LT => cmp.is_lt(),
-            };
-            Ok((cmp, found))
+            }
         }
     }
 
