@@ -820,6 +820,26 @@ tests = [
 # IDs. It serves AC-T1.4.2 and AC-T1.4.3 (`amphora-bench --vlog`) and T-T1.3.1
 # (crates/engine/tests/versioned_crash.rs).
 
+# lane qs6: query speed step 6 (G5 step 3), parallel execution in morsels (docs/design/executor.md
+# section 8).
+[[own]]
+id = "QT.6"
+title = "Parallel execution across cores: morsel-driven scans, hash joins, index lookups and aggregates"
+criteria = [
+  { id = "AC-QT.6.1", text = "TPC-H SF 10 median best time, the threads used stated, is at most 2,328.8 ms, by bench/planner/record.sh on jupiter, best of 3, each run begun at a load under 2" },
+  { id = "AC-QT.6.2", text = "JOB median best time over the parent's (step 5's end) is at most 0.42" },
+  { id = "AC-QT.6.3", text = "JOB's queries that ran in under 20 ms at the parent take at most 1.05 times as long, each query's best of 3" },
+  { id = "AC-QT.6.4", text = "Answers identical at every worker count; the threads used and the class-for-class comparison in the record" },
+]
+tests = [
+  { id = "T-QT.6.1", text = "Random filters, groupings and aggregates over random tables at 2, 3, 4 and 8 workers and random morsel sizes (vdbe/morsel.rs) — passes when every answer equals the serial one value for value" },
+  { id = "T-QT.6.2", text = "Random equi-joins probed in parallel (vdbe/morsel.rs) — passes when the matches equal the serial probe's in order and a nested loop's" },
+  { id = "T-QT.6.3", text = "A REAL sum's terms in several orders and split across partials — passes when one value, bit for bit" },
+  { id = "T-QT.6.4", text = "A statement whose workers together pass its memory budget — passes when refused with the typed error at every worker count and the budget never passed" },
+  { id = "T-QT.6.5", text = "The degree from stated costs — passes when off and short statements are serial, a long one uses more than one worker and no more than the cores, and morsels grow as dispatch grows against a row's cost" },
+  { id = "T-QT.6.6", text = "Every JOB and TPC-H query at 1, 2, 4, 8, 16 and 32 workers (the coordinator's) — passes when identical answers at every count" },
+]
+
 # lane g3s2
 # Amphora's own IDs for G3, point reads (kiln plan 01a16b0f464172dc80c7a3b9a14acbce): G3.n for its step n.
 
