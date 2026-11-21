@@ -21,7 +21,7 @@ use amphora_corpus::run::{Limits, Outcome, run_file};
 #[test]
 fn t_g2_4_2_an_unknown_engine_is_refused() {
     assert_eq!(
-        open("oracle").err(),
+        open("oracle", None).err(),
         Some(Unavailable::Unknown("oracle".into()))
     );
     assert_eq!(ENGINES.len(), 9);
@@ -43,7 +43,7 @@ fn t_g2_4_2_an_engine_whose_program_is_missing_is_refused() {
     ];
     let mut refused = Vec::new();
     for spec in specs {
-        match Shell::open(spec) {
+        match Shell::open(spec, None) {
             Err(Unavailable::Missing {
                 engine, program, ..
             }) => {
@@ -70,7 +70,7 @@ fn t_g2_4_2_clickhouse_without_its_server_is_refused() {
         .local_addr()
         .unwrap()
         .port();
-    match ClickHouse::open(&format!("http://127.0.0.1:{port}")) {
+    match ClickHouse::open(&format!("http://127.0.0.1:{port}"), None) {
         Err(Unavailable::Unreachable { engine, .. }) => assert_eq!(engine, "clickhouse"),
         Err(other) => panic!("{other}"),
         Ok(_) => panic!("opened with no server"),
@@ -142,7 +142,7 @@ after
 /// the next record isn't reached; where it isn't, the engine is refused as Missing (not passed).
 #[test]
 fn t_g2_4_2_a_file_runs_on_sqlites_shell_or_is_refused() {
-    let mut engine = match open("sqlite") {
+    let mut engine = match open("sqlite", None) {
         Ok(e) => e,
         Err(Unavailable::Missing { engine, .. }) => {
             assert_eq!(engine, "sqlite");
