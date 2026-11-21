@@ -7,7 +7,8 @@
 //!                                     "<n> values hashing to <md5>"
 //! skipif <engine> | onlyif <engine>   before a record: whether that engine runs it
 //! hash-threshold <n>                  answers of more values than n are compared by their MD5
-//! halt                                stop reading the file
+//! halt                                stop reading the file (the runner stops; the reader keeps
+//!                                     going, as the halt may be under skipif or onlyif)
 //! ```
 //!
 //! A line this reader doesn't know is skipped, as the C runner skips it.
@@ -208,12 +209,14 @@ fn hashed(line: &str) -> Option<Expected> {
 mod tests {
     use super::*;
 
-    /// Do: read a file with every item kind. Expect: each as sqllogictest.c reads it.
+    /// Do: read a file with every item kind. Expect: each as sqllogictest.c reads it, and the
+    /// record after `halt` still read: a halt may sit under `skipif`/`onlyif`, so whether it stops
+    /// a file is the runner's to decide for its engine (run.rs, slt.py's run), not the reader's.
     #[test]
     fn reads_every_item() {
         let text = "hash-threshold 8\n\n# a comment\nstatement ok\nCREATE TABLE t(a)\n\nskipif mysql\nonlyif sqlite\nquery I rowsort label-1\nSELECT a\nFROM t\n----\n1\n2\n\nquery T nosort\nSELECT 'x'\n----\n3 values hashing to 0123456789abcdef0123456789abcdef\n\nstatement error\nSELECT nope\n\nhalt\n\nstatement ok\nSELECT 1\n";
         let items = parse(text).unwrap();
-        assert_eq!(items.len(), 6);
+        assert_eq!(items.len(), 7);
         assert_eq!(items[0], Item::HashThreshold(8));
         let Item::Record(r) = &items[2] else {
             panic!("{:?}", items[2])
@@ -244,6 +247,8 @@ mod tests {
         let Item::Record(e) = &items[4] else { panic!() };
         assert_eq!(e.kind, Kind::Statement { ok: false });
         assert_eq!(items[5], Item::Halt(vec![]));
+        let Item::Record(after) = &items[6] else { panic!() };
+        assert_eq!((after.line, after.sql.as_str()), (26, "SELECT 1"));
     }
 
     /// Do: ask which queries only read. Expect: SELECT and VALUES past comments; nothing else.
