@@ -208,6 +208,14 @@ fn seek(c: &mut dyn CursorTrait, pager: &Pager, key: &Key, op: SeekOp) -> bool {
     }
 }
 
+/// A key as a failure names it: a rowid, or a record's bytes.
+fn described(key: &Key) -> String {
+    match key {
+        Key::Rowid(r) => r.to_string(),
+        Key::Record(rec) => format!("{:?}", rec.get_payload()),
+    }
+}
+
 enum Key {
     Rowid(i64),
     Record(ImmutableRecord),
@@ -294,8 +302,13 @@ fn run(kind: Kind, seed: u64, ops: usize) {
     // Whether a step may follow: the cursor is on a row, or has just deleted one.
     let mut may_step = false;
     let mut next_rowid = 1i64;
+    // The operations so far, the last few of which a failure names.
+    let mut trail: Vec<String> = Vec::new();
     for step in 0..ops {
-        let at = format!("{kind:?} seed {seed} step {step}");
+        let at = format!(
+            "{kind:?} seed {seed} step {step} after {:?}",
+            trail.get(trail.len().saturating_sub(8)..)
+        );
         let roll = rng.below(100);
         if roll < 35 {
             // Insert: a seek for the key, then the insert at it.
@@ -322,6 +335,7 @@ fn run(kind: Kind, seed: u64, ops: usize) {
                 }
             };
             let op = SeekOp::GE { eq_only: true };
+            trail.push(format!("insert {}", described(&key)));
             let fb = seek(b, &pager, &key, op);
             let fv = seek(v, &pager, &key, op);
             assert_eq!(fb, fv, "{at}: the insert's seek");
@@ -340,6 +354,7 @@ fn run(kind: Kind, seed: u64, ops: usize) {
                 continue;
             }
             assert_eq!(seen(b, &pager), seen(v, &pager), "{at}: the row deleted");
+            trail.push("delete".into());
             pager.io.block(|| b.delete()).unwrap();
             pager.io.block(|| v.delete()).unwrap();
             may_step = true;
@@ -348,6 +363,7 @@ fn run(kind: Kind, seed: u64, ops: usize) {
                 continue;
             }
             let forward = rng.chance(70);
+            trail.push(if forward { "next" } else { "prev" }.into());
             if forward {
                 pager.io.block(|| b.next()).unwrap();
                 pager.io.block(|| v.next()).unwrap();
@@ -380,6 +396,7 @@ fn run(kind: Kind, seed: u64, ops: usize) {
                     Key::Record(record(&vals))
                 }
             };
+            trail.push(format!("seek {op:?} {}", described(&key)));
             let fb = seek(b, &pager, &key, op);
             let fv = seek(v, &pager, &key, op);
             assert_eq!(fb, fv, "{at}: seek {op:?}");
@@ -396,18 +413,21 @@ fn run(kind: Kind, seed: u64, ops: usize) {
             }
             may_step = fb;
         } else if roll < 93 {
+            trail.push("rewind".into());
             pager.io.block(|| b.rewind()).unwrap();
             pager.io.block(|| v.rewind()).unwrap();
             let (sb, sv) = (seen(b, &pager), seen(v, &pager));
             assert_eq!(sb, sv, "{at}: rewind");
             may_step = sb.row.is_some();
         } else if roll < 98 {
+            trail.push("last".into());
             pager.io.block(|| b.last()).unwrap();
             pager.io.block(|| v.last()).unwrap();
             let (sb, sv) = (seen(b, &pager), seen(v, &pager));
             assert_eq!(sb, sv, "{at}: last");
             may_step = sb.row.is_some();
         } else {
+            trail.push("count".into());
             let nb = pager.io.block(|| b.count()).unwrap();
             let nv = pager.io.block(|| v.count()).unwrap();
             assert_eq!(nb, nv, "{at}: count");
