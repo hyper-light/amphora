@@ -101,7 +101,7 @@ impl Pair {
         conn.execute("CREATE TABLE t (k INTEGER PRIMARY KEY, v TEXT)")
             .unwrap();
         let order = KeyOrder::rowid();
-        let vdb = VDatabase::open(Arc::new(Simulated::new(seed)), 4_000, 1, || {
+        let vdb = VDatabase::open(Arc::new(Simulated::new(seed, 1).unwrap()), 4_000, 1, || {
             order.comparator()
         })
         .unwrap();
@@ -226,7 +226,9 @@ impl Pair {
             return;
         };
         self.conn.execute("COMMIT").unwrap();
-        self.vdb.commit(txn, &mut self.d, false).unwrap();
+        self.vdb
+            .commit(txn, &mut self.d, self.vdb.lane(), false)
+            .unwrap();
         self.saves.clear();
         self.committed = rows(&self.conn, "SELECT k, v FROM t ORDER BY k");
         self.counts.commits += 1;
@@ -354,7 +356,10 @@ fn ns2_transactions_match_the_current_engine() {
 #[test]
 fn ns2_rollback_to_restores_rows_as_the_savepoint_found_them() {
     let order = KeyOrder::rowid();
-    let vdb = VDatabase::open(Arc::new(Simulated::new(1)), 200, 1, || order.comparator()).unwrap();
+    let vdb = VDatabase::open(Arc::new(Simulated::new(1, 1).unwrap()), 200, 1, || {
+        order.comparator()
+    })
+    .unwrap();
     let mut d = Descender::new();
     let before = vdb.snapshot().unwrap();
     let mut txn = vdb.begin().unwrap();
@@ -372,7 +377,7 @@ fn ns2_rollback_to_restores_rows_as_the_savepoint_found_them() {
     // The savepoint stays good: change again, roll back again.
     vdb.put(&mut d, &mut txn, 0, &rowid_key(3), b"d").unwrap();
     vdb.rollback_to(&mut d, &mut txn, sp).unwrap();
-    vdb.commit(txn, &mut d, false).unwrap();
+    vdb.commit(txn, &mut d, vdb.lane(), false).unwrap();
     assert_eq!(
         vdb.scan(&mut d, &before, 0, None, usize::MAX).unwrap(),
         vec![]
@@ -389,7 +394,10 @@ fn ns2_rollback_to_restores_rows_as_the_savepoint_found_them() {
 #[test]
 fn ns2_rollback_to_refuses_a_savepoint_not_its_own() {
     let order = KeyOrder::rowid();
-    let vdb = VDatabase::open(Arc::new(Simulated::new(2)), 200, 1, || order.comparator()).unwrap();
+    let vdb = VDatabase::open(Arc::new(Simulated::new(2, 1).unwrap()), 200, 1, || {
+        order.comparator()
+    })
+    .unwrap();
     let mut d = Descender::new();
     let other = vdb.begin().unwrap();
     let foreign = other.savepoint();

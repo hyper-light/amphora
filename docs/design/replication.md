@@ -2414,3 +2414,51 @@ The W tests run with read sets on.
 Falsified by: a non-serializable history with read sets on; a release A/B against G where read sets don't cut G's
 write gaps; a `conflict` share near one on workloads whose writes touch different pages (the read set too wide: the
 recorder catching reads the session didn't make).
+
+## Decision (lane g12s2): the raft log as the WAL (2026-11-21, G12 step 2)
+
+Requirements AC-T1.8.L1 and L2, tests T-T1.8.L1 and L2 (docs/requirements.toml); kiln plan "G12 Replication
+(CP-T1.8)", step 2.
+
+### What was left
+
+Applies already flushed nothing on the owner's thread ("A replica's database log", decision 1), and a write was
+already acknowledged only once hyper-durable held it on a quorum's raft logs (durable.md §4.1, I5). One flush was
+still the owner's: `Machine::persist`, which hyper-durable's `Replica::compact` asks before it moves the raft log's
+start, flushed the database's log inline. So each compaction stood the owner still for a flush, the stall decision 1
+removed from applies, and the rule "the engine's log is durable before Raft compacts past it" rested on that inline
+flush rather than on what had been made durable.
+
+### The decision
+
+`Machine::persist` does nothing. `Replica::compact` moves the start to `durable() - keep` at most (hyper-durable,
+replica.rs, I8), and `Machine::durable` is the point the owner's flushing thread last made durable
+(`flushed_through`). So a compaction waits for the engine's flush: it never passes it, and one asked before the flush
+ends moves the start only as far as the last finished flush; the next compaction, at a later step, takes the rest.
+The raft log always holds every entry past what the database's log made durable, so a power cut that loses the
+database log's unflushed tail reopens at `durable()` and applies the rest again from the raft log (§4.3), as before.
+The raft log is the write-ahead log; the database's log is a cache of it that the flushing thread makes durable in
+its own time. Still flushed inline, all rare and as before: a membership change (its join rows), an install, the
+seed, a persisted class entry, and `open`.
+
+The owner compacts when the raft log holds 128 MiB of applied entries or is stalled for room. A stall waits on the
+flushing thread, which is always asked to flush what was applied (`Actor::flush`), so it frees room once that flush
+ends, not on a flush of the owner's own.
+
+### Evidence
+
+- T-T1.8.L1 `compaction_waits_for_the_engines_flush` (database::replicated): a voter's flushes held, 1 flushed and
+  2 to 5 applied. A compaction keeping nothing moves the raft log's start to the flushed point and no further, and
+  flushes nothing (2 to 5 stay unflushed); once flushed, the next compaction reaches the last entry applied.
+- T-T1.8.L2 `the_records_suite_answers_alike_at_one_voter_and_three` (tests/records_conformance.rs): one harness,
+  `Group::new(voters)`, the group's size its only parameter, runs the Records suite and seeded histories against the
+  simulator at one voter and at three, each at its leader; every case passes and the two transcripts are identical.
+- The tests that compact a leader to make a joiner install its image now wait until its flushing thread has
+  flushed what it applied (`Driven::flushed`), the fact that compaction now waits on.
+
+### Falsified by
+
+- a compaction that moves the raft log's start past `Machine::durable`;
+- an acknowledged write lost after a power cut that lost the database log's unflushed tail (the power-cut nemesis);
+- a stalled owner whose raft log never frees room while its flushing thread keeps flushing;
+- a store test whose answers differ between one voter and three.

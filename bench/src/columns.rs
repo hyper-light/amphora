@@ -147,7 +147,7 @@ fn run<B: Block + 'static>(o: &Opts, name: &str, clients: usize, keep: bool) -> 
     let row = 8 + o.value as u64 + 6;
     let frames = usize::try_from((o.rows * 4) * row / 1_500 + 1_000)?;
     let db = Database::open(
-        Arc::new(Files::open(&dir).map_err(e)?),
+        Arc::new(Files::open(&dir, 1).map_err(e)?),
         frames,
         1,
         || -> Comparator { Box::new(|a: &[u8], b: &[u8]| a.cmp(b)) },
@@ -163,7 +163,7 @@ fn run<B: Block + 'static>(o: &Opts, name: &str, clients: usize, keep: bool) -> 
             db.put(&mut d, &mut t, 0, &mix(k).to_be_bytes(), &v)
                 .map_err(e)?;
         }
-        db.commit(t, &mut d, false).map_err(e)?;
+        db.commit(t, &mut d, db.lane(), false).map_err(e)?;
         i = end;
     }
     db.sync().map_err(e)?;
@@ -205,7 +205,7 @@ fn run<B: Block + 'static>(o: &Opts, name: &str, clients: usize, keep: bool) -> 
                         db.abort(t, &mut d).map_err(e)?;
                         continue;
                     }
-                    db.commit(t, &mut d, true).map_err(e)?;
+                    db.commit(t, &mut d, db.lane(), true).map_err(e)?;
                     mine.push(t0.elapsed().as_nanos() as u64);
                     commits.fetch_add(1, Ordering::Relaxed);
                 }

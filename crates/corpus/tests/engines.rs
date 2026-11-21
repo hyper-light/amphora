@@ -157,6 +157,7 @@ fn t_g2_4_2_a_file_runs_on_sqlites_shell_or_is_refused() {
         &mut render,
         FILE,
         None,
+        None,
         Limits {
             deadline: None,
             record: Some(std::time::Duration::from_millis(300)),
