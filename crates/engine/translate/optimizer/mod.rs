@@ -3771,6 +3771,10 @@ pub(crate) mod bushy_test_hook {
                 "SELECT count(*), sum(p.w) FROM a, b, c, p WHERE b.x = a.x AND c.y = b.y AND p.z = c.z",
                 "SELECT a.id, b.id, c.id, p.id FROM a JOIN b ON b.x = a.x JOIN c ON c.y = b.y \
                  JOIN p ON p.z = c.z AND p.w > a.x",
+                            "SELECT a.id, b.id, c.id, p.id FROM a, b JOIN c ON c.y = b.y JOIN p ON p.z = c.z \
+                 WHERE a.id = 2",
+                "SELECT a.id, b.id, c.id, p.id, p.w FROM a, b JOIN c ON c.y = b.y \
+                 JOIN p ON p.z = c.z WHERE a.id = 3 AND b.x <> a.x AND p.w > a.x + c.id",
             ];
             APPLIED.with(|applied| applied.set(0));
             let mut compared = 0;
@@ -3792,7 +3796,7 @@ pub(crate) mod bushy_test_hook {
                     compared += 1;
                 }
             }
-            assert_eq!(compared, 8);
+            assert_eq!(compared, 12);
             // Non-vacuity: some of the plans were run bushy.
             assert!(
                 APPLIED.with(Cell::get) > 0,
