@@ -610,10 +610,14 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   cost against the nested loop's early out: the outer rows build the hash table, the subquery's table probes it, and
   `HashMarkFirstMatch` passes each build row on at its first match in a probe pass only (its matched bit, kept in
   grace partitions when the table spills). `tests/hash_semi_join.rs` runs EXISTS queries with NULL and duplicate
-  keys under all three join methods, in memory and spilled, against a model. Index-only reads were already planned
-  (covering indexes). Left: bitmap-style sorted row fetches (a one-branch RowSet read; the multi-index fetch cost
-  assumes page locality and should be learned first), and the 2x measurements on order_by_sort, exists_subquery
-  and left_join_anti (the coordinator's).
+  keys under all three join methods, in memory and spilled, against a model. Sorted row fetches are a prototype behind
+  `Connection::set_sorted_fetches` (off by default): the chosen read of a non-covering index runs as a one-branch
+  multi-index read, its rowids sorted in a RowSet and the rows fetched in rowid order, kept when the existing
+  intersection cost says it is cheaper; `tests/sorted_fetch.rs` runs reads with it off and on. That cost counts the
+  fetch as the share of table pages, which assumes page locality: it should be learned before the switch goes on
+  by default. Index-only reads were already planned (covering indexes, expression indexes included). Left: the 2x
+  measurements on order_by_sort, exists_subquery and left_join_anti, and the sorted fetch's measurement against the
+  plain read (the coordinator's).
 - **The replicated class** (docs/design/replication.md, "Fast acknowledgement"; Ada's word 2026-11-01): built on
   t1/replicated-line, not on main (fast-ack, class-metrics, class-quorum and disk-stalls, merged in that order). A
   replicated database opened with `Durability::Replicated(Fates)` answers a write once members spanning the fates
