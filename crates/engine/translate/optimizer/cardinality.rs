@@ -19,7 +19,7 @@ use super::{
 use crate::schema::{Schema, Table as SchemaTable};
 use crate::translate::{
     expr::{literal_truth, simplified_and_or},
-    plan::{JoinType, JoinedTable, Plan, WhereTerm, WhereTermOrigin},
+    plan::{JoinOrigin, JoinType, JoinedTable, Plan, WhereTerm, WhereTermOrigin},
     planner::TableMask,
 };
 
@@ -155,6 +155,21 @@ struct Table {
     /// restricts to reads it for the same terms (CERT).
     sampled_on: Option<Sampled>,
     sampled_both: Option<Sampled>,
+    /// The ON terms of its own outer join that read none of its columns (`y.c = 3` in `y LEFT JOIN
+    /// x ON y.c = 3`, which `x RIGHT JOIN y ON y.c = 3` becomes, PL.8), found by their origin among
+    /// the WHERE terms and counted by the earlier tables' `on_elsewhere` constraints: they decide
+    /// which left rows match, as its own ON terms do.
+    on_elsewhere: SmallVec<[Elsewhere; 1]>,
+}
+
+/// The ON terms of a later outer join that one earlier table's `on_elsewhere` constraints count.
+struct Elsewhere {
+    table: usize,
+    /// Each constraint's index in the table's `on_elsewhere`, with its pair selectivity as in
+    /// [Counted].
+    counted: SmallVec<[(usize, Option<f64>); 2]>,
+    /// Those terms its sample ran, as a right table's ON terms are (decision 21).
+    sampled: Option<Sampled>,
 }
 
 /// Which of a table's terms its sample runs: its filters, or its own outer join's ON terms.
@@ -294,7 +309,26 @@ impl<'a> JoinedSetRows<'a> {
             class_terms.push(pos);
         }
         let unique_keys = composite_keys(joined_tables, &kinds, &columns, schema);
-        for ((table_idx, joined), keys) in joined_tables.iter().enumerate().zip(keys_by_table) {
+        let on_elsewhere: Vec<SmallVec<[Elsewhere; 1]>> = joined_tables
+            .iter()
+            .map(|joined| {
+                on_elsewhere(
+                    joined,
+                    joined_tables,
+                    constraints,
+                    where_clause,
+                    &pair_terms,
+                    schema,
+                    params,
+                )
+            })
+            .collect();
+        for (((table_idx, joined), keys), on_elsewhere) in joined_tables
+            .iter()
+            .enumerate()
+            .zip(keys_by_table)
+            .zip(on_elsewhere)
+        {
             let kind = kinds.get(table_idx).copied().unwrap_or(Kind::Inner);
             let rows = table_rows(table_idx);
             // Whether a join has null-extended the table by the time a term evaluated after the
@@ -464,6 +498,7 @@ impl<'a> JoinedSetRows<'a> {
                 sampled,
                 sampled_on,
                 sampled_both,
+                on_elsewhere,
             });
         }
         // A WHERE term no row passes (`WHERE NULL`) leaves no rows in any set, whether or not
@@ -670,6 +705,55 @@ impl<'a> JoinedSetRows<'a> {
             )
     }
 
+    /// The share of the pairs of an outer join's left rows and `table`'s rows its ON terms keep:
+    /// its own constraints' and those of its ON terms that read only earlier tables, each counted
+    /// once its tables are ready, as a right table's ON terms are ([Self::selectivity_of]).
+    fn on_selectivity(&self, table: usize, ready: &TableMask) -> f64 {
+        let own = self.selectivity(table, Class::On, ready);
+        let Some(t) = self.tables.get(table) else {
+            return own;
+        };
+        let mut selectivity = own;
+        for e in t.on_elsewhere.iter().filter(|e| ready.get(e.table)) {
+            let Some(table_constraints) = self.constraints.get(e.table) else {
+                continue;
+            };
+            let counted = e
+                .counted
+                .iter()
+                .filter_map(|(at, pair)| {
+                    table_constraints.on_elsewhere.get(*at).map(|c| (c, *pair))
+                })
+                .filter(|(c, _)| {
+                    c.lhs_mask
+                        .iter()
+                        .all(|other| other == e.table || ready.get(other))
+                });
+            let reads_a_table = |c: &(&Constraint, Option<f64>)| !c.0.lhs_mask.is_empty();
+            let alone: f64 = counted
+                .clone()
+                .filter(reads_a_table)
+                .map(|(c, pair)| pair.unwrap_or(c.selectivity))
+                .product();
+            let in_sampled = |c: &Constraint| {
+                e.sampled
+                    .as_ref()
+                    .is_some_and(|s| s.terms.contains(&c.where_clause_pos.0))
+            };
+            let shares: SmallVec<[f64; 1]> = e.sampled.iter().map(|s| s.selectivity).collect();
+            selectivity *= alone
+                * constraints_selectivity(
+                    counted
+                        .filter(|c| !reads_a_table(c))
+                        .map(|(c, _)| c)
+                        .filter(|c| !in_sampled(c)),
+                    &shares,
+                    self.params,
+                );
+        }
+        selectivity
+    }
+
     /// The share of an outer join's matches its other filters keep: what they restrict beyond its
     /// ON terms, `sel(ON and filters) / sel(ON)`, so a filter bounding a column its ON terms bound
     /// makes one range with them, and the matches are never more than the inner join's rows.
@@ -703,7 +787,7 @@ impl<'a> JoinedSetRows<'a> {
             Kind::Left => {
                 // Statistics give an average match count, not its distribution: a Poisson model
                 // gives the chance that a left row matches nothing, and that row is kept once.
-                let matches = t.rows * self.selectivity(table, Class::On, ready);
+                let matches = t.rows * self.on_selectivity(table, ready);
                 let unmatched = (-matches).exp();
                 let only_unmatched = t
                     .counted
@@ -747,7 +831,7 @@ impl<'a> JoinedSetRows<'a> {
         let Some(t) = self.tables.get(table) else {
             return left;
         };
-        let pair = self.selectivity(table, Class::On, ready);
+        let pair = self.on_selectivity(table, ready);
         let matched = left * t.rows * pair;
         let unmatched_right = t.rows * (-(left * pair)).exp();
         let unmatched_left = if t.kind == Kind::Full {
@@ -971,6 +1055,89 @@ fn sampled_filters(
         share.min(super::sample_filter::backoff(&mut own))
     };
     Some(Sampled { terms, selectivity })
+}
+
+/// The ON terms of `joined`'s own outer join that read none of its columns, found by their origin
+/// among the WHERE terms, grouped by the earlier table whose `on_elsewhere` constraint counts each:
+/// a term reading several earlier tables counts once, by its most selective constraint, as a term
+/// with a table on both sides does ([JoinedSetRows::new]). Empty for a table no outer join reaches.
+fn on_elsewhere(
+    joined: &JoinedTable,
+    joined_tables: &[JoinedTable],
+    constraints: &[TableConstraints],
+    where_clause: &[WhereTerm],
+    pair_terms: &[(usize, f64)],
+    schema: &Schema,
+    params: &CostModelParams,
+) -> SmallVec<[Elsewhere; 1]> {
+    let mut found: SmallVec<[Elsewhere; 1]> = SmallVec::new();
+    let own = constraints
+        .iter()
+        .find(|c| c.table_id == joined.internal_id)
+        .map_or(&[][..], |c| &c.constraints[..]);
+    for (pos, term) in where_clause.iter().enumerate() {
+        let of_this_join = term
+            .origin
+            .join_origin()
+            .and_then(JoinOrigin::outer_table)
+            .is_some_and(|outer| outer == joined.internal_id);
+        if !of_this_join || term.consumed || own.iter().any(|c| c.where_clause_pos.0 == pos) {
+            continue;
+        }
+        // The earlier table and constraint that count the term: its most selective.
+        let mut best: Option<(usize, usize, f64)> = None;
+        for (table, table_constraints) in constraints.iter().enumerate() {
+            for (at, c) in table_constraints.on_elsewhere.iter().enumerate() {
+                if c.where_clause_pos.0 == pos
+                    && !c.implied
+                    && best.is_none_or(|(_, _, s)| c.selectivity < s)
+                {
+                    best = Some((table, at, c.selectivity));
+                }
+            }
+        }
+        let Some((table, at, _)) = best else {
+            continue;
+        };
+        let pair = pair_terms
+            .iter()
+            .find(|(p, _)| *p == pos)
+            .map(|(_, selectivity)| *selectivity);
+        match found.iter_mut().find(|e| e.table == table) {
+            Some(e) => e.counted.push((at, pair)),
+            None => {
+                let mut counted = SmallVec::new();
+                counted.push((at, pair));
+                found.push(Elsewhere {
+                    table,
+                    counted,
+                    sampled: None,
+                });
+            }
+        }
+    }
+    for e in found.iter_mut() {
+        let (Some(earlier), Some(table_constraints)) =
+            (joined_tables.get(e.table), constraints.get(e.table))
+        else {
+            continue;
+        };
+        let terms: SmallVec<[usize; 4]> = e
+            .counted
+            .iter()
+            .filter_map(|(at, _)| table_constraints.on_elsewhere.get(*at))
+            .map(|c| c.where_clause_pos.0)
+            .collect();
+        e.sampled = sampled_filters(
+            earlier,
+            &table_constraints.on_elsewhere,
+            where_clause,
+            &|pos| terms.contains(&pos).then_some(false),
+            schema,
+            params,
+        );
+    }
+    found
 }
 
 /// A column's domain, at least one and at most its table's `rows`, and whether it is a count: a
