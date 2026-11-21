@@ -474,7 +474,7 @@ mod tests {
             let folder = FolderBlobs::open(dir.path(), 8).unwrap();
             let sim = SimBlobs::new(8, 10_000, 1 << 20);
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-            let mut key = |rng: &mut Rng| {
+            let key = |rng: &mut Rng| {
                 let n = 1 + rng.below(3);
                 (0..n)
                     .map(|_| {

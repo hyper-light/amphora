@@ -252,9 +252,9 @@ fn drill(seed: u64) {
 }
 
 /// Opens `path` backed up to `blobs` under "db", stamped by `now`.
-fn open_backed_up(
+fn open_backed_up<B: Blobs + 'static>(
     path: &std::path::Path,
-    blobs: &Arc<SimBlobs>,
+    blobs: &Arc<B>,
     now: &Arc<AtomicU64>,
 ) -> (Database, backup::Shipping) {
     let read = Arc::clone(now);
@@ -351,4 +351,88 @@ fn t_t1_12_d2_a_database_backed_up_ships_as_it_commits() {
             "second {second}"
         );
     }
+}
+
+/// The digest of a database holding `rows` in table `t`: the source's rows at a second, as the
+/// model kept them.
+fn oracle_digest(dir: &std::path::Path, name: &str, rows: &Rows) -> backup::RowDigest {
+    let db = Db::open(&dir.join(name)).unwrap();
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    for (id, v) in rows {
+        db.exec(&format!("INSERT INTO t (id, v) VALUES ({id}, '{v}')"))
+            .unwrap();
+    }
+    backup::digest(&db).unwrap()
+}
+
+/// T-T1.12.C1 (AC-T1.12.4): restore-and-check on the folder store. Do: back a database up to a
+/// folder (AMPHORA-BLOBS-8), write a row a second, close it; restore-and-check the newest second
+/// against the model's rows, then against rows that differ. Expect: the newest second is the last
+/// one written, the first check passes, the second fails naming the rows, and the counters say so.
+#[test]
+fn t_t1_12_c1_restore_and_check_on_a_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.db");
+    let blobs = Arc::new(backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap());
+    let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+    let mut model = Rows::new();
+    let mut history: Vec<(u64, Rows)> = Vec::new();
+    let (database, shipping) = open_backed_up(&path, &blobs, &now);
+    database
+        .call(until(), |c| {
+            c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+            Ok(())
+        })
+        .unwrap();
+    history.push((now.load(Ordering::SeqCst), model.clone()));
+    shipping.wait(until(), |s| s.bases >= 1).unwrap();
+    write_seconds(&database, &now, 1..12, &mut model, &mut history);
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    drop(database);
+    let status = shipping.wait(until(), |s| s.ended).unwrap();
+    assert_eq!(status.failures, 0, "{:?}", status.last_failure);
+
+    let last = history.last().unwrap().0.div_ceil(SECOND_NS);
+    let newest = backup::newest_second(blobs.as_ref(), "db", until())
+        .unwrap()
+        .unwrap();
+    assert!(newest >= last, "newest {newest} before the last write's {last}");
+    let counters = backup::CheckCounters::default();
+    let oracle_dir = tempfile::tempdir().unwrap();
+    let source = |second: u64| -> anyhow::Result<Option<backup::RowDigest>> {
+        let rows = at(&history, second).cloned().unwrap_or_default();
+        Ok(Some(oracle_digest(oracle_dir.path(), &format!("o{second}.db"), &rows)))
+    };
+    let check = backup::restore_and_check(
+        blobs.as_ref(),
+        "db",
+        &dir.path().join("check-1.db"),
+        &source,
+        &counters,
+        until(),
+    )
+    .unwrap();
+    assert!(matches!(check, backup::Check::Passed { second, .. } if second == newest), "{check:?}");
+
+    let mut wrong = model.clone();
+    wrong.insert(1, "changed".into());
+    let wrong_source = |_second: u64| -> anyhow::Result<Option<backup::RowDigest>> {
+        Ok(Some(oracle_digest(oracle_dir.path(), "wrong.db", &wrong)))
+    };
+    let check = backup::restore_and_check(
+        blobs.as_ref(),
+        "db",
+        &dir.path().join("check-2.db"),
+        &wrong_source,
+        &counters,
+        until(),
+    )
+    .unwrap();
+    assert!(
+        matches!(check, backup::Check::Failed { why: backup::CheckFailure::Rows { .. }, .. }),
+        "{check:?}"
+    );
+    assert_eq!(counters.passed.load(Ordering::Relaxed), 1);
+    assert_eq!(counters.failed.load(Ordering::Relaxed), 1);
 }
