@@ -54,7 +54,8 @@ fn fill(conn: &Arc<Connection>, rng: &mut ChaCha8Rng, name: &str, rows: usize) {
         let b = if rng.random_range(0..10) == 0 {
             "NULL".to_string()
         } else {
-            rng.random_range(-1_000_000_000_000i64..1_000_000_000_000).to_string()
+            rng.random_range(-1_000_000_000_000i64..1_000_000_000_000)
+                .to_string()
         };
         let c = if rng.random_range(0..10) == 0 {
             "NULL".to_string()
@@ -144,7 +145,12 @@ fn random_query(rng: &mut ChaCha8Rng) -> (Vec<Predicate>, Vec<usize>, Vec<Aggreg
     (filter, group_by, aggregates)
 }
 
-fn to_sql(name: &str, filter: &[Predicate], group_by: &[usize], aggregates: &[Aggregate]) -> String {
+fn to_sql(
+    name: &str,
+    filter: &[Predicate],
+    group_by: &[usize],
+    aggregates: &[Aggregate],
+) -> String {
     let mut select: Vec<String> = group_by.iter().map(|g| COLUMNS[*g].to_string()).collect();
     for aggregate in aggregates {
         select.push(match aggregate {
@@ -218,7 +224,11 @@ fn t_qt_6_7_leaf_morsels_answer_as_the_serial_vdbe() {
     conn.execute("BEGIN").unwrap();
     let count = sql_rows(&conn, "SELECT count(*) FROM t");
     let table = source(&conn, "t");
-    assert!(table.leaves() > 8, "the table spans {} leaves", table.leaves());
+    assert!(
+        table.leaves() > 8,
+        "the table spans {} leaves",
+        table.leaves()
+    );
     let mut parallel_runs = 0usize;
     for _ in 0..60 {
         let (filter, group_by, aggregates) = random_query(&mut rng);
@@ -279,17 +289,18 @@ fn t_qt_6_8_leaf_morsel_probe_matches_the_serial_vdbe_join() {
         let expected: Vec<(i64, i64)> = sql_rows(&conn, &sql)
             .into_iter()
             .map(|row| match (&row[0], &row[1]) {
-                (Value::Numeric(crate::numeric::Numeric::Integer(t)), Value::Numeric(crate::numeric::Numeric::Integer(u))) => (*t, *u),
+                (
+                    Value::Numeric(crate::numeric::Numeric::Integer(t)),
+                    Value::Numeric(crate::numeric::Numeric::Integer(u)),
+                ) => (*t, *u),
                 other => panic!("not two rowids: {other:?}"),
             })
             .collect();
         assert!(!expected.is_empty());
         let build_rows = build_table.rows().unwrap();
-        let build_values: Vec<Vec<Value>> =
-            build_rows.iter().map(|(_, row)| row.clone()).collect();
+        let build_values: Vec<Vec<Value>> = build_rows.iter().map(|(_, row)| row.clone()).collect();
         let budget = MemoryBudget::new(usize::MAX);
-        let probe =
-            HashProbe::build(&build_values, &build_key, &[], &probe_key, &budget).unwrap();
+        let probe = HashProbe::build(&build_values, &build_key, &[], &probe_key, &budget).unwrap();
         let pipeline = TableProbe {
             table: &probe_table,
             probe: &probe,
@@ -334,11 +345,18 @@ fn t_qt_6_9_rowid_alias_and_empty_table() {
     assert!(empty.rows().unwrap().is_empty());
     conn.execute("COMMIT").unwrap();
     for i in 0..2000 {
-        conn.execute(format!("INSERT INTO e VALUES ({}, {})", i * 3 - 500, i % 17))
-            .unwrap();
+        conn.execute(format!(
+            "INSERT INTO e VALUES ({}, {})",
+            i * 3 - 500,
+            i % 17
+        ))
+        .unwrap();
     }
     conn.execute("BEGIN").unwrap();
-    let expected = sql_rows(&conn, "SELECT sum(id), min(id), max(id), count(*) FROM e WHERE v > 4");
+    let expected = sql_rows(
+        &conn,
+        "SELECT sum(id), min(id), max(id), count(*) FROM e WHERE v > 4",
+    );
     let table = TableSource::open(conn.get_pager(), root, 2, Some(0)).unwrap();
     assert!(table.leaves() > 2);
     let filter = [Predicate::Compare {

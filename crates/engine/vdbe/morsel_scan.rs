@@ -13,8 +13,8 @@
 use std::ops::Range;
 
 use super::morsel::{
-    execute, execute_at, Degree, HashProbe, MachineCosts, MemoryBudget, MorselError,
-    ParallelMode, Pipeline, RunStats, ScanAggregate,
+    execute, execute_at, Degree, HashProbe, MachineCosts, MemoryBudget, MorselError, ParallelMode,
+    Pipeline, RunStats, ScanAggregate,
 };
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::{PageRef, Pager};
@@ -51,11 +51,10 @@ impl TableSource {
         rowid_alias: Option<usize>,
     ) -> Result<Self, MorselError> {
         // The bound is the format's: no b-tree has more pages than the database may hold.
-        let most_pages = usize::try_from(pager.get_max_page_count()).map_err(|_| {
-            MorselError::Overflow {
+        let most_pages =
+            usize::try_from(pager.get_max_page_count()).map_err(|_| MorselError::Overflow {
                 what: "the database's page count",
-            }
-        })?;
+            })?;
         let mut level: Vec<LevelPage> = Vec::new();
         level.try_reserve_exact(1)?;
         level.push((root, None, false));
@@ -87,8 +86,9 @@ impl TableSource {
                             let child = contents
                                 .cell_interior_read_left_child_page(cell)
                                 .map_err(storage)?;
-                            let divider =
-                                contents.cell_table_interior_read_rowid(cell).map_err(storage)?;
+                            let divider = contents
+                                .cell_table_interior_read_rowid(cell)
+                                .map_err(storage)?;
                             next.push((i64::from(child), Some(divider), false));
                         }
                         let right = contents
@@ -234,10 +234,7 @@ fn read_page(pager: &Pager, number: i64) -> Result<PageRef, MorselError> {
         .block(|| pager.read_page(number))
         .map_err(storage)?;
     if let Some(completion) = completion {
-        pager
-            .io
-            .wait_for_completion(completion)
-            .map_err(storage)?;
+        pager.io.wait_for_completion(completion).map_err(storage)?;
     }
     Ok(page)
 }
