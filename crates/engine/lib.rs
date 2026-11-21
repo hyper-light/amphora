@@ -133,7 +133,9 @@ pub use cdc::{
 };
 #[cfg(feature = "simulator")]
 pub use connection::SubqueryUnnestingMode;
-pub use connection::{resolve_ext_path, Connection, PrepareOptions, Row, StepResult, SymbolTable};
+pub use connection::{
+    resolve_ext_path, Connection, JoinMethods, PrepareOptions, Row, StepResult, SymbolTable,
+};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 #[cfg(feature = "simulator")]
 pub use database::{clear_database_registry, SharedWalTestingSnapshot};

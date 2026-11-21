@@ -39,7 +39,7 @@ impl GroupTicket {
 }
 
 /// FNV-1a: a key's group stays put from build to build and machine to machine.
-fn fnv(key: &str) -> u64 {
+pub(crate) fn fnv(key: &str) -> u64 {
     key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
     })
