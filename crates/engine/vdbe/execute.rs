@@ -1406,6 +1406,13 @@ pub fn op_open_read(
             "root page should be non negative when we are not in a MVCC transaction"
         );
     }
+    if let Some(switch) = program.connection.versioned.as_ref() {
+        if let Some(cursor) = versioned_cursor(switch, cursor_type, *root_page, &pager)? {
+            replace_cursor(&mut state.cursors, *cursor_id, cursor)?;
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
     let cursors = &mut state.cursors;
     let num_columns = match cursor_type {
         CursorType::BTreeTable(table_rc) => table_rc.columns().len(),
@@ -13759,6 +13766,38 @@ pub fn op_offset_limit(
 // this cursor may be reused for next insert
 // Update: tablemoveto is used to travers on not exists, on insert depending on flags if nonseek it traverses again.
 // If not there might be some optimizations obviously.
+/// Amphora (G7 step 2, `AC-NS.2.1`): with the connection's switch on, the cursor on the versioned
+/// storage's tree at `root_page` for a rowid table or an index; `None` for a cursor of another
+/// kind. A WITHOUT ROWID table is refused until the catalog records a comparison per tree.
+fn versioned_cursor(
+    switch: &crate::storage::versioned::switch::Switch,
+    cursor_type: &CursorType,
+    root_page: i64,
+    pager: &Arc<Pager>,
+) -> Result<Option<Cursor>> {
+    let index = match cursor_type {
+        CursorType::BTreeTable(table) if table.has_rowid => None,
+        CursorType::BTreeTable(_) => {
+            return Err(LimboError::ParseError(
+                "a WITHOUT ROWID table on the versioned storage waits for its catalog (G7 step 2)"
+                    .into(),
+            ))
+        }
+        CursorType::BTreeIndex(index) => Some(Arc::new(IndexInfo::new_from_index(index)?)),
+        _ => return Ok(None),
+    };
+    let cursor = switch.cursor(root_page, index, pager.clone())?;
+    Ok(Some(Cursor::new_btree_dyn(Box::new(cursor))))
+}
+
+fn replace_cursor(cursors: &mut [Option<Cursor>], id: usize, cursor: Cursor) -> Result<()> {
+    cursors
+        .get_mut(id)
+        .ok_or_else(|| LimboError::InternalError(format!("no cursor slot {id}")))?
+        .replace(cursor);
+    Ok(())
+}
+
 pub fn op_open_write(
     program: &Program,
     state: &mut ProgramState,
@@ -13846,6 +13885,13 @@ pub fn op_open_write(
     };
 
     if !can_reuse_cursor {
+        if let Some(switch) = program.connection.versioned.as_ref() {
+            if let Some(cursor) = versioned_cursor(switch, cursor_type, root_page, &pager)? {
+                replace_cursor(cursors, *cursor_id, cursor)?;
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
         let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<BTreeCursor>,
                                             mv_cursor_type: MvccCursorType|
          -> Result<OpenedBTree> {
@@ -14025,6 +14071,19 @@ pub fn op_create_btree(
 
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly.into());
+    }
+    if let Some(switch) = program.connection.versioned.as_ref() {
+        if *db == crate::MAIN_DB_ID {
+            if !flags.is_table() {
+                return Err(LimboError::ParseError(
+                    "an index on the versioned storage waits for its catalog's comparison per tree (G7 step 2)".into(),
+                )
+                .into());
+            }
+            state.registers[*root].set_int(switch.make_table()?);
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
     }
     let mv_store = program.connection.mv_store_for_db(*db);
 

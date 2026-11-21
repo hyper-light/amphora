@@ -490,6 +490,7 @@ enum StatsRefresh {
 pub struct ConnectOpts {
     encryption_key: Option<EncryptionKey>,
     page_codec: Option<Arc<dyn PageCodec>>,
+    versioned: bool,
 }
 
 #[expect(
@@ -503,6 +504,7 @@ impl ConnectOpts {
         Self {
             encryption_key: None,
             page_codec: None,
+            versioned: false,
         }
     }
 
@@ -518,6 +520,14 @@ impl ConnectOpts {
     /// for this connection and is not cached on the shared `Database`.
     pub fn with_page_codec(mut self, page_codec: Arc<dyn PageCodec>) -> Self {
         self.page_codec = Some(page_codec);
+        self
+    }
+
+    /// Amphora (G7 step 2, `AC-NS.2.1`): puts the database's B-trees on the versioned storage
+    /// (`storage::versioned::switch`), made by the first connection that asks; every connection
+    /// made after it uses it too. `AMPHORA_STORAGE=versioned` asks the same for every connection.
+    pub fn with_versioned_storage(mut self) -> Self {
+        self.versioned = true;
         self
     }
 }
@@ -740,6 +750,9 @@ pub struct Database<
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
     page_codec_id: Option<PageCodecId>,
+    /// Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage its connections' B-trees are on,
+    /// once a connection has asked for it (`storage::versioned::switch`).
+    versioned: Mutex<Option<Arc<crate::storage::versioned::durable::Database>>>,
     // Last: release this Database's I/O fields before its scoped registry entry.
     registry_registration: std::sync::OnceLock<ScopedRegistration>,
 }
@@ -897,6 +910,7 @@ impl Database {
             page_codec_id,
 
             durable_storage: None,
+            versioned: Mutex::new(None),
             registry_registration: std::sync::OnceLock::new(),
         };
 
@@ -2507,6 +2521,7 @@ impl Database {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn connect(self: &Arc<Database>, opts: ConnectOpts) -> Result<Arc<Connection>> {
+        self.versioned_storage(opts.versioned)?;
         self._connect(
             false,
             None,
@@ -2666,7 +2681,11 @@ impl Database {
         context: Option<Arc<dyn Any + Send + Sync>>,
     ) -> Result<Arc<Connection>> {
         let encryption_cipher = self.encryption_cipher_mode.get();
+        let versioned = self
+            .versioned_storage(crate::storage::versioned::switch::asked())?
+            .map(crate::storage::versioned::switch::Switch::new);
         let conn = Arc::new(Connection {
+            versioned,
             db: self.clone(),
             context,
             pager: ArcSwap::new(pager),
@@ -2759,6 +2778,18 @@ impl Database {
         // add built-in extensions symbols to the connection to prevent having to load each time
         conn.syms.write().extend(&builtin_syms);
         Ok(conn)
+    }
+
+    /// The versioned storage the connections' B-trees are on: made now if `ask` and not yet made.
+    fn versioned_storage(
+        &self,
+        ask: bool,
+    ) -> Result<Option<Arc<crate::storage::versioned::durable::Database>>> {
+        let mut slot = self.versioned.lock();
+        if slot.is_none() && ask {
+            *slot = Some(crate::storage::versioned::switch::open(&self.path)?);
+        }
+        Ok(slot.clone())
     }
 
     pub fn is_readonly(&self) -> bool {

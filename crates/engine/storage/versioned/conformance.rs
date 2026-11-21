@@ -169,7 +169,7 @@ fn pair(
         })
         .unwrap(),
     );
-    let txn = Arc::new(Mutex::new(vdb.begin().unwrap()));
+    let txn = Arc::new(Mutex::new(Some(vdb.begin().unwrap())));
     let versioned = VersionedCursor::new(vdb, 0, order, Access::Write(txn), pager.clone()).unwrap();
     (btree, Box::new(versioned), pager, (db, conn))
 }
@@ -794,7 +794,7 @@ fn ns_1_1_a_cursor_sees_writes_through_another_cursor_of_its_transaction() {
         .unwrap(),
     );
     let (pager, _db, _conn) = engine();
-    let txn = Arc::new(Mutex::new(vdb.begin().unwrap()));
+    let txn = Arc::new(Mutex::new(Some(vdb.begin().unwrap())));
     let mut w = VersionedCursor::new(
         vdb.clone(),
         0,
