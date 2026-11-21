@@ -311,8 +311,8 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   cursors, CREATE/DROP TABLE and INDEX, DELETE without WHERE, `sqlite_schema` (tree 1) and ANALYZE
   run on it, each SQL transaction one storage transaction, a failed statement undone alone by a
   savepoint. `sql.rs` (`T-NS.2.6`) runs the same SQL on both storages and compares. Not yet: a file
-  database reopened (recovery remakes every tree in rowid order; the header stays the pager's), DROP
-  undone by ROLLBACK, SQL's named SAVEPOINT, a database past the pool's frames or a transaction past
+  database reopened (recovery remakes every tree in rowid order; the header stays the pager's), SQL's
+  named SAVEPOINT, a database past the pool's frames or a transaction past
   its budget (no eviction yet; the budget is the shell's to give); the engine's suites with the
   switch on are the coordinator's run.
 - **Three ways to reach a cached page** (G7 step 3, `NS.3`; `crates/engine/storage/reach`,
@@ -421,10 +421,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   worst of the last thousand holds (`log_bound::GENERATION` gone; replication.md, "Decision (lane constants): a
   generation of restarts ends once it covers its spend"; GN.2); and the replicated owner's tick period is learned
   from its voters' round trips, its flushes, its leader's link and its timer by hyper-timing's law, 10 ms only the
-  start state before they are measured (replication.md, "Decision (lane constants): the owner's tick pace"; TP.1).
+  start state before they are measured (replication.md, "Decision (lane constants): the owner's tick pace"; TP.1); and the raft log is compacted by Ongaro's
+  rule at an expansion learned from the owner's own measured image and replay costs a byte, its machine reporting its
+  image's size (replication.md, "Decision (lane constants): the compaction's expansion learned where it runs"; CT.1); and a
+  command's and an image's envelope is what their encoding adds ("Decision (lane constants): an envelope is what its
+  encoding adds"; EN.1).
   Left: an owner's other descriptors (endpoint, engine files, a replica's log) charged by kind, the core's tick
   counts (twenty an election, two a heartbeat: raft-rs's defaults, fixed in tick mode), the owner's queue
-  and outgoing bounds and the log's compaction trigger, and the rest of the list (handoff/amphora-constants-list.md).
+  and outgoing bounds, and the rest of the list (handoff/amphora-constants-list.md).
 - **Region-local groups under a global root** (CP-T1.11, G14 step 1, lane regions; `crates/amphora/src/regions.rs`,
   docs/design/regions.md): members carry a region label; a regional group's voters and lead stay in its home
   region, and the root spreads its voters so losing the regions it survives leaves a quorum (CockroachDB's
@@ -530,9 +534,14 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   SQLite, DuckDB and Turso through their own shells, PostgreSQL, OrioleDB and CedarDB through `psql`,
   MySQL through `mysql`, ClickHouse through its HTTP interface, each kept open for a file and settled
   before each query; an engine a machine lacks is refused (exit 3), and the nightly runs every one,
-  each on its share of the night's budget, and fails when any couldn't run. Left: the adapters other
-  than SQLite's run only where their programs are (none ran yet: the lane's machine had none), and
-  kiln's queries in the pool (kiln_queries.py needs sqlglot).
+  each on its share of the night's budget, and fails when any couldn't run. Lane corpus-ci-6: an engine's
+  opening, settling and closing statements are bounded by the run's budget (a server that doesn't answer
+  is unreachable, never a hung run); an untyped column is declared BLOB by SQLite's affinity rule 3
+  (DuckDB's comparable records on 40 written files: 152 to 193); Turso's list output, which escapes
+  nothing, is counted again by Turso when an answer disagrees, and a misread one is unreadable, not a
+  disagreement; `CORPUS_BIN_<ENGINE>` may be a command (a client in its server's container). The five
+  server engines ran a pool through the harness on jupiter's Docker (2026-11-21). Left: kiln's queries
+  in the pool (kiln_queries.py needs sqlglot).
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691
@@ -597,6 +606,12 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   at least the time asked; `follower_read_micros` is now less the replica's measured p99 lag. `amphora::search` asks
   partitions at once and merges newest first. Closes with: AC-T1.10.3 and AC-T1.10.4 measured (`amphora-bench
   --cluster`), an idle group's time closed on demand, and the attached client's request on the wire.
+- **Query speed step 6 (QT.6), started** (lane qs6; docs/design/executor.md section 8): built and unit-tested, not
+  measured, not yet in the VDBE's loops. `vdbe/morsel.rs` runs a scan with its filter and aggregates, and a hash join's
+  probe side, in morsels on several threads behind `ParallelMode` (off by default); the worker count and morsel size
+  come from costs measured where it runs, answers equal at every worker count (T-QT.6.1 to T-QT.6.5). Closes with:
+  the VDBE's scan and join loops run through it (a cursor per worker over one snapshot), a shared hash build, loom or
+  shuttle on the dispatcher, worker and morsel metrics, and AC-QT.6.1 to AC-QT.6.4 measured.
 - **Query speed step 5 (QT.5), started** (lane qs5): `Connection::set_join_methods` plans a connection's new
   statements by cost, with index nested loops only, or with hash joins only; `tests/join_methods.rs` (T-QT.5.1) runs
   inner, left, semi and anti joins with NULL and duplicate keys all three ways and against a model. The harness
@@ -749,6 +764,15 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   the cascade a loop with no fixed depth; integers, doubles, strings and nulls round-trip bit for
   bit (T-CS.3.1). Its decode benchmark (`cargo bench -p amphora-columnar --bench decode`) is not yet
   measured against [c18]'s 8 values a cycle.
+  Step 4 (CS.4, lane g11s4), built, not measured: `columns/scan.rs` scans the copy granule by
+  granule, a granule being one of its blocks decoded into column vectors, so its size is the block
+  size the sizer learns, now charged per row of the table so skipped granules count. Each carries
+  min/max and null counts per column and its key range and position; filters skip granules their
+  summaries exclude and run on whole vectors, as do COUNT, SUM (exact for reals), MIN, MAX and
+  group-by. Blocks no change touches are decoded once a generation. Every class equals the row
+  store's answer with writes between scans (T-CS.4.1, T-CS.4.2). Open: driving `Plan` from the
+  morsel executor once `vdbe/morsel.rs` (lane qs6) is on main, the planner's use (step 5), and the
+  benches against CedarDB and ClickHouse (AC-CS.4.1, AC-CS.4.2).
 
 ## Open
 

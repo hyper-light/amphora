@@ -537,6 +537,11 @@ pub(super) fn submit(
         Operation::Call(_) | Operation::Mutation(Mutation::Sql(_) | Mutation::Migrate(_)) => {
             Err(api::invalid("client operation", "unexpected dispatch"))
         }
+        // A group's holding is its own engine's (CP-T1.9), never a remote client's to send.
+        Operation::Mutation(Mutation::Holding(_)) => Err(api::invalid(
+            "holding",
+            "a group's holding is kept by the group's own engine",
+        )),
     }
 }
 

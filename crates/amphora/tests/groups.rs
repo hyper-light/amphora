@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use amphora::db::Db;
 use amphora::groups::Groups;
 use amphora::reshard::directory::{Directory, Proposal};
-use amphora::reshard::driver::{Answer, Driver, Out};
+use amphora::reshard::driver::{Answer, Do, Driver, Failure, Out, Reply};
 use amphora::reshard::holding::{Away, Fenced, replays};
 use amphora::reshard::{GroupId, NodeId, OpId, Pos, Seq, Span, position};
 use amphora::store::{
@@ -397,7 +397,10 @@ fn events(dir: &std::path::Path, name: &str) -> anyhow::Result<Events> {
 }
 
 fn lab(dir: &std::path::Path) -> Groups<Events> {
-    Groups::start(GROUPS, Config::default(), |i| events(dir, &i.to_string())).unwrap()
+    Groups::start(GROUPS, Config::default(), &dir.join("retired"), |i| {
+        events(dir, &i.to_string())
+    })
+    .unwrap()
 }
 
 const COUNT: &str = "SELECT count(*) FROM events WHERE key = ?1";
@@ -526,6 +529,14 @@ fn t_t1_9_r3_a_groups_holding_is_kept_with_its_rows_across_a_restart() {
     assert_eq!(count(&again, &other), 1);
 }
 
+/// The groups `directory` places, on files in `dir`, the groups retired kept there too.
+fn on(dir: &std::path::Path, directory: &Directory) -> Groups<Events> {
+    Groups::on(directory, Config::default(), &dir.join("retired"), |g| {
+        events(dir, &g.0.to_string())
+    })
+    .unwrap()
+}
+
 /// Carries `out` and every action and answer after it to `groups` until the driver is idle,
 /// writing a row to the next of `keys` before each action, and counting each write acknowledged
 /// in `acked` (a write refused while its span is fenced is not acknowledged).
@@ -619,12 +630,7 @@ fn every_key_in_its_group(groups: &Groups<Events>, keys: &[String], acked: &[i64
 fn t_t1_9_r4_a_split_copies_the_moving_ranges_rows_and_a_merge_brings_them_back() {
     let dir = tempfile::tempdir().unwrap();
     let directory = Directory::new(NodeId(0));
-    // Small batches (the test's parameter) so the copy, catch-up and sweep each take several.
-    let config = Config {
-        commit_rows: 4,
-        ..Config::default()
-    };
-    let groups = Groups::on(&directory, config, |g| events(dir.path(), &g.0.to_string())).unwrap();
+    let groups = on(dir.path(), &directory);
     let keys: Vec<String> = (0..64).map(|i| format!("k{i}")).collect();
     let mut acked = vec![0i64; keys.len()];
     for (i, key) in keys.iter().enumerate() {
@@ -689,6 +695,83 @@ fn t_t1_9_r4_a_split_copies_the_moving_ranges_rows_and_a_merge_brings_them_back(
     every_key_in_its_group(&groups, &keys, &acked);
 }
 
+/// T-T1.9.R6 (CP-T1.9; docs/design/reshard.md, "Retired groups kept"): a split and a merge back
+/// through the shell, the split's new group retired by the merge; the node started again by the
+/// directory from before both (a router behind), and the split's Create asked again (a stale
+/// driver); expect the retired group neither started nor made again, empty, but the Create refused
+/// as of an operation that ended, and every acknowledged row still in the one group left.
+#[test]
+fn t_t1_9_r6_a_retired_group_stays_retired_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let directory = Directory::new(NodeId(0));
+    let groups = on(dir.path(), &directory);
+    let keys: Vec<String> = (0..64).map(|i| format!("k{i}")).collect();
+    let mut acked = vec![0i64; keys.len()];
+    for (i, key) in keys.iter().enumerate() {
+        let t = groups.put(vec![row(key, 0)]).unwrap();
+        groups.durable(&t, soon()).unwrap();
+        acked[i] = 1;
+    }
+    let mut next = 0;
+    let (mut driver, _) = Driver::recover(directory.clone(), 1).unwrap();
+    let out = driver
+        .begin(&Proposal::Split {
+            group: GroupId(0),
+            at: 1 << 63,
+        })
+        .unwrap();
+    let create = out
+        .iter()
+        .find_map(|o| match o {
+            Out::Send(a) if matches!(a.what, Do::Create { .. }) => Some(*a),
+            _ => None,
+        })
+        .unwrap();
+    let mut ended = drive(
+        dir.path(),
+        &groups,
+        &mut driver,
+        out,
+        &keys,
+        &mut acked,
+        &mut next,
+    );
+    let out = driver
+        .begin(&Proposal::Merge {
+            from: GroupId(1),
+            into: GroupId(0),
+        })
+        .unwrap();
+    ended += drive(
+        dir.path(),
+        &groups,
+        &mut driver,
+        out,
+        &keys,
+        &mut acked,
+        &mut next,
+    );
+    assert_eq!(ended, 2);
+    assert!(groups.holding_of(GroupId(1)).is_none());
+    groups.sync(soon()).unwrap();
+    drop(groups);
+
+    let again = on(dir.path(), &directory);
+    assert_eq!(again.len(), 1);
+    let reply = again
+        .carry(&create, soon(), |g| events(dir.path(), &g.0.to_string()))
+        .unwrap();
+    assert_eq!(
+        reply,
+        Reply::Failed(Failure::Refused(amphora::reshard::Refused::Ended(
+            create.op
+        )))
+    );
+    assert_eq!(again.len(), 1);
+    again.route(driver.directory()).unwrap();
+    every_key_in_its_group(&again, &keys, &acked);
+}
+
 /// T-T1.9.R5 (CP-T1.9 step 3; the driver's contract, docs/design/reshard.md): the split and merge
 /// of T-T1.9.R4 with every action carried out twice at the real groups (the first answer lost) and
 /// the driver restarted from the directory as it is durable, its stale
@@ -699,11 +782,7 @@ fn t_t1_9_r4_a_split_copies_the_moving_ranges_rows_and_a_merge_brings_them_back(
 fn t_t1_9_r5_repeated_actions_and_driver_restarts_move_every_row_once() {
     let dir = tempfile::tempdir().unwrap();
     let directory = Directory::new(NodeId(0));
-    let config = Config {
-        commit_rows: 4,
-        ..Config::default()
-    };
-    let groups = Groups::on(&directory, config, |g| events(dir.path(), &g.0.to_string())).unwrap();
+    let groups = on(dir.path(), &directory);
     let keys: Vec<String> = (0..64).map(|i| format!("k{i}")).collect();
     let mut acked = vec![0i64; keys.len()];
     for (i, key) in keys.iter().enumerate() {
@@ -824,10 +903,7 @@ fn lab_run(keys: usize, preload: usize, clients: usize, target: u64) -> LabRun {
 
     let dir = tempfile::tempdir().unwrap();
     let directory = Directory::new(NodeId(0));
-    let groups = Groups::on(&directory, Config::default(), |g| {
-        events(dir.path(), &g.0.to_string())
-    })
-    .unwrap();
+    let groups = on(dir.path(), &directory);
     let keys: Arc<Vec<String>> = Arc::new((0..keys).map(|i| format!("k{i}")).collect());
     let acked = Arc::new(Mutex::new(vec![0i64; keys.len()]));
     let all: Vec<usize> = (0..keys.len()).collect();
