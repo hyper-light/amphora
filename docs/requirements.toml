@@ -583,6 +583,19 @@ tests = [
 ]
 
 [[own]]
+id = "TP.1"
+title = "The replicated owner's tick period learned where it runs, not a picked 10 ms"
+criteria = [
+  { id = "AC-TP.1.1", text = "Each voter's round trips are measured from the owner's own heartbeats', pre-votes' and votes' sends and answers, a request timed only once every earlier one to its peer is answered (Karn's rule), with RFC 9002's smoothed estimator; the log's flushes, the leader's link's arrival lateness and the owner's timer lateness are folded beside them" },
+  { id = "AC-TP.1.2", text = "Once an election timeout the period is derived by hyper-timing's law (Ballot, election span, arrival detector, ElectionTiming, TickPace) and the owner ticks, sets its write slot's bounds and its leases at it; before a quorum, the timer and the link are measured it is hyper-timing's start state (TickPace::floor) at the period the owner opened with" },
+]
+tests = [
+  { id = "T-TP.1.1", text = "Requests sent and answered in order, behind unanswered ones, and past the core's count for a lost peer — passes when only an unambiguous request's answer is sampled, at its own round trip" },
+  { id = "T-TP.1.2", text = "A pace fed nothing, then a quorum and the timer, then a near and a far group's heartbeats — passes when it is the start state until the link is measured, then covers the measured election, the far group's period longer than the near one's and neither the start period" },
+  { id = "T-TP.1.3", text = "The driven election, patience and lease tests — passes when each reads its owner's pace and none assumes 10 ms" },
+]
+
+[[own]]
 id = "WK.1"
 title = "The replicated owner wakes on its events and its next deadline, not a picked 1 ms poll"
 criteria = [
@@ -665,6 +678,7 @@ tests = [
   { id = "T-T1.9.R3", text = "A group's holding kept by its own database with its rows: a key fenced, then the groups started again on the same files — passes when the fenced key is still refused, typed, and the group's other keys are still taken" },
   # lane split-merge-6
   { id = "T-T1.9.R4", text = "A group with rows split by the driver through the shell (Groups::carry) while writes go on, then merged back — passes when the moving range's rows, those there before and those written during the copy and catch-up, are in the new group, every acknowledged write is read back from exactly one group, and after the merge the retired group is gone with every row in the one left" },
+  { id = "T-T1.9.R5", text = "The split and merge of T-T1.9.R4 with every action carried twice at the real groups, stale actions carried late and the driver restarted from the durable directory at the third action, the sixth, the twelfth and so on — passes when each operation still ends flipped, every acknowledged write is read back from exactly one group, and the one group left holds every row" },
   { id = "T-T1.9.P1", text = "The cutover-pause harness (AC-T1.9.2): one group of AMPHORA_RESHARD_PAUSE_ROWS rows split by the planner while clients write — prints each cutover's pause and the longest a write waited on a refusal; passes when every acknowledged write is read back from exactly one group" },
   { id = "T-T1.9.L1", text = "The lab harness (AC-T1.9.3): AMPHORA_RESHARD_OPS automatic operations chosen by the planner from measured rows, writes and cores, carried out while clients write — passes when writes lost is 0 and every key is in exactly one group's file" },
 ]
