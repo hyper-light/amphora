@@ -12,6 +12,18 @@ use std::cell::Cell;
 use std::num::NonZero;
 use std::sync::Arc;
 
+/// These tests exercise the pager's page paths (allocations per lookup on each), which the
+/// versioned storage doesn't have: with its switch on (`AMPHORA_STORAGE=versioned`, G7 step 2,
+/// `AC-NS.2.1`) they say so and pass over, and aren't ported. The versioned storage's own pool is
+/// tested in `storage::versioned`.
+fn pager_only() -> bool {
+    let on = amphora_engine::storage::versioned::switch::asked();
+    if on {
+        eprintln!("pager-only: this test exercises the pager's page paths (allocations per lookup on each); the versioned storage has none");
+    }
+    on
+}
+
 /// Counts the allocations made on a thread while it has counting on.
 struct Counting;
 
@@ -112,6 +124,9 @@ fn per_lookup(db: &Arc<Database>, path: PagePath, cache: i64, rows: i64, lookups
 /// allocate less than today's; its hits no more.
 #[test]
 fn g3s3_allocations_per_point_lookup_on_each_page_path() {
+    if pager_only() {
+        return;
+    }
     let rows = 16_000;
     for share in [false, true] {
         let dir = tempfile::tempdir().unwrap();

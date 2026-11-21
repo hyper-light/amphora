@@ -1783,6 +1783,17 @@ impl Database {
                         Err(e) => return Err(e),
                     }
 
+                    // Amphora (G7 step 2, `AC-NS.2.1`): with the B-trees on the versioned
+                    // storage, `sqlite_schema` is its tree 1, not the pager's page 1, which
+                    // holds none of them: the schema is read from there.
+                    let conn = state
+                        .conn
+                        .as_ref()
+                        .ok_or_else(|| LimboError::InternalError("open: no connection past Init".into()))?;
+                    if conn.versioned.is_some() {
+                        conn.load_versioned_schema()?;
+                    }
+
                     // Load custom types from __turso_internal_types if the table
                     // exists and custom types are enabled. The schema loaded by
                     // make_from_btree includes the table definition but not its
@@ -2548,15 +2559,22 @@ impl Database {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn connect(self: &Arc<Database>, opts: ConnectOpts) -> Result<Arc<Connection>> {
+        let made = opts.versioned && self.versioned.lock().is_none();
         self.versioned_storage(opts.versioned)?;
-        self._connect(
+        let conn = self._connect(
             false,
             None,
             opts.encryption_key,
             opts.page_codec,
             None,
             StatsRefresh::Blocking,
-        )
+        )?;
+        // Amphora (G7 step 2): the database was opened on the pager's schema; the storage made
+        // now holds its own (`sqlite_schema` as its tree 1), which the database takes.
+        if made {
+            conn.load_versioned_schema()?;
+        }
+        Ok(conn)
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
