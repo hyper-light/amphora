@@ -612,6 +612,18 @@ tests = [
 ]
 
 [[own]]
+id = "EN.1"
+title = "A replicated command's and an image's envelope is what their encoding adds, not a picked mebibyte"
+criteria = [
+  { id = "AC-EN.1.1", text = "The bound past a command's or an image's page budget is postcard's most for its baseline prefix and declaration, its base, its page list's length and each page's id and length at the one page size admitted" },
+]
+tests = [
+  { id = "T-EN.1.1", text = "The widest prepared transaction at its whole budget — passes when it encodes within its bound, short only by the list length's unused varint bytes" },
+  { id = "T-EN.1.2", text = "The widest image at a lowered budget, and the full budget's arithmetic — passes the same" },
+  { id = "T-EN.1.3", text = "Postcard's varint widths and the declaration's — passes when each matches the encoder" },
+]
+
+[[own]]
 id = "WK.1"
 title = "The replicated owner wakes on its events and its next deadline, not a picked 1 ms poll"
 criteria = [

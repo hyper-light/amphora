@@ -2433,6 +2433,28 @@ by `apply_change`, rarely).
 `compaction_the_factor_is_the_image_cost_over_the_replay_cost` (T-CT.1.2), `compaction_samples_weigh_by_their_bytes`
 (T-CT.1.3), all in `database::compacting`; the driven compaction tests of `database::replicated` (T-CT.1.4).
 
+## Decision (lane constants): an envelope is what its encoding adds (2026-11-21)
+
+Ada's rule: no picked numbers. A replicated command and an image were each bounded by their pages' budget plus
+`ENVELOPE_BYTES`, a mebibyte for what their encoding adds, which nothing measured or derived.
+
+**The decision (EN.1).** The envelope is what postcard's encoding adds to the pages, at the most, from its wire format
+(`replication.rs`): a declared baseline's prefix and its declaration (a varint node and a 32-byte identity), a
+prepared transaction's base index and term (varints, ten bytes at the most), the page list's length (a varint) and
+each page's id (a `u32` varint, five bytes at the most) and length (the page size's varint), for as many pages as the
+budget holds at the one page size `validate_pages` admits. So a command's envelope is a few bytes a page (57 KiB over
+its 32 MiB), an image's the same over its budget, a test's lowered budget included. A read set still rides in what
+a command's entry leaves of its bound, or the write goes without one, as before: a write near its whole budget now
+goes without one sooner.
+
+**What is left.** `SNAPSHOT_BYTES`, the image's own budget (256 MiB), is the seam owner's ruling (c): a memory bound
+from the process memory budget's room for one image, once a learned budget exists. The transport's own framing past
+an entry (`replicated.rs`'s `MESSAGE_BYTES` and `WIRE_BYTES`, two mebibytes each) is the owner's queue piece's.
+
+**Tests.** `envelope_a_command_at_its_widest_fits_its_bound_exactly` (T-EN.1.1),
+`envelope_an_image_at_its_widest_fits_its_bound_exactly` (T-EN.1.2), `envelope_varints_take_seven_bits_a_byte`
+(T-EN.1.3), in `replication::envelope_tests`.
+
 ## A follower's write that read nothing written since its base: read sets (built 2026-11-21, Amphora goal ceea4e0a)
 
 D of goal 9c63f7d4, on top of the write slot (above). In the release A/B, D halved G's write gaps
