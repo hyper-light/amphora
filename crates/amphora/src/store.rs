@@ -191,6 +191,9 @@ pub enum Refused {
     Disk,
     /// The batch's rows are in more than one group ([`crate::groups`]): a batch is one group's.
     Groups,
+    /// The key's group doesn't answer it now ([`crate::reshard::holding::Away`]): it is fenced for
+    /// a cutover (ask again once the directory has flipped), or the router's directory is stale.
+    Away(crate::reshard::holding::Away),
 }
 
 impl std::fmt::Display for Refused {
@@ -204,6 +207,12 @@ impl std::fmt::Display for Refused {
                 "a flush of the store's disk failed; nothing more is made durable until it is started again"
             }
             Self::Groups => "the batch's rows are in more than one group; a batch is one group's",
+            Self::Away(crate::reshard::holding::Away::Fenced(_)) => {
+                "the key's group has fenced it for a cutover; ask again once the directory has flipped"
+            }
+            Self::Away(crate::reshard::holding::Away::Elsewhere) => {
+                "the key's group doesn't hold it: the router's directory is stale"
+            }
         })
     }
 }

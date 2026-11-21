@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use super::{GroupId, NodeId, OpId, Pos, Refused, Span};
 
 /// What an operation does to its span.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     /// The upper part of a group's span goes to a new group beside it.
     Split,
@@ -39,7 +39,7 @@ impl Kind {
 }
 
 /// Where an operation stands, as the directory keeps it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Phase {
     /// The span is being copied to its new group and caught up; its old group still answers it.
     Copying,
@@ -52,7 +52,7 @@ pub enum Phase {
 }
 
 /// One operation: `span` going from group `from` to group `to`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Op {
     pub id: OpId,
     pub kind: Kind,
@@ -74,7 +74,7 @@ pub enum Proposal {
 }
 
 /// A change to the directory, applied in order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Change {
     /// An operation begins; `place` is the node of the group it makes, when it makes one.
     Begin { op: Op, place: Option<NodeId> },
@@ -90,7 +90,7 @@ pub enum Change {
 }
 
 /// The directory.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Directory {
     generation: u64,
     /// In position order, each starting where the one before ends: every position exactly once.
@@ -405,7 +405,7 @@ fn check(spans: &[(Span, GroupId)], groups: &BTreeMap<GroupId, NodeId>) -> Resul
     let mut expected: Option<Pos> = Some(0);
     let mut seen = std::collections::BTreeSet::new();
     for (span, group) in spans {
-        if expected != Some(span.lo()) {
+        if expected != Some(span.lo()) || span.lo() > span.hi() {
             return Err(Refused::Broken("a gap or an overlap between spans"));
         }
         if !groups.contains_key(group) {

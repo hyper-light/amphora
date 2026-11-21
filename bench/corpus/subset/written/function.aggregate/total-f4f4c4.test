@@ -1,0 +1,75 @@
+hash-threshold 8
+
+# written for function.aggregate:total: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+query R rowsort
+SELECT total(a) FROM t1
+----
+21.000
+
+query R rowsort
+SELECT total(b) FROM t1
+----
+0.000
+
+query R rowsort
+SELECT total(c) FROM t1
+----
+10.250
+
+query R rowsort
+SELECT total(e) FROM t1
+----
+10.500
+
+query R rowsort
+SELECT total(DISTINCT a) FROM t1
+----
+21.000
+
+query R rowsort
+SELECT total(a * 2) FROM t1
+----
+42.000
+
+query R rowsort
+SELECT total(length(b)) FROM t1
+----
+21.000
+
+query R rowsort
+SELECT total(c + a) FROM t1
+----
+21.000
+
+query R rowsort
+SELECT total(CASE WHEN a > 2 THEN a END) FROM t1
+----
+18.000
+
+query R rowsort
+SELECT total(coalesce(c, 0)) FROM t1
+----
+10.250
+
+query IR nosort
+SELECT a % 2, total(a) FROM t1 GROUP BY 1 ORDER BY 1
+----
+NULL
+0.000
+0
+12.000
+1
+9.000
