@@ -8,12 +8,17 @@
 //! have found (its key, the index's other columns and the rowid, all held in the table), so both loops share one body from the deferred table seek on,
 //! and the close reads the next match from the hash table in place of the index's next entry.
 //! Rows joined by seeks before the switch are not joined again: the switch comes between outer rows.
+//!
+//! The build is where the inner table is held whole, and so where the plan's estimate of it meets
+//! its count (the re-plan, `optimizer::adaptive::MaterializePoint`): past the estimate's own error,
+//! `JoinSwitchBuilt` sets the table's row counter (PL.9) to the rows counted, and the statement is
+//! prepared again on them before its next run, as is every other statement planned on that table.
 
 use super::*;
 use crate::translate::emitter::AdaptiveJoinCtx;
 use crate::translate::optimizer::adaptive::switch_point;
 use crate::translate::optimizer::learned_costs::LearnedWeights;
-use crate::vdbe::insn::JoinSwitchData;
+use crate::vdbe::insn::{JoinSwitchBuiltData, JoinSwitchData};
 
 /// An inner index seek that may switch to a hash join, with the switch's inputs.
 pub(super) struct AdaptiveSeek<'a> {
@@ -21,6 +26,9 @@ pub(super) struct AdaptiveSeek<'a> {
     seek_def: &'a SeekDef,
     weights: LearnedWeights,
     build_rows: f64,
+    /// ANALYZE's count of the inner table's rows, and its statistics' relative standard error.
+    analyzed_rows: f64,
+    estimate_error: f64,
     index_cursor_id: CursorID,
 }
 
@@ -77,12 +85,18 @@ impl<'a> AdaptiveSeek<'a> {
         }
         let weights = t_ctx.resolver.learned_weights()?;
         let stats = t_ctx.resolver.schema().analyze_stats.table_stats(&btree.name)?;
-        let build_rows = stats.row_count.or_else(|| {
+        let analyzed_rows = stats.row_count.or_else(|| {
             stats
                 .index_stats
                 .values()
                 .find_map(|stat| stat.total_rows)
         })? as f64;
+        let estimate_error = crate::row_changes::statistics_error(stats, analyzed_rows);
+        // The rows the plan counts the table at (PL.9): ANALYZE's with the changes since.
+        let build_rows = match t_ctx.resolver.plan_values() {
+            Some(values) => values.live_rows(&btree.name, analyzed_rows, estimate_error),
+            None => analyzed_rows,
+        };
         // No break-even (a probe costs a seek or more): the join never switches, so none is emitted.
         switch_point(&weights, build_rows).ok()??;
         Some(Self {
@@ -90,6 +104,8 @@ impl<'a> AdaptiveSeek<'a> {
             seek_def,
             weights,
             build_rows,
+            analyzed_rows,
+            estimate_error,
             index_cursor_id: index_cursor_id?,
         })
     }
@@ -194,9 +210,14 @@ impl<'a> AdaptiveSeek<'a> {
         program.preassign_label_to_next_insn(built);
         program.emit_insn(Insn::HashBuildFinalize { hash_table_id });
         program.emit_insn(Insn::JoinSwitchBuilt {
-            switch_id,
-            hash_table_id,
-            target_pc: seek,
+            data: Box::new(JoinSwitchBuiltData {
+                switch_id,
+                hash_table_id,
+                target_pc: seek,
+                table: btree.name.clone(),
+                analyzed_rows: self.analyzed_rows,
+                estimate_error: self.estimate_error,
+            }),
         });
 
         // The probe: this outer row's seek key, looked up in the table.

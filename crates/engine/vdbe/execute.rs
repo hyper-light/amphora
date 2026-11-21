@@ -18809,41 +18809,87 @@ pub fn op_join_switch_hash(
 /// Amphora (PL.13): an adaptive join's hash table, built: kept for probing if it fits its share
 /// of memory, else freed and the switch refused (a probe of a spilled table needs the grace
 /// loop a hash join plans, which an adaptive join has not), the join going on as a nested loop.
+/// Kept, it is the inner table held whole, a materialization point
+/// (`optimizer::adaptive::MaterializePoint`): see [`replan_on_built_rows`].
 pub fn op_join_switch_built(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(
-        JoinSwitchBuilt {
-            switch_id,
-            hash_table_id,
-            target_pc
-        },
-        insn
-    );
-    let spilled = state
+    load_insn!(JoinSwitchBuilt { data }, insn);
+    let held = state
         .hash_tables
-        .get(hash_table_id)
-        .is_some_and(|table| table.has_spilled());
-    if spilled {
-        if let Some(mut table) = state.hash_tables.remove(hash_table_id) {
-            table.close();
+        .get(&data.hash_table_id)
+        .map(|table| (table.has_spilled(), table.held()));
+    match held {
+        Some((true, _)) => {
+            if let Some(mut table) = state.hash_tables.remove(&data.hash_table_id) {
+                table.close();
+            }
+            if let Some(Some(switch)) = state.join_switches.get_mut(&data.switch_id) {
+                switch.refuse();
+            }
+            tracing::debug!(
+                switch = data.switch_id,
+                "adaptive join's hash table spilled: it stays a nested loop"
+            );
+            state.pc = data.target_pc.as_offset_int();
         }
-        if let Some(Some(switch)) = state.join_switches.get_mut(switch_id) {
-            switch.refuse();
+        _ => {
+            program.connection.count_adaptive_join_switch();
+            if let Some((_, (rows, bytes))) = held {
+                replan_on_built_rows(program, data, rows, bytes);
+            }
+            state.pc += 1;
         }
-        tracing::debug!(
-            switch = switch_id,
-            "adaptive join's hash table spilled: it stays a nested loop"
-        );
-        state.pc = target_pc.as_offset_int();
-    } else {
-        program.connection.count_adaptive_join_switch();
-        state.pc += 1;
     }
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Amphora (PL.13, the re-plan): the rows an adaptive join's hash table holds, the whole inner
+/// table, set against the rows the plan counted it at (ANALYZE's with the changes since, PL.9).
+/// Within the estimate's own error the plan stands. Past it the table's row counter is set to the
+/// rows counted, so the statement's planned table has moved and the statement is handed to a
+/// second prepare, on the counted rows, before its next run (`Statement::statistics_moved`); every
+/// other statement planned on the table is too. This run goes on as planned: its answer is right,
+/// and the rows it may have returned already are not returned again.
+fn replan_on_built_rows(program: &Program, data: &JoinSwitchBuiltData, rows: usize, bytes: usize) {
+    use crate::translate::optimizer::adaptive::{MaterializePoint, Replan};
+    let counter = program.connection.db.row_changes.counter(&data.table);
+    let estimate = crate::row_changes::live_rows(
+        data.analyzed_rows,
+        counter.load(crate::sync::atomic::Ordering::Acquire),
+    );
+    // The table's bytes are already held to its share of memory: it spills past it, checked above.
+    let verdict = MaterializePoint::new(estimate, data.estimate_error, u64::MAX).and_then(
+        |mut point| {
+            point.rows(rows as u64, bytes as u64)?;
+            Ok(point.verdict())
+        },
+    );
+    match verdict {
+        Ok(Replan::Again { rows }) => {
+            let changes = i64::try_from(rows)
+                .unwrap_or(i64::MAX)
+                .saturating_sub(data.analyzed_rows as i64);
+            // A count the planner floors to the estimate it already has would plan the same.
+            if crate::row_changes::live_rows(data.analyzed_rows, changes) != estimate {
+                counter.store(changes, crate::sync::atomic::Ordering::Release);
+                program.connection.count_adaptive_replan();
+                tracing::debug!(
+                    table = %data.table,
+                    estimate,
+                    rows,
+                    "adaptive join's build counted past the estimate: planned again"
+                );
+            }
+        }
+        Ok(Replan::Keep) => {}
+        Err(refused) => {
+            tracing::debug!(table = %data.table, %refused, "adaptive join's rows not checked");
+        }
+    }
 }
 
 pub fn op_hash_clear(

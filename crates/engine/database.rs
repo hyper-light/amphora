@@ -2789,6 +2789,7 @@ impl Database {
             sorted_fetches: AtomicBool::new(false),
             adaptive_joins: AtomicBool::new(false),
             adaptive_join_switches: AtomicU64::new(0),
+            adaptive_replans: AtomicU64::new(0),
             vectorized_scans: AtomicBool::new(false),
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),

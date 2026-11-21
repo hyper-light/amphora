@@ -522,6 +522,9 @@ pub struct Connection {
     /// Amphora (PL.13): how many joins switched from seeks to a hash table while running; see
     /// [`Connection::adaptive_join_switches`].
     pub(super) adaptive_join_switches: AtomicU64,
+    /// Amphora (PL.13): how many adaptive joins' hash tables held rows past their estimate's
+    /// error, so their statements are prepared again; see [`Connection::adaptive_replans`].
+    pub(super) adaptive_replans: AtomicU64,
     /// Amphora: see [`Connection::set_vectorized_scans`].
     pub(super) vectorized_scans: AtomicBool,
     /// Per-connection runtime extension loading flag.
@@ -1018,6 +1021,16 @@ impl Connection {
 
     pub(crate) fn count_adaptive_join_switch(&self) {
         self.adaptive_join_switches.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Amphora (PL.13): how many adaptive joins on this connection built a hash table whose rows
+    /// were past the estimate's error, handing their statements to a second prepare.
+    pub fn adaptive_replans(&self) -> u64 {
+        self.adaptive_replans.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn count_adaptive_replan(&self) {
+        self.adaptive_replans.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Amphora (query speed step 7, QT.7; a prototype behind this switch, off by default): newly

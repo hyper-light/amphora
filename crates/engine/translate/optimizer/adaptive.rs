@@ -21,6 +21,8 @@
 //!
 //! The executor drives the join switch: `translate/main_loop/adaptive.rs` emits an index join with
 //! its hash join beside it, and `JoinSwitchStep` (`vdbe/execute.rs`) steps the switch per outer row.
+//! Its hash table, once built, is a materialization point: `JoinSwitchBuilt` sets the rows it holds
+//! against the plan's estimate and, past the estimate's error, has the statement prepared again.
 
 use std::fmt;
 
@@ -237,11 +239,11 @@ impl MaterializePoint {
         })
     }
 
-    /// Counts one row of `bytes` held; past the budget it refuses.
-    pub(crate) fn row(&mut self, bytes: u64) -> Result<(), AdaptiveError> {
+    /// Counts `rows` more rows, `bytes` more held; past the budget it refuses.
+    pub(crate) fn rows(&mut self, rows: u64, bytes: u64) -> Result<(), AdaptiveError> {
         self.rows = self
             .rows
-            .checked_add(1)
+            .checked_add(rows)
             .ok_or(AdaptiveError::CountOverflow {
                 what: "materialized rows",
             })?;
@@ -520,7 +522,7 @@ mod tests {
         ] {
             let mut point = MaterializePoint::new(1_000.0, error, u64::MAX).unwrap();
             for _ in 0..rows {
-                point.row(8).unwrap();
+                point.rows(1, 8).unwrap();
             }
             assert_eq!(point.verdict(), expect, "{rows} rows");
         }
@@ -532,10 +534,10 @@ mod tests {
     fn t_pl_13_3_materialization_is_bounded() {
         let mut point = MaterializePoint::new(10.0, 0.1, 100).unwrap();
         for _ in 0..12 {
-            point.row(8).unwrap();
+            point.rows(1, 8).unwrap();
         }
         assert_eq!(
-            point.row(8),
+            point.rows(1, 8),
             Err(AdaptiveError::MaterializeOverBudget {
                 needed: 104,
                 budget: 100

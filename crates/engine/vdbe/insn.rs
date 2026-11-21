@@ -288,6 +288,22 @@ pub struct JoinSwitchData {
     pub probe_pc: BranchOffset,
 }
 
+/// Amphora (PL.13): an adaptive join's hash table, built (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct JoinSwitchBuiltData {
+    pub switch_id: usize,
+    pub hash_table_id: usize,
+    /// The seek: where the join goes on if the table spilled.
+    pub target_pc: BranchOffset,
+    /// The inner table, as its row counter (PL.9, `row_changes`) names it.
+    pub table: String,
+    /// ANALYZE's count of the inner table's rows.
+    pub analyzed_rows: f64,
+    /// The relative standard error of the statistics that count came from
+    /// (`row_changes::statistics_error`).
+    pub estimate_error: f64,
+}
+
 /// Key columns of a seek that use `IS` instead of `=`, so NULL may match in
 /// them. Most seeks have no such columns, so the empty mask is a null pointer
 /// and only IS-seeks allocate (boxed to keep Insn small).
@@ -2267,11 +2283,10 @@ pub enum Insn {
 
     /// Amphora (PL.13): after an adaptive join's hash table is built: if it spilled past its share
     /// of memory, the switch is refused (the table freed, the join a nested loop from this row on,
-    /// `target_pc` its seek); else on to the probe.
+    /// `target_pc` its seek); else its rows are set against the estimate (a re-plan past the
+    /// estimate's error) and on to the probe.
     JoinSwitchBuilt {
-        switch_id: usize,
-        hash_table_id: usize,
-        target_pc: BranchOffset,
+        data: Box<JoinSwitchBuiltData>,
     },
 }
 

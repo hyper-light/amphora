@@ -2741,18 +2741,20 @@ pub fn insn_to_row(
             0,
             format!("if switch {switch_id} switched goto {}", target_pc.as_debug_int()),
         ),
-        Insn::JoinSwitchBuilt {
-            switch_id,
-            hash_table_id,
-            target_pc,
-        } => (
+        Insn::JoinSwitchBuilt { data } => (
             "JoinSwitchBuilt",
-            *switch_id as i64,
-            *hash_table_id as i64,
-            target_pc.as_debug_int() as i64,
+            data.switch_id as i64,
+            data.hash_table_id as i64,
+            data.target_pc.as_debug_int() as i64,
             Value::build_text(""),
             0,
-            format!("if hash table {hash_table_id} spilled, switch {switch_id} refused: goto {}", target_pc.as_debug_int()),
+            format!(
+                "if hash table {} spilled, switch {} refused: goto {}; else its rows against {}'s estimate",
+                data.hash_table_id,
+                data.switch_id,
+                data.target_pc.as_debug_int(),
+                data.table
+            ),
         ),
         Insn::HashClear { hash_table_id: hash_table_reg } => (
             "HashClear",
