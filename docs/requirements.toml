@@ -700,6 +700,9 @@ tests = [
   { id = "T-T1.9.R5", text = "The split and merge of T-T1.9.R4 with every action carried twice at the real groups, stale actions carried late and the driver restarted from the durable directory at the third action, the sixth, the twelfth and so on — passes when each operation still ends flipped, every acknowledged write is read back from exactly one group, and the one group left holds every row" },
   { id = "T-T1.9.P1", text = "The cutover-pause harness (AC-T1.9.2): one group of AMPHORA_RESHARD_PAUSE_ROWS rows split by the planner while clients write — prints each cutover's pause and the longest a write waited on a refusal; passes when every acknowledged write is read back from exactly one group" },
   { id = "T-T1.9.L1", text = "The lab harness (AC-T1.9.3): AMPHORA_RESHARD_OPS automatic operations chosen by the planner from measured rows, writes and cores, carried out while clients write — passes when writes lost is 0 and every key is in exactly one group's file" },
+  # lane split-merge-7
+  { id = "T-T1.9.R6", text = "A split and a merge back through the shell, the node started again by the directory from before both and the split's Create asked again — passes when the retired group is neither started nor made again but the Create is refused as of an ended operation, and every acknowledged row is in the one group left" },
+  { id = "T-T1.9.R7", text = "A local database as a group's engine, its holding fenced through the shell, then the group started again on the same file — passes when the fenced holding is answered after the restart, kept in the file as the Holding command left it" },
 ]
 
 # lane qs5
@@ -817,6 +820,26 @@ tests = [
 # IDs. It serves AC-T1.4.2 and AC-T1.4.3 (`amphora-bench --vlog`) and T-T1.3.1
 # (crates/engine/tests/versioned_crash.rs).
 
+# lane qs6: query speed step 6 (G5 step 3), parallel execution in morsels (docs/design/executor.md
+# section 8).
+[[own]]
+id = "QT.6"
+title = "Parallel execution across cores: morsel-driven scans, hash joins, index lookups and aggregates"
+criteria = [
+  { id = "AC-QT.6.1", text = "TPC-H SF 10 median best time, the threads used stated, is at most 2,328.8 ms, by bench/planner/record.sh on jupiter, best of 3, each run begun at a load under 2" },
+  { id = "AC-QT.6.2", text = "JOB median best time over the parent's (step 5's end) is at most 0.42" },
+  { id = "AC-QT.6.3", text = "JOB's queries that ran in under 20 ms at the parent take at most 1.05 times as long, each query's best of 3" },
+  { id = "AC-QT.6.4", text = "Answers identical at every worker count; the threads used and the class-for-class comparison in the record" },
+]
+tests = [
+  { id = "T-QT.6.1", text = "Random filters, groupings and aggregates over random tables at 2, 3, 4 and 8 workers and random morsel sizes (vdbe/morsel.rs) — passes when every answer equals the serial one value for value" },
+  { id = "T-QT.6.2", text = "Random equi-joins probed in parallel (vdbe/morsel.rs) — passes when the matches equal the serial probe's in order and a nested loop's" },
+  { id = "T-QT.6.3", text = "A REAL sum's terms in several orders and split across partials — passes when one value, bit for bit" },
+  { id = "T-QT.6.4", text = "A statement whose workers together pass its memory budget — passes when refused with the typed error at every worker count and the budget never passed" },
+  { id = "T-QT.6.5", text = "The degree from stated costs — passes when off and short statements are serial, a long one uses more than one worker and no more than the cores, and morsels grow as dispatch grows against a row's cost" },
+  { id = "T-QT.6.6", text = "Every JOB and TPC-H query at 1, 2, 4, 8, 16 and 32 workers (the coordinator's) — passes when identical answers at every count" },
+]
+
 # lane g3s2
 # Amphora's own IDs for G3, point reads (kiln plan 01a16b0f464172dc80c7a3b9a14acbce): G3.n for its step n.
 
@@ -868,6 +891,7 @@ tests = [
   { id = "T-G3.3.3", text = "crates/engine/tests/shared_pages.rs g3s3_a_byte_flipped_on_disk_is_refused_on_each_page_path — passes when a fresh connection on each path refuses the flipped page with a checksum error" },
   { id = "T-G3.3.4", text = "storage::pager::tests::g3s3_plain_pins_count_as_atomic_pins_do — passes when plain pins count as atomic pins do" },
   { id = "T-G3.3.5", text = "crates/engine/tests/shared_pages.rs g3s3_plain_misses_read_into_the_pages_evictions_leave — passes when a table four times the cache reads today's rows on the plain path and its misses read into recycled pages" },
+  { id = "T-G3.3.6", text = "crates/engine/tests/page_path_allocs.rs — passes when the plain path's point lookups that miss allocate less than today's and its hits no more (a counting allocator; --nocapture prints allocations per lookup, AC-G3.3.2's harness)" },
 ]
 
 # lane qs7

@@ -65,6 +65,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | executor | 5 | An ORDER BY with a LIMIT keeps only the rows its reader takes | [executor.md](design/executor.md#5-an-order-by-with-a-limit-keeps-only-the-rows-its-reader-takes) |
 | executor | 6 | A subquery runs where it is read | [executor.md](design/executor.md#6-a-subquery-runs-where-it-is-read) |
 | executor | 7 | A row's header is parsed once, a cache hit takes no exclusive lock, and the index's terms run before the row is fetched | [executor.md](design/executor.md#7-a-rows-header-is-parsed-once-a-cache-hit-takes-no-exclusive-lock-and-the-indexs-terms-run-before-the-row-is-fetched) |
+| executor | 8 | A scan, its aggregates and a hash join's probe run on every core, in morsels | [executor.md](design/executor.md#8-a-scan-its-aggregates-and-a-hash-joins-probe-run-on-every-core-in-morsels) |
 | executor | 9 | A table scan decodes each leaf once into column batches, behind a switch | [executor.md](design/executor.md#9-a-table-scan-decodes-each-leaf-once-into-column-batches-behind-a-switch) |
 | local-owner-transport | – | Versions (2026-11-06) | [local-owner-transport.md](design/local-owner-transport.md#versions-2026-11-06) |
 | local-owner-transport | – | The tests' budgets (2026-10-31) | [local-owner-transport.md](design/local-owner-transport.md#the-tests-budgets-2026-10-31) |
@@ -133,6 +134,9 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | replication | – | Decision (lane constants): the owner's tick pace (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-the-owners-tick-pace-2026-11-21) |
 | regions | – | Decision (lane regions): region-local groups under a global root, placed by declared survival | [regions.md](design/regions.md#decision-lane-regions-region-local-groups-under-a-global-root-placed-by-declared-survival) |
 | reshard | – | Decision (lane split-merge): split, merge and move as one fenced hand-off, decided by measured share | [reshard.md](design/reshard.md#decision-lane-split-merge-split-merge-and-move-as-one-fenced-hand-off-decided-by-measured-share) |
+| reshard | – | Decision (lane split-merge-7): batches learned where they run | [reshard.md](design/reshard.md#decision-lane-split-merge-7-batches-learned-where-they-run) |
+| reshard | – | Decision (lane split-merge-7): retired groups kept | [reshard.md](design/reshard.md#decision-lane-split-merge-7-retired-groups-kept) |
+| reshard | – | Decision (lane split-merge-7): a local database keeps its holding through its command | [reshard.md](design/reshard.md#decision-lane-split-merge-7-a-local-database-keeps-its-holding-through-its-command) |
 | semantics | 1 | TEXT is well-formed UTF-8 | [semantics.md](design/semantics.md#1-text-is-well-formed-utf-8) |
 | semantics | 2 | atanh's last digit is its platform's C library's | [semantics.md](design/semantics.md#2-atanhs-last-digit-is-its-platforms-c-librarys) |
 | store | 1 | A group commit with no timer | [store.md](design/store.md#1-a-group-commit-with-no-timer) |
