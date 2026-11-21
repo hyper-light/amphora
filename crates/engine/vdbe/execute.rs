@@ -1483,11 +1483,13 @@ pub fn op_open_read(
                 .into());
             }
             let btree_cursor: Box<BTreeCursor> = if table.has_rowid {
+                // Amphora (G3.5): a cursor opened to read may stand on a named leaf.
                 BTreeCursor::new_table(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                     num_columns,
                 )
+                .open_read()
                 .into_boxed()
             } else {
                 BTreeCursor::new_without_rowid_table(
@@ -5577,6 +5579,9 @@ pub fn op_savepoint(
                         return Err(mirror_err);
                     }
                     conn.push_named_savepoint(frame);
+                    if let Some(switch) = conn.versioned.as_ref() {
+                        switch.push_named(name)?;
+                    }
                     if starts_transaction {
                         turso_assert!(
                             !conn.tx_is_poisoned(),
@@ -5613,6 +5618,9 @@ pub fn op_savepoint(
                 }
                 SavepointResult::Release => {
                     let _ = conn.release_named_savepoint_frame(name);
+                    if let Some(switch) = conn.versioned.as_ref() {
+                        switch.release_named(name);
+                    }
                     mirror_named_savepoint_to_active_non_main_databases(
                         &conn,
                         SavepointMirror::Release(name),
@@ -5647,6 +5655,9 @@ pub fn op_savepoint(
                 return Err(LimboError::TxError(format!("no such savepoint: {name}")).into());
             };
             let frame_info = conn.rollback_named_savepoint_frame(name);
+            if let Some(switch) = conn.versioned.as_ref() {
+                switch.rollback_named(name)?;
+            }
             mirror_named_savepoint_to_active_non_main_databases(
                 &conn,
                 SavepointMirror::Rollback(name),
