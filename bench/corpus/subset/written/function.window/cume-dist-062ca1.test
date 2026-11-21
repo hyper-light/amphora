@@ -1,0 +1,65 @@
+hash-threshold 8
+
+# written for function.window:cume_dist: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+query IR nosort
+SELECT a, cume_dist() OVER (ORDER BY a) FROM t1 ORDER BY a
+----
+14 values hashing to d723b6f878cbc6e4035d4978f30556ea
+
+query IR nosort
+SELECT a, cume_dist() OVER (ORDER BY a DESC) FROM t1 ORDER BY a
+----
+14 values hashing to 245ab4b6487223843f4b4071bfa2b4fa
+
+query IR nosort
+SELECT a, cume_dist() OVER (PARTITION BY a % 2 ORDER BY a) FROM t1 ORDER BY a
+----
+14 values hashing to cc828333959ba2a044309c6673b95437
+
+query IR nosort
+SELECT a, cume_dist() OVER (ORDER BY b) FROM t1 ORDER BY a
+----
+14 values hashing to 9a4756ee46c736cdcd3ada40a84cd053
+
+query IR nosort
+SELECT a, cume_dist() OVER (ORDER BY c NULLS FIRST) FROM t1 ORDER BY a
+----
+14 values hashing to 130e3357d6f4084e7d0a48e502e66cc4
+
+query IR nosort
+SELECT a, cume_dist() OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t1 ORDER BY a
+----
+14 values hashing to d723b6f878cbc6e4035d4978f30556ea
+
+query IR nosort
+SELECT a, cume_dist() OVER (ORDER BY a RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t1 ORDER BY a
+----
+14 values hashing to d723b6f878cbc6e4035d4978f30556ea
+
+query IR nosort
+SELECT a, cume_dist() OVER (ORDER BY a GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM t1 ORDER BY a
+----
+14 values hashing to d723b6f878cbc6e4035d4978f30556ea
+
+query IR nosort
+SELECT a, cume_dist() OVER (PARTITION BY b IS NULL ORDER BY a) FROM t1 ORDER BY a
+----
+14 values hashing to 3c28868d13ba45f2b8dc5fef3fcec6ba
+
+query IR nosort
+SELECT a, cume_dist() OVER (ORDER BY e) FROM t1 ORDER BY a
+----
+14 values hashing to 27583a6f8bbff9cf1584fe8aa7427b65

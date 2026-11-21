@@ -1,0 +1,70 @@
+hash-threshold 8
+
+# written for syntax:insert-stmt: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+statement ok
+INSERT INTO t2 VALUES (40, 'v', 4)
+
+statement ok
+INSERT INTO t2(b, c) VALUES ('auto', 5)
+
+statement ok
+INSERT INTO t2 DEFAULT VALUES
+
+statement ok
+INSERT INTO t2 SELECT a + 100, b, a FROM t1 WHERE a IS NOT NULL
+
+query II rowsort
+SELECT count(*), max(a) FROM t2
+----
+14
+106
+
+query IT rowsort
+INSERT INTO t2(a, b) VALUES (50, 'm'), (51, 'n') RETURNING a, b
+----
+50
+m
+51
+n
+
+statement ok
+REPLACE INTO t2 VALUES (40, 'replaced', 0)
+
+statement ok
+INSERT OR REPLACE INTO t2(a, b) VALUES (51, 'again')
+
+statement ok
+WITH v(x) AS (VALUES (60), (61)) INSERT INTO t2(a) SELECT x FROM v
+
+statement ok
+INSERT INTO main.t2 AS t(a, b) VALUES (70, 'alias')
+
+statement error
+INSERT INTO t2 VALUES (1, 'dup', 0)
+
+statement error
+INSERT INTO t2(a, b) VALUES (80)
+
+statement error
+INSERT INTO t2(nope) VALUES (1)
+
+query ITI nosort
+SELECT a, b, c FROM t2 WHERE a >= 40 ORDER BY a
+----
+42 values hashing to f882db71343e9ebc82f8992b6c2f03b0
+
+statement ok
+INSERT INTO t2 VALUES (90, 'x', 1) ON CONFLICT DO NOTHING

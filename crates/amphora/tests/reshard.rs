@@ -821,7 +821,10 @@ fn t_t1_9_s1_a_release_queued_behind_a_retire_is_still_answered() {
             .is_some_and(|q| q.iter().any(|a| matches!(a.what, Do::Retire { .. })))
     };
     while !retiring(&sim) {
-        assert!(sim.deliver_action() || sim.deliver_answer(false), "the move stalled");
+        assert!(
+            sim.deliver_action() || sim.deliver_answer(false),
+            "the move stalled"
+        );
         sim.check(true);
     }
     // The driver restarts before the retire is carried out; past the flip it asks the new group to
@@ -831,9 +834,19 @@ fn t_t1_9_s1_a_release_queued_behind_a_retire_is_still_answered() {
     let to = sim.driver.directory().owner(0).unwrap();
     assert!(matches!(sim.deliver_at(to), Some(Do::Activate { .. })));
     assert!(sim.deliver_answer(false));
-    assert_eq!(sim.queues[&GroupId(0)].len(), 2, "the old retire, then the release");
-    assert!(matches!(sim.deliver_at(GroupId(0)), Some(Do::Retire { .. })));
-    assert!(matches!(sim.deliver_at(GroupId(0)), Some(Do::Release { .. })));
+    assert_eq!(
+        sim.queues[&GroupId(0)].len(),
+        2,
+        "the old retire, then the release"
+    );
+    assert!(matches!(
+        sim.deliver_at(GroupId(0)),
+        Some(Do::Retire { .. })
+    ));
+    assert!(matches!(
+        sim.deliver_at(GroupId(0)),
+        Some(Do::Release { .. })
+    ));
     assert_eq!(sim.quiesce(), 0);
     assert!(sim.driver.idle());
     assert_eq!(sim.ended, 1);

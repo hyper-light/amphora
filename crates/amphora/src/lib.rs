@@ -12,6 +12,7 @@
 //! Amphora: the database kiln keeps every record in: KilnDB made a product (docs/design/README.md,
 //! STATUS.md).
 //!
+//! - [`audit`]: the audit log (CP-T1.7): RFC 6962's Merkle tree over Records, verified on read.
 //! - [`store`]: a database's commit pipeline and its readers (CP-T1.1): one writer with a group
 //!   commit and no timer, durable beside it by a flusher, readers on connections of their own, and
 //!   no checkpoint in a commit's way.
@@ -21,11 +22,13 @@
 //!   by copy, catch-up and a brief cutover (CP-T1.9).
 //! - [`db`]: stores on Amphora's engine (`crates/engine`).
 //! - [`meter`]: what a store counts.
+//! - [`xgroup`]: transactions across groups (CP-T1.10): two-phase commit and Parallel Commits.
 //! - [`memory`]: the memory this process may use, as the system says (the process's page pool is a
 //!   part of it).
 //!
 //! The `amphora` binary says what it is ([`reply`]).
 
+pub mod audit;
 pub mod database;
 pub mod db;
 mod descriptors;
@@ -34,9 +37,11 @@ pub mod memory;
 pub mod meter;
 pub mod replication;
 pub mod reshard;
+pub mod search;
 pub mod sql;
 pub mod store;
 pub mod transport;
+pub mod xgroup;
 
 /// What `amphora` prints for its arguments, where, and the exit status.
 #[derive(Debug, PartialEq, Eq)]

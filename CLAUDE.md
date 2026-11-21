@@ -132,6 +132,7 @@ cargo clippy --workspace --all-targets --locked --target aarch64-apple-darwin --
 cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings
 bash scripts/check-production.sh
 cargo test --workspace --locked
+cargo run --locked -p amphora-corpus -- run bench/corpus/subset --budget-s 120 --times <file>
 python3 scripts/vendor.py check
 ```
 

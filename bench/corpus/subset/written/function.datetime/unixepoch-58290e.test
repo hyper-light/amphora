@@ -1,0 +1,75 @@
+hash-threshold 8
+
+# written for function.datetime:unixepoch: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+query I rowsort
+SELECT unixepoch('2024-01-31')
+----
+1706659200
+
+query I rowsort
+SELECT unixepoch('2024-02-29 12:30:00')
+----
+1709209800
+
+query I rowsort
+SELECT unixepoch('2023-12-31 23:59:59')
+----
+1704067199
+
+query I rowsort
+SELECT unixepoch('2000-01-01')
+----
+946684800
+
+query I rowsort
+SELECT unixepoch('1970-01-01 00:00:00')
+----
+0
+
+query I rowsort
+SELECT unixepoch('2024-03-15 08:05:00.123')
+----
+1710489900
+
+query I rowsort
+SELECT unixepoch('2038-01-19 03:14:07')
+----
+2147483647
+
+query I rowsort
+SELECT unixepoch('1999-12-31T23:00:00')
+----
+946681200
+
+query I rowsort
+SELECT unixepoch('2024-06-30')
+----
+1719705600
+
+query I rowsort
+SELECT unixepoch(2460385.5)
+----
+1710547200
+
+query T rowsort
+SELECT unixepoch(1710460800)
+----
+NULL
+
+query T rowsort
+SELECT typeof(unixepoch('now'))
+----
+integer

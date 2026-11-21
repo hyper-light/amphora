@@ -1,0 +1,65 @@
+hash-threshold 8
+
+# written for function.core:format: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+query T rowsort
+SELECT format('%d-%s', 7, 'x')
+----
+7-x
+
+query T rowsort
+SELECT format('%5.2f', 3.14159)
+----
+ 3.14
+
+query T rowsort
+SELECT format('%-5s|', 'ab')
+----
+ab   |
+
+query T rowsort
+SELECT format('%x', 255)
+----
+ff
+
+query T rowsort
+SELECT format('%%')
+----
+%
+
+query T rowsort
+SELECT format('%q', 'it''s')
+----
+it''s
+
+query T rowsort
+SELECT format('%c', 65)
+----
+6
+
+query T rowsort
+SELECT format('%e', 12345.678)
+----
+1.234568e+04
+
+query T rowsort
+SELECT format('%03d', 7)
+----
+007
+
+query T rowsort
+SELECT format('%s %s', NULL, 1)
+----
+ 1
