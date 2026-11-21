@@ -1408,7 +1408,7 @@ impl BTreeCursor {
                 Some(leaf) if leaf.covers(&rowid) => leaf.cells,
                 _ => {
                     hook.refute(self.descent_skip, self.root_page, page_id);
-                    return Ok(false);
+                    return false;
                 }
             };
         hook.confirm(self.descent_skip, self.root_page);
