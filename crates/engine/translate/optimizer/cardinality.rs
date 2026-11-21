@@ -1224,7 +1224,10 @@ fn column_domain(
     };
     let stats = schema.analyze_stats.table_stats(name);
     let mut distinct = None;
-    for index in schema.get_indices(name).filter(|index| leads(index)) {
+    for index in schema
+        .get_indices(name)
+        .filter(|index| index.is_public() && leads(index))
+    {
         if index.unique && index.columns.len() == 1 {
             return (rows, true);
         }
@@ -1296,7 +1299,11 @@ fn composite_keys(
             }
         }
         for index in schema.get_indices(joined.table.get_name()) {
-            if !index.unique || index.where_clause.is_some() || index.columns.len() < 2 {
+            if !index.is_public()
+                || !index.unique
+                || index.where_clause.is_some()
+                || index.columns.len() < 2
+            {
                 continue;
             }
             let key: Option<SmallVec<[usize; 4]>> = index
@@ -1350,7 +1357,7 @@ fn null_test_of_never_null(
         table
             .table
             .get_column_at(column_pos)
-            .is_some_and(|column| column.is_rowid_alias() || column.notnull())
+            .is_some_and(|column| column.is_rowid_alias() || column.trusted_notnull())
     })
 }
 

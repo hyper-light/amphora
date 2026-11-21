@@ -8,7 +8,7 @@
 )]
 
 use amphora_corpus::amphora::{Amphora, AmphoraRender};
-use amphora_corpus::run::{Outcome, run_file};
+use amphora_corpus::run::{Limits, Outcome, run_file};
 
 const FILE: &str = "hash-threshold 4
 
@@ -61,7 +61,7 @@ fn t_g2_7_2_a_file_runs_on_amphora_as_sqlite_runs_it() {
         &mut render,
         &wrong_hash,
         None,
-        None,
+        Limits::default(),
         &mut |r| {
             if r.outcome != Outcome::Agree {
                 off.push((r.record.line, r.outcome));
@@ -79,7 +79,7 @@ fn t_g2_7_2_a_file_runs_on_amphora_as_sqlite_runs_it() {
         &mut render,
         &fixed,
         None,
-        None,
+        Limits::default(),
         &mut |r| {
             if r.outcome != Outcome::Agree {
                 off.push((r.record.line, r.outcome));
@@ -101,9 +101,58 @@ fn records_past_the_deadline_are_unreached_not_failed() {
         &mut render,
         FILE,
         None,
-        Some(past),
+        Limits {
+            deadline: Some(past),
+            record: None,
+        },
         &mut |_| {},
     )
     .unwrap();
     assert_eq!((counts.agree, counts.disagree, counts.unreached), (0, 0, 6));
+}
+
+/// A table of 100 rows, then a 10-way join of it: 10^20 rows to count, which no machine finishes.
+pub fn endless() -> String {
+    let values: Vec<String> = (1..=100).map(|i| format!("({i})")).collect();
+    let from: Vec<String> = (0..10).map(|i| format!("n t{i}")).collect();
+    format!(
+        "statement ok\nCREATE TABLE n(x INTEGER)\n\nstatement ok\nINSERT INTO n VALUES {}\n\nquery I nosort\nSELECT count(*) FROM {}\n----\n0\n\nquery I nosort\nSELECT 1\n----\n1\n",
+        values.join(", "),
+        from.join(", ")
+    )
+}
+
+/// T-G2.7.4: Do: run a file whose query can't finish, each record bounded (a bound the test picks
+/// as its input; the runner's own comes from the gate's budget). Expect: the engine stops it and
+/// it's classified past the budget, not a disagreement; the statements before it agree, and the
+/// next record still runs (no deadline: a required file) and agrees.
+#[test]
+fn t_g2_7_4_a_record_that_cant_finish_is_stopped_and_classified() {
+    let mut render = AmphoraRender::new().unwrap();
+    let mut seen = Vec::new();
+    let counts = run_file(
+        &mut Amphora::in_memory().unwrap(),
+        &mut render,
+        &endless(),
+        None,
+        Limits {
+            deadline: None,
+            record: Some(std::time::Duration::from_millis(200)),
+        },
+        &mut |r| seen.push(r.outcome),
+    )
+    .unwrap();
+    assert_eq!(
+        seen,
+        [
+            Outcome::Agree,
+            Outcome::Agree,
+            Outcome::PastBudget,
+            Outcome::Agree
+        ]
+    );
+    assert_eq!(
+        (counts.agree, counts.disagree, counts.past_budget),
+        (3, 0, 1)
+    );
 }

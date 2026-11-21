@@ -290,7 +290,7 @@ pub const REPLICA_METRICS: [(&str, &str, &str); 16] = [
     (
         "amphora_replica_quorum_patience_refused_total",
         "counter",
-        "Answer gaps a leading replica refused to learn for its quorum patience, because they passed its ceiling.",
+        "Answer gaps a leading replica refused to learn for its quorum patience, because the host's detector suspected the voter meanwhile.",
     ),
     // As Kiln Metrics agreed it (amphora-constants/names/v1): the falsifier of the owner's own
     // sessions' lease (replication.md, "The owner's own sessions last their role's raft timing").
@@ -459,7 +459,7 @@ pub struct ReplicaCounters {
     pub commits_classic: u64,
     /// The quorum patience in force while this member leads; zero while it follows.
     pub quorum_patience: Duration,
-    /// Answer gaps refused for the patience because they passed its ceiling.
+    /// Answer gaps refused for the patience because the host's detector suspected the voter.
     pub quorum_patience_refused: u64,
     /// Local reads run on this replica's readers, and those turned away by
     /// [`LocalRefusal::ALL`]'s order.

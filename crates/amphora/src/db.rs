@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 pub use amphora_engine::LogFormat;
 use amphora_engine::io::FileSyncType;
 use amphora_engine::{
-    CheckpointMode, Completion, CompletionError, ConnectOpts, Connection, Database, DatabaseOpts,
-    IO, IOExt, LimboError, OpenFlags, OpenOptions, PlatformIO, Row, SqliteDialect, Statement,
-    StepResult, Value,
+    Buffer, CheckpointMode, Completion, CompletionError, ConnectOpts, Connection, Database,
+    DatabaseOpts, IO, IOExt, LimboError, OpenFlags, OpenOptions, PlatformIO, Row, SqliteDialect,
+    Statement, StepResult, Value,
 };
 
 use crate::store::{Checkpointed, Config, Flush, Opener};
@@ -141,6 +141,13 @@ fn in_place(_path: &Path) {}
 /// A connection on a Turso database, with the statements it prepared kept.
 pub(crate) type Pages = Vec<(u32, Vec<u8>)>;
 
+/// What a traced preparation read (`Db::prepare_traced`): its read set, `None` past its bound,
+/// and page 1 as it stood at the session's base.
+pub(crate) struct Traced {
+    pub(crate) reads: Option<Vec<u32>>,
+    pub(crate) page_one: Vec<u8>,
+}
+
 pub struct Db {
     io: Arc<dyn IO>,
     db: Arc<Database>,
@@ -153,6 +160,8 @@ pub struct Db {
     fenced: Arc<AtomicBool>,
     /// The frames of log a restart keeps the log's file for ([`Db::keep_log`]).
     log_kept: u64,
+    /// What a backup asks of this database's writer ([`Db::back_up`]); readers have none.
+    backup: Option<Arc<crate::backup::Hooks>>,
 }
 
 /// What a reader's opener and the flusher keep of their database: the engine's handles, then the
@@ -212,6 +221,7 @@ impl Db {
             owner: None,
             fenced: Arc::new(AtomicBool::new(false)),
             log_kept: log_kept(),
+            backup: None,
         })
     }
 
@@ -307,6 +317,7 @@ impl Db {
             owner: None,
             fenced: Arc::new(AtomicBool::new(false)),
             log_kept: log_kept(),
+            backup: None,
         };
         d.exec("PRAGMA synchronous = NORMAL")?;
         d.exec("PRAGMA foreign_keys = ON")?;
@@ -344,6 +355,7 @@ impl Db {
             owner: self.owner.clone(),
             fenced: Arc::clone(&self.fenced),
             log_kept: self.log_kept,
+            backup: None,
         };
         r.keep_pages(READER_PAGES)?;
         Ok(r)
@@ -373,6 +385,7 @@ impl Db {
                 owner: held.owner.clone(),
                 fenced: Arc::clone(&fenced),
                 log_kept,
+                backup: None,
             };
             r.keep_pages(READER_PAGES)?;
             Ok(r)
@@ -454,9 +467,22 @@ impl Db {
     /// and starts the log from its beginning: whether it did. The log's file keeps its length
     /// (decision 13), unless it holds room for more frames than [`Db::keep_log`] keeps: then it is
     /// cut to nothing, once every frame is in the file (docs/design/store.md, decision 31).
+    ///
+    /// A database backed up ([`Db::back_up`]) starts its log again only once the backup has shipped
+    /// all of it, until the log is past what a restart keeps (decision 31): then it starts again
+    /// and the backup is told its log broke there (docs/design/backup.md).
     pub fn restart_log(&mut self) -> anyhow::Result<bool> {
         self.ensure_unfenced()?;
-        let mode = if self.log_frames()? > self.log_kept {
+        let over = self.log_frames()? > self.log_kept;
+        let (seq, frame) = self.db.wal_end();
+        let shipped = match &self.backup {
+            Some(hooks) => hooks.fence.holds(seq, frame)?,
+            None => true,
+        };
+        if !shipped && !over {
+            return Ok(false);
+        }
+        let mode = if over {
             CheckpointMode::Truncate {
                 upper_bound_inclusive: None,
             }
@@ -464,10 +490,128 @@ impl Db {
             CheckpointMode::Restart
         };
         match self.conn.checkpoint(mode) {
-            Ok(_) => Ok(true),
+            Ok(_) => {
+                if let Some(hooks) = &self.backup {
+                    hooks.fence.ended(seq, frame, !shipped)?;
+                }
+                Ok(true)
+            }
             Err(LimboError::Busy) => Ok(false),
             Err(e) => Err(fail(e)),
         }
+    }
+
+    /// Backs this database up through `hooks` (docs/design/backup.md): each commit made on this
+    /// connection is stamped, and its log starts again only once shipped ([`Db::restart_log`]).
+    /// Only the writer is backed up: it makes every commit.
+    ///
+    /// The engine, as SQLite does, starts a log every frame of which is in the file again by
+    /// itself at the writer's next write, and empties it when its last connection closes: both
+    /// would overwrite frames the backup hasn't shipped, a break in its log. A backed-up writer
+    /// turns both off, so its log starts again only through [`Db::restart_log`] (CP-T1.12,
+    /// T-T1.12.D1). Its checkpoints after commits are off already (`wal_autocheckpoint = 0`).
+    pub fn back_up(&mut self, hooks: Arc<crate::backup::Hooks>) {
+        self.hold_log();
+        self.backup = Some(hooks);
+    }
+
+    /// Turns off the engine's own restart of the log at this connection's next write and its
+    /// emptying of the log when this connection closes last ([`Db::back_up`]).
+    pub(crate) fn hold_log(&self) {
+        self.conn.wal_auto_actions_disable();
+    }
+
+    /// The frames of log a restart keeps the log's file for ([`Db::keep_log`]): the most a log
+    /// holds between restarts.
+    pub(crate) fn log_kept_frames(&self) -> u64 {
+        self.log_kept
+    }
+
+    /// Stamps the commit that just ended, if this database is backed up and one did.
+    fn marked(&self) -> anyhow::Result<()> {
+        if let Some(hooks) = &self.backup
+            && self.conn.get_auto_commit()
+        {
+            let (seq, frame) = self.db.wal_end();
+            if frame > 0 {
+                hooks.marks.committed(seq, frame)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The log's generation and its last committed frame.
+    pub(crate) fn log_end(&self) -> (u32, u64) {
+        self.db.wal_end()
+    }
+
+    /// `len` bytes of the log's file from `offset`; None when there is no log file.
+    pub(crate) fn read_log(&self, offset: u64, len: usize) -> anyhow::Result<Option<Vec<u8>>> {
+        self.read_at(&wal_path(&self.path).display().to_string(), offset, len)
+    }
+
+    /// `len` bytes of the database's file from `offset`.
+    pub(crate) fn read_file(&self, offset: u64, len: usize) -> anyhow::Result<Vec<u8>> {
+        self.read_at(&self.path.display().to_string(), offset, len)?
+            .ok_or_else(|| anyhow::anyhow!("{} is gone", self.path.display()))
+    }
+
+    /// The bytes the database's file holds.
+    pub(crate) fn file_bytes(&self) -> anyhow::Result<u64> {
+        let file = self
+            .io
+            .open_file(&self.path.display().to_string(), OpenFlags::NoLock, false)
+            .map_err(fail)?;
+        file.size().map_err(fail)
+    }
+
+    fn read_at(&self, path: &str, offset: u64, len: usize) -> anyhow::Result<Option<Vec<u8>>> {
+        let file = match self.io.open_file(path, OpenFlags::NoLock, false) {
+            Ok(file) => file,
+            Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::NotFound,
+                _,
+            ))) => return Ok(None),
+            Err(e) => return Err(fail(e)),
+        };
+        if len == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let got: Arc<std::sync::Mutex<Option<Vec<u8>>>> = Arc::default();
+        let into = Arc::clone(&got);
+        let completion = Completion::new_read(Arc::new(Buffer::new_temporary(len)), move |read| {
+            if let Ok((buffer, n)) = read
+                && let Ok(n) = usize::try_from(n)
+                && let Some(bytes) = buffer.as_slice().get(..n)
+                && let Ok(mut slot) = into.lock()
+            {
+                *slot = Some(bytes.to_vec());
+            }
+            None
+        });
+        let completion = file.pread(offset, completion).map_err(fail)?;
+        self.io.wait_for_completion(completion).map_err(fail)?;
+        let bytes = got
+            .lock()
+            .map_err(|_| anyhow::anyhow!("a read's lock was poisoned"))?
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("reading {path} failed"))?;
+        if bytes.len() != len {
+            anyhow::bail!("{path} held {} bytes at {offset}, not {len}", bytes.len());
+        }
+        Ok(Some(bytes))
+    }
+
+    /// Copies the whole log into the file and empties it, with no reader reading: a restore's
+    /// replay of one generation (docs/design/backup.md).
+    pub(crate) fn fold_log(&mut self) -> anyhow::Result<()> {
+        self.ensure_unfenced()?;
+        self.conn
+            .checkpoint(CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            })
+            .map(|_| ())
+            .map_err(fail)
     }
 
     /// The frames the log holds now, as this connection last saw it: for a writer, all of them.
@@ -556,6 +700,7 @@ impl Db {
         // A failed script may have executed DDL before refusing. Invalidate on its actual schema,
         // including rollback and raw-image reparses, without flushing every BEGIN/COMMIT.
         self.statements.schema(self.conn.current_schema())?;
+        self.marked()?;
         result
     }
 
@@ -582,7 +727,7 @@ impl Db {
         if same_schema(&schema, &current) {
             self.statements.put(sql, stmt, marked)?;
         }
-        Ok(())
+        self.marked()
     }
 
     pub fn changes(&self) -> i64 {
@@ -806,6 +951,61 @@ impl Db {
         result
     }
 
+    /// `prepare_pages`, answering also what the session read: its read set (`None` when it read
+    /// more than `bound` pages, as if unknown) and page 1 as it was at the session's base. The
+    /// record ends before capture: capturing reads every dirty page again, which the session itself
+    /// may not have read (replication.md, "A follower's write that read nothing written since its
+    /// base: read sets").
+    pub(crate) fn prepare_traced<R>(
+        &mut self,
+        max_bytes: usize,
+        bound: u64,
+        f: impl FnOnce(&mut Self) -> anyhow::Result<R>,
+    ) -> anyhow::Result<(R, Pages, Traced)> {
+        self.exec("BEGIN IMMEDIATE")?;
+        let pager = self.conn.get_pager();
+        let result = self.page_one().and_then(|page_one| {
+            pager.record_access(bound).map_err(fail)?;
+            let answer = f(self)?;
+            let access = pager.take_access().map_err(fail)?;
+            let pages = pager.transaction_image(max_bytes).map_err(fail)?;
+            let reads = (!access.overflowed()).then(|| access.read().collect());
+            Ok((answer, pages, Traced { reads, page_one }))
+        });
+        pager.end_access();
+        // A prepared transaction never leaves an engine commit marker, even when capture fails.
+        self.exec("ROLLBACK")?;
+        result
+    }
+
+    /// Page 1's bytes in the transaction under way.
+    fn page_one(&self) -> anyhow::Result<Vec<u8>> {
+        let pager = self.conn.get_pager();
+        let (page, completion) = self.io.block(|| pager.read_page(1))?;
+        if let Some(completion) = completion {
+            self.io.wait_for_completion(completion).map_err(fail)?;
+        }
+        if !page.is_loaded() {
+            anyhow::bail!("page 1 was not loaded");
+        }
+        Ok(page.get_contents().as_ptr().to_vec())
+    }
+
+    /// The root page of table `name`: the replica's marker table's, which every apply writes.
+    pub(crate) fn root_page(&self, name: &str) -> anyhow::Result<u32> {
+        let mut root = None;
+        self.query_owned(
+            "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+            [Value::from_text(name.to_string())],
+            |row| {
+                root = Some(row.get::<i64>(0)?);
+                Ok(false)
+            },
+        )?;
+        let root = root.ok_or_else(|| anyhow::anyhow!("table {name} has no root page"))?;
+        Ok(u32::try_from(root)?)
+    }
+
     /// The pages an image of this database holds now, and their bytes.
     fn image_extent(&self) -> anyhow::Result<(u32, usize)> {
         let pager = self.conn.get_pager();
@@ -888,6 +1088,7 @@ impl Db {
         match result {
             Ok(answer) => {
                 self.conn.wal_insert_end(true).map_err(fail)?;
+                self.marked()?;
                 // An installed image can replace a catalog at an equal or older schema cookie.
                 // Publish that exact committed schema so readers cannot re-adopt the old one.
                 self.conn
@@ -914,6 +1115,61 @@ impl Db {
         each: impl FnMut(&Row) -> anyhow::Result<bool>,
     ) -> anyhow::Result<()> {
         self.query_owned(sql, params, each)
+    }
+
+    /// The schema cookie moved on and this writer's schema read again inside its transaction, for an
+    /// online schema change's state rows (`amphora_engine::schema::INDEX_STATES_TABLE`) to take:
+    /// the writer sees them at once, every other connection at the cookie when this commits
+    /// (CP-T1.12, docs/design/online-schema.md). The caller holds the write transaction.
+    pub(crate) fn restage_schema(&self) -> anyhow::Result<()> {
+        let mut version = None;
+        self.query("PRAGMA schema_version", [], |row| {
+            version = Some(row.get::<i64>(0).map_err(fail)?);
+            Ok(false)
+        })?;
+        // The cookie is a 32-bit field of the database header (sqlite.org/fileformat2.html, offset
+        // 40), which the engine's SetCookie writes as an i32.
+        let next = version
+            .and_then(|v| v.checked_add(1))
+            .filter(|v| i32::try_from(*v).is_ok())
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| anyhow::anyhow!("the schema cookie can't move past {version:?}"))?;
+        // Not `PRAGMA schema_version = n`: the engine makes that a no-op (SQLite's defensive mode),
+        // so the cookie would stay, and readers would keep the schema from before the step. This
+        // writes the header's cookie, marks the transaction's schema changed (published to every
+        // connection when it commits) and reads this writer's schema again.
+        self.conn.write_schema_version(next).map_err(fail)?;
+        self.statements.schema(self.conn.current_schema())?;
+        Ok(())
+    }
+
+    /// One batch of a write-only index's backfill (CP-T1.12): the rows after rowid `after`, at most
+    /// `rows`, each given its entry. The last rowid it visited (None: none was past `after`) and
+    /// how many it visited. The caller holds the write transaction.
+    pub(crate) fn index_backfill(
+        &self,
+        index: &str,
+        after: Option<i64>,
+        rows: u64,
+    ) -> anyhow::Result<(Option<i64>, u64)> {
+        self.ensure_unfenced()?;
+        let mut stmt = self
+            .conn
+            .prepare_index_backfill(index, after, rows)
+            .map_err(fail)?;
+        let mut answer = None;
+        step(self.io.as_ref(), &mut stmt, [], |row| {
+            let last = match row.get::<&Value>(0).map_err(fail)? {
+                Value::Null => None,
+                _ => Some(row.get::<i64>(0).map_err(fail)?),
+            };
+            let visited = u64::try_from(row.get::<i64>(1).map_err(fail)?)?;
+            answer = Some((last, visited));
+            // Run on to its Halt: a write statement stopped at its row is abandoned unfinished,
+            // and the engine then refuses the transaction's commit.
+            Ok(true)
+        })?;
+        answer.ok_or_else(|| anyhow::anyhow!("the backfill of {index} answered nothing"))
     }
 
     /// `f` in one transaction: committed if it returns Ok and the commit goes through, rolled back

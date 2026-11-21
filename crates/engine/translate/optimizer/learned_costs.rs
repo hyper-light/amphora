@@ -75,7 +75,11 @@ impl Rate {
     fn nanos_per_unit(&self) -> Option<f64> {
         let units = self.previous.units + self.current.units;
         let nanos = self.previous.nanos + self.current.nanos;
-        (units > 0.0 && nanos > 0.0).then_some(nanos / units)
+        if units > 0.0 && nanos > 0.0 {
+            Some(nanos / units)
+        } else {
+            None
+        }
     }
 }
 

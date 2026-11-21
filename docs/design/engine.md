@@ -245,24 +245,29 @@ at commit.
 
 **Built** (`storage/versioned/redo.rs`): one record a commit (its changes, its timestamp, each
 record's length and XXH3), appended under the clock's publish lock to the pending bytes of the
-current one of two files; whoever next needs a commit durable takes the flush lock and writes and
-flushes everything pending at once, so one flush serves every commit appended before it began, with
-no timer. A flush that fails stops the log: nothing more is logged or made durable until the
-database is reopened (store.md, decision 9). Recovery reads each file up to its first torn or
-damaged record and cuts the file there, so an append past it can't leave a torn record's leftovers
-to be read back behind it.
+writer's lane (decision 11; one lane is the one log this decision describes); whoever next needs a
+commit durable takes a lane's flush lock and writes and flushes everything pending in it at once, so
+one flush serves every commit appended to the lane before it began, with no timer. A flush that
+fails stops the log: nothing more is logged or made durable until the database is reopened
+(store.md, decision 9). Recovery reads each file up to its first torn or damaged record and cuts the
+file after the last record it replays, so an append past it can't leave a torn record's leftovers to
+be read back behind it.
 
 **Falsified by.** An acknowledged commit lost after a crash at any write (crash injection,
 T-T1.3.1); log bytes per row on the suite not less than a quarter of page-a-frame's.
 
 ## 7. Checkpoints: dirty pages copied in a pause, and the rows to correct
 
-**Decision.** A checkpoint holds a gate exclusive (each row change, commit and rollback holds it
-shared for as long as it changes pages or publishes), takes the last commit's timestamp T and
-switches the redo log's file at it, copies every page changed since the last checkpoint and lists
-the rows whose copied version isn't their version as of T (changes of transactions still open),
-each with that version. Taken under the gate, T splits no commit, and no commit after it exists
-until the gate is released. The pause is the copies' memory time. The copies, the list and T go into
+**Decision.** A checkpoint holds a gate exclusive for a pause (each row change, commit, rollback
+and collection holds it shared for as long as it changes pages or publishes): it takes the last
+commit's timestamp T and switches the redo log's turn at it, ends the buffer pool's epoch of writes,
+and lists the rows whose version in the pages isn't their version as of T (changes of transactions
+still open), each with that version. Taken under the gate, T splits no commit, and no commit after
+it exists until the gate is released. After the pause, while writers go on, it copies every page
+written in the epoch it ended as the page was at the pause, by copy-on-update: a page no one has
+written since is copied under its shared latch; a writer reaching such a page first keeps its bytes
+before its change (at most one kept page a frame), and the checkpoint takes those. The pause is the
+list's time, bounded by the rows with versions, not by the pages written. The copies, the list and T go into
 a checkpoint journal, flushed; then the copies and a header naming the checkpoint are written over
 the data file, flushed; then the redo file switched from, which holds only commits up to T, is cut.
 Journals take turns by the checkpoint's sequence number, so a checkpoint never writes over the
@@ -278,12 +283,15 @@ changes, which split as they must. The pause, not the I/O, is what writers wait 
 
 **Sources.** InnoDB's doublewrite buffer (MySQL reference manual, "Doublewrite Buffer"): pages
 written whole to one place, flushed, then over their homes, so a torn write is repaired from the
-first copy. SQLite's write-ahead log backfill (sqlite.org/wal.html) for the same order. Mohan et
+first copy. Cao, Vaz Salles, Sowell, Yue, Gehrke, Demers, White, "Fast Checkpoint Recovery
+Algorithms for Frequently Consistent Applications" (SIGMOD 2011): copy-on-update, a consistent
+image taken while updates go on, each update copying what it changes first. SQLite's write-ahead log backfill (sqlite.org/wal.html) for the same order. Mohan et
 al., ARIES (ACM TODS 17(1), 1992), for what the list replaces: undo of uncommitted changes from
 records logged before each page write.
 
 **Falsified by.** A file after recovery that holds a change of a transaction that never committed,
-or misses one that did; a pause longer than the copies' memory time.
+or misses one that did; a commit's p99.9 while checkpoints run more than 1 ms above its p99.9
+without them (AC-T1.4.3, `amphora-bench --vlog`).
 
 ## 8. Recovery: the file's pages, the last journal, its list, then the redo after T
 
@@ -291,8 +299,12 @@ or misses one that did; a pause longer than the copies' memory time.
 header names (a damaged header, any complete journal) and writes its pages and header over the
 data file again: a power cut may keep a checkpoint's header and not every page it wrote. It then
 applies the journal's list (each row back to its version as of T), replays every redo record
-committed after T, in timestamp order across both files, and clears the versions' flags (no
-snapshot outlives the process), removing the cells of removed rows. A data file with no complete
+committed after T, in timestamp order across every lane's files up to the first timestamp none holds
+(decision 11), and clears the versions' flags (no snapshot outlives the process), removing the cells
+of removed rows. The lanes' files are read side by side and the list and records replayed side by
+side, each row's changes in their order on one thread of as many as the machine runs (SiloR: Zheng,
+Tu, Liskov, Madden, "Fast Databases with Fast Durability and Recovery Through Multicore
+Parallelism", OSDI 2014), which leaves each row as replaying in order would. A data file with no complete
 journal is made anew only when it is empty and no commit is logged; otherwise it is refused as
 corrupt, never replaced by an empty database.
 
@@ -335,6 +347,47 @@ without rewriting the newest journal, making a database whenever the header is u
 checkpoints that don't stop the log when they fail, redo tails left uncut, and versions left on
 recovered cells (which fails five).
 
+**The cursor** (stage 3's first step, NS.1, `storage/versioned/cursor.rs`). `VersionedCursor`
+implements `CursorTrait` on one tree of a `durable::Database`, reading as a snapshot sees it and
+writing in a transaction (`Access`), so the executor reaches it through the `Cursor::Dyn` slot the
+MVCC cursor uses. Keys: a table's are its rowids, 8 bytes big-endian with the sign bit flipped (a
+format value: the bytes order as the integers); an index's (and a WITHOUT ROWID table's) are its
+records with an empty value, ordered by the index's columns and then by the record's bytes, so a
+cell's key is exactly the record put. A record equal on the columns but not in its bytes (another
+spelling under NOCASE, a WITHOUT ROWID row's other columns) replaces the one the executor's seek
+placed the cursor on by removal and insertion, so each snapshot sees the record it saw: a B-link
+cell's key never changes in place. The cursor holds no latch between calls. It copies the rows of
+one leaf its snapshot sees, under the leaf's shared latch, with the frame's version, and while the
+version stays the copy is the leaf; once it moves (any write to the leaf) the cursor finds its row
+again by its key. That is how it sees its transaction's writes through another cursor, as SQLite's
+cursors do after `saveAllCursors`. Moving on from a copy's last row follows the right link; moving
+back from its first descends to the leaf just short of its lower bound, as the leaves link only to
+the right. A seek is a point between keys: a table's just short of or just past its rowid's key, an
+index's placed by the executor's record comparison with SQLite's tie-breakers
+(`get_tie_breaker_from_seek_op`). An exact seek is placed as its inexact kind is, then asked whether
+the record found equals the key. A delete leaves the cursor in the removed row's gap: the next row is
+the first after it, the previous the last before it.
+
+*Evidence.* `storage/versioned/conformance.rs`: random sequences of 2,000 operations each, in the
+executor's grammar (an insert after the seek for its key, a delete of the row the cursor is on, steps
+from a row or a write, every seek kind with `TryAdvance` followed by its step), on the current
+engine's B-tree cursor and the versioned one through `CursorTrait`, compared after every step (the
+seek's answer, whether the cursor is on a row, its rowid and record) and in full at the end. It runs
+on a table, an ascending binary index of (a, b, rowid), and an index whose first column descends and
+whose second compares under NOCASE, with records that differ only in case put over each other. Beside
+it: a reading cursor walks and seeks its snapshot exactly while 4 writers commit rows into its leaves
+and split them; a cursor sees writes made through another cursor of its transaction; a reading
+cursor refuses writes (`ReadOnly`).
+
+*Falsified by.* A sequence of the executor's operations after which the two cursors differ; a
+snapshot's walk that misses or repeats a row while other transactions split its leaves.
+
+*What step 2 needs from it.* A comparison per tree (`Database::open` takes one for all trees; an
+index's is `KeyOrder::index`), trees made and dropped by the catalog (`btree_destroy` is refused
+until then), overflow for rows past a cell's bound (refused now, `TooBig`), the connection's
+transaction behind `Access::Write` (begin, commit, rollback, savepoints from decision 4's versions),
+and the connection's pager for `get_pager`.
+
 ## 10. Memory: versions pruned between snapshots, one budget, typed refusals
 
 **Decision.** Collection keeps, of a row's older versions, only those an open snapshot sees: for
@@ -371,6 +424,51 @@ and SSI), T-G8.2.2 and T-G8.2.3.
 its limit, an untyped failure, a scan that isn't its snapshot's, or bytes not given back; or a
 workload whose refusals under the budget a version store out of memory (LeanStore's graveyard)
 would have avoided at a cost the suite accepts (the step this leaves open).
+
+## 11. The log in lanes: one group-committed log, or a log a writer
+
+**Decision.** The redo log is in lanes, each its own pair of files; a writer takes a lane
+(`Database::lane`) and appends its commits' records to it. One lane is one group-committed log (decision
+6); a lane a writer is per-thread logging. Commit timestamps run with no gap, every commit logging
+one record under the publish lock, so the lanes merge by timestamp alone: a commit is acknowledged
+once every lane is durable through it (a lane holding nothing at or before it already is, with no
+I/O; one holding some is flushed by whichever waiting thread takes its lock first), and recovery
+replays from the checkpoint to the first timestamp no lane holds, then cuts every lane after the
+last record it replayed, so a record past a gap (never acknowledged) can't be read back beside the
+commit that takes its timestamp next. No timer and no group size: each flush carries what arrived
+in its lane while the one before it ran, so groups follow the device's flush time as it is, flush
+by flush (`Database::log_counters`: flushes and the records they carried). On Linux, with the
+engine's `io_uring` feature, a flush is its write and a data flush linked in one submission, a ring
+a file (`storage/versioned/uring.rs`); elsewhere a positional write and `sync_data`.
+
+**Why.** One log's flush lock makes every commit wait for the flush before its own: up to two
+flushes. Lanes flushing side by side put as many flushes in flight as there are writers, which NVMe
+serves at once; whether the file system lets them overlap (btrfs commits its log one flush at a time,
+store.md decision 4) is what the measurement decides, lane count 1 against one a core, on the same
+binary.
+
+**Sources.** Haubenschild, Sauer, Neumann, Leis, "Rethinking Logging, Checkpoints, and Recovery for
+High-Performance Storage Engines" (SIGMOD 2020): a log per worker thread, merged at recovery; their
+remote-flush avoidance acknowledges a commit before other logs are durable when it depends on none of
+them, which recovers a set of commits closed under dependency, not a prefix: this storage keeps the
+prefix (decision 8's falsifier), and pays for it only where another lane holds an earlier commit not
+yet durable. Haas, Leis, "What Modern NVMe Storage Can Do, And How To Exploit It" (PVLDB 16(9),
+2023): NVMe needs many requests in flight, and io_uring puts them there. Johnson et al., Aether
+(above): flush pipelining.
+
+**Evidence.** `redo.rs`'s tests: a commit on one lane flushes it and every lane holding an earlier
+commit, and no idle lane; 8 threads on 4 lanes merge back in order; the merge stops at the first
+missing commit and cuts each lane there; records out of order or twice are refused as damage.
+`durable.rs`'s: commits racing checkpoints (pages copied as writers change them) recover a prefix on
+one lane and on eight; a crash at many points on one lane and on three. T-T1.3.1
+(`tests/versioned_crash.rs`): each seed's workload (one to four lanes, open transactions across
+checkpoints) crashed at every disk operation it makes, the power cut keeping each unflushed write
+whole, torn or lost; 200 seeds in every gate, 10,000 on their own: acknowledged commits lost 0.
+Not yet measured: `amphora-bench --vlog` (AC-T1.4.2, AC-T1.4.3).
+
+**Falsified by.** At 32 writers on NVMe, per-thread lanes' commit p99 not at most half one log's
+(AC-T1.4.2), in which case one lane stays the default and the lanes go; an acknowledged commit lost
+in T-T1.3.1.
 
 ## Stages, each measured
 

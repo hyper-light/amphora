@@ -38,6 +38,7 @@ pub(crate) mod compaction;
 mod guards;
 mod import;
 mod log_bound;
+pub mod online;
 mod patience;
 pub(crate) mod remote;
 pub(crate) mod replicated;
@@ -47,6 +48,7 @@ mod slot;
 mod watch;
 pub use guards::Guards;
 pub(crate) use guards::Owned;
+pub use online::SchemaChange;
 pub use restore::Restore;
 pub use watch::Watch;
 
@@ -516,6 +518,56 @@ where
     }
     done
 }
+/// A read's answer and the time it was answered at (replication.md, "Follower reads at a closed
+/// time"): the state it read is its group's at that time, every write at it or before and none
+/// after.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosedRead<R> {
+    pub value: R,
+    /// Microseconds since the Unix epoch, on the group's own time.
+    pub micros: u64,
+}
+/// [`run_query`] at this reader's closed time: the session runs only if the state the
+/// transaction reads is at `at_least` or later. `Err` with the time it found (none before its
+/// group's first stamped entry) if it is earlier; the session is left for the next try.
+fn run_closed<R, F>(
+    db: &mut Db,
+    at_least: u64,
+    until: Instant,
+    claim: Option<&Application>,
+    session: &Mutex<Option<F>>,
+) -> anyhow::Result<Result<ClosedRead<R>, Option<u64>>>
+where
+    F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R>,
+{
+    if Instant::now() >= until {
+        return Err(Refusal::Timeout.into());
+    }
+    if restore::incomplete(db)? {
+        return Err(api::invalid("database", "restore is incomplete").into());
+    }
+    let done = db.query_transaction(|db| {
+        // The transaction's first read takes its snapshot: the time is the state's own.
+        let time = crate::replication::closed::recorded(db)?;
+        let micros = match time {
+            Some(micros) if micros >= at_least => micros,
+            found => return Ok(Err(found)),
+        };
+        let f = locked(session)?
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("SQL query was already executed"))?;
+        let _deadline = db.deadline(until);
+        application::claim_holds(db, claim)?;
+        let mut connection = crate::sql::Connection::new(db);
+        let value = f(&mut connection)?;
+        connection.finish()?;
+        Ok(Ok(ClosedRead { value, micros }))
+    });
+    if done.is_err() && Instant::now() >= until {
+        return Err(Refusal::Timeout.into());
+    }
+    done
+}
 fn locked<T>(m: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, Refusal> {
     m.lock()
         .map_err(|_| unavailable("a database response lock was poisoned"))
@@ -837,6 +889,34 @@ impl Database {
         Self::open_owned(path, until, false, None, |_| Ok(()))
     }
 
+    /// [`Database::open`], its writer backed up to `archive` (CP-T1.12; docs/design/backup.md):
+    /// each commit stamped as it is made, the log started again only once shipped, and a thread
+    /// that ships the log and copies bases as the database commits, until the database ends. A
+    /// live owner of the database in this process is refused: it must drain first, as only the
+    /// writer's own open can back it up.
+    pub fn open_backed_up(
+        path: &Path,
+        archive: crate::backup::Archive,
+        until: Instant,
+    ) -> Result<(Self, crate::backup::Shipping), Refusal> {
+        let mut prepared = None;
+        let database = Self::open_owned(path, until, false, None, |db| {
+            prepared =
+                Some(crate::backup::Prepared::on(db, archive, until).map_err(|e| refused(&e))?);
+            Ok(())
+        })?;
+        let (Some(prepared), Writer::Local(store)) = (prepared, &database.shared.writer) else {
+            return Err(api::invalid(
+                "backup",
+                "a live owner of this database isn't backed up: it must drain first",
+            ));
+        };
+        let shipping = prepared
+            .start(|watcher| store.on_commit(watcher))
+            .map_err(|e| refused(&e))?;
+        Ok((database, shipping))
+    }
+
     /// [`Database::open`], this process owning the database with `guards` kept beside its lease
     /// until the owner has drained (local-owner-transport.md, "Owner guards"). It makes no
     /// directory: a missing parent is refused. A live owner in this process is reused only if
@@ -1057,6 +1137,24 @@ impl Database {
         })
     }
 
+    /// [`Database::call`] on the owner's own session, its SQL free to name Amphora's own tables
+    /// (`__amphora_*`): for a cross-group transaction's steps (CP-T1.10, `crate::xgroup`). An
+    /// attached client is refused: its closure can't cross to the owner.
+    pub(crate) fn call_internal<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
+    {
+        let database = self.resolve(until)?;
+        if database.remote_client().is_some() {
+            return Err(api::invalid(
+                "cross-group step",
+                "an attached client can't run Amphora's own SQL; run it on the owner",
+            ));
+        }
+        database.call_db(until, f)
+    }
+
     fn call_db<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
     where
         R: Send + 'static,
@@ -1126,6 +1224,70 @@ impl Database {
                 .query_local(until, f)
                 .map_err(Refusal::from),
             Writer::Local(_) => database.query(until, f),
+        }
+    }
+
+    /// A follower read (replication.md, "Follower reads at a closed time"; AC-T1.10.C2): one
+    /// read-only SQL session on this node's own state, as [`Database::query_local`] runs it, at
+    /// this replica's closed time once that is `at_least` (microseconds since the Unix epoch). It
+    /// answers with the time it read at: the state it saw is its group's at that time, every
+    /// write at it or before and none after, whoever led when. It waits on the caller's thread
+    /// for the time to come, until `until`, and is refused Timeout past it. Standalone, it is
+    /// [`Database::query`] at the wall clock when it began: its writes carry no time. An attached
+    /// client's is refused until the wire carries it.
+    pub fn query_closed<R, F>(
+        &self,
+        at_least: u64,
+        until: Instant,
+        f: F,
+    ) -> Result<ClosedRead<R>, Refusal>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
+    {
+        let database = self.resolve(until)?;
+        match &database.shared.writer {
+            Writer::Replicated { client, .. } => {
+                let session = Mutex::new(Some(f));
+                let claim = database.application.as_ref();
+                client.read_closed(at_least, until, |reader| {
+                    run_closed(reader, at_least, until, claim, &session)
+                })
+            }
+            Writer::Client(_) => Err(api::invalid(
+                "closed-time read",
+                "an attached client's waits for the wire's next version",
+            )),
+            Writer::Local(_) => {
+                let micros = replicated::wall_micros()?;
+                database
+                    .query(until, f)
+                    .map(|value| ClosedRead { value, micros })
+            }
+        }
+    }
+
+    /// The time a follower read here can ask and not wait for, most of the time: now, less the
+    /// lag this replica measured between its closed time and its clock (the p99 of its last
+    /// moves; replication.md, "Follower reads at a closed time", AC-T1.10.C3). Refused
+    /// Unavailable before it has measured any. Standalone, now.
+    pub fn follower_read_micros(&self, until: Instant) -> Result<u64, Refusal> {
+        let database = self.resolve(until)?;
+        let now = replicated::wall_micros()?;
+        match &database.shared.writer {
+            Writer::Replicated { client, .. } => client
+                .closed_lag()?
+                .map(|lag| now.saturating_sub(lag))
+                .ok_or_else(|| {
+                    Refusal::Unavailable(
+                        "this replica has measured no replication delay yet".into(),
+                    )
+                }),
+            Writer::Client(_) => Err(api::invalid(
+                "closed-time read",
+                "an attached client's waits for the wire's next version",
+            )),
+            Writer::Local(_) => Ok(now),
         }
     }
 
@@ -2056,7 +2218,8 @@ fn successor(prefix: &[u8]) -> Option<Vec<u8>> {
 /// Whether this is the copy of the test binary that runs `test` alone, in a process of its own: a
 /// test that fills or reads the process's owner table can't share it with the tests beside it. The
 /// parent runs the child and checks that it passed.
-#[cfg(test)]
+// Its callers run a child process sharing a lease, which only Unix builds do.
+#[cfg(all(test, unix))]
 pub(crate) fn in_child(test: &str) -> bool {
     const CHILD: &str = "AMPHORA_DATABASE_CHILD";
     if std::env::var_os(CHILD).is_some_and(|name| name == test) {

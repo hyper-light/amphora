@@ -290,6 +290,12 @@ fn translate_integrity_check_for_schema(
         let mut bound_indexes = Vec::new();
         if let Some(indexes) = schema.indexes.get(btree_table.name.as_str()) {
             for index in indexes {
+                // Amphora: an index an online schema change hasn't made public lacks the entries of
+                // rows its backfill hasn't reached; its pages are still checked as a B-tree
+                // (`resolved_root_pages`), its entries against the rows only once public (CP-T1.12).
+                if !index.is_public() {
+                    continue;
+                }
                 if index.root_page <= 0 || !connection_root_pages.contains(&index.root_page) {
                     continue;
                 }
@@ -342,7 +348,20 @@ fn translate_integrity_check_for_schema(
         }
 
         let mut bound_checks = Vec::with_capacity(btree_table.check_constraints.len());
-        for check in &btree_table.check_constraints {
+        // Amphora: a column's CHECK an online schema change is still validating isn't one every
+        // row is known to keep (CP-T1.12, schema::CONSTRAINT_STATES_TABLE).
+        let validating = |check: &&crate::schema::CheckConstraint| {
+            check.column.as_deref().is_some_and(|name| {
+                btree_table
+                    .get_column(name)
+                    .is_some_and(|(_, column)| column.unvalidated())
+            })
+        };
+        for check in btree_table
+            .check_constraints
+            .iter()
+            .filter(|check| !validating(check))
+        {
             bound_checks.push(bind_expr_for_table(
                 &check.expr,
                 &mut table_references,
@@ -374,7 +393,7 @@ fn translate_integrity_check_for_schema(
             .iter()
             .enumerate()
             .filter(|(_, c)| !c.is_rowid_alias()) // nothing to check on IPK cols
-            .filter(|(_, c)| c.notnull() || btree_table.is_strict)
+            .filter(|(_, c)| c.trusted_notnull() || btree_table.is_strict)
             .map(|(idx, col)| {
                 let col_ref = match col.generated_type() {
                     GeneratedType::Virtual { expr, .. } => BoundIndexColumn::Expr(
@@ -408,7 +427,7 @@ fn translate_integrity_check_for_schema(
                     col_reg,
                 );
             }
-            if col.notnull() {
+            if col.trusted_notnull() {
                 emit_notnull_check(program, &registers, btree_table, col_name, col_reg);
             }
         }

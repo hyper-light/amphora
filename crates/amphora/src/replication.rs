@@ -24,7 +24,9 @@ use crate::db::Db;
 pub use crate::database::replicated::{ReceiveReceipt, ReplicaHandle};
 pub mod bootstrap;
 pub(crate) mod class;
+pub(crate) mod closed;
 pub(crate) mod floor;
+pub(crate) mod readsets;
 
 const BASELINE_DELTA: &[u8] = b"amphora.delta.v1\0";
 const BASELINE_SNAPSHOT: &[u8] = b"amphora.snapshot.v1\0";
@@ -52,26 +54,50 @@ pub struct Prepared {
     pages: Vec<(u32, Vec<u8>)>,
     #[serde(skip)]
     baseline: Option<api::replication::Bootstrap>,
+    /// What its session read, carried after its encoding (`readsets`): `None` for a session that
+    /// read more than its entry could carry, and for what isn't a caller's write.
+    #[serde(skip)]
+    reads: Option<readsets::ReadSet>,
 }
 
 impl Prepared {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        base: Point,
+        pages: Vec<(u32, Vec<u8>)>,
+        reads: Option<readsets::ReadSet>,
+    ) -> Self {
+        Self {
+            base_index: base.index,
+            base_term: base.term,
+            pages,
+            baseline: None,
+            reads,
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.pages.is_empty()
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, Refusal> {
-        let bytes = if let Some(declaration) = &self.baseline {
+        let mut bytes = if let Some(declaration) = &self.baseline {
             let mut bytes = BASELINE_DELTA.to_vec();
             bytes.extend(postcard::to_allocvec(&(declaration, self)).map_err(unavailable)?);
             bytes
         } else {
             postcard::to_allocvec(self).map_err(unavailable)?
         };
-        api::bound(
-            "replicated command",
-            bytes.len(),
-            COMMAND_BYTES.saturating_add(ENVELOPE_BYTES),
-        )?;
+        let bound = COMMAND_BYTES.saturating_add(ENVELOPE_BYTES);
+        api::bound("replicated command", bytes.len(), bound)?;
+        // The read set rides after the encoding while the entry keeps its bound; past it, the
+        // write goes without one and the exact base decides it, as for a binary from before.
+        if let Some(reads) = &self.reads {
+            let trailer = postcard::to_allocvec(reads).map_err(unavailable)?;
+            if bytes.len().saturating_add(trailer.len()) <= bound {
+                bytes.extend(trailer);
+            }
+        }
         Ok(bytes)
     }
 
@@ -119,6 +145,7 @@ fn on_base(base_index: u64, base_term: u64, point: Point) -> Result<(), Refusal>
 /// group's commit (replication.md, "A write made at a follower is answered on the leader's
 /// commit"). The outer error is a malformed entry, whose apply fences.
 pub(crate) fn verdict(data: &[u8], before: Point) -> Result<Result<(), Refusal>, Refusal> {
+    let (_, data) = closed::open(data)?;
     api::bound(
         "replicated command",
         data.len(),
@@ -157,6 +184,12 @@ pub struct Machine {
     replicated: bool,
     configuration: ConfState,
     baseline: bootstrap::Baseline,
+    /// The group's time at the last entry applied (replication.md, "Follower reads at a closed
+    /// time"): none before its first stamped entry.
+    time: Option<u64>,
+    // A test's count of the entries whose stamp was lifted past the time before them.
+    #[cfg(test)]
+    lifted: u64,
     /// The group's class as its log recorded it last (replication.md, "The class stated once per
     /// group"), and the class this member's owner stated: the two must stay compatible.
     class: Option<api::replication::Durability>,
@@ -445,6 +478,7 @@ impl Machine {
         }
         let (point, configuration) = state.unwrap_or((Point::default(), initial));
         let recorded = class::recorded(&db).map_err(unavailable)?;
+        let time = closed::recorded(&db).map_err(unavailable)?;
         db.transaction(|db| marker(db, point, &configuration))
             .map_err(unavailable)?;
         db.flusher()().map_err(unavailable)?;
@@ -455,6 +489,9 @@ impl Machine {
             replicated,
             configuration,
             baseline,
+            time,
+            #[cfg(test)]
+            lifted: 0,
             class: recorded,
             stated: None,
             #[cfg(test)]
@@ -656,20 +693,31 @@ impl Machine {
         f: impl FnOnce(&mut Db) -> anyhow::Result<R>,
     ) -> Result<(Prepared, R), Refusal> {
         self.require_baseline()?;
-        let (answer, pages) = self
+        // Each page number takes at least one byte of the entry, so a session that read more
+        // pages than the entry has bytes could not carry its read set.
+        let bound = u64::try_from(COMMAND_BYTES.saturating_add(ENVELOPE_BYTES)).unwrap_or(u64::MAX);
+        let (answer, pages, traced) = self
             .db
-            .prepare_pages(COMMAND_BYTES, |db| {
-                let answer = f(db)?;
-                Ok(answer)
-            })
+            .prepare_traced(COMMAND_BYTES, bound, f)
             .map_err(|e| crate::database::refused(&e))?;
         validate_pages(&pages, COMMAND_BYTES)?;
+        let page1 = match pages.iter().find(|(page, _)| *page == 1) {
+            Some((_, image)) => readsets::page1_change(&traced.page_one, image),
+            None => readsets::Page1::Unwritten,
+        };
         Ok((
             Prepared {
                 base_index: self.point.index,
                 base_term: self.point.term,
                 pages,
                 baseline: self.baseline.declaration().cloned(),
+                // Only on a base whose state has the closed time's table: an apply that makes it
+                // (the group's first stamped entry) changes the schema beyond any entry's pages,
+                // so a write prepared before it must not move past it (`readsets`).
+                reads: traced
+                    .reads
+                    .filter(|_| self.time.is_some())
+                    .map(|reads| readsets::ReadSet { reads, page1 }),
             },
             answer,
         ))
@@ -700,6 +748,7 @@ impl Machine {
             base_term: self.point.term,
             pages: image,
             baseline: self.baseline.declaration().cloned(),
+            reads: None,
         };
         // The hard page fence proves the worst-case bound; retain the exact serialization check
         // before proposal as a format-change and arithmetic guard.
@@ -734,26 +783,12 @@ impl Machine {
         &mut self,
         f: impl FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R>,
     ) -> Result<(Prepared, R), Refusal> {
-        self.require_baseline()?;
-        let (answer, pages) = self
-            .db
-            .prepare_pages(COMMAND_BYTES, |db| {
-                let mut connection = crate::sql::Connection::new(db);
-                let value = f(&mut connection)?;
-                connection.finish()?;
-                Ok(value)
-            })
-            .map_err(|e| crate::database::refused(&e))?;
-        validate_pages(&pages, COMMAND_BYTES)?;
-        Ok((
-            Prepared {
-                base_index: self.point.index,
-                base_term: self.point.term,
-                pages,
-                baseline: self.baseline.declaration().cloned(),
-            },
-            answer,
-        ))
+        self.prepare_db(|db| {
+            let mut connection = crate::sql::Connection::new(db);
+            let value = f(&mut connection)?;
+            connection.finish()?;
+            Ok(value)
+        })
     }
 
     /// The owner calls this only after hyper-durable releases the matching ReadIndex context.
@@ -778,6 +813,17 @@ impl Machine {
             ));
         }
         Ok(answer)
+    }
+
+    /// The pages every apply writes (`readsets`): the replica's marker table's and the closed
+    /// time's (`closed::record`).
+    pub(crate) fn applied_pages(&self) -> Result<[u32; 2], Refusal> {
+        let root = |name: &str| {
+            self.db
+                .root_page(name)
+                .map_err(|e| crate::database::refused(&e))
+        };
+        Ok([root("__amphora_replica")?, root("__amphora_closed")?])
     }
 
     /// Applies `pages` at `at`, and flushes the log with them unless `flush` says the owner will.
@@ -820,6 +866,27 @@ impl Machine {
     /// The last entry applied.
     pub(crate) fn applied(&self) -> Point {
         self.point
+    }
+
+    /// The group's time at the last entry applied: this replica's closed time (replication.md,
+    /// "Follower reads at a closed time"), none before its group's first stamped entry.
+    pub(crate) fn closed(&self) -> Option<u64> {
+        self.time
+    }
+    /// An entry applied: its time is the machine's.
+    fn timed(&mut self, next: closed::Next) {
+        self.time = next.time;
+        #[cfg(test)]
+        if next.lifted {
+            self.lifted = self.lifted.saturating_add(1);
+        }
+        #[cfg(not(test))]
+        let _ = next.lifted;
+    }
+    /// The entries applied whose stamp was lifted past the time before them.
+    #[cfg(test)]
+    pub(crate) fn lifted(&self) -> u64 {
+        self.lifted
     }
 
     /// The last entry applied that no finished flush covers yet.
@@ -947,18 +1014,27 @@ impl StateMachine for Machine {
             index: entry.index,
             term: entry.term,
         };
-        if !entry.data.is_empty()
+        // The entry inside its stamp, and the group's time once it is applied, written in the
+        // entry's own transaction (replication.md, "Follower reads at a closed time").
+        let (stamp, data) = closed::open(entry.data).map_err(failed)?;
+        let before = self.time;
+        let next = closed::next(before, stamp, !data.is_empty()).map_err(failed)?;
+        if !data.is_empty()
             && self
                 .baseline
-                .apply_seed(&mut self.db, entry.data, |db| {
+                .apply_seed(&mut self.db, data, |db| {
                     crate::database::bootstrap_db(db)?;
                     db.exec(META)?;
-                    marker(db, at, &self.configuration)
+                    marker(db, at, &self.configuration)?;
+                    // The seed's last chunk installs an image from before any time: its table is
+                    // made again whatever the machine held.
+                    closed::record(db, None, next.time)
                 })
                 .map_err(failed)?
         {
             self.point = at;
             self.flushed = at;
+            self.timed(next);
             answers.push(Applied {
                 index: entry.index,
                 context: entry.context.to_vec(),
@@ -966,10 +1042,10 @@ impl StateMachine for Machine {
             });
             return Ok(());
         }
-        if class::is_class(entry.data) {
+        if class::is_class(data) {
             // The last compatible entry is the record; one that isn't changes nothing, on every
             // member alike, as it depends on the log alone.
-            let stated = class::decode(entry.data).map_err(failed)?;
+            let stated = class::decode(data).map_err(failed)?;
             let supersedes = self
                 .class
                 .as_ref()
@@ -977,6 +1053,7 @@ impl StateMachine for Machine {
             let configuration = self.configuration.clone();
             if supersedes {
                 self.advance_with(at, &[], &configuration, !self.replicated, |db| {
+                    closed::record(db, before, next.time)?;
                     class::record(db, &stated)
                 })?;
                 #[cfg(test)]
@@ -985,15 +1062,18 @@ impl StateMachine for Machine {
                 }
                 self.class = Some(stated);
             } else {
-                self.advance(at, &[], &configuration, !self.replicated)?;
+                self.advance_with(at, &[], &configuration, !self.replicated, |db| {
+                    closed::record(db, before, next.time)
+                })?;
             }
+            self.timed(next);
             return self.hold_to_class();
         }
         let mut result = Ok(());
         let mut pages = Vec::new();
-        if !entry.data.is_empty() {
+        if !data.is_empty() {
             self.require_baseline().map_err(failed)?;
-            let prepared = Prepared::decode(entry.data).map_err(failed)?;
+            let prepared = Prepared::decode(data).map_err(failed)?;
             if prepared.baseline.as_ref() != self.baseline.declaration() {
                 return Err(failed("resolved delta baseline identity differs"));
             }
@@ -1003,9 +1083,14 @@ impl StateMachine for Machine {
             }
         }
         // Its flush is the owner's flushing thread's, in every class (replication.md, "A
-        // replica's database log"): durable() stays at what a finished flush covers.
-        self.advance(at, &pages, &self.configuration.clone(), false)?;
-        if !entry.data.is_empty() {
+        // replica's database log"): durable() stays at what a finished flush covers. A refused
+        // transaction changes nothing but still takes its time: the time counts entries, and every
+        // member refuses it alike.
+        self.advance_with(at, &pages, &self.configuration.clone(), false, |db| {
+            closed::record(db, before, next.time)
+        })?;
+        self.timed(next);
+        if !data.is_empty() {
             answers.push(Applied {
                 index: entry.index,
                 context: entry.context.to_vec(),
@@ -1044,7 +1129,7 @@ impl StateMachine for Machine {
     /// commit, held or classic, and a restart that finds it past the member's log opens the log at
     /// the machine's point (durable.md §4.3).
     fn acts_at_start(&self, entry: &EntryRef<'_>) -> bool {
-        !self.replicated || bootstrap::is_seed(entry.data)
+        !self.replicated || closed::open(entry.data).is_ok_and(|(_, data)| bootstrap::is_seed(data))
     }
 
     fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
@@ -1115,14 +1200,20 @@ impl StateMachine for Machine {
         self.configuration_at = at.index;
         self.baseline.completed();
         self.class = class::recorded(&self.db).map_err(failed)?;
+        // The image's time is the group's at its point: an image never goes back in time, as
+        // it is taken past what this member applied.
+        self.time = closed::recorded(&self.db).map_err(failed)?;
         self.hold_to_class()?;
         #[cfg(test)]
         self.record_digest(at.index)?;
         Ok(())
     }
+    /// The raft log is the write-ahead log (CP-T1.8, G12 step 2; replication.md, "The raft log
+    /// as the WAL"): compaction asks this before it moves the raft log's start, and moves it no
+    /// further than [`StateMachine::durable`], what the owner's flushing thread last made durable
+    /// (I8). So nothing is flushed here, on the owner's thread: compaction waits for the engine's
+    /// flush, and the raft log keeps every entry the database's log may still lose.
     fn persist(&mut self) -> Result<(), Fatal> {
-        self.log_flusher()().map_err(failed)?;
-        self.flushed = self.point;
         Ok(())
     }
 }

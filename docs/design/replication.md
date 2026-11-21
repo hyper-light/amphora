@@ -94,7 +94,8 @@ thread the two clocks are one. In a test, a call's deadline is an hour ahead of 
 those checks never fire there: they are hang guards.
 
 The production shell is the owner thread. Its clock is the real one (`Instant::now`), and before
-each step it waits on the bounded channel (`recv_timeout(POLL)`) for the next input. The handle's
+each step it takes the next input queued, or waits on its bell until something wakes it or its next deadline
+comes ("Decision (lane constants): the owner's wakes"). The handle's
 caller-side reads stay on the real clock, because they are the caller's own deadlines:
 - `submit`, and `receive` with its `enqueue_receive`, before enqueueing and while waiting for the
   answer;
@@ -120,7 +121,7 @@ slow work moves the real clock. It relays wire records between steps.
 A test caller enqueues its call and polls the answer between steps; it never blocks on a channel.
 Its deadline is a virtual instant, so it expires only when the test advances a clock past it. The
 hour's lead keeps any real-clock check of a test deadline (a receipt's poll) true for an hour. A
-round with nothing to relay yields `POLL` to the disk, and a counted budget of rounds, about a
+round with nothing to relay yields `POLL` (a test's own pacing; the owner never polls) to the disk, and a counted budget of rounds, about a
 minute of such yields, calls a scenario hung. Both are hang guards, and no test's verdict depends on
 them. The three-owner scenarios move to the test shell. Their thread-shell helpers go with them:
 the relay's blocking call, `seeded_nodes` and `known_leader`, with their five-second budgets of the
@@ -564,7 +565,7 @@ in its Grafana overview (deploy/grafana/dashboards/kiln-overview.json):
 | Flush seconds p50 / p99 | `histogram_quantile(0.5 / 0.99, sum by (le, db) (rate(amphora_replica_flush_seconds_bucket[5m])))` | `p50:` and `p99:amphora_replica_flush_seconds{$host} by {db}` |
 | Commits by quorum, stacked: the held share is the bars' proportion | `sum by (quorum) (rate(amphora_replica_commits_total[5m]))` | `sum:amphora_replica_commits_total{$host} by {quorum}.as_count()` |
 | Quorum patience (seconds), the leader's ("The leader's quorum patience") | `max by (instance, db) (amphora_replica_quorum_patience_seconds)` | `max:amphora_replica_quorum_patience_seconds{$host} by {host,db}` |
-| Answer gaps refused past the patience's ceiling | `sum by (db) (rate(amphora_replica_quorum_patience_refused_total[5m]))` | `sum:amphora_replica_quorum_patience_refused_total{$host} by {db}.as_count()` |
+| Answer gaps refused for the patience, their voter suspected | `sum by (db) (rate(amphora_replica_quorum_patience_refused_total[5m]))` | `sum:amphora_replica_quorum_patience_refused_total{$host} by {db}.as_count()` |
 
 Its tests: the counts a host reads, through a held flush and the flushing thread's, and in the persisted class its
 own thread's flushes and no held commit (`the_replicated_class_counts_its_backlog_flushes_and_commits`); the buckets
@@ -805,10 +806,13 @@ leader, so a dead leader is replaced as fast as before.
 - **Measured**: each other voter's answer gaps as the leader sees them, in the leader's own ticks:
   the ticks between two messages of that voter in a term the owner leads, the first counted from
   the tick it began to lead. In ticks, so the leader's own stalls are not counted.
-- **Window**: two generations of 3,000 ticks (30 s). A voter's tail is the longest gap it ended in
-  the current generation or the one before, so a gap is believed for 30 to 60 s, longer than the
-  record's loaded runs went between gaps over 200 ms on average (at fewest, 84 in 1,800 s). Where
-  stalls are rare the patience lapses between them.
+- **Window**: two of the voter's own generations. A voter's tail is the longest gap it ended in
+  the current generation or the one before; a generation lasts as long as the voter went between
+  its last two gaps past the election timeout, its first counted from the tick the leader began to
+  measure it, so a gap is believed for one to two of its own recurrences: through each while its
+  stalls recur, and it lapses once they stop. The window was a fixed one first, measured once on
+  one host: a picked number by Ada's word (2026-11-21; "Decision (lane constants): generations
+  learned where they run").
 - **Quantile**: the window's maximum. A leader patient for less than the longest gap it measured is
   deposed by the gaps above its quantile; the window bounds how long one gap is believed.
 - **Quorum**: the k-th smallest of the other voters' tails, k being half the voters rounded down
@@ -824,17 +828,15 @@ leader, so a dead leader is replaced as fast as before.
 - **Patience**: that tail less the election timeout, never below zero. A leader whose check is due
   after as many ticks as the gap is never deposed by a silence that long wherever it falls, since
   its check counts every answer since the last (`docs/raft.md` §3.6).
-- **Ceiling**: a gap of 165 ticks, so a patience of at most 145 beyond the election timeout. It is
-  the largest quorum tail the record shows: in loaded run 2, member 2's answers from 1 and 3 had a
-  p99.9 of 1642.788 and 2286.190 ms, the smaller 1642.788 ms, in whole ticks rounded up; every
-  other run's smaller p99.9 is below it, jupiter's at most 331.339 ms. These are clock gaps, which
-  overstate the tick gaps. A gap past the ceiling is refused, typed (`PastCeiling`, naming the gap
-  and the ceiling), logged (`amphora.replica`, event `quorum_patience_refused`) and not learned: a
-  voter silent that long is gone, not slow. The patience is never clamped.
+- **Gone, not slow**: a gap over which the host's detector suspected the voter (`Verdict::Suspected`,
+  told to the owner) is refused, typed (`Suspected`, naming the gap), logged (`amphora.replica`,
+  event `quorum_patience_refused`) and not learned, the write slot's rule. No number bounds a gap:
+  the ceiling first taken here, the largest quorum tail of step 1's record, was measured once on
+  one host, a picked number by Ada's word (2026-11-21). The patience is never clamped.
 - **A cut-off leader's cost**: it steps down at the first check that finds no answer in its
   window, within the election timeout and the patience in force of the first check after the cut:
-  at the ceiling 165 ticks (1.65 s), and at most twice that, 330 ticks (3.3 s), after the cut,
-  against 40 ticks (400 ms) at fixed ticks, and only while its window holds gaps that long. Its
+  the longest gap its window believes, and at most twice that after the cut, against 40 ticks
+  (400 ms) at fixed ticks, and only while its window holds gaps that long. Its
   proposals in flight answer UnknownOutcome then, as they do now.
 - **A member's own patience** (`Raft::set_patience`) stays zero: its own stalls already count one
   tick, so they never run its election timer, and a patience for its leader's stalls would delay
@@ -857,11 +859,12 @@ leader, so a dead leader is replaced as fast as before.
     waits beyond its election timeout before its quorum check, in seconds; zero while it follows
     or has measured no answer gap.";
   - `amphora_replica_quorum_patience_refused_total`, a counter: "Answer gaps a leading replica
-    refused to learn for its quorum patience, because they passed its ceiling."
+    refused to learn for its quorum patience, because the host's detector suspected the voter
+    meanwhile." (until 2026-11-21: "because they passed its ceiling")
   No labels from Amphora (it may add only small closed sets); kiln adds its own. They are in the
   replica meter (`meter::REPLICA_METRICS`, read through `ReplicaHandle::counters`, Amphora goal
   867fa589): the owner sets the gauge where it sets the patience, the patience in ticks of `TICK`
-  while it leads and zero while it follows, and counts a gap refused past the ceiling where
+  while it leads and zero while it follows, and counts a gap refused for its suspected voter where
   `heard` refuses it; the event above stays beside the count. A gap refused because the leader
   measures as many voters as it can (`Unmeasured::Full`) is the event alone, outside the
   counter's help line. Tested by `the_quorum_patience_and_its_refusals_are_counted_for_the_host`.
@@ -890,7 +893,7 @@ Falsified by:
 - a leader whose followers' answers are held as long as a gap it measured that steps down
   (`a_leader_whose_followers_answer_as_late_as_it_measured_keeps_its_lead`);
 - a leader cut off from every follower that still leads past the election timeout and the patience
-  in force after the first check following the cut, or past the ceiling
+  in force after the first check following the cut
   (`a_leader_cut_off_from_its_followers_steps_down_within_its_patience`);
 - a read answered or an entry committed by a leader without a quorum;
 - step 1's measurement re-run with the patience in force, on loaded adacachy or a Mac Studio under
@@ -1802,10 +1805,12 @@ applies every commit once, on a leader, a follower and a learner alike):
 - *over*, the base tail: an entry applied, not held, by a step that took longer than AC-T1.3.4's bound on a
   commit's p99.9 (15 ms). This is a proxy: it is the delay the owner added itself, past the p99.9. A commit's
   quorum and network time aren't the owner's to see, and don't change with restarts;
-- *next*: the most one restart held, the restart about to come guessed by the worst seen.
+- *next*: the most one of the last 1 / (1 - q) restarts (a thousand) held, the restart about to come guessed by the
+  worst seen: the worst of n holds estimates their 1 - 1/n quantile, the quantile the rule holds.
 
-A restart is due when (held + over + next) / applied < 1 - q, all over patience's window (the current and previous
-generation of `patience::GENERATION` ticks, 30 to 60 s; its derivation is there). Here q = 0.999 is the highest
+A restart is due when (held + over + next) / applied < 1 - q, all over the current generation: from the restart
+that began it, and ended by the restart made once it alone covers its own spend so ("Decision (lane constants): a
+generation of restarts ends once it covers its spend"). Here q = 0.999 is the highest
 quantile the registry holds a commit's latency to (AC-T1.3.4's p99.9, and AC-T1.4.3's). The code keeps q as the
 fraction 999/1,000 and compares cross-multiplied, with checked arithmetic. The comparison is strict, net of the
 measured base tail, and counts the coming restart, so a restart that holds no more than the worst seen leaves the
@@ -1896,19 +1901,20 @@ the counts at each owner step and tick; the restart's held at each step until id
 On adas-mac-studio.local-2 (macOS aarch64), 2026-11-11; the core's tests in `database::log_bound`, the owner's in
 `database::replicated`:
 - T-T1.8.D3 `the_first_restart_is_free`, `a_restart_spends_what_it_held_and_spaces_the_next` (held 5: due at 10,001
-  applied, not 10,000), `long_steps_spend_the_tail_before_any_restart`, `the_window_forgets_after_two_generations`.
+  applied, not 10,000), `long_steps_spend_the_tail_before_any_restart`,
+  `a_generation_ends_once_it_covers_its_spend_and_is_forgotten`, `the_guess_is_the_worst_of_the_last_thousand_holds`.
 - T-T1.8.D3 `a_restart_due_again_by_its_share_on_an_owner_never_idle`: a restart that found 3 bytes queued holds 7
   entries until a step begins with 3, and through a million steps never idle a restart comes due again. Red on
   4a274ec, whose hold ended only at an idle step: every one of 1,000,005 entries held.
-- T-T1.8.D3, the share: `restarts_made_when_due_keep_their_share_below_the_tail`. Four generations of steps of 1 to
+- T-T1.8.D3, the share: `restarts_made_when_due_keep_their_share_below_the_tail`. 240,000 steps of 1 to
   7 entries, a long one in 20,011, each restart made when due and holding 1 to 9. After every restart that held no
   more than the worst before it, held + over stays strictly below a thousandth of the entries applied over the
-  window.
+  generation it ended and the one it began.
 - T-T1.8.D3 `a_log_takes_its_file_and_an_equal_share_of_what_is_free_past_one_image`: the room at its edges, and a
   frame grown from free bytes into the file leaves one log's room where it was.
 - T-T1.8.D3 `the_first_restart_is_free_and_the_next_waits_on_its_share`: a learner restarts after its first write
   (on b151af0 none, its bound being 131,072 frames). Told of a restart that held one entry, it makes none while 20
-  more apply, and makes one once two generations passed.
+  more apply, and makes one once its generation covered its spend.
 - T-T1.8.D3 `past_its_room_a_replica_refuses_submits_and_restarts_whatever_its_share`: a voter whose share is spent
   (a million held) and whose filesystem has nothing free past one image. With a local read held open, a write is
   refused `Unavailable` naming the frames past the room, and no restart is made. Once the read ends a restart
@@ -2036,7 +2042,8 @@ pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `star
 **The slot's length is learned, not picked** (Q3; Ada's rule, 2026-11-11). It is learned the way the quorum patience
 learns quorum gaps (`patience`), and adds no number. For each member, the leader measures the gap from the start of
 that member's slot to its next forward, and keeps the longest gap of this generation and of the one before
-(`patience::GENERATION`, 30 s). A member's slot is the larger of those two. A retry that arrives after its slot expired
+(each generation as long as the member's last two learned gaps were apart: "Decision (lane constants): generations
+learned where they run"). A member's slot is the larger of those two. A retry that arrives after its slot expired
 is still measured, so an expiry teaches the next slot rather than censoring it. Before a member's first measured gap,
 its slot is the core's election timeout in the owner's ticks (`election_tick × TICK`), the derived first value. No
 number bounds a gap: a gap over which the host's detector suspected its member is refused, typed
@@ -2117,6 +2124,115 @@ Falsified by:
 - a leader that holds its writes past a member's learned length for a write that never comes, or at all for a
   member that never comes back after its refusal.
 
+## Decision (lane follower-reads): Follower reads at a closed time (2026-11-21, G13 step 4, kiln goal 80d4cf5e)
+
+CP-T1.10 asks for follower reads "after ReadIndex, or at bounded staleness" (AC-T1.10.3: p99 at most 2 ms). A local
+read on a replica ("A local read on a replica", above) already answers without the leader, but says nothing of *when*
+the state it saw was the group's. This decision gives every replica's state a time, so a follower read can say the time
+it read at and refuse to answer older than a time its caller asks.
+
+### How CockroachDB does it, and what carries over
+
+CockroachDB closes timestamps (Taft et al., SIGMOD 2020, §3.3 and §4.3): a range's leaseholder promises no write will
+commit at or below a closed timestamp, carried in its Raft commands and, for idle ranges, a side transport; a follower
+that has applied up to that command serves MVCC reads at or below it. Its closed timestamp lags now by a target
+duration so that transactions whose timestamps were taken earlier aren't pushed. Spanner's safe time is the same idea
+for Paxos groups (Corbett et al., OSDI 2012, §4.1.3). Two of its parts don't carry over, for reasons in Amphora's own
+design:
+- **No leases.** hyper-raft trusts no clock (`read.rs`), so a promise made outside the log (a heartbeat, a side
+  transport) can't bind the next leader: a deposed leader in a minority could keep closing times a new leader writes
+  under. Here a time is known only from committed entries.
+- **No lag needed at the leader.** CockroachDB's target lag exists because a transaction's timestamp is taken before its
+  commit. Amphora's leader prepares one transaction at a time and proposes it at once ("Resolved transactions", the
+  base fence), so the order of the log is the order of time: an entry can close its own time.
+- **No MVCC history in a replica.** A replica holds one state, the one after its last applied entry, so a read is
+  answered at that state's time, never at an arbitrary earlier one: CockroachDB's bounded-staleness reads
+  (`with_min_timestamp`), which read at the follower's closed timestamp if it is new enough, not its exact-time reads.
+
+### The decision
+
+- **Stamps.** Every entry an owner proposes (a resolved transaction, a class entry, a seed's chunk) is stamped with its
+  proposer's wall clock: the prefix `amphora.time.v1\0`, a `u64` of microseconds since the Unix epoch, then the entry
+  (`replication/closed.rs`). An owner's wall clock is the system's when it started, moved on by its own clock (`wall`
+  plus the owner's time since it started), so its stamps never go back within one opening. The room for a stamp comes
+  out of the entry's room (`Actor::entry_room`).
+- **Times.** Applying entry *i*, every member computes the group's time *t(i)* = max(stamp(i), *t(i-1)* + 1 µs). An
+  unstamped entry that changes state (from a binary before stamps) takes *t(i-1)* + 1 once there is a time; one that
+  changes nothing (an election's empty entry, a change of members) keeps it. The time is written in the entry's own
+  transaction (`__amphora_closed`, made by the first stamped entry, so at the same index on every member and the page
+  layout stays the same everywhere), and travels with images. It depends on the log alone, so every member computes the
+  same times, and they rise strictly along the committed log whoever leads: a leader whose clock is behind its
+  predecessor's has its stamps lifted (counted by the machine), never a time that goes back. Raft's leader completeness
+  (Ongaro's dissertation §3.6.3) puts every committed entry, with its time, in every later leader's log.
+- **Closed time.** A replica's closed time is the time of its last applied entry. The state it holds is exactly the
+  group's at that time: every entry at or before it is applied (they come earlier in the log), and none after (times
+  rise). A follower read (`Database::query_closed(at_least, until, f)`) runs on a local reader, reads the time as its
+  transaction's first statement (which takes the snapshot, so the time is the state's own), and answers with the
+  value and that time. If the time is earlier than `at_least`, it waits on its caller's thread for the owner's next
+  published time (the owner publishes after each step and tells waiting reads), up to its deadline, refused Timeout past
+  it and Fenced once the owner ends. Each wait is for a time later than the one last found, so the retries are bounded by
+  the deadline.
+- **The lag, measured.** Each time a replica's closed time moves, its owner samples how far it stands behind its own
+  wall clock: replication delay plus the proposer's clock offset. `Database::follower_read_micros` is now less the
+  nearest-rank p99 of the last 100 samples: a read asked at it finds its time without waiting at least 99 times in 100
+  while the delays hold. The quantile is AC-T1.10.3's; 100 is the fewest samples whose p99 is not their maximum,
+  1 / (1 - 0.99). Nothing is measured once and frozen: every replica learns its own, continuously. Refused before the
+  first sample.
+- **Standalone** (`Writer::Local`), a follower read is `Database::query` at the wall clock when it began: its writes
+  carry no time. **An attached client's** is refused, typed, until the wire carries it (a new `Request` variant and
+  `wire::VERSION` 7).
+
+### Evidence
+
+- `closed::tests`: the stamp round-trips; times rise strictly whatever the stamps (behind, equal, unstamped); the lag is
+  the p99 of the last hundred and forgets older ones.
+- T-T1.10.C1, `no_read_under_leader_changes_sees_a_version_past_its_time` (driven shell): three voters whose wall clocks
+  stand an hour apart, the lead passed 1, 2, 3, 1, each writing three values, every member reading before and after it
+  catches up. Every read sees 1..=k; a read at a later time never sees less; two at one time see the same; lifted stamps
+  are counted, so the case where a new leader's clock is behind was exercised. With a time equal to its stamp alone,
+  member 2's writes would read at times an hour before member 1's, with more rows: the check fails.
+- T-T1.10.C2, `a_follower_read_waits_for_its_time_and_is_refused_past_its_deadline`.
+- AC-T1.10.3's p99 is measured by `amphora-bench --cluster --shapes read` (the coordinator's run).
+
+### What it costs, and the limits stated
+
+- 24 bytes an entry, and one more row written in each applied transaction.
+- **Idle groups.** A group with no writes has a closed time that stands still while the clock moves, so a read asked
+  past it waits to its deadline. The fix keeps the log the only source of times: a replica whose read asks past its
+  closed time proposes an empty stamped entry (forwarded to the leader like any follower's proposal), which closes the
+  time at the proposer's clock in one commit. Not built in this change (left below).
+- **Rollout.** A binary from before this change fences on the first stamped entry (its decode refuses the prefix), as on
+  the class entry: every member of a group runs this binary before one of them leads (Ada's word, as for the class).
+
+### Falsified by
+
+- a follower read that sees a write whose time is past the time it answered with, or misses one at or before it;
+- two members' times for one index that differ, or a time that goes back along the committed log;
+- a follower read answered at a time earlier than its `at_least`, or past its deadline;
+- `follower_read_micros` reads that wait more than 1 in 100 under steady replication delay (the lag is too short).
+
+## Decision (lane follower-reads): Search over partitions (2026-11-21, G13 step 4)
+
+CP-T1.10's "search fanned out over directory partitions" and AC-T1.10.4 (search p50 at most 30 ms over 1,000,000 events
+on three nodes). Kiln's search is K0's: `SELECT … FROM events WHERE text LIKE '%word%' ORDER BY at DESC LIMIT n`. Its
+rows are spread over partitions (groups), so one search is a search of each.
+
+**Decision.** `amphora::search::fan_out` asks every partition at once, the first on the caller's thread and each other on
+a scoped thread of its own (bounded by the partitions the caller holds), so a search takes about its slowest
+partition's time rather than their sum; `amphora::search::newest` merges their answers, each newest first and cut to the
+limit, with a k-way merge holding one row a partition and taking at most the limit (equal keys in partition order, so a
+merge is the same every time). On a replicated cluster each partition is asked on this node's replica, at its closed
+time (`Database::query_closed`), so a search reads no leader. Each partition answers at its own time: the merged answer
+is each partition's state at a time it reports, not one snapshot across them (that is cross-group work, CP-T1.10's
+transactions).
+
+**Evidence.** `search::tests`: the merge equals the sorted union cut to the limit over 500 random shapes; every partition
+is asked while every other is (each ask waits for all to begin, which asked in turn never happens). AC-T1.10.4 is measured
+by `amphora-bench --cluster --shapes search` (three members of every group in one process, relayed by the bench as a
+host relays them; the coordinator's run).
+
+**Falsified by:** a search slower than its slowest partition by more than a thread's start; a merged answer that differs
+from the newest rows of all partitions together.
 ## Decision (lane constants): one drive a step (2026-11-21)
 
 Ada's rule: no picked numbers. `DRIVE_QUANTUM` (32) bounded how many times one step of the owner drove its replica
@@ -2142,3 +2258,207 @@ some step leaves more to drive for the next. A step that drives until nothing is
 
 **Falsified by:** an input waiting more than one drive while the replica has more to drive; the replicated benches'
 commit latency or throughput worse than at 4e74cee beyond their noise.
+
+## Decision (lane constants): the owner's wakes (2026-11-21)
+
+Ada's rule: no picked numbers. `POLL` (1 ms) was how long the owner thread waited on its input channel before it
+stepped anyway: a poll, so the log's finished writes, its flushes and its deadlines were seen at the next poll, and
+an idle owner woke a thousand times a second for nothing. No measurement made 1 ms.
+
+**The decision.** The owner waits on a bell (`Bell`: a flag and a condition variable) and steps when it rings or when
+its next deadline comes, whichever is first (`run_loop`, `Actor::deadline`). What rings it:
+- an input queued (`ReplicaHandle::enqueue`, after the send);
+- a handle dropped (`Ring`, after the handle's sender is gone), so the last one's drop finds the channel closed;
+- the replication log's write or compaction done: the bell's own `Waker`, which hyper-durable hands to the store
+  (`Store::submit`'s waker, woken when the write lands: its `hyperlog.rs`, `memory.rs`);
+- a flush of the database's log done (the flushing thread, after its answer).
+A ring before the wait is kept, so none is lost between the owner's look at its channel and its wait.
+
+Its next deadline is its next tick, or sooner a deadline it holds: a queued or pending submit's, a change of members',
+a hand-off's, the write slot's end. Everything else it checks by time counts in ticks (elections, heartbeats, the
+quorum check, a bootstrap's hand-off), so is due at a tick. A step that drove and left more steps again at once, as
+before ("one drive a step"). Nothing is left to pick: the waits are the events' own times and the deadlines'.
+
+**What still waits for a tick.** A local reader given back and the host draining the outgoing queue don't ring the
+bell: the owner sees them at its next step, at the latest its next tick, as it did at its next poll. The tick itself
+(`TICK`) is the next constant this lane replaces.
+
+**Tests.** `the_owners_bell_keeps_a_ring_and_its_waker_rings_it` (T-WK.1.1),
+`an_owners_next_deadline_is_its_tick_or_a_sooner_held_deadline` (T-WK.1.2),
+`an_owner_thread_answers_on_its_wakes_and_ends_with_its_last_handle` (T-WK.1.3).
+
+**Falsified by:** a write, flush or input that waits for the owner's next tick to be seen (the replicated benches'
+commit latency worse than at 954ee1d beyond their noise); an idle owner's thread waking more often than its ticks.
+
+## Decision (lane constants): generations learned where they run (2026-11-21)
+
+Ada's word (2026-11-21): a value measured once on one host and frozen into the code is picked. Two such values were
+left in the quorum patience (`patience.rs`), and the write slot and the database log's restarts borrowed one of them:
+- `QUORUM_CEILING` (165 ticks), the largest quorum tail of step 1's record on adacachy: a gap past it was refused as
+  a voter gone, not slow;
+- `GENERATION` (3,000 ticks), how long a learned gap was believed (one to two generations), chosen longer than step
+  1's loaded runs went between gaps past the election timeout; the write slot believed its learned gaps for the same
+  generations, and the log's restarts counted over a window of two of them.
+
+**The decision.** Each window's generation is learned from its own events where it runs (`patience::Recurrence`): it
+lasts as long as the last two of its events were apart, the first counted from the tick the window began to watch,
+so what it learned is believed for one to two of its own recurrences: through each while the events recur, and it
+lapses once they stop. Whose events:
+- the quorum patience: each voter's own gaps past the election timeout, the gaps its patience covers, so each voter
+  ages on its own (`Answers`, a generation a voter);
+- the write slot: each member's own learned retry gaps (`slot::Slots::expire`), on the owner's clock.
+
+The log's restarts kept the fixed window (`log_bound::GENERATION`) here; the next decision replaces it. A window
+learned from their own spacing was tried and fails its share test
+(`restarts_made_when_due_keep_their_share_below_the_tail`): it feeds back on itself, since a window as short as the
+restarts' spacing forgets a hold, so the next restart is due at once, and the spacing shortens again.
+Gone, not slow, is the host's detector's verdict, as the write slot already ruled: a gap over which the detector
+suspected its voter is refused (`patience::Unmeasured::Suspected`) and counted in
+`amphora_replica_quorum_patience_refused_total`, its help line now saying so.
+
+**What it costs.** A lone stall after a long calm is believed for as long as the calm was; its size, not its
+belief's length, bounds what a cut-off leader waits (the patience is the gap less the election timeout). A host
+whose detector never suspects a voter that was cut off, under pre-vote (no term moved), teaches the gap the cut
+lasted; the detector's verdict is the owner's only word on that.
+
+**Tests.** `a_recurrence_is_the_time_between_its_last_two_events`,
+`a_gap_is_believed_for_one_to_two_of_its_voters_own_recurrences`, `a_suspected_voters_gap_is_refused_and_not_learned`
+(T-GN.1.1); `a_learned_gap_is_believed_for_one_to_two_of_its_members_generations` (T-GN.1.2);
+the driven patience tests,
+`the_quorum_patience_and_its_refusals_are_counted_for_the_host` now refusing a suspected voter's gap.
+
+**Falsified by:** step 1's measurement re-run with the learned windows in force, with more quorum-check step-downs
+than with the fixed window; a leader that keeps a patience after its voters' stalls stopped for two of their own
+recurrences.
+
+## Decision (lane constants): a generation of restarts ends once it covers its spend (2026-11-21)
+
+`log_bound::GENERATION` (3,000 ticks, the quorum patience's old window, measured once on adacachy) set how long the
+database log's restarts were counted: a picked number by Ada's word. A window learned from the restarts' own spacing
+fed back on itself (the decision before). **The decision** (GN.2): a generation runs from one restart to the restart
+made once it alone covers its own spend at the quantile: its held, its base tail and the next restart's guess,
+strictly below 1 - q of the entries it applied. That restart begins the next generation, and the one it ended is
+forgotten: it paid for itself, so forgetting it never makes a restart due, and a calm stretch banks no restarts for
+later. A restart made before (past the log's room, disk before latency) counts into the same generation, so its
+spend is paid before the next is due. The guess is the worst of the last 1 / (1 - q) holds (a thousand at the p99.9,
+a bounded monotonic queue): it falls back once a large hold is that many restarts old. No time enters: the owner's
+tick no longer touches the count.
+
+**What it costs.** Restarts are spaced by each generation's own spend, not by a window's slack: on the share test's
+load 64 restarts against the fixed window's 182, each still within the tail.
+
+**Tests.** `a_generation_ends_once_it_covers_its_spend_and_is_forgotten`,
+`the_guess_is_the_worst_of_the_last_thousand_holds` (T-GN.2.1); the share test,
+`restarts_made_when_due_keep_their_share_below_the_tail`, over the generation a restart ended and the one it began;
+the owner's `the_first_restart_is_free_and_the_next_waits_on_its_share`.
+
+**Falsified by:** the restarts bench (AC-T1.4.3, restarts on against off) with p99.9 moved more than with the fixed
+window; a restart's hold larger than every one of the last thousand pushing the share past the tail in a run.
+
+## A follower's write that read nothing written since its base: read sets (built 2026-11-21, Amphora goal ceea4e0a)
+
+D of goal 9c63f7d4, on top of the write slot (above). In the release A/B, D halved G's write gaps
+(bench/records/2026-11-09-write-starve-*; docs/research/follower-write-starvation.md). The slot makes a refused write's
+next try land; read sets keep most writes from being refused at all, when they touched pages nothing since wrote.
+
+**The read set.** The pager records the pages a prepared session reads (`Pager::record_access`, from its `BEGIN
+IMMEDIATE` to before its capture, which reads every dirty page again). The write states what it did to page 1: nothing,
+only the database's size and the checksum trailer (an allocation), or more. The record's bound is the entry's own
+bound in bytes, since each page number takes at least one byte in the entry: a session that read more could not carry
+its read set, and goes without one.
+
+**On the wire: append-only.** The read set rides after the write's `Prepared` encoding, as a postcard trailer
+(`replication::readsets`). A binary from before it decodes the `Prepared` and ignores what follows (postcard's
+`from_bytes` reads a value's prefix), so a mixed group decides every entry the same way. A write whose trailer would
+pass the entry's bound goes without one: the exact base decides it.
+
+**The leader decides, once.** As the leader steps a member's forwarded write (`step_forward`), the entry before the
+append is its own last entry. If the write's base is older, the leader walks its log from the entry after the base to
+that last entry. If none wrote a page the write read or wrote, it moves the write's base to its last entry, rewriting
+the two numbers in place. Every member then applies the entry by the exact base, as before, so no member keeps state of
+its own for the decision and none can decide it differently: a restart, an image or a binary from before changes
+nothing. That is Kung and Robinson's backward validation (research f4, f5), over pages. An entry that no page list
+describes (a change of members, a class entry, a seed, one the leader can't read) conflicts. Every apply writes the
+replica's marker table and the closed time's table ("Follower reads at a closed time"), so a write that read or wrote
+either page conflicts with every entry. The leader reads a write inside its proposer's closed-time stamp, and moving its
+base keeps the stamp as it was. The group's first stamped entry makes the closed time's table at apply, a schema change
+no page list shows, so a follower carries a read set only on a base whose state already has that table. Entries refused
+at their own apply still count as written: conservative, never unsound.
+
+**Page 1 merges its size.** Every session reads page 1. An entry that changed it only in the size conflicts only with
+a write that writes page 1 too; one that changed more of it (the schema, its cookie, the free list) conflicts with
+every write, whether or not the write's record caught its read of page 1. Two allocations from one base would allocate the same page, which conflicts on that
+page anyway. An entry with no read set that wrote page 1 counts as more than a size change.
+
+**The window is derived.** It is the leader's log between the write's base and the append, bounded by the log's own
+bound: what it holds since its last compaction. A base the log no longer holds, or whose term differs from the log's, is left to the exact base,
+which refuses it. There is no window constant and no cap on age. The walk reads the log in slices of one command's
+bytes and ends at the first conflict. A write forwarded with others in one message is left to the exact base.
+
+**Why it is serializable.** A write admitted this way read, at its base, exactly what it would have read at the
+leader's last entry: no page it read changed in between, and page 1 changed at most in the size, which it didn't
+write. Its pages overwrite none that changed. So it is equivalent to the same session run at the entry before it.
+
+**Observability.** A debug event `replication.read_set` (`outcome` = rebased, conflict or unknown_base, with the base
+and the leader's last index). The names go to Kiln Metrics before any metric is added.
+
+**Requirements and tests.** AC-T1.8.R1 to R3 (docs/requirements.toml):
+- T-T1.8.R1 to R3, the core's tests in `replication::readsets`;
+- T-T1.8.R4, `r4_a_follower_write_on_pages_nothing_since_wrote_lands_on_its_first_try`, an interleaving the test
+  builds with the slot off: the follower's write on another table lands on its first try, one on the leader's table is
+  refused, and with read sets off both are refused;
+- T-T1.8.R5, `r5_read_sets_keep_every_list_append_history_serializable`, Elle's list-append runs with the slot off and
+  on. The mutant that moves every stale base unchecked must be caught there.
+The W tests run with read sets on.
+
+Falsified by: a non-serializable history with read sets on; a release A/B against G where read sets don't cut G's
+write gaps; a `conflict` share near one on workloads whose writes touch different pages (the read set too wide: the
+recorder catching reads the session didn't make).
+
+## Decision (lane g12s2): the raft log as the WAL (2026-11-21, G12 step 2)
+
+Requirements AC-T1.8.L1 and L2, tests T-T1.8.L1 and L2 (docs/requirements.toml); kiln plan "G12 Replication
+(CP-T1.8)", step 2.
+
+### What was left
+
+Applies already flushed nothing on the owner's thread ("A replica's database log", decision 1), and a write was
+already acknowledged only once hyper-durable held it on a quorum's raft logs (durable.md §4.1, I5). One flush was
+still the owner's: `Machine::persist`, which hyper-durable's `Replica::compact` asks before it moves the raft log's
+start, flushed the database's log inline. So each compaction stood the owner still for a flush, the stall decision 1
+removed from applies, and the rule "the engine's log is durable before Raft compacts past it" rested on that inline
+flush rather than on what had been made durable.
+
+### The decision
+
+`Machine::persist` does nothing. `Replica::compact` moves the start to `durable() - keep` at most (hyper-durable,
+replica.rs, I8), and `Machine::durable` is the point the owner's flushing thread last made durable
+(`flushed_through`). So a compaction waits for the engine's flush: it never passes it, and one asked before the flush
+ends moves the start only as far as the last finished flush; the next compaction, at a later step, takes the rest.
+The raft log always holds every entry past what the database's log made durable, so a power cut that loses the
+database log's unflushed tail reopens at `durable()` and applies the rest again from the raft log (§4.3), as before.
+The raft log is the write-ahead log; the database's log is a cache of it that the flushing thread makes durable in
+its own time. Still flushed inline, all rare and as before: a membership change (its join rows), an install, the
+seed, a persisted class entry, and `open`.
+
+The owner compacts when the raft log holds 128 MiB of applied entries or is stalled for room. A stall waits on the
+flushing thread, which is always asked to flush what was applied (`Actor::flush`), so it frees room once that flush
+ends, not on a flush of the owner's own.
+
+### Evidence
+
+- T-T1.8.L1 `compaction_waits_for_the_engines_flush` (database::replicated): a voter's flushes held, 1 flushed and
+  2 to 5 applied. A compaction keeping nothing moves the raft log's start to the flushed point and no further, and
+  flushes nothing (2 to 5 stay unflushed); once flushed, the next compaction reaches the last entry applied.
+- T-T1.8.L2 `the_records_suite_answers_alike_at_one_voter_and_three` (tests/records_conformance.rs): one harness,
+  `Group::new(voters)`, the group's size its only parameter, runs the Records suite and seeded histories against the
+  simulator at one voter and at three, each at its leader; every case passes and the two transcripts are identical.
+- The tests that compact a leader to make a joiner install its image now wait until its flushing thread has
+  flushed what it applied (`Driven::flushed`), the fact that compaction now waits on.
+
+### Falsified by
+
+- a compaction that moves the raft log's start past `Machine::durable`;
+- an acknowledged write lost after a power cut that lost the database log's unflushed tail (the power-cut nemesis);
+- a stalled owner whose raft log never frees room while its flushing thread keeps flushing;
+- a store test whose answers differ between one voter and three.

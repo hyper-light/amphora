@@ -1306,3 +1306,376 @@ fn ten_thousand_power_cuts() {
         .unwrap_or(1);
     seeds(10_000, from);
 }
+
+/// T-T1.12.1's database: 300 rows of `t`, made durable.
+const ONLINE_PATH: &str = "online.db";
+const ONLINE_ROWS: i64 = 300;
+/// The backfill's batch in this test (a test's workload size, not Amphora's: its driver learns
+/// its own, `online::Sizer`).
+const ONLINE_BATCH: u64 = 16;
+
+fn online_plan() -> amphora::database::online::Plan {
+    amphora::database::online::Plan::parse(&amphora_api::Migration {
+        name: "ix".into(),
+        sql: "CREATE INDEX ix ON t (a)".into(),
+    })
+    .unwrap()
+}
+
+/// Each step in its own transaction, made durable as the writer's pipeline makes it before its
+/// caller hears; a write between steps, and one after the last, so some cuts fall after the
+/// cutover is durable. Stops at the first failure (the power going out).
+fn online_run(db: &mut Db) -> anyhow::Result<()> {
+    online_steps(db, &online_plan())
+}
+
+/// [`online_run`]'s steps and writes for any online change.
+fn online_steps(db: &mut Db, plan: &amphora::database::online::Plan) -> anyhow::Result<()> {
+    for i in 0..10_000i64 {
+        let stepped =
+            db.transaction(|db| amphora::database::online::step(db, plan, ONLINE_BATCH))?;
+        db.flusher()().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let ended = matches!(
+            stepped,
+            amphora::database::online::Stepped::Public { .. }
+                | amphora::database::online::Stepped::Already
+        );
+        db.transaction(|db| {
+            db.query(
+                "INSERT INTO t (a) VALUES (?1)",
+                [Value::from_i64(i % 31)],
+                |_| Ok(true),
+            )?;
+            db.query(
+                "DELETE FROM t WHERE id = ?1",
+                [Value::from_i64(i * 11 + 3)],
+                |_| Ok(true),
+            )
+        })?;
+        db.flusher()().map_err(|e| anyhow::anyhow!("{e}"))?;
+        if ended {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("the change never ended")
+}
+
+fn online_baseline() -> HashMap<String, Vec<u8>> {
+    let disk = Disk::new(0, HashMap::new());
+    let mut db = Db::open_with(std::path::Path::new(ONLINE_PATH), disk.clone()).unwrap();
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER); CREATE TABLE __amphora_migrations (name TEXT PRIMARY KEY, sql TEXT NOT NULL)").unwrap();
+    db.transaction(|db| {
+        for i in 0..ONLINE_ROWS {
+            db.query(
+                "INSERT INTO t (a) VALUES (?1)",
+                [Value::from_i64(i % 31)],
+                |_| Ok(true),
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    db.flusher()().unwrap();
+    drop(db);
+    disk.image()
+}
+
+/// The schema after a restart: the old one (no `ix` readable, its change unfinished or not begun)
+/// or the new (`ix` public, its migration recorded, every row's entry in it). Never both or
+/// neither: a public `ix` without its migration, or a recorded migration without `ix`.
+fn online_check(db: &mut Db) -> Result<bool, String> {
+    let mut check = String::new();
+    db.query("PRAGMA integrity_check", [], |r| {
+        check = r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(true)
+    })
+    .map_err(|e| format!("integrity_check: {e:#}"))?;
+    if check != "ok" {
+        return Err(format!("integrity_check: {check}"));
+    }
+    let migrated = count(
+        db,
+        "SELECT count(*) FROM __amphora_migrations WHERE name = 'ix'",
+        vec![],
+    )? == 1;
+    let readable = count(
+        db,
+        "SELECT count(*) FROM t INDEXED BY ix WHERE a >= 0",
+        vec![],
+    );
+    match (migrated, readable) {
+        (true, Ok(indexed)) => {
+            let all = count(db, "SELECT count(*) FROM t NOT INDEXED", vec![])?;
+            if indexed != all {
+                return Err(format!("ix is public with {indexed} of {all} rows"));
+            }
+            Ok(true)
+        }
+        (false, Err(_)) => Ok(false),
+        (true, Err(e)) => Err(format!("the migration is recorded, ix isn't readable: {e}")),
+        (false, Ok(_)) => Err("ix is readable, its migration unrecorded".into()),
+    }
+}
+
+/// T-T1.12.1: a power cut at every change the online build of `ix` makes (each step, each backfill
+/// batch, each write between them, each flush), then the restart. Expect: the old schema or the
+/// new, never both or neither, the integrity check passing; and the change, carried on, ends with
+/// `ix` public and whole.
+#[test]
+fn t_t1_12_1_a_power_cut_at_every_step_of_an_online_index_leaves_old_or_new() {
+    let baseline = online_baseline();
+    let path = std::path::Path::new(ONLINE_PATH);
+    // The whole run's changes, uncut: every crash point is one of them.
+    let disk = Disk::new(0, baseline.clone());
+    let mut db = Db::open_with(path, disk.clone()).unwrap();
+    disk.arm(u64::MAX);
+    online_run(&mut db).unwrap();
+    let changes = disk.changes.load(Ordering::SeqCst);
+    drop(db);
+    assert!(changes > 50, "the run made only {changes} changes");
+    let (mut old, mut new) = (0u64, 0u64);
+    for at in 1..=changes {
+        let disk = Disk::new(at, baseline.clone());
+        let mut db = Db::open_with(path, disk.clone()).unwrap();
+        disk.arm(at);
+        let ran = online_run(&mut db);
+        drop(db);
+        let image = disk.image();
+        let mut db = Db::open_with(path, Disk::new(at, image)).unwrap();
+        match online_check(&mut db) {
+            Ok(true) => new += 1,
+            Ok(false) => old += 1,
+            Err(e) => panic!("cut at change {at} of {changes} ({ran:?}): {e}"),
+        }
+        online_run(&mut db).unwrap_or_else(|e| panic!("cut at change {at}: carrying on: {e:#}"));
+        assert_eq!(
+            online_check(&mut db),
+            Ok(true),
+            "cut at change {at}: carried on"
+        );
+    }
+    assert!(
+        old > 0 && new > 0,
+        "old schema after {old} cuts, new after {new}"
+    );
+}
+
+/// T-T1.12.1's column: `c` added online to the same 300 rows, a write before and after, each
+/// made durable, stopping at the first failure (the power going out).
+fn column_run(db: &mut Db) -> anyhow::Result<()> {
+    let plan = amphora::database::online::Plan::parse(&amphora_api::Migration {
+        name: "c".into(),
+        sql: "ALTER TABLE t ADD COLUMN c INTEGER NOT NULL DEFAULT 7 CHECK (c >= 0)".into(),
+    })
+    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let write = |db: &mut Db, i: i64| -> anyhow::Result<()> {
+        db.transaction(|db| {
+            db.query(
+                "INSERT INTO t (a) VALUES (?1)",
+                [Value::from_i64(i % 31)],
+                |_| Ok(true),
+            )?;
+            db.query(
+                "DELETE FROM t WHERE id = ?1",
+                [Value::from_i64(i * 11 + 3)],
+                |_| Ok(true),
+            )
+        })?;
+        db.flusher()().map_err(|e| anyhow::anyhow!("{e}"))
+    };
+    write(db, 1)?;
+    let stepped = db.transaction(|db| amphora::database::online::step(db, &plan, ONLINE_BATCH))?;
+    db.flusher()().map_err(|e| anyhow::anyhow!("{e}"))?;
+    write(db, 2)?;
+    match stepped {
+        amphora::database::online::Stepped::Public { .. }
+        | amphora::database::online::Stepped::Already => Ok(()),
+        other => anyhow::bail!("a column's change stepped {other:?}"),
+    }
+}
+
+/// The schema after a restart: the old one (no `c`, its migration unrecorded) or the new (`c` on
+/// every row, its migration recorded). Never a column without its record or a record without it.
+fn column_check(db: &mut Db) -> Result<bool, String> {
+    let mut check = String::new();
+    db.query("PRAGMA integrity_check", [], |r| {
+        check = r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(true)
+    })
+    .map_err(|e| format!("integrity_check: {e:#}"))?;
+    if check != "ok" {
+        return Err(format!("integrity_check: {check}"));
+    }
+    let migrated = count(
+        db,
+        "SELECT count(*) FROM __amphora_migrations WHERE name = 'c'",
+        vec![],
+    )? == 1;
+    let column = count(
+        db,
+        "SELECT count(*) FROM pragma_table_info('t') WHERE name = 'c'",
+        vec![],
+    )? == 1;
+    match (migrated, column) {
+        (true, true) => {
+            let unset = count(db, "SELECT count(*) FROM t WHERE c IS NOT 7", vec![])?;
+            if unset != 0 {
+                return Err(format!("{unset} rows read c other than its default"));
+            }
+            Ok(true)
+        }
+        (false, false) => Ok(false),
+        (true, false) => Err("the migration is recorded, c isn't there".into()),
+        (false, true) => Err("c is there, its migration unrecorded".into()),
+    }
+}
+
+/// T-T1.12.1, a column: a power cut at every change adding `c` online makes (the write before,
+/// the change, the write after, each flush), then the restart. Expect: the old schema or the new,
+/// never both or neither, the integrity check passing; and the change, carried on, ends with `c`.
+#[test]
+fn t_t1_12_1_a_power_cut_at_every_step_of_an_online_column_leaves_old_or_new() {
+    let baseline = online_baseline();
+    let path = std::path::Path::new(ONLINE_PATH);
+    let disk = Disk::new(0, baseline.clone());
+    let mut db = Db::open_with(path, disk.clone()).unwrap();
+    disk.arm(u64::MAX);
+    column_run(&mut db).unwrap();
+    let changes = disk.changes.load(Ordering::SeqCst);
+    drop(db);
+    assert!(changes > 2, "the run made only {changes} changes");
+    let (mut old, mut new) = (0u64, 0u64);
+    for at in 1..=changes {
+        let disk = Disk::new(at, baseline.clone());
+        let mut db = Db::open_with(path, disk.clone()).unwrap();
+        disk.arm(at);
+        let ran = column_run(&mut db);
+        drop(db);
+        let image = disk.image();
+        let mut db = Db::open_with(path, Disk::new(at, image)).unwrap();
+        match column_check(&mut db) {
+            Ok(true) => new += 1,
+            Ok(false) => old += 1,
+            Err(e) => panic!("cut at change {at} of {changes} ({ran:?}): {e}"),
+        }
+        column_run(&mut db).unwrap_or_else(|e| panic!("cut at change {at}: carrying on: {e:#}"));
+        assert_eq!(
+            column_check(&mut db),
+            Ok(true),
+            "cut at change {at}: carried on"
+        );
+    }
+    assert!(
+        old > 0 && new > 0,
+        "old schema after {old} cuts, new after {new}"
+    );
+}
+
+/// T-T1.12.1's constraint: NOT NULL and CHECK added online to `a` of the same 300 rows, each
+/// step and each write between them made durable, stopping at the first failure.
+fn constraint_run(db: &mut Db) -> anyhow::Result<()> {
+    let plan = amphora::database::online::Plan::parse(&amphora_api::Migration {
+        name: "nn".into(),
+        sql: "ALTER TABLE t ALTER COLUMN a TO a INTEGER NOT NULL CHECK (a >= 0)".into(),
+    })
+    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    online_steps(db, &plan)
+}
+
+/// The schema after a restart: the old one (its migration unrecorded; `a` without the constraint,
+/// or with it still marked unvalidated) or the new (its migration recorded, `a` declared with it,
+/// no mark, no row breaking it). Never a constraint public without its record, or a record
+/// without the constraint public.
+fn constraint_check(db: &mut Db) -> Result<bool, String> {
+    let mut check = String::new();
+    db.query("PRAGMA integrity_check", [], |r| {
+        check = r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(true)
+    })
+    .map_err(|e| format!("integrity_check: {e:#}"))?;
+    if check != "ok" {
+        return Err(format!("integrity_check: {check}"));
+    }
+    let migrated = count(
+        db,
+        "SELECT count(*) FROM __amphora_migrations WHERE name = 'nn'",
+        vec![],
+    )? == 1;
+    let declared = count(
+        db,
+        "SELECT count(*) FROM sqlite_schema WHERE name = 't' AND sql LIKE '%NOT NULL%' AND sql LIKE '%CHECK%'",
+        vec![],
+    )? == 1;
+    let kept = count(
+        db,
+        "SELECT count(*) FROM sqlite_schema WHERE name = '__amphora_constraint_states'",
+        vec![],
+    )? == 1;
+    let marked = kept
+        && count(
+            db,
+            "SELECT count(*) FROM __amphora_constraint_states WHERE tbl = 't' AND col = 'a'",
+            vec![],
+        )? == 1;
+    match (migrated, declared && !marked) {
+        (true, true) => {
+            let broken = count(
+                db,
+                "SELECT count(*) FROM t WHERE a IS NULL OR a < 0",
+                vec![],
+            )?;
+            if broken != 0 {
+                return Err(format!("{broken} rows break the public constraint"));
+            }
+            Ok(true)
+        }
+        (false, false) => Ok(false),
+        (true, false) => Err(format!(
+            "the migration is recorded, the constraint isn't public (declared {declared}, marked {marked})"
+        )),
+        (false, true) => Err("the constraint is public, its migration unrecorded".into()),
+    }
+}
+
+/// T-T1.12.1, a constraint: a power cut at every change adding NOT NULL and CHECK to `a` online
+/// makes (each step, each validation batch, each write between them, each flush), then the
+/// restart. Expect: the old schema or the new, never both or neither, the integrity check
+/// passing; and the change, carried on, ends with the constraint public.
+#[test]
+fn t_t1_12_1_a_power_cut_at_every_step_of_an_online_constraint_leaves_old_or_new() {
+    let baseline = online_baseline();
+    let path = std::path::Path::new(ONLINE_PATH);
+    let disk = Disk::new(0, baseline.clone());
+    let mut db = Db::open_with(path, disk.clone()).unwrap();
+    disk.arm(u64::MAX);
+    constraint_run(&mut db).unwrap();
+    let changes = disk.changes.load(Ordering::SeqCst);
+    drop(db);
+    assert!(changes > 20, "the run made only {changes} changes");
+    let (mut old, mut new) = (0u64, 0u64);
+    for at in 1..=changes {
+        let disk = Disk::new(at, baseline.clone());
+        let mut db = Db::open_with(path, disk.clone()).unwrap();
+        disk.arm(at);
+        let ran = constraint_run(&mut db);
+        drop(db);
+        let image = disk.image();
+        let mut db = Db::open_with(path, Disk::new(at, image)).unwrap();
+        match constraint_check(&mut db) {
+            Ok(true) => new += 1,
+            Ok(false) => old += 1,
+            Err(e) => panic!("cut at change {at} of {changes} ({ran:?}): {e}"),
+        }
+        constraint_run(&mut db)
+            .unwrap_or_else(|e| panic!("cut at change {at}: carrying on: {e:#}"));
+        assert_eq!(
+            constraint_check(&mut db),
+            Ok(true),
+            "cut at change {at}: carried on"
+        );
+    }
+    assert!(
+        old > 0 && new > 0,
+        "old schema after {old} cuts, new after {new}"
+    );
+}
