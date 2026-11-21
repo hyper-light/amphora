@@ -196,10 +196,14 @@ deterministic simulator:
    `Groups::carry` is the shell: it carries each of the driver's actions to this node's groups
    (create, copy, catch-up, fence, activate, release with its sweep, unfence, discard, retire) and
    answers it. A fence's entry is numbered on the group's writer, after every batch let in before
-   it. A batch is as many positions or entries as the store's `commit_rows`, the rows one commit of
-   its writer takes, so a batch holds a writer no longer than a commit does. A split or merge carried
+   it. A batch is as many positions or entries as hold each writer it runs on
+   about as long as a commit there does, learned from the batches run before (decision "Batches
+   learned where they run", below). A split or merge carried
    through it moves the range's rows while writes go on (T-T1.9.R4), and the harnesses for the
    cutover pause (T-T1.9.P1, AC-T1.9.2) and the operations' lab (T-T1.9.L1, AC-T1.9.3) run on it.
+
+   Built (lane split-merge-7): batches learned where they run, and the groups retired on a node
+   kept durable (the two decisions below, T-T1.9.R6).
 
    Still left of this item: `database::Local` as a group's engine, its holding and log kept through
    a replicated command; moves to another node (the copy and catch-up over the network); a retired
@@ -211,3 +215,34 @@ deterministic simulator:
    three-machine lab's 1,000 operations (AC-T1.9.3).
 4. **Metrics.** Operations by kind and outcome, and the fence lag. Their names still need
    agreement with kiln's Observe owner (CLAUDE.md §10).
+
+## Decision (lane split-merge-7): batches learned where they run
+
+A copy, catch-up or sweep batch runs on a group's writer, and every write to that group waits
+behind it. So a batch should hold the writer about as long as one of the writer's own commits
+does: then a write waits for a batch no longer than it already waits for a commit. Both sides of
+that are measured where they run, never picked:
+- the target is the writer's mean commit time (its meter's commit time over its commits); a group
+  that hasn't committed yet uses the mean over this node's groups (one machine, one disk);
+- the cost of a unit (a position read or swept, a log entry replayed, a moved key written) is the
+  time every batch of that kind held that writer, over its units, so it moves as the load and the
+  rows move.
+
+A batch is the target over a unit's cost, at least one unit. A copy or catch-up runs on two
+writers (the read on the old group's, the write on the new one's), so it takes the smaller of the
+two. The first batch of a kind, before any cost is measured, is one unit. On a node where nothing
+has committed, no write is waiting, and a batch doubles from the last, as TCP's slow start probes
+for room (RFC 5681, section 3.1). This replaces the store's `commit_rows` as the batch size: that
+counted rows, not time, and a copied position costs nothing like a committed row.
+
+## Decision (lane split-merge-7): retired groups kept
+
+A merge or a move retires a group. A stale driver can ask again for the Create that made it.
+Before this, a node kept the groups it retired only in memory, so after a restart such a Create
+made an empty group with the retired id. Now each node keeps the groups it retired in one file of
+its own (`Groups::on`'s `retired`), replaced whole and flushed before the retire is answered. A
+restart reads it back: a retired group is neither started nor made again, and a Create of it is
+refused as of an ended operation (T-T1.9.R6). The file stays bounded. An id leaves it once the
+directory the node routes by shows the group retired (its id given out, the group placed nowhere),
+because from then on the directory says the same thing. So the file holds no more ids than this
+node's directory lags behind its own retires.
