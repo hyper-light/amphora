@@ -2276,8 +2276,11 @@ the two numbers in place. Every member then applies the entry by the exact base,
 its own for the decision and none can decide it differently: a restart, an image or a binary from before changes
 nothing. That is Kung and Robinson's backward validation (research f4, f5), over pages. An entry that no page list
 describes (a change of members, a class entry, a seed, one the leader can't read) conflicts. Every apply writes the
-replica's marker table, so a write that read or wrote its page conflicts with every entry. Entries refused at their own
-apply still count as written: conservative, never unsound.
+replica's marker table and the closed time's table ("Follower reads at a closed time"), so a write that read or wrote
+either page conflicts with every entry. The leader reads a write inside its proposer's closed-time stamp, and moving its
+base keeps the stamp as it was. The group's first stamped entry makes the closed time's table at apply, a schema change
+no page list shows, so a follower carries a read set only on a base whose state already has that table. Entries refused
+at their own apply still count as written: conservative, never unsound.
 
 **Page 1 merges its size.** Every session reads page 1. An entry that changed it only in the size conflicts only with
 a write that writes page 1 too; one that changed more of it (the schema, its cookie, the free list) conflicts with
