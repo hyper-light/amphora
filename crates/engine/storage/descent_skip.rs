@@ -1,4 +1,4 @@
-//! Amphora: skipping the B-tree descent, two prototypes (G3 step 5, prototypes D and E; PR.5).
+//! Amphora: skipping the B-tree descent, two prototypes (G3 step 5, prototypes D and E; G3.5).
 //!
 //! A point read descends from the root: a binary search at every interior page, then one at the
 //! leaf. Both prototypes name the leaf instead, and the caller searches only that leaf:
@@ -17,7 +17,7 @@
 //! prototype learned the page (the caller's `stamp`, a count it raises whenever a page is freed or
 //! changes tree, so a leaf of another table holding the same rowid can't answer). Leaves of one
 //! B-tree hold disjoint ranges, so a leaf of this tree whose range holds the key is the only place
-//! the key can be: the row it holds, or its absence, is what a descent returns (T-PR.5.1). A page
+//! the key can be: the row it holds, or its absence, is what a descent returns (T-G3.5.1). A page
 //! that doesn't prove it is refuted and forgotten, and the caller descends as today. Upkeep is
 //! therefore paid where the tree changed and a search noticed: a refuted page is dropped, and the
 //! descent that follows teaches the leaf it found.
@@ -942,13 +942,13 @@ mod tests {
         pages.row(leaf, rowid)
     }
 
-    /// T-PR.5.1: two rowid tables share pages (a page one frees, the other reuses), under random
+    /// T-G3.5.1: two rowid tables share pages (a page one frees, the other reuses), under random
     /// inserts (appends and fills, splitting leaves and the root), deletes (single and ranges,
     /// merging and freeing leaves) and lookups of present and absent rowids; every lookup through
     /// the adaptive hash and through the learned locator returns the row a plain descent returns,
     /// and each prototype answered lookups itself, was refuted, and dropped all on a free.
     #[test]
-    fn t_pr_5_1_skips_return_what_a_descent_returns() {
+    fn t_g3_5_1_skips_return_what_a_descent_returns() {
         for seed in 0..8u64 {
             let mut rng = ChaCha8Rng::seed_from_u64(0x0050_5235 ^ seed);
             let mut pages = Pages::default();
@@ -1014,11 +1014,11 @@ mod tests {
         }
     }
 
-    /// T-PR.5.2: over a table's complete fences, the locator names exactly the leaf a descent
+    /// T-G3.5.2: over a table's complete fences, the locator names exactly the leaf a descent
     /// finds for every rowid, present or absent between leaves, and its fit splits a table whose
     /// leaves fill unevenly into more than one segment.
     #[test]
-    fn t_pr_5_2_locator_names_the_descents_leaf() {
+    fn t_g3_5_2_locator_names_the_descents_leaf() {
         let mut rng = ChaCha8Rng::seed_from_u64(0x0050_5235_0002);
         let mut pages = Pages::default();
         let tree = Tree::new(&mut pages, 8);
@@ -1053,7 +1053,7 @@ mod tests {
             .unwrap_or(default)
     }
 
-    /// The micro-benchmark behind PR.5's measurements, over the model B-tree: lookup and upkeep
+    /// The micro-benchmark behind G3.5's measurements, over the model B-tree: lookup and upkeep
     /// costs of the plain descent, the adaptive hash (D) and the learned locator (E). Run it,
     /// release, nothing else building:
     /// `cargo test -p amphora-engine --release --lib descent_skip_bench -- --ignored --nocapture`

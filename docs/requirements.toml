@@ -813,3 +813,17 @@ tests = [
   { id = "T-G3.2.1", text = "storage::wal::tests::g3_2_* — passes when every page read through each lock-free way (filtered, published, optimistic), at random snapshots while frames are appended, rewound, rolled back, checkpointed and the log restarted, and beside a writer thread, finds the frame the index read under its lock finds, or none" },
   { id = "T-G3.2.2", text = "crates/engine/tests/log_read_index.rs — passes when, after a crash at every write of a checkpoint and of a log restart, every read through each way returns its page's last committed version" },
 ]
+
+# lane g3s5: G3 step 5 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), skipping the descent.
+[[own]]
+id = "G3.5"
+title = "Skipping the descent: adaptive hash index against a learned leaf locator (G3 step 5; store.md decision 41)"
+criteria = [
+  { id = "AC-G3.5.1", text = "each prototype's lookup and write (upkeep) costs recorded on every point-read and write class (measured by the coordinator)" },
+  { id = "AC-G3.5.2", text = "point_pk at 1 client with the winner rises at least 20% against after steps 2-4 (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-G3.5.1", text = "storage::descent_skip::tests::t_g3_5_1_* — passes when every lookup through the adaptive hash and the learned locator, under random inserts, deletes, splits and merges over pages two tables share, returns the row a plain descent returns" },
+  { id = "T-G3.5.2", text = "storage::descent_skip::tests::t_g3_5_2_* — passes when, over a table's complete fences, the locator names the leaf a descent finds for every covered rowid" },
+]
+

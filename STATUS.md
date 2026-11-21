@@ -218,6 +218,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   beside a cached page, built once the page's searches have paid for it, replaces a probe's decode
   and compare when the heads order the cell. Built and model-tested (T-PR.4.1); not yet measured
   (AC-PR.4.1, AC-PR.4.2).
+- **Skipping the descent** (docs/design/store.md decision 41, `crates/engine/storage/descent_skip.rs`;
+  G3 step 5, G3.5): two cores that name a point read's leaf without descending, each answer proven
+  by the leaf's own range: InnoDB's adaptive hash index, built a leaf at a time by a ski rental
+  counted in probes, and a learned rowid-to-leaf locator whose error bound is its own fit's. Built
+  and model-tested against a plain descent (T-G3.5.1, T-G3.5.2); not yet wired into the cursor
+  or measured (AC-G3.5.1, AC-G3.5.2; `descent_skip_bench` measures the cores).
 - **A shared page found in one lookup** (docs/design/store.md decision 22): the pool keeps each image
   in its map's entry and counts lookups in each shard, under the lock it holds anyway, where one
   count for the pool moved between 32 readers' cores at every lookup. Sharing 256 MiB at 32 clients:
