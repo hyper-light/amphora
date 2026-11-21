@@ -12,6 +12,7 @@
 //! Amphora: the database kiln keeps every record in: KilnDB made a product (docs/design/README.md,
 //! STATUS.md).
 //!
+//! - [`audit`]: the audit log (CP-T1.7): RFC 6962's Merkle tree over Records, verified on read.
 //! - [`store`]: a database's commit pipeline and its readers (CP-T1.1): one writer with a group
 //!   commit and no timer, durable beside it by a flusher, readers on connections of their own, and
 //!   no checkpoint in a commit's way.
@@ -24,6 +25,7 @@
 //!
 //! The `amphora` binary says what it is ([`reply`]).
 
+pub mod audit;
 pub mod database;
 pub mod db;
 pub mod groups;
