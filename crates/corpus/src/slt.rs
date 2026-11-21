@@ -247,7 +247,9 @@ mod tests {
         let Item::Record(e) = &items[4] else { panic!() };
         assert_eq!(e.kind, Kind::Statement { ok: false });
         assert_eq!(items[5], Item::Halt(vec![]));
-        let Item::Record(after) = &items[6] else { panic!() };
+        let Item::Record(after) = &items[6] else {
+            panic!()
+        };
         assert_eq!((after.line, after.sql.as_str()), (26, "SELECT 1"));
     }
 

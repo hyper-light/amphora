@@ -39,12 +39,14 @@ pub fn as_int(v: &Value) -> i64 {
     }
 }
 
+/// A REAL as an integer: NaN is 0, and at or past ±2^63 (exact in an f64; i64::MAX itself has no
+/// f64) it saturates.
 fn real_to_int(r: f64) -> i64 {
     if r.is_nan() {
         0
-    } else if r >= 9.223_372_036_854_775_807e18 {
+    } else if r >= 9_223_372_036_854_775_808.0 {
         i64::MAX
-    } else if r <= -9.223_372_036_854_775_808e18 {
+    } else if r <= -9_223_372_036_854_775_808.0 {
         i64::MIN
     } else {
         trunc_in_range(r)

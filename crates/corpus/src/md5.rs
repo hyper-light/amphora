@@ -100,11 +100,11 @@ impl Md5 {
         // The message's length is kept modulo 2^64 bits (RFC 1321, 3.2): wrapping is the format.
         self.bytes = self.bytes.wrapping_add(data.len() as u64);
         self.pending.extend_from_slice(data);
-        let mut blocks = self.pending.chunks_exact(64);
-        for block in &mut blocks {
+        let (blocks, rest) = self.pending.as_chunks::<64>();
+        for block in blocks {
             compress(&mut self.state, block);
         }
-        self.pending = blocks.remainder().to_vec();
+        self.pending = rest.to_vec();
     }
 
     /// The digest as 32 lowercase hex digits.
@@ -134,12 +134,10 @@ impl Md5 {
 }
 
 /// One 64-byte block into the state (RFC 1321, 3.4).
-fn compress(state: &mut [u32; 4], block: &[u8]) {
+fn compress(state: &mut [u32; 4], block: &[u8; 64]) {
     let mut m = [0u32; 16];
-    for (word, bytes) in m.iter_mut().zip(block.chunks_exact(4)) {
-        if let [a, b, c, d] = *bytes {
-            *word = u32::from_le_bytes([a, b, c, d]);
-        }
+    for (word, bytes) in m.iter_mut().zip(block.as_chunks::<4>().0) {
+        *word = u32::from_le_bytes(*bytes);
     }
     let [mut a, mut b, mut c, mut d] = *state;
     for (i, (shift, sine)) in SHIFTS.iter().zip(SINES.iter()).enumerate() {
