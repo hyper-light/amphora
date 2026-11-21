@@ -314,6 +314,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   rowid order; the header stays the pager's), a statement's own rollback inside a transaction, DROP
   undone by ROLLBACK, a pool past the page cache's bound; the engine's suites with the switch on are
   the coordinator's run.
+- **Three ways to reach a cached page** (G7 step 3, `NS.3`; `crates/engine/storage/reach`,
+  `amphora-bench --reach`): behind one trait, sharing frames, CLOCK eviction and one miss path, (a) a
+  page table in shards with pins and a private pin on a client's current page (PostgreSQL), (b)
+  references by frame index read optimistically under a version, atomics standing in for
+  unsynchronized reads (LeanStore, Umbra), and (c) a direct array of frames by page number
+  (vmcache without the page table). Shards follow the machine's threads, the array the file's pages.
+  The model test with eviction under 32 threads (`T-NS.3.1`) passes on all three. Not yet: the
+  harness's runs (point reads and scans at 1 and 32 clients, cached and a pool a tenth of the file)
+  and the choice by their numbers, the coordinator's; misses read an in-memory stand-in for the file.
 - **Serializable validation, three prototypes behind one switch** (G8 step 1, docs/design/engine.md
   decision 5, `crates/engine/storage/versioned/{version,elle}.rs`, `amphora-bench --cc`): precision
   locking (the default), SSI and Silo-style OCC validate commits on the versioned storage's commit

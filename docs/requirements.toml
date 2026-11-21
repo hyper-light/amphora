@@ -509,6 +509,18 @@ tests = [
   { id = "T-NS.2.6", text = "SQL end to end through the switch and without it (CREATE TABLE, INSERT, SELECT, transactions) answers alike" },
 ]
 
+# lane g7s3
+[[own]]
+id = "NS.3"
+title = "Three ways to reach a cached page, prototyped against each other (G7 step 3)"
+criteria = [
+  { id = "AC-NS.3.1", text = "the three prototypes' costs on the corpus recorded side by side; the choice made by the numbers and recorded with the losers" },
+  { id = "AC-NS.3.2", text = "cycles per cached-page access with the winner against a hash-table lookup and pin falls by at least 50%" },
+]
+tests = [
+  { id = "T-NS.3.1", text = "The model test with eviction under 32 threads (crates/engine/storage/reach/model.rs) — passes when no stale or torn page read and no use after eviction, every page equal to the reference map" },
+]
+
 # lane follower-reads (G13 step 4, kiln goal 80d4cf5e; docs/design/replication.md, "Follower reads at a
 # closed time" and "Search over partitions"). AC-T1.10.3 and AC-T1.10.4 are the measures; these are what they
 # rest on.
