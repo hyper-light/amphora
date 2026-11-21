@@ -13,7 +13,8 @@
 //! cursor's place after `sqlite3BtreeDelete` as only good for the step that follows (the
 //! executor's `OP_Delete` is followed by `OP_Next`/`OP_Prev`, never by a read or a second
 //! delete). That step is checked against a plain ordered model of the rows too: the row after the
-//! deleted one, or the one before it.
+//! deleted one, or the one before it. The versioned cursor must match the model; the reference
+//! (btree.rs) is known to leave it on `prev` after a delete, so there the model alone decides.
 
 use super::cursor::{Access, KeyOrder, VersionedCursor};
 use super::disk::Simulated;
@@ -394,8 +395,8 @@ fn run(kind: Kind, seed: u64, ops: usize) {
     let mut place = Place::Unplaced;
     // The key of the row last deleted, while `place` is `Deleted`.
     let mut deleted: Vec<u8> = Vec::new();
-    // Steps where the reference's `prev` after deleting the last row left it elsewhere than the
-    // model's row (btree.rs; see `step_after_delete`), counted so the report can name them.
+    // Steps where the reference's `prev` after a delete left it elsewhere than the model's row
+    // (btree.rs), counted so a run names them.
     let mut reference_diverged = 0usize;
     let mut next_rowid = 1i64;
     // The operations so far, the last few of which a failure names.
@@ -486,15 +487,23 @@ fn run(kind: Kind, seed: u64, ops: usize) {
                     "{at}: {name} after a delete, against the ordered model"
                 );
                 if record(&sb).as_deref() != want {
-                    // The reference's own divergence, known in one case only: `prev` after
-                    // deleting the last row (btree.rs, shared engine code this suite doesn't
-                    // change). Anywhere else it fails the run. Both cursors are placed afresh
-                    // before anything is compared again.
-                    let was_last = model.step_from(&deleted, true).is_none();
+                    // The reference's own divergence, known for `prev` after a delete only
+                    // (btree.rs, shared engine code this suite doesn't change): it lands
+                    // elsewhere than the row before the deleted one. A `next` that leaves the
+                    // model fails the run. Both cursors are placed afresh before anything is
+                    // compared again.
                     assert!(
-                        !forward && was_last,
+                        !forward,
                         "{at}: the reference's {name} after a delete left the ordered model: \
                          reference {sb:?}, versioned {sv:?}"
+                    );
+                    eprintln!(
+                        "{at}: reference prev after deleting {:?} (last: {}) landed on {:?}, \
+                         the model's row {:?}",
+                        deleted,
+                        model.step_from(&deleted, true).is_none(),
+                        record(&sb),
+                        want
                     );
                     reference_diverged += 1;
                     place = Place::Unplaced;
@@ -585,8 +594,8 @@ fn run(kind: Kind, seed: u64, ops: usize) {
     assert_eq!(records, modelled, "{kind:?} seed {seed}: the model's rows at the end");
     if reference_diverged > 0 {
         eprintln!(
-            "{kind:?} seed {seed}: the reference's prev after deleting the last row left the \
-             ordered model {reference_diverged} times (versioned matched it)"
+            "{kind:?} seed {seed}: the reference's prev after a delete left the ordered model \
+             {reference_diverged} times (versioned matched it)"
         );
     }
     assert!(
