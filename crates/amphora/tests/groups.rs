@@ -691,8 +691,9 @@ fn t_t1_9_r4_a_split_copies_the_moving_ranges_rows_and_a_merge_brings_them_back(
 
 /// T-T1.9.R5 (CP-T1.9 step 3; the driver's contract, docs/design/reshard.md): the split and merge
 /// of T-T1.9.R4 with every action carried out twice at the real groups (the first answer lost) and
-/// the driver restarted from the directory as it is durable after every third action, its stale
-/// actions still carried; expect each operation still to end flipped, every acknowledged write read
+/// the driver restarted from the directory as it is durable, its stale
+/// actions still carried (third action, sixth, twelfth, each restart twice as far as the one before);
+/// expect each operation still to end flipped, every acknowledged write read
 /// back from exactly one group, and after the merge the one group left holding every row.
 #[test]
 fn t_t1_9_r5_repeated_actions_and_driver_restarts_move_every_row_once() {
@@ -728,6 +729,7 @@ fn t_t1_9_r5_repeated_actions_and_driver_restarts_move_every_row_once() {
         let mut pending: std::collections::VecDeque<Out> = driver.begin(&proposal).unwrap().into();
         let mut ended = 0;
         let mut carried = 0u64;
+        let mut restart_at = 3u64;
         while let Some(o) = pending.pop_front() {
             match o {
                 Out::Commit(c) => {
@@ -753,7 +755,11 @@ fn t_t1_9_r5_repeated_actions_and_driver_restarts_move_every_row_once() {
                     }
                     let reply = groups.carry(&a, soon(), make).unwrap();
                     carried += 1;
-                    if carried.is_multiple_of(3) {
+                    // Restarts at actions 3, 6, 12, 24, ...: each driver after one gets twice
+                    // as far before the next, so the operation gets past every stage (a driver
+                    // restarted every few actions for ever can't finish a catch-up round).
+                    if carried == restart_at {
+                        restart_at *= 2;
                         epoch += 1;
                         stale.push(a);
                         let (d, out) = Driver::recover(durable.clone(), epoch).unwrap();
