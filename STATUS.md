@@ -590,6 +590,15 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
 
 ## Next
 
+- **Replication measured: the harnesses** (G12 steps 1 and 3, CP-T1.8; lane repl-measure; `bench/src/repl.rs`,
+  `bench/servers/repl/`): built and unit-tested, not run at size. `amphora-bench --repl commit|failover|catchup
+  --system amphora|rqlite|dqlite|litefs|libsql` gives commit latency p50/p99/p99.9 and throughput, the time from a
+  leader kill to the first acknowledged write with the acknowledged events lost, and a member's time to catch up,
+  every size and duration an input. Amphora's three members run in one process (a kill is a cut from the relay);
+  the competitors run as three-node container clusters through their scripts (dqlite and LiteFS through the bench's
+  Go shim). libSQL has no failover and dqlite no member-local read, so those are refused, typed, as is LiteFS's
+  failover until its script runs a Consul lease. Closes with: the comparison set and Amphora's classes measured on
+  adacachy, fedora and jupiter, best of 3, and Amphora's members across machines for the LAN p99.
 - **Follower reads at a closed time and search over partitions** (G13 step 4; replication.md, "Follower reads at a
   closed time" and "Search over partitions"; lane follower-reads): built and unit-tested, not measured. Every proposed
   entry carries its proposer's clock; every member applies it at the larger of that and one past the time before it,

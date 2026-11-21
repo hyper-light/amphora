@@ -776,7 +776,7 @@ mod http {
                 _ => Dialect::Shim,
             };
             let agent: ureq::Agent = ureq::Agent::config_builder().no_delay(true).http_status_as_error(false).timeout_global(Some(deadline)).build().into();
-            let mut h = Self { system: system.to_owned(), dialect, script: scripts.join(format!("{system}.sh")), shell: shell.to_owned(), endpoints: Vec::new(), agent };
+            let mut h = Self { system: system.to_owned(), dialect, script: PathBuf::from(format!("{}/{system}.sh", scripts.display())), shell: shell.to_owned(), endpoints: Vec::new(), agent };
             h.script(&["up"]).map_err(|e| Refusal::Unavailable(format!("{system}'s cluster didn't come up through {}: {e}", h.script.display())))?;
             for n in 0..NODES {
                 h.endpoints.push(h.script(&["endpoint", &n.to_string()])?.trim().to_owned());
@@ -784,6 +784,8 @@ mod http {
             Ok(h)
         }
 
+        /// The script run by `--shell` (on Windows, name Git's bash by its full path: a bare `bash`
+        /// can resolve to WSL's, which can't reach Docker Desktop's CLI the same way).
         fn script(&self, args: &[&str]) -> anyhow::Result<String> {
             let out = std::process::Command::new(&self.shell).arg(&self.script).args(args).output()?;
             anyhow::ensure!(out.status.success(), "{} {}: {}", self.script.display(), args.join(" "), String::from_utf8_lossy(&out.stderr).trim());

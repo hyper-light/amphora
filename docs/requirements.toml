@@ -873,3 +873,9 @@ tests = [
   { id = "T-G3.3.5", text = "crates/engine/tests/shared_pages.rs g3s3_plain_misses_read_into_the_pages_evictions_leave — passes when a table four times the cache reads today's rows on the plain path and its misses read into recycled pages" },
   { id = "T-G3.3.6", text = "crates/engine/tests/page_path_allocs.rs — passes when the plain path's point lookups that miss allocate less than today's and its hits no more (a counting allocator; --nocapture prints allocations per lookup, AC-G3.3.2's harness)" },
 ]
+
+# lane repl-measure (G12 steps 1 and 3, CP-T1.8): no new IDs. `amphora-bench --repl` is the harness
+# for AC-T1.8.2 and AC-T1.8.3 (`commit`), AC-T1.8.4 and the lab half of AC-T1.8.5 (`failover`: kill the
+# leader under load, count acknowledged events lost), the catch-up of G12 step 3 (`catchup`), and
+# G12 step 1's comparison set (dqlite, rqlite, LiteFS and libSQL through bench/servers/repl/). Its
+# tests: bench/src/repl.rs g12_repl_*. The measurements are the coordinator's.

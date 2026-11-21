@@ -86,8 +86,9 @@ pub fn query(amphora: &mut Amphora, name: &str, sql: &str, params: &Params, mode
         for (i, (_, values)) in params.seeds.iter().enumerate() {
             // The modes' order turns with each run: the first mode of one run is the last of the next.
             let turn = (pass + i) % each.len().max(1);
-            for k in 0..each.len() {
-                let Some(m) = each.get_mut((k + turn) % each.len()) else { continue };
+            let modes = each.len();
+            for k in 0..modes {
+                let Some(m) = each.get_mut((k + turn) % modes) else { continue };
                 if m.stopped.is_some() {
                     continue;
                 }
