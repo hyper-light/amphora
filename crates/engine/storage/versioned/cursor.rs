@@ -183,6 +183,9 @@ struct Rows {
     low: Option<Vec<u8>>,
     high: Option<Vec<u8>>,
     right: Option<u64>,
+    /// Whether the copy runs to the leaf's last cell: not when copied going back from a point
+    /// inside it.
+    end: bool,
     bytes: Vec<u8>,
     /// Each row's start in `bytes`, its key's length and its value's length.
     at: Vec<(usize, usize, usize)>,
@@ -246,8 +249,10 @@ impl Rows {
         self.right = super::page::right(leaf.page)?;
         self.bytes.clear();
         self.at.clear();
+        let count = super::page::count(leaf.page)?;
+        self.end = after || leaf.split >= count;
         let cells = if after {
-            leaf.split..super::page::count(leaf.page)?
+            leaf.split..count
         } else {
             0..leaf.split
         };
@@ -478,8 +483,17 @@ impl VersionedCursor {
                         self.at = At::Row(next);
                         return Ok(());
                     }
-                    // Past the copy's last row: on to the leaf right of it, whose rows are all
-                    // past the copy's upper bound.
+                    // Past the copy's last row, where the copy stops short of the leaf's end
+                    // (copied going back): the rest of this leaf, then on (T-NS.1.1).
+                    if !self.rows.end {
+                        let key = self.rows.key(i)?.to_vec();
+                        let from = (self.rows.leaf, self.rows.low.clone());
+                        return self
+                            .first_after(&Point::Above(&key), Some(from))
+                            .map(|_| ());
+                    }
+                    // Else on to the leaf right of it, whose rows are all past the copy's upper
+                    // bound.
                     let Some(right) = self.rows.right else {
                         return Ok(());
                     };
