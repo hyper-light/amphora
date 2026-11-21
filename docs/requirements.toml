@@ -439,3 +439,18 @@ criteria = [
 tests = [
   { id = "T-DQ.1.1", text = "Three members, an election and 20 writes on driven time — passes when every write is answered and some step left more to drive for the next" },
 ]
+
+# lane records-api: Amphora's own IDs for CP-T1.5's Records API (kiln goal a1f386fe, G9 step 1;
+# docs/design/records.md). The suite's cases are AC-T1.5.3's.
+
+[[own]]
+id = "RA.1"
+title = "Records in amphora-api, typed and simulated: the feed's guarantees, the simulator, index families, counters"
+criteria = [
+  { id = "AC-RA.1.1", text = "Amphora's Namespace (in memory, on a file, through the local owner) and SimRecords each pass every case of amphora_api::conformance, kiln-seams' RECORDS-1 to 14 among them" },
+  { id = "AC-RA.1.2", text = "SimRecords answers every request as Amphora does, refusals and compaction progress included" },
+]
+tests = [
+  { id = "T-RA.1.1", text = "the_simulator_answers_as_amphora_does over AMPHORA_RECORDS_SEEDS seeded histories — passes when every answer is equal and every kind of request was answered and refused" },
+  { id = "T-RA.1.2", text = "index_keys_keep_term_order_and_prefixes_reach_one_term over every term of up to three bytes from {0x00, 0x01, 0xFF, a} — passes when keys sort as (term, key) and a prefix reaches its own term only" },
+]
