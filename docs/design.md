@@ -127,6 +127,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | replication | – | Decision (lane constants): a generation of restarts ends once it covers its spend (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-a-generation-of-restarts-ends-once-it-covers-its-spend-2026-11-21) |
 | replication | – | A follower's write that read nothing written since its base: read sets (built 2026-11-21, Amphora goal ceea4e0a) | [replication.md](design/replication.md#a-followers-write-that-read-nothing-written-since-its-base-read-sets-built-2026-11-21-amphora-goal-ceea4e0a) |
 | replication | – | Decision (lane g12s2): the raft log as the WAL (2026-11-21, G12 step 2) | [replication.md](design/replication.md#decision-lane-g12s2-the-raft-log-as-the-wal-2026-11-21-g12-step-2) |
+| replication | – | Decision (lane constants): the owner's tick pace (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-the-owners-tick-pace-2026-11-21) |
 | reshard | – | Decision (lane split-merge): split, merge and move as one fenced hand-off, decided by measured share | [reshard.md](design/reshard.md#decision-lane-split-merge-split-merge-and-move-as-one-fenced-hand-off-decided-by-measured-share) |
 | semantics | 1 | TEXT is well-formed UTF-8 | [semantics.md](design/semantics.md#1-text-is-well-formed-utf-8) |
 | semantics | 2 | atanh's last digit is its platform's C library's | [semantics.md](design/semantics.md#2-atanhs-last-digit-is-its-platforms-c-librarys) |
@@ -170,6 +171,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | store | 37 | A commit logs its pages' changes: a log of both kinds of slot | [store.md](design/store.md#37-a-commit-logs-its-pages-changes-a-log-of-both-kinds-of-slot) |
 | store | 38 | A page is searched by key heads once its searches have paid for them (prototype, behind a switch) | [store.md](design/store.md#38-a-page-is-searched-by-key-heads-once-its-searches-have-paid-for-them-prototype-behind-a-switch) |
 | store | 39 | A page read past the cache reads its own frames: pages new to a chain are page frames, a chain's entries records of one slot | [store.md](design/store.md#39-a-page-read-past-the-cache-reads-its-own-frames-pages-new-to-a-chain-are-page-frames-a-chains-entries-records-of-one-slot) |
+| store | 40 | A page read finds its frame and the log's header without the shared locks (prototype, behind a switch) | [store.md](design/store.md#40-a-page-read-finds-its-frame-and-the-logs-header-without-the-shared-locks-prototype-behind-a-switch) |
 | store | – | Decision (lane wal-read): a commit's records published at a lookup's cost, its deltas found a word at a time | [store.md](design/store.md#decision-lane-wal-read-a-commits-records-published-at-a-lookups-cost-its-deltas-found-a-word-at-a-time) |
 | without-rowid | – | Native primary-root query access | [without-rowid.md](design/without-rowid.md#native-primary-root-query-access) |
 | xgroup | – | The two protocols: two-phase commit and Parallel Commits behind a switch, two-phase locking without waiting | [xgroup.md](design/xgroup.md#the-two-protocols) |
