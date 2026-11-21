@@ -425,6 +425,9 @@ impl Drop for ExplicitCheckpointGuard {
 /// `bump_prepare_context_generation()` in its setter so cached prepared
 /// statements know they need to be reprepared.
 pub struct Connection {
+    /// Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage its B-trees are on, when switched
+    /// on (`storage::versioned::switch`); else the pager's.
+    pub(crate) versioned: Option<crate::storage::versioned::switch::Switch>,
     pub(crate) db: Arc<Database>,
     pub(super) context: Option<Arc<dyn Any + Send + Sync>>,
     pub(crate) pager: ArcSwap<Pager>,

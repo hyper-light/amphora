@@ -28,6 +28,9 @@ pub(crate) enum Work {
     /// Sorting, in rows times log2 rows, as the planner counts a sort
     /// (`cost::estimate_sort_cpu_cost`).
     Sort,
+    /// One page read from the database's file, as the pager times it from the read's submission
+    /// to its completion (`sqlite3_ondisk::begin_read_page`). The planner's unit of cost.
+    PageRead,
 }
 
 /// Units of work and the nanoseconds they took.
@@ -90,6 +93,7 @@ struct Rates {
     hash_build: Rate,
     hash_probe: Rate,
     sort: Rate,
+    page: Rate,
 }
 
 impl Rates {
@@ -100,28 +104,41 @@ impl Rates {
             Work::HashBuild => &mut self.hash_build,
             Work::HashProbe => &mut self.hash_probe,
             Work::Sort => &mut self.sort,
+            Work::PageRead => &mut self.page,
         }
     }
 
-    fn weights(&self) -> Option<LearnedWeights> {
+    /// The weights, with `miss`, the share of the connection's recent page fetches that read a
+    /// file (`Pager::page_miss_ratio`), passed through for the planner.
+    fn weights(&self, miss: Option<f64>) -> Option<LearnedWeights> {
         let row = self.row.nanos_per_unit()?;
         Some(LearnedWeights {
+            row_in_pages: self.page.nanos_per_unit().map(|page| row / page),
             seek: self.seek.nanos_per_unit()? / row,
             hash_build: self.hash_build.nanos_per_unit()? / row,
             hash_probe: self.hash_probe.nanos_per_unit()? / row,
             sort: self.sort.nanos_per_unit()? / row,
+            page_miss: miss.filter(|m| m.is_finite()).map(|m| m.clamp(0.0, 1.0)),
         })
     }
 }
 
 /// The four weights, each in rows' visits: what one unit of the work takes against one row read
-/// and tested.
+/// and tested; and the row's visit itself in page reads, the planner's unit, once the database has
+/// read a page from its file.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct LearnedWeights {
+    /// A row's visit against a page read; None until the database has timed one (a database
+    /// whose pages all came from memory so far has no page read to weigh it against).
+    pub(crate) row_in_pages: Option<f64>,
     pub(crate) seek: f64,
     pub(crate) hash_build: f64,
     pub(crate) hash_probe: f64,
     pub(crate) sort: f64,
+    /// The share of the connection's recent page fetches that read a file, None before its first
+    /// fetch (`Pager::page_miss_ratio`): how many of the pages a plan would first read from a cold
+    /// cache it reads from the file (`cost::file_reads`).
+    pub(crate) page_miss: Option<f64>,
 }
 
 /// A database's running cost estimator, shared by its connections.
@@ -147,9 +164,37 @@ impl LearnedCosts {
         self.rates.lock().rate_mut(work).observe(units, nanos);
     }
 
-    /// The weights as they stand; None only if the clock never moved while calibrating.
+    /// The weights as they stand, no fetch's miss share given; None only if the clock never moved
+    /// while calibrating.
+    #[cfg(test)]
     pub(crate) fn weights(&self) -> Option<LearnedWeights> {
-        self.rates.lock().weights()
+        self.rates.lock().weights(None)
+    }
+
+    /// The weights as they stand for a connection whose recent page fetches read the file `miss`
+    /// of the time (`Pager::page_miss_ratio`; None before its first fetch).
+    pub(crate) fn weights_at(&self, miss: Option<f64>) -> Option<LearnedWeights> {
+        self.rates.lock().weights(miss)
+    }
+
+    /// Anchors the page read's rate to `reads` page reads timed at open in `nanos`
+    /// (`time_page_read`), before the database has read a page of its own. They count beside the
+    /// database's own reads, and the first epoch of those replaces them.
+    pub(crate) fn anchor_page_read(&self, reads: f64, nanos: f64) {
+        let mut rates = self.rates.lock();
+        if !(reads.is_finite() && reads > 0.0 && nanos.is_finite() && nanos > 0.0) {
+            return;
+        }
+        rates.page.previous = Span {
+            units: reads,
+            nanos,
+        };
+    }
+
+    /// The page reads an epoch of the page read's rate holds: the most the open's anchor times
+    /// (`time_page_read`), as calibration times each kind of work up to a page of it.
+    pub(crate) fn page_read_epoch(&self) -> usize {
+        self.rates.lock().page.epoch.max(1.0) as usize
     }
 }
 
@@ -164,7 +209,7 @@ fn process_calibration() -> &'static Rates {
 
 /// SplitMix64's output function (Steele, Lea and Flood, "Fast splittable pseudorandom number
 /// generators", OOPSLA 2014; its published constants): keys in no order, the same every run.
-fn mix(i: u64) -> u64 {
+pub(crate) fn mix(i: u64) -> u64 {
     let mut z = i.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -245,7 +290,115 @@ fn calibrate(clock: &mut dyn FnMut() -> f64) -> Rates {
         let (reps, nanos) = measure(clock, target, n, &mut **work);
         *rates.rate_mut(*kind) = Rate::calibrated(reps * *units, nanos);
     }
+    // A page read can't be timed here: there's no file yet. Each database anchors it at open
+    // (`time_page_read`, `LearnedCosts::anchor_page_read`), then its own reads move it
+    // (`LearnedCosts::observe`), its epoch the pages whose rows calibration visited.
+    rates.page = Rate {
+        epoch: (rates.row.epoch / rows).max(1.0),
+        ..Rate::default()
+    };
     rates
+}
+
+/// Times page reads at a database's open, before it has read a page of its own (QT.5): a scratch
+/// page of `page_size` bytes, written beside the database through its own IO and read back as its
+/// pager reads (`read_through_io`). (reads, nanoseconds), or None if no scratch page could be
+/// written there (a database whose directory takes no file is one opened read-only, whose open
+/// reads its own file).
+///
+/// The reads come from the OS's cache, as the database's own reads do while its pages are cached.
+/// They are not read uncached (`O_DIRECT`, `F_NOCACHE`, `FILE_FLAG_NO_BUFFERING`): that prices a
+/// cached database's page at a device read, which made row visits all but free against it and
+/// flipped the planner's plans for databases held in memory (lane qs5-4, kiln run r326 on Windows:
+/// three of `tests/planner.rs`'s plans). A database whose reads go to the device teaches the
+/// estimator that with its own reads: the first epoch of them replaces these
+/// (`LearnedCosts::anchor_page_read`).
+///
+/// The first read is not the rate: it pays for the IO's first use (on jupiter, Windows, the
+/// process's first read took 121.7 us, the reads after it 24.7 to 38.9 us; lane qs5-5's probe,
+/// kiln run r558), and a single read anchored on it flipped the key joins of
+/// `tests/records_plans.rs`'s `a_join_on_a_whole_key_searches_it_without_statistics` (kiln run
+/// r546; it passes with this, run r649). So the reads after it are timed, doubling in number, until
+/// their time reaches the first's or they number `most_reads`, as calibration times each kind of
+/// work until its time reaches the slowest single run (`measure`).
+pub(crate) fn time_page_read(
+    db_path: &str,
+    io: &crate::sync::Arc<dyn crate::io::IO>,
+    page_size: usize,
+    most_reads: usize,
+) -> Option<(f64, f64)> {
+    let page: Vec<u8> = (0..page_size).map(|i| mix(i as u64) as u8).collect();
+    let scratch = if crate::database::is_memory_like(db_path) {
+        format!(":memory:-page-read-{}", uuid::Uuid::new_v4().simple())
+    } else {
+        format!("{db_path}-page-read-{}", uuid::Uuid::new_v4().simple())
+    };
+    match read_through_io(io, &scratch, page, most_reads) {
+        Ok(timed) => Some(timed),
+        Err(err) => {
+            tracing::debug!("QT.5: no scratch page read beside {db_path}: {err}");
+            None
+        }
+    }
+}
+
+/// Writes `page` to `scratch` through `io` and reads it back as the pager reads, each read from
+/// its submission to its completion: the first read alone, then the reads after it as
+/// `time_page_read` says; (those reads, their nanoseconds). The file is removed whatever happens.
+fn read_through_io(
+    io: &crate::sync::Arc<dyn crate::io::IO>,
+    scratch: &str,
+    page: Vec<u8>,
+    most_reads: usize,
+) -> crate::Result<(f64, f64)> {
+    use crate::io::{Buffer, Completion, OpenFlags};
+    use crate::sync::Arc;
+    let file = io.open_file(scratch, OpenFlags::Create, false)?;
+    let timed = (|| -> crate::Result<(f64, f64)> {
+        let len = page.len();
+        let written = file.pwrite(
+            0,
+            Arc::new(Buffer::new(page)),
+            Completion::new_write(|_| {}),
+        )?;
+        io.wait_for_completion(written)?;
+        let read_once = || -> crate::Result<()> {
+            let read = file.pread(
+                0,
+                Completion::new_read(Arc::new(Buffer::new(vec![0; len])), move |res| match res {
+                    Ok((_, n)) if n as usize == len => None,
+                    Ok((_, n)) => Some(crate::error::CompletionError::ShortRead {
+                        page_idx: 0,
+                        expected: len,
+                        actual: n.max(0) as usize,
+                    }),
+                    Err(err) => Some(err),
+                }),
+            )?;
+            io.wait_for_completion(read)
+        };
+        let start = std::time::Instant::now();
+        read_once()?;
+        let first = start.elapsed().as_nanos() as f64;
+        let most_reads = most_reads.max(1);
+        let mut reads: usize = 1;
+        loop {
+            let start = std::time::Instant::now();
+            for _ in 0..reads {
+                read_once()?;
+            }
+            let nanos = start.elapsed().as_nanos() as f64;
+            match reads.checked_mul(2) {
+                Some(next) if nanos < first && next <= most_reads => reads = next,
+                _ => return Ok((reads as f64, nanos)),
+            }
+        }
+    })();
+    drop(file);
+    let removed = io.remove_file(scratch);
+    let timed = timed?;
+    removed?;
+    Ok(timed)
 }
 
 #[cfg(test)]
@@ -259,6 +412,10 @@ mod tests {
             hash_build: Rate::calibrated(100.0, 100.0 * build),
             hash_probe: Rate::calibrated(100.0, 100.0 * probe),
             sort: Rate::calibrated(100.0, 100.0 * sort),
+            page: Rate {
+                epoch: 4.0,
+                ..Rate::default()
+            },
         }
     }
 
@@ -320,11 +477,113 @@ mod tests {
         assert_eq!(slow.sort * 2.0, fast.sort);
     }
 
+    /// Do: plan before the database read any page from its file, then after it timed page reads at
+    /// 50 rows' visits each, then after reads turn four times slower for two epochs. Expect: no
+    /// row-to-page weight at first, then a fiftieth, then a two-hundredth (the anchor learned where
+    /// it runs, and followed as the device moves).
+    #[test]
+    fn t_qt_5_5_the_row_is_weighed_against_observed_page_reads() {
+        let costs = LearnedCosts::from_rates(fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0));
+        assert_eq!(costs.weights().unwrap().row_in_pages, None);
+        costs.observe(Work::PageRead, 1.0, 100.0);
+        assert_eq!(costs.weights().unwrap().row_in_pages, Some(2.0 / 100.0));
+        for _ in 0..8 {
+            costs.observe(Work::PageRead, 1.0, 400.0);
+        }
+        assert_eq!(costs.weights().unwrap().row_in_pages, Some(2.0 / 400.0));
+    }
+
+    /// Do: the weights with no page read timed, and with one, applied to the planner's parameters.
+    /// Expect: the row's cost stays the parameters' until a page read is timed, then is the
+    /// learned ratio, and every other weight follows it (T-QT.5.5).
+    #[test]
+    fn t_qt_5_5_the_planner_takes_the_learned_row_cost() {
+        let params = super::super::cost_params::CostModelParams::new();
+        let costs = LearnedCosts::from_rates(fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0));
+        let before = params.with_learned(costs.weights());
+        assert_eq!(before.cpu_cost_per_row, params.cpu_cost_per_row);
+        costs.observe(Work::PageRead, 1.0, 128.0);
+        let after = params.with_learned(costs.weights());
+        assert_eq!(after.cpu_cost_per_row, 2.0 / 128.0);
+        assert_eq!(after.cpu_cost_per_seek, 10.0 / 128.0);
+        assert_eq!(after.hash_insert_cost, 20.0 / 128.0);
+    }
+
+    /// Do: weigh with no fetch yet, with a share of 0.25, and with a share out of range. Expect:
+    /// the share passed through as the planner's page miss, clamped to [0, 1] (T-QT.5.5).
+    #[test]
+    fn t_qt_5_5_the_page_miss_share_reaches_the_planner() {
+        let costs = LearnedCosts::from_rates(fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0));
+        let params = super::super::cost_params::CostModelParams::new();
+        assert_eq!(params.with_learned(costs.weights_at(None)).page_miss, 1.0);
+        for (miss, want) in [(Some(0.25), 0.25), (Some(3.0), 1.0), (Some(f64::NAN), 1.0)] {
+            assert_eq!(params.with_learned(costs.weights_at(miss)).page_miss, want);
+        }
+    }
+
+    /// Do: anchor the page read at 100 ns, as a database's open does, then read pages of its own
+    /// at 400 ns each for one epoch. Expect: the row weighed against the anchor at first, then
+    /// against the database's own reads alone (the anchor replaced, no fixed number left).
+    #[test]
+    fn t_qt_5_5_the_open_anchor_stands_until_the_database_reads() {
+        let costs = LearnedCosts::from_rates(fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0));
+        costs.anchor_page_read(1.0, 100.0);
+        assert_eq!(costs.weights().unwrap().row_in_pages, Some(2.0 / 100.0));
+        for _ in 0..4 {
+            costs.observe(Work::PageRead, 1.0, 400.0);
+        }
+        assert_eq!(costs.weights().unwrap().row_in_pages, Some(2.0 / 400.0));
+    }
+
+    /// Do: time a scratch page read beside a new database file. Expect: a time, and the
+    /// directory left as it was (the scratch page removed).
+    #[cfg(feature = "fs")]
+    #[test]
+    fn t_qt_5_5_a_scratch_page_read_is_timed_beside_the_database() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("anchor.db");
+        let io: crate::sync::Arc<dyn crate::io::IO> =
+            crate::sync::Arc::new(crate::PlatformIO::new().unwrap());
+        let (reads, nanos) = time_page_read(path.to_str().unwrap(), &io, 4096, 8).unwrap();
+        assert!((1.0..=8.0).contains(&reads), "{reads}");
+        assert!(nanos.is_finite() && nanos > 0.0, "{nanos}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// Do: time a scratch page read for a database in memory. Expect: a time, read through its
+    /// own IO.
+    #[test]
+    fn t_qt_5_5_a_scratch_page_read_is_timed_in_memory() {
+        let io: crate::sync::Arc<dyn crate::io::IO> = crate::sync::Arc::new(crate::MemoryIO::new());
+        let (reads, nanos) = time_page_read(":memory:", &io, 4096, 8).unwrap();
+        assert!((1.0..=8.0).contains(&reads), "{reads}");
+        assert!(nanos.is_finite() && nanos > 0.0, "{nanos}");
+    }
+
+    /// Do: open a new, empty database file and ask for its weights before any query. Expect: the
+    /// row already weighed in page reads (the open's anchor), not left to a fixed number.
+    #[cfg(feature = "fs")]
+    #[test]
+    fn t_qt_5_5_a_new_database_has_a_page_read_before_its_first_query() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("new.db");
+        let io: crate::sync::Arc<dyn crate::io::IO> =
+            crate::sync::Arc::new(crate::PlatformIO::new().unwrap());
+        let db = crate::Database::open_file(
+            io,
+            path.to_str().unwrap(),
+            crate::sync::Arc::new(crate::SqliteDialect),
+        )
+        .unwrap();
+        let row = db.learned_costs.weights().unwrap().row_in_pages.unwrap();
+        assert!(row.is_finite() && row > 0.0, "{row}");
+    }
+
     /// Do: calibrate with a clock that never moves. Expect: no weights, so the planner is told it
     /// has none rather than given zeros (T-QT.5.5).
     #[test]
     fn t_qt_5_5_a_stopped_clock_gives_no_weights() {
         let rates = calibrate(&mut || 0.0);
-        assert_eq!(rates.weights(), None);
+        assert_eq!(rates.weights(None), None);
     }
 }
