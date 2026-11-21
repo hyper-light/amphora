@@ -42,7 +42,9 @@ impl Zone {
     }
 
     fn rows(&self) -> Result<u64, SkipError> {
-        self.ints.checked_add(self.others).ok_or(SkipError::Overflow)
+        self.ints
+            .checked_add(self.others)
+            .ok_or(SkipError::Overflow)
     }
 
     fn add(&mut self, rowid: i64, value: Option<i64>) -> Result<(), SkipError> {
@@ -105,7 +107,9 @@ impl ZoneMapBuilder {
         }
         self.previous = Some(rowid);
         self.rows = self.rows.checked_add(1).ok_or(SkipError::Overflow)?;
-        self.open.get_or_insert_with(|| Zone::new(rowid)).add(rowid, value)
+        self.open
+            .get_or_insert_with(|| Zone::new(rowid))
+            .add(rowid, value)
     }
 
     /// The leaf the rows came from ended: the next row starts a new zone.
@@ -174,7 +178,11 @@ impl ZoneMap {
                 if tail && full {
                     // Appended past a full tail: a new leaf would start here, so a new zone does.
                     self.zones.push(Zone::new(rowid));
-                    self.stats.zones_split = self.stats.zones_split.checked_add(1).ok_or(SkipError::Overflow)?;
+                    self.stats.zones_split = self
+                        .stats
+                        .zones_split
+                        .checked_add(1)
+                        .ok_or(SkipError::Overflow)?;
                     after
                 } else {
                     index
@@ -192,7 +200,11 @@ impl ZoneMap {
         self.zones.get_mut(index).ok_or(SkipError::Inconsistent)
     }
 
-    fn zone_for_existing(&mut self, rowid: i64, value: Option<i64>) -> Result<&mut Zone, SkipError> {
+    fn zone_for_existing(
+        &mut self,
+        rowid: i64,
+        value: Option<i64>,
+    ) -> Result<&mut Zone, SkipError> {
         let after = self.zones.partition_point(|zone| zone.start <= rowid);
         after
             .checked_sub(1)
@@ -202,10 +214,16 @@ impl ZoneMap {
 
     /// The write path's hook for this summary.
     pub fn on_write(&mut self, write: RowWrite) -> Result<(), SkipError> {
-        self.stats.writes = self.stats.writes.checked_add(1).ok_or(SkipError::Overflow)?;
+        self.stats.writes = self
+            .stats
+            .writes
+            .checked_add(1)
+            .ok_or(SkipError::Overflow)?;
         match write {
             RowWrite::Insert { rowid, value } => self.zone_for_insert(rowid)?.add(rowid, value),
-            RowWrite::Delete { rowid, old } => self.zone_for_existing(rowid, old)?.remove(rowid, old),
+            RowWrite::Delete { rowid, old } => {
+                self.zone_for_existing(rowid, old)?.remove(rowid, old)
+            }
             RowWrite::Update { rowid, old, new } => {
                 let zone = self.zone_for_existing(rowid, old)?;
                 zone.remove(rowid, old)?;

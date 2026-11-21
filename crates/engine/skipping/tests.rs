@@ -55,11 +55,7 @@ fn random_write(rng: &mut ChaCha8Rng, table: &mut Table) -> RowWrite {
         let rowid = match rng.random_range(0..4) {
             0 => {
                 let r = rng.random_range(-50..=last + 1);
-                if table.contains_key(&r) {
-                    last + 1
-                } else {
-                    r
-                }
+                if table.contains_key(&r) { last + 1 } else { r }
             }
             _ => last + rng.random_range(1..4),
         };
@@ -129,13 +125,20 @@ fn t_g5_4_1_zone_maps_writes_between_scans_match_a_plain_scan() {
                 for range in &ranges {
                     found.extend(plain_range(&table, range.first, range.last, lo, hi));
                 }
-                assert_eq!(found, plain(&table, lo, hi), "seed {seed}, filter {lo}..={hi}");
+                assert_eq!(
+                    found,
+                    plain(&table, lo, hi),
+                    "seed {seed}, filter {lo}..={hi}"
+                );
             }
             let Skipping::ZoneMaps(zones) = &skipping else {
                 unreachable!()
             };
             for (&rowid, &value) in &table {
-                assert!(zones.covers(rowid, value), "seed {seed}: row {rowid} = {value:?} outside its zone");
+                assert!(
+                    zones.covers(rowid, value),
+                    "seed {seed}: row {rowid} = {value:?} outside its zone"
+                );
             }
         }
         let Skipping::ZoneMaps(zones) = &skipping else {
@@ -168,7 +171,8 @@ fn t_g5_4_1_cracking_writes_between_scans_match_a_plain_scan() {
     for seed in 0..SEEDS {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let mut table = initial_table(&mut rng);
-        let mut skipping = Skipping::Cracking(CrackerColumn::new(table.iter().map(|(r, v)| (*r, *v))));
+        let mut skipping =
+            Skipping::Cracking(CrackerColumn::new(table.iter().map(|(r, v)| (*r, *v))));
         let mut repeats = Vec::new();
         for _ in 0..OPS {
             let write = random_write(&mut rng, &mut table);
@@ -190,7 +194,11 @@ fn t_g5_4_1_cracking_writes_between_scans_match_a_plain_scan() {
                 };
                 let mut entries = cracker.matching_entries(lo, hi).unwrap();
                 for (value, rowid) in &entries {
-                    assert_eq!(table.get(rowid), Some(&Some(*value)), "seed {seed}: stale entry for row {rowid}");
+                    assert_eq!(
+                        table.get(rowid),
+                        Some(&Some(*value)),
+                        "seed {seed}: stale entry for row {rowid}"
+                    );
                 }
                 entries.sort_by_key(|(_, rowid)| *rowid);
                 let rowids: Vec<i64> = entries.iter().map(|(_, rowid)| *rowid).collect();
@@ -201,15 +209,27 @@ fn t_g5_4_1_cracking_writes_between_scans_match_a_plain_scan() {
             unreachable!()
         };
         // Every row the table holds is in the column once: integers as entries, others apart.
-        let mut held: Vec<i64> = cracker.matching_entries(i64::MIN, i64::MAX).unwrap().iter().map(|(_, r)| *r).collect();
+        let mut held: Vec<i64> = cracker
+            .matching_entries(i64::MIN, i64::MAX)
+            .unwrap()
+            .iter()
+            .map(|(_, r)| *r)
+            .collect();
         held.extend(cracker.others());
         held.sort_unstable();
-        assert_eq!(held, table.keys().copied().collect::<Vec<_>>(), "seed {seed}");
+        assert_eq!(
+            held,
+            table.keys().copied().collect::<Vec<_>>(),
+            "seed {seed}"
+        );
         cracks += cracker.stats().cracks;
         queries += cracker.stats().queries;
         moved += cracker.stats().entries_moved;
     }
-    assert!(cracks > 0 && cracks < 2 * queries, "cracks {cracks} for {queries} queries");
+    assert!(
+        cracks > 0 && cracks < 2 * queries,
+        "cracks {cracks} for {queries} queries"
+    );
     assert!(moved > 0, "no write ever rippled");
 }
 
@@ -218,7 +238,12 @@ fn t_g5_4_1_cracking_writes_between_scans_match_a_plain_scan() {
 #[test]
 fn t_g5_4_1_switch_off_keeps_nothing() {
     let mut skipping = Skipping::Off;
-    skipping.on_write(RowWrite::Insert { rowid: 1, value: Some(1) }).unwrap();
+    skipping
+        .on_write(RowWrite::Insert {
+            rowid: 1,
+            value: Some(1),
+        })
+        .unwrap();
     assert_eq!(skipping.candidates(0, 0).unwrap(), Candidates::All);
 }
 
@@ -227,19 +252,43 @@ fn t_g5_4_1_switch_off_keeps_nothing() {
 fn t_g5_4_1_disagreements_are_refused() {
     let mut zones = ZoneMapBuilder::new().finish();
     assert_eq!(
-        zones.on_write(RowWrite::Delete { rowid: 3, old: Some(1) }),
-        Err(SkipError::MissingRow { rowid: 3, value: Some(1) })
+        zones.on_write(RowWrite::Delete {
+            rowid: 3,
+            old: Some(1)
+        }),
+        Err(SkipError::MissingRow {
+            rowid: 3,
+            value: Some(1)
+        })
     );
     let mut cracker = CrackerColumn::new([(1, Some(5))]);
     assert_eq!(
-        cracker.on_write(RowWrite::Delete { rowid: 1, old: Some(6) }),
-        Err(SkipError::MissingRow { rowid: 1, value: Some(6) })
+        cracker.on_write(RowWrite::Delete {
+            rowid: 1,
+            old: Some(6)
+        }),
+        Err(SkipError::MissingRow {
+            rowid: 1,
+            value: Some(6)
+        })
     );
     assert_eq!(
-        cracker.on_write(RowWrite::Delete { rowid: 2, old: None }),
-        Err(SkipError::MissingRow { rowid: 2, value: None })
+        cracker.on_write(RowWrite::Delete {
+            rowid: 2,
+            old: None
+        }),
+        Err(SkipError::MissingRow {
+            rowid: 2,
+            value: None
+        })
     );
     let mut builder = ZoneMapBuilder::new();
     builder.row(5, Some(1)).unwrap();
-    assert_eq!(builder.row(5, Some(2)), Err(SkipError::RowidOrder { previous: 5, rowid: 5 }));
+    assert_eq!(
+        builder.row(5, Some(2)),
+        Err(SkipError::RowidOrder {
+            previous: 5,
+            rowid: 5
+        })
+    );
 }

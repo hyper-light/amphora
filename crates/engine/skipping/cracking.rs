@@ -102,7 +102,10 @@ impl CrackerColumn {
             .range((Excluded(bound), Unbounded))
             .next()
             .map_or(self.entries.len(), |(_, position)| *position);
-        let piece = self.entries.get_mut(start..end).ok_or(SkipError::Inconsistent)?;
+        let piece = self
+            .entries
+            .get_mut(start..end)
+            .ok_or(SkipError::Inconsistent)?;
         let mut split: usize = 0;
         for index in 0..piece.len() {
             if piece.get(index).is_some_and(|(value, _)| *value < bound) {
@@ -149,7 +152,11 @@ impl CrackerColumn {
     /// cracker holds them (T-G5.4.1 checks each against the table: none stale).
     pub fn matching_entries(&mut self, lo: i64, hi: i64) -> Result<Vec<(i64, i64)>, SkipError> {
         let (from, to) = self.cracked(lo, hi)?;
-        Ok(self.entries.get(from..to).ok_or(SkipError::Inconsistent)?.to_vec())
+        Ok(self
+            .entries
+            .get(from..to)
+            .ok_or(SkipError::Inconsistent)?
+            .to_vec())
     }
 
     /// The rowids whose value isn't an integer.
@@ -179,7 +186,12 @@ impl CrackerColumn {
         // highest, gives up its piece's first entry to the hole and moves up by one.
         let mut hole = self.entries.len();
         self.entries.push((value, rowid));
-        for position in self.cracks.range_mut((Excluded(value), Unbounded)).rev().map(|(_, p)| p) {
+        for position in self
+            .cracks
+            .range_mut((Excluded(value), Unbounded))
+            .rev()
+            .map(|(_, p)| p)
+        {
             self.entries.swap(*position, hole);
             hole = *position;
             *position = position.checked_add(1).ok_or(SkipError::Overflow)?;
@@ -191,12 +203,22 @@ impl CrackerColumn {
     fn remove(&mut self, rowid: i64, value: Option<i64>) -> Result<(), SkipError> {
         let missing = SkipError::MissingRow { rowid, value };
         let Some(value) = value else {
-            return if self.others.remove(&rowid) { Ok(()) } else { Err(missing) };
+            return if self.others.remove(&rowid) {
+                Ok(())
+            } else {
+                Err(missing)
+            };
         };
         let (start, end) = self.piece_of(value);
-        let piece = self.entries.get(start..end).ok_or(SkipError::Inconsistent)?;
+        let piece = self
+            .entries
+            .get(start..end)
+            .ok_or(SkipError::Inconsistent)?;
         let found = piece.iter().position(|entry| *entry == (value, rowid));
-        count(&mut self.stats.entries_searched, found.map_or(piece.len(), |at| at.saturating_add(1)));
+        count(
+            &mut self.stats.entries_searched,
+            found.map_or(piece.len(), |at| at.saturating_add(1)),
+        );
         let at = found.and_then(|at| start.checked_add(at)).ok_or(missing)?;
         // The entry moves to its piece's end, then the hole moves up: each crack above it moves
         // down by one, its piece's last entry taking the hole at its front.
@@ -207,7 +229,11 @@ impl CrackerColumn {
             .range((Excluded(value), Unbounded))
             .map(|(_, position)| *position)
             .collect();
-        let ends = above.iter().skip(1).copied().chain(std::iter::once(self.entries.len()));
+        let ends = above
+            .iter()
+            .skip(1)
+            .copied()
+            .chain(std::iter::once(self.entries.len()));
         for (position, piece_end) in self
             .cracks
             .range_mut((Excluded(value), Unbounded))

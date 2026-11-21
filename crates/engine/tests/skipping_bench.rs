@@ -29,7 +29,10 @@ const LEAF_HEADER_BYTES: usize = 8;
 const CELL_POINTER_BYTES: usize = 2;
 
 fn env(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn varint_len(v: u64) -> usize {
@@ -95,13 +98,21 @@ fn build(table: &Table, column: fn(&Item) -> i64, cracking: bool) -> (Skipping, 
     (Skipping::ZoneMaps(zones), count)
 }
 
-fn write(rng: &mut ChaCha8Rng, table: &mut Table, next: &mut i64, column: fn(&Item) -> i64) -> RowWrite {
+fn write(
+    rng: &mut ChaCha8Rng,
+    table: &mut Table,
+    next: &mut i64,
+    column: fn(&Item) -> i64,
+) -> RowWrite {
     match rng.random_range(0..3) {
         0 => {
             *next += 1;
             let it = item(rng, *next);
             table.insert(*next, it);
-            RowWrite::Insert { rowid: *next, value: Some(column(&it)) }
+            RowWrite::Insert {
+                rowid: *next,
+                value: Some(column(&it)),
+            }
         }
         pick => {
             let rowid = loop {
@@ -115,7 +126,11 @@ fn write(rng: &mut ChaCha8Rng, table: &mut Table, next: &mut i64, column: fn(&It
                 let mut it = item(rng, rowid);
                 it.created = table[&rowid].created;
                 table.insert(rowid, it);
-                RowWrite::Update { rowid, old, new: Some(column(&it)) }
+                RowWrite::Update {
+                    rowid,
+                    old,
+                    new: Some(column(&it)),
+                }
             } else {
                 table.remove(&rowid);
                 RowWrite::Delete { rowid, old }
@@ -163,10 +178,18 @@ fn run_class(class: &Class, prototype: &str, rows: usize, scans: usize, writes: 
                 let (n, m) = rows.fold((0, 0), |(n, m), (_, i)| (n + 1, m + usize::from(hit(i))));
                 (s + n, f + m)
             }),
-            Candidates::Rowids(rowids) => (rowids.len(), rowids.iter().filter(|r| hit(&table[*r])).count()),
+            Candidates::Rowids(rowids) => (
+                rowids.len(),
+                rowids.iter().filter(|r| hit(&table[*r])).count(),
+            ),
         };
         scan_ns += t.elapsed().as_nanos();
-        assert_eq!(found, table.values().filter(|i| hit(i)).count(), "{} {prototype}", class.name);
+        assert_eq!(
+            found,
+            table.values().filter(|i| hit(i)).count(),
+            "{} {prototype}",
+            class.name
+        );
         examined += seen;
         matched += found;
     }

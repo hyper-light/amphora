@@ -36,16 +36,28 @@ pub use zone_map::{RowidRange, ZoneMap, ZoneMapBuilder, ZoneStats};
 /// rowid and its summarized column's value before and after (`None`: not an integer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowWrite {
-    Insert { rowid: i64, value: Option<i64> },
-    Delete { rowid: i64, old: Option<i64> },
-    Update { rowid: i64, old: Option<i64>, new: Option<i64> },
+    Insert {
+        rowid: i64,
+        value: Option<i64>,
+    },
+    Delete {
+        rowid: i64,
+        old: Option<i64>,
+    },
+    Update {
+        rowid: i64,
+        old: Option<i64>,
+        new: Option<i64>,
+    },
 }
 
 /// What a summary refuses, with why.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SkipError {
     /// The builder was handed rowids out of the B-tree's order: a leaf run must ascend.
-    #[error("skipping summary: rowid {rowid} came after {previous}; a table's rows ascend by rowid")]
+    #[error(
+        "skipping summary: rowid {rowid} came after {previous}; a table's rows ascend by rowid"
+    )]
     RowidOrder { previous: i64, rowid: i64 },
     /// A delete or update named a row the summary never held: the write path and the summary
     /// disagree, so the summary can't be trusted and must be rebuilt.
