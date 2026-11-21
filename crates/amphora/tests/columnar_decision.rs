@@ -77,7 +77,9 @@ fn claims(note: &str) -> Result<BTreeMap<String, Claim>, String> {
 /// The note's sources table: key to (locator, grade).
 fn sources(note: &str) -> BTreeMap<String, (String, String)> {
     let rest = note.split_once("## Sources").map_or("", |(_, rest)| rest);
-    let section = rest.split_once("\n## ").map_or(rest, |(section, _)| section);
+    let section = rest
+        .split_once("\n## ")
+        .map_or(rest, |(section, _)| section);
     section
         .lines()
         .filter(|l| l.starts_with("| `"))
