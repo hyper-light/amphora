@@ -19,6 +19,7 @@
 //!   parallel.
 //! - [`db`]: stores on Amphora's engine (`crates/engine`).
 //! - [`meter`]: what a store counts.
+//! - [`xgroup`]: transactions across groups (CP-T1.10): two-phase commit and Parallel Commits.
 //! - [`memory`]: the memory this process may use, as the system says (the process's page pool is a
 //!   part of it).
 //!
@@ -33,6 +34,7 @@ pub mod replication;
 pub mod sql;
 pub mod store;
 pub mod transport;
+pub mod xgroup;
 
 /// What `amphora` prints for its arguments, where, and the exit status.
 #[derive(Debug, PartialEq, Eq)]

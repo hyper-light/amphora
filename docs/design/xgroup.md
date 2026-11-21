@@ -1,0 +1,80 @@
+# Transactions across groups (CP-T1.10; G13 step 3; lane xgroup-txn, 2026-11-21)
+
+`crates/amphora/src/xgroup.rs` and `xgroup/`. A transaction reads and writes keys in several fixed
+groups and commits in all of them or none (AC-T1.10.5, T-T1.10.1). The step asks for two prototypes,
+behind a switch (`Protocol`), the faster kept at zero anomalies.
+
+## The two protocols
+
+- **Two-phase commit over groups** (Spanner, OSDI 2012, section 4.2.1, "Running two-phase commit
+  over Paxos mitigates the availability problems"): each participant group locks its keys and holds
+  the writes (prepare); then the anchor group records the decision; the client hears after two
+  group commits one after the other. An abort needs no record: only the coordinator could have
+  decided commit, and a recovery that finds no decision aborts.
+- **Parallel Commits** (CockroachDB, SIGMOD 2020, section 3.2: "a staging transaction status which
+  makes the true status of the transaction conditional on whether all of its writes have been
+  replicated"): the anchor writes a staging record naming the participants in the same commit as its
+  own locks, beside the other groups' locks; the transaction is committed once every lock is in
+  place, so the client hears after one group commit. The explicit commit and the resolutions go out
+  together afterwards. An abort must turn the staging record aborted before anyone hears so.
+
+Both share every group-side rule (`apply`). Concurrency control is two-phase locking, no-wait: a
+step that meets another transaction's conflicting lock is refused whole and its transaction aborts
+(no deadlock, no waiting; a waiting or wound-wait policy is a later choice, measured). Reads take
+shared locks, writes exclusive ones, all held until resolution, so a committed transaction held all
+its locks at once (conflict-serializable, and strictly so: the lock point precedes the answer).
+
+## Crashes
+
+Every decision lives in a group; the coordinator keeps nothing. An incarnation is an epoch the
+registry group hands out (`Step::Begin`). A new incarnation scans every group (`Step::Scan`), which
+also fences the older ones there: a group refuses any later step from an older epoch (`Fenced`), so
+the scan's list of what the old incarnation left is complete. It then finishes each transaction:
+`Recover` at the anchor answers the decision, aborts one with no record, or returns a staging
+record's participants; `Prevent` at each participant answers whether it holds the locks and, if it
+doesn't, makes sure it never will (a done row). All present: committed (Parallel Commits' implicit
+commit); any absent: aborted. Every non-lock step is idempotent and is sent again when its outcome
+is lost; a lost lock aborts its transaction.
+
+A group refuses a late step of a transaction it has finished (its done row) and of any below the
+coordinator's floor, the oldest transaction it still runs, which every step carries once recovery
+is done; done rows and decided records below the floor are deleted, so they are bounded by what the
+coordinator runs at once.
+
+## On a group's database
+
+`xgroup::sql`: each step is one `Database` call (`call_internal`, the owner's own session, able to
+name `__amphora_xg_*`): one atomic commit in its group, committed by its quorum on a replicated
+group before it answers. The data the prototype's transactions act on is `__amphora_xg_data`, a
+key-value space over the groups; SQL sessions across groups are not built (AC-T1.10.1 is open).
+`Cluster` runs one coordinator on a driver thread; the route from key to group is the caller's, so
+the routing lanes keep it. Values introduced: none tuned. Bounds are the API's own (`TX_MAX`,
+`KEY_MAX`, `VALUE_MAX`, `REQUEST_MAX`, `SCAN_MAX` for a scan page); the transactions in flight are
+the caller's (its threads calling `transact`); each step's deadline is the caller's budget for that
+transaction, given again from the answer for its resolution. A step past it stops the incarnation,
+as a crash would, and the next open finishes it.
+
+## Evidence so far
+
+- In the simulator, Parallel Commits answers after one group commit and two-phase commit after two
+  (`ac_t1_10_2_parallel_commits_answers_after_one_group_commit_two_phase_after_two`): Parallel
+  Commits is expected to be the faster by one group commit per transaction. The step's decision
+  waits for the LAN measurement (AC-T1.10.2, bench `amphora_txn` on multi-node groups), which needs
+  the host to carry replication between machines.
+- A coordinator crash after each of its inputs, the steps out then landing or lost, and the
+  recovering incarnation crashed again at each of its own, ends committed or aborted everywhere,
+  matching what the client heard (T-T1.10.1).
+- Seeded runs with lost, late and reply-lost steps and coordinator crashes, checked Elle-style
+  (Kingsbury and Alvaro, PVLDB 14(3)): read-modify-writes of unique values give each key's version
+  chain; a lost update, an aborted or unwritten read, a partial commit, or a cycle in ww, wr, rw and
+  real-time edges is an anomaly.
+
+## Metrics (proposed; names to agree with kiln's Observe owner)
+
+`amphora_xgroup_committed_total`, `amphora_xgroup_aborted_total`, `amphora_xgroup_unknown_total`,
+`amphora_xgroup_recovered_total{outcome}`, `amphora_xgroup_retried_total`, from `Coordinator::counts`.
+
+## Falsified by
+
+A seed with an anomaly; a crash point that leaves a lock, a staging record, or a partly applied
+transaction; or, on the LAN, Parallel Commits' p99 not below two-phase commit's.

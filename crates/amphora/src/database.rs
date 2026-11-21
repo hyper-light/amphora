@@ -1017,6 +1017,24 @@ impl Database {
         })
     }
 
+    /// [`Database::call`] on the owner's own session, its SQL free to name Amphora's own tables
+    /// (`__amphora_*`): for a cross-group transaction's steps (CP-T1.10, `crate::xgroup`). An
+    /// attached client is refused: its closure can't cross to the owner.
+    pub(crate) fn call_internal<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
+    {
+        let database = self.resolve(until)?;
+        if database.remote_client().is_some() {
+            return Err(api::invalid(
+                "cross-group step",
+                "an attached client can't run Amphora's own SQL; run it on the owner",
+            ));
+        }
+        database.call_db(until, f)
+    }
+
     fn call_db<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
     where
         R: Send + 'static,

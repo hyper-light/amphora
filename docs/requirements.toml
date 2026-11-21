@@ -192,6 +192,8 @@ criteria = [
 ]
 tests = [
   { id = "T-T1.10.1", text = "A coordinator crash at every step of a cross-group transaction, then recovery — passes when it ends committed or aborted everywhere" },
+  # lane xgroup-txn: transactions across groups (docs/design/xgroup.md).
+  { id = "T-T1.10.C", text = "A group's steps of a cross-group transaction on the simulator's tablet and on a group's database — passes when both answer the same: locks conflict and share, staging, prevention, decisions that stand, fencing and the floor" },
   # Amphora's own: a local read on a replica (docs/design/replication.md, "A local read on a replica").
   { id = "T-T1.10.L1", text = "A learner of a voter that is then gone reads locally — passes when it answers what was written and caught up, while a call waits for the leader" },
   { id = "T-T1.10.L2", text = "Local reads within a preparation and while a write is proposed and uncommitted — passes when each sees only what was committed, and the write once applied" },

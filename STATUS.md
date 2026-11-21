@@ -257,6 +257,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (`settle_s`; Amphora's loader had left the whole load, 7.5 GB, in its log). `--query` runs a
   statement on a database a run left behind.
 
+- **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
+  over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
+  on a group's database (`Cluster`, each step one call to the group). A crashed coordinator's next incarnation fences
+  the old one and finishes what it left. Tested: a crash at every step (T-T1.10.1) and seeded runs with lost and late
+  steps and crashes, Elle-style. Left: the LAN p99 (AC-T1.10.2) on multi-node groups and the 10,000-seed run, which
+  decide between the two; SQL sessions across groups (AC-T1.10.1).
+
 ## Measured
 
 - **The oracles: wrong answers and slow plans** (G2 step 3; `amphora-bench --oracle`, `bench/src/oracle`,
