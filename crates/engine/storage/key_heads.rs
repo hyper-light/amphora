@@ -943,6 +943,7 @@ mod tests {
     ///   of probes the heads decided;
     /// - `build`: nanoseconds a cell decoded building the directories of the pages the seeks
     ///   visited, to set against `off`'s nanoseconds a probe.
+    ///
     /// It asserts nothing about time (the seeks it makes are checked equal across modes); the
     /// coordinator records its numbers in `bench/`.
     #[test]
