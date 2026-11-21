@@ -53,6 +53,7 @@ cfg_block! {
 }
 
 mod memory;
+pub mod system_memory;
 #[cfg(feature = "io_memory_yield")]
 mod memory_yield;
 #[cfg(feature = "fs")]
