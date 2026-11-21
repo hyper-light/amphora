@@ -1303,7 +1303,10 @@ pub fn translate_alter_table(
                     "column name is missing in ALTER TABLE ADD COLUMN".to_string(),
                 )
             })?;
-            if btree.get_column(&new_column_name).is_some() {
+            // Amphora: a dropped column's slot keeps its name (CP-T1.12).
+            if btree.get_column(&new_column_name).is_some()
+                || btree.has_dropped_column(&new_column_name)
+            {
                 return Err(LimboError::ParseError(
                     "duplicate column name: ".to_string() + &new_column_name,
                 ));
@@ -1871,6 +1874,7 @@ pub fn translate_alter_table(
             if btree
                 .get_column(col_name)
                 .is_some_and(|(at, _)| at != column_index)
+                || btree.has_dropped_column(col_name)
             {
                 return Err(LimboError::ParseError(format!(
                     "duplicate column name: \"{col_name}\""
