@@ -192,6 +192,14 @@ pub struct Resolver<'a> {
     /// costs (`docs/design/planner.md`, decision 5): the connection's, set at prepare; the engine's
     /// default page cache until then.
     cache_pages: usize,
+    /// Amphora: the memory a statement's hash and group tables hold together (decision 8 of
+    /// docs/design/executor.md): `Pager::statement_memory_budget`.
+    statement_memory: usize,
+    /// Amphora (QT.5): the cost weights the connection's database has learned
+    /// (`optimizer::learned_costs`), set at prepare.
+    learned_weights: Option<crate::translate::optimizer::learned_costs::LearnedWeights>,
+    /// Amphora: the join methods the planner may choose (`Connection::set_join_methods`).
+    join_methods: crate::JoinMethods,
     /// Cached flag: true when this connection has an active temp database.
     ///
     /// Computed once at Resolver construction to avoid repeated
@@ -316,6 +324,9 @@ impl<'a> Resolver<'a> {
             dialect,
             trigger_context: None,
             cache_pages: crate::storage::page_cache::DEFAULT_PAGE_CACHE_SIZE_IN_PAGES,
+            statement_memory: 0,
+            learned_weights: None,
+            join_methods: crate::JoinMethods::ByCost,
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
             unqualified_database_search_path: unqualified_database_search_path.clone(),
@@ -350,6 +361,37 @@ impl<'a> Resolver<'a> {
         self.cache_pages = pages;
     }
 
+    pub fn statement_memory(&self) -> usize {
+        self.statement_memory
+    }
+
+    /// Amphora: sets the memory the statement's hash and group tables hold: the connection's.
+    pub(crate) fn set_statement_memory(&mut self, bytes: usize) {
+        self.statement_memory = bytes;
+    }
+
+    pub(crate) fn learned_weights(
+        &self,
+    ) -> Option<crate::translate::optimizer::learned_costs::LearnedWeights> {
+        self.learned_weights
+    }
+
+    /// Amphora (QT.5): sets the cost weights the planner uses: the database's, as learned.
+    pub(crate) fn set_learned_weights(
+        &mut self,
+        weights: Option<crate::translate::optimizer::learned_costs::LearnedWeights>,
+    ) {
+        self.learned_weights = weights;
+    }
+
+    pub(crate) fn join_methods(&self) -> crate::JoinMethods {
+        self.join_methods
+    }
+
+    pub(crate) fn set_join_methods(&mut self, methods: crate::JoinMethods) {
+        self.join_methods = methods;
+    }
+
     pub fn fork(&self) -> Resolver<'a> {
         Resolver {
             schema: self.schema,
@@ -372,6 +414,9 @@ impl<'a> Resolver<'a> {
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             cache_pages: self.cache_pages,
+            statement_memory: self.statement_memory,
+            learned_weights: self.learned_weights,
+            join_methods: self.join_methods,
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
@@ -400,6 +445,9 @@ impl<'a> Resolver<'a> {
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             cache_pages: self.cache_pages,
+            statement_memory: self.statement_memory,
+            learned_weights: self.learned_weights,
+            join_methods: self.join_methods,
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
