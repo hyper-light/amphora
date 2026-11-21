@@ -151,7 +151,8 @@ impl PlanChoice {
         self.running += run.running.as_secs_f64();
     }
 
-    /// The custom runs measured so far.
+    /// The custom runs measured so far (its tests read it).
+    #[cfg(test)]
     pub(crate) fn custom_runs(&self) -> u64 {
         self.runs
     }

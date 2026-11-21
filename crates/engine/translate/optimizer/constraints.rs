@@ -2806,11 +2806,11 @@ fn apply_column_stats(
                 } else {
                     rhs
                 };
-                share(&**other)
+                share(other)
             }
             (ConstraintOperator::In { not: false, .. }, ast::Expr::InList { rhs, .. }) => rhs
                 .iter()
-                .map(|value| share(&**value))
+                .map(|value| share(value))
                 .sum::<f64>()
                 .min(1.0),
             _ => continue,

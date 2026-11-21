@@ -82,15 +82,18 @@ const BY_K: &str = "SELECT sum(v) FROM t WHERE k = ?";
 /// T-PL.12.3. Do: explain `k = ?` prepared once, unbound, then bound to the common value 1 and to
 /// the rare 300. Expect: unbound, the generic estimate, a share of the distinct values (a few
 /// rows); bound to 1, about the 4,500 rows it keeps; bound to 300, a few rows: the plan made with
-/// a run's value reads the value, where every value had the generic estimate.
+/// a run's value reads the value, where every value had the generic estimate. The statement
+/// returns its rows, not their sum: an aggregate's estimate is its one output row, whatever its
+/// filter keeps, so the rows the filter keeps are read where they are the statement's output.
 #[test]
 fn t_pl_12_3_a_plan_made_with_a_value_estimates_that_value() {
     let dir = tempfile::tempdir().unwrap();
     let conn = open(dir.path());
     skewed(&conn, true);
-    let (generic, generic_plan) = explain(&conn, BY_K, &[]);
-    let (common, common_plan) = explain(&conn, BY_K, &[1]);
-    let (rare, rare_plan) = explain(&conn, BY_K, &[300]);
+    let rows_by_k = "SELECT v FROM t WHERE k = ?";
+    let (generic, generic_plan) = explain(&conn, rows_by_k, &[]);
+    let (common, common_plan) = explain(&conn, rows_by_k, &[1]);
+    let (rare, rare_plan) = explain(&conn, rows_by_k, &[300]);
     assert!(generic < 50.0, "generic estimate {generic}: {generic_plan}");
     assert!(common > 2_500.0, "k = 1 estimated {common}: {common_plan}");
     assert!(rare < 50.0, "k = 300 estimated {rare}: {rare_plan}");
