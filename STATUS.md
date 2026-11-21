@@ -127,6 +127,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   was unnested into a scan of all 200,000 entries of `items_grp_created`: 227 → 26,895 statements a
   second at 1 client and 1,231 → 225,470 at 32, best of 3 in turns on adas-mac-studio-2, the controls
   within 2% (`bench/records/2026-10-25-adas-mac-studio-2-output-subquery-calls.md`).
+- **Correlated subqueries unnested in general** (docs/design/planner.md decision 22, PL.10,
+  `crates/engine/tests/unnesting.rs`): beside the fixed patterns, `NOT IN` becomes a NULL-aware
+  anti-join, an `EXISTS`/`IN` of several tables a semi- or anti-join with a derived table, an
+  `EXISTS` under `OR` or in the `SELECT` list a grouped left join, and nested subqueries unnest level
+  by level from a worklist with no recursion; the cheapest of the written, patterns' and general
+  forms is kept. Answers equal nested ones on 39 classes and 24 levels of nesting (T-PL.10.1); a
+  subquery reading a semi-joined table stays nested, and Q20's `0.5 * total()` isn't unnested yet. Open:
+  q21 at SF 10 and TPC-DS's ten queries measured (AC-PL.10.1, AC-PL.10.2).
 - **A one-row lookup orders its table** (docs/design/planner.md decision 10,
   `crates/engine/tests/records_plans.rs`): a loop that gives at most one row for each row before it
   (a unique key's whole lookup by `=`, or the rowid's) takes its table's ORDER BY columns as ordered
@@ -345,9 +353,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (local-owner-transport.md, "Decision (lane constants): one descriptor budget"; FD.1), with a replica's local
   readers following it; the replicated owner drives once a step, in turn with its inputs (replication.md, "Decision
   (lane constants): one drive a step"; DQ.1); and each owner charges its lease, or a client its socket, to the same
-  budget, no count of owners (`OWNERS_MAX` gone; AC-FD.1.4). Left: an owner's other descriptors (endpoint, engine
-  files, a replica's log) charged by kind, the replicated owner's tick and poll, and the rest of the list
-  (handoff/amphora-constants-list.md).
+  budget, no count of owners (`OWNERS_MAX` gone; AC-FD.1.4); the owner wakes on its inputs, not a poll (WK.1); the
+  quorum patience's and the write slot's generations are learned from their own events (GN.1); and a generation of
+  the database log's restarts ends once it alone covers its own spend at the p99.9, the next restart guessed by the
+  worst of the last thousand holds (`log_bound::GENERATION` gone; replication.md, "Decision (lane constants): a
+  generation of restarts ends once it covers its spend"; GN.2). Left: an owner's other descriptors (endpoint, engine
+  files, a replica's log) charged by kind, the replicated owner's tick (`TICK`, twenty ticks an election), its queue
+  and outgoing bounds and the log's compaction trigger, and the rest of the list (handoff/amphora-constants-list.md).
 - **Groups that split, merge and move themselves** (CP-T1.9, lane split-merge; `crates/amphora/src/reshard/`,
   docs/design/reshard.md): a pure core: a directory of hash spans with every position in exactly one group,
   each group's own holding (fenced, stale actions refused), a planner deciding from measured load, bytes and
@@ -372,7 +384,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   old schema or the new; rows that break a unique index undo the change. The 10M-row cutover p99
   (AC-T1.12.2) is not yet measured. A column (`ALTER TABLE … ADD COLUMN`) is added in one catalog
   change, its states run together, as no row is rewritten or read; one whose addition reads every
-  row is refused. Constraints on existing columns and DROP COLUMN are not yet built.
+  row is refused. NOT NULL and CHECK are added to an existing column (`ALTER COLUMN c TO` its own
+definition plus the constraint) write-only, then validated in learned rowid batches, then public by
+a catalog change; the planner doesn't rely on an unvalidated NOT NULL, a breaking row undoes the
+change, and a power cut leaves the old schema or the new. DROP COLUMN is not yet built.
 
 ## Measured
 

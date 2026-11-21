@@ -44,6 +44,41 @@ every statement naming the table). What would falsify it: an `ADD COLUMN` that t
 a scan of the table (its program loops over the table's rows), which `t_t1_12_1_a_column_is_added_in_one_catalog_change_and_its_constraints_hold_from_it`
 would not see; read `translate/alter.rs`'s `AddColumn` arm when it changes.
 
+## Decision (lane online-schema-6): a constraint is added write-only, validated, then public
+
+`Database::change_schema` takes one `ALTER TABLE t ALTER COLUMN c TO <def>` whose `<def>` is `c`'s
+own definition (same name, type and constraints, in order) with NOT NULL or CHECK constraints after
+it; anything else is refused before anything changes, so the change can always be undone by
+defining the column as it was. F1's states for a constraint (section 4: write-only enforces it on
+new writes, the reorganization validates the old rows, then public):
+
+1. **Absent to write-only**, one transaction: a row of `__amphora_constraint_states` (table, column
+   and the old definition) marks the column unvalidated, then `ALTER COLUMN` redefines it. Every
+   write from here is checked against the constraint. The engine reads the mark whenever a
+   connection parses its schema (a reparse phase after the index states', and on open), sets
+   `Column::unvalidated`, and then: `ALTER COLUMN` on that column doesn't scan the table (the
+   batches do), the planner doesn't rely on its NOT NULL (`trusted_notnull` in
+   `optimizer/cardinality.rs` and `Expr::is_nonnull`), and the integrity check doesn't call a NULL
+   in it corrupt. The change records the table's largest rowid: rows after it were written checked.
+2. **Validation**: batches read the rows up to that rowid in rowid order, at most the batch's rows,
+   each checked for a NULL under NOT NULL or a CHECK that is false (a NULL CHECK passes, as
+   SQLite's does). Batches are sized by the same learned `Sizer` as an index's backfill. A breaking
+   row stops the change (`online::BROKEN`) and it is undone: the column redefined as it was (its
+   mark still on, so the old constraints, which every row keeps, are not scanned for), then the mark
+   and the record removed, in one transaction.
+3. **Public, the cutover**: the mark goes, and the migration is recorded, in one transaction: only
+   the catalog changes, whatever the table's size.
+
+A power cut leaves the old schema (no constraint, or the constraint marked unvalidated and its
+migration unrecorded) or the new (declared, unmarked, recorded), never a public constraint without
+its record: `crates/amphora/tests/crash.rs`'s
+`t_t1_12_1_a_power_cut_at_every_step_of_an_online_constraint_leaves_old_or_new`. Refused: a
+generated column (its constraint is checked by computing every row at once), a WITHOUT ROWID table
+(no rowid order). What would falsify it: a write between two batches that leaves a row breaking the
+constraint at or below the recorded rowid after its batch passed (writes are checked from step 1,
+so it would mean the engine skipped the check for an unvalidated column), or a plan that answers
+`c IS NULL` from the declaration while the mark is on (`t_t1_12_1_an_unvalidated_not_null_is_not_relied_on_and_a_breaking_row_undoes_the_change`).
+
 **Sources.** Rae, Rollins, Shute, Sodhi, Vingralek, "Online, Asynchronous Schema Change in F1",
 PVLDB 6(11), 2013 (https://www.vldb.org/pvldb/vol6/p1045-rae.pdf): section 4's states (absent,
 delete-only, write-only, public), the reorganization (backfill) in write-only, and at most two
@@ -76,10 +111,11 @@ more than twice its p99 without one, measured by bench `online_ddl`.
 its cost grows with the schema's size, not the table's. `SchemaChange::cutover` says how long it held
 the writer; the 10,000,000-row measurement is the coordinator's.
 
-**Left.** Constraints on existing columns and generated columns checked against every row (CHECK,
-NOT NULL and foreign keys need their own write-only and validation states: enforced on writes,
-then existing rows validated in batches, then public); DROP COLUMN (hidden from reads first, then
-rows rewritten in batches); indexes on WITHOUT ROWID
+**Left.** Foreign keys and a generated column's constraints added online; DROP COLUMN (rows
+can't be rewritten to a new layout in batches while old rows keep the old one in the same table:
+the column must stay as a hidden slot, written NULL from the drop on and cleared in batches, as
+PostgreSQL's `attisdropped` keeps it, which needs the engine to hide a column from name resolution,
+`*` and inserts); indexes on WITHOUT ROWID
 tables (no rowid order to backfill by: refused typed); routing `migrate`'s index builds on large
 tables here; undoing a big index drops its pages in one transaction; metrics, to be agreed with
 Kiln Metrics.

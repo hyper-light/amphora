@@ -151,5 +151,8 @@ fn t_g2_7_4_a_record_that_cant_finish_is_stopped_and_classified() {
             Outcome::Agree
         ]
     );
-    assert_eq!((counts.agree, counts.disagree, counts.past_budget), (3, 0, 1));
+    assert_eq!(
+        (counts.agree, counts.disagree, counts.past_budget),
+        (3, 0, 1)
+    );
 }
