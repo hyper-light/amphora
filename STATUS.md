@@ -235,6 +235,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   path; Elle's list-append and register histories checked for G0, G1a, G1b, G1c, G-single and G2
   (snapshot isolation the control, showing G2). Not yet: the 10,000-seed runs and the three schemes'
   throughput, refusals and p99 on the suite's write classes and K0 (the batch's), then the choice.
+- **Versions collected, memory bounded** (G8 step 2, docs/design/engine.md decision 10,
+  `crates/engine/storage/versioned/version.rs`): collection keeps of each row only the versions some
+  open snapshot sees, so a long reader holds one version a row; versions, transactions' records and
+  commits kept for validation are charged to one budget (by default the pool's bytes, or the shell's
+  `with_budget`) and refused past it with a typed `MemoryBudget`; commits are kept only while a
+  transaction begun before them is open; reads past the budget escalate to the whole tree. Tested by
+  a short soak (one reader, 32 writers). Not yet: versions moved out of memory for long readers
+  (LeanStore's graveyard), the hour-long soak (`AMPHORA_G8_SOAK_SECONDS=3600`, the batch's), and the
+  shell passing a budget learned from the process's memory once it opens this storage.
 - **Ephemeral tables kept between runs** (docs/design/executor.md decision 1,
   `crates/engine/tests/ephemeral_reuse.rs`): a statement keeps each ephemeral table of at most 16
   pages (an IN list's keys, an IN subquery's rows) and empties it on its next run, where building
@@ -297,8 +306,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   docs/design/reshard.md): a pure core: a directory of hash spans with every position in exactly one group,
   each group's own holding (fenced, stale actions refused), a planner deciding from measured load, bytes and
   cores, and a driver doing copy, catch-up in rounds and a fenced cutover. Tested in a deterministic
-  simulator (T-T1.9.S1). Left: the shell over Amphora's groups and replicated owners, `bench reshard`
-  (AC-T1.9.2) and the three-machine lab (AC-T1.9.3).
+  simulator (T-T1.9.S1). Connected (lane split-merge-4): the directory is a replicated group's state
+  (`reshard::replicated::DirectoryMachine`, a hyper-durable state machine of directory changes; its
+  leader runs the driver under its term), and `Groups` routes by the directory instead of `fnv % n`, each
+  group checking every write and read against its holding (`store::Refused::Away`) (T-T1.9.R1, R2).
+  Left: each group's holding kept durable in its own state with its rows (it is in the router's memory
+  now), rows indexed by position for copy and sweep, the old group's log held through the operation,
+  the shell carrying the driver's actions to groups, `bench reshard` (AC-T1.9.2) and the three-machine
+  lab (AC-T1.9.3).
 
 ## Measured
 
