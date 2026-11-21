@@ -1,0 +1,72 @@
+hash-threshold 8
+
+# written for keyword:CURRENT_DATE: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+query T rowsort
+SELECT typeof(CURRENT_DATE)
+----
+text
+
+query I rowsort
+SELECT length(CURRENT_DATE)
+----
+10
+
+query I rowsort
+SELECT CURRENT_DATE IS NOT NULL
+----
+1
+
+query T rowsort
+SELECT substr(CURRENT_DATE, 5, 1)
+----
+-
+
+query I rowsort
+SELECT CURRENT_DATE > '2000-01-01'
+----
+1
+
+query I rowsort
+SELECT date(CURRENT_DATE) = CURRENT_DATE
+----
+1
+
+statement ok
+CREATE TABLE kd1(a, d DEFAULT CURRENT_DATE)
+
+statement ok
+INSERT INTO kd1(a) VALUES (1)
+
+query IT rowsort
+SELECT length(d), typeof(d) FROM kd1
+----
+10
+text
+
+query I rowsort
+SELECT CURRENT_DATE BETWEEN '1970-01-01' AND '9999-12-31'
+----
+1
+
+query T rowsort
+SELECT typeof(julianday(CURRENT_DATE))
+----
+real
+
+query I rowsort
+SELECT CURRENT_DATE LIKE '____-__-__'
+----
+1

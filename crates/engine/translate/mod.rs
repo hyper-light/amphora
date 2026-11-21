@@ -189,6 +189,43 @@ pub fn translate(
     program.build(connection, change_cnt_on, input)
 }
 
+/// Amphora: the program of one online index backfill batch ([`index::emit_index_backfill`]),
+/// set up as [`translate`] sets up a statement's. `input` is the statement's text, which no SQL
+/// parses: a statement made stale by a schema change refuses to run again rather than be
+/// prepared as some other statement.
+pub(crate) fn translate_index_backfill(
+    schema: &Schema,
+    connection: Arc<Connection>,
+    syms: &SymbolTable,
+    input: &str,
+    index_name: &str,
+    after: Option<i64>,
+    rows: u64,
+) -> Result<Program> {
+    let prepare_options = PrepareOptions::default();
+    let mut program = Box::new(ProgramBuilder::new(
+        QueryMode::Normal,
+        None,
+        ProgramBuilderOpts::new(1, 32, 2),
+    ));
+    program.set_mvcc_enabled(connection.mvcc_enabled());
+    program.prologue();
+    let resolver = Resolver::new(
+        schema,
+        connection.database_schemas(),
+        &connection.temp.database,
+        connection.attached_databases(),
+        syms,
+        connection.experimental_custom_types_enabled(),
+        connection.get_dqs_dml().into(),
+        Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>,
+        &prepare_options.unqualified_database_search_path,
+    );
+    index::emit_index_backfill(&mut program, &resolver, index_name, after, rows)?;
+    program.epilogue(schema);
+    program.build(connection, false, input)
+}
+
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
 // statements, we would have to return a program builder instead
 /// Translate SQL statement into bytecode program.

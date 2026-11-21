@@ -1,0 +1,31 @@
+# The whole corpus, nightly (G2 step 7, T-G2.7.3; bench/corpus/nightly.sh): every source fetched at
+# its pinned revision, the corpus built and run on SQLite, then run whole on every engine adapter
+# amphora-corpus has, each record's time kept, and the gate's pool (bench/corpus/subset) re-ranked
+# from them. Everything it writes is kept as the run's artifacts: the corpus's record, the times, the
+# runner's disagreements, the proposed pool and its diff against the gate's.
+name: corpus
+on:
+  # 10:00 UTC, 03:00 in the machines' time zone: after the oracles' night (.kiln/oracles.yaml).
+  schedule: ["0 10 * * *"]
+  manual: true
+concurrency: { group: "corpus", cancel-in-progress: false }
+jobs:
+  nightly:
+    name: corpus (whole, every engine adapter)
+    # A bench machine: PostgreSQL 17 runs in a container of the corpus's own (corpus.sh), and the
+    # sources and the corpus's Python are kept in its ~/.cache between nights.
+    runs-on: [baremetal, linux]
+    timeout-minutes: 720
+    env:
+      CARGO_INCREMENTAL: "0"
+      # The night's budget is this job's own: timeout-minutes above, in seconds (nightly.sh shares
+      # it among the engines and bounds each record by its engine's share).
+      CORPUS_BUDGET_S: "43200"
+      # The gate's build (.kiln/ci.yaml): the times re-rank the gate's pool, so they're its times.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - name: toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: the night's run
+        run: nice -n 10 bash bench/corpus/nightly.sh corpus-out
+    artifacts: ["corpus-out/**"]

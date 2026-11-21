@@ -1,0 +1,78 @@
+hash-threshold 8
+
+# written for keyword:INTERSECT: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+query I nosort
+SELECT a FROM t1 INTERSECT SELECT a FROM t2 ORDER BY 1
+----
+1
+2
+3
+6
+
+query T rowsort
+SELECT b FROM t2 INTERSECT SELECT b FROM t1
+----
+
+query I rowsort
+SELECT 1 INTERSECT SELECT 1
+----
+1
+
+query T rowsort
+SELECT NULL INTERSECT SELECT NULL
+----
+NULL
+
+query I rowsort
+VALUES (1), (2) INTERSECT VALUES (2), (3)
+----
+2
+
+query TT rowsort
+SELECT a, b FROM t1 INTERSECT SELECT a, b FROM t2
+----
+
+query I rowsort
+SELECT count(*) FROM (SELECT a FROM t1 INTERSECT SELECT a FROM t2)
+----
+4
+
+query I rowsort
+SELECT a FROM t1 INTERSECT SELECT a FROM t2 INTERSECT SELECT 3
+----
+3
+
+query I nosort
+SELECT a FROM t1 INTERSECT SELECT a FROM t2 UNION SELECT 99 ORDER BY 1
+----
+1
+2
+3
+6
+99
+
+statement error
+SELECT 1 INTERSECT SELECT 1, 2
+
+statement error
+SELECT a FROM t1 INTERSECT ALL SELECT a FROM t2
+
+query I nosort
+SELECT a FROM t1 INTERSECT SELECT c / 10 FROM t2 ORDER BY 1
+----
+NULL
+1
+2

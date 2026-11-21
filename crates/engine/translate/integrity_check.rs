@@ -290,6 +290,12 @@ fn translate_integrity_check_for_schema(
         let mut bound_indexes = Vec::new();
         if let Some(indexes) = schema.indexes.get(btree_table.name.as_str()) {
             for index in indexes {
+                // Amphora: an index an online schema change hasn't made public lacks the entries of
+                // rows its backfill hasn't reached; its pages are still checked as a B-tree
+                // (`resolved_root_pages`), its entries against the rows only once public (CP-T1.12).
+                if !index.is_public() {
+                    continue;
+                }
                 if index.root_page <= 0 || !connection_root_pages.contains(&index.root_page) {
                     continue;
                 }

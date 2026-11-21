@@ -2117,6 +2117,115 @@ Falsified by:
 - a leader that holds its writes past a member's learned length for a write that never comes, or at all for a
   member that never comes back after its refusal.
 
+## Decision (lane follower-reads): Follower reads at a closed time (2026-11-21, G13 step 4, kiln goal 80d4cf5e)
+
+CP-T1.10 asks for follower reads "after ReadIndex, or at bounded staleness" (AC-T1.10.3: p99 at most 2 ms). A local
+read on a replica ("A local read on a replica", above) already answers without the leader, but says nothing of *when*
+the state it saw was the group's. This decision gives every replica's state a time, so a follower read can say the time
+it read at and refuse to answer older than a time its caller asks.
+
+### How CockroachDB does it, and what carries over
+
+CockroachDB closes timestamps (Taft et al., SIGMOD 2020, §3.3 and §4.3): a range's leaseholder promises no write will
+commit at or below a closed timestamp, carried in its Raft commands and, for idle ranges, a side transport; a follower
+that has applied up to that command serves MVCC reads at or below it. Its closed timestamp lags now by a target
+duration so that transactions whose timestamps were taken earlier aren't pushed. Spanner's safe time is the same idea
+for Paxos groups (Corbett et al., OSDI 2012, §4.1.3). Two of its parts don't carry over, for reasons in Amphora's own
+design:
+- **No leases.** hyper-raft trusts no clock (`read.rs`), so a promise made outside the log (a heartbeat, a side
+  transport) can't bind the next leader: a deposed leader in a minority could keep closing times a new leader writes
+  under. Here a time is known only from committed entries.
+- **No lag needed at the leader.** CockroachDB's target lag exists because a transaction's timestamp is taken before its
+  commit. Amphora's leader prepares one transaction at a time and proposes it at once ("Resolved transactions", the
+  base fence), so the order of the log is the order of time: an entry can close its own time.
+- **No MVCC history in a replica.** A replica holds one state, the one after its last applied entry, so a read is
+  answered at that state's time, never at an arbitrary earlier one: CockroachDB's bounded-staleness reads
+  (`with_min_timestamp`), which read at the follower's closed timestamp if it is new enough, not its exact-time reads.
+
+### The decision
+
+- **Stamps.** Every entry an owner proposes (a resolved transaction, a class entry, a seed's chunk) is stamped with its
+  proposer's wall clock: the prefix `amphora.time.v1\0`, a `u64` of microseconds since the Unix epoch, then the entry
+  (`replication/closed.rs`). An owner's wall clock is the system's when it started, moved on by its own clock (`wall`
+  plus the owner's time since it started), so its stamps never go back within one opening. The room for a stamp comes
+  out of the entry's room (`Actor::entry_room`).
+- **Times.** Applying entry *i*, every member computes the group's time *t(i)* = max(stamp(i), *t(i-1)* + 1 µs). An
+  unstamped entry that changes state (from a binary before stamps) takes *t(i-1)* + 1 once there is a time; one that
+  changes nothing (an election's empty entry, a change of members) keeps it. The time is written in the entry's own
+  transaction (`__amphora_closed`, made by the first stamped entry, so at the same index on every member and the page
+  layout stays the same everywhere), and travels with images. It depends on the log alone, so every member computes the
+  same times, and they rise strictly along the committed log whoever leads: a leader whose clock is behind its
+  predecessor's has its stamps lifted (counted by the machine), never a time that goes back. Raft's leader completeness
+  (Ongaro's dissertation §3.6.3) puts every committed entry, with its time, in every later leader's log.
+- **Closed time.** A replica's closed time is the time of its last applied entry. The state it holds is exactly the
+  group's at that time: every entry at or before it is applied (they come earlier in the log), and none after (times
+  rise). A follower read (`Database::query_closed(at_least, until, f)`) runs on a local reader, reads the time as its
+  transaction's first statement (which takes the snapshot, so the time is the state's own), and answers with the
+  value and that time. If the time is earlier than `at_least`, it waits on its caller's thread for the owner's next
+  published time (the owner publishes after each step and tells waiting reads), up to its deadline, refused Timeout past
+  it and Fenced once the owner ends. Each wait is for a time later than the one last found, so the retries are bounded by
+  the deadline.
+- **The lag, measured.** Each time a replica's closed time moves, its owner samples how far it stands behind its own
+  wall clock: replication delay plus the proposer's clock offset. `Database::follower_read_micros` is now less the
+  nearest-rank p99 of the last 100 samples: a read asked at it finds its time without waiting at least 99 times in 100
+  while the delays hold. The quantile is AC-T1.10.3's; 100 is the fewest samples whose p99 is not their maximum,
+  1 / (1 - 0.99). Nothing is measured once and frozen: every replica learns its own, continuously. Refused before the
+  first sample.
+- **Standalone** (`Writer::Local`), a follower read is `Database::query` at the wall clock when it began: its writes
+  carry no time. **An attached client's** is refused, typed, until the wire carries it (a new `Request` variant and
+  `wire::VERSION` 7).
+
+### Evidence
+
+- `closed::tests`: the stamp round-trips; times rise strictly whatever the stamps (behind, equal, unstamped); the lag is
+  the p99 of the last hundred and forgets older ones.
+- T-T1.10.C1, `no_read_under_leader_changes_sees_a_version_past_its_time` (driven shell): three voters whose wall clocks
+  stand an hour apart, the lead passed 1, 2, 3, 1, each writing three values, every member reading before and after it
+  catches up. Every read sees 1..=k; a read at a later time never sees less; two at one time see the same; lifted stamps
+  are counted, so the case where a new leader's clock is behind was exercised. With a time equal to its stamp alone,
+  member 2's writes would read at times an hour before member 1's, with more rows: the check fails.
+- T-T1.10.C2, `a_follower_read_waits_for_its_time_and_is_refused_past_its_deadline`.
+- AC-T1.10.3's p99 is measured by `amphora-bench --cluster --shapes read` (the coordinator's run).
+
+### What it costs, and the limits stated
+
+- 24 bytes an entry, and one more row written in each applied transaction.
+- **Idle groups.** A group with no writes has a closed time that stands still while the clock moves, so a read asked
+  past it waits to its deadline. The fix keeps the log the only source of times: a replica whose read asks past its
+  closed time proposes an empty stamped entry (forwarded to the leader like any follower's proposal), which closes the
+  time at the proposer's clock in one commit. Not built in this change (left below).
+- **Rollout.** A binary from before this change fences on the first stamped entry (its decode refuses the prefix), as on
+  the class entry: every member of a group runs this binary before one of them leads (Ada's word, as for the class).
+
+### Falsified by
+
+- a follower read that sees a write whose time is past the time it answered with, or misses one at or before it;
+- two members' times for one index that differ, or a time that goes back along the committed log;
+- a follower read answered at a time earlier than its `at_least`, or past its deadline;
+- `follower_read_micros` reads that wait more than 1 in 100 under steady replication delay (the lag is too short).
+
+## Decision (lane follower-reads): Search over partitions (2026-11-21, G13 step 4)
+
+CP-T1.10's "search fanned out over directory partitions" and AC-T1.10.4 (search p50 at most 30 ms over 1,000,000 events
+on three nodes). Kiln's search is K0's: `SELECT … FROM events WHERE text LIKE '%word%' ORDER BY at DESC LIMIT n`. Its
+rows are spread over partitions (groups), so one search is a search of each.
+
+**Decision.** `amphora::search::fan_out` asks every partition at once, the first on the caller's thread and each other on
+a scoped thread of its own (bounded by the partitions the caller holds), so a search takes about its slowest
+partition's time rather than their sum; `amphora::search::newest` merges their answers, each newest first and cut to the
+limit, with a k-way merge holding one row a partition and taking at most the limit (equal keys in partition order, so a
+merge is the same every time). On a replicated cluster each partition is asked on this node's replica, at its closed
+time (`Database::query_closed`), so a search reads no leader. Each partition answers at its own time: the merged answer
+is each partition's state at a time it reports, not one snapshot across them (that is cross-group work, CP-T1.10's
+transactions).
+
+**Evidence.** `search::tests`: the merge equals the sorted union cut to the limit over 500 random shapes; every partition
+is asked while every other is (each ask waits for all to begin, which asked in turn never happens). AC-T1.10.4 is measured
+by `amphora-bench --cluster --shapes search` (three members of every group in one process, relayed by the bench as a
+host relays them; the coordinator's run).
+
+**Falsified by:** a search slower than its slowest partition by more than a thread's start; a merged answer that differs
+from the newest rows of all partitions together.
 ## Decision (lane constants): one drive a step (2026-11-21)
 
 Ada's rule: no picked numbers. `DRIVE_QUANTUM` (32) bounded how many times one step of the owner drove its replica
@@ -2142,3 +2251,63 @@ some step leaves more to drive for the next. A step that drives until nothing is
 
 **Falsified by:** an input waiting more than one drive while the replica has more to drive; the replicated benches'
 commit latency or throughput worse than at 4e74cee beyond their noise.
+
+## A follower's write that read nothing written since its base: read sets (built 2026-11-21, Amphora goal ceea4e0a)
+
+D of goal 9c63f7d4, on top of the write slot (above). In the release A/B, D halved G's write gaps
+(bench/records/2026-11-09-write-starve-*; docs/research/follower-write-starvation.md). The slot makes a refused write's
+next try land; read sets keep most writes from being refused at all, when they touched pages nothing since wrote.
+
+**The read set.** The pager records the pages a prepared session reads (`Pager::record_access`, from its `BEGIN
+IMMEDIATE` to before its capture, which reads every dirty page again). The write states what it did to page 1: nothing,
+only the database's size and the checksum trailer (an allocation), or more. The record's bound is the entry's own
+bound in bytes, since each page number takes at least one byte in the entry: a session that read more could not carry
+its read set, and goes without one.
+
+**On the wire: append-only.** The read set rides after the write's `Prepared` encoding, as a postcard trailer
+(`replication::readsets`). A binary from before it decodes the `Prepared` and ignores what follows (postcard's
+`from_bytes` reads a value's prefix), so a mixed group decides every entry the same way. A write whose trailer would
+pass the entry's bound goes without one: the exact base decides it.
+
+**The leader decides, once.** As the leader steps a member's forwarded write (`step_forward`), the entry before the
+append is its own last entry. If the write's base is older, the leader walks its log from the entry after the base to
+that last entry. If none wrote a page the write read or wrote, it moves the write's base to its last entry, rewriting
+the two numbers in place. Every member then applies the entry by the exact base, as before, so no member keeps state of
+its own for the decision and none can decide it differently: a restart, an image or a binary from before changes
+nothing. That is Kung and Robinson's backward validation (research f4, f5), over pages. An entry that no page list
+describes (a change of members, a class entry, a seed, one the leader can't read) conflicts. Every apply writes the
+replica's marker table and the closed time's table ("Follower reads at a closed time"), so a write that read or wrote
+either page conflicts with every entry. The leader reads a write inside its proposer's closed-time stamp, and moving its
+base keeps the stamp as it was. The group's first stamped entry makes the closed time's table at apply, a schema change
+no page list shows, so a follower carries a read set only on a base whose state already has that table. Entries refused
+at their own apply still count as written: conservative, never unsound.
+
+**Page 1 merges its size.** Every session reads page 1. An entry that changed it only in the size conflicts only with
+a write that writes page 1 too; one that changed more of it (the schema, its cookie, the free list) conflicts with
+every write, whether or not the write's record caught its read of page 1. Two allocations from one base would allocate the same page, which conflicts on that
+page anyway. An entry with no read set that wrote page 1 counts as more than a size change.
+
+**The window is derived.** It is the leader's log between the write's base and the append, bounded by the log's own
+bound: what it holds since its last compaction. A base the log no longer holds, or whose term differs from the log's, is left to the exact base,
+which refuses it. There is no window constant and no cap on age. The walk reads the log in slices of one command's
+bytes and ends at the first conflict. A write forwarded with others in one message is left to the exact base.
+
+**Why it is serializable.** A write admitted this way read, at its base, exactly what it would have read at the
+leader's last entry: no page it read changed in between, and page 1 changed at most in the size, which it didn't
+write. Its pages overwrite none that changed. So it is equivalent to the same session run at the entry before it.
+
+**Observability.** A debug event `replication.read_set` (`outcome` = rebased, conflict or unknown_base, with the base
+and the leader's last index). The names go to Kiln Metrics before any metric is added.
+
+**Requirements and tests.** AC-T1.8.R1 to R3 (docs/requirements.toml):
+- T-T1.8.R1 to R3, the core's tests in `replication::readsets`;
+- T-T1.8.R4, `r4_a_follower_write_on_pages_nothing_since_wrote_lands_on_its_first_try`, an interleaving the test
+  builds with the slot off: the follower's write on another table lands on its first try, one on the leader's table is
+  refused, and with read sets off both are refused;
+- T-T1.8.R5, `r5_read_sets_keep_every_list_append_history_serializable`, Elle's list-append runs with the slot off and
+  on. The mutant that moves every stale base unchecked must be caught there.
+The W tests run with read sets on.
+
+Falsified by: a non-serializable history with read sets on; a release A/B against G where read sets don't cut G's
+write gaps; a `conflict` share near one on workloads whose writes touch different pages (the read set too wide: the
+recorder catching reads the session didn't make).

@@ -111,8 +111,16 @@ impl AvailableIndexes {
             .iter()
             .filter(|jt| matches!(jt.table, Table::BTree(_) | Table::Virtual(_))) // only b-tree tables can have indexes
             .filter_map(|jt| {
+                // Amphora: an index in an online schema change's intermediate state lacks the
+                // entries of rows its backfill hasn't reached, so no plan reads it (CP-T1.12).
                 let indexes = resolver.with_schema(jt.database_id, |schema| {
-                    schema.indexes.get(jt.table.get_name()).cloned()
+                    schema.indexes.get(jt.table.get_name()).map(|indexes| {
+                        indexes
+                            .iter()
+                            .filter(|index| index.is_public())
+                            .cloned()
+                            .collect::<VecDeque<_>>()
+                    })
                 })?;
                 Some((jt.internal_id, indexes))
             })
@@ -4698,6 +4706,7 @@ fn ephemeral_index_build(
             .is_some_and(|btree| btree.has_rowid),
         index_method: None,
         on_conflict: None,
+        state: crate::schema::IndexState::Public,
     };
 
     if let Some(table) = table_reference.btree().filter(|table| !table.has_rowid) {

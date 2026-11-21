@@ -1,0 +1,45 @@
+hash-threshold 8
+
+# written for function.json:json_group_object: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+statement error
+SELECT json_group_object(coalesce(b, 'k' || rowid), a) FROM (SELECT * FROM t1 ORDER BY rowid)
+
+statement error
+SELECT json_group_object(coalesce(b, 'k' || rowid), b) FROM (SELECT * FROM t1 ORDER BY rowid)
+
+statement error
+SELECT json_group_object(coalesce(b, 'k' || rowid), c) FROM (SELECT * FROM t1 ORDER BY rowid)
+
+statement error
+SELECT json_group_object(coalesce(b, 'k' || rowid), e) FROM (SELECT * FROM t1 ORDER BY rowid)
+
+statement error
+SELECT json_group_object(coalesce(b, 'k' || rowid), a * 2) FROM (SELECT * FROM t1 ORDER BY rowid)
+
+statement error
+SELECT json_group_object(coalesce(b, 'k' || rowid), upper(b)) FROM (SELECT * FROM t1 ORDER BY rowid)
+
+statement error
+SELECT json_group_object(coalesce(b, 'k' || rowid), a IS NULL) FROM (SELECT * FROM t1 ORDER BY rowid)
+
+statement error
+SELECT json_group_object(coalesce(b, 'k' || rowid), length(b)) FROM (SELECT * FROM t1 ORDER BY rowid)
+
+statement error
+SELECT json_group_object(coalesce(b, 'k' || rowid), c > 2) FROM (SELECT * FROM t1 ORDER BY rowid)
+
+statement error
+SELECT json_group_object(coalesce(b, 'k' || rowid), coalesce(b, '')) FROM (SELECT * FROM t1 ORDER BY rowid)

@@ -18,6 +18,7 @@ pub mod amphora;
 pub mod answer;
 pub mod classify;
 pub mod complete;
+pub mod engines;
 pub mod md5;
 pub mod run;
 pub mod slt;

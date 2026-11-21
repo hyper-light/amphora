@@ -140,6 +140,49 @@ pub const SEQ_BACKING_TABLE_PREFIX: &str = "__turso_internal_seq_";
 // by applying SEQ_BACKING_TABLE_PREFIX to the full sequence name.
 pub const AUTOINCREMENT_SEQ_PREFIX: &str = "__turso_internal_autoincrement_";
 
+/// Amphora: the table that holds each index's place in an online schema change (CP-T1.12, F1's
+/// states; Amphora's `docs/design/online-schema.md`). A row names an index (or a name an index is
+/// about to take) and its state; an index without a row is public. Every connection reads it when it
+/// parses its schema, so a reader and the writer see an index in the same state at the same schema
+/// cookie. Its name is in Amphora's reserved `__amphora_` space, which its public SQL refuses.
+pub const INDEX_STATES_TABLE: &str = "__amphora_index_states";
+
+/// Amphora: where an index stands in an online schema change, by Rae et al., "Online, Asynchronous
+/// Schema Change in F1" (PVLDB 6(11), 2013), section 4: an index goes absent, delete-only,
+/// write-only, then public once a backfill has given every row its entry. Only a public index is
+/// read; the others are kept by writes as their state says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexState {
+    /// Deletes remove its entries; inserts add none. Nothing reads it.
+    DeleteOnly,
+    /// Inserts, updates and deletes keep it, unique checks included; nothing reads it, as rows
+    /// written before it got here have no entry until a backfill gives them one.
+    WriteOnly,
+    /// An ordinary index: complete, kept and read.
+    Public,
+}
+
+impl IndexState {
+    /// The state a row of [`INDEX_STATES_TABLE`] stores (a format value: 1 and 2, and no row for
+    /// public).
+    pub fn from_stored(stored: i64) -> Option<Self> {
+        match stored {
+            1 => Some(Self::DeleteOnly),
+            2 => Some(Self::WriteOnly),
+            _ => None,
+        }
+    }
+
+    /// What [`Self::from_stored`] reads back; public is stored as no row.
+    pub fn stored(self) -> Option<i64> {
+        match self {
+            Self::DeleteOnly => Some(1),
+            Self::WriteOnly => Some(2),
+            Self::Public => None,
+        }
+    }
+}
+
 /// Name of the hidden sequence owned by an AUTOINCREMENT table.
 pub fn autoincrement_sequence_name(table_name: &str) -> String {
     String::from(AUTOINCREMENT_SEQ_PREFIX) + table_name
@@ -770,6 +813,9 @@ pub struct Schema {
     pub generated_columns_enabled: bool,
     /// Named sequences (CREATE SEQUENCE)
     pub sequences: HashMap<String, Arc<Sequence>>,
+    /// Amphora: the states [`INDEX_STATES_TABLE`] holds, by normalized index name: an index added
+    /// under one of these names takes its state (see [`Schema::add_index`]).
+    pub index_states: HashMap<String, IndexState>,
 }
 
 impl Default for Schema {
@@ -912,6 +958,7 @@ impl Schema {
             type_registry,
             generated_columns_enabled: false,
             sequences: HashMap::default(),
+            index_states: HashMap::default(),
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
@@ -1469,6 +1516,7 @@ impl Schema {
 
     pub fn add_index(&mut self, index: Arc<Index>) -> Result<()> {
         self.check_object_name_conflict(&index.name, SchemaObjectType::Index)?;
+        let index = self.staged(index)?;
         let table_name = normalize_ident(&index.table_name);
         // We must add the new index to the front of the deque, because SQLite stores index definitions as a linked list
         // where the newest parsed index entry is at the head of list. If we would add it to the back of a regular Vec for example,
@@ -1511,6 +1559,45 @@ impl Schema {
             .map(|v| v.iter())
             .unwrap_or_default()
             .filter(|i| !i.is_backing_btree_index())
+    }
+
+    /// Amphora: the state [`INDEX_STATES_TABLE`] gives an index of this name (public without a row).
+    pub fn index_state(&self, index_name: &str) -> IndexState {
+        self.index_states
+            .get(&normalize_ident(index_name))
+            .copied()
+            .unwrap_or(IndexState::Public)
+    }
+
+    /// Amphora: `index` in the state its name is staged at, a copy if that differs from its own.
+    fn staged(&self, index: Arc<Index>) -> Result<Arc<Index>> {
+        let state = self.index_state(&index.name);
+        if index.state == state {
+            return Ok(index);
+        }
+        let mut staged = index.as_ref().try_clone()?;
+        staged.state = state;
+        Ok(Arc::new(staged))
+    }
+
+    /// Amphora: installs the states [`INDEX_STATES_TABLE`] holds (read as the schema is parsed) and
+    /// gives each index already added its own. A name may be staged before its index exists: the
+    /// transaction that creates it stages it first, so `CREATE INDEX` makes it empty (CP-T1.12).
+    pub fn set_index_states(&mut self, states: HashMap<String, IndexState>) -> Result<()> {
+        self.index_states = states;
+        let names = self.indexes.keys().cloned().collect::<Vec<_>>();
+        for name in names {
+            let Some(indexes) = self.indexes.remove(&name) else {
+                continue;
+            };
+            let mut staged = VecDeque::new();
+            staged.try_reserve(indexes.len())?;
+            for index in indexes {
+                staged.push_back(self.staged(index)?);
+            }
+            self.indexes.insert(name, staged);
+        }
+        Ok(())
     }
 
     pub fn get_unowned_backing_btrees(
@@ -2594,7 +2681,8 @@ impl Schema {
             let mut found = self
                 .get_indices(&parent_tbl.name)
                 .find(|idx| {
-                    idx.unique
+                    idx.is_public()
+                        && idx.unique
                         && idx.where_clause.is_none()
                         && idx.columns.len() == parent_cols.len()
                         && idx.columns.iter().zip(parent_cols.iter()).all(|(ic, pc)| {
@@ -2871,6 +2959,7 @@ impl TryClone for Index {
             where_clause: self.where_clause.clone(),
             index_method: self.index_method.clone(),
             on_conflict: self.on_conflict,
+            state: self.state,
         })
     }
 }
@@ -2949,6 +3038,7 @@ impl TryClone for Schema {
             type_registry: self.type_registry.try_clone()?,
             generated_columns_enabled: self.generated_columns_enabled,
             sequences: self.sequences.try_clone()?,
+            index_states: self.index_states.try_clone()?,
         })
     }
 }
@@ -5957,6 +6047,8 @@ pub struct Index {
     pub index_method: Option<Arc<dyn IndexMethodAttachment>>,
     /// ON CONFLICT clause from the constraint definition (PRIMARY KEY or UNIQUE).
     pub on_conflict: Option<ResolveType>,
+    /// Amphora: where it stands in an online schema change (public but for one under way).
+    pub state: IndexState,
 }
 
 #[allow(dead_code)]
@@ -6083,6 +6175,7 @@ impl Index {
             where_clause: None,
             index_method: None,
             on_conflict: None,
+            state: crate::schema::IndexState::Public,
         })
     }
 
@@ -6190,6 +6283,7 @@ impl Index {
                         where_clause: None,
                         index_method: Some(descriptor),
                         on_conflict: None,
+                        state: crate::schema::IndexState::Public,
                     })
                 } else {
                     Ok(Index {
@@ -6203,6 +6297,7 @@ impl Index {
                         where_clause,
                         index_method: None,
                         on_conflict: None,
+                        state: crate::schema::IndexState::Public,
                     })
                 }
             }
@@ -6213,6 +6308,12 @@ impl Index {
     /// Check if this is an expression index.
     pub fn is_expression_index(&self) -> bool {
         self.columns.iter().any(|c| c.expr.is_some())
+    }
+
+    /// Amphora: whether reads may use it (CP-T1.12): an index in an online schema change's
+    /// intermediate state lacks the entries of rows its backfill hasn't reached.
+    pub fn is_public(&self) -> bool {
+        self.state == IndexState::Public
     }
 
     /// check if this is special backing_btree index created and managed by custom index_method
@@ -6277,6 +6378,7 @@ impl Index {
             where_clause: None,
             index_method: None,
             on_conflict: conflict_clause,
+            state: crate::schema::IndexState::Public,
         })
     }
 
@@ -6329,6 +6431,7 @@ impl Index {
             where_clause: None,
             index_method: None,
             on_conflict: conflict_clause,
+            state: crate::schema::IndexState::Public,
         })
     }
 
