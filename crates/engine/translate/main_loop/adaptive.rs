@@ -266,7 +266,6 @@ impl<'a> AdaptiveSeek<'a> {
             joined_table_index,
             AdaptiveJoinCtx {
                 switch_id,
-                hash_table_id,
                 hash_next,
             },
         );
