@@ -141,6 +141,11 @@ pub fn translate(
         .clone()
         .unwrap_or_else(|| Arc::new(crate::plan_cache::PlanValues::generic()));
     resolver.set_plan_values(plan_values.clone());
+    // Amphora: what its hash and group tables hold before they spill (executor decision 8).
+    resolver.set_statement_memory(connection.get_pager().statement_memory_budget());
+    resolver.set_join_methods(connection.join_methods());
+    // Amphora: what a seek, a hash table and a sort cost, as this database has timed them (QT.5).
+    resolver.set_learned_weights(connection.db.learned_costs.weights());
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here

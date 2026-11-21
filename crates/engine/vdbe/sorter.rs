@@ -312,6 +312,9 @@ pub struct Sorter {
     kept: Option<Kept>,
     /// Amphora: whether the first insert has decided `kept`.
     limit_decided: bool,
+    /// Amphora (QT.5): the rows the last in-memory sort ordered and the nanoseconds it took, for
+    /// the database's learned sort cost (`take_in_memory_sort`).
+    in_memory_sort: Option<(usize, f64)>,
 }
 
 impl Sorter {
@@ -360,6 +363,7 @@ impl Sorter {
             temp_store,
             kept: None,
             limit_decided: false,
+            in_memory_sort: None,
         };
         Ok(this)
     }
@@ -397,6 +401,11 @@ impl Sorter {
         self.current.is_some()
     }
 
+    /// Amphora (QT.5): the rows the last in-memory sort ordered and the nanoseconds it took, once.
+    pub fn take_in_memory_sort(&mut self) -> Option<(usize, f64)> {
+        self.in_memory_sort.take()
+    }
+
     // We do the sorting here since this is what is called by the SorterSort instruction
     pub fn sort(&mut self) -> IOResultOr<()> {
         loop {
@@ -414,8 +423,11 @@ impl Sorter {
                         // NOTE: We can't just sort descending because stable sort preserves insertion
                         // order for equal elements, and descending sort doesn't reverse equal elements.
                         // SAFETY: All pointers in records are valid (arena hasn't been reset).
+                        let started = std::time::Instant::now();
                         self.records
                             .sort_by(|a, b| unsafe { a.as_ref().cmp(b.as_ref()) });
+                        self.in_memory_sort =
+                            Some((self.records.len(), started.elapsed().as_nanos() as f64));
                         self.records.reverse();
                         self.sort_state = SortState::Next;
                     } else {

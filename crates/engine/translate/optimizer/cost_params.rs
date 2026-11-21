@@ -76,6 +76,11 @@ pub struct CostModelParams {
     /// default page cache, 2,000 pages; planning replaces it with the connection's.
     pub cache_pages: f64,
 
+    /// Amphora: the memory a statement's hash and group tables hold together before they spill,
+    /// in bytes (`docs/design/executor.md`, decision 8): the connection's own cache
+    /// (`Pager::statement_memory_budget`). Planning replaces the default, nothing, with it.
+    pub statement_memory: usize,
+
     /// Bonus subtracted from cost when using an index (encourages index usage).
     pub index_bonus: f64,
 
@@ -130,6 +135,7 @@ impl CostModelParams {
             cpu_cost_per_where_step: 0.003,
             cpu_cost_per_seek: 0.01,
             cache_pages: 2000.0,
+            statement_memory: 0,
             index_bonus: 0.5,
 
             // Sort costs
@@ -209,6 +215,36 @@ impl CostModelParams {
                 values.value(variable).cloned()
             }
             _ => None,
+        }
+    }
+
+    /// Amphora (QT.5): these parameters with the seek's, the hash table's build and probe and the
+    /// sort's weights learned where the engine runs (`learned_costs`), each its multiple of a row's
+    /// visit times `cpu_cost_per_row`. The learned build and probe times include hashing the key,
+    /// so `hash_cpu_cost` adds nothing to them. None, a clock that never moved, leaves these.
+    pub(crate) fn with_learned(
+        &self,
+        learned: Option<super::learned_costs::LearnedWeights>,
+    ) -> Self {
+        let Some(learned) = learned else {
+            return self.clone();
+        };
+        let row = self.cpu_cost_per_row;
+        Self {
+            cpu_cost_per_seek: row * learned.seek,
+            hash_cpu_cost: 0.0,
+            hash_insert_cost: row * learned.hash_build,
+            hash_lookup_cost: row * learned.hash_probe,
+            sort_cpu_per_row: row * learned.sort,
+            ..self.clone()
+        }
+    }
+
+    /// Amphora: these parameters with the statement's memory, `bytes` (executor decision 8).
+    pub fn with_statement_memory(&self, bytes: usize) -> Self {
+        Self {
+            statement_memory: bytes,
+            ..self.clone()
         }
     }
 }

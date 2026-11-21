@@ -1054,6 +1054,9 @@ impl Records for Namespace {
             _ => Err(unavailable("unexpected wait response")),
         }
     }
+    fn changed(&self, f: &str, r: api::Rev, u: Instant) -> Result<Option<api::Rev>, Refusal> {
+        self.try_wait(f, r, u)
+    }
     fn head(&self, u: Instant) -> Result<api::Rev, Refusal> {
         match self.request(Record::Head, u)? {
             Answer::Rev(v) => Ok(v),

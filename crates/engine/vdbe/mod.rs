@@ -1908,6 +1908,9 @@ impl ExplainState {
 #[derive(Debug, Clone)]
 pub struct PreparedProgram {
     pub max_registers: usize,
+    /// Amphora (docs/design/executor.md, decision 8; QT.5): the hash and group tables the
+    /// program builds, each held to an equal share of the statement's memory budget.
+    pub memory_tables: usize,
     // we store original indices because we don't want to create new vec from
     // ProgramBuilder
     pub insns: Vec<(Insn, usize)>,

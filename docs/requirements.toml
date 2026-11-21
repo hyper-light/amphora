@@ -418,3 +418,64 @@ tests = [
   { id = "T-QT.3.4", text = "A loop over a non-covering index with a term on the index's columns and one on the table's — passes when the answer is unchanged and the table rows fetched are only those the index's term keeps, whatever order the terms are written in" },
   { id = "T-QT.3.5", text = "scripts/check-production.sh after the change — passes when it passes, with the ratchet's counts lowered by what the change removed" },
 ]
+
+# lane split-merge: groups that split, merge and move themselves (kiln goal 49477403, G13 step 2;
+# docs/design/reshard.md). Criteria are CP-T1.9's AC-T1.9.1 to AC-T1.9.3.
+[[own]]
+id = "RS.1"
+title = "Split, merge and move as one fenced hand-off: copy, catch-up in rounds, a brief cutover, decided by measured share"
+criteria = [
+  { id = "AC-RS.1.1", text = "Every position in exactly one group's span after every directory change; a change that would break it refused whole" },
+  { id = "AC-RS.1.2", text = "Split past one core's share of load or bytes, merge at half a core's share together, move only without overshoot: every value measured as it runs or the split's own factor of two" },
+]
+tests = [
+  { id = "T-T1.9.S1", text = "Automatic splits, merges and moves in the simulator under writes, driver and group restarts and lost logs — passes when every key is in exactly one group, the directory's, and writes lost is 0" },
+]
+
+# lane qs5
+[[own]]
+id = "QT.5"
+title = "Hash joins where a seek exists, chosen by cost, with predicate transfer (query-time step 5; with planner rank PL.5 and G6 step 4)"
+criteria = [
+  { id = "AC-QT.5.1", text = "JOB median best time is at most 147 ms, by bench/planner/record.sh on jupiter, best of 3, each run begun at a load under 2" },
+  { id = "AC-QT.5.2", text = "JOB queries at or under 78.4 ms number at least 38, by the same pass" },
+  { id = "AC-QT.5.3", text = "TPC-H SF 10 q09 best time is at most 35,000 ms" },
+  { id = "AC-QT.5.4", text = "TPC-H SF 10 median best time over the parent's is at most 1.05" },
+  { id = "AC-QT.5.5", text = "Every answer unchanged by step 1's whole-answer check; CERT and the order check clean" },
+]
+tests = [
+  { id = "T-QT.5.1", text = "Random joins with NULLs, duplicates, outer, semi and anti joins, run with index nested loops forced and with hash joins forced — passes when identical results" },
+  { id = "T-QT.5.2", text = "A build whose input outgrows its estimate tenfold — passes when it spills within its budget with its answer unchanged, and past the spill budget refuses with a typed error naming the budget" },
+  { id = "T-QT.5.3", text = "Predicate transfer over a cyclic join graph and over an outer join (transfer in one direction only) — passes when identical results, and the filters' memory within the statement's stated bound" },
+  { id = "T-QT.5.4", text = "TPC-H q01 and q06, which join nothing — passes when no filter built, times within the passes' spread of the parent's" },
+  { id = "T-QT.5.5", text = "The seek, hash-build, hash-probe and sort weights, learned per database (calibrated at start, moved by operators' times) — passes when calibration alone gives finite positive weights, observed times move a weight to the observed rate, and meaningless observations leave it" },
+]
+
+# lane records-api: Amphora's own IDs for CP-T1.5's Records API (kiln goal a1f386fe, G9 step 1;
+# docs/design/records.md). The suite's cases are AC-T1.5.3's.
+
+[[own]]
+id = "RA.1"
+title = "Records in amphora-api, typed and simulated: the feed's guarantees, the simulator, index families, counters"
+criteria = [
+  { id = "AC-RA.1.1", text = "Amphora's Namespace (in memory, on a file, through the local owner) and SimRecords each pass every case of amphora_api::conformance, kiln-seams' RECORDS-1 to 14 among them" },
+  { id = "AC-RA.1.2", text = "SimRecords answers every request as Amphora does, refusals and compaction progress included" },
+]
+tests = [
+  { id = "T-RA.1.1", text = "the_simulator_answers_as_amphora_does over AMPHORA_RECORDS_SEEDS seeded histories — passes when every answer is equal and every kind of request was answered and refused" },
+  { id = "T-RA.1.2", text = "index_keys_keep_term_order_and_prefixes_reach_one_term over every term of up to three bytes from {0x00, 0x01, 0xFF, a} — passes when keys sort as (term, key) and a prefix reaches its own term only" },
+]
+
+# lane columnar-decision
+# Amphora's own IDs for G11, analytics at column-store speed (kiln plan
+# 01a16b0f477676d5a7ce168b80aa29f5, research 01a16b0f477676d5a7ce168c89606fd2): CS.n for its step n.
+
+[[own]]
+id = "CS.1"
+title = "The columnar designs compared on Amphora's terms, one decision with its falsifier (G11 step 1)"
+criteria = [
+  { id = "AC-CS.1.1", text = "docs/design has the columnar decision with the alternatives' trade-offs and what would falsify it" },
+]
+tests = [
+  { id = "T-CS.1.1", text = "A doc-truth check of its claims (crates/amphora/tests/columnar_decision.rs) — passes when every claim cited: each citation resolves to a quoted, located claim from a graded source, and each number the decision states is in a quote it cites" },
+]
