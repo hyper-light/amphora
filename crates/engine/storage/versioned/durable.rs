@@ -350,7 +350,12 @@ impl Database {
         // that, a pool whose every frame is latched refuses.
         let parts = std::thread::available_parallelism()
             .map_or(1, std::num::NonZero::get)
-            .min(v.pool.capacity().checked_div(super::blink::WRITER_LATCHES).unwrap_or(1))
+            .min(
+                v.pool
+                    .capacity()
+                    .checked_div(super::blink::WRITER_LATCHES)
+                    .unwrap_or(1),
+            )
             .max(1);
         let mut by: Vec<Vec<&Op>> = vec![Vec::new(); parts];
         for op in changes {
@@ -390,17 +395,13 @@ impl Database {
         cmp: impl Fn() -> Comparator,
     ) -> Result<Self> {
         let all = trees.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
-        let v = Versioned::new_in(
-            Pool::backed(frames, disk.clone(), 0)?,
-            all,
-            |i| {
-                if i == trees {
-                    bytes_order()
-                } else {
-                    cmp()
-                }
-            },
-        )?;
+        let v = Versioned::new_in(Pool::backed(frames, disk.clone(), 0)?, all, |i| {
+            if i == trees {
+                bytes_order()
+            } else {
+                cmp()
+            }
+        })?;
         let allocated = v.pool.allocated();
         let epoch = v.pool.begin_copy()?;
         let journal = Journal {

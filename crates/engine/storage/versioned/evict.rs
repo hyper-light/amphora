@@ -49,23 +49,27 @@ fn g7s4_a_database_ten_times_its_pool_reads_and_writes_correctly() {
     {
         let db = Database::open(disk.clone(), FRAMES, 1, cmp).unwrap();
         let mut d = Descender::new();
-        for chunk in 0..20u64 {
+        for chunk in 0..100u64 {
             let mut t = db.begin().unwrap();
-            for i in chunk * 100..(chunk + 1) * 100 {
+            for i in chunk * 20..(chunk + 1) * 20 {
                 db.put(&mut d, &mut t, 0, &key(i), &value(i, 0)).unwrap();
                 want.insert(key(i), value(i, 0));
             }
             db.commit(t, &mut d, db.lane(), true).unwrap();
-            if chunk == 10 {
+            db.collect(&mut d).unwrap();
+            if chunk == 50 {
                 db.checkpoint().unwrap();
             }
         }
-        let mut t = db.begin().unwrap();
-        for i in (0..2_000u64).step_by(3) {
-            db.put(&mut d, &mut t, 0, &key(i), &value(i, 1)).unwrap();
-            want.insert(key(i), value(i, 1));
+        for chunk in (0..2_000u64).step_by(60) {
+            let mut t = db.begin().unwrap();
+            for i in (chunk..chunk + 60).step_by(3) {
+                db.put(&mut d, &mut t, 0, &key(i), &value(i, 1)).unwrap();
+                want.insert(key(i), value(i, 1));
+            }
+            db.commit(t, &mut d, db.lane(), true).unwrap();
+            db.collect(&mut d).unwrap();
         }
-        db.commit(t, &mut d, db.lane(), true).unwrap();
         assert_eq!(rows(&db), want);
         let snap = db.snapshot().unwrap();
         for (k, v) in want.iter().step_by(7) {
