@@ -402,6 +402,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   equal (T-T1.12.D1). `Database::open_backed_up` backs a local writer up: its commits stamped and a
   thread that ships and copies bases as it commits, across a close and a reopen (T-T1.12.D2). Not
   yet: kiln's adapter to Mantle, and the 100 GB restore measurement (AC-T1.12.3).
+  The folder store (`backup::FolderBlobs`, lane pitr-7): the owned default, a peer's folder over a
+  mount the same, passing the seam's suite and answering as the simulator (AMPHORA-BLOBS-8).
+  Restore-and-check (`backup::restore_and_check`): the newest whole second restored to a scratch file,
+  integrity-checked and its rows compared with the source's, typed and counted, due on the archive's
+  cadence (T-T1.12.C1, C2). One cut across groups (`backup::restore_cut`): every group restored to
+  one second, half-done cross-group transactions finished by their records (T-T1.12.X1). Not yet:
+  the source's digest taken by the shipping thread itself; incremental bases; cuts across nodes'
+  clocks.
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
@@ -612,9 +620,16 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
 - **Query speed step 6 (QT.6), started** (lane qs6; docs/design/executor.md section 8): built and unit-tested, not
   measured, not yet in the VDBE's loops. `vdbe/morsel.rs` runs a scan with its filter and aggregates, and a hash join's
   probe side, in morsels on several threads behind `ParallelMode` (off by default); the worker count and morsel size
-  come from costs measured where it runs, answers equal at every worker count (T-QT.6.1 to T-QT.6.5). Closes with:
-  the VDBE's scan and join loops run through it (a cursor per worker over one snapshot), a shared hash build, loom or
-  shuttle on the dispatcher, worker and morsel metrics, and AC-QT.6.1 to AC-QT.6.4 measured.
+  come from costs measured where it runs, answers equal at every worker count (T-QT.6.1 to T-QT.6.5).
+  `vdbe/morsel_scan.rs` (lane qs6-2) reads a table b-tree in morsels of leaf pages: the leaves come from its interior
+  pages, each worker opens its own cursor over its leaves through the statement's pager (one snapshot), and the scan
+  pipeline's filter and aggregates, or a hash join's probe, run over the rows; `choose_degree` sizes the morsels in
+  pages. Answers equal the VDBE's serial SQL answers at every worker count (T-QT.6.7 to T-QT.6.9). The VDBE's hook:
+  `Connection::set_parallel_mode` (off by default) lets a single-table scan with its filter and aggregates run as
+  `Insn::MorselAggregate` ahead of its serial loop, which answers when the run declines a value (`translate/parallel.rs`;
+  T-QT.6.10). Closes with: the hash join's probe loop handed over the same way, expressions beyond column-against-
+  literal terms (a program's own loop body per worker), a shared hash build, loom or shuttle on the dispatcher, worker
+  and morsel metrics, and AC-QT.6.1 to AC-QT.6.4 measured.
 - **Query speed step 5 (QT.5), started** (lane qs5): `Connection::set_join_methods` plans a connection's new
   statements by cost, with index nested loops only, or with hash joins only; `tests/join_methods.rs` (T-QT.5.1) runs
   inner, left, semi and anti joins with NULL and duplicate keys all three ways and against a model. The harness

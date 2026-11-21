@@ -196,6 +196,9 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | records-compaction | – | Bounded Records compaction on the namespace writer, step by recoverable step | [records-compaction.md](design/records-compaction.md) |
 | without-rowid | – | WITHOUT ROWID tables keep their primary-key index as the table | [without-rowid.md](design/without-rowid.md) |
 | backup | – | Decision (lane pitr): backups and point-in-time recovery to Mantle (CP-T1.12, G14 step 4) | [backup.md](design/backup.md) |
+| backup | – | The folder store: keys as paths, create once by link(2), listing in key order | [backup.md](design/backup.md#the-folder-store) |
+| backup | – | Restore-and-check: the newest whole second restored and checked, on the archive's cadence | [backup.md](design/backup.md#restore-and-check) |
+| backup | – | One cut across groups: each group restored to the second, half-done transactions finished by their records | [backup.md](design/backup.md#one-cut-across-groups) |
 
 ## Sections that are not decisions
 

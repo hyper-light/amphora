@@ -208,6 +208,9 @@ pub struct Resolver<'a> {
     join_methods: crate::JoinMethods,
     /// Amphora: whether the planner may choose a sorted fetch (`Connection::set_sorted_fetches`).
     sorted_fetches: bool,
+    /// Amphora: whether a qualifying scan's aggregates run in leaf-page morsels
+    /// (`Connection::set_parallel_mode`, QT.6).
+    parallel: bool,
     /// Cached flag: true when this connection has an active temp database.
     ///
     /// Computed once at Resolver construction to avoid repeated
@@ -338,6 +341,7 @@ impl<'a> Resolver<'a> {
             fitted_weights: None,
             join_methods: crate::JoinMethods::ByCost,
             sorted_fetches: false,
+            parallel: false,
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
             unqualified_database_search_path: unqualified_database_search_path.clone(),
@@ -435,6 +439,14 @@ impl<'a> Resolver<'a> {
         self.sorted_fetches = on;
     }
 
+    pub(crate) fn parallel(&self) -> bool {
+        self.parallel
+    }
+
+    pub(crate) fn set_parallel(&mut self, on: bool) {
+        self.parallel = on;
+    }
+
     pub fn fork(&self) -> Resolver<'a> {
         Resolver {
             schema: self.schema,
@@ -463,6 +475,7 @@ impl<'a> Resolver<'a> {
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
             sorted_fetches: self.sorted_fetches,
+            parallel: self.parallel,
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
@@ -497,6 +510,7 @@ impl<'a> Resolver<'a> {
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
             sorted_fetches: self.sorted_fetches,
+            parallel: self.parallel,
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
