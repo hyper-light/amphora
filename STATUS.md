@@ -633,7 +633,10 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   gets) pays for the leaves it writes out and reads again, as a hash join's spill already paid; a search of an index
   bigger than the cache keeps its inner pages held while they fit. Before, the automatic index cost CPU only and,
   against a measured page read, beat a unique key's search and a hash join on tables the cache can't hold.
-  Left: `cache_reuse_factor` (a picked 0.2) and multi-index table fetches through `file_reads`; sampled operator times.
+  `cache_reuse_factor` (a picked 0.2) is removed: a repeated whole read pays for what the cache can't keep, a
+  repeated search for its path below the root; multi-index fetches go through `file_reads`. Seeks, hash builds and
+  hash probes time sampled runs into the learned rates, one run in k with k set by each one's spread against the
+  timing's own cost (step 3a). Left: SQLite's skip-scan factor 1.375 (Ada's call), the row visit's own observed time.
 - **Query speed step 7 (QT.7), started** (lane qs7; also G5 step 2): behind `Connection::set_vectorized_scans`
   (off by default), a read-only statement's scanned tables decode each leaf once into column batches
   (`vdbe/leaf_batch.rs`, executor.md decision 9): one header parse a row, only the columns the statement reads, the
@@ -785,9 +788,9 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   group-by. A key range (a wide-range statement) skips blocks outside it undecoded, by the blocks'
   key bounds, and filters its boundary granules by their key column. Blocks no change touches are
   decoded once a generation. Every class equals the row store's answer, whole-table and over key
-  ranges, with writes between scans (T-CS.4.1 to T-CS.4.3). Open: driving `Plan` from the
-  morsel executor once `vdbe/morsel.rs` (lane qs6) is on main, the planner's use (step 5), and the
-  benches against CedarDB and ClickHouse (AC-CS.4.1, AC-CS.4.2).
+  ranges, with writes between scans, serially and on the morsel executor's workers (`Plan` is a
+  `vdbe/morsel.rs` pipeline, granules its unit) (T-CS.4.1 to T-CS.4.3). Open: the planner's use
+  (step 5), and the benches against CedarDB and ClickHouse (AC-CS.4.1, AC-CS.4.2).
 
 ## Open
 
