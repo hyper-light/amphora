@@ -168,8 +168,10 @@ impl CostModelParams {
 
     /// Amphora (QT.5): these parameters with the seek's, the hash table's build and probe and the
     /// sort's weights learned where the engine runs (`learned_costs`), each its multiple of a row's
-    /// visit times `cpu_cost_per_row`. The learned build and probe times include hashing the key,
-    /// so `hash_cpu_cost` adds nothing to them. None, a clock that never moved, leaves these.
+    /// visit times `cpu_cost_per_row`; and `cpu_cost_per_row` itself, the row's visit against a
+    /// page read, once the database has timed one. The learned build and probe times include
+    /// hashing the key, so `hash_cpu_cost` adds nothing to them. None, a clock that never moved,
+    /// leaves these.
     pub(crate) fn with_learned(
         &self,
         learned: Option<super::learned_costs::LearnedWeights>,
@@ -177,8 +179,9 @@ impl CostModelParams {
         let Some(learned) = learned else {
             return self.clone();
         };
-        let row = self.cpu_cost_per_row;
+        let row = learned.row_in_pages.unwrap_or(self.cpu_cost_per_row);
         Self {
+            cpu_cost_per_row: row,
             cpu_cost_per_seek: row * learned.seek,
             hash_cpu_cost: 0.0,
             hash_insert_cost: row * learned.hash_build,

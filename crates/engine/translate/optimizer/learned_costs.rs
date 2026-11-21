@@ -28,6 +28,9 @@ pub(crate) enum Work {
     /// Sorting, in rows times log2 rows, as the planner counts a sort
     /// (`cost::estimate_sort_cpu_cost`).
     Sort,
+    /// One page read from the database's file, as the pager times it from the read's submission
+    /// to its completion (`sqlite3_ondisk::begin_read_page`). The planner's unit of cost.
+    PageRead,
 }
 
 /// Units of work and the nanoseconds they took.
@@ -86,6 +89,7 @@ struct Rates {
     hash_build: Rate,
     hash_probe: Rate,
     sort: Rate,
+    page: Rate,
 }
 
 impl Rates {
@@ -96,12 +100,14 @@ impl Rates {
             Work::HashBuild => &mut self.hash_build,
             Work::HashProbe => &mut self.hash_probe,
             Work::Sort => &mut self.sort,
+            Work::PageRead => &mut self.page,
         }
     }
 
     fn weights(&self) -> Option<LearnedWeights> {
         let row = self.row.nanos_per_unit()?;
         Some(LearnedWeights {
+            row_in_pages: self.page.nanos_per_unit().map(|page| row / page),
             seek: self.seek.nanos_per_unit()? / row,
             hash_build: self.hash_build.nanos_per_unit()? / row,
             hash_probe: self.hash_probe.nanos_per_unit()? / row,
@@ -111,9 +117,13 @@ impl Rates {
 }
 
 /// The four weights, each in rows' visits: what one unit of the work takes against one row read
-/// and tested.
+/// and tested; and the row's visit itself in page reads, the planner's unit, once the database has
+/// read a page from its file.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct LearnedWeights {
+    /// A row's visit against a page read; None until the database has timed one (a database
+    /// whose pages all came from memory so far has no page read to weigh it against).
+    pub(crate) row_in_pages: Option<f64>,
     pub(crate) seek: f64,
     pub(crate) hash_build: f64,
     pub(crate) hash_probe: f64,
@@ -241,6 +251,12 @@ fn calibrate(clock: &mut dyn FnMut() -> f64) -> Rates {
         let (reps, nanos) = measure(clock, target, n, &mut **work);
         *rates.rate_mut(*kind) = Rate::calibrated(reps * *units, nanos);
     }
+    // A page read can't be timed here: there's no file yet. Its rate comes from the database's own
+    // reads (`LearnedCosts::observe`), its epoch the pages whose rows calibration visited.
+    rates.page = Rate {
+        epoch: (rates.row.epoch / rows).max(1.0),
+        ..Rate::default()
+    };
     rates
 }
 
@@ -255,6 +271,10 @@ mod tests {
             hash_build: Rate::calibrated(100.0, 100.0 * build),
             hash_probe: Rate::calibrated(100.0, 100.0 * probe),
             sort: Rate::calibrated(100.0, 100.0 * sort),
+            page: Rate {
+                epoch: 4.0,
+                ..Rate::default()
+            },
         }
     }
 
@@ -314,6 +334,38 @@ mod tests {
         let (fast, slow) = (fast.weights().unwrap(), slow.weights().unwrap());
         assert_eq!(slow.seek * 2.0, fast.seek);
         assert_eq!(slow.sort * 2.0, fast.sort);
+    }
+
+    /// Do: plan before the database read any page from its file, then after it timed page reads at
+    /// 50 rows' visits each, then after reads turn four times slower for two epochs. Expect: no
+    /// row-to-page weight at first, then a fiftieth, then a two-hundredth (the anchor learned where
+    /// it runs, and followed as the device moves).
+    #[test]
+    fn t_qt_5_5_the_row_is_weighed_against_observed_page_reads() {
+        let costs = LearnedCosts::from_rates(fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0));
+        assert_eq!(costs.weights().unwrap().row_in_pages, None);
+        costs.observe(Work::PageRead, 1.0, 100.0);
+        assert_eq!(costs.weights().unwrap().row_in_pages, Some(2.0 / 100.0));
+        for _ in 0..8 {
+            costs.observe(Work::PageRead, 1.0, 400.0);
+        }
+        assert_eq!(costs.weights().unwrap().row_in_pages, Some(2.0 / 400.0));
+    }
+
+    /// Do: the weights with no page read timed, and with one, applied to the planner's parameters.
+    /// Expect: the row's cost stays the parameters' until a page read is timed, then is the
+    /// learned ratio, and every other weight follows it (T-QT.5.5).
+    #[test]
+    fn t_qt_5_5_the_planner_takes_the_learned_row_cost() {
+        let params = super::super::cost_params::CostModelParams::new();
+        let costs = LearnedCosts::from_rates(fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0));
+        let before = params.with_learned(costs.weights());
+        assert_eq!(before.cpu_cost_per_row, params.cpu_cost_per_row);
+        costs.observe(Work::PageRead, 1.0, 128.0);
+        let after = params.with_learned(costs.weights());
+        assert_eq!(after.cpu_cost_per_row, 2.0 / 128.0);
+        assert_eq!(after.cpu_cost_per_seek, 10.0 / 128.0);
+        assert_eq!(after.hash_insert_cost, 20.0 / 128.0);
     }
 
     /// Do: calibrate with a clock that never moves. Expect: no weights, so the planner is told it

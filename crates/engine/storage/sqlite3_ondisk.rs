@@ -548,7 +548,9 @@ pub struct OverflowCell {
 /// if allow_empty_read is set, than empty read will be raise error for the page, but will not panic
 #[instrument(skip_all, level = Level::DEBUG)]
 /// Reads one page from the database file. The read is added to `group`,
-/// when given, before it is submitted.
+/// when given, before it is submitted. Amphora (QT.5): a whole page read tells `learned`, when
+/// given, how long it took from submission to completion (`learned_costs::Work::PageRead`).
+#[allow(clippy::too_many_arguments)]
 pub fn begin_read_page(
     db_file: &dyn DatabaseStorage,
     buffer_pool: &BufferPool,
@@ -557,8 +559,10 @@ pub fn begin_read_page(
     allow_empty_read: bool,
     io_ctx: &IOContext,
     group: Option<&mut CompletionGroup>,
+    learned: Option<Arc<crate::translate::optimizer::learned_costs::LearnedCosts>>,
 ) -> Result<Completion> {
     tracing::trace!("begin_read_btree_page(page_idx = {})", page_idx);
+    let submitted = std::time::Instant::now();
     let buf = buffer_pool.get_page();
     #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(buf);
@@ -590,6 +594,13 @@ pub fn begin_read_page(
                 expected: buf_len,
                 actual: bytes_read as usize,
             });
+        }
+        if let Some(learned) = learned.as_ref().filter(|_| bytes_read != 0) {
+            learned.observe(
+                crate::translate::optimizer::learned_costs::Work::PageRead,
+                1.0,
+                submitted.elapsed().as_nanos() as f64,
+            );
         }
         let page = page.clone();
         let buffer = if bytes_read == 0 {

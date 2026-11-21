@@ -1838,6 +1838,10 @@ pub struct Pager {
     /// The boxes are the point: each one is a cursor-sized allocation.
     #[allow(clippy::vec_box)]
     cursor_allocations: Mutex<Vec<Box<std::mem::MaybeUninit<crate::storage::btree::BTreeCursor>>>>,
+    /// Amphora (QT.5): the database's cost estimator, told how long each page read from the file
+    /// took (`learned_costs::Work::PageRead`); unset for a pager no database owns.
+    learned_costs:
+        std::sync::OnceLock<Arc<crate::translate::optimizer::learned_costs::LearnedCosts>>,
 }
 
 /// Retired record buffers kept per pager. Each holds a page-sized allocation.
@@ -2088,6 +2092,7 @@ impl Pager {
             wal,
             page_cache: Arc::new(RwLock::new(page_cache)),
             io,
+            learned_costs: std::sync::OnceLock::new(),
             pending_reads: RwLock::new(HashMap::new()),
             has_pending_reads: AtomicBool::new(false),
             #[cfg(test)]
@@ -4006,7 +4011,17 @@ impl Pager {
             allow_empty_read,
             io_ctx,
             group,
+            self.learned_costs.get().cloned(),
         )
+    }
+
+    /// Amphora (QT.5): the database's cost estimator, which this pager's page reads inform. Set
+    /// once, when the database makes the pager.
+    pub(crate) fn set_learned_costs(
+        &self,
+        costs: Arc<crate::translate::optimizer::learned_costs::LearnedCosts>,
+    ) {
+        let _ = self.learned_costs.set(costs);
     }
 
     /// Insert a page into the cache, with spilling support.

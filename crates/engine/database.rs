@@ -707,7 +707,8 @@ pub struct Database<
     // create DB connections.
     _shared_page_cache: Arc<RwLock<PageCache>>,
     /// Amphora (QT.5): what its operators' work costs, learned as its queries run.
-    pub(crate) learned_costs: crate::translate::optimizer::learned_costs::LearnedCosts,
+    /// Shared with its pagers, which time the pages they read from its file.
+    pub(crate) learned_costs: Arc<crate::translate::optimizer::learned_costs::LearnedCosts>,
 
     /// Optional per-database MVCC durable storage override.
     ///
@@ -861,7 +862,9 @@ impl Database {
                 s
             }))),
             _shared_page_cache: shared_page_cache,
-            learned_costs: crate::translate::optimizer::learned_costs::LearnedCosts::new(),
+            learned_costs: Arc::new(
+                crate::translate::optimizer::learned_costs::LearnedCosts::new(),
+            ),
             shared_wal,
             #[cfg(host_shared_wal)]
             shared_wal_coordination: OnceLock::new(),
@@ -3513,6 +3516,7 @@ impl Database {
             buffer_pool,
             self.pager_state.clone(),
         )?;
+        pager.set_learned_costs(self.learned_costs.clone());
         if self.initialized() {
             pager.set_page_size(page_size);
         }
