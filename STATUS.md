@@ -224,6 +224,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   after it, never an empty database over an existing file. Crash points through commits and
   checkpoints recover a prefix of the commits at least as long as the last acknowledged durable;
   the pool still holds every page, and nothing runs it under SQL yet (stage 3).
+- **Serializable validation, three prototypes behind one switch** (G8 step 1, docs/design/engine.md
+  decision 5, `crates/engine/storage/versioned/{version,elle}.rs`, `amphora-bench --cc`): precision
+  locking (the default), SSI and Silo-style OCC validate commits on the versioned storage's commit
+  path; Elle's list-append and register histories checked for G0, G1a, G1b, G1c, G-single and G2
+  (snapshot isolation the control, showing G2). Not yet: the 10,000-seed runs and the three schemes'
+  throughput, refusals and p99 on the suite's write classes and K0 (the batch's), then the choice.
 - **Ephemeral tables kept between runs** (docs/design/executor.md decision 1,
   `crates/engine/tests/ephemeral_reuse.rs`): a statement keeps each ephemeral table of at most 16
   pages (an IN list's keys, an IN subquery's rows) and empties it on its next run, where building
@@ -265,6 +271,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   0, 2, 4, ... drew the same), and every database checkpoints after its load before any run
   (`settle_s`; Amphora's loader had left the whole load, 7.5 GB, in its log). `--query` runs a
   statement on a database a run left behind.
+- **The leader's write slot** (AC-T1.8.W1, Amphora goal 9c63f7d4; replication.md, "the write slot"): a member
+  whose write is refused at the leader's append gets a slot for its next try, its length learned per member from
+  its retries' gaps (cold start: the core's election timeout). A gap over which the host's detector suspected the
+  member is not learned; no number bounds a gap (lane g-slot-close, 2026-11-21).
 
 - **Groups that split, merge and move themselves** (CP-T1.9, lane split-merge; `crates/amphora/src/reshard/`,
   docs/design/reshard.md): a pure core: a directory of hash spans with every position in exactly one group,
@@ -464,11 +474,23 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (docs/design/planner.md, "Decision (lane pl6)"). `bench/planner/loops.py` counts such plans in the
   bench's records: 30 of JOB's 113 at step 3, none of TPC-H's; the target is 0, with JOB's times within
   the passes' spread of the parent's.
+  PL.12 is built (lane pl12, docs/design/planner.md "custom plans, then a generic one"): a statement
+  whose estimates read a parameter's value is planned with each run's values until its own measured
+  costs say the generic plan does as well; one whose estimates read none keeps its generic plan. Its
+  TPC-H prepared measurement (AC-PL.12.1; its harness, `amphora-bench --planner --prepared` with
+  qgen's parameters, is written: bench/planner/README.md) and the suite's (AC-PL.12.2) are open.
 - **G11, analytics at column-store speed** (docs/design/columnar.md, decision 1; sources in
   docs/research/columnar.md; CS.1): decided, not built. Columns are a copy derived from the rows, fed
   by each commit's redo record after the commit, exact at every snapshot by a journal of changed keys
   read from the rows, never logged, every size and time learned where it runs. Next: step 2
   prototypes it in memory and as persistent blocks, on CP-T1.3's storage once that runs under SQL.
+  Step 3's two codecs are built (CS.3, crates/columnar, lane g11-compress): BtrBlocks' cascade
+  (one value, run lengths, dictionary, decimal doubles, frame of reference with horizontal packing)
+  and FastLanes' layouts (its interleaved 1,024-value packing, lane-wise DELTA, dictionary,
+  decimal), each scheme chosen per column from a sample that grows until its choice stops changing,
+  the cascade a loop with no fixed depth; integers, doubles, strings and nulls round-trip bit for
+  bit (T-CS.3.1). Its decode benchmark (`cargo bench -p amphora-columnar --bench decode`) is not yet
+  measured against [c18]'s 8 values a cycle.
 
 ## Open
 
