@@ -1406,6 +1406,13 @@ pub fn op_open_read(
             "root page should be non negative when we are not in a MVCC transaction"
         );
     }
+    if let Some(switch) = program.connection.versioned.as_ref() {
+        if let Some(cursor) = versioned_cursor(switch, cursor_type, *root_page, &pager)? {
+            replace_cursor(&mut state.cursors, *cursor_id, cursor)?;
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
     let cursors = &mut state.cursors;
     let num_columns = match cursor_type {
         CursorType::BTreeTable(table_rc) => table_rc.columns().len(),
@@ -13759,6 +13766,40 @@ pub fn op_offset_limit(
 // this cursor may be reused for next insert
 // Update: tablemoveto is used to travers on not exists, on insert depending on flags if nonseek it traverses again.
 // If not there might be some optimizations obviously.
+/// Amphora (G7 step 2, `AC-NS.2.1`): with the connection's switch on, the cursor on the versioned
+/// storage's tree at `root_page` for a table or an index; `None` for a cursor of another kind.
+fn versioned_cursor(
+    switch: &crate::storage::versioned::switch::Switch,
+    cursor_type: &CursorType,
+    root_page: i64,
+    pager: &Arc<Pager>,
+) -> Result<Option<Cursor>> {
+    let index = match cursor_type {
+        CursorType::BTreeTable(table) if table.has_rowid => None,
+        // A WITHOUT ROWID table is keyed by its primary key's record, as the pager's cursor keys it.
+        CursorType::BTreeTable(table) => BTreeCursor::new_without_rowid_table(
+            pager.clone(),
+            root_page,
+            table.as_ref(),
+            table.columns().len(),
+        )
+        .index_info
+        .clone(),
+        CursorType::BTreeIndex(index) => Some(Arc::new(IndexInfo::new_from_index(index)?)),
+        _ => return Ok(None),
+    };
+    let cursor = switch.cursor(root_page, index, pager.clone())?;
+    Ok(Some(Cursor::new_btree_dyn(Box::new(cursor))))
+}
+
+fn replace_cursor(cursors: &mut [Option<Cursor>], id: usize, cursor: Cursor) -> Result<()> {
+    cursors
+        .get_mut(id)
+        .ok_or_else(|| LimboError::InternalError(format!("no cursor slot {id}")))?
+        .replace(cursor);
+    Ok(())
+}
+
 pub fn op_open_write(
     program: &Program,
     state: &mut ProgramState,
@@ -13846,6 +13887,13 @@ pub fn op_open_write(
     };
 
     if !can_reuse_cursor {
+        if let Some(switch) = program.connection.versioned.as_ref() {
+            if let Some(cursor) = versioned_cursor(switch, cursor_type, root_page, &pager)? {
+                replace_cursor(cursors, *cursor_id, cursor)?;
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
         let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<BTreeCursor>,
                                             mv_cursor_type: MvccCursorType|
          -> Result<OpenedBTree> {
@@ -14025,6 +14073,13 @@ pub fn op_create_btree(
 
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly.into());
+    }
+    if let Some(switch) = program.connection.versioned.as_ref() {
+        if *db == crate::MAIN_DB_ID {
+            state.registers[*root].set_int(switch.make_tree(flags.is_table())?);
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
     }
     let mv_store = program.connection.mv_store_for_db(*db);
 
@@ -14210,6 +14265,15 @@ pub fn op_destroy(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
+    if let Some(switch) = program.connection.versioned.as_ref() {
+        if *db == MAIN_DB_ID {
+            // No tree moves into the dropped one's place: the storage keeps no autovacuum.
+            switch.drop_tree(*root)?;
+            state.registers[*former_root_reg].set_int(0);
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
 
     let destroy_pager = if *db != MAIN_DB_ID {
         program.get_pager_from_database_index(db)?
@@ -14269,6 +14333,23 @@ fn op_clear_btree_inner(
     pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(ClearBtree { db, root, count }, insn);
+    if let Some(switch) = program.connection.versioned.as_ref() {
+        if *db == MAIN_DB_ID {
+            let removed_entries = switch.clear(*root, pager.clone())?;
+            match count {
+                ClearBtreeCount::Nothing => {}
+                ClearBtreeCount::RowsWritten => state.record_rows_written(removed_entries),
+                ClearBtreeCount::ChangesAndRowsWritten => {
+                    let changes =
+                        i64::try_from(removed_entries).map_err(|_| LimboError::IntegerOverflow)?;
+                    state.record_statement_changes(changes);
+                    state.record_rows_written(removed_entries);
+                }
+            }
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
 
     let mv_store = program.connection.mv_store_for_db(*db);
     if mv_store.is_some() {
@@ -18540,6 +18621,31 @@ pub fn op_hash_mark_matched(
         hash_table.mark_current_matched();
     }
     state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// G6 step 5's hash semi join: emit a build row at its first match only.
+pub fn op_hash_mark_first_match(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        HashMarkFirstMatch {
+            hash_table_id,
+            target_pc,
+        },
+        insn
+    );
+    let hash_table = state.hash_tables.get_mut(hash_table_id).ok_or_else(|| {
+        LimboError::InternalError(format!("Hash table not found with ID: {hash_table_id}"))
+    })?;
+    if hash_table.mark_current_matched_first()? {
+        state.pc += 1;
+    } else {
+        state.pc = target_pc.as_offset_int();
+    }
     Ok(InsnFunctionStepResult::Step)
 }
 

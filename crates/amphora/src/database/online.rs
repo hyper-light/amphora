@@ -20,6 +20,11 @@
 //! checked from then on while the planner doesn't rely on it; batches check the rows written before
 //! it in rowid order; the cutover removes the mark, a catalog change only. A row that breaks it
 //! undoes the change: the column's old definition back.
+//!
+//! A column is dropped by `ALTER TABLE … DROP COLUMN` PostgreSQL's way: one catalog change names it
+//! in `__amphora_dropped_columns`, a slot the engine hides from names, `*`, inserts and `PRAGMA
+//! table_info` and every write stores NULL in; batches rewrite the rows before it in rowid order,
+//! clearing their values; then the drop is recorded.
 
 use super::*;
 use amphora_engine::schema::IndexState;
@@ -33,7 +38,8 @@ use std::time::Duration;
 const TABLES: &str = "
 CREATE TABLE IF NOT EXISTS __amphora_index_states (name TEXT PRIMARY KEY, state INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS __amphora_schema_changes (name TEXT PRIMARY KEY, sql TEXT NOT NULL, idx TEXT NOT NULL, tbl TEXT NOT NULL, phase INTEGER NOT NULL, after INTEGER, until INTEGER);
-CREATE TABLE IF NOT EXISTS __amphora_constraint_states (tbl TEXT NOT NULL, col TEXT NOT NULL, old TEXT NOT NULL, PRIMARY KEY (tbl, col));";
+CREATE TABLE IF NOT EXISTS __amphora_constraint_states (tbl TEXT NOT NULL, col TEXT NOT NULL, old TEXT NOT NULL, PRIMARY KEY (tbl, col));
+CREATE TABLE IF NOT EXISTS __amphora_dropped_columns (tbl TEXT NOT NULL, col TEXT NOT NULL, PRIMARY KEY (tbl, col));";
 
 /// The phases a change records (a format value of `__amphora_schema_changes.phase`): its index
 /// delete-only, write-only with its backfill under way, and backfilled. Public is no row.
@@ -68,6 +74,9 @@ enum Adds {
         column: String,
         definition: ColumnDefinition,
     },
+    /// A column dropped, by its case-folded name: hidden in one catalog change (a slot every
+    /// write stores NULL in), its old values cleared in batches, then recorded.
+    DropColumn(String),
 }
 
 impl Plan {
@@ -140,16 +149,20 @@ impl Plan {
                             alter.name.name,
                         )
                     }
+                    AlterTableBody::DropColumn(column) => (
+                        Adds::DropColumn(column.as_str().to_ascii_lowercase()),
+                        alter.name.name,
+                    ),
                     _ => {
                         return Err(refuse(
-                            "of ALTER TABLE, ADD COLUMN and ALTER COLUMN adding NOT NULL or CHECK are built online: the others rewrite or check every row",
+                            "of ALTER TABLE, ADD COLUMN, DROP COLUMN and ALTER COLUMN adding NOT NULL or CHECK are built online: RENAME checks every statement naming the table",
                         ));
                     }
                 }
             }
             _ => {
                 return Err(refuse(
-                    "only CREATE INDEX, ALTER TABLE … ADD COLUMN and ALTER COLUMN adding a constraint are built online",
+                    "only CREATE INDEX, ALTER TABLE … ADD COLUMN, DROP COLUMN and ALTER COLUMN adding a constraint are built online",
                 ));
             }
         };
@@ -352,6 +365,7 @@ pub fn step(db: &Db, plan: &Plan, rows: u64) -> anyhow::Result<Stepped> {
         Adds::Constraint { column, definition } => {
             return constraint_step(db, plan, column, definition, found, rows);
         }
+        Adds::DropColumn(column) => return drop_step(db, plan, column, found, rows),
     };
     let Some(record) = found else {
         return begin(db, plan, index);
@@ -537,7 +551,9 @@ pub fn abandon(db: &Db, plan: &Plan) -> anyhow::Result<()> {
     }
     let index = match &plan.adds {
         Adds::Index(index) => index,
-        Adds::Column => return Ok(()),
+        // A drop has no rows to refuse it, and its old values may be cleared already: once begun
+        // it only goes on.
+        Adds::Column | Adds::DropColumn(_) => return Ok(()),
         Adds::Constraint { column, .. } => return abandon_constraint(db, plan, column),
     };
     db.query(
@@ -716,7 +732,7 @@ fn begin_constraint(db: &Db, plan: &Plan, column: &str) -> anyhow::Result<Steppe
         |_| Ok(true),
     )?;
     db.restage_schema()?;
-    db.exec(&plan.sql)?;
+    db.exec_as_change(&plan.sql)?;
     let mut until = None;
     db.query_owned(
         &format!("SELECT max(rowid) FROM {}", quoted(&plan.table)),
@@ -851,7 +867,7 @@ fn abandon_constraint(db: &Db, plan: &Plan, column: &str) -> anyhow::Result<()> 
         },
     )?;
     if let Some(old) = old {
-        db.exec(&format!(
+        db.exec_as_change(&format!(
             "ALTER TABLE {} ALTER COLUMN {} TO {old}",
             quoted(&plan.table),
             quoted(column)
@@ -866,6 +882,244 @@ fn abandon_constraint(db: &Db, plan: &Plan, column: &str) -> anyhow::Result<()> 
     finish(db, plan)
 }
 
+/// The next step of a drop's change, by its record: begun (the column hidden), its clear's next
+/// batch, or the record once every row before it is cleared.
+fn drop_step(
+    db: &Db,
+    plan: &Plan,
+    column: &str,
+    found: Option<Record>,
+    rows: u64,
+) -> anyhow::Result<Stepped> {
+    let Some(record) = found else {
+        return begin_drop(db, plan, column);
+    };
+    if record.sql != plan.sql {
+        return Err(api::invalid(
+            "migration",
+            "a change of this name is under way with different SQL",
+        )
+        .into());
+    }
+    match record.phase {
+        WRITE_ONLY => clear(db, plan, column, &record, rows),
+        BACKFILLED => {
+            let began = Instant::now();
+            finish(db, plan)?;
+            migrated(db, plan)?;
+            Ok(Stepped::Public {
+                held: began.elapsed(),
+            })
+        }
+        phase => Err(anyhow::anyhow!(
+            "__amphora_schema_changes: {} is at phase {phase}",
+            plan.name
+        )),
+    }
+}
+
+/// The switch-over of a drop, in one transaction: the column named in `__amphora_dropped_columns`,
+/// so from this commit no name finds it, `*` and inserts pass it and every write stores NULL in it
+/// (PostgreSQL's `attisdropped`); the rows the clear must reach are those up to the largest rowid
+/// now. Refused before anything changes: what the engine's own `DROP COLUMN` refuses (its
+/// statement is prepared, never run: a key, UNIQUE, an index, a CHECK, a foreign key, a generated
+/// column, a view or a trigger naming it, the only column), a WITHOUT ROWID table (no rowid order
+/// to clear by), a table with triggers (the clear's updates would fire them) and a table with no
+/// other plain column for the clear to rewrite rows by.
+fn begin_drop(db: &Db, plan: &Plan, column: &str) -> anyhow::Result<Stepped> {
+    let refuse = |why: &str| -> anyhow::Error { api::invalid("online schema change", why).into() };
+    let (_, rowid) = column_definition(db, &plan.table, column)?;
+    if !rowid {
+        return Err(refuse(
+            "a WITHOUT ROWID table has no rowid order to clear a dropped column by",
+        ));
+    }
+    let mut triggers = false;
+    db.query(
+        "SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND lower(tbl_name) = ?1",
+        [text(&plan.table)],
+        |_| {
+            triggers = true;
+            Ok(false)
+        },
+    )?;
+    if triggers {
+        return Err(refuse(
+            "the table has triggers, which the batches clearing the dropped column would fire",
+        ));
+    }
+    db.column_count(&plan.sql)
+        .map_err(|error| refuse(&error.to_string()))?;
+    if rewriting_column(db, &plan.table, column)?.is_none() {
+        return Err(refuse(
+            "the table has no other plain column for the batches to rewrite its rows by",
+        ));
+    }
+    db.exec(TABLES)?;
+    db.query(
+        "INSERT INTO __amphora_dropped_columns(tbl, col) VALUES (?1, ?2)",
+        [text(&plan.table), text(column)],
+        |_| Ok(true),
+    )?;
+    let mut until = None;
+    db.query_owned(
+        &format!("SELECT max(rowid) FROM {}", quoted(&plan.table)),
+        [],
+        |row| {
+            until = optional(row, 0)?;
+            Ok(false)
+        },
+    )?;
+    db.query(
+        "INSERT INTO __amphora_schema_changes(name, sql, idx, tbl, phase, until) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        [
+            text(&plan.name),
+            text(&plan.sql),
+            text(column),
+            text(&plan.table),
+            EValue::from_i64(WRITE_ONLY),
+            until.map_or(EValue::Null, EValue::from_i64),
+        ],
+        |_| Ok(true),
+    )?;
+    db.restage_schema()?;
+    // What the engine's DROP COLUMN doesn't check, prepared (never run) against the schema without
+    // the column, in this transaction: a view naming it, and a CHECK of another column naming it
+    // (an insert compiles every CHECK). A failure refuses the drop and its transaction is undone.
+    let mut views = Vec::new();
+    db.query(
+        "SELECT name FROM sqlite_schema WHERE type = 'view'",
+        [],
+        |row| {
+            views.push(row.get::<String>(0).map_err(unavailable)?);
+            Ok(true)
+        },
+    )?;
+    for view in views {
+        db.column_count(&format!("SELECT * FROM {}", quoted(&view)))
+            .map_err(|error| refuse(&format!("view {view} names the column: {error}")))?;
+    }
+    db.column_count(&format!(
+        "INSERT INTO {} DEFAULT VALUES",
+        quoted(&plan.table)
+    ))
+    .map_err(|error| refuse(&format!("a constraint names the column: {error}")))?;
+    Ok(Stepped::WriteOnly)
+}
+
+/// A column of `table` other than `dropping` an update can set to itself to rewrite a row: shown
+/// (so not dropped), not generated, not a key. Rewriting a row stores NULL in its dropped columns.
+fn rewriting_column(db: &Db, table: &str, dropping: &str) -> anyhow::Result<Option<String>> {
+    let mut found = None;
+    // PRAGMA table_xinfo's rows: cid, name, type, notnull, dflt_value, pk, hidden (0 for a plain
+    // column; SQLite's documented format).
+    db.query_owned(
+        &format!("PRAGMA table_xinfo({})", quoted(table)),
+        [],
+        |row| {
+            let pk = row.get::<i64>(5).map_err(unavailable)?;
+            let hidden = row.get::<i64>(6).map_err(unavailable)?;
+            let name = row.get::<String>(1).map_err(unavailable)?;
+            if pk == 0 && hidden == 0 && !name.eq_ignore_ascii_case(dropping) {
+                found = Some(name);
+                return Ok(false);
+            }
+            Ok(true)
+        },
+    )?;
+    Ok(found)
+}
+
+/// One clearing batch: the rows after the last one cleared, up to the largest rowid the table held
+/// at the switch-over, at most `rows`, each rewritten (an update stores NULL in a dropped column).
+/// The last batch marks the change cleared.
+fn clear(
+    db: &Db,
+    plan: &Plan,
+    dropping: &str,
+    record: &Record,
+    rows: u64,
+) -> anyhow::Result<Stepped> {
+    let reached = |at: Option<i64>| match (at, record.until) {
+        (_, None) => true,
+        (Some(at), Some(until)) => at >= until,
+        (None, Some(_)) => false,
+    };
+    let (last, visited, held) = match (reached(record.after), record.until) {
+        (false, Some(until)) => {
+            let began = Instant::now();
+            // Saturating is the meaning: a last rowid of i64::MAX is at or past `until`.
+            let from = match record.after {
+                Some(after) => after.saturating_add(1),
+                None => i64::MIN,
+            };
+            let mut seen = (None, 0u64);
+            db.query_owned(
+                &format!(
+                    "SELECT max(r), count(*) FROM (SELECT rowid AS r FROM {} WHERE rowid >= ?1 AND rowid <= ?2 ORDER BY rowid LIMIT ?3)",
+                    quoted(&plan.table)
+                ),
+                [
+                    EValue::from_i64(from),
+                    EValue::from_i64(until),
+                    EValue::from_i64(i64::try_from(rows).unwrap_or(i64::MAX)),
+                ],
+                |row| {
+                    seen = (
+                        optional(row, 0)?,
+                        u64::try_from(row.get::<i64>(1).map_err(unavailable)?).unwrap_or(0),
+                    );
+                    Ok(false)
+                },
+            )?;
+            let (last, visited) = seen;
+            if let Some(last) = last {
+                let column = rewriting_column(db, &plan.table, dropping)?.ok_or_else(|| {
+                    anyhow::anyhow!("{} has no plain column to rewrite rows by", plan.table)
+                })?;
+                db.query_owned(
+                    &format!(
+                        "UPDATE {table} SET {column} = {column} WHERE rowid >= ?1 AND rowid <= ?2",
+                        table = quoted(&plan.table),
+                        column = quoted(&column)
+                    ),
+                    [EValue::from_i64(from), EValue::from_i64(last)],
+                    |_| Ok(true),
+                )
+                .map_err(clear_refusal)?;
+            }
+            (last.or(record.after), visited, began.elapsed())
+        }
+        _ => (record.after, 0, Duration::ZERO),
+    };
+    let done = visited < rows || reached(last);
+    db.query(
+        "UPDATE __amphora_schema_changes SET phase = ?2, after = ?3 WHERE name = ?1",
+        [
+            text(&plan.name),
+            EValue::from_i64(if done { BACKFILLED } else { WRITE_ONLY }),
+            last.map_or(EValue::Null, EValue::from_i64),
+        ],
+        |_| Ok(true),
+    )?;
+    Ok(Stepped::Batch { visited, held })
+}
+
+/// A clearing batch's failure: too many dirty pages for one transaction is halved by the driver.
+fn clear_refusal(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast_ref::<amphora_engine::LimboError>() {
+        Some(amphora_engine::LimboError::TransactionPageLimit { limit, attempted }) => {
+            Refusal::TooLarge {
+                what: "online schema change batch dirty pages".into(),
+                size: *attempted,
+                limit: *limit,
+            }
+            .into()
+        }
+        _ => error,
+    }
+}
+
 impl Database {
     /// Builds the index `migration` creates (one `CREATE [UNIQUE] INDEX`) online, by F1's states
     /// (CP-T1.12, docs/design/online-schema.md): writes go on while its backfill runs, and the
@@ -873,7 +1127,9 @@ impl Database {
     /// (one `ALTER TABLE … ADD COLUMN`) is added in one catalog change, its states run together;
     /// one whose addition would read every row is refused. A NOT NULL or CHECK (one `ALTER TABLE …
     /// ALTER COLUMN c TO` its definition plus the constraint) is checked on writes, then validated
-    /// against the rows before it in batches, then made public by a catalog change. Applied
+    /// against the rows before it in batches, then made public by a catalog change. A column
+    /// (one `ALTER TABLE … DROP COLUMN`) is hidden by a catalog change, its old values cleared
+    /// in batches, then its drop recorded. Applied
     /// once by name, as [`Database::migrate`]. A deadline that passes leaves the change at a
     /// step, invisible to reads; calling again with the same migration carries it on. Rows that
     /// break a unique index or the constraint undo the change and are refused.
@@ -1008,8 +1264,12 @@ mod tests {
         assert!(plan("ALTER TABLE t ADD COLUMN g AS (a + 1)").is_ok());
         assert!(plan("ALTER TABLE t ADD COLUMN g AS (a + 1) NOT NULL").is_err());
         assert!(plan("ALTER TABLE t ADD COLUMN g AS (a + 1) CHECK (g > 0)").is_err());
-        assert!(plan("ALTER TABLE t DROP COLUMN a").is_err());
+        assert_eq!(
+            plan("ALTER TABLE T DROP COLUMN A").unwrap().adds,
+            Adds::DropColumn("a".into())
+        );
         assert!(plan("ALTER TABLE t RENAME TO u").is_err());
+        assert!(plan("ALTER TABLE t RENAME COLUMN a TO b").is_err());
         assert!(plan("ALTER TABLE aux.t ADD COLUMN c").is_err());
     }
 

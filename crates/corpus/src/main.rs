@@ -190,8 +190,10 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
             fixture: fix_translation.as_ref(),
         });
         let file_began = Instant::now();
-        let mut engine =
-            amphora_corpus::engines::open(&a.engine).map_err(|e| format!("{UNAVAILABLE}{e}"))?;
+        // Its opening, settling and closing statements are bounded as a record is: a server that
+        // doesn't answer within the budget is unreachable, never a hung run.
+        let mut engine = amphora_corpus::engines::open(&a.engine, a.budget)
+            .map_err(|e| format!("{UNAVAILABLE}{e}"))?;
         // Fill files stop at the deadline; every record, required ones too, is stopped once it has
         // run as long as the whole budget.
         let limits = Limits {
@@ -204,6 +206,7 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
                 Outcome::Agree => "agree".to_owned(),
                 Outcome::Unreached => "unreached".to_owned(),
                 Outcome::Untranslatable(_) => "untranslatable".to_owned(),
+                Outcome::Unreadable(_) => "unreadable".to_owned(),
                 other => {
                     let (shown, said) = match other {
                         Outcome::Answer { want, got } => (format!("SQLite answers {want}\n    {name} answers {got}"), "disagree"),
@@ -243,6 +246,7 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
         }
         total.unsettled = total.unsettled.saturating_add(counts.unsettled);
         total.untranslatable = total.untranslatable.saturating_add(counts.untranslatable);
+        total.unreadable = total.unreadable.saturating_add(counts.unreadable);
     }
     if let Some(mut t) = times {
         t.flush().map_err(|e| e.to_string())?;
@@ -252,12 +256,13 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
     }
     writeln!(
         out,
-        "{}: {files} files in {:.1} s: {} records agree, {} disagree, {} untranslatable into its dialect, {} skipped (not SQLite's), {} not reached in the budget, {} stopped at the budget ({required_past} of them required), {} settles failed",
+        "{}: {files} files in {:.1} s: {} records agree, {} disagree, {} untranslatable into its dialect, {} unreadable in its output, {} skipped (not SQLite's), {} not reached in the budget, {} stopped at the budget ({required_past} of them required), {} settles failed",
         a.engine,
         began.elapsed().as_secs_f64(),
         total.agree,
         total.disagree,
         total.untranslatable,
+        total.unreadable,
         total.skipped,
         total.unreached,
         total.past_budget,
