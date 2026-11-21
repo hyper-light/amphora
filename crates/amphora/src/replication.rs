@@ -1208,9 +1208,12 @@ impl StateMachine for Machine {
         self.record_digest(at.index)?;
         Ok(())
     }
+    /// The raft log is the write-ahead log (CP-T1.8, G12 step 2; replication.md, "The raft log
+    /// as the WAL"): compaction asks this before it moves the raft log's start, and moves it no
+    /// further than [`StateMachine::durable`], what the owner's flushing thread last made durable
+    /// (I8). So nothing is flushed here, on the owner's thread: compaction waits for the engine's
+    /// flush, and the raft log keeps every entry the database's log may still lose.
     fn persist(&mut self) -> Result<(), Fatal> {
-        self.log_flusher()().map_err(failed)?;
-        self.flushed = self.point;
         Ok(())
     }
 }
