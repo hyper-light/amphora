@@ -659,6 +659,7 @@ fn t_t1_12_1_a_dropped_column_is_hidden_while_its_values_are_cleared_then_record
     assert!(db.exec("INSERT INTO t VALUES (NULL, 1, 'x')").is_err());
     assert!(db.exec("UPDATE t SET b = 'x'").is_err());
     db.exec("INSERT INTO t VALUES (NULL, 1)").unwrap();
+    db.exec("INSERT INTO t DEFAULT VALUES").unwrap();
     let mut steps = 0;
     let mut visited = 0;
     loop {

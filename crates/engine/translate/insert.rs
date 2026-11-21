@@ -2445,10 +2445,12 @@ fn init_source_emission<'a>(
             }
         }
         InsertBody::DefaultValues => {
+            // Amphora: a column an online DROP COLUMN dropped takes no value: the insert stores
+            // NULL in it (CP-T1.12).
             let storable_columns: Vec<_> = table
                 .columns()
                 .iter()
-                .filter(|c| !c.is_generated())
+                .filter(|c| !c.is_generated() && !c.dropped())
                 .collect();
             let num_values = storable_columns.len();
             let is_strict = table.is_strict();

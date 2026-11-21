@@ -999,8 +999,11 @@ fn begin_drop(db: &Db, plan: &Plan, column: &str) -> anyhow::Result<Stepped> {
         db.column_count(&format!("SELECT * FROM {}", quoted(&view)))
             .map_err(|error| refuse(&format!("view {view} names the column: {error}")))?;
     }
-    db.column_count(&format!("INSERT INTO {} DEFAULT VALUES", quoted(&plan.table)))
-        .map_err(|error| refuse(&format!("a constraint names the column: {error}")))?;
+    db.column_count(&format!(
+        "INSERT INTO {} DEFAULT VALUES",
+        quoted(&plan.table)
+    ))
+    .map_err(|error| refuse(&format!("a constraint names the column: {error}")))?;
     Ok(Stepped::WriteOnly)
 }
 
