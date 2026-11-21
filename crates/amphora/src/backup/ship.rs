@@ -310,7 +310,7 @@ impl Shipper {
         let identity = self
             .identity
             .ok_or_else(|| anyhow::anyhow!("no log generation to ship"))?;
-        let stored: Vec<StoredMark> = marks
+        let marks_stored: Vec<StoredMark> = marks
             .iter()
             .map(|m| StoredMark {
                 frame: m.frame,
@@ -324,7 +324,7 @@ impl Shipper {
             identity,
             first: self.shipped.saturating_add(1),
             header: self.header.clone(),
-            marks: stored,
+            marks: marks_stored,
             frames: Vec::new(),
         };
         let room = blobs
@@ -335,6 +335,7 @@ impl Shipper {
         if per_object == 0 {
             anyhow::bail!("the store's objects can't hold one frame of the log");
         }
+        let mut stored = std::mem::take(&mut body.marks);
         let mut shipped = Shipped::default();
         let mut from = self.shipped;
         while from < last {
@@ -368,16 +369,11 @@ impl Shipper {
                     None
                 },
             };
-            let marks_kept = std::mem::take(&mut body.marks);
+            // The marks go in the last part only: the others end at no mark.
             if is_last {
-                body.marks = marks_kept;
-            } else {
-                body.marks = Vec::new();
+                body.marks = std::mem::take(&mut stored);
             }
             let bytes = object::encode(&body)?;
-            if !is_last {
-                body.marks = marks_kept;
-            }
             create(blobs, &key.key(&self.prefix), &bytes, until)?;
             shipped.segments = shipped.segments.saturating_add(1);
             shipped.bytes = shipped.bytes.saturating_add(u64::try_from(bytes.len())?);
