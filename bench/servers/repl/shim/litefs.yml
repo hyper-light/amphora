@@ -1,0 +1,12 @@
+# LiteFS on each node of servers/repl/litefs.sh: its static lease (node 0 the primary), the shim run
+# once the mount is up.
+fuse:
+  dir: "/litefs"
+data:
+  dir: "/var/lib/litefs"
+lease:
+  type: "static"
+  advertise-url: "${LITEFS_PRIMARY}"
+  candidate: ${LITEFS_CANDIDATE}
+exec:
+  - cmd: "shim -backend sqlite -path /litefs/bench.db -listen :8080"
