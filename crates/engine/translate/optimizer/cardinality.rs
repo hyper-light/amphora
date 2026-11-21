@@ -1078,6 +1078,9 @@ fn on_elsewhere(
     params: &CostModelParams,
 ) -> SmallVec<[Elsewhere; 1]> {
     let mut found: SmallVec<[Elsewhere; 1]> = SmallVec::new();
+    // The terms no table holds a constraint of (`y.b ISNULL`): only a sample counts them, that of
+    // the one table whose columns they read, as a right table's sample counts its own.
+    let mut loose: SmallVec<[usize; 2]> = SmallVec::new();
     let own = constraints
         .iter()
         .find(|c| c.table_id == joined.internal_id)
@@ -1104,6 +1107,7 @@ fn on_elsewhere(
             }
         }
         let Some((table, at, _)) = best else {
+            loose.push(pos);
             continue;
         };
         let pair = pair_terms
@@ -1124,6 +1128,22 @@ fn on_elsewhere(
             }
         }
     }
+    let at = joined_tables
+        .iter()
+        .position(|t| t.internal_id == joined.internal_id)
+        .unwrap_or(joined_tables.len());
+    if !loose.is_empty() {
+        for table in 0..at {
+            if !found.iter().any(|e| e.table == table) {
+                found.push(Elsewhere {
+                    table,
+                    counted: SmallVec::new(),
+                    sampled: None,
+                    never: false,
+                });
+            }
+        }
+    }
     for e in found.iter_mut() {
         let (Some(earlier), Some(table_constraints)) =
             (joined_tables.get(e.table), constraints.get(e.table))
@@ -1135,13 +1155,10 @@ fn on_elsewhere(
             .iter()
             .filter_map(|(at, _)| table_constraints.on_elsewhere.get(*at))
             .map(|c| c.where_clause_pos.0)
+            .chain(loose.iter().copied())
             .collect();
         // Whether a join null-extends the earlier table before this join's ON terms run: its own
         // LEFT or FULL JOIN, or a RIGHT or FULL JOIN after it and before this one.
-        let at = joined_tables
-            .iter()
-            .position(|t| t.internal_id == joined.internal_id)
-            .unwrap_or(joined_tables.len());
         let join_type = |t: &JoinedTable| t.join_info.as_ref().map(|info| info.join_type);
         let null_extended = matches!(
             join_type(earlier),
@@ -1168,6 +1185,7 @@ fn on_elsewhere(
             params,
         );
     }
+    found.retain(|e| !e.counted.is_empty() || e.sampled.is_some());
     found
 }
 
