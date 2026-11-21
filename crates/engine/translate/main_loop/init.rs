@@ -630,6 +630,7 @@ fn right_join_metadata(
         where_clause: None,
         index_method: None,
         on_conflict: None,
+        state: crate::schema::IndexState::Public,
     });
     Ok(RightJoinMetadata {
         matched_rows_cursor_id: program.alloc_cursor_id(CursorType::BTreeIndex(matched_rows_index)),

@@ -1,0 +1,75 @@
+hash-threshold 8
+
+# written for datetime.modifier:NNN minutes: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+query T rowsort
+SELECT datetime('2024-01-31', '+1 minute')
+----
+2024-01-31 00:01:00
+
+query T rowsort
+SELECT datetime('2024-01-31', '-90 minutes')
+----
+2024-01-30 22:30:00
+
+query T rowsort
+SELECT datetime('2024-01-31', '+0.5 minutes')
+----
+2024-01-31 00:00:30
+
+query T rowsort
+SELECT datetime('2024-01-31', '1440 minutes')
+----
+2024-02-01 00:00:00
+
+query T rowsort
+SELECT datetime('2024-01-31', '-1 minutes')
+----
+2024-01-30 23:59:00
+
+query T rowsort
+SELECT datetime('2024-02-29 12:30:00', '+1 minute')
+----
+2024-02-29 12:31:00
+
+query T rowsort
+SELECT datetime('2024-02-29 12:30:00', '-90 minutes')
+----
+2024-02-29 11:00:00
+
+query T rowsort
+SELECT datetime('2024-02-29 12:30:00', '+0.5 minutes')
+----
+2024-02-29 12:30:30
+
+query T rowsort
+SELECT datetime('2024-02-29 12:30:00', '1440 minutes')
+----
+2024-03-01 12:30:00
+
+query T rowsort
+SELECT datetime('2024-02-29 12:30:00', '-1 minutes')
+----
+2024-02-29 12:29:00
+
+query T rowsort
+SELECT datetime('2000-01-01', '+1 minute')
+----
+2000-01-01 00:01:00
+
+query T rowsort
+SELECT datetime('2000-01-01', '-90 minutes')
+----
+1999-12-31 22:30:00

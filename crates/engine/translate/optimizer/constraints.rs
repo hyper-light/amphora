@@ -2808,11 +2808,9 @@ fn apply_column_stats(
                 };
                 share(other)
             }
-            (ConstraintOperator::In { not: false, .. }, ast::Expr::InList { rhs, .. }) => rhs
-                .iter()
-                .map(|value| share(value))
-                .sum::<f64>()
-                .min(1.0),
+            (ConstraintOperator::In { not: false, .. }, ast::Expr::InList { rhs, .. }) => {
+                rhs.iter().map(|value| share(value)).sum::<f64>().min(1.0)
+            }
             _ => continue,
         };
         constraint.selectivity = selectivity;

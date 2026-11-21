@@ -15,8 +15,10 @@ Amphora's groups and replicated owners is not built yet (see "What is left").
 
 ### The directory
 
-A key's position is its FNV-1a hash: the same hash `crate::groups` spreads keys by today
-(store.md, decision 10). Kiln's ids are time-ordered, so ordering groups by key would send every
+A key's position is its FNV-1a hash (store.md, decision 10) finished by MurmurHash3's
+64-bit finalizer (`fmix64`, SMHasher): spans cut by high bits, and FNV-1a alone leaves a change
+in a key's last byte out of its top bits, so `k0` to `k19` all fell in one quarter of the space
+(found by `tests/groups.rs` once `Groups` routed by spans). Kiln's ids are time-ordered, so ordering groups by key would send every
 new row to the last group, and no split could spread that load. Ordering by hash spreads them.
 A span is a run of positions, `lo` to `hi` inclusive. The directory keeps the spans in position
 order. Each span starts right after the one before it, the first at 0 and the last ending at
@@ -161,9 +163,20 @@ deterministic simulator:
    - the holding kept in the group's state machine, so it is replicated with its log;
    - the old group's log held from `P_1` until the operation ends.
 
-   The directory itself must be a replicated group's records, and the driver must run as that
-   group's leader, with its term as the driver's epoch. Until this shell exists, `Groups` keeps its
-   fixed `fnv % n`.
+   Built (lane split-merge-4): the directory is a replicated group's state,
+   `reshard::replicated::DirectoryMachine`, a hyper-durable state machine whose entries are the
+   directory's changes; like focal's control groups it keeps nothing durable of its own and is
+   replayed from the log, and every entry is acted on at start. Its leader runs the driver with its
+   term as the driver's epoch (`DirectoryMachine::lead`). `Groups` routes by the directory
+   (`Groups::route` takes a newer generation), and `Groups::start(n)` makes its `n` groups by
+   splits of the one group every database starts as. Each group checks every write and read
+   against its holding (`Groups::hold` carries out an action on it, under the route's write lock,
+   so every batch let in before a fence is queued before it); a refused key is
+   `store::Refused::Away`. Still left of this item: the holding is in the router's memory, not yet
+   durable in the group's own state with its rows; rows by position; the change feed; the old
+   group's log held from `P_1`; and the shell that carries the driver's actions to the groups. A
+   member that installs a directory image holds it in memory only, so it must be caught up again
+   from its leader after a restart: persisting images comes with the holding's durability.
 2. **Load measured from the store's meter.** The writer's busy time per window, a bounded sample
    of written positions for the load cut, and the size cut from the B-tree's middle key. The
    window is the time between planner runs, and shares don't depend on its length.
