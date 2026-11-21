@@ -114,7 +114,8 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   anti-join, an `EXISTS`/`IN` of several tables a semi- or anti-join with a derived table, an
   `EXISTS` under `OR` or in the `SELECT` list a grouped left join, and nested subqueries unnest level
   by level from a worklist with no recursion; the cheapest of the written, patterns' and general
-  forms is kept. Answers equal nested ones on 39 classes and 24 levels of nesting (T-PL.10.1). Open:
+  forms is kept. Answers equal nested ones on 39 classes and 24 levels of nesting (T-PL.10.1); a
+  subquery reading a semi-joined table stays nested, and Q20's `0.5 * total()` isn't unnested yet. Open:
   q21 at SF 10 and TPC-DS's ten queries measured (AC-PL.10.1, AC-PL.10.2).
 - **A one-row lookup orders its table** (docs/design/planner.md decision 10,
   `crates/engine/tests/records_plans.rs`): a loop that gives at most one row for each row before it

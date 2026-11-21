@@ -1307,6 +1307,16 @@ subqueries may run on rows in another order. So a form is taken only where nothi
 or change between calls (`expression_can_fail_on_input`, nondeterministic functions), and a derived
 table's own subqueries may read none of the outer query's tables.
 
+A subquery that reads a table a semi- or anti-join brought in stays nested
+(`reads_semi_or_anti_joined_table`): those loops stop after a match in their one table, so a join
+hung off that table would be a joined inner query they don't run. T-PL.10.1 found it: `EXISTS` in
+`EXISTS`, each on its parent, kept 24 of 46 customers when forced before this rule. A nested level
+whose key reaches the outermost table (the depth test's) still unnests.
+
+Not taken yet: a scalar aggregate whose result is an expression of an aggregate that isn't NULL
+over no rows, such as TPC-H Q20's `0.5 * total(..)` (`result_on_empty_input` takes a bare aggregate
+or one NULL on empty input). Q20's answers are checked; it isn't counted as unnested.
+
 The planner keeps choosing by cost: the written form, the patterns' form (as before PL.10) and,
 where the general forms went further, the general one are each searched, and the cheapest kept, at
 equal cost the one with fewer subqueries left. A query the patterns served keeps its plan when a
@@ -1316,7 +1326,7 @@ general form would cost more.
 classes, the corpus's (bench/planner/audit/07-unnesting.sql), TPC-H Q2, Q4, Q17, Q20, Q21, Q22 and
 each new form with NULLs, loose types, collations, outer joins inside and around, answer the same
 nested (`SubqueryUnnestingMode::Disabled`), forced and as planned; each class marked to unnest plans
-otherwise when forced; EXISTS nested 1 to 24 deep, each level correlated with its parent and the
+otherwise when forced (Q20 aside, above); EXISTS nested 1 to 24 deep, each level correlated with its parent and the
 outermost query, unnests every level. The measurements (AC-PL.10.1, q21 at SF 10 under PostgreSQL's
 1.195e+04 ms; AC-PL.10.2, TPC-DS's ten queries on the parent first) are the batch's.
 
