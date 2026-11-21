@@ -75,6 +75,28 @@ const PENDING_BYTE: u32 = 0x40000000;
 #[cfg(feature = "autovacuum")]
 use ptrmap::*;
 
+/// Amphora: the pages one prepared transaction read (`Pager::record_access`), the read set its
+/// write carries to the leader (docs/design/replication.md, "A follower's write that read nothing
+/// written since its base: read sets").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Access {
+    read: RoaringBitmap,
+    bound: u64,
+    overflowed: bool,
+}
+
+impl Access {
+    /// The pages read, in page order.
+    pub fn read(&self) -> impl Iterator<Item = u32> + '_ {
+        self.read.iter()
+    }
+
+    /// Whether the transaction read more pages than the record's bound: its read set is unknown.
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HeaderRef(PageRef);
 
@@ -1785,6 +1807,10 @@ pub struct Pager {
     dirty_pages: Arc<RwLock<RoaringBitmap>>,
     /// An owned transaction's hard dirty-page admission limit; zero disables the fence.
     transaction_page_limit: AtomicUsize,
+    /// Amphora: what a prepared transaction reads, while one is recorded. `recording` lets every
+    /// other read skip the lock.
+    access: RwLock<Option<Access>>,
+    recording: AtomicBool,
     subjournal: RwLock<Option<Subjournal>>,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
@@ -2096,6 +2122,8 @@ impl Pager {
             insert_yield: SpillYieldHook::new(),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
             transaction_page_limit: AtomicUsize::new(0),
+            access: RwLock::new(None),
+            recording: AtomicBool::new(false),
             subjournal: RwLock::new(None),
             savepoints: Arc::new(RwLock::new(Vec::new())),
             commit_info: RwLock::new(CommitInfo {
@@ -3892,6 +3920,9 @@ impl Pager {
     ) -> IOResultOr<(PageRef, Option<Completion>)> {
         turso_assert_greater_than_or_equal!(page_idx, 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
         tracing::debug!("read_page_nonblock(page_idx = {})", page_idx);
+        if self.recording.load(Ordering::Acquire) {
+            self.note_read(page_idx);
+        }
         #[cfg(test)]
         if self.spill_yield.should_yield_for(page_idx) {
             io_yield_one!(crate::Completion::new_yield());
@@ -4153,6 +4184,59 @@ impl Pager {
         }
         self.transaction_page_limit.store(limit, Ordering::Release);
         Ok(())
+    }
+
+    /// Amphora: records the pages this connection reads until `take_access`, at most `bound` of
+    /// them; one past it marks the record overflowed rather than answering it short.
+    pub fn record_access(&self, bound: u64) -> Result<()> {
+        let mut access = self.access.write();
+        if access.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "an access record is already under way".into(),
+            ));
+        }
+        *access = Some(Access {
+            read: RoaringBitmap::new(),
+            bound,
+            overflowed: false,
+        });
+        self.recording.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Amphora: ends the record `record_access` began and answers it.
+    pub fn take_access(&self) -> Result<Access> {
+        self.recording.store(false, Ordering::Release);
+        self.access
+            .write()
+            .take()
+            .ok_or_else(|| LimboError::InvalidArgument("no access record is under way".into()))
+    }
+
+    /// Amphora: ends any access record under way without answering it, as a failed preparation
+    /// does: its caller already has the failure that ended it.
+    pub fn end_access(&self) {
+        self.recording.store(false, Ordering::Release);
+        self.access.write().take();
+    }
+
+    fn note_read(&self, page_idx: i64) {
+        let mut access = self.access.write();
+        let Some(access) = access.as_mut() else {
+            return;
+        };
+        let Ok(page) = u32::try_from(page_idx) else {
+            access.overflowed = true;
+            return;
+        };
+        if access.read.contains(page) {
+            return;
+        }
+        if access.read.len() >= access.bound {
+            access.overflowed = true;
+            return;
+        }
+        access.read.insert(page);
     }
 
     /// Resolved pages of the current write transaction, before its commit is published.

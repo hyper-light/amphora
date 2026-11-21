@@ -806,6 +806,61 @@ impl Db {
         result
     }
 
+    /// `prepare_pages`, answering also what the session read: its read set (`None` when it read
+    /// more than `bound` pages, as if unknown) and page 1 as it was at the session's base. The
+    /// record ends before capture: capturing reads every dirty page again, which the session itself
+    /// may not have read (replication.md, "A follower's write that read nothing written since its
+    /// base: read sets").
+    pub(crate) fn prepare_traced<R>(
+        &mut self,
+        max_bytes: usize,
+        bound: u64,
+        f: impl FnOnce(&mut Self) -> anyhow::Result<R>,
+    ) -> anyhow::Result<(R, Pages, Option<Vec<u32>>, Vec<u8>)> {
+        self.exec("BEGIN IMMEDIATE")?;
+        let pager = self.conn.get_pager();
+        let result = self.page_one().and_then(|page_one| {
+            pager.record_access(bound).map_err(fail)?;
+            let answer = f(self)?;
+            let access = pager.take_access().map_err(fail)?;
+            let pages = pager.transaction_image(max_bytes).map_err(fail)?;
+            let reads = (!access.overflowed()).then(|| access.read().collect());
+            Ok((answer, pages, reads, page_one))
+        });
+        pager.end_access();
+        // A prepared transaction never leaves an engine commit marker, even when capture fails.
+        self.exec("ROLLBACK")?;
+        result
+    }
+
+    /// Page 1's bytes in the transaction under way.
+    fn page_one(&self) -> anyhow::Result<Vec<u8>> {
+        let pager = self.conn.get_pager();
+        let (page, completion) = self.io.block(|| pager.read_page(1))?;
+        if let Some(completion) = completion {
+            self.io.wait_for_completion(completion).map_err(fail)?;
+        }
+        if !page.is_loaded() {
+            anyhow::bail!("page 1 was not loaded");
+        }
+        Ok(page.get_contents().as_ptr().to_vec())
+    }
+
+    /// The root page of table `name`: the replica's marker table's, which every apply writes.
+    pub(crate) fn root_page(&self, name: &str) -> anyhow::Result<u32> {
+        let mut root = None;
+        self.query_owned(
+            "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+            [Value::from_text(name.to_string())],
+            |row| {
+                root = Some(row.get::<i64>(0)?);
+                Ok(false)
+            },
+        )?;
+        let root = root.ok_or_else(|| anyhow::anyhow!("table {name} has no root page"))?;
+        Ok(u32::try_from(root)?)
+    }
+
     /// The pages an image of this database holds now, and their bytes.
     fn image_extent(&self) -> anyhow::Result<(u32, usize)> {
         let pager = self.conn.get_pager();

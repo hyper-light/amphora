@@ -2624,13 +2624,22 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// property, Ongaro and Ousterhout, USENIX ATC 2014, figure 3) and the slots die with the
     /// term, so the refusal seen at the append is the one the commit decides; seen here, it
     /// comes before any member can learn of it (amphora-seam-owner-2's ruling, Q2).
-    fn step_forward(&mut self, from: u64, message: Message) -> Result<(), Refusal> {
+    fn step_forward(&mut self, from: u64, mut message: Message) -> Result<(), Refusal> {
         let log = self.replica.core().raft.log();
         let last = log.last_index().map_err(unavailable)?;
         let mut before = Point {
             index: last,
             term: log.term(last).map_err(unavailable)?,
         };
+        // One write forwarded alone appends right after `before`: a stale base that read nothing
+        // written since moves to it (`readsets`).
+        if let [entry] = message.entries.as_mut_slice()
+            && entry.entry_type == hyper_raft::proto::EntryType::EntryNormal
+            && let Ok(Err(_)) = crate::replication::verdict(&entry.data, before)
+            && let Some(data) = self.rebase(&entry.data, before)?
+        {
+            entry.data = data;
+        }
         let term = self.replica.term();
         let mut refused = false;
         for entry in &message.entries {
@@ -2658,6 +2667,54 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.slots.refused(from);
         }
         Ok(())
+    }
+    /// The write `data`, prepared on a base older than `before`, with its base moved to `before`
+    /// if no entry the leader's log holds after its base wrote a page it read or wrote; `None`
+    /// leaves it to the exact base, which refuses it at apply. The walk is over the log between
+    /// the base and `before`, which the log's own bound bounds, one entry at a time, ending at the
+    /// first conflict (replication.md, "A follower's write that read nothing written since its
+    /// base: read sets"; goal ceea4e0a).
+    fn rebase(&mut self, data: &[u8], before: Point) -> Result<Option<Vec<u8>>, Refusal> {
+        use crate::replication::readsets;
+        let Some(write) = readsets::Write::decode(data) else {
+            return Ok(None);
+        };
+        if write.base.index >= before.index {
+            return Ok(None);
+        }
+        let marker = self.replica.machine().marker_page()?;
+        let log = self.replica.core().raft.log();
+        let held = log.first_index().map_err(unavailable)?.saturating_sub(1);
+        if write.base.index < held || log.term(write.base.index).map_err(unavailable)? != write.base.term {
+            Self::read_set_event("unknown_base", write.base, before);
+            return Ok(None);
+        }
+        let bound = u64::try_from(crate::replication::COMMAND_BYTES).unwrap_or(u64::MAX);
+        let high = before.index.saturating_add(1);
+        let mut low = write.base.index.saturating_add(1);
+        while low < high {
+            let entries = log.slice(low, high, bound).map_err(unavailable)?;
+            let Some(last) = entries.last().map(|entry| entry.index) else {
+                return Ok(None);
+            };
+            for entry in &entries {
+                let wrote = if entry.entry_type == hyper_raft::proto::EntryType::EntryNormal {
+                    readsets::wrote(&entry.data)
+                } else {
+                    readsets::Wrote::Opaque
+                };
+                if !write.untouched_by(&wrote, marker) {
+                    Self::read_set_event("conflict", write.base, before);
+                    return Ok(None);
+                }
+            }
+            low = last.saturating_add(1);
+        }
+        Self::read_set_event("rebased", write.base, before);
+        Ok(write.rebased(data, before))
+    }
+    fn read_set_event(outcome: &'static str, base: Point, before: Point) {
+        tracing::debug!(target: "amphora.replication", event = "replication.read_set", outcome, base = base.index, before = before.index, "a write prepared on an older base was checked against its read set");
     }
     /// Steps what the write slot released, in the order it arrived. At a member that no longer
     /// leads, none is stepped: its core would forward it again under its sender's name, which
