@@ -33,7 +33,9 @@ use crate::numeric::Numeric;
 use crate::storage::versioned::version::Ts;
 use crate::sync::{Arc, Mutex};
 use crate::types::{ImmutableRecordRef, ValueRef};
-use crate::vdbe::morsel::{MemoryBudget, MorselError, Pipeline};
+use crate::vdbe::morsel::{
+    self, MachineCosts, MemoryBudget, MorselError, ParallelMode, Pipeline, RunStats,
+};
 use crate::Result;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1172,6 +1174,20 @@ impl Plan<'_> {
         finish(self.query, p)
     }
 
+    /// Runs the statement on as many cores as the morsel executor finds pay, from its pilot's cost
+    /// per granule and the machine's measured costs (`mode` off: the caller's thread alone).
+    pub fn run_on_cores(
+        &self,
+        mode: ParallelMode,
+        costs: &mut MachineCosts,
+        budget: &MemoryBudget,
+    ) -> std::result::Result<(Vec<Vec<Cell>>, Counts, RunStats), MorselError> {
+        let (p, stats) = morsel::execute(self, mode, costs, budget)?;
+        let counts = p.counts;
+        let rows = self.finish(p).map_err(morsel_error)?;
+        Ok((rows, counts, stats))
+    }
+
     /// Runs every granule on the caller's thread: the serial degree.
     pub fn run_all(&self) -> Result<(Vec<Vec<Cell>>, Counts)> {
         let mut p = self.empty();
@@ -1230,10 +1246,16 @@ fn morsel_result(
     match (done, refused) {
         (Ok(()), _) => Ok(()),
         (Err(_), Some(e)) => Err(e),
-        (Err(LimboError::IntegerOverflow), None) => Err(MorselError::IntegerOverflow),
-        (Err(_), None) => Err(MorselError::Overflow {
+        (Err(e), None) => Err(morsel_error(e)),
+    }
+}
+
+fn morsel_error(e: LimboError) -> MorselError {
+    match e {
+        LimboError::IntegerOverflow => MorselError::IntegerOverflow,
+        _ => MorselError::Overflow {
             what: "a column scan's granule range",
-        }),
+        },
     }
 }
 
@@ -1791,6 +1813,13 @@ mod tests {
             let (p, stats) =
                 morsel::execute_at(&plan, 0, degree, None, &MemoryBudget::new(usize::MAX)).unwrap();
             assert_eq!(plan.finish(p).unwrap(), want, "{stats:?}, {q:?}");
+            // And as the executor chooses, on a stated four-core machine.
+            let mut costs = MachineCosts::stated(NonZeroUsize::new(4).unwrap(), 1.0, 1.0);
+            let (got, counts, stats) = plan
+                .run_on_cores(ParallelMode::On, &mut costs, &MemoryBudget::new(usize::MAX))
+                .unwrap();
+            assert_eq!(got, want, "{stats:?}, {q:?}");
+            assert_eq!(counts, c);
         }
     }
 

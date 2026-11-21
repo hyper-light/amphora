@@ -88,6 +88,7 @@ use std::{
 pub(crate) mod access_method;
 mod adaptive;
 mod cardinality;
+pub(crate) mod column_path;
 pub(crate) mod constraints;
 pub(crate) mod cost;
 pub(crate) mod cost_fit;
