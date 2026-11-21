@@ -410,3 +410,7 @@ tests = [
   { id = "T-QT.3.4", text = "A loop over a non-covering index with a term on the index's columns and one on the table's — passes when the answer is unchanged and the table rows fetched are only those the index's term keeps, whatever order the terms are written in" },
   { id = "T-QT.3.5", text = "scripts/check-production.sh after the change — passes when it passes, with the ratchet's counts lowered by what the change removed" },
 ]
+
+# lane groupcommit (G8 step 3, the versioned storage's log; docs/design/engine.md decision 10): no new
+# IDs. It serves AC-T1.4.2 and AC-T1.4.3 (`amphora-bench --vlog`) and T-T1.3.1
+# (crates/engine/tests/versioned_crash.rs).

@@ -91,7 +91,8 @@ depth-first on the call stack. Work is flat: loops with counted budgets and boun
 Linux, macOS and Windows, on x86_64 and aarch64. Platform code sits behind `cfg` with a portable path
 beside it, or a typed refusal naming the platform. `unsafe` is denied; where an OS interface needs it,
 its file is named here with the reason, and every block carries a `// SAFETY:` comment stating its
-invariant.
+invariant. Named: `crates/engine/storage/versioned/uring.rs` (io_uring's push of a write
+whose bytes the kernel reads later; the engine's `io_uring` feature, Linux only).
 
 ## 13. Lean code
 
