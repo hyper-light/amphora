@@ -902,7 +902,7 @@ fn drop_step(
         .into());
     }
     match record.phase {
-        WRITE_ONLY => clear(db, plan, &record, rows),
+        WRITE_ONLY => clear(db, plan, column, &record, rows),
         BACKFILLED => {
             let began = Instant::now();
             finish(db, plan)?;
@@ -950,7 +950,7 @@ fn begin_drop(db: &Db, plan: &Plan, column: &str) -> anyhow::Result<Stepped> {
     }
     db.column_count(&plan.sql)
         .map_err(|error| refuse(&error.to_string()))?;
-    if rewriting_column(db, &plan.table)?.is_none() {
+    if rewriting_column(db, &plan.table, column)?.is_none() {
         return Err(refuse(
             "the table has no other plain column for the batches to rewrite its rows by",
         ));
@@ -986,9 +986,9 @@ fn begin_drop(db: &Db, plan: &Plan, column: &str) -> anyhow::Result<Stepped> {
     Ok(Stepped::WriteOnly)
 }
 
-/// A column of `table` an update can set to itself to rewrite a row: shown (so not dropped), not
-/// generated, not the rowid's alias. Rewriting a row stores NULL in its dropped columns.
-fn rewriting_column(db: &Db, table: &str) -> anyhow::Result<Option<String>> {
+/// A column of `table` other than `dropping` an update can set to itself to rewrite a row: shown
+/// (so not dropped), not generated, not a key. Rewriting a row stores NULL in its dropped columns.
+fn rewriting_column(db: &Db, table: &str, dropping: &str) -> anyhow::Result<Option<String>> {
     let mut found = None;
     // PRAGMA table_xinfo's rows: cid, name, type, notnull, dflt_value, pk, hidden (0 for a plain
     // column; SQLite's documented format).
@@ -998,8 +998,9 @@ fn rewriting_column(db: &Db, table: &str) -> anyhow::Result<Option<String>> {
         |row| {
             let pk = row.get::<i64>(5).map_err(unavailable)?;
             let hidden = row.get::<i64>(6).map_err(unavailable)?;
-            if pk == 0 && hidden == 0 {
-                found = Some(row.get::<String>(1).map_err(unavailable)?);
+            let name = row.get::<String>(1).map_err(unavailable)?;
+            if pk == 0 && hidden == 0 && !name.eq_ignore_ascii_case(dropping) {
+                found = Some(name);
                 return Ok(false);
             }
             Ok(true)
@@ -1011,7 +1012,13 @@ fn rewriting_column(db: &Db, table: &str) -> anyhow::Result<Option<String>> {
 /// One clearing batch: the rows after the last one cleared, up to the largest rowid the table held
 /// at the switch-over, at most `rows`, each rewritten (an update stores NULL in a dropped column).
 /// The last batch marks the change cleared.
-fn clear(db: &Db, plan: &Plan, record: &Record, rows: u64) -> anyhow::Result<Stepped> {
+fn clear(
+    db: &Db,
+    plan: &Plan,
+    dropping: &str,
+    record: &Record,
+    rows: u64,
+) -> anyhow::Result<Stepped> {
     let reached = |at: Option<i64>| match (at, record.until) {
         (_, None) => true,
         (Some(at), Some(until)) => at >= until,
@@ -1046,7 +1053,7 @@ fn clear(db: &Db, plan: &Plan, record: &Record, rows: u64) -> anyhow::Result<Ste
             )?;
             let (last, visited) = seen;
             if let Some(last) = last {
-                let column = rewriting_column(db, &plan.table)?.ok_or_else(|| {
+                let column = rewriting_column(db, &plan.table, dropping)?.ok_or_else(|| {
                     anyhow::anyhow!("{} has no plain column to rewrite rows by", plan.table)
                 })?;
                 db.query_owned(
