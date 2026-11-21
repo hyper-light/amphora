@@ -387,3 +387,42 @@ fn t_qt_6_9_rowid_alias_and_empty_table() {
     }
     conn.execute("COMMIT").unwrap();
 }
+
+/// T-QT.6.10: the VDBE's hook. Random filters, groupings and aggregates in SQL answer the same,
+/// row for row and in order, with `ParallelMode` off (the serial loop) and on, the machine stated
+/// as 2, 3, 4 and 8 cores with workers cheap to start, so the run takes that many workers; and
+/// the hook really ran (the parallel run measured the connection's costs).
+#[test]
+fn t_qt_6_10_vdbe_hook_answers_as_the_serial_loop() {
+    let conn = open(":memory:qt-6-10");
+    let mut rng = ChaCha8Rng::seed_from_u64(610);
+    fill(&conn, &mut rng, "t", 3000);
+    let mut hooked = 0usize;
+    for _ in 0..60 {
+        let (filter, group_by, aggregates) = random_query(&mut rng);
+        let sql = to_sql("t", &filter, &group_by, &aggregates);
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = sql_rows(&conn, &sql);
+        conn.set_parallel_mode(ParallelMode::On);
+        for cores in [2usize, 3, 4, 8] {
+            *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                NonZeroUsize::new(cores).unwrap(),
+                1.0,
+                1.0,
+            ));
+            assert_eq!(sql_rows(&conn, &sql), serial, "{sql} on {cores} cores");
+            // The stated costs are learned from by the run: a changed mean shows it ran.
+            let ran = conn
+                .morsel_costs
+                .lock()
+                .as_ref()
+                .is_some_and(|costs| costs.worker_start().samples() > 1);
+            if ran {
+                hooked += 1;
+            }
+        }
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+    // Non-vacuity: most queries qualify (every shape `random_query` makes does).
+    assert!(hooked > 120, "the hook ran {hooked} times of 240");
+}

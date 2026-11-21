@@ -1994,6 +1994,10 @@ impl ProgramBuilder {
                 Insn::HashDistinct { data } => resolve(&mut data.target_pc, "HashDistinct")?,
                 Insn::GroupFind { data } => resolve(&mut data.target_pc_full, "GroupFind")?,
                 Insn::GroupDrain { data } => resolve(&mut data.target_pc_done, "GroupDrain")?,
+                Insn::MorselAggregate { data } => {
+                    resolve(&mut data.target_pc_serial, "MorselAggregate")?
+                }
+                Insn::MorselNext { target_pc_done, .. } => resolve(target_pc_done, "MorselNext")?,
                 Insn::HashMarkFirstMatch { target_pc, .. } => {
                     resolve(target_pc, "HashMarkFirstMatch")?
                 }

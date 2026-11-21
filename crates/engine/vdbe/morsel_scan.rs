@@ -177,10 +177,7 @@ impl TableSource {
         row.try_reserve_exact(self.columns)?;
         // Ends: each pass moves the cursor to the next row; the loop stops when the rows run out
         // or a rowid passes the morsel's last leaf.
-        loop {
-            let Some(rowid) = io.block(|| cursor.rowid()).map_err(storage)? else {
-                break;
-            };
+        while let Some(rowid) = io.block(|| cursor.rowid()).map_err(storage)? {
             if upper.is_some_and(|bound| rowid > bound) {
                 break;
             }

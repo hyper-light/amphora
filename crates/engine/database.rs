@@ -2783,6 +2783,8 @@ impl Database {
                 crate::connection::JoinMethods::ByCost,
             ),
             sorted_fetches: AtomicBool::new(false),
+            parallel_mode: AtomicBool::new(false),
+            morsel_costs: crate::sync::Mutex::new(None),
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
