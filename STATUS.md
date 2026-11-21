@@ -775,9 +775,9 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   group-by. A key range (a wide-range statement) skips blocks outside it undecoded, by the blocks'
   key bounds, and filters its boundary granules by their key column. Blocks no change touches are
   decoded once a generation. Every class equals the row store's answer, whole-table and over key
-  ranges, with writes between scans (T-CS.4.1 to T-CS.4.3). Open: driving `Plan` from the
-  morsel executor once `vdbe/morsel.rs` (lane qs6) is on main, the planner's use (step 5), and the
-  benches against CedarDB and ClickHouse (AC-CS.4.1, AC-CS.4.2).
+  ranges, with writes between scans, serially and on the morsel executor's workers (`Plan` is a
+  `vdbe/morsel.rs` pipeline, granules its unit) (T-CS.4.1 to T-CS.4.3). Open: the planner's use
+  (step 5), and the benches against CedarDB and ClickHouse (AC-CS.4.1, AC-CS.4.2).
   Step 5's choice is built, behind `AMPHORA_COLUMN_PATH=on` (CS.5, lane g11s5): the planner prices
   "scan the column copy" from the copy's measured nanoseconds per row at its block size plus each
   queued key read from the rows and merged (`translate/optimizer/column_path.rs`), against the
