@@ -637,6 +637,16 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   repeated search for its path below the root; multi-index fetches go through `file_reads`. Seeks, hash builds and
   hash probes time sampled runs into the learned rates, one run in k with k set by each one's spread against the
   timing's own cost (step 3a). Left: SQLite's skip-scan factor 1.375 (Ada's call), the row visit's own observed time.
+- **Query speed step 7 (QT.7), started** (lane qs7; also G5 step 2): behind `Connection::set_vectorized_scans`
+  (off by default), a read-only statement's scanned tables decode each leaf once into column batches
+  (`vdbe/leaf_batch.rs`, executor.md decision 9): one header parse a row, only the columns the statement reads, the
+  window sized from the measured L2 cache and the statement's memory budget, each row charged its own bytes; an
+  overflow row or one over the budget is read row-at-a-time. Filters and aggregates read the batch through the
+  VDBE's own evaluator. COUNT(*) over a table already reads only the leaves' cell counts (`Count`).
+  `vdbe/leaf_batch/tests.rs` (T-QT.7.1 to .3) checks switch on against off on random tables. `amphora-bench
+  --planner` runs it as the target `amphora-vectorized`. Left: AC-QT.7.1 to .3 measured (the coordinator's);
+  filter and aggregate kernels over a batch with a selection vector (and, if G5 measures them better, compiled
+  pipelines instead); Windows's cache size, which needs an OS call this crate makes only with unsafe code.
 - **G6 step 5, plans that read less, started** (lane g6s5): an `EXISTS` may now run as a hash semi join, chosen by
   cost against the nested loop's early out: the outer rows build the hash table, the subquery's table probes it, and
   `HashMarkFirstMatch` passes each build row on at its first match in a probe pass only (its matched bit, kept in
