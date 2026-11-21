@@ -19,7 +19,8 @@ effect and its record (`__amphora_schema_changes`) committed together:
    table's size. The migration is recorded in `__amphora_migrations` in the same transaction.
 
 The engine keeps each index's state on `Index::state`, read from `__amphora_index_states` whenever a
-connection parses its schema (a reparse phase beside the custom types'), so the writer and every
+connection parses its schema (a reparse phase beside the custom types', and the same read when a
+database opens, whose first schema the engine builds by another path), so the writer and every
 reader see one state at one schema cookie, and a state change moves the cookie. Only a public index
 is read: the planner's candidates, foreign-key parent lookups, UPSERT targets, ANALYZE and the
 integrity check's entry comparison all skip the others. At run time an insert into a delete-only

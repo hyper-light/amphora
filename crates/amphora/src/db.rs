@@ -931,9 +931,13 @@ impl Db {
         let next = version
             .and_then(|v| v.checked_add(1))
             .filter(|v| i32::try_from(*v).is_ok())
+            .and_then(|v| u32::try_from(v).ok())
             .ok_or_else(|| anyhow::anyhow!("the schema cookie can't move past {version:?}"))?;
-        self.exec(&format!("PRAGMA schema_version = {next}"))?;
-        self.conn.reparse_unpublished_schema().map_err(fail)?;
+        // Not `PRAGMA schema_version = n`: the engine makes that a no-op (SQLite's defensive mode),
+        // so the cookie would stay, and readers would keep the schema from before the step. This
+        // writes the header's cookie, marks the transaction's schema changed (published to every
+        // connection when it commits) and reads this writer's schema again.
+        self.conn.write_schema_version(next).map_err(fail)?;
         self.statements.schema(self.conn.current_schema())?;
         Ok(())
     }
