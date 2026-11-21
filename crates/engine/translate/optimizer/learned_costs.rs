@@ -8,6 +8,7 @@
 //! it is not where they come from.
 
 use std::hint::black_box;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -94,6 +95,8 @@ struct Rates {
     hash_probe: Rate,
     sort: Rate,
     page: Rate,
+    /// What timing one run costs: a pair of clock reads (step 3a, `Sampling`).
+    timing_nanos: f64,
 }
 
 impl Rates {
@@ -145,6 +148,91 @@ pub(crate) struct LearnedWeights {
 #[derive(Debug)]
 pub(crate) struct LearnedCosts {
     rates: Mutex<Rates>,
+    /// Which runs of the seek, the hash build and the hash probe are timed (step 3a).
+    seek: Sampling,
+    hash_build: Sampling,
+    hash_probe: Sampling,
+    /// What timing one run costs: two clock reads, as calibration timed them.
+    timing_nanos: f64,
+}
+
+/// Amphora (QT.5, step 3a): which runs of one operation are timed, one in `every`, and the spread
+/// of the times sampled since `every` was last set.
+///
+/// Timing a run costs `c` (`LearnedCosts::timing_nanos`), so timing one in `k` adds a share
+/// `c / (k * mean)` to the operation's work; an epoch of the rate (`n` timed units) is then a
+/// mean over `n` samples whose relative standard error is `cv / sqrt(n)`, `cv` the times' spread
+/// (standard deviation over mean), and the epoch spans `n * k` runs. `every` is the `k` at which
+/// the two are equal over an epoch's runs `n`: `c / (k * mean) = cv * sqrt(k / n)`, that is
+/// `k = (c * sqrt(n) / sd)^(2/3)`; at least 1, at most `n`. A steadier operation is timed less
+/// often, a costlier timer too; one whose times scatter is timed more. Until a spread is measured,
+/// every run is timed.
+#[derive(Debug)]
+struct Sampling {
+    runs: AtomicU64,
+    every: AtomicU64,
+    spread: Mutex<Spread>,
+}
+
+/// Welford's running mean and sum of squared deviations (Welford, "Note on a method for
+/// calculating corrected sums of squares and products", Technometrics 4(3), 1962).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Spread {
+    count: f64,
+    mean: f64,
+    m2: f64,
+}
+
+impl Spread {
+    fn add(&mut self, x: f64) {
+        self.count += 1.0;
+        let delta = x - self.mean;
+        self.mean += delta / self.count;
+        self.m2 += delta * (x - self.mean);
+    }
+
+    fn sd(&self) -> Option<f64> {
+        (self.count > 1.0).then(|| (self.m2 / (self.count - 1.0)).max(0.0).sqrt())
+    }
+}
+
+impl Sampling {
+    fn new() -> Self {
+        Self {
+            runs: AtomicU64::new(0),
+            every: AtomicU64::new(1),
+            spread: Mutex::new(Spread::default()),
+        }
+    }
+
+    fn sampled(&self) -> bool {
+        let every = self.every.load(Ordering::Relaxed).max(1);
+        self.runs.fetch_add(1, Ordering::Relaxed) % every == 0
+    }
+
+    /// Adds a timed run's `nanos`; once an epoch's `epoch` samples are in, sets `every` from their
+    /// spread and `timing_nanos` and starts the next.
+    fn add(&self, nanos: f64, epoch: f64, timing_nanos: f64) {
+        let mut spread = self.spread.lock();
+        spread.add(nanos);
+        if spread.count < epoch.max(2.0) {
+            return;
+        }
+        if let Some(every) = sample_every(timing_nanos, epoch, spread.sd()) {
+            self.every.store(every, Ordering::Relaxed);
+        }
+        *spread = Spread::default();
+    }
+}
+
+/// `k = (c * sqrt(n) / sd)^(2/3)` between 1 and `n` (`Sampling`); None without a spread to go by.
+fn sample_every(timing_nanos: f64, epoch: f64, sd: Option<f64>) -> Option<u64> {
+    let sd = sd.filter(|sd| sd.is_finite() && *sd > 0.0)?;
+    if !(timing_nanos.is_finite() && timing_nanos > 0.0 && epoch.is_finite() && epoch >= 1.0) {
+        return None;
+    }
+    let k = (timing_nanos * epoch.sqrt() / sd).powf(2.0 / 3.0);
+    Some(k.clamp(1.0, epoch) as u64)
 }
 
 impl LearnedCosts {
@@ -156,6 +244,42 @@ impl LearnedCosts {
     fn from_rates(rates: Rates) -> Self {
         Self {
             rates: Mutex::new(rates),
+            seek: Sampling::new(),
+            hash_build: Sampling::new(),
+            hash_probe: Sampling::new(),
+            timing_nanos: rates.timing_nanos,
+        }
+    }
+
+    fn sampling(&self, work: Work) -> Option<&Sampling> {
+        match work {
+            Work::Seek => Some(&self.seek),
+            Work::HashBuild => Some(&self.hash_build),
+            Work::HashProbe => Some(&self.hash_probe),
+            Work::Row | Work::Sort | Work::PageRead => None,
+        }
+    }
+
+    /// Whether to time this run of `work` (step 3a: the seek, the hash build and the hash probe,
+    /// one run in their `Sampling`'s `every`).
+    pub(crate) fn sampled(&self, work: Work) -> bool {
+        self.sampling(work).is_some_and(Sampling::sampled)
+    }
+
+    /// Records a timed run of `work`, one unit in `nanos`: it moves the rate, and its spread sets
+    /// how often the runs are timed.
+    pub(crate) fn observe_sampled(&self, work: Work, nanos: f64) {
+        if !(nanos.is_finite() && nanos >= 0.0) {
+            return;
+        }
+        let epoch = {
+            let mut rates = self.rates.lock();
+            let rate = rates.rate_mut(work);
+            rate.observe(1.0, nanos);
+            rate.epoch
+        };
+        if let Some(sampling) = self.sampling(work) {
+            sampling.add(nanos, epoch, self.timing_nanos);
         }
     }
 
@@ -290,6 +414,13 @@ fn calibrate(clock: &mut dyn FnMut() -> f64) -> Rates {
         let (reps, nanos) = measure(clock, target, n, &mut **work);
         *rates.rate_mut(*kind) = Rate::calibrated(reps * *units, nanos);
     }
+    // A pair of clock reads, timed as the kinds are, a page's keys' worth of times at most.
+    let mut timing = || {
+        let start = Instant::now();
+        black_box(start.elapsed());
+    };
+    let (reps, nanos) = measure(clock, target, n, &mut timing);
+    rates.timing_nanos = nanos / reps;
     // A page read can't be timed here: there's no file yet. Each database anchors it at open
     // (`time_page_read`, `LearnedCosts::anchor_page_read`), then its own reads move it
     // (`LearnedCosts::observe`), its epoch the pages whose rows calibration visited.
@@ -416,7 +547,39 @@ mod tests {
                 epoch: 4.0,
                 ..Rate::default()
             },
+            timing_nanos: 20.0,
         }
+    }
+
+    /// Do: a timer of 20 ns, epochs of 100 samples, times spread 25 ns, 2,000 ns and 0.01 ns, and
+    /// none. Expect: one run in (20 * 10 / 25)^(2/3) = 4 timed; every run when the times scatter
+    /// past the timer's cost; one in the epoch when they barely move; no change without a spread
+    /// (step 3a: the sampling follows each operation's spread, no picked rate).
+    #[test]
+    fn t_qt_5_5_sampling_follows_the_spread() {
+        assert_eq!(sample_every(20.0, 100.0, Some(25.0)), Some(4));
+        assert_eq!(sample_every(20.0, 100.0, Some(2_000.0)), Some(1));
+        assert_eq!(sample_every(20.0, 100.0, Some(0.01)), Some(100));
+        assert_eq!(sample_every(20.0, 100.0, Some(0.0)), None);
+        assert_eq!(sample_every(20.0, 100.0, None), None);
+    }
+
+    /// Do: time every seek of an epoch, 100 ns and 150 ns in turn, then run 120 more. Expect:
+    /// every run of the first epoch timed; then some but not all; the seek's rate moved toward
+    /// the times observed, the hash probe's untouched (step 3a).
+    #[test]
+    fn t_qt_5_5_sampled_seeks_move_the_rate_and_thin_out() {
+        let costs = LearnedCosts::from_rates(fixed_rates(1.0, 10.0, 20.0, 15.0, 2.0));
+        for i in 0..100 {
+            assert!(costs.sampled(Work::Seek));
+            costs.observe_sampled(Work::Seek, if i % 2 == 0 { 100.0 } else { 150.0 });
+        }
+        let timed = (0..120).filter(|_| costs.sampled(Work::Seek)).count();
+        assert!(timed > 0 && timed < 120, "{timed}");
+        let weights = costs.weights().unwrap();
+        assert!((weights.seek - 125.0).abs() < 1e-9, "{weights:?}");
+        assert_eq!(weights.hash_probe, 15.0);
+        assert!(!costs.sampled(Work::Sort));
     }
 
     /// Do: calibrate on this machine with no operator observed. Expect: every weight a finite,
