@@ -176,6 +176,8 @@ pub fn translate(
         connection.get_pager().page_miss_ratio()
     };
     resolver.set_learned_weights(connection.db.learned_costs.weights_at(page_miss));
+    // Amphora (PL.7): and, with its switch on, as its statements' measured times fit them.
+    resolver.set_fitted_weights(connection.db.cost_fit.weights());
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here

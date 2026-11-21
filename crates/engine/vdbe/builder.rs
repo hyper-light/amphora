@@ -2598,6 +2598,7 @@ impl ProgramBuilder {
             prepare_context,
             write_databases: self.write_databases,
             read_databases: self.read_databases,
+            leaf_batch_plan: None,
         };
         Ok(prepared)
     }
@@ -2610,7 +2611,14 @@ impl ProgramBuilder {
         sql: &str,
     ) -> crate::Result<Program> {
         let prepare_context = PrepareContext::from_connection(&connection);
-        let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
+        let mut prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
+        // Amphora (QT.7): a read-only program's scans read their leaves by column batches when
+        // the connection's switch is on; a program that writes keeps the row-at-a-time read.
+        if connection.vectorized_scans() && prepared.readonly {
+            prepared.leaf_batch_plan =
+                super::leaf_batch::BatchPlan::for_program(&prepared.insns, &prepared.cursor_ref)
+                    .map(Arc::new);
+        }
         Ok(Program::from_prepared(Arc::new(prepared), connection))
     }
 }
