@@ -455,9 +455,12 @@ commit; the slots' checksums chain as frames' do, and every page of a record map
 slot, so frame numbers keep their meaning for read marks, backfill, the durable mark (decision 15)
 and restarts. The log header's file format says which a generation is, and a generation keeps the
 format it began with, so a log is always read as it was written and a page-a-frame log from before
-reads as ever. Packed generations begun since 2026-11-11 carry 0x414d_5004, mixed ones 0x414d_5005
-(decision 17's chains ended by their bytes); 0x414d_5002 and 0x414d_5003 are read and continued as
-before, and an older binary refuses the new values by name; to downgrade, checkpoint first. Records are kept decoded (4 MiB a database, the oldest dropped first past that; the
+reads as ever. Packed generations begun since 2026-11-11 carry 0x414d_5004 (decision 17's chains
+ended by their bytes), mixed ones 0x414d_5007 (decision 39's layout, its chains ended so too);
+0x414d_5002, 0x414d_5003 and 0x414d_5005 (a mixed generation of chains ended by their bytes in
+decision 37's layout) are read and continued as before, and an older binary refuses the new values
+by name; to downgrade, checkpoint first. Records are kept decoded (a page cache's worth of bytes,
+`packed::decoded_budget` (decision 39), the oldest dropped first past that; the
 writer keeps those it writes), the checkpoint reads a record once for all the pages it copies from
 it, and recovery reads record by record: a record whose slots don't all hold ends the log there, as
 a torn frame does; one whose slots all hold but that doesn't decode refuses the log, since no torn
@@ -576,7 +579,8 @@ and checks the log holds chains deeper than 8 (red at the old bound: "chains of 
 
 Chains past 8 come with new header format values (Amphora agent, 2026-11-12; CLAUDE.md §3, formats
 change append-only): a generation begun now is `packed::PACKED_CHAINS_FORMAT` (0x414d_5004) or
-`MIXED_CHAINS_FORMAT` (0x414d_5005). A generation begun under 0x414d_5002 or 0x414d_5003 keeps its
+`MIXED_CHAINS_FORMAT` (0x414d_5005; since decision 39 a mixed generation begins
+`MIXED_FRAMES_FORMAT`, 0x414d_5007, whose chains are ended by their bytes too). A generation begun under 0x414d_5002 or 0x414d_5003 keeps its
 format, and its chains keep that format's bound of 8 (`packed::most_deltas`), so a binary from
 before still reads it. A binary from before refuses a log of the new values as a format it doesn't
 know, naming the value ("the log's format 0x414d5004 isn't known"), never as corrupt. The remedy for
@@ -586,7 +590,8 @@ that refusal, a downgrade, is a checkpoint that empties the log on the newer bin
 8.
 
 What the bytes rule doesn't price is the number of records a cold read decodes: a chain of small
-deltas may reach 255 records back, each read once and kept decoded (decision 16's 4 MiB). If a
+deltas may reach 255 records back, each read once and kept decoded (within `packed::decoded_budget`,
+decision 39). If a
 cold read's latency on such a chain beats the image's bytes as the cost, the rule must count
 records too.
 
@@ -1565,7 +1570,9 @@ whose format it doesn't know rather than read it as page frames. Page numbers at
 (8 TiB of 4 KiB pages) are refused in a mixed generation. The raw frame interface (Turso's sync's,
 and the pages a replica installs, `Db::apply_pages`) reads and writes a mixed log's page frames as
 ever and refuses a record's slots; the multi-process authority refuses a mixed log, as it refuses a
-packed one.
+packed one. A mixed generation begun now is laid out as decision 39 has it (0x414d5007): pages new
+to a chain as page frames, the chains' entries in records of one slot; one begun as this decision
+had it keeps 0x414d5003 and its layout.
 
 **Why.** Decision 35's plan: on the unify audit's batched leg the log takes 16.6 bytes a byte of the
 rows the calls commit, a 4 KiB page for each page a commit touches; a packed log with deltas took
@@ -1618,3 +1625,172 @@ spills written over beside records included (`crates/amphora/tests/crash.rs`); a
 holding more frames past its last commit than the pages it dirtied (`spilled_log.rs` on a mixed
 log); the audit's 1, 4 and 8 MiB legs or the comprehensive bench's bulk statements slower than
 page-a-frame at 13e385d.
+
+## 39. A page read past the cache reads its own frames: pages new to a chain are page frames, a chain's entries records of one slot
+
+**Decision.** A mixed generation begun now (its header's file format
+`packed::MIXED_FRAMES_FORMAT`, `0x414d5007`; what `Db::open` begins) lays a commit's pages out by what
+a read of them will need (`WalFile::lay_out`). A page the log can't chain from (new to the
+generation, read back past the cache, renumbered, or whose latest frame isn't the version its buffer
+holds: `Logging::New`) is written as a page frame, whole and as it is, transformed straight into its
+frame as page-a-frame writes it. A
+page whose latest frame in the generation is the version its buffer holds is a delta (decision 17)
+or, where the chain's bound ends the chain, its image (`Logging::Ends`); these entries of chains are
+packed into records of one slot each (`packed::one_slot_records`): largest first, each into the first
+record with room for it, an image sized by what LZ4 makes of it alone, each record LZ4'd where that
+makes it smaller. An image that LZ4 can't fit in a slot is a page frame; a delta too large for a slot
+takes a record of the slots it needs. The page frames come first, then the records, and the last
+frame carries the commit's size. A chain may begin at a page frame: a read past the cache
+(`RecordRead`) reads one frame for each entry of its page's chain, a page frame's page or a
+record's slot, where decision 37's read the whole record that held each entry. The records kept
+decoded take at most what a connection's page cache holds by default (`packed::decoded_budget`:
+Turso's 2,000 pages, the budget Amphora's readers keep, times the page size), where 4 MiB was
+picked. A generation begun before keeps its format and is written and read as it began (0x414d5002
+and 0x414d5003 as decisions 16 and 37 have them, 0x414d5004 and 0x414d5005 as decision 17's chains
+ended by their bytes have them); a chain that begins at a page frame is a fault there. A binary that
+knows only 0x414d5003 or 0x414d5005 refuses a log of 0x414d5007 by name. A chain of 0x414d5007 ends
+as decision 17 has it: a delta while the chain's deltas, this one included, take less than the page,
+the depth field's width (255) its format bound.
+
+**Why.** Decision 37's interleaved rerun found the bulk statements slower than page-a-frame, the
+writer's time in reads past the cache from a record and in packing. Counted on adas-mac-studio.local-2
+(an Apple M3 Ultra, 2026-11-12; the batch head 930ac68 with counters in the read and write paths,
+`~/.cache/claude-scratch/probe-carrier/wal-read-measure.patch`, sha256 0daaf73a1566380b; the
+suite's `insert_batch_100` and `delete_range_insert`, 200,000 items, 1 s of warm-up and 5 s, each
+statement its own call; checks, not records):
+- A miss needs one page and reads 40 of them. At 32 clients `insert_batch_100` read 94,517 pages
+  past the cache from records. Their chains held 1.19 entries each (the deepest 9), 4,176 bytes of
+  entries a miss, while each miss read 171 KB: 16.19 GB in 89,304 reads of whole records, 42 slots
+  a record on average. 99.6% of the records read were compressed. The decoded records served 20% of
+  the entries the chains wanted (40% at 1 client), each record read kept and soon dropped (99,954
+  of 100,074 kept went again within the run). The misses took 4.78 s of the 6 s run, 50.6 µs each.
+  `delete_range_insert` at 32 clients: 86,769 misses read 11.87 GB for 357 MB of entries.
+- Packing is LZ4 on images. `prepare_records` took 857 ms at 32 clients, 689 ms of it in
+  `packed::encode`, which compressed 589 MB of raw entries: 75% of the pages a commit wrote were
+  images, and 133,724 of 185,412 were pages with no version to chain from (read back past the
+  cache after the writer's cache let them go). 95% of the records carried a delta, so all of them
+  were compressed.
+- The misses are of pages new to chains. Of the misses on records, 86-87% were of pages whose last
+  write had no version to make a delta against, 13-14% of pages in chains
+  (`wal-read-whatif2.patch`, ba853ce3a319d902: at 32 clients 71,843 and 11,134; at 1 client 29,220
+  and 4,919).
+
+So a page new to a chain, written and read as page-a-frame does it, costs what page-a-frame costs;
+a chain's entries, few and small, read one slot each. LZ4 then compresses only the chain's
+entries: a reset image once a chain, beside the deltas that chain saved.
+
+**Sources.** RocksDB's block-based table format (the RocksDB wiki, "Rocksdb BlockBasedTable
+Format") and LevelDB's table format (`doc/table_format.md`): data blocks of about 4 KiB, each
+compressed on its own, so a point read reads and decompresses one block; the unit of compression is
+the unit of reading. The LZ4 block format (`lz4_Block_format.md`): a match copies from up to 65,535
+bytes back in what was decoded, so an entry inside a compressed record can't be decoded without
+what came before it. SQLite's WAL (sqlite.org/wal.html, fileformat2.html): a reader reads the latest
+frame of a page, one frame. Levandoski, Lomet and Sengupta, "The Bw-Tree: A B-tree for New Hardware
+Platforms" (ICDE 2013): a page's delta chain is consolidated into a new image because a read pays
+for every delta in its chain. First-fit decreasing packing: Dósa, "The Tight Bound of First Fit
+Decreasing Bin-Packing Algorithm Is FFD(I) ≤ 11/9 OPT(I) + 6/9" (ESCAPE 2007, LNCS 4614).
+
+**The bound.** Decision 37's, kept: on the batched leg the log takes at most 4 bytes a byte of rows
+(`small_commits_log_their_changes_not_their_pages`). What the layouts would have taken there, from
+the same commits at 930ac68 (`wal-read-whatif.patch`, acaf450aae3fcd25): decision 37's 10,830 slots
+(3.05 bytes a byte of rows); every image a page frame 16,290 (4.58, over the bound); pages new to a
+chain as page frames and the chains' entries packed together 12,853 (3.62); the same, the chains'
+entries in records of one slot packed greedily in the order given 14,958 (4.21, over). The batched
+leg's images were 4,346 of pages new to a chain and 8,286 that ended chains: compressing the second
+keeps the bound, and packing them largest first leaves less of each slot unused than packing them
+in order. A read past the cache reads at most one frame for each entry of its chain, and a chain
+holds its image and deltas whose bytes take less than the page (decision 17), at most
+`packed::MOST_DELTAS` of them.
+
+**Evidence.** On the batched leg the log takes 3.9 bytes a byte of rows (14,644,960 bytes of rows,
+56,967,240 of log; 3.0 at 930ac68), within the bound. The suite's bulk statements, a quick check on
+adas-mac-studio.local-2 (an M3 Ultra, 2026-11-12, at 443b174 against 13e385d, interleaved, best of 3,
+loads 1.6 to 7.9; not a record): `insert_batch_100` 92.0 against 83.6 a second at 1 client and
+411.6 against 446.0 at 32 (slower in every round); `delete_range_insert` 124.2 against 114.4 and
+2,191.6 against 2,288.2. At 930ac68 on the same host the same statements ran 65.2 and 76.6, 113.2
+and 822.4. A profile of `insert_batch_100` at 32 clients (AMPHORA_PROFILE, the writer's thread,
+samples a commit): 3.05 against base's 2.54. The reads past the cache took 1.94 against 1.81 (a
+page frame's 1.63, a chain's records 0.23), the commit 0.90 against 0.59: its preparing 0.32 against
+0.12, of which the deltas' diff 0.13 and the records' packing 0.07. What is left is what deltas
+cost the writer, making them and rebuilding pages from them, and no longer the reads of records.
+
+`crates/engine/tests/packed_log.rs`: `a_page_new_to_the_log_is_read_in_one_frame` (300
+rows of a page each committed at once, the database opened again, rows looked up: no read of the
+log takes more than a frame, and the lookups read it) and `a_pages_chain_is_read_one_frame_an_entry`
+(the same rows changed in 12 transactions, so chains run to their bound and begin again, read back
+whole and by id: no read of the log more than a frame); both red at 930ac68. Also there:
+`a_mixed_generation_begun_before_keeps_its_records` (a generation stamped 0x414d5003 keeps its
+records and gets no page frame past its first commit, and the next generation begins 0x414d5007);
+the mixed log's existing tests with the new layout's expectations (pages new to the log as page
+frames, records of one slot, spills written over, rows read back through every path and after
+recovery). `storage::packed`'s unit tests: a chain's entries pack into records of one slot within
+first-fit decreasing's bound; an image that fits no slot is left for a page frame while a delta too
+large for one takes a record of its own; and a delta found a word at a time rebuilds 400 pages
+changed at random, word edges and the carried tail among the changes.
+
+**Falsified by.** A read past the cache reading more than one frame for an entry of its chain (the
+tests above); the batched leg's log above 4 bytes a byte of rows; a row read back other than as
+committed, on a fresh connection, after a checkpoint, after recovery or through the shared pages
+(`packed_log.rs`, `shared_pages.rs`, `reader_cache.rs`), or an acknowledged batch lost by a power
+cut (`crates/amphora/tests/crash.rs`); the comprehensive bench's bulk statements slower than
+page-a-frame at 13e385d, interleaved, best of 3.
+
+## Decision (lane wal-read): a commit's records published at a lookup's cost, its deltas found a word at a time
+
+**Decision.** Three costs decision 39 left on the writer of a mixed log, each where it begins, with
+the log's layout and size unchanged:
+- The record registry (`packed::Records`) publishes a record by a lookup. It kept its decoded records
+  in one map keyed by generation and first slot, so publishing a record, which drops whatever was
+  decoded at its first slot, passed over every record kept and over the order they were kept in. It
+  now keys them by first slot, with the generation beside each (a read of another generation finds
+  none), and the order of keeps passes over stale entries, swept once they outnumber the records
+  kept. Slot counts are kept in frame order, so the record that covers a frame is found by a search,
+  not a pass over every record of the generation.
+- A commit's records are given their pages in one pass over its pages ordered by frame
+  (`WalFile::publish_records`), not a pass over all of them for each record.
+- A delta is found a word of 8 bytes at a time (`packed::diff`), each word compared as one integer
+  and its first and last changed bytes read from the XOR's zero bytes, where a byte at a time took up
+  to 16 comparisons a word. Decision 39's `SAME_BLOCK` (64 bytes, a cache line on x86-64, half the M3
+  Ultra's) is gone: the integer's width is the unit, and no size is picked for a machine. The runs
+  are the same bytes as before.
+
+The bench can run the page-a-frame log in the same binary (`AMPHORA_PAGE_LOG=1`), so the bulk
+statements are compared log against log, everything else the same.
+
+Merged with decision 17's chains ended by their bytes (main's 0x414d_5004 and 0x414d_5005): a mixed
+generation begun now is decision 39's 0x414d_5007, and its layout (`WalFile::lay_out`) ends a chain
+by decision 17's rule as `prepare_records` does, the writer carrying each chain's bytes
+(`Logged::chain`) through the publishing above; the half page decision 39's layout still took as a
+delta's most is gone with it.
+
+**Why.** Decision 39's profile of `insert_batch_100` at 32 clients put the commit at 0.90 samples a
+commit against page-a-frame's 0.59: preparing 0.32 against 0.12 (the diff 0.13, packing 0.07), and
+0.58 against 0.47 outside it. Decision 39 writes a record for each slot of a commit's chains' entries,
+where decision 37 wrote a few records of about 42 slots, so what costs a record grew with it:
+- each record published passed over the decoded records kept, up to the budget of 2,000 pages'
+  bytes (`packed::decoded_budget`), hundreds of one-slot records, and over their order;
+- each record's pages were found by a pass over all of the commit's pages, up to 1,024
+  (`IOV_MAX`).
+
+Both grow with the records a commit writes times what is kept or written. The diff's share is its
+inner loop: a word that changed was searched byte by byte from each end.
+
+**Sources.** Decision 39's profile and counters (adas-mac-studio.local-2, 2026-11-12). Amortized
+analysis of a sweep paid for by what it removes: Tarjan, "Amortized Computational Complexity" (SIAM
+J. Algebraic Discrete Methods 6(2), 1985). The XOR of two words is zero exactly where they agree, and
+`u64::trailing_zeros` and `leading_zeros` count from the lowest and highest bit (the Rust standard
+library's documentation); with the words read little-endian the lowest byte is the first.
+
+**Evidence.** `storage::packed`'s unit tests: `records_published_over_kept_ones_leave_a_bounded_order`
+(5,000 records published over kept ones: the order of keeps never past twice the records kept and
+one more, the bytes always the kept records', another generation's record never given out, a
+rollback leaving no stale keep) and `a_delta_found_word_by_word_rebuilds_every_change` (400 pages
+changed at random, word edges and the carried tail among the changes, each rebuilt from its runs).
+The mixed log's tests (`packed_log.rs`, `shared_pages.rs`, `spilled_log.rs`, `reader_cache.rs`)
+pass unchanged. The bulk statements' interleaved bench, mixed against page-a-frame in one binary:
+the coordinator's, not yet run.
+
+**Falsified by.** The comprehensive bench's `insert_batch_100` or `delete_range_insert` slower on the
+mixed log than on the page-a-frame log of the same binary (`AMPHORA_PAGE_LOG=1`), interleaved, best
+of 3; a profile of the writer still showing the registry's publishing or the commit's pages found
+per record; a row read back other than as committed (the tests above).
