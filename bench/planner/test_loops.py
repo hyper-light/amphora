@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """loops.py (PL.6, AC-PL.6.1) on step 3's records and on plans written for it: step 3's JOB pass
 counts 30 of 113 plans and its TPC-H passes none; a scan beneath a scan counts, a scan or hash join
-beneath a lookup by rowid doesn't, a hash join beneath a scan does, and each subquery's block counts
-apart from its parent's.
+beneath a lookup by rowid doesn't, a hash join beneath a scan does, a hash join's build table read
+once after its probe doesn't, and each subquery's block counts apart from its parent's.
 
 usage: python3 -I bench/planner/test_loops.py
 """
@@ -63,6 +63,20 @@ class Plans(unittest.TestCase):
     def test_a_first_read_and_a_seek_do_not(self):
         self.assertEqual(self.found(node(1, "SCAN p", SCAN), node(2, "SEARCH q", SEEK)), [])
         self.assertEqual(self.found(node(1, "HASH JOIN q", HASH)), [])
+
+    def test_a_hash_joins_build_read_does_not_count(self):
+        probe = {"type": "hash_join", "table": "q", "build": "p"}
+        build = {"type": "scan", "source": "table", "table": "p"}
+        self.assertEqual(self.found(node(1, "HASH JOIN q", probe), node(2, "SCAN p", build)), [])
+        aliased = {"type": "hash_join", "table": "s", "build": "r2"}
+        build = {"type": "scan", "source": "table", "table": "r", "alias": "r2"}
+        self.assertEqual(self.found(node(1, "HASH JOIN s", aliased), node(2, "SCAN r AS r2", build)), [])
+
+    def test_a_scan_that_is_not_the_build_still_counts(self):
+        probe = {"type": "hash_join", "table": "s", "build": "r"}
+        build = {"type": "scan", "source": "table", "table": "r"}
+        other = {"type": "scan", "source": "table", "table": "u"}
+        self.assertEqual(self.found(node(1, "HASH JOIN s", probe), node(2, "SEARCH t", SEEK), node(3, "SCAN r", build), node(4, "SCAN u", other)), ["SCAN u"])
 
     def test_a_subquery_block_counts_apart(self):
         subquery = {"type": "scalar_subquery"}

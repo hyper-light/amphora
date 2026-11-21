@@ -22,7 +22,8 @@ fn open(dir: &Path) -> Arc<Connection> {
 /// The table accesses of `sql`'s plan that read a table whole beneath loops that can give more
 /// than one row, as `bench/planner/loops.py` counts them: in each block of the plan, a scan of a
 /// table or index, or a hash join (whose probe scans its table), after a table access that isn't a
-/// lookup by rowid.
+/// lookup by rowid. A hash join's build table (its `build`) is listed in the block after the probe
+/// but read once, before the first probe, so its read is neither counted nor a loop.
 fn whole_reads_in_loops(conn: &Arc<Connection>, sql: &str) -> Vec<String> {
     let mut stmt = conn
         .prepare(format!("EXPLAIN QUERY PLAN FORMAT=JSON {sql}"))
@@ -38,11 +39,26 @@ fn whole_reads_in_loops(conn: &Arc<Connection>, sql: &str) -> Vec<String> {
         }
     }
     for parent in parents {
+        let block: Vec<&serde_json::Value> =
+            nodes.iter().filter(|n| &n["parent"] == parent).collect();
+        let builds: Vec<&serde_json::Value> = block
+            .iter()
+            .filter(|n| n["op"]["type"] == "hash_join" && n["op"]["build"].is_string())
+            .map(|n| &n["op"]["build"])
+            .collect();
         let mut before: Vec<&serde_json::Value> = Vec::new();
-        for node in nodes.iter().filter(|n| &n["parent"] == parent) {
+        for node in block {
             let op = &node["op"];
             let kind = op["type"].as_str().unwrap_or("");
             if !["scan", "search", "multi_index", "hash_join", "index_method"].contains(&kind) {
+                continue;
+            }
+            let identifier = if op["alias"].is_string() {
+                &op["alias"]
+            } else {
+                &op["table"]
+            };
+            if kind == "scan" && builds.contains(&identifier) {
                 continue;
             }
             let whole = (kind == "scan" && op["source"] == "table") || kind == "hash_join";

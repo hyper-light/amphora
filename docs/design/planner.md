@@ -1314,8 +1314,11 @@ green with the change: `t_pl_6_1_ten_no_adaptive_reads_q_once` (T-PL.6.1), an ou
 reverse order, JOB 1a's dimension and facts, a one-row loop that keeps its scan, a cross join and
 a range join that keep theirs (the counter finds it, so it is not vacuous), and a chain of hash
 joins whose third table is read once. Each test counts as `bench/planner/loops.py` does, whose
-own test holds step 3's counts: 30 of JOB's 113 plans, none of TPC-H's 22 at SF 1 or SF 10. The
-JOB and TPC-H measurement against the parent is the batch's bench.
+own test holds step 3's counts: 30 of JOB's 113 plans, none of TPC-H's 22 at SF 1 or SF 10. A hash
+join's build table is listed in its block after the probe (`HASH JOIN q / SCAN p`) but read once,
+before the first probe (`Insn::Once`); the JSON plan's `hash_join` step names it (`build`), and the
+counter neither counts that read nor treats it as a loop. The JOB and TPC-H measurement against the
+parent is the batch's bench.
 
 **Falsified by.**
 - A JOB plan with such a read in the change's records (`loops.py` above 0), or a TPC-H plan.

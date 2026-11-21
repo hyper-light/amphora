@@ -7,7 +7,9 @@ count reads each Amphora query's EXPLAIN QUERY PLAN FORMAT=JSON in the planner b
 (`amphora-bench --planner`): in each query block (the steps with one parent), a step that reads a
 B-tree table whole (a `scan` of a table or of an index, or a `hash_join`, whose probe scans its
 table) counts when a table access comes before it in the block and any of those before it is not a
-lookup by rowid (`rowid_eq`, at most one row a row). A lookup by every column of a unique index
+lookup by rowid (`rowid_eq`, at most one row a row). A hash join's build table (the step's
+`build`) is listed in its block after the probe, but read once, before the first probe: its scan
+neither counts nor stands before a later step. A lookup by every column of a unique index
 gives at most one row too, but the JSON doesn't say an index is unique, so it counts here: the count
 is never below the planner's own. Step 3's records count 30 of JOB's 113 plans and none of TPC-H's.
 
@@ -30,11 +32,14 @@ def whole_reads_in_loops(plan):
         blocks.setdefault(node.get("parent"), []).append(node)
     found = []
     for nodes in blocks.values():
+        builds = {n["op"]["build"] for n in nodes if n.get("op", {}).get("type") == "hash_join" and "build" in n["op"]}
         before = []
         for node in nodes:
             op = node.get("op", {})
             kind = op.get("type")
             if kind not in ACCESS:
+                continue
+            if kind == "scan" and op.get("alias", op.get("table")) in builds:
                 continue
             whole = (kind == "scan" and op.get("source") == "table") or kind == "hash_join"
             if whole and before and not all(b["op"].get("search_kind") == "rowid_eq" for b in before):
