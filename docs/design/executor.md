@@ -398,7 +398,21 @@ tables of many leaves, sparse and negative rowids among them, at 1 to 8 workers 
 sizes equal the VDBE's serial SQL answers (T-QT.6.7); a probe read in leaf morsels equals the
 VDBE's join in its order (T-QT.6.8); an INTEGER PRIMARY KEY reads its rowid (T-QT.6.9).
 
-**Left.** The planner and VDBE handing a qualifying loop (a scan with its filter and aggregates, a
-hash join's probe) to these pipelines with each worker running its own copy of the program's loop
-body, a hash table built by all workers, the page cache's miss path sharded, loom
+**The VDBE's hook.** With `Connection::set_parallel_mode` on (off by default), a top-level SELECT
+whose whole work is one rowid table read whole with its filter and aggregates is emitted as
+`Insn::MorselAggregate` and a row loop over `Insn::MorselNext`, ahead of the statement's serial
+loop (`translate/parallel.rs`). Only shapes whose answers equal the serial loop's qualify: columns
+stored as written (INTEGER, TEXT or BLOB affinity, BINARY collation, no defaults, no generated
+columns), terms comparing a column with a literal of its own kind or testing it for NULL,
+plain-column GROUP BY keys, COUNT, SUM over INTEGER columns, MIN and MAX, and no HAVING, ORDER BY,
+LIMIT, DISTINCT, window or subquery; MVCC and the versioned storage, whose rows are not in the
+pager's b-trees, never qualify. When the run meets a value its aggregates don't take (a SUM over
+text) it jumps to the serial loop, so the answer never depends on the switch. Groups come out in
+their keys' SQLite order, as the serial GROUP BY gives them. The machine's costs are measured by a
+connection's first parallel statement and learned by each after. Evidence: random queries answer
+the same row for row and in order with the switch off and on at 2, 3, 4 and 8 cores (T-QT.6.10).
+
+**Left.** The hash join's probe loop handed over the same way; expressions beyond a column against
+a literal (each worker running its own copy of the program's loop body), a hash table built by all
+workers, the page cache's miss path sharded, loom
 or shuttle on the dispatcher, and the worker and morsel metrics are the step's next pieces.

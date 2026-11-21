@@ -616,9 +616,12 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   `vdbe/morsel_scan.rs` (lane qs6-2) reads a table b-tree in morsels of leaf pages: the leaves come from its interior
   pages, each worker opens its own cursor over its leaves through the statement's pager (one snapshot), and the scan
   pipeline's filter and aggregates, or a hash join's probe, run over the rows; `choose_degree` sizes the morsels in
-  pages. Answers equal the VDBE's serial SQL answers at every worker count (T-QT.6.7 to T-QT.6.9). Closes with: the
-  planner and VDBE handing a qualifying scan or probe loop to it (a program's own loop body per worker), a shared hash
-  build, loom or shuttle on the dispatcher, worker and morsel metrics, and AC-QT.6.1 to AC-QT.6.4 measured.
+  pages. Answers equal the VDBE's serial SQL answers at every worker count (T-QT.6.7 to T-QT.6.9). The VDBE's hook:
+  `Connection::set_parallel_mode` (off by default) lets a single-table scan with its filter and aggregates run as
+  `Insn::MorselAggregate` ahead of its serial loop, which answers when the run declines a value (`translate/parallel.rs`;
+  T-QT.6.10). Closes with: the hash join's probe loop handed over the same way, expressions beyond column-against-
+  literal terms (a program's own loop body per worker), a shared hash build, loom or shuttle on the dispatcher, worker
+  and morsel metrics, and AC-QT.6.1 to AC-QT.6.4 measured.
 - **Query speed step 5 (QT.5), started** (lane qs5): `Connection::set_join_methods` plans a connection's new
   statements by cost, with index nested loops only, or with hash joins only; `tests/join_methods.rs` (T-QT.5.1) runs
   inner, left, semi and anti joins with NULL and duplicate keys all three ways and against a model. The harness
