@@ -435,13 +435,15 @@ tests = [
   { id = "T-T1.12.P2", text = "A clock that steps back holds stamps at the last, each later than the one before, and is counted" },
   { id = "T-T1.12.P3", text = "Past their bound the two oldest marks merge and their seconds are refused as unknown" },
   { id = "T-T1.12.P4", text = "Archive keys round-trip through their text, in the store's order" },
-  { id = "T-T1.12.P5", text = "A second is located in the segment whose marks reach it; before the first mark, past what is whole, and in an unstamped stretch it is refused" },
+  { id = "T-T1.12.P5", text = "A second is located in the segment whose marks reach it, or in the quiet stretch before the next segment's first mark; before the first mark, past what is whole, and in an unstamped stretch it is refused" },
   { id = "T-T1.12.P6", text = "The cut is the last mark at or before the second; an unstamped stretch after it is refused" },
   { id = "T-T1.12.P7", text = "The chain takes the latest base on an unbroken log; a gap or a missing tail ends the walk" },
   { id = "T-T1.12.P8", text = "Retention lets go of what precedes the base the oldest kept second needs" },
   { id = "T-T1.12.P9", text = "A base is due with none, after a break, once the log outweighs it, and once a restore at measured rates would pass 30 minutes" },
   { id = "T-T1.12.P10", text = "An archive object round-trips; a changed byte is refused" },
   { id = "AMPHORA-BLOBS", text = "The Blobs seam's conformance suite (AMPHORA-BLOBS-1 to 7) passes on SimBlobs" },
+]
+
 # lane audit-log: Amphora's own IDs for G10 step 3 (kiln plan 01a16b0f47577325bcd9e51383067e04),
 # serving AC-T1.7.4 (docs/design/audit.md).
 
