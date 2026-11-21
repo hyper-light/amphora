@@ -10012,6 +10012,7 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         where_clause: None,
         index_method: None,
         on_conflict: None,
+        state: crate::schema::IndexState::Public,
     };
 
     pager.begin_read_tx().unwrap();
