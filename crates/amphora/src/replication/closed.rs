@@ -121,13 +121,16 @@ pub(crate) fn recorded(db: &Db) -> anyhow::Result<Option<u64>> {
         return Ok(None);
     }
     let mut time = None;
-    db.query("SELECT micros FROM __amphora_closed WHERE id = 1", [], |row| {
-        time = Some(u64::try_from(
-            row.get::<i64>(0)
-                .map_err(|e| anyhow::anyhow!("{e}"))?,
-        )?);
-        Ok(false)
-    })?;
+    db.query(
+        "SELECT micros FROM __amphora_closed WHERE id = 1",
+        [],
+        |row| {
+            time = Some(u64::try_from(
+                row.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?,
+            )?);
+            Ok(false)
+        },
+    )?;
     Ok(time)
 }
 
@@ -193,13 +196,37 @@ mod tests {
     #[test]
     fn times_rise_strictly_whatever_the_stamps_say() {
         let first = next(None, Some(100), true).unwrap();
-        assert_eq!(first, Next { time: Some(100), lifted: false });
+        assert_eq!(
+            first,
+            Next {
+                time: Some(100),
+                lifted: false
+            }
+        );
         let ahead = next(Some(100), Some(250), true).unwrap();
-        assert_eq!(ahead, Next { time: Some(250), lifted: false });
+        assert_eq!(
+            ahead,
+            Next {
+                time: Some(250),
+                lifted: false
+            }
+        );
         let behind = next(Some(250), Some(40), true).unwrap();
-        assert_eq!(behind, Next { time: Some(251), lifted: true });
+        assert_eq!(
+            behind,
+            Next {
+                time: Some(251),
+                lifted: true
+            }
+        );
         let equal = next(Some(251), Some(251), true).unwrap();
-        assert_eq!(equal, Next { time: Some(252), lifted: true });
+        assert_eq!(
+            equal,
+            Next {
+                time: Some(252),
+                lifted: true
+            }
+        );
         // An unstamped entry that changes state, once there is a time.
         assert_eq!(next(Some(252), None, true).unwrap().time, Some(253));
         // One that changes nothing, and any before the first stamp.

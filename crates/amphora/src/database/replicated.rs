@@ -150,12 +150,7 @@ impl Client {
     /// (the time a read found too old, if one did), on the caller's thread, until `until`
     /// (replication.md, "Follower reads at a closed time"). Refused Timeout at the deadline, and
     /// Fenced once the owner ended or is fenced.
-    fn wait_closed(
-        &self,
-        at_least: u64,
-        seen: Option<u64>,
-        until: Instant,
-    ) -> Result<(), Refusal> {
+    fn wait_closed(&self, at_least: u64, seen: Option<u64>, until: Instant) -> Result<(), Refusal> {
         let shared = &self.handle.shared;
         let mut closed = locked(&shared.closed)?;
         loop {

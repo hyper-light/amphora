@@ -1092,8 +1092,7 @@ impl StateMachine for Machine {
     /// commit, held or classic, and a restart that finds it past the member's log opens the log at
     /// the machine's point (durable.md §4.3).
     fn acts_at_start(&self, entry: &EntryRef<'_>) -> bool {
-        !self.replicated
-            || closed::open(entry.data).is_ok_and(|(_, data)| bootstrap::is_seed(data))
+        !self.replicated || closed::open(entry.data).is_ok_and(|(_, data)| bootstrap::is_seed(data))
     }
 
     fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {

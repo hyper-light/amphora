@@ -35,9 +35,9 @@ where
         answers.push(ask(first));
         for handle in spawned {
             answers.push(
-                handle
-                    .join()
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("a search partition's thread panicked"))),
+                handle.join().unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!("a search partition's thread panicked"))
+                }),
             );
         }
         answers.into_iter().collect()

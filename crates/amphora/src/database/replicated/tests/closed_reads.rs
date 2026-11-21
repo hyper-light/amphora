@@ -73,7 +73,11 @@ fn no_read_under_leader_changes_sees_a_version_past_its_time() {
 
     for (time, seen) in &reads {
         let k = u8::try_from(seen.len()).unwrap();
-        assert_eq!(*seen, (1..=k).collect::<Vec<u8>>(), "a read at {time} saw a gap");
+        assert_eq!(
+            *seen,
+            (1..=k).collect::<Vec<u8>>(),
+            "a read at {time} saw a gap"
+        );
     }
     for (a, seen_a) in &reads {
         for (b, seen_b) in &reads {
@@ -88,13 +92,18 @@ fn no_read_under_leader_changes_sees_a_version_past_its_time() {
         }
     }
     assert!(
-        reads.iter().any(|(_, seen)| seen.len() == usize::from(value)),
+        reads
+            .iter()
+            .any(|(_, seen)| seen.len() == usize::from(value)),
         "no read saw every write"
     );
     let lifted: u64 = (0..clients.len())
         .map(|owner| driven.owner(owner).replica.machine().lifted())
         .sum();
-    assert!(lifted > 0, "no leader's stamp was behind its predecessor's time");
+    assert!(
+        lifted > 0,
+        "no leader's stamp was behind its predecessor's time"
+    );
 }
 
 /// T-T1.10.C2 (AC-T1.10.C2, C3): a read that waits for its time. Do: three voters, 1 written and
@@ -123,15 +132,22 @@ fn a_follower_read_waits_for_its_time_and_is_refused_past_its_deadline() {
     assert_eq!(seen, vec![1]);
     let asked = time + 1;
     let reader = clients.get(follower).unwrap().clone();
-    let waiting =
-        std::thread::spawn(move || read_at(&reader, asked, Instant::now() + HANG_READ));
+    let waiting = std::thread::spawn(move || read_at(&reader, asked, Instant::now() + HANG_READ));
     write(&mut driven, &mut pump, clients.get(leader).unwrap(), 2);
     catch_up(&mut driven, &mut pump, &clients, leader, follower);
     let (seen, answered) = waiting.join().unwrap().unwrap();
     assert_eq!(seen, vec![1, 2]);
-    assert!(answered >= asked, "answered at {answered}, asked at {asked}");
     assert!(
-        clients.get(follower).unwrap().closed_lag().unwrap().is_some(),
+        answered >= asked,
+        "answered at {answered}, asked at {asked}"
+    );
+    assert!(
+        clients
+            .get(follower)
+            .unwrap()
+            .closed_lag()
+            .unwrap()
+            .is_some(),
         "the follower measured no lag"
     );
     let ahead = super::wall_micros().unwrap() + HOUR;
