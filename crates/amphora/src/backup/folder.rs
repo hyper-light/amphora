@@ -101,7 +101,11 @@ fn decode(name: &str) -> Option<(char, String)> {
         }
     }
     let segment = String::from_utf8(bytes).ok()?;
-    (encode(kind, &segment).ok()?.as_str() == name).then_some((kind, segment))
+    if encode(kind, &segment).ok()?.as_str() == name {
+        Some((kind, segment))
+    } else {
+        None
+    }
 }
 
 /// Flushes a directory's entries (the fsync(2) quote above). Windows has no portable way to open a

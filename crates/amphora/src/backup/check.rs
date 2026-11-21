@@ -141,7 +141,11 @@ pub fn newest_second(
     let through = segments.iter().map(|s| s.through).max().unwrap_or(0);
     // A second `s` is whole once the archive is whole through its end, `s * SECOND_NS`.
     let newest = through / SECOND_NS;
-    Ok((newest >= second_of(first)).then_some(newest))
+    Ok(if newest >= second_of(first) {
+        Some(newest)
+    } else {
+        None
+    })
 }
 
 /// Whether a check is due: the archive's cadence sets it, never a timer. One is due when a base
