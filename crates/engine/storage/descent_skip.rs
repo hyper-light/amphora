@@ -1065,19 +1065,21 @@ mod tests {
     }
 
     /// T-G3.5.2: over a table's complete fences, the locator names exactly the leaf a descent
-    /// finds for every rowid, present or absent between leaves, and its fit splits a table whose
-    /// leaves fill unevenly into more than one segment.
+    /// finds for every rowid, present or absent between leaves; and over a table whose rowids are
+    /// dense for a while and then sparse (one line misses by a quarter of the leaves, two are
+    /// near exact), its fit keeps more than one segment. (Rowids with random gaps spread evenly are
+    /// a random walk around one line: there more segments don't pay, and the fit keeps one.)
     #[test]
     fn t_g3_5_2_locator_names_the_descents_leaf() {
         let mut rng = ChaCha8Rng::seed_from_u64(0x0050_5235_0002);
         let mut pages = Pages::default();
         let tree = Tree::new(&mut pages, 8);
         let mut next = 0i64;
-        for _ in 0..4000 {
-            next += if rng.random_range(0..50) == 0 {
-                1000
-            } else {
+        for row in 0..4000 {
+            next += if row < 2000 {
                 rng.random_range(1..3)
+            } else {
+                rng.random_range(40..60)
             };
             tree.insert(&mut pages, next, 0);
         }
