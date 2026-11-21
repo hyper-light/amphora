@@ -1404,14 +1404,14 @@ impl BTreeCursor {
             hook.uncached();
             return Ok(false);
         }
-        let cells = match crate::storage::descent_skip::table_leaf_span(page.get_contents(), page_id)
-        {
-            Some(leaf) if leaf.covers(&rowid) => leaf.cells,
-            _ => {
-                hook.refute(self.descent_skip, self.root_page, page_id);
-                return Ok(false);
-            }
-        };
+        let cells =
+            match crate::storage::descent_skip::table_leaf_span(page.get_contents(), page_id) {
+                Some(leaf) if leaf.covers(&rowid) => leaf.cells,
+                _ => {
+                    hook.refute(self.descent_skip, self.root_page, page_id);
+                    return Ok(false);
+                }
+            };
         hook.confirm(self.descent_skip, self.root_page);
         self.stack.clear();
         self.going_upwards = false;
@@ -2739,13 +2739,13 @@ impl BTreeCursor {
             } else if one_leaf {
                 true
             } else {
-            match self.try_start_seek_on_current_table_leaf(rowid, seek_op)? {
-                CurrentTableLeafSeek::SearchFromRoot => true,
-                CurrentTableLeafSeek::SearchCurrentLeaf => false,
-                CurrentTableLeafSeek::NotFoundAtEnd => {
-                    return Ok(IOResult::Done(SeekResult::NotFound));
+                match self.try_start_seek_on_current_table_leaf(rowid, seek_op)? {
+                    CurrentTableLeafSeek::SearchFromRoot => true,
+                    CurrentTableLeafSeek::SearchCurrentLeaf => false,
+                    CurrentTableLeafSeek::NotFoundAtEnd => {
+                        return Ok(IOResult::Done(SeekResult::NotFound));
+                    }
                 }
-            }
             }
         } else {
             matches!(

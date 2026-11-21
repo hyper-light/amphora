@@ -830,6 +830,8 @@ tests = [
   { id = "T-G3.5.1", text = "storage::descent_skip::tests::t_g3_5_1_* — passes when every lookup through the adaptive hash and the learned locator, under random inserts, deletes, splits and merges over pages two tables share, returns the row a plain descent returns" },
   { id = "T-G3.5.2", text = "storage::descent_skip::tests::t_g3_5_2_* — passes when, over a table's complete fences, the locator names the leaf a descent finds for every covered rowid" },
   { id = "T-G3.5.3", text = "storage::descent_skip::tests::engine::t_g3_5_3_* — passes when, on a real rowid table through committed rounds of inserts and range deletes, each prototype's page proven by its bytes gives the leaf and cell a cursor's descent stands on, or none when it finds none" },
+  # lane g3s5-2: the cursor hook.
+  { id = "T-G3.5.4", text = "storage::descent_skip::tests::engine::t_g3_5_4_* — passes when, through the real cursor on two connections writing in turns at different snapshots (inserts, splits, range deletes), every seek with each AMPHORA_DESCENT_SKIP setting stands on the leaf and cell, and returns the row, the plain descent does, every step after it reaches the same row, and the hook counts seeks that stood on a named leaf under both prototypes" },
 ]
 
 # lane regions (G14 step 1, CP-T1.11; docs/design/regions.md): no new IDs. It serves AC-T1.11.4

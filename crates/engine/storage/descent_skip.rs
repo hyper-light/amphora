@@ -724,13 +724,12 @@ pub enum Switch {
 
 /// The switch as the environment sets it, read once; anything but `hash` or `locator` is off.
 pub(crate) fn switched() -> Switch {
-    static ON: crate::sync::LazyLock<Switch> = crate::sync::LazyLock::new(|| {
-        match std::env::var("AMPHORA_DESCENT_SKIP").as_deref() {
+    static ON: crate::sync::LazyLock<Switch> =
+        crate::sync::LazyLock::new(|| match std::env::var("AMPHORA_DESCENT_SKIP").as_deref() {
             Ok("hash") => Switch::Hash,
             Ok("locator") => Switch::Locator,
             _ => Switch::Off,
-        }
-    });
+        });
     *ON
 }
 
@@ -837,7 +836,13 @@ impl Hook {
     }
 
     /// The leaf the prototype names for `rowid` in the tree at `root`, for the cursor to prove.
-    pub(crate) fn name(&self, switch: Switch, root: i64, rowid: i64, wal: (u32, u64)) -> Option<u64> {
+    pub(crate) fn name(
+        &self,
+        switch: Switch,
+        root: i64,
+        rowid: i64,
+        wal: (u32, u64),
+    ) -> Option<u64> {
         let stamp = self.stamp(wal);
         let mut store = self.store.lock();
         store.sync(stamp);
@@ -1815,7 +1820,10 @@ mod tests {
                 }
                 let from = rng.random_range(0..next + 1);
                 conns[writer]
-                    .execute(format!("DELETE FROM t WHERE id BETWEEN {from} AND {}", from + 300))
+                    .execute(format!(
+                        "DELETE FROM t WHERE id BETWEEN {from} AND {}",
+                        from + 300
+                    ))
                     .unwrap();
                 conns[writer].execute("COMMIT").unwrap();
                 let root = root(&conns[writer]);
@@ -1855,7 +1863,11 @@ mod tests {
                             let why = format!("round {round} reader {reader} {switch:?} {rowid}");
                             assert_eq!(got, want, "{why}");
                             assert_eq!(cursor.position().last().copied(), want_at, "{why}");
-                            assert_eq!(pager.io.block(|| cursor.rowid()).unwrap(), want_row, "{why}");
+                            assert_eq!(
+                                pager.io.block(|| cursor.rowid()).unwrap(),
+                                want_row,
+                                "{why}"
+                            );
                             let got_step = match step {
                                 0 => Some(pager.io.block(|| cursor.next()).map(|_| ()).unwrap()),
                                 1 => Some(pager.io.block(|| cursor.prev()).map(|_| ()).unwrap()),
@@ -1875,9 +1887,18 @@ mod tests {
                     hook.prototype_counts(Switch::Locator),
                 );
                 // The prototypes' own counts are the last stamp's; the hook's span every stamp.
-                assert!(counts.stood_hash > 0, "connection {at}: hash never stood: {counts:?}");
-                assert!(counts.stood_locator > 0, "connection {at}: locator never stood: {counts:?}");
-                assert!(counts.stamp_drops > 0, "connection {at}'s stamp never moved: {counts:?}");
+                assert!(
+                    counts.stood_hash > 0,
+                    "connection {at}: hash never stood: {counts:?}"
+                );
+                assert!(
+                    counts.stood_locator > 0,
+                    "connection {at}: locator never stood: {counts:?}"
+                );
+                assert!(
+                    counts.stamp_drops > 0,
+                    "connection {at}'s stamp never moved: {counts:?}"
+                );
                 println!("connection {at}: {counts:?} hash {hash:?} locator {locator:?}");
             }
         }
