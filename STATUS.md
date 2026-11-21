@@ -86,6 +86,19 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   hurts: statements that write hundreds of pages, `insert_batch_100` at 32 clients 392 → 44 a
   second, `delete_range_insert` 2,800 → 1,011 (fedora, 2026-10-22, checks); single-row writes as
   before.
+- **Page reads without the log's shared locks** (G3 step 2, docs/design/store.md decision 40,
+  `crates/engine/storage/log_index.rs`), a prototype behind `AMPHORA_LOG_READ_INDEX`, off by
+  default: the log's header read from a seqlocked copy; a page the log doesn't hold answered from an
+  exact bitmap; the frame index read from a copy published per generation (`published`) or from
+  sharded latest-frame tables under version checks (`optimistic`). Built and tested (a model against
+  the locked index, crashes at every write of a checkpoint and restart); not yet measured, nor a way
+  chosen.
+- **The page path SQLite takes** (G3 step 3, docs/design/store.md decision 42), a prototype behind
+  `AMPHORA_PAGE_PATH=plain`, off by default: plain pin counts on a connection's own pages, a shared
+  page's buffer counted once as it enters a connection, file misses read in line with no completion
+  (Unix), the checksum checked once as a page enters the process. Built and tested (the shared-pages
+  model on the plain path; each path reads today's rows; a flipped byte refused on each path); not
+  yet measured. The miss still allocates the page and its buffer's `Arc`.
 - **The mixed log's commit costs** (docs/design/store.md, Decision (lane wal-read)): publishing a
   commit's records costs a lookup each, not a pass over the records kept decoded or over the
   commit's pages, and deltas are found a word at a time. Built, not merged; whether the bulk
@@ -211,6 +224,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   beside a cached page, built once the page's searches have paid for it, replaces a probe's decode
   and compare when the heads order the cell. Built and model-tested (T-PR.4.1); not yet measured
   (AC-PR.4.1, AC-PR.4.2).
+- **Skipping the descent** (docs/design/store.md decision 41, `crates/engine/storage/descent_skip.rs`;
+  G3 step 5, G3.5): two cores that name a point read's leaf without descending, each answer proven
+  by the leaf's own range: InnoDB's adaptive hash index, built a leaf at a time by a ski rental
+  counted in probes, and a learned rowid-to-leaf locator whose error bound is its own fit's. Built
+  and model-tested against a plain descent and on the engine's pages against the cursor (T-G3.5.1-3); not yet wired into the cursor
+  or measured (AC-G3.5.1, AC-G3.5.2; `descent_skip_bench` measures the cores).
 - **A shared page found in one lookup** (docs/design/store.md decision 22): the pool keeps each image
   in its map's entry and counts lookups in each shard, under the lock it holds anyway, where one
   count for the pool moved between 32 readers' cores at every lookup. Sharing 256 MiB at 32 clients:
@@ -285,8 +304,25 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   page now splits by bytes with the new cell counted (a split by count found no room once cells
   near the largest size gathered on one side). Trees made and dropped while running (`AC-NS.2.5`): a
   redo record each, a dropped tree's root listed as 0 in the checkpoint, both replayed; dropped
-  trees' pages stay unreferenced (the pool has no free list yet). Not yet: `sqlite_schema`, DDL and
-  ANALYZE on those trees, the connection's wiring, so the engine's suites don't yet run on it.
+  trees' pages stay unreferenced (the pool has no free list yet).
+- **The switch: SQL on the versioned storage** (G7 step 2, `AC-NS.2.1`, docs/design/engine.md
+  decision 13, `crates/engine/storage/versioned/{switch,sql}.rs`): `ConnectOpts::with_versioned_storage`
+  or `AMPHORA_STORAGE=versioned` puts a database's B-trees on the versioned storage; the executor's
+  cursors, CREATE/DROP TABLE and INDEX, DELETE without WHERE, `sqlite_schema` (tree 1) and ANALYZE
+  run on it, each SQL transaction one storage transaction. `sql.rs` (`T-NS.2.6`) runs the same SQL
+  on both storages and compares. Not yet: a file database reopened (recovery remakes every tree in
+  rowid order; the header stays the pager's), a statement's own rollback inside a transaction, DROP
+  undone by ROLLBACK, a pool past the page cache's bound; the engine's suites with the switch on are
+  the coordinator's run.
+- **Three ways to reach a cached page** (G7 step 3, `NS.3`; `crates/engine/storage/reach`,
+  `amphora-bench --reach`): behind one trait, sharing frames, CLOCK eviction and one miss path, (a) a
+  page table in shards with pins and a private pin on a client's current page (PostgreSQL), (b)
+  references by frame index read optimistically under a version, atomics standing in for
+  unsynchronized reads (LeanStore, Umbra), and (c) a direct array of frames by page number
+  (vmcache without the page table). Shards follow the machine's threads, the array the file's pages.
+  The model test with eviction under 32 threads (`T-NS.3.1`) passes on all three. Not yet: the
+  harness's runs (point reads and scans at 1 and 32 clients, cached and a pool a tenth of the file)
+  and the choice by their numbers, the coordinator's; misses read an in-memory stand-in for the file.
 - **Serializable validation, three prototypes behind one switch** (G8 step 1, docs/design/engine.md
   decision 5, `crates/engine/storage/versioned/{version,elle}.rs`, `amphora-bench --cc`): precision
   locking (the default), SSI and Silo-style OCC validate commits on the versioned storage's commit
@@ -382,9 +418,19 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   quorum patience's and the write slot's generations are learned from their own events (GN.1); and a generation of
   the database log's restarts ends once it alone covers its own spend at the p99.9, the next restart guessed by the
   worst of the last thousand holds (`log_bound::GENERATION` gone; replication.md, "Decision (lane constants): a
-  generation of restarts ends once it covers its spend"; GN.2). Left: an owner's other descriptors (endpoint, engine
-  files, a replica's log) charged by kind, the replicated owner's tick (`TICK`, twenty ticks an election), its queue
+  generation of restarts ends once it covers its spend"; GN.2); and the replicated owner's tick period is learned
+  from its voters' round trips, its flushes, its leader's link and its timer by hyper-timing's law, 10 ms only the
+  start state before they are measured (replication.md, "Decision (lane constants): the owner's tick pace"; TP.1).
+  Left: an owner's other descriptors (endpoint, engine files, a replica's log) charged by kind, the core's tick
+  counts (twenty an election, two a heartbeat: raft-rs's defaults, fixed in tick mode), the owner's queue
   and outgoing bounds and the log's compaction trigger, and the rest of the list (handoff/amphora-constants-list.md).
+- **Region-local groups under a global root** (CP-T1.11, G14 step 1, lane regions; `crates/amphora/src/regions.rs`,
+  docs/design/regions.md): members carry a region label; a regional group's voters and lead stay in its home
+  region, and the root spreads its voters so losing the regions it survives leaves a quorum (CockroachDB's
+  survival goals); a lost member is replaced from its region, never from another. Regional rows route to their
+  home region's directory, and reads try the reader's region first. The simulated lab (`regions::lab`, latencies
+  as its input) gives the same answers and rows at one node, three nodes and three regions. Open: the SQL corpus
+  at three regions on the replicated shell, the 60 ms lab's p99 (the coordinator's), the region-loss drill.
 - **Groups that split, merge and move themselves** (CP-T1.9, lane split-merge; `crates/amphora/src/reshard/`,
   docs/design/reshard.md): a pure core: a directory of hash spans with every position in exactly one group,
   each group's own holding (fenced, stale actions refused), a planner deciding from measured load, bytes and
@@ -400,7 +446,7 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   split-merge-6): an engine keeps a log of its commits and copies a span by position (`Engine::head`,
   `export`, `changed`, `import`, `keep_log`, `sweep`); the old group's log is held from the first copy
   until the operation ends; `Groups::carry` carries every driver action to this node's groups, so a split
-  or merge moves the range's rows (T-T1.9.R4), with the cutover-pause and lab harnesses (T-T1.9.P1, L1).
+  or merge moves the range's rows, through repeated actions and driver restarts (T-T1.9.R4, R5), with the cutover-pause and lab harnesses (T-T1.9.P1, L1).
   Left: `database::Local` as a group (its holding and log through a replicated command), moves across
   nodes, load from the store's meter, and the full AC-T1.9.2 and AC-T1.9.3 runs.
 
@@ -415,7 +461,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   row is refused. NOT NULL and CHECK are added to an existing column (`ALTER COLUMN c TO` its own
 definition plus the constraint) write-only, then validated in learned rowid batches, then public by
 a catalog change; the planner doesn't rely on an unvalidated NOT NULL, a breaking row undoes the
-change, and a power cut leaves the old schema or the new. DROP COLUMN is not yet built.
+change, and a power cut leaves the old schema or the new. DROP COLUMN is built PostgreSQL's way: one
+catalog change hides the column as a slot (no name finds it, `*` and inserts pass it, every write
+stores NULL in it), learned rowid batches clear its old values, then the drop is recorded.
 
 ## Measured
 
@@ -557,6 +605,28 @@ change, and a power cut leaves the old schema or the new. DROP COLUMN is not yet
   but not merged: with today's join costs it flips `records_plans`' one-row-lookup case to a hash join and a sort
   (the two plans cost about 110 each), so it waits for the learned costs, then the `rhs_has_selective_seek` gate removed, builds over joined inputs, PL.5's Bloom
   filters with LIP and predicate transfer, and sort-merge and prefetched index joins (G6 step 4).
+  Lane qs5-6: the planner no longer prices pages its cache holds as file reads. A tree's first reads are held at the
+  share of the connection's recent fetches that found their page cached (`Pager::page_miss_ratio`, over one to two
+  cache turnovers) times the part of the tree the cache has room for; reads past what the cache can keep are charged
+  whatever (`cost::file_reads`). `index_bonus` (a picked half page) is removed. `records_plans`' one-row-lookup join
+  now picks the scan and index searches it measured faster (1.75 ms against the hash join's 3.05 ms, jupiter, release).
+  Lane qs5-7: an automatic index, and a subquery's probe index, past its own cache (the default page cache its pager
+  gets) pays for the leaves it writes out and reads again, as a hash join's spill already paid; a search of an index
+  bigger than the cache keeps its inner pages held while they fit. Before, the automatic index cost CPU only and,
+  against a measured page read, beat a unique key's search and a hash join on tables the cache can't hold.
+  Left: `cache_reuse_factor` (a picked 0.2) and multi-index table fetches through `file_reads`; sampled operator times.
+- **G6 step 5, plans that read less, started** (lane g6s5): an `EXISTS` may now run as a hash semi join, chosen by
+  cost against the nested loop's early out: the outer rows build the hash table, the subquery's table probes it, and
+  `HashMarkFirstMatch` passes each build row on at its first match in a probe pass only (its matched bit, kept in
+  grace partitions when the table spills). `tests/hash_semi_join.rs` runs EXISTS queries with NULL and duplicate
+  keys under all three join methods, in memory and spilled, against a model. Sorted row fetches are a prototype behind
+  `Connection::set_sorted_fetches` (off by default): the chosen read of a non-covering index runs as a one-branch
+  multi-index read, its rowids sorted in a RowSet and the rows fetched in rowid order, kept when the existing
+  intersection cost says it is cheaper; `tests/sorted_fetch.rs` runs reads with it off and on. That cost counts the
+  fetch as the share of table pages, which assumes page locality: it should be learned before the switch goes on
+  by default. Index-only reads were already planned (covering indexes, expression indexes included). Left: the 2x
+  measurements on order_by_sort, exists_subquery and left_join_anti, and the sorted fetch's measurement against the
+  plain read (the coordinator's).
 - **The replicated class** (docs/design/replication.md, "Fast acknowledgement"; Ada's word 2026-11-01): built on
   t1/replicated-line, not on main (fast-ack, class-metrics, class-quorum and disk-stalls, merged in that order). A
   replicated database opened with `Durability::Replicated(Fates)` answers a write once members spanning the fates
@@ -645,8 +715,11 @@ change, and a power cut leaves the old schema or the new. DROP COLUMN is not yet
   table is planned as its mirrored LEFT JOIN, CD-C's commutativity rule, so the tables after it are no
   longer held behind its right table and the audit's 03-right-full-barrier reads tiny first (T-PL.8.1);
   an outer join's ON term that reads only earlier tables now counts in its join's estimate.
-  Not built: bushy plans over connected complement pairs with a composite hash-join build, and CD-C's
-  rules for outer, semi and anti joins in place of `required_lhs_by_table`; JOB's AC-PL.8.1 is open.
+  Lane pl8-3 (docs/design/planner.md "Decision (lane pl8-3)"): a LEFT JOIN's right table follows only
+  the tables its ON terms read (CD-C's left-asscom rule), answers held against SQLite (T-PL.8.2), and
+  `JoinN` carries a bushy shape (`inner_joins`) that left-deep plans leave empty.
+  Not built: bushy plans over connected complement pairs with a composite hash-join build, and semi
+  and anti joins placed before other loops (the emitter's no-match path); JOB's AC-PL.8.1 is open.
   PL.9 is built (lane pl9, docs/design/planner.md "row counts kept as rows change"): each table's
   rows inserted less deleted since ANALYZE are kept as writes finish (one atomic add a statement),
   the planner's row count follows them, and a prepared statement plans again once a table it counted

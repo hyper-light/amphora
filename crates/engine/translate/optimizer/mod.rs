@@ -3063,6 +3063,7 @@ fn find_table_access_plan(
         cost_limit,
         allow_automatic_index: resolver.join_methods() != crate::JoinMethods::NestedLoopsOnly,
         join_methods: resolver.join_methods(),
+        sorted_fetches: resolver.sorted_fetches(),
         row_goal,
     };
 
@@ -3278,6 +3279,7 @@ fn plan_unmatched_right_rows(
                 // In SQLite, `WHERE_RIGHT_JOIN` mode disables automatic indexes.
                 allow_automatic_index: false,
                 join_methods: resolver.join_methods(),
+                sorted_fetches: false,
                 row_goal: None,
             },
             &where_clause_for_unmatched_rows,
@@ -3558,6 +3560,14 @@ fn apply_table_access_plan(
         }
     }
 
+    // PL.8: the loops below run a left-deep plan; a bushy one's inner joins are built by the
+    // emitter's hash-join build inputs, which the search doesn't choose yet.
+    if !best_plan.is_left_deep() {
+        return Err(LimboError::InternalError(format!(
+            "PL.8: the bushy join plan {} reached the left-deep emitter",
+            best_plan.tree_text()?
+        )));
+    }
     let (best_access_methods, best_table_numbers) = (
         best_plan.best_access_methods().collect::<Vec<_>>(),
         best_plan.table_numbers().collect::<Vec<_>>(),

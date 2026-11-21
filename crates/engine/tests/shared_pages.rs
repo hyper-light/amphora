@@ -5,8 +5,8 @@
 //! written over, not a frame of a write rolled back (AC-T1.1.1, AC-T1.1.6).
 
 use amphora_engine::{
-    ConnectOpts, Connection, Database, DatabaseOpts, LogFormat, Numeric, OpenOptions, PlatformIO,
-    SqliteDialect, Value,
+    ConnectOpts, Connection, Database, DatabaseOpts, LogFormat, Numeric, OpenOptions, PagePath,
+    PlatformIO, SqliteDialect, Value,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -326,9 +326,19 @@ fn body(id: i64, version: u64, len: usize) -> String {
 /// rolls some back; checkpoints of every mode run; a random reader reads the table or rows by key,
 /// each read checked against a model.
 fn model(seed: u64, format: LogFormat) {
+    model_on(seed, format, PagePath::Today);
+}
+
+/// The model with every connection's reads on `path` (G3 step 3, decision 42).
+fn model_on(seed: u64, format: LogFormat, path: PagePath) {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), true);
     db.wal_format(format).unwrap();
+    let connect = |db: &Arc<Database>| {
+        let conn = connect(db);
+        conn.get_pager().set_page_path(path);
+        conn
+    };
     let writer = connect(&db);
     writer.execute("PRAGMA cache_size = 200").unwrap();
     writer
@@ -511,4 +521,139 @@ fn databases_sharing_one_pool_read_only_their_own_pages() {
     }
     assert!(pool.len() <= pool.capacity());
     assert_eq!(a.shared_page_counts(), b.shared_page_counts());
+}
+
+/// G3 step 3 (decision 42): do the shared-pages model's 300 steps for 16 seeds with every
+/// connection on the plain page path (plain pins, the pool's buffer counted once, misses read in
+/// line). Expect: every read the model's, and pages shared.
+#[test]
+fn g3s3_readers_on_the_plain_page_path_never_read_a_version_they_dont_see() {
+    for seed in 0..16 {
+        model_on(seed, LogFormat::Pages, PagePath::Plain);
+    }
+}
+
+/// The same on a mixed log.
+#[test]
+fn g3s3_readers_on_the_plain_page_path_read_a_mixed_log_as_the_model_says() {
+    for seed in 0..16 {
+        model_on(seed, LogFormat::Mixed, PagePath::Plain);
+    }
+}
+
+/// G3 step 3: do read a table from the log, then from the file after a checkpoint, then again from
+/// memory, on connections of each page path, with and without shared pages. Expect: every path
+/// reads the same rows as today's.
+#[test]
+fn g3s3_each_page_path_reads_the_pages_todays_path_reads() {
+    for share in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(dir.path(), share);
+        table(&connect(&db), 3000);
+        for checkpoint in [false, true] {
+            if checkpoint {
+                connect(&db)
+                    .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .unwrap();
+            }
+            let on = |path: PagePath| {
+                let conn = connect(&db);
+                conn.get_pager().set_page_path(path);
+                conn
+            };
+            let (today, plain) = (on(PagePath::Today), on(PagePath::Plain));
+            for round in 0..2 {
+                let want = rows(&today, "SELECT id, v FROM t ORDER BY id");
+                assert_eq!(want.len(), 3000);
+                let got = rows(&plain, "SELECT id, v FROM t ORDER BY id");
+                assert!(
+                    got == want,
+                    "share {share}, checkpointed {checkpoint}, round {round}: the plain path read other rows"
+                );
+                for id in [1, 2, 1500, 2999, 3000] {
+                    let sql = format!("SELECT id, v FROM t WHERE id = {id}");
+                    assert_eq!(rows(&plain, &sql), rows(&today, &sql), "row {id}");
+                }
+            }
+        }
+    }
+}
+
+/// G3 step 3 (AC: a byte flipped on disk is still refused when read from the file): do write a
+/// table, checkpoint it into the file, flip one byte of a page of the file, then read it through a
+/// fresh connection on each page path, with and without shared pages. Expect: refused with a
+/// checksum error each time.
+#[test]
+fn g3s3_a_byte_flipped_on_disk_is_refused_on_each_page_path() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open(dir.path(), false);
+        let conn = connect(&db);
+        table(&conn, 3000);
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+    let mut bytes = std::fs::read(dir.path().join("shared.db")).unwrap();
+    let page_size = 4096usize;
+    // A byte in the middle of the table's root page (page 2), far from its checksum.
+    let at = page_size + page_size / 2;
+    bytes[at] ^= 0xff;
+    for (n, (share, path)) in [
+        (false, PagePath::Today),
+        (false, PagePath::Plain),
+        (true, PagePath::Today),
+        (true, PagePath::Plain),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let copy = tempfile::tempdir().unwrap();
+        std::fs::write(copy.path().join("shared.db"), &bytes).unwrap();
+        let db = open(copy.path(), share);
+        let conn = connect(&db);
+        conn.get_pager().set_page_path(path);
+        let read = conn
+            .prepare("SELECT count(*), max(v) FROM t")
+            .and_then(|mut stmt| stmt.run_collect_rows());
+        let err = read.expect_err(&format!("case {n}: the flipped page was read"));
+        assert!(
+            err.to_string().contains("Checksum mismatch"),
+            "case {n} ({share}, {path:?}): {err}"
+        );
+    }
+}
+
+/// G3 step 3 (decision 42): do read a table four times larger than a 200-page cache from the file,
+/// twice, on a connection on the plain path and one on today's, without shared pages. Expect: the
+/// same rows, and the plain path's misses read into the pages its evictions left (pcache1's
+/// recycled pages) rather than new ones.
+#[test]
+fn g3s3_plain_misses_read_into_the_pages_evictions_leave() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), false);
+    table(&connect(&db), 16000);
+    connect(&db)
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let on = |path: PagePath| {
+        let conn = connect(&db);
+        conn.execute("PRAGMA cache_size = 200").unwrap();
+        conn.get_pager().set_page_path(path);
+        conn
+    };
+    let (today, plain) = (on(PagePath::Today), on(PagePath::Plain));
+    for round in 0..2 {
+        let want = rows(&today, "SELECT id, v FROM t ORDER BY id");
+        assert_eq!(want.len(), 16000);
+        assert!(
+            rows(&plain, "SELECT id, v FROM t ORDER BY id") == want,
+            "round {round}: the plain path read other rows"
+        );
+    }
+    let recycled = plain.get_pager().recycled_pages();
+    assert!(
+        recycled > 200,
+        "misses past the cache recycled {recycled} pages"
+    );
+    assert_eq!(today.get_pager().recycled_pages(), 0);
 }

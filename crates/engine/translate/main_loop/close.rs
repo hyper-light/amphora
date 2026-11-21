@@ -38,9 +38,9 @@ impl CloseLoop {
             // SEMI/ANTI-JOIN: emit Goto -> outer_next right after the body.
             // For semi-join: after body runs (one match found), skip inner's Next.
             // For anti-join: after body runs (inner exhausted), move to next outer row.
-            let is_hash_anti = matches!(table.op, Operation::HashJoin(ref hj) if
-                hj.join_type == HashJoinType::LeftAnti);
-            let uses_nested_semi_or_anti = !is_hash_anti
+            let is_hash_semi_or_anti = matches!(table.op, Operation::HashJoin(ref hj) if
+                matches!(hj.join_type, HashJoinType::LeftAnti | HashJoinType::LeftSemi));
+            let uses_nested_semi_or_anti = !is_hash_semi_or_anti
                 && table
                     .join_info
                     .as_ref()

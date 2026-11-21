@@ -1388,6 +1388,48 @@ join (those need a bushy plan: `(a JOIN b) RIGHT JOIN c` is `c LEFT JOIN (a JOIN
 `answers.py`) for a RIGHT JOIN led by one table; or such a plan slower than its parent's on the
 bench suite beyond the passes' spread.
 
+## Decision (lane pl8-3): a LEFT JOIN's right table follows the tables its ON terms read
+
+**Decision.** PL.8, CD-C's conflict rules for the left-deep orders the search makes
+(`optimizer/join.rs`, `required_lhs_by_table`). A LEFT JOIN's right table must follow the tables
+its ON terms read (CD-C's syntactic eligibility set), no longer every table before it in the FROM
+list: `a JOIN e ON e.x = a.x LEFT JOIN b ON b.y = a.y` may read a, b, e. When its ON terms read no
+table of its left side (`ON 1`, `ON b.x = 5`), CD-C keeps its whole left side before it, as before.
+A semi, anti, FULL, CROSS or LATERAL join's table keeps every table before it, and a RIGHT or FULL
+JOIN stays a barrier both ways, as before. Beside it, `JoinN` gains the bushy shape
+(`inner_joins`, `JoinN::tree`): runs of its tables joined among themselves first, empty for
+today's left-deep plans; the left-deep emitter refuses a bushy plan with a typed error.
+
+**Why.** Moving a LEFT JOIN's right table b ahead of a table e of its left side is the
+left-asscom rule `(e1 LEFT JOIN b) op e = (e1 op e) LEFT JOIN b`, which CD-C holds for op an inner,
+left, semi or anti join whose term doesn't read b. A table whose term reads b follows b by that
+term, and a WHERE term on b runs where its tables are read, after b's NULL row, as SQLite runs it.
+Semi and anti joins keep their place for the emitter's sake, not the algebra's: their no-match path
+jumps into the row's body (`main_loop/close.rs`), so their tables must be the last loops.
+
+**Sources.** Moerkotte, Fender and Eich, "On the correct and complete enumeration of the core
+search space", SIGMOD 2013 (f25): the operator properties table (left-asscom holds among inner,
+left outer, semi and anti joins) and CD-C's conflict rules.
+
+**Evidence.** `crates/engine/tests/join_search.rs`'s
+`t_pl_8_2_outer_semi_and_anti_joins_keep_their_answers` (T-PL.8.2): twelve queries (a LEFT JOIN
+reading only the first table after an inner join, two LEFT JOINs off one table, an inner join
+reading the null-extended table, ON terms reading no left table, a WHERE term on the NULL row, an
+aggregate, EXISTS and NOT EXISTS over them) answer as SQLite does, worked by hand from the rows.
+`optimizer/join.rs`'s `t_pl_8_bushy_shape_holds_left_deep_and_bushy_trees`: a left-deep plan reads
+as the chain, nested and side-by-side runs as subtrees, runs that don't nest are refused. Every
+planner suite (`planner`, `join_search`, `oracle_findings`, `nested_loops`, `records_plans`, the
+optimizer's unit tests) passes unchanged.
+
+**Not yet built.** The emitter's hash join whose build side is a join of tables that aren't the
+plan's leading ones (extending `MaterializedBuildInput`), DPccp's connected complement pairs on an
+explicit stack with a budget derived from the plan-time target, and semi and anti join tables
+placed before other loops (the emitter's no-match path first).
+
+**Falsified by.** An answer that changes against SQLite (the oracles' DQP, TLP and NoREC, and
+`answers.py`) for a query with a LEFT JOIN; or such a plan slower than its parent's on the bench
+suite beyond the passes' spread.
+
 ## Decision (lane pl12): custom plans, then a generic one, for prepared statements
 
 **Decision.** PL.12 (docs/research/planner.md section 9, rank 12; `crates/engine/plan_cache.rs`).

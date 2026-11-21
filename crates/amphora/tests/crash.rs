@@ -1679,3 +1679,122 @@ fn t_t1_12_1_a_power_cut_at_every_step_of_an_online_constraint_leaves_old_or_new
         "old schema after {old} cuts, new after {new}"
     );
 }
+
+/// T-T1.12.1's drop: 300 rows of `t` with a column `b` (its default in every row), made durable.
+fn drop_baseline() -> HashMap<String, Vec<u8>> {
+    let disk = Disk::new(0, HashMap::new());
+    let mut db = Db::open_with(std::path::Path::new(ONLINE_PATH), disk.clone()).unwrap();
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT NOT NULL DEFAULT 'kept'); CREATE TABLE __amphora_migrations (name TEXT PRIMARY KEY, sql TEXT NOT NULL)").unwrap();
+    db.transaction(|db| {
+        for i in 0..ONLINE_ROWS {
+            db.query(
+                "INSERT INTO t (a) VALUES (?1)",
+                [Value::from_i64(i % 31)],
+                |_| Ok(true),
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    db.flusher()().unwrap();
+    drop(db);
+    disk.image()
+}
+
+/// T-T1.12.1's drop: `b` dropped online from the same rows, each step and each write between
+/// them made durable, stopping at the first failure.
+fn drop_run(db: &mut Db) -> anyhow::Result<()> {
+    let plan = amphora::database::online::Plan::parse(&amphora_api::Migration {
+        name: "dc".into(),
+        sql: "ALTER TABLE t DROP COLUMN b".into(),
+    })
+    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    online_steps(db, &plan)
+}
+
+/// The schema after a restart: the old one (`b` found by name, its migration unrecorded) or the
+/// new (`b` found by no name, `*` passing it; recorded once the clear ended, unrecorded while it
+/// is under way). Never `b` found by name with its drop recorded, nor a record of the drop with
+/// its change still kept. Returns whether `b` is dropped, and whether the drop is recorded.
+fn drop_check(db: &mut Db) -> Result<(bool, bool), String> {
+    let mut check = String::new();
+    db.query("PRAGMA integrity_check", [], |r| {
+        check = r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(true)
+    })
+    .map_err(|e| format!("integrity_check: {e:#}"))?;
+    if check != "ok" {
+        return Err(format!("integrity_check: {check}"));
+    }
+    let migrated = count(
+        db,
+        "SELECT count(*) FROM __amphora_migrations WHERE name = 'dc'",
+        vec![],
+    )? == 1;
+    let named = db.column_count("SELECT b FROM t").is_ok();
+    let star = db
+        .column_count("SELECT * FROM t")
+        .map_err(|e| format!("SELECT *: {e:#}"))?;
+    if named != (star == 3) {
+        return Err(format!("b found by name {named}, yet * has {star} columns"));
+    }
+    let kept = count(
+        db,
+        "SELECT count(*) FROM sqlite_schema WHERE name = '__amphora_schema_changes'",
+        vec![],
+    )? == 1
+        && count(
+            db,
+            "SELECT count(*) FROM __amphora_schema_changes WHERE name = 'dc'",
+            vec![],
+        )? == 1;
+    match (migrated, named, kept) {
+        (true, true, _) => Err("the drop is recorded, b is found by name".into()),
+        (true, false, true) => Err("the drop is recorded and its change still kept".into()),
+        (false, false, false) => Err("b is dropped with neither its change nor its record".into()),
+        (false, true, true) => Err("b is found by name while its drop is under way".into()),
+        (migrated, named, _) => Ok((!named, migrated)),
+    }
+}
+
+/// T-T1.12.1, a drop: a power cut at every change dropping `b` online makes (the switch-over, each
+/// clearing batch, each write between them, each flush), then the restart. Expect: the old schema
+/// or the new, never both or neither, the integrity check passing; and the change, carried on,
+/// ends with `b` dropped and its drop recorded.
+#[test]
+fn t_t1_12_1_a_power_cut_at_every_step_of_an_online_drop_leaves_old_or_new() {
+    let baseline = drop_baseline();
+    let path = std::path::Path::new(ONLINE_PATH);
+    let disk = Disk::new(0, baseline.clone());
+    let mut db = Db::open_with(path, disk.clone()).unwrap();
+    disk.arm(u64::MAX);
+    drop_run(&mut db).unwrap();
+    let changes = disk.changes.load(Ordering::SeqCst);
+    drop(db);
+    assert!(changes > 20, "the run made only {changes} changes");
+    let (mut old, mut new) = (0u64, 0u64);
+    for at in 1..=changes {
+        let disk = Disk::new(at, baseline.clone());
+        let mut db = Db::open_with(path, disk.clone()).unwrap();
+        disk.arm(at);
+        let ran = drop_run(&mut db);
+        drop(db);
+        let image = disk.image();
+        let mut db = Db::open_with(path, Disk::new(at, image)).unwrap();
+        match drop_check(&mut db) {
+            Ok((true, _)) => new += 1,
+            Ok((false, _)) => old += 1,
+            Err(e) => panic!("cut at change {at} of {changes} ({ran:?}): {e}"),
+        }
+        drop_run(&mut db).unwrap_or_else(|e| panic!("cut at change {at}: carrying on: {e:#}"));
+        assert_eq!(
+            drop_check(&mut db),
+            Ok((true, true)),
+            "cut at change {at}: carried on"
+        );
+    }
+    assert!(
+        old > 0 && new > 0,
+        "old schema after {old} cuts, new after {new}"
+    );
+}

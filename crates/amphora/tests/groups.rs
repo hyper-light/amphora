@@ -689,6 +689,111 @@ fn t_t1_9_r4_a_split_copies_the_moving_ranges_rows_and_a_merge_brings_them_back(
     every_key_in_its_group(&groups, &keys, &acked);
 }
 
+/// T-T1.9.R5 (CP-T1.9 step 3; the driver's contract, docs/design/reshard.md): the split and merge
+/// of T-T1.9.R4 with every action carried out twice at the real groups (the first answer lost) and
+/// the driver restarted from the directory as it is durable, its stale
+/// actions still carried (third action, sixth, twelfth, each restart twice as far as the one before);
+/// expect each operation still to end flipped, every acknowledged write read
+/// back from exactly one group, and after the merge the one group left holding every row.
+#[test]
+fn t_t1_9_r5_repeated_actions_and_driver_restarts_move_every_row_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let directory = Directory::new(NodeId(0));
+    let config = Config {
+        commit_rows: 4,
+        ..Config::default()
+    };
+    let groups = Groups::on(&directory, config, |g| events(dir.path(), &g.0.to_string())).unwrap();
+    let keys: Vec<String> = (0..64).map(|i| format!("k{i}")).collect();
+    let mut acked = vec![0i64; keys.len()];
+    for (i, key) in keys.iter().enumerate() {
+        let t = groups.put(vec![row(key, 0)]).unwrap();
+        groups.durable(&t, soon()).unwrap();
+        acked[i] = 1;
+    }
+    let mut durable = directory.clone();
+    let mut epoch = 1;
+    let (mut driver, _) = Driver::recover(directory, epoch).unwrap();
+    let mut next = 0usize;
+    let mut stale: Vec<amphora::reshard::driver::Action> = Vec::new();
+    for proposal in [
+        Proposal::Split {
+            group: GroupId(0),
+            at: 1 << 62,
+        },
+        Proposal::Merge {
+            from: GroupId(1),
+            into: GroupId(0),
+        },
+    ] {
+        let mut pending: std::collections::VecDeque<Out> = driver.begin(&proposal).unwrap().into();
+        let mut ended = 0;
+        let mut carried = 0u64;
+        let mut restart_at = 3u64;
+        while let Some(o) = pending.pop_front() {
+            match o {
+                Out::Commit(c) => {
+                    durable.apply(&c).unwrap();
+                    groups.route(&durable).unwrap();
+                }
+                Out::Send(a) => {
+                    let i = next % keys.len();
+                    next += 1;
+                    match groups.put(vec![row(&keys[i], acked[i])]) {
+                        Ok(t) => {
+                            groups.durable(&t, soon()).unwrap();
+                            acked[i] += 1;
+                        }
+                        Err(Refused::Away(_)) => {}
+                        Err(e) => panic!("a write refused: {e:?}"),
+                    }
+                    let make = |g: GroupId| events(dir.path(), &g.0.to_string());
+                    let _lost = groups.carry(&a, soon(), make).unwrap();
+                    // A stale action from a driver before the restart, carried late: harmless.
+                    if let Some(old) = stale.pop() {
+                        let _ = groups.carry(&old, soon(), make).unwrap();
+                    }
+                    let reply = groups.carry(&a, soon(), make).unwrap();
+                    carried += 1;
+                    // Restarts at actions 3, 6, 12, 24, ...: each driver after one gets twice
+                    // as far before the next, so the operation gets past every stage (a driver
+                    // restarted every few actions for ever can't finish a catch-up round).
+                    if carried == restart_at {
+                        restart_at *= 2;
+                        epoch += 1;
+                        stale.push(a);
+                        let (d, out) = Driver::recover(durable.clone(), epoch).unwrap();
+                        driver = d;
+                        pending = out.into();
+                        continue;
+                    }
+                    pending.extend(
+                        driver
+                            .answer(Answer {
+                                ask: a.ask,
+                                op: a.op,
+                                reply,
+                            })
+                            .unwrap(),
+                    );
+                }
+                Out::Ended(e) => {
+                    assert!(e.done, "operation given up: {e:?}");
+                    ended += 1;
+                }
+            }
+        }
+        assert_eq!(ended, 1);
+        assert!(driver.idle());
+        every_key_in_its_group(&groups, &keys, &acked);
+    }
+    assert_eq!(groups.len(), 1);
+    assert_eq!(
+        groups.holding_of(GroupId(0)).unwrap().owned(),
+        Some(Span::ALL)
+    );
+}
+
 /// What a lab run saw: the operations that ended, flipped, and each cutover's pause (from the old
 /// group's fence carried out to the new group's taking the span up: the time the span took no
 /// writes), and the longest a client's write waited on a refusal before it was acknowledged.

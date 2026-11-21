@@ -490,6 +490,7 @@ enum StatsRefresh {
 pub struct ConnectOpts {
     encryption_key: Option<EncryptionKey>,
     page_codec: Option<Arc<dyn PageCodec>>,
+    versioned: bool,
 }
 
 #[expect(
@@ -503,6 +504,7 @@ impl ConnectOpts {
         Self {
             encryption_key: None,
             page_codec: None,
+            versioned: false,
         }
     }
 
@@ -518,6 +520,14 @@ impl ConnectOpts {
     /// for this connection and is not cached on the shared `Database`.
     pub fn with_page_codec(mut self, page_codec: Arc<dyn PageCodec>) -> Self {
         self.page_codec = Some(page_codec);
+        self
+    }
+
+    /// Amphora (G7 step 2, `AC-NS.2.1`): puts the database's B-trees on the versioned storage
+    /// (`storage::versioned::switch`), made by the first connection that asks; every connection
+    /// made after it uses it too. `AMPHORA_STORAGE=versioned` asks the same for every connection.
+    pub fn with_versioned_storage(mut self) -> Self {
+        self.versioned = true;
         self
     }
 }
@@ -707,7 +717,8 @@ pub struct Database<
     // create DB connections.
     _shared_page_cache: Arc<RwLock<PageCache>>,
     /// Amphora (QT.5): what its operators' work costs, learned as its queries run.
-    pub(crate) learned_costs: crate::translate::optimizer::learned_costs::LearnedCosts,
+    /// Shared with its pagers, which time the pages they read from its file.
+    pub(crate) learned_costs: Arc<crate::translate::optimizer::learned_costs::LearnedCosts>,
     /// Amphora (PL.9): each table's rows inserted less rows deleted since ANALYZE counted it.
     pub(crate) row_changes: Arc<crate::row_changes::RowChanges>,
 
@@ -740,6 +751,9 @@ pub struct Database<
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
     page_codec_id: Option<PageCodecId>,
+    /// Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage its connections' B-trees are on,
+    /// once a connection has asked for it (`storage::versioned::switch`).
+    versioned: Mutex<Option<Arc<crate::storage::versioned::switch::Storage>>>,
     // Last: release this Database's I/O fields before its scoped registry entry.
     registry_registration: std::sync::OnceLock<ScopedRegistration>,
 }
@@ -852,6 +866,25 @@ impl Database {
 
         let enable_custom_types = opts.enable_custom_types || dialect.requires_custom_types();
 
+        let learned_costs = {
+            use crate::translate::optimizer::learned_costs;
+            let costs = learned_costs::LearnedCosts::new();
+            // QT.5: the row's cost is weighed in page reads; before the database reads a page
+            // of its own, one scratch page read beside it gives the first time. A database opened
+            // read-only writes nothing beside it; its open reads its own file.
+            if !flags.contains(OpenFlags::ReadOnly) {
+                if let Some((reads, nanos)) = learned_costs::time_page_read(
+                    &path,
+                    io,
+                    BufferPool::DEFAULT_PAGE_SIZE,
+                    costs.page_read_epoch(),
+                ) {
+                    costs.anchor_page_read(reads, nanos);
+                }
+            }
+            Arc::new(costs)
+        };
+
         let db = Database {
             mv_store,
             allocators,
@@ -863,7 +896,7 @@ impl Database {
                 s
             }))),
             _shared_page_cache: shared_page_cache,
-            learned_costs: crate::translate::optimizer::learned_costs::LearnedCosts::new(),
+            learned_costs,
             row_changes: Arc::new(crate::row_changes::RowChanges::new()),
             shared_wal,
             #[cfg(host_shared_wal)]
@@ -897,6 +930,7 @@ impl Database {
             page_codec_id,
 
             durable_storage: None,
+            versioned: Mutex::new(None),
             registry_registration: std::sync::OnceLock::new(),
         };
 
@@ -1792,6 +1826,13 @@ impl Database {
                         })?;
                         db.with_schema_mut(|schema| schema.set_constraint_states(&columns))?;
                     }
+                    let dropped = conn.query_dropped_columns()?;
+                    if !dropped.is_empty() {
+                        let db = state.db.as_ref().ok_or_else(|| {
+                            LimboError::InternalError("open: no database past Init".into())
+                        })?;
+                        db.with_schema_mut(|schema| schema.set_dropped_columns(&dropped))?;
+                    }
 
                     state.phase = OpenDbAsyncPhase::BootstrapMvStore;
                 }
@@ -2507,6 +2548,7 @@ impl Database {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn connect(self: &Arc<Database>, opts: ConnectOpts) -> Result<Arc<Connection>> {
+        self.versioned_storage(opts.versioned)?;
         self._connect(
             false,
             None,
@@ -2666,7 +2708,11 @@ impl Database {
         context: Option<Arc<dyn Any + Send + Sync>>,
     ) -> Result<Arc<Connection>> {
         let encryption_cipher = self.encryption_cipher_mode.get();
+        let versioned = self
+            .versioned_storage(crate::storage::versioned::switch::asked())?
+            .map(crate::storage::versioned::switch::Switch::new);
         let conn = Arc::new(Connection {
+            versioned,
             db: self.clone(),
             context,
             pager: ArcSwap::new(pager),
@@ -2675,6 +2721,7 @@ impl Database {
             auto_commit: AtomicBool::new(true),
             transaction_state: AtomicTransactionState::new(TransactionState::None),
             poisoned_tx: AtomicBool::new(false),
+            online_change_own: AtomicBool::new(false),
             statement_journals: AtomicBool::new(true),
             last_insert_rowid: AtomicI64::new(0),
             changes: AtomicI64::new(0),
@@ -2735,6 +2782,7 @@ impl Database {
             join_methods: crate::connection::AtomicJoinMethods::new(
                 crate::connection::JoinMethods::ByCost,
             ),
+            sorted_fetches: AtomicBool::new(false),
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
@@ -2759,6 +2807,18 @@ impl Database {
         // add built-in extensions symbols to the connection to prevent having to load each time
         conn.syms.write().extend(&builtin_syms);
         Ok(conn)
+    }
+
+    /// The versioned storage the connections' B-trees are on: made now if `ask` and not yet made.
+    fn versioned_storage(
+        &self,
+        ask: bool,
+    ) -> Result<Option<Arc<crate::storage::versioned::switch::Storage>>> {
+        let mut slot = self.versioned.lock();
+        if slot.is_none() && ask {
+            *slot = Some(crate::storage::versioned::switch::open(&self.path)?);
+        }
+        Ok(slot.clone())
     }
 
     pub fn is_readonly(&self) -> bool {
@@ -3540,6 +3600,7 @@ impl Database {
             buffer_pool,
             self.pager_state.clone(),
         )?;
+        pager.set_learned_costs(self.learned_costs.clone());
         if self.initialized() {
             pager.set_page_size(page_size);
         }
