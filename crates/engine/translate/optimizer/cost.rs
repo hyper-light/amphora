@@ -143,12 +143,53 @@ pub(super) fn estimate_scan_cost(
 ///
 /// Each insert searches the part of the index that was already built. A
 /// balanced index needs about log2(rows) comparisons per insert.
+///
+/// Amphora (QT.5): and the pages it moves once it outgrows its cache. A statement's ephemeral
+/// index has a pager of its own, given the default page cache (`vdbe/execute.rs`, `OpenEphemeral`:
+/// `PageCache::default()`, `page_cache::DEFAULT_PAGE_CACHE_SIZE_IN_PAGES` pages). Each row's insert
+/// lands on a leaf among the index's `row_count / rows_per_leaf_page` at random, so the leaves it
+/// fetches are Mackert and Lohman's (`table_pages_fetched`). A leaf's first fetch makes it, no read;
+/// a fetch past that reads a leaf the cache dropped; and every fetch once the cache is full drops a
+/// changed page, a write.
 pub(super) fn estimate_ephemeral_index_build_cost(
     row_count: f64,
+    rows_per_leaf_page: f64,
     params: &CostModelParams,
 ) -> Cost {
     let comparisons_per_row = row_count.max(2.0).log2();
-    Cost(row_count * comparisons_per_row * params.cpu_cost_per_seek)
+    let cache = ephemeral_cache_pages();
+    let leaves = (row_count / rows_per_leaf_page.max(1.0)).max(1.0);
+    let fetched = table_pages_fetched(row_count, leaves, cache);
+    let reads = (fetched - leaves).max(0.0);
+    let writes = (fetched - cache).max(0.0);
+    Cost(row_count * comparisons_per_row * params.cpu_cost_per_seek + reads + writes)
+}
+
+/// Amphora (QT.5): `probes` searches of an ephemeral index of `row_count` rows built just before,
+/// `rows_per_probe` rows each: a seek and the rows' visits, and the leaves the cache the build left
+/// behind doesn't hold. The build's last pages are what that cache holds, so of the leaves first
+/// touched, the part the cache has room for is held (`file_reads` with no recent miss).
+pub(super) fn estimate_ephemeral_index_probe_cost(
+    probes: f64,
+    rows_per_probe: f64,
+    row_count: f64,
+    rows_per_leaf_page: f64,
+    params: &CostModelParams,
+) -> Cost {
+    let cache = ephemeral_cache_pages();
+    let leaves = (row_count / rows_per_leaf_page.max(1.0)).max(1.0);
+    let leaves_per_probe = (rows_per_probe / rows_per_leaf_page.max(1.0)).max(1.0);
+    let fetched = table_pages_fetched(probes * leaves_per_probe, leaves, cache);
+    Cost(
+        probes * params.cpu_cost_per_seek
+            + probes * rows_per_probe * params.cpu_cost_per_row
+            + file_reads(fetched, leaves, cache, 0.0),
+    )
+}
+
+/// The pages an ephemeral index's own pager caches (`estimate_ephemeral_index_build_cost`).
+fn ephemeral_cache_pages() -> f64 {
+    crate::storage::page_cache::DEFAULT_PAGE_CACHE_SIZE_IN_PAGES as f64
 }
 
 pub(super) fn estimate_sort_cpu_cost(row_count: f64, params: &CostModelParams) -> Cost {
@@ -301,17 +342,20 @@ pub fn estimate_index_cost(
         ) + looked_up * params.cpu_cost_per_seek
     };
 
-    // Amphora: many searches of an index the cache holds whole read each of its pages once at
-    // most (decision 6): its leaves as Mackert and Lohman count them, its inner pages once. One
-    // pass is read in order, and an index bigger than the cache keeps its searches' pages, as
-    // estimated above.
+    // Amphora: many searches of an index read each of its pages once at most while the cache
+    // holds them (decision 6): its leaves as Mackert and Lohman count them, its inner pages once.
+    // One pass is read in order.
     let leaf_pages = (base_row_count / index_info.rows_per_leaf_page).max(1.0);
     let index_pages = leaf_pages + leaf_pages / index_info.rows_per_leaf_page.max(2.0) + tree_depth;
-    let index_io = if input_cardinality > 1.0 && index_pages <= params.cache_pages {
+    // Amphora (QT.5): the inner pages, which every search reads, stay held while the cache has
+    // room for them, and the leaves share what room is left: an index bigger than the cache reads
+    // its leaves again as the cache drops them, not its inner pages too.
+    let inner_pages = index_pages - leaf_pages;
+    let index_io = if input_cardinality > 1.0 && inner_pages < params.cache_pages {
         let reads = table_pages_fetched(
             input_cardinality * index_leaf_pages_count,
             leaf_pages,
-            params.cache_pages,
+            params.cache_pages - inner_pages,
         ) + (tree_depth - 1.0).max(0.0);
         (seek_cost + leaf_scan_cost).min(reads)
     } else {
@@ -878,6 +922,33 @@ mod tests {
         assert_eq!(file_reads(300.0, 100.0, 2_000.0, 0.0), 200.0);
         assert_eq!(file_reads(300.0, 100.0, 2_000.0, 1.0), 300.0);
         assert_eq!(file_reads(300.0, 400.0, 100.0, 0.0), 225.0);
+    }
+
+    /// Do: build an ephemeral index of 1,000 rows, 10 a leaf, and of 10 million, then search each
+    /// a million times. Expect: the small one's build and searches only CPU, its 100 leaves
+    /// within its cache; the big one's build pays a read for each leaf fetched past its first and
+    /// a write for each fetch once the cache is full, and its searches read what the cache the
+    /// build left can't hold (T-QT.5.5: an ephemeral index's pages are priced like a tree's).
+    #[test]
+    fn t_qt_5_5_an_ephemeral_index_past_its_cache_reads_and_writes_its_leaves() {
+        let params = &DEFAULT_PARAMS;
+        let cpu_build = |rows: f64| rows * rows.log2() * params.cpu_cost_per_seek;
+        let small = estimate_ephemeral_index_build_cost(1_000.0, 10.0, params);
+        assert!((small.0 - cpu_build(1_000.0)).abs() < 1e-9);
+        let cpu_probe = 1e6 * (params.cpu_cost_per_seek + params.cpu_cost_per_row);
+        let probes = estimate_ephemeral_index_probe_cost(1e6, 1.0, 1_000.0, 10.0, params);
+        assert!((probes.0 - cpu_probe).abs() < 1e-6, "{probes:?}");
+
+        let cache = ephemeral_cache_pages();
+        let leaves = 1e6;
+        let fetched = table_pages_fetched(1e7, leaves, cache);
+        let big = estimate_ephemeral_index_build_cost(1e7, 10.0, params);
+        let io = (fetched - leaves) + (fetched - cache);
+        assert!((big.0 - cpu_build(1e7) - io).abs() < 1e-3, "{big:?}");
+        let probes = estimate_ephemeral_index_probe_cost(1e6, 1.0, 1e7, 10.0, params);
+        let read = file_reads(table_pages_fetched(1e6, leaves, cache), leaves, cache, 0.0);
+        assert!((probes.0 - cpu_probe - read).abs() < 1e-3, "{probes:?}");
+        assert!(read > 0.0);
     }
 
     /// Amphora: do: search an index of 1,000 leaf pages 200 times, with a cache that holds it and
