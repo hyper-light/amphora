@@ -442,7 +442,9 @@ pub(crate) fn diff(base: &[u8], new: &[u8], tail: usize, most: usize) -> Option<
         let at = word.checked_mul(8)?;
         let end = at.checked_add(a.len())?;
         let forced = (end > carried).then(|| carried.max(at).saturating_sub(at));
-        let Some((differs_first, differs_last)) = differing(a, b).or_else(|| forced.map(|f| (f, f))) else {
+        let Some((differs_first, differs_last)) =
+            differing(a, b).or_else(|| forced.map(|f| (f, f)))
+        else {
             continue;
         };
         let first = match forced {
