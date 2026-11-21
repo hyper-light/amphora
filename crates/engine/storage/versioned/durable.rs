@@ -27,7 +27,7 @@ use super::disk::{Disk, File};
 use super::page::PAGE_SIZE;
 use super::pool::Pool;
 use super::redo::{self, Op, Redo};
-use super::version::{Snapshot, Ts, Txn, Versioned};
+use super::version::{Savepoint, Snapshot, Ts, Txn, Versioned};
 use crate::error::LimboError;
 use crate::sync::{Arc, Mutex, RwLock};
 use crate::Result;
@@ -440,6 +440,12 @@ impl Database {
             self.redo.sync(&*self.disk, ts)?;
         }
         Ok(ts)
+    }
+
+    /// Rolls `txn` back to `sp` ([`Versioned::rollback_to`]).
+    pub fn rollback_to(&self, d: &mut Descender, txn: &mut Txn, sp: Savepoint) -> Result<()> {
+        let _changing = self.gate.read();
+        self.v.rollback_to(txn, sp, d)
     }
 
     pub fn abort(&self, txn: Txn, d: &mut Descender) -> Result<()> {

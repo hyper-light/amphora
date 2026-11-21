@@ -8,7 +8,8 @@
 //! versions on them ([`version`]: snapshots, first-writer-wins, rollback, collection); then their
 //! files ([`disk`]), the redo log ([`redo`]), and checkpoints and recovery ([`durable`]); and the
 //! commit validations' Elle-style isolation checks (`elle`, G8 step 1). Stage 3 begins with the
-//! executor's cursor on the trees ([`cursor`]).
+//! executor's cursor on the trees ([`cursor`]), then transactions' savepoints ([`version`]),
+//! checked against the current engine by the shared model test of transactions (`txn_model`).
 
 pub mod blink;
 #[cfg(test)]
@@ -21,4 +22,6 @@ mod elle;
 pub mod page;
 pub mod pool;
 pub mod redo;
+#[cfg(test)]
+mod txn_model;
 pub mod version;
