@@ -434,6 +434,19 @@ criteria = [
 ]
 tests = [
   { id = "T-NS.1.1", text = "Random operation sequences on both cursors — passes when identical keys, values and positions after each step" },
+]
+
+# lane g7s2
+[[own]]
+id = "NS.2"
+title = "Records, overflow, the catalog and transactions on the new pages (G7 step 2)"
+criteria = [
+  { id = "AC-NS.2.1", text = "the engine's test suites pass on the new storage" },
+  { id = "AC-NS.2.3", text = "A transaction rolls back to a savepoint from its versions: rows first changed after it as before the transaction, rows changed before and after as the savepoint found them, later changes out of its redo record; the savepoint stays good" },
+]
+tests = [
+  { id = "T-NS.2.1", text = "The shared model test of transactions on both storages — passes when identical answers, no anomaly" },
+]
 
 # lane follower-reads (G13 step 4, kiln goal 80d4cf5e; docs/design/replication.md, "Follower reads at a
 # closed time" and "Search over partitions"). AC-T1.10.3 and AC-T1.10.4 are the measures; these are what they
