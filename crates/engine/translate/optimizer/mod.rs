@@ -1061,6 +1061,21 @@ fn optimize_select_plan_with_cache(
         return Ok(());
     }
 
+    // Amphora (QT.5): a connection that asks for hash joins only asks that its joins run as hash
+    // joins. A correlated subquery left in place runs as a nested loop beneath its query, so the
+    // unnested form is taken wherever it can be emitted, as the forced unnesting mode takes it,
+    // rather than weighed against that loop.
+    if resolver.join_methods() == crate::JoinMethods::HashJoinsOnly {
+        let rewritten_table_plan =
+            find_select_plan_form(&mut rewritten, resolver, cache, false, None)?;
+        if !rewritten_form_is_emittable(&rewritten) {
+            return optimize_select_plan_form(plan, resolver, cache);
+        }
+        *plan = rewritten;
+        apply_select_table_plan(plan, rewritten_table_plan, resolver)?;
+        return Ok(());
+    }
+
     let original_table_plan = find_select_plan_form(plan, resolver, cache, true, None)?;
     // The query already returns no rows, so a cheaper form cannot be found.
     if plan.contains_constant_false_condition {
