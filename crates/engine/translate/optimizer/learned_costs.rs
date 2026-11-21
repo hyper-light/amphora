@@ -104,38 +104,18 @@ impl Rates {
         }
     }
 
-    /// The weights, the planner's page priced at `miss` of its fetches reading the file
-    /// (`Pager::page_miss_ratio`) and the rest found in the page cache; None for `miss` prices every
-    /// page as a file read, the estimate of a cache that has served no fetch yet.
+    /// The weights, with `miss`, the share of the connection's recent page fetches that read a
+    /// file (`Pager::page_miss_ratio`), passed through for the planner.
     fn weights(&self, miss: Option<f64>) -> Option<LearnedWeights> {
         let row = self.row.nanos_per_unit()?;
-        let probe = self.hash_probe.nanos_per_unit()?;
         Some(LearnedWeights {
-            row_in_pages: self
-                .page
-                .nanos_per_unit()
-                .map(|page| row / page_fetch_nanos(page, probe, miss)),
+            row_in_pages: self.page.nanos_per_unit().map(|page| row / page),
             seek: self.seek.nanos_per_unit()? / row,
             hash_build: self.hash_build.nanos_per_unit()? / row,
-            hash_probe: probe / row,
+            hash_probe: self.hash_probe.nanos_per_unit()? / row,
             sort: self.sort.nanos_per_unit()? / row,
+            page_miss: miss.filter(|m| m.is_finite()).map(|m| m.clamp(0.0, 1.0)),
         })
-    }
-}
-
-/// What one of the planner's pages costs, in nanoseconds (QT.5): the planner counts the pages a
-/// plan touches from a cold cache (`cost::table_pages_fetched`, Mackert and Lohman), but a page the
-/// pager's cache holds is not read from the file: its fetch is a lookup of the page cache's hash
-/// table by page number (`PageCache::get`), timed as the hash probe. So a page costs `miss` file
-/// reads, the share of the connection's recent fetches that read the file, and `1 - miss` probes.
-/// Without that share (no fetch yet) every page is a file read.
-fn page_fetch_nanos(read: f64, probe: f64, miss: Option<f64>) -> f64 {
-    match miss {
-        Some(miss) if miss.is_finite() => {
-            let miss = miss.clamp(0.0, 1.0);
-            miss * read + (1.0 - miss) * probe
-        }
-        _ => read,
     }
 }
 
@@ -151,6 +131,10 @@ pub(crate) struct LearnedWeights {
     pub(crate) hash_build: f64,
     pub(crate) hash_probe: f64,
     pub(crate) sort: f64,
+    /// The share of the connection's recent page fetches that read a file, None before its first
+    /// fetch (`Pager::page_miss_ratio`): how many of the pages a plan would first read from a cold
+    /// cache it reads from the file (`cost::file_reads`).
+    pub(crate) page_miss: Option<f64>,
 }
 
 /// A database's running cost estimator, shared by its connections.
@@ -520,18 +504,16 @@ mod tests {
         assert_eq!(after.hash_insert_cost, 20.0 / 128.0);
     }
 
-    /// Do: page reads timed at 100 ns and hash probes at 15 ns, then weigh the row for a
-    /// connection none of whose fetches read the file, one half of whose do, and one with no fetch
-    /// yet. Expect: the page priced at a probe, halfway, and at a read (T-QT.5.5: a cached page is
-    /// not charged as a file read).
+    /// Do: weigh with no fetch yet, with a share of 0.25, and with a share out of range. Expect:
+    /// the share passed through as the planner's page miss, clamped to [0, 1] (T-QT.5.5).
     #[test]
-    fn t_qt_5_5_a_cached_page_costs_a_cache_lookup_not_a_read() {
+    fn t_qt_5_5_the_page_miss_share_reaches_the_planner() {
         let costs = LearnedCosts::from_rates(fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0));
-        costs.anchor_page_read(1.0, 100.0);
-        assert_eq!(costs.weights_at(Some(0.0)).unwrap().row_in_pages, Some(2.0 / 15.0));
-        assert_eq!(costs.weights_at(Some(0.5)).unwrap().row_in_pages, Some(2.0 / 57.5));
-        assert_eq!(costs.weights_at(None).unwrap().row_in_pages, Some(2.0 / 100.0));
-        assert_eq!(costs.weights_at(Some(1.0)), costs.weights());
+        let params = super::super::cost_params::CostModelParams::new();
+        assert_eq!(params.with_learned(costs.weights_at(None)).page_miss, 1.0);
+        assert_eq!(params.with_learned(costs.weights_at(Some(0.25))).page_miss, 0.25);
+        assert_eq!(params.with_learned(costs.weights_at(Some(3.0))).page_miss, 1.0);
+        assert_eq!(params.with_learned(costs.weights_at(Some(f64::NAN))).page_miss, 1.0);
     }
 
     /// Do: anchor the page read at 100 ns, as a database's open does, then read pages of its own

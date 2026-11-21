@@ -136,7 +136,7 @@ pub(super) fn estimate_scan_cost(
     // CPU cost for processing all rows on each scan
     let cpu_cost = num_scans * base_row_count * params.cpu_cost_per_row;
 
-    Cost(io_cost + cpu_cost)
+    Cost(file_reads(io_cost, params.cache_pages, params.page_miss) + cpu_cost)
 }
 
 /// Estimate the work to add every row to a new in-memory index.
@@ -198,6 +198,17 @@ pub(super) fn table_pages_fetched(rows: f64, table_pages: f64, cache_pages: f64)
             b + (n - fills) * (t - b) / t
         }
     }
+}
+
+/// Amphora (QT.5): the file reads of `cold_reads`, the pages a plan reads from a cold cache of
+/// `cache_pages`: the first `cache_pages` of them at most are pages it touches first, read from
+/// the file only if the cache doesn't already hold them, `page_miss` of the time as the
+/// connection's recent fetches show; the rest are pages the cache was too small to keep, read
+/// again whatever it held. A page the cache holds costs no read: its lookup is part of the seek or
+/// row visit that touches it.
+pub(super) fn file_reads(cold_reads: f64, cache_pages: f64, page_miss: f64) -> f64 {
+    let first = cold_reads.min(cache_pages.max(1.0)).max(0.0);
+    cold_reads - first + first * page_miss.clamp(0.0, 1.0)
 }
 
 /// Estimate IO and CPU cost for index-based access.
@@ -274,8 +285,11 @@ pub fn estimate_index_cost(
     } else {
         let table_pages_count = (base_row_count / params.rows_per_table_page).max(1.0);
         let looked_up = input_cardinality * rows_per_seek;
-        table_pages_fetched(looked_up, table_pages_count, params.cache_pages)
-            + looked_up * params.cpu_cost_per_seek
+        file_reads(
+            table_pages_fetched(looked_up, table_pages_count, params.cache_pages),
+            params.cache_pages,
+            params.page_miss,
+        ) + looked_up * params.cpu_cost_per_seek
     };
 
     // Amphora: many searches of an index the cache holds whole read each of its pages once at
@@ -295,7 +309,7 @@ pub fn estimate_index_cost(
         seek_cost + leaf_scan_cost
     };
 
-    let io_cost = index_io + table_lookup_cost;
+    let io_cost = file_reads(index_io, params.cache_pages, params.page_miss) + table_lookup_cost;
 
     // CPU cost: key comparisons during seeks + row processing
     let total_rows = input_cardinality * rows_per_seek;
@@ -841,6 +855,18 @@ mod tests {
             2.0 * 4_000.0 * 1_000.0 / (8_000.0 + 1_000.0)
         ));
         assert_eq!(table_pages_fetched(0.0, 4_000.0, 2_000.0), 0.0);
+    }
+
+    /// Do: 300 cold reads with a cache of 100 pages, half the connection's fetches reading a
+    /// file, then none, then all. Expect: the 200 the cache couldn't keep read whatever, and of
+    /// the 100 first touched half, none and all (T-QT.5.5: a held page is no file read; a page
+    /// the cache is too small to keep is).
+    #[test]
+    fn t_qt_5_5_held_pages_are_not_read_but_pages_the_cache_drops_are() {
+        assert_eq!(file_reads(300.0, 100.0, 0.5), 250.0);
+        assert_eq!(file_reads(300.0, 100.0, 0.0), 200.0);
+        assert_eq!(file_reads(300.0, 100.0, 1.0), 300.0);
+        assert_eq!(file_reads(40.0, 2_000.0, 0.0), 0.0);
     }
 
     /// Amphora: do: search an index of 1,000 leaf pages 200 times, with a cache that holds it and

@@ -76,6 +76,13 @@ pub struct CostModelParams {
     /// default page cache, 2,000 pages; planning replaces it with the connection's.
     pub cache_pages: f64,
 
+    /// Amphora (QT.5): the share of the pages a plan would first read from a cold cache that it
+    /// reads from the file: the connection's recent page fetches' share that read a file
+    /// (`Pager::page_miss_ratio`), set as the statement is planned. 1, every such page read, until
+    /// the connection has fetched a page; pages a cache too small for the plan reads again are read
+    /// whatever it is (`cost::file_reads`).
+    pub page_miss: f64,
+
     /// Amphora: the memory a statement's hash and group tables hold together before they spill,
     /// in bytes (`docs/design/executor.md`, decision 8): the connection's own cache
     /// (`Pager::statement_memory_budget`). Planning replaces the default, nothing, with it.
@@ -132,6 +139,7 @@ impl CostModelParams {
             cpu_cost_per_where_step: 0.003,
             cpu_cost_per_seek: 0.01,
             cache_pages: 2000.0,
+            page_miss: 1.0,
             statement_memory: 0,
 
             // Sort costs
@@ -235,6 +243,7 @@ impl CostModelParams {
             hash_insert_cost: row * learned.hash_build,
             hash_lookup_cost: row * learned.hash_probe,
             sort_cpu_per_row: row * learned.sort,
+            page_miss: learned.page_miss.unwrap_or(1.0),
             ..self.clone()
         }
     }
