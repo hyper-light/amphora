@@ -64,3 +64,97 @@ to 12 random seconds each: every row equal. The planner's cases are unit tests (
 refused that the archive holds whole; a restore that succeeds across a break in the log without a base
 after it; the 100 GB restore drill (AC-T1.12.3) over 30 minutes from Mantle with bases taken by
 `base_due`.
+
+## The folder store
+
+**Decision.** The archive's default store is a folder Amphora owns (`backup::FolderBlobs`), with no
+cloud required; a peer machine's folder is the same store over a mount (Ada, 2026-11-21: own the
+storage, proven from a laptop up). PostgreSQL's archive contract allows any destination ("copy the
+segment files to an NFS-mounted directory on another machine", postgresql.org/docs/current/continuous-archiving.html
+§25.3.1), and pgBackRest's default repository is `posix` (pgbackrest.org/configuration.html;
+research/backup-single-node.md §1.3).
+
+- **Keys as paths.** Each segment of a key is a directory, its last a file. A name is one letter
+  (`d` directory, `f` object, `t` a create under way) and the segment's bytes, `[a-z0-9_-]` as they
+  are and the rest `%xx`, so names agree under case folding (APFS and NTFS fold case), are never `.`,
+  `..` or a Windows device name, and `a` and `a/b` live side by side. A segment whose name would pass
+  255 bytes (NAME_MAX on ext4, XFS, btrfs and APFS; NTFS's 255 UTF-16 units) is refused `Invalid`.
+- **Create once, atomically.** A create writes a temporary file beside the object, flushes it,
+  then link(2)s it into place: link refuses a name that exists, atomically, on local filesystems and
+  NFS alike (open(2), O_EXCL: "create a unique file on the same filesystem ... and use link(2) to make
+  a link to the lockfile"), so two writers never both create a key and a reader sees an object whole
+  or not at all. The directory is flushed after (fsync(2): "an explicit fsync() on a file descriptor
+  for the directory is also needed"). Windows' std can't open a directory to flush; NTFS journals
+  its directory changes itself.
+- **Listing in key order without reading everything.** The walk is a stack, not recursion
+  (CLAUDE.md §11): a directory sorts among its siblings as its key and a `/`, where its keys fall in
+  byte order; it starts at the prefix's directory, skips directories wholly before the cursor or
+  outside the prefix, and stops one past the limit. Names the folder didn't write (`desktop.ini`,
+  `lost+found`, a crashed create's temporary file) are not listed.
+- **Deletes** remove the file and then each directory left empty; a create that loses its directory
+  to such a delete makes it again, until its deadline.
+
+**Evidence.** `backup::folder` tests: the seam's conformance suite (AMPHORA-BLOBS-1 to 7) on a folder,
+at two depths, leaving the folder empty; names that differ only in case, `.`, `..`, device names and
+a key under a key each kept apart (AMPHORA-BLOBS-8); and 4 seeds of 400 random creates, deletes,
+gets and listings (random prefixes, cursors and limits) answered exactly as `SimBlobs` answers them.
+T-T1.12.C1 backs a database up to a folder through its own shipping thread and restores it.
+
+**Falsified by.** A listing on a folder that differs from the simulator's; two creates of one key
+both succeeding over a mount; an object read torn after a crash.
+
+## Restore-and-check
+
+**Decision.** A routine restores the newest second the archive holds whole into a scratch file and
+checks it: `PRAGMA integrity_check`, then every table's rows (count and a SHA-256 over them in rowid
+order, `backup::digest`) against the source's at that second. Meta, GitLab (after 2017) and Uber
+restore their backups continuously and check the result, and GitLab's untested dumps had failed
+silently for a long time (research/backup-single-node.md §0.3). The outcome is typed
+(`backup::Check`: passed, failed with why: restore, integrity or rows; the source moved on; an empty
+archive) and counted (`amphora_backup_checks_total` by result; name to agree with kiln's Observe
+owner).
+
+- **Its schedule is the archive's cadence, never a timer** (`backup::check_due`): a check is due
+  when a base landed since the last one (each base is checked once), or when the log shipped since
+  the last check outweighs the log that check replayed, so the log a restore replays is checked as
+  fast as it grows.
+- **The source's rows at the second** are the caller's to give (`source(second)`), none when it can
+  no longer say them, which counts as `source_moved`, never as a pass. Open: the shipping thread
+  taking the source's digest while it writes a through mark (the source quiet, its rows those of
+  that second), so a running database checks itself; not built.
+
+**Evidence.** T-T1.12.C1: a database backed up to a folder, written a row a second and closed;
+restore-and-check passes at its newest second against the model's rows and fails naming the rows
+against rows that differ; the counters say one of each. T-T1.12.C2: the cadence rule's cases.
+
+**Falsified by.** A check that passes on an archive whose restore differs from the source at that
+second; a check that never comes due while bases land.
+
+## One cut across groups
+
+**Decision.** Several groups restore to one second by restoring each group's archive to that second
+and then finishing every cross-group transaction the cut left half-done exactly as a crashed
+coordinator's are finished (docs/design/xgroup.md, "Crashes"): `backup::restore_cut` opens the
+coordinator's next incarnation over the restored groups, which scans every group and commits or
+aborts each transaction by its anchor's decision record (no record: aborted; under Parallel
+Commits, a staging record commits only if every intent is there). The cut needs no protocol of its
+own: a restore to a second is a crash at that second, and the protocol already survives a crash at
+every step. This is the consistent cut Chandy and Lamport define ("Distributed Snapshots", ACM TOCS
+3(1), 1985): no group holds the effect of a decision another group's cut has not yet reached once the
+records finish it.
+
+- **The groups' clocks.** A cut is one second in every group, so every group's commits must be
+  stamped by one clock. Groups on one node share it. Across nodes, a participant's intent stamped
+  later than its anchor's decision by clock skew would be cut away while the decision stays: open,
+  not built (the stamps would need a bound on skew, as Spanner's commit wait gives, or a hybrid
+  logical clock carried in each step).
+
+**Evidence.** T-T1.12.X1: two groups backed up to one folder under a clock that moves a second at
+every reading, so every commit in either group has its own second; two transactions across both
+groups; then both restored to every second from their first bases to the end, under two-phase
+commit and under Parallel Commits. At every cut the two keys are both absent, both the first
+transaction's or both the second's, never moving back, the last cut holding the second's, and some
+cut between the two (non-vacuous).
+
+**Falsified by.** A cut at which one group holds a transaction's write and another doesn't after
+`restore_cut`; a cut whose restore is refused while each group's archive holds the second whole.
