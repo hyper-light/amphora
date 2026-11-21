@@ -66,7 +66,7 @@ fn int_real(i: i64, r: f64) -> Ordering {
     }
     let near = i as f64;
     match reals(near, r) {
-        Ordering::Equal => i128::from(i).cmp(&whole(r).unwrap_or(i128::from(i))),
+        Ordering::Equal => i128::from(i).cmp(&whole(r).unwrap_or_else(|| i128::from(i))),
         o => o,
     }
 }
@@ -1096,7 +1096,7 @@ fn fold_vector(acc: &mut Acc, a: Agg, g: &Granule, sel: &[bool], selected: usize
 /// scanned with one [`Decode`] for its life: the cache holds what it decoded.
 #[derive(Default)]
 pub struct Cache {
-    slots: Mutex<Vec<(u64, Vec<Option<Arc<Granule>>>)>>,
+    slots: Mutex<Vec<Slot>>,
 }
 
 impl Cache {
@@ -1132,6 +1132,9 @@ impl Cache {
         })
     }
 }
+
+/// One generation's decoded granules, by block, keyed by its id.
+type Slot = (u64, Vec<Option<Arc<Granule>>>);
 
 /// Where a vectorized scan's granules came from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1287,7 +1290,7 @@ mod tests {
     fn record(k: u32, x: &mut u64) -> Vec<u8> {
         let r = rng(x);
         let a = int(i64::from(k) * 3 + i64::try_from(r % 3).unwrap());
-        let b = if r % 5 == 0 {
+        let b = if r.is_multiple_of(5) {
             Value::Null
         } else {
             real(f64::from(u32::try_from(r % 1000).unwrap()) / 7.0)
