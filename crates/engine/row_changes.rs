@@ -1,4 +1,4 @@
-//! Amphora (docs/design/planner.md, decision 22; PL.9): each table's rows inserted less rows deleted
+//! Amphora (docs/design/planner.md, decision (lane pl9); PL.9): each table's rows inserted less rows deleted
 //! since ANALYZE last counted it, kept as writes finish, so the planner's row counts follow the table
 //! between ANALYZE runs, and a prepared statement plans again once its tables have moved past what
 //! its estimates could already tell apart.
@@ -10,6 +10,7 @@
 use crate::stats::TableStat;
 use crate::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use crate::sync::{Arc, Mutex};
+use crate::util::normalize_ident;
 use std::collections::HashMap;
 
 /// Every table's counter, one per table name a statement planned against or wrote to. Bound: one
@@ -28,14 +29,16 @@ impl RowChanges {
         Self::default()
     }
 
-    /// The counter of `table` (a schema's normalized table name), made at zero the first time.
+    /// The counter of `table`, made at zero the first time. Keyed by the normalized name, as
+    /// ANALYZE's statistics are.
     pub(crate) fn counter(&self, table: &str) -> Arc<AtomicI64> {
+        let table = normalize_ident(table);
         let mut tables = self.tables.lock();
-        if let Some(counter) = tables.get(table) {
+        if let Some(counter) = tables.get(&table) {
             return counter.clone();
         }
         let counter = Arc::new(AtomicI64::new(0));
-        tables.insert(table.to_string(), counter.clone());
+        tables.insert(table, counter.clone());
         counter
     }
 
@@ -43,11 +46,12 @@ impl RowChanges {
     pub fn changed_since_analyze(&self, table: &str) -> i64 {
         self.tables
             .lock()
-            .get(table)
+            .get(&normalize_ident(table))
             .map_or(0, |counter| counter.load(Ordering::Acquire))
     }
 
-    /// ANALYZE counted these tables again: their changes start from zero.
+    /// ANALYZE counted these tables again (their normalized names, as `AnalyzeStats` keys them):
+    /// their changes start from zero.
     pub(crate) fn analyzed<'a>(&self, tables: impl Iterator<Item = &'a String>) {
         let known = self.tables.lock();
         for table in tables {

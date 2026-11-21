@@ -1392,3 +1392,53 @@ unit tests (T-PL.12.1, T-PL.12.2). The TPC-H prepared measurement (AC-PL.12.1) a
 connection's prepare generation where it re-plans, which resets each statement's choice
 (`Statement::reprepare`); a re-plan that keeps statistics close may want to keep the measurements
 instead, which is PL.9's call; `PlanValues` is how an estimate reads a bound value.
+
+## Decision (lane pl9): row counts kept as rows change, statements planned again past their statistics' error
+
+**Decision.** PL.9 (docs/research/planner.md section 9, rank 9; `crates/engine/row_changes.rs`).
+- Each table keeps, in memory on its database, its rows inserted less its rows deleted since
+  ANALYZE last counted it. An INSERT or DELETE of a main-database table adds its own change count
+  (the one `changes()` reports) when it finishes: one atomic add a statement, whatever its rows,
+  into a counter found when the statement was planned. The write path takes no lock and no lookup.
+- The planner's row count for an analyzed table is ANALYZE's count with those changes
+  (`base_row_estimate`), as PostgreSQL scales `reltuples` to the table's present size
+  (`estimate_rel_size`). The shares the sketch and the sample give (decisions 20 and 21) stay
+  shares: they apply to the count as it is now.
+- A statement notes, for each table it counted, the count it planned with and how far that count
+  may move before its estimates could tell the move apart from their own noise: the relative
+  standard error of the table's statistics. With a sample of `n` rows that is `1 / sqrt(n)` (a
+  share's binomial standard error `sqrt(p (1 - p) / n)`, relative to the half the sample resolves
+  best); with only HyperLogLog sketches, `1.04 / sqrt(m)` for their `m` registers; with only
+  `sqlite_stat1`, every row was counted, `1 / sqrt(rows)`. At each run's start the statement
+  compares (atomic loads only); a table grown or shrunk past `1 + error` since plans it again
+  through the existing reprepare, one prepare, which also starts PL.12's choice again. Within it,
+  nothing is planned. Nothing is picked: `n`, `m` and the rows are the statistics' own sizes.
+- ANALYZE sets the counts of the tables it counted back to zero when its statistics load.
+
+**Limits, stated.** The counts are in memory: a database opened again plans on ANALYZE's counts
+until its next writes. A statement's change count is added when the statement finishes, so a
+transaction rolled back after it leaves its rows counted, and rows a trigger or a foreign key's
+action writes, an UPSERT's updates, and an UPDATE (which moves no count) are not counted apart.
+`ANALYZE t` sets back every analyzed table's count, not only `t`'s. Each is a staleness measure
+off by what the next ANALYZE corrects, never a wrong answer.
+
+**Why.** ANALYZE's count stood still between ANALYZE runs, so a table grown tenfold kept the plan
+made for a tenth of its rows until someone ran ANALYZE, and a prepared statement kept its plan
+however far its tables moved (CH-benCHmark's tables grow as its transactions run).
+
+**Sources.** PostgreSQL `src/backend/optimizer/util/plancat.c`, `estimate_rel_size` (the tuple
+count scaled to the relation's current size); PostgreSQL's `n_mod_since_analyze` and autovacuum's
+analyze threshold (a picked `50 + 0.1 x reltuples`, which this replaces with the statistics' own
+error); Freitag and Neumann, "Every Row Counts", CIDR 2019 (statistics kept as rows change);
+Flajolet et al. 2007 (the sketch's error).
+
+**Evidence.** `crates/engine/tests/row_changes.rs` (T-PL.9.1, T-PL.9.2) and `row_changes.rs`'s unit
+tests. CH-benCHmark on the parent and the change (AC-PL.9.1) and the suite's writes (AC-PL.9.2)
+are the coordinator's.
+
+**Falsified by.**
+- CH-benCHmark's analytical queries no faster than the parent's as its tables grow, ANALYZE on the
+  same schedule (AC-PL.9.1).
+- The bench suite's writes more than 2% slower than the parent (AC-PL.9.2).
+- A statement planned again many times as its table grows slowly, each plan the same: the error
+  too tight to say when a plan could change.

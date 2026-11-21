@@ -1,5 +1,5 @@
 //! Statistics kept as rows change, and statements planned again as they move
-//! (docs/design/planner.md, decision 22; PL.9). ANALYZE's row count stood still between ANALYZE
+//! (docs/design/planner.md, decision (lane pl9); PL.9). ANALYZE's row count stood still between ANALYZE
 //! runs, and a statement prepared on it kept its plan however far its tables then grew.
 
 use amphora_engine::{

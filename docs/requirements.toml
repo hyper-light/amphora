@@ -349,6 +349,8 @@ criteria = [
 ]
 tests = [
   { id = "T-PL.9.1", text = "A table grown tenfold after its statement was prepared — passes when the statement plans again once and its answer is unchanged" },
+  # lane pl9
+  { id = "T-PL.9.2", text = "Writes that change rows, writes that change none, and reads — passes when each write that changed rows adds to its table's count exactly once and nothing else does" },
 ]
 
 [[own]]

@@ -2269,7 +2269,7 @@ fn base_row_estimate(
                         .values()
                         .find_map(|idx_stat| idx_stat.total_rows)
                 }) {
-                    // Amphora (PL.9, decision 22): ANALYZE's count with the rows inserted less
+                    // Amphora (PL.9, decision (lane pl9)): ANALYZE's count with the rows inserted less
                     // those deleted since, so the count follows the table between ANALYZE runs.
                     let analyzed = rows as f64;
                     let rows = match params.plan_values.as_deref() {

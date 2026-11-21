@@ -1086,7 +1086,7 @@ impl Statement {
         Ok(())
     }
 
-    /// Amphora (PL.9, decision 22): a table the plan counted has gained or lost more rows than
+    /// Amphora (PL.9, decision (lane pl9)): a table the plan counted has gained or lost more rows than
     /// its statistics' own error since, so a plan made now could differ. Atomic loads only.
     fn statistics_moved(&self) -> bool {
         self.program.planned_tables.iter().any(|table| table.moved())
