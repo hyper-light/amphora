@@ -318,8 +318,8 @@ pub fn estimate_index_cost(
         seek_cost + leaf_scan_cost
     };
 
-    let io_cost = file_reads(index_io, index_pages, params.cache_pages, params.page_miss)
-        + table_lookup_cost;
+    let io_cost =
+        file_reads(index_io, index_pages, params.cache_pages, params.page_miss) + table_lookup_cost;
 
     // CPU cost: key comparisons during seeks + row processing
     let total_rows = input_cardinality * rows_per_seek;
