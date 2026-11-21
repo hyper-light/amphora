@@ -52,17 +52,20 @@ fn claims(note: &str) -> Result<BTreeMap<String, Claim>, String> {
             return Err(format!("a claim line without four parts: {line}"));
         }
         let id = parts[0].trim_start_matches("- **").trim_end_matches("**");
-        let quoted = parts[3];
-        let (Some(a), Some(b)) = (quoted.find('"'), quoted.rfind('"')) else {
+        let Some(quote) = parts[3]
+            .split_once('"')
+            .and_then(|(_, after)| after.rsplit_once('"'))
+            .map(|(quote, _)| quote)
+        else {
             return Err(format!("{id} has no quote"));
         };
-        if b <= a + 1 {
+        if quote.is_empty() {
             return Err(format!("{id} has an empty quote"));
         }
         let claim = Claim {
             source: parts[1].trim().to_owned(),
             locator: parts[2].trim().to_owned(),
-            quote: quoted[a + 1..b].to_owned(),
+            quote: quote.to_owned(),
         };
         if out.insert(id.to_owned(), claim).is_some() {
             return Err(format!("{id} is defined twice"));
@@ -73,10 +76,9 @@ fn claims(note: &str) -> Result<BTreeMap<String, Claim>, String> {
 
 /// The note's sources table: key to (locator, grade).
 fn sources(note: &str) -> BTreeMap<String, (String, String)> {
-    let start = note.find("## Sources").unwrap_or(note.len());
-    let rest = &note[start..];
-    let end = rest[2..].find("\n## ").map_or(rest.len(), |e| e + 2);
-    rest[..end]
+    let rest = note.split_once("## Sources").map_or("", |(_, rest)| rest);
+    let section = rest.split_once("\n## ").map_or(rest, |(section, _)| section);
+    section
         .lines()
         .filter(|l| l.starts_with("| `"))
         .map(|l| {
@@ -91,10 +93,10 @@ fn sources(note: &str) -> BTreeMap<String, (String, String)> {
 fn cites(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = text;
-    while let Some(at) = rest.find("[c") {
-        let after = &rest[at + 2..];
-        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
-        if !digits.is_empty() && after[digits.len()..].starts_with(']') {
+    while let Some((_, after)) = rest.split_once("[c") {
+        let tail = after.trim_start_matches(|ch: char| ch.is_ascii_digit());
+        let digits = after.strip_suffix(tail).unwrap_or_default();
+        if !digits.is_empty() && tail.starts_with(']') {
             out.push(format!("c{digits}"));
         }
         rest = after;
@@ -141,14 +143,12 @@ fn numbers(text: &str, groups: bool) -> Vec<String> {
         loop {
             let ch = at(j);
             let next_digit = at(j + 1).is_ascii_digit();
-            if ch.is_ascii_digit() || ((ch == ',' || ch == '.') && next_digit) {
-                j += 1;
-            } else if groups
+            let grouped = groups
                 && ch == ' '
                 && (1..=3).all(|k| at(j + k).is_ascii_digit())
                 && !at(j + 4).is_ascii_digit()
-                && !(at(j + 4) == '.' && at(j + 5).is_ascii_digit())
-            {
+                && !(at(j + 4) == '.' && at(j + 5).is_ascii_digit());
+            if ch.is_ascii_digit() || ((ch == ',' || ch == '.') && next_digit) || grouped {
                 j += 1;
             } else {
                 break;
@@ -187,14 +187,14 @@ fn units(design: &str) -> Vec<Unit> {
             || trimmed
                 .split_once(". ")
                 .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|ch| ch.is_ascii_digit()));
-        if line.starts_with('#') || line.trim().is_empty() || line.starts_with('|') || item {
-            if let Some(text) = current.take() {
-                out.push(Unit {
-                    section: section.clone(),
-                    text,
-                    row: false,
-                });
-            }
+        if (line.starts_with('#') || line.trim().is_empty() || line.starts_with('|') || item)
+            && let Some(text) = current.take()
+        {
+            out.push(Unit {
+                section: section.clone(),
+                text,
+                row: false,
+            });
         }
         if line.starts_with('#') {
             section = line.to_owned();
@@ -236,11 +236,14 @@ fn stated(text: &str) -> String {
             out.push_str(rest);
             break;
         };
-        out.push_str(&rest[..at]);
+        let (before, from) = rest.split_at_checked(at).unwrap_or((rest, ""));
+        out.push_str(before);
         let close = if Some(at) == code { '`' } else { ']' };
-        rest = rest[at + 1..]
-            .find(close)
-            .map_or("", |e| &rest[at + 1 + e + 1..]);
+        // Past the opening '[' or '`' (one byte), then past its close.
+        rest = from
+            .get(1..)
+            .and_then(|inner| inner.split_once(close))
+            .map_or("", |(_, after)| after);
     }
     let t = out.trim_start();
     let marker = if let Some(stripped) = t.strip_prefix("- ") {
