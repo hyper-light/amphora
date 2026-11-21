@@ -406,8 +406,7 @@ impl<T> Slots<T> {
         }
     }
 
-    /// When the slot held ends by its length, if one is held: a test's view.
-    #[cfg(test)]
+    /// When the slot held ends by its length, if one is held: one of the owner's deadlines.
     pub(super) fn until(&self) -> Option<Instant> {
         self.holding.as_ref().map(|holding| holding.until)
     }

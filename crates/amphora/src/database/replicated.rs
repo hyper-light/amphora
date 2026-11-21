@@ -9597,7 +9597,8 @@ mod tests {
         }
         assert!(
             matches!(answered, Some(Ok(_))),
-            "the write's answer: {answered:?}"
+            "the write's answer: {:?}",
+            answered.as_ref().map(|answer| answer.as_ref().err())
         );
         drop(client);
         owner.join().unwrap();
