@@ -113,6 +113,25 @@ fn a_like_is_estimated_on_the_sample() {
     assert!(q_error(e, c) <= 1.5, "{sql}: estimated {e}, counted {c}");
 }
 
+/// Do: ANALYZE lineitem, then estimate an OR of 25 one-value BETWEENs on quantity, the odd
+/// quantities, half the table: a program of 124 operations, past the 64 a term was once held to.
+/// Expect: within 1.25 of its count, run on the sample. A term's length is bounded by its
+/// statement, and its run by the sample's rows, never more than a scan of the table runs it
+/// (decision 21, 2026-11-11; AC-PL.4.2).
+#[test]
+fn a_long_term_is_estimated_on_the_sample() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open(dir.path());
+    lineitem(&conn);
+    conn.execute("ANALYZE").unwrap();
+    let odd: Vec<String> = (0..25)
+        .map(|k| format!("quantity BETWEEN {q} AND {q}", q = 2 * k + 1))
+        .collect();
+    let sql = format!("SELECT id FROM lineitem WHERE {}", odd.join(" OR "));
+    let (e, c) = (estimate(&conn, &sql), count(&conn, &sql));
+    assert!(q_error(e, c) <= 1.25, "estimated {e}, counted {c}");
+}
+
 /// Do: ANALYZE a table whose y equals its x, then estimate a range on each. Expect: within 1.25
 /// of the half of the table counted: the sample sees the columns move together, where their
 /// product took a quarter or less (decision 21; audit row 5, the independence assumption).

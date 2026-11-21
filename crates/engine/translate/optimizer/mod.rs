@@ -30,6 +30,7 @@ use crate::{
         optimizer::{
             access_method::{
                 find_best_access_method_for_join_order, AccessMethod, AccessMethodParams,
+                WholeReads,
             },
             constraints::{
                 ConstraintUseCandidate, RangeConstraintRef, SeekRangeConstraint, TableConstraints,
@@ -1095,10 +1096,12 @@ fn find_select_plan_form(
     #[cfg(not(feature = "optimizer_params"))]
     let base: &cost_params::CostModelParams = &cost_params::DEFAULT_PARAMS;
     // Amphora: what a table lookup costs depends on the connection's cache (decision 5).
+    // Amphora (PL.12): and with the values its estimates may read for the statement's parameters.
     let params = &base
         .with_cache_pages(resolver.cache_pages())
         .with_statement_memory(resolver.statement_memory())
-        .with_learned(resolver.learned_weights());
+        .with_learned(resolver.learned_weights())
+        .with_plan_values(resolver.plan_values());
     plan.estimated_output_rows = None;
     plan.estimated_cost = None;
 
@@ -2784,10 +2787,12 @@ fn find_table_access_plan(
     #[cfg(not(feature = "optimizer_params"))]
     let base: &cost_params::CostModelParams = &cost_params::DEFAULT_PARAMS;
     // Amphora: what a table lookup costs depends on the connection's cache (decision 5).
+    // Amphora (PL.12): and with the values its estimates may read for the statement's parameters.
     let params = &base
         .with_cache_pages(resolver.cache_pages())
         .with_statement_memory(resolver.statement_memory())
-        .with_learned(resolver.learned_weights());
+        .with_learned(resolver.learned_weights())
+        .with_plan_values(resolver.plan_values());
 
     if table_references.joined_tables().is_empty() {
         return Ok(None);
@@ -3219,6 +3224,8 @@ fn plan_unmatched_right_rows(
             1.0,
             base_row_count,
             params,
+            // This read runs once, after the main loops.
+            WholeReads::Allowed,
         )?
         else {
             // The rowid candidate, or the INDEXED BY candidate, can always scan the table.

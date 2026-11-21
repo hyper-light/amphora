@@ -12,12 +12,12 @@ use amphora_api::Refusal;
 pub(super) const QUORUM_CEILING: usize = 165;
 
 /// Ticks of one generation of the window: a gap is believed for one to two of them, 30 to 60 s,
-/// longer than step 1's loaded runs went between gaps over 200 ms on average (at fewest, 84 in
-/// 1,800 s).
+/// longer than step 1's loaded runs went between gaps past the election timeout (the core's
+/// `election_tick` × `TICK`, 20 × 10 ms) on average (at fewest, 84 in 1,800 s).
 pub(super) const GENERATION: u64 = 3_000;
 
 /// Voters a leader measures at most: the replicated owner's member bound.
-const PEERS: usize = 64;
+const PEERS: usize = super::replicated::MEMBERS;
 
 /// An answer the window does not learn, and why.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
