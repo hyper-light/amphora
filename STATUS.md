@@ -297,11 +297,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   decision 13, `crates/engine/storage/versioned/{switch,sql}.rs`): `ConnectOpts::with_versioned_storage`
   or `AMPHORA_STORAGE=versioned` puts a database's B-trees on the versioned storage; the executor's
   cursors, CREATE/DROP TABLE and INDEX, DELETE without WHERE, `sqlite_schema` (tree 1) and ANALYZE
-  run on it, each SQL transaction one storage transaction. `sql.rs` (`T-NS.2.6`) runs the same SQL
-  on both storages and compares. Not yet: a file database reopened (recovery remakes every tree in
-  rowid order; the header stays the pager's), a statement's own rollback inside a transaction, DROP
-  undone by ROLLBACK, a pool past the page cache's bound; the engine's suites with the switch on are
-  the coordinator's run.
+  run on it, each SQL transaction one storage transaction, a failed statement undone alone by a
+  savepoint. `sql.rs` (`T-NS.2.6`) runs the same SQL on both storages and compares. Not yet: a file
+  database reopened (recovery remakes every tree in rowid order; the header stays the pager's), DROP
+  undone by ROLLBACK, SQL's named SAVEPOINT, a database past the pool's frames or a transaction past
+  its budget (no eviction yet; the budget is the shell's to give); the engine's suites with the
+  switch on are the coordinator's run.
 - **Serializable validation, three prototypes behind one switch** (G8 step 1, docs/design/engine.md
   decision 5, `crates/engine/storage/versioned/{version,elle}.rs`, `amphora-bench --cc`): precision
   locking (the default), SSI and Silo-style OCC validate commits on the versioned storage's commit
