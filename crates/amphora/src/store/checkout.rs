@@ -129,8 +129,8 @@ impl<R> Slots<R> {
     fn try_take(&self) -> Option<MutexGuard<'_, Option<R>>> {
         let len = self.slots.len();
         let first = thread_number().checked_rem(len).unwrap_or(0);
-        let (after, before) = self.slots.split_at(first.min(len));
-        before.iter().chain(after).find_map(|slot| match slot.0.try_lock() {
+        let (earlier, from_first) = self.slots.split_at(first.min(len));
+        from_first.iter().chain(earlier).find_map(|slot| match slot.0.try_lock() {
             Ok(guard) => Some(guard),
             Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
             Err(TryLockError::WouldBlock) => None,
