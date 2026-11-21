@@ -2673,6 +2673,7 @@ impl Database {
             has_non_main_pagers: AtomicBool::new(false),
             query_only: AtomicBool::new(false),
             row_counters: AtomicBool::new(false),
+            plan_cache_mode: AtomicU8::new(crate::PlanCacheMode::Auto.to_u8()),
             vdbe_trace: AtomicBool::new(false),
             dml_require_where: AtomicBool::new(false),
             count_changes: AtomicBool::new(false),

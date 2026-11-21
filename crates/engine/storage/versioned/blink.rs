@@ -134,7 +134,7 @@ impl Tree {
         self.root.load(Ordering::Acquire)
     }
 
-    fn compare(&self) -> Compare<'_> {
+    pub(super) fn compare(&self) -> Compare<'_> {
         &*self.cmp
     }
 
