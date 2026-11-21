@@ -97,6 +97,12 @@ pub struct Switch {
     /// The savepoints of the write statements under way in the transaction, newest last: one a
     /// statement, so bounded by the statements nested in one another.
     statements: Mutex<Vec<Savepoint>>,
+    /// Trees the transaction made, dropped if it rolls back, and trees it dropped, dropped once it
+    /// commits (making and dropping a tree is durable alone, decision 12): one a DDL statement.
+    made: Mutex<Vec<u64>>,
+    dropped: Mutex<Vec<u64>>,
+    /// SQL's named savepoints (`SAVEPOINT name`), oldest first, beside the connection's frames.
+    named: Mutex<Vec<(String, Savepoint)>>,
     d: Mutex<Descender>,
 }
 
@@ -107,6 +113,9 @@ impl Switch {
             storage,
             txn: Mutex::new(None),
             statements: Mutex::new(Vec::new()),
+            made: Mutex::new(Vec::new()),
+            dropped: Mutex::new(Vec::new()),
+            named: Mutex::new(Vec::new()),
             d: Mutex::new(Descender::new()),
         }
     }
@@ -163,15 +172,23 @@ impl Switch {
             orders.insert(id, slot);
             id
         };
+        self.made.lock().push(id);
         i64::try_from(id).map_err(|_| LimboError::IntegerOverflow)
     }
 
-    /// Drops the tree at `root_page` (DROP TABLE, DROP INDEX): durable before it returns, as
-    /// decision 12 makes it, not undone by a rollback.
+    /// Drops the tree at `root_page` (DROP TABLE, DROP INDEX) once the transaction commits, so a
+    /// rollback keeps it.
     pub fn drop_tree(&self, root_page: i64) -> Result<()> {
-        let tree = tree_of(root_page)?;
-        self.db.drop_tree(&mut self.d.lock(), tree)?;
-        self.storage.orders.lock().remove(&tree);
+        self.dropped.lock().push(tree_of(root_page)?);
+        Ok(())
+    }
+
+    /// Drops `trees` now, each durable before the next.
+    fn drop_now(&self, trees: Vec<u64>) -> Result<()> {
+        for tree in trees {
+            self.db.drop_tree(&mut self.d.lock(), tree)?;
+            self.storage.orders.lock().remove(&tree);
+        }
         Ok(())
     }
 
@@ -207,6 +224,50 @@ impl Switch {
         Ok(())
     }
 
+    /// Opens SQL's savepoint `name` (`SAVEPOINT name`) in the connection's transaction.
+    pub fn push_named(&self, name: &str) -> Result<()> {
+        let shared = self.txn()?;
+        let sp = shared
+            .lock()
+            .as_ref()
+            .ok_or_else(|| LimboError::TxError("versioned storage: no transaction".into()))?
+            .savepoint();
+        self.named.lock().push((name.to_string(), sp));
+        Ok(())
+    }
+
+    /// Releases the newest savepoint `name` and those opened after it (`RELEASE name`).
+    pub fn release_named(&self, name: &str) {
+        let mut named = self.named.lock();
+        if let Some(i) = named.iter().rposition(|(n, _)| n == name) {
+            named.truncate(i);
+        }
+    }
+
+    /// Rolls the transaction back to the newest savepoint `name` (`ROLLBACK TO name`), which
+    /// stays open; those opened after it end.
+    pub fn rollback_named(&self, name: &str) -> Result<()> {
+        let sp = {
+            let mut named = self.named.lock();
+            let Some(i) = named.iter().rposition(|(n, _)| n == name) else {
+                return Ok(());
+            };
+            named.truncate(i.checked_add(1).ok_or(LimboError::IntegerOverflow)?);
+            match named.get(i) {
+                Some((_, sp)) => *sp,
+                None => return Ok(()),
+            }
+        };
+        let Some(shared) = self.txn.lock().clone() else {
+            return Ok(());
+        };
+        let mut guard = shared.lock();
+        let Some(txn) = guard.as_mut() else {
+            return Ok(());
+        };
+        self.db.rollback_to(&mut self.d.lock(), txn, sp)
+    }
+
     /// Ends the newest statement's savepoint: kept, or rolled back to (its changes undone, the
     /// transaction's earlier ones kept).
     pub fn end_statement(&self, rollback: bool) -> Result<()> {
@@ -228,21 +289,22 @@ impl Switch {
 
     /// Ends the connection's transaction, if one is open: commits it (durable before it returns),
     /// or rolls it back. A cursor still holding it is refused its next write.
+    /// Trees the transaction made are dropped if it rolls back; trees it dropped, once it commits.
     pub fn finish(&self, rollback: bool) -> Result<()> {
         self.statements.lock().clear();
-        let Some(shared) = self.txn.lock().take() else {
-            return Ok(());
-        };
-        let Some(txn) = shared.lock().take() else {
-            return Ok(());
-        };
-        let mut d = self.d.lock();
-        if rollback {
-            self.db.abort(txn, &mut d)
-        } else {
-            self.db
-                .commit(txn, &mut d, self.db.lane(), true)
-                .map(|_| ())
+        self.named.lock().clear();
+        let made = std::mem::take(&mut *self.made.lock());
+        let dropped = std::mem::take(&mut *self.dropped.lock());
+        let shared = self.txn.lock().take();
+        let txn = shared.and_then(|s| s.lock().take());
+        if let Some(txn) = txn {
+            let mut d = self.d.lock();
+            if rollback {
+                self.db.abort(txn, &mut d)?;
+            } else {
+                self.db.commit(txn, &mut d, self.db.lane(), true)?;
+            }
         }
+        self.drop_now(if rollback { made } else { dropped })
     }
 }

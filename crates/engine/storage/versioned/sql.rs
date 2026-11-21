@@ -204,3 +204,65 @@ fn t_ns_2_6_a_failed_statement_is_undone_alone() {
     assert_eq!(want.len(), 2);
     assert_eq!(rows(&versioned, q), want);
 }
+
+/// Do: in a transaction, drop a table and create another, then roll back; then drop the table and
+/// commit. Expect: the rollback keeps the dropped table's rows and leaves no new table, and the
+/// commit drops it, on both storages.
+#[test]
+fn t_ns_2_6_ddl_rolls_back_with_its_transaction() {
+    let (_pdb, pager) = connect(false);
+    let (_vdb, versioned) = connect(true);
+    let q = "SELECT a FROM t ORDER BY a";
+    for conn in [&pager, &versioned] {
+        run(conn, "CREATE TABLE t (a INTEGER PRIMARY KEY)");
+        run(conn, "INSERT INTO t VALUES (1), (2)");
+        run(conn, "BEGIN");
+        run(conn, "DROP TABLE t");
+        run(conn, "CREATE TABLE u (b)");
+        run(conn, "INSERT INTO u VALUES (1)");
+        run(conn, "ROLLBACK");
+        assert_eq!(rows(conn, q).len(), 2);
+        assert!(conn.prepare("SELECT b FROM u").is_err());
+        run(conn, "BEGIN");
+        run(conn, "DROP TABLE t");
+        run(conn, "COMMIT");
+        assert!(conn.prepare(q).is_err());
+        run(conn, "CREATE TABLE v (c)");
+        run(conn, "INSERT INTO v VALUES ('after')");
+    }
+    let q = "SELECT c FROM v";
+    assert_eq!(rows(&versioned, q), rows(&pager, q));
+}
+
+/// Do: SAVEPOINTs nested in a transaction, ROLLBACK TO the inner one twice, RELEASE the outer one,
+/// COMMIT; and a SAVEPOINT that starts a transaction, rolled back to and released. Expect: the
+/// same rows on both storages.
+#[test]
+fn t_ns_2_6_named_savepoints_answer_alike() {
+    let (_pdb, pager) = connect(false);
+    let (_vdb, versioned) = connect(true);
+    for conn in [&pager, &versioned] {
+        run(conn, "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)");
+        run(conn, "BEGIN");
+        run(conn, "INSERT INTO t VALUES (1, 'kept')");
+        run(conn, "SAVEPOINT outer_sp");
+        run(conn, "INSERT INTO t VALUES (2, 'kept too')");
+        run(conn, "SAVEPOINT inner_sp");
+        run(conn, "INSERT INTO t VALUES (3, 'undone')");
+        run(conn, "UPDATE t SET b = 'undone' WHERE a = 1");
+        run(conn, "ROLLBACK TO inner_sp");
+        run(conn, "INSERT INTO t VALUES (4, 'undone again')");
+        run(conn, "ROLLBACK TO inner_sp");
+        run(conn, "RELEASE outer_sp");
+        run(conn, "COMMIT");
+        run(conn, "SAVEPOINT alone");
+        run(conn, "DELETE FROM t WHERE a = 2");
+        run(conn, "ROLLBACK TO alone");
+        run(conn, "INSERT INTO t VALUES (5, 'last')");
+        run(conn, "RELEASE alone");
+    }
+    let q = "SELECT a, b FROM t ORDER BY a";
+    let want = rows(&pager, q);
+    assert_eq!(want.len(), 3);
+    assert_eq!(rows(&versioned, q), want);
+}
