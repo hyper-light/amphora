@@ -22,6 +22,8 @@ point ("Continuous Archiving and Point-in-Time Recovery", postgresql.org/docs/cu
 - **The log's restarts wait for shipping.** `Db::restart_log` starts the log again only once the
   backup shipped all of it (`backup::Fence`), until the log is past what a restart keeps (decision
   31); then it starts again and the archive records a break: seconds across it need a base after it.
+  The engine's own restarts (at the writer's next write once every frame is in the file, and on
+  the last connection's close, as SQLite's) are off for a backed-up writer: they skipped the wait.
 - **Bases.** A copy of the file, chunk by chunk, with no reader held (a reader held for a 100 GB copy
   would hold the log's restarts and the store's readers back), made consistent by replaying the log
   from the first frame of the generation it began in through where the log stood when it ended, as

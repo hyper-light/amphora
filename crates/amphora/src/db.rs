@@ -497,7 +497,14 @@ impl Db {
     /// Backs this database up through `hooks` (docs/design/backup.md): each commit made on this
     /// connection is stamped, and its log starts again only once shipped ([`Db::restart_log`]).
     /// Only the writer is backed up: it makes every commit.
+    ///
+    /// The engine, as SQLite does, starts a log every frame of which is in the file again by
+    /// itself at the writer's next write, and empties it when its last connection closes: both
+    /// would overwrite frames the backup hasn't shipped, a break in its log. A backed-up writer
+    /// turns both off, so its log starts again only through [`Db::restart_log`] (CP-T1.12,
+    /// T-T1.12.D1). Its checkpoints after commits are off already (`wal_autocheckpoint = 0`).
     pub fn back_up(&mut self, hooks: Arc<crate::backup::Hooks>) {
+        self.conn.wal_auto_actions_disable();
         self.backup = Some(hooks);
     }
 
