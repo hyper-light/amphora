@@ -361,6 +361,8 @@ criteria = [
 ]
 tests = [
   { id = "T-PL.9.1", text = "A table grown tenfold after its statement was prepared — passes when the statement plans again once and its answer is unchanged" },
+  # lane pl9
+  { id = "T-PL.9.2", text = "Writes that change rows, writes that change none, and reads — passes when each write that changed rows adds to its table's count exactly once and nothing else does" },
 ]
 
 [[own]]
@@ -456,6 +458,18 @@ criteria = [
 ]
 tests = [
   { id = "T-NS.1.1", text = "Random operation sequences on both cursors — passes when identical keys, values and positions after each step" },
+]
+
+# lane g7s2
+[[own]]
+id = "NS.2"
+title = "Records, overflow, the catalog and transactions on the new pages (G7 step 2)"
+criteria = [
+  { id = "AC-NS.2.1", text = "the engine's test suites pass on the new storage" },
+  { id = "AC-NS.2.3", text = "A transaction rolls back to a savepoint from its versions: rows first changed after it as before the transaction, rows changed before and after as the savepoint found them, later changes out of its redo record; the savepoint stays good" },
+]
+tests = [
+  { id = "T-NS.2.1", text = "The shared model test of transactions on both storages — passes when identical answers, no anomaly" },
 ]
 
 # lane follower-reads (G13 step 4, kiln goal 80d4cf5e; docs/design/replication.md, "Follower reads at a
@@ -609,7 +623,9 @@ criteria = [
 tests = [
   { id = "T-T1.9.S1", text = "Automatic splits, merges and moves in the simulator under writes, driver and group restarts and lost logs — passes when every key is in exactly one group, the directory's, and writes lost is 0" },
   { id = "T-T1.9.R1", text = "A split carried through the directory group's replicated log while groups route by it — passes when every member holds the same directory, a write to the fenced range is refused typed, a router on the old directory is refused by the old group's holding after the flip, and once routed by the new directory the range is written to and read from the new group" },
-  { id = "T-T1.9.R2", text = "A refused directory change and a directory image — passes when the refusal is alike on every member and changes nothing, an image installs the same directory, and an image that doesn't decode is refused" },
+  { id = "T-T1.9.R2", text = "A refused directory change and a directory image — passes when the refusal is alike on every member and changes nothing, an image installs the same directory and a member reopened opens at the image it kept, and an image that doesn't decode, installed or kept, is refused" },
+  # lane split-merge-5
+  { id = "T-T1.9.R3", text = "A group's holding kept by its own database with its rows: a key fenced, then the groups started again on the same files — passes when the fenced key is still refused, typed, and the group's other keys are still taken" },
 ]
 
 # lane qs5

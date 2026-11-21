@@ -16,6 +16,11 @@ use crate::types::{IOResult, IOResultOr, Value};
 /// and Neumann, CIDR 2019; docs/research/planner.md f14).
 const PRECISION: u8 = 11;
 const REGISTERS: usize = 2048;
+/// The sketch's relative standard error, 1.04 / sqrt(m) (Flajolet et al.), for its m registers:
+/// how far a distinct count read from it may be off (PL.9 reads it as its statistics' error).
+pub(crate) fn relative_standard_error() -> f64 {
+    1.04 / (REGISTERS as f64).sqrt()
+}
 /// The hash's bits after a register's index: 64 - 11.
 const REST: u32 = 53;
 /// Set below the 53 bits a register reads, so their run of leading zeros ends by the 54th. A

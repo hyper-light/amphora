@@ -127,6 +127,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   was unnested into a scan of all 200,000 entries of `items_grp_created`: 227 → 26,895 statements a
   second at 1 client and 1,231 → 225,470 at 32, best of 3 in turns on adas-mac-studio-2, the controls
   within 2% (`bench/records/2026-10-25-adas-mac-studio-2-output-subquery-calls.md`).
+- **Correlated subqueries unnested in general** (docs/design/planner.md decision 22, PL.10,
+  `crates/engine/tests/unnesting.rs`): beside the fixed patterns, `NOT IN` becomes a NULL-aware
+  anti-join, an `EXISTS`/`IN` of several tables a semi- or anti-join with a derived table, an
+  `EXISTS` under `OR` or in the `SELECT` list a grouped left join, and nested subqueries unnest level
+  by level from a worklist with no recursion; the cheapest of the written, patterns' and general
+  forms is kept. Answers equal nested ones on 39 classes and 24 levels of nesting (T-PL.10.1); a
+  subquery reading a semi-joined table stays nested, and Q20's `0.5 * total()` isn't unnested yet. Open:
+  q21 at SF 10 and TPC-DS's ten queries measured (AC-PL.10.1, AC-PL.10.2).
 - **A one-row lookup orders its table** (docs/design/planner.md decision 10,
   `crates/engine/tests/records_plans.rs`): a loop that gives at most one row for each row before it
   (a unique key's whole lookup by `=`, or the rowid's) takes its table's ORDER BY columns as ordered
@@ -255,6 +263,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   the current engine's B-tree cursor through the same random operation sequences on a table and two
   indexes (one descending and NOCASE) and compares every step. Not yet: overflow rows (refused,
   `TooBig`), dropping a tree, a comparison per tree in one database, the connection's wiring (step 2).
+- **Savepoints on the versioned storage** (G7 step 2 in part, `NS.2`;
+  `crates/engine/storage/versioned/{version,txn_model}.rs`): a transaction rolls back to a savepoint
+  from its versions (rows first changed after it as before the transaction, rows changed before and
+  after as it found them, later changes out of the redo record). The shared model test of
+  transactions (`txn_model.rs`, `T-NS.2.1`) runs the same random transactions with savepoints on the
+  current engine through SQL and on the versioned storage, every read and scan compared, and checks
+  each snapshot sees exactly what was committed when it opened (300 seeds pass; the 10,000 are the
+  batch's). Not yet: overflow rows, the catalog (`sqlite_schema`, DDL, trees made and dropped at run
+  time) and ANALYZE, the connection's wiring, so the engine's suites don't yet run on it.
 - **Serializable validation, three prototypes behind one switch** (G8 step 1, docs/design/engine.md
   decision 5, `crates/engine/storage/versioned/{version,elle}.rs`, `amphora-bench --cc`): precision
   locking (the default), SSI and Silo-style OCC validate commits on the versioned storage's commit
@@ -342,10 +359,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (`reshard::replicated::DirectoryMachine`, a hyper-durable state machine of directory changes; its
   leader runs the driver under its term), and `Groups` routes by the directory instead of `fnv % n`, each
   group checking every write and read against its holding (`store::Refused::Away`) (T-T1.9.R1, R2).
-  Left: each group's holding kept durable in its own state with its rows (it is in the router's memory
-  now), rows indexed by position for copy and sweep, the old group's log held through the operation,
-  the shell carrying the driver's actions to groups, `bench reshard` (AC-T1.9.2) and the three-machine
-  lab (AC-T1.9.3).
+  Kept (lane split-merge-5): each group's holding is kept by its own engine with its rows
+  (`Engine::holding`/`keep_holding`), durable before the group acts on it, and a group started again
+  answers from it whatever directory it is started by; a directory member keeps the image it installed
+  (`DirectoryMachine::open`), so a restart needs no catch-up (T-T1.9.R1 to R3). Left: rows indexed by
+  position for copy and sweep, the change feed by log position, the old group's log held through the
+  operation, a split copying the range's rows, the shell carrying the driver's actions to groups,
+  `bench reshard` (AC-T1.9.2) and the three-machine lab (AC-T1.9.3).
 
 - **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
   `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then
@@ -575,6 +595,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   costs say the generic plan does as well; one whose estimates read none keeps its generic plan. Its
   TPC-H prepared measurement (AC-PL.12.1; its harness, `amphora-bench --planner --prepared` with
   qgen's parameters, is written: bench/planner/README.md) and the suite's (AC-PL.12.2) are open.
+  PL.9 is built (lane pl9, docs/design/planner.md "row counts kept as rows change"): each table's
+  rows inserted less deleted since ANALYZE are kept as writes finish (one atomic add a statement),
+  the planner's row count follows them, and a prepared statement plans again once a table it counted
+  has moved past its statistics' own error. CH-benCHmark (AC-PL.9.1) and the suite's writes
+  (AC-PL.9.2) are open.
 - **G11, analytics at column-store speed** (docs/design/columnar.md, decision 1; sources in
   docs/research/columnar.md; CS.1): decided, not built. Columns are a copy derived from the rows, fed
   by each commit's redo record after the commit, exact at every snapshot by a journal of changed keys
