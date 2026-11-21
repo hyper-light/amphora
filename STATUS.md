@@ -232,6 +232,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   after it, never an empty database over an existing file. Crash points through commits and
   checkpoints recover a prefix of the commits at least as long as the last acknowledged durable;
   the pool still holds every page, and nothing runs it under SQL yet (stage 3).
+- **Serializable validation, three prototypes behind one switch** (G8 step 1, docs/design/engine.md
+  decision 5, `crates/engine/storage/versioned/{version,elle}.rs`, `amphora-bench --cc`): precision
+  locking (the default), SSI and Silo-style OCC validate commits on the versioned storage's commit
+  path; Elle's list-append and register histories checked for G0, G1a, G1b, G1c, G-single and G2
+  (snapshot isolation the control, showing G2). Not yet: the 10,000-seed runs and the three schemes'
+  throughput, refusals and p99 on the suite's write classes and K0 (the batch's), then the choice.
 - **Ephemeral tables kept between runs** (docs/design/executor.md decision 1,
   `crates/engine/tests/ephemeral_reuse.rs`): a statement keeps each ephemeral table of at most 16
   pages (an IN list's keys, an IN subquery's rows) and empties it on its next run, where building
@@ -278,6 +284,18 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   its retries' gaps (cold start: the core's election timeout). A gap over which the host's detector suspected the
   member is not learned; no number bounds a gap (lane g-slot-close, 2026-11-21).
 
+- **Picked constants replaced by derived ones** (lane constants, kiln goal dfabffcc; Ada, 2026-11-11: "learned and
+  stat derived values only"): a page's chain of deltas ends where its bytes reach a page (store.md decision 17); the
+  store's log is copied past its bound (decision 35); a term runs on the whole sample (planner.md decision 21); a
+  drained lease is probed from the probe's cost to the learned window (J1); a class entry's bound, the patience's
+  voters and a change's charge follow from what they bound; an owner's own session lasts its role's raft timing; and
+  an owner's connections are bounded by the process's descriptor budget, the system's limit less what is open
+  (local-owner-transport.md, "Decision (lane constants): one descriptor budget"; FD.1), with a replica's local
+  readers following it; the replicated owner drives once a step, in turn with its inputs (replication.md, "Decision
+  (lane constants): one drive a step"; DQ.1); and each owner charges its lease, or a client its socket, to the same
+  budget, no count of owners (`OWNERS_MAX` gone; AC-FD.1.4). Left: an owner's other descriptors (endpoint, engine
+  files, a replica's log) charged by kind, the replicated owner's tick and poll, and the rest of the list
+  (handoff/amphora-constants-list.md).
 - **Groups that split, merge and move themselves** (CP-T1.9, lane split-merge; `crates/amphora/src/reshard/`,
   docs/design/reshard.md): a pure core: a directory of hash spans with every position in exactly one group,
   each group's own holding (fenced, stale actions refused), a planner deciding from measured load, bytes and
@@ -468,6 +486,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (PL.7, e0e7a1df), bushy plans with CD-C (PL.8, c837cde3), statistics kept as rows change (PL.9,
   26302efe), unnesting by dependent joins (PL.10, 61c79bd1), upper bounds as a guard (PL.11,
   f4e0bd7f), custom then generic plans (PL.12, aa0541f6) and adaptive joins (PL.13, 4f237e07).
+- **PL.6** (5e23ff8b, built and tested on t1/lane-pl6, its measurement open): no table is read whole
+  beneath loops that can give more than one row. A scan stays only beneath one-row loops (a lookup by a
+  unique key) or where no equality joins the table; elsewhere a seek, an automatic index or a hash join
+  reads it, and a hash
+  join's build input is materialized where its probe would otherwise be read once for each outer row
+  (docs/design/planner.md, "Decision (lane pl6)"). `bench/planner/loops.py` counts such plans in the
+  bench's records: 30 of JOB's 113 at step 3, none of TPC-H's; the target is 0, with JOB's times within
+  the passes' spread of the parent's.
   PL.12 is built (lane pl12, docs/design/planner.md "custom plans, then a generic one"): a statement
   whose estimates read a parameter's value is planned with each run's values until its own measured
   costs say the generic plan does as well; one whose estimates read none keeps its generic plan. Its

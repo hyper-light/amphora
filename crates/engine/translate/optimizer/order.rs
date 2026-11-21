@@ -457,7 +457,7 @@ fn first_column_off_tables(
 }
 
 /// Whether a loop gives at most one row for each row of the loops before it.
-fn access_method_is_one_row(access_method: &AccessMethod) -> bool {
+pub(super) fn access_method_is_one_row(access_method: &AccessMethod) -> bool {
     // A complete lookup on a UNIQUE index also returns at most one row.
     // Each key column must use `=`. `IS` can match many NULL entries.
     match &access_method.params {

@@ -177,6 +177,52 @@ recently committed writes, cheap for short transactions. Jordan, Banerjee, Ma, "
 **Falsified by.** A serializable history with a cycle (Elle, AC-T1.3); validation costing more than
 a fifth of a short transaction's time on the suite's `txn_read_write`.
 
+**Prototypes (G8 step 1, AC-G8.1.1, AC-G8.1.2).** Three validations sit behind one switch on the
+commit path (`storage/versioned/version.rs`, `Validation`, chosen per database by
+`Versioned::with_validation`; precision locking the default as this decision says, until the
+measurements below choose). Each validates inside the publish lock, so no commit lands between a
+transaction's check and its timestamp, and each refuses with `SerializationFailure`, the
+transaction rolled back. Reads that count are the ones made through `VTree::read` and
+`VTree::read_range` (a row by key; a span from a key to the last row given, or to the end when
+fewer came back than asked); a write's own read of its row needs no keeping, since the first
+writer's win already refuses a row changed since the snapshot.
+
+- *Precision locking* (HyPer): a transaction that wrote checks its rows and spans against the rows
+  written by every commit since its snapshot; one that only read commits unchecked, serialized at
+  its snapshot (a prefix of the commit order). Kept between commits: each writing commit's rows,
+  while a snapshot older than it is open.
+- *SSI* (PostgreSQL, after Cahill et al. and Ports and Grittner): read-write antidependencies
+  between concurrent transactions, each pair found at the later commit of the two, so only
+  committed transactions are checked; refused where the committing transaction would be the pivot
+  of `in -> pivot -> out` with `out` committed no later than `in`, or the `in` of a pivot that
+  committed with an `out` before it (Fekete et al.'s theorem: every cycle holds such a structure
+  whose `out` commits first). Readers are validated too (the read-only anomaly). Kept: every
+  commit's rows read and written, and its earliest `out`, while a snapshot older than it is open.
+- *OCC* (Silo): each row read is checked in its tree, by the version its head names, for a commit
+  since the snapshot; each span is read again for one. Silo's node set (a leaf's version) is
+  replaced by the rows of the span, since an open writer's in-place change moves a leaf's version
+  and would refuse the transactions reading beside it, its own included; Silo's refusal of a row
+  locked by an open writer is left out, since that writer commits after the publish lock and so
+  after the reader in the serial order. TicToc's lazily chosen commit timestamps don't apply: a
+  snapshot here is a prefix of commit timestamps, and a commit placed in the past would change
+  what open snapshots have already read. Kept: nothing.
+
+Precision locking and OCC refuse the same transactions (a row or span read that a commit since
+the snapshot wrote) by different work: a scan of the recent commits' rows against a transaction's
+reads, against a look-up of each read row and a second read of each span. SSI refuses fewer (a lone
+antidependency commits) for more kept state. The tests: `version.rs`'s `g8_1_*` (write skew, a
+phantom closing a cycle, a lone antidependency, the read-only anomaly, an open writer of a row
+read, and the kept commits bounded by the oldest snapshot); `storage/versioned/elle.rs`, Elle's
+list-append and register histories from its own generator, 32 transactions open at once, checked
+for G0, G1a, G1b, G1c, G-single and G2, with snapshot isolation as the control that shows G2. The
+throughput, refusals and p99 of each on the suite's write classes and K0 come from
+`amphora-bench --cc`, not yet recorded.
+
+A race this work found and fixed: a transaction or snapshot read the last published timestamp
+before counting itself open, so a commit and a collection between the two could drop versions it
+needed (and, with validation, the commits it must be checked against). It now reads the timestamp
+under the open snapshots' lock, which the low watermark takes too.
+
 ## 6. Durability: a row's change logged once, at commit
 
 **Decision.** A commit appends one redo record: each row change of the transaction (the B-tree, the

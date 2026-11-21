@@ -7,11 +7,14 @@
 //! the page format ([`page`]), the buffer pool ([`pool`]), B-link trees on it ([`blink`]) and row
 //! versions on them ([`version`]: snapshots, first-writer-wins, rollback, collection); then their
 //! files ([`disk`]; on Linux, `uring`: the engine's `io_uring` feature), the redo log ([`redo`]),
-//! and checkpoints and recovery ([`durable`]).
+//! and checkpoints and recovery ([`durable`]); and the commit validations' Elle-style isolation
+//! checks (`elle`, G8 step 1).
 
 pub mod blink;
 pub mod disk;
 pub mod durable;
+#[cfg(test)]
+mod elle;
 pub mod page;
 pub mod pool;
 pub mod redo;

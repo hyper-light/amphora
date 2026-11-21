@@ -28,6 +28,7 @@
 
 pub mod database;
 pub mod db;
+mod descriptors;
 pub mod groups;
 pub mod memory;
 pub mod meter;

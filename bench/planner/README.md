@@ -123,3 +123,8 @@ amphora-bench --planner --bench tpch --sf 1 --data ~/.cache/planner-bench/tpch-s
   plans and runs in one round trip.
 - **Agreement**: each engine's row count for each query; any query on which they differ is listed.
   With `--answers`, every row of every answer (`answers.py`).
+- **Whole reads in loops** (PL.6): `python3 -I loops.py <records.jsonl>...` counts the plans that
+  read a table whole (a scan, or a hash join's probe) beneath loops that can give more than one row,
+  from each Amphora plan's EXPLAIN QUERY PLAN FORMAT=JSON; a loop counts as one row only where it
+  looks its table up by rowid, so the count is never below the planner's own. `test_loops.py`
+  holds step 3's counts: 30 of JOB's 113 plans, none of TPC-H's.
