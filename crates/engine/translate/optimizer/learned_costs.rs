@@ -158,15 +158,24 @@ impl LearnedCosts {
         self.rates.lock().weights()
     }
 
-    /// Anchors the page read's rate to one read timed at open (`time_page_read`), before the
-    /// database has read a page of its own. It counts as one read beside the database's own, and
-    /// the first epoch of those replaces it.
-    pub(crate) fn anchor_page_read(&self, nanos: f64) {
+    /// Anchors the page read's rate to `reads` page reads timed at open in `nanos`
+    /// (`time_page_read`), before the database has read a page of its own. They count beside the
+    /// database's own reads, and the first epoch of those replaces them.
+    pub(crate) fn anchor_page_read(&self, reads: f64, nanos: f64) {
         let mut rates = self.rates.lock();
-        if !(nanos.is_finite() && nanos > 0.0) {
+        if !(reads.is_finite() && reads > 0.0 && nanos.is_finite() && nanos > 0.0) {
             return;
         }
-        rates.page.previous = Span { units: 1.0, nanos };
+        rates.page.previous = Span {
+            units: reads,
+            nanos,
+        };
+    }
+
+    /// The page reads an epoch of the page read's rate holds: the most the open's anchor times
+    /// (`time_page_read`), as calibration times each kind of work up to a page of it.
+    pub(crate) fn page_read_epoch(&self) -> usize {
+        self.rates.lock().page.epoch.max(1.0) as usize
     }
 }
 
@@ -272,32 +281,40 @@ fn calibrate(clock: &mut dyn FnMut() -> f64) -> Rates {
     rates
 }
 
-/// Times one page read at a database's open, before it has read a page of its own (QT.5): a
-/// scratch page of `page_size` bytes, written beside the database through its own IO and read back
-/// as its pager reads (`read_through_io`). Nanoseconds, or None if no scratch page could be
+/// Times page reads at a database's open, before it has read a page of its own (QT.5): a scratch
+/// page of `page_size` bytes, written beside the database through its own IO and read back as its
+/// pager reads (`read_through_io`). (reads, nanoseconds), or None if no scratch page could be
 /// written there (a database whose directory takes no file is one opened read-only, whose open
 /// reads its own file).
 ///
-/// The read comes from the OS's cache, as the database's own reads do while its pages are cached.
-/// It is not read uncached (`O_DIRECT`, `F_NOCACHE`, `FILE_FLAG_NO_BUFFERING`): that prices a
+/// The reads come from the OS's cache, as the database's own reads do while its pages are cached.
+/// They are not read uncached (`O_DIRECT`, `F_NOCACHE`, `FILE_FLAG_NO_BUFFERING`): that prices a
 /// cached database's page at a device read, which made row visits all but free against it and
 /// flipped the planner's plans for databases held in memory (lane qs5-4, kiln run r326 on Windows:
 /// three of `tests/planner.rs`'s plans). A database whose reads go to the device teaches the
-/// estimator that with its own reads: the first epoch of them replaces this one
+/// estimator that with its own reads: the first epoch of them replaces these
 /// (`LearnedCosts::anchor_page_read`).
+///
+/// The first read is not the rate: it pays for the IO's first use (on jupiter, Windows, the
+/// process's first read took 121.7 us, the reads after it 24.7 to 38.9 us; lane qs5-5's probe,
+/// kiln run r558), and a single read anchored on it flipped `tests/records_plans.rs`'s key joins
+/// to hash joins (kiln run r546). So the reads after it are timed, doubling in number, until
+/// their time reaches the first's or they number `most_reads`, as calibration times each kind of
+/// work until its time reaches the slowest single run (`measure`).
 pub(crate) fn time_page_read(
     db_path: &str,
     io: &crate::sync::Arc<dyn crate::io::IO>,
     page_size: usize,
-) -> Option<f64> {
+    most_reads: usize,
+) -> Option<(f64, f64)> {
     let page: Vec<u8> = (0..page_size).map(|i| mix(i as u64) as u8).collect();
     let scratch = if crate::database::is_memory_like(db_path) {
         format!(":memory:-page-read-{}", uuid::Uuid::new_v4().simple())
     } else {
         format!("{db_path}-page-read-{}", uuid::Uuid::new_v4().simple())
     };
-    match read_through_io(io, &scratch, page) {
-        Ok(nanos) => Some(nanos),
+    match read_through_io(io, &scratch, page, most_reads) {
+        Ok(timed) => Some(timed),
         Err(err) => {
             tracing::debug!("QT.5: no scratch page read beside {db_path}: {err}");
             None
@@ -305,17 +322,19 @@ pub(crate) fn time_page_read(
     }
 }
 
-/// Writes `page` to `scratch` through `io` and reads it back as the pager reads, from the read's
-/// submission to its completion; the read's nanoseconds. The file is removed whatever happens.
+/// Writes `page` to `scratch` through `io` and reads it back as the pager reads, each read from
+/// its submission to its completion: the first read alone, then the reads after it as
+/// `time_page_read` says; (those reads, their nanoseconds). The file is removed whatever happens.
 fn read_through_io(
     io: &crate::sync::Arc<dyn crate::io::IO>,
     scratch: &str,
     page: Vec<u8>,
-) -> crate::Result<f64> {
+    most_reads: usize,
+) -> crate::Result<(f64, f64)> {
     use crate::io::{Buffer, Completion, OpenFlags};
     use crate::sync::Arc;
     let file = io.open_file(scratch, OpenFlags::Create, false)?;
-    let timed = (|| -> crate::Result<f64> {
+    let timed = (|| -> crate::Result<(f64, f64)> {
         let len = page.len();
         let written = file.pwrite(
             0,
@@ -323,27 +342,43 @@ fn read_through_io(
             Completion::new_write(|_| {}),
         )?;
         io.wait_for_completion(written)?;
-        let start = std::time::Instant::now();
-        let read = file.pread(
-            0,
-            Completion::new_read(Arc::new(Buffer::new(vec![0; len])), move |res| match res {
-                Ok((_, n)) if n as usize == len => None,
-                Ok((_, n)) => Some(crate::error::CompletionError::ShortRead {
-                    page_idx: 0,
-                    expected: len,
-                    actual: n.max(0) as usize,
+        let read_once = || -> crate::Result<()> {
+            let read = file.pread(
+                0,
+                Completion::new_read(Arc::new(Buffer::new(vec![0; len])), move |res| match res {
+                    Ok((_, n)) if n as usize == len => None,
+                    Ok((_, n)) => Some(crate::error::CompletionError::ShortRead {
+                        page_idx: 0,
+                        expected: len,
+                        actual: n.max(0) as usize,
+                    }),
+                    Err(err) => Some(err),
                 }),
-                Err(err) => Some(err),
-            }),
-        )?;
-        io.wait_for_completion(read)?;
-        Ok(start.elapsed().as_nanos() as f64)
+            )?;
+            io.wait_for_completion(read)
+        };
+        let start = std::time::Instant::now();
+        read_once()?;
+        let first = start.elapsed().as_nanos() as f64;
+        let most_reads = most_reads.max(1);
+        let mut reads: usize = 1;
+        loop {
+            let start = std::time::Instant::now();
+            for _ in 0..reads {
+                read_once()?;
+            }
+            let nanos = start.elapsed().as_nanos() as f64;
+            match reads.checked_mul(2) {
+                Some(next) if nanos < first && next <= most_reads => reads = next,
+                _ => return Ok((reads as f64, nanos)),
+            }
+        }
     })();
     drop(file);
     let removed = io.remove_file(scratch);
-    let nanos = timed?;
+    let timed = timed?;
     removed?;
-    Ok(nanos)
+    Ok(timed)
 }
 
 #[cfg(test)]
@@ -460,7 +495,7 @@ mod tests {
     #[test]
     fn t_qt_5_5_the_open_anchor_stands_until_the_database_reads() {
         let costs = LearnedCosts::from_rates(fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0));
-        costs.anchor_page_read(100.0);
+        costs.anchor_page_read(1.0, 100.0);
         assert_eq!(costs.weights().unwrap().row_in_pages, Some(2.0 / 100.0));
         for _ in 0..4 {
             costs.observe(Work::PageRead, 1.0, 400.0);
@@ -477,7 +512,8 @@ mod tests {
         let path = dir.path().join("anchor.db");
         let io: crate::sync::Arc<dyn crate::io::IO> =
             crate::sync::Arc::new(crate::PlatformIO::new().unwrap());
-        let nanos = time_page_read(path.to_str().unwrap(), &io, 4096).unwrap();
+        let (reads, nanos) = time_page_read(path.to_str().unwrap(), &io, 4096, 8).unwrap();
+        assert!((1.0..=8.0).contains(&reads), "{reads}");
         assert!(nanos.is_finite() && nanos > 0.0, "{nanos}");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
@@ -487,7 +523,8 @@ mod tests {
     #[test]
     fn t_qt_5_5_a_scratch_page_read_is_timed_in_memory() {
         let io: crate::sync::Arc<dyn crate::io::IO> = crate::sync::Arc::new(crate::MemoryIO::new());
-        let nanos = time_page_read(":memory:", &io, 4096).unwrap();
+        let (reads, nanos) = time_page_read(":memory:", &io, 4096, 8).unwrap();
+        assert!((1.0..=8.0).contains(&reads), "{reads}");
         assert!(nanos.is_finite() && nanos > 0.0, "{nanos}");
     }
 

@@ -858,10 +858,13 @@ impl Database {
             // of its own, one scratch page read beside it gives the first time. A database opened
             // read-only writes nothing beside it; its open reads its own file.
             if !flags.contains(OpenFlags::ReadOnly) {
-                if let Some(nanos) =
-                    learned_costs::time_page_read(&path, io, BufferPool::DEFAULT_PAGE_SIZE)
-                {
-                    costs.anchor_page_read(nanos);
+                if let Some((reads, nanos)) = learned_costs::time_page_read(
+                    &path,
+                    io,
+                    BufferPool::DEFAULT_PAGE_SIZE,
+                    costs.page_read_epoch(),
+                ) {
+                    costs.anchor_page_read(reads, nanos);
                 }
             }
             Arc::new(costs)
