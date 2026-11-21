@@ -655,17 +655,13 @@ pub struct Run {
 impl Run {
     pub fn anomalies(&self, w: Workload) -> BTreeSet<Anomaly> {
         if w.lists {
-            let finals = self
-                .finals
-                .iter()
-                .map(|(k, r)| (key_of(k), decode(r)))
-                .collect();
+            let finals = self.finals.iter().map(|(k, r)| (*k, decode(r))).collect();
             check_lists(&self.history, &finals)
         } else {
             let finals = self
                 .finals
                 .iter()
-                .map(|(k, r)| (key_of(k), Some(key_of(r))))
+                .map(|(k, r)| (*k, Some(key_of(r))))
                 .collect();
             check_registers(&self.history, &finals)
         }
