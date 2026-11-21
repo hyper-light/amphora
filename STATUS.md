@@ -730,6 +730,14 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   attached table's largest degree, or two tables' ℓ2 norms); underestimates are left as they are
   (docs/design/planner.md, "Decision (lane pl11)"). Open: the bound holds for PL.9's net row
   change, not for updates or cancelled inserts between ANALYZE runs.
+- **PL.7** (b6a2313e, built and tested on t1/lane-pl7, behind a switch, its JOB measurement
+  open): with `Connection::set_fitted_costs` (or `AMPHORA_FITTED_COSTS=1`) on, the database times a
+  share of its statements, the share learned against the timer's cost and the measurement's spread,
+  and fits the planner's weights to their counted work (rows, seeks, hash rows added and looked up,
+  sort work, file page reads) by non-negative least squares with Huber weights, in bounded memory;
+  weights no sample determines keep the learned calibration's (docs/design/planner.md, "Decision
+  (lane pl7)"). Open: tables' pages from the file (T-PL.7.1), the P-error harness (AC-PL.7.2), and
+  AC-PL.7.1's JOB rank correlation with the switch on and off.
 - **PL.6** (5e23ff8b, built and tested on t1/lane-pl6, its measurement open): no table is read whole
   beneath loops that can give more than one row. A scan stays only beneath one-row loops (a lookup by a
   unique key) or where no equality joins the table; elsewhere a seek, an automatic index or a hash join
@@ -791,6 +799,14 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   ranges, with writes between scans, serially and on the morsel executor's workers (`Plan` is a
   `vdbe/morsel.rs` pipeline, granules its unit) (T-CS.4.1 to T-CS.4.3). Open: the planner's use
   (step 5), and the benches against CedarDB and ClickHouse (AC-CS.4.1, AC-CS.4.2).
+  Step 5's choice is built, behind `AMPHORA_COLUMN_PATH=on` (CS.5, lane g11s5): the planner prices
+  "scan the column copy" from the copy's measured nanoseconds per row at its block size plus each
+  queued key read from the rows and merged (`translate/optimizer/column_path.rs`), against the
+  row path's learned rates for a row's visit and a seek; a copy that can't answer the snapshot
+  exactly is no path. `storage/versioned/columns_path.rs` reads by the choice and charges the
+  copy's scan time back to it (T-CS.5.1 to T-CS.5.4). Open: SQL tables don't keep a copy yet, so
+  no SQL statement reaches it; step 4's vectorized scan replaces `Columns::scan` there; the
+  classes against CedarDB and ClickHouse (AC-CS.5.2) are the coordinator's.
 
 ## Open
 
