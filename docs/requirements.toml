@@ -127,6 +127,10 @@ criteria = [
   { id = "AC-T1.8.D1", text = "A replica's database log holds at most the room its filesystem's free bytes give it (an equal share among the replica logs there, past one snapshot's image), plus what the local reads out at its restart's due point let past it: copied by passive checkpoints and started again by its owner when its restarts' counted share of the p99.9 tail allows or past its room, refusing submits past its room, a local read's view whole throughout" },
   # Amphora's own: the leader's write slot (docs/design/replication.md, "A follower's write under steady leader writes: the write slot").
   { id = "AC-T1.8.W1", text = "Under steady leader writes, a member's write refused as stale lands on its next try under the leader's write slot, a member waits at most (members - 1) slots, the leader gets a turn between two slots, and the slot's length is learned from its members' retries" },
+  # lane d-readsets: read sets on top of the write slot (goal ceea4e0a).
+  { id = "AC-T1.8.R1", text = "A member's write prepared on an older base is admitted by the leader when no entry its log holds since that base wrote a page the write read or wrote; page 1 changed only in its size conflicts only with a write that writes page 1 too; the window is the leader's log between the base and the append" },
+  { id = "AC-T1.8.R2", text = "Read sets keep every history serializable, alone and under the write slot" },
+  { id = "AC-T1.8.R3", text = "The read set travels with the write as an append-only change: a binary from before it decodes the write and ignores the read set" },
   { id = "AC-T1.8.D2", text = "No class's owner flushes an ordinary entry's database log on its own thread: a flush that stands still stands no owner step still" },
 ]
 tests = [
@@ -143,6 +147,12 @@ tests = [
   { id = "T-T1.8.W2", text = "Two followers and the leader writing steadily - passes when every write commits within its deadline, no follower write is refused more than twice in a row, no write the leader makes in its turn after a slot is refused, and the history is serializable" },
   { id = "T-T1.8.W3", text = "A follower's retry racing its slot's start, the leader's last entry neither committed nor sent to it - passes when its barrier waits for that entry's commit and its write applies" },
   { id = "T-T1.8.W4", text = "The write slot's pure core: its queue and the leader's turn, held forwards, a second forward, expiry and a late retry learned, a retry its member was suspected through not learned, generations, the term and members, and the held barrier" },
+  # lane d-readsets: read sets.
+  { id = "T-T1.8.R1", text = "The leader's check over pages: a page read, one written, the marker page and an opaque entry conflict; one that touched nothing of the write doesn't" },
+  { id = "T-T1.8.R2", text = "Page 1: a size change merges with a write that only read page 1 and conflicts with one that allocates; only the size and checksum changed is an allocation" },
+  { id = "T-T1.8.R3", text = "A read set rides after the write's encoding; the base moves alone; a decoder from before reads the write and ignores the trailer" },
+  { id = "T-T1.8.R4", text = "In an interleaving the test builds, with the slot off: a follower's write on pages nothing since wrote lands on its first try, one on a changed page is refused, and with read sets off both are refused" },
+  { id = "T-T1.8.R5", text = "List-append runs, two followers and the leader, slot off and on, 32 and 2 lists - passes when every history is serializable, none unknown, some base moved, and the unchecked mutant is caught" },
   { id = "T-T1.8.C1", text = "An attachment whose durability differs from its owner's is refused, typed; the same fates in another order are taken; a process stating no replica restarts in the owner's class" },
   # Amphora's own: the replicated application floor (docs/design/replication.md, "The application floor, replicated").
   { id = "T-T1.8.C2", text = "Two members stating different classes — passes when, once the group's class entry commits, the member stating the other is fenced naming the class, refused Invalid reopening under it, and opens and catches up under the group's" },
@@ -422,6 +432,19 @@ tests = [
   { id = "T-QT.3.5", text = "scripts/check-production.sh after the change — passes when it passes, with the ratchet's counts lowered by what the change removed" },
 ]
 
+# lane nscursor
+# Amphora's own IDs for the executor on the new storage (kiln plan 01a16b0f46fa72e384b8dd0065dc94f9,
+# "G7 The executor on the new storage", CP-T1.3 stage 3): NS.n for its step n.
+
+[[own]]
+id = "NS.1"
+title = "The cursor on the versioned storage: the executor's B-tree cursor operations on the B-link trees (G7 step 1)"
+criteria = [
+  { id = "AC-NS.1.1", text = "a conformance suite of cursor operations passes on both storages with identical results" },
+]
+tests = [
+  { id = "T-NS.1.1", text = "Random operation sequences on both cursors — passes when identical keys, values and positions after each step" },
+
 # lane follower-reads (G13 step 4, kiln goal 80d4cf5e; docs/design/replication.md, "Follower reads at a
 # closed time" and "Search over partitions"). AC-T1.10.3 and AC-T1.10.4 are the measures; these are what they
 # rest on.
@@ -627,6 +650,8 @@ criteria = [
 ]
 tests = [
   { id = "T-G2.4.1", text = "a known dialect difference (integer division, NULL ordering) — passes when classified as a dialect difference, not a bug" },
+  # lane corpus-ci-4
+  { id = "T-G2.4.2", text = "the engine seam (crates/corpus/src/engines.rs, crates/corpus/tests/engines.rs): every engine of step 4 opens by name, one whose program or server is missing is refused with a typed error, and a file runs on SQLite's own shell through the gate's code path — passes when each missing engine is refused, never passed" },
 ]
 
 [[own]]
@@ -640,6 +665,8 @@ tests = [
   { id = "T-G2.7.1", text = "the pool chosen from measured times (bench/corpus/subset.py) and run with them kept (crates/corpus/tests/times.rs) — passes when each record and each file has its time and fill files stop at the deadline" },
   { id = "T-G2.7.2", text = "a corpus file run on Amphora through the gate's code path (crates/corpus/tests/amphora_runs.rs) — passes when the wrong answer, and only it, disagrees" },
   { id = "T-G2.7.3", text = "the whole corpus nightly (.kiln/corpus.yaml, bench/corpus/nightly.sh) — passes when its record, times and re-ranked pool are kept as the run's artifacts" },
+  # lane corpus-ci-4
+  { id = "T-G2.7.4", text = "a record that can't finish (a 10-way join of 100 rows) bounded by the run's budget (crates/corpus/tests/amphora_runs.rs, times.rs) — passes when the engine stops it and it is classified past the budget, the next record still runs, and a required record past it fails the run" },
 ]
 
 # lane g11-compress
