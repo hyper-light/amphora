@@ -51,7 +51,7 @@ def typed(expression):
                     column.replace(exp.ColumnDef(this=column.copy()))
     for column in expression.find_all(exp.ColumnDef):
         if column.args.get("kind") is None:
-            column.set("kind", exp.DataType.build("BLOB", dialect="sqlite"))
+            column.set("kind", exp.DataType(this=exp.DataType.Type.BLOB))
     return expression
 
 
