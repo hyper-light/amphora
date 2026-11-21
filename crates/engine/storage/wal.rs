@@ -476,9 +476,10 @@ pub struct PreparedFrames {
     /// Amphora: the packed records the frames are, as (first slot, slots), in order; each holds the
     /// pages of `metadata` that map to its first slot. Empty when each frame is a page.
     pub records: Vec<(u64, u32)>,
-    /// Amphora: for packed records, each page's depth in its record (as `metadata`), the records
+    /// Amphora: for packed records, each page's depth in its record and its chain's delta bytes
+    /// (as `metadata`), the records
     /// decoded (as `records`), and the log's generation they were made in.
-    pub(crate) depths: Vec<u8>,
+    pub(crate) depths: Vec<(u8, u32)>,
     pub(crate) decoded: Vec<Arc<Record>>,
     pub(crate) generation: u32,
 }
@@ -489,12 +490,15 @@ struct Against {
     generation: u32,
     upto: u64,
     most: usize,
+    /// Deltas in a row the generation's format allows (`packed::most_deltas`).
+    deepest: u8,
 }
 
 /// Amphora: how a commit logs a page (decisions 17 and 39).
 enum Logging {
-    /// The bytes that changed since the version of it the log holds: (its depth, its runs).
-    Delta(u8, Vec<u8>),
+    /// The bytes that changed since the version of it the log holds: (its depth, its chain's delta
+    /// bytes since its image, this delta's included, its runs).
+    Delta(u8, u32, Vec<u8>),
     /// Its image, ending a chain the delta would take past its bound: the page's latest frame in
     /// the generation is the version its buffer holds.
     Ends,
@@ -4109,7 +4113,8 @@ impl WalFile {
         let against = Against {
             generation: header.checkpoint_seq,
             upto: self.max_frame.load(Ordering::Acquire),
-            most: page_size.checked_div(2).unwrap_or(0),
+            most: page_size,
+            deepest: packed::most_deltas(header.file_format),
         };
         let len = pages
             .len()
@@ -4146,7 +4151,7 @@ impl WalFile {
             .zip(&logging)
             .map(|((number, image), how)| {
                 let body = match how {
-                    Logging::Delta(depth, runs) => packed::Body::Delta {
+                    Logging::Delta(depth, _, runs) => packed::Body::Delta {
                         depth: *depth,
                         runs,
                     },
@@ -4174,6 +4179,13 @@ impl WalFile {
         let mut records = Vec::with_capacity(count);
         let mut decoded = Vec::with_capacity(count);
         let mut next = first;
+        let chains: Vec<u32> = logging
+            .iter()
+            .map(|how| match how {
+                Logging::Delta(_, chain, _) => *chain,
+                Logging::Ends | Logging::New => 0,
+            })
+            .collect();
         for (index, cut) in cuts.into_iter().enumerate() {
             let held = entries
                 .get(cut.clone())
@@ -4212,12 +4224,15 @@ impl WalFile {
                 checksum = recompute_wal_frame_checksum(frame.as_mut_slice(), header, checksum);
                 bufs.push(frame);
             }
+            let held_chains = chains
+                .get(cut.clone())
+                .ok_or_else(|| LimboError::InternalError("a record past its pages".into()))?;
             let held_pages = pages
                 .get(cut)
                 .ok_or_else(|| LimboError::InternalError("a record past its pages".into()))?;
-            for (page, (_, body)) in held_pages.iter().zip(held) {
+            for ((page, (_, body)), chain) in held_pages.iter().zip(held).zip(held_chains) {
                 metadata.push((page.clone(), next, checksum));
-                depths.push(body.depth());
+                depths.push((body.depth(), *chain));
             }
             records.push((next, slots));
             decoded.push(Arc::new(record));
@@ -4242,10 +4257,9 @@ impl WalFile {
 
     /// Amphora: how a commit logs `version` of a page (`base`, its bytes as the page's buffer held
     /// them) now that it is `image` (as the log will hold it): the delta that turns one into the
-    /// other while `version` is of this generation of the log and the page's latest in it, fewer
-    /// than `packed::MOST_DELTAS` deltas from its image, and the delta saves half the page; its
-    /// image ending the chain where the delta would pass those bounds; else its image, the page new
-    /// to the log's chains.
+    /// other while `version` is of this generation of the log and the page's latest in it
+    /// (`chains_from`), within the chain's bounds (`extend`, decision 17); its image ending the
+    /// chain where the delta would pass them; else its image, the page new to the log's chains.
     fn delta(
         &self,
         page: u32,
@@ -4272,9 +4286,13 @@ impl WalFile {
     }
 
     /// Amphora: the entry of a page whose `version` the commit chains from (`base`, its bytes as
-    /// the page's buffer held them) now that it is `image`: the delta between them while the chain
-    /// is shorter than `packed::MOST_DELTAS` and the delta saves half the page, else its image,
-    /// ending the chain.
+    /// the page's buffer held them) now that it is `image`: the delta between them, with its depth
+    /// and its chain's delta bytes, while the chain's deltas, this one included, take less than the
+    /// page (`against.most`, decision 17); else its image, ending the chain. Past that the image
+    /// costs the log less than the deltas a read would apply; within it a read applies less than a
+    /// page of deltas to the image, so it decodes under twice an image's bytes. The generation's
+    /// format bounds the depth besides (`against.deepest`, `packed::most_deltas`: 8 in a generation
+    /// begun before 2026-11-11, which older binaries read, else the depth field's width).
     fn extend(
         version: Logged,
         base: &[u8],
@@ -4282,14 +4300,24 @@ impl WalFile {
         tail: usize,
         against: &Against,
     ) -> Logging {
-        if version.depth >= packed::MOST_DELTAS {
+        if version.depth >= against.deepest {
             return Logging::Ends;
         }
-        match (
-            packed::diff(base, image, tail, against.most),
-            version.depth.checked_add(1),
-        ) {
-            (Some(runs), Some(depth)) => Logging::Delta(depth, runs),
+        // What the chain's deltas so far leave of the page: a chain past it holds no more.
+        let Some(left) = usize::try_from(version.chain)
+            .ok()
+            .and_then(|chain| against.most.checked_sub(chain))
+        else {
+            return Logging::Ends;
+        };
+        let Some(runs) = packed::diff(base, image, tail, left) else {
+            return Logging::Ends;
+        };
+        let chain = u32::try_from(runs.len())
+            .ok()
+            .and_then(|bytes| bytes.checked_add(version.chain));
+        match (version.depth.checked_add(1), chain) {
+            (Some(depth), Some(chain)) => Logging::Delta(depth, chain, runs),
             _ => Logging::Ends,
         }
     }
@@ -4321,7 +4349,8 @@ impl WalFile {
         let against = Against {
             generation: header.checkpoint_seq,
             upto: self.max_frame.load(Ordering::Acquire),
-            most: page_size.checked_div(2).unwrap_or(0),
+            most: page_size,
+            deepest: packed::most_deltas(header.file_format),
         };
         let past = || LimboError::InternalError("an entry past the commit's pages".into());
         let unframed = || LimboError::InternalError("a log frame unlike its page's size".into());
@@ -4386,7 +4415,7 @@ impl WalFile {
             .zip(images.chunks_exact(page_size))
             .map(|((_, number, how), image)| {
                 let body = match how {
-                    Logging::Delta(depth, runs) => packed::Body::Delta {
+                    Logging::Delta(depth, _, runs) => packed::Body::Delta {
                         depth: *depth,
                         runs,
                     },
@@ -4433,7 +4462,8 @@ impl WalFile {
             checksum = recompute_wal_frame_checksum(frame.as_mut_slice(), header, checksum);
             bufs.push(frame);
             metadata.push((pages.get(index).ok_or_else(past)?.clone(), next, checksum));
-            depths.push(0);
+            // A page frame is an image: no deltas since it.
+            depths.push((0, 0));
             next = next.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
         }
         for (at, (held, payload, record)) in packing.records.into_iter().enumerate() {
@@ -4462,10 +4492,14 @@ impl WalFile {
                 bufs.push(frame);
             }
             for &k in &held {
-                let (index, _, _) = chained.get(k).ok_or_else(past)?;
+                let (index, _, how) = chained.get(k).ok_or_else(past)?;
                 let (_, body) = chain.get(k).ok_or_else(past)?;
                 metadata.push((pages.get(*index).ok_or_else(past)?.clone(), next, checksum));
-                depths.push(body.depth());
+                let bytes = match how {
+                    Logging::Delta(_, bytes, _) => *bytes,
+                    Logging::Ends | Logging::New => 0,
+                };
+                depths.push((body.depth(), bytes));
             }
             records.push((next, slots));
             decoded.push(Arc::new(record));
@@ -4653,7 +4687,7 @@ impl WalFile {
                 tracing::error!("packed log: a spill wrote {written} of {total} bytes");
                 return;
             }
-            for ((page, frame, _), depth) in metadata.iter().zip(&depths) {
+            for ((page, frame, _), &(depth, chain)) in metadata.iter().zip(&depths) {
                 // A page changed while its write was under way holds what it wrote no longer.
                 let kept = !page.changed_since_write_began();
                 page.set_wal_tag(*frame, epoch);
@@ -4661,7 +4695,8 @@ impl WalFile {
                     page.set_logged(Logged {
                         frame: *frame,
                         generation,
-                        depth: *depth,
+                        depth,
+                        chain,
                     });
                 }
             }
@@ -6232,11 +6267,12 @@ impl Wal for WalFile {
                 page.set_wal_tag(*frame_id, batch.epoch);
             }
             // Amphora: a packed batch's pages hold what the log now holds.
-            for ((page, frame, _), depth) in batch.metadata.iter().zip(&batch.depths) {
+            for ((page, frame, _), &(depth, chain)) in batch.metadata.iter().zip(&batch.depths) {
                 page.set_logged(Logged {
                     frame: *frame,
                     generation: batch.generation,
-                    depth: *depth,
+                    depth,
+                    chain,
                 });
             }
         }

@@ -134,6 +134,18 @@ pub fn translate(
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
     // Amphora: what a table lookup costs depends on what the connection caches (decision 5).
     resolver.set_cache_pages(connection.get_pager().cached_page_capacity());
+    // Amphora (PL.12): the values the estimates may read (none for the generic plan), and where
+    // they note that one asked, which says whether a custom plan could differ.
+    let plan_values = prepare_options
+        .plan_values
+        .clone()
+        .unwrap_or_else(|| Arc::new(crate::plan_cache::PlanValues::generic()));
+    resolver.set_plan_values(plan_values.clone());
+    // Amphora: what its hash and group tables hold before they spill (executor decision 8).
+    resolver.set_statement_memory(connection.get_pager().statement_memory_budget());
+    resolver.set_join_methods(connection.join_methods());
+    // Amphora: what a seek, a hash table and a sort cost, as this database has timed them (QT.5).
+    resolver.set_learned_weights(connection.db.learned_costs.weights());
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here
@@ -151,6 +163,7 @@ pub fn translate(
     };
 
     program.epilogue(schema);
+    program.reads_parameter_values = plan_values.asked();
 
     program.build(connection, change_cnt_on, input)
 }

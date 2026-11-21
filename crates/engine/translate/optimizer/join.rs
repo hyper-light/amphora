@@ -6,7 +6,10 @@ use smallvec::SmallVec;
 use amphora_engine_parser::ast::{Operator, SubqueryType, TableInternalId};
 
 use super::{
-    access_method::{add_where_cost, find_best_access_method_for_join_order, AccessMethod},
+    access_method::{
+        add_where_cost, find_best_access_method_for_join_order, reads_whole_table, AccessMethod,
+        WholeReads,
+    },
     cardinality::JoinedSetRows,
     constraints::{usable_constraints_for_lhs_mask, TableConstraints},
     cost_params::CostModelParams,
@@ -30,7 +33,7 @@ use crate::{
                 index_access_is_unique_point_lookup, rows_per_leaf_page_for_index,
                 where_expr_steps, AnalyzeCtx, Cost, IndexInfo, RowCountEstimate, RowGoal,
             },
-            order::plan_satisfies_order_target,
+            order::{access_method_is_one_row, plan_satisfies_order_target},
         },
         plan::{
             HashJoinKey, HashJoinType, JoinInfo, JoinOrderMember, JoinOrigin, JoinedTable,
@@ -52,6 +55,8 @@ pub(crate) struct JoinPlanningContext<'a> {
     pub cost_limit: Option<Cost>,
     /// Whether this table read may build an automatic index.
     pub allow_automatic_index: bool,
+    /// Amphora: the join methods the connection allows (`Connection::set_join_methods`).
+    pub join_methods: crate::JoinMethods,
     /// Amphora: the rows a LIMIT (and OFFSET) leaves a one-table read to produce before it stops
     /// (`docs/design/planner.md` decisions 16 and 17), None when it reads to its end.
     pub row_goal: Option<RowGoal>,
@@ -65,6 +70,7 @@ impl<'a> JoinPlanningContext<'a> {
             maybe_order_target,
             cost_limit: None,
             allow_automatic_index: true,
+            join_methods: crate::JoinMethods::ByCost,
             row_goal: None,
         }
     }
@@ -416,6 +422,7 @@ fn join_lhs_and_rhs<'a>(
         input_cardinality,
         rhs_base_rows,
         params,
+        WholeReads::Allowed,
     )?
     else {
         return Ok(None);
@@ -435,14 +442,68 @@ fn join_lhs_and_rhs<'a>(
         && where_terms.iter().any(|term| {
             term.table_mask.get(rhs_table_number) && term.table_mask.intersects(&lhs_mask)
         });
-    if lhs.is_some() && !has_join_constraint {
+    // Penalize cross products so we don't introduce a table before it can join.
+    let cross_product_cost = (lhs.is_some() && !has_join_constraint).then(|| {
         let rhs_self_constraint_selectivity =
             build_self_constraint_selectivity(rhs_constraints, rhs_table_number);
-        // Penalize cross products so we don't introduce a table before it can join.
         let effective_rhs_rows = (*rhs_base_rows) * rhs_self_constraint_selectivity;
-        let cross_cost = (input_cardinality) * effective_rhs_rows;
-        best_access_method.cost = best_access_method.cost + Cost(cross_cost);
+        Cost(input_cardinality * effective_rhs_rows)
+    });
+    if let Some(cross_cost) = cross_product_cost {
+        best_access_method.cost = best_access_method.cost + cross_cost;
     }
+
+    // Amphora (PL.6, `docs/design/planner.md`, "Decision (lane pl6)"): the cheapest read of this
+    // table reads it whole, and the loops before it can give more than one row, so it would be
+    // read again for each of them. Any read that seeks by a key replaces it (an index, an IN seek,
+    // an automatic index), and so does a hash join below, at any cost; it stays only where none
+    // of them can read this table. A seek kept from the start keeps its preference over a hash
+    // join (`rhs_has_selective_seek`); one taken only because the whole read was refused doesn't.
+    let whole_read_refused = lhs.is_some_and(|lhs| {
+        reads_whole_table(&best_access_method)
+            && !loops_give_at_most_one_row(lhs, access_methods_arena, None)
+    });
+    let rhs_has_selective_seek = matches!(
+        best_access_method.params,
+        AccessMethodParams::BTreeTable {
+            ref index,
+            build_index,
+            ref constraint_refs,
+            ..
+        } if !constraint_refs.is_empty()
+            && !build_index
+            && index.as_ref().is_none_or(|index| !index.ephemeral)
+    );
+    if whole_read_refused {
+        if let Some(mut keyed) = find_best_access_method_for_join_order(
+            rhs_table_reference,
+            rhs_constraints,
+            &lhs_mask,
+            join_order,
+            planning_context,
+            where_clause,
+            &ready_where,
+            available_indexes,
+            table_references,
+            subqueries,
+            schema,
+            analyze_stats,
+            input_cardinality,
+            rhs_base_rows,
+            params,
+            WholeReads::Refused,
+        )? {
+            if !reads_whole_table(&keyed) {
+                add_where_cost(&mut keyed, &ready_where, input_cardinality, params);
+                if let Some(cross_cost) = cross_product_cost {
+                    keyed.cost = keyed.cost + cross_cost;
+                }
+                best_access_method = keyed;
+            }
+        }
+    }
+    let best_is_refused_whole_read =
+        |best: &AccessMethod| whole_read_refused && reads_whole_table(best);
 
     // If we already have a non-empty LHS (at least one table has been joined),
     // consider a hash-join alternative for the current RHS. This is a left-deep
@@ -459,17 +520,6 @@ fn join_lhs_and_rhs<'a>(
         let last_lhs_table_idx = join_order[join_order.len() - 2].original_idx;
         let lhs_table_numbers: TableMask = lhs.table_numbers().try_collect()?;
 
-        let rhs_has_selective_seek = matches!(
-            best_access_method.params,
-            AccessMethodParams::BTreeTable {
-                ref index,
-                build_index,
-                ref constraint_refs,
-                ..
-            } if !constraint_refs.is_empty()
-                && !build_index
-                && index.as_ref().is_none_or(|index| !index.ephemeral)
-        );
         let rhs_builds_index = matches!(
             best_access_method.params,
             AccessMethodParams::BTreeTable {
@@ -708,8 +758,16 @@ fn join_lhs_and_rhs<'a>(
             // Eligibility gate: prefer nested-loop when uses a selective probe seek.
             // Probe->build chaining is only allowed when the
             // build input is materialized from the join prefix.
-            let allow_hash_join = !rhs_has_selective_seek
-                && !build_unique_key_search_without_statistics
+            // Amphora: one method only when the connection asks (QT.5);
+            // the structural conditions below hold whichever it asks for.
+            let preferred_over_seek = match planning_context.join_methods {
+                crate::JoinMethods::ByCost => {
+                    !rhs_has_selective_seek && !build_unique_key_search_without_statistics
+                }
+                crate::JoinMethods::NestedLoopsOnly => false,
+                crate::JoinMethods::HashJoinsOnly => true,
+            };
+            let allow_hash_join = preferred_over_seek
                 && !probe_table_is_prior_build
                 && (!build_has_prior_constraints || build_has_rowid)
                 && !chaining_across_outer
@@ -758,12 +816,15 @@ fn join_lhs_and_rhs<'a>(
                     subqueries,
                     joined_tables,
                     params,
+                    planning_context.join_methods != crate::JoinMethods::HashJoinsOnly,
                 )? {
                     let mut hash_join_method = hash_join_method;
                     let mut hash_join_allowed = true;
-                    let mem_budget = match &hash_join_method.params {
-                        AccessMethodParams::HashJoin { mem_budget, .. } => *mem_budget,
-                        _ => unreachable!("hash join params expected"),
+                    let AccessMethodParams::HashJoin { mem_budget, .. } = hash_join_method.params
+                    else {
+                        return Err(LimboError::InternalError(
+                            "a hash join's access method has no hash join parameters".to_string(),
+                        ));
                     };
                     if let AccessMethodParams::HashJoin {
                         materialize_build_input,
@@ -773,6 +834,15 @@ fn join_lhs_and_rhs<'a>(
                         ..
                     } = &mut hash_join_method.params
                     {
+                        // Amphora (PL.6): unless the build input holds the loops before the
+                        // build table, the probe table is read whole once for each of their rows;
+                        // it is materialized from them where they can give more than one row,
+                        // so the probe is read once.
+                        let probe_read_per_outer_row = !loops_give_at_most_one_row(
+                            lhs,
+                            access_methods_arena,
+                            Some(build_table_idx),
+                        );
                         let needs_materialization = build_has_uncovered_prior_constraints(
                             lhs_constraints,
                             join_keys,
@@ -780,7 +850,8 @@ fn join_lhs_and_rhs<'a>(
                             &prior_hash_build_mask,
                         ) || build_table_is_prior_probe
                             || build_read_is_in_seek
-                            || build_access_method_uses_constraints;
+                            || build_access_method_uses_constraints
+                            || probe_read_per_outer_row;
                         let estimated_materialized_rows = input_cardinality;
 
                         let materialization_too_large = needs_materialization
@@ -894,7 +965,12 @@ fn join_lhs_and_rhs<'a>(
                         input_cardinality,
                         params,
                     );
-                    if hash_join_allowed && hash_join_method.cost < best_access_method.cost {
+                    let forced = planning_context.join_methods == crate::JoinMethods::HashJoinsOnly;
+                    if hash_join_allowed
+                        && (forced
+                            || hash_join_method.cost < best_access_method.cost
+                            || best_is_refused_whole_read(&best_access_method))
+                    {
                         best_access_method = hash_join_method;
                     }
                 }
@@ -934,7 +1010,9 @@ fn join_lhs_and_rhs<'a>(
                 },
             };
             add_where_cost(&mut index_method, &ready_where, input_cardinality, params);
-            if index_method.cost < best_access_method.cost {
+            if index_method.cost < best_access_method.cost
+                || best_is_refused_whole_read(&best_access_method)
+            {
                 best_access_method = index_method;
             }
         }
@@ -966,6 +1044,30 @@ fn join_lhs_and_rhs<'a>(
         cost,
         prefix_cardinalities,
     }))
+}
+
+/// Amphora (PL.6): whether the loops of `lhs`, leaving out the table `except`, give at most one row
+/// in all: each reads its table by every column of a unique key with `=` (the rowid, a primary key
+/// or a unique index), so each gives at most one row for each row before it (`order.rs`'s one-row
+/// loop). A hash join's build-only table runs no loop of its own: the build is read once, before
+/// the loops, and its probe's loop gives its matches.
+fn loops_give_at_most_one_row(lhs: &JoinN, arena: &[AccessMethod], except: Option<usize>) -> bool {
+    let hash_join = |am_idx: usize| match arena.get(am_idx).map(|am| &am.params) {
+        Some(AccessMethodParams::HashJoin {
+            build_table_idx,
+            probe_table_idx,
+            ..
+        }) => Some((*build_table_idx, *probe_table_idx)),
+        _ => None,
+    };
+    let builds_only = |table: usize| {
+        let mut joins = lhs.data.iter().filter_map(|(_, am_idx)| hash_join(*am_idx));
+        joins.clone().any(|(build, _)| build == table) && !joins.any(|(_, probe)| probe == table)
+    };
+    lhs.data
+        .iter()
+        .filter(|(table, _)| Some(*table) != except && !builds_only(*table))
+        .all(|(_, am_idx)| arena.get(*am_idx).is_some_and(access_method_is_one_row))
 }
 
 fn materialized_build_input_reads_an_outer_query(
@@ -4804,6 +4906,7 @@ mod tests {
             &[],
             table_references.joined_tables(),
             &DEFAULT_PARAMS,
+            true,
         )
         .unwrap()
         .unwrap();

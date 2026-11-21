@@ -455,7 +455,9 @@ commit; the slots' checksums chain as frames' do, and every page of a record map
 slot, so frame numbers keep their meaning for read marks, backfill, the durable mark (decision 15)
 and restarts. The log header's file format says which a generation is, and a generation keeps the
 format it began with, so a log is always read as it was written and a page-a-frame log from before
-reads as ever. Records are kept decoded (4 MiB a database, the oldest dropped first past that; the
+reads as ever. Packed generations begun since 2026-11-11 carry 0x414d_5004, mixed ones 0x414d_5005
+(decision 17's chains ended by their bytes); 0x414d_5002 and 0x414d_5003 are read and continued as
+before, and an older binary refuses the new values by name; to downgrade, checkpoint first. Records are kept decoded (4 MiB a database, the oldest dropped first past that; the
 writer keeps those it writes), the checkpoint reads a record once for all the pages it copies from
 it, and recovery reads record by record: a record whose slots don't all hold ends the log there, as
 a torn frame does; one whose slots all hold but that doesn't decode refuses the log, since no torn
@@ -512,9 +514,10 @@ default, fewer writes a second or longer tails packed than page-a-frame on the c
 
 **Decision.** In a packed log (opt-in, decision 16) a page whose last version is in the log's
 current generation is written as the bytes that changed since (a delta: runs of offset, length and
-bytes, runs closer than a run's header merged), at most 8 deltas in a row (`packed::MOST_DELTAS`)
-before its next whole image, and only where the delta takes less than half a page; otherwise its
-image. The base
+bytes, runs closer than a run's header merged) while the deltas since its last whole image, this
+one included, take less than a page; otherwise its image (2026-11-11: this rule replaces a picked
+8 deltas in a row and a picked half a page a delta). The depth field's width, 255
+(`packed::MOST_DELTAS`), is the format's bound beside it. The base
 is what the page's buffer held when the page was last made dirty: `Pager::add_dirty` keeps a copy
 while the buffer holds a version as written to the log (`Page::logged`, set when a commit or a
 spill is published), and the delta is made only while that version is still the page's latest
@@ -541,7 +544,7 @@ are carried whole even where the buffer's stale copy matches the new one (a test
 a run merged with the carried tail had dropped its first byte, and the page's checksum refused the
 rebuilt page), chains of up to 8 deltas rebuild every version, damaged records are refused, and
 (`packed_log.rs`) rows changed commit after commit are logged mostly as deltas, at depths up to 8
-and never past it, and read back on fresh connections, after a checkpoint and after recovery. A
+and never past it (to 2026-11-11; the chain's bytes bound it since, below), and read back on fresh connections, after a checkpoint and after recovery. A
 model test there (random inserts, changes and deletes with savepoints rolled back amid spills, 8
 seeds, both formats) found that a balance renumbers its siblings' page objects, so one could carry
 another page's logged version: every page of a record shares its frame, so the check that the
@@ -557,9 +560,41 @@ frame removed, no test fails: no path found leaves a page holding a version that
 the check stays as a guard. The log's bytes a row and what reads pay for chains: to be measured
 beside decision 16's.
 
-**Falsified by.** A page read back other than as written; a chain longer than 8; an acknowledged
-batch lost or torn by a power cut; writes or reads slower with deltas than with compressed whole
-pages at any writer count.
+**Where a chain ends (2026-11-11).** Ada: "We don't tolerate arbitrary constants, learned and stat
+derived values only." The chain had ended at a picked 8 deltas, each delta at a picked half page.
+It now ends where its own bytes say. Each further delta is a choice between renting and buying, the
+ski-rental problem (Karlin, Manasse, Rudolph and Sleator, "Competitive snoopy caching",
+Algorithmica 3, 1988). A delta costs the log its runs, and each later read of the page applies them
+again. An image costs a page once and resets the chain. Buying when the rented bytes would reach the
+purchase is the deterministic rule whose cost is within twice the best in hindsight, with no
+constant in it. The reader then applies under a page of deltas to an image, so a rebuild decodes
+less than twice an image's bytes. The writer keeps a chain's bytes beside its depth (`Logged::chain`,
+packed above the generation in `PageInner::logged_as`). The engine's test
+(`packed_log.rs`, `pages_changed_again_and_again_*`) makes the same rows change a byte thirty times
+and checks the log holds chains deeper than 8 (red at the old bound: "chains of small deltas end at
+8") whose deltas' bytes, page by page, stay under a page.
+
+Chains past 8 come with new header format values (Amphora agent, 2026-11-12; CLAUDE.md §3, formats
+change append-only): a generation begun now is `packed::PACKED_CHAINS_FORMAT` (0x414d_5004) or
+`MIXED_CHAINS_FORMAT` (0x414d_5005). A generation begun under 0x414d_5002 or 0x414d_5003 keeps its
+format, and its chains keep that format's bound of 8 (`packed::most_deltas`), so a binary from
+before still reads it. A binary from before refuses a log of the new values as a format it doesn't
+know, naming the value ("the log's format 0x414d5004 isn't known"), never as corrupt. The remedy for
+that refusal, a downgrade, is a checkpoint that empties the log on the newer binary first.
+`a_generation_keeps_the_chain_bound_of_the_format_it_began_with`: a generation begun now takes
+0x414d_5004 (red: 0x414d_5002), and one restamped 0x414d_5002 keeps its format, with chains of at most
+8.
+
+What the bytes rule doesn't price is the number of records a cold read decodes: a chain of small
+deltas may reach 255 records back, each read once and kept decoded (decision 16's 4 MiB). If a
+cold read's latency on such a chain beats the image's bytes as the cost, the rule must count
+records too.
+
+**Falsified by.** A page read back other than as written; a chain whose deltas take a page or more,
+or deeper than 255; an acknowledged batch lost or torn by a power cut; writes or reads slower with
+deltas than with compressed whole pages at any writer count; a cold read of a page at the end of a
+long chain of small deltas slower than its read with chains cut at 8 (the record count, not the
+bytes, then being the cost).
 
 ## 18. A reader forgets only what was written since it last read
 
@@ -1356,9 +1391,10 @@ the parser above 1% of a prepared statement's hot loop.
 ## 35. Small commits: the checkpoint copies a page once for many commits
 
 **Decision.** While the log is within its bound, the checkpointer looks at it every period
-(`Config::checkpoint_every`, 25 ms) and copies it into the file only once `Config::copy_after`
-(8,192) of its frames aren't there yet, or once the log has passed its bound (decision 4's drain,
-unchanged): `Engine::uncopied`, `Db::uncopied`, the engine's `Database::wal_backfill`. A page that
+(`Config::checkpoint_every`, 25 ms) and leaves it uncopied; it copies once the log has passed its
+bound (decision 4's drain, unchanged). From 2026-11-06 to 2026-11-11 it copied once
+`Config::copy_after` (8,192) of its frames weren't in the file yet; that count was picked and is
+gone (below, "No count of frames"). It reads the log through `Engine::uncopied`, `Db::uncopied`, the engine's `Database::wal_backfill`. A page that
 many small commits change is copied into the file once for all of them, not once for each period's
 commits. What the log records for a commit is unchanged in this step: each page the commit touched,
 whole (SQLite's frame, a 24-byte header and the 4 KiB page; decision 30 for spills).
@@ -1394,10 +1430,10 @@ decision 30 does, and a commit writes packed records with deltas, their first sl
 marked apart from a page number; with the records' pages shared, and the bulk statements measured
 against page-a-frame. Step 3 is CP-T1.3's storage.
 
-**The bound.** Within the log's bound, the file is written at most once for each `copy_after` frames
-of log, and each time with at most the pages those frames hold: the bytes the checkpoint writes are
-never more than the log's (a page is in the log before it is copied), and at most the log's times
-W / `copy_after` for commits that touch a working set of W pages. For the batched leg (W about
+**The bound.** The file is written at most once for each generation of the log (the bound's frames,
+`copy_after` until 2026-11-11), and each time with at most the pages those frames hold: the bytes the
+checkpoint writes are never more than the log's (a page is in the log before it is copied), and at
+most the log's times W / the bound for commits that touch a working set of W pages. For the batched leg (W about
 1,000) the checkpoint writes at most a quarter of the log's bytes, where it wrote 60%
 (`small_commits_copy_their_pages_once_for_many_commits`), and the leg's bytes a byte of rows fall
 from 26.4 to at most 16.6 x 1.25 = 20.8. Commits that touch pages nothing touches again (random
@@ -1423,7 +1459,7 @@ log whatever was copied (Turso's recovery rebuilds the frame index from every fr
 generation, and a reopened log is copied again from its first frame), so copying more often buys no
 faster recovery. ARIES (Mohan et al., TODS 17(1), 1992): pages are written to their place
 independently of the log, which needs only that a page's log records be durable before it is
-(decision 15's mark, unchanged). The 8,192: what a 25 ms pass copied at 32 writers (decision 4: about
+(decision 15's mark, unchanged). The 8,192 (to 2026-11-11, now removed): what a 25 ms pass copied at 32 writers (decision 4: about
 73 frames a commit, about 5,000 commits a second, about 9,000 frames a period), so no pass copies
 more pages, or flushes the file over more, than passes did under that load, and that load's
 checkpoints are as before.
@@ -1439,8 +1475,26 @@ must write at most a quarter of the log's bytes. Red at 13e385d. What `copy_afte
 its 1, 4 and 8 MiB legs took 1.20, 6.40 and 14.61 s, best of 2, against 13e385d's 1.24, 6.99 and
 15.20 s.
 
+**No count of frames (2026-11-11).** Ada: "We don't tolerate arbitrary constants, learned and stat
+derived values only." The 8,192 was one load's pass size (32 writers on fedora), a 16th of the
+bound. No measured quantity calls for it. Copying a frame within the bound buys nothing this store
+can use: recovery reads the whole log whatever was copied (Sources, above), and a restart, the only
+thing that needs the log copied, comes past the bound, where the drain copies it anyway. Waiting
+only makes the copy smaller: a page changed by k commits within a generation is copied once, not
+up to k times. The table above already shows the trend: 32,768 frames copied 0.2 bytes a byte of
+rows with one flush. So the derived threshold is the bound itself, and `copy_after` is removed.
+What a pass then copies is the generation's distinct pages, at most the smaller of the database and
+the bound. The open question is decision 4's, not this one's: whether one pass of that size, with
+its flush of the file, lengthens the writers' tails at 32 writers and more against passes of 8,192
+frames. The falsifier below names that run. `crates/amphora/tests/store.rs`,
+`a_log_within_its_bound_is_not_copied`: a log of bound 12,288 holding 10,240 frames saw no pass (red
+before, adas-mac-studio.local-2: "passes with 10242 frames in a log of bound 12288"), then passes
+once past its bound, every row read back. The crash seeds (`tests/crash.rs`) copied after 0 to 7
+frames; they now take bounds of 8 to 23 frames, so cuts still land with frames left uncopied across
+commits.
+
 **Falsified by.** The checkpoint writing more than a quarter of the log's bytes on the batched leg
-(the test above); a reader reading a page other than as committed while copies wait, or an
+(the test above); a pass within the log's bound; a reader reading a page other than as committed while copies wait, or an
 acknowledged batch lost by a power cut with frames left uncopied across commits (`tests/crash.rs`,
 whose seeds copy after 0 to 7 frames); at 32 writers and more, commits slower or their tails longer
 than with a copy at every period (decision 4's bench).

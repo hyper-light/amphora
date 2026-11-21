@@ -76,6 +76,11 @@ pub struct CostModelParams {
     /// default page cache, 2,000 pages; planning replaces it with the connection's.
     pub cache_pages: f64,
 
+    /// Amphora: the memory a statement's hash and group tables hold together before they spill,
+    /// in bytes (`docs/design/executor.md`, decision 8): the connection's own cache
+    /// (`Pager::statement_memory_budget`). Planning replaces the default, nothing, with it.
+    pub statement_memory: usize,
+
     /// Bonus subtracted from cost when using an index (encourages index usage).
     pub index_bonus: f64,
 
@@ -96,6 +101,12 @@ pub struct CostModelParams {
 
     /// Estimated bytes per row for hash table spill estimation.
     pub hash_bytes_per_row: f64,
+
+    /// Amphora (PL.12): the values the estimates may read for the statement's parameters, a run's
+    /// for a custom plan and none for the generic one, where they note that one asked
+    /// (`plan_cache.rs`). Not a tuning parameter: set as the statement is planned.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) plan_values: Option<crate::sync::Arc<crate::plan_cache::PlanValues>>,
 }
 
 impl CostModelParams {
@@ -124,6 +135,7 @@ impl CostModelParams {
             cpu_cost_per_where_step: 0.003,
             cpu_cost_per_seek: 0.01,
             cache_pages: 2000.0,
+            statement_memory: 0,
             index_bonus: 0.5,
 
             // Sort costs
@@ -134,6 +146,8 @@ impl CostModelParams {
             hash_insert_cost: 0.002,
             hash_lookup_cost: 0.003,
             hash_bytes_per_row: 100.0,
+
+            plan_values: None,
         }
     }
 }
@@ -156,6 +170,80 @@ impl CostModelParams {
     pub fn with_cache_pages(&self, pages: usize) -> Self {
         Self {
             cache_pages: pages as f64,
+            ..self.clone()
+        }
+    }
+
+    /// Amphora (PL.12): these parameters with the statement's parameter values, `values`.
+    pub(crate) fn with_plan_values(
+        self,
+        values: Option<&crate::sync::Arc<crate::plan_cache::PlanValues>>,
+    ) -> Self {
+        Self {
+            plan_values: values.cloned(),
+            ..self
+        }
+    }
+
+    /// Amphora (PL.12): the value an estimate takes for `expr`: a literal's own, a parameter's
+    /// bound value (noting that an estimate asked for it), else `None`.
+    pub(crate) fn constant_value(
+        &self,
+        expr: &amphora_engine_parser::ast::Expr,
+    ) -> Option<crate::Value> {
+        use amphora_engine_parser::ast;
+        let mut expr = expr;
+        // A parenthesis of one expression is that expression: walked in a loop, not by recursion
+        // (CLAUDE.md §11); the AST is finite, so the loop ends.
+        while let ast::Expr::Parenthesized(exprs) = expr {
+            let [only] = exprs.as_slice() else {
+                return None;
+            };
+            expr = only;
+        }
+        match expr {
+            ast::Expr::Literal(ast::Literal::Numeric(n)) => match n.parse::<i64>() {
+                Ok(i) => Some(crate::Value::from_i64(i)),
+                Err(_) => n.parse::<f64>().ok().map(crate::Value::from_f64),
+            },
+            ast::Expr::Literal(ast::Literal::String(s)) => Some(crate::Value::build_text(
+                crate::translate::expr::sanitize_string(s),
+            )),
+            ast::Expr::Variable(variable) => {
+                let values = self.plan_values.as_deref()?;
+                values.note_asked();
+                values.value(variable).cloned()
+            }
+            _ => None,
+        }
+    }
+
+    /// Amphora (QT.5): these parameters with the seek's, the hash table's build and probe and the
+    /// sort's weights learned where the engine runs (`learned_costs`), each its multiple of a row's
+    /// visit times `cpu_cost_per_row`. The learned build and probe times include hashing the key,
+    /// so `hash_cpu_cost` adds nothing to them. None, a clock that never moved, leaves these.
+    pub(crate) fn with_learned(
+        &self,
+        learned: Option<super::learned_costs::LearnedWeights>,
+    ) -> Self {
+        let Some(learned) = learned else {
+            return self.clone();
+        };
+        let row = self.cpu_cost_per_row;
+        Self {
+            cpu_cost_per_seek: row * learned.seek,
+            hash_cpu_cost: 0.0,
+            hash_insert_cost: row * learned.hash_build,
+            hash_lookup_cost: row * learned.hash_probe,
+            sort_cpu_per_row: row * learned.sort,
+            ..self.clone()
+        }
+    }
+
+    /// Amphora: these parameters with the statement's memory, `bytes` (executor decision 8).
+    pub fn with_statement_memory(&self, bytes: usize) -> Self {
+        Self {
+            statement_memory: bytes,
             ..self.clone()
         }
     }

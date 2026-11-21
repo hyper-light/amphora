@@ -18,11 +18,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// The log header's file format for a packed generation, a mixed one begun now (decision 39), a
-/// mixed one begun before it (decision 37) and SQLite's one page a frame.
-const PACKED_FORMAT: u32 = 0x414d_5002;
+/// The log header's file format for a packed generation begun now (chains ended by their bytes,
+/// decision 17), a mixed one begun now (decision 39, its chains ended so too), a mixed one begun
+/// under decision 37 and SQLite's one page a frame.
+const PACKED_FORMAT: u32 = 0x414d_5004;
 const MIXED_FORMAT: u32 = 0x414d_5007;
 const MIXED_RECORDS_FORMAT: u32 = 0x414d_5003;
+/// The packed format whose chains end at 8 deltas in a row, as binaries before 2026-11-11 begin
+/// generations (decision 17).
+const PACKED_EIGHT_FORMAT: u32 = 0x414d_5002;
 const PAGE_FORMAT: u32 = 3_007_000;
 /// A mixed generation's mark of a record's first slot.
 const RECORD_HEAD: u32 = 0x8000_0000;
@@ -242,9 +246,9 @@ fn a_database_opened_on_a_packed_log_doesnt_share_its_pages() {
     assert_eq!(table(&connect(&db)), want);
 }
 
-/// The entries of every record in a packed log with no restart behind it, as (kind, depth): 0 an
-/// image, 1 a delta.
-fn entries(wal: &[u8]) -> Vec<(u8, u8)> {
+/// The entries of every record in a packed log with no restart behind it, in log order, as (page,
+/// kind, depth, body bytes): kind 0 an image, 1 a delta.
+fn entries(wal: &[u8]) -> Vec<(u32, u8, u8, usize)> {
     let frame = FRAME_HEADER + PAGE;
     let mut found = Vec::new();
     for (head, slots) in records(wal) {
@@ -266,16 +270,19 @@ fn entries(wal: &[u8]) -> Vec<(u8, u8)> {
         let count = u32::from_be_bytes(raw[0..4].try_into().unwrap()) as usize;
         for e in 0..count {
             let at = 4 + e * 12;
-            found.push((raw[at + 4], raw[at + 5]));
+            let page = u32::from_be_bytes(raw[at..at + 4].try_into().unwrap());
+            let len = u32::from_be_bytes(raw[at + 8..at + 12].try_into().unwrap()) as usize;
+            found.push((page, raw[at + 4], raw[at + 5], len));
         }
     }
     found
 }
 
-/// Do: in a packed log, change a few bytes of the same rows commit after commit, more times than
-/// a page's deltas may run in a row; read the rows on a fresh connection, after a checkpoint and
-/// after opening the database again. Expect: deltas in the log, at depths up to the most allowed
-/// and never past it, and every row as last written each time.
+/// Do: in a packed log, change a few bytes of the same rows commit after commit, thirty times;
+/// read the rows on a fresh connection, after a checkpoint and after opening the database again.
+/// Expect: deltas in the log, a page's chain running past eight deltas while its deltas' bytes stay
+/// under a page and never reaching one (decision 17: the chain ends where its bytes would pass an
+/// image's, no count of deltas), and every row as last written each time (AC-T1.4.4).
 #[test]
 fn pages_changed_again_and_again_are_logged_as_deltas_and_read_back() {
     deltas_read_back(LogFormat::Packed);
@@ -322,14 +329,32 @@ fn deltas_read_back(format: LogFormat) {
         }
         let wal = std::fs::read(wal_path(&path)).unwrap();
         let entries = entries(&wal);
-        let deltas = entries.iter().filter(|(kind, _)| *kind == 1).count();
-        let deepest = entries.iter().map(|(_, depth)| *depth).max().unwrap();
+        let deltas = entries.iter().filter(|(_, kind, _, _)| *kind == 1).count();
+        let deepest = entries.iter().map(|(_, _, depth, _)| *depth).max().unwrap();
         assert!(
             deltas * 2 > entries.len(),
             "{deltas} deltas of {} entries",
             entries.len()
         );
-        assert_eq!(deepest, 8, "chains run to the most allowed, and no further");
+        assert!(deepest > 8, "chains of small deltas end at {deepest}");
+        // Each page's chain, in log order: its depths count up from its image, its deltas' bytes
+        // stay under a page.
+        let mut chains: std::collections::HashMap<u32, (u8, usize)> = Default::default();
+        for (page, kind, depth, len) in &entries {
+            let chain = chains.entry(*page).or_default();
+            *chain = match kind {
+                0 => (0, 0),
+                _ => {
+                    assert_eq!(*depth, chain.0 + 1, "page {page}'s depths");
+                    (*depth, chain.1 + len)
+                }
+            };
+            assert!(
+                chain.1 < PAGE,
+                "page {page}'s deltas took {} bytes",
+                chain.1
+            );
+        }
         // Records that carry deltas are compressed, in either format.
         let compressed = records(&wal)
             .iter()
@@ -608,6 +633,86 @@ fn records_and_frames(wal: &[u8]) -> (Vec<(usize, u32)>, usize) {
     (found, frames)
 }
 
+/// Stamps the log at `path` with `format` in its header, and chains the header's and every
+/// frame's checksums again from it, as a binary that began the generation so would have written
+/// them.
+fn restamp(path: &Path, format: u32) {
+    let mut wal = std::fs::read(wal_path(path)).unwrap();
+    let big_endian = u32::from_be_bytes(wal[0..4].try_into().unwrap()) & 1 == 1;
+    wal[4..8].copy_from_slice(&format.to_be_bytes());
+    let mut seed = checksum(&wal[0..24], (0, 0), big_endian);
+    wal[24..28].copy_from_slice(&seed.0.to_be_bytes());
+    wal[28..32].copy_from_slice(&seed.1.to_be_bytes());
+    let frame = FRAME_HEADER + PAGE;
+    let mut at = HEADER;
+    while at + frame <= wal.len() {
+        let header = checksum(&wal[at..at + 8], seed, big_endian);
+        seed = checksum(&wal[at + FRAME_HEADER..at + frame], header, big_endian);
+        wal[at + 16..at + 20].copy_from_slice(&seed.0.to_be_bytes());
+        wal[at + 20..at + 24].copy_from_slice(&seed.1.to_be_bytes());
+        at += frame;
+    }
+    std::fs::write(wal_path(path), &wal).unwrap();
+}
+
+/// Do: begin a packed generation; then stamp a log's header with the format of 8 deltas in a row
+/// (0x414d_5002, as a binary before 2026-11-11 began it), reopen it, change a byte of the same
+/// rows thirty times, and read them back. Expect: a generation begun now takes 0x414d_5004, so an
+/// older binary refuses it as a format it doesn't know, naming the value, never as corrupt; the
+/// restamped generation keeps its format and its chains end at 8, so an older binary still reads
+/// it; every row as last written (decisions 16 and 17, 2026-11-11; AC-T1.4.4).
+#[test]
+fn a_generation_keeps_the_chain_bound_of_the_format_it_began_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("eight.db");
+    let mut want;
+    {
+        let db = open(&path);
+        db.wal_format(LogFormat::Packed).unwrap();
+        let conn = connect(&db);
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)")
+            .unwrap();
+        want = insert(&conn, 0..300, 500, false);
+        assert_eq!(wal_format(&path), PACKED_FORMAT);
+    }
+    restamp(&path, PACKED_EIGHT_FORMAT);
+    let db = open(&path);
+    let conn = connect(&db);
+    assert_eq!(table(&conn), want);
+    let mut update = conn.prepare("UPDATE t SET body = ? WHERE id = ?").unwrap();
+    for round in 0..30u8 {
+        conn.execute("BEGIN").unwrap();
+        for row in want
+            .iter_mut()
+            .filter(|(id, _)| *id % 3 == i64::from(round % 3))
+        {
+            row.1[usize::from(round) * 7 % 500] = round;
+            update.reset().unwrap();
+            update
+                .bind_at(NonZero::new(1).unwrap(), Value::from_slice(&row.1).unwrap())
+                .unwrap();
+            update
+                .bind_at(NonZero::new(2).unwrap(), Value::from_i64(row.0))
+                .unwrap();
+            update.run_ignore_rows().unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+    }
+    assert_eq!(
+        wal_format(&path),
+        PACKED_EIGHT_FORMAT,
+        "the generation kept its format"
+    );
+    let entries = entries(&std::fs::read(wal_path(&path)).unwrap());
+    let deepest = entries.iter().map(|(_, _, depth, _)| *depth).max().unwrap();
+    assert!(deepest >= 2, "deltas at all: {deepest}");
+    assert!(
+        deepest <= 8,
+        "a chain of {deepest} in a generation of 8 at most"
+    );
+    assert_eq!(table(&connect(&db)), want);
+}
+
 /// Do: open a packed log whose last record's checksums are recomputed after its payload was
 /// damaged, so they hold but it doesn't decode. Expect: the database is refused as corrupt, not
 /// opened with that commit (or any) quietly dropped.
@@ -807,7 +912,7 @@ fn a_log_of_a_format_not_known_is_refused() {
     }
     let mut wal = std::fs::read(wal_path(&path)).unwrap();
     let big_endian = u32::from_be_bytes(wal[0..4].try_into().unwrap()) & 1 == 1;
-    wal[4..8].copy_from_slice(&0x414d_5004u32.to_be_bytes());
+    wal[4..8].copy_from_slice(&0x414d_5006u32.to_be_bytes());
     let (c1, c2) = checksum(&wal[0..24], (0, 0), big_endian);
     wal[24..28].copy_from_slice(&c1.to_be_bytes());
     wal[28..32].copy_from_slice(&c2.to_be_bytes());
@@ -1062,26 +1167,6 @@ fn a_pages_chain_is_read_one_frame_an_entry() {
     }
 }
 
-/// `wal`'s header stamped `format` and its checksum and every frame's chained again, as a
-/// binary that began the generation with that format would have written them.
-fn restamp(wal: &mut [u8], format: u32) {
-    let big_endian = u32::from_be_bytes(wal[0..4].try_into().unwrap()) & 1 == 1;
-    wal[4..8].copy_from_slice(&format.to_be_bytes());
-    let (c1, c2) = checksum(&wal[0..24], (0, 0), big_endian);
-    wal[24..28].copy_from_slice(&c1.to_be_bytes());
-    wal[28..32].copy_from_slice(&c2.to_be_bytes());
-    let frame = FRAME_HEADER + PAGE;
-    let mut seed = (c1, c2);
-    let mut at = HEADER;
-    while at + frame <= wal.len() {
-        let header = checksum(&wal[at..at + 8], seed, big_endian);
-        seed = checksum(&wal[at + FRAME_HEADER..at + frame], header, big_endian);
-        wal[at + 16..at + 20].copy_from_slice(&seed.0.to_be_bytes());
-        wal[at + 20..at + 24].copy_from_slice(&seed.1.to_be_bytes());
-        at += frame;
-    }
-}
-
 /// Do: begin a mixed log's generation as a binary of decision 37 began it (its header restamped
 /// 0x414d_5003 over a first commit of new pages, its checksums chained again), open it, commit
 /// rows and change them, read them back, then start the log again (a truncating checkpoint) and
@@ -1100,14 +1185,12 @@ fn a_mixed_generation_begun_before_keeps_its_records() {
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)")
             .unwrap();
     }
-    let mut wal = std::fs::read(wal_path(&path)).unwrap();
-    let (records, first) = records_and_frames(&wal);
+    let (records, first) = records_and_frames(&std::fs::read(wal_path(&path)).unwrap());
     assert!(
         records.is_empty() && first > 0,
         "a first commit of page frames"
     );
-    restamp(&mut wal, MIXED_RECORDS_FORMAT);
-    std::fs::write(wal_path(&path), &wal).unwrap();
+    restamp(&path, MIXED_RECORDS_FORMAT);
     let mut want;
     {
         let db = open(&path);

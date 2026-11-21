@@ -70,6 +70,7 @@ mod numeric;
 mod parameters;
 #[cfg(feature = "percentile")]
 mod percentile;
+mod plan_cache;
 mod pragma;
 mod progress;
 mod pseudo;
@@ -133,7 +134,9 @@ pub use cdc::{
 };
 #[cfg(feature = "simulator")]
 pub use connection::SubqueryUnnestingMode;
-pub use connection::{resolve_ext_path, Connection, PrepareOptions, Row, StepResult, SymbolTable};
+pub use connection::{
+    resolve_ext_path, Connection, JoinMethods, PrepareOptions, Row, StepResult, SymbolTable,
+};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 #[cfg(feature = "simulator")]
 pub use database::{clear_database_registry, SharedWalTestingSnapshot};
@@ -173,6 +176,7 @@ pub use io::{
     SyscallIO, WriteCompletion, IO,
 };
 pub use numeric::{nonnan::NonNan, Numeric};
+pub use plan_cache::PlanCacheMode;
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
 pub use storage::{
     buffer_pool::BufferPool,
