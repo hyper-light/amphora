@@ -71,21 +71,9 @@ def norm(v):
 
 
 def translate(sql):
-    if DIALECT[ENGINE] == "sqlite":
-        return sql, None
-    import sqlglot
-    try:
-        out = sqlglot.transpile(sql, read="sqlite", write=DIALECT[ENGINE], unsupported_level=sqlglot.ErrorLevel.RAISE)
-    except Exception as e:  # sqlglot can't say it in this dialect
-        return None, f"untranslatable: {type(e).__name__}: {str(e)[:200]}"
-    if DIALECT[ENGINE] == "clickhouse":
-        # A primary key orders a MergeTree table, and its columns can't be Nullable there.
-        out = [re.sub(r"Nullable\(([A-Za-z0-9]+(?:\([0-9, ]+\))?)\)(\s+PRIMARY KEY)", r"\1\2", o) for o in out]
-    if DIALECT[ENGINE] == "mysql":
-        # SQLite's TEXT column is MySQL's VARCHAR: MySQL's TEXT takes no DEFAULT and no index
-        # without a prefix length, which SQLite's text has no need of.
-        out = [re.sub(r"\bTEXT\b", "VARCHAR(255)", o) if re.match(r"\s*(CREATE\s+(TEMPORARY\s+)?TABLE|ALTER\s+TABLE)", o, re.I) else o for o in out]
-    return ";\n".join(out), None
+    from dialects import translate as in_dialect  # the corpus's one translation (G2 step 4)
+
+    return in_dialect(sql, DIALECT[ENGINE])
 
 
 class Sqlite:

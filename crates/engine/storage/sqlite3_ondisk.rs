@@ -1605,6 +1605,7 @@ impl BuildSharedWal {
                 changes: SpinLock::new(ChangeLog::default()),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
+                read_index: Arc::new(crate::storage::log_index::ReadIndex::default()),
             },
         }));
 
@@ -2099,6 +2100,8 @@ impl StreamingWalReader {
         }
         let wfs = self.wal_shared.read();
         let mut frame_cache = wfs.runtime.frame_cache.lock();
+        // Amphora: the lock-free lookups are built again from the index (decision 40).
+        wfs.runtime.read_index.invalidate();
         // Amphora: a packed generation's records, known before their pages map to them.
         if !state.pending_records.is_empty() {
             let mut records = wfs.runtime.records.lock();
@@ -2138,6 +2141,7 @@ impl StreamingWalReader {
         let max_frame = st.last_valid_frame;
         if max_frame > 0 {
             let mut frame_cache = wfs.runtime.frame_cache.lock();
+            wfs.runtime.read_index.invalidate();
             for frames in frame_cache.values_mut() {
                 frames.retain(|&f| f <= max_frame);
             }
