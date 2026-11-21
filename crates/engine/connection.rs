@@ -273,6 +273,11 @@ enum ReparsePhase {
         stmt: Box<Statement>,
         columns: Vec<(String, String)>,
     },
+    /// Amphora: reading each column an online DROP COLUMN dropped (CP-T1.12).
+    LoadDroppedColumns {
+        stmt: Box<Statement>,
+        columns: Vec<(String, String)>,
+    },
     /// Best-effort ANALYZE-stats refresh before finalizing.
     RefreshStats {
         stats: crate::stats::RefreshAnalyzeStatsState,
@@ -434,6 +439,9 @@ pub struct Connection {
     /// was reset or dropped and there was no statement savepoint to undo only
     /// that statement. COMMIT must roll back the whole transaction.
     pub(crate) poisoned_tx: AtomicBool,
+    /// Amphora: whether the statements this connection prepares now are an online schema change's
+    /// own (see [`Connection::set_online_change_own`], CP-T1.12).
+    pub(crate) online_change_own: AtomicBool,
     /// Amphora: whether a write statement in an explicit transaction keeps a statement journal
     /// (see [`Connection::set_statement_journals`]).
     pub(crate) statement_journals: AtomicBool,
@@ -1780,6 +1788,13 @@ impl Connection {
                         .run_with_row_callback_nonblock(|row| constraint_state_row(row, columns)));
                     let columns = std::mem::take(columns);
                     inner.fresh.set_constraint_states(&columns)?;
+                    inner.phase = self.dropped_columns_phase(&inner.fresh)?;
+                }
+                ReparsePhase::LoadDroppedColumns { stmt, columns } => {
+                    crate::return_if_io!(stmt
+                        .run_with_row_callback_nonblock(|row| constraint_state_row(row, columns)));
+                    let columns = std::mem::take(columns);
+                    inner.fresh.set_dropped_columns(&columns)?;
                     inner.phase = ReparsePhase::RefreshStats {
                         stats: Default::default(),
                     };
@@ -1861,9 +1876,7 @@ impl Connection {
             .tables
             .contains_key(crate::schema::CONSTRAINT_STATES_TABLE)
         {
-            return Ok(ReparsePhase::RefreshStats {
-                stats: Default::default(),
-            });
+            return self.dropped_columns_phase(fresh);
         }
         self.with_schema_mut(|schema| {
             *schema = fresh.try_clone()?;
@@ -1877,6 +1890,53 @@ impl Connection {
             stmt: Box::new(stmt),
             columns: Vec::new(),
         })
+    }
+
+    /// Amphora: the phase after the constraint states: read the columns an online DROP COLUMN
+    /// dropped if their table exists (CP-T1.12), else go on to the statistics. The statement runs
+    /// against `fresh`, installed for it as the types' is.
+    fn dropped_columns_phase(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
+        if !fresh
+            .tables
+            .contains_key(crate::schema::DROPPED_COLUMNS_TABLE)
+        {
+            return Ok(ReparsePhase::RefreshStats {
+                stats: Default::default(),
+            });
+        }
+        self.with_schema_mut(|schema| {
+            *schema = fresh.try_clone()?;
+            Ok::<_, crate::alloc::TryReserveError>(())
+        })??;
+        let stmt = self.prepare_internal(format!(
+            "SELECT tbl, col FROM {}",
+            crate::schema::DROPPED_COLUMNS_TABLE
+        ))?;
+        Ok(ReparsePhase::LoadDroppedColumns {
+            stmt: Box::new(stmt),
+            columns: Vec::new(),
+        })
+    }
+
+    /// Amphora: the columns [`crate::schema::DROPPED_COLUMNS_TABLE`] names, for the open path, as
+    /// [`Self::query_constraint_states`] reads its own (CP-T1.12): a database reopened after an
+    /// online DROP COLUMN must keep the column hidden. Empty without the table.
+    pub(crate) fn query_dropped_columns(self: &Arc<Connection>) -> Result<Vec<(String, String)>> {
+        let mut columns = Vec::new();
+        if !self
+            .schema
+            .read()
+            .tables
+            .contains_key(crate::schema::DROPPED_COLUMNS_TABLE)
+        {
+            return Ok(columns);
+        }
+        let mut stmt = self.prepare_internal(format!(
+            "SELECT tbl, col FROM {}",
+            crate::schema::DROPPED_COLUMNS_TABLE
+        ))?;
+        stmt.run_with_row_callback(|row| constraint_state_row(row, &mut columns))?;
+        Ok(columns)
     }
 
     /// Amphora: the columns [`crate::schema::CONSTRAINT_STATES_TABLE`] names, for the open path,
@@ -1899,6 +1959,18 @@ impl Connection {
         ))?;
         stmt.run_with_row_callback(|row| constraint_state_row(row, &mut columns))?;
         Ok(columns)
+    }
+
+    /// Amphora: marks the statements this connection prepares from now on as an online schema
+    /// change's own, or not (CP-T1.12). Only the change's own `ALTER COLUMN` redefines a column it
+    /// holds (`__amphora_constraint_states`): a person's is refused, as it would leave the change's
+    /// mark on a definition the change never made.
+    pub fn set_online_change_own(&self, own: bool) {
+        self.online_change_own.store(own, Ordering::SeqCst);
+    }
+
+    pub(crate) fn online_change_own(&self) -> bool {
+        self.online_change_own.load(Ordering::SeqCst)
     }
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
