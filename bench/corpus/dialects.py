@@ -40,6 +40,14 @@ def typed(expression):
     then each engine's to take or refuse, as a BLOB column's would be: no type is picked here."""
     from sqlglot import exp
 
+    # sqlglot reads a column with neither type nor constraint as a bare name in CREATE TABLE's
+    # schema, one with constraints only as a ColumnDef without a kind.
+    for create in expression.find_all(exp.Create):
+        schema = create.this
+        if create.args.get("kind") == "TABLE" and isinstance(schema, exp.Schema):
+            for column in list(schema.expressions):
+                if isinstance(column, exp.Identifier):
+                    column.replace(exp.ColumnDef(this=column.copy()))
     for column in expression.find_all(exp.ColumnDef):
         if column.args.get("kind") is None:
             column.set("kind", exp.DataType.build("BLOB"))
