@@ -2826,11 +2826,20 @@ pub enum HashJoinType {
     LeftAnti,
     /// Like LeftOuter, plus unmatched probe rows get NULLs for the build side.
     FullOuter,
+    /// Each build row appears once, at its first match (EXISTS; G6 step 5). The probe side is the
+    /// semi join's table, the build side the rows it keeps.
+    LeftSemi,
 }
 
 impl HashJoinType {
     pub fn keeps_unmatched_build_rows(self) -> bool {
         matches!(self, Self::LeftOuter | Self::LeftAnti | Self::FullOuter)
+    }
+
+    /// Whether the hash table keeps a matched bit per build row: the joins that read unmatched
+    /// rows after the probe, and the semi join, which emits a build row only at its first match.
+    pub fn tracks_matched(self) -> bool {
+        self.keeps_unmatched_build_rows() || self == Self::LeftSemi
     }
 }
 
