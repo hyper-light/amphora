@@ -549,7 +549,7 @@ fn choose(len: usize, rank: impl Fn(&[Range<usize>]) -> Vec<Scheme>) -> Result<V
     let mut best: Option<Scheme> = None;
     loop {
         let whole = count.saturating_mul(GROUP) >= len;
-        let ranges = if whole { Vec::from([0..len]) } else { strata(len, count)? };
+        let ranges: Vec<Range<usize>> = if whole { std::iter::once(0..len).collect() } else { strata(len, count)? };
         let ranked = rank(&ranges);
         let first = ranked.first().copied();
         if whole || (best.is_some() && best == first) {

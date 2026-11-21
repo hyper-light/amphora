@@ -113,25 +113,26 @@ fn put(words: &mut [u64], first: usize, stride: usize, bit: usize, width: u32, v
     Ok(())
 }
 
-/// Decodes `packed` into `out` (cleared first), `len` values, each `base` plus its distance.
+/// Decodes `packed` into `out` (replacing what it held), `len` values, each `base` plus its distance.
 pub fn unpack(packed: &Packed, out: &mut Vec<u64>) -> Result<(), CodecError> {
     let need = padded_words(packed.layout, packed.width, packed.len)?;
     if packed.words.len() != need {
         return Err(CodecError::Corrupt("packed words do not match their width and length"));
     }
     out.clear();
-    out.reserve(need_values(packed)?);
+    out.resize(need_values(packed)?, packed.base);
     macro_rules! by_width {
         ($kernel:ident; $($w:literal)*) => {
             match packed.width {
-                $($w => $kernel::<$w>(&packed.words, packed.base, packed.len, out),)*
+                0 => {}
+                $($w => $kernel::<$w>(&packed.words, packed.base, out),)*
                 _ => return Err(CodecError::Corrupt("bit width above 64")),
             }
         };
     }
     match packed.layout {
-        Layout::Horizontal => by_width!(unpack_horizontal; 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64),
-        Layout::Interleaved => by_width!(unpack_interleaved; 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64),
+        Layout::Horizontal => by_width!(unpack_horizontal; 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64),
+        Layout::Interleaved => by_width!(unpack_interleaved; 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64),
     }
     out.truncate(packed.len);
     Ok(())
@@ -145,17 +146,13 @@ fn need_values(packed: &Packed) -> Result<usize, CodecError> {
     packed.len.div_ceil(unit).checked_mul(unit).ok_or(CodecError::Overflow)
 }
 
-/// Horizontal groups of 64 values in `W` words each.
-fn unpack_horizontal<const W: u32>(words: &[u64], base: u64, len: usize, out: &mut Vec<u64>) {
+/// Horizontal groups of 64 values in `W` words each, written over `out` (whole groups long).
+/// Value `j`'s word and shift depend on `j` and `W` alone, so the loop unrolls to constants.
+fn unpack_horizontal<const W: u32>(words: &[u64], base: u64, out: &mut [u64]) {
     let m = mask(W);
-    if W == 0 {
-        out.resize(len, base);
-        return;
-    }
     let w = W as usize;
-    for group in words.chunks_exact(w) {
-        let mut buf = [0u64; GROUP];
-        for (j, o) in (0u32..).zip(buf.iter_mut()) {
+    for (group, dst) in words.chunks_exact(w).zip(out.chunks_exact_mut(GROUP)) {
+        for (j, o) in (0u32..).zip(dst.iter_mut()) {
             let bit = j.wrapping_mul(W);
             let k = bit.wrapping_shr(6) as usize; // bit / 64
             let shift = bit & 63; // bit mod 64, the word's bits
@@ -163,45 +160,38 @@ fn unpack_horizontal<const W: u32>(words: &[u64], base: u64, len: usize, out: &m
             let v = if shift.wrapping_add(W) > WORD_BITS { lo | group.get(k.wrapping_add(1)).copied().unwrap_or(0).wrapping_shl(WORD_BITS.wrapping_sub(shift)) } else { lo };
             *o = (v & m).wrapping_add(base);
         }
-        out.extend_from_slice(&buf);
     }
 }
 
-/// FastLanes vectors: 64 rows of 16 lanes, `W` packed rows of 16 lanes each.
-fn unpack_interleaved<const W: u32>(words: &[u64], base: u64, len: usize, out: &mut Vec<u64>) {
+/// Zero words, for a packed row past the end of damaged input (its length is checked first).
+const ZERO_ROW: [u64; LANES] = [0; LANES];
+
+/// FastLanes vectors, written over `out` (whole vectors long): 64 rows of 16 lanes from `W`
+/// packed rows of 16 lanes. Row `r`'s packed row and shift depend on `r` and `W` alone, and each
+/// row is the same shift, mask and add on all 16 lanes: vector instructions [c90].
+fn unpack_interleaved<const W: u32>(words: &[u64], base: u64, out: &mut [u64]) {
     let m = mask(W);
-    if W == 0 {
-        out.resize(len, base);
-        return;
-    }
     let per_vector = (W as usize).wrapping_mul(LANES);
-    for vector in words.chunks_exact(per_vector) {
+    for (vector, dst) in words.chunks_exact(per_vector).zip(out.chunks_exact_mut(VECTOR)) {
         let (rows, _) = vector.as_chunks::<LANES>();
-        let mut packed_rows = rows.iter();
-        let mut cur = packed_rows.next().copied().unwrap_or([0; LANES]);
-        let mut shift = 0u32;
-        let mut buf = [[0u64; LANES]; ROWS];
-        for row in buf.iter_mut() {
+        let (dst_rows, _) = dst.as_chunks_mut::<LANES>();
+        for (r, row) in (0u32..).zip(dst_rows.iter_mut()) {
+            let bit = r.wrapping_mul(W);
+            let k = bit.wrapping_shr(6) as usize; // bit / 64
+            let shift = bit & 63; // bit mod 64
+            let lo = rows.get(k).unwrap_or(&ZERO_ROW);
             if shift.wrapping_add(W) <= WORD_BITS {
-                for (o, &c) in row.iter_mut().zip(cur.iter()) {
+                for (o, &c) in row.iter_mut().zip(lo) {
                     *o = (c.wrapping_shr(shift) & m).wrapping_add(base);
                 }
-                shift = shift.wrapping_add(W);
-                if shift == WORD_BITS {
-                    cur = packed_rows.next().copied().unwrap_or([0; LANES]);
-                    shift = 0;
-                }
             } else {
-                let next = packed_rows.next().copied().unwrap_or([0; LANES]);
+                let hi = rows.get(k.wrapping_add(1)).unwrap_or(&ZERO_ROW);
                 let back = WORD_BITS.wrapping_sub(shift);
-                for ((o, &c), &n) in row.iter_mut().zip(cur.iter()).zip(next.iter()) {
+                for ((o, &c), &n) in row.iter_mut().zip(lo).zip(hi) {
                     *o = ((c.wrapping_shr(shift) | n.wrapping_shl(back)) & m).wrapping_add(base);
                 }
-                cur = next;
-                shift = shift.wrapping_add(W).wrapping_sub(WORD_BITS);
             }
         }
-        out.extend_from_slice(buf.as_flattened());
     }
 }
 
