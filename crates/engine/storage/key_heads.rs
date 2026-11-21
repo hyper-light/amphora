@@ -950,6 +950,7 @@ mod tests {
     fn key_heads_bench() {
         use std::time::Instant;
 
+        use super::{probes, KeyHeads};
         use crate::storage::btree::PayloadLimits;
         use crate::storage::sqlite3_ondisk::PageType;
 
