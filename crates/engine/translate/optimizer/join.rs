@@ -324,6 +324,31 @@ pub struct JoinN {
     pub cost: Cost,
     /// Estimated output rows after each table access in `data`.
     pub prefix_cardinalities: Vec<f64>,
+    /// PL.8: the joins whose inner side is itself a join, so the plan is a bushy tree; empty for a
+    /// left-deep plan, where each table joins the tables before it one at a time. `data` lists the
+    /// tables in the order their reads run; each `InnerJoin` names a run of them joined among
+    /// themselves first, whose result joins the tables before the run.
+    pub inner_joins: Vec<InnerJoin>,
+}
+
+/// PL.8: one join of a bushy plan whose inner side is a join: `data[start..end]` of a [JoinN] is
+/// joined among itself first (with its own runs nested inside it), and its result is joined to
+/// `data[..start]`. The runs of a plan nest or are disjoint, as a tree's subtrees do, so the tree is
+/// the list of tables and these runs, read without recursion (CLAUDE.md §11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InnerJoin {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// PL.8: a node of a join tree, in an arena (`JoinN::tree`): a table read by an access method, or
+/// the join of an outer node with an inner one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinTreeNode {
+    /// `(table_number, access_method_index)`, as in `JoinN::data`.
+    Table(usize, usize),
+    /// Indexes of the outer and the inner node in the arena.
+    Join { outer: usize, inner: usize },
 }
 
 struct WhereTermInfo {
@@ -345,6 +370,68 @@ impl JoinN {
         self.data
             .iter()
             .map(|(_, access_method_index)| *access_method_index)
+    }
+
+    /// PL.8: whether each table joins the tables before it one at a time (no inner side is a join).
+    pub fn is_left_deep(&self) -> bool {
+        self.inner_joins.is_empty()
+    }
+
+    /// PL.8: the plan as a join tree, in an arena whose last node is the root. A left-deep plan is
+    /// the chain `((t0 ⋈ t1) ⋈ t2) ⋈ ...`; a run of `inner_joins` is a subtree on the inner side.
+    /// Built on an explicit stack, without recursion: each open run keeps the node of the tables
+    /// joined so far within it, and a run that ends joins its node as the inner side of the run (or
+    /// the plan) around it. Runs that neither nest nor stay apart, or are shorter than two tables or
+    /// past the list's end, are a typed error.
+    pub fn tree(&self) -> Result<Vec<JoinTreeNode>> {
+        let malformed = || LimboError::InternalError("PL.8: malformed bushy join plan".to_string());
+        let mut runs: Vec<InnerJoin> = self.inner_joins.clone();
+        runs.sort_by_key(|run| run.start);
+        let mut nodes: Vec<JoinTreeNode> = Vec::with_capacity(self.data.len().saturating_mul(2));
+        // The open runs: each with its start, its end and the node of its tables joined so far
+        // (`None` before its first table). The bottom entry is the whole plan.
+        let mut open: Vec<(usize, usize, Option<usize>)> = vec![(0, self.data.len(), None)];
+        let mut next_run = runs.iter().peekable();
+        for (position, &(table, access_method)) in self.data.iter().enumerate() {
+            while let Some(run) = next_run.next_if(|run| run.start == position) {
+                // A run starting where the run around it starts is that run's outer side, not
+                // an inner one.
+                let (enclosing_start, enclosing_end) =
+                    open.last().map_or((0, 0), |(start, end, _)| (*start, *end));
+                if run.start == enclosing_start
+                    || run.end > enclosing_end
+                    || run.end < run.start.saturating_add(2)
+                {
+                    return Err(malformed());
+                }
+                open.push((run.start, run.end, None));
+            }
+            nodes.push(JoinTreeNode::Table(table, access_method));
+            let mut node = nodes.len().saturating_sub(1);
+            // Join the table into the innermost run, then close every run that ends after it,
+            // its result joining the run around it as an inner side.
+            loop {
+                let Some((_, end, joined)) = open.last_mut() else {
+                    return Err(malformed());
+                };
+                node = match *joined {
+                    None => node,
+                    Some(outer) => {
+                        nodes.push(JoinTreeNode::Join { outer, inner: node });
+                        nodes.len().saturating_sub(1)
+                    }
+                };
+                *joined = Some(node);
+                if *end != position + 1 || open.len() == 1 {
+                    break;
+                }
+                open.pop();
+            }
+        }
+        if next_run.next().is_some() || open.len() != 1 {
+            return Err(malformed());
+        }
+        Ok(nodes)
     }
 }
 
@@ -1043,6 +1130,7 @@ fn join_lhs_and_rhs<'a>(
         output_cardinality,
         cost,
         prefix_cardinalities,
+        inner_joins: Vec::new(),
     }))
 }
 
@@ -2496,6 +2584,75 @@ mod tests {
         vdbe::builder::TableRefIdCounter,
         MAIN_DB_ID,
     };
+
+    fn plan_of(tables: usize, inner_joins: &[(usize, usize)]) -> JoinN {
+        JoinN {
+            data: (0..tables).map(|table| (table, table)).collect(),
+            output_cardinality: 1.0,
+            cost: Cost(1.0),
+            prefix_cardinalities: vec![1.0; tables],
+            inner_joins: inner_joins
+                .iter()
+                .map(|&(start, end)| InnerJoin { start, end })
+                .collect(),
+        }
+    }
+
+    /// The tree as text: a table by its number, a join as `(outer inner)`, walked on a stack.
+    fn tree_text(nodes: &[JoinTreeNode]) -> String {
+        let mut text = String::new();
+        let mut stack: Vec<Result<usize, &'static str>> = vec![Ok(nodes.len() - 1)];
+        while let Some(item) = stack.pop() {
+            match item {
+                Err(close) => text.push_str(close),
+                Ok(node) => match nodes[node] {
+                    JoinTreeNode::Table(table, _) => text.push_str(&table.to_string()),
+                    JoinTreeNode::Join { outer, inner } => {
+                        text.push('(');
+                        stack.extend([Err(")"), Ok(inner), Err(" "), Ok(outer)]);
+                    }
+                },
+            }
+        }
+        text
+    }
+
+    /// PL.8 (piece 1): a left-deep plan is the bushy shape's special case, a chain; runs of inner
+    /// joins nest as subtrees on the inner side; runs that don't nest are refused.
+    #[test]
+    fn t_pl_8_bushy_shape_holds_left_deep_and_bushy_trees() {
+        let left_deep = plan_of(4, &[]);
+        assert!(left_deep.is_left_deep());
+        assert_eq!(tree_text(&left_deep.tree().unwrap()), "(((0 1) 2) 3)");
+        assert_eq!(tree_text(&plan_of(1, &[]).tree().unwrap()), "0");
+
+        let bushy = plan_of(4, &[(2, 4)]);
+        assert!(!bushy.is_left_deep());
+        assert_eq!(tree_text(&bushy.tree().unwrap()), "((0 1) (2 3))");
+        assert_eq!(
+            tree_text(&plan_of(4, &[(2, 4), (1, 4)]).tree().unwrap()),
+            "(0 (1 (2 3)))"
+        );
+        assert_eq!(
+            tree_text(&plan_of(5, &[(1, 3), (3, 5)]).tree().unwrap()),
+            "((0 (1 2)) (3 4))"
+        );
+        assert_eq!(
+            tree_text(&plan_of(5, &[(1, 5), (3, 5)]).tree().unwrap()),
+            "(0 ((1 2) (3 4)))"
+        );
+
+        for malformed in [
+            &[(0, 2)][..],
+            &[(1, 2)],
+            &[(1, 5)],
+            &[(4, 6)],
+            &[(1, 3), (2, 4)],
+            &[(1, 4), (1, 3)],
+        ] {
+            assert!(plan_of(4, malformed).tree().is_err(), "{malformed:?}");
+        }
+    }
 
     #[test]
     fn hash_join_cost_includes_probe_scan() {
