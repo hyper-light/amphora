@@ -725,18 +725,18 @@ fn lab_run(keys: usize, preload: usize, clients: usize, target: u64) -> LabRun {
     .unwrap();
     let keys: Arc<Vec<String>> = Arc::new((0..keys).map(|i| format!("k{i}")).collect());
     let acked = Arc::new(Mutex::new(vec![0i64; keys.len()]));
-    for chunk in keys.chunks(64) {
+    let all: Vec<usize> = (0..keys.len()).collect();
+    for chunk in all.chunks(64) {
         for _ in 0..preload {
             let mut a = acked.lock().unwrap();
             let rows = chunk
                 .iter()
-                .map(|k| {
-                    let i = k[1..].parse::<usize>().unwrap();
+                .map(|&i| {
                     a[i] += 1;
-                    row(k, a[i] - 1)
+                    row(&keys[i], a[i] - 1)
                 })
                 .collect::<Vec<_>>();
-            // A preload batch spans groups only once there are several: there is one here.
+            // One group holds every key before the first split: a batch of any keys is its.
             let t = groups.put_wait(rows, soon()).unwrap();
             groups.durable(&t, soon()).unwrap();
         }
@@ -745,7 +745,8 @@ fn lab_run(keys: usize, preload: usize, clients: usize, target: u64) -> LabRun {
     let stop = Arc::new(AtomicBool::new(false));
     let hot = Arc::new(AtomicUsize::new(0));
     let longest = Arc::new(Mutex::new(Duration::ZERO));
-    let total = Arc::new(AtomicUsize::new(0));
+    // Writes acknowledged so far, told to the planner's loop as each is.
+    let total = Arc::new((Mutex::new(0usize), std::sync::Condvar::new()));
     let threads: Vec<_> = (0..clients)
         .map(|t| {
             let (groups, keys, acked, window, stop, hot, longest, total) = (
@@ -766,11 +767,12 @@ fn lab_run(keys: usize, preload: usize, clients: usize, target: u64) -> LabRun {
                     x ^= x >> 7;
                     x ^= x << 17;
                     // Most writes hit a run of a sixteenth of the keys that moves now and then.
-                    let i = if x % 4 != 0 {
+                    let i = if !x.is_multiple_of(4) {
                         let run = (mine.len() / 16).max(1);
-                        mine[(hot.load(Ordering::Relaxed) + (x >> 8) as usize % run) % mine.len()]
+                        let r = usize::try_from(x >> 33).unwrap();
+                        mine[(hot.load(Ordering::Relaxed) + r % run) % mine.len()]
                     } else {
-                        mine[(x >> 8) as usize % mine.len()]
+                        mine[usize::try_from(x >> 33).unwrap() % mine.len()]
                     };
                     let key = &keys[i];
                     let seq = acked.lock().unwrap()[i];
@@ -792,7 +794,8 @@ fn lab_run(keys: usize, preload: usize, clients: usize, target: u64) -> LabRun {
                     }
                     acked.lock().unwrap()[i] += 1;
                     *window.lock().unwrap().entry(position(key)).or_default() += 1;
-                    total.fetch_add(1, Ordering::Relaxed);
+                    *total.0.lock().unwrap() += 1;
+                    total.1.notify_all();
                 }
             })
         })
@@ -811,11 +814,10 @@ fn lab_run(keys: usize, preload: usize, clients: usize, target: u64) -> LabRun {
     let mut planned_at = 0;
     while run.ended < target {
         // A window: at least one write a key since the last plan (the test's parameter).
-        let seen = total.load(Ordering::Relaxed);
-        if seen < planned_at + keys.len() {
-            std::thread::sleep(Duration::from_millis(1));
-            continue;
-        }
+        let seen = *total
+            .1
+            .wait_while(total.0.lock().unwrap(), |n| *n < planned_at + keys.len())
+            .unwrap();
         planned_at = seen;
         let dirc = driver.directory().clone();
         let w: Vec<(Pos, u64)> = std::mem::take(&mut *window.lock().unwrap())
@@ -921,10 +923,10 @@ fn p99(mut d: Vec<Duration>) -> Duration {
 /// from the printed numbers, not asserted here (tests assert behaviour, not the clock).
 #[test]
 fn t_t1_9_p1_cutover_pause_harness() {
-    let keys = env("AMPHORA_RESHARD_PAUSE_KEYS", 256) as usize;
-    let rows = env("AMPHORA_RESHARD_PAUSE_ROWS", 1024) as usize;
+    let keys = usize::try_from(env("AMPHORA_RESHARD_PAUSE_KEYS", 256)).unwrap();
+    let rows = usize::try_from(env("AMPHORA_RESHARD_PAUSE_ROWS", 1024)).unwrap();
     let ops = env("AMPHORA_RESHARD_PAUSE_OPS", 1);
-    let clients = env("AMPHORA_RESHARD_CLIENTS", 4) as usize;
+    let clients = usize::try_from(env("AMPHORA_RESHARD_CLIENTS", 4)).unwrap();
     let run = lab_run(keys, rows.div_ceil(keys.max(1)), clients, ops);
     assert!(run.flipped >= 1, "no cutover (non-vacuity)");
     println!(
@@ -944,9 +946,9 @@ fn t_t1_9_p1_cutover_pause_harness() {
 /// read back from its key's group, and every key in exactly one group's file.
 #[test]
 fn t_t1_9_l1_automatic_operations_lose_no_write() {
-    let keys = env("AMPHORA_RESHARD_KEYS", 256) as usize;
+    let keys = usize::try_from(env("AMPHORA_RESHARD_KEYS", 256)).unwrap();
     let ops = env("AMPHORA_RESHARD_OPS", 4);
-    let clients = env("AMPHORA_RESHARD_CLIENTS", 4) as usize;
+    let clients = usize::try_from(env("AMPHORA_RESHARD_CLIENTS", 4)).unwrap();
     let run = lab_run(keys, 1, clients, ops);
     assert!(run.ended >= ops);
     println!(
