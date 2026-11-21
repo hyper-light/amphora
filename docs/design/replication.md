@@ -2401,6 +2401,38 @@ patience and lease tests, which read each owner's pace instead of assuming 10 ms
 **Falsified by:** a multi-node group on real clocks whose leader steps down or whose followers campaign more often
 with the learned pace than with 10 ms; a failover p99 past the requirement's 1000 ms where 10 ms met it.
 
+## Decision (lane constants): the compaction's expansion learned where it runs (2026-11-21)
+
+Ada's rule: no picked numbers. The replicated owner compacted its raft log once it held 128 MiB of applied entries,
+on every host and for every database, whatever an image or a replay cost there. No measurement made 128 MiB, and the
+machine reported no image size (`image_bytes` was none), so hyper-durable's own rule could not run.
+
+**The decision (CT.1).** The log is due by Ongaro's rule (thesis §5.1.2, "When to snapshot": once the log exceeds
+the previous snapshot times an expansion factor), as hyper-durable's `Replica::compaction_due` weighs it, with its
+wait for a member still taking what was applied. The factor is the owner's (`database/compacting.rs`):
+- the machine reports its image's bytes: the pages it opened with (`StateMachine::image_bytes`), and after the first
+  compaction hyper-durable weighs the image it made;
+- the owner times each image it makes (`Replica::compact`, the image's bytes from the machine) and each drive that
+  applied entries (the applied entries' bytes as the core counts them, `EntryRef::encoded_bytes`), on its own clock;
+- each cost is a ratio of decaying sums, nanoseconds over bytes, the sums kept at seven eighths at every sample: RFC
+  6298 §2's gain (Jacobson 1988), weighted by each sample's bytes, so it follows the host and its load;
+- the factor is the image's cost a byte over the replay's, raised to the whole factor the rule takes. The log is the
+  rent and the image the price: compacting once replaying the log would cost as much as making a fresh image is ski
+  rental's break-even (Karlin, Manasse, McGeoch and Owicki, SODA 1990), within twice the best in hindsight. Raised,
+  never rounded down, so no compaction comes before the break-even.
+A compaction still runs at once while the log stalls admission for room: it is what frees it.
+
+**The start state.** Before both costs are measured, and for a sample below the clock's resolution, the factor is
+one: with nothing measured a byte of log costs a byte of image, whose break-even is the log at its image's size.
+
+**What is left.** The image's bytes at open are its pages' (page count times page size); postcard's few bytes of
+framing a page are not counted. A configuration change's entry is not counted in the replay's bytes (it is applied
+by `apply_change`, rarely).
+
+**Tests.** `compaction_the_factor_is_one_until_both_costs_are_measured` (T-CT.1.1),
+`compaction_the_factor_is_the_image_cost_over_the_replay_cost` (T-CT.1.2), `compaction_samples_weigh_by_their_bytes`
+(T-CT.1.3), all in `database::compacting`; the driven compaction tests of `database::replicated` (T-CT.1.4).
+
 ## A follower's write that read nothing written since its base: read sets (built 2026-11-21, Amphora goal ceea4e0a)
 
 D of goal 9c63f7d4, on top of the write slot (above). In the release A/B, D halved G's write gaps
@@ -2487,7 +2519,8 @@ The raft log is the write-ahead log; the database's log is a cache of it that th
 its own time. Still flushed inline, all rare and as before: a membership change (its join rows), an install, the
 seed, a persisted class entry, and `open`.
 
-The owner compacts when the raft log holds 128 MiB of applied entries or is stalled for room. A stall waits on the
+The owner compacts when the raft log is due by Ongaro's rule at the expansion it learned ("Decision (lane constants):
+the compaction's expansion learned where it runs") or is stalled for room. A stall waits on the
 flushing thread, which is always asked to flush what was applied (`Actor::flush`), so it frees room once that flush
 ends, not on a flush of the owner's own.
 

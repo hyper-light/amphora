@@ -598,6 +598,20 @@ tests = [
 ]
 
 [[own]]
+id = "CT.1"
+title = "The raft log's compaction due at an expansion learned where it runs, not a picked 128 MiB"
+criteria = [
+  { id = "AC-CT.1.1", text = "The replicated machine reports its image's bytes, so hyper-durable's compaction_due (Ongaro's thesis §5.1.2) weighs the log against the image it opened with, then the image it last made" },
+  { id = "AC-CT.1.2", text = "The owner times each image and each drive that applied entries on its own clock, per byte, with RFC 6298's decaying sums; the expansion is the image's cost over the replay's, raised to a whole factor (ski rental's break-even), one before both are measured; a stall compacts at once" },
+]
+tests = [
+  { id = "T-CT.1.1", text = "Nothing measured, one cost, samples of no time — passes when the factor is one" },
+  { id = "T-CT.1.2", text = "Images four times dearer a byte than replay, a third as dear, then dearer — passes when the factor is four, one, then follows the images up" },
+  { id = "T-CT.1.3", text = "A large and a tiny sample — passes when each weighs by its bytes" },
+  { id = "T-CT.1.4", text = "The driven compaction tests of database::replicated — passes when each compacts by the learned rule" },
+]
+
+[[own]]
 id = "WK.1"
 title = "The replicated owner wakes on its events and its next deadline, not a picked 1 ms poll"
 criteria = [

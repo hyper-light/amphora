@@ -391,10 +391,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   worst of the last thousand holds (`log_bound::GENERATION` gone; replication.md, "Decision (lane constants): a
   generation of restarts ends once it covers its spend"; GN.2); and the replicated owner's tick period is learned
   from its voters' round trips, its flushes, its leader's link and its timer by hyper-timing's law, 10 ms only the
-  start state before they are measured (replication.md, "Decision (lane constants): the owner's tick pace"; TP.1).
+  start state before they are measured (replication.md, "Decision (lane constants): the owner's tick pace"; TP.1); and the raft log is compacted by Ongaro's
+  rule at an expansion learned from the owner's own measured image and replay costs a byte, its machine reporting its
+  image's size (replication.md, "Decision (lane constants): the compaction's expansion learned where it runs"; CT.1).
   Left: an owner's other descriptors (endpoint, engine files, a replica's log) charged by kind, the core's tick
   counts (twenty an election, two a heartbeat: raft-rs's defaults, fixed in tick mode), the owner's queue
-  and outgoing bounds and the log's compaction trigger, and the rest of the list (handoff/amphora-constants-list.md).
+  and outgoing bounds, and the rest of the list (handoff/amphora-constants-list.md).
 - **Region-local groups under a global root** (CP-T1.11, G14 step 1, lane regions; `crates/amphora/src/regions.rs`,
   docs/design/regions.md): members carry a region label; a regional group's voters and lead stay in its home
   region, and the root spreads its voters so losing the regions it survives leaves a quorum (CockroachDB's
