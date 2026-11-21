@@ -23,6 +23,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
+pub mod blobs;
 pub mod conformance;
 pub mod counter;
 pub mod import;

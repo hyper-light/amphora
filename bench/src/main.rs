@@ -19,6 +19,7 @@ mod blink;
 mod cc;
 mod clickhouse;
 mod cluster;
+mod columns;
 mod eqp;
 mod mysql;
 mod oracle;
@@ -34,6 +35,7 @@ mod suite;
 mod suite_db;
 mod vanilla;
 mod vitess;
+mod vlog;
 
 use std::collections::BinaryHeap;
 use std::sync::{Arc, Condvar, Mutex};
@@ -520,6 +522,14 @@ fn main() -> anyhow::Result<()> {
     // The versioned storage's B-link tree on its own (`blink.rs`).
     if std::env::args().any(|a| a == "--blink") {
         return blink::main();
+    }
+    // The versioned storage's log: one group-committed log against per-thread logs (`vlog.rs`).
+    if std::env::args().any(|a| a == "--vlog") {
+        return vlog::main();
+    }
+    // G11 step 2's column copies, A and B, against none (`columns.rs`).
+    if std::env::args().any(|a| a == "--columns") {
+        return columns::main();
     }
     let o = opts()?;
     let (k, q) = (o.connections, o.queue);

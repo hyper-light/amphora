@@ -1893,6 +1893,17 @@ pub fn translate_drop_table(
     }) {
         bail_parse_error!("table {name} has index {held} held by an online schema change");
     }
+    if let Some(held) = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(name).and_then(|table| {
+            table
+                .columns()
+                .iter()
+                .find(|column| column.unvalidated())
+                .and_then(|column| column.name.clone())
+        })
+    }) {
+        bail_parse_error!("table {name} has column {held} held by an online schema change");
+    }
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
     if connection.foreign_keys_enabled()

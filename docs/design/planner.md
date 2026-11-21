@@ -1336,6 +1336,58 @@ parent is the batch's bench.
   beyond the passes' spread (research rank 6's falsifier).
 - An answer that changes (`answers.py`), or an oracle finding where the forced materialization
   of a hash join's build input is planned.
+## Decision (lane pl8): a RIGHT JOIN led by one table is planned as its mirrored LEFT JOIN
+
+**Decision.** PL.8's first rule (docs/research/planner.md section 9, rank 8; audit row 4). Before
+the join search, `t0 RIGHT JOIN t1 ON p`, where t0 is the FROM list's first table alone and both
+are B-tree tables, becomes `t1 LEFT JOIN t0 ON p` (`optimizer/mod.rs`,
+`commute_leading_right_join`): the two tables swap places, t0 takes the join's information as a
+LEFT JOIN, and the ON terms' origin names t0. Columns, `*` and USING are bound by table ID before
+the swap, and what reads a table's place in the FROM list (`outer_join_may_null_extend`,
+`is_left_of_right_or_full_join`) reads it live, so each table is null-extended where it was.
+
+**Why.** A RIGHT JOIN's unmatched rows of its right table are read after every loop, so
+`required_lhs_by_table` holds every later table behind it. The audit's
+`03-right-full-barrier.out`: `(big RIGHT JOIN mid ON mid.k = big.k) JOIN tiny ON tiny.id = mid.id
+WHERE tiny.id = 5` read big and mid ahead of tiny, total_cost 328,300,039,000.3, where the same
+query written `mid JOIN tiny LEFT JOIN big` read tiny first at 23,007.0. As a LEFT JOIN only t0
+must follow t1, and tiny, whose term reads only mid, moves first.
+
+**Sources.** Moerkotte, Fender and Eich, "On the correct and complete enumeration of the core
+search space", SIGMOD 2013 (f25): a right outer join is the left outer join of its operands
+swapped, and CD-C reorders outer joins by such rules, correct and complete. Its left-asscom rule,
+`(e1 LEFT JOIN e2) JOIN e3 = (e1 JOIN e3) LEFT JOIN e2` when e3's term doesn't read e2, is what
+lets tiny move ahead of the LEFT JOIN, which the search already allowed.
+
+The estimate follows (decision 13): an outer join's ON term that reads none of its right table's
+columns, only tables before it (`y.c = 3` in `y LEFT JOIN x ON y.c = 3`, which `x RIGHT JOIN y ON
+y.c = 3` becomes), was counted nowhere: `constraints_from_where_clause` dropped an outer join's ON
+term on every table but its right table, and the right table has no constraint of it. Such terms
+now keep their constraints on the earlier tables apart, in `TableConstraints::on_elsewhere`, which
+no access path reads. The estimate finds a join's ON terms by their origin among the WHERE terms
+and counts those its right table holds no constraint of by those constraints and the earlier
+table's sample, at the join (`cardinality.rs`, `on_selectivity`), as a right table's ON terms are
+counted. So the RIGHT JOIN turned LEFT keeps its RIGHT JOIN's estimate, and a LEFT JOIN written
+that way is no longer estimated as if its ON term were absent.
+
+**Evidence.** `crates/engine/tests/planner.rs`'s `an_outer_join_is_estimated_at_least_its_inner_join`
+failed with the swap alone (`t0 RIGHT JOIN t1 ON y.c = 3`: right 10^12, full 10^11) and passes
+with the estimate's change. `crates/engine/tests/join_search.rs`: `t_pl_8_1_the_right_join_reads_tiny_first`
+(T-PL.8.1) plans tiny first and mid before big; `t_pl_8_2_a_right_join_turned_left_keeps_its_answers`
+(T-PL.8.2) answers eight RIGHT JOINs (`*`, a WHERE on the null-extended table, USING, a later inner,
+LEFT and RIGHT JOIN, an aggregate, an ON term on the left table) as SQLite does, worked by hand
+from the rows.
+
+**Not yet built.** The rest of rank 8: bushy plans over connected complement pairs (DPccp, DPhyp
+for terms over more than two tables) on rank 3's explicit stack and budget, a join's result built
+into a hash join through `MaterializedBuildInput`, and CD-C's conflict rules in place of
+`required_lhs_by_table` for outer, semi and anti joins and for RIGHT JOINs whose left side is a
+join (those need a bushy plan: `(a JOIN b) RIGHT JOIN c` is `c LEFT JOIN (a JOIN b)`).
+
+**Falsified by.** An answer that changes against SQLite (the oracles' DQP, TLP and NoREC, and
+`answers.py`) for a RIGHT JOIN led by one table; or such a plan slower than its parent's on the
+bench suite beyond the passes' spread.
+
 ## Decision (lane pl12): custom plans, then a generic one, for prepared statements
 
 **Decision.** PL.12 (docs/research/planner.md section 9, rank 12; `crates/engine/plan_cache.rs`).
@@ -1392,3 +1444,114 @@ unit tests (T-PL.12.1, T-PL.12.2). The TPC-H prepared measurement (AC-PL.12.1) a
 connection's prepare generation where it re-plans, which resets each statement's choice
 (`Statement::reprepare`); a re-plan that keeps statistics close may want to keep the measurements
 instead, which is PL.9's call; `PlanValues` is how an estimate reads a bound value.
+
+## Decision (lane pl9): row counts kept as rows change, statements planned again past their statistics' error
+
+**Decision.** PL.9 (docs/research/planner.md section 9, rank 9; `crates/engine/row_changes.rs`).
+- Each table keeps, in memory on its database, its rows inserted less its rows deleted since
+  ANALYZE last counted it. An INSERT or DELETE of a main-database table adds its own change count
+  (the one `changes()` reports) when it finishes: one atomic add a statement, whatever its rows,
+  into a counter found when the statement was planned. The write path takes no lock and no lookup.
+- The planner's row count for an analyzed table is ANALYZE's count with those changes
+  (`base_row_estimate`), as PostgreSQL scales `reltuples` to the table's present size
+  (`estimate_rel_size`). The shares the sketch and the sample give (decisions 20 and 21) stay
+  shares: they apply to the count as it is now.
+- A statement notes, for each table it counted, the count it planned with and how far that count
+  may move before its estimates could tell the move apart from their own noise: the relative
+  standard error of the table's statistics. With a sample of `n` rows that is `1 / sqrt(n)` (a
+  share's binomial standard error `sqrt(p (1 - p) / n)`, relative to the half the sample resolves
+  best); with only HyperLogLog sketches, `1.04 / sqrt(m)` for their `m` registers; with only
+  `sqlite_stat1`, every row was counted, `1 / sqrt(rows)`. At each run's start the statement
+  compares (atomic loads only); a table grown or shrunk past `1 + error` since plans it again
+  through the existing reprepare, one prepare, which also starts PL.12's choice again. Within it,
+  nothing is planned. Nothing is picked: `n`, `m` and the rows are the statistics' own sizes.
+- ANALYZE sets the counts of the tables it counted back to zero when its statistics load.
+
+**Limits, stated.** The counts are in memory: a database opened again plans on ANALYZE's counts
+until its next writes. A statement's change count is added when the statement finishes, so a
+transaction rolled back after it leaves its rows counted, and rows a trigger or a foreign key's
+action writes, an UPSERT's updates, and an UPDATE (which moves no count) are not counted apart.
+`ANALYZE t` sets back every analyzed table's count, not only `t`'s. Each is a staleness measure
+off by what the next ANALYZE corrects, never a wrong answer.
+
+**Why.** ANALYZE's count stood still between ANALYZE runs, so a table grown tenfold kept the plan
+made for a tenth of its rows until someone ran ANALYZE, and a prepared statement kept its plan
+however far its tables moved (CH-benCHmark's tables grow as its transactions run).
+
+**Sources.** PostgreSQL `src/backend/optimizer/util/plancat.c`, `estimate_rel_size` (the tuple
+count scaled to the relation's current size); PostgreSQL's `n_mod_since_analyze` and autovacuum's
+analyze threshold (a picked `50 + 0.1 x reltuples`, which this replaces with the statistics' own
+error); Freitag and Neumann, "Every Row Counts", CIDR 2019 (statistics kept as rows change);
+Flajolet et al. 2007 (the sketch's error).
+
+**Evidence.** `crates/engine/tests/row_changes.rs` (T-PL.9.1, T-PL.9.2) and `row_changes.rs`'s unit
+tests. CH-benCHmark on the parent and the change (AC-PL.9.1) and the suite's writes (AC-PL.9.2)
+are the coordinator's.
+
+**Falsified by.**
+- CH-benCHmark's analytical queries no faster than the parent's as its tables grow, ANALYZE on the
+  same schedule (AC-PL.9.1).
+- The bench suite's writes more than 2% slower than the parent (AC-PL.9.2).
+- A statement planned again many times as its table grows slowly, each plan the same: the error
+  too tight to say when a plan could change.
+
+## 22. Correlated subqueries unnested by dependent joins taken apart, from a worklist (PL.10)
+
+**Decision.** `optimizer/unnest.rs` keeps its fixed patterns and adds the general forms of Neumann
+and Kemper's dependent join, each taken from a worklist with a counted bound, never by recursion
+(CLAUDE.md §11, §2):
+
+- **Pulling the correlated predicates up** ("pull predicates up to eliminate correlations", Neumann
+  and Kemper's BTW 2015 talk, slide 8): an `EXISTS`, `NOT EXISTS`, `IN` or `NOT IN` conjunct of
+  `WHERE` whose subquery reads several tables, or has `DISTINCT` or `ORDER BY`, becomes a semi- or
+  anti-join with a derived table: the subquery without its correlated conjuncts, reading no outer
+  row, run once; the conjuncts join it, reading its tables through its columns.
+- **`NOT IN`** becomes an anti-join whose condition is `x = y OR x IS NULL OR y IS NULL`, the parts a
+  NOT NULL column can't meet left out: in `WHERE` a NULL test fails the row as FALSE does (SQLite's
+  lang_expr.html, "The IN and NOT IN operators"), and an empty subquery passes every row.
+- **A mark join** for an `EXISTS` no semi-join can take (under `OR`, in the `SELECT` list), correlated
+  by `=` with one outer table: a left join with the subquery grouped by its correlation columns, and
+  the test `key IS NOT NULL`. This is the domain `D` inferred from the equivalent inner attributes
+  (slide 18: "Instead of joining with D, we can often infer the attributes from D") with the grouping
+  pushed below the join (slide 11: `D ⋈ Γ` is `Γ` over `A ∪ A(D)`), the form the one-value aggregate
+  already had.
+- **Top-down** (Neumann, arXiv:2412.04294, section 5: "visits each operator at most once, starting
+  from dependent joins in top-to-bottom order"): the query's own subqueries are taken first; a
+  subquery spliced in brings its own correlated subqueries into the query, and they join the end of
+  the list. A derived table's own subqueries are unnested when the planner plans it, after this
+  query. The bound is twice the correlated subqueries nested in the query's subqueries: each is
+  taken at most once as a join and once as a value.
+
+The derived and grouped forms run the subquery's conditions over every row of its tables, where the
+correlated form ran them only on the rows each outer row selects; a spliced subquery's own
+subqueries may run on rows in another order. So a form is taken only where nothing it moves can fail
+or change between calls (`expression_can_fail_on_input`, nondeterministic functions), and a derived
+table's own subqueries may read none of the outer query's tables.
+
+A subquery that reads a table a semi- or anti-join brought in stays nested
+(`reads_semi_or_anti_joined_table`): those loops stop after a match in their one table, so a join
+hung off that table would be a joined inner query they don't run. T-PL.10.1 found it: `EXISTS` in
+`EXISTS`, each on its parent, kept 24 of 46 customers when forced before this rule. A nested level
+whose key reaches the outermost table (the depth test's) still unnests.
+
+Not taken yet: a scalar aggregate whose result is an expression of an aggregate that isn't NULL
+over no rows, such as TPC-H Q20's `0.5 * total(..)` (`result_on_empty_input` takes a bare aggregate
+or one NULL on empty input). Q20's answers are checked; it isn't counted as unnested.
+
+The planner keeps choosing by cost: the written form, the patterns' form (as before PL.10) and,
+where the general forms went further, the general one are each searched, and the cheapest kept, at
+equal cost the one with fewer subqueries left. A query the patterns served keeps its plan when a
+general form would cost more.
+
+**Evidence.** T-PL.10.1 (`crates/engine/tests/unnesting.rs`, run with `--features simulator`): 39
+classes, the corpus's (bench/planner/audit/07-unnesting.sql), TPC-H Q2, Q4, Q17, Q20, Q21, Q22 and
+each new form with NULLs, loose types, collations, outer joins inside and around, answer the same
+nested (`SubqueryUnnestingMode::Disabled`), forced and as planned; each class marked to unnest plans
+otherwise when forced (Q20 aside, above); EXISTS nested 1 to 24 deep, each level correlated with its parent and the
+outermost query, unnests every level. The measurements (AC-PL.10.1, q21 at SF 10 under PostgreSQL's
+1.195e+04 ms; AC-PL.10.2, TPC-DS's ten queries on the parent first) are the batch's.
+
+**Falsified by.** An answer of the oracles (TLP, NoREC, DQP, the differential check) or of
+T-PL.10.1 that differs between the forms; TPC-DS's ten queries no faster unnested; a query of the
+bench whose plan the general form made costlier than the patterns' (the three-way choice should
+make that impossible by estimate; the measurement says whether the estimate holds).

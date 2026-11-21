@@ -1031,8 +1031,21 @@ fn optimize_select_plan_with_cache(
     // that it needs are ready. It can then compare that step with the added
     // join tables in one search. Until then, both forms need their own search.
     let mut rewritten = plan.clone();
-    if !unnest::rewrite_correlated_subqueries(&mut rewritten, resolver)? {
+    let rewrites =
+        unnest::rewrite_correlated_subqueries(&mut rewritten, resolver, unnest::Reach::General)?;
+    if !rewrites.any {
         return optimize_select_plan_form(plan, resolver, cache);
+    }
+    // PL.10: where the general forms went further than the fixed patterns, the patterns' form is
+    // planned too, and kept where it is the cheapest: a query the patterns served keeps its plan
+    // when a general form would cost more.
+    let mut patterns = None;
+    if rewrites.general {
+        let mut form = plan.clone();
+        if unnest::rewrite_correlated_subqueries(&mut form, resolver, unnest::Reach::Patterns)?.any
+        {
+            patterns = Some(form);
+        }
     }
 
     #[cfg(feature = "simulator")]
@@ -1069,6 +1082,34 @@ fn optimize_select_plan_with_cache(
         use_rewritten,
         "correlated-subquery form cost comparison"
     );
+    if let Some(mut form) = patterns {
+        let best_cost = if use_rewritten {
+            rewritten.estimated_cost
+        } else {
+            plan.estimated_cost
+        };
+        let form_table_plan =
+            find_select_plan_form(&mut form, resolver, cache, false, best_cost.map(Cost))?;
+        // At equal cost the form with fewer subqueries left wins, as below: the general form over
+        // the patterns', the patterns' over the written one.
+        let wins = |form_cost: f64, best_cost: f64| {
+            if use_rewritten {
+                form_cost < best_cost
+            } else {
+                form_cost <= best_cost
+            }
+        };
+        if rewritten_form_is_emittable(&form)
+            && matches!(
+                (best_cost, form.estimated_cost),
+                (Some(best_cost), Some(form_cost)) if wins(form_cost, best_cost)
+            )
+        {
+            *plan = form;
+            apply_select_table_plan(plan, form_table_plan, resolver)?;
+            return Ok(());
+        }
+    }
     if use_rewritten {
         // Equal work is better without one subquery call per outer row.
         *plan = rewritten;
@@ -2277,7 +2318,18 @@ fn base_row_estimate(
                         .values()
                         .find_map(|idx_stat| idx_stat.total_rows)
                 }) {
-                    return RowCountEstimate::AnalyzeStats(rows as f64);
+                    // Amphora (PL.9, decision (lane pl9)): ANALYZE's count with the rows inserted less
+                    // those deleted since, so the count follows the table between ANALYZE runs.
+                    let analyzed = rows as f64;
+                    let rows = match params.plan_values.as_deref() {
+                        Some(values) => values.live_rows(
+                            &btree.name,
+                            analyzed,
+                            crate::row_changes::statistics_error(stats, analyzed),
+                        ),
+                        None => analyzed,
+                    };
+                    return RowCountEstimate::AnalyzeStats(rows);
                 }
             }
             RowCountEstimate::hardcoded_fallback(params)
@@ -2891,6 +2943,13 @@ fn find_table_access_plan(
         }
     }
 
+    // Amphora (PL.8, T-PL.8.1): `t0 RIGHT JOIN t1 ON p` is `t1 LEFT JOIN t0 ON p`, CD-C's
+    // commutativity of a left outer join with its mirror (docs/design/planner.md, lane pl8's
+    // decision). Written as a RIGHT JOIN, t1's unmatched-row pass runs after every loop, so the
+    // tables after it may not move before it; written as a LEFT JOIN, they move freely and only t0
+    // must follow t1.
+    commute_leading_right_join(table_references, where_clause);
+
     let has_expression_idx_or_partial_idx = table_references.joined_tables().iter().any(|t| {
         matches!(&t.table, Table::BTree(_) if available_indexes
             .indexes_for_table(t.internal_id)
@@ -3380,6 +3439,57 @@ fn operation_for_unmatched_right_rows(
         _ => Err(LimboError::InternalError(
             "the unmatched-right pass chose an unsupported table read".to_string(),
         )),
+    }
+}
+
+/// Turn a RIGHT JOIN whose left side is the FROM list's first table alone into the LEFT JOIN of
+/// the same two tables the other way round: `t0 RIGHT JOIN t1 ON p` is `t1 LEFT JOIN t0 ON p`
+/// (Moerkotte, Fender and Eich, "On the correct and complete enumeration of the core search
+/// space", SIGMOD 2013: a right outer join is its mirrored left outer join; docs/design/planner.md,
+/// lane pl8's decision). The swap is made before the join search: star columns, USING columns and
+/// every expression are bound by table ID already, and what reads a table's place in the FROM list
+/// (`is_left_of_right_or_full_join`, `outer_join_may_null_extend`) reads it live, so each table is
+/// null-extended exactly where it was. Only B-tree tables are swapped: a table function's
+/// arguments or a FROM subquery may read the table written before it.
+fn commute_leading_right_join(
+    table_references: &mut TableReferences,
+    where_clause: &mut [WhereTerm],
+) {
+    let tables = table_references.joined_tables_mut();
+    let is_leading_right_join = match tables.as_slice() {
+        [left, right, ..] => {
+            left.join_info.is_none()
+                && matches!(left.table, Table::BTree(_))
+                && matches!(right.table, Table::BTree(_))
+                && right.join_info.as_ref().is_some_and(|join_info| {
+                    join_info.join_type == JoinType::RightOuter
+                        && !join_info.lateral
+                        && !join_info.no_reorder
+                })
+        }
+        _ => false,
+    };
+    if !is_leading_right_join {
+        return;
+    }
+    tables.swap(0, 1);
+    let [first, second, ..] = tables.as_mut_slice() else {
+        return;
+    };
+    let Some(mut join_info) = first.join_info.take() else {
+        return;
+    };
+    join_info.join_type = JoinType::LeftOuter;
+    first.unmatched_right_rows_plan = None;
+    let (old_right, new_right) = (first.internal_id, second.internal_id);
+    second.join_info = Some(join_info);
+    for term in where_clause {
+        term.origin = match term.origin {
+            WhereTermOrigin::Join(JoinOrigin::Outer(table)) if table == old_right => {
+                WhereTermOrigin::Join(JoinOrigin::Outer(new_right))
+            }
+            origin => origin,
+        }
     }
 }
 
@@ -4371,7 +4481,7 @@ impl Optimizable for ast::Expr {
                 let column = &columns[*column];
                 // Only INTEGER PRIMARY KEY (rowid alias) is implicitly NOT NULL.
                 // Other PRIMARY KEY types (e.g., TEXT PRIMARY KEY) can contain NULL.
-                column.is_rowid_alias() || column.notnull()
+                column.is_rowid_alias() || column.trusted_notnull()
             }
             // A rowid is not NULL for a real table row. An outer join can
             // replace that row with a synthetic row whose rowid is NULL.

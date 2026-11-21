@@ -103,6 +103,15 @@ impl Drop for JsonCacheAccessGuard<'_> {
     }
 }
 
+// With the `fuzz` or `bench` feature (the simulator turns `fuzz` on, and the workspace build unifies
+// it in) `json` is a public module and this type is public, so clippy::new_without_default holds it
+// to a Default on every target.
+impl Default for JsonCacheCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JsonCacheCell {
     pub fn new() -> Self {
         Self {

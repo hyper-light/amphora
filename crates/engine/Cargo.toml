@@ -217,3 +217,8 @@ rand_chacha = { workspace = true }
 env_logger = { workspace = true }
 test-log = { version = "0.2.17", features = ["trace"] }
 sorted-vec = "0.8.6"
+
+# T-PL.10.1 reads the simulator's subquery unnesting control (nested against unnested answers).
+[[test]]
+name = "unnesting"
+required-features = ["simulator"]
