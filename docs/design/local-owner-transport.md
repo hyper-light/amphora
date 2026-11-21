@@ -436,6 +436,16 @@ system refuses a descriptor past the process's limit (`EMFILE`), so that limit i
    once (replication.md's reasoning, unchanged): now the budget's bound as it stands at each read. Readers hold no
    descriptor (`a_local_reader_opens_no_file`), so they charge none; their pages stay charged to the page budget,
    which is what bounds them in practice.
+6. **An owner charges its descriptor; no count of owners** (`OWNERS_MAX`, 4,096 since before 2026-11-11, was
+   picked). Each owner takes one descriptor from the budget at admission, before any probe makes a directory or
+   takes a lease: a local or replicated owner's is its lease, held beside it (`Owned`) and given back once the lease
+   is closed; a client's is the socket its calls open, held by its `Backend` while it lives. The other leases
+   (`Machine::open`, bootstrap's inspections) charge theirs the same way. Past the budget an open or attach is
+   refused `TooLarge` and makes nothing. The owner table's entries each hold such a charge while alive, and the dead
+   are forgotten before each admission, so the budget bounds the table. The drained paths kept (`DRAINED`, J1) are
+   at most the budget's bound as it stands, oldest evicted: each names a lease this process held, one descriptor of
+   it. An evicted mark makes an open that still finds the lease held refuse it as another process's, typed, rather
+   than wait.
 
 **Tests.**
 - `descriptors::tests::a_budget_holds_its_bound_and_takes_back_what_is_given` (T-FD.1.1).
@@ -446,11 +456,17 @@ system refuses a descriptor past the process's limit (`EMFILE`), so that limit i
   given back. With the old count of 32, the second was served.
 - `replicated::tests::local_readers_are_bounded_by_the_transport_not_four` (T-T1.10.L8): under a budget of 6, six
   readers out and the seventh waits to its deadline; the bound moves with the budget.
+- `database::remote::tests::an_owner_charges_its_lease_to_the_descriptor_budget` (T-FD.1.4): under a budget of 1, a
+  second database's open is refused while the first is open, and served once the first has drained.
+- `database::remote::tests::opens_refused_at_the_descriptor_budget_make_no_directory` and
+  `attach_refuses_at_the_descriptor_budget_before_it_touches_the_lease` (U05): with the budget spent, open,
+  open_replicated and attach_replicated are refused `TooLarge` and make no directory, endpoint or lease.
 
 **What is left (not in this change).**
-- `OWNERS_MAX` (4,096): the owners' own descriptors (the lease, the endpoint's lock and listener, the engine's
-  files, a replica's log) are not yet charged to this budget. Its derivation is the next step: each kind of owner
-  charges the descriptors it holds, stated by kind and held to the count by a `/dev/fd` test.
+- An owner's other descriptors (the endpoint's lock and listener, the engine's database and log files, a replica's
+  log) are charged by no kind yet: they come out of the same limit as descriptors open outside the budget, counted
+  again at the moments item 1 names. Charging each where it is held, stated by kind and held to the count by a
+  `/dev/fd` test, is the next step.
 - Memory: a connection's frames are bounded each (33 MiB), but their sum across connections is charged to no memory
   budget. Before, 32 connections a database bounded it loosely (and not across databases). It waits for the
   process memory budget (the same one `SNAPSHOT_BYTES` waits for).

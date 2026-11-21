@@ -423,11 +423,15 @@ criteria = [
   { id = "AC-FD.1.1", text = "No count of connections: each accepted connection charges its socket to the process's descriptor budget (the soft RLIMIT_NOFILE as it stands, read at every charge, less the descriptors open outside the budget, counted again when the limit moves, a charge would be refused or the system refuses one; 2^24 handles on Windows), and one past it is closed unserved with a typed refusal at the client" },
   { id = "AC-FD.1.2", text = "The listener's backlog is the system's own most (SOMAXCONN semantics), and the listener goes on when the system refuses a descriptor (EMFILE, ENFILE, WSAEMFILE)" },
   { id = "AC-FD.1.3", text = "A replica's local readers out at once are at most the budget's bound (AC-T1.10.L2)" },
+  # lane constants (2026-11-21): OWNERS_MAX's 4,096 replaced
+  { id = "AC-FD.1.4", text = "No count of owners: each owner charges one descriptor to the process's budget before any probe or lease (a local or replicated owner's lease, a client's socket), held where that file is held and given back once it closes; past the budget an open or attach is refused TooLarge and makes nothing; the drained paths kept are at most the budget's bound" },
 ]
 tests = [
   { id = "T-FD.1.1", text = "A budget of 3 asked for one, two, then one more — passes when the fourth is refused TooLarge naming what it was for, 4 past 3, and two more are held once two are given back" },
   { id = "T-FD.1.2", text = "The process's budget on Unix, its soft RLIMIT_NOFILE raised by one while it runs and put back — passes when it has room under the limit by stdin, stdout and stderr at least, and its limit follows the raise and the return at its next charge" },
   { id = "T-FD.1.3", text = "A budget of 1, an owner, one client served and kept, a second asked, the first let go, a third asked — passes when the second is turned away before any challenge and the third is served" },
+  # lane constants (2026-11-21)
+  { id = "T-FD.1.4", text = "A budget of 1, one database opened, a second opened, the first dropped and drained, the second opened again — passes when the first holds 1, the second is refused TooLarge at 1, then served" },
 ]
 
 [[own]]

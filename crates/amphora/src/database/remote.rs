@@ -648,7 +648,7 @@ mod tests {
         );
     }
 
-    /// CP-T1.5 (U05), AC-FD.1.1 (local-owner-transport.md, "One descriptor budget", item 6): with
+    /// CP-T1.5 (U05), AC-FD.1.4 (local-owner-transport.md, "One descriptor budget", item 6): with
     /// the descriptor budget spent, open, open_replicated and attach_replicated under directories
     /// that don't exist are refused at the budget and make none of them. Do: a budget of 2, both
     /// held; the three opens. Expect: each refused TooLarge at 2; no directory made.
@@ -678,7 +678,7 @@ mod tests {
         );
     }
 
-    /// CP-T1.5 (U05), AC-FD.1.1 (local-owner-transport.md, "One descriptor budget", item 6):
+    /// CP-T1.5 (U05), AC-FD.1.4 (local-owner-transport.md, "One descriptor budget", item 6):
     /// attach with the descriptor budget spent, on a database no process owns, is refused at the
     /// budget and leaves no endpoint directory or lease behind. Do: a budget of 2, both held;
     /// attach_replicated. Expect: refused TooLarge at 2; no endpoint directory.
@@ -703,7 +703,7 @@ mod tests {
         );
     }
 
-    /// AC-FD.1.1, T-FD.1.4 (local-owner-transport.md, "One descriptor budget", item 6): an owner
+    /// AC-FD.1.4, T-FD.1.4 (local-owner-transport.md, "One descriptor budget", item 6): an owner
     /// charges its lease to the process's descriptor budget, not to a count of owners, and gives
     /// it back once drained. Do: a budget of 1; open one database; open a second; drop the first
     /// and, once its lease's descriptor is given back, open the second again. Expect: the first

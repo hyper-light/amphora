@@ -274,8 +274,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   an owner's connections are bounded by the process's descriptor budget, the system's limit less what is open
   (local-owner-transport.md, "Decision (lane constants): one descriptor budget"; FD.1), with a replica's local
   readers following it; the replicated owner drives once a step, in turn with its inputs (replication.md, "Decision
-  (lane constants): one drive a step"; DQ.1). Left: the owners' descriptors charged to the same budget
-  (`OWNERS_MAX`), the replicated owner's tick and poll, and the rest of the list (handoff/amphora-constants-list.md).
+  (lane constants): one drive a step"; DQ.1); and each owner charges its lease, or a client its socket, to the same
+  budget, no count of owners (`OWNERS_MAX` gone; AC-FD.1.4). Left: an owner's other descriptors (endpoint, engine
+  files, a replica's log) charged by kind, the replicated owner's tick and poll, and the rest of the list
+  (handoff/amphora-constants-list.md).
 
 ## Measured
 
