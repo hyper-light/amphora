@@ -873,3 +873,18 @@ tests = [
   { id = "T-G3.3.5", text = "crates/engine/tests/shared_pages.rs g3s3_plain_misses_read_into_the_pages_evictions_leave — passes when a table four times the cache reads today's rows on the plain path and its misses read into recycled pages" },
   { id = "T-G3.3.6", text = "crates/engine/tests/page_path_allocs.rs — passes when the plain path's point lookups that miss allocate less than today's and its hits no more (a counting allocator; --nocapture prints allocations per lookup, AC-G3.3.2's harness)" },
 ]
+
+# lane g11s5
+[[own]]
+id = "CS.5"
+title = "The planner chooses the column copy or the rows for each scan by measured cost: whole-table and wide-range statements to the copy, point reads to the rows (G11 step 5)"
+criteria = [
+  { id = "AC-CS.5.1", text = "An access path 'scan the column copy' costed from the copy's measured scan cost per row and its freshness (queued keys merged from the rows), chosen against the row path's learned rates; a copy that can't answer the snapshot exactly is no path (translate/optimizer/column_path.rs, storage/versioned/columns_path.rs; behind AMPHORA_COLUMN_PATH=on until step 4's scan lands)" },
+  { id = "AC-CS.5.2", text = "Each analytic class against the best of CedarDB and ClickHouse is at least 1.0x (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-CS.5.1", text = "cs5_answers_identical_whichever_path_{plain,packed} (crates/engine/storage/versioned/columns_path.rs) — passes when every whole-table and point read, by either path, from a copy with deltas and queued keys, equals the rows at its snapshot" },
+  { id = "T-CS.5.2", text = "cs5_wide_aggregate_reads_the_copy_point_read_the_rows — passes when, by counts, the whole table comes from the copy (only queued keys from the rows) and a point read from one row read with the copy untouched" },
+  { id = "T-CS.5.3", text = "cs5_stale_copy_never_read_past_its_snapshot — passes when, at snapshots after commits a full queue dropped and before the copy's only generation, the rows are chosen, the copy is not read, and the answers equal the rows" },
+  { id = "T-CS.5.4", text = "cs5_* in translate/optimizer/column_path.rs — passes when the choice follows the costs: copy for wide shapes, rows for point reads and short ranges, no path when off or stale, queued keys priced, an unmeasured copy tried only for whole tables" },
+]

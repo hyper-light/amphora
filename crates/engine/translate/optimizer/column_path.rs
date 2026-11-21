@@ -111,8 +111,9 @@ pub fn copy_cost(shape: Shape, table_rows: f64, r: RowRates, c: CopyView) -> Opt
     let merge = c.queued.max(0.0) * (r.seek + r.row);
     match c.nanos_per_row {
         Some(per_row) => Some(c.reads.max(0.0) * per_row + merge),
-        // Unmeasured: tried where it visits what the row scan visits, priced as that scan.
-        None if shape == Shape::Whole => Some(rows_cost(shape, table_rows, r) + merge),
+        // Unmeasured: tried where it visits what the row scan visits, priced as that scan (its
+        // queued keys are part of the scan that measures it).
+        None if shape == Shape::Whole => Some(rows_cost(shape, table_rows, r)),
         None => None,
     }
 }
@@ -200,6 +201,8 @@ mod tests {
             ..fresh(10_000.0, 0.0)
         };
         assert_eq!(choose(true, Shape::Whole, 10_000.0, R, c).path, Path::Copy);
+        let queued = CopyView { queued: 50.0, ..c };
+        assert_eq!(choose(true, Shape::Whole, 10_000.0, R, queued).path, Path::Copy);
         assert_eq!(choose(true, Shape::Point, 10_000.0, R, c).path, Path::Rows);
         assert_eq!(
             choose(true, Shape::Range { rows: 9_000.0 }, 10_000.0, R, c).path,
