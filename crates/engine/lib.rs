@@ -75,6 +75,7 @@ mod pragma;
 mod progress;
 mod pseudo;
 mod regexp;
+mod row_changes;
 #[cfg(feature = "series")]
 mod series;
 mod stack;
@@ -184,7 +185,7 @@ pub use storage::{
     encryption::{CipherMode, EncryptionContext, EncryptionKey},
     packed::LogFormat,
     page_transform::{PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation},
-    pager::{Page, PageRef, Pager},
+    pager::{Access, Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
 };
 pub use translate::expr::{walk_expr_mut, WalkControl};

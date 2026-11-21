@@ -141,6 +141,13 @@ fn in_place(_path: &Path) {}
 /// A connection on a Turso database, with the statements it prepared kept.
 pub(crate) type Pages = Vec<(u32, Vec<u8>)>;
 
+/// What a traced preparation read (`Db::prepare_traced`): its read set, `None` past its bound,
+/// and page 1 as it stood at the session's base.
+pub(crate) struct Traced {
+    pub(crate) reads: Option<Vec<u32>>,
+    pub(crate) page_one: Vec<u8>,
+}
+
 pub struct Db {
     io: Arc<dyn IO>,
     db: Arc<Database>,
@@ -944,6 +951,61 @@ impl Db {
         result
     }
 
+    /// `prepare_pages`, answering also what the session read: its read set (`None` when it read
+    /// more than `bound` pages, as if unknown) and page 1 as it was at the session's base. The
+    /// record ends before capture: capturing reads every dirty page again, which the session itself
+    /// may not have read (replication.md, "A follower's write that read nothing written since its
+    /// base: read sets").
+    pub(crate) fn prepare_traced<R>(
+        &mut self,
+        max_bytes: usize,
+        bound: u64,
+        f: impl FnOnce(&mut Self) -> anyhow::Result<R>,
+    ) -> anyhow::Result<(R, Pages, Traced)> {
+        self.exec("BEGIN IMMEDIATE")?;
+        let pager = self.conn.get_pager();
+        let result = self.page_one().and_then(|page_one| {
+            pager.record_access(bound).map_err(fail)?;
+            let answer = f(self)?;
+            let access = pager.take_access().map_err(fail)?;
+            let pages = pager.transaction_image(max_bytes).map_err(fail)?;
+            let reads = (!access.overflowed()).then(|| access.read().collect());
+            Ok((answer, pages, Traced { reads, page_one }))
+        });
+        pager.end_access();
+        // A prepared transaction never leaves an engine commit marker, even when capture fails.
+        self.exec("ROLLBACK")?;
+        result
+    }
+
+    /// Page 1's bytes in the transaction under way.
+    fn page_one(&self) -> anyhow::Result<Vec<u8>> {
+        let pager = self.conn.get_pager();
+        let (page, completion) = self.io.block(|| pager.read_page(1))?;
+        if let Some(completion) = completion {
+            self.io.wait_for_completion(completion).map_err(fail)?;
+        }
+        if !page.is_loaded() {
+            anyhow::bail!("page 1 was not loaded");
+        }
+        Ok(page.get_contents().as_ptr().to_vec())
+    }
+
+    /// The root page of table `name`: the replica's marker table's, which every apply writes.
+    pub(crate) fn root_page(&self, name: &str) -> anyhow::Result<u32> {
+        let mut root = None;
+        self.query_owned(
+            "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+            [Value::from_text(name.to_string())],
+            |row| {
+                root = Some(row.get::<i64>(0)?);
+                Ok(false)
+            },
+        )?;
+        let root = root.ok_or_else(|| anyhow::anyhow!("table {name} has no root page"))?;
+        Ok(u32::try_from(root)?)
+    }
+
     /// The pages an image of this database holds now, and their bytes.
     fn image_extent(&self) -> anyhow::Result<(u32, usize)> {
         let pager = self.conn.get_pager();
@@ -1053,6 +1115,61 @@ impl Db {
         each: impl FnMut(&Row) -> anyhow::Result<bool>,
     ) -> anyhow::Result<()> {
         self.query_owned(sql, params, each)
+    }
+
+    /// The schema cookie moved on and this writer's schema read again inside its transaction, for an
+    /// online schema change's state rows (`amphora_engine::schema::INDEX_STATES_TABLE`) to take:
+    /// the writer sees them at once, every other connection at the cookie when this commits
+    /// (CP-T1.12, docs/design/online-schema.md). The caller holds the write transaction.
+    pub(crate) fn restage_schema(&self) -> anyhow::Result<()> {
+        let mut version = None;
+        self.query("PRAGMA schema_version", [], |row| {
+            version = Some(row.get::<i64>(0).map_err(fail)?);
+            Ok(false)
+        })?;
+        // The cookie is a 32-bit field of the database header (sqlite.org/fileformat2.html, offset
+        // 40), which the engine's SetCookie writes as an i32.
+        let next = version
+            .and_then(|v| v.checked_add(1))
+            .filter(|v| i32::try_from(*v).is_ok())
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| anyhow::anyhow!("the schema cookie can't move past {version:?}"))?;
+        // Not `PRAGMA schema_version = n`: the engine makes that a no-op (SQLite's defensive mode),
+        // so the cookie would stay, and readers would keep the schema from before the step. This
+        // writes the header's cookie, marks the transaction's schema changed (published to every
+        // connection when it commits) and reads this writer's schema again.
+        self.conn.write_schema_version(next).map_err(fail)?;
+        self.statements.schema(self.conn.current_schema())?;
+        Ok(())
+    }
+
+    /// One batch of a write-only index's backfill (CP-T1.12): the rows after rowid `after`, at most
+    /// `rows`, each given its entry. The last rowid it visited (None: none was past `after`) and
+    /// how many it visited. The caller holds the write transaction.
+    pub(crate) fn index_backfill(
+        &self,
+        index: &str,
+        after: Option<i64>,
+        rows: u64,
+    ) -> anyhow::Result<(Option<i64>, u64)> {
+        self.ensure_unfenced()?;
+        let mut stmt = self
+            .conn
+            .prepare_index_backfill(index, after, rows)
+            .map_err(fail)?;
+        let mut answer = None;
+        step(self.io.as_ref(), &mut stmt, [], |row| {
+            let last = match row.get::<&Value>(0).map_err(fail)? {
+                Value::Null => None,
+                _ => Some(row.get::<i64>(0).map_err(fail)?),
+            };
+            let visited = u64::try_from(row.get::<i64>(1).map_err(fail)?)?;
+            answer = Some((last, visited));
+            // Run on to its Halt: a write statement stopped at its row is abandoned unfinished,
+            // and the engine then refuses the transaction's commit.
+            Ok(true)
+        })?;
+        answer.ok_or_else(|| anyhow::anyhow!("the backfill of {index} answered nothing"))
     }
 
     /// `f` in one transaction: committed if it returns Ok and the commit goes through, rolled back

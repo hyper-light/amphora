@@ -28,20 +28,28 @@
 //! validates. A transaction's reads past the budget are escalated to its whole tree (PostgreSQL's
 //! lock escalation), a coarser record that refuses more but never less.
 //!
+//! A transaction rolls back to a [`Savepoint`] (SQLite's `ROLLBACK TO`; G7 step 2, `NS.2`) from
+//! the same versions: a row it first changed after the savepoint gets back the version it
+//! replaced, as its abort would put it back; a row it changed before the savepoint and again after
+//! gets back, in place, the value its last change before the savepoint left (the transaction's own
+//! changes are its redo record, so that value is in it). Its changes after the savepoint leave its
+//! redo record and its rows; what it read after it stays kept for its validation, as PostgreSQL
+//! keeps a subtransaction's predicate locks after its rollback (a superset refuses more, never less).
+//!
 //! Locks are always taken the publish lock, then the recent commits', then a page latch, then a
 //! head's shard, then a transaction's state, then the open snapshots', then the budget's, so
 //! readers, writers, rollbacks, cleanups, collections and validations never wait on each other in
 //! a cycle.
 
 use super::blink::{Cell, Change, Descender, Tree};
-use super::page::Flags;
+use super::page::{self, Flags};
 use super::pool::Pool;
 use super::redo::Op;
 use crate::error::LimboError;
 use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::Mutex;
 use crate::Result;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering as Order;
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::size_of;
@@ -348,6 +356,44 @@ impl Txn {
             own: Some(self.id),
         }
     }
+
+    /// A savepoint here: [`Versioned::rollback_to`] puts the transaction's rows back as they are
+    /// now.
+    pub fn savepoint(&self) -> Savepoint {
+        Savepoint {
+            txn: self.id,
+            ops: self.ops.len(),
+            changed: self.changed.len(),
+        }
+    }
+}
+
+/// A place in a transaction to roll back to: how many changes it had made, and how many rows it
+/// had changed, when it was taken. Good until the transaction rolls back to one taken before it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Savepoint {
+    txn: u64,
+    ops: usize,
+    changed: usize,
+}
+
+/// A row: its tree and its key.
+type Row<'a> = (u64, &'a [u8]);
+
+/// The bytes a change's record took from the budget ([`VTree::put`], [`VTree::remove`]).
+fn op_bytes(op: &Op) -> u64 {
+    let n = match op {
+        Op::Put { key, value, .. } => size_of::<Op>()
+            .saturating_add(key.len())
+            .saturating_add(value.len()),
+        Op::Remove { key, .. } => size_of::<Op>().saturating_add(key.len()),
+    };
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+/// The bytes a transaction's note of a row it changed took from the budget ([`VTree::take`]).
+fn noted_bytes(key: &[u8]) -> u64 {
+    u64::try_from(size_of::<(u64, Vec<u8>)>().saturating_add(key.len())).unwrap_or(u64::MAX)
 }
 
 impl Clock {
@@ -961,6 +1007,80 @@ impl VTree {
         self.tree.root()
     }
 
+    /// The B-link tree under the versions: a cursor walks its leaves ([`super::cursor`]).
+    pub(super) fn tree(&self) -> &Tree {
+        &self.tree
+    }
+
+    /// `f` on each of cells `cells` of `leaf` (a page under its latch) whose row `snap` sees, in
+    /// key order: its key and that row.
+    pub(super) fn leaf_rows(
+        &self,
+        clock: &Clock,
+        snap: &Snapshot,
+        leaf: &[u8],
+        cells: std::ops::Range<usize>,
+        mut f: impl FnMut(&[u8], &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        for i in cells {
+            let key = page::key(leaf, i)?;
+            let cell = Cell {
+                flags: page::flags(leaf, i)?,
+                value: page::value(leaf, i)?,
+            };
+            if cell.flags.versioned {
+                let row = {
+                    let heads = self.heads(key)?.lock();
+                    Self::visible(clock, snap, Some(cell), heads.get(key))?
+                };
+                if let Some(row) = row {
+                    f(key, &row)?;
+                }
+            } else if !cell.flags.removed {
+                f(key, cell.value)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Puts `value` (none: removed) back in place as `txn`'s version of the row under `key`, which
+    /// it holds: a rollback to a savepoint after which it changed the row again.
+    fn reset_own(
+        &self,
+        pool: &Pool,
+        d: &mut Descender,
+        txn: &Txn,
+        key: &[u8],
+        value: Option<&[u8]>,
+    ) -> Result<()> {
+        if let Some(v) = value {
+            Tree::check_row(key, v)?;
+        }
+        self.tree.modify(pool, d, key, |cell| {
+            let heads = self.heads(key)?.lock();
+            if heads.get(key).is_none_or(|h| h.writer != txn.id) {
+                return Err(LimboError::InternalError(
+                    "versioned storage: a savepoint's row its transaction doesn't hold".into(),
+                ));
+            }
+            let change = match (value, cell) {
+                (Some(v), _) => Change::Put(
+                    v.to_vec(),
+                    Flags {
+                        versioned: true,
+                        removed: false,
+                    },
+                ),
+                (None, Some(_)) => Change::Mark(Flags {
+                    versioned: true,
+                    removed: true,
+                }),
+                (None, None) => Change::Keep,
+            };
+            Ok((change, ()))
+        })
+    }
+
     /// Puts back the version `txn` replaced under `key` (its rollback).
     fn restore(
         &self,
@@ -1392,6 +1512,70 @@ impl Versioned {
         }
         self.clock.set_aborted(&txn)?;
         self.clock.forget(&txn)
+    }
+
+    /// Rolls `txn` back to `sp`, which stays good (SQLite's `ROLLBACK TO` keeps its savepoint):
+    /// each row it first changed after `sp` as it was before `txn` (as [`Versioned::abort`] puts
+    /// it), each row it changed before and after as `sp` found it, its later changes dropped from
+    /// its redo record. A failure leaves `txn` to [`Versioned::abort`], which still finds every
+    /// row it changed.
+    pub fn rollback_to(&self, txn: &mut Txn, sp: Savepoint, d: &mut Descender) -> Result<()> {
+        if sp.txn != txn.id || sp.ops > txn.ops.len() || sp.changed > txn.changed.len() {
+            return Err(LimboError::InternalError(
+                "versioned storage: a savepoint not of this transaction, or rolled back past"
+                    .into(),
+            ));
+        }
+        let (kept, later) = txn.ops.split_at(sp.ops);
+        let fresh = txn.changed.get(sp.changed..).unwrap_or_default();
+        let fresh_rows: FxHashSet<Row<'_>> =
+            fresh.iter().map(|(t, k)| (*t, k.as_slice())).collect();
+        // Each row's last value before the savepoint (none: removed).
+        let mut then: FxHashMap<Row<'_>, Option<&[u8]>> = FxHashMap::default();
+        for op in kept {
+            match op {
+                Op::Put { tree, key, value } => {
+                    then.insert((*tree, key.as_slice()), Some(value.as_slice()))
+                }
+                Op::Remove { tree, key } => then.insert((*tree, key.as_slice()), None),
+            };
+        }
+        // Rows changed before the savepoint and after it, each once, with that value.
+        let mut again: Vec<(Row<'_>, Option<&[u8]>)> = Vec::new();
+        let mut seen: FxHashSet<Row<'_>> = FxHashSet::default();
+        for op in later {
+            let row = match op {
+                Op::Put { tree, key, .. } | Op::Remove { tree, key } => (*tree, key.as_slice()),
+            };
+            if fresh_rows.contains(&row) || !seen.insert(row) {
+                continue;
+            }
+            let value = then.get(&row).copied().ok_or_else(|| {
+                LimboError::InternalError(
+                    "versioned storage: a row changed before a savepoint with no change of it"
+                        .into(),
+                )
+            })?;
+            again.push((row, value));
+        }
+        for ((tree, key), then) in &again {
+            self.tree(*tree)?
+                .reset_own(&self.pool, d, txn, key, *then)?;
+        }
+        for (tree, key) in fresh.iter().rev() {
+            self.tree(*tree)?
+                .restore(&self.pool, d, &self.clock, txn, key)?;
+        }
+        let freed = later
+            .iter()
+            .map(op_bytes)
+            .chain(fresh.iter().map(|(_, k)| noted_bytes(k)))
+            .fold(0u64, u64::saturating_add);
+        txn.ops.truncate(sp.ops);
+        txn.changed.truncate(sp.changed);
+        self.clock.budget.release(freed);
+        txn.charged = txn.charged.saturating_sub(freed);
+        Ok(())
     }
 
     /// Drops the versions no open snapshot can see: rows whose cell's version every snapshot sees

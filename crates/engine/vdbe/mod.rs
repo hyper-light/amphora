@@ -1930,6 +1930,10 @@ pub struct PreparedProgram {
     /// Amphora (PL.12): its plan could differ with its parameters' values
     /// (`ProgramBuilder::reads_parameter_values`).
     pub reads_parameter_values: bool,
+    /// Amphora (PL.9): the tables whose row counts the plan read, so a run can tell they moved.
+    pub planned_tables: Vec<crate::row_changes::PlannedTable>,
+    /// Amphora (PL.9): the table an INSERT or DELETE folds its change count into.
+    pub write_target: Option<crate::row_changes::WriteTarget>,
     pub sql: String,
     /// The statement is ANALYZE, so its completion refreshes the in-memory
     /// planner statistics. Decided once here instead of by scanning the SQL

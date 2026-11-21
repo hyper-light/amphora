@@ -98,6 +98,26 @@ pub trait Engine: Send + 'static {
         let _ = quiet;
         Ok(Upkept::default())
     }
+
+    /// The holding its database keeps with its rows, as [`Engine::keep_holding`] last kept it
+    /// (None: it keeps none yet): what a group in groups answers from (CP-T1.9;
+    /// docs/design/reshard.md, "A group's holding"). By default an engine keeps no holding, and
+    /// can't be a group's.
+    fn holding(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+        Err(anyhow::anyhow!(
+            "this engine keeps no holding, so it can't be a group's"
+        ))
+    }
+
+    /// Keeps `holding` with its rows, in place of the one kept before, in a commit of its own
+    /// after everything committed before it, and durable, with all of those, before it returns:
+    /// a restart answers from it, never from a router's memory.
+    fn keep_holding(&mut self, holding: &[u8]) -> anyhow::Result<()> {
+        let _ = holding;
+        Err(anyhow::anyhow!(
+            "this engine keeps no holding, so it can't be a group's"
+        ))
+    }
 }
 
 /// What a checkpoint left, in frames of the log: how many it holds, and how many of those aren't in

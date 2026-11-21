@@ -5,14 +5,15 @@
 use std::num::NonZero;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use amphora_engine::{
-    ConnectOpts, Connection, Database, DatabaseOpts, IO, MemoryIO, Numeric, OpenOptions,
-    SqliteDialect, Statement, StepResult,
+    ConnectOpts, Connection, Database, DatabaseOpts, IO, LimboError, MemoryIO, Numeric,
+    OpenOptions, SqliteDialect, Statement, StepResult,
 };
 
 use crate::answer::{Render, Value};
-use crate::run::Engine;
+use crate::run::{Engine, Stop};
 
 /// Names every in-memory database the process opens apart (the engine keeps databases by name).
 static OPENED: AtomicU64 = AtomicU64::new(0);
@@ -41,11 +42,18 @@ fn value(v: &amphora_engine::Value) -> Value {
     }
 }
 
+fn stop(e: LimboError) -> Stop {
+    match e {
+        LimboError::Interrupt => Stop::PastBudget,
+        e => Stop::Refused(e.to_string()),
+    }
+}
+
 /// Steps `stmt` to its end, keeping at most `keep` rows.
-fn drain(io: &dyn IO, stmt: &mut Statement, keep: usize) -> Result<Vec<Vec<Value>>, String> {
+fn drain(io: &dyn IO, stmt: &mut Statement, keep: usize) -> Result<Vec<Vec<Value>>, Stop> {
     let mut rows = Vec::new();
     loop {
-        match stmt.step().map_err(|e| e.to_string())? {
+        match stmt.step().map_err(stop)? {
             StepResult::Row => {
                 if rows.len() < keep
                     && let Some(r) = stmt.row()
@@ -54,8 +62,9 @@ fn drain(io: &dyn IO, stmt: &mut Statement, keep: usize) -> Result<Vec<Vec<Value
                 }
             }
             StepResult::Done => return Ok(rows),
-            StepResult::IO | StepResult::Yield => io.step().map_err(|e| e.to_string())?,
-            other => return Err(format!("step: {other:?}")),
+            StepResult::Interrupt => return Err(Stop::PastBudget),
+            StepResult::IO | StepResult::Yield => io.step().map_err(stop)?,
+            other => return Err(Stop::Refused(format!("step: {other:?}"))),
         }
     }
 }
@@ -76,15 +85,29 @@ impl Amphora {
 }
 
 impl Engine for Amphora {
-    fn run(&mut self, sql: &str, keep: usize) -> Result<Vec<Vec<Value>>, String> {
-        let mut stmt = self.conn.prepare(sql).map_err(|e| e.to_string())?;
+    /// The bound is the engine's own query deadline: its VM checks it as it steps and interrupts
+    /// the statement (vdbe `maybe_request_interrupt`), so a record that can't finish ends there.
+    fn run(
+        &mut self,
+        sql: &str,
+        keep: usize,
+        until: Option<Instant>,
+    ) -> Result<Vec<Vec<Value>>, Stop> {
+        let mut stmt = self.conn.prepare(sql).map_err(stop)?;
+        if let Some(u) = until {
+            stmt.set_query_timeout_override(Some(Some(
+                u.saturating_duration_since(Instant::now()),
+            )));
+        }
         drain(self.io.as_ref(), &mut stmt, keep)
     }
 
     /// `PRAGMA wal_checkpoint(TRUNCATE)`: every frame copied and the log cut to nothing, or the
     /// row it answers says busy (its first column non-zero).
     fn settle(&mut self) -> Result<(), String> {
-        let rows = self.run("PRAGMA wal_checkpoint(TRUNCATE)", 1)?;
+        let rows = self
+            .run("PRAGMA wal_checkpoint(TRUNCATE)", 1, None)
+            .map_err(|e| format!("{e:?}"))?;
         match rows.first().and_then(|r| r.first()) {
             Some(Value::Integer(0)) | None => Ok(()),
             Some(other) => Err(format!("the checkpoint answered busy: {other:?}")),
@@ -126,7 +149,7 @@ impl AmphoraRender {
         let first = NonZero::new(1usize).ok_or("parameter 0")?;
         stmt.bind_at(first, amphora_engine::Value::from_f64(r))
             .map_err(|e| e.to_string())?;
-        let rows = drain(io, stmt, 1)?;
+        let rows = drain(io, stmt, 1).map_err(|e| format!("{e:?}"))?;
         match rows.first().and_then(|row| row.first()) {
             Some(Value::Text(t)) => String::from_utf8(t.clone()).map_err(|e| e.to_string()),
             other => Err(format!("rendering {r}: {other:?}")),

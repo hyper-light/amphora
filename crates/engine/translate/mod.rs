@@ -141,6 +141,25 @@ pub fn translate(
         .clone()
         .unwrap_or_else(|| Arc::new(crate::plan_cache::PlanValues::generic()));
     resolver.set_plan_values(plan_values.clone());
+    // Amphora (PL.9): the row counts read each table's changes since ANALYZE.
+    plan_values.attach_row_changes(connection.db.row_changes.clone());
+    // Amphora (PL.9): an INSERT or DELETE of a main-database table folds its change count into
+    // that table's counter when it finishes.
+    let write_target = match &stmt {
+        ast::Stmt::Insert { tbl_name, .. } => Some((tbl_name, 1)),
+        ast::Stmt::Delete { tbl_name, .. } => Some((tbl_name, -1)),
+        _ => None,
+    }
+    .filter(|(tbl_name, _)| tbl_name.db_name.is_none())
+    .and_then(|(tbl_name, sign)| {
+        let table =
+            schema.get_btree_table(&crate::util::normalize_ident(tbl_name.name.as_str()))?;
+        Some(crate::row_changes::WriteTarget {
+            counter: connection.db.row_changes.counter(&table.name),
+            changes: connection.db.row_changes.clone(),
+            sign,
+        })
+    });
     // Amphora: what its hash and group tables hold before they spill (executor decision 8).
     resolver.set_statement_memory(connection.get_pager().statement_memory_budget());
     resolver.set_join_methods(connection.join_methods());
@@ -164,8 +183,47 @@ pub fn translate(
 
     program.epilogue(schema);
     program.reads_parameter_values = plan_values.asked();
+    program.planned_tables = plan_values.take_planned();
+    program.write_target = write_target;
 
     program.build(connection, change_cnt_on, input)
+}
+
+/// Amphora: the program of one online index backfill batch ([`index::emit_index_backfill`]),
+/// set up as [`translate`] sets up a statement's. `input` is the statement's text, which no SQL
+/// parses: a statement made stale by a schema change refuses to run again rather than be
+/// prepared as some other statement.
+pub(crate) fn translate_index_backfill(
+    schema: &Schema,
+    connection: Arc<Connection>,
+    syms: &SymbolTable,
+    input: &str,
+    index_name: &str,
+    after: Option<i64>,
+    rows: u64,
+) -> Result<Program> {
+    let prepare_options = PrepareOptions::default();
+    let mut program = Box::new(ProgramBuilder::new(
+        QueryMode::Normal,
+        None,
+        ProgramBuilderOpts::new(1, 32, 2),
+    ));
+    program.set_mvcc_enabled(connection.mvcc_enabled());
+    program.prologue();
+    let resolver = Resolver::new(
+        schema,
+        connection.database_schemas(),
+        &connection.temp.database,
+        connection.attached_databases(),
+        syms,
+        connection.experimental_custom_types_enabled(),
+        connection.get_dqs_dml().into(),
+        Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>,
+        &prepare_options.unqualified_database_search_path,
+    );
+    index::emit_index_backfill(&mut program, &resolver, index_name, after, rows)?;
+    program.epilogue(schema);
+    program.build(connection, false, input)
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
