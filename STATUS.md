@@ -93,6 +93,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   sharded latest-frame tables under version checks (`optimistic`). Built and tested (a model against
   the locked index, crashes at every write of a checkpoint and restart); not yet measured, nor a way
   chosen.
+- **The page path SQLite takes** (G3 step 3, docs/design/store.md decision 41), a prototype behind
+  `AMPHORA_PAGE_PATH=plain`, off by default: plain pin counts on a connection's own pages, a shared
+  page's buffer counted once as it enters a connection, file misses read in line with no completion
+  (Unix), the checksum checked once as a page enters the process. Built and tested (the shared-pages
+  model on the plain path; each path reads today's rows; a flipped byte refused on each path); not
+  yet measured. The miss still allocates the page and its buffer's `Arc`.
 - **The mixed log's commit costs** (docs/design/store.md, Decision (lane wal-read)): publishing a
   commit's records costs a lookup each, not a pass over the records kept decoded or over the
   commit's pages, and deltas are found a word at a time. Built, not merged; whether the bulk
