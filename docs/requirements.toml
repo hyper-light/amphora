@@ -385,7 +385,10 @@ title = "Degree-sequence upper bounds as a guard (planner rank 11)"
 criteria = [
   { id = "AC-PL.11.1", text = "JOB and TPC-H prefixes estimated above their bound is exactly 0, with step 3's 791 underestimates left as they are" },
 ]
-tests = []
+# lane pl11
+tests = [
+  { id = "T-PL.11.1", text = "Random skewed tables joined by random = terms, every subset counted — passes when no count exceeds its degree-sequence bound and ANALYZE's norms equal a GROUP BY's counts" },
+]
 
 [[own]]
 id = "PL.12"

@@ -914,6 +914,8 @@ pub enum ScalarFunc {
     StatInit,
     StatPush,
     StatGet,
+    /// Amphora (PL.11): an ANALYZE accumulator's degree norms, each index prefix's.
+    StatDegrees,
     ConnTxnId,
     IsAutocommit,
     SequenceWatermark,
@@ -1055,6 +1057,7 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::StatInit => false, // internal ANALYZE function
             ScalarFunc::StatPush => false, // internal ANALYZE function
             ScalarFunc::StatGet => false,  // internal ANALYZE function
+            ScalarFunc::StatDegrees => false, // internal ANALYZE function
             ScalarFunc::ConnTxnId => false, // depends on connection state
             ScalarFunc::IsAutocommit => false, // depends on connection state
             ScalarFunc::SequenceWatermark => false, // depends on active MVCC transactions
@@ -1207,6 +1210,7 @@ impl Display for ScalarFunc {
             Self::StatInit => "stat_init",
             Self::StatPush => "stat_push",
             Self::StatGet => "stat_get",
+            Self::StatDegrees => "stat_degrees",
             Self::ConnTxnId => "conn_txn_id",
             Self::IsAutocommit => "is_autocommit",
             Self::SequenceWatermark => "sequence_watermark_experimental",
@@ -1279,6 +1283,7 @@ impl ScalarFunc {
                 | Self::StatInit
                 | Self::StatPush
                 | Self::StatGet
+                | Self::StatDegrees
                 | Self::Attach
                 | Self::Detach
                 | Self::TableColumnsJsonArray
@@ -1359,6 +1364,7 @@ impl ScalarFunc {
             | Self::StatInit
             | Self::StatPush
             | Self::StatGet
+            | Self::StatDegrees
             | Self::Attach
             | Self::Detach
             | Self::TableColumnsJsonArray
