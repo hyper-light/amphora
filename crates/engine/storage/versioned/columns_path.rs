@@ -221,7 +221,8 @@ mod tests {
                 for k in [0u16, 1, 7, 11, 44, N - 1, N + 5, N + 39] {
                     let key = k.to_be_bytes();
                     let want: Rowset = truth.iter().filter(|(kk, _)| kk == &key).cloned().collect();
-                    let p = read(&copy, &at, snap.start, Ask::Point(&key), rates, on, &tick).unwrap();
+                    let p =
+                        read(&copy, &at, snap.start, Ask::Point(&key), rates, on, &tick).unwrap();
                     assert_eq!(p.rows, want, "key {k} {:?}", p.choice);
                 }
             }
@@ -230,9 +231,27 @@ mod tests {
         let whole_copy = read(&copy, &at, snap.start, Ask::Whole, RATES, true, &tick).unwrap();
         assert_eq!(whole_copy.choice.path, Path::Copy);
         let key = 7u16.to_be_bytes();
-        let p = read(&copy, &at, snap.start, Ask::Point(&key), seek_dear, true, &tick).unwrap();
+        let p = read(
+            &copy,
+            &at,
+            snap.start,
+            Ask::Point(&key),
+            seek_dear,
+            true,
+            &tick,
+        )
+        .unwrap();
         assert_eq!(p.choice.path, Path::Copy);
-        let p = read(&copy, &at, snap.start, Ask::Point(&key), RATES, false, &tick).unwrap();
+        let p = read(
+            &copy,
+            &at,
+            snap.start,
+            Ask::Point(&key),
+            RATES,
+            false,
+            &tick,
+        )
+        .unwrap();
         assert_eq!(p.choice.path, Path::Rows);
         db.close_snapshot(snap);
     }
@@ -276,7 +295,10 @@ mod tests {
         assert!(queued > 0);
         assert_eq!(whole.row_reads, whole.copy.queued);
         assert!(whole.copy.queued <= count(queued));
-        assert_eq!(whole.copy.copy.saturating_add(whole.copy.queued), count(truth.len()));
+        assert_eq!(
+            whole.copy.copy.saturating_add(whole.copy.queued),
+            count(truth.len())
+        );
         assert_eq!(whole.rows, truth);
 
         let key = 44u16.to_be_bytes();

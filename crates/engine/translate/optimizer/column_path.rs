@@ -202,7 +202,10 @@ mod tests {
         };
         assert_eq!(choose(true, Shape::Whole, 10_000.0, R, c).path, Path::Copy);
         let queued = CopyView { queued: 50.0, ..c };
-        assert_eq!(choose(true, Shape::Whole, 10_000.0, R, queued).path, Path::Copy);
+        assert_eq!(
+            choose(true, Shape::Whole, 10_000.0, R, queued).path,
+            Path::Copy
+        );
         assert_eq!(choose(true, Shape::Point, 10_000.0, R, c).path, Path::Rows);
         assert_eq!(
             choose(true, Shape::Range { rows: 9_000.0 }, 10_000.0, R, c).path,
@@ -210,6 +213,9 @@ mod tests {
         );
         // A copy measured dearer than the rows loses the whole table too.
         let slow = fresh(10_000.0, 80.0);
-        assert_eq!(choose(true, Shape::Whole, 10_000.0, R, slow).path, Path::Rows);
+        assert_eq!(
+            choose(true, Shape::Whole, 10_000.0, R, slow).path,
+            Path::Rows
+        );
     }
 }
