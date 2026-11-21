@@ -1455,3 +1455,114 @@ fn t_t1_12_1_a_power_cut_at_every_step_of_an_online_index_leaves_old_or_new() {
         "old schema after {old} cuts, new after {new}"
     );
 }
+
+/// T-T1.12.1's column: `c` added online to the same 300 rows, a write before and after, each
+/// made durable, stopping at the first failure (the power going out).
+fn column_run(db: &mut Db) -> anyhow::Result<()> {
+    let plan = amphora::database::online::Plan::parse(&amphora_api::Migration {
+        name: "c".into(),
+        sql: "ALTER TABLE t ADD COLUMN c INTEGER NOT NULL DEFAULT 7 CHECK (c >= 0)".into(),
+    })
+    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let write = |db: &mut Db, i: i64| -> anyhow::Result<()> {
+        db.transaction(|db| {
+            db.query(
+                "INSERT INTO t (a) VALUES (?1)",
+                [Value::from_i64(i % 31)],
+                |_| Ok(true),
+            )?;
+            db.query(
+                "DELETE FROM t WHERE id = ?1",
+                [Value::from_i64(i * 11 + 3)],
+                |_| Ok(true),
+            )
+        })?;
+        db.flusher()().map_err(|e| anyhow::anyhow!("{e}"))
+    };
+    write(db, 1)?;
+    let stepped = db.transaction(|db| amphora::database::online::step(db, &plan, ONLINE_BATCH))?;
+    db.flusher()().map_err(|e| anyhow::anyhow!("{e}"))?;
+    write(db, 2)?;
+    match stepped {
+        amphora::database::online::Stepped::Public { .. }
+        | amphora::database::online::Stepped::Already => Ok(()),
+        other => anyhow::bail!("a column's change stepped {other:?}"),
+    }
+}
+
+/// The schema after a restart: the old one (no `c`, its migration unrecorded) or the new (`c` on
+/// every row, its migration recorded). Never a column without its record or a record without it.
+fn column_check(db: &mut Db) -> Result<bool, String> {
+    let mut check = String::new();
+    db.query("PRAGMA integrity_check", [], |r| {
+        check = r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(true)
+    })
+    .map_err(|e| format!("integrity_check: {e:#}"))?;
+    if check != "ok" {
+        return Err(format!("integrity_check: {check}"));
+    }
+    let migrated = count(
+        db,
+        "SELECT count(*) FROM __amphora_migrations WHERE name = 'c'",
+        vec![],
+    )? == 1;
+    let column = count(
+        db,
+        "SELECT count(*) FROM pragma_table_info('t') WHERE name = 'c'",
+        vec![],
+    )? == 1;
+    match (migrated, column) {
+        (true, true) => {
+            let unset = count(db, "SELECT count(*) FROM t WHERE c IS NOT 7", vec![])?;
+            if unset != 0 {
+                return Err(format!("{unset} rows read c other than its default"));
+            }
+            Ok(true)
+        }
+        (false, false) => Ok(false),
+        (true, false) => Err("the migration is recorded, c isn't there".into()),
+        (false, true) => Err("c is there, its migration unrecorded".into()),
+    }
+}
+
+/// T-T1.12.1, a column: a power cut at every change adding `c` online makes (the write before,
+/// the change, the write after, each flush), then the restart. Expect: the old schema or the new,
+/// never both or neither, the integrity check passing; and the change, carried on, ends with `c`.
+#[test]
+fn t_t1_12_1_a_power_cut_at_every_step_of_an_online_column_leaves_old_or_new() {
+    let baseline = online_baseline();
+    let path = std::path::Path::new(ONLINE_PATH);
+    let disk = Disk::new(0, baseline.clone());
+    let mut db = Db::open_with(path, disk.clone()).unwrap();
+    disk.arm(u64::MAX);
+    column_run(&mut db).unwrap();
+    let changes = disk.changes.load(Ordering::SeqCst);
+    drop(db);
+    assert!(changes > 2, "the run made only {changes} changes");
+    let (mut old, mut new) = (0u64, 0u64);
+    for at in 1..=changes {
+        let disk = Disk::new(at, baseline.clone());
+        let mut db = Db::open_with(path, disk.clone()).unwrap();
+        disk.arm(at);
+        let ran = column_run(&mut db);
+        drop(db);
+        let image = disk.image();
+        let mut db = Db::open_with(path, Disk::new(at, image)).unwrap();
+        match column_check(&mut db) {
+            Ok(true) => new += 1,
+            Ok(false) => old += 1,
+            Err(e) => panic!("cut at change {at} of {changes} ({ran:?}): {e}"),
+        }
+        column_run(&mut db).unwrap_or_else(|e| panic!("cut at change {at}: carrying on: {e:#}"));
+        assert_eq!(
+            column_check(&mut db),
+            Ok(true),
+            "cut at change {at}: carried on"
+        );
+    }
+    assert!(
+        old > 0 && new > 0,
+        "old schema after {old} cuts, new after {new}"
+    );
+}
