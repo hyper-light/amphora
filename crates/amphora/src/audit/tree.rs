@@ -453,6 +453,25 @@ mod tests {
         level[0]
     }
 
+    /// RFC 6962 section 2.1.1's PATH as sides: at each split from the root down, whether the leaf
+    /// is in the left part. Two sizes whose paths share these sides give the same proof hashes in
+    /// the same order.
+    fn path_shape(index: u64, size: u64) -> Vec<bool> {
+        let (mut lo, mut hi) = (0u64, size);
+        let mut sides = Vec::new();
+        while hi - lo > 1 {
+            let k = 1u64 << (hi - lo - 1).ilog2();
+            let left = index < lo + k;
+            sides.push(left);
+            if left {
+                hi = lo + k;
+            } else {
+                lo += k;
+            }
+        }
+        sides
+    }
+
     fn leaves(n: usize) -> Vec<Vec<u8>> {
         (0..n).map(|i| format!("event {i}").into_bytes()).collect()
     }
@@ -494,7 +513,8 @@ mod tests {
 
     /// AL.1 (T-AL.1.3): do prove every leaf of every tree up to 70 leaves, and every earlier size of
     /// each; expect each proof to verify against the oracle's roots, and to fail with any one hash
-    /// changed, with the wrong index or size, or against another root.
+    /// changed, with the wrong index or leaf, with a size of another path shape (RFC 9162 section
+    /// 2.1.3.2 reads the size only for the shape), or against another root.
     #[test]
     fn al1_every_proof_verifies_and_every_altered_one_fails() {
         let all = leaves(70);
@@ -531,7 +551,19 @@ mod tests {
                         r
                     ));
                 }
-                assert!(!verify_inclusion(index, size + 1, &leaf, &proof, r));
+                // RFC 9162 section 2.1.3.2 reads the size only for the path's shape, so a size whose
+                // path has the same shape (leaf 0 of 3 and of 4) verifies against the same root: the
+                // signed root binds the size, the proof doesn't. A size of another shape fails; the
+                // larger tree's own root fails whatever the shape.
+                assert_eq!(
+                    verify_inclusion(index, size + 1, &leaf, &proof, r),
+                    path_shape(index, size) == path_shape(index, size + 1),
+                    "leaf {index} of {size} checked as one of {}",
+                    size + 1
+                );
+                if let Some(larger) = roots.get(n + 1) {
+                    assert!(!verify_inclusion(index, size + 1, &leaf, &proof, larger));
+                }
                 checked += 1;
             }
             for m in 1..=n {
