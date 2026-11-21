@@ -109,6 +109,15 @@ name = "amphora-columnar"
 version = "0.1.0"
 
 [[package]]
+name = "amphora-corpus"
+version = "0.1.0"
+dependencies = [
+ "amphora-engine",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "amphora-engine"
 version = "0.1.0"
 dependencies = [
