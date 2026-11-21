@@ -5,7 +5,7 @@
 //! row: before the learned costs' break-even it falls through to the seek; at it, it jumps once to
 //! a build of a hash table over the inner table keyed on the seek's columns, and from then on to a
 //! probe of that table. A probe's match positions the index cursor on the very entry the seek would
-//! have found (its key and rowid), so both loops share one body from the deferred table seek on,
+//! have found (its key, the index's other columns and the rowid, all held in the table), so both loops share one body from the deferred table seek on,
 //! and the close reads the next match from the hash table in place of the index's next entry.
 //! Rows joined by seeks before the switch are not joined again: the switch comes between outer rows.
 
@@ -71,9 +71,7 @@ impl<'a> AdaptiveSeek<'a> {
             || index.index_method.is_some()
             || !plain_equality
             || seek_def.prefix.len() > index.columns.len()
-            || index.columns[..seek_def.prefix.len()]
-                .iter()
-                .any(|column| column.expr.is_some())
+            || index.columns.iter().any(|column| column.expr.is_some())
         {
             return None;
         }
@@ -110,6 +108,11 @@ impl<'a> AdaptiveSeek<'a> {
     ) -> Result<BranchOffset> {
         let num_keys = self.seek_def.prefix.len();
         let key_columns = &self.index.columns[..num_keys];
+        // The index's other columns ride in the hash table beside the rowid, so a match finds its
+        // index entry by the whole of it: key, other columns, rowid.
+        let other_columns = &self.index.columns[num_keys..];
+        let num_payload = other_columns.len();
+        let entry_len = num_keys + num_payload + 1;
         let hash_table_id: usize = table.internal_id.into();
         let switch_id = hash_table_id;
         let affinities = super::seek::index_seek_affinities(self.seek_def, &self.seek_def.start);
@@ -126,7 +129,7 @@ impl<'a> AdaptiveSeek<'a> {
         // The bytes the hash table would hold, by the statistics: each row's key values and rowid.
         // Value's in-memory size is a format value (`size_of`); the table's own spill check
         // (`JoinSwitchBuilt` below) bounds what this estimate misses.
-        let entry_bytes = (num_keys as u64 + 1) * std::mem::size_of::<crate::Value>() as u64;
+        let entry_bytes = entry_len as u64 * std::mem::size_of::<crate::Value>() as u64;
         let build_bytes = (self.build_rows.max(0.0) as u64).saturating_mul(entry_bytes);
         program.emit_insn(Insn::JoinSwitchStep {
             data: Box::new(JoinSwitchData {
@@ -163,8 +166,8 @@ impl<'a> AdaptiveSeek<'a> {
             pc_if_empty: built,
         });
         program.preassign_label_to_next_insn(build_row);
-        let build_keys = program.alloc_registers(num_keys);
-        for (i, column) in key_columns.iter().enumerate() {
+        let build_keys = program.alloc_registers(num_keys + num_payload);
+        for (i, column) in key_columns.iter().chain(other_columns).enumerate() {
             program.emit_column_or_rowid(build_cursor_id, column.pos_in_table, build_keys + i);
         }
         emit_affinity(program, build_keys, num_keys, &affinities);
@@ -176,8 +179,8 @@ impl<'a> AdaptiveSeek<'a> {
                 hash_table_id,
                 mem_budget: t_ctx.resolver.statement_memory(),
                 collations,
-                payload_start_reg: None,
-                num_payload: 0,
+                payload_start_reg: (num_payload > 0).then_some(build_keys + num_keys),
+                num_payload,
                 track_matched: false,
             }),
         });
@@ -197,7 +200,7 @@ impl<'a> AdaptiveSeek<'a> {
 
         // The probe: this outer row's seek key, looked up in the table.
         program.preassign_label_to_next_insn(probe);
-        let probe_keys = program.alloc_registers(num_keys + 1);
+        let probe_keys = program.alloc_registers(entry_len);
         for (i, constraint) in self.seek_def.prefix.iter().enumerate() {
             let Some((_, expr, _)) = constraint.eq.as_ref() else {
                 crate::bail_parse_error!("an adaptive join's seek must be an equality");
@@ -218,7 +221,8 @@ impl<'a> AdaptiveSeek<'a> {
                 target_pc: loop_end,
             });
         }
-        let match_reg = probe_keys + num_keys;
+        let payload_reg = (num_payload > 0).then_some(probe_keys + num_keys);
+        let match_reg = probe_keys + num_keys + num_payload;
         program.emit_insn(Insn::HashProbe {
             hash_table_id: to_u32(hash_table_id),
             key_start_reg: to_u32(probe_keys),
@@ -226,8 +230,8 @@ impl<'a> AdaptiveSeek<'a> {
             dest_reg: to_u32(match_reg),
             target_pc: loop_end,
             deferred_target_pc: loop_end,
-            payload_dest_reg: None,
-            num_payload: 0,
+            payload_dest_reg: payload_reg.map(to_u32),
+            num_payload: to_u32(num_payload),
             probe_rowid_reg: None,
         });
 
@@ -238,7 +242,7 @@ impl<'a> AdaptiveSeek<'a> {
             is_index: true,
             cursor_id: self.index_cursor_id,
             start_reg: probe_keys,
-            num_regs: num_keys + 1,
+            num_regs: entry_len,
             target_pc: hash_next,
             eq_only: false,
             null_matching_mask: Default::default(),
@@ -246,7 +250,7 @@ impl<'a> AdaptiveSeek<'a> {
         program.emit_insn(Insn::IdxGT {
             cursor_id: self.index_cursor_id,
             start_reg: probe_keys,
-            num_regs: num_keys + 1,
+            num_regs: entry_len,
             target_pc: hash_next,
         });
         program.emit_insn(Insn::Goto { target_pc: body });
@@ -257,8 +261,8 @@ impl<'a> AdaptiveSeek<'a> {
             hash_table_id,
             dest_reg: match_reg,
             target_pc: loop_end,
-            payload_dest_reg: None,
-            num_payload: 0,
+            payload_dest_reg: payload_reg,
+            num_payload,
         });
         program.emit_insn(Insn::Goto { target_pc: found });
 
