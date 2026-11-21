@@ -3732,7 +3732,8 @@ pub(crate) mod bushy_test_hook {
             let conn = db.connect(ConnectOpts::new()).unwrap();
             for sql in [
                 "CREATE TABLE a(id INTEGER PRIMARY KEY, x INT)",
-                "CREATE TABLE b(id INTEGER PRIMARY KEY, x INT, y INT)",
+                "CREATE TABLE b(id INTEGER PRIMARY KEY, x INT, y INT, qid INT)",
+                "CREATE TABLE q(id INTEGER PRIMARY KEY, y INT)",
                 "CREATE TABLE c(id INTEGER PRIMARY KEY, y INT, z INT)",
                 "CREATE TABLE p(id INTEGER PRIMARY KEY, z INT, w INT)",
                 "CREATE INDEX c_y ON c(y)",
@@ -3745,11 +3746,16 @@ pub(crate) mod bushy_test_hook {
             }
             for id in 1..=12 {
                 conn.execute(format!(
-                    "INSERT INTO b VALUES ({id}, {}, {})",
+                    "INSERT INTO b VALUES ({id}, {}, {}, {})",
                     id % 5,
-                    id % 3
+                    id % 3,
+                    id % 4 + 1
                 ))
                 .unwrap();
+            }
+            for id in 1..=4 {
+                conn.execute(format!("INSERT INTO q VALUES ({id}, {})", id % 3))
+                    .unwrap();
             }
             for id in 1..=15 {
                 conn.execute(format!(
@@ -3775,6 +3781,10 @@ pub(crate) mod bushy_test_hook {
                  WHERE a.id = 2",
                 "SELECT a.id, b.id, c.id, p.id, p.w FROM a, b JOIN c ON c.y = b.y \
                  JOIN p ON p.z = c.z WHERE a.id = 3 AND b.x <> a.x AND p.w > a.x + c.id",
+                "SELECT a.id, b.id, q.id, c.id FROM a, b JOIN q ON q.id = b.qid \
+                 JOIN c ON c.z = q.y WHERE a.id = 2 AND b.x <> a.x",
+                "SELECT a.id, b.id, q.id, c.id, c.y FROM a, b JOIN q ON q.id = b.qid \
+                 JOIN c ON c.z = q.y AND c.y <> a.x WHERE a.id = 4",
             ];
             APPLIED.with(|applied| applied.set(0));
             let mut compared = 0;
@@ -3796,7 +3806,7 @@ pub(crate) mod bushy_test_hook {
                     compared += 1;
                 }
             }
-            assert_eq!(compared, 12);
+            assert_eq!(compared, 16);
             // Non-vacuity: some of the plans were run bushy.
             assert!(
                 APPLIED.with(Cell::get) > 0,
