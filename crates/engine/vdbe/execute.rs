@@ -10915,6 +10915,26 @@ pub fn op_function(
                 };
                 state.registers[*dest].set_value(result);
             }
+            ScalarFunc::StatDegrees => {
+                // Amphora (PL.11): stat_degrees(accum_blob), each index prefix's degree norms
+                // (`Degrees::encode_all`), NULL for an accumulator that saw no row.
+                let result = match state.registers.get(*start_reg).map(|r| r.get_value()) {
+                    Some(Value::Blob(bytes)) => match StatAccum::from_bytes(bytes) {
+                        Some(accum) if accum.n_row > 0 => {
+                            Value::Blob(crate::stats::Degrees::encode_all(&accum.get_degrees()))
+                        }
+                        _ => Value::Null,
+                    },
+                    _ => Value::Null,
+                };
+                state
+                    .registers
+                    .get_mut(*dest)
+                    .ok_or_else(|| {
+                        LimboError::InternalError("stat_degrees: no destination register".into())
+                    })?
+                    .set_value(result);
+            }
             ScalarFunc::ConnTxnId => {
                 // conn_txn_id(candidate): get-or-set semantics for CDC transaction ID.
                 // If unset (-1), store the candidate and return it.

@@ -622,6 +622,12 @@ change, and a power cut leaves the old schema or the new. DROP COLUMN is not yet
   (PL.7, e0e7a1df), bushy plans with CD-C (PL.8, c837cde3), statistics kept as rows change (PL.9,
   26302efe), unnesting by dependent joins (PL.10, 61c79bd1), upper bounds as a guard (PL.11,
   f4e0bd7f), custom then generic plans (PL.12, aa0541f6) and adaptive joins (PL.13, 4f237e07).
+- **PL.11** (f4e0bd7f, built and tested on t1/lane-pl11, its JOB and TPC-H counts open): ANALYZE
+  keeps each index prefix's degree sequence as its largest degree and sum of squared degrees, and
+  each joined set's estimate is cut to the upper bound they prove (one table's rows times each
+  attached table's largest degree, or two tables' ℓ2 norms); underestimates are left as they are
+  (docs/design/planner.md, "Decision (lane pl11)"). Open: the bound holds for PL.9's net row
+  change, not for updates or cancelled inserts between ANALYZE runs.
 - **PL.6** (5e23ff8b, built and tested on t1/lane-pl6, its measurement open): no table is read whole
   beneath loops that can give more than one row. A scan stays only beneath one-row loops (a lookup by a
   unique key) or where no equality joins the table; elsewhere a seek, an automatic index or a hash join

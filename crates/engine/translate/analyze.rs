@@ -371,11 +371,23 @@ pub fn translate_analyze(
             });
             program.preassign_label_to_next_insn(after_insert);
         }
-        for index in indexes {
-            emit_index_stats(program, stat_cursor, &target_table, &index, database_id);
-        }
+        // The column statistics first: their pass deletes the table's old rows, the index
+        // degrees' (PL.11) among them, before the index passes below keep the new ones. ANALYZE
+        // of one index keeps the table's column statistics as they were, as it keeps its
+        // other indexes' `sqlite_stat1` rows.
         if !is_specific_index_target {
             emit_column_stats(program, column_stats_cursor, &target_table, database_id)?;
+        }
+        let degrees_cursor = (!is_specific_index_target).then_some(column_stats_cursor);
+        for index in indexes {
+            emit_index_stats(
+                program,
+                stat_cursor,
+                degrees_cursor,
+                &target_table,
+                &index,
+                database_id,
+            )?;
         }
     }
 
@@ -696,16 +708,20 @@ fn emit_delete_rows_of(program: &mut ProgramBuilder, cursor: usize, table: &str)
 ///
 /// The stat string format is: "total avg1 avg2 avg3"
 /// where avgN = ceil(total / distinctN) = average rows per distinct prefix
+///
+/// Amphora (PL.11): with `degrees_cursor`, an index without a WHERE (all the table's rows) also
+/// keeps each prefix's degree norms there, `(tbl, index, 'degrees', stat_degrees(accum))`.
 fn emit_index_stats(
     program: &mut ProgramBuilder,
     stat_cursor: usize,
+    degrees_cursor: Option<usize>,
     table: &Arc<BTreeTable>,
     index: &Arc<Index>,
     database_id: usize,
-) {
+) -> Result<()> {
     let n_cols = index.columns.len();
     if n_cols == 0 {
-        return;
+        return Ok(());
     }
 
     // Open the index cursor
@@ -899,6 +915,55 @@ fn emit_index_stats(
         table_name: "sqlite_stat1".to_string(),
     });
 
+    if let Some(cursor) = degrees_cursor.filter(|_| index.where_clause.is_none()) {
+        let row = program.alloc_registers(4);
+        let (tbl, idx, kind, data) = (row, register(row, 1)?, register(row, 2)?, register(row, 3)?);
+        program.emit_insn(Insn::String8 {
+            value: table.name.to_string(),
+            dest: tbl,
+        });
+        program.emit_insn(Insn::String8 {
+            value: index.name.to_string(),
+            dest: idx,
+        });
+        program.emit_insn(Insn::String8 {
+            value: "degrees".to_string(),
+            dest: kind,
+        });
+        program.emit_insn(Insn::Function {
+            constant_mask: 0,
+            start_reg: reg_accum,
+            dest: data,
+            func: FuncCtx {
+                func: Func::Scalar(ScalarFunc::StatDegrees),
+                arg_count: 1,
+                collation: None,
+            },
+        });
+        let record = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(row),
+            count: to_u32(4),
+            dest_reg: to_u32(record),
+            index_name: None,
+            affinity_str: None,
+        });
+        let rowid = program.alloc_register();
+        program.emit_insn(Insn::NewRowid {
+            cursor,
+            rowid_reg: rowid,
+            prev_largest_reg: 0,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor,
+            key_reg: rowid,
+            record_reg: record,
+            flag: Default::default(),
+            table_name: COLUMN_STATS_TABLE.to_string(),
+        });
+    }
+
     // Label for empty index case, just skip the insert
     program.preassign_label_to_next_insn(lbl_empty);
+    Ok(())
 }
