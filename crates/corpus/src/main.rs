@@ -3,8 +3,9 @@
 //! file, `required` or `fill`, then its path; every `.test` file in path order when there is none).
 //! Required files run whole; fill files run until the budget, measured on this machine as it runs,
 //! is spent, so the subset's size is what this machine runs in the budget (G2 step 7). `--times`
-//! writes each record's outcome and time, a JSON line each, for re-ranking the pool from the
-//! machines that run it. A file `<source>/base.test` is the fixture of every file under `<source>/`
+//! writes each record's outcome and time, a JSON line each, then a line for the file whole
+//! (`file_ns`, its fresh database and fixture included), for re-ranking the pool from the machines
+//! that run it (bench/corpus/subset.py). A file `<source>/base.test` is the fixture of every file under `<source>/`
 //! (bench/corpus/build_corpus.py's rule). Exits 1 on any disagreement.
 
 use std::io::Write;
@@ -150,6 +151,7 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
             .unwrap_or(&file)
             .display()
             .to_string();
+        let file_began = Instant::now();
         let mut engine = Amphora::in_memory()?;
         let counts = run_file(&mut engine, &mut render, &text, fix.as_deref(), if required { None } else { deadline }, &mut |ran| {
             let outcome = match &ran.outcome {
@@ -176,6 +178,12 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
             }
         })
         .map_err(|e| format!("{rel}: {e}"))?;
+        if let Some(t) = times.as_mut() {
+            // The file whole, its fresh database and fixture included: what it costs a run's budget.
+            let ns = u64::try_from(file_began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let line = serde_json::json!({ "file": rel, "file_ns": ns, "required": required });
+            writeln!(t, "{line}").map_err(|e| e.to_string())?;
+        }
         files = files.saturating_add(1);
         total.agree = total.agree.saturating_add(counts.agree);
         total.disagree = total.disagree.saturating_add(counts.disagree);

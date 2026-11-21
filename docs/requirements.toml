@@ -458,3 +458,31 @@ criteria = [
 tests = [
   { id = "T-CS.1.1", text = "A doc-truth check of its claims (crates/amphora/tests/columnar_decision.rs) — passes when every claim cited: each citation resolves to a quoted, located claim from a graded source, and each number the decision states is in a quote it cites" },
 ]
+
+# lane corpus-ci
+# Amphora's own IDs for G2, the competition corpus (kiln plan 01a16b0f461b7065a845f678893846ec):
+# G2.n for its step n.
+
+[[own]]
+id = "G2.4"
+title = "One harness for every engine, each in its steady state (G2 step 4)"
+criteria = [
+  { id = "AC-G2.4.1", text = "every disagreement classified: Amphora bug, competitor bug, dialect difference, or translation gap" },
+  { id = "AC-G2.4.2", text = "competitors the corpus runs against: at least 8" },
+]
+tests = [
+  { id = "T-G2.4.1", text = "a known dialect difference (integer division, NULL ordering) — passes when classified as a dialect difference, not a bug" },
+]
+
+[[own]]
+id = "G2.7"
+title = "In the gate and nightly (G2 step 7)"
+criteria = [
+  { id = "AC-G2.7.1", text = "the subset runs in the gate in under 2 minutes" },
+  { id = "AC-G2.7.2", text = "the nightly run records results every night" },
+]
+tests = [
+  { id = "T-G2.7.1", text = "the pool chosen from measured times (bench/corpus/subset.py) and run with them kept (crates/corpus/tests/times.rs) — passes when each record and each file has its time and fill files stop at the deadline" },
+  { id = "T-G2.7.2", text = "a corpus file run on Amphora through the gate's code path (crates/corpus/tests/amphora_runs.rs) — passes when the wrong answer, and only it, disagrees" },
+  { id = "T-G2.7.3", text = "the whole corpus nightly (.kiln/corpus.yaml, bench/corpus/nightly.sh) — passes when its record, times and re-ranked pool are kept as the run's artifacts" },
+]
