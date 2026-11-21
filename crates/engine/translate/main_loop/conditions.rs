@@ -154,7 +154,7 @@ fn emit_conditions(
         subqueries,
         join_index,
     )?;
-    for cond in predicates
+    let terms = predicates
         .iter()
         .enumerate()
         .filter(|(cond_idx, _)| !prefiltered_terms.contains(cond_idx))
@@ -170,12 +170,89 @@ fn emit_conditions(
             SubqueryRefFilter::WithSubqueryRefs => {
                 condition_references_subquery(&cond.expr, subqueries)
             }
-        })
-    {
+        });
+    // Amphora (docs/design/executor.md, decision 7; QT.3): on a loop over a non-covering index,
+    // the terms that read only the index's columns run first, on the index entry, so a row they
+    // drop is never fetched by the deferred seek; then the rest, each group in written order.
+    let deferred = join_order
+        .get(join_index)
+        .and_then(|member| table_references.joined_tables().get(member.original_idx))
+        .filter(|table| !program.has_table_cursor_override(table.internal_id))
+        .and_then(DeferredIndex::of);
+    let (first, rest): (Vec<&WhereTerm>, Vec<&WhereTerm>) = match &deferred {
+        Some(deferred) => {
+            let mut first = Vec::new();
+            let mut rest = Vec::new();
+            for term in terms {
+                if deferred.covers(&term.expr)? {
+                    first.push(term);
+                } else {
+                    rest.push(term);
+                }
+            }
+            (first, rest)
+        }
+        None => (terms.collect(), Vec::new()),
+    };
+    for cond in first.into_iter().chain(rest) {
         emit_where_term(program, table_references, cond, next, &t_ctx.resolver)?;
     }
 
     Ok(())
+}
+
+/// A loop whose rows come from a non-covering index, its table row fetched by a deferred seek
+/// only when a column the index doesn't hold is read.
+struct DeferredIndex<'a> {
+    table: TableInternalId,
+    index: &'a Index,
+    btree: Arc<crate::schema::BTreeTable>,
+}
+
+impl<'a> DeferredIndex<'a> {
+    fn of(table: &'a JoinedTable) -> Option<Self> {
+        let index = table.op.index()?;
+        let btree = table.btree()?;
+        if index.index_method.is_some()
+            || !btree.has_rowid
+            || table.utilizes_covering_index()
+            || table.requires_table_cursor_for_unmatched_rows()
+        {
+            return None;
+        }
+        Some(Self {
+            table: table.internal_id,
+            index: index.as_ref(),
+            btree,
+        })
+    }
+
+    /// Whether every column of the loop's table that `expr` reads is read from the index entry:
+    /// one the index stores, or the rowid alias (`IdxRowId`). An explicit `rowid` reads the
+    /// table's cursor, so a term reading it waits for the row.
+    fn covers(&self, expr: &Expr) -> Result<bool> {
+        let rowid_alias = self.btree.get_rowid_alias_column().map(|(pos, _)| pos);
+        let mut covered = true;
+        walk_expr(expr, &mut |expr: &Expr| -> Result<WalkControl> {
+            match expr {
+                Expr::Column { table, column, .. } if *table == self.table => {
+                    let stored = self.index.column_table_pos_to_index_pos(*column).is_some()
+                        && self
+                            .btree
+                            .columns()
+                            .get(*column)
+                            .is_some_and(|c| !c.is_virtual_generated());
+                    if !stored && rowid_alias != Some(*column) {
+                        covered = false;
+                    }
+                }
+                Expr::RowId { table, .. } if *table == self.table => covered = false,
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        Ok(covered)
+    }
 }
 
 pub(super) fn emit_where_term(

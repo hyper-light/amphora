@@ -1,4 +1,5 @@
-use crate::sync::Arc;
+use crate::sync::atomic::{AtomicU8, Ordering};
+use crate::sync::{Arc, Weak};
 use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListLink};
 use rustc_hash::FxHashMap as HashMap;
 use tracing::trace;
@@ -8,7 +9,7 @@ use crate::{
     turso_assert,
 };
 
-use super::pager::PageRef;
+use super::pager::{Page, PageRef};
 
 #[cfg(not(target_family = "wasm"))]
 pub(crate) const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES: usize = 2000;
@@ -41,36 +42,65 @@ struct PageCacheEntry {
     key: PageCacheKey,
     /// The cached page
     page: PageRef,
-    /// Reference counter (SIEVE/GClock): starts at zero, bumped on access,
-    /// decremented during eviction, only pages at 0 are evicted.
-    ref_bit: u8,
     /// Intrusive link for SIEVE queue
     link: LinkedListLink,
 }
 
 intrusive_adapter!(EntryAdapter = Box<PageCacheEntry>: PageCacheEntry { link: LinkedListLink });
 
+/// What the cache's map holds for a page: its entry in the queue, and what a
+/// hit needs without reaching the entry, so a hit under the shared lock reads
+/// only what the map owns (`get_shared`; docs/design/executor.md, decision 7;
+/// QT.3).
+struct Slot {
+    entry: *mut PageCacheEntry,
+    /// The entry's page. Weak, so `evictable`'s count of holders stays the
+    /// entry's and its readers'; it upgrades while the entry holds the page,
+    /// which is until the entry leaves the map under the exclusive lock.
+    page: Weak<Page>,
+    /// Reference counter (SIEVE/GClock): starts at zero, bumped on access,
+    /// decremented during eviction, only pages at 0 are evicted. Atomic so that
+    /// a hit bumps it under the cache's shared lock; the sweep that decrements
+    /// it holds the exclusive lock, so a bump never races a decrement, and two
+    /// hits at once may count as one.
+    ref_bit: AtomicU8,
+}
+
+impl Slot {
+    /// Counts an access, up to `REF_MAX`. A load and a store, not a
+    /// read-modify-write: hits that race each other may count once, which a
+    /// recency hint allows, and no hit waits or retries.
+    #[inline]
+    fn bump_ref(&self) {
+        let old = self.ref_bit.load(Ordering::Relaxed);
+        if old < REF_MAX {
+            self.ref_bit
+                .store(old.saturating_add(1).min(REF_MAX), Ordering::Relaxed);
+        }
+    }
+
+    /// Takes one access off the count, down to zero. Returns the old value.
+    /// Called by the eviction sweep, under the cache's exclusive lock.
+    #[inline]
+    fn decrement_ref(&self) -> u8 {
+        let old = self.ref_bit.load(Ordering::Relaxed);
+        self.ref_bit.store(old.saturating_sub(1), Ordering::Relaxed);
+        old
+    }
+
+    #[inline]
+    fn ref_count(&self) -> u8 {
+        self.ref_bit.load(Ordering::Relaxed)
+    }
+}
+
 impl PageCacheEntry {
     fn new(key: PageCacheKey, page: PageRef) -> Box<Self> {
         Box::new(Self {
             key,
             page,
-            ref_bit: CLEAR,
             link: LinkedListLink::new(),
         })
-    }
-
-    #[inline]
-    fn bump_ref(&mut self) {
-        self.ref_bit = std::cmp::min(self.ref_bit + 1, REF_MAX);
-    }
-
-    #[inline]
-    /// Returns the old value
-    fn decrement_ref(&mut self) -> u8 {
-        let old = self.ref_bit;
-        self.ref_bit = old.saturating_sub(1);
-        old
     }
 }
 
@@ -101,7 +131,7 @@ pub struct PageCache {
     /// Capacity in pages
     capacity: usize,
     /// Map of Key -> pointer to entry in the queue
-    map: HashMap<PageCacheKey, *mut PageCacheEntry>,
+    map: HashMap<PageCacheKey, Slot>,
     /// The eviction queue (intrusive doubly-linked list)
     queue: LinkedList<EntryAdapter>,
     /// Clock hand cursor for SIEVE eviction (pointer to an entry in the queue, or null)
@@ -133,6 +163,15 @@ pub enum CacheError {
     Full,
     #[error("key already exists")]
     KeyExists,
+}
+
+/// What a lookup under the cache's shared lock found (`PageCache::get_shared`).
+pub enum SharedLookup {
+    Hit(PageRef),
+    Miss,
+    /// The page is in the cache but neither loaded nor being read: an aborted
+    /// read left it, and `get`, under the exclusive lock, deletes it.
+    NeedsExclusive,
 }
 
 #[derive(Debug, PartialEq)]
@@ -262,8 +301,8 @@ impl PageCache {
     ) -> Result<(), CacheError> {
         trace!("insert(key={:?})", key);
 
-        if let Some(&entry_ptr) = self.map.get(&key) {
-            let entry = unsafe { &mut *entry_ptr };
+        if let Some(slot) = self.map.get_mut(&key) {
+            let entry = unsafe { &mut *slot.entry };
             let p = &entry.page;
 
             if !p.is_loaded() && !p.is_locked() {
@@ -271,7 +310,7 @@ impl PageCache {
                 self._delete(key, true)?;
                 // Proceed to insert new entry
             } else {
-                entry.bump_ref();
+                slot.bump_ref();
                 if update_in_place {
                     // Track evictable count change if page state differs
                     let old_evictable = Self::counted_as_evictable(&entry.page);
@@ -281,6 +320,7 @@ impl PageCache {
                     } else if !old_evictable && new_evictable {
                         self.evictable_count += 1;
                     }
+                    slot.page = Arc::downgrade(&value);
                     entry.page = value;
                     return Ok(());
                 } else {
@@ -299,6 +339,7 @@ impl PageCache {
         // Track evictable count for the new page
         let is_evictable = Self::counted_as_evictable(&value);
 
+        let slot_page = Arc::downgrade(&value);
         let entry = PageCacheEntry::new(key, value);
 
         // Amphora: a new page joins at the head (the queue's back), as SIEVE has it (Zhang et al.,
@@ -310,7 +351,14 @@ impl PageCache {
         let entry_ptr = self.queue.back().get().ok_or_else(|| {
             CacheError::InternalError("Failed to get inserted entry pointer".into())
         })? as *const PageCacheEntry as *mut PageCacheEntry;
-        self.map.insert(key, entry_ptr);
+        self.map.insert(
+            key,
+            Slot {
+                entry: entry_ptr,
+                page: slot_page,
+                ref_bit: AtomicU8::new(CLEAR),
+            },
+        );
         if self.clock_hand.is_null() {
             self.clock_hand = entry_ptr;
         }
@@ -324,7 +372,7 @@ impl PageCache {
     }
 
     fn _delete(&mut self, key: PageCacheKey, clean_page: bool) -> Result<(), CacheError> {
-        let Some(&entry_ptr) = self.map.get(&key) else {
+        let Some(entry_ptr) = self.map.get(&key).map(|slot| slot.entry) else {
             return Ok(());
         };
 
@@ -401,11 +449,11 @@ impl PageCache {
 
     #[inline]
     pub fn get(&mut self, key: &PageCacheKey) -> crate::Result<Option<PageRef>> {
-        let Some(&entry_ptr) = self.map.get(key) else {
+        let Some(slot) = self.map.get(key) else {
             return Ok(None);
         };
 
-        let entry = unsafe { &mut *entry_ptr };
+        let entry = unsafe { &*slot.entry };
         let page = entry.page.clone();
 
         // Because we can abort a read_page completion, this means a page can be in the cache but be unloaded and unlocked.
@@ -417,17 +465,40 @@ impl PageCache {
             return Ok(None);
         }
 
-        entry.bump_ref();
+        slot.bump_ref();
         Ok(Some(page))
+    }
+
+    /// A lookup under the cache's shared lock: a hit takes no exclusive lock,
+    /// so lookups by many readers at once (a B-tree descent's three or four
+    /// pages each) don't serialize on the cache (docs/design/executor.md,
+    /// decision 7; QT.3).
+    #[inline]
+    pub fn get_shared(&self, key: &PageCacheKey) -> SharedLookup {
+        let Some(slot) = self.map.get(key) else {
+            return SharedLookup::Miss;
+        };
+        // The entry holds the page while its slot is in the map, and both
+        // leave only under the exclusive lock, so the upgrade fails only if
+        // that ever stops holding: then the exclusive path decides.
+        let Some(page) = slot.page.upgrade() else {
+            return SharedLookup::NeedsExclusive;
+        };
+        // `get` deletes such a page, which takes the exclusive lock.
+        if !page.is_loaded() && !page.is_locked() {
+            return SharedLookup::NeedsExclusive;
+        }
+        slot.bump_ref();
+        SharedLookup::Hit(page)
     }
 
     #[inline]
     pub fn peek(&mut self, key: &PageCacheKey, touch: bool) -> Option<PageRef> {
-        let &entry_ptr = self.map.get(key)?;
-        let entry = unsafe { &mut *entry_ptr };
+        let slot = self.map.get(key)?;
+        let entry = unsafe { &*slot.entry };
         let page = entry.page.clone();
         if touch {
-            entry.bump_ref();
+            slot.bump_ref();
         }
         Some(page)
     }
@@ -496,8 +567,8 @@ impl PageCache {
     fn count_evictable_pages(&self) -> usize {
         self.map
             .values()
-            .filter(|&&entry_ptr| {
-                let entry = unsafe { &*entry_ptr };
+            .filter(|slot| {
+                let entry = unsafe { &*slot.entry };
                 Self::evictable(&entry.page)
             })
             .count()
@@ -542,7 +613,7 @@ impl PageCache {
     /// This should be called when a page transitions from clean/spilled to dirty.
     /// The page must already be in the cache.
     pub fn notify_page_dirty(&mut self, key: PageCacheKey) {
-        if let Some(&entry_ptr) = self.map.get(&key) {
+        if let Some(entry_ptr) = self.map.get(&key).map(|slot| slot.entry) {
             let entry = unsafe { &*entry_ptr };
             let page = &entry.page;
             // Page was evictable (clean or spilled) before becoming dirty,
@@ -559,7 +630,7 @@ impl PageCache {
     /// This should be called when a page transitions from dirty to spilled.
     /// The page must already be in the cache.
     pub fn notify_page_spilled(&mut self, key: PageCacheKey) {
-        if let Some(&entry_ptr) = self.map.get(&key) {
+        if let Some(entry_ptr) = self.map.get(&key).map(|slot| slot.entry) {
             let entry = unsafe { &*entry_ptr };
             let page = &entry.page;
             // Page was dirty && !spilled (not evictable), now it's spilled (evictable)
@@ -584,7 +655,7 @@ impl PageCache {
         const EST_SPILL: usize = 128;
         let mut spillable: Vec<PinGuard> = Vec::with_capacity(EST_SPILL);
 
-        for &entry_ptr in self.map.values() {
+        for entry_ptr in self.map.values().map(|slot| slot.entry) {
             let entry = unsafe { &*entry_ptr };
             let page = &entry.page;
             if Self::spillable(page) {
@@ -684,7 +755,8 @@ impl PageCache {
 
             let evictable = Self::evictable(page);
 
-            if evictable && entry.ref_bit == CLEAR {
+            let ref_count = self.map.get(&key).map_or(CLEAR, Slot::ref_count);
+            if evictable && ref_count == CLEAR {
                 turso_assert!(
                     Self::counted_as_evictable(page),
                     "mismatched evictable count state"
@@ -714,7 +786,9 @@ impl PageCache {
                 return Ok(());
             } else if evictable {
                 // Decrement ref bit and continue
-                entry.decrement_ref();
+                if let Some(slot) = self.map.get(&key) {
+                    slot.decrement_ref();
+                }
                 self.advance_clock_hand();
                 examined += 1;
             } else {
@@ -729,7 +803,7 @@ impl PageCache {
 
     pub fn clear(&mut self, clear_dirty: bool) -> Result<(), CacheError> {
         // Check all pages are clean
-        for &entry_ptr in self.map.values() {
+        for entry_ptr in self.map.values().map(|slot| slot.entry) {
             let entry = unsafe { &*entry_ptr };
             if entry.page.is_dirty() && !clear_dirty {
                 return Err(CacheError::Dirty {
@@ -739,7 +813,7 @@ impl PageCache {
         }
 
         // Clean all pages
-        for &entry_ptr in self.map.values() {
+        for entry_ptr in self.map.values().map(|slot| slot.entry) {
             let entry = unsafe { &*entry_ptr };
             entry.page.clear_loaded();
             let _ = entry.page.get().take_buffer();
@@ -774,8 +848,8 @@ impl PageCache {
         for key in self
             .map
             .iter()
-            .filter_map(|(key, &entry_ptr)| {
-                let entry = unsafe { &*entry_ptr };
+            .filter_map(|(key, slot)| {
+                let entry = unsafe { &*slot.entry };
                 let page = &entry.page;
                 if !page.is_dirty() && page.has_wal_tag() {
                     let (frame, _) = page.wal_tag_pair();
@@ -808,7 +882,7 @@ impl PageCache {
                 entry.key,
                 page.get().flags.load(Ordering::SeqCst),
                 page.get().pin_count.load(Ordering::SeqCst),
-                entry.ref_bit,
+                self.map.get(&entry.key).map_or(CLEAR, Slot::ref_count),
             );
             cursor.move_next();
             i += 1;
@@ -933,7 +1007,7 @@ impl PageCache {
 
     #[cfg(test)]
     fn ref_of(&self, key: &PageCacheKey) -> Option<u8> {
-        self.map.get(key).map(|&ptr| unsafe { (*ptr).ref_bit })
+        self.map.get(key).map(Slot::ref_count)
     }
 }
 
@@ -1997,5 +2071,120 @@ mod tests {
         assert!(!cache.needs_spill());
 
         cache.verify_cache_integrity();
+    }
+}
+
+#[cfg(all(shuttle, test))]
+mod shuttle_tests {
+    use super::tests::page_with_content;
+    use super::*;
+    use crate::sync::RwLock;
+    use crate::thread;
+
+    const CAPACITY: usize = 4;
+
+    fn cache_with(pages: &[usize]) -> Arc<RwLock<PageCache>> {
+        let mut cache = PageCache::new(CAPACITY);
+        for &id in pages {
+            cache
+                .insert(PageCacheKey::new(id), page_with_content(id))
+                .unwrap();
+        }
+        Arc::new(RwLock::new(cache))
+    }
+
+    /// Do: three readers hit the same pages at once under the cache's shared lock, in every
+    /// interleaving shuttle tries. Expect: each hit returns the page its key names, and each
+    /// page hit at least once counts at least one access and at most `REF_MAX`: racing hits may
+    /// count as one, none counts as none (T-QT.3.3).
+    #[test]
+    fn shuttle_hits_under_the_shared_lock_count_each_page() {
+        shuttle::check_random(
+            || {
+                let cache = cache_with(&[2, 3, 4]);
+                let readers: Vec<_> = (0..3)
+                    .map(|reader| {
+                        let cache = cache.clone();
+                        thread::spawn(move || {
+                            for id in [2, 3, 4, 2 + reader % 3] {
+                                let looked = cache.read().get_shared(&PageCacheKey::new(id));
+                                match looked {
+                                    SharedLookup::Hit(page) => assert_eq!(page.get().id(), id),
+                                    _ => panic!("page {id} is in the cache"),
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+                for reader in readers {
+                    reader.join().unwrap();
+                }
+                let cache = cache.read();
+                for id in [2, 3, 4] {
+                    let count = cache.ref_of(&PageCacheKey::new(id)).unwrap();
+                    assert!((1..=REF_MAX).contains(&count), "page {id} counted {count}");
+                }
+            },
+            2_000,
+        );
+    }
+
+    /// Do: two readers hit pages under the shared lock while a writer inserts pages past the
+    /// capacity, which sweeps and evicts, and one reader holds page 2 the whole time, as a
+    /// cursor's stack holds its pages. Expect: page 2 is never evicted (still in the cache and
+    /// loaded at the end), every hit returns the page its key names, and the cache's lists stay
+    /// consistent (T-QT.3.3).
+    #[test]
+    fn shuttle_a_held_page_survives_evictions_beside_shared_hits() {
+        shuttle::check_random(
+            || {
+                let cache = cache_with(&[2, 3, 4]);
+                let held = match cache.read().get_shared(&PageCacheKey::new(2)) {
+                    SharedLookup::Hit(page) => page,
+                    _ => panic!("page 2 is in the cache"),
+                };
+                let writer = {
+                    let cache = cache.clone();
+                    thread::spawn(move || {
+                        for id in 10..16 {
+                            let mut cache = cache.write();
+                            match cache.insert(PageCacheKey::new(id), page_with_content(id)) {
+                                Ok(()) | Err(CacheError::Full) => {}
+                                Err(e) => panic!("insert {id}: {e:?}"),
+                            }
+                        }
+                    })
+                };
+                let readers: Vec<_> = (0..2)
+                    .map(|_| {
+                        let cache = cache.clone();
+                        thread::spawn(move || {
+                            for id in [2, 3, 10, 11, 4, 12] {
+                                let looked = cache.read().get_shared(&PageCacheKey::new(id));
+                                match looked {
+                                    SharedLookup::Hit(page) => assert_eq!(page.get().id(), id),
+                                    SharedLookup::Miss => assert_ne!(id, 2, "a held page left"),
+                                    SharedLookup::NeedsExclusive => {
+                                        panic!("page {id}: every page here is loaded")
+                                    }
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+                writer.join().unwrap();
+                for reader in readers {
+                    reader.join().unwrap();
+                }
+                let cache = cache.read();
+                assert!(
+                    cache.contains_key(&PageCacheKey::new(2)),
+                    "held page evicted"
+                );
+                assert!(held.is_loaded(), "held page's buffer taken");
+                cache.verify_cache_integrity();
+            },
+            2_000,
+        );
     }
 }

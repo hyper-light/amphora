@@ -47,7 +47,9 @@ use super::btree::offset::{
 use super::btree::{
     btree_init_page, payload_overflow_threshold_max, payload_overflow_threshold_min, PayloadLimits,
 };
-use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey, SpillResult};
+use super::page_cache::{
+    CacheError, CacheResizeResult, PageCache, PageCacheKey, SharedLookup, SpillResult,
+};
 use super::shared_pages::Version;
 use super::sqlite3_ondisk::{
     begin_write_btree_page, read_btree_cell, read_u32, BTreeCell, FREELIST_LEAF_PTR_SIZE,
@@ -3907,9 +3909,8 @@ impl Pager {
         } else {
             // Fast path: cache hit.
             {
-                let mut page_cache = self.page_cache.write();
                 let page_key = PageCacheKey::new(page_idx as usize);
-                if let Some(page) = page_cache.get(&page_key)? {
+                if let Some(page) = self.cache_lookup(&page_key)? {
                     turso_assert!(
                         page_idx as usize == page.get().id(),
                         "attempted to read page but got different page",
@@ -4065,9 +4066,20 @@ impl Pager {
     // Get a page from the cache, if it exists.
     pub fn cache_get(&self, page_idx: usize) -> Result<Option<PageRef>> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
-        let mut page_cache = self.page_cache.write();
-        let page_key = PageCacheKey::new(page_idx);
-        page_cache.get(&page_key)
+        self.cache_lookup(&PageCacheKey::new(page_idx))
+    }
+
+    /// A cache lookup that takes the cache's exclusive lock only to delete a
+    /// page an aborted read left; a hit or a miss takes the shared lock
+    /// (docs/design/executor.md, decision 7; QT.3).
+    #[inline]
+    fn cache_lookup(&self, page_key: &PageCacheKey) -> Result<Option<PageRef>> {
+        let looked = self.page_cache.read().get_shared(page_key);
+        match looked {
+            SharedLookup::Hit(page) => Ok(Some(page)),
+            SharedLookup::Miss => Ok(None),
+            SharedLookup::NeedsExclusive => self.page_cache.write().get(page_key),
+        }
     }
 
     /// Get a page from cache only if it matches the target frame

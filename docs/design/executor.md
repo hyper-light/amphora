@@ -247,3 +247,81 @@ once a group instead of once an input row.
 **Falsified by.** A subquery that runs where SQLite's doesn't (an error SQLite doesn't raise); an
 uncorrelated one run more than once in one run of the query that holds it, or a correlated one run
 twice for one read; a subquery statement of the suite slower than before.
+
+## 7. A row's header is parsed once, a cache hit takes no exclusive lock, and the index's terms run before the row is fetched
+
+**Decision.** Three changes to the work every row costs (QT.3, the query-time plan's step 3).
+
+A B-tree cursor keeps the parse of its current row's record header (`vdbe/row_header.rs`,
+`RowHeader`, a field of `BTreeCursor`): each column parsed so far, its serial type and where its
+value starts. Column and ColumnRange read a column's place from it and parse the header further
+only past the last column parsed (`BTreeCursor::record_payload_with_header`). It keeps at most the
+cursor's column count of columns, the number the schema gives the cursor when it opens, so it
+never holds more than a row of the table has; a column past that is found by walking on from the
+last one kept. It is dropped wherever the cursor's noted payload is dropped (every move, every
+write through the cursor, every saved position: `forget_noted_payload`), and whenever another
+payload is noted.
+
+A page-cache hit takes the cache's shared lock, not its exclusive one (`PageCache::get_shared`,
+`Pager::cache_lookup`), and reads only what the cache's map owns: each page's slot in the map
+holds a `Weak` handle to the page beside the pointer to its queue entry, and the page's reference
+count, an atomic. A hit upgrades the handle (the entry holds the page until both leave the map,
+under the exclusive lock) and adds one to the count, up to its cap of 3, with a load and a store;
+no `unsafe` is added for it (CLAUDE.md §12), the shared path reaching no entry. The eviction sweep,
+which takes one off, holds the exclusive lock and reads the count from the slot by the entry's key,
+one map lookup for each entry it examines; so a hit never races the sweep, and two hits at once on
+one page may count as one. A `Weak` leaves the page's count of holders as it was, which is what
+`evictable` reads. The one case a lookup changes the cache, a page an aborted read left neither
+loaded nor locked, takes the exclusive lock and deletes it, as before.
+
+On a loop over a non-covering index, whose table row a deferred seek fetches only when a column the
+index doesn't hold is read, the WHERE terms that read the loop's table only through the index (its
+stored columns and the rowid alias, read by `IdxRowId`) are tested first, in the order written,
+then the rest (`main_loop/conditions.rs`, `DeferredIndex`). An index entry they drop is never
+fetched from the table.
+
+**Why.** Column walked the record header from its first serial type on every call: a select list
+or a filter reading columns 6, 4 and 10 of a lineitem row walked 6, 4 and 10 serial types (f15 of
+the research). The page cache's exclusive lock was taken on every hit, three or four a B-tree
+descent, and a hit only bumps a count, so concurrent readers, which step 6 runs, would serialize on
+reads that change nothing in the cache's structure. And the terms of a loop ran in written order: a
+term on a table column written before a term on an index column fetched every row in the index's
+range. `tests/index_filters.rs` found it before the change: a query over 200 entries of an index on
+`(k, x)` fetched 200 table rows written one way and 20 the other.
+
+**Sources.** SQLite's `OP_Column` (`src/vdbe.c`) keeps a cursor's parsed header in `aType` and
+`aOffset`, with `nHdrParsed` columns parsed and the header's next byte at `iHdrOffset`, valid while
+`pC->cacheStatus` equals `p->cacheCtr`, which every cursor move makes stale (`docs/research/
+point-reads.md` §5; research finding f16). SQLite's `sqlite3WhereCodeOneLoopStart`
+(`src/wherecode.c`) codes a loop's terms in up to three passes, the first only those an index
+covers when the table row is fetched by a deferred seek (`OP_DeferredSeek`). Zhang, Yang, Yue,
+Vigfusson and Rashmi, "SIEVE is Simpler than LRU: an Efficient Turn-Key Eviction Algorithm for Web
+Caches" (NSDI 2024): a hit marks its object and moves nothing, so a hit needs no lock that the
+queue's order needs (f35). PostgreSQL raises a buffer's `usage_count` as it pins it, in the
+buffer's own state word, with no lock on the buffer table's mapping beyond a shared one
+(`src/backend/storage/buffer/README`, "Buffer Ring Replacement Strategy" and the buffer mapping
+lock's shared mode; f34).
+
+**Evidence.** `vdbe/row_header.rs`: 2,000 random records of every serial type, NULLs and long
+TEXT and BLOB, with a bound below, at and above their width, read column by column in random order
+and in runs from random starts, read what the header walk (`nth_into_register`) reads, past the
+record's end too; a corrupt header is refused with the walk's errors. `storage/btree.rs`,
+`a_cursor_reads_each_row_it_moves_to_from_its_own_header`: a cursor reads each row's own third
+column after next, prev, a seek, an overwrite of its row with another layout, and on a row that
+spills to overflow pages. `tests/row_header.rs`: a scan, an index seek's deferred seek and a self
+join read every column of 600 random rows (overflow pages, rows older than an `ALTER TABLE ... ADD
+COLUMN` reading its default) in random orders as the model holds them. With the parse never
+dropped (a mutant: `forget` a no-op), the B-tree test and both of these fail. Page cache, under
+shuttle (`RUSTFLAGS="--cfg shuttle"`, 2,000 interleavings each): three readers hitting the same
+pages under the shared lock return each its own page and leave each with a count of 1 to 3; two
+readers hitting while a writer inserts past the capacity and evicts never lose the page a third
+holds, and the cache's lists stay consistent. `tests/index_filters.rs`: the query above fetches 20
+table rows whichever order its terms are written in, with its answer the model's. Times: the
+change's records on jupiter (AC-QT.3.1 to AC-QT.3.4) are the Amphora agent's, with the parent's,
+by `bench/planner/record.sh`; until they are recorded the change is unmeasured.
+
+**Falsified by.** A column read through the parse that differs from the header walk's; a cursor
+reading a row's column from another row's header; a held or pinned page evicted, or a hit lost so
+that a page used since the sweep last passed is evicted first; a query whose answer changes with its
+terms' order beyond what SQLite's own order changes (which error a row raises first); q06 or JOB 5a
+and 5b no faster per row than on the parent.
