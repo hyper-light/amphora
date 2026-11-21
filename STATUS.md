@@ -804,9 +804,12 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   queued key read from the rows and merged (`translate/optimizer/column_path.rs`), against the
   row path's learned rates for a row's visit and a seek; a copy that can't answer the snapshot
   exactly is no path. `storage/versioned/columns_path.rs` reads by the choice and charges the
-  copy's scan time back to it (T-CS.5.1 to T-CS.5.4). Open: SQL tables don't keep a copy yet, so
-  no SQL statement reaches it; step 4's vectorized scan replaces `Columns::scan` there; the
-  classes against CedarDB and ClickHouse (AC-CS.5.2) are the coordinator's.
+  copy's scan time back to it (T-CS.5.1 to T-CS.5.4). Aggregates run on the copy through one
+  hook, `CopyScan`: step 4's vectorized scan as main has it (`Vectorized`, granules and `Plan`),
+  which a later scan replaces by implementing the trait, the choice unchanged; on the rows row by
+  row, with the same answer (T-CS.5.5, T-CS.5.6). Open: SQL tables don't keep a copy yet, so no
+  SQL statement reaches it; the classes against CedarDB and ClickHouse (AC-CS.5.2) are the
+  coordinator's.
 
 ## Open
 

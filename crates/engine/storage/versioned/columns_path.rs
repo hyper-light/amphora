@@ -8,10 +8,12 @@
 //! behind between the view and the scan. A copy scan's time is charged back to the copy
 //! ([`Columns::measured`]), which is how its cost per row is learned.
 //!
-//! An aggregate ([`aggregate`]) runs on the copy by G11 step 4's vectorized scan
-//! (`columns::scan`: granules with summaries, [`Plan`]), whose time is charged per row of the
-//! table ([`Columns::measured_scan`]), so the granules its summaries skip already lower the copy's
-//! learned cost per row; on the rows it runs row by row ([`evaluate_rows`]), with the same answer.
+//! An aggregate ([`aggregate`]) runs on the copy through one narrow hook, [`CopyScan`]: today
+//! G11 step 4's vectorized scan as main has it ([`Vectorized`]: granules with summaries, [`Plan`]),
+//! and whatever scan step 4 lands next drops in by implementing the same trait, with no change to
+//! the choice. Its time is charged per row of the table ([`Columns::measured_scan`]), so the
+//! granules its summaries skip already lower the copy's learned cost per row; on the rows it runs
+//! row by row ([`evaluate_rows`]), with the same answer.
 //!
 //! Behind the planner's switch (`column_path::asked`): no SQL table keeps a copy yet.
 #![cfg_attr(not(test), allow(dead_code))]
@@ -145,6 +147,64 @@ pub(crate) fn read<B: Block>(
     }
 }
 
+/// What the copy's scan gives back for an aggregate.
+#[derive(Debug)]
+pub(crate) struct Scanned {
+    /// Its rows: the groups' keys and aggregates.
+    pub(crate) answer: Vec<Vec<Cell>>,
+    pub(crate) counts: Counts,
+    pub(crate) sources: Sources,
+    /// Rows its granules hold: on a fallback ([`Sources::fallbacks`]), every row, read from the
+    /// rows.
+    pub(crate) built: usize,
+}
+
+/// The copy's scan for an aggregate: the one seam a vectorized scan plugs into (G11 step 4; CS.5's
+/// hook). It answers `q` at snapshot `s` exactly, reading `rows` (the row B-tree at `s`) for what
+/// the copy hasn't applied, and only `rows` when no generation answers `s`; each row's columns
+/// decoded by `dec`. The choice of path, the timing and the charge stay with [`aggregate`], so a
+/// new scan changes neither.
+pub(crate) trait CopyScan<B: Block> {
+    fn scan(
+        &self,
+        copy: &Columns<B>,
+        s: Ts,
+        rows: &dyn Rows,
+        dec: &dyn Decode,
+        q: &Query,
+    ) -> Result<Scanned>;
+}
+
+/// Step 4's scan as main has it: the copy's granules, with their summaries, over the statement's
+/// key range ([`Columns::granules`]), run on the caller's thread by [`Plan`].
+pub(crate) struct Vectorized<'a> {
+    /// The decoded blocks kept between scans.
+    pub(crate) cache: &'a Cache,
+}
+
+impl<B: Block> CopyScan<B> for Vectorized<'_> {
+    fn scan(
+        &self,
+        copy: &Columns<B>,
+        s: Ts,
+        rows: &dyn Rows,
+        dec: &dyn Decode,
+        q: &Query,
+    ) -> Result<Scanned> {
+        let (granules, sources) = copy.granules(s, rows, dec, self.cache, &q.keys)?;
+        let built = granules
+            .iter()
+            .fold(0usize, |n, p| n.saturating_add(p.granule.rows));
+        let (answer, counts) = Plan { granules, query: q }.run_all()?;
+        Ok(Scanned {
+            answer,
+            counts,
+            sources,
+            built,
+        })
+    }
+}
+
 /// An aggregate's answer and where it came from.
 #[derive(Debug)]
 pub(crate) struct Aggregated {
@@ -159,9 +219,8 @@ pub(crate) struct Aggregated {
     pub(crate) row_reads: u64,
 }
 
-/// Runs aggregate `q` at snapshot `s` by the path the planner chooses: on the copy by the
-/// vectorized scan over granules `cache` keeps, or row by row over `rows` (the row B-tree at `s`),
-/// each row's columns decoded by `dec`. A whole-table statement is priced as one; a key range by
+/// Runs aggregate `q` at snapshot `s` by the path the planner chooses: on the copy by `scan`, or
+/// row by row over `rows` (the row B-tree at `s`), each row's columns decoded by `dec`. A whole-table statement is priced as one; a key range by
 /// the rows the copy holds, the most it can read (no estimate of the range's rows is made here).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn aggregate<B: Block>(
@@ -170,7 +229,7 @@ pub(crate) fn aggregate<B: Block>(
     s: Ts,
     q: &Query,
     dec: &dyn Decode,
-    cache: &Cache,
+    scan: &dyn CopyScan<B>,
     rates: RowRates,
     on: bool,
     clock: &dyn Fn() -> u128,
@@ -213,11 +272,12 @@ pub(crate) fn aggregate<B: Block>(
         }
         Path::Copy => {
             let start = clock();
-            let (granules, sources) = copy.granules(s, rows, dec, cache, &q.keys)?;
-            let built = granules
-                .iter()
-                .fold(0usize, |n, p| n.saturating_add(p.granule.rows));
-            let (answer, counts) = Plan { granules, query: q }.run_all()?;
+            let Scanned {
+                answer,
+                counts,
+                sources,
+                built,
+            } = scan.scan(copy, s, rows, dec, q)?;
             // A fallback's granules were built from every row; else the queued keys were looked up.
             let row_reads = if sources.fallbacks > 0 {
                 count(built)
@@ -245,7 +305,6 @@ mod tests {
     use crate::storage::versioned::durable::Database;
     use crate::storage::versioned::version::Snapshot;
     use crate::sync::Arc;
-    use std::cell::Cell;
 
     const N: u16 = 600;
 
@@ -299,7 +358,7 @@ mod tests {
     /// A clock that moves `step` nanoseconds a reading: a copy scan (two readings) is measured at
     /// `step` for the rows it read, so the test sets the copy's learned cost per row.
     fn clock(step: u128) -> impl Fn() -> u128 {
-        let t = Cell::new(0u128);
+        let t = std::cell::Cell::new(0u128);
         move || {
             let now = t.get().saturating_add(step);
             t.set(now);
@@ -471,14 +530,22 @@ mod tests {
             db: &db,
             snap: &snap,
         };
-        let cache = Cache::default();
+        let cache = Cache::new(usize::MAX);
         let tick = clock(1);
         let queued = copy.plan_view(snap.start).queued;
         assert!(queued > 0);
         for q in queries() {
             let want = truth(&at, &q);
             let off = aggregate(
-                &copy, &at, snap.start, &q, &Records, &cache, RATES, false, &tick,
+                &copy,
+                &at,
+                snap.start,
+                &q,
+                &Records,
+                &Vectorized { cache: &cache },
+                RATES,
+                false,
+                &tick,
             )
             .unwrap();
             assert_eq!(off.answer, want);
@@ -486,7 +553,15 @@ mod tests {
             assert_eq!(off.counts, Counts::default());
             assert_eq!(off.row_reads, count(at.all().unwrap().len()));
             let on = aggregate(
-                &copy, &at, snap.start, &q, &Records, &cache, RATES, true, &tick,
+                &copy,
+                &at,
+                snap.start,
+                &q,
+                &Records,
+                &Vectorized { cache: &cache },
+                RATES,
+                true,
+                &tick,
             )
             .unwrap();
             assert_eq!(on.answer, want, "{:?}", on.choice);
@@ -510,7 +585,15 @@ mod tests {
         };
         for q in queries() {
             let r = aggregate(
-                &copy, &at, snap.start, &q, &Records, &cache, RATES, true, &tick,
+                &copy,
+                &at,
+                snap.start,
+                &q,
+                &Records,
+                &Vectorized { cache: &cache },
+                RATES,
+                true,
+                &tick,
             )
             .unwrap();
             assert_eq!((r.choice.path, r.choice.copy_cost), (Path::Rows, None));
@@ -520,6 +603,93 @@ mod tests {
             );
             assert_eq!(r.answer, truth(&at, &q));
         }
+        db.close_snapshot(snap);
+    }
+
+    /// A scan dropped in through the hook: step 4's as main has it, counting its calls.
+    struct Counted<'a> {
+        inner: Vectorized<'a>,
+        calls: std::cell::Cell<u32>,
+    }
+
+    impl<B: Block> CopyScan<B> for Counted<'_> {
+        fn scan(
+            &self,
+            copy: &Columns<B>,
+            s: Ts,
+            rows: &dyn Rows,
+            dec: &dyn Decode,
+            q: &Query,
+        ) -> Result<Scanned> {
+            self.calls.set(self.calls.get().saturating_add(1));
+            self.inner.scan(copy, s, rows, dec, q)
+        }
+    }
+
+    /// Do: run the aggregates through a scan given to the hook, with the switch on and off, then
+    /// on a copy behind its snapshot. Expect: the hook's scan runs once for each aggregate the copy
+    /// is chosen for and answers it, never with the switch off, never on a stale copy; every
+    /// answer equals the rows' (CS.5's hook for step 4's scan).
+    #[test]
+    fn cs5_scan_hook_runs_only_when_the_copy_is_chosen() {
+        use crate::storage::versioned::columns::scan::Records;
+        let cache = Cache::new(usize::MAX);
+        let tick = clock(1);
+        let hooked = Counted {
+            inner: Vectorized { cache: &cache },
+            calls: std::cell::Cell::new(0),
+        };
+        let (db, feed) = open(18, usize::MAX);
+        let copy = Columns::<Plain>::new(feed);
+        commit_records(&db, 0..N, 0);
+        rebuild(&db, &copy);
+        commit_records(&db, (0..N).step_by(9), 4);
+        let snap = db.snapshot().unwrap();
+        let at = At {
+            db: &db,
+            snap: &snap,
+        };
+        let qs = queries();
+        for q in &qs {
+            let off = aggregate(
+                &copy, &at, snap.start, q, &Records, &hooked, RATES, false, &tick,
+            )
+            .unwrap();
+            assert_eq!(off.choice.path, Path::Rows);
+            assert_eq!(off.answer, truth(&at, q));
+        }
+        assert_eq!(hooked.calls.get(), 0);
+        for q in &qs {
+            let on = aggregate(
+                &copy, &at, snap.start, q, &Records, &hooked, RATES, true, &tick,
+            )
+            .unwrap();
+            assert_eq!(on.choice.path, Path::Copy, "{:?}", on.choice);
+            assert_eq!(on.answer, truth(&at, q));
+        }
+        assert_eq!(hooked.calls.get(), u32::try_from(qs.len()).unwrap());
+        db.close_snapshot(snap);
+
+        let (db, feed) = open(19, 0);
+        let copy = Columns::<Packed>::new(feed);
+        commit_records(&db, 0..N, 0);
+        rebuild(&db, &copy);
+        commit_records(&db, (0..N).step_by(5), 2);
+        let snap = db.snapshot().unwrap();
+        let at = At {
+            db: &db,
+            snap: &snap,
+        };
+        let before = hooked.calls.get();
+        for q in &qs {
+            let r = aggregate(
+                &copy, &at, snap.start, q, &Records, &hooked, RATES, true, &tick,
+            )
+            .unwrap();
+            assert_eq!(r.choice.path, Path::Rows);
+            assert_eq!(r.answer, truth(&at, q));
+        }
+        assert_eq!(hooked.calls.get(), before);
         db.close_snapshot(snap);
     }
 
