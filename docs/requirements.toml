@@ -505,6 +505,8 @@ tests = [
   # lane g7s2-2
   { id = "T-NS.2.4", text = "Values past a page read at every snapshot; rollback and savepoints across them; recovery after a power cut and a crash at each of many writes recovers a prefix of the commits" },
   { id = "T-NS.2.5", text = "Trees made and dropped survive reopens and power cuts; a crash at each write of a workload that makes, fills and drops trees recovers a prefix of its steps" },
+  # lane g7s2-3
+  { id = "T-NS.2.6", text = "SQL end to end through the switch and without it (CREATE TABLE, INSERT, SELECT, transactions) answers alike" },
 ]
 
 # lane follower-reads (G13 step 4, kiln goal 80d4cf5e; docs/design/replication.md, "Follower reads at a
@@ -829,3 +831,7 @@ tests = [
   { id = "T-G3.5.2", text = "storage::descent_skip::tests::t_g3_5_2_* — passes when, over a table's complete fences, the locator names the leaf a descent finds for every covered rowid" },
 ]
 
+# lane regions (G14 step 1, CP-T1.11; docs/design/regions.md): no new IDs. It serves AC-T1.11.4
+# (crates/amphora/tests/regions.rs, ac_t1_11_4_*: the corpus on the simulated lab at one node, three
+# nodes and three regions) and AC-T1.11.2's lab (crates/amphora/examples/regions_lab.rs; the 60 ms run
+# and its p99 are the coordinator's).
