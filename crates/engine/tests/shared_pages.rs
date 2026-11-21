@@ -631,7 +631,7 @@ fn g3s3_a_byte_flipped_on_disk_is_refused_on_each_page_path() {
 fn g3s3_plain_misses_read_into_the_pages_evictions_leave() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), false);
-    table(&connect(&db), 4000);
+    table(&connect(&db), 16000);
     connect(&db)
         .execute("PRAGMA wal_checkpoint(TRUNCATE)")
         .unwrap();
@@ -644,7 +644,7 @@ fn g3s3_plain_misses_read_into_the_pages_evictions_leave() {
     let (today, plain) = (on(PagePath::Today), on(PagePath::Plain));
     for round in 0..2 {
         let want = rows(&today, "SELECT id, v FROM t ORDER BY id");
-        assert_eq!(want.len(), 4000);
+        assert_eq!(want.len(), 16000);
         assert!(
             rows(&plain, "SELECT id, v FROM t ORDER BY id") == want,
             "round {round}: the plain path read other rows"
