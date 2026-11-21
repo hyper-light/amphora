@@ -169,7 +169,7 @@ fn pair(
         })
         .unwrap(),
     );
-    let txn = Arc::new(Mutex::new(vdb.begin().unwrap()));
+    let txn = Arc::new(Mutex::new(Some(vdb.begin().unwrap())));
     let versioned = VersionedCursor::new(vdb, 0, order, Access::Write(txn), pager.clone()).unwrap();
     (btree, Box::new(versioned), pager, (db, conn))
 }
@@ -258,7 +258,13 @@ fn value(rng: &mut Rng) -> Value {
             Value::from_text(text(rng, len))
         }
         _ => {
-            let len = usize::try_from(rng.below(200)).unwrap();
+            // Now and then one past a page, its record kept in overflow on both storages
+            // (AC-NS.2.4).
+            let len = if rng.chance(10) {
+                usize::try_from(4_000 + rng.below(9_000)).unwrap()
+            } else {
+                usize::try_from(rng.below(200)).unwrap()
+            };
             Value::from_slice(&vec![u8::try_from(rng.below(256)).unwrap(); len]).unwrap()
         }
     }
@@ -623,9 +629,9 @@ fn seeds() -> u64 {
 }
 
 /// Do: 2,000 random operations (inserts after their seeks, deletes, steps, seeks of every kind,
-/// rewinds, lasts, counts) on a table's tree through both storages' cursors, for each seed.
-/// Expect: identical seek answers, rows, rowids and records after every step, and the same rows at
-/// the end (T-NS.1.1, AC-NS.1.1).
+/// rewinds, lasts, counts) on a table's tree through both storages' cursors, for each seed, some
+/// records past a page. Expect: identical seek answers, rows, rowids and records after every step,
+/// and the same rows at the end (T-NS.1.1, AC-NS.1.1, AC-NS.2.4).
 #[test]
 fn ns_1_1_table_cursors_agree_step_by_step() {
     for seed in 0..seeds() {
@@ -788,7 +794,7 @@ fn ns_1_1_a_cursor_sees_writes_through_another_cursor_of_its_transaction() {
         .unwrap(),
     );
     let (pager, _db, _conn) = engine();
-    let txn = Arc::new(Mutex::new(vdb.begin().unwrap()));
+    let txn = Arc::new(Mutex::new(Some(vdb.begin().unwrap())));
     let mut w = VersionedCursor::new(
         vdb.clone(),
         0,

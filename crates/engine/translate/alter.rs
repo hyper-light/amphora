@@ -911,6 +911,29 @@ pub fn translate_alter_table(
         )));
     }
 
+    // Amphora: a table with a column an online schema change is validating is the change's until
+    // it ends (CP-T1.12): only that change's own ALTER COLUMN of the column itself goes on (it
+    // redefines it, and undoes that; the change marks its statements, `online_change_own`); any
+    // other change, a person's ALTER COLUMN of it included, would leave its mark naming a column
+    // that moved or a definition it never made.
+    if let Some(held) = original_btree
+        .columns()
+        .iter()
+        .find(|column| column.unvalidated())
+        .and_then(|column| column.name.clone())
+    {
+        let redefines_it = connection.online_change_own()
+            && matches!(
+                &alter_table,
+                ast::AlterTableBody::AlterColumn { old, .. } if normalize_ident(old.as_str()) == normalize_ident(&held)
+            );
+        if !redefines_it {
+            crate::bail_parse_error!(
+                "table {table_name} has column {held} held by an online schema change"
+            );
+        }
+    }
+
     let mut btree = (*original_btree).clone();
 
     match alter_table {
@@ -1283,7 +1306,10 @@ pub fn translate_alter_table(
                     "column name is missing in ALTER TABLE ADD COLUMN".to_string(),
                 )
             })?;
-            if btree.get_column(&new_column_name).is_some() {
+            // Amphora: a dropped column's slot keeps its name (CP-T1.12).
+            if btree.get_column(&new_column_name).is_some()
+                || btree.has_dropped_column(&new_column_name)
+            {
                 return Err(LimboError::ParseError(
                     "duplicate column name: ".to_string() + &new_column_name,
                 ));
@@ -1851,6 +1877,7 @@ pub fn translate_alter_table(
             if btree
                 .get_column(col_name)
                 .is_some_and(|(at, _)| at != column_index)
+                || btree.has_dropped_column(col_name)
             {
                 return Err(LimboError::ParseError(format!(
                     "duplicate column name: \"{col_name}\""

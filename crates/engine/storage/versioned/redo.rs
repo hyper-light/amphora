@@ -21,7 +21,8 @@
 //! A record: `magic` (`u32`), the body's length (`u32`), the body's XXH3 (`u64`), then the body:
 //! the commit timestamp (`u64`), the change count (`u32`), and each change: the tree (`u64`), its
 //! kind (`u8`: 1 a put, 2 a removal), the key's length (`u32`) and key, and a put's value's length
-//! (`u32`) and value. Recovery reads records until the first that is torn or doesn't check out:
+//! (`u32`) and value; or a tree made (3) or dropped (4), with an empty key (`AC-NS.2.5`). Recovery
+//! reads records until the first that is torn or doesn't check out:
 //! a flush that never ended may leave a prefix of what it wrote.
 
 use super::disk::{Disk, File};
@@ -44,6 +45,14 @@ pub enum Op {
     Remove {
         tree: u64,
         key: Vec<u8>,
+    },
+    /// Tree `tree` made, empty (`AC-NS.2.5`): a record of its own.
+    Made {
+        tree: u64,
+    },
+    /// Tree `tree` dropped (`AC-NS.2.5`): a record of its own.
+    Dropped {
+        tree: u64,
     },
 }
 
@@ -83,6 +92,11 @@ pub fn encode(ts: u64, ops: &[Op]) -> Result<Vec<u8>> {
                 body.push(2);
                 push_u32(&mut body, key.len())?;
                 body.extend_from_slice(key);
+            }
+            Op::Made { tree } | Op::Dropped { tree } => {
+                body.extend_from_slice(&tree.to_le_bytes());
+                body.push(if matches!(op, Op::Made { .. }) { 3 } else { 4 });
+                push_u32(&mut body, 0)?;
             }
         }
     }
@@ -148,6 +162,8 @@ fn decode_body(body: &[u8]) -> Option<Record> {
                 }
             }
             2 => Op::Remove { tree, key },
+            3 if key.is_empty() => Op::Made { tree },
+            4 if key.is_empty() => Op::Dropped { tree },
             _ => return None,
         });
     }
@@ -601,6 +617,8 @@ mod tests {
                 tree: 2,
                 key: vec![n, n],
             },
+            Op::Made { tree: u64::from(n) },
+            Op::Dropped { tree: 3 },
         ]
     }
 

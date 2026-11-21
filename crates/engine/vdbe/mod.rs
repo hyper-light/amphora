@@ -35,6 +35,7 @@ pub mod group_table;
 pub mod hash_table;
 pub mod insn;
 pub mod metrics;
+pub mod morsel;
 #[cfg(test)]
 mod native_extension_tests;
 pub mod row_counts;
@@ -1020,6 +1021,9 @@ pub struct ProgramState {
     /// the statement subtransactionwill roll back.
     fk_immediate_violations_during_stmt: AtomicIsize,
     uses_subjournal: bool,
+    /// Amphora (G7 step 2, `AC-NS.2.1`): this write statement in an explicit transaction opened a
+    /// savepoint of the versioned storage's transaction, to undo it alone.
+    versioned_statement: bool,
     /// Amphora: this write statement in an explicit transaction kept no statement journal (its
     /// connection's are off): undoing it alone means rolling back the whole transaction.
     skipped_subjournal: bool,
@@ -1117,6 +1121,7 @@ impl ProgramState {
             ephemeral_temp_files: HashMap::default(),
             ephemeral_kept: HashMap::default(),
             uses_subjournal: false,
+            versioned_statement: false,
             skipped_subjournal: false,
             is_active_write: false,
             has_stmt_transaction: false,
@@ -1310,6 +1315,7 @@ impl ProgramState {
                 .retain(|cursor_id, _| kept.contains_key(cursor_id));
         }
         self.uses_subjournal = false;
+        self.versioned_statement = false;
         self.skipped_subjournal = false;
         self.is_active_write = false;
         self.has_stmt_transaction = false;
@@ -1582,6 +1588,10 @@ impl ProgramState {
     ) -> IOResultOr<()> {
         let in_explicit_txn = !connection.auto_commit.load(Ordering::SeqCst);
         if write && in_explicit_txn {
+            if let Some(switch) = connection.versioned.as_ref() {
+                switch.begin_statement()?;
+                self.versioned_statement = true;
+            }
             // Check if MVCC is active - if so, use MVCC savepoints instead of pager savepoints
             if let Some(mv_store) = connection.mv_store().as_ref() {
                 if let Some(tx_id) = connection.get_mv_tx_id() {
@@ -1648,6 +1658,11 @@ impl ProgramState {
 
         // Drain attached pagers upfront so we can clean them up regardless of path.
         let attached_pagers: Vec<Arc<Pager>> = std::mem::take(&mut self.attached_savepoint_pagers);
+        if std::mem::take(&mut self.versioned_statement) {
+            if let Some(switch) = connection.versioned.as_ref() {
+                switch.end_statement(matches!(end_statement, EndStatement::RollbackSavepoint))?;
+            }
+        }
         let result = match end_statement {
             EndStatement::ReleaseSavepoint => {
                 if let Some(mv_store) = connection.mv_store().as_ref() {
@@ -2947,6 +2962,11 @@ impl Program {
             let transaction_finished = self.connection.auto_commit.load(Ordering::SeqCst)
                 && self.connection.get_tx_state() == TransactionState::None;
             if transaction_finished {
+                // Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage's transaction ends
+                // where the pager's does.
+                if let Some(switch) = self.connection.versioned.as_ref() {
+                    switch.finish(rollback)?;
+                }
                 // Finalize the in-memory TEMP schema only when the outer
                 // transaction actually finishes. Updating the committed temp
                 // snapshot after every statement inside an explicit

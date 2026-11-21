@@ -34,11 +34,13 @@ pub(crate) fn installed_floor(db: &Db) -> anyhow::Result<Option<Application>> {
 }
 pub use application::WriterBoundary;
 
+mod compacting;
 pub(crate) mod compaction;
 mod guards;
 mod import;
 mod log_bound;
 pub mod online;
+mod pace;
 mod patience;
 pub(crate) mod remote;
 pub(crate) mod replicated;
@@ -57,7 +59,8 @@ CREATE TABLE IF NOT EXISTS __amphora_namespaces (name TEXT PRIMARY KEY, head INT
 CREATE TABLE IF NOT EXISTS __amphora_versions (namespace TEXT NOT NULL, family TEXT NOT NULL, key BLOB NOT NULL, rev INTEGER NOT NULL, seq INTEGER NOT NULL, value BLOB, PRIMARY KEY(namespace, family, key, rev));
 CREATE INDEX IF NOT EXISTS __amphora_feed ON __amphora_versions(namespace, family, rev, seq);
 CREATE TABLE IF NOT EXISTS __amphora_families (namespace TEXT NOT NULL, family TEXT NOT NULL, newest INTEGER NOT NULL, PRIMARY KEY(namespace, family));
-CREATE TABLE IF NOT EXISTS __amphora_migrations (name TEXT PRIMARY KEY, sql TEXT NOT NULL);";
+CREATE TABLE IF NOT EXISTS __amphora_migrations (name TEXT PRIMARY KEY, sql TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS __amphora_holding (one INTEGER PRIMARY KEY CHECK (one = 0), holding BLOB NOT NULL);";
 const LIVE_MAX: u64 = 10_000_000;
 const QUEUED_BYTES: usize = 512 << 20;
 struct Admission(Arc<AtomicUsize>);
@@ -1843,6 +1846,31 @@ impl Engine for Local {
     fn restart_log(&mut self) -> anyhow::Result<bool> {
         self.db.restart_log()
     }
+
+    fn holding(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+        let mut kept = None;
+        self.db.query(
+            "SELECT holding FROM __amphora_holding WHERE one = 0",
+            [],
+            |r| {
+                kept = bytes(r, 0)?;
+                Ok(false)
+            },
+        )?;
+        Ok(kept)
+    }
+
+    /// The holding kept through [`Mutation::Holding`], the command a replicated owner's log
+    /// carries, applied as one commit of its own after every commit before it, and flushed with
+    /// them before it returns (CP-T1.9).
+    fn keep_holding(&mut self, holding: &[u8]) -> anyhow::Result<()> {
+        let operation = Operation::Mutation(Mutation::Holding(holding.to_vec()));
+        self.db
+            .transaction(|db| apply(db, "", &operation))?
+            .map_err(|refusal| anyhow::anyhow!("a holding not kept: {refusal:?}"))?;
+        (self.db.flusher())()?;
+        Ok(())
+    }
 }
 
 fn validate_sql(sql: &str, script: bool) -> Result<(), Refusal> {
@@ -1991,6 +2019,16 @@ fn apply(
             )?;
             return Ok(Ok(Answer::Migrated(true)));
         }
+        Operation::Mutation(Mutation::Holding(holding)) => {
+            // A group's holding, kept by the same apply a local writer and a replicated owner's
+            // log entry run (CP-T1.9): never written past the log.
+            db.query(
+                "INSERT INTO __amphora_holding(one, holding) VALUES (0, ?1) ON CONFLICT(one) DO UPDATE SET holding = excluded.holding",
+                [blob(holding)?],
+                |_| Ok(true),
+            )?;
+            return Ok(Ok(Answer::Done));
+        }
         _ => {}
     }
     if import::incomplete(db, namespace)? {
@@ -2115,9 +2153,11 @@ fn apply(
         Operation::Import(_)
         | Operation::ImportProgress
         | Operation::Call(_)
-        | Operation::Mutation(Mutation::Sql(_) | Mutation::Migrate(_)) => Err(anyhow::anyhow!(
-            "SQL operation reached the Records dispatch"
-        )),
+        | Operation::Mutation(Mutation::Sql(_) | Mutation::Migrate(_) | Mutation::Holding(_)) => {
+            Err(anyhow::anyhow!(
+                "SQL operation reached the Records dispatch"
+            ))
+        }
     }
 }
 
@@ -2292,5 +2332,64 @@ mod drain_pause {
             probes += 1;
         }
         assert!(probes < 40, "{probes} probes in a second");
+    }
+}
+
+#[cfg(test)]
+mod group_holding {
+    use super::*;
+    use crate::groups::Groups;
+    use crate::reshard::directory::Directory;
+    use crate::reshard::holding::Fenced;
+    use crate::reshard::{GroupId, NodeId, OpId, Span, position};
+
+    fn local(path: &Path) -> anyhow::Result<Local> {
+        let db = Db::open(path)?;
+        bootstrap_db(&db).map_err(|r| anyhow::anyhow!("{r:?}"))?;
+        Ok(Local {
+            db,
+            restoring: false,
+        })
+    }
+
+    /// T-T1.9.R7 (CP-T1.9; docs/design/reshard.md, "A local database keeps its holding through
+    /// its command"): a local database as a group's engine, its holding fenced through the shell
+    /// ([`Groups::hold`]), then the group started again on the same file; expect the fenced
+    /// holding answered after the restart, kept in the file as the `Holding` command left it.
+    #[test]
+    fn t_t1_9_r7_a_local_databases_holding_is_kept_through_its_command_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g0.db");
+        let retired = dir.path().join("retired");
+        let directory = Directory::new(NodeId(0));
+        let until = Instant::now() + Duration::from_secs(60);
+        let groups = Groups::on(&directory, store::Config::default(), &retired, |_| {
+            local(&path)
+        })
+        .unwrap();
+        assert_eq!(
+            groups.holding_of(GroupId(0)).unwrap().owned(),
+            Some(Span::ALL)
+        );
+        let pos = position("database");
+        let span = Span::new(pos, pos).unwrap();
+        let fenced = groups
+            .hold(GroupId(0), until, |h| h.fence(OpId(1), span, 1))
+            .unwrap();
+        assert_eq!(fenced, Fenced::New(1));
+        let held = groups.holding_of(GroupId(0)).unwrap();
+        drop(groups);
+
+        let again = Groups::on(&directory, store::Config::default(), &retired, |_| {
+            local(&path)
+        })
+        .unwrap();
+        assert_eq!(again.holding_of(GroupId(0)), Some(held));
+        drop(again);
+        let mut engine = local(&path).unwrap();
+        assert_eq!(
+            engine.holding().unwrap(),
+            Some(postcard::to_allocvec(&held).unwrap())
+        );
     }
 }

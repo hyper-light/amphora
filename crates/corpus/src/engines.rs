@@ -9,11 +9,11 @@
 //! the bench's own container for it (bench/corpus/run.sh, bench/servers/<engine>.sh).
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::answer::Value;
 use crate::run::{Engine, Stop};
@@ -76,12 +76,17 @@ fn dsn(engine: &str, default: &str) -> String {
 }
 
 /// Opens `name` on a fresh database. The program each shell engine runs can be pointed elsewhere
-/// with `CORPUS_BIN_<ENGINE>` (a build of its own, a path off PATH).
-pub fn open(name: &str) -> Result<Box<dyn Engine>, Unavailable> {
+/// with `CORPUS_BIN_<ENGINE>` (a build of its own, a path off PATH), a command line split at its
+/// spaces, so a client inside a server's container runs as `docker exec -i <container> psql`.
+/// `bound` is how long each statement that opens it (its fresh database), settles it or drops it
+/// may take, the run's budget (G2 step 7): a server that doesn't answer within it is Unreachable,
+/// and None waits on it as long as it takes.
+pub fn open(name: &str, bound: Option<Duration>) -> Result<Box<dyn Engine>, Unavailable> {
     let bin = |engine: &str, default: &str| {
         std::env::var(format!("CORPUS_BIN_{}", engine.to_ascii_uppercase()))
             .unwrap_or_else(|_| default.to_owned())
     };
+    let shell = |spec: ShellSpec| Shell::open(spec, bound).map(boxed);
     match name {
         "amphora" => crate::amphora::Amphora::in_memory()
             .map(|a| Box::new(a) as Box<dyn Engine>)
@@ -89,37 +94,35 @@ pub fn open(name: &str) -> Result<Box<dyn Engine>, Unavailable> {
                 engine: "amphora",
                 why,
             }),
-        "sqlite" => Shell::open(sqlite_shell("sqlite", bin("sqlite", "sqlite3"))).map(boxed),
-        "duckdb" => Shell::open(duckdb(bin("duckdb", "duckdb"))).map(boxed),
-        "turso" => Shell::open(turso(bin("turso", "tursodb"))).map(boxed),
+        "sqlite" => shell(sqlite_shell("sqlite", bin("sqlite", "sqlite3"))),
+        "duckdb" => shell(duckdb(bin("duckdb", "duckdb"))),
+        "turso" => shell(turso(bin("turso", "tursodb"))),
         // Run.sh's addresses for the bench's containers (bench/servers/<engine>.sh).
-        "postgres" => Shell::open(postgres(
+        "postgres" => shell(postgres(
             "postgres",
             bin("postgres", "psql"),
             dsn("postgres", "postgres://postgres@127.0.0.1:55432/postgres"),
-        ))
-        .map(boxed),
-        "orioledb" => Shell::open(postgres(
+        )),
+        "orioledb" => shell(postgres(
             "orioledb",
             bin("orioledb", "psql"),
             dsn("orioledb", "postgres://postgres@127.0.0.1:55433/postgres"),
-        ))
-        .map(boxed),
-        "cedardb" => Shell::open(postgres(
+        )),
+        "cedardb" => shell(postgres(
             "cedardb",
             bin("cedardb", "psql"),
             dsn(
                 "cedardb",
                 "postgres://postgres:amphorabenchlocalonly2026@127.0.0.1:55434/postgres",
             ),
-        ))
-        .map(boxed),
-        "mysql" => Shell::open(mysql(
+        )),
+        "mysql" => shell(mysql(
             bin("mysql", "mysql"),
             &dsn("mysql", "mysql://root@127.0.0.1:33306/convo"),
-        )?)
-        .map(boxed),
-        "clickhouse" => ClickHouse::open(&dsn("clickhouse", "http://127.0.0.1:58123")).map(boxed),
+        )?),
+        "clickhouse" => {
+            ClickHouse::open(&dsn("clickhouse", "http://127.0.0.1:58123"), bound).map(boxed)
+        }
         other => Err(Unavailable::Unknown(other.to_owned())),
     }
 }
@@ -163,6 +166,9 @@ pub struct ShellSpec {
     pub rows: Rows,
     /// Whether a line of its output says the statement failed.
     pub error: fn(&str) -> bool,
+    /// For a shell whose rows can't carry every text whole, the query that counts a query's rows
+    /// (Engine::recount).
+    pub recount: Option<fn(&str) -> String>,
 }
 
 /// SQLite's own shell (`sqlite3`), on an in-memory database as Amphora's is.
@@ -177,6 +183,7 @@ pub fn sqlite_shell(engine: &'static str, program: String) -> ShellSpec {
         terminator_line: true,
         settle: Some("PRAGMA wal_checkpoint(TRUNCATE)"),
         rows: Rows::Quote,
+        recount: None,
         error: |l| {
             !l.starts_with('\'')
                 && (l.starts_with("Parse error")
@@ -186,12 +193,23 @@ pub fn sqlite_shell(engine: &'static str, program: String) -> ShellSpec {
     }
 }
 
-/// DuckDB's shell (SQLite's shell's descendant: the same `.mode quote` and `.print`).
+/// DuckDB's shell (SQLite's shell's descendant: the same `.mode quote` and `.print`). Its quote mode
+/// writes a header line and puts its column separator (`|` by default) between values, so both are
+/// set as SQLite's shell has them (checked on DuckDB 2.0.1's release CLI).
 pub fn duckdb(program: String) -> ShellSpec {
     ShellSpec {
         engine: "duckdb",
         program,
-        args: ["-batch", "-quote", ":memory:"].map(String::from).to_vec(),
+        args: [
+            "-batch",
+            "-noheader",
+            "-quote",
+            "-separator",
+            ",",
+            ":memory:",
+        ]
+        .map(String::from)
+        .to_vec(),
         settle: Some("CHECKPOINT"),
         // Its errors are "<Kind> Error: ..." (Parser, Catalog, Binder, Conversion, ...).
         error: |l| !l.starts_with('\'') && (l.contains("Error: ") || l.starts_with("Error")),
@@ -199,7 +217,13 @@ pub fn duckdb(program: String) -> ShellSpec {
     }
 }
 
-/// Turso's shell (`tursodb`), its list mode with `|` between values and NULL as nothing.
+/// Turso's shell (`tursodb`), its list mode with `|` between values. Its NULL is nothing there, as
+/// empty text is, so `.nullvalue` makes it [`NULL_MARK`]. Its shell has no quote, JSON or escaped
+/// mode and no `.separator` (tursodb 0.8.4, and its main at 0.9.0-pre.6: `OutputMode` is list,
+/// pretty and line, cli/input.rs, none escaping), so a text value holding `|` or a line end reads
+/// as more values or rows than it is: such an answer is counted again by Turso itself
+/// (`SELECT count(*) FROM (...)`) and, when what was read doesn't match, is unreadable, never a
+/// disagreement (Engine::recount).
 pub fn turso(program: String) -> ShellSpec {
     ShellSpec {
         engine: "turso",
@@ -207,17 +231,19 @@ pub fn turso(program: String) -> ShellSpec {
         args: ["--quiet", "--output-mode", "list", ":memory:"]
             .map(String::from)
             .to_vec(),
-        setup: Vec::new(),
+        setup: vec![format!(".nullvalue {NULL_MARK}")],
         teardown: Vec::new(),
-        echo: |m| format!("SELECT '{m}'"),
+        // A SELECT of its own, ended: the line after a statement isn't read until its `;`.
+        echo: |m| format!("SELECT '{m}';"),
         terminator_line: true,
         settle: Some("PRAGMA wal_checkpoint(TRUNCATE)"),
         rows: Rows::Delimited {
             field: '|',
-            null: "",
+            null: NULL_MARK,
             escapes: false,
         },
-        // Its errors are miette reports: "× <kind> error: ...", or "Error: ...".
+        recount: Some(|q| format!("SELECT count(*) FROM ({q})")),
+        // Its errors are miette reports, "  × Parse error: no such table: nope", or "Error: ...".
         error: |l| {
             let t = l.trim_start();
             t.starts_with('×') || t.starts_with("Error") || t.starts_with("Parse error")
@@ -246,6 +272,11 @@ pub fn postgres(engine: &'static str, program: String, dsn: String) -> ShellSpec
             format!("null={NULL_MARK}"),
             "-v".into(),
             "ON_ERROR_STOP=0".into(),
+            // Its statements from `-f -` (standard input) rather than from standard input as such:
+            // only a file's errors are written `psql:<file>:<line>: ERROR:`, which is how a refusal
+            // is told from a row (psql's documentation of -f; its log_locus_callback).
+            "-f".into(),
+            "-".into(),
             "-d".into(),
             dsn,
         ],
@@ -257,13 +288,21 @@ pub fn postgres(engine: &'static str, program: String, dsn: String) -> ShellSpec
         teardown: vec![format!("DROP SCHEMA {schema} CASCADE")],
         echo: |m| format!("\\echo {m}"),
         terminator_line: true,
-        settle: Some("CHECKPOINT"),
+        // CedarDB (v2026-10-08) answers CHECKPOINT "ERROR: CHECKPOINT not implemented yet" (run on
+        // its image, 2026-11-21) and documents no other statement that settles it, so its settle
+        // runs none, rather than every query after a statement failing its settle.
+        settle: if engine == "cedardb" {
+            None
+        } else {
+            Some("CHECKPOINT")
+        },
         rows: Rows::Delimited {
             field: '\u{1f}',
             null: NULL_MARK,
             escapes: false,
         },
         error: |l| l.starts_with("psql:") && (l.contains("ERROR:") || l.contains("FATAL:")),
+        recount: None,
     }
 }
 
@@ -312,6 +351,7 @@ pub fn mysql(program: String, dsn: &str) -> Result<ShellSpec, Unavailable> {
             escapes: true,
         },
         error: |l| l.starts_with("ERROR "),
+        recount: None,
     })
 }
 
@@ -325,10 +365,15 @@ pub struct Shell {
     marks: u64,
     /// Set when the process was stopped (a bound) or ended: no statement runs on it again.
     ended: Option<String>,
+    /// How long each opening, settling and closing statement may take (crate::engines::open).
+    bound: Option<Duration>,
 }
 
 impl Shell {
-    pub fn open(spec: ShellSpec) -> Result<Self, Unavailable> {
+    /// Its program started and its opening statements run, each within `bound`: one that isn't
+    /// answered within it makes the engine Unreachable (a server that never answers can't hold
+    /// the run).
+    pub fn open(spec: ShellSpec, bound: Option<Duration>) -> Result<Self, Unavailable> {
         let missing = |why: String| Unavailable::Missing {
             engine: spec.engine,
             program: spec.program.clone(),
@@ -336,8 +381,17 @@ impl Shell {
         };
         let (reader, writer) = std::io::pipe().map_err(|e| missing(e.to_string()))?;
         let err = writer.try_clone().map_err(|e| missing(e.to_string()))?;
-        let mut cmd = Command::new(&spec.program);
-        cmd.args(&spec.args)
+        // CORPUS_BIN_<ENGINE> may be a command line: its first word runs, the rest come first
+        // (a program whose own path holds spaces is run whole).
+        let mut words = spec.program.split_whitespace();
+        let mut cmd = if std::path::Path::new(&spec.program).exists() {
+            words = "".split_whitespace();
+            Command::new(&spec.program)
+        } else {
+            Command::new(words.next().unwrap_or_default())
+        };
+        cmd.args(words)
+            .args(&spec.args)
             .stdin(Stdio::piped())
             .stdout(writer)
             .stderr(err);
@@ -374,17 +428,27 @@ impl Shell {
             lines,
             marks: 0,
             ended: None,
+            bound,
         };
         let setup = std::mem::take(&mut shell.spec.setup);
         for s in &setup {
+            let until = shell.until();
             shell
-                .run(s, 0, None)
+                .run(s, 0, until)
                 .map_err(|e| Unavailable::Unreachable {
                     engine: shell.spec.engine,
-                    why: format!("{s}: {e:?}"),
+                    why: match e {
+                        Stop::PastBudget => format!("{s}: no answer within {bound:?}"),
+                        Stop::Refused(e) => format!("{s}: {e}"),
+                    },
                 })?;
         }
         Ok(shell)
+    }
+
+    /// The bound of an opening or closing statement begun now.
+    fn until(&self) -> Option<Instant> {
+        self.bound.and_then(|b| Instant::now().checked_add(b))
     }
 
     fn stop(&mut self, why: String) {
@@ -479,14 +543,26 @@ impl Engine for Shell {
         Ok(rows)
     }
 
-    fn settle(&mut self) -> Result<(), String> {
+    fn settle(&mut self, until: Option<Instant>) -> Result<(), Stop> {
         match self.spec.settle {
-            Some(s) => self
-                .run(s, 0, None)
-                .map(drop)
-                .map_err(|e| format!("{s}: {e:?}")),
+            Some(s) => self.run(s, 0, until).map(drop),
             None => Ok(()),
         }
+    }
+
+    fn recount(&mut self, sql: &str, until: Option<Instant>) -> Option<Result<u64, Stop>> {
+        let count = (self.spec.recount?)(sql.trim().trim_end_matches(';'));
+        Some(self.run(&count, 2, until).and_then(|rows| {
+            match rows.as_slice() {
+                [row] => match row.as_slice() {
+                    [Value::Integer(n)] => u64::try_from(*n).ok(),
+                    [Value::Text(t)] => std::str::from_utf8(t).ok().and_then(|t| t.parse().ok()),
+                    _ => None,
+                },
+                _ => None,
+            }
+            .ok_or_else(|| Stop::Refused(format!("{count}: not one count: {rows:?}")))
+        }))
     }
 
     fn ended(&self) -> bool {
@@ -499,7 +575,8 @@ impl Drop for Shell {
         if self.ended.is_none() {
             let teardown = std::mem::take(&mut self.spec.teardown);
             for s in &teardown {
-                let _ = self.run(s, 0, None);
+                let until = self.until();
+                let _ = self.run(s, 0, until);
             }
         }
         let _ = self.child.kill();
@@ -614,10 +691,14 @@ pub struct ClickHouse {
     host: String,
     db: String,
     ended: Option<String>,
+    /// How long each opening, settling and closing request may take (crate::engines::open).
+    bound: Option<Duration>,
 }
 
 impl ClickHouse {
-    pub fn open(url: &str) -> Result<Self, Unavailable> {
+    /// Its fresh database made, within `bound`: a server that doesn't answer within it is
+    /// Unreachable.
+    pub fn open(url: &str, bound: Option<Duration>) -> Result<Self, Unavailable> {
         let addr = url
             .strip_prefix("http://")
             .ok_or_else(|| Unavailable::Unreachable {
@@ -631,15 +712,25 @@ impl ClickHouse {
             addr,
             db: "default".into(),
             ended: None,
+            bound,
         };
         let db = fresh_name();
-        ch.request(&format!("CREATE DATABASE {db}"), None)
+        let until = ch.until();
+        ch.request(&format!("CREATE DATABASE {db}"), until)
             .map_err(|e| Unavailable::Unreachable {
                 engine: "clickhouse",
-                why: format!("{e:?}"),
+                why: match e {
+                    Stop::PastBudget => format!("no answer within {bound:?}"),
+                    Stop::Refused(e) => e,
+                },
             })?;
         ch.db = db;
         Ok(ch)
+    }
+
+    /// The bound of an opening or closing request begun now.
+    fn until(&self) -> Option<Instant> {
+        self.bound.and_then(|b| Instant::now().checked_add(b))
     }
 
     fn request(&mut self, sql: &str, until: Option<Instant>) -> Result<String, Stop> {
@@ -648,17 +739,33 @@ impl ClickHouse {
         }
         let refused = |e: std::io::Error| Stop::Refused(e.to_string());
         let mut path = format!("/?database={}&default_format=TabSeparated", self.db);
-        let mut stream = TcpStream::connect(&self.addr).map_err(refused)?;
-        if let Some(u) = until {
-            let left = u.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(Stop::PastBudget);
+        let left = until.map(|u| u.saturating_duration_since(Instant::now()));
+        if left.is_some_and(|l| l.is_zero()) {
+            return Err(Stop::PastBudget);
+        }
+        let mut stream = match left {
+            None => TcpStream::connect(&self.addr).map_err(refused)?,
+            // A server that takes the connection no sooner than the bound is past it.
+            Some(left) => {
+                let at = self
+                    .addr
+                    .to_socket_addrs()
+                    .map_err(refused)?
+                    .next()
+                    .ok_or_else(|| Stop::Refused(format!("{}: no address", self.addr)))?;
+                TcpStream::connect_timeout(&at, left).map_err(|e| match e.kind() {
+                    std::io::ErrorKind::TimedOut => Stop::PastBudget,
+                    _ => refused(e),
+                })?
             }
+        };
+        if let Some(left) = left {
             path.push_str(&format!(
                 "&max_execution_time={}&timeout_overflow_mode=throw",
                 left.as_secs_f64()
             ));
             stream.set_read_timeout(Some(left)).map_err(refused)?;
+            stream.set_write_timeout(Some(left)).map_err(refused)?;
         }
         let head = format!(
             "POST {path} HTTP/1.0\r\nHost: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -722,16 +829,13 @@ impl Engine for ClickHouse {
     }
 
     /// Its steady state: every MergeTree table's parts merged into one (OPTIMIZE ... FINAL).
-    fn settle(&mut self) -> Result<(), String> {
-        let tables = self
-            .request(
-                "SELECT name FROM system.tables WHERE database = currentDatabase() AND engine LIKE '%MergeTree'",
-                None,
-            )
-            .map_err(|e| format!("{e:?}"))?;
+    fn settle(&mut self, until: Option<Instant>) -> Result<(), Stop> {
+        let tables = self.request(
+            "SELECT name FROM system.tables WHERE database = currentDatabase() AND engine LIKE '%MergeTree'",
+            until,
+        )?;
         for t in tables.lines() {
-            self.request(&format!("OPTIMIZE TABLE `{t}` FINAL"), None)
-                .map_err(|e| format!("{t}: {e:?}"))?;
+            self.request(&format!("OPTIMIZE TABLE `{t}` FINAL"), until)?;
         }
         Ok(())
     }
@@ -743,7 +847,8 @@ impl Drop for ClickHouse {
             let db = std::mem::take(&mut self.db);
             self.db = "default".into();
             self.ended = None;
-            let _ = self.request(&format!("DROP DATABASE {db}"), None);
+            let until = self.until();
+            let _ = self.request(&format!("DROP DATABASE {db}"), until);
         }
     }
 }

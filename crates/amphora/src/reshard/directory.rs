@@ -139,6 +139,13 @@ impl Directory {
         self.groups.iter().map(|(g, n)| (*g, *n))
     }
 
+    /// Whether `group`'s id has been given out (it may since have been retired): ids are never
+    /// given out again.
+    #[must_use]
+    pub fn given_out(&self, group: GroupId) -> bool {
+        group.0 < self.next_group
+    }
+
     /// The operations under way.
     pub fn ops(&self) -> impl Iterator<Item = &Op> + '_ {
         self.ops.values()

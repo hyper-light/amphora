@@ -15,9 +15,11 @@ pub(crate) mod buffer_pool;
 pub(crate) mod changes;
 pub(crate) mod checksum;
 pub mod database;
+pub mod descent_skip;
 pub(crate) mod encryption;
 pub(crate) mod journal_mode;
 pub(crate) mod key_heads;
+pub mod log_index;
 pub(crate) mod packed;
 #[cfg(feature = "aristo-instr")]
 pub mod page_cache;
@@ -26,6 +28,7 @@ pub(crate) mod page_cache;
 pub(crate) mod page_transform;
 #[allow(clippy::arc_with_non_send_sync)]
 pub(crate) mod pager;
+pub mod reach;
 pub mod shared_pages;
 #[cfg(host_shared_wal)]
 #[allow(dead_code)]

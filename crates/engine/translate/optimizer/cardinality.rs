@@ -19,7 +19,7 @@ use super::{
 use crate::schema::{Schema, Table as SchemaTable};
 use crate::translate::{
     expr::{literal_truth, simplified_and_or},
-    plan::{JoinType, JoinedTable, Plan, WhereTerm, WhereTermOrigin},
+    plan::{JoinOrigin, JoinType, JoinedTable, Plan, WhereTerm, WhereTermOrigin},
     planner::TableMask,
 };
 
@@ -155,6 +155,25 @@ struct Table {
     /// restricts to reads it for the same terms (CERT).
     sampled_on: Option<Sampled>,
     sampled_both: Option<Sampled>,
+    /// The ON terms of its own outer join that read none of its columns (`y.c = 3` in `y LEFT JOIN
+    /// x ON y.c = 3`, which `x RIGHT JOIN y ON y.c = 3` becomes, PL.8), found by their origin among
+    /// the WHERE terms and counted by the earlier tables' `on_elsewhere` constraints: they decide
+    /// which left rows match, as its own ON terms do.
+    on_elsewhere: SmallVec<[Elsewhere; 1]>,
+}
+
+/// The ON terms of a later outer join that one earlier table's `on_elsewhere` constraints count.
+struct Elsewhere {
+    table: usize,
+    /// Each constraint's index in the table's `on_elsewhere`, with its pair selectivity as in
+    /// [Counted].
+    counted: SmallVec<[(usize, Option<f64>); 2]>,
+    /// Those terms its sample ran, as a right table's ON terms are (decision 21).
+    sampled: Option<Sampled>,
+    /// One of them is `col IS NULL` of a column never NULL in a row of the table, which no join
+    /// has null-extended where the ON terms run: no left row matches, as with a right table's
+    /// `matches_none`.
+    never: bool,
 }
 
 /// Which of a table's terms its sample runs: its filters, or its own outer join's ON terms.
@@ -184,6 +203,8 @@ pub(super) struct JoinedSetRows<'a> {
     params: &'a CostModelParams,
     initial: f64,
     memo: HashMap<TableMask, f64>,
+    /// Each set's proven upper bound, which its estimate never passes (PL.11).
+    bound: DegreeBound,
 }
 
 impl<'a> JoinedSetRows<'a> {
@@ -294,7 +315,34 @@ impl<'a> JoinedSetRows<'a> {
             class_terms.push(pos);
         }
         let unique_keys = composite_keys(joined_tables, &kinds, &columns, schema);
-        for ((table_idx, joined), keys) in joined_tables.iter().enumerate().zip(keys_by_table) {
+        let bound = DegreeBound::new(
+            joined_tables,
+            &kinds,
+            &columns,
+            &equalities,
+            &table_rows,
+            schema,
+        );
+        let on_elsewhere: Vec<SmallVec<[Elsewhere; 1]>> = joined_tables
+            .iter()
+            .map(|joined| {
+                on_elsewhere(
+                    joined,
+                    joined_tables,
+                    constraints,
+                    where_clause,
+                    &pair_terms,
+                    schema,
+                    params,
+                )
+            })
+            .collect();
+        for (((table_idx, joined), keys), on_elsewhere) in joined_tables
+            .iter()
+            .enumerate()
+            .zip(keys_by_table)
+            .zip(on_elsewhere)
+        {
             let kind = kinds.get(table_idx).copied().unwrap_or(Kind::Inner);
             let rows = table_rows(table_idx);
             // Whether a join has null-extended the table by the time a term evaluated after the
@@ -464,6 +512,7 @@ impl<'a> JoinedSetRows<'a> {
                 sampled,
                 sampled_on,
                 sampled_both,
+                on_elsewhere,
             });
         }
         // A WHERE term no row passes (`WHERE NULL`) leaves no rows in any set, whether or not
@@ -481,6 +530,7 @@ impl<'a> JoinedSetRows<'a> {
             params,
             initial: if none_pass { 0.0 } else { initial },
             memo: HashMap::default(),
+            bound,
         }
     }
 
@@ -489,7 +539,9 @@ impl<'a> JoinedSetRows<'a> {
         if let Some(rows) = self.memo.get(set) {
             return *rows;
         }
-        let rows = self.capped(set);
+        // PL.11: an estimate above the set's proven bound is cut to it; one below is left.
+        // The bound is a join's for one row of its input, as `initial` counts them.
+        let rows = self.bound.cap(set, self.capped(set), self.initial);
         if self.memo.len() < MEMO_SETS {
             if let Ok(key) = crate::alloc::TryClone::try_clone(set) {
                 self.memo.insert(key, rows);
@@ -670,6 +722,58 @@ impl<'a> JoinedSetRows<'a> {
             )
     }
 
+    /// The share of the pairs of an outer join's left rows and `table`'s rows its ON terms keep:
+    /// its own constraints' and those of its ON terms that read only earlier tables, each counted
+    /// once its tables are ready, as a right table's ON terms are ([Self::selectivity_of]).
+    fn on_selectivity(&self, table: usize, ready: &TableMask) -> f64 {
+        let own = self.selectivity(table, Class::On, ready);
+        let Some(t) = self.tables.get(table) else {
+            return own;
+        };
+        let mut selectivity = own;
+        for e in t.on_elsewhere.iter().filter(|e| ready.get(e.table)) {
+            if e.never {
+                return 0.0;
+            }
+            let Some(table_constraints) = self.constraints.get(e.table) else {
+                continue;
+            };
+            let counted = e
+                .counted
+                .iter()
+                .filter_map(|(at, pair)| {
+                    table_constraints.on_elsewhere.get(*at).map(|c| (c, *pair))
+                })
+                .filter(|(c, _)| {
+                    c.lhs_mask
+                        .iter()
+                        .all(|other| other == e.table || ready.get(other))
+                });
+            let reads_a_table = |c: &(&Constraint, Option<f64>)| !c.0.lhs_mask.is_empty();
+            let alone: f64 = counted
+                .clone()
+                .filter(reads_a_table)
+                .map(|(c, pair)| pair.unwrap_or(c.selectivity))
+                .product();
+            let in_sampled = |c: &Constraint| {
+                e.sampled
+                    .as_ref()
+                    .is_some_and(|s| s.terms.contains(&c.where_clause_pos.0))
+            };
+            let shares: SmallVec<[f64; 1]> = e.sampled.iter().map(|s| s.selectivity).collect();
+            selectivity *= alone
+                * constraints_selectivity(
+                    counted
+                        .filter(|c| !reads_a_table(c))
+                        .map(|(c, _)| c)
+                        .filter(|c| !in_sampled(c)),
+                    &shares,
+                    self.params,
+                );
+        }
+        selectivity
+    }
+
     /// The share of an outer join's matches its other filters keep: what they restrict beyond its
     /// ON terms, `sel(ON and filters) / sel(ON)`, so a filter bounding a column its ON terms bound
     /// makes one range with them, and the matches are never more than the inner join's rows.
@@ -703,7 +807,7 @@ impl<'a> JoinedSetRows<'a> {
             Kind::Left => {
                 // Statistics give an average match count, not its distribution: a Poisson model
                 // gives the chance that a left row matches nothing, and that row is kept once.
-                let matches = t.rows * self.selectivity(table, Class::On, ready);
+                let matches = t.rows * self.on_selectivity(table, ready);
                 let unmatched = (-matches).exp();
                 let only_unmatched = t
                     .counted
@@ -747,7 +851,7 @@ impl<'a> JoinedSetRows<'a> {
         let Some(t) = self.tables.get(table) else {
             return left;
         };
-        let pair = self.selectivity(table, Class::On, ready);
+        let pair = self.on_selectivity(table, ready);
         let matched = left * t.rows * pair;
         let unmatched_right = t.rows * (-(left * pair)).exp();
         let unmatched_left = if t.kind == Kind::Full {
@@ -812,6 +916,320 @@ impl<'a> JoinedSetRows<'a> {
             barrier = end;
         }
         rows / self.class_divisor(set)
+    }
+}
+
+/// How a table's rows enter a set's upper bound (PL.11).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Role {
+    /// An inner join's table: the set has at most the rest's rows times what each of them meets.
+    Inner,
+    /// A semi or anti join's table: it keeps or drops rows, never adds one.
+    Filter,
+    /// An outer join's table: it keeps rows that match nothing, which this bound doesn't count,
+    /// so a set holding one has none.
+    Unbounded,
+}
+
+/// A prefix of an index's columns, each one of the bound's columns, and its degree norms: the
+/// most rows of the table one binding of them meets, and the ℓ2 norm of its degree sequence.
+#[derive(Clone, Debug)]
+struct BoundKey {
+    columns: SmallVec<[usize; 4]>,
+    max: f64,
+    l2: f64,
+}
+
+#[derive(Clone, Debug)]
+struct BoundTable {
+    role: Role,
+    /// The table's rows as ANALYZE counted them, raised by the rows added since; `None` where no
+    /// count exists, and no bound counts the table's rows whole.
+    rows: Option<f64>,
+    /// Its index prefixes with degree norms (each raised by the rows added since, which may all
+    /// hold one value), and the rowid's: one row a value.
+    keys: SmallVec<[BoundKey; 4]>,
+}
+
+/// Each joined set's proven upper bound from its tables' degree sequences (docs/design/planner.md,
+/// decision (lane pl11); PL.11; LpBound, Zhang et al., SIGMOD 2025; the degree-sequence bound of
+/// Deeds, Suciu and Balazinska, SafeBound, SIGMOD 2023). One table's rows, then each other table
+/// attached along the `=` terms by the most rows one binding of its joined columns holds (the ℓ∞
+/// norm of that prefix's degree sequence), or by its rows where no term attaches it; or, for two
+/// tables joined on one column, the product of their columns' ℓ2 norms (Cauchy-Schwarz, the
+/// (2, 2) Hölder pair) as the start. Every such order gives a bound; the least of the orders this
+/// greedy search tries is kept. An estimate above it is cut to it and one below left as it is.
+#[derive(Clone, Debug, Default)]
+pub(super) struct DegreeBound {
+    tables: Vec<BoundTable>,
+    /// The table of each of [JoinedSetRows::columns].
+    column_tables: Vec<usize>,
+    /// The `=` terms the bound may follow, by their columns' places: those that compare as the
+    /// index orders them, both columns of one affinity (no conversion) and BINARY collation.
+    equalities: Vec<(usize, usize)>,
+}
+
+impl DegreeBound {
+    fn new(
+        joined_tables: &[JoinedTable],
+        kinds: &[Kind],
+        columns: &[Domain],
+        equalities: &[(usize, usize)],
+        table_rows: &impl Fn(usize) -> f64,
+        schema: &Schema,
+    ) -> Self {
+        let binary = |c: crate::translate::collate::CollationSeq| {
+            matches!(
+                c,
+                crate::translate::collate::CollationSeq::Binary
+                    | crate::translate::collate::CollationSeq::Unset
+            )
+        };
+        // A column's affinity, `None` where it doesn't compare as BINARY.
+        let comparison = |d: &Domain| {
+            let joined = joined_tables.get(d.table)?;
+            match d.column {
+                None => Some(crate::vdbe::affinity::Affinity::Integer),
+                Some(pos) => {
+                    let column = joined.table.get_column_at(pos)?;
+                    binary(column.collation()).then(|| column.affinity())
+                }
+            }
+        };
+        let equalities = equalities
+            .iter()
+            .copied()
+            .filter(|(a, b)| {
+                let (Some(a), Some(b)) = (columns.get(*a), columns.get(*b)) else {
+                    return false;
+                };
+                matches!((comparison(a), comparison(b)), (Some(x), Some(y)) if x == y)
+            })
+            .collect();
+        let tables = joined_tables
+            .iter()
+            .enumerate()
+            .map(|(table, joined)| {
+                let role = match kinds.get(table) {
+                    Some(Kind::Inner) => Role::Inner,
+                    Some(Kind::SemiOrAnti) => Role::Filter,
+                    _ => Role::Unbounded,
+                };
+                let mut bound = BoundTable {
+                    role,
+                    rows: None,
+                    keys: SmallVec::new(),
+                };
+                let Some(btree) = joined.table.btree() else {
+                    return bound;
+                };
+                let Some(stats) = schema.analyze_stats.table_stats(&btree.name) else {
+                    return bound;
+                };
+                let Some(analyzed) = stats
+                    .row_count
+                    .or_else(|| stats.index_stats.values().find_map(|stat| stat.total_rows))
+                else {
+                    return bound;
+                };
+                let analyzed = analyzed as f64;
+                // PL.9's live count: rows added since ANALYZE raise every count and norm by at
+                // most their number (‖d + e‖p ≤ ‖d‖p + ‖e‖1).
+                let growth = (table_rows(table) - analyzed).max(0.0);
+                let rows = analyzed + growth;
+                bound.rows = Some(rows);
+                let place = |column: Option<usize>| {
+                    columns
+                        .iter()
+                        .position(|d| d.table == table && d.column == column)
+                };
+                if let Some(rowid) = place(None) {
+                    bound.keys.push(BoundKey {
+                        columns: smallvec::smallvec![rowid],
+                        max: 1.0,
+                        l2: rows.sqrt(),
+                    });
+                }
+                for index in schema
+                    .get_indices(&btree.name)
+                    .filter(|index| index.is_public() && index.where_clause.is_none())
+                {
+                    let Some(stat) = stats.index_stats.get(&index.name) else {
+                        continue;
+                    };
+                    if stat.degrees.len() != index.columns.len() {
+                        continue;
+                    }
+                    let mut prefix: SmallVec<[usize; 4]> = SmallVec::new();
+                    for (column, degrees) in index.columns.iter().zip(&stat.degrees) {
+                        let orders_as_compared = column.expr.is_none()
+                            && column.collation.is_none_or(binary)
+                            && btree
+                                .columns()
+                                .get(column.pos_in_table)
+                                .is_some_and(|c| !c.is_rowid_alias() && binary(c.collation()));
+                        let Some(at) =
+                            place(Some(column.pos_in_table)).filter(|_| orders_as_compared)
+                        else {
+                            break;
+                        };
+                        prefix.push(at);
+                        bound.keys.push(BoundKey {
+                            columns: prefix.clone(),
+                            max: degrees.max as f64 + growth,
+                            l2: degrees.l2() + growth,
+                        });
+                    }
+                }
+                bound
+            })
+            .collect();
+        Self {
+            tables,
+            column_tables: columns.iter().map(|d| d.table).collect(),
+            equalities,
+        }
+    }
+
+    /// `estimate`, for `scale` rows of input, cut to the set's bound for that many.
+    fn cap(&self, set: &TableMask, estimate: f64, scale: f64) -> f64 {
+        let bound = self.upper_bound(set);
+        if bound.is_finite() {
+            estimate.min(bound * scale)
+        } else {
+            estimate
+        }
+    }
+
+    /// The most rows the join of `set` can return for one row of input, infinite where its
+    /// statistics prove none. Each start (a table, or two tables joined on one column) extends
+    /// greedily over the set's other inner tables: at most (tables + terms) starts, each at most
+    /// tables² steps over their keys, all bounded by the join's size.
+    fn upper_bound(&self, set: &TableMask) -> f64 {
+        let in_set: SmallVec<[usize; 16]> = set.iter().collect();
+        if in_set.iter().any(|t| {
+            self.tables
+                .get(*t)
+                .is_none_or(|t| t.role == Role::Unbounded)
+        }) {
+            return f64::INFINITY;
+        }
+        let inner: SmallVec<[usize; 16]> = in_set
+            .iter()
+            .copied()
+            .filter(|t| self.tables.get(*t).is_some_and(|t| t.role == Role::Inner))
+            .collect();
+        if inner.is_empty() {
+            return f64::INFINITY;
+        }
+        // The set's classes, over the terms the bound may follow: a union-find whose every find
+        // is a loop of at most as many steps as there are columns.
+        let mut parent: SmallVec<[usize; 16]> = (0..self.column_tables.len()).collect();
+        let find = |parent: &[usize], mut at: usize| {
+            for _ in 0..parent.len() {
+                match parent.get(at) {
+                    Some(&up) if up != at => at = up,
+                    _ => break,
+                }
+            }
+            at
+        };
+        let follows = |&(a, b): &(usize, usize)| {
+            let in_set = |c: usize| self.column_tables.get(c).is_some_and(|t| set.get(*t));
+            in_set(a) && in_set(b)
+        };
+        for &(a, b) in self.equalities.iter().filter(|e| follows(e)) {
+            let (root_a, root_b) = (find(&parent, a), find(&parent, b));
+            if let Some(up) = parent.get_mut(root_a) {
+                *up = root_b;
+            }
+        }
+        let roots: SmallVec<[usize; 16]> = (0..parent.len()).map(|c| find(&parent, c)).collect();
+        let mut best = f64::INFINITY;
+        for &start in &inner {
+            if let Some(rows) = self.tables.get(start).and_then(|t| t.rows) {
+                best = best.min(self.extend(&inner, &roots, &[start], rows));
+            }
+        }
+        for &(a, b) in self.equalities.iter().filter(|e| follows(e)) {
+            let (Some(&ta), Some(&tb)) = (self.column_tables.get(a), self.column_tables.get(b))
+            else {
+                continue;
+            };
+            if ta == tb || !inner.contains(&ta) || !inner.contains(&tb) {
+                continue;
+            }
+            let l2 = |table: usize, column: usize| {
+                self.tables
+                    .get(table)
+                    .into_iter()
+                    .flat_map(|t| &t.keys)
+                    .filter(|k| k.columns.as_slice() == [column])
+                    .map(|k| k.l2)
+                    .fold(f64::INFINITY, f64::min)
+            };
+            let pair = l2(ta, a) * l2(tb, b);
+            if pair.is_finite() {
+                best = best.min(self.extend(&inner, &roots, &[ta, tb], pair));
+            }
+        }
+        best
+    }
+
+    /// `start`'s tables, holding at most `rows` rows, joined with the rest of `inner` one table at
+    /// a time: each the one meeting the fewest rows of it, by the key whose every column's class
+    /// holds a table already joined, else by its rows. Infinite where a table has neither.
+    fn extend(&self, inner: &[usize], roots: &[usize], start: &[usize], rows: f64) -> f64 {
+        let mut joined: SmallVec<[usize; 16]> = start.iter().copied().collect();
+        let mut bound = rows;
+        // Whether each class root holds a column of a joined table.
+        let mut reached: SmallVec<[bool; 16]> = roots.iter().map(|_| false).collect();
+        let reach = |reached: &mut SmallVec<[bool; 16]>, table: usize| {
+            for (column, root) in roots.iter().enumerate() {
+                if self.column_tables.get(column) == Some(&table) {
+                    if let Some(r) = reached.get_mut(*root) {
+                        *r = true;
+                    }
+                }
+            }
+        };
+        for table in start {
+            reach(&mut reached, *table);
+        }
+        for _ in 0..inner.len() {
+            let next = inner
+                .iter()
+                .filter(|t| !joined.contains(t))
+                .filter_map(|&t| {
+                    let table = self.tables.get(t)?;
+                    let by_key = table
+                        .keys
+                        .iter()
+                        .filter(|k| {
+                            k.columns.iter().all(|c| {
+                                roots
+                                    .get(*c)
+                                    .and_then(|root| reached.get(*root))
+                                    .copied()
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .map(|k| k.max)
+                        .fold(f64::INFINITY, f64::min);
+                    Some((t, by_key.min(table.rows.unwrap_or(f64::INFINITY))))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            let Some((table, factor)) = next else {
+                break;
+            };
+            if !factor.is_finite() {
+                return f64::INFINITY;
+            }
+            bound *= factor;
+            joined.push(table);
+            reach(&mut reached, table);
+        }
+        bound
     }
 }
 
@@ -971,6 +1389,131 @@ fn sampled_filters(
         share.min(super::sample_filter::backoff(&mut own))
     };
     Some(Sampled { terms, selectivity })
+}
+
+/// The ON terms of `joined`'s own outer join that read none of its columns, found by their origin
+/// among the WHERE terms, grouped by the earlier table whose `on_elsewhere` constraint counts each:
+/// a term reading several earlier tables counts once, by its most selective constraint, as a term
+/// with a table on both sides does ([JoinedSetRows::new]). Empty for a table no outer join reaches.
+fn on_elsewhere(
+    joined: &JoinedTable,
+    joined_tables: &[JoinedTable],
+    constraints: &[TableConstraints],
+    where_clause: &[WhereTerm],
+    pair_terms: &[(usize, f64)],
+    schema: &Schema,
+    params: &CostModelParams,
+) -> SmallVec<[Elsewhere; 1]> {
+    let mut found: SmallVec<[Elsewhere; 1]> = SmallVec::new();
+    // The terms no table holds a constraint of (`y.b ISNULL`): only a sample counts them, that of
+    // the one table whose columns they read, as a right table's sample counts its own.
+    let mut loose: SmallVec<[usize; 2]> = SmallVec::new();
+    let own = constraints
+        .iter()
+        .find(|c| c.table_id == joined.internal_id)
+        .map_or(&[][..], |c| &c.constraints[..]);
+    for (pos, term) in where_clause.iter().enumerate() {
+        let of_this_join = term
+            .origin
+            .join_origin()
+            .and_then(JoinOrigin::outer_table)
+            .is_some_and(|outer| outer == joined.internal_id);
+        if !of_this_join || term.consumed || own.iter().any(|c| c.where_clause_pos.0 == pos) {
+            continue;
+        }
+        // The earlier table and constraint that count the term: its most selective.
+        let mut best: Option<(usize, usize, f64)> = None;
+        for (table, table_constraints) in constraints.iter().enumerate() {
+            for (at, c) in table_constraints.on_elsewhere.iter().enumerate() {
+                if c.where_clause_pos.0 == pos
+                    && !c.implied
+                    && best.is_none_or(|(_, _, s)| c.selectivity < s)
+                {
+                    best = Some((table, at, c.selectivity));
+                }
+            }
+        }
+        let Some((table, at, _)) = best else {
+            loose.push(pos);
+            continue;
+        };
+        let pair = pair_terms
+            .iter()
+            .find(|(p, _)| *p == pos)
+            .map(|(_, selectivity)| *selectivity);
+        match found.iter_mut().find(|e| e.table == table) {
+            Some(e) => e.counted.push((at, pair)),
+            None => {
+                let mut counted = SmallVec::new();
+                counted.push((at, pair));
+                found.push(Elsewhere {
+                    table,
+                    counted,
+                    sampled: None,
+                    never: false,
+                });
+            }
+        }
+    }
+    let at = joined_tables
+        .iter()
+        .position(|t| t.internal_id == joined.internal_id)
+        .unwrap_or(joined_tables.len());
+    if !loose.is_empty() {
+        for table in 0..at {
+            if !found.iter().any(|e| e.table == table) {
+                found.push(Elsewhere {
+                    table,
+                    counted: SmallVec::new(),
+                    sampled: None,
+                    never: false,
+                });
+            }
+        }
+    }
+    for e in found.iter_mut() {
+        let (Some(earlier), Some(table_constraints)) =
+            (joined_tables.get(e.table), constraints.get(e.table))
+        else {
+            continue;
+        };
+        let terms: SmallVec<[usize; 4]> = e
+            .counted
+            .iter()
+            .filter_map(|(at, _)| table_constraints.on_elsewhere.get(*at))
+            .map(|c| c.where_clause_pos.0)
+            .chain(loose.iter().copied())
+            .collect();
+        // Whether a join null-extends the earlier table before this join's ON terms run: its own
+        // LEFT or FULL JOIN, or a RIGHT or FULL JOIN after it and before this one.
+        let join_type = |t: &JoinedTable| t.join_info.as_ref().map(|info| info.join_type);
+        let null_extended = matches!(
+            join_type(earlier),
+            Some(JoinType::LeftOuter | JoinType::FullOuter)
+        ) || joined_tables.iter().take(at).skip(e.table + 1).any(|t| {
+            matches!(
+                join_type(t),
+                Some(JoinType::RightOuter | JoinType::FullOuter)
+            )
+        });
+        e.never = !null_extended
+            && e.counted.iter().any(|(at, _)| {
+                table_constraints
+                    .on_elsewhere
+                    .get(*at)
+                    .is_some_and(|c| null_test_of_never_null(c, where_clause, earlier))
+            });
+        e.sampled = sampled_filters(
+            earlier,
+            &table_constraints.on_elsewhere,
+            where_clause,
+            &|pos| terms.contains(&pos).then_some(false),
+            schema,
+            params,
+        );
+    }
+    found.retain(|e| !e.counted.is_empty() || e.sampled.is_some());
+    found
 }
 
 /// A column's domain, at least one and at most its table's `rows`, and whether it is a count: a
@@ -1227,4 +1770,274 @@ fn grouped_by_keys(
         }
     }
     keys
+}
+
+#[cfg(test)]
+mod degree_bound_tests {
+    //! PL.11's bound against counted joins of random tables (falsified by a prefix counted above
+    //! its bound, docs/research/planner.md section 9 rank 11), and its cap (AC-PL.11.1).
+    use super::*;
+    use crate::stats::StatAccum;
+
+    /// splitmix64 (Steele, Lea and Flood, OOPSLA 2014): the same tables for the same seed.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+    }
+
+    type Row = [Option<i64>; 2];
+    /// An `=` term: `(table, column) = (table, column)`.
+    type Term = ((usize, usize), (usize, usize));
+
+    /// A table of two columns, its values skewed by squaring a draw over a small domain, some
+    /// NULL, so degrees range from one to most of the table.
+    fn table(rng: &mut Rng) -> Vec<Row> {
+        let rows = rng.below(24);
+        let domain = 1 + rng.below(8);
+        (0..rows)
+            .map(|_| {
+                let mut value = || {
+                    if rng.below(10) == 0 {
+                        None
+                    } else {
+                        let d = rng.below(domain);
+                        Some(((d * d) % domain) as i64)
+                    }
+                };
+                [value(), value()]
+            })
+            .collect()
+    }
+
+    /// ANALYZE's ordered scan of an index on `columns`, pushed into its accumulator as
+    /// `emit_index_stats` pushes it (NULLs compared equal, as its `Ne` with `null_eq` does).
+    fn degrees_of(rows: &[Row], columns: &[usize]) -> Vec<crate::stats::Degrees> {
+        let mut keys: Vec<Vec<Option<i64>>> = rows
+            .iter()
+            .map(|r| columns.iter().map(|c| r[*c]).collect())
+            .collect();
+        keys.sort();
+        let mut accum = StatAccum::new(columns.len());
+        let mut prev: Option<&Vec<Option<i64>>> = None;
+        for key in &keys {
+            let chng = match prev {
+                None => 0,
+                Some(p) => p
+                    .iter()
+                    .zip(key)
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(columns.len()),
+            };
+            accum.push(chng);
+            prev = Some(key);
+        }
+        let back = StatAccum::from_bytes(&accum.to_bytes()).unwrap();
+        assert_eq!(back.get_degrees(), accum.get_degrees());
+        accum.get_degrees()
+    }
+
+    /// The bound of `tables`, its terms `(table, column) = (table, column)`, each table with an
+    /// index on each column and one on both, its count exact.
+    fn bound_of(tables: &[Vec<Row>], terms: &[Term]) -> DegreeBound {
+        let mut column_tables = Vec::new();
+        let mut places: Vec<(usize, usize)> = Vec::new();
+        let mut place = |c: (usize, usize)| {
+            places.iter().position(|p| *p == c).unwrap_or_else(|| {
+                places.push(c);
+                column_tables.push(c.0);
+                places.len() - 1
+            })
+        };
+        let equalities: Vec<(usize, usize)> =
+            terms.iter().map(|(a, b)| (place(*a), place(*b))).collect();
+        let bound_tables = tables
+            .iter()
+            .enumerate()
+            .map(|(t, rows)| {
+                let mut keys = SmallVec::new();
+                for index in [vec![0], vec![1], vec![0, 1]] {
+                    let degrees = degrees_of(rows, &index);
+                    let mut prefix: SmallVec<[usize; 4]> = SmallVec::new();
+                    for (column, d) in index.iter().zip(&degrees) {
+                        let Some(at) = places.iter().position(|p| *p == (t, *column)) else {
+                            break;
+                        };
+                        prefix.push(at);
+                        keys.push(BoundKey {
+                            columns: prefix.clone(),
+                            max: d.max as f64,
+                            l2: d.l2(),
+                        });
+                    }
+                }
+                BoundTable {
+                    role: Role::Inner,
+                    rows: Some(rows.len() as f64),
+                    keys,
+                }
+            })
+            .collect();
+        DegreeBound {
+            tables: bound_tables,
+            column_tables,
+            equalities,
+        }
+    }
+
+    /// The rows the join of the tables of `set` returns under the terms both of whose tables it
+    /// holds, counted by enumerating every combination (at most 23^4).
+    fn count(tables: &[Vec<Row>], terms: &[Term], set: &[usize]) -> u64 {
+        let mut at = vec![0usize; set.len()];
+        if set.iter().any(|t| tables[*t].is_empty()) {
+            return 0;
+        }
+        let mut n = 0;
+        loop {
+            let row = |t: usize| {
+                let i = set.iter().position(|s| *s == t).unwrap();
+                tables[t][at[i]]
+            };
+            let holds = terms.iter().all(|((ta, ca), (tb, cb))| {
+                if !set.contains(ta) || !set.contains(tb) {
+                    return true;
+                }
+                matches!((row(*ta)[*ca], row(*tb)[*cb]), (Some(x), Some(y)) if x == y)
+            });
+            n += u64::from(holds);
+            let mut i = 0;
+            loop {
+                if i == set.len() {
+                    return n;
+                }
+                at[i] += 1;
+                if at[i] < tables[set[i]].len() {
+                    break;
+                }
+                at[i] = 0;
+                i += 1;
+            }
+        }
+    }
+
+    fn mask(set: &[usize]) -> TableMask {
+        let mut m = TableMask::default();
+        for t in set {
+            m.set(*t).unwrap();
+        }
+        m
+    }
+
+    /// Do: 400 seeds of two to four random tables, joined by random `=` terms (chains, stars,
+    /// cycles, two terms between one pair), and count every subset's join. Expect: no count above
+    /// its bound, and the bound finite for every connected set (T-PL.11.1).
+    #[test]
+    fn pl11_no_counted_join_exceeds_its_bound() {
+        let mut checked = 0u64;
+        let mut tight = 0u64;
+        for seed in 0..400u64 {
+            let mut rng = Rng(seed);
+            let n = 2 + rng.below(3) as usize;
+            let tables: Vec<Vec<Row>> = (0..n).map(|_| table(&mut rng)).collect();
+            let mut terms = Vec::new();
+            for t in 1..n {
+                let other = rng.below(t as u64) as usize;
+                terms.push(((other, rng.below(2) as usize), (t, rng.below(2) as usize)));
+            }
+            for _ in 0..rng.below(3) {
+                let (a, b) = (rng.below(n as u64) as usize, rng.below(n as u64) as usize);
+                if a != b {
+                    terms.push(((a, rng.below(2) as usize), (b, rng.below(2) as usize)));
+                }
+            }
+            let bound = bound_of(&tables, &terms);
+            for subset in 1u32..(1 << n) {
+                let set: Vec<usize> = (0..n).filter(|t| subset & (1 << t) != 0).collect();
+                let b = bound.upper_bound(&mask(&set));
+                let counted = count(&tables, &terms, &set) as f64;
+                assert!(
+                    counted <= b * (1.0 + 1e-12),
+                    "seed {seed}: set {set:?} counted {counted} above its bound {b}; terms {terms:?}"
+                );
+                assert!(b.is_finite(), "seed {seed}: set {set:?} has no bound");
+                checked += 1;
+                tight += u64::from(counted == b);
+            }
+        }
+        // Non-vacuity: the sets checked, and some bound met exactly (single tables at least).
+        assert!(checked > 2_000, "{checked}");
+        assert!(tight > 0);
+    }
+
+    /// Do: two tables of 100 and 50 rows joined on a column whose most common value holds 2 of
+    /// the second's rows and 4 of the first's: the bound is min(100 * 2, 50 * 4, ℓ2 * ℓ2) = 200.
+    /// Expect: an estimate of 2,000 cut to 200, one of 20 left at 20, and a set holding an outer
+    /// join's table left as estimated (AC-PL.11.1).
+    #[test]
+    fn pl11_an_estimate_above_its_bound_is_capped_and_one_below_is_unchanged() {
+        let key = |column: usize, max: f64, l2: f64| BoundKey {
+            columns: smallvec::smallvec![column],
+            max,
+            l2,
+        };
+        let table = |role, rows: f64, keys| BoundTable {
+            role,
+            rows: Some(rows),
+            keys,
+        };
+        let mut bound = DegreeBound {
+            tables: vec![
+                table(Role::Inner, 100.0, smallvec::smallvec![key(0, 4.0, 1e6)]),
+                table(Role::Inner, 50.0, smallvec::smallvec![key(1, 2.0, 1e6)]),
+            ],
+            column_tables: vec![0, 1],
+            equalities: vec![(0, 1)],
+        };
+        let both = mask(&[0, 1]);
+        assert_eq!(bound.upper_bound(&both), 200.0);
+        assert_eq!(bound.cap(&both, 2_000.0, 1.0), 200.0);
+        assert_eq!(bound.cap(&both, 20.0, 1.0), 20.0);
+        // For three rows of input, three times the bound.
+        assert_eq!(bound.cap(&both, 2_000.0, 3.0), 600.0);
+        // ℓ2 norms of 10 and 5 give Cauchy-Schwarz's 50, below either key's order.
+        bound.tables[0].keys[0].l2 = 10.0;
+        bound.tables[1].keys[0].l2 = 5.0;
+        assert_eq!(bound.cap(&both, 2_000.0, 1.0), 50.0);
+        // A term the bound may not follow (another collation or affinity): the cross product.
+        bound.equalities.clear();
+        assert_eq!(bound.upper_bound(&both), 5_000.0);
+        bound.tables[1].role = Role::Unbounded;
+        assert_eq!(bound.cap(&both, 1e9, 1.0), 1e9);
+    }
+
+    /// Do: push an index's sorted values (a: 1 1 1 2 3 3; b distinct under each a) through
+    /// ANALYZE's accumulator. Expect: prefix (a) holds max 3 and squares 9 + 1 + 4 = 14, prefix
+    /// (a, b) max 1 and 6, and the encoding reads back (T-PL.11.1).
+    #[test]
+    fn pl11_the_accumulator_keeps_each_prefixs_degree_norms() {
+        let mut accum = StatAccum::new(2);
+        for chng in [0, 1, 1, 0, 0, 1] {
+            accum.push(chng);
+        }
+        let degrees = accum.get_degrees();
+        assert_eq!(degrees[0].max, 3);
+        assert_eq!(degrees[0].sum_sq, 14);
+        assert_eq!(degrees[1].max, 1);
+        assert_eq!(degrees[1].sum_sq, 6);
+        let encoded = crate::stats::Degrees::encode_all(&degrees);
+        assert_eq!(
+            crate::stats::Degrees::decode_all(&encoded).unwrap(),
+            degrees
+        );
+        assert!(crate::stats::Degrees::decode_all(&encoded[1..]).is_none());
+        assert_eq!(accum.get_stat1(), "6 2 1");
+    }
 }

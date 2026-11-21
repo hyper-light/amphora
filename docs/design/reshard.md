@@ -184,9 +184,35 @@ deterministic simulator:
    catch-up (T-T1.9.R2). Amphora's own engine (`database::Local`) doesn't keep a holding yet: it
    becomes a group's with the shell below.
 
-   Still left of this item: rows by position; the change feed; the old group's log held from
-   `P_1`; a split that copies the moving range's rows; and the shell that carries the driver's
-   actions to the groups.
+   Built (lane split-merge-6): the copy path. An engine that can be a group's keeps a log of its
+   commits: each commit of rows, and each kept holding (a fence's entry), is one entry numbered in
+   order (`Engine::head`). It reads a span's keys in position order (`Engine::export`, rows indexed
+   by position), and the keys a run of its entries changed, as they stand now, stamped with its head
+   (`Engine::changed`, the change feed by log position, or none once the log no longer reaches back);
+   the new group writes a key only over an older stamp (`Engine::import`, `holding::replays`). The old
+   group's log is held from the first copy's read (`Engine::keep_log`), on the same turn of its
+   writer as that read, and let go when it releases or unfences. A key read as it stands at head `H`
+   is the key as of every entry up to `H`, so the feed needs only the keys, not their values.
+   `Groups::carry` is the shell: it carries each of the driver's actions to this node's groups
+   (create, copy, catch-up, fence, activate, release with its sweep, unfence, discard, retire) and
+   answers it. A fence's entry is numbered on the group's writer, after every batch let in before
+   it. A batch is as many positions or entries as hold each writer it runs on
+   about as long as a commit there does, learned from the batches run before (decision "Batches
+   learned where they run", below). A split or merge carried
+   through it moves the range's rows while writes go on (T-T1.9.R4), and the harnesses for the
+   cutover pause (T-T1.9.P1, AC-T1.9.2) and the operations' lab (T-T1.9.L1, AC-T1.9.3) run on it.
+
+   Built (lane split-merge-7): batches learned where they run, and the groups retired on a node
+   kept durable (the two decisions below, T-T1.9.R6). Amphora's own engine (`database::Local`)
+   keeps a group's holding through a command of its own, `Mutation::Holding`, appended to the
+   wire, applied by the same `apply` a local writer and a replicated owner's log entry run
+   (decision "A local database keeps its holding through its command", below; T-T1.9.R7).
+
+   Still left of this item: the rest of `database::Local` as a group's engine: its log of commits
+   and copy path (`head`, `export`, `changed`, `import`, `keep_log`, `sweep`), which needs its rows
+   indexed by position (today every command of a database is one key), and a `Database` over
+   `Groups<Local>`; moves to another node (the copy and catch-up over the network); a retired
+   group's files, which the shell's caller deletes.
 2. **Load measured from the store's meter.** The writer's busy time per window, a bounded sample
    of written positions for the load cut, and the size cut from the B-tree's middle key. The
    window is the time between planner runs, and shares don't depend on its length.
@@ -194,3 +220,48 @@ deterministic simulator:
    three-machine lab's 1,000 operations (AC-T1.9.3).
 4. **Metrics.** Operations by kind and outcome, and the fence lag. Their names still need
    agreement with kiln's Observe owner (CLAUDE.md §10).
+
+## Decision (lane split-merge-7): batches learned where they run
+
+A copy, catch-up or sweep batch runs on a group's writer, and every write to that group waits
+behind it. So a batch should hold the writer about as long as one of the writer's own commits
+does: then a write waits for a batch no longer than it already waits for a commit. Both sides of
+that are measured where they run, never picked:
+- the target is the writer's mean commit time (its meter's commit time over its commits); a group
+  that hasn't committed yet uses the mean over this node's groups (one machine, one disk);
+- the cost of a unit (a position read or swept, a log entry replayed, a moved key written) is the
+  time every batch of that kind held that writer, over its units, so it moves as the load and the
+  rows move.
+
+A batch is the target over a unit's cost, at least one unit. A copy or catch-up runs on two
+writers (the read on the old group's, the write on the new one's), so it takes the smaller of the
+two. The first batch of a kind, before any cost is measured, is one unit. On a node where nothing
+has committed, no write is waiting, and a batch doubles from the last, as TCP's slow start probes
+for room (RFC 5681, section 3.1). This replaces the store's `commit_rows` as the batch size: that
+counted rows, not time, and a copied position costs nothing like a committed row.
+
+## Decision (lane split-merge-7): retired groups kept
+
+A merge or a move retires a group. A stale driver can ask again for the Create that made it.
+Before this, a node kept the groups it retired only in memory, so after a restart such a Create
+made an empty group with the retired id. Now each node keeps the groups it retired in one file of
+its own (`Groups::on`'s `retired`), replaced whole and flushed before the retire is answered. A
+restart reads it back: a retired group is neither started nor made again, and a Create of it is
+refused as of an ended operation (T-T1.9.R6). The file keeps the directory the node routed by when
+it was written, with the retired groups that directory doesn't show retired (its id given out, the
+group placed nowhere). A restart routes by the newer of that directory and the one it is started
+by, so a router never goes back past what it routed by, and every group retired here shows retired
+by the one or the other. The file stays bounded: an id leaves it once a directory kept with it
+shows the group retired. So it holds one directory and no more ids than this node's directory lags
+behind its own retires.
+
+## Decision (lane split-merge-7): a local database keeps its holding through its command
+
+A group's holding must be kept with its rows, in its log, never written beside it. Amphora's own
+engine keeps it as one more command of its database, `Mutation::Holding`, appended after every
+other variant of the wire (postcard by variant index, so the wire only grows). It is applied by
+the same `apply` that a local writer's commit and a replicated owner's log entry run: one row of a
+table of its own, replaced whole. So a replicated database keeps a holding through its log like
+any write, and a local one as one commit of its writer, flushed with every commit before it
+before the shell acts on it (`Engine::keep_holding`). A remote client can't send it: a holding is
+the group's own engine's.

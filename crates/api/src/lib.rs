@@ -82,6 +82,11 @@ pub enum Mutation {
     Records { namespace: String, tx: Tx },
     Compact { namespace: String, before: Rev },
     CompactStep { namespace: String, before: Rev },
+    // A group's holding (CP-T1.9, docs/design/reshard.md, "A group's holding"), encoded by the
+    // group's shell, kept with its rows in place of the one before: one entry of its log, so a
+    // replicated group keeps it through its log like any write. Appended after every other
+    // variant (postcard by variant index): the wire only grows.
+    Holding(Vec<u8>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

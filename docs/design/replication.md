@@ -2355,6 +2355,106 @@ the owner's `the_first_restart_is_free_and_the_next_waits_on_its_share`.
 **Falsified by:** the restarts bench (AC-T1.4.3, restarts on against off) with p99.9 moved more than with the fixed
 window; a restart's hold larger than every one of the last thousand pushing the share past the tail in a run.
 
+## Decision (lane constants): the owner's tick pace (2026-11-21)
+
+Ada's rule: no picked numbers. `TICK` (10 ms) was the replicated owner's period between ticks, so its core's twenty
+ticks made a 200 ms election timeout and its two a 20 ms heartbeat on every host and every network, whatever its
+paths measured. No measurement made 10 ms.
+
+**The decision (TP.1).** The owner learns its period where it runs (`database/pace.rs`) and derives it by the
+vendored hyper-raft's own law (`docs/timing.md` §2.1–§2.3 there):
+- each voter's round trips, from the replication messages' own sends and answers: heartbeats, pre-votes and votes,
+  none of which touches the voter's disk; a request is timed only once every earlier one to that peer is answered
+  (Karn and Partridge 1987), and the smoothed estimator is RFC 9002 §5.3's (`hyper_timing::ExchangeRtt`);
+- the flush a vote waits for: the mean of the replica's vote writes (hyper-durable's `Replica::flushes`), or before
+  one the mean of its log writes (`Output::flushed`), as hyper-durable's own `Replica::measure` takes them;
+- the leader's link: the lateness of each heartbeat at a follower, or each answer to one at the leader, past the
+  interval its heartbeats leave at, folded for the term (a new term is a new link);
+- the timer's granularity: the lateness of the owner's own timed waits (`hyper_timing::Lateness`).
+From them hyper-timing's ballot and split-vote span (`Ballot::measure`, `Ballot::span`), the margin that minimizes
+the group's unavailability on the link's arrivals at the heartbeat interval (`arrival_detector_at`, the MTBF the
+Jeffreys one of the owner's own exposure, `Exposure`), the election timing (`ElectionTiming::derive`) and the period
+at which the core's fixed tick counts cover it (`TickPace::derive`), no finer than the timer's granularity and with no
+ceiling picked. It is derived once an election timeout, the ticks the core draws each timeout over. The write slot's
+bounds, the owner's session lease, the quorum patience's gauge and the bootstrap hand-off's retry read the pace in
+force.
+
+**The start state.** Before a quorum's paths, the timer and the link are measured, the pace is hyper-timing's
+`TickPace::floor`, "the pace with nothing measured: the configured period" (hyper-timing's lib.rs): the 10 ms the
+owner opens with, so a group can elect its first leader, whose votes are the first round trips measured. Once
+measured, it bounds nothing: the period goes below it on a near network and above it on a far one.
+
+**What is left.** The core's tick counts (twenty for an election, two for a heartbeat) are hyper-raft's `Config::new`,
+raft-rs 0.7's defaults: a core in tick mode fixes them when it opens (`TickPace`'s premise), so the measured period
+carries the time. Deriving the counts themselves means moving the owner to the core's elections by suspicion
+(`Elections::Suspicion`), which take no ticks. The owner's exposure counts only since it opened: its restarts and the
+group's failures are not stored.
+
+**Tests.** `election_tick_an_answer_times_its_own_request`,
+`election_tick_a_request_sent_behind_unanswered_ones_waits_for_their_answers`,
+`election_tick_a_peer_the_core_takes_for_lost_starts_its_count_again` (T-TP.1.1);
+`tick_the_pace_is_the_start_until_a_quorum_the_timer_and_the_link_are_measured`,
+`tick_the_pace_follows_the_measured_election`,
+`tick_a_new_term_measures_its_link_afresh_and_a_member_that_left_is_forgotten` (T-TP.1.2); the driven election,
+patience and lease tests, which read each owner's pace instead of assuming 10 ms (T-TP.1.3).
+
+**Falsified by:** a multi-node group on real clocks whose leader steps down or whose followers campaign more often
+with the learned pace than with 10 ms; a failover p99 past the requirement's 1000 ms where 10 ms met it.
+
+## Decision (lane constants): the compaction's expansion learned where it runs (2026-11-21)
+
+Ada's rule: no picked numbers. The replicated owner compacted its raft log once it held 128 MiB of applied entries,
+on every host and for every database, whatever an image or a replay cost there. No measurement made 128 MiB, and the
+machine reported no image size (`image_bytes` was none), so hyper-durable's own rule could not run.
+
+**The decision (CT.1).** The log is due by Ongaro's rule (thesis §5.1.2, "When to snapshot": once the log exceeds
+the previous snapshot times an expansion factor), as hyper-durable's `Replica::compaction_due` weighs it, with its
+wait for a member still taking what was applied. The factor is the owner's (`database/compacting.rs`):
+- the machine reports its image's bytes: the pages it opened with (`StateMachine::image_bytes`), and after the first
+  compaction hyper-durable weighs the image it made;
+- the owner times each image it makes (`Replica::compact`, the image's bytes from the machine) and each drive that
+  applied entries (the applied entries' bytes as the core counts them, `EntryRef::encoded_bytes`), on its own clock;
+- each cost is a ratio of decaying sums, nanoseconds over bytes, the sums kept at seven eighths at every sample: RFC
+  6298 §2's gain (Jacobson 1988), weighted by each sample's bytes, so it follows the host and its load;
+- the factor is the image's cost a byte over the replay's, raised to the whole factor the rule takes. The log is the
+  rent and the image the price: compacting once replaying the log would cost as much as making a fresh image is ski
+  rental's break-even (Karlin, Manasse, McGeoch and Owicki, SODA 1990), within twice the best in hindsight. Raised,
+  never rounded down, so no compaction comes before the break-even.
+A compaction still runs at once while the log stalls admission for room: it is what frees it.
+
+**The start state.** Before both costs are measured, and for a sample below the clock's resolution, the factor is
+one: with nothing measured a byte of log costs a byte of image, whose break-even is the log at its image's size.
+
+**What is left.** The image's bytes at open are its pages' (page count times page size); postcard's few bytes of
+framing a page are not counted. A configuration change's entry is not counted in the replay's bytes (it is applied
+by `apply_change`, rarely).
+
+**Tests.** `compaction_the_factor_is_one_until_both_costs_are_measured` (T-CT.1.1),
+`compaction_the_factor_is_the_image_cost_over_the_replay_cost` (T-CT.1.2), `compaction_samples_weigh_by_their_bytes`
+(T-CT.1.3), all in `database::compacting`; the driven compaction tests of `database::replicated` (T-CT.1.4).
+
+## Decision (lane constants): an envelope is what its encoding adds (2026-11-21)
+
+Ada's rule: no picked numbers. A replicated command and an image were each bounded by their pages' budget plus
+`ENVELOPE_BYTES`, a mebibyte for what their encoding adds, which nothing measured or derived.
+
+**The decision (EN.1).** The envelope is what postcard's encoding adds to the pages, at the most, from its wire format
+(`replication.rs`): a declared baseline's prefix and its declaration (a varint node and a 32-byte identity), a
+prepared transaction's base index and term (varints, ten bytes at the most), the page list's length (a varint) and
+each page's id (a `u32` varint, five bytes at the most) and length (the page size's varint), for as many pages as the
+budget holds at the one page size `validate_pages` admits. So a command's envelope is a few bytes a page (57 KiB over
+its 32 MiB), an image's the same over its budget, a test's lowered budget included. A read set still rides in what
+a command's entry leaves of its bound, or the write goes without one, as before: a write near its whole budget now
+goes without one sooner.
+
+**What is left.** `SNAPSHOT_BYTES`, the image's own budget (256 MiB), is the seam owner's ruling (c): a memory bound
+from the process memory budget's room for one image, once a learned budget exists. The transport's own framing past
+an entry (`replicated.rs`'s `MESSAGE_BYTES` and `WIRE_BYTES`, two mebibytes each) is the owner's queue piece's.
+
+**Tests.** `envelope_a_command_at_its_widest_fits_its_bound_exactly` (T-EN.1.1),
+`envelope_an_image_at_its_widest_fits_its_bound_exactly` (T-EN.1.2), `envelope_varints_take_seven_bits_a_byte`
+(T-EN.1.3), in `replication::envelope_tests`.
+
 ## A follower's write that read nothing written since its base: read sets (built 2026-11-21, Amphora goal ceea4e0a)
 
 D of goal 9c63f7d4, on top of the write slot (above). In the release A/B, D halved G's write gaps
@@ -2415,7 +2515,7 @@ Falsified by: a non-serializable history with read sets on; a release A/B agains
 write gaps; a `conflict` share near one on workloads whose writes touch different pages (the read set too wide: the
 recorder catching reads the session didn't make).
 
-## The raft log as the WAL (built 2026-11-21, G12 step 2, lane g12s2)
+## Decision (lane g12s2): the raft log as the WAL (2026-11-21, G12 step 2)
 
 Requirements AC-T1.8.L1 and L2, tests T-T1.8.L1 and L2 (docs/requirements.toml); kiln plan "G12 Replication
 (CP-T1.8)", step 2.
@@ -2441,7 +2541,8 @@ The raft log is the write-ahead log; the database's log is a cache of it that th
 its own time. Still flushed inline, all rare and as before: a membership change (its join rows), an install, the
 seed, a persisted class entry, and `open`.
 
-The owner compacts when the raft log holds 128 MiB of applied entries or is stalled for room. A stall waits on the
+The owner compacts when the raft log is due by Ongaro's rule at the expansion it learned ("Decision (lane constants):
+the compaction's expansion learned where it runs") or is stalled for room. A stall waits on the
 flushing thread, which is always asked to flush what was applied (`Actor::flush`), so it frees room once that flush
 ends, not on a flush of the owner's own.
 

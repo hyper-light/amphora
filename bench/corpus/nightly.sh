@@ -64,6 +64,9 @@ CORPUS_SRC="$SRC" CORPUS_PY="$PY" KILN_REPO="$SRC/corpus-kiln" bash "$HERE/corpu
 mkdir -p "$WORK/corpus/slt"
 ln -sfn "$SRC/$(field slt checkout)/test" "$WORK/corpus/slt/test"
 
+stage "each record translated once per dialect (G2 step 4: the harness reads them)"
+"$PY" "$HERE/dialects.py" "$WORK/corpus"
+
 stage "amphora-corpus (the gate's build: the times re-rank the gate's pool)"
 (cd "$ROOT" && cargo build --locked -p amphora-corpus)
 bin="$(cd "$ROOT" && cargo metadata --format-version 1 --no-deps | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')/debug/amphora-corpus"
