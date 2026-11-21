@@ -769,3 +769,7 @@ criteria = [
 tests = [
   { id = "T-CS.3.1", text = "crates/columnar/tests/round_trip.rs — passes when every random and real-like column, of every size around the group and vector edges, decodes equal to the input in both codecs, every bit width packs and unpacks in both layouts, the schemes follow the data, and damaged encodings are refused" },
 ]
+
+# lane groupcommit (G8 step 3, the versioned storage's log; docs/design/engine.md decision 11): no new
+# IDs. It serves AC-T1.4.2 and AC-T1.4.3 (`amphora-bench --vlog`) and T-T1.3.1
+# (crates/engine/tests/versioned_crash.rs).

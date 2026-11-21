@@ -57,6 +57,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   flight so commits land during flushes. 10,000 seeds: no acknowledged batch lost, no refused batch
   kept, no batch torn, the integrity check passing (2026-10-20). Every gate runs 200. A test holds a
   flush and commits during it: no checkpoint copies that commit before a later flush (decision 15).
+- **The versioned storage's log in lanes** (CP-T1.3's log, `crates/engine/storage/versioned`,
+  docs/design/engine.md decision 11): one group-committed log or a log a writer, merged by commit
+  timestamp; a commit acknowledged once every lane is durable through it; recovery replays to the
+  first missing commit, reading and replaying side by side (SiloR), and cuts each lane there; on Linux
+  a flush is one io_uring submission (the engine's `io_uring` feature). Checkpoints copy pages by
+  copy-on-update after a pause that only lists rows with versions (decision 7). T-T1.3.1, a crash at
+  every disk operation of each seed's workload: 200 seeds in every gate; the 10,000 and
+  `amphora-bench --vlog` (AC-T1.4.2, AC-T1.4.3) not yet run.
 - **Stores on the engine** (`crates/amphora/src/db.rs`): a database opened for the pipeline, its
   readers, its flusher, its checkpoints and its log's restart.
 - **Amphora's engine** (`crates/engine*`, its `ORIGIN.md`): Turso's four crates (core, sqlite/parser,

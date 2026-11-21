@@ -36,6 +36,10 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 
 # AMPHORA_PROFILE (Unix only): a sampling profile of the mixed phase (a timer signal and backtraces: no root, no
 # perf), written as a flamegraph and the hottest frames.
+# The versioned storage's log through io_uring (`--vlog --uring`): Linux's.
+[target.'cfg(target_os = "linux")'.dependencies]
+amphora-engine = { path = "../crates/engine", default-features = false, features = ["fs", "json", "pure-rust-crypto", "checksum", "io_uring"] }
+
 [target.'cfg(unix)'.dependencies]
 pprof = { version = "0.14", default-features = false, features = ["flamegraph"] }
 
