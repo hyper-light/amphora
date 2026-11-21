@@ -461,6 +461,12 @@ pub trait IO: Clock + Send + Sync {
         false
     }
 
+    /// Amphora (G7 step 2): whether its files live in memory, not on the host's filesystem, so a
+    /// database's versioned storage (`storage::versioned::switch`) is kept in memory beside them.
+    fn is_memory(&self) -> bool {
+        false
+    }
+
     fn step(&self) -> Result<()> {
         Ok(())
     }

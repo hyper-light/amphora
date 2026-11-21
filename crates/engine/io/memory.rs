@@ -86,6 +86,10 @@ impl Clock for MemoryIO {
 }
 
 impl IO for MemoryIO {
+    fn is_memory(&self) -> bool {
+        true
+    }
+
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         let mut files = self.files.lock();
         if !files.files.contains_key(path) && !flags.contains(OpenFlags::Create) {

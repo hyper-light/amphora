@@ -2795,7 +2795,10 @@ impl Database {
     ) -> Result<Option<Arc<crate::storage::versioned::switch::Storage>>> {
         let mut slot = self.versioned.lock();
         if slot.is_none() && ask {
-            *slot = Some(crate::storage::versioned::switch::open(&self.path)?);
+            *slot = Some(crate::storage::versioned::switch::open(
+                &self.path,
+                self.io.is_memory(),
+            )?);
         }
         Ok(slot.clone())
     }

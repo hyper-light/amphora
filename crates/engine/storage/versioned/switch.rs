@@ -45,13 +45,13 @@ pub struct Storage {
     orders: Mutex<HashMap<u64, Arc<OnceLock<KeyOrder>>>>,
 }
 
-/// The versioned storage of the database at `path`: in memory for a memory database, else in the
-/// directory `<path>-versioned`. Its pool holds as many pages as the pager's page cache does by
+/// The versioned storage of the database at `path`: in memory for a memory database or one whose
+/// files the engine keeps in memory (`memory`), else in the directory `<path>-versioned`. Its pool holds as many pages as the pager's page cache does by
 /// default (`DEFAULT_PAGE_CACHE_SIZE_IN_PAGES`, the engine's bound on the pages it keeps), and its
 /// redo log takes a lane per thread the machine runs (decision 11).
-pub fn open(path: &str) -> Result<Arc<Storage>> {
+pub fn open(path: &str, memory: bool) -> Result<Arc<Storage>> {
     let lanes = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let disk: Arc<dyn Disk> = if crate::database::is_memory_like(path) {
+    let disk: Arc<dyn Disk> = if memory || crate::database::is_memory_like(path) {
         Arc::new(Simulated::new(0, lanes)?)
     } else {
         let dir = std::path::PathBuf::from(format!("{path}-versioned"));
