@@ -5577,6 +5577,9 @@ pub fn op_savepoint(
                         return Err(mirror_err);
                     }
                     conn.push_named_savepoint(frame);
+                    if let Some(switch) = conn.versioned.as_ref() {
+                        switch.push_named(name)?;
+                    }
                     if starts_transaction {
                         turso_assert!(
                             !conn.tx_is_poisoned(),
@@ -5613,6 +5616,9 @@ pub fn op_savepoint(
                 }
                 SavepointResult::Release => {
                     let _ = conn.release_named_savepoint_frame(name);
+                    if let Some(switch) = conn.versioned.as_ref() {
+                        switch.release_named(name);
+                    }
                     mirror_named_savepoint_to_active_non_main_databases(
                         &conn,
                         SavepointMirror::Release(name),
@@ -5647,6 +5653,9 @@ pub fn op_savepoint(
                 return Err(LimboError::TxError(format!("no such savepoint: {name}")).into());
             };
             let frame_info = conn.rollback_named_savepoint_frame(name);
+            if let Some(switch) = conn.versioned.as_ref() {
+                switch.rollback_named(name)?;
+            }
             mirror_named_savepoint_to_active_non_main_databases(
                 &conn,
                 SavepointMirror::Rollback(name),

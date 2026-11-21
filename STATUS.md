@@ -309,11 +309,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   decision 13, `crates/engine/storage/versioned/{switch,sql}.rs`): `ConnectOpts::with_versioned_storage`
   or `AMPHORA_STORAGE=versioned` puts a database's B-trees on the versioned storage; the executor's
   cursors, CREATE/DROP TABLE and INDEX, DELETE without WHERE, `sqlite_schema` (tree 1) and ANALYZE
-  run on it, each SQL transaction one storage transaction. `sql.rs` (`T-NS.2.6`) runs the same SQL
-  on both storages and compares. Not yet: a file database reopened (recovery remakes every tree in
-  rowid order; the header stays the pager's), a statement's own rollback inside a transaction, DROP
-  undone by ROLLBACK, a pool past the page cache's bound; the engine's suites with the switch on are
-  the coordinator's run.
+  run on it, each SQL transaction one storage transaction, a failed statement undone alone by a
+  savepoint. `sql.rs` (`T-NS.2.6`) runs the same SQL on both storages and compares. Not yet: a file
+  database reopened (recovery remakes every tree in rowid order; the header stays the pager's), SQL's
+  named SAVEPOINT, a database past the pool's frames or a transaction past
+  its budget (no eviction yet; the budget is the shell's to give); the engine's suites with the
+  switch on are the coordinator's run.
 - **Three ways to reach a cached page** (G7 step 3, `NS.3`; `crates/engine/storage/reach`,
   `amphora-bench --reach`): behind one trait, sharing frames, CLOCK eviction and one miss path, (a) a
   page table in shards with pins and a private pin on a client's current page (PostgreSQL), (b)
@@ -529,9 +530,14 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   SQLite, DuckDB and Turso through their own shells, PostgreSQL, OrioleDB and CedarDB through `psql`,
   MySQL through `mysql`, ClickHouse through its HTTP interface, each kept open for a file and settled
   before each query; an engine a machine lacks is refused (exit 3), and the nightly runs every one,
-  each on its share of the night's budget, and fails when any couldn't run. Left: the adapters other
-  than SQLite's run only where their programs are (none ran yet: the lane's machine had none), and
-  kiln's queries in the pool (kiln_queries.py needs sqlglot).
+  each on its share of the night's budget, and fails when any couldn't run. Lane corpus-ci-6: an engine's
+  opening, settling and closing statements are bounded by the run's budget (a server that doesn't answer
+  is unreachable, never a hung run); an untyped column is declared BLOB by SQLite's affinity rule 3
+  (DuckDB's comparable records on 40 written files: 152 to 193); Turso's list output, which escapes
+  nothing, is counted again by Turso when an answer disagrees, and a misread one is unreadable, not a
+  disagreement; `CORPUS_BIN_<ENGINE>` may be a command (a client in its server's container). The five
+  server engines ran a pool through the harness on jupiter's Docker (2026-11-21). Left: kiln's queries
+  in the pool (kiln_queries.py needs sqlglot).
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691
@@ -596,6 +602,12 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   at least the time asked; `follower_read_micros` is now less the replica's measured p99 lag. `amphora::search` asks
   partitions at once and merges newest first. Closes with: AC-T1.10.3 and AC-T1.10.4 measured (`amphora-bench
   --cluster`), an idle group's time closed on demand, and the attached client's request on the wire.
+- **Query speed step 6 (QT.6), started** (lane qs6; docs/design/executor.md section 8): built and unit-tested, not
+  measured, not yet in the VDBE's loops. `vdbe/morsel.rs` runs a scan with its filter and aggregates, and a hash join's
+  probe side, in morsels on several threads behind `ParallelMode` (off by default); the worker count and morsel size
+  come from costs measured where it runs, answers equal at every worker count (T-QT.6.1 to T-QT.6.5). Closes with:
+  the VDBE's scan and join loops run through it (a cursor per worker over one snapshot), a shared hash build, loom or
+  shuttle on the dispatcher, worker and morsel metrics, and AC-QT.6.1 to AC-QT.6.4 measured.
 - **Query speed step 5 (QT.5), started** (lane qs5): `Connection::set_join_methods` plans a connection's new
   statements by cost, with index nested loops only, or with hash joins only; `tests/join_methods.rs` (T-QT.5.1) runs
   inner, left, semi and anti joins with NULL and duplicate keys all three ways and against a model. The harness
@@ -743,7 +755,7 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   the cascade a loop with no fixed depth; integers, doubles, strings and nulls round-trip bit for
   bit (T-CS.3.1). Its decode benchmark (`cargo bench -p amphora-columnar --bench decode`) is not yet
   measured against [c18]'s 8 values a cycle.
-- **G5 step 4, skipping rows** (docs/design/executor.md decision 8; AC-G5.4.1, T-G5.4.1; lane
+- **G5 step 4, skipping rows** (docs/design/executor.md decision 9; AC-G5.4.1, T-G5.4.1; lane
   g5s4): built, not measured, not wired. `crates/engine/skipping` holds zone maps over leaf runs and
   database cracking behind one switch, each kept from the write path through one hook; with writes
   between scans each names exactly what a plain scan finds (T-G5.4.1). Open: the scan and write

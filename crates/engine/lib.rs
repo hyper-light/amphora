@@ -193,6 +193,8 @@ pub use translate::expr::{walk_expr_mut, WalkControl};
 pub use translate::plan::TablePlanEstimate;
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
 pub use util::IOExt;
+/// Morsel-driven parallel execution (QT.6, docs/design/executor.md section 8).
+pub use vdbe::morsel;
 pub use vdbe::row_counts::{RowCount, RowCountKind, RowCountSite};
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
