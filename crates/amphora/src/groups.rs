@@ -127,8 +127,9 @@ struct Route<E: Engine> {
     /// Groups retired here that the directory routed by doesn't yet show retired (an id it has
     /// given out, a group it no longer places): a create, release or retire asked of one again
     /// is answered as the driver's contract says, never by making an empty group. Kept in `book`
-    /// before a retire is answered, so a restart keeps it too; an id leaves it once the directory
-    /// routed by shows it retired, so it holds no more than the directory lags this node by.
+    /// ([`Book`]) with the directory routed by, before a retire is answered, so a restart keeps
+    /// both; an id leaves it once a directory kept with it shows it retired, so it holds no more
+    /// than the directory lags this node by.
     retired: BTreeSet<GroupId>,
     book: PathBuf,
 }
@@ -145,26 +146,46 @@ fn shows_retired(directory: &Directory, group: GroupId) -> bool {
     directory.given_out(group) && directory.node_of(group).is_none()
 }
 
-/// The retired groups kept in `book` (none: no book yet, a node started now).
-fn read_book(book: &Path) -> anyhow::Result<BTreeSet<GroupId>> {
+/// What a node keeps of the groups it retired (`Groups::on`'s `retired`): the directory routed by
+/// when it was last kept, and the groups retired here that directory doesn't show retired. A
+/// restart routes by the newer of it and the directory it is started by, so every group retired
+/// here shows retired, by the one or by the other.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct Book {
+    directory: Option<Directory>,
+    retired: Vec<u64>,
+}
+
+/// The book kept in `book` (an empty one: no book yet, a node started now).
+fn read_book(book: &Path) -> anyhow::Result<Book> {
     match std::fs::read(book) {
-        Ok(bytes) => {
-            let ids: Vec<u64> = postcard::from_bytes(&bytes)
-                .map_err(|_| anyhow::anyhow!("a book of retired groups that doesn't decode"))?;
-            Ok(ids.into_iter().map(GroupId).collect())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+        Ok(bytes) => postcard::from_bytes(&bytes)
+            .map_err(|_| anyhow::anyhow!("a book of retired groups that doesn't decode")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Book::default()),
         Err(e) => Err(e.into()),
     }
 }
 
-/// `retired` kept in `book`, replaced whole and durable before it returns.
-fn keep_book(book: &Path, retired: &BTreeSet<GroupId>) -> anyhow::Result<()> {
-    let ids: Vec<u64> = retired.iter().map(|g| g.0).collect();
-    let bytes = postcard::to_allocvec(&ids)
+/// `directory` and the groups of `retired` it doesn't show retired, kept in `book`, replaced whole
+/// and durable before it returns: those it keeps.
+fn keep_book(
+    book: &Path,
+    directory: &Directory,
+    retired: &BTreeSet<GroupId>,
+) -> anyhow::Result<BTreeSet<GroupId>> {
+    let left: BTreeSet<GroupId> = retired
+        .iter()
+        .copied()
+        .filter(|g| !shows_retired(directory, *g))
+        .collect();
+    let kept = Book {
+        directory: Some(directory.clone()),
+        retired: left.iter().map(|g| g.0).collect(),
+    };
+    let bytes = postcard::to_allocvec(&kept)
         .map_err(|_| anyhow::anyhow!("a book of retired groups that doesn't encode"))?;
     reshard::replicated::replace(book, &bytes)?;
-    Ok(())
+    Ok(left)
 }
 
 /// A store in groups: cheap to clone, usable from any thread; clones share one route.
@@ -279,7 +300,18 @@ impl<E: Engine> Groups<E> {
     ) -> anyhow::Result<Self> {
         directory.check()?;
         let book = retired.to_path_buf();
-        let retired = read_book(&book)?;
+        let kept = read_book(&book)?;
+        let retired: BTreeSet<GroupId> = kept.retired.into_iter().map(GroupId).collect();
+        // The directory routed by before a restart, if it is newer than the one started by: a
+        // router never goes back past what it routed by.
+        let directory = match kept.directory {
+            Some(d) if d.generation() > directory.generation() => {
+                d.check()?;
+                d
+            }
+            _ => directory.clone(),
+        };
+        let directory = &directory;
         let mut groups = BTreeMap::new();
         for (group, _) in directory.groups() {
             if retired.contains(&group) {
@@ -309,20 +341,12 @@ impl<E: Engine> Groups<E> {
         let mut route = self.route.write().unwrap_or_else(PoisonError::into_inner);
         if directory.generation() > route.directory.generation() {
             route.directory = directory.clone();
-            // The groups the directory now shows retired leave the book. If it can't be kept,
-            // it keeps them all, which is as true: they are dropped at the next directory.
-            let shown: Vec<GroupId> = route
-                .retired
-                .iter()
-                .copied()
-                .filter(|g| shows_retired(directory, *g))
-                .collect();
-            if !shown.is_empty() {
-                let mut left = route.retired.clone();
-                left.retain(|g| !shown.contains(g));
-                if keep_book(&route.book, &left).is_ok() {
-                    route.retired = left;
-                }
+            // The groups the directory now shows retired leave the book, kept with it. If it
+            // can't be kept, the book keeps the older directory with them all, which is as true:
+            // they leave at the next directory.
+            let shown = route.retired.iter().any(|g| shows_retired(directory, *g));
+            if shown && let Ok(left) = keep_book(&route.book, directory, &route.retired) {
+                route.retired = left;
             }
         }
         Ok(())
@@ -612,14 +636,12 @@ impl<E: Engine> Groups<E> {
                     }
                     route.groups.remove(&group);
                 }
-                if !route.was_retired(group) {
-                    // Kept before it is answered: a create asked again after a restart is refused,
-                    // never made an empty group.
-                    let mut next = route.retired.clone();
-                    next.insert(group);
-                    keep_book(&route.book, &next)?;
-                    route.retired = next;
-                }
+                // Kept before it is answered, with the directory routed by: a create asked again
+                // after a restart is refused, never made an empty group, whatever directory the
+                // node is started by.
+                let mut next = route.retired.clone();
+                next.insert(group);
+                route.retired = keep_book(&route.book, &route.directory, &next)?;
                 Ok(Reply::Retired)
             }
         }

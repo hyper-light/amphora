@@ -242,7 +242,10 @@ Before this, a node kept the groups it retired only in memory, so after a restar
 made an empty group with the retired id. Now each node keeps the groups it retired in one file of
 its own (`Groups::on`'s `retired`), replaced whole and flushed before the retire is answered. A
 restart reads it back: a retired group is neither started nor made again, and a Create of it is
-refused as of an ended operation (T-T1.9.R6). The file stays bounded. An id leaves it once the
-directory the node routes by shows the group retired (its id given out, the group placed nowhere),
-because from then on the directory says the same thing. So the file holds no more ids than this
-node's directory lags behind its own retires.
+refused as of an ended operation (T-T1.9.R6). The file keeps the directory the node routed by when
+it was written, with the retired groups that directory doesn't show retired (its id given out, the
+group placed nowhere). A restart routes by the newer of that directory and the one it is started
+by, so a router never goes back past what it routed by, and every group retired here shows retired
+by the one or the other. The file stays bounded: an id leaves it once a directory kept with it
+shows the group retired. So it holds one directory and no more ids than this node's directory lags
+behind its own retires.
