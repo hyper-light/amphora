@@ -632,6 +632,12 @@ change, and a power cut leaves the old schema or the new. DROP COLUMN is not yet
   costs say the generic plan does as well; one whose estimates read none keeps its generic plan. Its
   TPC-H prepared measurement (AC-PL.12.1; its harness, `amphora-bench --planner --prepared` with
   qgen's parameters, is written: bench/planner/README.md) and the suite's (AC-PL.12.2) are open.
+  PL.8 is started (docs/design/planner.md "Decision (lane pl8)"): a RIGHT JOIN led by one
+  table is planned as its mirrored LEFT JOIN, CD-C's commutativity rule, so the tables after it are no
+  longer held behind its right table and the audit's 03-right-full-barrier reads tiny first (T-PL.8.1);
+  an outer join's ON term that reads only earlier tables now counts in its join's estimate.
+  Not built: bushy plans over connected complement pairs with a composite hash-join build, and CD-C's
+  rules for outer, semi and anti joins in place of `required_lhs_by_table`; JOB's AC-PL.8.1 is open.
   PL.9 is built (lane pl9, docs/design/planner.md "row counts kept as rows change"): each table's
   rows inserted less deleted since ANALYZE are kept as writes finish (one atomic add a statement),
   the planner's row count follows them, and a prepared statement plans again once a table it counted
