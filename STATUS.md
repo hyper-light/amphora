@@ -547,6 +547,11 @@ change, and a power cut leaves the old schema or the new. DROP COLUMN is not yet
   but not merged: with today's join costs it flips `records_plans`' one-row-lookup case to a hash join and a sort
   (the two plans cost about 110 each), so it waits for the learned costs, then the `rhs_has_selective_seek` gate removed, builds over joined inputs, PL.5's Bloom
   filters with LIP and predicate transfer, and sort-merge and prefetched index joins (G6 step 4).
+  Lane qs5-6: the planner no longer prices pages its cache holds as file reads. A tree's first reads are held at the
+  share of the connection's recent fetches that found their page cached (`Pager::page_miss_ratio`, over one to two
+  cache turnovers) times the part of the tree the cache has room for; reads past what the cache can keep are charged
+  whatever (`cost::file_reads`). `index_bonus` (a picked half page) is removed. `records_plans`' one-row-lookup join
+  now picks the scan and index searches it measured faster (1.75 ms against the hash join's 3.05 ms, jupiter, release).
 - **The replicated class** (docs/design/replication.md, "Fast acknowledgement"; Ada's word 2026-11-01): built on
   t1/replicated-line, not on main (fast-ack, class-metrics, class-quorum and disk-stalls, merged in that order). A
   replicated database opened with `Durability::Replicated(Fates)` answers a write once members spanning the fates
