@@ -61,7 +61,9 @@ pub enum SkipError {
     RowidOrder { previous: i64, rowid: i64 },
     /// A delete or update named a row the summary never held: the write path and the summary
     /// disagree, so the summary can't be trusted and must be rebuilt.
-    #[error("skipping summary: no row {rowid} with value {value:?} to remove; rebuild the summary")]
+    #[error(
+        "skipping summary: no row {rowid} with value {value:?} to remove; rebuild the summary"
+    )]
     MissingRow { rowid: i64, value: Option<i64> },
     /// The summary's positions disagree with its entries: rebuild it.
     #[error("skipping summary: its positions disagree with its entries; rebuild the summary")]

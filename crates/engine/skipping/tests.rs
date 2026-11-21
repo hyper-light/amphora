@@ -55,7 +55,11 @@ fn random_write(rng: &mut ChaCha8Rng, table: &mut Table) -> RowWrite {
         let rowid = match rng.random_range(0..4) {
             0 => {
                 let r = rng.random_range(-50..=last + 1);
-                if table.contains_key(&r) { last + 1 } else { r }
+                if table.contains_key(&r) {
+                    last + 1
+                } else {
+                    r
+                }
             }
             _ => last + rng.random_range(1..4),
         };
