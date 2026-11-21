@@ -237,7 +237,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn clock() -> (Arc<AtomicU64>, Clock) {
-        let now = Arc::new(AtomicU64::new(10 * SECOND_NS));
+        // Just past a second's start: a stamp at exactly 10 s is in second 10 ((9, 10] s) and one
+        // half a second later in second 11, so the tests begin inside a second, as most stamps are.
+        let now = Arc::new(AtomicU64::new(10 * SECOND_NS + 1));
         let read = Arc::clone(&now);
         (now, Arc::new(move || read.load(Ordering::SeqCst)))
     }
@@ -287,7 +289,7 @@ mod tests {
         let drained = hooks.marks.drain().unwrap();
         assert_eq!(drained.marks.len(), 2);
         assert_eq!(drained.marks[0].frame, 2);
-        assert_eq!(drained.marks[0].unknown_from, Some(10 * SECOND_NS));
+        assert_eq!(drained.marks[0].unknown_from, Some(10 * SECOND_NS + 1));
         assert_eq!(hooks.marks.counts().unwrap().1, 1);
     }
 }
