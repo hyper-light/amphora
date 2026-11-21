@@ -97,10 +97,12 @@ fn stale_preparations_are_refused_and_snapshots_restore_rows_and_membership_toge
             .is_err()
     );
     // An applied entry is durable once its owner's flushing thread flushes it (replication.md,
-    // "A replica's database log"); this test has no owner, so it flushes as a compaction does.
+    // "A replica's database log"). This test has no owner, and a compaction's ask flushes
+    // nothing (T-T1.8.L1; replication.md, "The raft log as the WAL"): nothing is durable yet, so
+    // no compaction may pass any of it.
     assert_eq!(source.durable(), Point::default());
     source.persist().unwrap();
-    assert_eq!(source.durable(), Point { index: 2, term: 1 });
+    assert_eq!(source.durable(), Point::default());
     assert_eq!(value(&mut source), vec![1]);
     let mut image = Vec::new();
     let (at, membership) = source.image(&mut image).unwrap();

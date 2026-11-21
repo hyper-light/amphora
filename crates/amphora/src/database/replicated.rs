@@ -2001,7 +2001,6 @@ impl<F: BlockFile + 'static> Actor<F> {
             for voter in &self.detected {
                 self.answers.suspected(*voter);
             }
-            self.spacing.tick()?;
             let election = self.replica.core().raft.config().election_tick;
             let patience = self
                 .answers
@@ -2171,7 +2170,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                     {
                         pass.caught_up = false;
                         pass.busy = false;
-                        self.spacing.restarted(queued);
+                        self.spacing.restarted(queued)?;
                         self.control.meter.restarted();
                     }
                 }
@@ -4748,6 +4747,17 @@ mod tests {
                 actor.replica.machine().log_flusher()().unwrap();
                 actor.replica.machine_mut().flushed_through(at);
             }
+        }
+        /// Rounds until owner `owner`'s flushing thread has made all it applied durable: a
+        /// compaction moves the raft log's start no further than that (I8).
+        fn flushed(&mut self, pump: &mut Pump<'_>, owner: usize) {
+            for _ in 0..ROUNDS {
+                if self.owner(owner).replica.machine().unflushed().is_none() {
+                    return;
+                }
+                self.round(pump);
+            }
+            panic!("owner {owner} did not flush in {ROUNDS} driven rounds");
         }
         /// A new member's clock: its reading, which only the test moves, and the clock its owner
         /// reads it through.
@@ -10190,6 +10200,7 @@ mod tests {
         joins_tracked(&mut driven, &mut pump, &[0, 1, 2]);
         write(&mut driven, &mut pump, &clients[leader], 1);
         quiet(&mut driven, &mut pump);
+        driven.flushed(&mut pump, leader);
         let compacted = {
             let owner = &mut driven.owner_mut(leader);
             let now = owner.now().unwrap();
@@ -13120,6 +13131,7 @@ mod tests {
             })
             .unwrap();
         quiet(&mut driven, &mut pump);
+        driven.flushed(&mut pump, 0);
         let compacted = {
             let owner = driven.owner_mut(0);
             let now = owner.now().unwrap();
@@ -13454,6 +13466,74 @@ mod tests {
         pump.finish();
     }
 
+    /// AC-T1.8.L1, T-T1.8.L1 (CP-T1.8, G12 step 2; replication.md, "The raft log as the WAL"):
+    /// compaction waits for the engine's flush. Do: a voter and its learner, the voter's flushes
+    /// held; 1 written and the voter's log flushed; 2 to 5 written, applied unflushed; the voter's
+    /// raft log compacted, keeping nothing; then its log flushed and compacted again. Expect: the
+    /// writes answered with their flushes held; the first compaction moved the raft log's start
+    /// to the flushed point and no further, and flushed nothing itself (2 to 5 still unflushed,
+    /// still in the raft log); after the flush, the second moved it to the last entry applied.
+    #[test]
+    fn compaction_waits_for_the_engines_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = voter_and_learner(&mut driven, dir.path());
+        driven.hold_flushes(0);
+        let mut pump = Pump::new(&clients);
+        write(&mut driven, &mut pump, &clients[0], 1);
+        driven.flush(0);
+        let flushed = StateMachine::durable(driven.owner(0).replica.machine());
+        for value in 2..=5 {
+            write(&mut driven, &mut pump, &clients[0], value);
+        }
+        quiet(&mut driven, &mut pump);
+        let start = |driven: &Driven| {
+            driven
+                .owner(0)
+                .replica
+                .core()
+                .raft
+                .log()
+                .first_index()
+                .unwrap()
+        };
+        let compact = |driven: &mut Driven, pump: &mut Pump<'_>| {
+            driven.quiet(pump);
+            let owner = driven.owner_mut(0);
+            let now = owner.now().unwrap();
+            let out = owner
+                .replica
+                .compact(0, now, std::task::Waker::noop())
+                .unwrap();
+            assert!(out, "no compaction went out");
+            driven.quiet(pump);
+        };
+        let applied = driven.owner(0).replica.applied();
+        assert!(
+            applied.index > flushed.index,
+            "2 to 5 weren't applied past the flush"
+        );
+        assert!(
+            start(&driven) <= flushed.index,
+            "the raft log already started past the flush"
+        );
+        compact(&mut driven, &mut pump);
+        assert_eq!(
+            start(&driven),
+            flushed.index + 1,
+            "the raft log's start isn't the flushed point"
+        );
+        let machine = driven.owner(0).replica.machine();
+        assert_eq!(machine.unflushed(), Some(applied), "the compaction flushed");
+        assert_eq!(StateMachine::durable(machine), flushed);
+        driven.flush(0);
+        compact(&mut driven, &mut pump);
+        assert_eq!(start(&driven), applied.index + 1);
+        assert_eq!(held(&mut driven, 0), vec![1, 2, 3, 4, 5]);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
     /// AC-T1.8.D1, T-T1.8.D1 (replication.md, "A replica's database log bounded by what it
     /// measures", the bound stated): a restart that falls due while a local read is out waits for
     /// that read, and so no longer than the read's deadline. Do: a voter and its learner on one
@@ -13642,12 +13722,12 @@ mod tests {
 
     /// AC-T1.8.D1, T-T1.8.D3 (replication.md, "A replica's database log bounded by what it
     /// measures", A): the first restart is free, a restart that held entries spaces the next by a
-    /// thousand times them, and the window forgets after two generations. Do: a voter and its
-    /// learner, the room the filesystem's own; 1 written and flushed, rounds until the learner
-    /// restarts; its count then told of a restart that held one entry; 2 to 21 written and
-    /// flushed; then two generations of the learner's ticks, 22 written, rounds. Expect: a
-    /// restart after 1 (on b151af0 none: its bound was 131,072 frames); none while 2 to 21
-    /// applied; one after the window forgot.
+    /// thousand times them and the guess. Do: a voter and its learner, the room the filesystem's
+    /// own; 1 written and flushed, rounds until the learner restarts; its count then told of a
+    /// restart that held one entry; 2 to 21 written and flushed; then its count told of a million
+    /// entries applied (its generation covering its spend), 22 written, rounds. Expect: a restart
+    /// after 1 (on b151af0 none: its bound was 131,072 frames); none while 2 to 21 applied; one
+    /// once its generation covered its spend.
     #[test]
     fn the_first_restart_is_free_and_the_next_waits_on_its_share() {
         own_account();
@@ -13673,7 +13753,7 @@ mod tests {
             handle.counters()
         );
         let spacing = &mut driven.owner_mut(1).spacing;
-        spacing.restarted(0);
+        spacing.restarted(0).unwrap();
         spacing.stepped(1, Duration::ZERO, 1).unwrap();
         spacing.stepped(0, Duration::ZERO, 0).unwrap();
         let restarts = handle.counters().database_log_restarts;
@@ -13685,14 +13765,16 @@ mod tests {
             driven.round(&mut pump);
         }
         assert_eq!(handle.counters().database_log_restarts, restarts);
-        for _ in 0..2 * log_bound::GENERATION {
-            driven.owner_mut(1).spacing.tick().unwrap();
-        }
+        driven
+            .owner_mut(1)
+            .spacing
+            .stepped(1_000_000, Duration::ZERO, 0)
+            .unwrap();
         write(&mut driven, &mut pump, &clients[0], 22);
         settle_log(&mut driven, &mut pump, &clients);
         assert!(
             restarted(&mut driven, &mut pump, restarts),
-            "no restart once the window forgot: {:?}",
+            "no restart once its generation covered its spend: {:?}",
             handle.counters()
         );
         driven.drain(&mut pump);
@@ -13718,7 +13800,7 @@ mod tests {
         settle_log(&mut driven, &mut pump, &clients);
         // Its share spent, so the log holds 2's frames when the test makes a restart due.
         let spacing = &mut driven.owner_mut(1).spacing;
-        spacing.restarted(0);
+        spacing.restarted(0).unwrap();
         spacing.stepped(1_000_000, Duration::ZERO, 1).unwrap();
         write(&mut driven, &mut pump, &clients[0], 2);
         settle_log(&mut driven, &mut pump, &clients);
@@ -13784,7 +13866,7 @@ mod tests {
         write(&mut driven, &mut pump, voter, 1);
         settle_log(&mut driven, &mut pump, &clients);
         let spacing = &mut driven.owner_mut(0).spacing;
-        spacing.restarted(0);
+        spacing.restarted(0).unwrap();
         spacing.stepped(1_000_000, Duration::ZERO, 1).unwrap();
         driven
             .owner(0)

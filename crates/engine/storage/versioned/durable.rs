@@ -1,20 +1,24 @@
 //! Amphora: a versioned database on disk (Amphora's `docs/design/engine.md`, decisions 6 to 8).
 //!
 //! The data file holds a header and the pages after it (page `n` at `n` pages in). A commit is
-//! logged to the redo log in timestamp order and made durable by a flush of it ([`Redo`]). A
-//! checkpoint stops row changes (each holds the gate shared for its page changes; the checkpoint
-//! holds it exclusive while it copies), takes the last commit's timestamp T, switches the redo
-//! log's file at it, copies the pages written since the last checkpoint and lists the rows whose
-//! copied version isn't their version as of T: changes of transactions still open. The copies, the
-//! list and the new header go to the next journal, flushed, then over the data file, flushed; then
-//! the redo file switched from, which holds only commits up to T, is cut. Making a database is
-//! checkpoint 0. A checkpoint that fails leaves the database making nothing more durable until it
-//! is reopened: the pages it took as copied may not have reached the file.
+//! logged to its writer's lane of the redo log in timestamp order and made durable by flushes of
+//! the lanes ([`Redo`]). A checkpoint pauses row changes (each holds the gate shared for its page
+//! changes; the checkpoint holds it exclusive for the pause): it takes the last commit's timestamp
+//! T, switches the redo log's turn at it, ends the pool's epoch of writes, and lists the rows whose
+//! version in the pages isn't their version as of T: changes of transactions still open. After the
+//! pause, while writers go on, it copies the pages written in that epoch as they were at the pause
+//! (copy-on-update, [`Pool::copy_owed`]). The copies, the list and the new header go to the next
+//! journal, flushed, then over the data file, flushed; then the redo turn switched from, which
+//! holds only commits up to T, is cut. Making a database is checkpoint 0. A checkpoint that fails
+//! leaves the database making nothing more durable until it is reopened: the pages it took as
+//! copied may not have reached the file.
 //!
 //! Recovery takes the newest complete journal at or after the header's checkpoint and writes its
 //! pages and header again (a power cut may keep a checkpoint's header and not every page it wrote),
-//! loads the pages, puts the rows of its list back to their versions as of T, replays the redo
-//! log's commits after T and clears the versions left on cells: no snapshot outlives the process.
+//! loads the pages, merges the redo lanes by timestamp up to the first commit none holds (cutting
+//! each lane after it), puts the rows of the journal's list back to their versions as of T and
+//! replays the commits after T, side by side by row (SiloR), and clears the versions left on
+//! cells: no snapshot outlives the process.
 //!
 //! Journal and header: `magic` (`u64`), the body's length (`u64`) and XXH3 (`u64`), then the body:
 //! the checkpoint's sequence number (`u64`), T (`u64`), the pages handed out (`u64`), the tree count
@@ -28,7 +32,7 @@ use super::disk::{Disk, File};
 use super::overflow;
 use super::page::PAGE_SIZE;
 use super::pool::Pool;
-use super::redo::{self, Op, Redo};
+use super::redo::{self, LaneId, Op, Redo};
 use super::version::{Savepoint, Snapshot, Ts, Txn, Versioned};
 use crate::error::LimboError;
 use crate::sync::{Arc, Mutex, RwLock};
@@ -144,14 +148,22 @@ fn page_offset(page: u64) -> Result<u64> {
     page.checked_mul(size).ok_or(LimboError::IntegerOverflow)
 }
 
-/// The pages written since this was last asked, each with a copy of its bytes (asked while no page
-/// can change).
-fn copy_dirty(pool: &Pool) -> Result<Vec<(u64, Vec<u8>)>> {
-    let mut pages = Vec::new();
-    for page in pool.take_dirty()? {
-        pages.push((page, pool.read(page)?.to_vec()));
+/// The partition of the replay a row's changes go to: one per thread recovery runs.
+fn partition(op: &Op, parts: usize) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    match op {
+        Op::Put { tree, key, .. } | Op::Remove { tree, key } => {
+            tree.hash(&mut h);
+            key.hash(&mut h);
+        }
+        // Replayed alone, between the row changes ([`Database::apply`]).
+        Op::Made { tree } | Op::Dropped { tree } => tree.hash(&mut h),
     }
-    Ok(pages)
+    usize::try_from(h.finish())
+        .unwrap_or(usize::MAX)
+        .checked_rem(parts)
+        .unwrap_or(0)
 }
 
 /// A journal's contents: its stamp, its pages and its list.
@@ -253,11 +265,11 @@ impl Database {
                 newest = Some(j);
             }
         }
-        let (records, ends) = redo::read(&*disk)?;
         let Some(journal) = newest else {
             // Making a database flushes its journal before it writes the data file: with neither,
             // and no commit logged, it was never made.
-            if header.is_none() && n == 0 && records.iter().all(Vec::is_empty) {
+            let logged = redo::read(&*disk)?;
+            if header.is_none() && n == 0 && logged.iter().all(redo::Found::is_empty) {
                 return Self::create(disk, frames, trees, cmp);
             }
             return Err(corrupt(
@@ -265,8 +277,10 @@ impl Database {
             ));
         };
         Self::write_journal_pages(&*disk, &journal)?;
-        redo::trim(&*disk, ends)?;
         let Journal { stamp, list, .. } = journal;
+        // A checkpoint that switched turns and never finished leaves commits after T in both.
+        let replay = redo::merge(redo::read(&*disk)?, disk.lanes(), stamp.ts)?;
+        redo::trim(&*disk, &replay.ends)?;
         let pool = Pool::new(frames);
         let mut buf = vec![0u8; PAGE_SIZE];
         for page in 1..=stamp.allocated {
@@ -285,44 +299,86 @@ impl Database {
                 cmp()
             }
         })?;
-        let mut d = Descender::new();
-        for op in &list {
-            v.tree(Self::tree_of(op)?)?
-                .apply_plain(&v.pool, &mut d, op)?;
-        }
-        // A checkpoint that switched redo files and never finished leaves commits after T in
-        // both: they are replayed by timestamp.
-        let mut after: Vec<_> = records
-            .into_iter()
-            .flatten()
-            .filter(|r| r.ts > stamp.ts)
-            .collect();
-        after.sort_by_key(|r| r.ts);
-        let mut newest = stamp.ts;
-        for record in &after {
-            for op in &record.ops {
-                match op {
-                    Op::Made { tree } => v.remake_tree(*tree, cmp())?,
-                    Op::Dropped { tree } => v.drop_tree(*tree)?,
-                    Op::Put { tree, .. } | Op::Remove { tree, .. } => {
-                        v.tree(*tree)?.apply_plain(&v.pool, &mut d, op)?
-                    }
-                }
-            }
-            newest = record.ts;
-        }
-        v.clear_versions(&mut d)?;
-        v.clock.recovered(newest);
-        // Each checkpoint switches the file appends go to: after checkpoint `seq`, file `seq % 2`.
-        let current = usize::from(!stamp.seq.is_multiple_of(2));
+        let changes = list
+            .iter()
+            .chain(replay.records.iter().flat_map(|r| r.ops.iter()));
+        Self::apply(&v, changes, &cmp)?;
+        v.clear_versions(&mut Descender::new())?;
+        v.clock.recovered(replay.newest);
+        // Each checkpoint switches the turn appends go to: after checkpoint `seq`, turn `seq % 2`.
+        let turn = usize::from(!stamp.seq.is_multiple_of(2));
         Ok(Self {
             disk,
             v,
-            redo: Redo::new(current, ends, newest),
+            redo: Redo::new(replay.ends, turn, replay.newest)?,
             gate: RwLock::new(()),
             last: Mutex::new(stamp.seq),
             columns: std::sync::OnceLock::new(),
             overflow: u64::try_from(trees).map_err(|_| LimboError::IntegerOverflow)?,
+        })
+    }
+
+    /// Makes `changes` directly, with no versions (recovery): the row changes between two trees
+    /// made or dropped side by side ([`Database::apply_rows`]), each tree made or dropped
+    /// (`AC-NS.2.5`) once every change before it is made, a made tree ordered by `cmp`.
+    fn apply<'a>(
+        v: &Versioned,
+        changes: impl Iterator<Item = &'a Op>,
+        cmp: &dyn Fn() -> Comparator,
+    ) -> Result<()> {
+        let mut rows = Vec::new();
+        for op in changes {
+            match op {
+                Op::Made { tree } => {
+                    Self::apply_rows(v, std::mem::take(&mut rows))?;
+                    v.remake_tree(*tree, cmp())?;
+                }
+                Op::Dropped { tree } => {
+                    Self::apply_rows(v, std::mem::take(&mut rows))?;
+                    v.drop_tree(*tree)?;
+                }
+                Op::Put { .. } | Op::Remove { .. } => rows.push(op),
+            }
+        }
+        Self::apply_rows(v, rows)
+    }
+
+    /// Makes row changes directly, with no versions (recovery), side by side: each row's changes in
+    /// their order on one thread of as many as the machine runs (SiloR's parallel replay: Zheng,
+    /// Tu, Liskov, Madden, OSDI 2014), so the rows end as one thread making them in order would
+    /// leave them.
+    fn apply_rows(v: &Versioned, changes: Vec<&Op>) -> Result<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let parts = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let mut by: Vec<Vec<&Op>> = vec![Vec::new(); parts];
+        for op in changes {
+            by.get_mut(partition(op, parts))
+                .ok_or(LimboError::IntegerOverflow)?
+                .push(op);
+        }
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = by
+                .into_iter()
+                .filter(|ops| !ops.is_empty())
+                .map(|ops| {
+                    scope.spawn(move || -> Result<()> {
+                        let mut d = Descender::new();
+                        for op in ops {
+                            v.tree(Self::tree_of(op)?)?
+                                .apply_plain(&v.pool, &mut d, op)?;
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            for w in workers {
+                w.join().map_err(|_| {
+                    LimboError::InternalError("versioned storage: a recovery replayer ended".into())
+                })??;
+            }
+            Ok(())
         })
     }
 
@@ -345,24 +401,27 @@ impl Database {
                 }
             },
         )?;
+        let allocated = v.pool.allocated();
+        let epoch = v.pool.begin_copy()?;
         let journal = Journal {
             stamp: Stamp {
                 seq: 0,
                 ts: 0,
-                allocated: v.pool.allocated(),
+                allocated,
                 roots: v.roots(),
             },
-            pages: copy_dirty(&v.pool)?,
+            pages: v.pool.copy_owed(epoch, allocated)?,
             list: Vec::new(),
         };
         // What the redo files hold is no record (the caller found none) of this database.
-        redo::trim(&*disk, [0, 0])?;
+        let ends = vec![[0, 0]; disk.lanes()];
+        redo::trim(&*disk, &ends)?;
         Self::write_journal(&*disk, &journal)?;
         Self::write_journal_pages(&*disk, &journal)?;
         Ok(Self {
             disk,
             v,
-            redo: Redo::new(0, [0, 0], 0),
+            redo: Redo::new(ends, 0, 0)?,
             gate: RwLock::new(()),
             last: Mutex::new(0),
             columns: std::sync::OnceLock::new(),
@@ -370,7 +429,7 @@ impl Database {
         })
     }
 
-    /// The tree of a checkpoint's correction: a row change.
+    /// The tree of a row change (a checkpoint's correction or a replayed one).
     fn tree_of(op: &Op) -> Result<u64> {
         match op {
             Op::Put { tree, .. } | Op::Remove { tree, .. } => Ok(*tree),
@@ -411,10 +470,11 @@ impl Database {
     /// Logs `op` alone at the next timestamp, durable, under the gate held exclusive.
     fn log_alone(&self, d: &mut Descender, op: Op) -> Result<()> {
         let txn = self.v.clock.begin()?;
+        let lane = self.redo.lane();
         let ts = self.v.commit_logged(txn, d, |ts, _| {
-            self.redo.append(ts, std::slice::from_ref(&op))
+            self.redo.append(lane, ts, std::slice::from_ref(&op))
         })?;
-        self.redo.sync(&*self.disk, ts).map(|_| ())
+        self.redo.sync(&*self.disk, lane, ts)
     }
 
     fn write_header(disk: &dyn Disk, stamp: &Stamp) -> Result<()> {
@@ -621,15 +681,20 @@ impl Database {
         Ok(before)
     }
 
-    /// Commits `txn`, logged; durable before it returns if `durable`, else once a later
-    /// [`Database::sync`] returns. Its timestamp.
-    pub fn commit(&self, txn: Txn, d: &mut Descender, durable: bool) -> Result<Ts> {
+    /// A redo lane for a writer to commit on: its own while there are as many lanes as writers.
+    pub fn lane(&self) -> LaneId {
+        self.redo.lane()
+    }
+
+    /// Commits `txn`, logged to `lane`; durable before it returns if `durable` (every commit up to
+    /// it durable), else once a later [`Database::sync`] returns. Its timestamp.
+    pub fn commit(&self, txn: Txn, d: &mut Descender, lane: LaneId, durable: bool) -> Result<Ts> {
         // Shared for the publish, which a checkpoint's timestamp must not split, and for a
         // rollback a failed append makes, which changes pages.
         let ts = {
             let _changing = self.gate.read();
             self.v.commit_logged(txn, d, |ts, ops| {
-                self.redo.append(ts, ops)?;
+                self.redo.append(lane, ts, ops)?;
                 if let Some(feed) = self.columns.get() {
                     feed.offer(ts, ops);
                 }
@@ -637,7 +702,7 @@ impl Database {
             })?
         };
         if durable {
-            self.redo.sync(&*self.disk, ts)?;
+            self.redo.sync(&*self.disk, lane, ts)?;
         }
         Ok(ts)
     }
@@ -661,15 +726,29 @@ impl Database {
         self.v.clock.at_publish(|ts| ts)
     }
 
+    /// Drops the versions no open snapshot can see ([`Versioned::collect`]): how many rows lost
+    /// their heads. It changes pages (a removed row's cell goes), so it holds the gate shared, as
+    /// every page change does: a checkpoint's pause sees no page change under way.
+    pub fn collect(&self, d: &mut Descender) -> Result<usize> {
+        let _changing = self.gate.read();
+        self.v.collect(d)
+    }
+
     pub fn abort(&self, txn: Txn, d: &mut Descender) -> Result<()> {
         let _changing = self.gate.read();
         self.v.abort(txn, d)
     }
 
+    /// The redo log's flushes so far and the records they carried.
+    pub fn log_counters(&self) -> redo::Counters {
+        self.redo.counters()
+    }
+
     /// Makes every commit so far durable: the newest durable commit.
     pub fn sync(&self) -> Result<Ts> {
         let ts = self.v.clock.at_publish(|ts| ts);
-        self.redo.sync(&*self.disk, ts)
+        self.redo.sync_all(&*self.disk, ts)?;
+        Ok(ts)
     }
 
     /// A checkpoint (decision 7): the pages written since the last, the rows to correct, the
@@ -693,20 +772,30 @@ impl Database {
     }
 
     fn checkpoint_as(&self, seq: u64) -> Result<Ts> {
-        let (journal, from) = {
+        // The pause: no page changes and no commit publishes while it lasts. What it takes is
+        // bounded by the rows with versions, not by the pages written.
+        let (stamp, list, epoch, from) = {
             let _alone = self.gate.write();
             let (ts, from) = self.v.clock.at_publish(|ts| (ts, self.redo.switch()));
-            let journal = Journal {
-                stamp: Stamp {
-                    seq,
-                    ts,
-                    allocated: self.v.pool.allocated(),
-                    roots: self.v.roots(),
-                },
-                pages: copy_dirty(&self.v.pool)?,
-                list: self.v.corrections(ts)?,
+            let stamp = Stamp {
+                seq,
+                ts,
+                allocated: self.v.pool.allocated(),
+                roots: self.v.roots(),
             };
-            (journal, from)
+            (
+                stamp,
+                self.v.corrections(ts)?,
+                self.v.pool.begin_copy()?,
+                from,
+            )
+        };
+        // Off the commit path: writers go on, each keeping a page's bytes at the pause before its
+        // first change of it.
+        let journal = Journal {
+            pages: self.v.pool.copy_owed(epoch, stamp.allocated)?,
+            stamp,
+            list,
         };
         Self::write_journal(&*self.disk, &journal)?;
         Self::write_journal_pages(&*self.disk, &journal)?;
@@ -740,7 +829,7 @@ mod tests {
     /// them (T-T1.3.1).
     #[test]
     fn durable_commits_survive_a_reopen_and_a_power_cut() {
-        let disk = Arc::new(Simulated::new(5));
+        let disk = Arc::new(Simulated::new(5, 1).unwrap());
         let mut want = BTreeMap::new();
         {
             let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
@@ -751,7 +840,7 @@ mod tests {
                     db.put(&mut d, &mut t, 0, &[k], &[round]).unwrap();
                     want.insert(vec![k], vec![round]);
                 }
-                db.commit(t, &mut d, true).unwrap();
+                db.commit(t, &mut d, db.lane(), true).unwrap();
                 if round == 1 {
                     db.checkpoint().unwrap();
                 }
@@ -762,7 +851,7 @@ mod tests {
         let mut d = Descender::new();
         let mut t = db.begin().unwrap();
         db.put(&mut d, &mut t, 0, b"late", b"x").unwrap();
-        db.commit(t, &mut d, false).unwrap();
+        db.commit(t, &mut d, db.lane(), false).unwrap();
         drop(db);
         disk.power_cut().unwrap();
         let db = Database::open(disk, 2_000, 1, cmp).unwrap();
@@ -778,20 +867,20 @@ mod tests {
     /// redo log replayed the commit after it (T-T1.3.1).
     #[test]
     fn a_checkpoint_mid_transaction_keeps_only_what_commits() {
-        let disk = Arc::new(Simulated::new(9));
+        let disk = Arc::new(Simulated::new(9, 1).unwrap());
         let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
         let mut d = Descender::new();
         let mut base = db.begin().unwrap();
         db.put(&mut d, &mut base, 0, b"a", b"0").unwrap();
         db.put(&mut d, &mut base, 0, b"b", b"0").unwrap();
-        db.commit(base, &mut d, true).unwrap();
+        db.commit(base, &mut d, db.lane(), true).unwrap();
         let mut kept = db.begin().unwrap();
         db.put(&mut d, &mut kept, 0, b"a", b"1").unwrap();
         let mut lost = db.begin().unwrap();
         db.put(&mut d, &mut lost, 0, b"b", b"9").unwrap();
         db.put(&mut d, &mut lost, 0, b"c", b"9").unwrap();
         db.checkpoint().unwrap();
-        db.commit(kept, &mut d, true).unwrap();
+        db.commit(kept, &mut d, db.lane(), true).unwrap();
         db.abort(lost, &mut d).unwrap();
         drop(db);
         disk.power_cut().unwrap();
@@ -811,7 +900,7 @@ mod tests {
     /// (T-T1.3.1).
     #[test]
     fn a_checkpoint_whose_header_outlived_its_pages_is_finished_from_its_journal() {
-        let disk = Arc::new(Simulated::new(11));
+        let disk = Arc::new(Simulated::new(11, 1).unwrap());
         let mut want = BTreeMap::new();
         {
             let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
@@ -822,7 +911,7 @@ mod tests {
                     db.put(&mut d, &mut t, 0, &[k], &[round]).unwrap();
                     want.insert(vec![k], vec![round]);
                 }
-                db.commit(t, &mut d, true).unwrap();
+                db.commit(t, &mut d, db.lane(), true).unwrap();
                 db.checkpoint().unwrap();
             }
             assert_eq!(
@@ -844,7 +933,7 @@ mod tests {
     /// (T-T1.3.1).
     #[test]
     fn a_damaged_header_is_recovered_from_its_journal_and_never_made_anew() {
-        let disk = Arc::new(Simulated::new(13));
+        let disk = Arc::new(Simulated::new(13, 1).unwrap());
         let mut want = BTreeMap::new();
         {
             let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
@@ -854,7 +943,7 @@ mod tests {
                 db.put(&mut d, &mut t, 0, &[k], &[k]).unwrap();
                 want.insert(vec![k], vec![k]);
             }
-            db.commit(t, &mut d, true).unwrap();
+            db.commit(t, &mut d, db.lane(), true).unwrap();
             db.checkpoint().unwrap();
         }
         disk.write_at(File::Data, 20, &[0xff; 8]).unwrap();
@@ -879,18 +968,18 @@ mod tests {
     /// copied may not be on the disk; after a power cut, the rows committed before (T-T1.3.1).
     #[test]
     fn a_failed_checkpoint_refuses_commits_until_reopened() {
-        let disk = Arc::new(Simulated::new(17));
+        let disk = Arc::new(Simulated::new(17, 1).unwrap());
         let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
         let mut d = Descender::new();
         let mut t = db.begin().unwrap();
         db.put(&mut d, &mut t, 0, b"a", b"1").unwrap();
-        db.commit(t, &mut d, true).unwrap();
+        db.commit(t, &mut d, db.lane(), true).unwrap();
         let mut t = db.begin().unwrap();
         db.put(&mut d, &mut t, 0, b"b", b"1").unwrap();
         // The journal's cut, write and flush, then the first page's write: the next fails.
         disk.crash_after(4);
         assert!(db.checkpoint().is_err());
-        assert!(db.commit(t, &mut d, false).is_err());
+        assert!(db.commit(t, &mut d, db.lane(), false).is_err());
         let snap = db.snapshot().unwrap();
         assert_eq!(db.get(&mut d, &snap, 0, b"b").unwrap(), None);
         db.close_snapshot(snap);
@@ -908,13 +997,13 @@ mod tests {
     /// line the old record up behind it (T-T1.3.1).
     #[test]
     fn a_torn_redo_tail_is_cut_before_appends_reach_it() {
-        let disk = Arc::new(Simulated::new(19));
+        let disk = Arc::new(Simulated::new(19, 1).unwrap());
         {
             let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
             let mut d = Descender::new();
             let mut t = db.begin().unwrap();
             db.put(&mut d, &mut t, 0, b"a", b"1").unwrap();
-            db.commit(t, &mut d, true).unwrap();
+            db.commit(t, &mut d, db.lane(), true).unwrap();
         }
         let put = |key: &[u8], value: &[u8]| Op::Put {
             tree: 0,
@@ -925,16 +1014,17 @@ mod tests {
         let old = redo::encode(3, &[put(b"a", b"old")]).unwrap();
         let mut tail = vec![0xee; next.len()];
         tail.extend_from_slice(&old);
-        let end = disk.len(File::Redo).unwrap();
-        disk.write_at(File::Redo, end, &tail).unwrap();
-        disk.sync(File::Redo).unwrap();
+        let redo = File::Redo { lane: 0, turn: 0 };
+        let end = disk.len(redo).unwrap();
+        disk.write_at(redo, end, &tail).unwrap();
+        disk.sync(redo).unwrap();
         {
             let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
             let mut d = Descender::new();
             let mut t = db.begin().unwrap();
             db.put(&mut d, &mut t, 0, b"b", b"2").unwrap();
             assert_eq!(
-                db.commit(t, &mut d, true).unwrap(),
+                db.commit(t, &mut d, db.lane(), true).unwrap(),
                 2,
                 "the record is `next`"
             );
@@ -950,18 +1040,26 @@ mod tests {
     }
 
     /// Do: 8 threads commit to their own keys, every other commit durable, one of them
-    /// checkpointing every 20 commits while the rest commit on; cut the power and reopen. Expect:
-    /// the rows of every commit up to some timestamp, applied in timestamp order, at least up to
-    /// the last commit acknowledged durable (T-T1.3.1).
+    /// checkpointing every 20 commits while the rest commit on (copying pages as they change them);
+    /// one log, then a lane each; cut the power and reopen. Expect: the rows of every commit up to
+    /// some timestamp, applied in timestamp order, at least up to the last commit acknowledged
+    /// durable (T-T1.3.1).
     #[test]
     fn commits_racing_checkpoints_recover_a_prefix() {
-        let disk = Arc::new(Simulated::new(23));
+        for lanes in [1, 8] {
+            commits_racing_checkpoints(lanes);
+        }
+    }
+
+    fn commits_racing_checkpoints(lanes: usize) {
+        let disk = Arc::new(Simulated::new(23, lanes).unwrap());
         let db = Arc::new(Database::open(disk.clone(), 20_000, 1, cmp).unwrap());
         let writers: Vec<_> = (0..8u8)
             .map(|w| {
                 let db = db.clone();
                 std::thread::spawn(move || {
                     let mut d = Descender::new();
+                    let lane = db.lane();
                     let mut done = Vec::new();
                     for i in 0..200u32 {
                         let mut t = db.begin().unwrap();
@@ -969,7 +1067,7 @@ mod tests {
                         let value = i.to_be_bytes().to_vec();
                         db.put(&mut d, &mut t, 0, &key, &value).unwrap();
                         let durable = i.is_multiple_of(2);
-                        let ts = db.commit(t, &mut d, durable).unwrap();
+                        let ts = db.commit(t, &mut d, lane, durable).unwrap();
                         done.push((ts, key, value, durable));
                         if w == 0 && i % 20 == 19 {
                             db.checkpoint().unwrap();
@@ -1000,14 +1098,15 @@ mod tests {
         let n = matched.expect("the rows match no prefix of the commits");
         assert!(
             n >= acknowledged,
-            "{n} recovered, {acknowledged} acknowledged"
+            "{lanes} lanes: {n} recovered, {acknowledged} acknowledged"
         );
     }
 
     /// Do: for many crash points, run a workload of commits (durable, some not) and checkpoints on
-    /// a disk that crashes after that many operations, then cut the power and reopen. Expect: the
-    /// rows after reopening are exactly those of a prefix of the commits, at least as long as the
-    /// last commit acknowledged durable (T-T1.3.1).
+    /// a disk that crashes after that many operations, then cut the power and reopen; on one log
+    /// and on three lanes, commits taking the lanes in turn. Expect: the rows after reopening are
+    /// exactly those of a prefix of the commits, at least as long as the last commit acknowledged
+    /// durable (T-T1.3.1).
     #[test]
     fn a_crash_at_any_operation_recovers_a_prefix_of_commits() {
         crash_recovers_prefixes((5..400).step_by(7), |_| 30);
@@ -1028,18 +1127,19 @@ mod tests {
         });
     }
 
-    /// The crash workload: for each crash point, commits of puts (values of `len(seed)` bytes)
-    /// and removals, some durable, and checkpoints, on a disk that crashes after that many
-    /// operations; then a power cut and a reopen, whose rows must be a prefix of the commits at
-    /// least as long as the last acknowledged.
+    /// The crash workload: for each crash point, on one log and on three lanes, commits of puts
+    /// (values of `len(seed)` bytes) and removals, some durable, and checkpoints, on a disk that
+    /// crashes after that many operations; then a power cut and a reopen, whose rows must be a
+    /// prefix of the commits at least as long as the last acknowledged.
     fn crash_recovers_prefixes(crashes: impl Iterator<Item = u64>, len: impl Fn(u64) -> usize) {
         let mut checked = 0;
-        for crash in crashes {
-            let disk = Arc::new(Simulated::new(crash));
+        for (crash, lanes) in crashes.flat_map(|c| [(c, 1), (c, 3)]) {
+            let disk = Arc::new(Simulated::new(crash, lanes).unwrap());
             let mut commits: Vec<BTreeMap<Vec<u8>, Option<Vec<u8>>>> = Vec::new();
             let mut acknowledged = 0usize;
             {
                 let db = Database::open(disk.clone(), 4_000, 1, cmp).unwrap();
+                let taken: Vec<_> = (0..lanes).map(|_| db.lane()).collect();
                 disk.crash_after(crash);
                 let mut d = Descender::new();
                 let mut seed = crash;
@@ -1065,7 +1165,8 @@ mod tests {
                         }
                     }
                     commits.push(changes);
-                    match db.commit(t, &mut d, !i.is_multiple_of(3)) {
+                    let lane = taken[usize::try_from(i).unwrap() % lanes];
+                    match db.commit(t, &mut d, lane, !i.is_multiple_of(3)) {
                         Ok(_) if !i.is_multiple_of(3) => acknowledged = commits.len(),
                         Ok(_) => {}
                         Err(_) => break 'run,
@@ -1077,7 +1178,7 @@ mod tests {
             }
             disk.power_cut().unwrap();
             let db = Database::open(disk.clone(), 4_000, 1, cmp)
-                .unwrap_or_else(|e| panic!("crash {crash}: reopen: {e}"));
+                .unwrap_or_else(|e| panic!("crash {crash}, {lanes} lanes: reopen: {e}"));
             let got = rows(&db);
             let mut state: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
             let mut prefixes = vec![state.clone()];
@@ -1090,17 +1191,16 @@ mod tests {
                 }
                 prefixes.push(state.clone());
             }
-            let n = prefixes
-                .iter()
-                .position(|p| p == &got)
-                .unwrap_or_else(|| panic!("crash {crash}: rows match no prefix of the commits"));
+            let n = prefixes.iter().position(|p| p == &got).unwrap_or_else(|| {
+                panic!("crash {crash}, {lanes} lanes: rows match no prefix of the commits")
+            });
             assert!(
                 n >= acknowledged,
-                "crash {crash}: {n} commits recovered, {acknowledged} acknowledged"
+                "crash {crash}, {lanes} lanes: {n} commits recovered, {acknowledged} acknowledged"
             );
             checked += 1;
         }
-        assert!(checked > 50);
+        assert!(checked > 100);
     }
 
     /// Every tree's rows from id 2 on (after tree 0 and the overflow tree) up to `ids`: None for a
@@ -1125,7 +1225,7 @@ mod tests {
     /// id; a drop refused (`Busy`) while an open transaction has changed its rows (AC-NS.2.5).
     #[test]
     fn ns2_5_trees_made_and_dropped_survive_reopens() {
-        let disk = Arc::new(Simulated::new(31));
+        let disk = Arc::new(Simulated::new(31, 1).unwrap());
         let want;
         {
             let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
@@ -1138,7 +1238,7 @@ mod tests {
                 db.put(&mut d, &mut txn, t, b"k", &[n; 3]).unwrap();
                 db.put(&mut d, &mut txn, t, b"long", &vec![n; 3 * PAGE_SIZE])
                     .unwrap();
-                db.commit(txn, &mut d, true).unwrap();
+                db.commit(txn, &mut d, db.lane(), true).unwrap();
             }
             let mut open = db.begin().unwrap();
             db.put(&mut d, &mut open, a, b"k", b"open").unwrap();
@@ -1153,7 +1253,7 @@ mod tests {
             assert_eq!(c, 4);
             let mut txn = db.begin().unwrap();
             db.put(&mut d, &mut txn, c, b"c", b"3").unwrap();
-            db.commit(txn, &mut d, true).unwrap();
+            db.commit(txn, &mut d, db.lane(), true).unwrap();
             db.drop_tree(&mut d, b).unwrap();
             want = made_trees(&db, 6);
             assert_eq!(want[0], None);
@@ -1180,7 +1280,7 @@ mod tests {
     fn ns2_5_a_crash_at_each_write_of_trees_made_and_dropped() {
         let mut checked = 0;
         for crash in (3..600).step_by(11) {
-            let disk = Arc::new(Simulated::new(crash));
+            let disk = Arc::new(Simulated::new(crash, 1).unwrap());
             let mut states = vec![vec![None; 38]];
             let mut acknowledged = 1usize;
             {
@@ -1213,7 +1313,7 @@ mod tests {
                     if db.put(&mut d, &mut txn, t, b"row", &v).is_err() {
                         break 'run;
                     }
-                    if db.commit(txn, &mut d, true).is_err() {
+                    if db.commit(txn, &mut d, db.lane(), true).is_err() {
                         states.push({
                             let mut s = state.clone();
                             s.entry(t).or_default().insert(b"row".to_vec(), v.clone());
@@ -1293,7 +1393,7 @@ mod tests {
     /// again and then removed, the newest snapshot sees no chunk rows (AC-NS.2.4).
     #[test]
     fn ns2_4_values_past_a_page_read_at_every_snapshot() {
-        let db = Database::open(Arc::new(Simulated::new(21)), 2_000, 1, cmp).unwrap();
+        let db = Database::open(Arc::new(Simulated::new(21, 1).unwrap()), 2_000, 1, cmp).unwrap();
         let mut d = Descender::new();
         let key = b"big".to_vec();
         let mut values = lengths(&key, 1);
@@ -1303,7 +1403,7 @@ mod tests {
             let mut t = db.begin().unwrap();
             db.put(&mut d, &mut t, 0, &key, v).unwrap();
             db.put(&mut d, &mut t, 0, b"next", b"n").unwrap();
-            db.commit(t, &mut d, false).unwrap();
+            db.commit(t, &mut d, db.lane(), false).unwrap();
             seen.push((db.snapshot().unwrap(), v.clone()));
         }
         for (snap, v) in &seen {
@@ -1326,7 +1426,7 @@ mod tests {
             db.remove(&mut d, &mut t, 0, &key).unwrap(),
             Some(long.1.clone())
         );
-        db.commit(t, &mut d, false).unwrap();
+        db.commit(t, &mut d, db.lane(), false).unwrap();
         let snap = db.snapshot().unwrap();
         assert_eq!(db.get(&mut d, &snap, 0, &key).unwrap(), None);
         assert_eq!(chunk_rows(&db, &snap), 0, "a removal removes its chunks");
@@ -1340,14 +1440,14 @@ mod tests {
     /// chunks as many as before (AC-NS.2.4).
     #[test]
     fn ns2_4_rollback_and_savepoints_across_large_values() {
-        let db = Database::open(Arc::new(Simulated::new(22)), 2_000, 1, cmp).unwrap();
+        let db = Database::open(Arc::new(Simulated::new(22, 1).unwrap()), 2_000, 1, cmp).unwrap();
         let mut d = Descender::new();
         let key = b"k".to_vec();
         let vals = lengths(&key, 7);
         let (first, longer, other) = (&vals[4], &vals[6], &vals[5]);
         let mut t = db.begin().unwrap();
         db.put(&mut d, &mut t, 0, &key, first).unwrap();
-        db.commit(t, &mut d, false).unwrap();
+        db.commit(t, &mut d, db.lane(), false).unwrap();
         let before = chunk_rows(&db, &db.snapshot().unwrap());
         let mut t = db.begin().unwrap();
         assert_eq!(
@@ -1384,7 +1484,7 @@ mod tests {
     /// Expect: every committed value whole, the open transaction's absent (AC-NS.2.4, T-T1.3.1).
     #[test]
     fn ns2_4_large_values_survive_recovery() {
-        let disk = Arc::new(Simulated::new(23));
+        let disk = Arc::new(Simulated::new(23, 1).unwrap());
         let mut want = BTreeMap::new();
         {
             let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
@@ -1393,7 +1493,7 @@ mod tests {
                 let mut t = db.begin().unwrap();
                 let k = vec![b'a', i as u8];
                 db.put(&mut d, &mut t, 0, &k, &v).unwrap();
-                db.commit(t, &mut d, true).unwrap();
+                db.commit(t, &mut d, db.lane(), true).unwrap();
                 want.insert(k, v);
             }
             let mut open = db.begin().unwrap();
@@ -1404,7 +1504,7 @@ mod tests {
                 let mut t = db.begin().unwrap();
                 let k = vec![b'b', i as u8];
                 db.put(&mut d, &mut t, 0, &k, &v).unwrap();
-                db.commit(t, &mut d, true).unwrap();
+                db.commit(t, &mut d, db.lane(), true).unwrap();
                 want.insert(k, v);
             }
         }

@@ -1805,11 +1805,12 @@ applies every commit once, on a leader, a follower and a learner alike):
 - *over*, the base tail: an entry applied, not held, by a step that took longer than AC-T1.3.4's bound on a
   commit's p99.9 (15 ms). This is a proxy: it is the delay the owner added itself, past the p99.9. A commit's
   quorum and network time aren't the owner's to see, and don't change with restarts;
-- *next*: the most one restart held, the restart about to come guessed by the worst seen.
+- *next*: the most one of the last 1 / (1 - q) restarts (a thousand) held, the restart about to come guessed by the
+  worst seen: the worst of n holds estimates their 1 - 1/n quantile, the quantile the rule holds.
 
-A restart is due when (held + over + next) / applied < 1 - q, all over a window of the current and previous
-generation of `log_bound::GENERATION` ticks, 30 to 60 s, the quorum patience's window until 2026-11-21 and still a
-picked number ("Decision (lane constants): generations learned where they run"). Here q = 0.999 is the highest
+A restart is due when (held + over + next) / applied < 1 - q, all over the current generation: from the restart
+that began it, and ended by the restart made once it alone covers its own spend so ("Decision (lane constants): a
+generation of restarts ends once it covers its spend"). Here q = 0.999 is the highest
 quantile the registry holds a commit's latency to (AC-T1.3.4's p99.9, and AC-T1.4.3's). The code keeps q as the
 fraction 999/1,000 and compares cross-multiplied, with checked arithmetic. The comparison is strict, net of the
 measured base tail, and counts the coming restart, so a restart that holds no more than the worst seen leaves the
@@ -1900,19 +1901,20 @@ the counts at each owner step and tick; the restart's held at each step until id
 On adas-mac-studio.local-2 (macOS aarch64), 2026-11-11; the core's tests in `database::log_bound`, the owner's in
 `database::replicated`:
 - T-T1.8.D3 `the_first_restart_is_free`, `a_restart_spends_what_it_held_and_spaces_the_next` (held 5: due at 10,001
-  applied, not 10,000), `long_steps_spend_the_tail_before_any_restart`, `the_window_forgets_after_two_generations`.
+  applied, not 10,000), `long_steps_spend_the_tail_before_any_restart`,
+  `a_generation_ends_once_it_covers_its_spend_and_is_forgotten`, `the_guess_is_the_worst_of_the_last_thousand_holds`.
 - T-T1.8.D3 `a_restart_due_again_by_its_share_on_an_owner_never_idle`: a restart that found 3 bytes queued holds 7
   entries until a step begins with 3, and through a million steps never idle a restart comes due again. Red on
   4a274ec, whose hold ended only at an idle step: every one of 1,000,005 entries held.
-- T-T1.8.D3, the share: `restarts_made_when_due_keep_their_share_below_the_tail`. Four generations of steps of 1 to
+- T-T1.8.D3, the share: `restarts_made_when_due_keep_their_share_below_the_tail`. 240,000 steps of 1 to
   7 entries, a long one in 20,011, each restart made when due and holding 1 to 9. After every restart that held no
   more than the worst before it, held + over stays strictly below a thousandth of the entries applied over the
-  window.
+  generation it ended and the one it began.
 - T-T1.8.D3 `a_log_takes_its_file_and_an_equal_share_of_what_is_free_past_one_image`: the room at its edges, and a
   frame grown from free bytes into the file leaves one log's room where it was.
 - T-T1.8.D3 `the_first_restart_is_free_and_the_next_waits_on_its_share`: a learner restarts after its first write
   (on b151af0 none, its bound being 131,072 frames). Told of a restart that held one entry, it makes none while 20
-  more apply, and makes one once two generations passed.
+  more apply, and makes one once its generation covered its spend.
 - T-T1.8.D3 `past_its_room_a_replica_refuses_submits_and_restarts_whatever_its_share`: a voter whose share is spent
   (a million held) and whose filesystem has nothing free past one image. With a local read held open, a write is
   refused `Unavailable` naming the frames past the room, and no restart is made. Once the read ends a restart
@@ -2306,11 +2308,10 @@ lapses once they stop. Whose events:
   ages on its own (`Answers`, a generation a voter);
 - the write slot: each member's own learned retry gaps (`slot::Slots::expire`), on the owner's clock.
 
-The log's restarts keep the fixed window (`log_bound::GENERATION`), still a picked number. A window learned from
-their own spacing was tried and fails its share test (`restarts_made_when_due_keep_their_share_below_the_tail`): it
-feeds back on itself, since a window as short as the restarts' spacing forgets a hold, so the next restart is due at
-once, and the spacing shortens again. Its learned form must be set by what the rule needs instead: a generation that
-ends once it alone covers its own spend at the quantile, so what it forgets never made a restart due.
+The log's restarts kept the fixed window (`log_bound::GENERATION`) here; the next decision replaces it. A window
+learned from their own spacing was tried and fails its share test
+(`restarts_made_when_due_keep_their_share_below_the_tail`): it feeds back on itself, since a window as short as the
+restarts' spacing forgets a hold, so the next restart is due at once, and the spacing shortens again.
 Gone, not slow, is the host's detector's verdict, as the write slot already ruled: a gap over which the detector
 suspected its voter is refused (`patience::Unmeasured::Suspected`) and counted in
 `amphora_replica_quorum_patience_refused_total`, its help line now saying so.
@@ -2329,6 +2330,30 @@ the driven patience tests,
 **Falsified by:** step 1's measurement re-run with the learned windows in force, with more quorum-check step-downs
 than with the fixed window; a leader that keeps a patience after its voters' stalls stopped for two of their own
 recurrences.
+
+## Decision (lane constants): a generation of restarts ends once it covers its spend (2026-11-21)
+
+`log_bound::GENERATION` (3,000 ticks, the quorum patience's old window, measured once on adacachy) set how long the
+database log's restarts were counted: a picked number by Ada's word. A window learned from the restarts' own spacing
+fed back on itself (the decision before). **The decision** (GN.2): a generation runs from one restart to the restart
+made once it alone covers its own spend at the quantile: its held, its base tail and the next restart's guess,
+strictly below 1 - q of the entries it applied. That restart begins the next generation, and the one it ended is
+forgotten: it paid for itself, so forgetting it never makes a restart due, and a calm stretch banks no restarts for
+later. A restart made before (past the log's room, disk before latency) counts into the same generation, so its
+spend is paid before the next is due. The guess is the worst of the last 1 / (1 - q) holds (a thousand at the p99.9,
+a bounded monotonic queue): it falls back once a large hold is that many restarts old. No time enters: the owner's
+tick no longer touches the count.
+
+**What it costs.** Restarts are spaced by each generation's own spend, not by a window's slack: on the share test's
+load 64 restarts against the fixed window's 182, each still within the tail.
+
+**Tests.** `a_generation_ends_once_it_covers_its_spend_and_is_forgotten`,
+`the_guess_is_the_worst_of_the_last_thousand_holds` (T-GN.2.1); the share test,
+`restarts_made_when_due_keep_their_share_below_the_tail`, over the generation a restart ended and the one it began;
+the owner's `the_first_restart_is_free_and_the_next_waits_on_its_share`.
+
+**Falsified by:** the restarts bench (AC-T1.4.3, restarts on against off) with p99.9 moved more than with the fixed
+window; a restart's hold larger than every one of the last thousand pushing the share past the tail in a run.
 
 ## A follower's write that read nothing written since its base: read sets (built 2026-11-21, Amphora goal ceea4e0a)
 
@@ -2389,3 +2414,51 @@ The W tests run with read sets on.
 Falsified by: a non-serializable history with read sets on; a release A/B against G where read sets don't cut G's
 write gaps; a `conflict` share near one on workloads whose writes touch different pages (the read set too wide: the
 recorder catching reads the session didn't make).
+
+## Decision (lane g12s2): the raft log as the WAL (2026-11-21, G12 step 2)
+
+Requirements AC-T1.8.L1 and L2, tests T-T1.8.L1 and L2 (docs/requirements.toml); kiln plan "G12 Replication
+(CP-T1.8)", step 2.
+
+### What was left
+
+Applies already flushed nothing on the owner's thread ("A replica's database log", decision 1), and a write was
+already acknowledged only once hyper-durable held it on a quorum's raft logs (durable.md §4.1, I5). One flush was
+still the owner's: `Machine::persist`, which hyper-durable's `Replica::compact` asks before it moves the raft log's
+start, flushed the database's log inline. So each compaction stood the owner still for a flush, the stall decision 1
+removed from applies, and the rule "the engine's log is durable before Raft compacts past it" rested on that inline
+flush rather than on what had been made durable.
+
+### The decision
+
+`Machine::persist` does nothing. `Replica::compact` moves the start to `durable() - keep` at most (hyper-durable,
+replica.rs, I8), and `Machine::durable` is the point the owner's flushing thread last made durable
+(`flushed_through`). So a compaction waits for the engine's flush: it never passes it, and one asked before the flush
+ends moves the start only as far as the last finished flush; the next compaction, at a later step, takes the rest.
+The raft log always holds every entry past what the database's log made durable, so a power cut that loses the
+database log's unflushed tail reopens at `durable()` and applies the rest again from the raft log (§4.3), as before.
+The raft log is the write-ahead log; the database's log is a cache of it that the flushing thread makes durable in
+its own time. Still flushed inline, all rare and as before: a membership change (its join rows), an install, the
+seed, a persisted class entry, and `open`.
+
+The owner compacts when the raft log holds 128 MiB of applied entries or is stalled for room. A stall waits on the
+flushing thread, which is always asked to flush what was applied (`Actor::flush`), so it frees room once that flush
+ends, not on a flush of the owner's own.
+
+### Evidence
+
+- T-T1.8.L1 `compaction_waits_for_the_engines_flush` (database::replicated): a voter's flushes held, 1 flushed and
+  2 to 5 applied. A compaction keeping nothing moves the raft log's start to the flushed point and no further, and
+  flushes nothing (2 to 5 stay unflushed); once flushed, the next compaction reaches the last entry applied.
+- T-T1.8.L2 `the_records_suite_answers_alike_at_one_voter_and_three` (tests/records_conformance.rs): one harness,
+  `Group::new(voters)`, the group's size its only parameter, runs the Records suite and seeded histories against the
+  simulator at one voter and at three, each at its leader; every case passes and the two transcripts are identical.
+- The tests that compact a leader to make a joiner install its image now wait until its flushing thread has
+  flushed what it applied (`Driven::flushed`), the fact that compaction now waits on.
+
+### Falsified by
+
+- a compaction that moves the raft log's start past `Machine::durable`;
+- an acknowledged write lost after a power cut that lost the database log's unflushed tail (the power-cut nemesis);
+- a stalled owner whose raft log never frees room while its flushing thread keeps flushing;
+- a store test whose answers differ between one voter and three.

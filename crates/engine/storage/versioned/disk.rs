@@ -1,9 +1,11 @@
 //! Amphora: the versioned storage's files (Amphora's `docs/design/engine.md`, decisions 6 to 8),
-//! behind a seam: positional reads and writes, flushes, lengths and cuts of a database's three
-//! files ([`File`]). [`Files`] keeps them in a directory; [`Simulated`] keeps them in memory, its
-//! writes durable only once flushed, and can crash after any number of operations, keeping of each
-//! write since its file's last flush all of it, none of it, or a prefix of its sectors, as a power
-//! cut may (CLAUDE.md §9: a simulator beside the real thing).
+//! behind a seam: positional reads and writes, flushes, lengths and cuts of a database's files
+//! ([`File`]): its data file, its two checkpoint journals, and two redo files for each of its log's
+//! lanes. [`Files`] keeps them in a directory; [`Simulated`] keeps them in memory, its writes
+//! durable only once flushed, and can crash after any number of operations, keeping of each write
+//! since its file's last flush all of it, none of it, or a prefix of its sectors, as a power cut
+//! may (CLAUDE.md §9: a simulator beside the real thing). On Linux, `uring` (the engine's
+//! `io_uring` feature) writes and flushes a log's bytes in one submission.
 
 use crate::error::LimboError;
 use crate::sync::Mutex;
@@ -14,32 +16,61 @@ use crate::Result;
 pub enum File {
     /// The pages, and the header ahead of them.
     Data,
-    /// The redo log's two files, taking turns (decision 6).
-    Redo,
-    RedoNext,
     /// The checkpoint journals, taking turns: each a checkpoint's pages, its list of rows to
     /// correct and its timestamp (decision 7).
     Journal,
     JournalNext,
+    /// Lane `lane`'s redo files, `turn` 0 or 1 taking turns at checkpoints (decision 6).
+    Redo {
+        lane: usize,
+        turn: usize,
+    },
 }
 
-/// The files there are.
-const FILES: usize = 5;
+/// The files ahead of the redo files.
+const FIXED: usize = 3;
 
 impl File {
-    fn index(self) -> usize {
+    /// Its place among `lanes` lanes' files; refused past them.
+    pub(super) fn index(self, lanes: usize) -> Result<usize> {
         match self {
-            File::Data => 0,
-            File::Redo => 1,
-            File::RedoNext => 2,
-            File::Journal => 3,
-            File::JournalNext => 4,
+            File::Data => Ok(0),
+            File::Journal => Ok(1),
+            File::JournalNext => Ok(2),
+            File::Redo { lane, turn } if lane < lanes && turn < 2 => lane
+                .checked_mul(2)
+                .and_then(|l| l.checked_add(turn))
+                .and_then(|l| l.checked_add(FIXED))
+                .ok_or(LimboError::IntegerOverflow),
+            File::Redo { lane, .. } => Err(LimboError::InternalError(format!(
+                "versioned storage: no redo lane {lane} among {lanes}"
+            ))),
         }
     }
+
+    /// How many files `lanes` lanes make.
+    pub(super) fn count(lanes: usize) -> Result<usize> {
+        lanes
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(FIXED))
+            .ok_or(LimboError::IntegerOverflow)
+    }
+}
+
+/// A log of no lanes holds nothing: refused.
+fn check_lanes(lanes: usize) -> Result<()> {
+    if lanes == 0 {
+        return Err(LimboError::InvalidArgument(
+            "versioned storage: a redo log needs a lane".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// A database's files, as the storage reads and writes them.
 pub trait Disk: Send + Sync {
+    /// The redo log's lanes these files hold.
+    fn lanes(&self) -> usize;
     /// Reads into `buf` from `offset`: the bytes read, fewer past the file's end.
     fn read_at(&self, file: File, offset: u64, buf: &mut [u8]) -> Result<usize>;
     /// Writes `data` at `offset`, growing the file if it ends before.
@@ -49,20 +80,50 @@ pub trait Disk: Send + Sync {
     fn len(&self, file: File) -> Result<u64>;
     /// Cuts `file` to `len` bytes, durably once synced.
     fn truncate(&self, file: File, len: u64) -> Result<()>;
+    /// Writes `data` at `offset` and makes every write to `file` durable: a log's flush.
+    fn write_sync(&self, file: File, offset: u64, data: &[u8]) -> Result<()> {
+        self.write_at(file, offset, data)?;
+        self.sync(file)
+    }
 }
 
-fn io(what: &str, e: std::io::Error) -> LimboError {
+pub(super) fn io(what: &str, e: std::io::Error) -> LimboError {
     LimboError::InternalError(format!("versioned storage: {what}: {e}"))
 }
 
-/// The files in a directory: `data`, `redo`, `redo-next`, `journal` and `journal-next`.
+/// A redo file's name in a directory.
+fn redo_name(lane: usize, turn: usize) -> String {
+    format!("redo-{lane}-{turn}")
+}
+
+/// The lane a redo file's name names, if it names one.
+fn lane_of(name: &str) -> Option<usize> {
+    let rest = name.strip_prefix("redo-")?;
+    match rest.split_once('-')? {
+        (lane, "0" | "1") => lane.parse().ok(),
+        _ => None,
+    }
+}
+
+/// The files in a directory: `data`, `journal`, `journal-next`, and each lane's `redo-<lane>-0`
+/// and `redo-<lane>-1`.
 pub struct Files {
-    files: [std::fs::File; FILES],
+    files: Vec<std::fs::File>,
+    lanes: usize,
 }
 
 impl Files {
-    /// Opens (creating) the files in `dir`.
-    pub fn open(dir: &std::path::Path) -> Result<Self> {
+    /// Opens (creating) the files in `dir`, with `lanes` lanes, or as many as it already holds if
+    /// more: a lane's records are never left unread.
+    pub fn open(dir: &std::path::Path, lanes: usize) -> Result<Self> {
+        check_lanes(lanes)?;
+        let mut held = lanes;
+        for entry in std::fs::read_dir(dir).map_err(|e| io("a directory", e))? {
+            let entry = entry.map_err(|e| io("a directory", e))?;
+            if let Some(lane) = entry.file_name().to_str().and_then(lane_of) {
+                held = held.max(lane.checked_add(1).ok_or(LimboError::IntegerOverflow)?);
+            }
+        }
         let open = |name: &str| {
             std::fs::OpenOptions::new()
                 .read(true)
@@ -72,24 +133,24 @@ impl Files {
                 .open(dir.join(name))
                 .map_err(|e| io(name, e))
         };
-        Ok(Self {
-            files: [
-                open("data")?,
-                open("redo")?,
-                open("redo-next")?,
-                open("journal")?,
-                open("journal-next")?,
-            ],
-        })
+        let mut files = Vec::with_capacity(File::count(held)?);
+        for name in ["data", "journal", "journal-next"] {
+            files.push(open(name)?);
+        }
+        for lane in 0..held {
+            for turn in 0..2 {
+                files.push(open(&redo_name(lane, turn))?);
+            }
+        }
+        Ok(Self { files, lanes: held })
     }
 
-    fn file(&self, file: File) -> Result<&std::fs::File> {
+    pub(super) fn file(&self, file: File) -> Result<&std::fs::File> {
         self.files
-            .get(file.index())
+            .get(file.index(self.lanes)?)
             .ok_or_else(|| LimboError::InternalError("versioned storage: a missing file".into()))
     }
 }
-
 #[cfg(unix)]
 fn pread(f: &std::fs::File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
     use std::os::unix::fs::FileExt;
@@ -158,6 +219,10 @@ fn pwrite(_: &std::fs::File, _: u64, _: &[u8]) -> std::io::Result<()> {
 }
 
 impl Disk for Files {
+    fn lanes(&self) -> usize {
+        self.lanes
+    }
+
     fn read_at(&self, file: File, offset: u64, buf: &mut [u8]) -> Result<usize> {
         pread(self.file(file)?, offset, buf).map_err(|e| io("a read", e))
     }
@@ -217,28 +282,40 @@ fn put(bytes: &mut Vec<u8>, offset: u64, data: &[u8]) -> Result<()> {
 }
 
 struct SimState {
-    files: [SimFile; FILES],
+    files: Vec<SimFile>,
     /// Operations left before the simulated crash (None: never).
     budget: Option<u64>,
     crashed: bool,
     seed: u64,
+    /// Operations done, crashed or not.
+    done: u64,
 }
 
 /// The files in memory, for tests: durable once flushed, crashing on demand.
 pub struct Simulated {
     state: Mutex<SimState>,
+    lanes: usize,
 }
 
 impl Simulated {
-    pub fn new(seed: u64) -> Self {
-        Self {
+    /// Empty files for a log of `lanes` lanes; a power cut's losses drawn from `seed`.
+    pub fn new(seed: u64, lanes: usize) -> Result<Self> {
+        check_lanes(lanes)?;
+        Ok(Self {
             state: Mutex::new(SimState {
-                files: Default::default(),
+                files: vec![SimFile::default(); File::count(lanes)?],
                 budget: None,
                 crashed: false,
                 seed: seed | 1,
+                done: 0,
             }),
-        }
+            lanes,
+        })
+    }
+
+    /// The operations asked of it so far: a workload's count, to crash it at each.
+    pub fn operations(&self) -> u64 {
+        self.state.lock().done
     }
 
     /// Fails every operation after `ops` more, as a process that stopped there would.
@@ -298,6 +375,7 @@ impl Simulated {
     }
 
     fn spend(s: &mut SimState) -> Result<()> {
+        s.done = s.done.saturating_add(1);
         if s.crashed {
             return Err(LimboError::InternalError(
                 "versioned storage: the simulated disk crashed".into(),
@@ -315,18 +393,22 @@ impl Simulated {
         Ok(())
     }
 
-    fn file(s: &mut SimState, file: File) -> Result<&mut SimFile> {
+    fn file(s: &mut SimState, lanes: usize, file: File) -> Result<&mut SimFile> {
         s.files
-            .get_mut(file.index())
+            .get_mut(file.index(lanes)?)
             .ok_or_else(|| LimboError::InternalError("versioned storage: a missing file".into()))
     }
 }
 
 impl Disk for Simulated {
+    fn lanes(&self) -> usize {
+        self.lanes
+    }
+
     fn read_at(&self, file: File, offset: u64, buf: &mut [u8]) -> Result<usize> {
         let mut s = self.state.lock();
         Self::spend(&mut s)?;
-        let f = Self::file(&mut s, file)?;
+        let f = Self::file(&mut s, self.lanes, file)?;
         let start = usize::try_from(offset).map_err(|_| LimboError::IntegerOverflow)?;
         let have = f.now.get(start..).unwrap_or_default();
         let n = have.len().min(buf.len());
@@ -339,7 +421,7 @@ impl Disk for Simulated {
     fn write_at(&self, file: File, offset: u64, data: &[u8]) -> Result<()> {
         let mut s = self.state.lock();
         Self::spend(&mut s)?;
-        let f = Self::file(&mut s, file)?;
+        let f = Self::file(&mut s, self.lanes, file)?;
         put(&mut f.now, offset, data)?;
         f.pending.push(Pending::Write(offset, data.to_vec()));
         Ok(())
@@ -348,7 +430,7 @@ impl Disk for Simulated {
     fn sync(&self, file: File) -> Result<()> {
         let mut s = self.state.lock();
         Self::spend(&mut s)?;
-        let f = Self::file(&mut s, file)?;
+        let f = Self::file(&mut s, self.lanes, file)?;
         f.durable = f.now.clone();
         f.pending.clear();
         Ok(())
@@ -357,14 +439,14 @@ impl Disk for Simulated {
     fn len(&self, file: File) -> Result<u64> {
         let mut s = self.state.lock();
         Self::spend(&mut s)?;
-        let f = Self::file(&mut s, file)?;
+        let f = Self::file(&mut s, self.lanes, file)?;
         u64::try_from(f.now.len()).map_err(|_| LimboError::IntegerOverflow)
     }
 
     fn truncate(&self, file: File, len: u64) -> Result<()> {
         let mut s = self.state.lock();
         Self::spend(&mut s)?;
-        let f = Self::file(&mut s, file)?;
+        let f = Self::file(&mut s, self.lanes, file)?;
         f.now
             .truncate(usize::try_from(len).map_err(|_| LimboError::IntegerOverflow)?);
         f.pending.push(Pending::Cut(len));
@@ -381,15 +463,16 @@ mod tests {
     #[test]
     fn a_power_cut_keeps_what_was_flushed() {
         for seed in 0..20 {
-            let d = Simulated::new(seed);
+            let d = Simulated::new(seed, 1).unwrap();
+            let redo = File::Redo { lane: 0, turn: 0 };
             d.write_at(File::Data, 0, &[1; 1024]).unwrap();
             d.sync(File::Data).unwrap();
-            d.write_at(File::Redo, 0, &[2; 2048]).unwrap();
+            d.write_at(redo, 0, &[2; 2048]).unwrap();
             d.power_cut().unwrap();
             let mut buf = vec![0; 4096];
             assert_eq!(d.read_at(File::Data, 0, &mut buf).unwrap(), 1024);
             assert!(buf[..1024].iter().all(|&b| b == 1));
-            let n = d.read_at(File::Redo, 0, &mut buf).unwrap();
+            let n = d.read_at(redo, 0, &mut buf).unwrap();
             assert!(n.is_multiple_of(SECTOR) && n <= 2048, "{n} bytes kept");
             assert!(buf[..n].iter().all(|&b| b == 2));
         }
@@ -399,7 +482,7 @@ mod tests {
     /// power cut.
     #[test]
     fn a_crash_stops_every_operation_until_the_power_cut() {
-        let d = Simulated::new(1);
+        let d = Simulated::new(1, 1).unwrap();
         d.crash_after(3);
         for _ in 0..3 {
             d.write_at(File::Data, 0, b"x").unwrap();
@@ -414,7 +497,7 @@ mod tests {
     #[test]
     fn files_in_a_directory_read_back_what_was_written() {
         let dir = tempfile::tempdir().unwrap();
-        let d = Files::open(dir.path()).unwrap();
+        let d = Files::open(dir.path(), 2).unwrap();
         d.write_at(File::Journal, 10, b"hello").unwrap();
         d.sync(File::Journal).unwrap();
         let mut buf = [0u8; 15];
@@ -422,5 +505,29 @@ mod tests {
         assert_eq!(&buf[10..], b"hello");
         d.truncate(File::Journal, 12).unwrap();
         assert_eq!(d.len(File::Journal).unwrap(), 12);
+    }
+
+    /// Do: write to lane 3 of a directory opened with four lanes, reopen it asking for one; ask a
+    /// simulator for a lane past its own, and either for none. Expect: the reopened files hold four
+    /// lanes and lane 3's bytes (a lane's records are never left unread); the lane past refused; no
+    /// lanes refused.
+    #[test]
+    fn a_directory_reopens_with_every_lane_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let lane3 = File::Redo { lane: 3, turn: 1 };
+        Files::open(dir.path(), 4)
+            .unwrap()
+            .write_sync(lane3, 0, b"rec")
+            .unwrap();
+        let d = Files::open(dir.path(), 1).unwrap();
+        assert_eq!(d.lanes(), 4);
+        let mut buf = [0u8; 3];
+        assert_eq!(d.read_at(lane3, 0, &mut buf).unwrap(), 3);
+        assert_eq!(&buf, b"rec");
+        let s = Simulated::new(1, 2).unwrap();
+        assert!(s
+            .write_at(File::Redo { lane: 2, turn: 0 }, 0, b"x")
+            .is_err());
+        assert!(Simulated::new(1, 0).is_err() && Files::open(dir.path(), 0).is_err());
     }
 }
