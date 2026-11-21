@@ -41,7 +41,7 @@ fn initial_table(rng: &mut ChaCha8Rng) -> Table {
 fn plain(table: &Table, lo: i64, hi: i64) -> Vec<i64> {
     table
         .iter()
-        .filter(|(_, value)| value.is_some_and(|v| lo <= v && v <= hi))
+        .filter(|(_, value)| value.is_some_and(|v| (lo..=hi).contains(&v)))
         .map(|(rowid, _)| *rowid)
         .collect()
 }
@@ -151,7 +151,7 @@ fn t_g5_4_1_zone_maps_writes_between_scans_match_a_plain_scan() {
 fn plain_range(table: &Table, first: i64, last: i64, lo: i64, hi: i64) -> Vec<i64> {
     table
         .range(first..=last)
-        .filter(|(_, value)| value.is_some_and(|v| lo <= v && v <= hi))
+        .filter(|(_, value)| value.is_some_and(|v| (lo..=hi).contains(&v)))
         .map(|(rowid, _)| *rowid)
         .collect()
 }
@@ -180,7 +180,7 @@ fn t_g5_4_1_cracking_writes_between_scans_match_a_plain_scan() {
                 };
                 let found: Vec<i64> = rowids
                     .iter()
-                    .filter(|rowid| table[rowid].is_some_and(|v| lo <= v && v <= hi))
+                    .filter(|rowid| table[*rowid].is_some_and(|v| (lo..=hi).contains(&v)))
                     .copied()
                     .collect();
                 let expected = plain(&table, lo, hi);

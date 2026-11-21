@@ -163,7 +163,7 @@ fn run_class(class: &Class, prototype: &str, rows: usize, scans: usize, writes: 
                 let (n, m) = rows.fold((0, 0), |(n, m), (_, i)| (n + 1, m + usize::from(hit(i))));
                 (s + n, f + m)
             }),
-            Candidates::Rowids(rowids) => (rowids.len(), rowids.iter().filter(|r| hit(&table[r])).count()),
+            Candidates::Rowids(rowids) => (rowids.len(), rowids.iter().filter(|r| hit(&table[*r])).count()),
         };
         scan_ns += t.elapsed().as_nanos();
         assert_eq!(found, table.values().filter(|i| hit(i)).count(), "{} {prototype}", class.name);

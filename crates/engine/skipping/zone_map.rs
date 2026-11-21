@@ -189,7 +189,7 @@ impl ZoneMap {
                 0
             }
         };
-        self.zones.get_mut(index).ok_or(SkipError::Overflow)
+        self.zones.get_mut(index).ok_or(SkipError::Inconsistent)
     }
 
     fn zone_for_existing(&mut self, rowid: i64, value: Option<i64>) -> Result<&mut Zone, SkipError> {
@@ -255,7 +255,7 @@ impl ZoneMap {
         let after = self.zones.partition_point(|zone| zone.start <= rowid);
         match after.checked_sub(1).and_then(|index| self.zones.get(index)) {
             Some(zone) => match value {
-                Some(v) => zone.ints > 0 && zone.min <= v && v <= zone.max,
+                Some(v) => zone.ints > 0 && (zone.min..=zone.max).contains(&v),
                 None => zone.others > 0,
             },
             None => false,

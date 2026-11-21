@@ -124,31 +124,31 @@ impl CrackerColumn {
     pub fn candidate_rowids(&mut self, lo: i64, hi: i64) -> Result<Vec<i64>, SkipError> {
         self.stats.queries = self.stats.queries.saturating_add(1);
         let mut rowids: Vec<i64> = self.others.iter().copied().collect();
-        if lo <= hi {
-            let from = self.crack(lo)?;
-            let to = match hi.checked_add(1) {
-                Some(above) => self.crack(above)?,
-                None => self.entries.len(),
-            };
-            let piece = self.entries.get(from..to).ok_or(SkipError::Inconsistent)?;
-            count(&mut self.stats.entries_returned, piece.len());
-            rowids.extend(piece.iter().map(|(_, rowid)| *rowid));
-        }
+        let (from, to) = self.cracked(lo, hi)?;
+        let piece = self.entries.get(from..to).ok_or(SkipError::Inconsistent)?;
+        count(&mut self.stats.entries_returned, piece.len());
+        rowids.extend(piece.iter().map(|(_, rowid)| *rowid));
         rowids.sort_unstable();
         Ok(rowids)
     }
 
-    /// The (value, rowid) entries a filter `lo <= value <= hi` matches among the integers, as the
-    /// cracker holds them (T-G5.4.1 checks each against the table: none stale).
-    pub fn matching_entries(&mut self, lo: i64, hi: i64) -> Result<Vec<(i64, i64)>, SkipError> {
+    /// The positions of the piece `lo <= value <= hi` cuts out, cracking at both bounds.
+    fn cracked(&mut self, lo: i64, hi: i64) -> Result<(usize, usize), SkipError> {
         if lo > hi {
-            return Ok(Vec::new());
+            return Ok((0, 0));
         }
         let from = self.crack(lo)?;
         let to = match hi.checked_add(1) {
             Some(above) => self.crack(above)?,
             None => self.entries.len(),
         };
+        Ok((from, to))
+    }
+
+    /// The (value, rowid) entries a filter `lo <= value <= hi` matches among the integers, as the
+    /// cracker holds them (T-G5.4.1 checks each against the table: none stale).
+    pub fn matching_entries(&mut self, lo: i64, hi: i64) -> Result<Vec<(i64, i64)>, SkipError> {
+        let (from, to) = self.cracked(lo, hi)?;
         Ok(self.entries.get(from..to).ok_or(SkipError::Inconsistent)?.to_vec())
     }
 
