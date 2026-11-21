@@ -543,7 +543,9 @@ fn drive(
                         groups.durable(&t, soon()).unwrap();
                         acked[i] += 1;
                     }
-                    Err(Refused::Away(Away::Fenced(_))) => {}
+                    // Fenced for the cutover, or flipped to a group that hasn't taken it up yet:
+                    // asked again later, not acknowledged.
+                    Err(Refused::Away(_)) => {}
                     Err(e) => panic!("a write refused: {e:?}"),
                 }
                 let reply = groups
