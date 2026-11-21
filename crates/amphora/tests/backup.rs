@@ -472,12 +472,7 @@ fn t_t1_12_x1_cross_group_cut_at_every_second() {
 }
 
 fn cross_group_cut(protocol: amphora::xgroup::Protocol) {
-    use amphora::xgroup::{Answer, Cluster, Protocol, Txn};
-    let parallel = matches!(protocol, Protocol::Parallel);
-    let fresh = || match parallel {
-        true => Protocol::Parallel,
-        false => Protocol::TwoPhase,
-    };
+    use amphora::xgroup::{Answer, Cluster, Txn};
     let dir = tempfile::tempdir().unwrap();
     let blobs =
         Arc::new(backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap());
@@ -497,7 +492,7 @@ fn cross_group_cut(protocol: amphora::xgroup::Protocol) {
     let (g0, s0) = open(0);
     let (g1, s1) = open(1);
     let route: amphora::xgroup::Route = Arc::new(|k: &[u8]| u32::from(k == b"b"));
-    let cluster = Cluster::open(vec![g0, g1], Arc::clone(&route), 7, fresh(), 1, until()).unwrap();
+    let cluster = Cluster::open(vec![g0, g1], Arc::clone(&route), 7, protocol, 1, until()).unwrap();
     s0.wait(until(), |s| s.bases >= 1).unwrap();
     s1.wait(until(), |s| s.bases >= 1).unwrap();
     let based = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
@@ -538,13 +533,13 @@ fn cross_group_cut(protocol: amphora::xgroup::Protocol) {
                 )
             })
             .collect();
-        backup::restore_cut(blobs.as_ref(), &groups, second, 7, fresh(), until())
+        backup::restore_cut(blobs.as_ref(), &groups, second, 7, protocol, until())
             .unwrap_or_else(|e| panic!("second {second}: {e:#}"));
         let restored: Vec<Database> = groups
             .iter()
             .map(|(_, p)| Database::open(p, until()).unwrap())
             .collect();
-        let reader = Cluster::open(restored, Arc::clone(&route), 7, fresh(), 1, until()).unwrap();
+        let reader = Cluster::open(restored, Arc::clone(&route), 7, protocol, 1, until()).unwrap();
         let read = Txn {
             reads: vec![b"a".to_vec(), b"b".to_vec()],
             writes: vec![],
