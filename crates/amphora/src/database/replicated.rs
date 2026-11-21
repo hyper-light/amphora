@@ -4287,7 +4287,7 @@ mod tests {
             durability: Durability,
         ) -> Client {
             let path = dir.join(format!("state-{node_id}.db"));
-            let lease = Owned::new(lease(&path), None);
+            let lease = Owned::unbudgeted(lease(&path), None);
             let (reading, clock) = self.reading();
             let (client, actor, receiver) = super::open(
                 &path,
@@ -4323,7 +4323,7 @@ mod tests {
             drop(self.owners.get_mut(owner).unwrap().take());
             let node_id = u64::try_from(owner + 1).unwrap();
             let path = dir.join(format!("state-{node_id}.db"));
-            let lease = Owned::new(lease(&path), None);
+            let lease = Owned::unbudgeted(lease(&path), None);
             let (base, read) = (self.base, Arc::clone(self.clocks.get(owner).unwrap()));
             let (client, actor, receiver) = super::open(
                 &path,
@@ -4918,7 +4918,7 @@ mod tests {
             reading: Arc<AtomicU64>,
         ) -> (Client, (Actor<F>, mpsc::Receiver<Envelope>)) {
             let machine_lease =
-                Owned::new(lease(&dir.join(format!("state-{node_id}.lease"))), None);
+                Owned::unbudgeted(lease(&dir.join(format!("state-{node_id}.lease"))), None);
             let log_owner =
                 Arc::try_unwrap(lease(&dir.join(format!("raft-{node_id}.lease")))).unwrap();
             let replicated = matches!(durability, Durability::Replicated(_));
@@ -6523,7 +6523,7 @@ mod tests {
                 },
                 durability,
                 Arc::new(Changed::default()),
-                Owned::new(lease(&path), None),
+                Owned::unbudgeted(lease(&path), None),
                 driven.until(),
                 clock,
             )
@@ -6707,7 +6707,7 @@ mod tests {
             },
             wider.clone(),
             Arc::new(Changed::default()),
-            Owned::new(lease(&path), None),
+            Owned::unbudgeted(lease(&path), None),
             driven.until(),
             clock,
         )
@@ -13840,7 +13840,7 @@ mod tests {
                 },
                 Durability::Persisted,
                 Arc::new(Changed::default()),
-                Owned::new(lease(&path), None),
+                Owned::unbudgeted(lease(&path), None),
                 until,
                 Arc::new(Instant::now),
             )

@@ -117,13 +117,12 @@ struct Owner {
 static OWNERS: OnceLock<Mutex<BTreeMap<PathBuf, Owner>>> = OnceLock::new();
 /// The paths whose owner this process drained, the latest last. A lease there may still read held
 /// for a moment: a child this process forked shares it until its exec (local-owner-transport.md,
-/// "Owner guards", J1). At most `OWNERS_MAX`, since no more paths can have drained at once, the
-/// oldest evicted first; a path's mark goes once this process takes its lease again.
+/// "Owner guards", J1). A mark names a lease this process held, one descriptor of the process's
+/// descriptor budget, so the marks kept are at most that budget's bound as it stands, the oldest
+/// evicted first (local-owner-transport.md, "One descriptor budget", item 6). An evicted mark
+/// makes an open that still finds the lease held refuse it as another process's, typed, rather
+/// than wait. A path's mark goes once this process takes its lease again.
 static DRAINED: OnceLock<Mutex<std::collections::VecDeque<PathBuf>>> = OnceLock::new();
-/// The owner table's bound (`open database owners`), for a local open and a client's attach
-/// alike. A count picked before 2026-11-11; its derivation, from the process's descriptor limit
-/// with each owner holding its files open, is still open.
-pub(super) const OWNERS_MAX: usize = 4096;
 /// The window this process last waited out for a drained path's lease, from its first probe to
 /// taking it, in nanoseconds (0: none waited yet): how long a child it forked held the lease until
 /// its exec, learned (J1; 62.8 µs once measured on fedora, t1/guards-flake). One last sample: it
@@ -357,12 +356,11 @@ fn forget_drained(owners: &mut BTreeMap<PathBuf, Owner>) -> Result<(), Refusal> 
     if gone.is_empty() {
         return Ok(());
     }
+    let most = crate::descriptors::process()?.bound();
     let mut drained = locked(DRAINED.get_or_init(Mutex::default))?;
     for path in gone {
         drained.retain(|marked| *marked != path);
-        if drained.len() >= OWNERS_MAX {
-            drained.pop_front();
-        }
+        while drained.len() >= most && drained.pop_front().is_some() {}
         drained.try_reserve(1).map_err(unavailable)?;
         drained.push_back(path);
     }
@@ -759,11 +757,10 @@ impl Database {
                     continue;
                 }
             }
-            api::bound(
-                "open database owners",
-                owners.len().saturating_add(1),
-                OWNERS_MAX,
-            )?;
+            // The owner table holds no count of its own: each owner charges the descriptor it
+            // holds, its lease or, a client's, the socket its calls open, to the process's
+            // descriptor budget (local-owner-transport.md, "One descriptor budget", item 6).
+            let descriptor = crate::descriptors::process()?.take("open descriptors", 1)?;
             let lease = match guards {
                 // The path is canonical and its parent exists: the lease makes no directory above.
                 Some(_) => crate::transport::try_lease(&path)?,
@@ -788,7 +785,7 @@ impl Database {
                         "another process owns the destination",
                     ));
                 }
-                match remote::attach(&path, replica, until) {
+                match remote::attach(&path, replica, descriptor, until) {
                     Ok(database) => {
                         owners.insert(
                             path,
@@ -818,7 +815,7 @@ impl Database {
                 drain_window_taken(since);
             }
             let key = guards.as_ref().map(Guards::key);
-            let owner = Owned::new(Arc::new(lease), guards);
+            let owner = Owned::new(Arc::new(lease), descriptor, guards);
             let database = create(&path, owner.clone())?;
             remote::publish(&database, &path)?;
             let identity = file_identity(&path)?;
