@@ -4748,6 +4748,17 @@ mod tests {
                 actor.replica.machine_mut().flushed_through(at);
             }
         }
+        /// Rounds until owner `owner`'s flushing thread has made all it applied durable: a
+        /// compaction moves the raft log's start no further than that (I8).
+        fn flushed(&mut self, pump: &mut Pump<'_>, owner: usize) {
+            for _ in 0..ROUNDS {
+                if self.owner(owner).replica.machine().unflushed().is_none() {
+                    return;
+                }
+                self.round(pump);
+            }
+            panic!("owner {owner} did not flush in {ROUNDS} driven rounds");
+        }
         /// A new member's clock: its reading, which only the test moves, and the clock its owner
         /// reads it through.
         fn reading(&self) -> (Arc<AtomicU64>, Clock) {
@@ -10189,6 +10200,7 @@ mod tests {
         joins_tracked(&mut driven, &mut pump, &[0, 1, 2]);
         write(&mut driven, &mut pump, &clients[leader], 1);
         quiet(&mut driven, &mut pump);
+        driven.flushed(&mut pump, leader);
         let compacted = {
             let owner = &mut driven.owner_mut(leader);
             let now = owner.now().unwrap();
@@ -13119,6 +13131,7 @@ mod tests {
             })
             .unwrap();
         quiet(&mut driven, &mut pump);
+        driven.flushed(&mut pump, 0);
         let compacted = {
             let owner = driven.owner_mut(0);
             let now = owner.now().unwrap();
@@ -13449,6 +13462,74 @@ mod tests {
             flushed,
             "the pass copied through another frame than the flush covered: {copied:?}"
         );
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// AC-T1.8.L1, T-T1.8.L1 (CP-T1.8, G12 step 2; replication.md, "The raft log as the WAL"):
+    /// compaction waits for the engine's flush. Do: a voter and its learner, the voter's flushes
+    /// held; 1 written and the voter's log flushed; 2 to 5 written, applied unflushed; the voter's
+    /// raft log compacted, keeping nothing; then its log flushed and compacted again. Expect: the
+    /// writes answered with their flushes held; the first compaction moved the raft log's start
+    /// to the flushed point and no further, and flushed nothing itself (2 to 5 still unflushed,
+    /// still in the raft log); after the flush, the second moved it to the last entry applied.
+    #[test]
+    fn compaction_waits_for_the_engines_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = voter_and_learner(&mut driven, dir.path());
+        driven.hold_flushes(0);
+        let mut pump = Pump::new(&clients);
+        write(&mut driven, &mut pump, &clients[0], 1);
+        driven.flush(0);
+        let flushed = StateMachine::durable(driven.owner(0).replica.machine());
+        for value in 2..=5 {
+            write(&mut driven, &mut pump, &clients[0], value);
+        }
+        quiet(&mut driven, &mut pump);
+        let start = |driven: &Driven| {
+            driven
+                .owner(0)
+                .replica
+                .core()
+                .raft
+                .log()
+                .first_index()
+                .unwrap()
+        };
+        let compact = |driven: &mut Driven, pump: &mut Pump<'_>| {
+            driven.quiet(pump);
+            let owner = driven.owner_mut(0);
+            let now = owner.now().unwrap();
+            let out = owner
+                .replica
+                .compact(0, now, std::task::Waker::noop())
+                .unwrap();
+            assert!(out, "no compaction went out");
+            driven.quiet(pump);
+        };
+        let applied = driven.owner(0).replica.applied();
+        assert!(
+            applied.index > flushed.index,
+            "2 to 5 weren't applied past the flush"
+        );
+        assert!(
+            start(&driven) <= flushed.index,
+            "the raft log already started past the flush"
+        );
+        compact(&mut driven, &mut pump);
+        assert_eq!(
+            start(&driven),
+            flushed.index + 1,
+            "the raft log's start isn't the flushed point"
+        );
+        let machine = driven.owner(0).replica.machine();
+        assert_eq!(machine.unflushed(), Some(applied), "the compaction flushed");
+        assert_eq!(StateMachine::durable(machine), flushed);
+        driven.flush(0);
+        compact(&mut driven, &mut pump);
+        assert_eq!(start(&driven), applied.index + 1);
+        assert_eq!(held(&mut driven, 0), vec![1, 2, 3, 4, 5]);
         driven.drain(&mut pump);
         pump.finish();
     }

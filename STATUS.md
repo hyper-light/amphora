@@ -340,6 +340,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   whose write is refused at the leader's append gets a slot for its next try, its length learned per member from
   its retries' gaps (cold start: the core's election timeout). A gap over which the host's detector suspected the
   member is not learned; no number bounds a gap (lane g-slot-close, 2026-11-21).
+- **The raft log as the WAL** (G12 step 2, AC-T1.8.L1 and L2; replication.md, "The raft log as the WAL"): the engine
+  applies committed entries without flushing its log per commit; compaction asks nothing of the owner's thread and
+  moves the raft log's start no further than what the flushing thread made durable (T-T1.8.L1). The Records suite
+  and seeded histories run on one harness at one voter and three, with identical transcripts (T-T1.8.L2; lane
+  g12s2, 2026-11-21).
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
