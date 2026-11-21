@@ -7,8 +7,8 @@
 //!   made is gone: until a step begins with no more input queued than it found (held). One is
 //!   due only while the entries held by restarts, the entries the owner's own long steps already
 //!   delayed past AC-T1.3.4's p99.9 (over), and the most one restart held (next, for the restart
-//!   about to come) stay strictly below the p99.9's tail of the entries applied, over patience's
-//!   window of two generations;
+//!   about to come) stay strictly below the p99.9's tail of the entries applied, over a window of
+//!   two generations ([`GENERATION`]);
 //! - the log may hold what its own file and an equal share, among the replica logs on its
 //!   filesystem, of what is free there less one snapshot's image, hold: each frame its own bytes
 //!   and the page its copy may add to the database's file ([`log_room`]).
@@ -16,7 +16,14 @@
 use amphora_api::Refusal;
 use std::time::Duration;
 
-use super::patience::GENERATION;
+/// Ticks of one generation of the restarts' window: the quorum patience's fixed window until
+/// 2026-11-21 (30 s, measured once on adacachy), kept here alone. Still a picked number (Ada's word,
+/// 2026-11-21): a window learned from its own restarts' spacing feeds back on itself (a short
+/// window forgets a hold, so the next restart is due at once, and the spacing shortens again), so
+/// its learned form, a generation that ends once it alone covers its spend at the quantile, waits
+/// for its own change (replication.md, "Decision (lane constants): generations learned where they
+/// run").
+pub(super) const GENERATION: u64 = 3_000;
 
 /// The quantile the registry holds a commit's latency to, as a fraction: AC-T1.3.4's p99.9, the
 /// highest of docs/requirements.toml (AC-T1.4.3 holds the same quantile).
