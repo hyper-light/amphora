@@ -2787,6 +2787,8 @@ impl Database {
                 crate::connection::JoinMethods::ByCost,
             ),
             sorted_fetches: AtomicBool::new(false),
+            parallel_mode: AtomicBool::new(false),
+            morsel_costs: crate::sync::Mutex::new(None),
             vectorized_scans: AtomicBool::new(false),
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),

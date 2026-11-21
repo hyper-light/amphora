@@ -63,6 +63,10 @@ pub enum MorselError {
     Unsupported { kind: &'static str },
     #[error("out of memory")]
     Alloc,
+    #[error("reading the table: {0}")]
+    Storage(Box<crate::LimboError>),
+    #[error("the table's b-tree is malformed: {0}")]
+    Corrupt(&'static str),
 }
 
 impl From<std::collections::TryReserveError> for MorselError {
@@ -1000,6 +1004,63 @@ impl ScanAggregate<'_> {
         Ok(out)
     }
 
+    /// Folds one input row, at `position` in the input's order (the order ties break by), into
+    /// `partial`: the loop body every source of rows shares, rows in memory or a worker's cursor
+    /// (`morsel_scan.rs`).
+    pub(crate) fn fold(
+        &self,
+        row: &[Value],
+        position: usize,
+        partial: &mut AggregatePartial,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        let mut passes = true;
+        for term in self.filter {
+            if !term.holds(row)? {
+                passes = false;
+                break;
+            }
+        }
+        if !passes {
+            return Ok(());
+        }
+        let mut key = Vec::new();
+        key.try_reserve_exact(self.group_by.len())?;
+        for at in self.group_by {
+            key.push(key_part(column(row, *at)?));
+        }
+        let group = match partial.groups.get_mut(&key) {
+            Some(group) => group,
+            None => {
+                budget.charge(self.group_bytes())?;
+                let mut values = Vec::new();
+                values.try_reserve_exact(self.group_by.len())?;
+                for at in self.group_by {
+                    values.push(
+                        column(row, *at)?
+                            .try_clone()
+                            .map_err(|_| MorselError::Alloc)?,
+                    );
+                }
+                let accumulators = self
+                    .aggregates
+                    .iter()
+                    .map(|a| Accumulator::new(*a))
+                    .collect();
+                partial.groups.try_reserve(1)?;
+                partial.groups.entry(key).or_insert(Group {
+                    first_row: position,
+                    key: values,
+                    accumulators,
+                })
+            }
+        };
+        for (accumulator, aggregate) in group.accumulators.iter_mut().zip(self.aggregates) {
+            accumulator.step(*aggregate, row, position)?;
+        }
+        Ok(())
+    }
+
     fn group_bytes(&self) -> usize {
         let key = std::mem::size_of::<KeyPart>()
             .saturating_add(std::mem::size_of::<Value>())
@@ -1035,51 +1096,7 @@ impl Pipeline for ScanAggregate<'_> {
             });
         };
         for (offset, row) in morsel.iter().enumerate() {
-            let mut passes = true;
-            for term in self.filter {
-                if !term.holds(row)? {
-                    passes = false;
-                    break;
-                }
-            }
-            if !passes {
-                continue;
-            }
-            let position = first.saturating_add(offset);
-            let mut key = Vec::new();
-            key.try_reserve_exact(self.group_by.len())?;
-            for at in self.group_by {
-                key.push(key_part(column(row, *at)?));
-            }
-            let group = match partial.groups.get_mut(&key) {
-                Some(group) => group,
-                None => {
-                    budget.charge(self.group_bytes())?;
-                    let mut values = Vec::new();
-                    values.try_reserve_exact(self.group_by.len())?;
-                    for at in self.group_by {
-                        values.push(
-                            column(row, *at)?
-                                .try_clone()
-                                .map_err(|_| MorselError::Alloc)?,
-                        );
-                    }
-                    let accumulators = self
-                        .aggregates
-                        .iter()
-                        .map(|a| Accumulator::new(*a))
-                        .collect();
-                    partial.groups.try_reserve(1)?;
-                    partial.groups.entry(key).or_insert(Group {
-                        first_row: position,
-                        key: values,
-                        accumulators,
-                    })
-                }
-            };
-            for (accumulator, aggregate) in group.accumulators.iter_mut().zip(self.aggregates) {
-                accumulator.step(*aggregate, row, position)?;
-            }
+            self.fold(row, first.saturating_add(offset), partial, budget)?;
         }
         Ok(())
     }
@@ -1154,6 +1171,15 @@ impl<'a> HashProbe<'a> {
         })
     }
 
+    /// The build rows whose key equals `row`'s at the probe key's columns, in build order; none
+    /// when the key holds a NULL or nothing matches.
+    pub(crate) fn matches(&self, row: &[Value]) -> Result<&[usize], MorselError> {
+        let Some(key) = join_key(row, self.probe_key)? else {
+            return Ok(&[]);
+        };
+        Ok(self.table.get(&key).map_or(&[], Vec::as_slice))
+    }
+
     /// The matches as (probe row, build row), in the serial order.
     pub fn finish(&self, mut partial: ProbePartial) -> Result<Vec<(usize, usize)>, MorselError> {
         partial.sort_by_key(|(first, _)| *first);
@@ -1207,12 +1233,10 @@ impl Pipeline for HashProbe<'_> {
         };
         let mut found = Vec::new();
         for (offset, row) in morsel.iter().enumerate() {
-            let Some(key) = join_key(row, self.probe_key)? else {
+            let matches = self.matches(row)?;
+            if matches.is_empty() {
                 continue;
-            };
-            let Some(matches) = self.table.get(&key) else {
-                continue;
-            };
+            }
             budget.charge(std::mem::size_of::<(usize, usize)>().saturating_mul(matches.len()))?;
             found.try_reserve(matches.len())?;
             let position = first.saturating_add(offset);
