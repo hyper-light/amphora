@@ -85,6 +85,10 @@ const BY_K: &str = "SELECT sum(v) FROM t WHERE k = ?";
 /// a run's value reads the value, where every value had the generic estimate. The statement
 /// returns its rows, not their sum: an aggregate's estimate is its one output row, whatever its
 /// filter keeps, so the rows the filter keeps are read where they are the statement's output.
+/// Which plan the estimates choose is not asserted: it weighs them by the seek, hash and sort costs
+/// the database times where it runs (QT.5's learned weights), so on one machine an index search
+/// for nine rows in ten of a table its cache holds whole costs less than a scan, and on another
+/// more; the estimates are what a value bound changes.
 #[test]
 fn t_pl_12_3_a_plan_made_with_a_value_estimates_that_value() {
     let dir = tempfile::tempdir().unwrap();
@@ -97,10 +101,6 @@ fn t_pl_12_3_a_plan_made_with_a_value_estimates_that_value() {
     assert!(generic < 50.0, "generic estimate {generic}: {generic_plan}");
     assert!(common > 2_500.0, "k = 1 estimated {common}: {common_plan}");
     assert!(rare < 50.0, "k = 300 estimated {rare}: {rare_plan}");
-    assert_ne!(
-        common_plan, generic_plan,
-        "k = 1 keeps nine rows in ten: its plan should not be the generic one's"
-    );
 }
 
 /// T-PL.12.3. Do: explain `d < ?`, a range on a column no index holds, filtered on the table's
