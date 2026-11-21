@@ -23,15 +23,14 @@ use std::{cell::RefCell, cmp::Ordering, hash::Hasher};
 
 const DEFAULT_SEED: u64 = 1337;
 
-// set to a *very* small 32KB, intentionally to trigger frequent spilling during tests
-#[cfg(debug_assertions)]
-pub const DEFAULT_MEM_BUDGET: usize = 32 * 1024;
-
-/// 64MB default memory budget for hash joins.
-/// TODO: make configurable via PRAGMA
-#[cfg(not(debug_assertions))]
-pub const DEFAULT_MEM_BUDGET: usize = 64 * 1024 * 1024;
-const DEFAULT_BUCKETS: usize = 1024;
+/// Amphora (docs/design/executor.md, decision 8; QT.5): the share of a statement's memory
+/// budget (`Pager::statement_memory_budget`) each of its `tables` hash and group tables holds
+/// before it spills: equal shares, so together they hold no more than the budget.
+pub fn table_share(statement_budget: usize, tables: usize) -> usize {
+    statement_budget
+        .checked_div(tables)
+        .unwrap_or(statement_budget)
+}
 /// Minimum number of partitions for grace hash join.
 pub const MIN_PARTITIONS: usize = 16;
 /// Maximum number of partitions for adaptive partitioning.
@@ -792,11 +791,13 @@ pub struct HashTableConfig {
     pub partition_count: Option<usize>,
 }
 
+/// Tests' tables: a budget of 32 KiB, small enough that a few hundred rows spill.
+#[cfg(test)]
 impl Default for HashTableConfig {
     fn default() -> Self {
         Self {
-            initial_buckets: DEFAULT_BUCKETS,
-            mem_budget: DEFAULT_MEM_BUDGET,
+            initial_buckets: 1024,
+            mem_budget: 32 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
             temp_store: crate::TempStore::Default,

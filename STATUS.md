@@ -373,6 +373,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Next
 
+- **Query speed step 5 (QT.5), started** (lane qs5): `Connection::set_join_methods` plans a connection's new
+  statements by cost, with index nested loops only, or with hash joins only; `tests/join_methods.rs` (T-QT.5.1) runs
+  inner, left, semi and anti joins with NULL and duplicate keys all three ways and against a model. The harness
+  `bench/join_methods` times both methods at 10^2 to 10^7 rows (the check on the join costs, the coordinator's run).
+  Left: the hash join's and the seek's costs and every hash, group and sort budget learned where the engine runs
+  (calibrated at start and from observed operator times). A budget taken from the connection's cache was built
+  but not merged: with today's join costs it flips `records_plans`' one-row-lookup case to a hash join and a sort
+  (the two plans cost about 110 each), so it waits for the learned costs, then the `rhs_has_selective_seek` gate removed, builds over joined inputs, PL.5's Bloom
+  filters with LIP and predicate transfer, and sort-merge and prefetched index joins (G6 step 4).
 - **The replicated class** (docs/design/replication.md, "Fast acknowledgement"; Ada's word 2026-11-01): built on
   t1/replicated-line, not on main (fast-ack, class-metrics, class-quorum and disk-stalls, merged in that order). A
   replicated database opened with `Durability::Replicated(Fates)` answers a write once members spanning the fates
@@ -435,6 +444,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (PL.7, e0e7a1df), bushy plans with CD-C (PL.8, c837cde3), statistics kept as rows change (PL.9,
   26302efe), unnesting by dependent joins (PL.10, 61c79bd1), upper bounds as a guard (PL.11,
   f4e0bd7f), custom then generic plans (PL.12, aa0541f6) and adaptive joins (PL.13, 4f237e07).
+- **G11, analytics at column-store speed** (docs/design/columnar.md, decision 1; sources in
+  docs/research/columnar.md; CS.1): decided, not built. Columns are a copy derived from the rows, fed
+  by each commit's redo record after the commit, exact at every snapshot by a journal of changed keys
+  read from the rows, never logged, every size and time learned where it runs. Next: step 2
+  prototypes it in memory and as persistent blocks, on CP-T1.3's storage once that runs under SQL.
 
 ## Open
 

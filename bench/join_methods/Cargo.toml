@@ -1,0 +1,20 @@
+[package]
+name = "join-methods"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Index nested loops against a hash join over the same tables, by build size (QT.5)"
+
+# A workspace of its own, outside Amphora's gates, building only the engine.
+[workspace]
+
+[dependencies]
+amphora-engine = { path = "../../crates/engine" }
+
+# The product's release profile (the root Cargo.toml).
+[profile.release]
+lto = "thin"
+codegen-units = 1
+overflow-checks = true
+debug = "line-tables-only"
