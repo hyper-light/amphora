@@ -215,6 +215,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   after it, never an empty database over an existing file. Crash points through commits and
   checkpoints recover a prefix of the commits at least as long as the last acknowledged durable;
   the pool still holds every page, and nothing runs it under SQL yet (stage 3).
+- **Serializable validation, three prototypes behind one switch** (G8 step 1, docs/design/engine.md
+  decision 5, `crates/engine/storage/versioned/{version,elle}.rs`, `amphora-bench --cc`): precision
+  locking (the default), SSI and Silo-style OCC validate commits on the versioned storage's commit
+  path; Elle's list-append and register histories checked for G0, G1a, G1b, G1c, G-single and G2
+  (snapshot isolation the control, showing G2). Not yet: the 10,000-seed runs and the three schemes'
+  throughput, refusals and p99 on the suite's write classes and K0 (the batch's), then the choice.
 - **Ephemeral tables kept between runs** (docs/design/executor.md decision 1,
   `crates/engine/tests/ephemeral_reuse.rs`): a statement keeps each ephemeral table of at most 16
   pages (an IN list's keys, an IN subquery's rows) and empties it on its next run, where building
