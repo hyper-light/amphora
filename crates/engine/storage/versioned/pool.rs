@@ -120,10 +120,12 @@ impl Slots {
         let (b, i) = Self::at(page).ok_or(LimboError::IntegerOverflow)?;
         let cell = self.buckets.get(b).ok_or(LimboError::IntegerOverflow)?;
         if cell.get().is_none() {
-            let len = 1usize.checked_shl(u32::try_from(b).map_err(|_| LimboError::IntegerOverflow)?)
+            let len = 1usize
+                .checked_shl(u32::try_from(b).map_err(|_| LimboError::IntegerOverflow)?)
                 .ok_or(LimboError::IntegerOverflow)?;
             let mut v = Vec::new();
-            v.try_reserve_exact(len).map_err(|_| LimboError::OutOfMemory)?;
+            v.try_reserve_exact(len)
+                .map_err(|_| LimboError::OutOfMemory)?;
             v.resize_with(len, Slot::default);
             // Another caller may have made it first: theirs stays.
             let _ = cell.set(v.into_boxed_slice());
@@ -305,7 +307,10 @@ impl Pool {
                     "versioned storage: a page past the data file's end".into(),
                 ));
             }
-            pool.slots.make(page)?.sum.store(checksum(&buf), Ordering::Relaxed);
+            pool.slots
+                .make(page)?
+                .sum
+                .store(checksum(&buf), Ordering::Relaxed);
         }
         pool.allocated.store(allocated, Ordering::Release);
         Ok(pool)
@@ -763,7 +768,10 @@ mod tests {
             assert!(holds(&pool.read(p).unwrap(), p, 2), "page {p}");
         }
         let c = pool.counts();
-        assert!(c.evictions >= 100 && c.spilled >= 100 && c.misses >= 80, "{c:?}");
+        assert!(
+            c.evictions >= 100 && c.spilled >= 100 && c.misses >= 80,
+            "{c:?}"
+        );
         assert_eq!(pool.capacity(), 4);
     }
 

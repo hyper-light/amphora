@@ -346,7 +346,12 @@ impl Database {
         if changes.is_empty() {
             return Ok(());
         }
-        let parts = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        // No more replayers than the pool's frames can hold latched at once (G7 step 4): past
+        // that, a pool whose every frame is latched refuses.
+        let parts = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZero::get)
+            .min(v.pool.capacity().checked_div(super::blink::WRITER_LATCHES).unwrap_or(1))
+            .max(1);
         let mut by: Vec<Vec<&Op>> = vec![Vec::new(); parts];
         for op in changes {
             by.get_mut(partition(op, parts))

@@ -28,7 +28,9 @@ fn rows(db: &Database) -> BTreeMap<Vec<u8>, Vec<u8>> {
 const FRAMES: usize = 24;
 
 fn key(i: u64) -> Vec<u8> {
-    (i.wrapping_mul(0x9e37_79b9) % 1_000_003).to_be_bytes().to_vec()
+    (i.wrapping_mul(0x9e37_79b9) % 1_000_003)
+        .to_be_bytes()
+        .to_vec()
 }
 
 fn value(i: u64, round: u64) -> Vec<u8> {
@@ -86,7 +88,10 @@ fn g7s4_a_database_ten_times_its_pool_reads_and_writes_correctly() {
 /// The crash workload on a pool of [`FRAMES`]: commits of puts and removes over a database many
 /// times the pool, some durable, checkpoints every few commits, on `disk` crashing where it was
 /// told. The commits as made, and how many were acknowledged durable.
-fn crash_workload(disk: &Arc<Simulated>, crash: Option<u64>) -> (Vec<BTreeMap<Vec<u8>, Option<Vec<u8>>>>, usize, u64) {
+fn crash_workload(
+    disk: &Arc<Simulated>,
+    crash: Option<u64>,
+) -> (Vec<BTreeMap<Vec<u8>, Option<Vec<u8>>>>, usize, u64) {
     let mut commits = Vec::new();
     let mut acknowledged = 0usize;
     let db = Database::open(disk.clone(), FRAMES, 1, cmp).unwrap();
@@ -194,7 +199,12 @@ fn g7s4_the_pool_model_test_with_eviction_under_32_threads() {
         }
     }
     let whole = |p: u64, bytes: &[u8]| -> Option<u64> {
-        (0..64u64).find(|&r| bytes.iter().enumerate().all(|(j, b)| *b == pattern(p, r, j)))
+        (0..64u64).find(|&r| {
+            bytes
+                .iter()
+                .enumerate()
+                .all(|(j, b)| *b == pattern(p, r, j))
+        })
     };
     std::thread::scope(|s| {
         for t in 0..32usize {
@@ -242,7 +252,11 @@ fn g7s4_the_pool_model_test_with_eviction_under_32_threads() {
     });
     for (t, pair) in pages.chunks(2).enumerate() {
         for &p in pair {
-            assert_eq!(whole(p, &pool.read(p).unwrap()), Some(39), "thread {t} page {p}");
+            assert_eq!(
+                whole(p, &pool.read(p).unwrap()),
+                Some(39),
+                "thread {t} page {p}"
+            );
         }
     }
     let c = pool.counts();
