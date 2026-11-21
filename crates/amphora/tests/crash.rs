@@ -1323,20 +1323,19 @@ fn online_plan() -> amphora::database::online::Plan {
 }
 
 /// Each step in its own transaction, made durable as the writer's pipeline makes it before its
-/// caller hears; a write between steps. Stops at the first failure (the power going out).
+/// caller hears; a write between steps, and one after the last, so some cuts fall after the
+/// cutover is durable. Stops at the first failure (the power going out).
 fn online_run(db: &mut Db) -> anyhow::Result<()> {
     let plan = online_plan();
     for i in 0..10_000i64 {
         let stepped =
             db.transaction(|db| amphora::database::online::step(db, &plan, ONLINE_BATCH))?;
         db.flusher()().map_err(|e| anyhow::anyhow!("{e}"))?;
-        if matches!(
+        let ended = matches!(
             stepped,
             amphora::database::online::Stepped::Public { .. }
                 | amphora::database::online::Stepped::Already
-        ) {
-            return Ok(());
-        }
+        );
         db.transaction(|db| {
             db.query(
                 "INSERT INTO t (a) VALUES (?1)",
@@ -1350,6 +1349,9 @@ fn online_run(db: &mut Db) -> anyhow::Result<()> {
             )
         })?;
         db.flusher()().map_err(|e| anyhow::anyhow!("{e}"))?;
+        if ended {
+            return Ok(());
+        }
     }
     anyhow::bail!("the change never ended")
 }
