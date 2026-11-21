@@ -4718,8 +4718,23 @@ impl Wal for WalFile {
             if !self.coordination.try_begin_write_tx() {
                 return Err(LimboError::Busy);
             }
-            let db_changed =
-                self.db_changed_against(self.load_coordination_snapshot(), self.connection_state());
+            // Amphora: only what a reader sees makes its snapshot stale for a write, as in
+            // SQLite, whose upgrade compares the WAL-index header alone (wal.c,
+            // walBeginWriteTransaction), which holds no backfill count. A checkpoint's backfill
+            // since the read changes none of it, and the write takes up the backfill as it found
+            // it (a replica's apply beside its flushing thread's passive pass, T-T1.8.W1).
+            let shared = self.load_coordination_snapshot();
+            let local = self.connection_state();
+            let db_changed = self.db_changed_against(
+                WalSnapshot {
+                    nbackfills: local.snapshot.nbackfills,
+                    ..shared
+                },
+                local,
+            );
+            if !db_changed && shared.nbackfills != local.snapshot.nbackfills {
+                self.install_connection_state(local.with_snapshot(shared));
+            }
             if db_changed {
                 // Snapshot is stale, give up and let caller retry from scratch.
                 // Return BusySnapshot instead of Busy so the caller knows it must
@@ -12629,6 +12644,65 @@ pub mod test {
             wal.begin_write_tx(WalAutoActions::all_enabled())
         };
         assert!(matches!(result, Ok(())));
+    }
+
+    /// Amphora (a replica's apply fenced "Database snapshot is stale" beside its flushing thread's
+    /// checkpoint pass, T-T1.8.W1 on Linux): do begin a read on one connection, then let a
+    /// passive checkpoint on another backfill the WAL, which changes nothing a reader sees;
+    /// expect the reader's upgrade to a write to succeed, as SQLite's does (wal.c,
+    /// walBeginWriteTransaction, compares only the WAL-index header, which holds no backfill
+    /// count), and a write made after it still to refuse it.
+    #[test]
+    fn test_wal_backfill_alone_leaves_a_read_snapshot_writable() {
+        let (db, _path) = get_database();
+        let conn1 = db.connect(ConnectOpts::new()).unwrap();
+        let conn2 = db.connect(ConnectOpts::new()).unwrap();
+        conn1
+            .execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        bulk_inserts(&conn1, 5, 5);
+        {
+            let pager = conn2.pager.load();
+            pager.wal.as_ref().unwrap().begin_read_tx(0).unwrap();
+        }
+        {
+            let pager = conn1.pager.load();
+            run_checkpoint_until_done(
+                &pager,
+                CheckpointMode::Passive {
+                    upper_bound_inclusive: None,
+                },
+            );
+        }
+        let result = {
+            let pager = conn2.pager.load();
+            pager
+                .wal
+                .as_ref()
+                .unwrap()
+                .begin_write_tx(WalAutoActions::all_enabled())
+        };
+        assert!(matches!(result, Ok(())), "{result:?}");
+        {
+            let pager = conn2.pager.load();
+            let wal = pager.wal.as_ref().unwrap();
+            wal.end_write_tx();
+            wal.end_read_tx();
+            wal.begin_read_tx(0).unwrap();
+        }
+        bulk_inserts(&conn1, 1, 1);
+        let result = {
+            let pager = conn2.pager.load();
+            pager
+                .wal
+                .as_ref()
+                .unwrap()
+                .begin_write_tx(WalAutoActions::all_enabled())
+        };
+        assert!(
+            matches!(result, Err(LimboError::BusySnapshot)),
+            "a write after the read still makes it stale: {result:?}"
+        );
     }
 
     #[test]
