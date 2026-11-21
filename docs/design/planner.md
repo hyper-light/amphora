@@ -1284,6 +1284,58 @@ independent; an OR no constraint takes was not counted at all.
   executor probes through an index and the sample walks value by value breaks it).
 - A CERT failure in the oracles.
 
+## Decision (lane pl6): No table read whole beneath loops that can give more than one row
+
+**Decision.** PL.6 (docs/research/planner.md section 9, rank 6). A read of a B-tree table by no
+key (a scan of the table, or of an index with no constraint seeking it) is planned beneath the
+loops before it only when they give at most one row: each reads its table by every column of a
+unique key with `=` (the rowid, a primary key or a unique index: `order.rs`'s one-row loop), or
+there are none. A hash join's build-only table runs no loop of its own and is left out. Otherwise
+the planner reads the table by a key at any cost: a seek of an index, an IN seek, a multi-index
+read or an automatic index (`access_method.rs`, `WholeReads::Refused`), or a hash join
+(`join.rs`, `join_lhs_and_rhs`), the cheaper of what exists. A seek taken only because the whole
+read was refused doesn't keep a seek's preference over a hash join, so a hash join of the same
+rows as the scan still wins where the seek reads more. The whole read stays only where none of
+these can read the table: no equality joins it to the loops before it (a cross join, a join by a
+range), or INDEXED BY and NOT INDEXED leave nothing else. A hash join's probe is a whole read
+too: where the loops before its build table can give more than one row, its build input is
+materialized from them (the existing key and payload materialization), so the probe is read
+once. The read that finds a RIGHT or FULL JOIN's unmatched rows runs once and keeps its choice.
+
+**Why.** An estimate of rows decides how often a whole read runs, and an estimate can be wrong
+by any factor: at step 3, 30 of JOB's 113 plans read a table whole beneath a first table
+estimated at 0.4 or 1.2 rows by a fixed selectivity (`bench/planner/loops.py` over
+`bench/records/2026-10-26-jupiter-planner-job-a.jsonl`). Each first table counted one row, so the
+whole read ran once; the audit's `10-no-adaptive`, statistics taken at 10 rows and the tables grown
+to 3,000, read q whole for each of p's 3,000 rows. Only a one-row loop bounds the reads by
+construction rather than by estimate. A hash join or an automatic index reads the table once
+whatever the loops before it give; a seek reads only the rows it finds.
+
+**Sources.**
+- Leis et al., "How Good Are Query Optimizers, Really?", PVLDB 9(3), 2015, section 4.1 (f32, A):
+  nested-loop joins without an index are "extremely risky" under misestimates, and with them
+  disabled "we observed no more timeouts" on JOB under PostgreSQL's estimates
+  (docs/research/planner.md section 5, lines 894 and 899 of the paper's text).
+- Leis et al. 2015 (f11, A): JOB's estimates are off by orders of magnitude at several joins,
+  the misestimate the rule is robust to.
+
+**Evidence.** `crates/engine/tests/nested_loops.rs`, red at c1ce17a (the batch's planner) and
+green with the change: `t_pl_6_1_ten_no_adaptive_reads_q_once` (T-PL.6.1), an outer join and the
+reverse order, JOB 1a's dimension and facts, a one-row loop that keeps its scan, a cross join and
+a range join that keep theirs (the counter finds it, so it is not vacuous), and a chain of hash
+joins whose third table is read once. Each test counts as `bench/planner/loops.py` does, whose
+own test holds step 3's counts: 30 of JOB's 113 plans, none of TPC-H's 22 at SF 1 or SF 10. A hash
+join's build table is listed in its block after the probe (`HASH JOIN q / SCAN p`) but read once,
+before the first probe (`Insn::Once`); the JSON plan's `hash_join` step names it (`build`), and the
+counter neither counts that read nor treats it as a loop. The JOB and TPC-H measurement against the
+parent is the batch's bench.
+
+**Falsified by.**
+- A JOB plan with such a read in the change's records (`loops.py` above 0), or a TPC-H plan.
+- A plan the rule changes that runs slower than its parent's on JOB, TPC-H or the bench suite
+  beyond the passes' spread (research rank 6's falsifier).
+- An answer that changes (`answers.py`), or an oracle finding where the forced materialization
+  of a hash join's build input is planned.
 ## Decision (lane pl12): custom plans, then a generic one, for prepared statements
 
 **Decision.** PL.12 (docs/research/planner.md section 9, rank 12; `crates/engine/plan_cache.rs`).

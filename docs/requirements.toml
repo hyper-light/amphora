@@ -453,6 +453,21 @@ tests = [
   { id = "T-DQ.1.1", text = "Three members, an election and 20 writes on driven time — passes when every write is answered and some step left more to drive for the next" },
 ]
 
+# lane cc-proto
+# Amphora's own IDs for G8 step 1 (kiln plan 01a16b0f4716761cb68dc0c96863b53b, step 1, under
+# CP-T1.3 and AC-T1.3.6): serializability by precision locking against SSI and OCC, measured.
+[[own]]
+id = "G8.1"
+title = "Serializability: precision locking against SSI and OCC, measured (G8 step 1)"
+criteria = [
+  { id = "AC-G8.1.1", text = "anomalies over 10,000 Elle seeds with the chosen validation is exactly 0" },
+  { id = "AC-G8.1.2", text = "the three validations' throughput, refusal rates and p99 on the suite's write classes and K0 at 32 writers recorded (amphora-bench --cc)" },
+]
+tests = [
+  { id = "T-G8.1.1", text = "Elle list-append and rw-register histories, 10,000 seeds — passes when no G0, G1a, G1b, G1c, G-single or G2" },
+  { id = "T-G8.1.2", text = "Each validation on hand-made schedules (write skew, a phantom closing a cycle, a lone antidependency, the read-only anomaly, an open writer of a row read) — passes when each refuses exactly what its scheme says" },
+]
+
 # lane split-merge: groups that split, merge and move themselves (kiln goal 49477403, G13 step 2;
 # docs/design/reshard.md). Criteria are CP-T1.9's AC-T1.9.1 to AC-T1.9.3.
 [[own]]
