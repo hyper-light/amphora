@@ -545,7 +545,7 @@ pub fn split(
         .checked_sub(1)
         .filter(|&l| l >= 1)
         .ok_or_else(|| corrupt("a split of fewer than two cells"))?;
-    let mut mid = 0;
+    let mut mid = 0usize;
     let mut before = 0usize;
     for &size in &sizes {
         let next = before.checked_add(size).ok_or(LimboError::IntegerOverflow)?;
