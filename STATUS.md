@@ -444,6 +444,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   by each commit's redo record after the commit, exact at every snapshot by a journal of changed keys
   read from the rows, never logged, every size and time learned where it runs. Next: step 2
   prototypes it in memory and as persistent blocks, on CP-T1.3's storage once that runs under SQL.
+  Step 3's two codecs are built (CS.3, crates/columnar, lane g11-compress): BtrBlocks' cascade
+  (one value, run lengths, dictionary, decimal doubles, frame of reference with horizontal packing)
+  and FastLanes' layouts (its interleaved 1,024-value packing, lane-wise DELTA, dictionary,
+  decimal), each scheme chosen per column from a sample that grows until its choice stops changing,
+  the cascade a loop with no fixed depth; integers, doubles, strings and nulls round-trip bit for
+  bit (T-CS.3.1). Its decode benchmark (`cargo bench -p amphora-columnar --bench decode`) is not yet
+  measured against [c18]'s 8 values a cycle.
 
 ## Open
 

@@ -458,3 +458,15 @@ criteria = [
 tests = [
   { id = "T-CS.1.1", text = "A doc-truth check of its claims (crates/amphora/tests/columnar_decision.rs) — passes when every claim cited: each citation resolves to a quoted, located claim from a graded source, and each number the decision states is in a quote it cites" },
 ]
+
+# lane g11-compress
+[[own]]
+id = "CS.3"
+title = "BtrBlocks against FastLanes: column codecs decoded in vectorizable safe Rust, each scheme chosen from a sample (G11 step 3)"
+criteria = [
+  { id = "AC-CS.3.1", text = "Both codecs (crates/columnar) round-trip integers, doubles, strings and nulls bit for bit, each column's schemes chosen from samples of it, no depth or sample size fixed" },
+  { id = "AC-CS.3.2", text = "Values decoded per cycle with the winner is at least 8, and bytes per value, on the corpus's columns (benches/decode.rs; measured by the coordinator)" },
+]
+tests = [
+  { id = "T-CS.3.1", text = "crates/columnar/tests/round_trip.rs — passes when every random and real-like column, of every size around the group and vector edges, decodes equal to the input in both codecs, every bit width packs and unpacks in both layouts, the schemes follow the data, and damaged encodings are refused" },
+]
