@@ -991,15 +991,7 @@ mod tests {
             collation: CollationSeq::Binary,
             nulls_order: None,
         };
-        let info = Arc::new(
-            IndexInfo::new(
-                [name_key],
-                true,
-                2,
-                false,
-            )
-            .unwrap(),
-        );
+        let info = Arc::new(IndexInfo::new([name_key], true, 2, false).unwrap());
         let keys: Vec<usize> = (0..seeks).map(|_| rng.random_range(0..rows)).collect();
         let cell_count = |page: usize| -> usize {
             let (page, _) = pager.io.block(|| pager.read_page(page as i64)).unwrap();
@@ -1024,8 +1016,11 @@ mod tests {
                     let reg = [Register::Value(Value::Text(Text::new(names[key].clone())))];
                     pager.io.block(|| cursor.seek_unpacked(&reg, op)).unwrap();
                 } else {
-                    let rowid = SeekKey::TableRowId(key as i64);
-                    pager.io.block(|| cursor.seek(rowid, op)).unwrap();
+                    let rowid = key as i64;
+                    pager
+                        .io
+                        .block(|| cursor.seek(SeekKey::TableRowId(rowid), op))
+                        .unwrap();
                 }
             }
             // The index's keys made before the clock starts.
@@ -1039,8 +1034,11 @@ mod tests {
                 if index {
                     pager.io.block(|| cursor.seek_unpacked(reg, op)).unwrap();
                 } else {
-                    let rowid = SeekKey::TableRowId(key as i64);
-                    pager.io.block(|| cursor.seek(rowid, op)).unwrap();
+                    let rowid = key as i64;
+                    pager
+                        .io
+                        .block(|| cursor.seek(SeekKey::TableRowId(rowid), op))
+                        .unwrap();
                 }
                 positions.push(cursor.position());
             }
