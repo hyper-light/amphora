@@ -300,11 +300,11 @@ impl<E: Engine> Groups<E> {
     ) -> anyhow::Result<Self> {
         directory.check()?;
         let book = retired.to_path_buf();
-        let kept = read_book(&book)?;
-        let retired: BTreeSet<GroupId> = kept.retired.into_iter().map(GroupId).collect();
+        let kept_book = read_book(&book)?;
+        let retired: BTreeSet<GroupId> = kept_book.retired.into_iter().map(GroupId).collect();
         // The directory routed by before a restart, if it is newer than the one started by: a
         // router never goes back past what it routed by.
-        let directory = match kept.directory {
+        let directory = match kept_book.directory {
             Some(d) if d.generation() > directory.generation() => {
                 d.check()?;
                 d

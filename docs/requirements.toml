@@ -687,6 +687,7 @@ tests = [
   { id = "T-T1.9.L1", text = "The lab harness (AC-T1.9.3): AMPHORA_RESHARD_OPS automatic operations chosen by the planner from measured rows, writes and cores, carried out while clients write — passes when writes lost is 0 and every key is in exactly one group's file" },
   # lane split-merge-7
   { id = "T-T1.9.R6", text = "A split and a merge back through the shell, the node started again by the directory from before both and the split's Create asked again — passes when the retired group is neither started nor made again but the Create is refused as of an ended operation, and every acknowledged row is in the one group left" },
+  { id = "T-T1.9.R7", text = "A local database as a group's engine, its holding fenced through the shell, then the group started again on the same file — passes when the fenced holding is answered after the restart, kept in the file as the Holding command left it" },
 ]
 
 # lane qs5

@@ -203,10 +203,15 @@ deterministic simulator:
    cutover pause (T-T1.9.P1, AC-T1.9.2) and the operations' lab (T-T1.9.L1, AC-T1.9.3) run on it.
 
    Built (lane split-merge-7): batches learned where they run, and the groups retired on a node
-   kept durable (the two decisions below, T-T1.9.R6).
+   kept durable (the two decisions below, T-T1.9.R6). Amphora's own engine (`database::Local`)
+   keeps a group's holding through a command of its own, `Mutation::Holding`, appended to the
+   wire, applied by the same `apply` a local writer and a replicated owner's log entry run
+   (decision "A local database keeps its holding through its command", below; T-T1.9.R7).
 
-   Still left of this item: `database::Local` as a group's engine, its holding and log kept through
-   a replicated command; moves to another node (the copy and catch-up over the network); a retired
+   Still left of this item: the rest of `database::Local` as a group's engine: its log of commits
+   and copy path (`head`, `export`, `changed`, `import`, `keep_log`, `sweep`), which needs its rows
+   indexed by position (today every command of a database is one key), and a `Database` over
+   `Groups<Local>`; moves to another node (the copy and catch-up over the network); a retired
    group's files, which the shell's caller deletes.
 2. **Load measured from the store's meter.** The writer's busy time per window, a bounded sample
    of written positions for the load cut, and the size cut from the B-tree's middle key. The
@@ -249,3 +254,14 @@ by, so a router never goes back past what it routed by, and every group retired 
 by the one or the other. The file stays bounded: an id leaves it once a directory kept with it
 shows the group retired. So it holds one directory and no more ids than this node's directory lags
 behind its own retires.
+
+## Decision (lane split-merge-7): a local database keeps its holding through its command
+
+A group's holding must be kept with its rows, in its log, never written beside it. Amphora's own
+engine keeps it as one more command of its database, `Mutation::Holding`, appended after every
+other variant of the wire (postcard by variant index, so the wire only grows). It is applied by
+the same `apply` that a local writer's commit and a replicated owner's log entry run: one row of a
+table of its own, replaced whole. So a replicated database keeps a holding through its log like
+any write, and a local one as one commit of its writer, flushed with every commit before it
+before the shell acts on it (`Engine::keep_holding`). A remote client can't send it: a holding is
+the group's own engine's.
