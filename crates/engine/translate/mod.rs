@@ -8,7 +8,6 @@
 //! will read rows from the database and filter them according to a WHERE clause.
 
 pub(crate) mod aggregation;
-pub(crate) mod parallel;
 pub(crate) mod alter;
 pub(crate) mod analyze;
 pub(crate) mod attach;
@@ -29,6 +28,7 @@ pub(crate) mod logical;
 pub(crate) mod main_loop;
 pub(crate) mod optimizer;
 pub(crate) mod order_by;
+pub(crate) mod parallel;
 pub(crate) mod plan;
 pub(crate) mod planner;
 pub(crate) mod pragma;
