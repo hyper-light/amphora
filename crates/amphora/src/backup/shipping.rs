@@ -125,7 +125,13 @@ impl Prepared {
         // The shipping reader may be the engine's last connection to close: its close must not
         // empty a log the backup hasn't shipped either.
         reader.hold_log();
-        let shipper = Shipper::open(&archive.prefix, hooks, archive.blobs.as_ref(), &reader, until)?;
+        let shipper = Shipper::open(
+            &archive.prefix,
+            hooks,
+            archive.blobs.as_ref(),
+            &reader,
+            until,
+        )?;
         Ok(Self {
             archive,
             shipper,
@@ -142,7 +148,7 @@ impl Prepared {
         // its first base begins, without waiting for a commit.
         wake.try_send(())?;
         on_commit(Box::new(move || {
-            !matches!(wake.try_send(()), Err(TrySendError::Disconnected(()))))
+            !matches!(wake.try_send(()), Err(TrySendError::Disconnected(())))
         }));
         let shipping = Shipping {
             status: Arc::default(),

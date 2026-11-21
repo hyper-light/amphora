@@ -245,13 +245,19 @@ fn write_seconds(
 ) {
     for id in ids {
         now.fetch_add(SECOND_NS, Ordering::SeqCst);
-        let v = format!("{id}:{}", "y".repeat(usize::try_from(id).unwrap() * 97 % 3000));
+        let v = format!(
+            "{id}:{}",
+            "y".repeat(usize::try_from(id).unwrap() * 97 % 3000)
+        );
         let written = v.clone();
         database
             .call(until(), move |c| {
                 c.execute(
                     "INSERT INTO t (id, v) VALUES (?1, ?2)",
-                    vec![amphora_api::Value::Integer(id), amphora_api::Value::Text(written)],
+                    vec![
+                        amphora_api::Value::Integer(id),
+                        amphora_api::Value::Text(written),
+                    ],
                 )?;
                 Ok(())
             })
@@ -303,6 +309,10 @@ fn t_t1_12_d2_a_database_backed_up_ships_as_it_commits() {
         backup::restore(blobs.as_ref(), "db", second, &target, until())
             .unwrap_or_else(|e| panic!("second {second} refused: {e:#}"));
         let expected = at(&history, second).cloned().unwrap_or_default();
-        assert_eq!(rows(&Db::open(&target).unwrap()), expected, "second {second}");
+        assert_eq!(
+            rows(&Db::open(&target).unwrap()),
+            expected,
+            "second {second}"
+        );
     }
 }
