@@ -6508,6 +6508,40 @@ pub fn op_seek(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
+    timed_run(
+        program,
+        crate::translate::optimizer::learned_costs::Work::Seek,
+        || seek_run(program, state, insn, pager),
+    )
+}
+
+/// Amphora (QT.5, step 3a): runs `run`, one run of `work`, timing it when the database's
+/// estimator samples this one (`LearnedCosts::sampled`). A run that waits on IO is not timed:
+/// its time is its page reads', which the pager times (`Work::PageRead`), and its resumption's
+/// would be part of the work.
+fn timed_run(
+    program: &Program,
+    work: crate::translate::optimizer::learned_costs::Work,
+    run: impl FnOnce() -> InsnResult,
+) -> InsnResult {
+    let costs = &program.connection.db.learned_costs;
+    if !costs.sampled(work) {
+        return run();
+    }
+    let started = std::time::Instant::now();
+    let result = run();
+    if matches!(result, Ok(InsnFunctionStepResult::Step)) {
+        costs.observe_sampled(work, started.elapsed().as_nanos() as f64);
+    }
+    result
+}
+
+fn seek_run(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
     let (cursor_id, is_index, start_reg, num_regs, target_pc) = match insn {
         Insn::SeekGE {
             cursor_id,
@@ -17966,6 +18000,19 @@ pub fn op_hash_build(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
+    timed_run(
+        program,
+        crate::translate::optimizer::learned_costs::Work::HashBuild,
+        || hash_build_run(program, state, insn, pager),
+    )
+}
+
+fn hash_build_run(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
     load_insn!(HashBuild { data }, insn);
 
     let mut op_state = match state.active_op_state.hash_build().take().filter(|s| {
@@ -18396,6 +18443,19 @@ fn write_hash_payload_to_registers(
 }
 
 pub fn op_hash_probe(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
+    timed_run(
+        program,
+        crate::translate::optimizer::learned_costs::Work::HashProbe,
+        || hash_probe_run(program, state, insn, pager),
+    )
+}
+
+fn hash_probe_run(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
