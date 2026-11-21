@@ -15,27 +15,25 @@ use std::time::{Duration, Instant};
 use crate::meter::SlotEnd;
 
 /// What a slot's length is learned against: the core's election timeout, a member's slot before
-/// any of its retries is measured; the ceiling past which a retry's gap is not learned (a member
-/// that slow is gone, not slow); and the generation a learned gap is believed for one to two of.
-/// The owner states each from the quorum patience's (`patience`), so the slot adds no number.
+/// any of its retries is measured; and the generation a learned gap is believed for one to two of
+/// (the quorum patience's, `patience`). No ceiling bounds a gap by a number: a member is gone, not
+/// slow, when the host's detector suspects it while its retry is awaited (`keep`), a verdict
+/// learned where it runs (Ada's word, 2026-11-21: a value measured once on one host and frozen is
+/// picked). So the slot adds no number.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Bounds {
     pub(super) election: Duration,
-    pub(super) ceiling: Duration,
     pub(super) generation: Duration,
 }
 
 /// A retry's gap the slot does not learn, and why.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(super) enum Unmeasured {
+    /// The host's detector suspected the member while its retry was awaited: gone, not slow.
     #[error(
-        "member {member} forwarded {gap:?} after its write slot began, past the ceiling of {ceiling:?}"
+        "member {member} forwarded {gap:?} after its write slot began, suspected by the host's detector meanwhile"
     )]
-    PastCeiling {
-        member: u64,
-        gap: Duration,
-        ceiling: Duration,
-    },
+    Suspected { member: u64, gap: Duration },
 }
 
 /// A slot that ended: whose, how, and how long the leader held its own writes for it.
@@ -64,12 +62,14 @@ struct Holding {
 
 /// One member's retries as the leader measured them: the longest gap from a slot's start to its
 /// next forward in this generation and in the one before, and the start of the slot it is
-/// waiting on, if any. A slot that expired keeps waiting, so a late retry still teaches the next.
+/// waiting on, if any. A slot that expired keeps waiting, so a late retry still teaches the next,
+/// unless the host's detector suspected the member while it waited (`suspected`).
 struct Gap {
     member: u64,
     current: Option<Duration>,
     before: Option<Duration>,
     from: Option<Instant>,
+    suspected: bool,
 }
 
 /// One leader's slots, in the term it leads. The queue, the barriers waiting, the gaps and the
@@ -149,6 +149,11 @@ impl<T> Slots<T> {
             }
         }
         self.gaps.retain(|gap| member(gap.member));
+        for gap in &mut self.gaps {
+            if gap.from.is_some() && suspected(gap.member) {
+                gap.suspected = true;
+            }
+        }
         if self
             .holding
             .as_ref()
@@ -253,12 +258,16 @@ impl<T> Slots<T> {
             self.read = Some((member, barrier));
         }
         match self.gaps.iter_mut().find(|gap| gap.member == member) {
-            Some(gap) => gap.from = Some(at),
+            Some(gap) => {
+                gap.from = Some(at);
+                gap.suspected = false;
+            }
             None => self.gaps.push(Gap {
                 member,
                 current: None,
                 before: None,
                 from: Some(at),
+                suspected: false,
             }),
         }
         Some((member, length))
@@ -415,11 +424,10 @@ impl<T> Slots<T> {
             return Ok(());
         };
         let measured = at.saturating_duration_since(from);
-        if measured > self.bounds.ceiling {
-            return Err(Unmeasured::PastCeiling {
+        if std::mem::take(&mut gap.suspected) {
+            return Err(Unmeasured::Suspected {
                 member,
                 gap: measured,
-                ceiling: self.bounds.ceiling,
             });
         }
         gap.current = Some(
@@ -451,7 +459,6 @@ mod tests {
     const MS: Duration = Duration::from_millis(1);
     const BOUNDS: Bounds = Bounds {
         election: Duration::from_millis(200),
-        ceiling: Duration::from_millis(1650),
         generation: Duration::from_secs(30),
     };
 
@@ -642,27 +649,43 @@ mod tests {
         assert_eq!(slots.length(2), 300 * MS);
     }
 
-    /// T-T1.8.W4 (Q3): do let a retry come past the ceiling; expect it refused, typed, and not
-    /// learned: the next slot keeps the election timeout.
+    /// T-T1.8.W4 (Q3): do let the host's detector suspect a member while its retry is awaited,
+    /// then trust it again, and the retry come; expect the gap refused, typed, and not learned
+    /// (the next slot keeps the election timeout), and a later retry no detector suspected
+    /// through learned however long it took: no number bounds it.
     #[test]
-    fn a_retry_past_the_ceiling_is_not_learned() {
+    fn a_retry_its_member_was_suspected_through_is_not_learned() {
         let t = Instant::now();
         let mut slots = leading(t);
         slots.refused(2);
         waits(&mut slots, 2, t);
         slots.start(t, 1, 1, false);
-        let late = t + BOUNDS.ceiling + MS;
-        slots.expire(late);
+        let ended = slots.keep(t + MS, |_| true, |member| member == 2);
+        assert_eq!(
+            ended.map(|e| (e.member, e.how)),
+            Some((2, SlotEnd::Released))
+        );
+        slots.keep(t + 2 * MS, |_| true, |_| false);
+        let late = t + 300 * MS;
         let forward = slots.forward(2, late, "gone");
         assert_eq!(
             forward.unmeasured,
-            Some(Unmeasured::PastCeiling {
+            Some(Unmeasured::Suspected {
                 member: 2,
-                gap: BOUNDS.ceiling + MS,
-                ceiling: BOUNDS.ceiling
+                gap: 300 * MS,
             })
         );
         assert_eq!(slots.length(2), BOUNDS.election);
+        drained(&mut slots);
+        slots.took_turn();
+        let at = t + 400 * MS;
+        slots.refused(2);
+        waits(&mut slots, 2, at);
+        slots.start(at, 1, 1, false);
+        slots.expire(at + 5 * BOUNDS.election);
+        let slow = slots.forward(2, at + 5 * BOUNDS.election, "slow");
+        assert_eq!(slow.unmeasured, None);
+        assert_eq!(slots.length(2), 5 * BOUNDS.election);
     }
 
     /// T-T1.8.W4 (Q3): do learn a gap, then two generations with none; expect it believed through

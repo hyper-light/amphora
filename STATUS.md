@@ -265,6 +265,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   0, 2, 4, ... drew the same), and every database checkpoints after its load before any run
   (`settle_s`; Amphora's loader had left the whole load, 7.5 GB, in its log). `--query` runs a
   statement on a database a run left behind.
+- **The leader's write slot** (AC-T1.8.W1, Amphora goal 9c63f7d4; replication.md, "the write slot"): a member
+  whose write is refused at the leader's append gets a slot for its next try, its length learned per member from
+  its retries' gaps (cold start: the core's election timeout). A gap over which the host's detector suspected the
+  member is not learned; no number bounds a gap (lane g-slot-close, 2026-11-21).
 
 - **Groups that split, merge and move themselves** (CP-T1.9, lane split-merge; `crates/amphora/src/reshard/`,
   docs/design/reshard.md): a pure core: a directory of hash spans with every position in exactly one group,
@@ -466,6 +470,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   by each commit's redo record after the commit, exact at every snapshot by a journal of changed keys
   read from the rows, never logged, every size and time learned where it runs. Next: step 2
   prototypes it in memory and as persistent blocks, on CP-T1.3's storage once that runs under SQL.
+  Step 3's two codecs are built (CS.3, crates/columnar, lane g11-compress): BtrBlocks' cascade
+  (one value, run lengths, dictionary, decimal doubles, frame of reference with horizontal packing)
+  and FastLanes' layouts (its interleaved 1,024-value packing, lane-wise DELTA, dictionary,
+  decimal), each scheme chosen per column from a sample that grows until its choice stops changing,
+  the cascade a loop with no fixed depth; integers, doubles, strings and nulls round-trip bit for
+  bit (T-CS.3.1). Its decode benchmark (`cargo bench -p amphora-columnar --bench decode`) is not yet
+  measured against [c18]'s 8 values a cycle.
 
 ## Open
 
