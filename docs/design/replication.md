@@ -2109,7 +2109,7 @@ a write that writes page 1 too. Two allocations from one base would allocate the
 page anyway. An entry with no read set that wrote page 1 counts as more than a size change.
 
 **The window is derived.** It is the leader's log between the write's base and the append, bounded by the log's own
-bound (log_bound.rs). A base the log no longer holds, or whose term differs from the log's, is left to the exact base,
+bound: what it holds since its last compaction. A base the log no longer holds, or whose term differs from the log's, is left to the exact base,
 which refuses it. There is no window constant and no cap on age. The walk reads the log in slices of one command's
 bytes and ends at the first conflict. A write forwarded with others in one message is left to the exact base.
 
