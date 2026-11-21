@@ -85,6 +85,11 @@ impl LogReadIndex {
 static PROCESS_DEFAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(UNSET);
 const UNSET: u8 = u8::MAX;
 
+/// Called with the frame index and its high-water frame, under the index's lock.
+pub(crate) type FromIndex<'a> = dyn FnMut(&FxHashMap<u64, Vec<u64>>, u64) + 'a;
+/// Takes the index's lock and calls what it is given with it.
+pub(crate) type IndexUnderLock<'a> = dyn Fn(&mut FromIndex<'_>) + 'a;
+
 /// What the lock-free path says of a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Lookup {
@@ -421,6 +426,7 @@ impl ReadIndex {
     }
 
     /// Switches the way; what was built is built again by the next reader.
+    #[cfg(test)]
     pub(crate) fn set_mode(&self, mode: LogReadIndex) {
         self.mode.store(mode as u8, Ordering::Relaxed);
         self.invalidate();
@@ -514,7 +520,7 @@ impl ReadIndex {
         page: u64,
         min_frame: u64,
         max_frame: u64,
-        index: &dyn Fn(&mut dyn FnMut(&FxHashMap<u64, Vec<u64>>, u64)),
+        index: &IndexUnderLock<'_>,
     ) -> Lookup {
         let mode = self.mode();
         if mode == LogReadIndex::Locked {
@@ -565,7 +571,7 @@ impl ReadIndex {
         min_frame: u64,
         max_frame: u64,
         generation: u64,
-        index: &dyn Fn(&mut dyn FnMut(&FxHashMap<u64, Vec<u64>>, u64)),
+        index: &IndexUnderLock<'_>,
     ) -> Lookup {
         let mut published = self.published.load_full();
         if published.generation != generation || published.upto < max_frame {
@@ -602,10 +608,5 @@ impl ReadIndex {
             Some(&frame) if frame >= min_frame => Lookup::Frame(frame),
             _ => Lookup::Absent,
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn generation_for_tests(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
     }
 }

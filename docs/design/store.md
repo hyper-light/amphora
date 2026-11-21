@@ -1794,3 +1794,52 @@ the coordinator's, not yet run.
 mixed log than on the page-a-frame log of the same binary (`AMPHORA_PAGE_LOG=1`), interleaved, best
 of 3; a profile of the writer still showing the registry's publishing or the commit's pages found
 per record; a row read back other than as committed (the tests above).
+
+## 40. A page read finds its frame and the log's header without the shared locks (prototype, behind a switch)
+
+G3 step 2 (kiln plan "G3 Point reads", step 2; docs/research/read-path.md fix 1(b)). Every page read
+took the read side of the `RwLock` over the log's shared state, then the frame index's lock
+(`find_frame`) or the header's (`wal_header`). At 32 point readers those were `point_pk`'s three
+hottest leaves: `find_frame` 26.9%, `wal_header` 23.4%, `RwLock::lock_shared_slow` 13.2%
+(bench/records/2026-10-23-adacachy-read-path.md).
+
+The prototype is `crates/engine/storage/log_index.rs`. Its switch is `LogReadIndex`:
+`AMPHORA_LOG_READ_INDEX` = `locked` (today's path, the default), `filtered`, `published` or
+`optimistic`, or `LogReadIndex::set_process_default`. Each connection holds the log's `ReadIndex`.
+The `ReadIndex` is never replaced, so reaching it takes no lock.
+
+- **The header** is copied, all eight words, under a sequence number (a seqlock) each time its
+  guard lets the lock go. A reader reads the copy and checks that the sequence didn't move. Only
+  when a writer is mid-change does it read the header under its lock.
+- **A page the log doesn't hold** is answered from a bitmap with one bit per page number. The
+  bitmap's size is the highest page the log holds, doubled as it grows. It is exact: it never
+  reports a page as held when no frame holds it, except frames cut since the bitmap was built. It
+  has no false-positive rate to choose, unlike a Bloom filter. The empty log (`max_frame <
+  min_frame`) already skipped the index.
+- **Way (a), `published`**: the whole index is copied and published through an `ArcSwap`. A reader
+  whose snapshot reaches past the copy publishes a new one. Each new copy costs O(pages in the log).
+  While another reader publishes, it reads under the lock. A read-only workload publishes once.
+- **Way (b), `optimistic`**: a table of each page's latest frame, in shards. Each shard has its own
+  version, after LeanStore's optimistic latches (Leis et al., ICDE 2018): read the version, read
+  the slot, check the version. There is one shard for each thread that can run at once
+  (`available_parallelism`, the reader count where the process runs). There are twice as many slots
+  as the log has pages, so each shard is at most half full. Knuth (TAOCP vol. 3 §6.4) gives linear
+  probing 2.5 expected probes for a miss and 1.5 for a hit at that load. A shard that would pass
+  half full doubles the table. A read whose version moved, or that finds a frame newer than its
+  snapshot, is answered under the lock: one try, never retried. An append costs O(1).
+- **Changes other than an append** (a rollback, slots written again, a log restart, recovery,
+  restore) move the index's generation on. The next reader rebuilds from the index under its lock.
+  A reader that loaded a structure just before the generation moved still answers correctly:
+  frames that are cut or written again lie past every committed snapshot, and a restart happens
+  only when no reader reads the log.
+- Not taken: the multi-process backend (`ShmWalCoordination`). Its local index is filled from other
+  processes' frames, so its fallback reads under the locks.
+
+Tests: `storage::wal::tests::g3_2_*` (the model, and readers beside a writer) and
+`crates/engine/tests/log_read_index.rs` (a crash at every write of a checkpoint and of a log
+restart). The measurements are the coordinator's: the 32-client profiles, the suite at 10M rows
+and `bench/prof_parts.py`'s shares, with each way switched on. One way is kept and the others are
+removed, as the numbers favour. Falsified, as read-path.md has it, if with the log empty after the
+settle `point_pk`'s instructions per statement at one client fall by less than 15%, or if
+`table_count` at 32 clients rises less than 3x. The step's own bars: the log's and locks' share of
+point reads at 32 clients is at most 5%, and `point_pk` at 32 clients is at least 4x one client.

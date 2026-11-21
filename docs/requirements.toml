@@ -644,3 +644,19 @@ criteria = [
 tests = [
   { id = "T-CS.3.1", text = "crates/columnar/tests/round_trip.rs — passes when every random and real-like column, of every size around the group and vector edges, decodes equal to the input in both codecs, every bit width packs and unpacks in both layouts, the schemes follow the data, and damaged encodings are refused" },
 ]
+
+# lane g3s2
+# Amphora's own IDs for G3, point reads (kiln plan 01a16b0f464172dc80c7a3b9a14acbce): G3.n for its step n.
+
+[[own]]
+id = "G3.2"
+title = "The log out of the read path: no frame index or shared lock per page read (G3 step 2; store.md decision 40)"
+criteria = [
+  { id = "AC-G3.2.1", text = "the log's and locks' share of point-read user cycles at 32 clients is at most 5% (frame-pointer call graphs, bench/prof_parts.py; measured by the coordinator)" },
+  { id = "AC-G3.2.2", text = "point_pk at 32 clients over 1 client is at least 4x (the suite at 10M rows, best of 3; measured by the coordinator)" },
+  { id = "AC-G3.2.3", text = "table_count statements a second at 32 clients rises at least 200% over G1's whole-log profile (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-G3.2.1", text = "storage::wal::tests::g3_2_* — passes when every page read through each lock-free way (filtered, published, optimistic), at random snapshots while frames are appended, rewound, rolled back, checkpointed and the log restarted, and beside a writer thread, finds the frame the index read under its lock finds, or none" },
+  { id = "T-G3.2.2", text = "crates/engine/tests/log_read_index.rs — passes when, after a crash at every write of a checkpoint and of a log restart, every read through each way returns its page's last committed version" },
+]

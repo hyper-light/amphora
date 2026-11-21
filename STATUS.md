@@ -78,6 +78,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   hurts: statements that write hundreds of pages, `insert_batch_100` at 32 clients 392 → 44 a
   second, `delete_range_insert` 2,800 → 1,011 (fedora, 2026-10-22, checks); single-row writes as
   before.
+- **Page reads without the log's shared locks** (G3 step 2, docs/design/store.md decision 40,
+  `crates/engine/storage/log_index.rs`), a prototype behind `AMPHORA_LOG_READ_INDEX`, off by
+  default: the log's header read from a seqlocked copy; a page the log doesn't hold answered from an
+  exact bitmap; the frame index read from a copy published per generation (`published`) or from
+  sharded latest-frame tables under version checks (`optimistic`). Built and tested (a model against
+  the locked index, crashes at every write of a checkpoint and restart); not yet measured, nor a way
+  chosen.
 - **The mixed log's commit costs** (docs/design/store.md, Decision (lane wal-read)): publishing a
   commit's records costs a lookup each, not a pass over the records kept decoded or over the
   commit's pages, and deltas are found a word at a time. Built, not merged; whether the bulk

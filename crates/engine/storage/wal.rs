@@ -1445,7 +1445,7 @@ impl WalCoordination for InProcessWalCoordination {
         // decision 40); what that path can't answer is answered under them.
         if let Some(read_index) = &self.read_index {
             let (low, high) = frame_watermark.map_or((min_frame, max_frame), |x| (0, x));
-            let index = |build: &mut dyn FnMut(&FxHashMap<u64, Vec<u64>>, u64)| {
+            let index = |build: &mut super::log_index::FromIndex<'_>| {
                 let shared = self.shared.read();
                 let frame_cache = shared.runtime.frame_cache.lock();
                 let high_water = shared
@@ -3650,7 +3650,7 @@ impl Drop for HeaderGuard<'_> {
     fn drop(&mut self) {
         self.copy
             .store(self.locked.checkpoint_seq, Ordering::Release);
-        self.whole.store(&*self.locked);
+        self.whole.store(&self.locked);
     }
 }
 
@@ -9970,7 +9970,6 @@ pub mod test {
     #[test]
     fn g3_2_lock_free_page_reads_find_the_frame_the_locked_index_finds() {
         use super::super::log_index::Lookup;
-        use rustc_hash::FxHashMap;
         use rand_chacha::{
             rand_core::{RngCore, SeedableRng},
             ChaCha8Rng,
@@ -10016,7 +10015,7 @@ pub mod test {
                         9 => first = 1 + rng.next_u64() % next,
                         10 if rng.next_u64() % 4 == 0 => {
                             // The log restarted: its frames gone, the next one frame 1.
-                            let mut guard = shared.write();
+                            let guard = shared.write();
                             guard.runtime.read_index.invalidate();
                             guard.runtime.frame_cache.lock().clear();
                             guard
@@ -10037,7 +10036,7 @@ pub mod test {
                         for page in 0..48u64 {
                             let locked =
                                 coordination.find_frame_locked(page, min_frame, max_frame, None);
-                            let index = |build: &mut dyn FnMut(&FxHashMap<u64, Vec<u64>>, u64)| {
+                            let index = |build: &mut super::super::log_index::FromIndex<'_>| {
                                 let guard = shared.read();
                                 let frame_cache = guard.runtime.frame_cache.lock();
                                 let high_water = guard
