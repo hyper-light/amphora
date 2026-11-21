@@ -4,12 +4,18 @@
 //! one map, and the group's leader runs the [`Driver`] with its term as the driver's epoch: an
 //! answer to a deposed leader's ask never matches the new leader's.
 //!
-//! The machine keeps nothing durable of its own, as focal's control groups don't: it reports the
-//! point before the log's first entry, and the shell replays what the log states committed
-//! (hyper-durable's `docs/durable.md` §4.3). Every entry is acted on at start (the driver takes
-//! each operation up again from its phase), so each is applied only once the member's durable
-//! commit covers it (§4.1, I5). Its images are the whole directory, which the plan's merge rule
-//! keeps to at most `8C + 1` groups (`plan`), checked whole before one is installed.
+//! The machine keeps one thing durable of its own: the last image it installed, in one file
+//! (`kept`), written whole and in place before [`StateMachine::install`] returns (hyper-durable's
+//! `docs/durable.md`, I8: the log's start moves past the image only after). A restart opens at that
+//! image and the shell replays what the log states committed after it (§4.3), so a member that
+//! installed an image needs no catch-up from its leader after a restart. Every entry is acted on at
+//! start (the driver takes each operation up again from its phase), so each is applied only once
+//! the member's durable commit covers it (§4.1, I5). Its images are the whole directory, which the
+//! plan's merge rule keeps to at most `8C + 1` groups (`plan`), checked whole before one is
+//! installed or opened.
+
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
 use hyper_durable::{EntryRef, Fatal, Point, StateMachine};
 use hyper_raft::proto::{ConfChangeV2, ConfState};
@@ -40,27 +46,112 @@ fn decode(bytes: &[u8]) -> Result<Change, Refused> {
         .map_err(|_| Refused::Invalid("a directory entry that doesn't decode"))
 }
 
+/// The last image a member installed, as its file keeps it: the directory, the point it is of
+/// and the configuration the group held there (hyper-raft's `ConfState`, field by field).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Kept {
+    index: u64,
+    term: u64,
+    voters: Vec<u64>,
+    learners: Vec<u64>,
+    voters_outgoing: Vec<u64>,
+    learners_next: Vec<u64>,
+    auto_leave: bool,
+    directory: Directory,
+}
+
+/// `bytes` in place of `file`, durably: written beside it, flushed, renamed over it, and the
+/// rename flushed with its folder, so a crash leaves the old file or the new one, whole.
+fn replace(file: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let folder = file
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut next = file.as_os_str().to_owned();
+    next.push(".new");
+    let next = PathBuf::from(next);
+    {
+        let mut f = std::fs::File::create(&next)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&next, file)?;
+    open_folder(folder)?.sync_all()
+}
+
+#[cfg(not(windows))]
+fn open_folder(folder: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(folder)
+}
+
+/// Windows opens a folder only with `FILE_FLAG_BACKUP_SEMANTICS` (the Win32 API's flag, its value
+/// from `winbase.h`), and flushes a folder's handle with `FlushFileBuffers`, as `sync_all` does.
+#[cfg(windows)]
+fn open_folder(folder: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(folder)
+}
+
 /// The directory group's state machine.
 #[derive(Debug, Clone)]
 pub struct DirectoryMachine {
     directory: Directory,
     applied: Point,
     configuration: ConfState,
-    /// The point before the log's first entry: what a restart opens at, replaying the rest.
+    /// The point of the last image installed (else the point before the log's first entry): what
+    /// a restart opens at, replaying the rest.
     start: Point,
+    /// Where the last image installed is kept.
+    kept: PathBuf,
 }
 
 impl DirectoryMachine {
-    /// A directory group's machine at its log's start: one group holding every position on
-    /// `node` (AC-T1.9.1).
-    #[must_use]
-    pub fn new(node: NodeId, configuration: ConfState) -> Self {
-        Self {
+    /// A directory group's member, keeping its images in `kept`: opened at the image kept there,
+    /// or, with none, at its log's start, one group holding every position on `node` (AC-T1.9.1)
+    /// under `configuration`. A kept image that doesn't decode, or whose spans don't cover every
+    /// position once, is refused: the member is not opened on a directory it can't trust.
+    pub fn open(node: NodeId, configuration: ConfState, kept: PathBuf) -> Result<Self, Fatal> {
+        let fresh = Self {
             directory: Directory::new(node),
             applied: Point::default(),
             configuration,
             start: Point::default(),
+            kept,
+        };
+        let bytes = match std::fs::read(&fresh.kept) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(fresh),
+            Err(_) => return Err(Fatal("the directory's kept image can't be read")),
+        };
+        if bytes.len() > crate::replication::SNAPSHOT_BYTES {
+            return Err(Fatal("a kept directory image larger than a snapshot"));
         }
+        let k: Kept = postcard::from_bytes(&bytes)
+            .map_err(|_| Fatal("a kept directory image that doesn't decode"))?;
+        k.directory
+            .check()
+            .map_err(|_| Fatal("a kept directory image whose spans don't cover every position once"))?;
+        let at = Point {
+            index: k.index,
+            term: k.term,
+        };
+        Ok(Self {
+            directory: k.directory,
+            applied: at,
+            configuration: ConfState {
+                voters: k.voters,
+                learners: k.learners,
+                voters_outgoing: k.voters_outgoing,
+                learners_next: k.learners_next,
+                auto_leave: k.auto_leave,
+            },
+            start: at,
+            kept: fresh.kept,
+        })
     }
 
     /// The directory as of the last entry applied: what routers on this member route by.
@@ -158,7 +249,21 @@ impl StateMachine for DirectoryMachine {
         directory
             .check()
             .map_err(|_| Fatal("a directory image whose spans don't cover every position once"))?;
-        self.directory = directory;
+        let kept = Kept {
+            index: at.index,
+            term: at.term,
+            voters: configuration.voters.clone(),
+            learners: configuration.learners.clone(),
+            voters_outgoing: configuration.voters_outgoing.clone(),
+            learners_next: configuration.learners_next.clone(),
+            auto_leave: configuration.auto_leave,
+            directory,
+        };
+        let bytes = postcard::to_allocvec(&kept)
+            .map_err(|_| Fatal("the directory's image doesn't encode to be kept"))?;
+        // Durable before the machine takes it, as `install` must be (I8).
+        replace(&self.kept, &bytes).map_err(|_| Fatal("the directory's image couldn't be kept"))?;
+        self.directory = kept.directory;
         self.applied = at;
         self.start = at;
         self.configuration = configuration.clone();
@@ -173,6 +278,7 @@ impl StateMachine for DirectoryMachine {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use hyper_raft::proto::EntryType;
@@ -184,10 +290,24 @@ mod tests {
     use crate::reshard::{GroupId, OpId, Span, position};
     use crate::store::{Config, Engine, Refused as Store};
 
-    /// A group's rows, in memory: what this test's groups write.
+    /// Where a test group's engine keeps its holding: it outlives the group's store, as a disk
+    /// would, so a group started again finds it.
+    type Kept = Arc<Mutex<Option<Vec<u8>>>>;
+
+    /// A group's rows, in memory, and its holding, kept in `kept`: what this test's groups write.
     #[derive(Default)]
     struct Mem {
         rows: BTreeMap<String, i64>,
+        kept: Kept,
+    }
+
+    /// Group `g`'s engine, on its disk in `disks`.
+    fn mem(disks: &Mutex<BTreeMap<GroupId, Kept>>, g: GroupId) -> Mem {
+        let kept = Arc::clone(disks.lock().unwrap().entry(g).or_default());
+        Mem {
+            rows: BTreeMap::new(),
+            kept,
+        }
     }
 
     impl Engine for Mem {
@@ -204,20 +324,38 @@ mod tests {
             }
             Ok(rows.len())
         }
+
+        fn holding(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+            Ok(self.kept.lock().unwrap().clone())
+        }
+
+        fn keep_holding(&mut self, holding: &[u8]) -> anyhow::Result<()> {
+            *self.kept.lock().unwrap() = Some(holding.to_vec());
+            Ok(())
+        }
     }
 
-    /// The directory group's members, applying one committed log in order.
+    /// The directory group's members, applying one committed log in order, each keeping its
+    /// images in a file of its own in `dir`.
     struct Log {
         members: Vec<DirectoryMachine>,
         index: u64,
+        dir: tempfile::TempDir,
     }
 
     impl Log {
         fn new(n: usize) -> Self {
-            let m = DirectoryMachine::new(NodeId(0), ConfState::default());
+            let dir = tempfile::tempdir().unwrap();
+            let members = (0..n)
+                .map(|i| {
+                    let kept = dir.path().join(format!("member-{i}"));
+                    DirectoryMachine::open(NodeId(0), ConfState::default(), kept).unwrap()
+                })
+                .collect();
             Self {
-                members: vec![m; n],
+                members,
                 index: 0,
+                dir,
             }
         }
 
@@ -268,14 +406,14 @@ mod tests {
     /// steps at the groups; expect every member to hold the same directory, writes to the moving
     /// range refused while it is fenced (the pause), a router still on the old directory refused by
     /// the old group's holding after the flip, and once routed by the new directory the range
-    /// written to and read from the new group, the rest staying where it was.
+    /// written to and read from the new group, the rest staying where it was; and groups started
+    /// again by a stale directory answering from the holdings they kept, not from the directory.
     #[test]
     fn t_t1_9_r1_routes_through_the_replicated_directory_as_a_split_moves_a_range() {
         let mut log = Log::new(3);
-        let groups = Groups::on(log.members[0].directory(), Config::default(), |_| {
-            Ok(Mem::default())
-        })
-        .unwrap();
+        let disks = Mutex::new(BTreeMap::new());
+        let stale = log.members[0].directory().clone();
+        let groups = Groups::on(&stale, Config::default(), |g| Ok(mem(&disks, g))).unwrap();
         let at = 1u64 << 63;
         let (low, high) = (key(|p| p < at), key(|p| p >= at));
         let t = groups.put(vec![(low.clone(), 1)]).unwrap();
@@ -305,9 +443,9 @@ mod tests {
         assert!(!taken.idle(), "the new leader carries the split on");
 
         // The new group, taking the (empty) range in.
-        groups.create(op.to, || Ok(Mem::default())).unwrap();
+        groups.create(op.to, || Ok(mem(&disks, op.to))).unwrap();
         groups
-            .hold(op.to, |h| {
+            .hold(op.to, soon(), |h| {
                 h.receive(op.id, op.span)?;
                 h.copied(op.id, None, true, 0)
             })
@@ -322,7 +460,7 @@ mod tests {
         );
         assert_eq!(
             groups
-                .hold(op.from, |h| h.fence(op.id, op.span, 1))
+                .hold(op.from, soon(), |h| h.fence(op.id, op.span, 1))
                 .unwrap(),
             Fenced::New(1)
         );
@@ -339,8 +477,8 @@ mod tests {
                 .iter()
                 .all(Result::is_ok)
         );
-        groups.hold(op.to, |h| h.activate(op.id)).unwrap();
-        groups.hold(op.from, |h| h.release(op.id)).unwrap();
+        groups.hold(op.to, soon(), |h| h.activate(op.id)).unwrap();
+        groups.hold(op.from, soon(), |h| h.release(op.id)).unwrap();
         assert_eq!(
             groups.put(vec![(high.clone(), 4)]).err(),
             Some(Store::Away(Away::Elsewhere))
@@ -366,6 +504,19 @@ mod tests {
         let before = groups.generation();
         groups.route(&Directory::new(NodeId(0))).unwrap();
         assert_eq!(groups.generation(), before);
+
+        // Started again by the directory from before the split: the old group answers from the
+        // holding it kept, which no longer holds the range, so the stale route is refused.
+        drop(groups);
+        let again = Groups::on(&stale, Config::default(), |g| Ok(mem(&disks, g))).unwrap();
+        assert_eq!(
+            again.put(vec![(high.clone(), 6)]).err(),
+            Some(Store::Away(Away::Elsewhere))
+        );
+        assert_eq!(again.put(vec![(low, 7)]).unwrap().group(), op.from);
+        again.create(op.to, || Ok(mem(&disks, op.to))).unwrap();
+        again.route(log.members[2].directory()).unwrap();
+        assert_eq!(again.put(vec![(high, 8)]).unwrap().group(), op.to);
     }
 
     /// T-T1.9.R2: a change the directory refuses is refused alike on every member and changes
@@ -388,7 +539,8 @@ mod tests {
         assert!(log.commit(1, &begin).iter().all(Result::is_ok));
         let mut image = Vec::new();
         let (at, conf) = log.members[0].image(&mut image).unwrap();
-        let mut fresh = DirectoryMachine::new(NodeId(9), ConfState::default());
+        let kept = log.dir.path().join("fresh");
+        let mut fresh = DirectoryMachine::open(NodeId(9), ConfState::default(), kept.clone()).unwrap();
         fresh.install(&image, at, &conf).unwrap();
         assert_eq!(fresh.directory(), log.members[0].directory());
         assert_eq!(fresh.durable(), at);
@@ -396,5 +548,16 @@ mod tests {
         let cut = image.len() / 2;
         assert!(fresh.install(&image[..cut], at, &conf).is_err());
         assert_eq!(fresh.directory(), log.members[0].directory());
+
+        // A restart opens at the image installed, with no catch-up from the leader.
+        let again = DirectoryMachine::open(NodeId(9), ConfState::default(), kept.clone()).unwrap();
+        assert_eq!(again.directory(), log.members[0].directory());
+        assert_eq!((again.durable(), again.applied()), (at, at));
+        assert_eq!(again.configuration(), &conf);
+
+        // A kept image cut short is refused at open, never taken for a directory.
+        let whole = std::fs::read(&kept).unwrap();
+        std::fs::write(&kept, &whole[..whole.len() / 2]).unwrap();
+        assert!(DirectoryMachine::open(NodeId(9), ConfState::default(), kept).is_err());
     }
 }
