@@ -16,6 +16,7 @@
 use super::columns::{Block, Columns, Rows, Rowset, ScanCounts};
 use super::version::Ts;
 use crate::translate::optimizer::column_path::{self, Choice, CopyView, Path, RowRates, Shape};
+use crate::translate::optimizer::learned_costs::LearnedCosts;
 use crate::Result;
 
 /// What a statement asks of the table.
@@ -41,6 +42,34 @@ pub(crate) struct Read {
 
 fn count(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+/// Reads `ask` at snapshot `s` as a statement does: by the planner's switch ([`column_path::asked`])
+/// and the database's learned rates. Before both a row's visit and a seek were timed, the rows.
+pub(crate) fn read_learned<B: Block>(
+    copy: &Columns<B>,
+    rows: &dyn Rows,
+    s: Ts,
+    ask: Ask<'_>,
+    costs: &LearnedCosts,
+    clock: &dyn Fn() -> u128,
+) -> Result<Read> {
+    match RowRates::learned(costs) {
+        Some(rates) => read(copy, rows, s, ask, rates, column_path::asked(), clock),
+        // Unknown rates price nothing: the rows, which the switch being off also gives.
+        None => read(
+            copy,
+            rows,
+            s,
+            ask,
+            RowRates {
+                row: 0.0,
+                seek: 0.0,
+            },
+            false,
+            clock,
+        ),
+    }
 }
 
 /// Reads `ask` at snapshot `s`, `rows` being the row B-tree at `s`, by the path the planner chooses
@@ -243,6 +272,34 @@ mod tests {
         let paths = check(seek_dear);
         assert!(paths.contains(&(Shape::Point, Path::Copy)));
         assert!(paths.contains(&(Shape::Point, Path::Rows)));
+        db.close_snapshot(snap);
+    }
+
+    /// Do: read through the statement's entry, with this process's learned rates and the switch
+    /// as the environment sets it. Expect: whatever path they choose, the answers equal the rows.
+    #[test]
+    fn cs5_learned_rates_answer_like_the_rows() {
+        let (db, copy) = kept::<Packed>(15);
+        let snap = db.snapshot().unwrap();
+        let at = At {
+            db: &db,
+            snap: &snap,
+        };
+        let truth = at.all().unwrap();
+        let costs = LearnedCosts::new();
+        let tick = clock(1);
+        for _ in 0..2 {
+            let whole = read_learned(&copy, &at, snap.start, Ask::Whole, &costs, &tick).unwrap();
+            assert_eq!(whole.rows, truth, "{:?}", whole.choice);
+            let key = 44u16.to_be_bytes();
+            let want: Rowset = truth.iter().filter(|(k, _)| k == &key).cloned().collect();
+            let p = read_learned(&copy, &at, snap.start, Ask::Point(&key), &costs, &tick).unwrap();
+            assert_eq!(p.rows, want, "{:?}", p.choice);
+        }
+        assert_eq!(
+            column_path::asked(),
+            std::env::var(column_path::ENV).is_ok_and(|v| v == "on")
+        );
         db.close_snapshot(snap);
     }
 
