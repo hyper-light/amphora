@@ -2093,7 +2093,11 @@ impl<F: BlockFile + 'static> Actor<F> {
             .drive(nanos, &self.waker, &mut output)
             .map_err(raft_error)?;
         // What the drive applied, and the time it took: a byte of log's replay (CT.1).
-        let replayed = self.replica.machine().applied_bytes().saturating_sub(applying);
+        let replayed = self
+            .replica
+            .machine()
+            .applied_bytes()
+            .saturating_sub(applying);
         self.compacting
             .replayed(replayed, nanos_between(began, (self.clock)()));
         if let Some((submitted, taken)) = driven.flushed {

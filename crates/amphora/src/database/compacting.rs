@@ -93,7 +93,11 @@ mod tests {
         assert_eq!(costs.expansion(), 1);
         costs.imaged(1 << 20, 0);
         costs.replayed(1 << 20, 0);
-        assert_eq!(costs.expansion(), 1, "a sample below the clock's resolution");
+        assert_eq!(
+            costs.expansion(),
+            1,
+            "a sample below the clock's resolution"
+        );
         costs.imaged(1 << 20, 4_000_000);
         assert_eq!(costs.expansion(), 1, "the replay not yet measured");
         let mut costs = Costs::default();
@@ -115,7 +119,11 @@ mod tests {
         let mut cheap = Costs::default();
         cheap.imaged(3 << 20, 1_000_000);
         cheap.replayed(1 << 20, 1_000_000);
-        assert_eq!(cheap.expansion(), 1, "a third rounds up to the whole factor");
+        assert_eq!(
+            cheap.expansion(),
+            1,
+            "a third rounds up to the whole factor"
+        );
         // The images grow dearer: each sample moves the factor up, by RFC 6298's gain.
         let before = costs.expansion();
         for _ in 0..64 {
