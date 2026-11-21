@@ -12,18 +12,28 @@
 //! no row (each row written before it reads the column's constant default), so absent to public is
 //! one catalog change, its record in the same transaction. A column whose addition would read every
 //! row (a generated one with NOT NULL or CHECK, which the engine checks against each row) is
-//! refused: it needs the validation states constraints need, not yet built.
+//! refused.
+//!
+//! A constraint (NOT NULL or CHECK) is added to an existing column by `ALTER TABLE … ALTER COLUMN c
+//! TO <its definition plus the constraint>` through write-only, validated, public: one transaction
+//! marks the column unvalidated in `__amphora_constraint_states` and redefines it, so writes are
+//! checked from then on while the planner doesn't rely on it; batches check the rows written before
+//! it in rowid order; the cutover removes the mark, a catalog change only. A row that breaks it
+//! undoes the change: the column's old definition back.
 
 use super::*;
 use amphora_engine::schema::IndexState;
-use amphora_engine_parser::ast::{AlterTableBody, ColumnConstraint, ColumnDefinition};
+use amphora_engine_parser::ast::{
+    AlterTableBody, ColumnConstraint, ColumnDefinition, CreateTableBody,
+};
 use std::time::Duration;
 
 /// The tables a change keeps, made by its first step (never at open: a replica on a binary from
 /// before them would not make them, as `application.rs` says of its own).
 const TABLES: &str = "
 CREATE TABLE IF NOT EXISTS __amphora_index_states (name TEXT PRIMARY KEY, state INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS __amphora_schema_changes (name TEXT PRIMARY KEY, sql TEXT NOT NULL, idx TEXT NOT NULL, tbl TEXT NOT NULL, phase INTEGER NOT NULL, after INTEGER, until INTEGER);";
+CREATE TABLE IF NOT EXISTS __amphora_schema_changes (name TEXT PRIMARY KEY, sql TEXT NOT NULL, idx TEXT NOT NULL, tbl TEXT NOT NULL, phase INTEGER NOT NULL, after INTEGER, until INTEGER);
+CREATE TABLE IF NOT EXISTS __amphora_constraint_states (tbl TEXT NOT NULL, col TEXT NOT NULL, old TEXT NOT NULL, PRIMARY KEY (tbl, col));";
 
 /// The phases a change records (a format value of `__amphora_schema_changes.phase`): its index
 /// delete-only, write-only with its backfill under way, and backfilled. Public is no row.
@@ -31,12 +41,12 @@ const DELETE_ONLY: i64 = 1;
 const WRITE_ONLY: i64 = 2;
 const BACKFILLED: i64 = 3;
 
-/// What a refusal says when the table's rows break the unique index a change would add: the
-/// change can't finish, and its driver undoes it.
+/// What a refusal says when the table's rows break the unique index or the constraint a change
+/// would add: the change can't finish, and its driver undoes it.
 pub const BROKEN: &str = "online schema change's rows";
 
-/// A change asked for: its migration's name and SQL (one `CREATE [UNIQUE] INDEX` or `ALTER TABLE …
-/// ADD COLUMN`), what it adds, and its table as SQL names it (case-folded, as the engine's
+/// A change asked for: its migration's name and SQL (one `CREATE [UNIQUE] INDEX`, `ALTER TABLE …
+/// ADD COLUMN` or `ALTER TABLE … ALTER COLUMN` adding a constraint), what it adds, and its table as SQL names it (case-folded, as the engine's
 /// `normalize_ident` folds names).
 pub struct Plan {
     name: String,
@@ -52,6 +62,12 @@ enum Adds {
     Index(String),
     /// A column whose addition rewrites and reads no row: absent to public in one catalog change.
     Column,
+    /// NOT NULL or CHECK on an existing column, by its case-folded name and new definition:
+    /// write-only, validated in batches, public.
+    Constraint {
+        column: String,
+        definition: ColumnDefinition,
+    },
 }
 
 impl Plan {
@@ -92,24 +108,48 @@ impl Plan {
                 )
             }
             Cmd::Stmt(Stmt::AlterTable(alter)) => {
-                let AlterTableBody::AddColumn(column) = alter.body else {
-                    return Err(refuse(
-                        "of ALTER TABLE, only ADD COLUMN is built online: the others rewrite or check every row",
-                    ));
-                };
                 if alter.name.db_name.is_some() {
                     return Err(refuse("a column of the main database's table"));
                 }
-                if reads_every_row(&column) {
-                    return Err(refuse(
-                        "a generated column with NOT NULL or CHECK is checked against every row: it needs validation states, not yet built",
-                    ));
+                match alter.body {
+                    AlterTableBody::AddColumn(column) => {
+                        if reads_every_row(&column) {
+                            return Err(refuse(
+                                "a generated column with NOT NULL or CHECK is checked against every row: add the column, then its constraint by ALTER COLUMN",
+                            ));
+                        }
+                        (Adds::Column, alter.name.name)
+                    }
+                    AlterTableBody::AlterColumn { old, new } => {
+                        let column = old.as_str().to_ascii_lowercase();
+                        if new.col_name.as_str().to_ascii_lowercase() != column {
+                            return Err(refuse(
+                                "ALTER COLUMN online keeps the column's name: it only adds NOT NULL or CHECK",
+                            ));
+                        }
+                        if !new.constraints.iter().any(|c| constrains(&c.constraint)) {
+                            return Err(refuse(
+                                "ALTER COLUMN online adds NOT NULL or CHECK, and this definition has neither",
+                            ));
+                        }
+                        (
+                            Adds::Constraint {
+                                column,
+                                definition: new,
+                            },
+                            alter.name.name,
+                        )
+                    }
+                    _ => {
+                        return Err(refuse(
+                            "of ALTER TABLE, ADD COLUMN and ALTER COLUMN adding NOT NULL or CHECK are built online: the others rewrite or check every row",
+                        ));
+                    }
                 }
-                (Adds::Column, alter.name.name)
             }
             _ => {
                 return Err(refuse(
-                    "only CREATE INDEX and ALTER TABLE … ADD COLUMN are built online",
+                    "only CREATE INDEX, ALTER TABLE … ADD COLUMN and ALTER COLUMN adding a constraint are built online",
                 ));
             }
         };
@@ -142,6 +182,17 @@ fn reads_every_row(column: &ColumnDefinition) -> bool {
         })
 }
 
+/// Whether a column constraint is one an online change adds: NOT NULL or CHECK.
+fn constrains(constraint: &ColumnConstraint) -> bool {
+    matches!(
+        constraint,
+        ColumnConstraint::NotNull {
+            nullable: false,
+            ..
+        } | ColumnConstraint::Check { .. }
+    )
+}
+
 /// What one step did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stepped {
@@ -149,9 +200,10 @@ pub enum Stepped {
     Already,
     /// The index is made, empty and delete-only.
     DeleteOnly,
-    /// The index is write-only: writes keep it from here.
+    /// The index is write-only: writes keep it from here; or the constraint is, checked on writes
+    /// from here.
     WriteOnly,
-    /// A backfill batch visited `visited` rows, holding the writer `held` for them.
+    /// A backfill (or a constraint's validation) batch visited `visited` rows, holding the writer `held` for them.
     Batch { visited: u64, held: Duration },
     /// The index is public: the cutover held the writer `held`.
     Public { held: Duration },
@@ -160,9 +212,9 @@ pub enum Stepped {
 /// What a change did, for its caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SchemaChange {
-    /// Whether this call made the index public (false: its migration was applied before).
+    /// Whether this call made the change public (false: its migration was applied before).
     pub applied: bool,
-    /// The backfill's batches and the rows they visited, in this call.
+    /// The backfill's (or validation's) batches and the rows they visited, in this call.
     pub batches: u64,
     pub rows: u64,
     /// How long the cutover to public held the writer (AC-T1.12.2's pause, at the writer).
@@ -293,11 +345,15 @@ pub fn step(db: &Db, plan: &Plan, rows: u64) -> anyhow::Result<Stepped> {
         }
         return Err(api::invalid("migration", "the applied name has different SQL").into());
     }
+    let found = record(db, plan)?;
     let index = match &plan.adds {
         Adds::Index(index) => index.as_str(),
         Adds::Column => return add_column(db, plan),
+        Adds::Constraint { column, definition } => {
+            return constraint_step(db, plan, column, definition, found, rows);
+        }
     };
-    let Some(record) = record(db, plan)? else {
+    let Some(record) = found else {
         return begin(db, plan, index);
     };
     if record.sql != plan.sql {
@@ -473,15 +529,17 @@ fn finish(db: &Db, plan: &Plan) -> anyhow::Result<()> {
     )
 }
 
-/// Undoes `plan`'s change, at whatever step it stands: its index dropped, its records gone, the
-/// old schema whole. Nothing to undo when it never began.
+/// Undoes `plan`'s change, at whatever step it stands: its index dropped (or its column's old
+/// definition back), its records gone, the old schema whole. Nothing to undo when it never began.
 pub fn abandon(db: &Db, plan: &Plan) -> anyhow::Result<()> {
-    let Adds::Index(index) = &plan.adds else {
-        return Ok(());
-    };
     if record(db, plan)?.is_none() {
         return Ok(());
     }
+    let index = match &plan.adds {
+        Adds::Index(index) => index,
+        Adds::Column => return Ok(()),
+        Adds::Constraint { column, .. } => return abandon_constraint(db, plan, column),
+    };
     db.query(
         "DELETE FROM __amphora_index_states WHERE name = ?1",
         [text(index)],
@@ -492,15 +550,309 @@ pub fn abandon(db: &Db, plan: &Plan) -> anyhow::Result<()> {
     finish(db, plan)
 }
 
+/// The next step of a constraint's change, by its record: begun (write-only), its validation's
+/// next batch, or the cutover once every row before it is checked.
+fn constraint_step(
+    db: &Db,
+    plan: &Plan,
+    column: &str,
+    definition: &ColumnDefinition,
+    found: Option<Record>,
+    rows: u64,
+) -> anyhow::Result<Stepped> {
+    let Some(record) = found else {
+        return begin_constraint(db, plan, column);
+    };
+    if record.sql != plan.sql {
+        return Err(api::invalid(
+            "migration",
+            "a change of this name is under way with different SQL",
+        )
+        .into());
+    }
+    match record.phase {
+        WRITE_ONLY => validate(db, plan, column, definition, &record, rows),
+        BACKFILLED => {
+            let began = Instant::now();
+            db.query(
+                "DELETE FROM __amphora_constraint_states WHERE tbl = ?1 AND col = ?2",
+                [text(&plan.table), text(column)],
+                |_| Ok(true),
+            )?;
+            db.restage_schema()?;
+            finish(db, plan)?;
+            migrated(db, plan)?;
+            Ok(Stepped::Public {
+                held: began.elapsed(),
+            })
+        }
+        phase => Err(anyhow::anyhow!(
+            "__amphora_schema_changes: {} is at phase {phase}",
+            plan.name
+        )),
+    }
+}
+
+/// The definition `column` has in its table's `CREATE TABLE`, and whether the table has a rowid.
+fn column_definition(db: &Db, table: &str, column: &str) -> anyhow::Result<(ColumnDefinition, bool)> {
+    let mut sql = None;
+    db.query(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND lower(name) = ?1",
+        [text(table)],
+        |row| {
+            sql = Some(row.get::<String>(0).map_err(unavailable)?);
+            Ok(false)
+        },
+    )?;
+    let refuse = |why: String| -> anyhow::Error { api::invalid("online schema change", &why).into() };
+    let sql = sql.ok_or_else(|| refuse(format!("no table {table}")))?;
+    let mut parser = Parser::new(sql.as_bytes());
+    let Some(Cmd::Stmt(Stmt::CreateTable {
+        body:
+            CreateTableBody::ColumnsAndConstraints {
+                columns, options, ..
+            },
+        ..
+    })) = parser.next_cmd().map_err(|e| refuse(e.to_string()))?
+    else {
+        return Err(refuse(format!("{table} is not a table of columns")));
+    };
+    let definition = columns
+        .into_iter()
+        .find(|c| c.col_name.as_str().to_ascii_lowercase() == column)
+        .ok_or_else(|| refuse(format!("no column {column} in {table}")))?;
+    Ok((definition, options.without_rowid_text.is_none()))
+}
+
+/// Whether `new` is exactly `old` with NOT NULL or CHECK constraints after its own: the same type
+/// and constraints, then only the added ones, so removing them gives `old` back (the change can be
+/// undone by redefining the column as it was). NOT NULL is added only to a column without it.
+fn adds_only_constraints(old: &ColumnDefinition, new: &ColumnDefinition) -> bool {
+    let kept = old.constraints.len();
+    let (Some(head), Some(added)) = (new.constraints.get(..kept), new.constraints.get(kept..))
+    else {
+        return false;
+    };
+    let not_null = |c: &&amphora_engine_parser::ast::NamedColumnConstraint| {
+        matches!(
+            c.constraint,
+            ColumnConstraint::NotNull {
+                nullable: false,
+                ..
+            }
+        )
+    };
+    old.col_type == new.col_type
+        && head == old.constraints.as_slice()
+        && !added.is_empty()
+        && added.iter().all(|c| constrains(&c.constraint))
+        && !(old.constraints.iter().any(|c| not_null(&c)) && added.iter().any(|c| not_null(&c)))
+}
+
+/// Absent to write-only for a constraint, in one transaction: the column marked unvalidated (its
+/// old definition kept beside the mark, to undo it by), then redefined with the constraint, which
+/// writes are checked against from here and which the engine doesn't scan the table for (the
+/// mark says the batches will); the rows the validation must reach are those up to the largest
+/// rowid now.
+fn begin_constraint(db: &Db, plan: &Plan, column: &str) -> anyhow::Result<Stepped> {
+    let Adds::Constraint { definition, .. } = &plan.adds else {
+        return Err(anyhow::anyhow!("{} adds no constraint", plan.name));
+    };
+    let (old, rowid) = column_definition(db, &plan.table, column)?;
+    if !rowid {
+        return Err(api::invalid(
+            "online schema change",
+            "a WITHOUT ROWID table has no rowid order to validate by",
+        )
+        .into());
+    }
+    if old
+        .constraints
+        .iter()
+        .any(|c| matches!(c.constraint, ColumnConstraint::Generated { .. }))
+    {
+        return Err(api::invalid(
+            "online schema change",
+            "a generated column's constraint is checked by computing it for every row at once: not built online",
+        )
+        .into());
+    }
+    if !adds_only_constraints(&old, definition) {
+        return Err(api::invalid(
+            "online schema change",
+            &format!(
+                "the new definition must be the column's own ({old}) with NOT NULL or CHECK after it"
+            ),
+        )
+        .into());
+    }
+    db.exec(TABLES)?;
+    db.query(
+        "INSERT INTO __amphora_constraint_states(tbl, col, old) VALUES (?1, ?2, ?3)",
+        [text(&plan.table), text(column), text(&old.to_string())],
+        |_| Ok(true),
+    )?;
+    db.restage_schema()?;
+    db.exec(&plan.sql)?;
+    let mut until = None;
+    db.query_owned(
+        &format!("SELECT max(rowid) FROM {}", quoted(&plan.table)),
+        [],
+        |row| {
+            until = optional(row, 0)?;
+            Ok(false)
+        },
+    )?;
+    db.query(
+        "INSERT INTO __amphora_schema_changes(name, sql, idx, tbl, phase, until) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        [
+            text(&plan.name),
+            text(&plan.sql),
+            text(column),
+            text(&plan.table),
+            EValue::from_i64(WRITE_ONLY),
+            until.map_or(EValue::Null, EValue::from_i64),
+        ],
+        |_| Ok(true),
+    )?;
+    // The redefinition gave the writer's schema the column without its mark: read it again, so
+    // the writer's own reads don't rely on the constraint before it is validated either.
+    db.restage_schema()?;
+    Ok(Stepped::WriteOnly)
+}
+
+/// What a row breaking `definition`'s NOT NULL and CHECK constraints makes true, as SQL over the
+/// column's table: a NULL under NOT NULL, or a CHECK that is false (a NULL CHECK passes, as
+/// SQLite's does). The column's earlier constraints hold already; checking them again costs a
+/// little and keeps one expression.
+fn breaks(column: &str, definition: &ColumnDefinition) -> String {
+    definition
+        .constraints
+        .iter()
+        .filter_map(|c| match &c.constraint {
+            ColumnConstraint::NotNull {
+                nullable: false,
+                ..
+            } => Some(format!("{} IS NULL", quoted(column))),
+            ColumnConstraint::Check { expr, .. } => Some(format!("coalesce(NOT ({expr}), 0)")),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+/// One validation batch: the rows after the last one checked, up to the largest rowid the table
+/// held when the constraint went write-only, at most `rows`. A row that breaks the constraint
+/// stops the change ([`BROKEN`]); the last batch marks it validated.
+fn validate(
+    db: &Db,
+    plan: &Plan,
+    column: &str,
+    definition: &ColumnDefinition,
+    record: &Record,
+    rows: u64,
+) -> anyhow::Result<Stepped> {
+    let reached = |at: Option<i64>| match (at, record.until) {
+        (_, None) => true,
+        (Some(at), Some(until)) => at >= until,
+        (None, Some(_)) => false,
+    };
+    let (last, visited, held) = match (reached(record.after), record.until) {
+        (false, Some(until)) => {
+            let began = Instant::now();
+            let from = match record.after {
+                Some(after) => after.checked_add(1).unwrap_or(i64::MAX),
+                None => i64::MIN,
+            };
+            let mut seen = (None, 0u64, None);
+            db.query_owned(
+                &format!(
+                    "SELECT max(r), count(*), min(CASE WHEN bad THEN r END) FROM (SELECT rowid AS r, ({}) AS bad FROM {} WHERE rowid >= ?1 AND rowid <= ?2 ORDER BY rowid LIMIT ?3)",
+                    breaks(column, definition),
+                    quoted(&plan.table)
+                ),
+                [
+                    EValue::from_i64(from),
+                    EValue::from_i64(until),
+                    EValue::from_i64(i64::try_from(rows).unwrap_or(i64::MAX)),
+                ],
+                |row| {
+                    seen = (
+                        optional(row, 0)?,
+                        u64::try_from(row.get::<i64>(1).map_err(unavailable)?).unwrap_or(0),
+                        optional(row, 2)?,
+                    );
+                    Ok(false)
+                },
+            )?;
+            let (last, visited, broken) = seen;
+            if let Some(broken) = broken {
+                return Err(api::invalid(
+                    BROKEN,
+                    &format!(
+                        "row {broken} of {} breaks the constraint added to {column}",
+                        plan.table
+                    ),
+                )
+                .into());
+            }
+            (last.or(record.after), visited, began.elapsed())
+        }
+        _ => (record.after, 0, Duration::ZERO),
+    };
+    let done = visited < rows || reached(last);
+    db.query(
+        "UPDATE __amphora_schema_changes SET phase = ?2, after = ?3 WHERE name = ?1",
+        [
+            text(&plan.name),
+            EValue::from_i64(if done { BACKFILLED } else { WRITE_ONLY }),
+            last.map_or(EValue::Null, EValue::from_i64),
+        ],
+        |_| Ok(true),
+    )?;
+    Ok(Stepped::Batch { visited, held })
+}
+
+/// Undoes a constraint's change: the column redefined as it was (its mark still on, so the engine
+/// doesn't scan the table for its old constraints, which every row keeps), then the mark and the
+/// record gone, in the caller's transaction.
+fn abandon_constraint(db: &Db, plan: &Plan, column: &str) -> anyhow::Result<()> {
+    let mut old = None;
+    db.query(
+        "SELECT old FROM __amphora_constraint_states WHERE tbl = ?1 AND col = ?2",
+        [text(&plan.table), text(column)],
+        |row| {
+            old = Some(row.get::<String>(0).map_err(unavailable)?);
+            Ok(false)
+        },
+    )?;
+    if let Some(old) = old {
+        db.exec(&format!(
+            "ALTER TABLE {} ALTER COLUMN {} TO {old}",
+            quoted(&plan.table),
+            quoted(column)
+        ))?;
+        db.query(
+            "DELETE FROM __amphora_constraint_states WHERE tbl = ?1 AND col = ?2",
+            [text(&plan.table), text(column)],
+            |_| Ok(true),
+        )?;
+        db.restage_schema()?;
+    }
+    finish(db, plan)
+}
+
 impl Database {
     /// Builds the index `migration` creates (one `CREATE [UNIQUE] INDEX`) online, by F1's states
     /// (CP-T1.12, docs/design/online-schema.md): writes go on while its backfill runs, and the
     /// writer is held for the cutover to public only as long as a catalog change takes. A column
     /// (one `ALTER TABLE … ADD COLUMN`) is added in one catalog change, its states run together;
-    /// one whose addition would read every row is refused. Applied
+    /// one whose addition would read every row is refused. A NOT NULL or CHECK (one `ALTER TABLE …
+    /// ALTER COLUMN c TO` its definition plus the constraint) is checked on writes, then validated
+    /// against the rows before it in batches, then made public by a catalog change. Applied
     /// once by name, as [`Database::migrate`]. A deadline that passes leaves the change at a
     /// step, invisible to reads; calling again with the same migration carries it on. Rows that
-    /// break a unique index undo the change and are refused.
+    /// break a unique index or the constraint undo the change and are refused.
     pub fn change_schema(
         &self,
         migration: Migration,

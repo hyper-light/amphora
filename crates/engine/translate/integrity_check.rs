@@ -380,7 +380,7 @@ fn translate_integrity_check_for_schema(
             .iter()
             .enumerate()
             .filter(|(_, c)| !c.is_rowid_alias()) // nothing to check on IPK cols
-            .filter(|(_, c)| c.notnull() || btree_table.is_strict)
+            .filter(|(_, c)| c.trusted_notnull() || btree_table.is_strict)
             .map(|(idx, col)| {
                 let col_ref = match col.generated_type() {
                     GeneratedType::Virtual { expr, .. } => BoundIndexColumn::Expr(
@@ -414,7 +414,7 @@ fn translate_integrity_check_for_schema(
                     col_reg,
                 );
             }
-            if col.notnull() {
+            if col.trusted_notnull() {
                 emit_notnull_check(program, &registers, btree_table, col_name, col_reg);
             }
         }

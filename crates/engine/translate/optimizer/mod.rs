@@ -4371,7 +4371,7 @@ impl Optimizable for ast::Expr {
                 let column = &columns[*column];
                 // Only INTEGER PRIMARY KEY (rowid alias) is implicitly NOT NULL.
                 // Other PRIMARY KEY types (e.g., TEXT PRIMARY KEY) can contain NULL.
-                column.is_rowid_alias() || column.notnull()
+                column.is_rowid_alias() || column.trusted_notnull()
             }
             // A rowid is not NULL for a real table row. An outer join can
             // replace that row with a synthetic row whose rowid is NULL.
