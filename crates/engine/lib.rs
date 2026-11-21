@@ -139,6 +139,11 @@ pub use connection::{
     resolve_ext_path, Connection, JoinMethods, PrepareOptions, Row, StepResult, SymbolTable,
 };
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
+// Amphora (G6 step 3): learned plan hints, a prototype behind `HintSet::apply`.
+pub use translate::optimizer::plan_hints::{
+    candidate_plans, plan_features, HintChooser, HintGuard, HintModel, HintSet, PlanFeatures,
+    Verdict,
+};
 #[cfg(feature = "simulator")]
 pub use database::{clear_database_registry, SharedWalTestingSnapshot};
 pub(crate) use database::{is_memory_like, DatabaseCatalog, InitState};

@@ -517,6 +517,8 @@ pub struct Connection {
     pub(super) join_methods: AtomicJoinMethods,
     /// Amphora: see [`Connection::set_sorted_fetches`].
     pub(super) sorted_fetches: AtomicBool,
+    /// Amphora: see [`Connection::set_automatic_indexes`].
+    pub(super) automatic_indexes: AtomicBool,
     /// Per-connection runtime extension loading flag.
     pub(super) enable_load_extension: AtomicBool,
     /// Cumulative count of autonomous sequence inner-tx retries (each
@@ -979,6 +981,19 @@ impl Connection {
 
     pub(crate) fn sorted_fetches(&self) -> bool {
         self.sorted_fetches.load(Ordering::Acquire)
+    }
+
+    /// Amphora (G6 step 3, learned plan hints; `optimizer::plan_hints`): lets newly prepared
+    /// statements build an automatic index for a join, on by default as SQLite's planner has it.
+    /// Off, the planner weighs every join without one. `JoinMethods::NestedLoopsOnly` builds none
+    /// either way.
+    pub fn set_automatic_indexes(&self, on: bool) {
+        self.automatic_indexes.store(on, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn automatic_indexes(&self) -> bool {
+        self.automatic_indexes.load(Ordering::Acquire)
     }
 
     /// Choose how correlated subqueries are planned in newly prepared statements.
