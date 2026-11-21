@@ -179,6 +179,12 @@ pub trait File: Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion>;
+    /// Amphora (G3 step 3, decision 42): reads into `dest` at `pos` now, in line, when this
+    /// backend completes its reads in line: the bytes read, or `None` when it completes them
+    /// later (then `pread`, with its completion, is the read).
+    fn pread_inline(&self, _pos: u64, _dest: &mut [u8]) -> Result<Option<usize>> {
+        Ok(None)
+    }
     fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion>;
     /// Sync file data&metadata to disk.
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion>;
@@ -458,6 +464,12 @@ pub trait IO: Clock + Send + Sync {
 
     /// Whether this IO backend can back host-filesystem shared WAL coordination.
     fn supports_shared_wal_coordination(&self) -> bool {
+        false
+    }
+
+    /// Amphora (G7 step 2): whether its files live in memory, not on the host's filesystem, so a
+    /// database's versioned storage (`storage::versioned::switch`) is kept in memory beside them.
+    fn is_memory(&self) -> bool {
         false
     }
 

@@ -93,6 +93,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   sharded latest-frame tables under version checks (`optimistic`). Built and tested (a model against
   the locked index, crashes at every write of a checkpoint and restart); not yet measured, nor a way
   chosen.
+- **The page path SQLite takes** (G3 step 3, docs/design/store.md decision 42), a prototype behind
+  `AMPHORA_PAGE_PATH=plain`, off by default: plain pin counts on a connection's own pages, a shared
+  page's buffer counted once as it enters a connection, file misses read in line with no completion
+  (Unix), the checksum checked once as a page enters the process. Built and tested (the shared-pages
+  model on the plain path; each path reads today's rows; a flipped byte refused on each path); not
+  yet measured. The miss still allocates the page and its buffer's `Arc`.
 - **The mixed log's commit costs** (docs/design/store.md, Decision (lane wal-read)): publishing a
   commit's records costs a lookup each, not a pass over the records kept decoded or over the
   commit's pages, and deltas are found a word at a time. Built, not merged; whether the bulk
@@ -303,11 +309,21 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   decision 13, `crates/engine/storage/versioned/{switch,sql}.rs`): `ConnectOpts::with_versioned_storage`
   or `AMPHORA_STORAGE=versioned` puts a database's B-trees on the versioned storage; the executor's
   cursors, CREATE/DROP TABLE and INDEX, DELETE without WHERE, `sqlite_schema` (tree 1) and ANALYZE
-  run on it, each SQL transaction one storage transaction. `sql.rs` (`T-NS.2.6`) runs the same SQL
-  on both storages and compares. Not yet: a file database reopened (recovery remakes every tree in
-  rowid order; the header stays the pager's), a statement's own rollback inside a transaction, DROP
-  undone by ROLLBACK, a pool past the page cache's bound; the engine's suites with the switch on are
-  the coordinator's run.
+  run on it, each SQL transaction one storage transaction, a failed statement undone alone by a
+  savepoint. `sql.rs` (`T-NS.2.6`) runs the same SQL on both storages and compares. Not yet: a file
+  database reopened (recovery remakes every tree in rowid order; the header stays the pager's), DROP
+  undone by ROLLBACK, SQL's named SAVEPOINT, a database past the pool's frames or a transaction past
+  its budget (no eviction yet; the budget is the shell's to give); the engine's suites with the
+  switch on are the coordinator's run.
+- **Three ways to reach a cached page** (G7 step 3, `NS.3`; `crates/engine/storage/reach`,
+  `amphora-bench --reach`): behind one trait, sharing frames, CLOCK eviction and one miss path, (a) a
+  page table in shards with pins and a private pin on a client's current page (PostgreSQL), (b)
+  references by frame index read optimistically under a version, atomics standing in for
+  unsynchronized reads (LeanStore, Umbra), and (c) a direct array of frames by page number
+  (vmcache without the page table). Shards follow the machine's threads, the array the file's pages.
+  The model test with eviction under 32 threads (`T-NS.3.1`) passes on all three. Not yet: the
+  harness's runs (point reads and scans at 1 and 32 clients, cached and a pool a tenth of the file)
+  and the choice by their numbers, the coordinator's; misses read an in-memory stand-in for the file.
 - **Serializable validation, three prototypes behind one switch** (G8 step 1, docs/design/engine.md
   decision 5, `crates/engine/storage/versioned/{version,elle}.rs`, `amphora-bench --cc`): precision
   locking (the default), SSI and Silo-style OCC validate commits on the versioned storage's commit
@@ -610,10 +626,14 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   cost against the nested loop's early out: the outer rows build the hash table, the subquery's table probes it, and
   `HashMarkFirstMatch` passes each build row on at its first match in a probe pass only (its matched bit, kept in
   grace partitions when the table spills). `tests/hash_semi_join.rs` runs EXISTS queries with NULL and duplicate
-  keys under all three join methods, in memory and spilled, against a model. Index-only reads were already planned
-  (covering indexes). Left: bitmap-style sorted row fetches (a one-branch RowSet read; the multi-index fetch cost
-  assumes page locality and should be learned first), and the 2x measurements on order_by_sort, exists_subquery
-  and left_join_anti (the coordinator's).
+  keys under all three join methods, in memory and spilled, against a model. Sorted row fetches are a prototype behind
+  `Connection::set_sorted_fetches` (off by default): the chosen read of a non-covering index runs as a one-branch
+  multi-index read, its rowids sorted in a RowSet and the rows fetched in rowid order, kept when the existing
+  intersection cost says it is cheaper; `tests/sorted_fetch.rs` runs reads with it off and on. That cost counts the
+  fetch as the share of table pages, which assumes page locality: it should be learned before the switch goes on
+  by default. Index-only reads were already planned (covering indexes, expression indexes included). Left: the 2x
+  measurements on order_by_sort, exists_subquery and left_join_anti, and the sorted fetch's measurement against the
+  plain read (the coordinator's).
 - **The replicated class** (docs/design/replication.md, "Fast acknowledgement"; Ada's word 2026-11-01): built on
   t1/replicated-line, not on main (fast-ack, class-metrics, class-quorum and disk-stalls, merged in that order). A
   replicated database opened with `Durability::Replicated(Fates)` answers a write once members spanning the fates
@@ -679,6 +699,12 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   (PL.7, e0e7a1df), bushy plans with CD-C (PL.8, c837cde3), statistics kept as rows change (PL.9,
   26302efe), unnesting by dependent joins (PL.10, 61c79bd1), upper bounds as a guard (PL.11,
   f4e0bd7f), custom then generic plans (PL.12, aa0541f6) and adaptive joins (PL.13, 4f237e07).
+- **PL.11** (f4e0bd7f, built and tested on t1/lane-pl11, its JOB and TPC-H counts open): ANALYZE
+  keeps each index prefix's degree sequence as its largest degree and sum of squared degrees, and
+  each joined set's estimate is cut to the upper bound they prove (one table's rows times each
+  attached table's largest degree, or two tables' ℓ2 norms); underestimates are left as they are
+  (docs/design/planner.md, "Decision (lane pl11)"). Open: the bound holds for PL.9's net row
+  change, not for updates or cancelled inserts between ANALYZE runs.
 - **PL.6** (5e23ff8b, built and tested on t1/lane-pl6, its measurement open): no table is read whole
   beneath loops that can give more than one row. A scan stays only beneath one-row loops (a lookup by a
   unique key) or where no equality joins the table; elsewhere a seek, an automatic index or a hash join

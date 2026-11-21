@@ -203,6 +203,8 @@ pub struct Resolver<'a> {
     learned_weights: Option<crate::translate::optimizer::learned_costs::LearnedWeights>,
     /// Amphora: the join methods the planner may choose (`Connection::set_join_methods`).
     join_methods: crate::JoinMethods,
+    /// Amphora: whether the planner may choose a sorted fetch (`Connection::set_sorted_fetches`).
+    sorted_fetches: bool,
     /// Cached flag: true when this connection has an active temp database.
     ///
     /// Computed once at Resolver construction to avoid repeated
@@ -331,6 +333,7 @@ impl<'a> Resolver<'a> {
             statement_memory: 0,
             learned_weights: None,
             join_methods: crate::JoinMethods::ByCost,
+            sorted_fetches: false,
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
             unqualified_database_search_path: unqualified_database_search_path.clone(),
@@ -406,6 +409,14 @@ impl<'a> Resolver<'a> {
         self.join_methods = methods;
     }
 
+    pub(crate) fn sorted_fetches(&self) -> bool {
+        self.sorted_fetches
+    }
+
+    pub(crate) fn set_sorted_fetches(&mut self, on: bool) {
+        self.sorted_fetches = on;
+    }
+
     pub fn fork(&self) -> Resolver<'a> {
         Resolver {
             schema: self.schema,
@@ -432,6 +443,7 @@ impl<'a> Resolver<'a> {
             statement_memory: self.statement_memory,
             learned_weights: self.learned_weights,
             join_methods: self.join_methods,
+            sorted_fetches: self.sorted_fetches,
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
@@ -464,6 +476,7 @@ impl<'a> Resolver<'a> {
             statement_memory: self.statement_memory,
             learned_weights: self.learned_weights,
             join_methods: self.join_methods,
+            sorted_fetches: self.sorted_fetches,
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),

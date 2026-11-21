@@ -385,7 +385,10 @@ title = "Degree-sequence upper bounds as a guard (planner rank 11)"
 criteria = [
   { id = "AC-PL.11.1", text = "JOB and TPC-H prefixes estimated above their bound is exactly 0, with step 3's 791 underestimates left as they are" },
 ]
-tests = []
+# lane pl11
+tests = [
+  { id = "T-PL.11.1", text = "Random skewed tables joined by random = terms, every subset counted — passes when no count exceeds its degree-sequence bound and ANALYZE's norms equal a GROUP BY's counts" },
+]
 
 [[own]]
 id = "PL.12"
@@ -507,6 +510,18 @@ tests = [
   { id = "T-NS.2.5", text = "Trees made and dropped survive reopens and power cuts; a crash at each write of a workload that makes, fills and drops trees recovers a prefix of its steps" },
   # lane g7s2-3
   { id = "T-NS.2.6", text = "SQL end to end through the switch and without it (CREATE TABLE, INSERT, SELECT, transactions) answers alike" },
+]
+
+# lane g7s3
+[[own]]
+id = "NS.3"
+title = "Three ways to reach a cached page, prototyped against each other (G7 step 3)"
+criteria = [
+  { id = "AC-NS.3.1", text = "the three prototypes' costs on the corpus recorded side by side; the choice made by the numbers and recorded with the losers" },
+  { id = "AC-NS.3.2", text = "cycles per cached-page access with the winner against a hash-table lookup and pin falls by at least 50%" },
+]
+tests = [
+  { id = "T-NS.3.1", text = "The model test with eviction under 32 threads (crates/engine/storage/reach/model.rs) — passes when no stale or torn page read and no use after eviction, every page equal to the reference map" },
 ]
 
 # lane follower-reads (G13 step 4, kiln goal 80d4cf5e; docs/design/replication.md, "Follower reads at a
@@ -841,7 +856,7 @@ tests = [
 # lane g3s5: G3 step 5 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), skipping the descent.
 [[own]]
 id = "G3.5"
-title = "Skipping the descent: adaptive hash index against a learned leaf locator (G3 step 5; store.md decision 41)"
+title = "Skipping the descent: adaptive hash index against a learned leaf locator (G3 step 5; store.md decision 42)"
 criteria = [
   { id = "AC-G3.5.1", text = "each prototype's lookup and write (upkeep) costs recorded on every point-read and write class (measured by the coordinator)" },
   { id = "AC-G3.5.2", text = "point_pk at 1 client with the winner rises at least 20% against after steps 2-4 (measured by the coordinator)" },
@@ -856,3 +871,21 @@ tests = [
 # (crates/amphora/tests/regions.rs, ac_t1_11_4_*: the corpus on the simulated lab at one node, three
 # nodes and three regions) and AC-T1.11.2's lab (crates/amphora/examples/regions_lab.rs; the 60 ms run
 # and its p99 are the coordinator's).
+# lane g3s3
+
+[[own]]
+id = "G3.3"
+title = "The page path SQLite takes: plain pins, recycled buffers, checksums once (G3 step 3; store.md decision 42)"
+criteria = [
+  { id = "AC-G3.3.1", text = "atomic read-modify-writes per point_pk lookup are at most 2 (perf: atomic instructions per statement; measured by the coordinator)" },
+  { id = "AC-G3.3.2", text = "allocations per point_pk lookup are at most 1 (a counting allocator; measured by the coordinator)" },
+  { id = "AC-G3.3.3", text = "page cache, pager, checksums, atomics and I/O completion together are at most 15% of a point read's user cycles (bench/prof_parts.py; measured by the coordinator)" },
+  { id = "AC-G3.3.4", text = "a byte flipped on disk is still refused when read from the file" },
+]
+tests = [
+  { id = "T-G3.3.1", text = "crates/engine/tests/shared_pages.rs g3s3_readers_on_the_plain_page_path_* — passes when the shared-pages model's reads on the plain path are the model's, on page and mixed logs" },
+  { id = "T-G3.3.2", text = "crates/engine/tests/shared_pages.rs g3s3_each_page_path_reads_the_pages_todays_path_reads — passes when the plain path reads today's rows from the log, the file and memory, with and without shared pages" },
+  { id = "T-G3.3.3", text = "crates/engine/tests/shared_pages.rs g3s3_a_byte_flipped_on_disk_is_refused_on_each_page_path — passes when a fresh connection on each path refuses the flipped page with a checksum error" },
+  { id = "T-G3.3.4", text = "storage::pager::tests::g3s3_plain_pins_count_as_atomic_pins_do — passes when plain pins count as atomic pins do" },
+  { id = "T-G3.3.5", text = "crates/engine/tests/shared_pages.rs g3s3_plain_misses_read_into_the_pages_evictions_leave — passes when a table four times the cache reads today's rows on the plain path and its misses read into recycled pages" },
+]
