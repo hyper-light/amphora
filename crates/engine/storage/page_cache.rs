@@ -143,6 +143,13 @@ pub struct PageCache {
     /// Conservative estimation of pages that are evictable based on dirty/spilled state.
     #[cfg_attr(feature = "aristo-instr", inspect)]
     evictable_count: usize,
+    /// Amphora (G3 step 3, `docs/design/store.md` decision 42): the plain page the last eviction
+    /// left with no other holder, with its buffer, for the next miss to read into (`pcache1`
+    /// recycles the page a fetch evicts, `pcache1FetchStage2`). At most one: the page an eviction
+    /// frees, taken by the read that follows it.
+    spare: Option<PageRef>,
+    /// Amphora: spare pages taken by misses so far.
+    recycled: u64,
 }
 
 unsafe impl Send for PageCache {}
@@ -207,7 +214,23 @@ impl PageCache {
             spill_threshold: spill_threshold.max(1),
             spill_enabled,
             evictable_count: 0,
+            spare: None,
+            recycled: 0,
         }
+    }
+
+    /// Amphora (decision 42): the page the last eviction left spare, for a miss to read into.
+    pub fn take_spare(&mut self) -> Option<PageRef> {
+        let spare = self.spare.take();
+        if spare.is_some() {
+            self.recycled = self.recycled.saturating_add(1);
+        }
+        spare
+    }
+
+    /// Amphora (decision 42): spare pages misses have taken.
+    pub fn recycled(&self) -> u64 {
+        self.recycled
     }
 
     /// Advances the clock hand to the next entry in the circular queue.
@@ -772,12 +795,20 @@ impl PageCache {
                 self.map.remove(&key);
                 // Clean the page
                 page.clear_loaded();
-                let _ = page.get().take_buffer();
+                // Amphora (decision 42): a plain page no one else holds keeps its buffer, to be
+                // the next miss's (`take_spare`); a shared page's buffer is the pool's.
+                let spare = page.is_plain() && !page.is_shared();
+                if !spare {
+                    let _ = page.get().take_buffer();
+                }
 
                 // Remove from queue
-                unsafe {
+                let removed = unsafe {
                     let mut cursor = self.queue.cursor_mut_from_ptr(entry_ptr);
-                    cursor.remove();
+                    cursor.remove()
+                };
+                if spare {
+                    self.spare = removed.map(|entry| entry.page);
                 }
 
                 // Update evictable count after successful eviction

@@ -57,6 +57,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | engine | 10 | Memory: versions pruned between snapshots, one budget, typed refusals | [engine.md](design/engine.md#10-memory-versions-pruned-between-snapshots-one-budget-typed-refusals) |
 | engine | 11 | The log in lanes: one group-committed log, or a log a writer | [engine.md](design/engine.md#11-the-log-in-lanes-one-group-committed-log-or-a-log-a-writer) |
 | engine | 12 | Large rows as chunk rows of an overflow tree; trees made and dropped as records of their own | [engine.md](design/engine.md#12-large-rows-as-chunk-rows-of-an-overflow-tree-trees-made-and-dropped-as-records-of-their-own) |
+| engine | 13 | The switch: a connection's B-trees on the versioned storage, the pager beside it | [engine.md](design/engine.md#13-the-switch-a-connections-b-trees-on-the-versioned-storage-the-pager-beside-it) |
 | executor | 1 | A statement keeps its small ephemeral tables from one run to the next | [executor.md](design/executor.md#1-a-statement-keeps-its-small-ephemeral-tables-from-one-run-to-the-next) |
 | executor | 2 | `IN (SELECT ...)` answers a row with one search of its list | [executor.md](design/executor.md#2-in-select--answers-a-row-with-one-search-of-its-list) |
 | executor | 3 | LIKE jumps to where the literal after a `%` can match | [executor.md](design/executor.md#3-like-jumps-to-where-the-literal-after-a--can-match) |
@@ -99,6 +100,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | planner | – | Decision (lane pl8-3): a LEFT JOIN's right table follows the tables its ON terms read | [planner.md](design/planner.md#decision-lane-pl8-3-a-left-joins-right-table-follows-the-tables-its-on-terms-read) |
 | planner | – | Decision (lane pl12): custom plans, then a generic one, for prepared statements | [planner.md](design/planner.md#decision-lane-pl12-custom-plans-then-a-generic-one-for-prepared-statements) |
 | planner | – | Decision (lane pl9): row counts kept as rows change, statements planned again past their statistics' error | [planner.md](design/planner.md#decision-lane-pl9-row-counts-kept-as-rows-change-statements-planned-again-past-their-statistics-error) |
+| planner | – | Decision (lane pl11): degree-sequence upper bounds guard each joined set's estimate | [planner.md](design/planner.md#decision-lane-pl11-degree-sequence-upper-bounds-guard-each-joined-sets-estimate) |
 | records-compaction | – | Durable progress and retention | [records-compaction.md](design/records-compaction.md#durable-progress-and-retention) |
 | records-compaction | – | Dirty-page and serialized bounds | [records-compaction.md](design/records-compaction.md#dirty-page-and-serialized-bounds) |
 | records-compaction | – | Embedded owner compatibility | [records-compaction.md](design/records-compaction.md#embedded-owner-compatibility) |
@@ -175,7 +177,9 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | store | 38 | A page is searched by key heads once its searches have paid for them (prototype, behind a switch) | [store.md](design/store.md#38-a-page-is-searched-by-key-heads-once-its-searches-have-paid-for-them-prototype-behind-a-switch) |
 | store | 39 | A page read past the cache reads its own frames: pages new to a chain are page frames, a chain's entries records of one slot | [store.md](design/store.md#39-a-page-read-past-the-cache-reads-its-own-frames-pages-new-to-a-chain-are-page-frames-a-chains-entries-records-of-one-slot) |
 | store | 40 | A page read finds its frame and the log's header without the shared locks (prototype, behind a switch) | [store.md](design/store.md#40-a-page-read-finds-its-frame-and-the-logs-header-without-the-shared-locks-prototype-behind-a-switch) |
+| store | 41 | Skipping the descent: an adaptive hash against a learned leaf locator (prototypes, not yet wired) | [store.md](design/store.md#41-skipping-the-descent-an-adaptive-hash-against-a-learned-leaf-locator-prototypes-not-yet-wired) |
 | store | – | Decision (lane wal-read): a commit's records published at a lookup's cost, its deltas found a word at a time | [store.md](design/store.md#decision-lane-wal-read-a-commits-records-published-at-a-lookups-cost-its-deltas-found-a-word-at-a-time) |
+| store | 42 | The page path SQLite takes: plain pins, the pool's buffer counted once, misses read in line, checksums once (prototype, behind a switch) | [store.md](design/store.md#42-the-page-path-sqlite-takes-plain-pins-the-pools-buffer-counted-once-misses-read-in-line-checksums-once-prototype-behind-a-switch) |
 | without-rowid | – | Native primary-root query access | [without-rowid.md](design/without-rowid.md#native-primary-root-query-access) |
 | xgroup | – | The two protocols: two-phase commit and Parallel Commits behind a switch, two-phase locking without waiting | [xgroup.md](design/xgroup.md#the-two-protocols) |
 | xgroup | – | Crashes: every decision lives in a group, a new incarnation fences the old and finishes its transactions | [xgroup.md](design/xgroup.md#crashes) |
