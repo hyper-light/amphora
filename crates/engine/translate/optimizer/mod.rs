@@ -2981,7 +2981,8 @@ fn find_table_access_plan(
     let planning_context = JoinPlanningContext {
         maybe_order_target: maybe_order_target.as_ref(),
         cost_limit,
-        allow_automatic_index: true,
+        allow_automatic_index: resolver.join_methods() != crate::JoinMethods::NestedLoopsOnly,
+        join_methods: resolver.join_methods(),
         row_goal,
     };
 
@@ -3196,6 +3197,7 @@ fn plan_unmatched_right_rows(
                 cost_limit: None,
                 // In SQLite, `WHERE_RIGHT_JOIN` mode disables automatic indexes.
                 allow_automatic_index: false,
+                join_methods: resolver.join_methods(),
                 row_goal: None,
             },
             &where_clause_for_unmatched_rows,

@@ -1522,6 +1522,7 @@ pub fn try_hash_join_access_method(
     subqueries: &[NonFromClauseSubquery],
     joined_tables: &[JoinedTable],
     params: &CostModelParams,
+    prefer_seeks: bool,
 ) -> Result<Option<AccessMethod>> {
     if probe_table
         .join_info
@@ -1566,8 +1567,9 @@ pub fn try_hash_join_access_method(
         return Ok(None);
     }
 
-    // Prefer nested loops when an index can read the join columns.
-    for join_key in &join_keys {
+    // Prefer nested loops when an index can read the join columns, unless the connection asks for
+    // hash joins only (`prefer_seeks` false; Amphora's QT.5).
+    for join_key in join_keys.iter().filter(|_| prefer_seeks) {
         let probe_expr = join_key.get_probe_expr(where_clause);
         if expr_is_simple_column_from_table(probe_expr, probe_table.internal_id)
             && probe_index_can_seek_join_key(

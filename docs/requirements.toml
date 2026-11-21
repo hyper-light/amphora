@@ -410,3 +410,21 @@ tests = [
   { id = "T-QT.3.4", text = "A loop over a non-covering index with a term on the index's columns and one on the table's — passes when the answer is unchanged and the table rows fetched are only those the index's term keeps, whatever order the terms are written in" },
   { id = "T-QT.3.5", text = "scripts/check-production.sh after the change — passes when it passes, with the ratchet's counts lowered by what the change removed" },
 ]
+
+# lane qs5
+[[own]]
+id = "QT.5"
+title = "Hash joins where a seek exists, chosen by cost, with predicate transfer (query-time step 5; with planner rank PL.5 and G6 step 4)"
+criteria = [
+  { id = "AC-QT.5.1", text = "JOB median best time is at most 147 ms, by bench/planner/record.sh on jupiter, best of 3, each run begun at a load under 2" },
+  { id = "AC-QT.5.2", text = "JOB queries at or under 78.4 ms number at least 38, by the same pass" },
+  { id = "AC-QT.5.3", text = "TPC-H SF 10 q09 best time is at most 35,000 ms" },
+  { id = "AC-QT.5.4", text = "TPC-H SF 10 median best time over the parent's is at most 1.05" },
+  { id = "AC-QT.5.5", text = "Every answer unchanged by step 1's whole-answer check; CERT and the order check clean" },
+]
+tests = [
+  { id = "T-QT.5.1", text = "Random joins with NULLs, duplicates, outer, semi and anti joins, run with index nested loops forced and with hash joins forced — passes when identical results" },
+  { id = "T-QT.5.2", text = "A build whose input outgrows its estimate tenfold — passes when it spills within its budget with its answer unchanged, and past the spill budget refuses with a typed error naming the budget" },
+  { id = "T-QT.5.3", text = "Predicate transfer over a cyclic join graph and over an outer join (transfer in one direction only) — passes when identical results, and the filters' memory within the statement's stated bound" },
+  { id = "T-QT.5.4", text = "TPC-H q01 and q06, which join nothing — passes when no filter built, times within the passes' spread of the parent's" },
+]

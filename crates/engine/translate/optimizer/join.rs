@@ -52,6 +52,8 @@ pub(crate) struct JoinPlanningContext<'a> {
     pub cost_limit: Option<Cost>,
     /// Whether this table read may build an automatic index.
     pub allow_automatic_index: bool,
+    /// Amphora: the join methods the connection allows (`Connection::set_join_methods`).
+    pub join_methods: crate::JoinMethods,
     /// Amphora: the rows a LIMIT (and OFFSET) leaves a one-table read to produce before it stops
     /// (`docs/design/planner.md` decisions 16 and 17), None when it reads to its end.
     pub row_goal: Option<RowGoal>,
@@ -65,6 +67,7 @@ impl<'a> JoinPlanningContext<'a> {
             maybe_order_target,
             cost_limit: None,
             allow_automatic_index: true,
+            join_methods: crate::JoinMethods::ByCost,
             row_goal: None,
         }
     }
@@ -708,8 +711,16 @@ fn join_lhs_and_rhs<'a>(
             // Eligibility gate: prefer nested-loop when uses a selective probe seek.
             // Probe->build chaining is only allowed when the
             // build input is materialized from the join prefix.
-            let allow_hash_join = !rhs_has_selective_seek
-                && !build_unique_key_search_without_statistics
+            // Amphora: one method only when the connection asks (QT.5);
+            // the structural conditions below hold whichever it asks for.
+            let preferred_over_seek = match planning_context.join_methods {
+                crate::JoinMethods::ByCost => {
+                    !rhs_has_selective_seek && !build_unique_key_search_without_statistics
+                }
+                crate::JoinMethods::NestedLoopsOnly => false,
+                crate::JoinMethods::HashJoinsOnly => true,
+            };
+            let allow_hash_join = preferred_over_seek
                 && !probe_table_is_prior_build
                 && (!build_has_prior_constraints || build_has_rowid)
                 && !chaining_across_outer
@@ -758,12 +769,15 @@ fn join_lhs_and_rhs<'a>(
                     subqueries,
                     joined_tables,
                     params,
+                    planning_context.join_methods != crate::JoinMethods::HashJoinsOnly,
                 )? {
                     let mut hash_join_method = hash_join_method;
                     let mut hash_join_allowed = true;
-                    let mem_budget = match &hash_join_method.params {
-                        AccessMethodParams::HashJoin { mem_budget, .. } => *mem_budget,
-                        _ => unreachable!("hash join params expected"),
+                    let AccessMethodParams::HashJoin { mem_budget, .. } = hash_join_method.params
+                    else {
+                        return Err(LimboError::InternalError(
+                            "a hash join's access method has no hash join parameters".to_string(),
+                        ));
                     };
                     if let AccessMethodParams::HashJoin {
                         materialize_build_input,
@@ -894,7 +908,11 @@ fn join_lhs_and_rhs<'a>(
                         input_cardinality,
                         params,
                     );
-                    if hash_join_allowed && hash_join_method.cost < best_access_method.cost {
+                    let forced =
+                        planning_context.join_methods == crate::JoinMethods::HashJoinsOnly;
+                    if hash_join_allowed
+                        && (forced || hash_join_method.cost < best_access_method.cost)
+                    {
                         best_access_method = hash_join_method;
                     }
                 }
@@ -4804,6 +4822,7 @@ mod tests {
             &[],
             table_references.joined_tables(),
             &DEFAULT_PARAMS,
+            true,
         )
         .unwrap()
         .unwrap();
