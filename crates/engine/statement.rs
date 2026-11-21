@@ -670,6 +670,14 @@ impl Statement {
         // Amphora (docs/design/planner.md, decision 20; AC-PL.2.3): the connection's statements
         // plan again at their next run, on the statistics ANALYZE kept, as SQLite's ANALYZE ends
         // with OP_Expire.
+        // Amphora (PL.9): the tables ANALYZE counted again start their changes from zero.
+        {
+            let conn = &self.program.connection;
+            let schema = conn.schema.read();
+            conn.db
+                .row_changes
+                .analyzed(schema.analyze_stats.tables.keys());
+        }
         self.program.connection.bump_prepare_context_generation();
         self.analyze_refresh = None;
         self.busy = false;
@@ -704,6 +712,7 @@ impl Statement {
                 .program
                 .prepare_context
                 .matches_connection(&self.program.connection)
+                || self.statistics_moved()
             {
                 if let Err(err) = self.reprepare() {
                     self.release_active_root_if_counted();
@@ -785,6 +794,10 @@ impl Statement {
             self.busy = false;
             self.busy_handler_state = None; // Reset busy state on completion
             self.state.query_deadline = None;
+            // Amphora (PL.9): an INSERT or DELETE adds its rows to its table's count, one add.
+            if let Some(target) = self.program.write_target.as_ref() {
+                target.fold(self.state.n_change.load(Ordering::SeqCst));
+            }
 
             // After ANALYZE completes, refresh in-memory stats so planners can use them.
             if self.program.refreshes_analyze_stats {
@@ -1071,6 +1084,12 @@ impl Statement {
             }
         }
         Ok(())
+    }
+
+    /// Amphora (PL.9, decision 22): a table the plan counted has gained or lost more rows than
+    /// its statistics' own error since, so a plan made now could differ. Atomic loads only.
+    fn statistics_moved(&self) -> bool {
+        self.program.planned_tables.iter().any(|table| table.moved())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

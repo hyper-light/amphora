@@ -708,6 +708,8 @@ pub struct Database<
     _shared_page_cache: Arc<RwLock<PageCache>>,
     /// Amphora (QT.5): what its operators' work costs, learned as its queries run.
     pub(crate) learned_costs: crate::translate::optimizer::learned_costs::LearnedCosts,
+    /// Amphora (PL.9): each table's rows inserted less rows deleted since ANALYZE counted it.
+    pub(crate) row_changes: Arc<crate::row_changes::RowChanges>,
 
     /// Optional per-database MVCC durable storage override.
     ///
@@ -862,6 +864,7 @@ impl Database {
             }))),
             _shared_page_cache: shared_page_cache,
             learned_costs: crate::translate::optimizer::learned_costs::LearnedCosts::new(),
+            row_changes: Arc::new(crate::row_changes::RowChanges::new()),
             shared_wal,
             #[cfg(host_shared_wal)]
             shared_wal_coordination: OnceLock::new(),

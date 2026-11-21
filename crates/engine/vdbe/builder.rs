@@ -333,6 +333,10 @@ pub struct ProgramBuilder {
     /// Amphora (PL.12): an estimate asked for a parameter's value while the statement was planned,
     /// so a plan made with a run's values could differ from this one (`plan_cache.rs`).
     pub(crate) reads_parameter_values: bool,
+    /// Amphora (PL.9): the tables whose row counts the plan read (`row_changes.rs`).
+    pub(crate) planned_tables: Vec<crate::row_changes::PlannedTable>,
+    /// Amphora (PL.9): the table an INSERT or DELETE folds its change count into.
+    pub(crate) write_target: Option<crate::row_changes::WriteTarget>,
     pub resolve_type: ResolveType,
     /// When set, all triggers fired from this program should use this conflict resolution.
     /// This is used in UPSERT DO UPDATE context to ensure nested trigger's OR IGNORE/REPLACE
@@ -773,6 +777,8 @@ impl ProgramBuilder {
             output_rows: None,
             plan_cost: None,
             reads_parameter_values: false,
+            planned_tables: Vec::new(),
+            write_target: None,
             flags: ProgramBuilderFlags::new(is_subprogram),
             emitted_function_call: false,
             trigger,
@@ -2566,6 +2572,8 @@ impl ProgramBuilder {
             output_rows: self.output_rows,
             plan_cost: self.plan_cost,
             reads_parameter_values: self.reads_parameter_values,
+            planned_tables: self.planned_tables,
+            write_target: self.write_target,
             sql: sql.to_string(),
             refreshes_analyze_stats: sql
                 .trim_start()

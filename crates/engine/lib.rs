@@ -71,6 +71,7 @@ mod parameters;
 #[cfg(feature = "percentile")]
 mod percentile;
 mod plan_cache;
+mod row_changes;
 mod pragma;
 mod progress;
 mod pseudo;
