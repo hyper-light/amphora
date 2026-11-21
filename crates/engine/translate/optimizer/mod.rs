@@ -86,9 +86,12 @@ use std::{
 };
 
 pub(crate) mod access_method;
+mod adaptive;
 mod cardinality;
+pub(crate) mod column_path;
 pub(crate) mod constraints;
 pub(crate) mod cost;
+pub(crate) mod cost_fit;
 mod cost_params;
 pub(crate) mod join;
 pub(crate) mod learned_costs;
@@ -1060,6 +1063,21 @@ fn optimize_select_plan_with_cache(
         return Ok(());
     }
 
+    // Amphora (QT.5): a connection that asks for hash joins only asks that its joins run as hash
+    // joins. A correlated subquery left in place runs as a nested loop beneath its query, so the
+    // unnested form is taken wherever it can be emitted, as the forced unnesting mode takes it,
+    // rather than weighed against that loop.
+    if resolver.join_methods() == crate::JoinMethods::HashJoinsOnly {
+        let rewritten_table_plan =
+            find_select_plan_form(&mut rewritten, resolver, cache, false, None)?;
+        if !rewritten_form_is_emittable(&rewritten) {
+            return optimize_select_plan_form(plan, resolver, cache);
+        }
+        *plan = rewritten;
+        apply_select_table_plan(plan, rewritten_table_plan, resolver)?;
+        return Ok(());
+    }
+
     let original_table_plan = find_select_plan_form(plan, resolver, cache, true, None)?;
     // The query already returns no rows, so a cheaper form cannot be found.
     if plan.contains_constant_false_condition {
@@ -1150,6 +1168,7 @@ fn find_select_plan_form(
         .with_cache_pages(resolver.cache_pages())
         .with_statement_memory(resolver.statement_memory())
         .with_learned(resolver.learned_weights())
+        .with_fitted(resolver.fitted_weights())
         .with_plan_values(resolver.plan_values());
     plan.estimated_output_rows = None;
     plan.estimated_cost = None;
@@ -2852,6 +2871,7 @@ fn find_table_access_plan(
         .with_cache_pages(resolver.cache_pages())
         .with_statement_memory(resolver.statement_memory())
         .with_learned(resolver.learned_weights())
+        .with_fitted(resolver.fitted_weights())
         .with_plan_values(resolver.plan_values());
 
     if table_references.joined_tables().is_empty() {
