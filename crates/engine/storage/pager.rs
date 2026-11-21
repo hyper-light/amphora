@@ -3771,6 +3771,14 @@ impl Pager {
             // Parent statement will handle the transaction rollback.
             return;
         }
+        // Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage's transaction rolls back with
+        // the pager's, on every path that ends one. This returns no error, so a failed rollback
+        // is reported here.
+        if let Some(switch) = connection.versioned.as_ref() {
+            if let Err(e) = switch.finish(true) {
+                tracing::error!(target: "amphora.versioned", event = "rollback_failed", error = %e);
+            }
+        }
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
             return;

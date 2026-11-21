@@ -104,13 +104,13 @@ impl Engine for Amphora {
 
     /// `PRAGMA wal_checkpoint(TRUNCATE)`: every frame copied and the log cut to nothing, or the
     /// row it answers says busy (its first column non-zero).
-    fn settle(&mut self) -> Result<(), String> {
-        let rows = self
-            .run("PRAGMA wal_checkpoint(TRUNCATE)", 1, None)
-            .map_err(|e| format!("{e:?}"))?;
+    fn settle(&mut self, until: Option<Instant>) -> Result<(), Stop> {
+        let rows = self.run("PRAGMA wal_checkpoint(TRUNCATE)", 1, until)?;
         match rows.first().and_then(|r| r.first()) {
             Some(Value::Integer(0)) | None => Ok(()),
-            Some(other) => Err(format!("the checkpoint answered busy: {other:?}")),
+            Some(other) => Err(Stop::Refused(format!(
+                "the checkpoint answered busy: {other:?}"
+            ))),
         }
     }
 }

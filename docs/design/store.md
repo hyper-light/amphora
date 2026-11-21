@@ -1831,3 +1831,95 @@ the coordinator's, not yet run.
 mixed log than on the page-a-frame log of the same binary (`AMPHORA_PAGE_LOG=1`), interleaved, best
 of 3; a profile of the writer still showing the registry's publishing or the commit's pages found
 per record; a row read back other than as committed (the tests above).
+
+## 40. A page read finds its frame and the log's header without the shared locks (prototype, behind a switch)
+
+G3 step 2 (kiln plan "G3 Point reads", step 2; docs/research/read-path.md fix 1(b)). Every page read
+took the read side of the `RwLock` over the log's shared state, then the frame index's lock
+(`find_frame`) or the header's (`wal_header`). At 32 point readers those were `point_pk`'s three
+hottest leaves: `find_frame` 26.9%, `wal_header` 23.4%, `RwLock::lock_shared_slow` 13.2%
+(bench/records/2026-10-23-adacachy-read-path.md).
+
+The prototype is `crates/engine/storage/log_index.rs`. Its switch is `LogReadIndex`:
+`AMPHORA_LOG_READ_INDEX` = `locked` (today's path, the default), `filtered`, `published` or
+`optimistic`, or `LogReadIndex::set_process_default`. Each connection holds the log's `ReadIndex`.
+The `ReadIndex` is never replaced, so reaching it takes no lock.
+
+- **The header** is copied, all eight words, under a sequence number (a seqlock) each time its
+  guard lets the lock go. A reader reads the copy and checks that the sequence didn't move. Only
+  when a writer is mid-change does it read the header under its lock.
+- **A page the log doesn't hold** is answered from a bitmap with one bit per page number. The
+  bitmap's size is the highest page the log holds, doubled as it grows. It is exact: it never
+  reports a page as held when no frame holds it, except frames cut since the bitmap was built. It
+  has no false-positive rate to choose, unlike a Bloom filter. The empty log (`max_frame <
+  min_frame`) already skipped the index.
+- **Way (a), `published`**: the whole index is copied and published through an `ArcSwap`. A reader
+  whose snapshot reaches past the copy publishes a new one. Each new copy costs O(pages in the log).
+  While another reader publishes, it reads under the lock. A read-only workload publishes once.
+- **Way (b), `optimistic`**: a table of each page's latest frame, in shards. Each shard has its own
+  version, after LeanStore's optimistic latches (Leis et al., ICDE 2018): read the version, read
+  the slot, check the version. There is one shard for each thread that can run at once
+  (`available_parallelism`, the reader count where the process runs). There are twice as many slots
+  as the log has pages, so each shard is at most half full. Knuth (TAOCP vol. 3 §6.4) gives linear
+  probing 2.5 expected probes for a miss and 1.5 for a hit at that load. A shard that would pass
+  half full doubles the table. A read whose version moved, or that finds a frame newer than its
+  snapshot, is answered under the lock: one try, never retried. An append costs O(1).
+- **Changes other than an append** (a rollback, slots written again, a log restart, recovery,
+  restore) move the index's generation on. The next reader rebuilds from the index under its lock.
+  A reader that loaded a structure just before the generation moved still answers correctly:
+  frames that are cut or written again lie past every committed snapshot, and a restart happens
+  only when no reader reads the log.
+- Not taken: the multi-process backend (`ShmWalCoordination`). Its local index is filled from other
+  processes' frames, so its fallback reads under the locks.
+
+Tests: `storage::wal::tests::g3_2_*` (the model, and readers beside a writer) and
+`crates/engine/tests/log_read_index.rs` (a crash at every write of a checkpoint and of a log
+restart). The measurements are the coordinator's: the 32-client profiles, the suite at 10M rows
+and `bench/prof_parts.py`'s shares, with each way switched on. One way is kept and the others are
+removed, as the numbers favour. Falsified, as read-path.md has it, if with the log empty after the
+settle `point_pk`'s instructions per statement at one client fall by less than 15%, or if
+`table_count` at 32 clients rises less than 3x. The step's own bars: the log's and locks' share of
+point reads at 32 clients is at most 5%, and `point_pk` at 32 clients is at least 4x one client.
+
+## 41. Skipping the descent: an adaptive hash against a learned leaf locator (prototypes, not yet wired)
+
+G3 step 5 (G3.5, kiln plan 01a16b0f464172dc80c7a3b9a14acbce): the descent is within B-tree search's
+11.9-23.0% of a point read's user cycles (bench/records/2026-10-23-adacachy-read-path.md), so with it
+gone a point read gains at most 1.14-1.30x (Amdahl's bound).
+
+- **What.** Two cores that name a leaf without descending (`crates/engine/storage/descent_skip.rs`):
+  prototype D, InnoDB's adaptive hash index (`btr0sea.cc`; MySQL 8.0 reference manual §15.5.3), a
+  hash from a key to its leaf page built a leaf at a time; prototype E, a learned, error-bounded
+  locator from a rowid to its leaf for rowid tables (Kraska et al., SIGMOD 2018, RMI; Ferragina and
+  Vinciguerra, PVLDB 13(8) 2020, PGM): lines through the leaves' first rowids.
+- **Never trusted.** The caller reads the page named and takes its answer only if it is a leaf whose
+  first key is at most the key and last at least, and no page has left its tree since the prototype
+  learned it (a stamp the caller raises on every freed page). Leaves of one tree hold disjoint
+  ranges, so that leaf is the only place the key can be. Anything else is refuted, forgotten, and
+  the descent runs as today and teaches the prototype the leaf it found.
+- **When D builds.** A ski rental (Karlin, Manasse, Rudolph, Sleator, Algorithmica 3, 1988), as
+  decision 38: a descent ending at a leaf without a hash is charged the probes it made above the
+  leaf (what a hit saves), counted as it makes them; the hash is built when the charges reach the
+  leaf's cell count (a key hashed per cell). The one assumption, that a hash insert costs what a
+  probe does, is measured by `descent_skip_bench`.
+- **E's error bound.** Each segment is the line through its first and last fence; its bound is the
+  largest distance between where the line puts a fence and where it is, the fit's own. The worst
+  segment is split at its worst fence until all are exact, and the number of splits with the fewest
+  expected probes over all fences (a search over the segments plus one over the window, in
+  integers) is kept: one split at a time stalls where a bit more search buys a bit less window. Learning a leaf refits only the
+  segments its fences touched.
+- **Upkeep.** Lazy: paid where a write moved a leaf and a lookup noticed (a refute, then a learn).
+  Every freed page drops everything either holds: coarse, and right for a prototype; a per-page
+  owner would keep what a free didn't touch.
+- **Memory.** D holds at most its budget of entries (keys plus leaves tracked), evicting the least
+  recently used leaves and refusing a leaf larger than the budget; E at most its budget of fences,
+  refusing past it. The caller derives both from the memory it grants.
+- **Not yet.** The hook into `BTreeCursor`'s seek, behind a switch: a freed-page count every
+  connection sees, and a cursor that stands on a leaf it didn't descend to (SQLite's leaves have no
+  sibling links, so a step past the leaf must descend first). Until then the costs are the model's.
+- **Falsified if** point_pk at one client with the winner rises less than 20% against steps 2-4
+  (AC-G3.5.2), or the winner's upkeep on the corpus's writes costs more than its lookups save.
+- **Tested.** T-G3.5.1: two tables sharing pages under random inserts, deletes, splits and merges,
+  every lookup through each prototype against a plain descent: the same row or absence always, with
+  hits, refutes and stamp drops counted. T-G3.5.2: over complete fences the locator names the
+  descent's leaf.

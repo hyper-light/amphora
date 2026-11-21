@@ -190,3 +190,79 @@ fn t_pl_8_2_a_right_join_turned_left_keeps_its_answers() {
         assert_eq!(answers(&conn, sql), expected, "{sql}");
     }
 }
+
+/// Do: run LEFT JOINs whose right table CD-C's conflict rules let the search read before tables of
+/// its left side that its ON terms don't read (PL.8, CD-C's left-asscom rule), beside an inner join
+/// reading the null-extended table, an ON term reading no left table, a WHERE term on the NULL row,
+/// an aggregate, and semi and anti joins (EXISTS, NOT EXISTS) over them. Expect: SQLite's answers,
+/// worked by hand from the rows of `barrier` (T-PL.8.2).
+#[test]
+fn t_pl_8_2_outer_semi_and_anti_joins_keep_their_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = barrier(dir.path());
+    let cases: [(&str, &[&str]); 12] = [
+        (
+            "SELECT big.id, mid.id, tiny.id FROM big JOIN mid ON mid.k = big.k \
+             LEFT JOIN tiny ON tiny.id = big.id + 5 ORDER BY big.id",
+            &["1|5|6", "2|7|NULL"],
+        ),
+        (
+            "SELECT big.id, mid.id, tiny.id FROM big JOIN mid ON mid.k = big.k \
+             LEFT JOIN tiny ON tiny.id = big.id + 5 WHERE tiny.id IS NULL",
+            &["2|7|NULL"],
+        ),
+        (
+            "SELECT big.id, mid.id, tiny.id FROM big LEFT JOIN mid ON mid.k = big.k \
+             LEFT JOIN tiny ON tiny.id = big.id + 4 ORDER BY big.id",
+            &["1|5|5", "2|7|6", "3|NULL|NULL"],
+        ),
+        (
+            "SELECT big.id, mid.id, tiny.id FROM big LEFT JOIN mid ON mid.k = big.k \
+             JOIN tiny ON tiny.id = mid.id ORDER BY big.id",
+            &["1|5|5"],
+        ),
+        (
+            "SELECT big.id, mid.id FROM big LEFT JOIN mid ON mid.id = 6 ORDER BY big.id",
+            &["1|6", "2|6", "3|6"],
+        ),
+        (
+            "SELECT big.id, mid.id FROM big LEFT JOIN mid ON mid.id = 9 ORDER BY big.id",
+            &["1|NULL", "2|NULL", "3|NULL"],
+        ),
+        (
+            "SELECT big.id, mid.id, tiny.id FROM big JOIN mid ON mid.k = big.k \
+             LEFT JOIN tiny ON tiny.id = mid.id AND big.id = 1 ORDER BY big.id",
+            &["1|5|5", "2|7|NULL"],
+        ),
+        (
+            "SELECT count(*), count(tiny.id) FROM big JOIN mid ON mid.k = big.k \
+             LEFT JOIN tiny ON tiny.id = big.id + 5",
+            &["2|1"],
+        ),
+        (
+            "SELECT big.id FROM big LEFT JOIN mid ON mid.k = big.k \
+             WHERE EXISTS (SELECT 1 FROM tiny WHERE tiny.id = mid.id) ORDER BY big.id",
+            &["1"],
+        ),
+        (
+            "SELECT big.id FROM big LEFT JOIN mid ON mid.k = big.k \
+             WHERE NOT EXISTS (SELECT 1 FROM tiny WHERE tiny.id = mid.id) ORDER BY big.id",
+            &["2", "3"],
+        ),
+        (
+            "SELECT big.id, tiny.id FROM big JOIN mid ON mid.k = big.k \
+             LEFT JOIN tiny ON tiny.id = big.id + 5 \
+             WHERE EXISTS (SELECT 1 FROM tiny t2 WHERE t2.id = mid.id) ORDER BY big.id",
+            &["1|6"],
+        ),
+        (
+            "SELECT big.id, tiny.id FROM big JOIN mid ON mid.k = big.k \
+             LEFT JOIN tiny ON tiny.id = big.id + 5 \
+             WHERE NOT EXISTS (SELECT 1 FROM tiny t2 WHERE t2.id = mid.id) ORDER BY big.id",
+            &["2|NULL"],
+        ),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(answers(&conn, sql), expected, "{sql}");
+    }
+}

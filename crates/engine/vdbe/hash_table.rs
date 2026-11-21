@@ -2070,6 +2070,45 @@ impl HashTable {
         }
     }
 
+    /// Mark the current matched entry, returning whether it was unmarked before: a semi join emits
+    /// its build row only then (G6 step 5). Must be called after a successful probe/next_match on
+    /// a table that tracks matches; anything else is an internal error, not a panic.
+    pub fn mark_current_matched_first(&mut self) -> Result<bool> {
+        if !self.track_matched {
+            return Err(LimboError::InternalError(
+                "semi join's hash table does not track matches".to_string(),
+            ));
+        }
+        let entry_idx = self.probe_entry_idx.checked_sub(1).ok_or_else(|| {
+            LimboError::InternalError("hash first-match test without a probe match".to_string())
+        })?;
+        let bucket_idx = self.probe_bucket_idx;
+        let bits = if let Some(spill_state) = &mut self.spill_state {
+            let partition_idx = self.current_spill_partition_idx;
+            let partition = spill_state
+                .find_partition_mut(partition_idx)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "spilled partition {partition_idx} missing at a hash first-match test"
+                    ))
+                })?;
+            &mut partition.matched_bits
+        } else {
+            &mut self.matched_bits
+        };
+        let bit = bits
+            .get_mut(bucket_idx)
+            .and_then(|bucket| bucket.get_mut(entry_idx))
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "hash first-match test past its bucket ({bucket_idx}, {entry_idx})"
+                ))
+            })?;
+        let first = !*bit;
+        *bit = true;
+        Ok(first)
+    }
+
     /// Reset all matched_bits to false. Called at the start of each outer-loop
     /// iteration so that marks from a previous iteration don't suppress NULL-fill
     /// rows in the current one.

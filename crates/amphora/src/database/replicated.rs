@@ -33,7 +33,11 @@ pub(crate) const MEMBERS: usize = 64;
 const WIRE_BYTES: usize = crate::replication::SNAPSHOT_BYTES.saturating_add(2 << 20);
 const MESSAGE_BYTES: usize = crate::replication::COMMAND_BYTES.saturating_add(2 << 20);
 // Ticks are the pinned core's documented tick election mode (raft.rs, Elections::Ticks). Its
-// twenty-tick randomized election and two-tick heartbeat use this owner clock, never host votes.
+// randomized election and heartbeat, in the core's fixed tick counts, use this owner clock, never
+// host votes. The period between ticks is learned where the owner runs (`pace`): this is only
+// hyper-timing's start state, the period of a pace with nothing measured (`TickPace::floor`,
+// vendor/hyper-raft/crates/hyper-timing/src/lib.rs), the owner's period before it has measured a
+// quorum's round trips, its timer and its leader's link. Once measured, it bounds nothing.
 const TICK: Duration = Duration::from_millis(10);
 // The admission charge of a change of members, a hand-off of the lead, a catch-up or an
 // attestation: the bytes the queued input itself takes, its place in the queue's byte budget (an
@@ -797,6 +801,12 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     // What this owner measured of its voters' answers while it led: its quorum patience
     // (replication.md, "The leader's quorum patience").
     answers: patience::Answers,
+    // The tick pace this owner measured where it runs (replication.md, "Decision (lane
+    // constants): the owner's tick pace").
+    pace: super::pace::Pace,
+    // The ticks since the pace was last derived: it is derived once an election timeout, the
+    // span the core draws each timeout over.
+    paced: usize,
     // A measurement's record of this owner's stalls (kiln goal 6b112f14, step 1): test-only.
     #[cfg(test)]
     stalls: Option<Arc<Mutex<tests::Stalls>>>,
@@ -1451,14 +1461,15 @@ fn open(
 }
 
 /// The write slot's bounds, stated from the core's, so the slot adds no number of its own: a
-/// member's first slot is the core's election timeout in this owner's ticks; a learned gap is
-/// believed for one to two of its member's own recurrences (`slot`). A retry is not learned when
-/// the host's detector suspected its member meanwhile (`slot::Slots::keep`).
-fn slot_bounds(election_tick: usize) -> Result<super::slot::Bounds, Refusal> {
+/// member's first slot is the core's election timeout in this owner's ticks of `period`, its pace
+/// in force; a learned gap is believed for one to two of its member's own recurrences (`slot`). A
+/// retry is not learned when the host's detector suspected its member meanwhile
+/// (`slot::Slots::keep`).
+fn slot_bounds(election_tick: usize, period: Duration) -> Result<super::slot::Bounds, Refusal> {
     Ok(super::slot::Bounds {
         election: u32::try_from(election_tick)
             .ok()
-            .and_then(|count| TICK.checked_mul(count))
+            .and_then(|count| period.checked_mul(count))
             .ok_or_else(|| fenced("the write slot's bounds overflowed"))?,
     })
 }
@@ -1538,7 +1549,7 @@ fn open_on<F: BlockFile + 'static>(
         moved: std::sync::Condvar::new(),
     });
     let election = replica.core().raft.config().election_tick;
-    let slots = super::slot::Slots::new(slot_bounds(election)?);
+    let slots = super::slot::Slots::new(slot_bounds(election, TICK)?);
     let (sender, receiver) = mpsc::sync_channel(COMMANDS);
     let at = clock();
     let mut actor = Actor {
@@ -1576,6 +1587,8 @@ fn open_on<F: BlockFile + 'static>(
         log_full: None,
         step_queued: 0,
         answers: patience::Answers::new(election),
+        pace: super::pace::Pace::new(TICK, 0),
+        paced: 0,
         #[cfg(test)]
         stalls: None,
         #[cfg(test)]
@@ -1933,8 +1946,19 @@ impl<F: BlockFile + 'static> Actor<F> {
                 Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
                 Err(mpsc::TryRecvError::Empty) if self.driving => None,
                 Err(mpsc::TryRecvError::Empty) => {
-                    let wait = self.deadline().saturating_duration_since((self.clock)());
+                    let deadline = self.deadline();
+                    let wait = deadline.saturating_duration_since((self.clock)());
                     self.control.bell.wait(wait)?;
+                    // A wait begun before its deadline and ended at or past it, whatever ended
+                    // it, is one the timer's lateness is measured on (`hyper_timing::Lateness`).
+                    let woke = (self.clock)();
+                    if !wait.is_zero() && woke >= deadline {
+                        let since = |at: Instant| {
+                            u64::try_from(at.saturating_duration_since(self.started).as_nanos())
+                                .map_err(unavailable)
+                        };
+                        self.pace.waited(since(deadline)?, since(woke)?);
+                    }
                     match receiver.try_recv() {
                         Ok(envelope) => Some(envelope),
                         Err(mpsc::TryRecvError::Empty) => None,
@@ -1945,12 +1969,36 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.run_step(input)?;
         }
     }
+    /// The tick pace from what this owner measured (`pace`), derived once an election timeout:
+    /// the core draws each timeout over that many ticks, so a pace derived oftener changes no
+    /// timeout drawn meanwhile. The write slot's bounds follow it.
+    fn repace(&mut self) -> Result<(), Refusal> {
+        let raft = &self.replica.core().raft;
+        let (election, heartbeat) = (raft.config().election_tick, raft.config().heartbeat_tick);
+        self.paced = self.paced.saturating_add(1);
+        if self.paced < election {
+            return Ok(());
+        }
+        self.paced = 0;
+        let voters = raft.configuration().voters().to_vec();
+        let votes = self.replica.flushes().mean();
+        let now = self.now()?;
+        let id = self.replica.id();
+        let pace = self
+            .pace
+            .derive(&voters, id, election, heartbeat, votes, now);
+        self.slots.bound(slot_bounds(election, pace.period)?);
+        Ok(())
+    }
     /// The owner's next deadline: its next tick, or sooner a deadline of what it holds (a queued
     /// or pending submit's, a change's, a hand-off's, the write slot's). Every other timed check
     /// counts in ticks (elections, heartbeats, the quorum check, a bootstrap's hand-off), so it
     /// is due at a tick.
     fn deadline(&self) -> Instant {
-        let tick = self.ticked.checked_add(TICK).unwrap_or(self.at);
+        let tick = self
+            .ticked
+            .checked_add(self.pace.period())
+            .unwrap_or(self.at);
         let waiting = self
             .waiting
             .iter()
@@ -1987,9 +2035,10 @@ impl<F: BlockFile + 'static> Actor<F> {
         if let Some(stalls) = &self.stalls {
             locked(stalls)?.stepped(at);
         }
-        if at.saturating_duration_since(self.ticked) >= TICK {
+        if at.saturating_duration_since(self.ticked) >= self.pace.period() {
             // A delayed owner does not invent missed heartbeats or run an unbounded catchup.
             self.ticked = at;
+            self.repace()?;
             // The quorum patience in force for this tick's check, from the answers measured.
             let leading = self.replica.is_leader().then(|| self.replica.term());
             // The voters the core's quorum check counts: the newest configuration its log states,
@@ -2011,7 +2060,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             let shown = if leading.is_some() { patience } else { 0 };
             let shown = u32::try_from(shown)
                 .ok()
-                .and_then(|ticks| TICK.checked_mul(ticks))
+                .and_then(|ticks| self.pace.period().checked_mul(ticks))
                 .ok_or_else(|| fenced("the quorum patience overflowed its gauge"))?;
             self.control.meter.patience(shown);
             self.replica.tick().map_err(raft_error)?;
@@ -2032,6 +2081,9 @@ impl<F: BlockFile + 'static> Actor<F> {
             .replica
             .drive(nanos, &self.waker, &mut output)
             .map_err(raft_error)?;
+        if let Some((submitted, taken)) = driven.flushed {
+            self.pace.flushed(submitted, taken);
+        }
         #[cfg(test)]
         if let (Some(stalls), Some((submitted, taken))) = (&self.stalls, driven.flushed) {
             locked(stalls)?.wrote(Duration::from_nanos(taken.saturating_sub(submitted)));
@@ -2820,6 +2872,10 @@ impl<F: BlockFile + 'static> Actor<F> {
                 "sender is not a current member",
             ));
         }
+        // What the message measures of its path and its link, at the owner's clock (`pace`).
+        let heartbeat = self.replica.core().raft.config().heartbeat_tick;
+        let now = self.now()?;
+        self.pace.took(&message, now, heartbeat);
         // A forwarded proposal's entries name their origin in their contexts (`context`). Nothing
         // re-forwards a proposal, so its origin is its authenticated sender: one naming another
         // member is refused here and applies nowhere (replication.md, "Attestation").
@@ -3313,8 +3369,17 @@ impl<F: BlockFile + 'static> Actor<F> {
                 answer(response, Err(unknown()));
             }
         }
+        // The heartbeats unanswered at which the core takes a peer for lost: an election timeout's.
+        let config = self.replica.core().raft.config();
+        let lost = config
+            .election_tick
+            .checked_div(config.heartbeat_tick)
+            .and_then(|beats| u32::try_from(beats).ok())
+            .unwrap_or(u32::MAX);
+        let now = self.now()?;
         let mut outgoing = locked(&self.control.outgoing)?;
         for message in output.messages {
+            self.pace.sent(&message, now, lost);
             let mut bytes = Vec::new();
             message.encode(&mut bytes);
             api::bound("replica outgoing record", bytes.len(), WIRE_BYTES)?;
@@ -3420,7 +3485,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             // one such request is made per period, never a host election.
             let period = u32::try_from(self.replica.core().raft.config().election_tick)
                 .ok()
-                .and_then(|ticks| TICK.checked_mul(ticks))
+                .and_then(|ticks| self.pace.period().checked_mul(ticks))
                 .ok_or_else(|| fenced("tick period overflow"))?;
             let due = self.transferred.is_none_or(|(term, at)| {
                 term != self.replica.term() || self.at.saturating_duration_since(at) >= period
@@ -3594,7 +3659,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         };
         ticks
             .and_then(|ticks| u32::try_from(ticks).ok())
-            .and_then(|ticks| TICK.checked_mul(ticks))
+            .and_then(|ticks| self.pace.period().checked_mul(ticks))
             .ok_or_else(|| fenced("own session lease overflow"))
     }
     /// One of the floor's own sessions, through the same barrier and proposal as a call; it has no
@@ -4720,6 +4785,19 @@ mod tests {
             let clock = self.clocks.get(owner).unwrap();
             set(clock, self.base, self.base + offset(clock) + by);
         }
+        /// Owner `owner`'s tick period: the pace it derived from what it measured (`pace`), read,
+        /// never assumed; a stopped owner's is the start pace it reopens with.
+        fn period(&self, owner: usize) -> Duration {
+            self.owners
+                .get(owner)
+                .and_then(Option::as_ref)
+                .map_or(TICK, |(actor, _)| actor.pace.period())
+        }
+        /// Owner `owner`'s clock moves one tick of its own pace.
+        fn advance_tick(&mut self, owner: usize) {
+            let period = self.period(owner);
+            self.advance(owner, period);
+        }
         /// Owner `owner`'s clock, for a call's work to move while the owner runs it.
         fn clock(&self, owner: usize) -> Arc<AtomicU64> {
             Arc::clone(self.clocks.get(owner).unwrap())
@@ -4995,7 +5073,7 @@ mod tests {
         /// group is quiet: what the tick sent is answered at the same count of its ticks, unless
         /// the answer is held.
         fn tick(&mut self, pump: &mut Pump<'_>, owner: usize) {
-            self.advance(owner, TICK);
+            self.advance_tick(owner);
             self.step();
             self.quiet(pump);
         }
@@ -5671,7 +5749,7 @@ mod tests {
         // one tick a round, until the restarted member follows it through the write.
         let id = u64::try_from(leader + 1).unwrap();
         let caught_up = (0..ROUNDS).any(|_| {
-            driven.advance(leader, TICK);
+            driven.advance_tick(leader);
             driven.round(&mut pump);
             clients.iter().all(|client| {
                 let status = client.handle().status().unwrap();
@@ -6486,7 +6564,7 @@ mod tests {
         // so that only the owners' steps, not the disk's pace, decide who campaigns.
         for _ in 0..election * 4 {
             for owner in 0..clients.len() {
-                driven.advance(owner, TICK);
+                driven.advance_tick(owner);
             }
             driven.step();
             driven.quiet(&mut pump);
@@ -7721,7 +7799,7 @@ mod tests {
     /// Do: the leader measures a gap of `HELD` ticks in its followers' answers (`measured_lead`)
     /// and ticks on; then the host's detector suspects one follower, whose answers are held while
     /// the other's flow, then trusts it again, and its answers are let go (T-GN.1.1). Expect: the leader's `amphora_replica_quorum_patience_seconds` is its core's
-    /// patience in ticks of `TICK`, its followers' zero, and nothing refused; then the leader still
+    /// patience in ticks of its pace, its followers' zero, and nothing refused; then the leader still
     /// leads and has refused that one gap.
     #[test]
     fn the_quorum_patience_and_its_refusals_are_counted_for_the_host() {
@@ -7739,7 +7817,7 @@ mod tests {
         let counters = |owner: usize| clients.get(owner).unwrap().handle().counters();
         assert_eq!(
             counters(leader).quorum_patience,
-            TICK * u32::try_from(ticks).unwrap()
+            driven.period(leader) * u32::try_from(ticks).unwrap()
         );
         assert_eq!(counters(leader).quorum_patience_refused, 0);
         for follower in (0..3).filter(|i| *i != leader) {
@@ -8173,10 +8251,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!((added.voters, added.learners), (vec![1], vec![9]));
-        // An election timeout on ticks: the core's election_tick, each tick a step past TICK.
+        // An election timeout on ticks: the core's election_tick, each tick a step of its own pace.
         let election = |driven: &mut Driven| {
             for _ in 0..=leader_core_election_tick(driven) {
-                driven.advance(0, TICK);
+                driven.advance_tick(0);
                 drop(leader.handle().drain(OUTGOING_MESSAGES).unwrap());
                 driven.step();
             }
@@ -8663,7 +8741,7 @@ mod tests {
         assert!(matches!(asked.try_recv(), Err(mpsc::TryRecvError::Empty)));
         let refused = (0..ROUNDS)
             .find_map(|_| {
-                driven.advance(leader, TICK);
+                driven.advance_tick(leader);
                 driven.step();
                 asked.try_recv().ok()
             })
@@ -8707,7 +8785,7 @@ mod tests {
         let answered = (0..ROUNDS)
             .find_map(|_| {
                 for owner in &others {
-                    driven.advance(*owner, TICK);
+                    driven.advance_tick(*owner);
                 }
                 driven.round(&mut pump);
                 asked.try_recv().ok()
@@ -9035,7 +9113,7 @@ mod tests {
         let answered = (0..ROUNDS)
             .find_map(|_| {
                 for owner in &others {
-                    driven.advance(*owner, TICK);
+                    driven.advance_tick(*owner);
                 }
                 driven.round(&mut pump);
                 asked.try_recv().ok()
@@ -9167,8 +9245,8 @@ mod tests {
         );
         let answered = (0..ROUNDS)
             .find_map(|_| {
-                driven.advance(leader, TICK);
-                driven.advance(other, TICK);
+                driven.advance_tick(leader);
+                driven.advance_tick(other);
                 driven.round(&mut pump);
                 asked.try_recv().ok()
             })
@@ -9719,12 +9797,15 @@ mod tests {
         let leader = driven.elect(&mut pump, &clients, 0, 1);
         let follower = (leader + 1) % 3;
         quiet(&mut driven, &mut pump);
-        let ticks = |n: usize| TICK * u32::try_from(n).unwrap();
+        let ticks = |period: Duration, n: usize| period * u32::try_from(n).unwrap();
 
         clients[follower].handle().attest(kiln(7)).unwrap();
         let lease = session_lease(&mut driven, follower);
         let raft = &driven.owner(follower).replica.core().raft;
-        let want = ticks(2 * raft.config().election_tick + raft.patience());
+        let want = ticks(
+            driven.period(follower),
+            2 * raft.config().election_tick + raft.patience(),
+        );
         assert_eq!(lease, want, "the follower's session lease");
         for _ in 0..ROUNDS {
             if attested(&mut driven, leader, u64::try_from(follower + 1).unwrap()).is_some() {
@@ -9736,13 +9817,17 @@ mod tests {
         clients[leader].handle().attest(kiln(7)).unwrap();
         let lease = session_lease(&mut driven, leader);
         let raft = &driven.owner(leader).replica.core().raft;
-        let want = ticks(2 * (raft.config().election_tick + raft.quorum_patience()));
+        let want = ticks(
+            driven.period(leader),
+            2 * (raft.config().election_tick + raft.quorum_patience()),
+        );
         assert_eq!(lease, want, "the leader's session lease");
         let mut waited = Duration::ZERO;
         while driven.owner_mut(leader).pending.is_some() {
             assert!(waited <= lease, "a stalled leader's session past its lease");
-            driven.advance(leader, TICK);
-            waited += TICK;
+            let period = driven.period(leader);
+            driven.advance(leader, period);
+            waited += period;
             driven.step();
         }
         driven.drain(&mut pump);
@@ -9803,7 +9888,7 @@ mod tests {
         let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
         driven.step();
         let owner = driven.owner(0);
-        assert_eq!(owner.deadline(), owner.ticked + TICK);
+        assert_eq!(owner.deadline(), owner.ticked + owner.pace.period());
         let due = owner.at + Duration::from_nanos(1);
         let _answer = submit(&client, due, |_| Ok(Vec::new()));
         driven.step();
@@ -11015,7 +11100,7 @@ mod tests {
         let answered = (0..ROUNDS)
             .find_map(|_| {
                 for owner in &others {
-                    driven.advance(*owner, TICK);
+                    driven.advance_tick(*owner);
                 }
                 driven.round(&mut pump);
                 raised.try_recv().ok()
@@ -11476,7 +11561,7 @@ mod tests {
                 break;
             }
             for owner in 0..3 {
-                driven.advance(owner, TICK);
+                driven.advance_tick(owner);
             }
             driven.round(&mut pump);
         }
@@ -11584,7 +11669,7 @@ mod tests {
                 return *leader;
             }
             for owner in 0..4 {
-                driven.advance(owner, TICK);
+                driven.advance_tick(owner);
             }
             driven.round(pump);
         }
@@ -11988,7 +12073,7 @@ mod tests {
                                     break;
                                 }
                                 for owner in 0..4 {
-                                    driven.advance(owner, TICK);
+                                    driven.advance_tick(owner);
                                 }
                                 driven.round(&mut pump);
                             }
@@ -13049,7 +13134,7 @@ mod tests {
                          clients: &[Client]| {
             let applied = |n: usize| clients[n].handle().status().unwrap().applied;
             (0..ROUNDS).any(|_| {
-                driven.advance(leader, TICK);
+                driven.advance_tick(leader);
                 driven.round(pump);
                 applied(follower) >= applied(leader)
             })

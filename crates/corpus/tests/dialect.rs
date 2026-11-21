@@ -40,7 +40,7 @@ impl Engine for Kept {
         }
     }
 
-    fn settle(&mut self) -> Result<(), String> {
+    fn settle(&mut self, _until: Option<Instant>) -> Result<(), Stop> {
         Ok(())
     }
 }

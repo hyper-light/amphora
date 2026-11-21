@@ -505,6 +505,8 @@ tests = [
   # lane g7s2-2
   { id = "T-NS.2.4", text = "Values past a page read at every snapshot; rollback and savepoints across them; recovery after a power cut and a crash at each of many writes recovers a prefix of the commits" },
   { id = "T-NS.2.5", text = "Trees made and dropped survive reopens and power cuts; a crash at each write of a workload that makes, fills and drops trees recovers a prefix of its steps" },
+  # lane g7s2-3
+  { id = "T-NS.2.6", text = "SQL end to end through the switch and without it (CREATE TABLE, INSERT, SELECT, transactions) answers alike" },
 ]
 
 # lane g7s3
@@ -542,6 +544,8 @@ tests = [
 # (t_t1_12_1_a_power_cut_at_every_step_of_an_online_index_leaves_old_or_new).
 # lane online-schema-6: constraints on existing columns serve the same T-T1.12.1
 # (t_t1_12_1_a_power_cut_at_every_step_of_an_online_constraint_leaves_old_or_new).
+# lane online-schema-7: DROP COLUMN online serves the same T-T1.12.1
+# (t_t1_12_1_a_power_cut_at_every_step_of_an_online_drop_leaves_old_or_new).
 
 # lane audit-log: Amphora's own IDs for G10 step 3 (kiln plan 01a16b0f47577325bcd9e51383067e04),
 # serving AC-T1.7.4 (docs/design/audit.md).
@@ -592,6 +596,19 @@ criteria = [
 ]
 tests = [
   { id = "T-DQ.1.1", text = "Three members, an election and 20 writes on driven time — passes when every write is answered and some step left more to drive for the next" },
+]
+
+[[own]]
+id = "TP.1"
+title = "The replicated owner's tick period learned where it runs, not a picked 10 ms"
+criteria = [
+  { id = "AC-TP.1.1", text = "Each voter's round trips are measured from the owner's own heartbeats', pre-votes' and votes' sends and answers, a request timed only once every earlier one to its peer is answered (Karn's rule), with RFC 9002's smoothed estimator; the log's flushes, the leader's link's arrival lateness and the owner's timer lateness are folded beside them" },
+  { id = "AC-TP.1.2", text = "Once an election timeout the period is derived by hyper-timing's law (Ballot, election span, arrival detector, ElectionTiming, TickPace) and the owner ticks, sets its write slot's bounds and its leases at it; before a quorum, the timer and the link are measured it is hyper-timing's start state (TickPace::floor) at the period the owner opened with" },
+]
+tests = [
+  { id = "T-TP.1.1", text = "Requests sent and answered in order, behind unanswered ones, and past the core's count for a lost peer — passes when only an unambiguous request's answer is sampled, at its own round trip" },
+  { id = "T-TP.1.2", text = "A pace fed nothing, then a quorum and the timer, then a near and a far group's heartbeats — passes when it is the start state until the link is measured, then covers the measured election, the far group's period longer than the near one's and neither the start period" },
+  { id = "T-TP.1.3", text = "The driven election, patience and lease tests — passes when each reads its owner's pace and none assumes 10 ms" },
 ]
 
 [[own]]
@@ -677,6 +694,7 @@ tests = [
   { id = "T-T1.9.R3", text = "A group's holding kept by its own database with its rows: a key fenced, then the groups started again on the same files — passes when the fenced key is still refused, typed, and the group's other keys are still taken" },
   # lane split-merge-6
   { id = "T-T1.9.R4", text = "A group with rows split by the driver through the shell (Groups::carry) while writes go on, then merged back — passes when the moving range's rows, those there before and those written during the copy and catch-up, are in the new group, every acknowledged write is read back from exactly one group, and after the merge the retired group is gone with every row in the one left" },
+  { id = "T-T1.9.R5", text = "The split and merge of T-T1.9.R4 with every action carried twice at the real groups, stale actions carried late and the driver restarted from the durable directory at the third action, the sixth, the twelfth and so on — passes when each operation still ends flipped, every acknowledged write is read back from exactly one group, and the one group left holds every row" },
   { id = "T-T1.9.P1", text = "The cutover-pause harness (AC-T1.9.2): one group of AMPHORA_RESHARD_PAUSE_ROWS rows split by the planner while clients write — prints each cutover's pause and the longest a write waited on a refusal; passes when every acknowledged write is read back from exactly one group" },
   { id = "T-T1.9.L1", text = "The lab harness (AC-T1.9.3): AMPHORA_RESHARD_OPS automatic operations chosen by the planner from measured rows, writes and cores, carried out while clients write — passes when writes lost is 0 and every key is in exactly one group's file" },
 ]
@@ -795,3 +813,37 @@ tests = [
 # lane groupcommit (G8 step 3, the versioned storage's log; docs/design/engine.md decision 11): no new
 # IDs. It serves AC-T1.4.2 and AC-T1.4.3 (`amphora-bench --vlog`) and T-T1.3.1
 # (crates/engine/tests/versioned_crash.rs).
+
+# lane g3s2
+# Amphora's own IDs for G3, point reads (kiln plan 01a16b0f464172dc80c7a3b9a14acbce): G3.n for its step n.
+
+[[own]]
+id = "G3.2"
+title = "The log out of the read path: no frame index or shared lock per page read (G3 step 2; store.md decision 40)"
+criteria = [
+  { id = "AC-G3.2.1", text = "the log's and locks' share of point-read user cycles at 32 clients is at most 5% (frame-pointer call graphs, bench/prof_parts.py; measured by the coordinator)" },
+  { id = "AC-G3.2.2", text = "point_pk at 32 clients over 1 client is at least 4x (the suite at 10M rows, best of 3; measured by the coordinator)" },
+  { id = "AC-G3.2.3", text = "table_count statements a second at 32 clients rises at least 200% over G1's whole-log profile (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-G3.2.1", text = "storage::wal::tests::g3_2_* — passes when every page read through each lock-free way (filtered, published, optimistic), at random snapshots while frames are appended, rewound, rolled back, checkpointed and the log restarted, and beside a writer thread, finds the frame the index read under its lock finds, or none" },
+  { id = "T-G3.2.2", text = "crates/engine/tests/log_read_index.rs — passes when, after a crash at every write of a checkpoint and of a log restart, every read through each way returns its page's last committed version" },
+]
+
+# lane g3s5: G3 step 5 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), skipping the descent.
+[[own]]
+id = "G3.5"
+title = "Skipping the descent: adaptive hash index against a learned leaf locator (G3 step 5; store.md decision 41)"
+criteria = [
+  { id = "AC-G3.5.1", text = "each prototype's lookup and write (upkeep) costs recorded on every point-read and write class (measured by the coordinator)" },
+  { id = "AC-G3.5.2", text = "point_pk at 1 client with the winner rises at least 20% against after steps 2-4 (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-G3.5.1", text = "storage::descent_skip::tests::t_g3_5_1_* — passes when every lookup through the adaptive hash and the learned locator, under random inserts, deletes, splits and merges over pages two tables share, returns the row a plain descent returns" },
+  { id = "T-G3.5.2", text = "storage::descent_skip::tests::t_g3_5_2_* — passes when, over a table's complete fences, the locator names the leaf a descent finds for every covered rowid" },
+]
+
+# lane regions (G14 step 1, CP-T1.11; docs/design/regions.md): no new IDs. It serves AC-T1.11.4
+# (crates/amphora/tests/regions.rs, ac_t1_11_4_*: the corpus on the simulated lab at one node, three
+# nodes and three regions) and AC-T1.11.2's lab (crates/amphora/examples/regions_lab.rs; the 60 ms run
+# and its p99 are the coordinator's).
