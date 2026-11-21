@@ -22,6 +22,7 @@ use std::{fmt, sync::Arc};
 use super::buffer_pool::BufferPool;
 use super::changes::{latest_by_page, ChangeLog};
 use super::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
+use super::log_index::{Lookup, ReadIndex};
 use super::packed::{self, LogFormat, Record, Records};
 use super::pager::{Logged, PageRef, Pager};
 use super::sqlite3_ondisk::{
@@ -1269,12 +1270,58 @@ pub trait Wal: Debug + Send + Sync {
 #[derive(Debug)]
 struct InProcessWalCoordination {
     shared: Arc<RwLock<WalFileShared>>,
+    /// Amphora: the log's lookups without the shared state's lock (G3 step 2, decision 40). None
+    /// where another process writes the log too (the shared-memory backend's fallback): its index
+    /// is filled from the other processes' frames by paths this one doesn't see.
+    read_index: Option<Arc<ReadIndex>>,
 }
 
 impl InProcessWalCoordination {
     /// Build the in-process coordination backend over the existing shared WAL state.
     fn new(shared: Arc<RwLock<WalFileShared>>) -> Self {
-        Self { shared }
+        let read_index = {
+            let guard = shared.read();
+            let read_index = guard.runtime.read_index.clone();
+            read_index.set_header(guard.metadata.wal_header.clone());
+            read_index
+        };
+        Self {
+            shared,
+            read_index: Some(read_index),
+        }
+    }
+
+    /// The shared-memory backend's fallback: every lookup under the locks.
+    #[cfg(host_shared_wal)]
+    fn fallback(shared: Arc<RwLock<WalFileShared>>) -> Self {
+        Self {
+            shared,
+            read_index: None,
+        }
+    }
+
+    fn find_frame_locked(
+        &self,
+        page_id: u64,
+        min_frame: u64,
+        max_frame: u64,
+        frame_watermark: Option<u64>,
+    ) -> Option<u64> {
+        let shared = self.shared.read();
+        let frame_cache = shared.runtime.frame_cache.lock();
+        let range = frame_watermark
+            .map(|x| 0..=x)
+            .unwrap_or(min_frame..=max_frame);
+        let result = frame_cache
+            .get(&page_id)
+            .and_then(|frames| shared.runtime.latest_frame_in_range(frames, &range));
+        result
+    }
+
+    /// Something other than an append changed the frame index: what the lock-free path built from
+    /// it is stale.
+    fn index_changed(shared: &WalFileShared) {
+        shared.runtime.read_index.invalidate();
     }
 
     #[cfg(test)]
@@ -1394,15 +1441,26 @@ impl WalCoordination for InProcessWalCoordination {
         max_frame: u64,
         frame_watermark: Option<u64>,
     ) -> Option<u64> {
-        let shared = self.shared.read();
-        let frame_cache = shared.runtime.frame_cache.lock();
-        let range = frame_watermark
-            .map(|x| 0..=x)
-            .unwrap_or(min_frame..=max_frame);
-        let result = frame_cache
-            .get(&page_id)
-            .and_then(|frames| shared.runtime.latest_frame_in_range(frames, &range));
-        result
+        // Amphora: without the shared state's lock or the index's where the switch says (G3 step 2,
+        // decision 40); what that path can't answer is answered under them.
+        if let Some(read_index) = &self.read_index {
+            let (low, high) = frame_watermark.map_or((min_frame, max_frame), |x| (0, x));
+            let index = |build: &mut super::log_index::FromIndex<'_>| {
+                let shared = self.shared.read();
+                let frame_cache = shared.runtime.frame_cache.lock();
+                let high_water = shared
+                    .runtime
+                    .frame_cache_high_water
+                    .load(Ordering::Acquire);
+                build(&frame_cache, high_water);
+            };
+            match read_index.find(page_id, low, high, &index) {
+                Lookup::Absent => return None,
+                Lookup::Frame(frame) => return Some(frame),
+                Lookup::Ask => {}
+            }
+        }
+        self.find_frame_locked(page_id, min_frame, max_frame, frame_watermark)
     }
 
     fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)> {
@@ -1701,6 +1759,10 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn wal_header(&self) -> WalHeader {
+        // Amphora: the header's copy, without the shared state's lock or the header's (decision 40).
+        if let Some(header) = self.read_index.as_ref().and_then(|index| index.header()) {
+            return header;
+        }
         *self.shared.read().metadata.wal_header.lock()
     }
 
@@ -1793,6 +1855,7 @@ impl WalCoordination for InProcessWalCoordination {
             let from = records.covering(frame_id).unwrap_or(frame_id);
             records.drop_after(from.saturating_sub(1));
             drop(records);
+            Self::index_changed(&shared);
             frame_cache.retain(|_page_id, frames| {
                 while frames.last().is_some_and(|&frame| frame >= from) {
                     frames.pop();
@@ -1809,6 +1872,10 @@ impl WalCoordination for InProcessWalCoordination {
                 frame_cache.insert(page_id, vec![frame_id]);
             }
         }
+        shared
+            .runtime
+            .read_index
+            .appended(&frame_cache, &mut std::iter::once(page_id), frame_id);
         // Amphora: listed in frame order for readers to forget (decision 18).
         let mut changes = shared.runtime.changes.lock();
         if let Some(from) = cut {
@@ -1835,6 +1902,7 @@ impl WalCoordination for InProcessWalCoordination {
             // `cache_frame`'s guard: the slots from `head` up are written again, and with them any
             // record they cut into.
             let from = records.covering(head).unwrap_or(head);
+            Self::index_changed(&shared);
             frame_cache.retain(|_page_id, frames| {
                 while frames.last().is_some_and(|&frame| frame >= from) {
                     frames.pop();
@@ -1856,6 +1924,10 @@ impl WalCoordination for InProcessWalCoordination {
                 }
             }
         }
+        shared
+            .runtime
+            .read_index
+            .appended(&frame_cache, &mut pages.iter().copied(), head);
         let mut changes = shared.runtime.changes.lock();
         // The frames the cut record began at are gone from the cache: from the list too, which the
         // checkpointer reads as the cache (decision 24).
@@ -1898,6 +1970,7 @@ impl WalCoordination for InProcessWalCoordination {
     fn rollback_cache(&self, max_frame: u64) {
         let shared = self.shared.read();
         let mut frame_cache = shared.runtime.frame_cache.lock();
+        Self::index_changed(&shared);
         frame_cache.retain(|_page_id, frames| {
             while frames.last().is_some_and(|&frame| frame > max_frame) {
                 frames.pop();
@@ -2027,7 +2100,7 @@ impl ShmWalCoordination {
         shared: Arc<RwLock<WalFileShared>>,
         authority: Arc<MappedSharedWalCoordination>,
     ) -> Self {
-        let fallback = InProcessWalCoordination::new(shared.clone());
+        let fallback = InProcessWalCoordination::fallback(shared.clone());
         let coordination = Self {
             shared,
             fallback,
@@ -2106,6 +2179,7 @@ impl ShmWalCoordination {
         let mut shared = self.shared.write();
         Self::install_local_snapshot(&mut shared, snapshot, true);
         shared.metadata.initialized.store(false, Ordering::Release);
+        shared.runtime.read_index.invalidate();
         shared.runtime.frame_cache.lock().clear();
         shared
             .runtime
@@ -2401,6 +2475,7 @@ impl ShmWalCoordination {
             let mut shared = self.shared.write();
             Self::install_local_snapshot(&mut shared, restarted, true);
             shared.metadata.initialized.store(false, Ordering::Release);
+            shared.runtime.read_index.invalidate();
             shared.runtime.frame_cache.lock().clear();
             shared
                 .runtime
@@ -3506,14 +3581,18 @@ impl fmt::Debug for WalFile {
 pub struct HeaderCell {
     header: SpinLock<WalHeader>,
     checkpoint_seq: AtomicU32,
+    /// Amphora: the whole header, readable without the lock (G3 step 2, decision 40).
+    copy: super::log_index::HeaderCopy,
 }
 
 impl HeaderCell {
     pub fn new(header: WalHeader) -> Self {
         let checkpoint_seq = AtomicU32::new(header.checkpoint_seq);
+        let copy = super::log_index::HeaderCopy::new(&header);
         Self {
             header: SpinLock::new(header),
             checkpoint_seq,
+            copy,
         }
     }
 
@@ -3521,7 +3600,12 @@ impl HeaderCell {
         HeaderGuard {
             locked: self.header.lock(),
             copy: &self.checkpoint_seq,
+            whole: &self.copy,
         }
+    }
+
+    pub(crate) fn copy(&self) -> &super::log_index::HeaderCopy {
+        &self.copy
     }
 
     /// The header's `checkpoint_seq` as its last guard left it.
@@ -3544,6 +3628,7 @@ impl std::fmt::Debug for HeaderCell {
 pub struct HeaderGuard<'a> {
     locked: crate::fast_lock::SpinLockGuard<'a, WalHeader>,
     copy: &'a AtomicU32,
+    whole: &'a super::log_index::HeaderCopy,
 }
 
 impl std::ops::Deref for HeaderGuard<'_> {
@@ -3564,6 +3649,7 @@ impl Drop for HeaderGuard<'_> {
     fn drop(&mut self) {
         self.copy
             .store(self.locked.checkpoint_seq, Ordering::Release);
+        self.whole.store(&self.locked);
     }
 }
 
@@ -3643,6 +3729,9 @@ pub struct WalSharedRuntime {
     /// forget only those (`changes::ChangeLog`, decision 18). Taken after `frame_cache`'s lock
     /// when both are held; a leaf lock.
     pub(crate) changes: SpinLock<ChangeLog>,
+    /// Amphora: the frame index and header as page reads find them without the locks above (G3
+    /// step 2, decision 40). Never replaced: a connection holds it outside the shared state's lock.
+    pub(crate) read_index: Arc<ReadIndex>,
     #[cfg(test)]
     pub(crate) frames_compared: AtomicU64,
 }
@@ -7809,6 +7898,7 @@ impl WalFileShared {
                 changes: SpinLock::new(ChangeLog::default()),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
+                read_index: Arc::new(ReadIndex::default()),
             },
         };
         Ok(Arc::new(RwLock::new(shared)))
@@ -7892,6 +7982,7 @@ impl WalFileShared {
                 changes: SpinLock::new(ChangeLog::default()),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
+                read_index: Arc::new(ReadIndex::default()),
             },
         };
         Arc::new(RwLock::new(shared))
@@ -7941,6 +8032,7 @@ impl WalFileShared {
                 changes: SpinLock::new(ChangeLog::default()),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
+                read_index: Arc::new(ReadIndex::default()),
             },
         };
         Ok(Arc::new(RwLock::new(shared)))
@@ -7990,6 +8082,10 @@ impl WalFileShared {
             self.metadata.wal_header = Arc::new(HeaderCell::new(header));
             self.runtime.legacy_durable_allowed = false;
         }
+        self.runtime
+            .read_index
+            .set_header(self.metadata.wal_header.clone());
+        self.runtime.read_index.invalidate();
         self.runtime.frame_cache.lock().clear();
         self.runtime
             .frame_cache_high_water
@@ -8023,6 +8119,10 @@ impl WalFileShared {
         // Also reject a caller-supplied restored state that happened to retain the old header Arc.
         let header = *self.metadata.wal_header.lock();
         self.metadata.wal_header = Arc::new(HeaderCell::new(header));
+        self.runtime
+            .read_index
+            .set_header(self.metadata.wal_header.clone());
+        self.runtime.read_index.invalidate();
         self.runtime.frame_cache = restored.runtime.frame_cache;
         // Amphora: in place, as connections hold the registry's `Arc`.
         *self.runtime.records.lock() = std::mem::take(&mut *restored.runtime.records.lock());
@@ -9729,6 +9829,12 @@ pub mod test {
     #[test]
     fn in_process_frame_lookups_compare_few_frames_when_a_page_has_many_frames() {
         let shared = WalFileShared::new_noop();
+        // The index read under its lock, whatever `AMPHORA_LOG_READ_INDEX` says (decision 40).
+        shared
+            .read()
+            .runtime
+            .read_index
+            .set_mode(super::super::log_index::LogReadIndex::Locked);
         let coordination = make_test_coordination(&shared);
         let frame_count = 1000u64;
         for frame_id in 1..=frame_count {
@@ -9814,6 +9920,7 @@ pub mod test {
                         next = to + 1;
                     }
                     9 if rng.next_u64() % 8 == 0 => {
+                        shared.read().runtime.read_index.invalidate();
                         shared.write().runtime.frame_cache.lock().clear();
                         shared
                             .read()
@@ -9852,6 +9959,218 @@ pub mod test {
             }
         }
         assert!(listed > 10_000, "the list answered {listed} ranges");
+    }
+
+    /// The ways a page read finds its frame without the locks (G3 step 2, decision 40).
+    const LOCK_FREE_WAYS: [super::super::log_index::LogReadIndex; 3] = [
+        super::super::log_index::LogReadIndex::Filtered,
+        super::super::log_index::LogReadIndex::Published,
+        super::super::log_index::LogReadIndex::Optimistic,
+    ];
+
+    /// Do (T-G3.2.1): random appends of frames and records, rewinds into them, rollbacks,
+    /// checkpoints (the snapshot's first frame moved on) and log restarts, and after each, every
+    /// page read at random snapshots through each lock-free way. Expect: the frame the index read
+    /// under its lock gives, or none, for every read; most reads answered without the lock.
+    #[test]
+    fn g3_2_lock_free_page_reads_find_the_frame_the_locked_index_finds() {
+        use super::super::log_index::Lookup;
+        use rand_chacha::{
+            rand_core::{RngCore, SeedableRng},
+            ChaCha8Rng,
+        };
+        for mode in LOCK_FREE_WAYS {
+            let mut answered = 0u64;
+            let mut reads = 0u64;
+            for seed in 0..12u64 {
+                let shared = WalFileShared::new_noop();
+                shared.read().runtime.read_index.set_mode(mode);
+                let coordination = make_test_coordination(&shared);
+                let read_index = shared.read().runtime.read_index.clone();
+                let mut rng = ChaCha8Rng::seed_from_u64(seed);
+                let mut next = 1u64;
+                // The first frame a snapshot reads: past what a checkpoint copied.
+                let mut first = 1u64;
+                for _ in 0..300 {
+                    match rng.next_u64() % 12 {
+                        0..=5 => {
+                            coordination.cache_frame(rng.next_u64() % 40, next);
+                            next += 1;
+                        }
+                        6 => {
+                            let slots = u32::try_from(1 + rng.next_u64() % 3).unwrap();
+                            let pages: Vec<u64> = (0..1 + rng.next_u64() % 4)
+                                .map(|_| rng.next_u64() % 40)
+                                .collect();
+                            coordination.cache_record(next, slots, &mut pages.into_iter());
+                            next += u64::from(slots);
+                        }
+                        7 if next > 2 => {
+                            next = 1 + rng.next_u64() % (next - 1);
+                            first = first.min(next);
+                            coordination.cache_frame(rng.next_u64() % 40, next);
+                            next += 1;
+                        }
+                        8 if next > 2 => {
+                            let to = rng.next_u64() % (next - 1);
+                            coordination.rollback_cache(to);
+                            next = to + 1;
+                            first = first.min(next);
+                        }
+                        9 => first = 1 + rng.next_u64() % next,
+                        10 if rng.next_u64() % 4 == 0 => {
+                            // The log restarted: its frames gone, the next one frame 1.
+                            let guard = shared.write();
+                            guard.runtime.read_index.invalidate();
+                            guard.runtime.frame_cache.lock().clear();
+                            guard
+                                .runtime
+                                .frame_cache_high_water
+                                .store(0, Ordering::Release);
+                            guard.runtime.records.lock().clear();
+                            guard.runtime.changes.lock().reset();
+                            drop(guard);
+                            next = 1;
+                            first = 1;
+                        }
+                        _ => {}
+                    }
+                    for _ in 0..4 {
+                        let max_frame = rng.next_u64() % next;
+                        let min_frame = first.min(max_frame.max(1));
+                        for page in 0..48u64 {
+                            let locked =
+                                coordination.find_frame_locked(page, min_frame, max_frame, None);
+                            let index = |build: &mut super::super::log_index::FromIndex<'_>| {
+                                let guard = shared.read();
+                                let frame_cache = guard.runtime.frame_cache.lock();
+                                let high_water =
+                                    guard.runtime.frame_cache_high_water.load(Ordering::Acquire);
+                                build(&frame_cache, high_water);
+                            };
+                            reads += 1;
+                            match read_index.find(page, min_frame, max_frame, &index) {
+                                Lookup::Ask => {}
+                                Lookup::Absent => {
+                                    answered += 1;
+                                    assert_eq!(locked, None, "{mode:?} seed {seed} page {page} {min_frame}..={max_frame}");
+                                }
+                                Lookup::Frame(frame) => {
+                                    answered += 1;
+                                    assert_eq!(locked, Some(frame), "{mode:?} seed {seed} page {page} {min_frame}..={max_frame}");
+                                }
+                            }
+                            assert_eq!(
+                                coordination.find_frame(page, min_frame, max_frame, None),
+                                locked,
+                                "{mode:?} seed {seed} page {page} {min_frame}..={max_frame}"
+                            );
+                        }
+                    }
+                }
+            }
+            // Non-vacuity: the way answers most reads itself (the filter alone answers the pages
+            // the log doesn't hold, 8 of every 48 at least).
+            assert!(
+                answered * 6 > reads,
+                "{mode:?} answered {answered} of {reads}"
+            );
+        }
+    }
+
+    /// Do (T-G3.2.1): one writer appends frames in commits (some appended and rolled back), while
+    /// four readers read every page at random committed snapshots through each lock-free way.
+    /// Expect: the frame the index read under its lock gives, or none, for every read.
+    #[test]
+    fn g3_2_readers_beside_a_writer_find_the_frame_the_locked_index_finds() {
+        use crate::sync::atomic::{AtomicBool, AtomicU64};
+        use rand_chacha::{
+            rand_core::{RngCore, SeedableRng},
+            ChaCha8Rng,
+        };
+        for mode in LOCK_FREE_WAYS {
+            let shared = WalFileShared::new_noop();
+            shared.read().runtime.read_index.set_mode(mode);
+            let coordination = make_test_coordination(&shared);
+            let committed = AtomicU64::new(0);
+            let done = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                for reader in 0..4u64 {
+                    let (coordination, committed, done) = (&coordination, &committed, &done);
+                    scope.spawn(move || {
+                        let mut rng = ChaCha8Rng::seed_from_u64(reader);
+                        let mut rounds = 0u64;
+                        while !done.load(Ordering::Acquire) || rounds < 10 {
+                            rounds += 1;
+                            let upto = committed.load(Ordering::Acquire);
+                            let max_frame = rng.next_u64() % (upto + 1);
+                            let min_frame = 1 + rng.next_u64() % (max_frame + 1);
+                            for page in 0..48u64 {
+                                let fast =
+                                    coordination.find_frame(page, min_frame, max_frame, None);
+                                let locked = coordination
+                                    .find_frame_locked(page, min_frame, max_frame, None);
+                                assert_eq!(
+                                    fast, locked,
+                                    "{mode:?} page {page} {min_frame}..={max_frame}"
+                                );
+                            }
+                        }
+                    });
+                }
+                let mut rng = ChaCha8Rng::seed_from_u64(99);
+                let mut next = 1u64;
+                for _ in 0..2_000 {
+                    let frames = 1 + rng.next_u64() % 4;
+                    for _ in 0..frames {
+                        coordination.cache_frame(rng.next_u64() % 40, next);
+                        next += 1;
+                    }
+                    if rng.next_u64() % 5 == 0 {
+                        let to = committed.load(Ordering::Acquire);
+                        coordination.rollback_cache(to);
+                        next = to + 1;
+                    } else {
+                        committed.store(next - 1, Ordering::Release);
+                    }
+                }
+                done.store(true, Ordering::Release);
+            });
+        }
+    }
+
+    /// Do (T-G3.2.1): change the log's header through its lock, then read it through the
+    /// coordination with each lock-free way. Expect: the header as last written, each time.
+    #[test]
+    fn g3_2_the_header_read_without_its_lock_is_the_last_one_written() {
+        for mode in LOCK_FREE_WAYS {
+            let shared = WalFileShared::new_noop();
+            shared.read().runtime.read_index.set_mode(mode);
+            let coordination = make_test_coordination(&shared);
+            for round in 1..50u32 {
+                {
+                    let guard = shared.read();
+                    let mut header = guard.metadata.wal_header.lock();
+                    header.checkpoint_seq = round;
+                    header.salt_1 = round * 3;
+                    header.salt_2 = round * 7;
+                    header.checksum_1 = round * 11;
+                    header.checksum_2 = round * 13;
+                }
+                let header = coordination.wal_header();
+                assert_eq!(
+                    (
+                        header.checkpoint_seq,
+                        header.salt_1,
+                        header.salt_2,
+                        header.checksum_1,
+                        header.checksum_2
+                    ),
+                    (round, round * 3, round * 7, round * 11, round * 13),
+                    "{mode:?}"
+                );
+            }
+        }
     }
 
     #[test]

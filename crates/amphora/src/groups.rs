@@ -13,13 +13,14 @@
 //! is acted on, and a group started again answers from what it kept, whatever directory it is
 //! started by: never from a router's memory.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Instant;
 
 use crate::meter::Counters;
 use crate::reshard::directory::{Change, Directory, Proposal};
-use crate::reshard::holding::{Away, Holding};
+use crate::reshard::driver::{Action, Do, Failure, Reply};
+use crate::reshard::holding::{Away, Fenced, Holding};
 use crate::reshard::{self, GroupId, NodeId, Pos, Span, position};
 use crate::store::{Config, Engine, Refused, Store, Ticket};
 
@@ -44,6 +45,10 @@ impl<E: Engine> Clone for Group<E> {
 struct Route<E: Engine> {
     directory: Directory,
     groups: BTreeMap<GroupId, Group<E>>,
+    /// Groups retired here since this node started: a release or retire asked of one again is
+    /// done (the driver's contract). After a restart, the directory routed by says the same: a
+    /// group it no longer places, with an id it has given out, was retired.
+    retired: BTreeSet<GroupId>,
 }
 
 /// A store in groups: cheap to clone, usable from any thread; clones share one route.
@@ -163,6 +168,7 @@ impl<E: Engine> Groups<E> {
         let route = Route {
             directory: directory.clone(),
             groups,
+            retired: BTreeSet::new(),
         };
         Ok(Self {
             route: Arc::new(RwLock::new(route)),
@@ -236,6 +242,243 @@ impl<E: Engine> Groups<E> {
             held.holding = next;
         }
         Ok(out)
+    }
+
+    /// The store of `group`, if it is on this node.
+    fn store_of(&self, group: GroupId) -> Option<Store<E>> {
+        let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
+        route.groups.get(&group).map(|g| g.store.clone())
+    }
+
+    /// The holding `group` answers from now, if it is on this node.
+    #[must_use]
+    pub fn holding_of(&self, group: GroupId) -> Option<Holding> {
+        let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
+        route.groups.get(&group).map(|g| g.holding)
+    }
+
+    /// Carries out a driver's action at this node's groups and answers it (CP-T1.9; the shell of
+    /// docs/design/reshard.md, "What is left"): a group's holding through [`Groups::hold`], kept
+    /// before it is acted on; a copy or catch-up batch read on the old group's writer, after every
+    /// batch handed to it before, and written to the new group's in one transaction; a fence as
+    /// an entry of the group's own log, numbered on its writer, so every batch let in before it
+    /// is in the log before it. `engine` starts a group's engine (`Do::Create`). Both groups of a
+    /// copy or catch-up must be on this node (a move to another node carries rows over the
+    /// network, not built yet): a group not here is [`Failure::NoGroup`].
+    ///
+    /// A batch is as many positions (copy, sweep) or log entries (catch-up) as the store's
+    /// `commit_rows`: the rows one commit of its writer takes at once (decision 23), so a batch
+    /// holds a writer no longer than a commit of its own. An error is the group's (its engine or
+    /// its writer): the driver asks again ([`reshard::driver::Driver::restarted`]).
+    pub fn carry(
+        &self,
+        action: &Action,
+        until: Instant,
+        engine: impl FnOnce(GroupId) -> anyhow::Result<E>,
+    ) -> anyhow::Result<Reply> {
+        let op = action.op;
+        let batch = self.config.commit_rows.max(1);
+        let refused = |e: anyhow::Error| match e.downcast::<reshard::Refused>() {
+            Ok(reshard::Refused::NoGroup(_)) => Ok(Reply::Failed(Failure::NoGroup)),
+            Ok(r) => Ok(Reply::Failed(Failure::Refused(r))),
+            Err(e) => Err(e),
+        };
+        match action.what {
+            Do::Create { group, .. } => {
+                let retired = self
+                    .route
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .retired
+                    .contains(&group);
+                if retired {
+                    return Ok(Reply::Failed(Failure::Refused(reshard::Refused::Ended(op))));
+                }
+                self.create(group, || engine(group))?;
+                Ok(Reply::Created)
+            }
+            Do::Copy { from, to, span } => {
+                let (Some(src), Some(_)) = (self.store_of(from), self.store_of(to)) else {
+                    return Ok(Reply::Failed(Failure::NoGroup));
+                };
+                let progress = match self.hold(to, until, |h| h.receive(op, span)) {
+                    Ok(p) => p,
+                    Err(e) => return refused(e),
+                };
+                let rest = match progress.copied {
+                    Some(p) if p >= span.hi() => None,
+                    Some(p) => p.checked_add(1).and_then(|lo| Span::new(lo, span.hi())),
+                    None => Some(span),
+                };
+                let first = progress.first_at.is_none();
+                // The old group's log is held from the first copy's position on, read at the same
+                // entry as the batch, so no entry catch-up needs is let go between them.
+                let exported = src.run(until, move |e| {
+                    let head = e.head()?;
+                    if first {
+                        e.keep_log(Some(head))?;
+                    }
+                    match rest {
+                        Some(rest) => e.export(rest, batch),
+                        None => Ok(crate::store::Exported {
+                            keys: Vec::new(),
+                            at: head,
+                            last: None,
+                            done: true,
+                        }),
+                    }
+                })?;
+                let dst = self.store_of(to).ok_or(reshard::Refused::NoGroup(to))?;
+                let at = exported.at;
+                let (last, done) = (exported.last, exported.done);
+                if !exported.keys.is_empty() {
+                    let keys = exported.keys;
+                    dst.run(until, move |e| e.import(&keys))?;
+                }
+                match self.hold(to, until, |h| h.copied(op, last, done, at)) {
+                    Ok(progress) => Ok(Reply::Copied { progress, head: at }),
+                    Err(e) => refused(e),
+                }
+            }
+            Do::Replay {
+                from,
+                to,
+                span,
+                upto,
+            } => {
+                let (Some(src), Some(dst)) = (self.store_of(from), self.store_of(to)) else {
+                    return Ok(Reply::Failed(Failure::NoGroup));
+                };
+                let Some(incoming) = self
+                    .holding_of(to)
+                    .and_then(|h| h.incoming())
+                    .filter(|i| i.op == op)
+                else {
+                    return Ok(Reply::Failed(Failure::Refused(reshard::Refused::Ended(op))));
+                };
+                let after = incoming.progress.replayed;
+                let entries = u64::try_from(batch).unwrap_or(u64::MAX);
+                let changed = src.run(until, move |e| e.changed(after, upto, span, entries))?;
+                let Some(changed) = changed else {
+                    return Ok(Reply::Failed(Failure::LogGone));
+                };
+                let (through, head) = (changed.through, changed.head);
+                if !changed.keys.is_empty() {
+                    let keys = changed.keys;
+                    dst.run(until, move |e| e.import(&keys))?;
+                }
+                match self.hold(to, until, |h| h.replayed(op, through)) {
+                    Ok(progress) => Ok(Reply::Replayed { progress, head }),
+                    Err(e) => refused(e),
+                }
+            }
+            Do::Fence { group, span } => match self.fence(group, op, span, until) {
+                Ok(at) => Ok(Reply::Fenced { at }),
+                Err(e) => refused(e),
+            },
+            Do::Activate { group } => match self.hold(group, until, |h| h.activate(op)) {
+                Ok(()) => Ok(Reply::Activated),
+                Err(e) => refused(e),
+            },
+            Do::Unfence { group } => {
+                let Some(store) = self.store_of(group) else {
+                    return Ok(Reply::Unfenced);
+                };
+                if let Err(e) = self.hold(group, until, |h| h.unfence(op)) {
+                    return refused(e);
+                }
+                store.run(until, |e| e.keep_log(None))?;
+                Ok(Reply::Unfenced)
+            }
+            Do::Release { group, span } | Do::Discard { group, span } => {
+                let release = matches!(action.what, Do::Release { .. });
+                let Some(store) = self.store_of(group) else {
+                    // A retired group held nothing when it was retired: a release asked of it
+                    // again is done. A group never made has nothing to discard.
+                    let retired = {
+                        let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
+                        route.retired.contains(&group) || route.directory.given_out(group)
+                    };
+                    return Ok(match (release, retired) {
+                        (true, true) => Reply::Released { done: true },
+                        (true, false) => Reply::Failed(Failure::NoGroup),
+                        (false, _) => Reply::Discarded { done: true },
+                    });
+                };
+                let r = if release {
+                    self.hold(group, until, |h| h.release(op))
+                } else {
+                    self.hold(group, until, |h| h.discard(op))
+                };
+                if let Err(e) = r {
+                    return refused(e);
+                }
+                let holding = self
+                    .holding_of(group)
+                    .ok_or(reshard::Refused::NoGroup(group))?;
+                let done = store.run(until, move |e| {
+                    if release {
+                        e.keep_log(None)?;
+                    }
+                    e.sweep(span, batch, &|pos| holding.garbage(pos))
+                })?;
+                Ok(if release {
+                    Reply::Released { done }
+                } else {
+                    Reply::Discarded { done }
+                })
+            }
+            Do::Retire { group } => {
+                let mut route = self.route.write().unwrap_or_else(PoisonError::into_inner);
+                if let Some(held) = route.groups.get(&group) {
+                    let h = held.holding;
+                    if h.owned().is_some() || h.incoming().is_some() || h.fenced().is_some() {
+                        return Ok(Reply::Failed(Failure::Refused(reshard::Refused::Invalid(
+                            "a group retired while it holds a span",
+                        ))));
+                    }
+                    route.groups.remove(&group);
+                }
+                route.retired.insert(group);
+                Ok(Reply::Retired)
+            }
+        }
+    }
+
+    /// `group` fences `span` for `op`: the fence's entry numbered on the group's writer, after
+    /// every batch let in before it (under the route's write lock, so none is let in between),
+    /// and the holding kept as that entry. The entry's number.
+    fn fence(
+        &self,
+        group: GroupId,
+        op: reshard::OpId,
+        span: Span,
+        until: Instant,
+    ) -> anyhow::Result<reshard::Seq> {
+        let mut route = self.route.write().unwrap_or_else(PoisonError::into_inner);
+        let held = route
+            .groups
+            .get_mut(&group)
+            .ok_or(reshard::Refused::NoGroup(group))?;
+        let holding = held.holding;
+        let (at, kept) = held.store.run(until, move |e| {
+            let mut next = holding;
+            let next_entry = e
+                .head()?
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("the log's entries ran out"))?;
+            match next.fence(op, span, next_entry)? {
+                Fenced::Already(at) => Ok((at, None)),
+                Fenced::New(at) => {
+                    e.keep_holding(&encode(&next)?)?;
+                    Ok((at, Some(next)))
+                }
+            }
+        })?;
+        if let Some(kept) = kept {
+            held.holding = kept;
+        }
+        Ok(at)
     }
 
     /// How many groups are on this node.
