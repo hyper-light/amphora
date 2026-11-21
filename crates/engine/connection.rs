@@ -5561,13 +5561,6 @@ impl Connection {
         }
         self.rollback_attached_wal_txns();
         self.index_methods_on_transaction_rolled_back();
-        // Amphora (G7 step 2): the versioned storage's transaction rolls back with the pager's.
-        // This path returns no error, so a failed rollback is reported where it happens.
-        if let Some(switch) = self.versioned.as_ref() {
-            if let Err(e) = switch.finish(true) {
-                tracing::error!(target: "amphora.versioned", event = "rollback_failed", error = %e);
-            }
-        }
         self.set_tx_state(TransactionState::None);
         self.clear_tx_poison();
     }

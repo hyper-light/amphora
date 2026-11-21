@@ -119,13 +119,18 @@ impl KeyOrder {
     /// ordered by its bytes and marked.
     pub fn comparator(&self) -> Comparator {
         let order = self.clone();
-        Box::new(move |a: &[u8], b: &[u8]| match order.order(a, b) {
+        Box::new(move |a: &[u8], b: &[u8]| order.compare(a, b))
+    }
+
+    /// [`KeyOrder::order`], a record it can't read ordered by its bytes and marked.
+    pub fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
+        match self.order(a, b) {
             Ok(o) => o,
             Err(_) => {
-                order.unreadable.store(true, AtomicOrdering::Release);
+                self.unreadable.store(true, AtomicOrdering::Release);
                 a.cmp(b)
             }
-        })
+        }
     }
 
     /// Refuses once the tree's comparison has met a record it can't read.
@@ -750,7 +755,7 @@ impl VersionedCursor {
     }
 
     /// Removes every row the snapshot sees, in the cursor's transaction: how many.
-    fn clear_rows(&mut self) -> Result<u64> {
+    pub(crate) fn clear_rows(&mut self) -> Result<u64> {
         self.record_stale();
         let mut n = 0u64;
         let mut keys: Vec<Vec<u8>> = Vec::new();

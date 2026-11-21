@@ -13767,8 +13767,7 @@ pub fn op_offset_limit(
 // Update: tablemoveto is used to travers on not exists, on insert depending on flags if nonseek it traverses again.
 // If not there might be some optimizations obviously.
 /// Amphora (G7 step 2, `AC-NS.2.1`): with the connection's switch on, the cursor on the versioned
-/// storage's tree at `root_page` for a rowid table or an index; `None` for a cursor of another
-/// kind. A WITHOUT ROWID table is refused until the catalog records a comparison per tree.
+/// storage's tree at `root_page` for a table or an index; `None` for a cursor of another kind.
 fn versioned_cursor(
     switch: &crate::storage::versioned::switch::Switch,
     cursor_type: &CursorType,
@@ -13777,12 +13776,15 @@ fn versioned_cursor(
 ) -> Result<Option<Cursor>> {
     let index = match cursor_type {
         CursorType::BTreeTable(table) if table.has_rowid => None,
-        CursorType::BTreeTable(_) => {
-            return Err(LimboError::ParseError(
-                "a WITHOUT ROWID table on the versioned storage waits for its catalog (G7 step 2)"
-                    .into(),
-            ))
-        }
+        // A WITHOUT ROWID table is keyed by its primary key's record, as the pager's cursor keys it.
+        CursorType::BTreeTable(table) => BTreeCursor::new_without_rowid_table(
+            pager.clone(),
+            root_page,
+            table.as_ref(),
+            table.columns().len(),
+        )
+        .index_info
+        .clone(),
         CursorType::BTreeIndex(index) => Some(Arc::new(IndexInfo::new_from_index(index)?)),
         _ => return Ok(None),
     };
@@ -14074,13 +14076,7 @@ pub fn op_create_btree(
     }
     if let Some(switch) = program.connection.versioned.as_ref() {
         if *db == crate::MAIN_DB_ID {
-            if !flags.is_table() {
-                return Err(LimboError::ParseError(
-                    "an index on the versioned storage waits for its catalog's comparison per tree (G7 step 2)".into(),
-                )
-                .into());
-            }
-            state.registers[*root].set_int(switch.make_table()?);
+            state.registers[*root].set_int(switch.make_tree(flags.is_table())?);
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
@@ -14269,6 +14265,15 @@ pub fn op_destroy(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
+    if let Some(switch) = program.connection.versioned.as_ref() {
+        if *db == MAIN_DB_ID {
+            // No tree moves into the dropped one's place: the storage keeps no autovacuum.
+            switch.drop_tree(*root)?;
+            state.registers[*former_root_reg].set_int(0);
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
 
     let destroy_pager = if *db != MAIN_DB_ID {
         program.get_pager_from_database_index(db)?
@@ -14328,6 +14333,23 @@ fn op_clear_btree_inner(
     pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(ClearBtree { db, root, count }, insn);
+    if let Some(switch) = program.connection.versioned.as_ref() {
+        if *db == MAIN_DB_ID {
+            let removed_entries = switch.clear(*root, pager.clone())?;
+            match count {
+                ClearBtreeCount::Nothing => {}
+                ClearBtreeCount::RowsWritten => state.record_rows_written(removed_entries),
+                ClearBtreeCount::ChangesAndRowsWritten => {
+                    let changes =
+                        i64::try_from(removed_entries).map_err(|_| LimboError::IntegerOverflow)?;
+                    state.record_statement_changes(changes);
+                    state.record_rows_written(removed_entries);
+                }
+            }
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
 
     let mv_store = program.connection.mv_store_for_db(*db);
     if mv_store.is_some() {

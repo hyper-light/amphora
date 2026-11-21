@@ -752,7 +752,7 @@ pub struct Database<
     page_codec_id: Option<PageCodecId>,
     /// Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage its connections' B-trees are on,
     /// once a connection has asked for it (`storage::versioned::switch`).
-    versioned: Mutex<Option<Arc<crate::storage::versioned::durable::Database>>>,
+    versioned: Mutex<Option<Arc<crate::storage::versioned::switch::Storage>>>,
     // Last: release this Database's I/O fields before its scoped registry entry.
     registry_registration: std::sync::OnceLock<ScopedRegistration>,
 }
@@ -2784,7 +2784,7 @@ impl Database {
     fn versioned_storage(
         &self,
         ask: bool,
-    ) -> Result<Option<Arc<crate::storage::versioned::durable::Database>>> {
+    ) -> Result<Option<Arc<crate::storage::versioned::switch::Storage>>> {
         let mut slot = self.versioned.lock();
         if slot.is_none() && ask {
             *slot = Some(crate::storage::versioned::switch::open(&self.path)?);
