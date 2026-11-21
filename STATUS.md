@@ -311,8 +311,8 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   cursors, CREATE/DROP TABLE and INDEX, DELETE without WHERE, `sqlite_schema` (tree 1) and ANALYZE
   run on it, each SQL transaction one storage transaction, a failed statement undone alone by a
   savepoint. `sql.rs` (`T-NS.2.6`) runs the same SQL on both storages and compares. Not yet: a file
-  database reopened (recovery remakes every tree in rowid order; the header stays the pager's), DROP
-  undone by ROLLBACK, SQL's named SAVEPOINT, a database past the pool's frames or a transaction past
+  database reopened (recovery remakes every tree in rowid order; the header stays the pager's), SQL's
+  named SAVEPOINT, a database past the pool's frames or a transaction past
   its budget (no eviction yet; the budget is the shell's to give); the engine's suites with the
   switch on are the coordinator's run.
 - **Three ways to reach a cached page** (G7 step 3, `NS.3`; `crates/engine/storage/reach`,
