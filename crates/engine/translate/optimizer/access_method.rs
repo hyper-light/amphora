@@ -637,7 +637,10 @@ pub(super) fn choose_best_btree_candidate(
         };
         let costs_equal = (candidate_total.0 - best_total.0).abs() < 1e-9;
         let candidate_is_whole = usable_constraint_refs.is_empty();
-        let better = match (refused_whole(candidate_is_whole), refused_whole(best_is_whole)) {
+        let better = match (
+            refused_whole(candidate_is_whole),
+            refused_whole(best_is_whole),
+        ) {
             (false, true) => true,
             (true, false) => false,
             _ => {

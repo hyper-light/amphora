@@ -140,8 +140,10 @@ fn dimension_and_facts(dir: &Path) -> Arc<Connection> {
     conn.execute("CREATE TABLE company_type (id INTEGER PRIMARY KEY, kind TEXT NOT NULL)")
         .unwrap();
     conn.execute("CREATE TABLE movie_companies (id INTEGER PRIMARY KEY, movie_id INTEGER NOT NULL, company_type_id INTEGER NOT NULL, note TEXT)").unwrap();
-    conn.execute("CREATE INDEX company_type_id_movie_companies ON movie_companies (company_type_id)")
-        .unwrap();
+    conn.execute(
+        "CREATE INDEX company_type_id_movie_companies ON movie_companies (company_type_id)",
+    )
+    .unwrap();
     conn.execute("INSERT INTO company_type VALUES (1, 'distributors'), (2, 'production companies'), (3, 'special effects companies'), (4, 'miscellaneous companies')").unwrap();
     conn.execute("INSERT INTO movie_companies(movie_id, company_type_id, note) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20000) SELECT i, CASE WHEN i % 10 < 6 THEN 2 WHEN i % 10 < 9 THEN 1 ELSE 3 + i % 2 END, CASE WHEN i % 7 = 0 THEN '(presents)' END FROM n").unwrap();
     conn.execute("ANALYZE").unwrap();
@@ -181,7 +183,11 @@ fn a_whole_read_beneath_a_rowid_lookup_stays() {
     let sql = "SELECT count(*) FROM p JOIN q ON q.k = p.k WHERE p.id = 5";
     let plan = plan_text(&conn, sql);
     assert!(plan.contains("SCAN q"), "{plan}");
-    assert_eq!(whole_reads_in_loops(&conn, sql), Vec::<String>::new(), "{plan}");
+    assert_eq!(
+        whole_reads_in_loops(&conn, sql),
+        Vec::<String>::new(),
+        "{plan}"
+    );
     assert_eq!(count(&conn, sql), 1);
 }
 
@@ -200,10 +206,18 @@ fn a_join_with_no_equality_keeps_its_loop() {
     conn.execute("INSERT INTO b(y) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 30) SELECT i FROM n").unwrap();
     conn.execute("ANALYZE").unwrap();
     let cross = "SELECT count(*) FROM a, b";
-    assert_eq!(whole_reads_in_loops(&conn, cross).len(), 1, "{}", plan_text(&conn, cross));
+    assert_eq!(
+        whole_reads_in_loops(&conn, cross).len(),
+        1,
+        "{}",
+        plan_text(&conn, cross)
+    );
     assert_eq!(count(&conn, cross), 1_200);
     let range = "SELECT count(*) FROM a JOIN b ON b.y < a.x";
-    assert_eq!(count(&conn, range), (1..=40).map(|x: i64| (x - 1).min(30)).sum::<i64>());
+    assert_eq!(
+        count(&conn, range),
+        (1..=40).map(|x: i64| (x - 1).min(30)).sum::<i64>()
+    );
 }
 
 /// Do: three tables joined in a chain with no index on any join column, so the third is joined
