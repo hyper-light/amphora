@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::answer::{Render, Value, answer, compare, expected_values};
 use crate::complete::split;
+use crate::dialect::Translated;
 use crate::slt::{Item, Kind, Record, parse};
 
 /// The engine whose conditions the corpus's records follow: every answer in it is SQLite's.
@@ -61,6 +62,10 @@ pub enum Outcome {
     Unreached,
     /// The record ran past its bound and the engine stopped it.
     PastBudget,
+    /// The record has no translation into the engine's dialect, or it disagrees after a statement
+    /// of the file (or its fixture) that has none or that the engine refused in its dialect, which
+    /// it may rest on: not a disagreement (G2 step 4).
+    Untranslatable(String),
 }
 
 /// The time a file's records may take, both from the run's own budget (never a picked number).
@@ -100,29 +105,61 @@ pub struct Counts {
     pub past_budget: u64,
     /// Settles that failed (the steady state not reached before a query).
     pub unsettled: u64,
+    /// Records with no translation into the engine's dialect, or resting on one that has none.
+    pub untranslatable: u64,
 }
 
 /// Runs `text` (after `fixture`'s statements, a file of tables a source's files share) on `engine`,
 /// handing each record's outcome to `each`. Records after the deadline aren't run (Unreached), and
-/// a record past its bound is stopped by the engine (PastBudget).
+/// a record past its bound is stopped by the engine (PastBudget). With `translated`, each record
+/// runs as its translation into the engine's dialect says (crate::dialect), and one with none is
+/// Untranslatable; so is a disagreement after a statement with none (a table it would have made).
 pub fn run_file(
     engine: &mut dyn Engine,
     render: &mut dyn Render,
     text: &str,
     fixture: Option<&str>,
+    translated: Option<Translated<'_>>,
     limits: Limits,
     each: &mut dyn FnMut(Ran<'_>),
 ) -> Result<Counts, String> {
     let mut counts = Counts::default();
+    // The first statement the file's records may rest on that didn't run in the engine's dialect.
+    let mut untranslated: Option<String> = None;
     if let Some(f) = fixture {
         for item in parse(f)? {
             if let Item::Record(r) = item
                 && matches!(r.kind, Kind::Statement { .. })
             {
-                for part in split(&r.sql) {
-                    engine
-                        .run(&part, 0, None)
-                        .map_err(|e| format!("the fixture's line {}: {e:?}", r.line))?;
+                let sql = match translated.map(|t| {
+                    t.fixture
+                        .map_or(Err("the fixture has no translation"), |f| f.get(r.line))
+                }) {
+                    None => r.sql.as_str(),
+                    Some(Ok(sql)) => sql,
+                    Some(Err(why)) => {
+                        untranslated
+                            .get_or_insert_with(|| format!("the fixture's line {}: {why}", r.line));
+                        continue;
+                    }
+                };
+                for part in split(sql) {
+                    match (engine.run(&part, 0, None), translated) {
+                        (Ok(_), _) => {}
+                        // Refused in the dialect: the translation's gap or the dialect's, the
+                        // file's records' to say (classify.rs), not the run's failure.
+                        (Err(e), Some(_)) => {
+                            untranslated.get_or_insert_with(|| {
+                                format!(
+                                    "the fixture's line {}, refused in the dialect: {e:?}",
+                                    r.line
+                                )
+                            });
+                        }
+                        (Err(e), None) => {
+                            return Err(format!("the fixture's line {}: {e:?}", r.line));
+                        }
+                    }
                 }
             }
         }
@@ -162,12 +199,28 @@ pub fn run_file(
             });
             continue;
         }
+        let sql = match translated.map(|t| t.file.get(record.line)) {
+            None => record.sql.as_str(),
+            Some(Ok(sql)) => sql,
+            Some(Err(why)) => {
+                if matches!(record.kind, Kind::Statement { ok: true }) {
+                    untranslated.get_or_insert_with(|| format!("line {}: {why}", record.line));
+                }
+                counts.untranslatable = counts.untranslatable.saturating_add(1);
+                each(Ran {
+                    record: &record,
+                    outcome: Outcome::Untranslatable(why.to_owned()),
+                    nanos: 0,
+                });
+                continue;
+            }
+        };
         let began = Instant::now();
         let until = limits.until(began);
         let outcome = match &record.kind {
             Kind::Statement { ok } => {
                 dirty = true;
-                let ran = split(&record.sql)
+                let ran = split(sql)
                     .iter()
                     .try_for_each(|part| engine.run(part, 0, until).map(drop));
                 match (ran, ok) {
@@ -193,7 +246,7 @@ pub fn run_file(
                 let keep = expected.as_ref().map_or(usize::MAX, |e| {
                     expected_values(e).div_ceil(width).saturating_add(1)
                 });
-                match engine.run(&record.sql, keep, until) {
+                match engine.run(sql, keep, until) {
                     Err(Stop::PastBudget) => Outcome::PastBudget,
                     Err(Stop::Refused(e)) => Outcome::Refused(e),
                     Ok(rows) => {
@@ -209,11 +262,31 @@ pub fn run_file(
                 }
             }
         };
+        let outcome = match (outcome, &untranslated) {
+            (
+                o @ (Outcome::Answer { .. } | Outcome::Refused(_) | Outcome::Accepted),
+                Some(after),
+            ) => Outcome::Untranslatable(format!(
+                "after a statement with no translation ({after}): {o:?}"
+            )),
+            (o, _) => o,
+        };
+        // A statement the file rests on, refused in the engine's dialect: it is this record's
+        // disagreement (classify.rs says whose), and the later records' disagreements rest on it.
+        if translated.is_some()
+            && let (Kind::Statement { ok: true }, Outcome::Refused(e)) = (&record.kind, &outcome)
+        {
+            untranslated.get_or_insert_with(|| {
+                format!("line {}, refused in the dialect: {e}", record.line)
+            });
+        }
         let nanos = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
         if outcome == Outcome::Agree {
             counts.agree = counts.agree.saturating_add(1);
         } else if outcome == Outcome::PastBudget {
             counts.past_budget = counts.past_budget.saturating_add(1);
+        } else if matches!(outcome, Outcome::Untranslatable(_)) {
+            counts.untranslatable = counts.untranslatable.saturating_add(1);
         } else {
             counts.disagree = counts.disagree.saturating_add(1);
         }

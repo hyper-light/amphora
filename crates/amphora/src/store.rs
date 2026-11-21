@@ -27,6 +27,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::meter::{Counters, Meter};
+use crate::reshard::{Pos, Seq, Span};
 
 /// Flushes what an engine has committed to its disk, from the store's flusher thread.
 pub type Flush = Box<dyn Fn() -> std::io::Result<()> + Send + Sync>;
@@ -111,13 +112,109 @@ pub trait Engine: Send + 'static {
 
     /// Keeps `holding` with its rows, in place of the one kept before, in a commit of its own
     /// after everything committed before it, and durable, with all of those, before it returns:
-    /// a restart answers from it, never from a router's memory.
+    /// a restart answers from it, never from a router's memory. In an engine that keeps a log of
+    /// its commits ([`Engine::head`]), it is one entry of it: a fence's.
     fn keep_holding(&mut self, holding: &[u8]) -> anyhow::Result<()> {
         let _ = holding;
         Err(anyhow::anyhow!(
             "this engine keeps no holding, so it can't be a group's"
         ))
     }
+
+    // The copy path of a split, merge or move (CP-T1.9; docs/design/reshard.md, "Copy, then
+    // catch-up, then a brief cutover"). A group's engine keeps a log of its commits: each commit
+    // of rows, and each [`Engine::keep_holding`], is one entry, numbered from 1 in the order made,
+    // and the log's head is the last entry's number. By default an engine keeps none, and a span
+    // can't be copied out of it or into it.
+
+    /// The number of the last entry in its log (0: none yet).
+    fn head(&mut self) -> anyhow::Result<Seq> {
+        Err(no_copy_path())
+    }
+
+    /// The keys whose position is in `span`, in position order, from the first of them: every key
+    /// at the first `positions` positions that have any (so a position's keys are never cut in
+    /// two), each with its rows as they stand now, stamped with the log's head.
+    fn export(&mut self, span: Span, positions: usize) -> anyhow::Result<Exported> {
+        let _ = (span, positions);
+        Err(no_copy_path())
+    }
+
+    /// The keys in `span` changed by entries `after + 1` through `upto` (at most `entries` of
+    /// them, from the first), each with its rows as they stand now, stamped with the log's head:
+    /// none if the log no longer reaches back to `after + 1`.
+    fn changed(
+        &mut self,
+        after: Seq,
+        upto: Seq,
+        span: Span,
+        entries: u64,
+    ) -> anyhow::Result<Option<Changed>> {
+        let _ = (after, upto, span, entries);
+        Err(no_copy_path())
+    }
+
+    /// Writes `moved` over what it holds of each key, one transaction, durable before it returns:
+    /// a key only if [`crate::reshard::holding::replays`] its change over the stamp the key holds,
+    /// and then with the moved stamp.
+    fn import(&mut self, moved: &[Moved]) -> anyhow::Result<()> {
+        let _ = moved;
+        Err(no_copy_path())
+    }
+
+    /// Holds its log from entry `from` on (none: lets it go), durable before it returns: the old
+    /// group's log from the first copy's position until its operation ends. Holding it again
+    /// keeps the older of the two.
+    fn keep_log(&mut self, from: Option<Seq>) -> anyhow::Result<()> {
+        let _ = from;
+        Err(no_copy_path())
+    }
+
+    /// Deletes the rows (and stamps) of the keys at the first `positions` positions in `span`
+    /// that `garbage` says are no longer its, durable before it returns: whether none is left.
+    fn sweep(
+        &mut self,
+        span: Span,
+        positions: usize,
+        garbage: &dyn Fn(Pos) -> bool,
+    ) -> anyhow::Result<bool> {
+        let _ = (span, positions, garbage);
+        Err(no_copy_path())
+    }
+}
+
+fn no_copy_path() -> anyhow::Error {
+    anyhow::anyhow!("this engine keeps no log of its commits, so a span can't be copied with it")
+}
+
+/// A key's rows moving from one group to another (CP-T1.9): its rows encoded by its engine (none:
+/// it has none now), the entry of the old group's log that changed it (for a copy, the log's head)
+/// and the head it was read at, the stamp it is written with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Moved {
+    pub pos: Pos,
+    pub key: String,
+    pub rows: Option<Vec<u8>>,
+    pub entry: Seq,
+    pub at: Seq,
+}
+
+/// A batch of a span's keys, read at entry `at` of the log: through `last` (the last position
+/// whose keys are all in it, none: the span has no key), and `done` when none is past it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exported {
+    pub keys: Vec<Moved>,
+    pub at: Seq,
+    pub last: Option<Pos>,
+    pub done: bool,
+}
+
+/// The keys changed by a run of the log's entries, through entry `through`; `head` the log's head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Changed {
+    pub keys: Vec<Moved>,
+    pub through: Seq,
+    pub head: Seq,
 }
 
 /// What a checkpoint left, in frames of the log: how many it holds, and how many of those aren't in

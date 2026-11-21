@@ -86,6 +86,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   hurts: statements that write hundreds of pages, `insert_batch_100` at 32 clients 392 → 44 a
   second, `delete_range_insert` 2,800 → 1,011 (fedora, 2026-10-22, checks); single-row writes as
   before.
+- **Page reads without the log's shared locks** (G3 step 2, docs/design/store.md decision 40,
+  `crates/engine/storage/log_index.rs`), a prototype behind `AMPHORA_LOG_READ_INDEX`, off by
+  default: the log's header read from a seqlocked copy; a page the log doesn't hold answered from an
+  exact bitmap; the frame index read from a copy published per generation (`published`) or from
+  sharded latest-frame tables under version checks (`optimistic`). Built and tested (a model against
+  the locked index, crashes at every write of a checkpoint and restart); not yet measured, nor a way
+  chosen.
 - **The mixed log's commit costs** (docs/design/store.md, Decision (lane wal-read)): publishing a
   commit's records costs a lookup each, not a pass over the records kept decoded or over the
   commit's pages, and deltas are found a word at a time. Built, not merged; whether the bulk
@@ -269,8 +276,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   latch and finds its row again by key once the leaf's version moves, so it sees its own
   transaction's writes through other cursors. A conformance suite (`conformance.rs`) drives it and
   the current engine's B-tree cursor through the same random operation sequences on a table and two
-  indexes (one descending and NOCASE) and compares every step. Not yet: overflow rows (refused,
-  `TooBig`), dropping a tree, a comparison per tree in one database, the connection's wiring (step 2).
+  indexes (one descending and NOCASE) and compares every step. It puts back a large row's overflow
+  chunks after each leaf's copy (`AC-NS.2.4`). Not yet: a comparison per tree in one database, the
+  connection's wiring (step 2).
 - **Savepoints on the versioned storage** (G7 step 2 in part, `NS.2`;
   `crates/engine/storage/versioned/{version,txn_model}.rs`): a transaction rolls back to a savepoint
   from its versions (rows first changed after it as before the transaction, rows changed before and
@@ -278,8 +286,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   transactions (`txn_model.rs`, `T-NS.2.1`) runs the same random transactions with savepoints on the
   current engine through SQL and on the versioned storage, every read and scan compared, and checks
   each snapshot sees exactly what was committed when it opened (300 seeds pass; the 10,000 are the
-  batch's). Not yet: overflow rows, the catalog (`sqlite_schema`, DDL, trees made and dropped at run
-  time) and ANALYZE, the connection's wiring, so the engine's suites don't yet run on it.
+  batch's). Overflow rows (`AC-NS.2.4`, `overflow.rs`): a value past a cell's room keeps that many
+  bytes in its cell and the rest as versioned chunk rows of the database's overflow tree, written by
+  the same transaction, so snapshots, rollback, savepoints, the redo log and recovery carry them; a
+  page now splits by bytes with the new cell counted (a split by count found no room once cells
+  near the largest size gathered on one side). Trees made and dropped while running (`AC-NS.2.5`): a
+  redo record each, a dropped tree's root listed as 0 in the checkpoint, both replayed; dropped
+  trees' pages stay unreferenced (the pool has no free list yet). Not yet: `sqlite_schema`, DDL and
+  ANALYZE on those trees, the connection's wiring, so the engine's suites don't yet run on it.
 - **Serializable validation, three prototypes behind one switch** (G8 step 1, docs/design/engine.md
   decision 5, `crates/engine/storage/versioned/{version,elle}.rs`, `amphora-bench --cc`): precision
   locking (the default), SSI and Silo-style OCC validate commits on the versioned storage's commit
@@ -389,10 +403,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   Kept (lane split-merge-5): each group's holding is kept by its own engine with its rows
   (`Engine::holding`/`keep_holding`), durable before the group acts on it, and a group started again
   answers from it whatever directory it is started by; a directory member keeps the image it installed
-  (`DirectoryMachine::open`), so a restart needs no catch-up (T-T1.9.R1 to R3). Left: rows indexed by
-  position for copy and sweep, the change feed by log position, the old group's log held through the
-  operation, a split copying the range's rows, the shell carrying the driver's actions to groups,
-  `bench reshard` (AC-T1.9.2) and the three-machine lab (AC-T1.9.3).
+  (`DirectoryMachine::open`), so a restart needs no catch-up (T-T1.9.R1 to R3). Copied (lane
+  split-merge-6): an engine keeps a log of its commits and copies a span by position (`Engine::head`,
+  `export`, `changed`, `import`, `keep_log`, `sweep`); the old group's log is held from the first copy
+  until the operation ends; `Groups::carry` carries every driver action to this node's groups, so a split
+  or merge moves the range's rows, through repeated actions and driver restarts (T-T1.9.R4, R5), with the cutover-pause and lab harnesses (T-T1.9.P1, L1).
+  Left: `database::Local` as a group (its holding and log through a replicated command), moves across
+  nodes, load from the store's meter, and the full AC-T1.9.2 and AC-T1.9.3 runs.
 
 - **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
   `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then
@@ -627,6 +644,12 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   costs say the generic plan does as well; one whose estimates read none keeps its generic plan. Its
   TPC-H prepared measurement (AC-PL.12.1; its harness, `amphora-bench --planner --prepared` with
   qgen's parameters, is written: bench/planner/README.md) and the suite's (AC-PL.12.2) are open.
+  PL.8 is started (docs/design/planner.md "Decision (lane pl8)"): a RIGHT JOIN led by one
+  table is planned as its mirrored LEFT JOIN, CD-C's commutativity rule, so the tables after it are no
+  longer held behind its right table and the audit's 03-right-full-barrier reads tiny first (T-PL.8.1);
+  an outer join's ON term that reads only earlier tables now counts in its join's estimate.
+  Not built: bushy plans over connected complement pairs with a composite hash-join build, and CD-C's
+  rules for outer, semi and anti joins in place of `required_lhs_by_table`; JOB's AC-PL.8.1 is open.
   PL.9 is built (lane pl9, docs/design/planner.md "row counts kept as rows change"): each table's
   rows inserted less deleted since ANALYZE are kept as writes finish (one atomic add a statement),
   the planner's row count follows them, and a prepared statement plans again once a table it counted

@@ -365,6 +365,11 @@ pub struct TableConstraints {
     pub candidates: Vec<ConstraintUseCandidate>,
     /// Conditions that a temporary index may use for a lookup.
     pub temporary_index_terms: SmallVec<[ConstraintRef; 4]>,
+    /// The constraints of a later outer join's ON terms on this table (`y.c = 3` in `y LEFT JOIN
+    /// x ON y.c = 3`): they decide which of this table's rows match that join, not which rows it
+    /// reads, so no access path uses them; only the estimate of that join's matches reads them
+    /// (PL.8, `cardinality.rs`).
+    pub on_elsewhere: Vec<Constraint>,
 }
 
 /// Build the search terms for an automatic index.
@@ -815,6 +820,7 @@ pub fn constraints_from_where_clause(
             table_id: table_reference.internal_id,
             constraints: Vec::new(),
             temporary_index_terms: SmallVec::new(),
+            on_elsewhere: Vec::new(),
             candidates: available_indexes
                 .indexes_for_table(table_reference.internal_id)
                 .map_or(Vec::new(), |indexes| {
@@ -850,12 +856,8 @@ pub fn constraints_from_where_clause(
         for (i, term) in where_clause.iter().enumerate() {
             let join_origin = term.origin.join_origin();
             // Constraints originating from an outer JOIN must always be evaluated in that join's RHS table's loop,
-            // regardless of which tables the constraint references.
-            if let Some(outer_join_tbl) = join_origin.and_then(JoinOrigin::outer_table) {
-                if outer_join_tbl != table_reference.internal_id {
-                    continue;
-                }
-            }
+            // regardless of which tables the constraint references: on another table they go to
+            // `on_elsewhere`, below, which only the join's estimate reads.
 
             // A term must not constrain the loop of a table that an outer join
             // can null-extend, except in the three cases below. Consuming the
@@ -1328,6 +1330,25 @@ pub fn constraints_from_where_clause(
                 }
             }
         }
+        let (own, elsewhere): (Vec<Constraint>, Vec<Constraint>) =
+            std::mem::take(&mut cs.constraints)
+                .into_iter()
+                .partition(|c| {
+                    where_clause
+                        .get(c.where_clause_pos.0)
+                        .and_then(|term| term.origin.join_origin())
+                        .and_then(JoinOrigin::outer_table)
+                        .is_none_or(|outer| outer == table_reference.internal_id)
+                });
+        cs.constraints = own;
+        cs.on_elsewhere = elsewhere;
+        apply_column_stats(
+            &mut cs.on_elsewhere,
+            table_reference,
+            where_clause,
+            schema,
+            params,
+        );
         // sort equalities first so that index keys will be properly constructed.
         // see e.g.: https://www.solarwinds.com/blog/the-left-prefix-index-rule
         // A stable partition, not a comparison: comparing two equalities as

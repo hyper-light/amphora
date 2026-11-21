@@ -153,7 +153,7 @@ fn database(validation: Validation, trees: usize) -> anyhow::Result<Versioned> {
         .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
         .ok_or_else(|| anyhow::anyhow!("/proc/meminfo has no MemAvailable"))?;
     let frames = usize::try_from(kib * 1024 / PAGE_SIZE as u64)?;
-    Ok(Versioned::new(frames, trees, || Box::new(|a: &[u8], b: &[u8]| a.cmp(b))).map_err(e)?.with_validation(validation))
+    Ok(Versioned::new(frames, trees, |_| Box::new(|a: &[u8], b: &[u8]| a.cmp(b))).map_err(e)?.with_validation(validation))
 }
 
 /// What a run counted, across its writers.
