@@ -215,6 +215,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   after it, never an empty database over an existing file. Crash points through commits and
   checkpoints recover a prefix of the commits at least as long as the last acknowledged durable;
   the pool still holds every page, and nothing runs it under SQL yet (stage 3).
+- **The executor's cursor on the versioned storage** (docs/design/engine.md decision 9, NS.1;
+  `crates/engine/storage/versioned/cursor.rs`): `CursorTrait` on a B-link tree's rows as a snapshot
+  sees them, keyed by rowid or by an index's record; it copies a leaf at a time under its shared
+  latch and finds its row again by key once the leaf's version moves, so it sees its own
+  transaction's writes through other cursors. A conformance suite (`conformance.rs`) drives it and
+  the current engine's B-tree cursor through the same random operation sequences on a table and two
+  indexes (one descending and NOCASE) and compares every step. Not yet: overflow rows (refused,
+  `TooBig`), dropping a tree, a comparison per tree in one database, the connection's wiring (step 2).
 - **Ephemeral tables kept between runs** (docs/design/executor.md decision 1,
   `crates/engine/tests/ephemeral_reuse.rs`): a statement keeps each ephemeral table of at most 16
   pages (an IN list's keys, an IN subquery's rows) and empties it on its next run, where building

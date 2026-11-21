@@ -19,7 +19,7 @@
 //! writers, rollbacks, cleanups and collections never wait on each other in a cycle.
 
 use super::blink::{Cell, Change, Descender, Tree};
-use super::page::Flags;
+use super::page::{self, Flags};
 use super::pool::Pool;
 use super::redo::Op;
 use crate::error::LimboError;
@@ -529,6 +529,42 @@ impl VTree {
     /// The tree's root page.
     pub fn root(&self) -> u64 {
         self.tree.root()
+    }
+
+    /// The B-link tree under the versions: a cursor walks its leaves ([`super::cursor`]).
+    pub(super) fn tree(&self) -> &Tree {
+        &self.tree
+    }
+
+    /// `f` on each of cells `cells` of `leaf` (a page under its latch) whose row `snap` sees, in
+    /// key order: its key and that row.
+    pub(super) fn leaf_rows(
+        &self,
+        clock: &Clock,
+        snap: &Snapshot,
+        leaf: &[u8],
+        cells: std::ops::Range<usize>,
+        mut f: impl FnMut(&[u8], &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        for i in cells {
+            let key = page::key(leaf, i)?;
+            let cell = Cell {
+                flags: page::flags(leaf, i)?,
+                value: page::value(leaf, i)?,
+            };
+            if cell.flags.versioned {
+                let row = {
+                    let heads = self.heads(key)?.lock();
+                    Self::visible(clock, snap, Some(cell), heads.get(key))?
+                };
+                if let Some(row) = row {
+                    f(key, &row)?;
+                }
+            } else if !cell.flags.removed {
+                f(key, cell.value)?;
+            }
+        }
+        Ok(())
     }
 
     /// Puts back the version `txn` replaced under `key` (its rollback).

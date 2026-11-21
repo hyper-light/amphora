@@ -6,9 +6,13 @@
 //! the current engine stays the default until the comprehensive suite says otherwise. This stage:
 //! the page format ([`page`]), the buffer pool ([`pool`]), B-link trees on it ([`blink`]) and row
 //! versions on them ([`version`]: snapshots, first-writer-wins, rollback, collection); then their
-//! files ([`disk`]), the redo log ([`redo`]), and checkpoints and recovery ([`durable`]).
+//! files ([`disk`]), the redo log ([`redo`]), and checkpoints and recovery ([`durable`]). Stage 3
+//! begins with the executor's cursor on the trees ([`cursor`]).
 
 pub mod blink;
+#[cfg(test)]
+mod conformance;
+pub mod cursor;
 pub mod disk;
 pub mod durable;
 pub mod page;

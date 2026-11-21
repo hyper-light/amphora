@@ -410,3 +410,17 @@ tests = [
   { id = "T-QT.3.4", text = "A loop over a non-covering index with a term on the index's columns and one on the table's — passes when the answer is unchanged and the table rows fetched are only those the index's term keeps, whatever order the terms are written in" },
   { id = "T-QT.3.5", text = "scripts/check-production.sh after the change — passes when it passes, with the ratchet's counts lowered by what the change removed" },
 ]
+
+# lane nscursor
+# Amphora's own IDs for the executor on the new storage (kiln plan 01a16b0f46fa72e384b8dd0065dc94f9,
+# "G7 The executor on the new storage", CP-T1.3 stage 3): NS.n for its step n.
+
+[[own]]
+id = "NS.1"
+title = "The cursor on the versioned storage: the executor's B-tree cursor operations on the B-link trees (G7 step 1)"
+criteria = [
+  { id = "AC-NS.1.1", text = "a conformance suite of cursor operations passes on both storages with identical results" },
+]
+tests = [
+  { id = "T-NS.1.1", text = "Random operation sequences on both cursors — passes when identical keys, values and positions after each step" },
+]
