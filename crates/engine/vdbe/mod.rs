@@ -36,6 +36,7 @@ pub mod hash_table;
 pub mod insn;
 pub mod metrics;
 pub mod morsel;
+pub mod morsel_scan;
 #[cfg(test)]
 mod native_extension_tests;
 pub mod row_counts;
