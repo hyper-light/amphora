@@ -9,6 +9,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (`CLAUDE.md`), the requirement registry (`docs/requirements.toml`), the design's starting point
   (`docs/design/README.md`), the gate (`scripts/gates.sh`, run by kiln CI from `.kiln/ci.yaml`), and the
   vendoring tool (`scripts/vendor.py`, kiln's).
+- **Records in amphora-api, typed and simulated** (CP-T1.5, kiln goal a1f386fe; lane records-api;
+  docs/design/records.md): the trait's change feed is documented with etcd's watch guarantees and read
+  from the commits' own version rows, and gains `changed` (a wait's answer without waiting);
+  `amphora_api::sim::SimRecords` keeps Amphora's layout in memory, bounded by the caller's
+  `SimLimits`; `amphora_api::index` (index families) and `amphora_api::counter` (counters) type
+  kiln's deploy layout; `amphora_api::conformance` holds kiln-seams' RECORDS-1 to 14, ported, and
+  Amphora's own cases. Amphora (in memory, on a file, through the local owner) and the simulator
+  pass it, and a seeded differential test holds the simulator's answers to Amphora's
+  (`crates/amphora/tests/records_conformance.rs`).
 - **The `amphora` binary** says what it is (`amphora --version`, `amphora --help`), and nothing more yet.
 - **The store's commit pipeline** (CP-T1.1, `crates/amphora/src/store.rs`, docs/design/store.md): one
   writer with a group commit and no timer; durable beside it by a flusher (a write is durable once a
