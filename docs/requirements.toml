@@ -650,6 +650,22 @@ tests = [
   { id = "T-CS.1.1", text = "A doc-truth check of its claims (crates/amphora/tests/columnar_decision.rs) — passes when every claim cited: each citation resolves to a quoted, located claim from a graded source, and each number the decision states is in a quote it cites" },
 ]
 
+# lane g11-copies
+
+[[own]]
+id = "CS.2"
+title = "In-memory columns against persistent column blocks: both prototypes behind one core, measured, the choice made by the numbers (G11 step 2)"
+criteria = [
+  { id = "AC-CS.2.1", text = "Prototype A (blocks in memory, unlogged, rebuilt from the rows) and prototype B (compressed blocks with positional deltas kept as a file, reused at open when current) share one core fed by each commit's redo record" },
+  { id = "AC-CS.2.2", text = "Both prototypes' numbers recorded (write throughput and commit latency at 1 and 32 clients with and without the copy, freshness lag p50 to p99.9, bytes a row, scan speed, the learned block size); the choice made by them; write throughput at 32 clients with the chosen copy kept falls by no more than 5%" },
+]
+tests = [
+  { id = "T-CS.2.1", text = "cs2_scan_at_each_snapshot_equals_rows_{plain,packed} (crates/engine/storage/versioned/columns.rs) — passes when, under concurrent writers and the copy's own rebuilds, every scan of the copy at a fresh or held snapshot equals the rows at that snapshot, and some were answered by the copy with deltas" },
+  { id = "T-CS.2.2", text = "cs2_full_queue_falls_back_to_rows_and_stays_exact — passes when, with a queue too small for most records, no commit is refused and every scan still equals the rows at its snapshot" },
+  { id = "T-CS.2.3", text = "cs2_packed_copy_reused_at_open_only_when_current — passes when prototype B's file is reused at the commit it was written at, scans equal the rows, and it is refused at a later commit" },
+  { id = "T-CS.2.4", text = "amphora-bench --columns (bench/src/columns.rs) — one JSON line a copy and client count with the four measures; passes when recorded under bench/records with hardware, commit, date and load" },
+]
+
 # lane corpus-ci
 # Amphora's own IDs for G2, the competition corpus (kiln plan 01a16b0f461b7065a845f678893846ec):
 # G2.n for its step n.
