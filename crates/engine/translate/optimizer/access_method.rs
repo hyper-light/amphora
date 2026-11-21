@@ -42,7 +42,8 @@ use super::{
     },
     join::JoinPlanningContext,
     multi_index::{
-        consider_multi_index_intersection, consider_multi_index_union, MultiIndexBranchParams,
+        consider_multi_index_intersection, consider_multi_index_union, consider_sorted_fetch,
+        MultiIndexBranchParams,
     },
     order::{
         btree_access_order_consumed, subquery_intrinsic_order_consumed, ColumnTarget,
@@ -1327,9 +1328,34 @@ fn find_best_access_method_for_btree(
             );
         }
 
-        // A sorted fetch (G6 step 5) is a one-branch intersection: one index's rowids, sorted, then
-        // the rows fetched in rowid order.
-        if !sorted_fetches && !has_two_local_constraint_terms(rhs_constraints, where_clause) {
+        if sorted_fetches {
+            if let Some(sorted_fetch) = consider_sorted_fetch(
+                rhs_table,
+                rhs_constraints,
+                &best_access_method,
+                table_references,
+                available_indexes,
+                subqueries,
+                schema,
+                input_cardinality,
+                base_row_count,
+                params,
+                alternative_cost_limit(&best_access_method, best_cost_with_filters),
+                analyze_stats,
+            )? {
+                replace_if_cheaper(
+                    &mut best_access_method,
+                    &mut best_cost_with_filters,
+                    sorted_fetch,
+                    ready_where,
+                    input_cardinality,
+                    params,
+                    whole_reads,
+                );
+            }
+        }
+
+        if !has_two_local_constraint_terms(rhs_constraints, where_clause) {
             return Ok(Some(best_access_method));
         }
         if let Some(multi_idx_and_method) = consider_multi_index_intersection(
@@ -1345,7 +1371,6 @@ fn find_best_access_method_for_btree(
             alternative_cost_limit(&best_access_method, best_cost_with_filters),
             lhs_mask,
             analyze_stats,
-            sorted_fetches,
         )? {
             replace_if_cheaper(
                 &mut best_access_method,
