@@ -9,6 +9,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (`CLAUDE.md`), the requirement registry (`docs/requirements.toml`), the design's starting point
   (`docs/design/README.md`), the gate (`scripts/gates.sh`, run by kiln CI from `.kiln/ci.yaml`), and the
   vendoring tool (`scripts/vendor.py`, kiln's).
+- **Records in amphora-api, typed and simulated** (CP-T1.5, kiln goal a1f386fe; lane records-api;
+  docs/design/records.md): the trait's change feed is documented with etcd's watch guarantees and read
+  from the commits' own version rows, and gains `changed` (a wait's answer without waiting);
+  `amphora_api::sim::SimRecords` keeps Amphora's layout in memory, bounded by the caller's
+  `SimLimits`; `amphora_api::index` (index families) and `amphora_api::counter` (counters) type
+  kiln's deploy layout; `amphora_api::conformance` holds kiln-seams' RECORDS-1 to 14, ported, and
+  Amphora's own cases. Amphora (in memory, on a file, through the local owner) and the simulator
+  pass it, and a seeded differential test holds the simulator's answers to Amphora's
+  (`crates/amphora/tests/records_conformance.rs`).
 - **The `amphora` binary** says what it is (`amphora --version`, `amphora --help`), and nothing more yet.
 - **The store's commit pipeline** (CP-T1.1, `crates/amphora/src/store.rs`, docs/design/store.md): one
   writer with a group commit and no timer; durable beside it by a flusher (a write is durable once a
@@ -262,6 +271,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (`settle_s`; Amphora's loader had left the whole load, 7.5 GB, in its log). `--query` runs a
   statement on a database a run left behind.
 
+- **Groups that split, merge and move themselves** (CP-T1.9, lane split-merge; `crates/amphora/src/reshard/`,
+  docs/design/reshard.md): a pure core: a directory of hash spans with every position in exactly one group,
+  each group's own holding (fenced, stale actions refused), a planner deciding from measured load, bytes and
+  cores, and a driver doing copy, catch-up in rounds and a fenced cutover. Tested in a deterministic
+  simulator (T-T1.9.S1). Left: the shell over Amphora's groups and replicated owners, `bench reshard`
+  (AC-T1.9.2) and the three-machine lab (AC-T1.9.3).
+
 ## Measured
 
 - **The oracles: wrong answers and slow plans** (G2 step 3; `amphora-bench --oracle`, `bench/src/oracle`,
@@ -307,6 +323,16 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   NOCASE)` is 1 where SQLite says 0 (the left operand's collation decides), and `PRAGMA index_xinfo`
   names the rowid's column '' where SQLite gives NULL. CedarDB's server dies on
   `SELECT 0 OR NULL, 1 OR NULL`, and again when it's tried a second time.
+- **The corpus's runner** (G2 steps 4 and 7, lane corpus-ci; `crates/corpus`, built, not yet in the gate):
+  sqllogictest records read, run, rendered (I, R, T as slt_sqlite.c writes them, REALs through Amphora's
+  port of SQLite's printf), sorted and compared (MD5 past the hash threshold) as SQLite's own runner does,
+  one code path for the gate's subset and the bench's run over every engine; each query after a statement
+  settles the engine first (`PRAGMA wal_checkpoint(TRUNCATE)`), and each disagreement classifies as an
+  Amphora bug, a competitor's bug, a dialect difference or a translation gap. `amphora-corpus run <pool>
+  --budget-s <s>` runs a ranked pool on Amphora: required files whole, the rest until the budget, timed on
+  the machine as it runs, so the subset's size is what that machine runs in the budget. Left: the pool
+  chosen and checked in, its line in `scripts/gates.sh`, the bench's adapters for the other engines, the
+  nightly in `.kiln/`.
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691
@@ -364,6 +390,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Next
 
+- **Query speed step 5 (QT.5), started** (lane qs5): `Connection::set_join_methods` plans a connection's new
+  statements by cost, with index nested loops only, or with hash joins only; `tests/join_methods.rs` (T-QT.5.1) runs
+  inner, left, semi and anti joins with NULL and duplicate keys all three ways and against a model. The harness
+  `bench/join_methods` times both methods at 10^2 to 10^7 rows (the check on the join costs, the coordinator's run).
+  Left: the hash join's and the seek's costs and every hash, group and sort budget learned where the engine runs
+  (calibrated at start and from observed operator times). A budget taken from the connection's cache was built
+  but not merged: with today's join costs it flips `records_plans`' one-row-lookup case to a hash join and a sort
+  (the two plans cost about 110 each), so it waits for the learned costs, then the `rhs_has_selective_seek` gate removed, builds over joined inputs, PL.5's Bloom
+  filters with LIP and predicate transfer, and sort-merge and prefetched index joins (G6 step 4).
 - **The replicated class** (docs/design/replication.md, "Fast acknowledgement"; Ada's word 2026-11-01): built on
   t1/replicated-line, not on main (fast-ack, class-metrics, class-quorum and disk-stalls, merged in that order). A
   replicated database opened with `Durability::Replicated(Fates)` answers a write once members spanning the fates
@@ -426,6 +461,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (PL.7, e0e7a1df), bushy plans with CD-C (PL.8, c837cde3), statistics kept as rows change (PL.9,
   26302efe), unnesting by dependent joins (PL.10, 61c79bd1), upper bounds as a guard (PL.11,
   f4e0bd7f), custom then generic plans (PL.12, aa0541f6) and adaptive joins (PL.13, 4f237e07).
+- **G11, analytics at column-store speed** (docs/design/columnar.md, decision 1; sources in
+  docs/research/columnar.md; CS.1): decided, not built. Columns are a copy derived from the rows, fed
+  by each commit's redo record after the commit, exact at every snapshot by a journal of changed keys
+  read from the rows, never logged, every size and time learned where it runs. Next: step 2
+  prototypes it in memory and as persistent blocks, on CP-T1.3's storage once that runs under SQL.
 
 ## Open
 
