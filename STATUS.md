@@ -78,6 +78,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   hurts: statements that write hundreds of pages, `insert_batch_100` at 32 clients 392 → 44 a
   second, `delete_range_insert` 2,800 → 1,011 (fedora, 2026-10-22, checks); single-row writes as
   before.
+- **The mixed log's commit costs** (docs/design/store.md, Decision (lane wal-read)): publishing a
+  commit's records costs a lookup each, not a pass over the records kept decoded or over the
+  commit's pages, and deltas are found a word at a time. Built, not merged; whether the bulk
+  statements now match the page-a-frame log (`AMPHORA_PAGE_LOG=1` in the bench) waits on the
+  interleaved bench.
 - **The planner where the suite found it choosing far more work** (docs/design/planner.md,
   `crates/engine/tests/planner.rs`): a closed range with unknown bounds is 0.5% of its table whether
   it drives a seek or filters one, so a join from a key range looks each row's partner up by key; a
@@ -237,6 +242,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   after it, never an empty database over an existing file. Crash points through commits and
   checkpoints recover a prefix of the commits at least as long as the last acknowledged durable;
   the pool still holds every page, and nothing runs it under SQL yet (stage 3).
+- **The executor's cursor on the versioned storage** (docs/design/engine.md decision 9, NS.1;
+  `crates/engine/storage/versioned/cursor.rs`): `CursorTrait` on a B-link tree's rows as a snapshot
+  sees them, keyed by rowid or by an index's record; it copies a leaf at a time under its shared
+  latch and finds its row again by key once the leaf's version moves, so it sees its own
+  transaction's writes through other cursors. A conformance suite (`conformance.rs`) drives it and
+  the current engine's B-tree cursor through the same random operation sequences on a table and two
+  indexes (one descending and NOCASE) and compares every step. Not yet: overflow rows (refused,
+  `TooBig`), dropping a tree, a comparison per tree in one database, the connection's wiring (step 2).
 - **Serializable validation, three prototypes behind one switch** (G8 step 1, docs/design/engine.md
   decision 5, `crates/engine/storage/versioned/{version,elle}.rs`, `amphora-bench --cc`): precision
   locking (the default), SSI and Silo-style OCC validate commits on the versioned storage's commit

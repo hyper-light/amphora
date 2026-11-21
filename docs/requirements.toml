@@ -422,6 +422,19 @@ tests = [
   { id = "T-QT.3.5", text = "scripts/check-production.sh after the change — passes when it passes, with the ratchet's counts lowered by what the change removed" },
 ]
 
+# lane nscursor
+# Amphora's own IDs for the executor on the new storage (kiln plan 01a16b0f46fa72e384b8dd0065dc94f9,
+# "G7 The executor on the new storage", CP-T1.3 stage 3): NS.n for its step n.
+
+[[own]]
+id = "NS.1"
+title = "The cursor on the versioned storage: the executor's B-tree cursor operations on the B-link trees (G7 step 1)"
+criteria = [
+  { id = "AC-NS.1.1", text = "a conformance suite of cursor operations passes on both storages with identical results" },
+]
+tests = [
+  { id = "T-NS.1.1", text = "Random operation sequences on both cursors — passes when identical keys, values and positions after each step" },
+
 # lane follower-reads (G13 step 4, kiln goal 80d4cf5e; docs/design/replication.md, "Follower reads at a
 # closed time" and "Search over partitions"). AC-T1.10.3 and AC-T1.10.4 are the measures; these are what they
 # rest on.

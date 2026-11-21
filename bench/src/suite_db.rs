@@ -5,7 +5,8 @@
 //! - **amphora**: reads on the store's readers, on what is committed; writes handed to its writer
 //!   (one group: the suite's data isn't split by key), committed with whatever else came, and
 //!   answered once its flusher made them durable. AMPHORA_PACK_LOG=1 packs its log;
-//!   AMPHORA_READER_PAGES sets each reader's page budget, AMPHORA_WRITER_PAGES its writer's;
+//!   AMPHORA_PAGE_LOG=1 logs a page a frame (the log before decision 37, for comparing against the
+//!   mixed log Amphora ships in one binary); AMPHORA_READER_PAGES sets each reader's page budget, AMPHORA_WRITER_PAGES its writer's;
 //!   AMPHORA_COMMIT_ROWS the statements a commit takes at most; AMPHORA_SHARED_PAGES=<pages>
 //!   shares pages among its connections;
 //! - **turso**: upstream Turso at 3e09a82 with its defaults, a connection a client;
@@ -240,6 +241,9 @@ mod amphora_target {
             let db = Db::open_sharing(&path, &sharing)?;
             if std::env::var("AMPHORA_PACK_LOG").ok().as_deref() == Some("1") {
                 db.log_format(amphora::db::LogFormat::Packed)?;
+            }
+            if std::env::var("AMPHORA_PAGE_LOG").ok().as_deref() == Some("1") {
+                db.log_format(amphora::db::LogFormat::Pages)?;
             }
             if let Some(pages) = std::env::var("AMPHORA_WRITER_PAGES").ok().and_then(|v| v.parse().ok()) {
                 db.keep_pages(pages)?;
