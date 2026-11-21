@@ -313,6 +313,16 @@ impl File for UnixFile {
         Ok(())
     }
 
+    /// Amphora (decision 40): `pread` completes in line here, so the plain page path reads with
+    /// no completion: one `pread(2)`, as `pread` does.
+    fn pread_inline(&self, pos: u64, dest: &mut [u8]) -> Result<Option<usize>> {
+        use std::os::unix::fs::FileExt;
+        self.file
+            .read_at(dest, pos)
+            .map(Some)
+            .map_err(|e| io_error(e, "pread"))
+    }
+
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
         let result = unsafe {

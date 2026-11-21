@@ -122,6 +122,17 @@ pub trait DatabaseStorage: Send + Sync {
     fn read_header(&self, c: Completion) -> Result<Completion>;
 
     fn read_page(&self, page_idx: usize, io_ctx: &IOContext, c: Completion) -> Result<Completion>;
+    /// Amphora (G3 step 3, decision 40): reads page `page_idx` into `dest` now, in line, its
+    /// checksum checked as it enters the process, when the storage completes reads in line: the
+    /// bytes read, or `None` when it doesn't (then `read_page` is the read).
+    fn read_page_inline(
+        &self,
+        _page_idx: usize,
+        _io_ctx: &IOContext,
+        _dest: &mut [u8],
+    ) -> Result<Option<usize>> {
+        Ok(None)
+    }
     fn write_page(
         &self,
         page_idx: usize,
@@ -317,6 +328,47 @@ impl DatabaseStorage for DatabaseFile {
             }
             PageTransform::None => self.file.pread(pos, c),
         }
+    }
+
+    fn read_page_inline(
+        &self,
+        page_idx: usize,
+        io_ctx: &IOContext,
+        dest: &mut [u8],
+    ) -> Result<Option<usize>> {
+        let size = dest.len();
+        // The same refusals as `read_page`'s.
+        if page_idx == 0 {
+            return Err(LimboError::Corrupt(
+                "attempted to read page 0 (page numbers start at 1)".into(),
+            ));
+        }
+        if !(512..=65536).contains(&size) || !size.is_power_of_two() {
+            return Err(LimboError::NotADB);
+        }
+        let Some(pos) = u64::try_from(page_idx)
+            .ok()
+            .and_then(|page| page.checked_sub(1))
+            .and_then(|page| page.checked_mul(u64::try_from(size).ok()?))
+        else {
+            return Err(LimboError::IntegerOverflow);
+        };
+        let checksum = match io_ctx.page_transform() {
+            // A codec decodes into a buffer of its own: its reads stay on `read_page`.
+            PageTransform::Codec(_) => return Ok(None),
+            PageTransform::Checksum(ctx) => Some(ctx),
+            PageTransform::None => None,
+        };
+        let Some(read) = self.file.pread_inline(pos, dest)? else {
+            return Ok(None);
+        };
+        // Checked once, here, as the page enters the process (PostgreSQL's rule: `bufmgr.c`
+        // verifies a page as it is read in, never while it stays in shared buffers). An empty
+        // read (past the file's end) has nothing to check, as `read_page`.
+        if let (Some(ctx), true) = (checksum, read > 0) {
+            ctx.verify_checksum(dest, page_idx)?;
+        }
+        Ok(Some(read))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
