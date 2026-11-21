@@ -86,6 +86,7 @@ use std::{
 };
 
 pub(crate) mod access_method;
+mod adaptive;
 mod cardinality;
 pub(crate) mod constraints;
 pub(crate) mod cost;

@@ -95,6 +95,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | planner | – | Decision (lane pl6): No table read whole beneath loops that can give more than one row | [planner.md](design/planner.md#decision-lane-pl6-no-table-read-whole-beneath-loops-that-can-give-more-than-one-row) |
 | planner | – | Decision (lane pl12): custom plans, then a generic one, for prepared statements | [planner.md](design/planner.md#decision-lane-pl12-custom-plans-then-a-generic-one-for-prepared-statements) |
 | planner | – | Decision (lane pl9): row counts kept as rows change, statements planned again past their statistics' error | [planner.md](design/planner.md#decision-lane-pl9-row-counts-kept-as-rows-change-statements-planned-again-past-their-statistics-error) |
+| planner | – | Decision (lane pl13): a nested loop that turns into a hash join at the learned costs' break-even, and a plan made again past its estimate's error | [planner.md](design/planner.md#decision-lane-pl13-a-nested-loop-that-turns-into-a-hash-join-at-the-learned-costs-break-even-and-a-plan-made-again-past-its-estimates-error) |
 | records-compaction | – | Durable progress and retention | [records-compaction.md](design/records-compaction.md#durable-progress-and-retention) |
 | records-compaction | – | Dirty-page and serialized bounds | [records-compaction.md](design/records-compaction.md#dirty-page-and-serialized-bounds) |
 | records-compaction | – | Embedded owner compatibility | [records-compaction.md](design/records-compaction.md#embedded-owner-compatibility) |
