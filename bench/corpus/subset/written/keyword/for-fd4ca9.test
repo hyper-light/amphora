@@ -1,0 +1,64 @@
+hash-threshold 8
+
+# written for keyword:FOR: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+statement ok
+CREATE TABLE kfr(a)
+
+statement ok
+CREATE TABLE kfl(n)
+
+statement ok
+CREATE TRIGGER kfr1 AFTER INSERT ON kfr FOR EACH ROW BEGIN INSERT INTO kfl VALUES (NEW.a); END
+
+statement ok
+CREATE TRIGGER kfr2 BEFORE DELETE ON kfr FOR EACH ROW WHEN OLD.a > 1 BEGIN INSERT INTO kfl VALUES (-OLD.a); END
+
+statement ok
+INSERT INTO kfr VALUES (1), (2), (3)
+
+statement ok
+DELETE FROM kfr WHERE a >= 2
+
+query I nosort
+SELECT n FROM kfl ORDER BY rowid
+----
+1
+2
+3
+-2
+-3
+
+statement ok
+CREATE TRIGGER kfr3 AFTER UPDATE ON kfr FOR EACH ROW BEGIN INSERT INTO kfl VALUES (NEW.a * 100); END
+
+statement ok
+UPDATE kfr SET a = a + 1
+
+query I nosort
+SELECT n FROM kfl ORDER BY rowid
+----
+1
+2
+3
+-2
+-3
+200
+
+statement error
+CREATE TRIGGER kfr4 AFTER INSERT ON kfr FOR EACH STATEMENT BEGIN SELECT 1; END
+
+statement error
+CREATE TRIGGER kfr5 AFTER INSERT ON kfr FOR ROW BEGIN SELECT 1; END

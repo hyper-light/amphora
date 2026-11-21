@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 
 pub(super) struct Backend {
     pub(super) client: crate::transport::Client,
+    /// The descriptor its calls' socket holds, charged to the process's descriptor budget while
+    /// this client lives (local-owner-transport.md, "One descriptor budget", item 6).
+    _descriptor: crate::descriptors::Held,
     path: PathBuf,
     restart: Mutex<
         Option<(
@@ -117,6 +120,7 @@ pub(super) fn attach(
         &api::replication::ReplicaConfig,
         &api::replication::Durability,
     )>,
+    descriptor: crate::descriptors::Held,
     until: Instant,
 ) -> Result<Database, Refusal> {
     let client = crate::transport::Client::connect(path, until)?;
@@ -146,6 +150,7 @@ pub(super) fn attach(
             path: OnceLock::new(),
             writer: Writer::Client(Backend {
                 client,
+                _descriptor: descriptor,
                 path: path.to_path_buf(),
                 restart: Mutex::new(restart),
                 promoted: Mutex::new(None),
@@ -356,8 +361,10 @@ impl Database {
             }
         }
         // Admission before the probe: a probe makes the endpoint directory and takes the lease,
-        // which a full table would refuse to anyone who went on to open.
-        api::bound("open database owners", owners.len().saturating_add(1), 4096)?;
+        // which a spent descriptor budget would refuse to anyone who went on to open. The charge
+        // is the probe's lease, then the attached client's socket (local-owner-transport.md, "One
+        // descriptor budget", item 6).
+        let descriptor = crate::descriptors::process()?.take("open descriptors", 1)?;
         // No owner holds a lease under a directory that doesn't exist; attach makes no directory.
         if !parent(&path).try_exists().map_err(unavailable)? {
             return Ok(None);
@@ -378,20 +385,23 @@ impl Database {
             // This process drained the owner here: a child it forked may share the lease until its
             // exec. Wait for it to the deadline; once free, no owner holds it.
             drop(owners);
-            let mut pause = FIRST_PAUSE;
+            let (since, mut pause) = (Instant::now(), None);
+            let mut probed = since;
             loop {
                 if Instant::now() >= until {
                     lease_held_since_drain(&path);
                     return Err(Refusal::Timeout);
                 }
-                pause_for_lease(&mut pause, until);
+                pause_for_lease(&mut pause, probed, since, until);
+                probed = Instant::now();
                 if let Some(lease) = crate::transport::try_lease(&path)? {
                     drop(lease);
+                    drain_window_taken(since);
                     return Ok(None);
                 }
             }
         }
-        let database = attach(&path, expected, until)?;
+        let database = attach(&path, expected, descriptor, until)?;
         owners.insert(
             path,
             Owner {
@@ -638,30 +648,15 @@ mod tests {
         );
     }
 
+    /// CP-T1.5 (U05), AC-FD.1.4 (local-owner-transport.md, "One descriptor budget", item 6): with
+    /// the descriptor budget spent, open, open_replicated and attach_replicated under directories
+    /// that don't exist are refused at the budget and make none of them. Do: a budget of 2, both
+    /// held; the three opens. Expect: each refused TooLarge at 2; no directory made.
     #[test]
-    fn opens_refused_at_the_owner_bound_make_no_directory() {
-        // CP-T1.5 (U05): with the owner table full, open, open_replicated and attach_replicated
-        // under directories that don't exist are refused at the bound and make none of them.
-        if !in_child("database::remote::tests::opens_refused_at_the_owner_bound_make_no_directory")
-        {
-            return;
-        }
+    fn opens_refused_at_the_descriptor_budget_make_no_directory() {
+        let budget = crate::descriptors::tests::budget(2);
+        let _spent = budget.take("open descriptors", 2).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let held = Arc::new(File::create(dir.path().join("held")).unwrap());
-        {
-            let mut owners = OWNERS.get_or_init(Mutex::default).lock().unwrap();
-            for n in 0..4096 {
-                owners.insert(
-                    dir.path().join(format!("full-{n}")),
-                    Owner {
-                        shared: Weak::new(),
-                        lease: Arc::downgrade(&held),
-                        identity: None,
-                        key: None,
-                    },
-                );
-            }
-        }
         let before = entries(dir.path());
         let (db, log) = (
             dir.path().join("a").join("db"),
@@ -669,7 +664,7 @@ mod tests {
         );
         let full = |refused: Result<(), Refusal>| {
             assert!(
-                matches!(refused, Err(Refusal::TooLarge { limit: 4096, .. })),
+                matches!(refused, Err(Refusal::TooLarge { limit: 2, .. })),
                 "{refused:?}"
             );
         };
@@ -683,42 +678,21 @@ mod tests {
         );
     }
 
+    /// CP-T1.5 (U05), AC-FD.1.4 (local-owner-transport.md, "One descriptor budget", item 6):
+    /// attach with the descriptor budget spent, on a database no process owns, is refused at the
+    /// budget and leaves no endpoint directory or lease behind. Do: a budget of 2, both held;
+    /// attach_replicated. Expect: refused TooLarge at 2; no endpoint directory.
     #[test]
-    fn attach_refuses_at_the_owner_bound_before_it_touches_the_lease() {
-        // CP-T1.5 (U05): attach with the owner table full, on a database no process owns, is
-        // refused at the bound and leaves no endpoint directory or lease behind.
-        if !in_child(
-            "database::remote::tests::attach_refuses_at_the_owner_bound_before_it_touches_the_lease",
-        ) {
-            return;
-        }
+    fn attach_refuses_at_the_descriptor_budget_before_it_touches_the_lease() {
+        let budget = crate::descriptors::tests::budget(2);
+        let _spent = budget.take("open descriptors", 2).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let held = Arc::new(File::create(dir.path().join("held")).unwrap());
-        {
-            let mut owners = OWNERS.get_or_init(Mutex::default).lock().unwrap();
-            for n in 0..4096 {
-                owners.insert(
-                    dir.path().join(format!("full-{n}")),
-                    Owner {
-                        shared: Weak::new(),
-                        lease: Arc::downgrade(&held),
-                        identity: None,
-                        key: None,
-                    },
-                );
-            }
-        }
         let path = dir.path().join("db");
-        let config = api::replication::ReplicaConfig {
-            node_id: 1,
-            voters: vec![1],
-            learners: vec![],
-            bootstrap: None,
-        };
-        let attached = Database::attach_replicated(&path, &dir.path().join("log"), config, until());
+        let attached =
+            Database::attach_replicated(&path, &dir.path().join("log"), config(), until());
         assert!(
-            matches!(attached, Err(Refusal::TooLarge { limit: 4096, .. })),
-            "attach at the bound: {:?}",
+            matches!(attached, Err(Refusal::TooLarge { limit: 2, .. })),
+            "attach at the budget: {:?}",
             attached.map(|d| d.is_some())
         );
         let mut sidecar = path.into_os_string();
@@ -727,6 +701,36 @@ mod tests {
             !Path::new(&sidecar).exists(),
             "the refused attach made the endpoint directory"
         );
+    }
+
+    /// AC-FD.1.4, T-FD.1.4 (local-owner-transport.md, "One descriptor budget", item 6): an owner
+    /// charges its lease to the process's descriptor budget, not to a count of owners, and gives
+    /// it back once drained. Do: a budget of 1; open one database; open a second; drop the first
+    /// and, once its lease's descriptor is given back, open the second again. Expect: the first
+    /// open holds 1; the second refused TooLarge at 1; then served.
+    #[test]
+    fn an_owner_charges_its_lease_to_the_descriptor_budget() {
+        let budget = crate::descriptors::tests::budget(1);
+        let dir = tempfile::tempdir().unwrap();
+        let first = Database::open(&dir.path().join("first"), until()).unwrap();
+        assert_eq!(budget.held(), 1);
+        let second = dir.path().join("second");
+        let refused = Database::open(&second, until()).map(drop);
+        assert!(
+            matches!(refused, Err(Refusal::TooLarge { limit: 1, .. })),
+            "{refused:?}"
+        );
+        drop(first);
+        // The owner drains on its own threads; the lease's descriptor is given back after.
+        let deadline = until();
+        while budget.held() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the drained owner's lease was kept"
+            );
+            std::thread::park_timeout(std::time::Duration::from_millis(1));
+        }
+        drop(Database::open(&second, until()).unwrap());
     }
 
     #[test]

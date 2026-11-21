@@ -105,6 +105,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "amphora-columnar"
+version = "0.1.0"
+
+[[package]]
 name = "amphora-corpus"
 version = "0.1.0"
 dependencies = [

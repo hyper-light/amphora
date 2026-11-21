@@ -177,6 +177,52 @@ recently committed writes, cheap for short transactions. Jordan, Banerjee, Ma, "
 **Falsified by.** A serializable history with a cycle (Elle, AC-T1.3); validation costing more than
 a fifth of a short transaction's time on the suite's `txn_read_write`.
 
+**Prototypes (G8 step 1, AC-G8.1.1, AC-G8.1.2).** Three validations sit behind one switch on the
+commit path (`storage/versioned/version.rs`, `Validation`, chosen per database by
+`Versioned::with_validation`; precision locking the default as this decision says, until the
+measurements below choose). Each validates inside the publish lock, so no commit lands between a
+transaction's check and its timestamp, and each refuses with `SerializationFailure`, the
+transaction rolled back. Reads that count are the ones made through `VTree::read` and
+`VTree::read_range` (a row by key; a span from a key to the last row given, or to the end when
+fewer came back than asked); a write's own read of its row needs no keeping, since the first
+writer's win already refuses a row changed since the snapshot.
+
+- *Precision locking* (HyPer): a transaction that wrote checks its rows and spans against the rows
+  written by every commit since its snapshot; one that only read commits unchecked, serialized at
+  its snapshot (a prefix of the commit order). Kept between commits: each writing commit's rows,
+  while a snapshot older than it is open.
+- *SSI* (PostgreSQL, after Cahill et al. and Ports and Grittner): read-write antidependencies
+  between concurrent transactions, each pair found at the later commit of the two, so only
+  committed transactions are checked; refused where the committing transaction would be the pivot
+  of `in -> pivot -> out` with `out` committed no later than `in`, or the `in` of a pivot that
+  committed with an `out` before it (Fekete et al.'s theorem: every cycle holds such a structure
+  whose `out` commits first). Readers are validated too (the read-only anomaly). Kept: every
+  commit's rows read and written, and its earliest `out`, while a snapshot older than it is open.
+- *OCC* (Silo): each row read is checked in its tree, by the version its head names, for a commit
+  since the snapshot; each span is read again for one. Silo's node set (a leaf's version) is
+  replaced by the rows of the span, since an open writer's in-place change moves a leaf's version
+  and would refuse the transactions reading beside it, its own included; Silo's refusal of a row
+  locked by an open writer is left out, since that writer commits after the publish lock and so
+  after the reader in the serial order. TicToc's lazily chosen commit timestamps don't apply: a
+  snapshot here is a prefix of commit timestamps, and a commit placed in the past would change
+  what open snapshots have already read. Kept: nothing.
+
+Precision locking and OCC refuse the same transactions (a row or span read that a commit since
+the snapshot wrote) by different work: a scan of the recent commits' rows against a transaction's
+reads, against a look-up of each read row and a second read of each span. SSI refuses fewer (a lone
+antidependency commits) for more kept state. The tests: `version.rs`'s `g8_1_*` (write skew, a
+phantom closing a cycle, a lone antidependency, the read-only anomaly, an open writer of a row
+read, and the kept commits bounded by the oldest snapshot); `storage/versioned/elle.rs`, Elle's
+list-append and register histories from its own generator, 32 transactions open at once, checked
+for G0, G1a, G1b, G1c, G-single and G2, with snapshot isolation as the control that shows G2. The
+throughput, refusals and p99 of each on the suite's write classes and K0 come from
+`amphora-bench --cc`, not yet recorded.
+
+A race this work found and fixed: a transaction or snapshot read the last published timestamp
+before counting itself open, so a commit and a collection between the two could drop versions it
+needed (and, with validation, the commits it must be checked against). It now reads the timestamp
+under the open snapshots' lock, which the low watermark takes too.
+
 ## 6. Durability: a row's change logged once, at commit
 
 **Decision.** A commit appends one redo record: each row change of the transaction (the B-tree, the
@@ -288,6 +334,43 @@ commit appended before it durable. Five mutants each fail the test written for t
 without rewriting the newest journal, making a database whenever the header is unreadable,
 checkpoints that don't stop the log when they fail, redo tails left uncut, and versions left on
 recovered cells (which fails five).
+
+## 10. Memory: versions pruned between snapshots, one budget, typed refusals
+
+**Decision.** Collection keeps, of a row's older versions, only those an open snapshot sees: for
+each open snapshot the newest version at or before it unless it sees the row's newest, every
+version after the last commit read with the snapshots and the newest at or before it (what a
+snapshot opened meanwhile may see), and the version an open writer replaced (its rollback's). A
+long reader so holds one version a row, not one an update. Every byte kept beside the pages (row
+versions and their heads, each transaction's write and read records, the commits kept for
+validation) is charged to one budget, reserved before anything changes and refused past it with a
+typed `MemoryBudget`, the change refused whole. Commits are kept for validation only while a
+transaction begun before them is open: a read-only snapshot never validates. A transaction's reads
+that the budget can't take become its whole tree, one span. The budget is the shell's
+(`Versioned::with_budget`, the process's memory as `crates/amphora/src/memory.rs` learns it where
+it runs); until the shell opens this storage, the pool's own bytes.
+
+**Why.** The low watermark alone bounds versions by the oldest snapshot: one reader held an hour
+keeps every version written since, which no budget survives. Pruning between snapshots bounds them
+by rows times open snapshots; the budget turns what is left into a refusal a caller can handle
+instead of the process running out of memory. Escalation keeps a long serializable reader running:
+a coarser record refuses more, never fewer.
+
+**Sources.** Böttcher, Leis, Neumann, Kemper, "Scalable Garbage Collection for In-Memory MVCC
+Systems", PVLDB 12(6), 2019 (Steam: eager pruning of versions no active snapshot sees). Lee et al.,
+"Hybrid Garbage Collection for Multi-Version Concurrency Control in SAP HANA", SIGMOD 2016
+(interval collection). Alhomssi, Leis, PVLDB 2023 (LeanStore: version records in the buffer
+manager, bounded by it). Ports, Grittner, PVLDB 5(12), 2012 (PostgreSQL SSI: predicate locks
+promoted to coarser grains when memory runs short). The MySQL reference manual, "InnoDB
+Multi-Versioning" (undo in buffer-pool pages).
+
+**Evidence.** `version.rs`'s T-G8.2.1 soak (one reader, 32 writers, a collector; precision locking
+and SSI), T-G8.2.2 and T-G8.2.3.
+
+**Falsified by.** The hour-long soak (`AMPHORA_G8_SOAK_SECONDS=3600`) finding the budget held past
+its limit, an untyped failure, a scan that isn't its snapshot's, or bytes not given back; or a
+workload whose refusals under the budget a version store out of memory (LeanStore's graveyard)
+would have avoided at a cost the suite accepts (the step this leaves open).
 
 ## Stages, each measured
 

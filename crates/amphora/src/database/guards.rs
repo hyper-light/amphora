@@ -29,13 +29,33 @@ impl Guards {
 #[derive(Clone)]
 pub(crate) struct Owned {
     lease: Arc<File>,
+    // The lease's descriptor, charged to the process's descriptor budget (local-owner-transport.md,
+    // "One descriptor budget", item 6). Declared after the lease, so given back once it is closed.
+    _descriptor: Arc<crate::descriptors::Held>,
     // Declared after the lease, so dropped after it: the group outlives the lease it came with.
     guards: Option<Guards>,
 }
 
 impl Owned {
-    pub(crate) fn new(lease: Arc<File>, guards: Option<Guards>) -> Self {
-        Self { lease, guards }
+    pub(crate) fn new(
+        lease: Arc<File>,
+        descriptor: crate::descriptors::Held,
+        guards: Option<Guards>,
+    ) -> Self {
+        Self {
+            lease,
+            _descriptor: Arc::new(descriptor),
+            guards,
+        }
+    }
+
+    /// A lease a test made, charged to a budget of its own rather than the process's.
+    #[cfg(test)]
+    pub(crate) fn unbudgeted(lease: Arc<File>, guards: Option<Guards>) -> Self {
+        let descriptor = crate::descriptors::Descriptors::fixed(1)
+            .take("a test's lease", 1)
+            .unwrap();
+        Self::new(lease, descriptor, guards)
     }
 
     pub(crate) fn lease(&self) -> &Arc<File> {
@@ -424,7 +444,7 @@ mod tests {
         let log = existing_path(&gone.join("log")).unwrap();
         std::fs::remove_dir(&gone).unwrap();
         let owned = |guards: Option<Guards>| {
-            Owned::new(
+            Owned::unbudgeted(
                 Arc::new(File::create(dir.path().join("lease")).unwrap()),
                 guards,
             )

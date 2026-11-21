@@ -23,8 +23,10 @@ pub fn is_replica(path: &std::path::Path) -> Result<bool, Refusal> {
     if !path.try_exists().map_err(unavailable)? {
         return Ok(false);
     }
+    let descriptor = crate::descriptors::process()?.take("open descriptors", 1)?;
     let owner = crate::database::Owned::new(
         std::sync::Arc::new(crate::database::exclusive_file(path)?),
+        descriptor,
         None,
     );
     let mut db = Db::open_readonly(path).map_err(unavailable)?;
@@ -40,8 +42,10 @@ pub fn inspect_source(path: &std::path::Path, source_node: u64) -> Result<Bootst
     if source_node == 0 {
         return Err(api::invalid("baseline source", "node ID must be positive"));
     }
+    let descriptor = crate::descriptors::process()?.take("open descriptors", 1)?;
     let owner = crate::database::Owned::new(
         std::sync::Arc::new(crate::database::exclusive_file(path)?),
+        descriptor,
         None,
     );
     let mut db = Db::open_readonly(path).map_err(unavailable)?;
@@ -586,7 +590,7 @@ mod tests {
         };
         let open = |node| {
             let path = dir.path().join(format!("machine-{node}.db"));
-            let owner = crate::database::Owned::new(
+            let owner = crate::database::Owned::unbudgeted(
                 std::sync::Arc::new(crate::database::exclusive_file(&path).unwrap()),
                 None,
             );
