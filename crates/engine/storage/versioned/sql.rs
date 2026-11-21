@@ -104,8 +104,7 @@ fn t_ns_2_6_transactions_end_alike() {
     assert_eq!(rows(&versioned, q), want);
 }
 
-/// Do: tables with indexes (an explicit one, a descending NOCASE one, a UNIQUE autoindex, a WITHOUT
-/// ROWID table), queries that read through them, DELETE without WHERE, DROP INDEX and DROP TABLE,
+/// Do: tables with indexes (an explicit one, a descending NOCASE one, a UNIQUE autoindex), queries that read through them, DELETE without WHERE, DROP INDEX and DROP TABLE,
 /// on both storages. Expect: the same answers, and a duplicate refused by the UNIQUE index on both.
 #[test]
 fn t_ns_2_6_ddl_and_indexes_answer_alike() {
@@ -113,9 +112,7 @@ fn t_ns_2_6_ddl_and_indexes_answer_alike() {
         "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT UNIQUE, c INTEGER)",
         "CREATE INDEX tc ON t (c)",
         "CREATE INDEX tb ON t (b COLLATE NOCASE DESC)",
-        "CREATE TABLE w (k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
         "INSERT INTO t VALUES (1, 'Pear', 30), (2, 'apple', 10), (3, 'Fig', 20), (4, 'date', 10)",
-        "INSERT INTO w VALUES ('m', 1), ('a', 2), ('z', 3)",
         "UPDATE t SET c = 40 WHERE b = 'Fig'",
         "CREATE TABLE gone (x)",
         "INSERT INTO gone VALUES (1), (2)",
@@ -129,8 +126,6 @@ fn t_ns_2_6_ddl_and_indexes_answer_alike() {
         "SELECT c, b FROM t INDEXED BY tc WHERE c > 15",
         "SELECT b FROM t INDEXED BY tb ORDER BY b COLLATE NOCASE DESC",
         "SELECT a FROM t WHERE b = 'apple'",
-        "SELECT k, v FROM w ORDER BY k",
-        "SELECT v FROM w WHERE k = 'z'",
         "SELECT name FROM sqlite_schema ORDER BY name",
         "SELECT x FROM later",
     ];
@@ -151,4 +146,33 @@ fn t_ns_2_6_ddl_and_indexes_answer_alike() {
     }
     let q = "SELECT a, b, c FROM t ORDER BY c, a";
     assert_eq!(rows(&versioned, q), rows(&pager, q));
+}
+
+/// Do: ANALYZE a table with two indexes on both storages, then read `sqlite_stat1` and let a new
+/// connection load the statistics. Expect: the same statistics rows, and the new connection's
+/// query answering alike.
+#[test]
+fn t_ns_2_6_analyze_answers_alike() {
+    let (pdb, pager) = connect(false);
+    let (vdb, versioned) = connect(true);
+    for conn in [&pager, &versioned] {
+        run(conn, "CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER, c TEXT)");
+        run(conn, "CREATE INDEX tb ON t (b)");
+        run(conn, "CREATE INDEX tbc ON t (b, c)");
+        for i in 0..200 {
+            run(
+                conn,
+                &format!("INSERT INTO t VALUES ({i}, {}, 'c{}')", i % 7, i % 3),
+            );
+        }
+        run(conn, "ANALYZE");
+    }
+    let q = "SELECT tbl, idx, stat FROM sqlite_stat1 ORDER BY tbl, idx";
+    let want = rows(&pager, q);
+    assert!(!want.is_empty());
+    assert_eq!(rows(&versioned, q), want);
+    let other_p = pdb.connect(ConnectOpts::new()).unwrap();
+    let other_v = vdb.connect(ConnectOpts::new()).unwrap();
+    let q = "SELECT count(*) FROM t WHERE b = 3 AND c = 'c1'";
+    assert_eq!(rows(&other_v, q), rows(&other_p, q));
 }

@@ -285,8 +285,16 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   page now splits by bytes with the new cell counted (a split by count found no room once cells
   near the largest size gathered on one side). Trees made and dropped while running (`AC-NS.2.5`): a
   redo record each, a dropped tree's root listed as 0 in the checkpoint, both replayed; dropped
-  trees' pages stay unreferenced (the pool has no free list yet). Not yet: `sqlite_schema`, DDL and
-  ANALYZE on those trees, the connection's wiring, so the engine's suites don't yet run on it.
+  trees' pages stay unreferenced (the pool has no free list yet).
+- **The switch: SQL on the versioned storage** (G7 step 2, `AC-NS.2.1`, docs/design/engine.md
+  decision 13, `crates/engine/storage/versioned/{switch,sql}.rs`): `ConnectOpts::with_versioned_storage`
+  or `AMPHORA_STORAGE=versioned` puts a database's B-trees on the versioned storage; the executor's
+  cursors, CREATE/DROP TABLE and INDEX, DELETE without WHERE, `sqlite_schema` (tree 1) and ANALYZE
+  run on it, each SQL transaction one storage transaction. `sql.rs` (`T-NS.2.6`) runs the same SQL
+  on both storages and compares. Not yet: a file database reopened (recovery remakes every tree in
+  rowid order; the header stays the pager's), a statement's own rollback inside a transaction, DROP
+  undone by ROLLBACK, a pool past the page cache's bound; the engine's suites with the switch on are
+  the coordinator's run.
 - **Serializable validation, three prototypes behind one switch** (G8 step 1, docs/design/engine.md
   decision 5, `crates/engine/storage/versioned/{version,elle}.rs`, `amphora-bench --cc`): precision
   locking (the default), SSI and Silo-style OCC validate commits on the versioned storage's commit
