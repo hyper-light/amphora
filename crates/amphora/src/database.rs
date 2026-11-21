@@ -213,6 +213,7 @@ fn admission_refusal(error: store::Refused) -> Refusal {
         store::Refused::Stopped => unavailable("database writer stopped"),
         store::Refused::Failed => unavailable("transaction could not be committed"),
         store::Refused::Groups => api::invalid("database batch", "cross-group submission"),
+        store::Refused::Away(_) => unavailable(error),
     }
 }
 
