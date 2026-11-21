@@ -161,10 +161,6 @@ impl Pace {
             current: TickPace::floor(start),
         }
     }
-    /// The pace in force.
-    pub(super) fn pace(&self) -> TickPace {
-        self.current
-    }
     /// The period between ticks in force.
     pub(super) fn period(&self) -> Duration {
         self.current.period
@@ -415,18 +411,18 @@ mod tests {
     fn tick_the_pace_follows_the_measured_election() {
         let near = measured(MS / 2, MS / 10);
         let far = measured(80 * MS, 20 * MS);
-        assert!(near.pace().samples > 0 && far.pace().samples > 0);
+        assert!(near.current.samples > 0 && far.current.samples > 0);
         // Its ticks cover the measured election, whichever period that takes.
         for pace in [&near, &far] {
-            let timeout = pace.pace().election_timeout(20);
-            assert!(timeout >= pace.pace().covered, "{:?}", pace.pace());
+            let timeout = pace.current.election_timeout(20);
+            assert!(timeout >= pace.current.covered, "{:?}", pace.current);
         }
         // A slower group's paths and link take a longer period than a near one's.
         assert!(
             far.period() > near.period(),
             "{:?} vs {:?}",
-            far.pace(),
-            near.pace()
+            far.current,
+            near.current
         );
         // Neither is bound by the period the owner opened with.
         assert_ne!(near.period(), Duration::from_millis(10));

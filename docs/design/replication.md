@@ -2355,6 +2355,52 @@ the owner's `the_first_restart_is_free_and_the_next_waits_on_its_share`.
 **Falsified by:** the restarts bench (AC-T1.4.3, restarts on against off) with p99.9 moved more than with the fixed
 window; a restart's hold larger than every one of the last thousand pushing the share past the tail in a run.
 
+## Decision (lane constants): the owner's tick pace (2026-11-21)
+
+Ada's rule: no picked numbers. `TICK` (10 ms) was the replicated owner's period between ticks, so its core's twenty
+ticks made a 200 ms election timeout and its two a 20 ms heartbeat on every host and every network, whatever its
+paths measured. No measurement made 10 ms.
+
+**The decision (TP.1).** The owner learns its period where it runs (`database/pace.rs`) and derives it by the
+vendored hyper-raft's own law (`docs/timing.md` §2.1–§2.3 there):
+- each voter's round trips, from the replication messages' own sends and answers: heartbeats, pre-votes and votes,
+  none of which touches the voter's disk; a request is timed only once every earlier one to that peer is answered
+  (Karn and Partridge 1987), and the smoothed estimator is RFC 9002 §5.3's (`hyper_timing::ExchangeRtt`);
+- the flush a vote waits for: the mean of the replica's vote writes (hyper-durable's `Replica::flushes`), or before
+  one the mean of its log writes (`Output::flushed`), as hyper-durable's own `Replica::measure` takes them;
+- the leader's link: the lateness of each heartbeat at a follower, or each answer to one at the leader, past the
+  interval its heartbeats leave at, folded for the term (a new term is a new link);
+- the timer's granularity: the lateness of the owner's own timed waits (`hyper_timing::Lateness`).
+From them hyper-timing's ballot and split-vote span (`Ballot::measure`, `Ballot::span`), the margin that minimizes
+the group's unavailability on the link's arrivals at the heartbeat interval (`arrival_detector_at`, the MTBF the
+Jeffreys one of the owner's own exposure, `Exposure`), the election timing (`ElectionTiming::derive`) and the period
+at which the core's fixed tick counts cover it (`TickPace::derive`), no finer than the timer's granularity and with no
+ceiling picked. It is derived once an election timeout, the ticks the core draws each timeout over. The write slot's
+bounds, the owner's session lease, the quorum patience's gauge and the bootstrap hand-off's retry read the pace in
+force.
+
+**The start state.** Before a quorum's paths, the timer and the link are measured, the pace is hyper-timing's
+`TickPace::floor`, "the pace with nothing measured: the configured period" (hyper-timing's lib.rs): the 10 ms the
+owner opens with, so a group can elect its first leader, whose votes are the first round trips measured. Once
+measured, it bounds nothing: the period goes below it on a near network and above it on a far one.
+
+**What is left.** The core's tick counts (twenty for an election, two for a heartbeat) are hyper-raft's `Config::new`,
+raft-rs 0.7's defaults: a core in tick mode fixes them when it opens (`TickPace`'s premise), so the measured period
+carries the time. Deriving the counts themselves means moving the owner to the core's elections by suspicion
+(`Elections::Suspicion`), which take no ticks. The owner's exposure counts only since it opened: its restarts and the
+group's failures are not stored.
+
+**Tests.** `election_tick_an_answer_times_its_own_request`,
+`election_tick_a_request_sent_behind_unanswered_ones_waits_for_their_answers`,
+`election_tick_a_peer_the_core_takes_for_lost_starts_its_count_again` (T-TP.1.1);
+`tick_the_pace_is_the_start_until_a_quorum_the_timer_and_the_link_are_measured`,
+`tick_the_pace_follows_the_measured_election`,
+`tick_a_new_term_measures_its_link_afresh_and_a_member_that_left_is_forgotten` (T-TP.1.2); the driven election,
+patience and lease tests, which read each owner's pace instead of assuming 10 ms (T-TP.1.3).
+
+**Falsified by:** a multi-node group on real clocks whose leader steps down or whose followers campaign more often
+with the learned pace than with 10 ms; a failover p99 past the requirement's 1000 ms where 10 ms met it.
+
 ## A follower's write that read nothing written since its base: read sets (built 2026-11-21, Amphora goal ceea4e0a)
 
 D of goal 9c63f7d4, on top of the write slot (above). In the release A/B, D halved G's write gaps
