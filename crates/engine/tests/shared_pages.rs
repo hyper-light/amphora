@@ -651,6 +651,9 @@ fn g3s3_plain_misses_read_into_the_pages_evictions_leave() {
         );
     }
     let recycled = plain.get_pager().recycled_pages();
-    assert!(recycled > 200, "misses past the cache recycled {recycled} pages");
+    assert!(
+        recycled > 200,
+        "misses past the cache recycled {recycled} pages"
+    );
     assert_eq!(today.get_pager().recycled_pages(), 0);
 }
