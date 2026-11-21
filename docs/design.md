@@ -67,6 +67,9 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | local-owner-transport | – | The tests' budgets (2026-10-31) | [local-owner-transport.md](design/local-owner-transport.md#the-tests-budgets-2026-10-31) |
 | local-owner-transport | – | Owner guards (2026-11-06) | [local-owner-transport.md](design/local-owner-transport.md#owner-guards-2026-11-06) |
 | local-owner-transport | – | Decision (lane constants): one descriptor budget (2026-11-21) | [local-owner-transport.md](design/local-owner-transport.md#decision-lane-constants-one-descriptor-budget-2026-11-21) |
+| online-schema | – | Decision (lane online-schema): an index is built absent, delete-only, write-only, public | [online-schema.md](design/online-schema.md#decision-lane-online-schema-an-index-is-built-absent-delete-only-write-only-public) |
+| online-schema | – | Decision (lane online-schema-5): a column is added with its states run together | [online-schema.md](design/online-schema.md#decision-lane-online-schema-5-a-column-is-added-with-its-states-run-together) |
+| online-schema | – | Decision (lane online-schema-6): a constraint is added write-only, validated, then public | [online-schema.md](design/online-schema.md#decision-lane-online-schema-6-a-constraint-is-added-write-only-validated-then-public) |
 | planner | 1 | A closed range is half a percent of its table, whether it seeks or filters | [planner.md](design/planner.md#1-a-closed-range-is-half-a-percent-of-its-table-whether-it-seeks-or-filters) |
 | planner | 2 | The sort is charged to the candidate that needs it, on the rows it sorts | [planner.md](design/planner.md#2-the-sort-is-charged-to-the-candidate-that-needs-it-on-the-rows-it-sorts) |
 | planner | 3 | A GLOB's literal prefix is a range of the index; a BLOB matches no GLOB or LIKE | [planner.md](design/planner.md#3-a-globs-literal-prefix-is-a-range-of-the-index-a-blob-matches-no-glob-or-like) |
@@ -88,8 +91,10 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | planner | 19 | Joins searched over connected subsets within a counted budget; past it, the fewest rows first | [planner.md](design/planner.md#19-joins-searched-over-connected-subsets-within-a-counted-budget-past-it-the-fewest-rows-first) |
 | planner | 20 | ANALYZE keeps each column's distinct count and a sample of each table | [planner.md](design/planner.md#20-analyze-keeps-each-columns-distinct-count-and-a-sample-of-each-table) |
 | planner | 21 | A table's filters are estimated together on its sample, and otherwise combine by backoff | [planner.md](design/planner.md#21-a-tables-filters-are-estimated-together-on-its-sample-and-otherwise-combine-by-backoff) |
+| planner | 22 | Correlated subqueries unnested by dependent joins taken apart, from a worklist (PL.10) | [planner.md](design/planner.md#22-correlated-subqueries-unnested-by-dependent-joins-taken-apart-from-a-worklist-pl10) |
 | planner | – | Decision (lane pl6): No table read whole beneath loops that can give more than one row | [planner.md](design/planner.md#decision-lane-pl6-no-table-read-whole-beneath-loops-that-can-give-more-than-one-row) |
 | planner | – | Decision (lane pl12): custom plans, then a generic one, for prepared statements | [planner.md](design/planner.md#decision-lane-pl12-custom-plans-then-a-generic-one-for-prepared-statements) |
+| planner | – | Decision (lane pl9): row counts kept as rows change, statements planned again past their statistics' error | [planner.md](design/planner.md#decision-lane-pl9-row-counts-kept-as-rows-change-statements-planned-again-past-their-statistics-error) |
 | records-compaction | – | Durable progress and retention | [records-compaction.md](design/records-compaction.md#durable-progress-and-retention) |
 | records-compaction | – | Dirty-page and serialized bounds | [records-compaction.md](design/records-compaction.md#dirty-page-and-serialized-bounds) |
 | records-compaction | – | Embedded owner compatibility | [records-compaction.md](design/records-compaction.md#embedded-owner-compatibility) |
@@ -110,7 +115,13 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | replication | – | A replica's database log: copied, bounded, and flushed off the owner (2026-11-09) | [replication.md](design/replication.md#a-replicas-database-log-copied-bounded-and-flushed-off-the-owner-2026-11-09) |
 | replication | – | A replica's database log bounded by what it measures (2026-11-11) | [replication.md](design/replication.md#a-replicas-database-log-bounded-by-what-it-measures-2026-11-11) |
 | replication | – | A follower's write under steady leader writes: the write slot (decided 2026-11-12, Amphora goal 9c63f7d4) | [replication.md](design/replication.md#a-followers-write-under-steady-leader-writes-the-write-slot-decided-2026-11-12-amphora-goal-9c63f7d4) |
+| replication | – | Decision (lane follower-reads): Follower reads at a closed time (2026-11-21, G13 step 4, kiln goal 80d4cf5e) | [replication.md](design/replication.md#decision-lane-follower-reads-follower-reads-at-a-closed-time-2026-11-21-g13-step-4-kiln-goal-80d4cf5e) |
+| replication | – | Decision (lane follower-reads): Search over partitions (2026-11-21, G13 step 4) | [replication.md](design/replication.md#decision-lane-follower-reads-search-over-partitions-2026-11-21-g13-step-4) |
 | replication | – | Decision (lane constants): one drive a step (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-one-drive-a-step-2026-11-21) |
+| replication | – | Decision (lane constants): the owner's wakes (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-the-owners-wakes-2026-11-21) |
+| replication | – | Decision (lane constants): generations learned where they run (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-generations-learned-where-they-run-2026-11-21) |
+| replication | – | Decision (lane constants): a generation of restarts ends once it covers its spend (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-a-generation-of-restarts-ends-once-it-covers-its-spend-2026-11-21) |
+| replication | – | A follower's write that read nothing written since its base: read sets (built 2026-11-21, Amphora goal ceea4e0a) | [replication.md](design/replication.md#a-followers-write-that-read-nothing-written-since-its-base-read-sets-built-2026-11-21-amphora-goal-ceea4e0a) |
 | reshard | – | Decision (lane split-merge): split, merge and move as one fenced hand-off, decided by measured share | [reshard.md](design/reshard.md#decision-lane-split-merge-split-merge-and-move-as-one-fenced-hand-off-decided-by-measured-share) |
 | semantics | 1 | TEXT is well-formed UTF-8 | [semantics.md](design/semantics.md#1-text-is-well-formed-utf-8) |
 | semantics | 2 | atanh's last digit is its platform's C library's | [semantics.md](design/semantics.md#2-atanhs-last-digit-is-its-platforms-c-librarys) |
@@ -152,7 +163,13 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | store | 35 | Small commits: the checkpoint copies a page once for many commits | [store.md](design/store.md#35-small-commits-the-checkpoint-copies-a-page-once-for-many-commits) |
 | store | 36 | A validated text is marked on its statement-cache entry | [store.md](design/store.md#36-a-validated-text-is-marked-on-its-statement-cache-entry) |
 | store | 37 | A commit logs its pages' changes: a log of both kinds of slot | [store.md](design/store.md#37-a-commit-logs-its-pages-changes-a-log-of-both-kinds-of-slot) |
+| store | 38 | A page is searched by key heads once its searches have paid for them (prototype, behind a switch) | [store.md](design/store.md#38-a-page-is-searched-by-key-heads-once-its-searches-have-paid-for-them-prototype-behind-a-switch) |
+| store | 39 | A page read past the cache reads its own frames: pages new to a chain are page frames, a chain's entries records of one slot | [store.md](design/store.md#39-a-page-read-past-the-cache-reads-its-own-frames-pages-new-to-a-chain-are-page-frames-a-chains-entries-records-of-one-slot) |
+| store | – | Decision (lane wal-read): a commit's records published at a lookup's cost, its deltas found a word at a time | [store.md](design/store.md#decision-lane-wal-read-a-commits-records-published-at-a-lookups-cost-its-deltas-found-a-word-at-a-time) |
 | without-rowid | – | Native primary-root query access | [without-rowid.md](design/without-rowid.md#native-primary-root-query-access) |
+| xgroup | – | The two protocols: two-phase commit and Parallel Commits behind a switch, two-phase locking without waiting | [xgroup.md](design/xgroup.md#the-two-protocols) |
+| xgroup | – | Crashes: every decision lives in a group, a new incarnation fences the old and finishes its transactions | [xgroup.md](design/xgroup.md#crashes) |
+| xgroup | – | On a group's database: each step one atomic commit in its group, resolution timeouts learned as TCP's | [xgroup.md](design/xgroup.md#on-a-groups-database) |
 | local-owner-transport | – | Embedded local owner transport: one owner process, an authenticated local client for the rest | [local-owner-transport.md](design/local-owner-transport.md) |
 | records-compaction | – | Bounded Records compaction on the namespace writer, step by recoverable step | [records-compaction.md](design/records-compaction.md) |
 | without-rowid | – | WITHOUT ROWID tables keep their primary-key index as the table | [without-rowid.md](design/without-rowid.md) |
@@ -167,3 +184,6 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 - engine: The evidence that asks for it ([engine.md](design/engine.md#the-evidence-that-asks-for-it))
 - engine: Stages, each measured ([engine.md](design/engine.md#stages-each-measured))
 - store: Crash injection (T-T1.1.1) ([store.md](design/store.md#crash-injection-t-t111))
+- xgroup: Evidence so far ([xgroup.md](design/xgroup.md#evidence-so-far))
+- xgroup: Metrics (proposed; names to agree with kiln's Observe owner) ([xgroup.md](design/xgroup.md#metrics-proposed-names-to-agree-with-kilns-observe-owner))
+- xgroup: Falsified by ([xgroup.md](design/xgroup.md#falsified-by))
