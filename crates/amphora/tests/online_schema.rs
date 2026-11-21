@@ -288,3 +288,80 @@ fn t_t1_12_1_rows_that_break_a_unique_index_leave_the_old_schema() {
         .unwrap();
     assert!(!again.applied);
 }
+
+#[test]
+fn t_t1_12_1_a_column_is_added_in_one_catalog_change_and_its_constraints_hold_from_it() {
+    // CP-T1.12: add c NOT NULL DEFAULT 7 CHECK (c >= 0) to a 300-row table online. Expect: public
+    // in one step that backfills no row, each row written before reads 7, a write breaking the
+    // CHECK or NOT NULL is refused from then on, and the same migration again is already applied;
+    // a generated column checked against every row is refused and leaves the table as it was.
+    let dir = tempfile::tempdir().unwrap();
+    let until = || Instant::now() + Duration::from_secs(60);
+    let database = Database::open(&dir.path().join("d.db"), until()).unwrap();
+    database
+        .migrate(
+            Migration {
+                name: "t".into(),
+                sql: "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER); WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300) INSERT INTO t (a) SELECT i % 50 FROM n".into(),
+            },
+            until(),
+        )
+        .unwrap();
+    let column = || Migration {
+        name: "c".into(),
+        sql: "ALTER TABLE t ADD COLUMN c INTEGER NOT NULL DEFAULT 7 CHECK (c >= 0)".into(),
+    };
+    let added = database.change_schema(column(), until()).unwrap();
+    assert!(
+        added.applied && added.cutover.is_some() && added.batches == 0 && added.rows == 0,
+        "{added:?}"
+    );
+    let read = |sql: &'static str| {
+        database
+            .call(until(), move |c| {
+                let n: i64 = c.query_row(sql, [], |r| r.get(0usize))?;
+                Ok(n)
+            })
+            .unwrap()
+    };
+    assert_eq!(read("SELECT count(*) FROM t WHERE c = 7"), 300);
+    let write = |sql: &'static str| {
+        database.call(until(), move |c| {
+            c.execute(sql, [])?;
+            Ok(())
+        })
+    };
+    assert!(write("INSERT INTO t (a, c) VALUES (1, -1)").is_err());
+    assert!(write("INSERT INTO t (a, c) VALUES (1, NULL)").is_err());
+    write("INSERT INTO t (a, c) VALUES (1, 3)").unwrap();
+    assert_eq!(read("SELECT count(*) FROM t"), 301);
+    assert!(!database.change_schema(column(), until()).unwrap().applied);
+    let other = database
+        .change_schema(
+            Migration {
+                name: "c".into(),
+                sql: "ALTER TABLE t ADD COLUMN d INTEGER".into(),
+            },
+            until(),
+        )
+        .unwrap_err();
+    assert!(matches!(other, Refusal::Invalid { .. }), "{other:?}");
+    let generated = database
+        .change_schema(
+            Migration {
+                name: "g".into(),
+                sql: "ALTER TABLE t ADD COLUMN g AS (a + 1) NOT NULL".into(),
+            },
+            until(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(generated, Refusal::Invalid { .. }),
+        "{generated:?}"
+    );
+    assert_eq!(
+        read("SELECT count(*) FROM pragma_table_info('t')"),
+        3,
+        "the table's columns: id, a, c"
+    );
+}

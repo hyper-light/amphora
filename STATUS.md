@@ -321,7 +321,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (a batch holds the writer about as long as it waited for it). Reads use the index only once
   public; the cutover changes only the catalog. A power cut at every change of a build leaves the
   old schema or the new; rows that break a unique index undo the change. The 10M-row cutover p99
-  (AC-T1.12.2) is not yet measured; columns and constraints are not yet built.
+  (AC-T1.12.2) is not yet measured. A column (`ALTER TABLE … ADD COLUMN`) is added in one catalog
+  change, its states run together, as no row is rewritten or read; one whose addition reads every
+  row is refused. Constraints on existing columns and DROP COLUMN are not yet built.
 
 ## Measured
 

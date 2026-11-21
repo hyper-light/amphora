@@ -7,9 +7,16 @@
 //! changes only the catalog. Every step is recorded in `__amphora_schema_changes` in the same
 //! transaction as its effect, so a crash leaves the change at a step, invisible to reads until it is
 //! public, and the next call carries it on from there.
+//!
+//! A column is added the same way with its states run together: `ALTER TABLE … ADD COLUMN` rewrites
+//! no row (each row written before it reads the column's constant default), so absent to public is
+//! one catalog change, its record in the same transaction. A column whose addition would read every
+//! row (a generated one with NOT NULL or CHECK, which the engine checks against each row) is
+//! refused: it needs the validation states constraints need, not yet built.
 
 use super::*;
 use amphora_engine::schema::IndexState;
+use amphora_engine_parser::ast::{AlterTableBody, ColumnConstraint, ColumnDefinition};
 use std::time::Duration;
 
 /// The tables a change keeps, made by its first step (never at open: a replica on a binary from
@@ -28,13 +35,23 @@ const BACKFILLED: i64 = 3;
 /// change can't finish, and its driver undoes it.
 pub const BROKEN: &str = "online schema change's rows";
 
-/// A change asked for: its migration's name and SQL (one `CREATE [UNIQUE] INDEX`), its index and
-/// table as SQL names them (case-folded, as the engine's `normalize_ident` folds them).
+/// A change asked for: its migration's name and SQL (one `CREATE [UNIQUE] INDEX` or `ALTER TABLE …
+/// ADD COLUMN`), what it adds, and its table as SQL names it (case-folded, as the engine's
+/// `normalize_ident` folds names).
 pub struct Plan {
     name: String,
     sql: String,
-    index: String,
+    adds: Adds,
     table: String,
+}
+
+/// What a change adds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Adds {
+    /// An index, by its case-folded name: built absent, delete-only, write-only, public.
+    Index(String),
+    /// A column whose addition rewrites and reads no row: absent to public in one catalog change.
+    Column,
 }
 
 impl Plan {
@@ -50,33 +67,79 @@ impl Plan {
             .map_err(|e| refuse(&e.to_string()))?
             .is_some()
         {
-            return Err(refuse("one statement, a CREATE INDEX"));
+            return Err(refuse("one statement"));
         }
-        let Cmd::Stmt(Stmt::CreateIndex {
-            if_not_exists,
-            idx_name,
-            tbl_name,
-            using,
-            ..
-        }) = first
-        else {
-            return Err(refuse("only CREATE INDEX is built online"));
+        let (adds, table) = match first {
+            Cmd::Stmt(Stmt::CreateIndex {
+                if_not_exists,
+                idx_name,
+                tbl_name,
+                using,
+                ..
+            }) => {
+                // Staging a name an index already has would turn that index's reads off: the
+                // change names an index that must not exist, and applies once by its migration's
+                // name.
+                if if_not_exists {
+                    return Err(refuse("IF NOT EXISTS: the change applies once by name"));
+                }
+                if idx_name.db_name.is_some() || using.is_some() {
+                    return Err(refuse("an index of the main database, without USING"));
+                }
+                (
+                    Adds::Index(idx_name.name.as_str().to_ascii_lowercase()),
+                    tbl_name,
+                )
+            }
+            Cmd::Stmt(Stmt::AlterTable(alter)) => {
+                let AlterTableBody::AddColumn(column) = alter.body else {
+                    return Err(refuse(
+                        "of ALTER TABLE, only ADD COLUMN is built online: the others rewrite or check every row",
+                    ));
+                };
+                if alter.name.db_name.is_some() {
+                    return Err(refuse("a column of the main database's table"));
+                }
+                if reads_every_row(&column) {
+                    return Err(refuse(
+                        "a generated column with NOT NULL or CHECK is checked against every row: it needs validation states, not yet built",
+                    ));
+                }
+                (Adds::Column, alter.name.name)
+            }
+            _ => {
+                return Err(refuse(
+                    "only CREATE INDEX and ALTER TABLE … ADD COLUMN are built online",
+                ));
+            }
         };
-        // Staging a name an index already has would turn that index's reads off: the change
-        // names an index that must not exist, and applies once by its migration's name.
-        if if_not_exists {
-            return Err(refuse("IF NOT EXISTS: the change applies once by name"));
-        }
-        if idx_name.db_name.is_some() || using.is_some() {
-            return Err(refuse("an index of the main database, without USING"));
-        }
         Ok(Self {
             name: migration.name.clone(),
             sql: migration.sql.clone(),
-            index: idx_name.name.as_str().to_ascii_lowercase(),
-            table: tbl_name.as_str().to_ascii_lowercase(),
+            adds,
+            table: table.as_str().to_ascii_lowercase(),
         })
     }
+}
+
+/// Whether adding `column` makes the engine read every row of its table: a generated column with
+/// NOT NULL or CHECK, which `ALTER TABLE` checks against each row (`emit_column_constraints_validation`
+/// in the engine's `translate/alter.rs`). Every other addition's checks read at most the table's
+/// first row (is it empty) and its constant default.
+fn reads_every_row(column: &ColumnDefinition) -> bool {
+    let has = |wanted: fn(&ColumnConstraint) -> bool| {
+        column.constraints.iter().any(|c| wanted(&c.constraint))
+    };
+    has(|c| matches!(c, ColumnConstraint::Generated { .. }))
+        && has(|c| {
+            matches!(
+                c,
+                ColumnConstraint::NotNull {
+                    nullable: false,
+                    ..
+                } | ColumnConstraint::Check { .. }
+            )
+        })
 }
 
 /// What one step did.
@@ -230,8 +293,12 @@ pub fn step(db: &Db, plan: &Plan, rows: u64) -> anyhow::Result<Stepped> {
         }
         return Err(api::invalid("migration", "the applied name has different SQL").into());
     }
+    let index = match &plan.adds {
+        Adds::Index(index) => index.as_str(),
+        Adds::Column => return add_column(db, plan),
+    };
     let Some(record) = record(db, plan)? else {
-        return begin(db, plan);
+        return begin(db, plan, index);
     };
     if record.sql != plan.sql {
         return Err(api::invalid(
@@ -241,9 +308,9 @@ pub fn step(db: &Db, plan: &Plan, rows: u64) -> anyhow::Result<Stepped> {
         .into());
     }
     match record.phase {
-        DELETE_ONLY => write_only(db, plan),
-        WRITE_ONLY => backfill(db, plan, record.after, record.until, rows),
-        BACKFILLED => cutover(db, plan),
+        DELETE_ONLY => write_only(db, plan, index),
+        WRITE_ONLY => backfill(db, plan, index, record.after, record.until, rows),
+        BACKFILLED => cutover(db, plan, index),
         phase => Err(anyhow::anyhow!(
             "__amphora_schema_changes: {} is at phase {phase}",
             plan.name
@@ -252,14 +319,14 @@ pub fn step(db: &Db, plan: &Plan, rows: u64) -> anyhow::Result<Stepped> {
 }
 
 /// Absent to delete-only: the name staged, then the index made under it, empty.
-fn begin(db: &Db, plan: &Plan) -> anyhow::Result<Stepped> {
+fn begin(db: &Db, plan: &Plan, index: &str) -> anyhow::Result<Stepped> {
     db.exec(TABLES)?;
     db.query(
         "INSERT INTO __amphora_schema_changes(name, sql, idx, tbl, phase) VALUES (?1, ?2, ?3, ?4, ?5)",
         [
             text(&plan.name),
             text(&plan.sql),
-            text(&plan.index),
+            text(index),
             text(&plan.table),
             EValue::from_i64(DELETE_ONLY),
         ],
@@ -267,7 +334,7 @@ fn begin(db: &Db, plan: &Plan) -> anyhow::Result<Stepped> {
     )?;
     db.query(
         "INSERT INTO __amphora_index_states(name, state) VALUES (?1, ?2)",
-        [text(&plan.index), stored(IndexState::DeleteOnly)?],
+        [text(index), stored(IndexState::DeleteOnly)?],
         |_| Ok(true),
     )?;
     db.restage_schema()?;
@@ -279,10 +346,10 @@ fn begin(db: &Db, plan: &Plan) -> anyhow::Result<Stepped> {
 /// write runs on the writer's schema, which this transaction moves, so the drain is immediate
 /// (docs/design/online-schema.md says when that stops holding). The rows the backfill must reach
 /// are those up to the largest rowid now: a row written after gets its entry from its write.
-fn write_only(db: &Db, plan: &Plan) -> anyhow::Result<Stepped> {
+fn write_only(db: &Db, plan: &Plan, index: &str) -> anyhow::Result<Stepped> {
     db.query(
         "UPDATE __amphora_index_states SET state = ?2 WHERE name = ?1",
-        [text(&plan.index), stored(IndexState::WriteOnly)?],
+        [text(index), stored(IndexState::WriteOnly)?],
         |_| Ok(true),
     )?;
     let mut until = None;
@@ -311,6 +378,7 @@ fn write_only(db: &Db, plan: &Plan) -> anyhow::Result<Stepped> {
 fn backfill(
     db: &Db,
     plan: &Plan,
+    index: &str,
     after: Option<i64>,
     until: Option<i64>,
     rows: u64,
@@ -325,8 +393,8 @@ fn backfill(
     } else {
         let began = Instant::now();
         let (last, visited) = db
-            .index_backfill(&plan.index, after, rows)
-            .map_err(|error| backfill_refusal(plan, error))?;
+            .index_backfill(index, after, rows)
+            .map_err(|error| backfill_refusal(index, error))?;
         (last.or(after), visited, began.elapsed())
     };
     let done = visited < rows || reached(last);
@@ -344,10 +412,10 @@ fn backfill(
 
 /// A backfill's failure as its driver acts on it: rows that break the unique index the change
 /// would add ([`BROKEN`]), a batch too large for one transaction (halved), or the error itself.
-fn backfill_refusal(plan: &Plan, error: anyhow::Error) -> anyhow::Error {
+fn backfill_refusal(index: &str, error: anyhow::Error) -> anyhow::Error {
     match error.downcast_ref::<amphora_engine::LimboError>() {
         Some(amphora_engine::LimboError::Constraint(why)) => {
-            api::invalid(BROKEN, &format!("{} can't be unique: {why}", plan.index)).into()
+            api::invalid(BROKEN, &format!("{index} can't be unique: {why}")).into()
         }
         Some(amphora_engine::LimboError::TransactionPageLimit { limit, attempted }) => {
             Refusal::TooLarge {
@@ -362,23 +430,39 @@ fn backfill_refusal(plan: &Plan, error: anyhow::Error) -> anyhow::Error {
 }
 
 /// Write-only to public: the cutover. Only the catalog changes, whatever the table's size.
-fn cutover(db: &Db, plan: &Plan) -> anyhow::Result<Stepped> {
+fn cutover(db: &Db, plan: &Plan, index: &str) -> anyhow::Result<Stepped> {
     let began = Instant::now();
     db.query(
         "DELETE FROM __amphora_index_states WHERE name = ?1",
-        [text(&plan.index)],
+        [text(index)],
         |_| Ok(true),
     )?;
     db.restage_schema()?;
     finish(db, plan)?;
+    migrated(db, plan)?;
+    Ok(Stepped::Public {
+        held: began.elapsed(),
+    })
+}
+
+/// Absent to public for a column: its states run together, as its addition is one catalog change
+/// (each row written before it reads its constant default), recorded as migrated in the same
+/// transaction. A crash leaves the table without the column or with it, never between.
+fn add_column(db: &Db, plan: &Plan) -> anyhow::Result<Stepped> {
+    let began = Instant::now();
+    db.exec(&plan.sql)?;
+    migrated(db, plan)?;
+    Ok(Stepped::Public {
+        held: began.elapsed(),
+    })
+}
+
+fn migrated(db: &Db, plan: &Plan) -> anyhow::Result<()> {
     db.query(
         "INSERT INTO __amphora_migrations(name, sql) VALUES (?1, ?2)",
         [text(&plan.name), text(&plan.sql)],
         |_| Ok(true),
-    )?;
-    Ok(Stepped::Public {
-        held: began.elapsed(),
-    })
+    )
 }
 
 fn finish(db: &Db, plan: &Plan) -> anyhow::Result<()> {
@@ -392,23 +476,28 @@ fn finish(db: &Db, plan: &Plan) -> anyhow::Result<()> {
 /// Undoes `plan`'s change, at whatever step it stands: its index dropped, its records gone, the
 /// old schema whole. Nothing to undo when it never began.
 pub fn abandon(db: &Db, plan: &Plan) -> anyhow::Result<()> {
+    let Adds::Index(index) = &plan.adds else {
+        return Ok(());
+    };
     if record(db, plan)?.is_none() {
         return Ok(());
     }
     db.query(
         "DELETE FROM __amphora_index_states WHERE name = ?1",
-        [text(&plan.index)],
+        [text(index)],
         |_| Ok(true),
     )?;
     db.restage_schema()?;
-    db.exec(&format!("DROP INDEX IF EXISTS {}", quoted(&plan.index)))?;
+    db.exec(&format!("DROP INDEX IF EXISTS {}", quoted(index)))?;
     finish(db, plan)
 }
 
 impl Database {
     /// Builds the index `migration` creates (one `CREATE [UNIQUE] INDEX`) online, by F1's states
     /// (CP-T1.12, docs/design/online-schema.md): writes go on while its backfill runs, and the
-    /// writer is held for the cutover to public only as long as a catalog change takes. Applied
+    /// writer is held for the cutover to public only as long as a catalog change takes. A column
+    /// (one `ALTER TABLE … ADD COLUMN`) is added in one catalog change, its states run together;
+    /// one whose addition would read every row is refused. Applied
     /// once by name, as [`Database::migrate`]. A deadline that passes leaves the change at a
     /// step, invisible to reads; calling again with the same migration carries it on. Rows that
     /// break a unique index undo the change and are refused.
@@ -516,10 +605,35 @@ mod tests {
             })
         };
         let made = plan("CREATE UNIQUE INDEX \"Ix\" ON T(a)").unwrap();
-        assert_eq!((made.index.as_str(), made.table.as_str()), ("ix", "t"));
+        assert_eq!(
+            (&made.adds, made.table.as_str()),
+            (&Adds::Index("ix".into()), "t")
+        );
         assert!(plan("CREATE INDEX IF NOT EXISTS ix ON t(a)").is_err());
         assert!(plan("CREATE INDEX ix ON t(a); CREATE INDEX iy ON t(b)").is_err());
         assert!(plan("CREATE TABLE t(a)").is_err());
         assert!(plan("CREATE INDEX aux.ix ON t(a)").is_err());
+    }
+
+    #[test]
+    fn t_t1_12_a_column_plan_is_an_add_column_that_reads_no_row() {
+        // CP-T1.12: ADD COLUMN, with a constant default, NOT NULL or CHECK, is one catalog change;
+        // a generated column with NOT NULL or CHECK (checked against every row) and every other
+        // ALTER TABLE (rewrites or checks every row) are refused.
+        let plan = |sql: &str| {
+            Plan::parse(&Migration {
+                name: "m".into(),
+                sql: sql.into(),
+            })
+        };
+        let made =
+            plan("ALTER TABLE T ADD COLUMN c INTEGER NOT NULL DEFAULT 0 CHECK (c >= 0)").unwrap();
+        assert_eq!((&made.adds, made.table.as_str()), (&Adds::Column, "t"));
+        assert!(plan("ALTER TABLE t ADD COLUMN g AS (a + 1)").is_ok());
+        assert!(plan("ALTER TABLE t ADD COLUMN g AS (a + 1) NOT NULL").is_err());
+        assert!(plan("ALTER TABLE t ADD COLUMN g AS (a + 1) CHECK (g > 0)").is_err());
+        assert!(plan("ALTER TABLE t DROP COLUMN a").is_err());
+        assert!(plan("ALTER TABLE t RENAME TO u").is_err());
+        assert!(plan("ALTER TABLE aux.t ADD COLUMN c").is_err());
     }
 }

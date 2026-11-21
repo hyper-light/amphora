@@ -27,6 +27,23 @@ integrity check's entry comparison all skip the others. At run time an insert in
 index does nothing, and a delete that finds no entry in a non-public index is expected. An index or
 table held by a change refuses `DROP`.
 
+## Decision (lane online-schema-5): a column is added with its states run together
+
+`Database::change_schema` also takes one `ALTER TABLE … ADD COLUMN`. Adding a column rewrites no
+row: a row written before it reads the column's constant default, and the engine's checks of the
+addition read at most the table's first row (is it empty: NOT NULL with a NULL default, a
+non-constant default, a STRICT default's type) and the default itself (its CHECK). So F1's absent,
+delete-only, write-only and public for a column (section 4 of the paper, where delete-only and
+write-only exist so servers on different schemas agree while the column is backfilled) run together
+here: there is nothing to backfill, and with one writer the drain is the commit. The change is one
+transaction, its record in `__amphora_migrations` in it: a crash leaves the table without the column
+or with it. A column whose addition reads every row is refused: a generated column with NOT NULL or
+CHECK, which `ALTER TABLE` checks against each row (`emit_column_constraints_validation`); so are
+the other `ALTER TABLE` forms (DROP COLUMN, ALTER COLUMN and RENAME rewrite or check every row or
+every statement naming the table). What would falsify it: an `ADD COLUMN` that the engine runs with
+a scan of the table (its program loops over the table's rows), which `t_t1_12_1_a_column_is_added_in_one_catalog_change_and_its_constraints_hold_from_it`
+would not see; read `translate/alter.rs`'s `AddColumn` arm when it changes.
+
 **Sources.** Rae, Rollins, Shute, Sodhi, Vingralek, "Online, Asynchronous Schema Change in F1",
 PVLDB 6(11), 2013 (https://www.vldb.org/pvldb/vol6/p1045-rae.pdf): section 4's states (absent,
 delete-only, write-only, public), the reorganization (backfill) in write-only, and at most two
@@ -59,8 +76,10 @@ more than twice its p99 without one, measured by bench `online_ddl`.
 its cost grows with the schema's size, not the table's. `SchemaChange::cutover` says how long it held
 the writer; the 10,000,000-row measurement is the coordinator's.
 
-**Left.** Columns and constraints (ADD COLUMN is already a catalog change in this engine; CHECK, NOT
-NULL and foreign keys need their own write-only and validation states); indexes on WITHOUT ROWID
+**Left.** Constraints on existing columns and generated columns checked against every row (CHECK,
+NOT NULL and foreign keys need their own write-only and validation states: enforced on writes,
+then existing rows validated in batches, then public); DROP COLUMN (hidden from reads first, then
+rows rewritten in batches); indexes on WITHOUT ROWID
 tables (no rowid order to backfill by: refused typed); routing `migrate`'s index builds on large
 tables here; undoing a big index drops its pages in one transaction; metrics, to be agreed with
 Kiln Metrics.
