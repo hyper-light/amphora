@@ -535,14 +535,8 @@ fn ns_1_1_a_reading_cursor_sees_its_snapshot_while_writers_split_leaves() {
     }
     vdb.commit(txn, &mut d, false).unwrap();
     let snap = vdb.snapshot().unwrap();
-    let mut reader = VersionedCursor::new(
-        vdb.clone(),
-        0,
-        order,
-        Access::Read(snap),
-        pager,
-    )
-    .unwrap();
+    let mut reader =
+        VersionedCursor::new(vdb.clone(), 0, order, Access::Read(snap), pager).unwrap();
     let writers: Vec<_> = (0..4i64)
         .map(|w| {
             let (vdb, rec) = (vdb.clone(), rec.get_payload().to_vec());
@@ -607,14 +601,7 @@ fn ns_1_1_a_cursor_sees_writes_through_another_cursor_of_its_transaction() {
         pager.clone(),
     )
     .unwrap();
-    let mut r = VersionedCursor::new(
-        vdb,
-        0,
-        order,
-        Access::Write(txn),
-        pager,
-    )
-    .unwrap();
+    let mut r = VersionedCursor::new(vdb, 0, order, Access::Write(txn), pager).unwrap();
     let old = record(&[Value::from_text("old".repeat(30))]);
     let new = record(&[Value::from_text("new")]);
     for k in (0..200i64).filter(|k| *k != 13) {
@@ -651,8 +638,7 @@ fn ns_1_1_a_reading_cursor_refuses_writes() {
     );
     let (pager, _db, _conn) = engine();
     let snap = vdb.snapshot().unwrap();
-    let mut c =
-        VersionedCursor::new(vdb, 0, order, Access::Read(snap), pager).unwrap();
+    let mut c = VersionedCursor::new(vdb, 0, order, Access::Read(snap), pager).unwrap();
     let rec = record(&[Value::from_i64(1)]);
     let refused = c.insert(&BTreeKey::new_table_rowid(1, Some(&rec)));
     assert!(matches!(
