@@ -1010,4 +1010,47 @@ mod tests {
         assert!(plan("ALTER TABLE t RENAME TO u").is_err());
         assert!(plan("ALTER TABLE aux.t ADD COLUMN c").is_err());
     }
+
+    #[test]
+    fn t_t1_12_a_constraint_plan_keeps_the_name_and_adds_not_null_or_check() {
+        // CP-T1.12: ALTER COLUMN c TO c's definition with NOT NULL or CHECK is a constraint's
+        // change; a rename or a definition adding neither is refused; a definition is the old one
+        // plus constraints after it only when type and earlier constraints match.
+        let plan = |sql: &str| {
+            Plan::parse(&Migration {
+                name: "m".into(),
+                sql: sql.into(),
+            })
+        };
+        let made = plan("ALTER TABLE T ALTER COLUMN \"A\" TO a INTEGER NOT NULL").unwrap();
+        assert!(matches!(&made.adds, Adds::Constraint { column, .. } if column == "a"));
+        assert!(plan("ALTER TABLE t ALTER COLUMN a TO b INTEGER NOT NULL").is_err());
+        assert!(plan("ALTER TABLE t ALTER COLUMN a TO a INTEGER DEFAULT 1").is_err());
+        let definition = |sql: &str| match plan(sql).unwrap().adds {
+            Adds::Constraint { definition, .. } => definition,
+            other => panic!("{other:?}"),
+        };
+        let old = definition("ALTER TABLE t ALTER COLUMN a TO a INTEGER CHECK (a > 0)");
+        let adds = |sql: &str| adds_only_constraints(&old, &definition(sql));
+        assert!(adds(
+            "ALTER TABLE t ALTER COLUMN a TO a INTEGER CHECK (a>0) NOT NULL"
+        ));
+        assert!(adds(
+            "ALTER TABLE t ALTER COLUMN a TO a INTEGER CHECK (a > 0) CHECK (a < 9)"
+        ));
+        assert!(!adds(
+            "ALTER TABLE t ALTER COLUMN a TO a TEXT CHECK (a > 0) NOT NULL"
+        ));
+        assert!(!adds(
+            "ALTER TABLE t ALTER COLUMN a TO a INTEGER NOT NULL CHECK (a > 0)"
+        ));
+        assert!(!adds(
+            "ALTER TABLE t ALTER COLUMN a TO a INTEGER CHECK (a > 1) NOT NULL"
+        ));
+        let not_null = definition("ALTER TABLE t ALTER COLUMN a TO a INTEGER NOT NULL");
+        assert!(!adds_only_constraints(
+            &not_null,
+            &definition("ALTER TABLE t ALTER COLUMN a TO a INTEGER NOT NULL NOT NULL")
+        ));
+    }
 }
