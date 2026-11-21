@@ -678,21 +678,25 @@ impl Machine {
         f: impl FnOnce(&mut Db) -> anyhow::Result<R>,
     ) -> Result<(Prepared, R), Refusal> {
         self.require_baseline()?;
-        let (answer, pages) = self
+        // Each page number takes at least one byte of the entry, so a session that read more
+        // pages than the entry has bytes could not carry its read set.
+        let bound = u64::try_from(COMMAND_BYTES.saturating_add(ENVELOPE_BYTES)).unwrap_or(u64::MAX);
+        let (answer, pages, traced) = self
             .db
-            .prepare_pages(COMMAND_BYTES, |db| {
-                let answer = f(db)?;
-                Ok(answer)
-            })
+            .prepare_traced(COMMAND_BYTES, bound, f)
             .map_err(|e| crate::database::refused(&e))?;
         validate_pages(&pages, COMMAND_BYTES)?;
+        let page1 = match pages.iter().find(|(page, _)| *page == 1) {
+            Some((_, image)) => readsets::page1_change(&traced.page_one, image),
+            None => readsets::Page1::Unwritten,
+        };
         Ok((
             Prepared {
                 base_index: self.point.index,
                 base_term: self.point.term,
                 pages,
                 baseline: self.baseline.declaration().cloned(),
-                reads: None,
+                reads: traced.reads.map(|reads| readsets::ReadSet { reads, page1 }),
             },
             answer,
         ))
@@ -758,34 +762,12 @@ impl Machine {
         &mut self,
         f: impl FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R>,
     ) -> Result<(Prepared, R), Refusal> {
-        self.require_baseline()?;
-        // Each page number takes at least one byte of the entry, so a session that read more
-        // pages than the entry has bytes could not carry its read set.
-        let bound = u64::try_from(COMMAND_BYTES.saturating_add(ENVELOPE_BYTES)).unwrap_or(u64::MAX);
-        let (answer, pages, traced) = self
-            .db
-            .prepare_traced(COMMAND_BYTES, bound, |db| {
-                let mut connection = crate::sql::Connection::new(db);
-                let value = f(&mut connection)?;
-                connection.finish()?;
-                Ok(value)
-            })
-            .map_err(|e| crate::database::refused(&e))?;
-        validate_pages(&pages, COMMAND_BYTES)?;
-        let page1 = match pages.iter().find(|(page, _)| *page == 1) {
-            Some((_, image)) => readsets::page1_change(&traced.page_one, image),
-            None => readsets::Page1::Unwritten,
-        };
-        Ok((
-            Prepared {
-                base_index: self.point.index,
-                base_term: self.point.term,
-                pages,
-                baseline: self.baseline.declaration().cloned(),
-                reads: traced.reads.map(|reads| readsets::ReadSet { reads, page1 }),
-            },
-            answer,
-        ))
+        self.prepare_db(|db| {
+            let mut connection = crate::sql::Connection::new(db);
+            let value = f(&mut connection)?;
+            connection.finish()?;
+            Ok(value)
+        })
     }
 
     /// The owner calls this only after hyper-durable releases the matching ReadIndex context.
