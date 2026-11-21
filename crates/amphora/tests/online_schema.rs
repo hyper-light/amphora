@@ -165,8 +165,16 @@ fn t_t1_12_1_writes_during_the_change_keep_the_index_and_reads_wait_for_public()
         steps > 100,
         "the backfill ran in {steps} steps, not batches of 7"
     );
-    assert!(plan_text(&db, query).contains("ix"));
-    assert!(plan_text(&reader, query).contains("ix"));
+    let writer_plan = plan_text(&db, query);
+    assert!(
+        writer_plan.contains("ix"),
+        "the writer's plan after public: {writer_plan}"
+    );
+    let reader_plan = plan_text(&reader, query);
+    assert!(
+        reader_plan.contains("ix"),
+        "a reader's plan after public: {reader_plan}"
+    );
     whole(&db);
     assert_eq!(
         db.transaction(|db| online::step(db, &ix, 7)).unwrap(),
