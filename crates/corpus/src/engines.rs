@@ -223,7 +223,8 @@ pub fn turso(program: String) -> ShellSpec {
             .to_vec(),
         setup: vec![format!(".nullvalue {NULL_MARK}")],
         teardown: Vec::new(),
-        echo: |m| format!("SELECT '{m}'"),
+        // A SELECT of its own, ended: the line after a statement isn't read until its `;`.
+        echo: |m| format!("SELECT '{m}';"),
         terminator_line: true,
         settle: Some("PRAGMA wal_checkpoint(TRUNCATE)"),
         rows: Rows::Delimited {
