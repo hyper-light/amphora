@@ -27,7 +27,9 @@ const DEFAULT_SEED: u64 = 1337;
 /// budget (`Pager::statement_memory_budget`) each of its `tables` hash and group tables holds
 /// before it spills: equal shares, so together they hold no more than the budget.
 pub fn table_share(statement_budget: usize, tables: usize) -> usize {
-    statement_budget.checked_div(tables).unwrap_or(statement_budget)
+    statement_budget
+        .checked_div(tables)
+        .unwrap_or(statement_budget)
 }
 /// Minimum number of partitions for grace hash join.
 pub const MIN_PARTITIONS: usize = 16;

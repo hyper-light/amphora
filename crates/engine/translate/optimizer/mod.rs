@@ -89,8 +89,8 @@ mod cardinality;
 pub(crate) mod constraints;
 pub(crate) mod cost;
 mod cost_params;
-pub(crate) mod learned_costs;
 pub(crate) mod join;
+pub(crate) mod learned_costs;
 pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
 pub(crate) mod order;
@@ -1365,11 +1365,8 @@ fn estimate_hashed_groups(
             }
             Some(total as f64 / per_group as f64)
         })?;
-    let room = crate::vdbe::group_table::groups_in_budget(
-        leading,
-        num_accs,
-        statement_memory,
-    ) as f64;
+    let room =
+        crate::vdbe::group_table::groups_in_budget(leading, num_accs, statement_memory) as f64;
     if groups <= room {
         Some(groups)
     } else {
