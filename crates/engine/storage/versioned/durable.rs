@@ -440,7 +440,9 @@ impl Database {
     }
 
     /// Makes an empty tree ordered by `cmp` (`AC-NS.2.5`), logged as a record of its own, durable
-    /// before it returns: its id. Row changes and checkpoints wait for it.
+    /// before it returns: its id. Row changes and checkpoints wait for it. `cmp` must order as the
+    /// comparison the database is opened with: recovery remakes the tree with that one, until the
+    /// catalog names a comparison per tree (G7 step 2's `sqlite_schema`).
     pub fn make_tree(&self, d: &mut Descender, cmp: Comparator) -> Result<u64> {
         let _alone = self.gate.write();
         self.redo.usable()?;
