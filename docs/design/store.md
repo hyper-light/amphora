@@ -1922,4 +1922,7 @@ gone a point read gains at most 1.14-1.30x (Amdahl's bound).
 - **Tested.** T-G3.5.1: two tables sharing pages under random inserts, deletes, splits and merges,
   every lookup through each prototype against a plain descent: the same row or absence always, with
   hits, refutes and stamp drops counted. T-G3.5.2: over complete fences the locator names the
-  descent's leaf.
+  descent's leaf. T-G3.5.3: on the engine's own pages, each named page proven by its bytes
+  (`table_leaf_span`) gives the leaf and cell a cursor's descent stands on. Measured by
+  `descent_skip_bench` (the model: lookups, builds, upkeep a write) and `descent_skip_engine_bench`
+  (the engine's pages: lookups and E's rebuild).
