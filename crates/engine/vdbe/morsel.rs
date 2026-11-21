@@ -228,7 +228,7 @@ impl MemoryBudget {
 
     pub fn charge(&self, bytes: usize) -> Result<(), MorselError> {
         self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| used.checked_add(bytes).filter(|total| *total <= self.limit))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| used.checked_add(bytes).filter(|total| *total <= self.limit))
             .map(|_| ())
             .map_err(|used| MorselError::MemoryBudget { asked: bytes, used, budget: self.limit })
     }
@@ -1010,16 +1010,17 @@ mod tests {
             })
     }
 
-    /// T-QS6.1: random filters, groupings and aggregates over random tables; at 2, 3, 4 and 8
+    /// T-QT.6.1: random filters, groupings and aggregates over random tables; at 2, 3, 4 and 8
     /// workers and random morsel sizes the answer equals the serial one, value for value.
     #[test]
-    fn t_qs6_1_parallel_scan_aggregates_equal_serial() {
+    fn t_qt_6_1_parallel_scan_aggregates_equal_serial() {
         let mut nonempty = 0;
         let mut multi_group = 0;
         let mut ran_parallel = 0;
         for seed in 0..300u64 {
             let mut rng = ChaCha8Rng::seed_from_u64(seed);
-            let rows = random_table(&mut rng, rng.random_range(0..600));
+            let count = rng.random_range(0..600);
+            let rows = random_table(&mut rng, count);
             let (filter, group_by, aggregates) = random_query(&mut rng);
             let pipeline = ScanAggregate { rows: &rows, filter: &filter, group_by: &group_by, aggregates: &aggregates };
             let budget = MemoryBudget::new(BIG);
@@ -1054,15 +1055,17 @@ mod tests {
         assert!(ran_parallel > 1000, "{ran_parallel}");
     }
 
-    /// T-QS6.2: random equi-joins on one or two key columns: the parallel probe's matches equal the
+    /// T-QT.6.2: random equi-joins on one or two key columns: the parallel probe's matches equal the
     /// serial probe's, in the same order, and a plain nested loop's set of matches.
     #[test]
-    fn t_qs6_2_parallel_hash_probe_equals_serial() {
+    fn t_qt_6_2_parallel_hash_probe_equals_serial() {
         let mut matched = 0usize;
         for seed in 0..200u64 {
             let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0x5eed);
-            let build = random_table(&mut rng, rng.random_range(0..200));
-            let probe = random_table(&mut rng, rng.random_range(0..400));
+            let count = rng.random_range(0..200);
+            let build = random_table(&mut rng, count);
+            let count = rng.random_range(0..400);
+            let probe = random_table(&mut rng, count);
             let keys: Vec<usize> = (0..rng.random_range(1..3)).map(|_| [0, 3, 2][rng.random_range(0..3)]).collect();
             let budget = MemoryBudget::new(BIG);
             let join = HashProbe::build(&build, &keys, &probe, &keys, &budget).unwrap();
@@ -1087,9 +1090,9 @@ mod tests {
         assert!(matched > 10_000, "{matched}");
     }
 
-    /// T-QS6.3: a REAL sum's answer does not depend on the order of its terms.
+    /// T-QT.6.3: a REAL sum's answer does not depend on the order of its terms.
     #[test]
-    fn t_qs6_3_exact_sum_is_order_free() {
+    fn t_qt_6_3_exact_sum_is_order_free() {
         let terms = [1e100, 1.0, -1e100, 1e-30, 3.5, -2.25, 1e16, -1e16];
         let mut forward = ExactSum::default();
         terms.iter().for_each(|t| forward.add(*t).unwrap());
@@ -1109,10 +1112,10 @@ mod tests {
         assert_eq!(special.value(), f64::INFINITY);
     }
 
-    /// T-QS6.4: a statement whose workers together pass its memory budget is refused with the typed
+    /// T-QT.6.4: a statement whose workers together pass its memory budget is refused with the typed
     /// error at every worker count, and the budget's use never passes its limit.
     #[test]
-    fn t_qs6_4_memory_budget_refuses() {
+    fn t_qt_6_4_memory_budget_refuses() {
         let mut rng = ChaCha8Rng::seed_from_u64(7);
         let rows = random_table(&mut rng, 2_000);
         let group_by = [0, 3];
@@ -1127,11 +1130,11 @@ mod tests {
         }
     }
 
-    /// T-QS6.5: the degree comes from the costs: off is serial, a short statement is serial, a long
+    /// T-QT.6.5: the degree comes from the costs: off is serial, a short statement is serial, a long
     /// cheap-to-start one uses more than one worker and no more than the cores, and its morsels
     /// grow as the dispatch cost grows against the cost of a row.
     #[test]
-    fn t_qs6_5_degree_from_measured_costs() {
+    fn t_qt_6_5_degree_from_measured_costs() {
         let cores = NonZeroUsize::new(16).unwrap();
         let costs = MachineCosts::stated(cores, 50_000.0, 20.0);
         assert_eq!(choose_degree(ParallelMode::Off, 10_000_000, 50.0, &costs), Degree::Serial);
@@ -1145,10 +1148,10 @@ mod tests {
         assert_eq!(choose_degree(ParallelMode::On, 10_000_000, 50.0, &one), Degree::Serial);
     }
 
-    /// T-QS6.6: the whole path, pilot and measured machine included: the answer equals the serial
+    /// T-QT.6.6: the whole path, pilot and measured machine included: the answer equals the serial
     /// one, and the machine's costs learn from the run.
     #[test]
-    fn t_qs6_6_execute_with_measured_costs_equals_serial() {
+    fn t_qt_6_6_execute_with_measured_costs_equals_serial() {
         let mut costs = MachineCosts::measure().unwrap();
         let mut rng = ChaCha8Rng::seed_from_u64(11);
         let rows = random_table(&mut rng, 50_000);

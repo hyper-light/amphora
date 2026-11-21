@@ -155,6 +155,8 @@ pub use database::{
 ))]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 pub use dialect::{Dialect, SqliteDialect};
+/// Morsel-driven parallel execution (QT.6, docs/design/executor.md section 8).
+pub use vdbe::morsel;
 pub use error::{io_error, CompletionError, LimboError};
 pub use function::ContextCollationFunction;
 #[cfg(feature = "io_memory_yield")]
