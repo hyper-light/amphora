@@ -15,6 +15,9 @@ fn cmp() -> Comparator {
     Box::new(|a: &[u8], b: &[u8]| a.cmp(b))
 }
 
+/// A commit's changes: each key's new value, or None for a removal.
+type Changes = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
+
 fn rows(db: &Database) -> BTreeMap<Vec<u8>, Vec<u8>> {
     let mut d = Descender::new();
     let snap = db.snapshot().unwrap();
@@ -92,10 +95,7 @@ fn g7s4_a_database_ten_times_its_pool_reads_and_writes_correctly() {
 /// The crash workload on a pool of [`FRAMES`]: commits of puts and removes over a database many
 /// times the pool, some durable, checkpoints every few commits, on `disk` crashing where it was
 /// told. The commits as made, and how many were acknowledged durable.
-fn crash_workload(
-    disk: &Arc<Simulated>,
-    crash: Option<u64>,
-) -> (Vec<BTreeMap<Vec<u8>, Option<Vec<u8>>>>, usize, u64) {
+fn crash_workload(disk: &Arc<Simulated>, crash: Option<u64>) -> (Vec<Changes>, usize, u64) {
     let mut commits = Vec::new();
     let mut acknowledged = 0usize;
     let db = Database::open(disk.clone(), FRAMES, 1, cmp).unwrap();
