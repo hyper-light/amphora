@@ -822,7 +822,6 @@ fn t_t1_12_1_a_persons_alter_column_of_a_held_column_is_refused_and_the_changes_
         assert!(db.exec(sql).is_err(), "{sql} went on");
         assert_eq!(sql_of_t(&db), held, "{sql} changed the table");
     }
-    db.exec("UPDATE __amphora_constraint_states SET tbl = tbl").unwrap();
     db.transaction(|db| online::abandon(db, &nn)).unwrap();
     assert!(!sql_of_t(&db).contains("NOT NULL"), "{}", sql_of_t(&db));
     db.exec("ALTER TABLE t ALTER COLUMN a TO a INTEGER CHECK (a >= 0)")
