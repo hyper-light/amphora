@@ -782,8 +782,10 @@ fn validate(
     let (last, visited, held) = match (reached(record.after), record.until) {
         (false, Some(until)) => {
             let began = Instant::now();
+            // Saturating is the meaning: a last rowid of i64::MAX is at or past `until`, so a batch
+            // never starts there.
             let from = match record.after {
-                Some(after) => after.checked_add(1).unwrap_or(i64::MAX),
+                Some(after) => after.saturating_add(1),
                 None => i64::MIN,
             };
             let mut seen = (None, 0u64, None);
