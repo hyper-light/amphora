@@ -13576,16 +13576,8 @@ mod tests {
             driven.round(&mut pump);
         }
         assert_eq!(handle.counters().database_log_restarts, restarts);
-        // The window's generations are its restarts' own spacing: one restart a tick on, which
-        // held nothing, gives it one, and two of them pass.
-        let spacing = &mut driven.owner_mut(1).spacing;
-        spacing.tick().unwrap();
-        spacing.restarted(0);
-        spacing.stepped(0, Duration::ZERO, 0).unwrap();
-        spacing.stepped(0, Duration::ZERO, 0).unwrap();
-        let generation = spacing.generation().unwrap();
-        for _ in 0..=2 * generation {
-            spacing.tick().unwrap();
+        for _ in 0..2 * log_bound::GENERATION {
+            driven.owner_mut(1).spacing.tick().unwrap();
         }
         write(&mut driven, &mut pump, &clients[0], 22);
         settle_log(&mut driven, &mut pump, &clients);

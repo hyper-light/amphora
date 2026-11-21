@@ -515,12 +515,10 @@ title = "Windows' generations learned from their own events where they run, and 
 criteria = [
   { id = "AC-GN.1.1", text = "The quorum patience believes each voter's gap for one to two of that voter's own generations, each as long as its last two gaps past the election timeout were apart; a gap over which the host's detector suspected the voter is refused Suspected, counted and not learned; no ceiling" },
   { id = "AC-GN.1.2", text = "The write slot believes each member's learned gap for one to two of its own generations, each as long as its last two learned gaps were apart" },
-  { id = "AC-GN.1.3", text = "The database log's restarts are counted over two generations, each as long as the owner's last two restarts were apart" },
 ]
 tests = [
   { id = "T-GN.1.1", text = "Patience: two gaps of 50 ticks 99 apart, then prompt answers; a suspected voter answering 200 late — passes when the second gap is believed 98 ticks on and forgotten 100 later, and the suspected gap refused and not learned" },
   { id = "T-GN.1.2", text = "Slot: a gap of 40 ms after a member's first slot, then none — passes when it is believed at 40 and 79 ms and forgotten at 80 ms" },
-  { id = "T-GN.1.3", text = "Spacing: a restart holding 50 entries 10 ticks in, then ticks — passes when it is kept 10 ticks on and forgotten one tick later" },
 ]
 
 # lane cc-proto

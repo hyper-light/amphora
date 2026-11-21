@@ -1808,8 +1808,8 @@ applies every commit once, on a leader, a follower and a learner alike):
 - *next*: the most one restart held, the restart about to come guessed by the worst seen.
 
 A restart is due when (held + over + next) / applied < 1 - q, all over a window of the current and previous
-generation, each as long as the owner's last two restarts were apart ("Decision (lane constants): generations
-learned where they run"). Here q = 0.999 is the highest
+generation of `log_bound::GENERATION` ticks, 30 to 60 s, the quorum patience's window until 2026-11-21 and still a
+picked number ("Decision (lane constants): generations learned where they run"). Here q = 0.999 is the highest
 quantile the registry holds a commit's latency to (AC-T1.3.4's p99.9, and AC-T1.4.3's). The code keeps q as the
 fraction 999/1,000 and compares cross-multiplied, with checked arithmetic. The comparison is strict, net of the
 measured base tail, and counts the coming restart, so a restart that holds no more than the worst seen leaves the
@@ -2304,8 +2304,13 @@ so what it learned is believed for one to two of its own recurrences: through ea
 lapses once they stop. Whose events:
 - the quorum patience: each voter's own gaps past the election timeout, the gaps its patience covers, so each voter
   ages on its own (`Answers`, a generation a voter);
-- the write slot: each member's own learned retry gaps (`slot::Slots::expire`), on the owner's clock;
-- the log's restarts: the owner's own restarts, a restart within another's hold the same one (`log_bound::Spacing`).
+- the write slot: each member's own learned retry gaps (`slot::Slots::expire`), on the owner's clock.
+
+The log's restarts keep the fixed window (`log_bound::GENERATION`), still a picked number. A window learned from
+their own spacing was tried and fails its share test (`restarts_made_when_due_keep_their_share_below_the_tail`): it
+feeds back on itself, since a window as short as the restarts' spacing forgets a hold, so the next restart is due at
+once, and the spacing shortens again. Its learned form must be set by what the rule needs instead: a generation that
+ends once it alone covers its own spend at the quantile, so what it forgets never made a restart due.
 Gone, not slow, is the host's detector's verdict, as the write slot already ruled: a gap over which the detector
 suspected its voter is refused (`patience::Unmeasured::Suspected`) and counted in
 `amphora_replica_quorum_patience_refused_total`, its help line now saying so.
@@ -2318,7 +2323,7 @@ lasted; the detector's verdict is the owner's only word on that.
 **Tests.** `a_recurrence_is_the_time_between_its_last_two_events`,
 `a_gap_is_believed_for_one_to_two_of_its_voters_own_recurrences`, `a_suspected_voters_gap_is_refused_and_not_learned`
 (T-GN.1.1); `a_learned_gap_is_believed_for_one_to_two_of_its_members_generations` (T-GN.1.2);
-`the_window_forgets_after_two_of_its_own_generations` (T-GN.1.3); the driven patience tests,
+the driven patience tests,
 `the_quorum_patience_and_its_refusals_are_counted_for_the_host` now refusing a suspected voter's gap.
 
 **Falsified by:** step 1's measurement re-run with the learned windows in force, with more quorum-check step-downs
