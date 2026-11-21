@@ -870,6 +870,17 @@ pub trait CursorTrait: Any + Send + Sync {
     // --- end: BTreeCursor specific functions ----
 }
 
+/// Amphora (query speed step 7, QS.7): a table leaf as the cursor on it sees it
+/// ([`BTreeCursor::table_leaf_under_cursor`]).
+pub(crate) struct TableLeafUnderCursor<'a> {
+    pub contents: &'a PageContent,
+    /// The cell the cursor stands on.
+    pub cell: usize,
+    pub limits: &'a PayloadLimits,
+    /// The cursor's count of peers at this moment: a batch decoded now is stale once it moves.
+    pub peers_epoch: u64,
+}
+
 pub struct BTreeCursor {
     /// The pager that is used to read and write to the database file.
     pub pager: Arc<Pager>,
@@ -988,6 +999,11 @@ pub struct BTreeCursor {
     /// unregister_cursor when the bucket crosses the 1↔2 threshold; lets
     /// drive_pending_peer_save skip the registry mutex in the common case.
     has_peers: crate::sync::atomic::AtomicBool,
+    /// Amphora (query speed step 7, QS.7): counts the times another cursor came to share this
+    /// cursor's B-tree. A column batch decoded from a leaf under this cursor
+    /// (`vdbe/leaf_batch.rs`) is kept only while the count stands where it was at the decode:
+    /// a peer could have written the leaf.
+    peers_epoch: crate::sync::atomic::AtomicU64,
     /// True if this cursor went through Cursor::new_btree (and thus pushed
     /// itself into the registry). Direct BTreeCursor::new callers (tests,
     /// internal utilities) bypass that path; their Drop skips unregister.
@@ -1269,6 +1285,7 @@ impl BTreeCursor {
             iteration_pending_descent: None,
             pending_peer_save: None,
             has_peers: crate::sync::atomic::AtomicBool::new(false),
+            peers_epoch: crate::sync::atomic::AtomicU64::new(0),
             did_register: crate::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, injected_yields))]
             yield_injector: None,
@@ -1356,6 +1373,35 @@ impl BTreeCursor {
     ) -> Self {
         let num_columns = index_info.num_cols;
         Self::new_with_index_info(pager, root_page, num_columns, Some(index_info))
+    }
+
+    /// Amphora (query speed step 7, QS.7): the table leaf under the cursor and the cell it stands
+    /// on, for a scan that decodes the leaf once into column batches (`vdbe/leaf_batch.rs`).
+    /// None when the cursor isn't on a row of a table leaf, must restore its position first, or
+    /// shares its B-tree with another cursor that could write the leaf.
+    pub(crate) fn table_leaf_under_cursor(&self) -> Option<TableLeafUnderCursor<'_>> {
+        if self.needs_restore()
+            || self.null_flag
+            || !self.has_record
+            || self.index_info.is_some()
+            || self.has_peers.load(crate::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
+        }
+        let page = self.stack.stack.get(self.stack.current())?.as_ref()?;
+        let contents: &PageContent = page.get_contents();
+        if !matches!(contents.page_type(), Ok(PageType::TableLeaf)) {
+            return None;
+        }
+        let cell = usize::try_from(self.stack.current_cell_index()).ok()?;
+        Some(TableLeafUnderCursor {
+            contents,
+            cell,
+            limits: &self.payload_limits,
+            peers_epoch: self
+                .peers_epoch
+                .load(crate::sync::atomic::Ordering::Relaxed),
+        })
     }
 
     /// Amphora (PR.4): turns the key heads on or off for this cursor, whatever the switch says.
@@ -7788,6 +7834,12 @@ impl CursorTrait for BTreeCursor {
     }
 
     fn set_has_peers_for_external_writes(&self, has_peers: bool) {
+        if has_peers {
+            // Wraps only after 2^64 peers: a batch then compares against a reused count, which
+            // still differs from the count at its decode unless exactly 2^64 peers came between.
+            self.peers_epoch
+                .fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
+        }
         self.has_peers
             .store(has_peers, crate::sync::atomic::Ordering::Relaxed);
     }

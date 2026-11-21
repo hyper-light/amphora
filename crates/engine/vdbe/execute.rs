@@ -2187,6 +2187,25 @@ fn op_column_fetch(
         .registers
         .get_mut(dest)
         .ok_or_else(|| register_out_of_range("Column", dest))?;
+    // Amphora (QS.7): a scanned table's column comes from its leaf's batch when the program has
+    // one (`leaf_batch.rs`); otherwise, and for a row the batch left out, the row is read here.
+    if let Some(plan) = program.leaf_batch_plan.as_deref() {
+        match super::leaf_batch::serve_column(
+            &mut state.leaf_batches,
+            plan,
+            cursor_id,
+            cursor,
+            column,
+            dest_reg,
+        )? {
+            super::leaf_batch::Served::Value => return Ok(InsnFunctionStepResult::Step),
+            super::leaf_batch::Served::PastEnd => {
+                apply_column_default(default, dest_reg)?;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+            super::leaf_batch::Served::RowAtATime => {}
+        }
+    }
     let Some((payload, header)) = return_if_io!(state, cursor.record_payload_with_header()) else {
         // A null-row cursor, or one that is not positioned on a valid row
         // (e.g., empty table). Return NULL, not the column's default value.
@@ -2409,6 +2428,34 @@ fn op_column_range_fetch(
         .checked_add(defaults.len())
         .and_then(|end| state.registers.get_mut(dest..end))
         .ok_or_else(|| register_out_of_range("ColumnRange", dest))?;
+    // Amphora (QS.7): as Column does, from the leaf's batch; a row the batch left out is read
+    // whole below.
+    if let Some(plan) = program.leaf_batch_plan.as_deref() {
+        let mut served = true;
+        for (offset, (default, reg)) in defaults.iter().zip(dest_regs.iter_mut()).enumerate() {
+            let column = start_column
+                .checked_add(offset)
+                .ok_or(LimboError::IntegerOverflow)?;
+            match super::leaf_batch::serve_column(
+                &mut state.leaf_batches,
+                plan,
+                cursor_id,
+                cursor,
+                column,
+                reg,
+            )? {
+                super::leaf_batch::Served::Value => {}
+                super::leaf_batch::Served::PastEnd => apply_column_default(default, reg)?,
+                super::leaf_batch::Served::RowAtATime => {
+                    served = false;
+                    break;
+                }
+            }
+        }
+        if served {
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
     let Some((payload, header)) = return_if_io!(state, cursor.record_payload_with_header()) else {
         dest_regs.iter_mut().for_each(Register::set_null);
         return Ok(InsnFunctionStepResult::Step);

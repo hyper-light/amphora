@@ -33,6 +33,7 @@ pub mod explain;
 pub mod group_table;
 #[allow(dead_code)]
 pub mod hash_table;
+pub mod leaf_batch;
 pub mod insn;
 pub mod metrics;
 #[cfg(test)]
@@ -957,6 +958,8 @@ pub struct ProgramState {
     /// Amphora: the rows each of the program's counters counted this run, by its slot
     /// (`row_counts.rs`); empty unless the program has counters.
     pub(crate) row_counts: Vec<u64>,
+    /// Amphora (QS.7): this run's column batches (`leaf_batch.rs`).
+    pub(crate) leaf_batches: leaf_batch::LeafBatches,
     op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
@@ -1103,6 +1106,7 @@ impl ProgramState {
             seek_state: OpSeekState::Start,
             metrics: StatementMetrics::new(),
             row_counts: Vec::new(),
+            leaf_batches: leaf_batch::LeafBatches::default(),
             distinct_key_values: Vec::new(),
             op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
@@ -1264,6 +1268,7 @@ impl ProgramState {
         } else {
             self.row_counts.fill(0);
         }
+        self.leaf_batches.clear();
         self.deferred_seeks.iter_mut().for_each(|s| *s = None);
         self.ended_coroutine.clear();
         self.once.clear();
@@ -1956,6 +1961,9 @@ pub struct PreparedProgram {
     /// Amphora: the program's row counters, by slot (`row_counts.rs`); empty unless the
     /// connection asked for them when it prepared the program.
     pub row_count_sites: Vec<row_counts::RowCountSite>,
+    /// Amphora (query speed step 7, QS.7): the scanned table cursors whose leaves are decoded
+    /// into column batches, when the connection's switch was on as the program was built.
+    pub leaf_batch_plan: Option<Arc<leaf_batch::BatchPlan>>,
 }
 
 #[derive(Clone)]
