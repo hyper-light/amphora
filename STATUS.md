@@ -500,9 +500,14 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   SQLite, DuckDB and Turso through their own shells, PostgreSQL, OrioleDB and CedarDB through `psql`,
   MySQL through `mysql`, ClickHouse through its HTTP interface, each kept open for a file and settled
   before each query; an engine a machine lacks is refused (exit 3), and the nightly runs every one,
-  each on its share of the night's budget, and fails when any couldn't run. Left: the adapters other
-  than SQLite's run only where their programs are (none ran yet: the lane's machine had none), and
-  kiln's queries in the pool (kiln_queries.py needs sqlglot).
+  each on its share of the night's budget, and fails when any couldn't run. Lane corpus-ci-6: an engine's
+  opening, settling and closing statements are bounded by the run's budget (a server that doesn't answer
+  is unreachable, never a hung run); an untyped column is declared BLOB by SQLite's affinity rule 3
+  (DuckDB's comparable records on 40 written files: 152 to 193); Turso's list output, which escapes
+  nothing, is counted again by Turso when an answer disagrees, and a misread one is unreadable, not a
+  disagreement; `CORPUS_BIN_<ENGINE>` may be a command (a client in its server's container). The five
+  server engines ran a pool through the harness on jupiter's Docker (2026-11-21). Left: kiln's queries
+  in the pool (kiln_queries.py needs sqlglot).
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691

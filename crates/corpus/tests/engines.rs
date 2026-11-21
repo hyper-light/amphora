@@ -176,7 +176,13 @@ fn t_g2_4_2_a_file_runs_on_sqlites_shell_or_is_refused() {
 #[test]
 fn t_g2_4_2_cedardb_runs_no_checkpoint() {
     let dsn = || "postgres://p@127.0.0.1:1/p".to_owned();
-    assert_eq!(postgres("postgres", "psql".into(), dsn()).settle, Some("CHECKPOINT"));
-    assert_eq!(postgres("orioledb", "psql".into(), dsn()).settle, Some("CHECKPOINT"));
+    assert_eq!(
+        postgres("postgres", "psql".into(), dsn()).settle,
+        Some("CHECKPOINT")
+    );
+    assert_eq!(
+        postgres("orioledb", "psql".into(), dsn()).settle,
+        Some("CHECKPOINT")
+    );
     assert_eq!(postgres("cedardb", "psql".into(), dsn()).settle, None);
 }
