@@ -2190,7 +2190,8 @@ fn successor(prefix: &[u8]) -> Option<Vec<u8>> {
 /// Whether this is the copy of the test binary that runs `test` alone, in a process of its own: a
 /// test that fills or reads the process's owner table can't share it with the tests beside it. The
 /// parent runs the child and checks that it passed.
-#[cfg(test)]
+// Its callers run a child process sharing a lease, which only Unix builds do.
+#[cfg(all(test, unix))]
 pub(crate) fn in_child(test: &str) -> bool {
     const CHILD: &str = "AMPHORA_DATABASE_CHILD";
     if std::env::var_os(CHILD).is_some_and(|name| name == test) {
