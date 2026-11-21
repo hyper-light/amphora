@@ -86,6 +86,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   hurts: statements that write hundreds of pages, `insert_batch_100` at 32 clients 392 → 44 a
   second, `delete_range_insert` 2,800 → 1,011 (fedora, 2026-10-22, checks); single-row writes as
   before.
+- **Page reads without the log's shared locks** (G3 step 2, docs/design/store.md decision 40,
+  `crates/engine/storage/log_index.rs`), a prototype behind `AMPHORA_LOG_READ_INDEX`, off by
+  default: the log's header read from a seqlocked copy; a page the log doesn't hold answered from an
+  exact bitmap; the frame index read from a copy published per generation (`published`) or from
+  sharded latest-frame tables under version checks (`optimistic`). Built and tested (a model against
+  the locked index, crashes at every write of a checkpoint and restart); not yet measured, nor a way
+  chosen.
 - **The mixed log's commit costs** (docs/design/store.md, Decision (lane wal-read)): publishing a
   commit's records costs a lookup each, not a pass over the records kept decoded or over the
   commit's pages, and deltas are found a word at a time. Built, not merged; whether the bulk
@@ -396,10 +403,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   Kept (lane split-merge-5): each group's holding is kept by its own engine with its rows
   (`Engine::holding`/`keep_holding`), durable before the group acts on it, and a group started again
   answers from it whatever directory it is started by; a directory member keeps the image it installed
-  (`DirectoryMachine::open`), so a restart needs no catch-up (T-T1.9.R1 to R3). Left: rows indexed by
-  position for copy and sweep, the change feed by log position, the old group's log held through the
-  operation, a split copying the range's rows, the shell carrying the driver's actions to groups,
-  `bench reshard` (AC-T1.9.2) and the three-machine lab (AC-T1.9.3).
+  (`DirectoryMachine::open`), so a restart needs no catch-up (T-T1.9.R1 to R3). Copied (lane
+  split-merge-6): an engine keeps a log of its commits and copies a span by position (`Engine::head`,
+  `export`, `changed`, `import`, `keep_log`, `sweep`); the old group's log is held from the first copy
+  until the operation ends; `Groups::carry` carries every driver action to this node's groups, so a split
+  or merge moves the range's rows, through repeated actions and driver restarts (T-T1.9.R4, R5), with the cutover-pause and lab harnesses (T-T1.9.P1, L1).
+  Left: `database::Local` as a group (its holding and log through a replicated command), moves across
+  nodes, load from the store's meter, and the full AC-T1.9.2 and AC-T1.9.3 runs.
 
 - **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
   `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then

@@ -698,7 +698,7 @@ impl Database {
             self.v.commit_logged(txn, d, |ts, ops| {
                 self.redo.append(lane, ts, ops)?;
                 if let Some(feed) = self.columns.get() {
-                    feed.offer(ts, ops);
+                    feed.offer(ts, &self.whole(ops)?);
                 }
                 Ok(())
             })?
@@ -707,6 +707,47 @@ impl Database {
             self.redo.sync(&*self.disk, lane, ts)?;
         }
         Ok(ts)
+    }
+
+    /// `ops` as a column copy reads them (`AC-NS.2.4`): each put of a value that continues in
+    /// chunks with the chunks put after it in the same commit (every put of a long value writes
+    /// all of its chunks, in order, right after its cell), the overflow tree's own changes left
+    /// out.
+    fn whole(&self, ops: &[Op]) -> Result<Vec<Op>> {
+        // Each continuing put's chunk key prefix (its tree and key), to where it is in `out`.
+        let mut open: rustc_hash::FxHashMap<Vec<u8>, usize> = rustc_hash::FxHashMap::default();
+        let mut out: Vec<Op> = Vec::with_capacity(ops.len());
+        for op in ops {
+            match op {
+                Op::Put { tree, key, value } if *tree == self.overflow => {
+                    let prefix = key.get(..key.len().saturating_sub(4)).unwrap_or_default();
+                    if let Some(Op::Put { value: whole, .. }) =
+                        open.get(prefix).and_then(|&at| out.get_mut(at))
+                    {
+                        whole.extend_from_slice(value);
+                    }
+                }
+                Op::Remove { tree, .. } if *tree == self.overflow => {}
+                Op::Put { tree, key, value } => {
+                    let mut prefix = overflow::chunk_key(*tree, key, 0);
+                    prefix.truncate(prefix.len().saturating_sub(4));
+                    if overflow::continues(key, value) {
+                        open.insert(prefix, out.len());
+                    } else {
+                        open.remove(&prefix);
+                    }
+                    out.push(op.clone());
+                }
+                Op::Remove { tree, key } => {
+                    let mut prefix = overflow::chunk_key(*tree, key, 0);
+                    prefix.truncate(prefix.len().saturating_sub(4));
+                    open.remove(&prefix);
+                    out.push(op.clone());
+                }
+                Op::Made { .. } | Op::Dropped { .. } => out.push(op.clone()),
+            }
+        }
+        Ok(out)
     }
 
     /// Rolls `txn` back to `sp` ([`Versioned::rollback_to`]).
@@ -1358,6 +1399,57 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 40);
+    }
+
+    /// Do: keep a column copy's feed of tree 0, then commit a value past a page, a short one over
+    /// it, and a long one again. Expect: the feed queues each value whole, not its cell's part,
+    /// and nothing of the overflow tree (AC-NS.2.4, G11 decision 1 part 2).
+    #[test]
+    fn ns2_4_a_column_feed_gets_large_values_whole() {
+        let db = Database::open(Arc::new(Simulated::new(24, 1).unwrap()), 2_000, 1, cmp).unwrap();
+        let feed = Arc::new(Feed::new(0, usize::MAX, Box::new(|| 0)));
+        db.keep_columns(feed.clone()).unwrap();
+        let mut d = Descender::new();
+        let key = b"k".to_vec();
+        let mut queued = 0;
+        for v in [
+            vec![5u8; 3 * PAGE_SIZE],
+            vec![6u8; 3],
+            vec![7u8; 2 * PAGE_SIZE + 1],
+        ] {
+            let mut t = db.begin().unwrap();
+            db.put(&mut d, &mut t, 0, &key, &v).unwrap();
+            db.commit(t, &mut d, db.lane(), false).unwrap();
+            queued += key.len() + v.len();
+            assert_eq!(feed.queued_bytes(), queued);
+        }
+        let ops = vec![
+            Op::Put {
+                tree: 0,
+                key: key.clone(),
+                value: vec![1; overflow::inline_len(&key).unwrap()],
+            },
+            Op::Put {
+                tree: db.overflow,
+                key: overflow::chunk_key(0, &key, 0),
+                value: vec![2; 9],
+            },
+            Op::Put {
+                tree: db.overflow,
+                key: overflow::chunk_key(0, &key, 1),
+                value: vec![3; 4],
+            },
+            Op::Remove {
+                tree: db.overflow,
+                key: overflow::chunk_key(0, &key, 2),
+            },
+        ];
+        let whole = db.whole(&ops).unwrap();
+        assert_eq!(whole.len(), 1);
+        let Op::Put { value, .. } = &whole[0] else {
+            panic!("a put")
+        };
+        assert_eq!(value.len(), overflow::inline_len(&key).unwrap() + 13);
     }
 
     /// The overflow tree's rows `snap` sees.
