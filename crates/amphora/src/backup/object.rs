@@ -51,6 +51,16 @@ pub(super) struct Manifest {
     pub chunks: u64,
 }
 
+/// A through mark ([`super::plan::ThroughKey`]): the log shipped through frame `last` of
+/// `generation` held every commit stamped at or before `through`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct Through {
+    pub format: u8,
+    pub generation: u64,
+    pub last: u64,
+    pub through: u64,
+}
+
 /// `body` with its sum before it.
 pub(super) fn sealed(body: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(

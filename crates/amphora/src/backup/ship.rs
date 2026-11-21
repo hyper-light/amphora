@@ -13,8 +13,8 @@ use std::time::Instant;
 
 use amphora_api::blobs::{BlobRefusal, Blobs};
 
-use super::object::{self, FORMAT, Identity, Manifest, Segment, StoredMark};
-use super::plan::{self, BaseKey, Link, Rates, SegmentKey};
+use super::object::{self, FORMAT, Identity, Manifest, Segment, StoredMark, Through};
+use super::plan::{self, BaseKey, Link, Rates, SegmentKey, ThroughKey};
 use super::{Hooks, Mark, SECOND_NS, second_of};
 use crate::db::{Db, PAGE_BYTES};
 
@@ -69,6 +69,9 @@ pub struct Shipper {
     base_bytes: Option<u64>,
     /// Marks of a generation that ended before they were shipped: their commits are in a gap.
     lost_marks: u64,
+    /// The key of the archive's latest through mark ([`ThroughKey`]), let go once a later one or a
+    /// segment says more.
+    through_mark: Option<String>,
 }
 
 pub(super) fn list_all(
@@ -160,6 +163,7 @@ impl Shipper {
             since_base: 0,
             base_bytes: None,
             lost_marks: 0,
+            through_mark: None,
         };
         let segments = list_all(blobs, &format!("{prefix}/log/"), until)?;
         if let Some((key, _)) = segments.last() {
@@ -173,6 +177,23 @@ impl Shipper {
                 shipper.identity = Some(body.identity);
                 shipper.header = head;
                 shipper.shipped = last.last;
+            }
+            // A through mark after the last segment says how long the log stayed as it left it;
+            // any other is one a later segment outdid, let go.
+            let marks = super::restore::through_marks(blobs, prefix, until)?;
+            let newest = marks
+                .iter()
+                .filter(|(m, _)| (m.generation, m.last) == (last.generation, last.last))
+                .max_by_key(|(m, _)| m.through)
+                .map(|(m, k)| (m.through, k.clone()));
+            for (_, key) in &marks {
+                if newest.as_ref().is_none_or(|(_, k)| k != key) {
+                    blobs.delete(key, until)?;
+                }
+            }
+            if let Some((through, key)) = newest {
+                shipper.archived_through = shipper.archived_through.max(through);
+                shipper.through_mark = Some(key);
             }
         }
         // The latest base and what was shipped after it.
@@ -209,7 +230,8 @@ impl Shipper {
     }
 
     /// Ships what is durable and stamped: one segment, split into parts where it outgrows the
-    /// store's objects. Nothing when nothing is.
+    /// store's objects. With nothing new to ship, and every commit stamped so far shipped, a
+    /// through mark says the archive is whole through now, once that reaches a later second.
     pub fn ship(&mut self, db: &Db, blobs: &dyn Blobs, until: Instant) -> anyhow::Result<Shipped> {
         let drained = self.hooks.marks.drain()?;
         self.pending.extend(drained.marks);
@@ -217,6 +239,58 @@ impl Shipper {
         // What was committed before now is durable once this ends (store.md, decision 2): every
         // mark drained is then of a durable commit.
         (db.flusher())()?;
+        let shipped = self.ship_durable(db, blobs, until)?;
+        if shipped.segments > 0 {
+            // The segment says as much as the mark did, and more.
+            if let Some(old) = self.through_mark.take() {
+                blobs.delete(&old, until)?;
+            }
+        } else {
+            self.mark_through(blobs, until)?;
+        }
+        Ok(shipped)
+    }
+
+    /// Writes a through mark at the log's shipped end when every commit drained is shipped and
+    /// the archive's through moves into a later second: restore targets are whole seconds
+    /// (AC-T1.12.1), so a mark within the second the archive is whole through already says
+    /// nothing a restore asks, and the marks written are at most one a second, only while rounds
+    /// run (a commit or a base's chunk wakes one).
+    fn mark_through(&mut self, blobs: &dyn Blobs, until: Instant) -> anyhow::Result<()> {
+        if !self.pending.is_empty()
+            || self.identity.is_none()
+            || self.shipped == 0
+            || self.through / SECOND_NS <= self.archived_through / SECOND_NS
+        {
+            return Ok(());
+        }
+        let mark = ThroughKey {
+            generation: self.generation,
+            last: self.shipped,
+            through: self.through,
+        };
+        let key = mark.key(&self.prefix);
+        let body = Through {
+            format: FORMAT,
+            generation: mark.generation,
+            last: mark.last,
+            through: mark.through,
+        };
+        create(blobs, &key, &object::encode(&body)?, until)?;
+        self.archived_through = self.through;
+        if let Some(old) = self.through_mark.replace(key) {
+            blobs.delete(&old, until)?;
+        }
+        Ok(())
+    }
+
+    /// Sends what is durable and stamped of the log's generation now.
+    fn ship_durable(
+        &mut self,
+        db: &Db,
+        blobs: &dyn Blobs,
+        until: Instant,
+    ) -> anyhow::Result<Shipped> {
         let (seq, end) = db.log_end();
         let durable = db.durable_frame().unwrap_or(0).min(end);
         let Some(head) = db.read_log(0, usize::try_from(LOG_HEADER_BYTES)?)? else {
@@ -277,7 +351,12 @@ impl Shipper {
 
     fn begin_generation(&mut self, identity: Identity, head: Vec<u8>) -> anyhow::Result<()> {
         let link = match self.identity {
-            Some(old) if self.hooks.fence.ended_whole(old.seq, self.shipped)? => {
+            Some(old)
+                if self
+                    .hooks
+                    .fence
+                    .ended_whole(old.seq, self.shipped, identity.seq)? =>
+            {
                 Link::Whole(self.shipped)
             }
             _ => Link::Gap,

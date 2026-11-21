@@ -13,6 +13,11 @@
 //! - `p/base/{end_gen}/{end_frame}/{start_gen}/{id}`: a base's manifest, written after its pages:
 //!   a copy of the file begun in generation `start_gen` and ended at `end_frame` of `end_gen`.
 //! - `p/pages/{id}/{chunk}`: a base's pages.
+//! - `p/through/{generation}/{last}/{through}`: a through mark: the log, shipped through frame
+//!   `last` of `generation`, held every commit stamped at or before `through`, a time later than
+//!   the segment ending there says; written when a round finds nothing new to ship
+//!   ([`super::Shipper::ship`]), so a database that stops committing (or closes) is whole through
+//!   the second it stopped in (T-T1.12.D2).
 //!
 //! Numbers are zero-padded to 20 digits so that the store's key order is their order.
 
@@ -177,6 +182,61 @@ impl BaseKey {
             start_gen: num(start_gen)?,
             id: num(id)?,
         })
+    }
+}
+
+/// A through mark as its key names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThroughKey {
+    pub generation: u64,
+    pub last: u64,
+    pub through: u64,
+}
+
+impl ThroughKey {
+    #[must_use]
+    pub fn key(&self, prefix: &str) -> String {
+        format!(
+            "{prefix}/through/{}/{}/{}",
+            pad(self.generation),
+            pad(self.last),
+            pad(self.through)
+        )
+    }
+
+    pub fn parse(prefix: &str, key: &str) -> Result<Self, Unrestorable> {
+        let bad = |why: &str| Unrestorable::Malformed {
+            key: key.into(),
+            why: why.into(),
+        };
+        let rest = key
+            .strip_prefix(prefix)
+            .and_then(|k| k.strip_prefix("/through/"))
+            .ok_or_else(|| bad("not a through mark's key"))?;
+        let parts: Vec<&str> = rest.split('/').collect();
+        let [generation, last, through] = parts.as_slice() else {
+            return Err(bad("not three fields"));
+        };
+        let num = |s: &str| s.parse::<u64>().map_err(|_| bad("a field isn't a number"));
+        Ok(Self {
+            generation: num(generation)?,
+            last: num(last)?,
+            through: num(through)?,
+        })
+    }
+}
+
+/// Raises the through of each segment a through mark follows (the one ending at the mark's frame
+/// of its generation) to the mark's. `segments` are in key order, so in order of where they end.
+pub fn raise_through(segments: &mut [SegmentKey], marks: &[ThroughKey]) {
+    for mark in marks {
+        if let Ok(at) =
+            segments.binary_search_by_key(&(mark.generation, mark.last), |s| (s.generation, s.last))
+            && let Some(segment) = segments.get_mut(at)
+            && segment.marks.is_some()
+        {
+            segment.through = segment.through.max(mark.through);
+        }
     }
 }
 
@@ -509,6 +569,40 @@ mod tests {
         assert!(seg(3, 9, 9, None, 0).key("p") < seg(3, 10, 10, None, 0).key("p"));
         assert!(seg(3, 99, 99, None, 0).key("p") < seg(4, 1, 1, None, 0).key("p"));
         assert!(SegmentKey::parse("p", "p/log/1/2").is_err());
+        let t = ThroughKey {
+            generation: 3,
+            last: 40,
+            through: 12,
+        };
+        assert_eq!(ThroughKey::parse("p", &t.key("p")).unwrap(), t);
+        assert!(ThroughKey::parse("p", "p/through/1/2").is_err());
+    }
+
+    /// T-T1.12.P12: a through mark makes the seconds after the last segment's whole through its
+    /// time; one that doesn't end at a segment says nothing.
+    #[test]
+    fn t_t1_12_p12_through_marks() {
+        let mut segments = vec![
+            seg(1, 1, 10, Some((2 * S, 3 * S)), 3 * S + 5),
+            seg(1, 11, 20, Some((4 * S, 6 * S)), 6 * S + 5),
+        ];
+        assert!(matches!(
+            locate(&segments, 7),
+            Err(Unrestorable::NotYetArchived { .. })
+        ));
+        let mark = |last, through| ThroughKey {
+            generation: 1,
+            last,
+            through,
+        };
+        raise_through(&mut segments, &[mark(19, 9 * S), mark(20, 7 * S + 1)]);
+        assert_eq!(segments[0].through, 3 * S + 5);
+        assert_eq!(segments[1].through, 7 * S + 1);
+        assert_eq!(locate(&segments, 7), Ok(1));
+        assert!(matches!(
+            locate(&segments, 8),
+            Err(Unrestorable::NotYetArchived { .. })
+        ));
     }
 
     /// T-T1.12.P5: a second is found in the segment whose marks reach it, or in the quiet stretch

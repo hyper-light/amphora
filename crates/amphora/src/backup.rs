@@ -166,13 +166,33 @@ impl Marks {
     }
 }
 
+/// The log's restarts since the last that ended a generation with frames in it (an empty one ends
+/// no frames, so is never forced). The engine's restart raises the header's checkpoint sequence by
+/// one (`restart_wal_header`, as SQLite's `walRestartHdr`), so the generations they ended run on
+/// from `seq` one by one, and a log restarted twice with no write between keeps its link whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ended {
+    /// The generation that ended with frames in it, its last frame, and whether it was started
+    /// again before all of it was shipped.
+    seq: u32,
+    frame: u64,
+    forced: bool,
+    /// How many empty generations ended after it, one after another.
+    empties: u32,
+}
+
+impl Ended {
+    /// The generation the latest restart began.
+    fn next(&self) -> u32 {
+        self.seq.wrapping_add(self.empties).wrapping_add(1)
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct FenceState {
     /// The last frame shipped, of generation `.0`.
     shipped: Option<(u32, u64)>,
-    /// How the last generation that ended ended: its sequence, its last frame, and whether it was
-    /// started again before all of it was shipped.
-    ended: Option<(u32, u64, bool)>,
+    ended: Option<Ended>,
 }
 
 /// What a log restart asks of the backup: whether all the log holds is shipped.
@@ -203,13 +223,38 @@ impl Fence {
     }
 
     pub(crate) fn ended(&self, seq: u32, frame: u64, forced: bool) -> anyhow::Result<()> {
-        self.state()?.ended = Some((seq, frame, forced));
+        let mut state = self.state()?;
+        state.ended = match state.ended {
+            Some(mut e) if frame == 0 && e.next() == seq => {
+                e.empties = e.empties.wrapping_add(1);
+                Some(e)
+            }
+            _ => Some(Ended {
+                seq,
+                frame,
+                forced,
+                empties: 0,
+            }),
+        };
         Ok(())
     }
 
-    /// Whether generation `seq` ended at `frame`, shipped whole.
-    pub(crate) fn ended_whole(&self, seq: u32, frame: u64) -> anyhow::Result<bool> {
-        Ok(self.state()?.ended == Some((seq, frame, false)))
+    /// Whether the log ran unbroken from frame `frame` of generation `old`, as it ended, to the start
+    /// of generation `new`: every restart between them was through [`crate::db::Db::restart_log`]
+    /// and none of them forced (T-T1.12.D1).
+    pub(crate) fn ended_whole(&self, old: u32, frame: u64, new: u32) -> anyhow::Result<bool> {
+        let Some(e) = self.state()?.ended else {
+            return Ok(false);
+        };
+        if e.next() != new {
+            return Ok(false);
+        }
+        if old == e.seq {
+            return Ok(frame == e.frame && !e.forced);
+        }
+        // One of the empty generations after it: it ended at frame 0.
+        let after = old.wrapping_sub(e.seq);
+        Ok(frame == 0 && (1..=e.empties).contains(&after))
     }
 }
 
@@ -296,5 +341,31 @@ mod tests {
         assert_eq!(drained.marks[0].frame, 2);
         assert_eq!(drained.marks[0].unknown_from, Some(10 * SECOND_NS + 1));
         assert_eq!(hooks.marks.counts().unwrap().1, 1);
+    }
+
+    /// T-T1.12.P11: a log started again twice with no write between keeps its link whole; a
+    /// restart forced before its frames were shipped, or one the fence wasn't told of, breaks it.
+    #[test]
+    fn t_t1_12_p11_fence_follows_restarts_one_by_one() {
+        let fence = Fence::default();
+        assert!(!fence.ended_whole(4, 9, 5).unwrap(), "no restart seen");
+        fence.shipped(4, 9).unwrap();
+        fence.ended(4, 9, false).unwrap();
+        assert!(fence.ended_whole(4, 9, 5).unwrap());
+        assert!(!fence.ended_whole(4, 8, 5).unwrap(), "ended past what was shipped");
+        // Generation 5 holds nothing and starts again: 4 still reaches 6 whole, and so does 5.
+        fence.ended(5, 0, false).unwrap();
+        assert!(fence.ended_whole(4, 9, 6).unwrap());
+        assert!(fence.ended_whole(5, 0, 6).unwrap());
+        assert!(!fence.ended_whole(4, 9, 5).unwrap(), "the log is past 5");
+        assert!(!fence.ended_whole(4, 9, 7).unwrap(), "6 ended untold");
+        // A forced restart breaks the link from it on.
+        fence.ended(6, 3, true).unwrap();
+        assert!(!fence.ended_whole(6, 3, 7).unwrap());
+        assert!(!fence.ended_whole(4, 9, 7).unwrap());
+        // An empty generation that doesn't follow on starts afresh.
+        fence.ended(9, 0, false).unwrap();
+        assert!(fence.ended_whole(9, 0, 10).unwrap());
+        assert!(!fence.ended_whole(6, 3, 10).unwrap());
     }
 }

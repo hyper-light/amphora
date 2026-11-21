@@ -441,6 +441,8 @@ tests = [
   { id = "T-T1.12.P8", text = "Retention lets go of what precedes the base the oldest kept second needs" },
   { id = "T-T1.12.P9", text = "A base is due with none, after a break, once the log outweighs it, and once a restore at measured rates would pass 30 minutes" },
   { id = "T-T1.12.P10", text = "An archive object round-trips; a changed byte is refused" },
+  { id = "T-T1.12.P11", text = "A log started again twice with no write between keeps its link whole; a restart forced before its frames were shipped, or one the fence wasn't told of, breaks it" },
+  { id = "T-T1.12.P12", text = "A through mark makes the seconds after the last segment's whole through its time; one that doesn't end at a segment says nothing" },
   { id = "AMPHORA-BLOBS", text = "The Blobs seam's conformance suite (AMPHORA-BLOBS-1 to 7) passes on SimBlobs" },
 ]
 

@@ -24,6 +24,12 @@ point ("Continuous Archiving and Point-in-Time Recovery", postgresql.org/docs/cu
   31); then it starts again and the archive records a break: seconds across it need a base after it.
   The engine's own restarts (at the writer's next write once every frame is in the file, and on
   the last connection's close, as SQLite's) are off for a backed-up writer: they skipped the wait.
+  The fence follows restarts one by one (each raises the header's checkpoint sequence by one), so a
+  log started again twice with no write between, its middle generation empty, stays linked whole.
+- **Through marks.** A round with nothing new to ship, every commit stamped so far shipped, writes
+  a small sealed object (`p/through/...`) saying the archive is whole through now, once that is in
+  a later second than it was: a database that stops committing, or closes, restores up to the
+  second it stopped in. A later mark or segment lets the earlier mark go.
 - **Bases.** A copy of the file, chunk by chunk, with no reader held (a reader held for a 100 GB copy
   would hold the log's restarts and the store's readers back), made consistent by replaying the log
   from the first frame of the generation it began in through where the log stood when it ended, as

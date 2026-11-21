@@ -10,7 +10,7 @@ use amphora_api::blobs::Blobs;
 
 use super::Mark;
 use super::object::{self, Manifest, Segment};
-use super::plan::{self, BaseKey, SegmentKey};
+use super::plan::{self, BaseKey, SegmentKey, ThroughKey};
 use super::ship::{FRAME_BYTES, list_all};
 use crate::db::Db;
 
@@ -29,6 +29,19 @@ fn wal_path(path: &Path) -> std::path::PathBuf {
     std::path::PathBuf::from(wal)
 }
 
+/// The through marks under `prefix` ([`plan::ThroughKey`]).
+pub(super) fn through_marks(
+    blobs: &dyn Blobs,
+    prefix: &str,
+    until: Instant,
+) -> anyhow::Result<Vec<(ThroughKey, String)>> {
+    let mut marks = Vec::new();
+    for (key, _) in list_all(blobs, &format!("{prefix}/through/"), until)? {
+        marks.push((ThroughKey::parse(prefix, &key)?, key));
+    }
+    Ok(marks)
+}
+
 /// Restores the database as it stood at the end of `second` (every commit stamped at or before
 /// it) from the archive under `prefix`, into a new file at `path`.
 pub fn restore(
@@ -45,7 +58,12 @@ pub fn restore(
     for (key, _) in list_all(blobs, &format!("{prefix}/log/"), until)? {
         keys.push((SegmentKey::parse(prefix, &key)?, key));
     }
-    let segments: Vec<SegmentKey> = keys.iter().map(|(s, _)| s.clone()).collect();
+    let mut segments: Vec<SegmentKey> = keys.iter().map(|(s, _)| s.clone()).collect();
+    let marks: Vec<ThroughKey> = through_marks(blobs, prefix, until)?
+        .into_iter()
+        .map(|(m, _)| m)
+        .collect();
+    plan::raise_through(&mut segments, &marks);
     let mut bases = Vec::new();
     for (key, _) in list_all(blobs, &format!("{prefix}/base/"), until)? {
         bases.push(BaseKey::parse(prefix, &key)?);
@@ -171,6 +189,11 @@ pub fn expire(
     for (key, _) in list_all(blobs, &format!("{prefix}/log/"), until)? {
         segments.push(SegmentKey::parse(prefix, &key)?);
     }
+    let marks: Vec<ThroughKey> = through_marks(blobs, prefix, until)?
+        .into_iter()
+        .map(|(m, _)| m)
+        .collect();
+    plan::raise_through(&mut segments, &marks);
     let mut bases = Vec::new();
     for (key, _) in list_all(blobs, &format!("{prefix}/base/"), until)? {
         bases.push(BaseKey::parse(prefix, &key)?);
