@@ -167,6 +167,32 @@ pub(super) struct ChosenBtreeCandidate {
     pub(super) cost: Cost,
 }
 
+/// Amphora: whether a table may be read whole for each row of the loops before it (PL.6,
+/// `docs/design/planner.md`, "Decision (lane pl6)"). A table read whole beneath loops that can give
+/// more than one row is read again for each of their rows, whatever its estimate said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WholeReads {
+    /// The loops before this table give at most one row, or there are none: the read runs once.
+    Allowed,
+    /// The loops before this table can give more than one row: a seek, an automatic index or a
+    /// hash join reads it instead, and a whole read stays only where none of them can.
+    Refused,
+}
+
+/// Amphora: whether this access reads its B-tree table whole, by no key (a scan of the table or
+/// of an index with no constraint seeking it): the read PL.6 keeps out of loops that can give
+/// more than one row.
+pub(super) fn reads_whole_table(method: &AccessMethod) -> bool {
+    matches!(
+        &method.params,
+        AccessMethodParams::BTreeTable {
+            build_index: false,
+            constraint_refs,
+            ..
+        } if constraint_refs.is_empty()
+    )
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ChosenInSeekCandidate {
     pub(super) index: Option<Arc<Index>>,
@@ -265,6 +291,7 @@ pub(super) fn choose_best_btree_candidate(
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
+    whole_reads: WholeReads,
 ) -> Result<Option<ChosenBtreeCandidate>> {
     let keeps_right_rows = rhs_table
         .join_info
@@ -298,6 +325,10 @@ pub(super) fn choose_best_btree_candidate(
     };
     let mut best_adjusted_output = f64::MAX;
     let mut best_is_ordered = false;
+    // Amphora (PL.6): where whole reads are refused, any candidate that seeks by a key ranks above
+    // one that reads the table whole, whatever their costs; two of a kind compare by cost.
+    let refused_whole = |whole: bool| whole_reads == WholeReads::Refused && whole;
+    let mut best_is_whole = true;
 
     // Build a mask for the rhs table itself.
     let mut rhs_table_mask = TableMask::default();
@@ -605,12 +636,20 @@ pub(super) fn choose_best_btree_candidate(
             _ => (cost, best_cost),
         };
         let costs_equal = (candidate_total.0 - best_total.0).abs() < 1e-9;
-        if candidate_total < best_total
-            || (costs_equal && adjusted_output < best_adjusted_output - 1e-12)
-        {
+        let candidate_is_whole = usable_constraint_refs.is_empty();
+        let better = match (refused_whole(candidate_is_whole), refused_whole(best_is_whole)) {
+            (false, true) => true,
+            (true, false) => false,
+            _ => {
+                candidate_total < best_total
+                    || (costs_equal && adjusted_output < best_adjusted_output - 1e-12)
+            }
+        };
+        if better {
             best_cost = cost;
             best_adjusted_output = adjusted_output;
             best_is_ordered = is_index_ordered;
+            best_is_whole = candidate_is_whole;
             best_choice = ChosenBtreeCandidate {
                 iter_dir,
                 index: candidate.index.clone(),
@@ -894,6 +933,9 @@ pub(super) fn add_where_cost(
     method.cost = cost_with_where_work(method, ready_where, input_cardinality, params);
 }
 
+/// Replace the best method with `method` if it costs less, or, where whole reads are refused, if
+/// the best reads the table whole (`method`, an automatic index, an IN seek or a multi-index read,
+/// seeks by a key).
 fn replace_if_cheaper(
     best_method: &mut AccessMethod,
     best_cost: &mut Cost,
@@ -901,9 +943,12 @@ fn replace_if_cheaper(
     ready_where: &[(usize, usize)],
     input_cardinality: f64,
     params: &CostModelParams,
+    whole_reads: WholeReads,
 ) {
     let cost = cost_with_where_work(&method, ready_where, input_cardinality, params);
-    if cost < *best_cost {
+    let replaces_refused_whole_read =
+        whole_reads == WholeReads::Refused && reads_whole_table(best_method);
+    if cost < *best_cost || replaces_refused_whole_read {
         *best_method = method;
         *best_cost = cost;
     }
@@ -927,6 +972,7 @@ pub fn find_best_access_method_for_join_order(
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
+    whole_reads: WholeReads,
 ) -> Result<Option<AccessMethod>> {
     match &rhs_table.table {
         Table::BTree(_) => find_best_access_method_for_btree(
@@ -947,6 +993,7 @@ pub fn find_best_access_method_for_join_order(
             input_cardinality,
             base_row_count,
             params,
+            whole_reads,
         ),
         Table::Virtual(vtab) => find_best_access_method_for_vtab(
             vtab,
@@ -1006,6 +1053,7 @@ fn find_best_access_method_for_btree(
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
+    whole_reads: WholeReads,
 ) -> Result<Option<AccessMethod>> {
     let rhs_table_idx = join_order.last().unwrap().original_idx;
     // Amphora: the goal holds only when every WHERE term left to evaluate is one of this table's
@@ -1033,6 +1081,7 @@ fn find_best_access_method_for_btree(
         input_cardinality,
         base_row_count,
         params,
+        whole_reads,
     )?
     else {
         return Ok(None);
@@ -1113,10 +1162,14 @@ fn find_best_access_method_for_btree(
             ..
         } if constraint_refs.is_empty()
     );
+    // Amphora (PL.6): a whole read the loops before it refuse, a scan of an index as well as of
+    // the table, is replaced by any read that seeks by a key, at any cost.
+    let whole_read_refused =
+        |method: &AccessMethod| whole_reads == WholeReads::Refused && reads_whole_table(method);
     // SQLite does not build this temporary index for the right table of a RIGHT or FULL JOIN.
     // The unmatched-row pass must scan the preserved source after the main loop.
     if rhs_table.indexed.is_none()
-        && uses_full_table_scan
+        && (uses_full_table_scan || whole_read_refused(&best_access_method))
         && !lhs_mask.is_empty()
         && !keeps_right_rows
         && allow_automatic_index
@@ -1189,10 +1242,20 @@ fn find_best_access_method_for_btree(
                 ready_where,
                 input_cardinality,
                 params,
+                whole_reads,
             );
         }
     }
 
+    // An alternative must cost less than the best to be kept, unless the best is a refused whole
+    // read, which any of them replaces.
+    let alternative_cost_limit = |method: &AccessMethod, cost: Cost| {
+        if whole_read_refused(method) {
+            Cost(f64::MAX)
+        } else {
+            cost
+        }
+    };
     // Skip alternative access methods (in-seek, multi-index) when INDEXED BY or NOT INDEXED
     // is specified — the user explicitly requested a specific index or no index.
     if rhs_table.indexed.is_none() && rhs_table.btree().is_some_and(|b| b.has_rowid) {
@@ -1205,7 +1268,7 @@ fn find_best_access_method_for_btree(
             input_cardinality,
             base_row_count,
             params,
-            best_cost_with_filters,
+            alternative_cost_limit(&best_access_method, best_cost_with_filters),
         )? {
             let mut in_seek_method = in_seek_method;
             if let AccessMethodParams::InSeek { index, .. } = &in_seek_method.params {
@@ -1225,6 +1288,7 @@ fn find_best_access_method_for_btree(
                 ready_where,
                 input_cardinality,
                 params,
+                whole_reads,
             );
         }
 
@@ -1244,7 +1308,7 @@ fn find_best_access_method_for_btree(
             input_cardinality,
             base_row_count,
             params,
-            best_cost_with_filters,
+            alternative_cost_limit(&best_access_method, best_cost_with_filters),
             lhs_mask,
             analyze_stats,
         )? {
@@ -1255,6 +1319,7 @@ fn find_best_access_method_for_btree(
                 ready_where,
                 input_cardinality,
                 params,
+                whole_reads,
             );
         }
 
@@ -1271,7 +1336,7 @@ fn find_best_access_method_for_btree(
             input_cardinality,
             base_row_count,
             params,
-            best_cost_with_filters,
+            alternative_cost_limit(&best_access_method, best_cost_with_filters),
             lhs_mask,
             analyze_stats,
         )? {
@@ -1282,6 +1347,7 @@ fn find_best_access_method_for_btree(
                 ready_where,
                 input_cardinality,
                 params,
+                whole_reads,
             );
         }
     }

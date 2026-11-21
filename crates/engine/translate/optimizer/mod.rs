@@ -30,6 +30,7 @@ use crate::{
         optimizer::{
             access_method::{
                 find_best_access_method_for_join_order, AccessMethod, AccessMethodParams,
+                WholeReads,
             },
             constraints::{
                 ConstraintUseCandidate, RangeConstraintRef, SeekRangeConstraint, TableConstraints,
@@ -3209,6 +3210,8 @@ fn plan_unmatched_right_rows(
             1.0,
             base_row_count,
             params,
+            // This read runs once, after the main loops.
+            WholeReads::Allowed,
         )?
         else {
             // The rowid candidate, or the INDEXED BY candidate, can always scan the table.

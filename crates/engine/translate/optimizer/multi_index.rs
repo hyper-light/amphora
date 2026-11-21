@@ -12,7 +12,7 @@ use crate::stats::AnalyzeStats;
 use crate::translate::expr::expr_references_any_subquery;
 use crate::translate::optimizer::access_method::{
     choose_best_btree_candidate, choose_best_in_seek_candidate, AccessMethod, AccessMethodParams,
-    BranchReadMode, ChosenInSeekCandidate,
+    BranchReadMode, ChosenInSeekCandidate, WholeReads,
 };
 use crate::translate::optimizer::constraints::{
     analyze_binary_term_for_index, can_use_partial_index, constraints_from_where_clause,
@@ -363,6 +363,8 @@ fn choose_multi_index_branch_access(
         1.0,
         base_row_count,
         params,
+        // A branch reads its rows once, to gather their rowids.
+        WholeReads::Allowed,
     )?;
 
     let mut best_branch = chosen_seek
