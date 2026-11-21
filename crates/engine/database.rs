@@ -1770,6 +1770,19 @@ impl Database {
                         }
                     }
 
+                    // Amphora: the online schema change states, which `make_from_btree` doesn't
+                    // read (CP-T1.12): without them an index a change left delete-only or
+                    // write-only would open public, read before its backfill gave every row its
+                    // entry.
+                    conn.maybe_update_schema();
+                    let states = conn.query_index_states()?;
+                    if !states.is_empty() {
+                        let db = state.db.as_ref().ok_or_else(|| {
+                            LimboError::InternalError("open: no database past Init".into())
+                        })?;
+                        db.with_schema_mut(|schema| schema.set_index_states(states))?;
+                    }
+
                     state.phase = OpenDbAsyncPhase::BootstrapMvStore;
                 }
 

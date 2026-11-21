@@ -1,0 +1,80 @@
+hash-threshold 8
+
+# written for keyword:OFFSET: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+query I nosort
+SELECT a FROM t1 ORDER BY a LIMIT 2 OFFSET 1
+----
+1
+2
+
+query I nosort
+SELECT a FROM t1 ORDER BY a LIMIT 100 OFFSET 5
+----
+5
+6
+
+query I nosort
+SELECT a FROM t1 ORDER BY a LIMIT -1 OFFSET 3
+----
+3
+4
+5
+6
+
+query I nosort
+SELECT a FROM t1 ORDER BY a LIMIT 2 OFFSET -1
+----
+NULL
+1
+
+query T nosort
+SELECT a FROM t1 ORDER BY a LIMIT 1 OFFSET 100
+----
+
+query T nosort
+SELECT b FROM t2 ORDER BY a LIMIT 1 OFFSET (SELECT count(*) FROM t2) - 1
+----
+X
+
+query I nosort
+SELECT a FROM t1 UNION SELECT a FROM t2 ORDER BY 1 LIMIT 3 OFFSET 2
+----
+2
+3
+4
+
+query I nosort
+SELECT a FROM t1 ORDER BY a LIMIT 2 OFFSET 1 + 1
+----
+2
+3
+
+query I nosort
+SELECT a FROM t1 ORDER BY a LIMIT 3, 2
+----
+3
+4
+
+statement error
+SELECT a FROM t1 ORDER BY a OFFSET 2
+
+statement error
+SELECT a FROM t1 ORDER BY a LIMIT 1 OFFSET 'x'
+
+query I rowsort
+SELECT count(*) FROM (SELECT a FROM t1 LIMIT 3 OFFSET 2)
+----
+3

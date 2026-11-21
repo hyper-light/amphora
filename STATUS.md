@@ -24,6 +24,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   pass it, and a seeded differential test holds the simulator's answers to Amphora's
   (`crates/amphora/tests/records_conformance.rs`).
 - **The `amphora` binary** says what it is (`amphora --version`, `amphora --help`), and nothing more yet.
+- **The design's index and the README** (AC-T1.2.3, T-T1.13.2; lane docs): `docs/design.md` gives every
+  decision of `docs/design/` one line and a link, held to the records by
+  `crates/amphora/tests/design_index.rs` (a decision without a line, or a line that points nowhere,
+  fails it); it compares the client protocol with PostgreSQL's, MySQL's, SQLite's API and Hrana from
+  `docs/research/client-protocol.md`, and `docs/design/client-protocol.md` proposes the decision
+  (embedded first; the network listener open). `README.md` takes a fresh clone to a build, a working
+  database (`cargo run -p amphora --example quickstart`) and the gates. Built and merged; a fresh
+  agent following it on a clean machine (T-T1.13.2's run) is still to do.
 - **The store's commit pipeline** (CP-T1.1, `crates/amphora/src/store.rs`, docs/design/store.md): one
   writer with a group commit and no timer; durable beside it by a flusher (a write is durable once a
   flush begun after its commit ends, `Store::durable` by its batch's ticket); readers of their own on
@@ -234,12 +242,29 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   after it, never an empty database over an existing file. Crash points through commits and
   checkpoints recover a prefix of the commits at least as long as the last acknowledged durable;
   the pool still holds every page, and nothing runs it under SQL yet (stage 3).
+- **The executor's cursor on the versioned storage** (docs/design/engine.md decision 9, NS.1;
+  `crates/engine/storage/versioned/cursor.rs`): `CursorTrait` on a B-link tree's rows as a snapshot
+  sees them, keyed by rowid or by an index's record; it copies a leaf at a time under its shared
+  latch and finds its row again by key once the leaf's version moves, so it sees its own
+  transaction's writes through other cursors. A conformance suite (`conformance.rs`) drives it and
+  the current engine's B-tree cursor through the same random operation sequences on a table and two
+  indexes (one descending and NOCASE) and compares every step. Not yet: overflow rows (refused,
+  `TooBig`), dropping a tree, a comparison per tree in one database, the connection's wiring (step 2).
 - **Serializable validation, three prototypes behind one switch** (G8 step 1, docs/design/engine.md
   decision 5, `crates/engine/storage/versioned/{version,elle}.rs`, `amphora-bench --cc`): precision
   locking (the default), SSI and Silo-style OCC validate commits on the versioned storage's commit
   path; Elle's list-append and register histories checked for G0, G1a, G1b, G1c, G-single and G2
   (snapshot isolation the control, showing G2). Not yet: the 10,000-seed runs and the three schemes'
   throughput, refusals and p99 on the suite's write classes and K0 (the batch's), then the choice.
+- **Versions collected, memory bounded** (G8 step 2, docs/design/engine.md decision 10,
+  `crates/engine/storage/versioned/version.rs`): collection keeps of each row only the versions some
+  open snapshot sees, so a long reader holds one version a row; versions, transactions' records and
+  commits kept for validation are charged to one budget (by default the pool's bytes, or the shell's
+  `with_budget`) and refused past it with a typed `MemoryBudget`; commits are kept only while a
+  transaction begun before them is open; reads past the budget escalate to the whole tree. Tested by
+  a short soak (one reader, 32 writers). Not yet: versions moved out of memory for long readers
+  (LeanStore's graveyard), the hour-long soak (`AMPHORA_G8_SOAK_SECONDS=3600`, the batch's), and the
+  shell passing a budget learned from the process's memory once it opens this storage.
 - **Ephemeral tables kept between runs** (docs/design/executor.md decision 1,
   `crates/engine/tests/ephemeral_reuse.rs`): a statement keeps each ephemeral table of at most 16
   pages (an IN list's keys, an IN subquery's rows) and empties it on its next run, where building
@@ -286,6 +311,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   its retries' gaps (cold start: the core's election timeout). A gap over which the host's detector suspected the
   member is not learned; no number bounds a gap (lane g-slot-close, 2026-11-21).
 
+- **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
+  over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
+  on a group's database (`Cluster`, each step one call to the group). A crashed coordinator's next incarnation fences
+  the old one and finishes what it left. Tested: a crash at every step (T-T1.10.1) and seeded runs with lost and late
+  steps and crashes, Elle-style. Left: the LAN p99 (AC-T1.10.2) on multi-node groups and the 10,000-seed run, which
+  decide between the two; SQL sessions across groups (AC-T1.10.1).
 - **Picked constants replaced by derived ones** (lane constants, kiln goal dfabffcc; Ada, 2026-11-11: "learned and
   stat derived values only"): a page's chain of deltas ends where its bytes reach a page (store.md decision 17); the
   store's log is copied past its bound (decision 35); a term runs on the whole sample (planner.md decision 21); a
@@ -302,8 +333,24 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   docs/design/reshard.md): a pure core: a directory of hash spans with every position in exactly one group,
   each group's own holding (fenced, stale actions refused), a planner deciding from measured load, bytes and
   cores, and a driver doing copy, catch-up in rounds and a fenced cutover. Tested in a deterministic
-  simulator (T-T1.9.S1). Left: the shell over Amphora's groups and replicated owners, `bench reshard`
-  (AC-T1.9.2) and the three-machine lab (AC-T1.9.3).
+  simulator (T-T1.9.S1). Connected (lane split-merge-4): the directory is a replicated group's state
+  (`reshard::replicated::DirectoryMachine`, a hyper-durable state machine of directory changes; its
+  leader runs the driver under its term), and `Groups` routes by the directory instead of `fnv % n`, each
+  group checking every write and read against its holding (`store::Refused::Away`) (T-T1.9.R1, R2).
+  Left: each group's holding kept durable in its own state with its rows (it is in the router's memory
+  now), rows indexed by position for copy and sweep, the old group's log held through the operation,
+  the shell carrying the driver's actions to groups, `bench reshard` (AC-T1.9.2) and the three-machine
+  lab (AC-T1.9.3).
+
+- **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
+  `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then
+  public, each step a transaction through the writer, with a backfill in batches sized as it runs
+  (a batch holds the writer about as long as it waited for it). Reads use the index only once
+  public; the cutover changes only the catalog. A power cut at every change of a build leaves the
+  old schema or the new; rows that break a unique index undo the change. The 10M-row cutover p99
+  (AC-T1.12.2) is not yet measured. A column (`ALTER TABLE … ADD COLUMN`) is added in one catalog
+  change, its states run together, as no row is rewritten or read; one whose addition reads every
+  row is refused. Constraints on existing columns and DROP COLUMN are not yet built.
 
 ## Measured
 
@@ -350,16 +397,21 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   NOCASE)` is 1 where SQLite says 0 (the left operand's collation decides), and `PRAGMA index_xinfo`
   names the rowid's column '' where SQLite gives NULL. CedarDB's server dies on
   `SELECT 0 OR NULL, 1 OR NULL`, and again when it's tried a second time.
-- **The corpus's runner** (G2 steps 4 and 7, lane corpus-ci; `crates/corpus`, built, not yet in the gate):
+- **The corpus's runner** (G2 steps 4 and 7, lane corpus-ci; `crates/corpus`, in the gate):
   sqllogictest records read, run, rendered (I, R, T as slt_sqlite.c writes them, REALs through Amphora's
   port of SQLite's printf), sorted and compared (MD5 past the hash threshold) as SQLite's own runner does,
   one code path for the gate's subset and the bench's run over every engine; each query after a statement
   settles the engine first (`PRAGMA wal_checkpoint(TRUNCATE)`), and each disagreement classifies as an
   Amphora bug, a competitor's bug, a dialect difference or a translation gap. `amphora-corpus run <pool>
   --budget-s <s>` runs a ranked pool on Amphora: required files whole, the rest until the budget, timed on
-  the machine as it runs, so the subset's size is what that machine runs in the budget. Left: the pool
-  chosen and checked in, its line in `scripts/gates.sh`, the bench's adapters for the other engines, the
-  nightly in `.kiln/`.
+  the machine as it runs, so the subset's size is what that machine runs in the budget. The gate's pool
+  (`bench/corpus/subset`, chosen by `bench/corpus/subset.py` from measured times: required files reach
+  every entry Amphora answers right somewhere, then query types per measured second up to the plan's 2
+  minutes) runs in `scripts/gates.sh`, its times kept as CI artifacts; `.kiln/corpus.yaml`
+  (`bench/corpus/nightly.sh`) builds and runs the whole corpus nightly and re-ranks the pool. Left: the
+  adapters for the other engines (only Amphora has one), a bound on one record's time (a select5 join
+  ran past 12 minutes on a debug build, and the deadline is checked only between records), and kiln's
+  queries in the pool (kiln_queries.py needs sqlglot).
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691
@@ -417,6 +469,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Next
 
+- **Follower reads at a closed time and search over partitions** (G13 step 4; replication.md, "Follower reads at a
+  closed time" and "Search over partitions"; lane follower-reads): built and unit-tested, not measured. Every proposed
+  entry carries its proposer's clock; every member applies it at the larger of that and one past the time before it,
+  so times rise along the log whoever leads. `Database::query_closed` answers at the replica's closed time once it is
+  at least the time asked; `follower_read_micros` is now less the replica's measured p99 lag. `amphora::search` asks
+  partitions at once and merges newest first. Closes with: AC-T1.10.3 and AC-T1.10.4 measured (`amphora-bench
+  --cluster`), an idle group's time closed on demand, and the attached client's request on the wire.
 - **Query speed step 5 (QT.5), started** (lane qs5): `Connection::set_join_methods` plans a connection's new
   statements by cost, with index nested loops only, or with hash joins only; `tests/join_methods.rs` (T-QT.5.1) runs
   inner, left, semi and anti joins with NULL and duplicate keys all three ways and against a model. The harness

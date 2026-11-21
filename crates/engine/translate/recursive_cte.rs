@@ -96,6 +96,7 @@ pub(crate) fn emit_recursive_cte(
         where_clause: None,
         index_method: None,
         on_conflict: None,
+        state: crate::schema::IndexState::Public,
     });
     let queue_cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(queue_index.clone()));
     program.emit_insn(Insn::OpenEphemeral {
@@ -131,6 +132,7 @@ pub(crate) fn emit_recursive_cte(
             where_clause: None,
             index_method: None,
             on_conflict: None,
+            state: crate::schema::IndexState::Public,
         });
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(seen_row_index.clone()));
         program.emit_insn(Insn::OpenEphemeral {

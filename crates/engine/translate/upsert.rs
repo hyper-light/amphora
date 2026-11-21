@@ -456,7 +456,7 @@ pub fn resolve_upsert_target(
 
     // Otherwise match a UNIQUE index, also covering non-rowid PRIMARY KEYs
     for idx in schema.get_indices(table.get_name()) {
-        if idx.unique && upsert_matches_index(upsert, idx, table) {
+        if idx.is_public() && idx.unique && upsert_matches_index(upsert, idx, table) {
             return Ok(ResolvedUpsertTarget::Index(Arc::clone(idx)));
         }
     }

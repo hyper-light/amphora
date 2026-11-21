@@ -1,0 +1,67 @@
+hash-threshold 8
+
+# written for keyword:RENAME: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+statement ok
+CREATE TABLE krn(a, b)
+
+statement ok
+ALTER TABLE krn RENAME TO krn2
+
+statement ok
+ALTER TABLE krn2 RENAME COLUMN a TO x
+
+statement ok
+ALTER TABLE krn2 RENAME b TO y
+
+query T nosort
+SELECT name FROM pragma_table_info('krn2') ORDER BY cid
+----
+x
+y
+
+statement ok
+CREATE VIEW krnv AS SELECT x FROM krn2
+
+statement ok
+ALTER TABLE krn2 RENAME COLUMN x TO z
+
+query T rowsort
+SELECT sql FROM sqlite_schema WHERE name = 'krnv'
+----
+CREATE VIEW krnv AS SELECT z FROM krn2
+
+statement error
+ALTER TABLE krn2 RENAME TO t1
+
+statement error
+ALTER TABLE krn2 RENAME COLUMN nope TO w
+
+statement error
+ALTER TABLE krn2 RENAME COLUMN z TO y
+
+statement ok
+CREATE INDEX krni ON krn2(z)
+
+statement ok
+ALTER TABLE krn2 RENAME TO krn3
+
+query T rowsort
+SELECT tbl_name FROM sqlite_schema WHERE name = 'krni'
+----
+krn3
+
+statement ok
+ALTER TABLE main.krn3 RENAME TO "krn 4"

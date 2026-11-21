@@ -1,0 +1,75 @@
+hash-threshold 8
+
+# written for keyword:ABORT: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+statement ok
+CREATE TABLE kab(k INTEGER PRIMARY KEY, v TEXT UNIQUE ON CONFLICT ABORT)
+
+statement ok
+INSERT INTO kab VALUES (1, 'a')
+
+statement error
+INSERT INTO kab VALUES (2, 'a')
+
+statement error
+INSERT OR ABORT INTO kab VALUES (1, 'x')
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO kab VALUES (3, 'c')
+
+statement error
+INSERT OR ABORT INTO kab VALUES (4, 'c')
+
+statement ok
+COMMIT
+
+query IT nosort
+SELECT k, v FROM kab ORDER BY k
+----
+1
+a
+3
+c
+
+statement error
+UPDATE OR ABORT kab SET v = 'a' WHERE k = 3
+
+statement ok
+CREATE TABLE kac(a NOT NULL ON CONFLICT ABORT)
+
+statement error
+INSERT INTO kac VALUES (NULL)
+
+statement error
+INSERT INTO kac VALUES (1), (NULL)
+
+query I rowsort
+SELECT count(*) FROM kac
+----
+0
+
+statement ok
+CREATE TRIGGER kat BEFORE INSERT ON kab WHEN NEW.v = 'z' BEGIN SELECT RAISE(ABORT, 'no z'); END
+
+statement error
+INSERT INTO kab VALUES (9, 'z')
+
+query I rowsort
+SELECT count(*) FROM kab
+----
+2

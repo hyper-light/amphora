@@ -1121,6 +1121,7 @@ fn get_subquery_parser<'a>(
                     where_clause: None,
                     index_method: None,
                     on_conflict: None,
+                    state: crate::schema::IndexState::Public,
                 });
 
                 let cursor_id =

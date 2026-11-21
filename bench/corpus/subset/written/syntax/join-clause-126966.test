@@ -1,0 +1,130 @@
+hash-threshold 8
+
+# written for syntax:join-clause: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+query IT nosort
+SELECT t1.a, t2.b FROM t1 JOIN t2 ON t1.a = t2.a ORDER BY 1
+----
+1
+x
+2
+Y
+3
+y
+6
+z
+
+query IT nosort
+SELECT t1.a, t2.b FROM t1, t2 WHERE t1.a = t2.a ORDER BY 1
+----
+1
+x
+2
+Y
+3
+y
+6
+z
+
+query IT nosort
+SELECT t1.a, t2.b FROM t1 LEFT JOIN t2 ON t1.a = t2.a ORDER BY 1
+----
+14 values hashing to 37777dde4aebca81c19a4f246c61d8ce
+
+query II nosort
+SELECT t1.a, t2.a FROM t1 RIGHT JOIN t2 ON t1.a = t2.a ORDER BY 2
+----
+10 values hashing to 0900d2165c9c41e49c298771b2f2bdb0
+
+query II nosort
+SELECT t1.a, t2.a FROM t1 FULL JOIN t2 ON t1.a = t2.a ORDER BY coalesce(t1.a, t2.a)
+----
+16 values hashing to b431b7b7ed8b68ad308d35da22624b91
+
+query I rowsort
+SELECT count(*) FROM t1 CROSS JOIN t2
+----
+35
+
+query IT nosort
+SELECT a, t2.b FROM t1 JOIN t2 USING (a) ORDER BY a
+----
+1
+x
+2
+Y
+3
+y
+6
+z
+
+query TT nosort
+SELECT a, b FROM t1 NATURAL JOIN t2 ORDER BY a
+----
+
+query II nosort
+SELECT x.a, y.a FROM t1 AS x JOIN t1 AS y ON y.a = x.a + 1 ORDER BY 1
+----
+10 values hashing to d7f5a9f7f64f698705eec642cba7d09c
+
+query I nosort
+SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.a JOIN t1 AS t3 ON t3.a = t2.a ORDER BY 1
+----
+1
+2
+3
+6
+
+query I rowsort
+SELECT count(*) FROM t1 INNER JOIN t2 ON 1
+----
+35
+
+query II nosort
+SELECT t1.a, t2.c FROM t1 LEFT OUTER JOIN t2 ON t1.a = t2.a AND t2.c > 10 ORDER BY 1
+----
+14 values hashing to 9bbd688882a2deae16539e3e5ee3ac25
+
+statement error
+SELECT * FROM t1 JOIN t2 USING (nope)
+
+query II nosort
+SELECT t1.a, t2.a FROM t1 RIGHT OUTER JOIN t2 USING (a) ORDER BY 2
+----
+10 values hashing to 0900d2165c9c41e49c298771b2f2bdb0
+
+query TI nosort
+SELECT t1.a, t2.a FROM t1 FULL OUTER JOIN t2 USING (a) WHERE t1.a IS NULL ORDER BY 2
+----
+NULL
+NULL
+NULL
+7
+
+query I nosort
+SELECT a FROM t1 NATURAL LEFT JOIN t2 ORDER BY a
+----
+NULL
+1
+2
+3
+4
+5
+6
+
+query I rowsort
+SELECT count(*) FROM t1 JOIN t2
+----
+35

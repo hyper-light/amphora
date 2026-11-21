@@ -1,0 +1,124 @@
+hash-threshold 8
+
+# written for syntax:upsert-clause: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+statement ok
+CREATE TABLE kv(k TEXT PRIMARY KEY, v INTEGER, n INTEGER DEFAULT 0, u TEXT UNIQUE)
+
+statement ok
+INSERT INTO kv VALUES ('a', 1, 0, 'ua'), ('b', 2, 0, 'ub')
+
+statement ok
+INSERT INTO kv(k, v) VALUES ('a', 10) ON CONFLICT (k) DO UPDATE SET v = excluded.v, n = n + 1
+
+query TII rowsort
+INSERT INTO kv(k, v) VALUES ('a', 20) ON CONFLICT (k) DO UPDATE SET v = excluded.v WHERE excluded.v > kv.v RETURNING k, v, n
+----
+a
+20
+1
+
+query TT rowsort
+INSERT INTO kv(k, v) VALUES ('a', 5) ON CONFLICT (k) DO UPDATE SET v = excluded.v WHERE excluded.v > kv.v RETURNING k, v
+----
+
+query TIIT rowsort
+INSERT INTO kv(k, v) VALUES ('c', 3) ON CONFLICT (k) DO NOTHING RETURNING *
+----
+c
+3
+0
+NULL
+
+query TTTT rowsort
+INSERT INTO kv(k, v) VALUES ('c', 33) ON CONFLICT DO NOTHING RETURNING *
+----
+
+statement error
+INSERT INTO kv(k, v, u) VALUES ('d', 4, 'ua') ON CONFLICT (k) DO UPDATE SET v = 0
+
+query TIT rowsort
+INSERT INTO kv(k, v, u) VALUES ('d', 4, 'ua') ON CONFLICT (u) DO UPDATE SET v = excluded.v + 100 RETURNING k, v, u
+----
+a
+104
+ua
+
+query TI rowsort
+INSERT INTO kv(k, v, u) VALUES ('b', 7, 'ub') ON CONFLICT (k) DO UPDATE SET v = -1 ON CONFLICT (u) DO NOTHING RETURNING k, v
+----
+b
+-1
+
+query TI rowsort
+INSERT INTO kv(k, v) VALUES ('e', 1), ('e', 2), ('e', 3) ON CONFLICT (k) DO UPDATE SET v = v + excluded.v RETURNING k, v
+----
+e
+1
+e
+3
+e
+6
+
+statement ok
+INSERT INTO kv(k, v) SELECT b, a FROM t1 WHERE b IS NOT NULL ON CONFLICT (k) DO UPDATE SET n = n + 1
+
+statement ok
+INSERT INTO kv(k, v) SELECT b, a FROM t1 WHERE true ON CONFLICT (k) DO UPDATE SET n = n + 1
+
+statement error
+INSERT INTO kv(k, v) VALUES ('a', 1) ON CONFLICT (v) DO NOTHING
+
+statement error
+INSERT INTO kv AS t(k, v) VALUES ('a', 50) ON CONFLICT (k) DO UPDATE SET v = t.v + excluded.v RETURNING t.k, t.v
+
+statement error
+INSERT INTO kv(k, v) VALUES ('a', 1) ON CONFLICT (k) DO UPDATE SET k = 'b'
+
+statement error
+INSERT INTO kv(k, v) VALUES ('h', 8) ON CONFLICT (k) DO UPDATE SET v = 0 RETURNING excluded.v
+
+query ITI rowsort
+INSERT INTO t2(a, b, c) VALUES (2, 'two', 0) ON CONFLICT (a) DO UPDATE SET c = excluded.c * 10 WHERE excluded.b = 'two' RETURNING a, b, c
+----
+2
+Y
+0
+
+query ITI rowsort
+INSERT INTO t2(b, c) VALUES ('new', 1) ON CONFLICT DO UPDATE SET c = 99 RETURNING a > 0, b, c
+----
+1
+new
+1
+
+query TI rowsort
+WITH src(k, v) AS (VALUES ('a', 100), ('z', 26)) INSERT INTO kv(k, v) SELECT k, v FROM src WHERE 1 ON CONFLICT (k) DO UPDATE SET v = excluded.v RETURNING k, v
+----
+a
+100
+z
+26
+
+statement ok
+INSERT INTO kv(k, v) VALUES ('a', 1) ON CONFLICT (k) WHERE v > 0 DO NOTHING
+
+statement error
+INSERT INTO kv(k, v) VALUES ('q', 1) ON CONFLICT DO UPDATE SET v = 2 ON CONFLICT (k) DO NOTHING
+
+query TIIT nosort
+SELECT k, v, n, u FROM kv ORDER BY k
+----
+48 values hashing to 02a8e9d33cdd6eabc626c85b1ef8cf1a
