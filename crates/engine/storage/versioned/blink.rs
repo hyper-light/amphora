@@ -566,6 +566,88 @@ impl Tree {
         }
     }
 
+    /// The leaf whose keys may include those on either side of `before`'s point, and its lower
+    /// bound (None: the leftmost leaf), from the root through the descender's copies of the inner
+    /// pages, moving right past splits as [`Tree::descend`] does. A child's lower bound is the key
+    /// of the parent's cell that leads to it (the parent's own, for its first child), and a page
+    /// moved right to has the bound of the page moved from as its own: pages split only to the
+    /// right, so a page's lower bound never changes.
+    pub fn leaf_for(
+        &self,
+        pool: &Pool,
+        d: &mut Descender,
+        before: Before<'_>,
+    ) -> Result<(u64, Option<Vec<u8>>)> {
+        let mut page = self.root();
+        let mut low: Option<Vec<u8>> = None;
+        for _ in 0..MAX_LEVELS {
+            let mut moves = 0u64;
+            let image = loop {
+                let image = d.image(pool, page)?;
+                let past = match page::high(image)? {
+                    Some(high) => before(high)?,
+                    None => false,
+                };
+                if !past {
+                    break d.image(pool, page)?;
+                }
+                let high = page::high(image)?.map(<[u8]>::to_vec);
+                let next = page::right(image)?;
+                page = step_right(pool, &mut moves, page, next)?;
+                low = high;
+            };
+            let level = page::level(image)?;
+            if level == 0 {
+                return Ok((page, low));
+            }
+            let child = match cells_before(image, before)?.checked_sub(1) {
+                None => page::first(image)?,
+                Some(i) => {
+                    low = Some(page::key(image, i)?.to_vec());
+                    page::child(image, i)?
+                }
+            };
+            if level == 1 {
+                return Ok((child, low));
+            }
+            page = child;
+        }
+        Err(too_tall())
+    }
+
+    /// `f` on the leaf from `start` (whose lower bound is `low`) that holds the keys on either
+    /// side of `before`'s point, under its shared latch: moving right past splits made since
+    /// `start` was found.
+    pub fn read_leaf<R>(
+        &self,
+        pool: &Pool,
+        start: u64,
+        low: Option<Vec<u8>>,
+        before: Before<'_>,
+        f: impl FnOnce(Leaf<'_>) -> Result<R>,
+    ) -> Result<R> {
+        let (mut leaf, mut low, mut moves) = (start, low, 0u64);
+        loop {
+            let r = pool.read(leaf)?;
+            if let Some(high) = page::high(&r)? {
+                if before(high)? {
+                    let next = page::right(&r)?;
+                    low = Some(high.to_vec());
+                    leaf = step_right(pool, &mut moves, leaf, next)?;
+                    continue;
+                }
+            }
+            let split = cells_before(&r, before)?;
+            return f(Leaf {
+                no: leaf,
+                version: r.version(),
+                low: low.as_deref(),
+                split,
+                page: &r,
+            });
+        }
+    }
+
     /// The leftmost leaf.
     fn leftmost(&self, pool: &Pool, d: &mut Descender) -> Result<u64> {
         let mut page = self.root();
@@ -620,6 +702,40 @@ pub enum Change {
     Mark(page::Flags),
     /// Removes the cell.
     Remove,
+}
+
+/// Whether a key comes before a point between keys that a cursor moves from (a seek's place, or
+/// the place just short of or just past a key): true for every key up to the point, false from it
+/// on, in the tree's order. The point is never a key, so no key is at it.
+pub type Before<'a> = &'a mut dyn FnMut(&[u8]) -> Result<bool>;
+
+/// How many of a page's cells hold keys before `before`'s point (its cells are in key order).
+fn cells_before(p: &[u8], before: Before<'_>) -> Result<usize> {
+    let (mut lo, mut hi) = (0usize, page::count(p)?);
+    while lo < hi {
+        let mid = lo
+            .checked_add(hi.checked_sub(lo).ok_or(LimboError::IntegerOverflow)? / 2)
+            .ok_or(LimboError::IntegerOverflow)?;
+        if before(page::key(p, mid)?)? {
+            lo = mid.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
+/// A leaf under its shared latch, as [`Tree::read_leaf`] hands it to a cursor.
+pub struct Leaf<'a> {
+    /// Its page.
+    pub no: u64,
+    /// Its frame's version: the leaf is as read while the frame's version stays this.
+    pub version: u64,
+    /// Its lower bound: the least key it may hold (None: the leftmost leaf).
+    pub low: Option<&'a [u8]>,
+    /// How many of its cells come before the point it was read for.
+    pub split: usize,
+    pub page: &'a [u8],
 }
 
 /// A split: the page that split, the page it split into, the key dividing them and their level.

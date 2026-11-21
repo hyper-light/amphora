@@ -709,6 +709,8 @@ pub struct Database<
     /// Amphora (QT.5): what its operators' work costs, learned as its queries run.
     /// Shared with its pagers, which time the pages they read from its file.
     pub(crate) learned_costs: Arc<crate::translate::optimizer::learned_costs::LearnedCosts>,
+    /// Amphora (PL.9): each table's rows inserted less rows deleted since ANALYZE counted it.
+    pub(crate) row_changes: Arc<crate::row_changes::RowChanges>,
 
     /// Optional per-database MVCC durable storage override.
     ///
@@ -882,6 +884,7 @@ impl Database {
             }))),
             _shared_page_cache: shared_page_cache,
             learned_costs,
+            row_changes: Arc::new(crate::row_changes::RowChanges::new()),
             shared_wal,
             #[cfg(host_shared_wal)]
             shared_wal_coordination: OnceLock::new(),
@@ -1801,6 +1804,13 @@ impl Database {
                             LimboError::InternalError("open: no database past Init".into())
                         })?;
                         db.with_schema_mut(|schema| schema.set_index_states(states))?;
+                    }
+                    let columns = conn.query_constraint_states()?;
+                    if !columns.is_empty() {
+                        let db = state.db.as_ref().ok_or_else(|| {
+                            LimboError::InternalError("open: no database past Init".into())
+                        })?;
+                        db.with_schema_mut(|schema| schema.set_constraint_states(&columns))?;
                     }
 
                     state.phase = OpenDbAsyncPhase::BootstrapMvStore;

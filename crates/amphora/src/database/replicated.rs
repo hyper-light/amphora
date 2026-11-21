@@ -35,7 +35,6 @@ const MESSAGE_BYTES: usize = crate::replication::COMMAND_BYTES.saturating_add(2 
 // Ticks are the pinned core's documented tick election mode (raft.rs, Elections::Ticks). Its
 // twenty-tick randomized election and two-tick heartbeat use this owner clock, never host votes.
 const TICK: Duration = Duration::from_millis(10);
-const POLL: Duration = Duration::from_millis(1);
 // The admission charge of a change of members, a hand-off of the lead, a catch-up or an
 // attestation: the bytes the queued input itself takes, its place in the queue's byte budget (an
 // attestation's name is charged beside it). The response channel's own allocation is charged for
@@ -51,7 +50,60 @@ type Response<T> = mpsc::SyncSender<Result<T, Refusal>>;
 #[derive(Clone)]
 pub struct ReplicaHandle {
     sender: mpsc::SyncSender<Envelope>,
+    // Declared after `sender`, so it rings once the sender is gone: the last handle's drop wakes
+    // the owner to find its channel closed.
+    _ring: Ring,
     shared: Arc<Control>,
+}
+
+/// What wakes the owner thread (replication.md, "Decision (lane constants): the owner's wakes"): an input queued, a handle
+/// dropped, the log's write or compaction done (its [`std::task::Waker`]), or a flush done. The
+/// owner waits on it only until its next deadline, so a wake is never needed for a deadline.
+struct Bell {
+    rung: Mutex<bool>,
+    ringing: std::sync::Condvar,
+}
+impl Bell {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            rung: Mutex::new(false),
+            ringing: std::sync::Condvar::new(),
+        })
+    }
+    /// Wakes the owner, or its next wait if it isn't waiting. A poisoned bell only rings for an
+    /// owner whose own wait fails on that poison and fences, so nothing is left to wake.
+    fn ring(&self) {
+        if let Ok(mut rung) = self.rung.lock() {
+            *rung = true;
+            self.ringing.notify_one();
+        }
+    }
+    /// Waits until the bell rings or `wait` passes, whichever is first, and takes the ring:
+    /// whether it rang.
+    fn wait(&self, wait: Duration) -> Result<bool, Refusal> {
+        let rung = locked(&self.rung)?;
+        let (mut rung, _) = self
+            .ringing
+            .wait_timeout_while(rung, wait, |rung| !*rung)
+            .map_err(|_| fenced("the owner's bell was poisoned"))?;
+        Ok(std::mem::take(&mut *rung))
+    }
+}
+impl std::task::Wake for Bell {
+    fn wake(self: Arc<Self>) {
+        self.ring();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.ring();
+    }
+}
+/// A handle's ring as it drops.
+#[derive(Clone)]
+struct Ring(Arc<Bell>);
+impl Drop for Ring {
+    fn drop(&mut self) {
+        self.0.ring();
+    }
 }
 
 /// Completion of a bounded queued wire record. Admission transfers byte ownership only;
@@ -234,6 +286,7 @@ struct Control {
     status: Mutex<Result<ReplicaStatus, Refusal>>,
     meter: Arc<ReplicaMeter>,
     local: Local,
+    bell: Arc<Bell>,
     // This replica's closed time and measured lag, as its owner published them after its last
     // step; told on `moved` whenever the time moves or the owner ends (replication.md, "Follower
     // reads at a closed time").
@@ -725,6 +778,8 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     // Whether this step's drive left more to drive without waiting for the log
     // (`Driven::more`): the next step comes at once, without waiting for an input.
     driving: bool,
+    // The log's writes and compactions wake the owner through this, its bell's waker.
+    waker: std::task::Waker,
     // The instant this owner last read from its clock: at its step's start, and again after a
     // preparation, whose work takes time of its own.
     at: Instant,
@@ -760,6 +815,15 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     // While set, this leader holds no write slot: today's rule alone, a test's control.
     #[cfg(test)]
     slot_off: bool,
+    // While set, this leader moves no stale base by its read set: the exact base alone, a test's
+    // control; and the mutant the isolation checks must catch, which moves every one unchecked.
+    #[cfg(test)]
+    read_sets_off: bool,
+    #[cfg(test)]
+    read_sets_unchecked: bool,
+    // Stale bases this leader moved by their read sets. Read by tests: non-vacuity.
+    #[cfg(test)]
+    read_sets_moved: u64,
     // The leader's writes made in its turn after a slot, and those refused as stale; and the one
     // in flight. Read by tests: a turn is a turn in fact.
     #[cfg(test)]
@@ -838,6 +902,7 @@ impl Flushing {
         machine: &crate::replication::Machine,
         meter: Arc<ReplicaMeter>,
         account: Arc<Account>,
+        bell: Arc<Bell>,
     ) -> Result<Self, Refusal> {
         let flush = machine.log_flusher();
         let mut copier = machine.reader()().map_err(|error| refused(&error))?;
@@ -899,6 +964,7 @@ impl Flushing {
                     if finished.send(result).is_err() {
                         return;
                     }
+                    bell.ring();
                 }
             })
             .map_err(unavailable)?;
@@ -1025,12 +1091,16 @@ impl ReplicaHandle {
                 bytes,
             },
         };
-        self.sender.try_send(envelope).map_err(|error| match error {
-            mpsc::TrySendError::Full(_) => Refusal::Full { limit: COMMANDS },
-            mpsc::TrySendError::Disconnected(_) => {
-                fenced("replica owner ended; reopen from durable state")
-            }
-        })
+        self.sender
+            .try_send(envelope)
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => Refusal::Full { limit: COMMANDS },
+                mpsc::TrySendError::Disconnected(_) => {
+                    fenced("replica owner ended; reopen from durable state")
+                }
+            })?;
+        self.shared.bell.ring();
+        Ok(())
     }
 
     pub(super) fn submit(
@@ -1380,19 +1450,16 @@ fn open(
     )
 }
 
-/// The write slot's bounds, stated from the core's and the quorum patience's (`patience`), so the
-/// slot adds no number of its own: a member's first slot is the core's election timeout in this
-/// owner's ticks, and a learned gap is believed for the patience's generations. A retry is not
-/// learned when the host's detector suspected its member meanwhile (`slot::Slots::keep`).
+/// The write slot's bounds, stated from the core's, so the slot adds no number of its own: a
+/// member's first slot is the core's election timeout in this owner's ticks; a learned gap is
+/// believed for one to two of its member's own recurrences (`slot`). A retry is not learned when
+/// the host's detector suspected its member meanwhile (`slot::Slots::keep`).
 fn slot_bounds(election_tick: usize) -> Result<super::slot::Bounds, Refusal> {
-    let ticks = |count: Option<u32>| {
-        count
-            .and_then(|count| TICK.checked_mul(count))
-            .ok_or_else(|| fenced("the write slot's bounds overflowed"))
-    };
     Ok(super::slot::Bounds {
-        election: ticks(u32::try_from(election_tick).ok())?,
-        generation: ticks(u32::try_from(super::patience::GENERATION).ok())?,
+        election: u32::try_from(election_tick)
+            .ok()
+            .and_then(|count| TICK.checked_mul(count))
+            .ok_or_else(|| fenced("the write slot's bounds overflowed"))?,
     })
 }
 
@@ -1414,7 +1481,8 @@ fn open_on<F: BlockFile + 'static>(
     machine.state_class(&durability)?;
     let settings = settings(config.node_id, &durability)?;
     let meter = Arc::new(ReplicaMeter::default());
-    let flushing = Flushing::start(&machine, Arc::clone(&meter), account())?;
+    let bell = Bell::new();
+    let flushing = Flushing::start(&machine, Arc::clone(&meter), account(), Arc::clone(&bell))?;
     let reader = machine.reader();
     let log_config = hyper_log::Config {
         segment_bytes: 64 << 20,
@@ -1462,13 +1530,15 @@ fn open_on<F: BlockFile + 'static>(
         status: Mutex::new(Ok(status(&replica))),
         meter,
         local,
+        bell: Arc::clone(&bell),
         closed: Mutex::new(Closed {
             time: replica.machine().closed(),
             lag: None,
         }),
         moved: std::sync::Condvar::new(),
     });
-    let slots = super::slot::Slots::new(slot_bounds(replica.core().raft.config().election_tick)?);
+    let election = replica.core().raft.config().election_tick;
+    let slots = super::slot::Slots::new(slot_bounds(election)?);
     let (sender, receiver) = mpsc::sync_channel(COMMANDS);
     let at = clock();
     let mut actor = Actor {
@@ -1505,13 +1575,19 @@ fn open_on<F: BlockFile + 'static>(
         spacing: log_bound::Spacing::default(),
         log_full: None,
         step_queued: 0,
-        answers: patience::Answers::default(),
+        answers: patience::Answers::new(election),
         #[cfg(test)]
         stalls: None,
         #[cfg(test)]
         class_held: false,
         #[cfg(test)]
         slot_off: false,
+        #[cfg(test)]
+        read_sets_off: false,
+        #[cfg(test)]
+        read_sets_unchecked: false,
+        #[cfg(test)]
+        read_sets_moved: 0,
         #[cfg(test)]
         turns: (0, 0),
         #[cfg(test)]
@@ -1527,6 +1603,7 @@ fn open_on<F: BlockFile + 'static>(
         lag: crate::replication::closed::Lag::default(),
         ticked: at,
         driving: false,
+        waker: std::task::Waker::from(Arc::clone(&bell)),
         at,
     };
     actor.refresh()?;
@@ -1537,6 +1614,7 @@ fn open_on<F: BlockFile + 'static>(
     let client = Client {
         handle: ReplicaHandle {
             sender,
+            _ring: Ring(bell),
             shared: control,
         },
     };
@@ -1845,25 +1923,52 @@ impl<F: BlockFile + 'static> Actor<F> {
             }
         }
     }
-    /// The owner thread: each step after waiting up to `POLL` for an input, or at once while the
-    /// last step's drive left more to drive.
+    /// The owner thread: a step for each input queued, at once while the last step's drive left
+    /// more to drive, and otherwise once its bell rings or its next deadline comes, whichever is
+    /// first (replication.md, "Decision (lane constants): the owner's wakes"). It ends once every handle is gone.
     fn run_loop(&mut self, receiver: &mpsc::Receiver<Envelope>) -> Result<(), Refusal> {
         loop {
-            let input = if self.driving {
-                match receiver.try_recv() {
-                    Ok(envelope) => Some(envelope),
-                    Err(mpsc::TryRecvError::Empty) => None,
-                    Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
-                }
-            } else {
-                match receiver.recv_timeout(POLL) {
-                    Ok(envelope) => Some(envelope),
-                    Err(mpsc::RecvTimeoutError::Timeout) => None,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            let input = match receiver.try_recv() {
+                Ok(envelope) => Some(envelope),
+                Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+                Err(mpsc::TryRecvError::Empty) if self.driving => None,
+                Err(mpsc::TryRecvError::Empty) => {
+                    let wait = self.deadline().saturating_duration_since((self.clock)());
+                    self.control.bell.wait(wait)?;
+                    match receiver.try_recv() {
+                        Ok(envelope) => Some(envelope),
+                        Err(mpsc::TryRecvError::Empty) => None,
+                        Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+                    }
                 }
             };
             self.run_step(input)?;
         }
+    }
+    /// The owner's next deadline: its next tick, or sooner a deadline of what it holds (a queued
+    /// or pending submit's, a change's, a hand-off's, the write slot's). Every other timed check
+    /// counts in ticks (elections, heartbeats, the quorum check, a bootstrap's hand-off), so it
+    /// is due at a tick.
+    fn deadline(&self) -> Instant {
+        let tick = self.ticked.checked_add(TICK).unwrap_or(self.at);
+        let waiting = self
+            .waiting
+            .iter()
+            .filter_map(|envelope| match &envelope.command {
+                Input::Submit { until, .. } => Some(*until),
+                _ => None,
+            });
+        let held = [
+            self.pending.as_ref().map(|pending| pending.until),
+            self.changing.as_ref().map(|changing| changing.until),
+            self.transferring
+                .as_ref()
+                .map(|transferring| transferring.until),
+            self.slots.until(),
+        ];
+        waiting
+            .chain(held.into_iter().flatten())
+            .fold(tick, Instant::min)
     }
     /// One step at its clock's reading: the input first, then a tick if one is due, the core's
     /// work, deadlines, and what waits.
@@ -1892,7 +1997,10 @@ impl<F: BlockFile + 'static> Actor<F> {
             let configuration = self.replica.core().raft.configuration();
             let (voters, outgoing) = (configuration.voters(), configuration.outgoing());
             self.answers.tick(leading, voters, outgoing)?;
-            self.spacing.tick()?;
+            // A voter the host's detector suspects is gone, not slow: its gap isn't learned.
+            for voter in &self.detected {
+                self.answers.suspected(*voter);
+            }
             let election = self.replica.core().raft.config().election_tick;
             let patience = self
                 .answers
@@ -1922,7 +2030,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         let nanos = self.now()?;
         let driven = self
             .replica
-            .drive(nanos, std::task::Waker::noop(), &mut output)
+            .drive(nanos, &self.waker, &mut output)
             .map_err(raft_error)?;
         #[cfg(test)]
         if let (Some(stalls), Some((submitted, taken))) = (&self.stalls, driven.flushed) {
@@ -1969,7 +2077,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         {
             let nanos = self.now()?;
             self.replica
-                .compact(0, nanos, std::task::Waker::noop())
+                .compact(0, nanos, &self.waker)
                 .map_err(raft_error)?;
         }
         #[cfg(test)]
@@ -2062,7 +2170,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                     {
                         pass.caught_up = false;
                         pass.busy = false;
-                        self.spacing.restarted(queued);
+                        self.spacing.restarted(queued)?;
                         self.control.meter.restarted();
                     }
                 }
@@ -2731,7 +2839,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             && self.replica.core().raft.configuration().votes(from)
             && let Err(unmeasured) = self.answers.heard(from, message.term)
         {
-            if matches!(unmeasured, patience::Unmeasured::PastCeiling { .. }) {
+            if matches!(unmeasured, patience::Unmeasured::Suspected { .. }) {
                 self.control.meter.refused();
             }
             tracing::warn!(target: "amphora.replica", event = "quorum_patience_refused", error = %unmeasured, "an answer gap was not learned for the leader's quorum patience");
@@ -2768,6 +2876,18 @@ impl<F: BlockFile + 'static> Actor<F> {
                 _ => {}
             }
         }
+        let mut message = message;
+        if self.replica.is_leader()
+            && message.msg_type == hyper_raft::proto::MessageType::MsgPropose
+        {
+            let log = self.replica.core().raft.log();
+            let last = log.last_index().map_err(unavailable)?;
+            let before = Point {
+                index: last,
+                term: log.term(last).map_err(unavailable)?,
+            };
+            self.rebase_forward(&mut message, before)?;
+        }
         self.replica.step(message).map_err(raft_error)
     }
     /// Steps a member's forwarded proposal into the leading core, and tells the slot what it
@@ -2777,13 +2897,14 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// property, Ongaro and Ousterhout, USENIX ATC 2014, figure 3) and the slots die with the
     /// term, so the refusal seen at the append is the one the commit decides; seen here, it
     /// comes before any member can learn of it (amphora-seam-owner-2's ruling, Q2).
-    fn step_forward(&mut self, from: u64, message: Message) -> Result<(), Refusal> {
+    fn step_forward(&mut self, from: u64, mut message: Message) -> Result<(), Refusal> {
         let log = self.replica.core().raft.log();
         let last = log.last_index().map_err(unavailable)?;
         let mut before = Point {
             index: last,
             term: log.term(last).map_err(unavailable)?,
         };
+        self.rebase_forward(&mut message, before)?;
         let term = self.replica.term();
         let mut refused = false;
         for entry in &message.entries {
@@ -2811,6 +2932,87 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.slots.refused(from);
         }
         Ok(())
+    }
+    /// The write `data`, prepared on a base older than `before`, with its base moved to `before`
+    /// if no entry the leader's log holds after its base wrote a page it read or wrote; `None`
+    /// leaves it to the exact base, which refuses it at apply. The walk is over the log between
+    /// the base and `before`, which the log's own bound bounds, one entry at a time, ending at the
+    /// first conflict (replication.md, "A follower's write that read nothing written since its
+    /// base: read sets"; goal ceea4e0a).
+    fn rebase(&mut self, data: &[u8], before: Point) -> Result<Option<Vec<u8>>, Refusal> {
+        use crate::replication::readsets;
+        let Some(write) = readsets::Write::decode(data) else {
+            return Ok(None);
+        };
+        if write.base.index >= before.index {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        if self.read_sets_off {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        if self.read_sets_unchecked {
+            self.read_sets_moved += 1;
+            return Ok(write.rebased(data, before));
+        }
+        // A leader without the closed time's table holds no write that carries a read set
+        // (`Machine::prepare_db`): its refusal leaves the write to the exact base.
+        let Ok(applied) = self.replica.machine().applied_pages() else {
+            Self::read_set_event("unknown_base", write.base, before);
+            return Ok(None);
+        };
+        let log = self.replica.core().raft.log();
+        let held = log.first_index().map_err(unavailable)?.saturating_sub(1);
+        if write.base.index < held
+            || log.term(write.base.index).map_err(unavailable)? != write.base.term
+        {
+            Self::read_set_event("unknown_base", write.base, before);
+            return Ok(None);
+        }
+        let bound = u64::try_from(crate::replication::COMMAND_BYTES).unwrap_or(u64::MAX);
+        let high = before.index.saturating_add(1);
+        let mut low = write.base.index.saturating_add(1);
+        while low < high {
+            let entries = log.slice(low, high, bound).map_err(unavailable)?;
+            let Some(last) = entries.last().map(|entry| entry.index) else {
+                return Ok(None);
+            };
+            for entry in &entries {
+                let wrote = if entry.entry_type == hyper_raft::proto::EntryType::EntryNormal {
+                    readsets::wrote(&entry.data)
+                } else {
+                    readsets::Wrote::Opaque
+                };
+                if !write.untouched_by(&wrote, &applied) {
+                    Self::read_set_event("conflict", write.base, before);
+                    return Ok(None);
+                }
+            }
+            low = last.saturating_add(1);
+        }
+        Self::read_set_event("rebased", write.base, before);
+        #[cfg(test)]
+        {
+            self.read_sets_moved += 1;
+        }
+        Ok(write.rebased(data, before))
+    }
+    /// A member's forwarded proposal, at the leader: one write forwarded alone appends right after
+    /// `before`, the leader's last entry, so a stale base that read nothing written since moves
+    /// to it (`readsets`).
+    fn rebase_forward(&mut self, message: &mut Message, before: Point) -> Result<(), Refusal> {
+        if let [entry] = message.entries.as_mut_slice()
+            && entry.entry_type == hyper_raft::proto::EntryType::EntryNormal
+            && let Ok(Err(_)) = crate::replication::verdict(&entry.data, before)
+            && let Some(data) = self.rebase(&entry.data, before)?
+        {
+            entry.data = data;
+        }
+        Ok(())
+    }
+    fn read_set_event(outcome: &'static str, base: Point, before: Point) {
+        tracing::debug!(target: "amphora.replication", event = "replication.read_set", outcome, base = base.index, before = before.index, "a write prepared on an older base was checked against its read set");
     }
     /// Steps what the write slot released, in the order it arrived. At a member that no longer
     /// leads, none is stepped: its core would forward it again under its sender's name, which
@@ -3707,6 +3909,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
 
+    /// A test relay's yield to the disk when it had nothing to move: a hang guard on the test's
+    /// own pacing, which no verdict depends on (replication.md, "The owner's time"). The owner
+    /// itself waits on its bell, never on this.
+    const POLL: Duration = Duration::from_millis(1);
     // Follower reads at a closed time, under leader changes (replication.md, "Follower reads at a
     // closed time"): in a file of its own, on this module's driven shell.
     mod closed_reads;
@@ -4541,6 +4747,17 @@ mod tests {
                 actor.replica.machine().log_flusher()().unwrap();
                 actor.replica.machine_mut().flushed_through(at);
             }
+        }
+        /// Rounds until owner `owner`'s flushing thread has made all it applied durable: a
+        /// compaction moves the raft log's start no further than that (I8).
+        fn flushed(&mut self, pump: &mut Pump<'_>, owner: usize) {
+            for _ in 0..ROUNDS {
+                if self.owner(owner).replica.machine().unflushed().is_none() {
+                    return;
+                }
+                self.round(pump);
+            }
+            panic!("owner {owner} did not flush in {ROUNDS} driven rounds");
         }
         /// A new member's clock: its reading, which only the test moves, and the clock its owner
         /// reads it through.
@@ -6179,6 +6396,7 @@ mod tests {
             owner.replica.machine(),
             Arc::clone(&owner.control.meter),
             account(),
+            Arc::clone(&owner.control.bell),
         )
         .unwrap();
         driven.owner_mut(leader).flushing = thread;
@@ -7501,8 +7719,8 @@ mod tests {
     /// CP-T1.8, kiln goals 6b112f14 and 867fa589 (replication.md, "The leader's quorum patience",
     /// its metrics; CLAUDE.md section 10): the patience and its refusals as the host reads them.
     /// Do: the leader measures a gap of `HELD` ticks in its followers' answers (`measured_lead`)
-    /// and ticks on; then one follower's answers are held past the ceiling while the other's flow,
-    /// and let go. Expect: the leader's `amphora_replica_quorum_patience_seconds` is its core's
+    /// and ticks on; then the host's detector suspects one follower, whose answers are held while
+    /// the other's flow, then trusts it again, and its answers are let go (T-GN.1.1). Expect: the leader's `amphora_replica_quorum_patience_seconds` is its core's
     /// patience in ticks of `TICK`, its followers' zero, and nothing refused; then the leader still
     /// leads and has refused that one gap.
     #[test]
@@ -7529,10 +7747,13 @@ mod tests {
         }
 
         let late = (leader + 1) % 3;
+        let late_id = u64::try_from(late + 1).unwrap();
+        tell(&mut driven, &clients, leader, Verdict::Suspected(late_id)).unwrap();
         pump.held = vec![late];
-        for _ in 0..=patience::QUORUM_CEILING {
+        for _ in 0..HELD {
             driven.tick(&mut pump, leader);
         }
+        tell(&mut driven, &clients, leader, Verdict::Trusted(late_id)).unwrap();
         pump.held.clear();
         driven.tick(&mut pump, leader);
         assert!(
@@ -7566,10 +7787,7 @@ mod tests {
         driven.tick(&mut pump, leader);
         let raft = &driven.owner(leader).replica.core().raft;
         let (election, patience) = (raft.config().election_tick, raft.quorum_patience());
-        assert!(
-            patience <= patience::QUORUM_CEILING - election,
-            "{patience}"
-        );
+        assert!(patience <= HELD + 1 - election, "{patience}");
         let due = election + patience;
         for _ in 1..due - 1 {
             driven.tick(&mut pump, leader);
@@ -7580,7 +7798,7 @@ mod tests {
             Ok(vec![1])
         });
         let mut after = None;
-        for count in due - 1..=due + election + patience::QUORUM_CEILING {
+        for count in due - 1..=due + election + patience {
             if clients
                 .get(leader)
                 .unwrap()
@@ -7647,28 +7865,14 @@ mod tests {
             .unwrap()
             .core
             .election_tick;
-        let ceiling = patience::QUORUM_CEILING;
         let tick = TICK.as_millis();
-        let seconds = |ticks: usize| {
-            let ms = u128::try_from(ticks).unwrap() * tick;
-            format!("{}", f64::from(u32::try_from(ms).unwrap()) / 1000.0)
-        };
-        let generation = usize::try_from(patience::GENERATION).unwrap();
         let own = [
             tick.to_string(),
-            ceiling.to_string(),
-            (ceiling - election).to_string(),
-            seconds(ceiling),
-            (2 * ceiling).to_string(),
-            seconds(2 * ceiling),
             (2 * election).to_string(),
             (2 * u128::try_from(election).unwrap() * tick).to_string(),
-            format!("{},{:03}", generation / 1000, generation % 1000),
-            seconds(generation),
-            seconds(2 * generation),
         ];
         assert!(requirements.contains("failover p99 is at most 1000 ms"));
-        let cited = ["1000", "2014", "2017", "2018", "2026-11-06"];
+        let cited = ["1000", "2014", "2017", "2018", "2026-11-06", "2026-11-21"];
         let stray: Vec<&str> = numbers(decision)
             .into_iter()
             .filter(|n| !record.contains(n) && !own.iter().any(|o| o == n) && !cited.contains(n))
@@ -9569,6 +9773,100 @@ mod tests {
         pump.finish();
     }
 
+    /// CP-T1.8, AC-WK.1.1 (replication.md, "Decision (lane constants): the owner's wakes"): the owner's bell keeps a ring
+    /// given before its wait, and its waker rings it from another thread. Do: ring, then wait not
+    /// at all, twice; then wait an hour while another thread wakes the bell's waker. Expect: the
+    /// first wait finds the ring and the second none; the hour's wait ends rung.
+    #[test]
+    fn the_owners_bell_keeps_a_ring_and_its_waker_rings_it() {
+        let bell = Bell::new();
+        bell.ring();
+        assert!(bell.wait(Duration::ZERO).unwrap(), "a ring before the wait");
+        assert!(!bell.wait(Duration::ZERO).unwrap(), "a ring taken twice");
+        let waker = std::task::Waker::from(Arc::clone(&bell));
+        let ringer = std::thread::spawn(move || waker.wake());
+        assert!(
+            bell.wait(Duration::from_secs(3600)).unwrap(),
+            "the waker's ring"
+        );
+        ringer.join().unwrap();
+    }
+
+    /// CP-T1.8, AC-WK.1.2: an owner with nothing to do waits until its next deadline: its next
+    /// tick, or sooner the deadline of a submit it holds. Do: a lone member of three (no leader),
+    /// stepped with its clock standing still; then a submit due a nanosecond past its clock, which
+    /// it holds for want of a leader. Expect: its deadline is its next tick, then the submit's.
+    #[test]
+    fn an_owners_next_deadline_is_its_tick_or_a_sooner_held_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
+        driven.step();
+        let owner = driven.owner(0);
+        assert_eq!(owner.deadline(), owner.ticked + TICK);
+        let due = owner.at + Duration::from_nanos(1);
+        let _answer = submit(&client, due, |_| Ok(Vec::new()));
+        driven.step();
+        assert_eq!(
+            driven.owner(0).deadline(),
+            due,
+            "the held submit's deadline"
+        );
+    }
+
+    /// CP-T1.8, AC-WK.1.3: the owner thread wakes on events, not on a poll. Do: a lone voter on
+    /// the owner thread and the real clock; a write submitted until it is answered (it waits on
+    /// the log's write, which wakes the owner); then every handle dropped. Expect: the write
+    /// answered, and the owner thread ended once the last handle went.
+    #[test]
+    fn an_owner_thread_answers_on_its_wakes_and_ends_with_its_last_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let (client, mut actor, receiver) = super::open(
+            &path,
+            &dir.path().join("raft.log"),
+            ReplicaConfig {
+                node_id: 1,
+                voters: vec![1],
+                learners: Vec::new(),
+                bootstrap: None,
+            },
+            Durability::Persisted,
+            Arc::new(Changed::default()),
+            Owned::unbudgeted(lease(&path), None),
+            Instant::now() + Duration::from_secs(60),
+            Arc::new(Instant::now),
+        )
+        .unwrap();
+        let owner = std::thread::spawn(move || actor.run(receiver));
+        let mut answered = None;
+        for _ in 0..ROUNDS {
+            let until = Instant::now() + Duration::from_secs(30);
+            let receiver = submit(&client, until, |db| {
+                db.exec(
+                    "CREATE TABLE IF NOT EXISTS woken(n INTEGER); INSERT INTO woken VALUES (1)",
+                )?;
+                Ok(Vec::new())
+            });
+            match receiver.recv_timeout(Duration::from_secs(30)).unwrap() {
+                Err(Refusal::NotLeader { .. } | Refusal::Unavailable(_)) => {
+                    std::thread::park_timeout(POLL)
+                }
+                other => {
+                    answered = Some(other);
+                    break;
+                }
+            }
+        }
+        assert!(
+            matches!(answered, Some(Ok(_))),
+            "the write's answer: {:?}",
+            answered.as_ref().map(|answer| answer.as_ref().err())
+        );
+        drop(client);
+        owner.join().unwrap();
+    }
+
     /// CP-T1.8 (amphora-seam-owner-2, amphora-owner-t1-constants-721acf2-20261112): an owner's own
     /// session that reaches its lease at its barrier while its member still leads its term is
     /// counted. Do, in a group of three voters: the leader binds kiln.host-store 7 and its keeper
@@ -9902,6 +10200,7 @@ mod tests {
         joins_tracked(&mut driven, &mut pump, &[0, 1, 2]);
         write(&mut driven, &mut pump, &clients[leader], 1);
         quiet(&mut driven, &mut pump);
+        driven.flushed(&mut pump, leader);
         let compacted = {
             let owner = &mut driven.owner_mut(leader);
             let now = owner.now().unwrap();
@@ -12832,6 +13131,7 @@ mod tests {
             })
             .unwrap();
         quiet(&mut driven, &mut pump);
+        driven.flushed(&mut pump, 0);
         let compacted = {
             let owner = driven.owner_mut(0);
             let now = owner.now().unwrap();
@@ -13166,6 +13466,74 @@ mod tests {
         pump.finish();
     }
 
+    /// AC-T1.8.L1, T-T1.8.L1 (CP-T1.8, G12 step 2; replication.md, "The raft log as the WAL"):
+    /// compaction waits for the engine's flush. Do: a voter and its learner, the voter's flushes
+    /// held; 1 written and the voter's log flushed; 2 to 5 written, applied unflushed; the voter's
+    /// raft log compacted, keeping nothing; then its log flushed and compacted again. Expect: the
+    /// writes answered with their flushes held; the first compaction moved the raft log's start
+    /// to the flushed point and no further, and flushed nothing itself (2 to 5 still unflushed,
+    /// still in the raft log); after the flush, the second moved it to the last entry applied.
+    #[test]
+    fn compaction_waits_for_the_engines_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = voter_and_learner(&mut driven, dir.path());
+        driven.hold_flushes(0);
+        let mut pump = Pump::new(&clients);
+        write(&mut driven, &mut pump, &clients[0], 1);
+        driven.flush(0);
+        let flushed = StateMachine::durable(driven.owner(0).replica.machine());
+        for value in 2..=5 {
+            write(&mut driven, &mut pump, &clients[0], value);
+        }
+        quiet(&mut driven, &mut pump);
+        let start = |driven: &Driven| {
+            driven
+                .owner(0)
+                .replica
+                .core()
+                .raft
+                .log()
+                .first_index()
+                .unwrap()
+        };
+        let compact = |driven: &mut Driven, pump: &mut Pump<'_>| {
+            driven.quiet(pump);
+            let owner = driven.owner_mut(0);
+            let now = owner.now().unwrap();
+            let out = owner
+                .replica
+                .compact(0, now, std::task::Waker::noop())
+                .unwrap();
+            assert!(out, "no compaction went out");
+            driven.quiet(pump);
+        };
+        let applied = driven.owner(0).replica.applied();
+        assert!(
+            applied.index > flushed.index,
+            "2 to 5 weren't applied past the flush"
+        );
+        assert!(
+            start(&driven) <= flushed.index,
+            "the raft log already started past the flush"
+        );
+        compact(&mut driven, &mut pump);
+        assert_eq!(
+            start(&driven),
+            flushed.index + 1,
+            "the raft log's start isn't the flushed point"
+        );
+        let machine = driven.owner(0).replica.machine();
+        assert_eq!(machine.unflushed(), Some(applied), "the compaction flushed");
+        assert_eq!(StateMachine::durable(machine), flushed);
+        driven.flush(0);
+        compact(&mut driven, &mut pump);
+        assert_eq!(start(&driven), applied.index + 1);
+        assert_eq!(held(&mut driven, 0), vec![1, 2, 3, 4, 5]);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
     /// AC-T1.8.D1, T-T1.8.D1 (replication.md, "A replica's database log bounded by what it
     /// measures", the bound stated): a restart that falls due while a local read is out waits for
     /// that read, and so no longer than the read's deadline. Do: a voter and its learner on one
@@ -13354,12 +13722,12 @@ mod tests {
 
     /// AC-T1.8.D1, T-T1.8.D3 (replication.md, "A replica's database log bounded by what it
     /// measures", A): the first restart is free, a restart that held entries spaces the next by a
-    /// thousand times them, and the window forgets after two generations. Do: a voter and its
-    /// learner, the room the filesystem's own; 1 written and flushed, rounds until the learner
-    /// restarts; its count then told of a restart that held one entry; 2 to 21 written and
-    /// flushed; then two generations of the learner's ticks, 22 written, rounds. Expect: a
-    /// restart after 1 (on b151af0 none: its bound was 131,072 frames); none while 2 to 21
-    /// applied; one after the window forgot.
+    /// thousand times them and the guess. Do: a voter and its learner, the room the filesystem's
+    /// own; 1 written and flushed, rounds until the learner restarts; its count then told of a
+    /// restart that held one entry; 2 to 21 written and flushed; then its count told of a million
+    /// entries applied (its generation covering its spend), 22 written, rounds. Expect: a restart
+    /// after 1 (on b151af0 none: its bound was 131,072 frames); none while 2 to 21 applied; one
+    /// once its generation covered its spend.
     #[test]
     fn the_first_restart_is_free_and_the_next_waits_on_its_share() {
         own_account();
@@ -13385,7 +13753,7 @@ mod tests {
             handle.counters()
         );
         let spacing = &mut driven.owner_mut(1).spacing;
-        spacing.restarted(0);
+        spacing.restarted(0).unwrap();
         spacing.stepped(1, Duration::ZERO, 1).unwrap();
         spacing.stepped(0, Duration::ZERO, 0).unwrap();
         let restarts = handle.counters().database_log_restarts;
@@ -13397,14 +13765,16 @@ mod tests {
             driven.round(&mut pump);
         }
         assert_eq!(handle.counters().database_log_restarts, restarts);
-        for _ in 0..2 * patience::GENERATION {
-            driven.owner_mut(1).spacing.tick().unwrap();
-        }
+        driven
+            .owner_mut(1)
+            .spacing
+            .stepped(1_000_000, Duration::ZERO, 0)
+            .unwrap();
         write(&mut driven, &mut pump, &clients[0], 22);
         settle_log(&mut driven, &mut pump, &clients);
         assert!(
             restarted(&mut driven, &mut pump, restarts),
-            "no restart once the window forgot: {:?}",
+            "no restart once its generation covered its spend: {:?}",
             handle.counters()
         );
         driven.drain(&mut pump);
@@ -13430,7 +13800,7 @@ mod tests {
         settle_log(&mut driven, &mut pump, &clients);
         // Its share spent, so the log holds 2's frames when the test makes a restart due.
         let spacing = &mut driven.owner_mut(1).spacing;
-        spacing.restarted(0);
+        spacing.restarted(0).unwrap();
         spacing.stepped(1_000_000, Duration::ZERO, 1).unwrap();
         write(&mut driven, &mut pump, &clients[0], 2);
         settle_log(&mut driven, &mut pump, &clients);
@@ -13496,7 +13866,7 @@ mod tests {
         write(&mut driven, &mut pump, voter, 1);
         settle_log(&mut driven, &mut pump, &clients);
         let spacing = &mut driven.owner_mut(0).spacing;
-        spacing.restarted(0);
+        spacing.restarted(0).unwrap();
         spacing.stepped(1_000_000, Duration::ZERO, 1).unwrap();
         driven
             .owner(0)
@@ -14144,6 +14514,8 @@ mod tests {
         unknown: u64,
         // The leader's writes in its turn after a slot, and those refused.
         turns: (u64, u64),
+        // Stale bases the leader moved by their read sets.
+        moved: u64,
     }
     type Answering = mpsc::Receiver<Result<Answer, Refusal>>;
     fn list(db: &mut Db, key: u64) -> anyhow::Result<Vec<String>> {
@@ -14170,6 +14542,24 @@ mod tests {
         keys: u64,
         ops: u64,
     ) -> ListRun {
+        list_append_run_with(writers, slot_off, ReadSets::On, seed, keys, ops)
+    }
+    /// How a list-append run's leader treats read sets: as built, off (the exact base alone), or
+    /// the mutant that moves every stale base unchecked.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum ReadSets {
+        On,
+        Off,
+        Unchecked,
+    }
+    fn list_append_run_with(
+        writers: &[usize],
+        slot_off: bool,
+        read_sets: ReadSets,
+        seed: u64,
+        keys: u64,
+        ops: u64,
+    ) -> ListRun {
         let dir = tempfile::tempdir().unwrap();
         let mut driven = Driven::new();
         let clients: Vec<Client> = (1..=3)
@@ -14191,6 +14581,8 @@ mod tests {
             .unwrap();
         driven.tick(&mut pump, leader);
         driven.owner_mut(leader).slot_off = slot_off;
+        driven.owner_mut(leader).read_sets_off = read_sets == ReadSets::Off;
+        driven.owner_mut(leader).read_sets_unchecked = read_sets == ReadSets::Unchecked;
         pump.delay = Some(Delay::new(seed, 3));
         let mut state = seed;
         let mut history: Vec<Append> = Vec::new();
@@ -14203,6 +14595,7 @@ mod tests {
             streak: vec![0; writers.len()],
             unknown: 0,
             turns: (0, 0),
+            moved: 0,
         };
         let mut rounds = 0;
         while run.committed.iter().any(|done| *done < ops) {
@@ -14275,6 +14668,7 @@ mod tests {
             .collect();
         run.violations = list_violations(&history, &finals);
         run.turns = driven.owner(leader).turns;
+        run.moved = driven.owner(leader).read_sets_moved;
         driven.drain(&mut pump);
         pump.finish();
         run
@@ -14527,6 +14921,168 @@ mod tests {
             driven.drain(&mut pump);
             pump.finish();
         }
+    }
+
+    /// T-T1.8.R4 (AC-T1.8.R1; goal ceea4e0a): a follower's write that read nothing written since
+    /// its base lands on its first try. Do, with the write slot off so read sets act alone: the
+    /// follower's write to table `u` forwarded and held in transit while the leader appends a
+    /// write of its own to table `t` on the same base, then let through; then the same with both
+    /// writing `t`. Expect, with read sets on: the first applied (its base moved, counted), the
+    /// second refused, stale, as its page changed. With read sets off: both refused.
+    #[test]
+    fn r4_a_follower_write_on_pages_nothing_since_wrote_lands_on_its_first_try() {
+        for off in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut driven = Driven::new();
+            let clients: Vec<Client> = (1..=3)
+                .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+                .collect();
+            let mut pump = Pump::new(&clients);
+            let leader = driven.elect(&mut pump, &clients, 0, 1);
+            assert_eq!(leader, 0);
+            driven
+                .call(&mut pump, &clients[0], |db| {
+                    db.exec("CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)")?;
+                    db.exec("CREATE TABLE u(k INTEGER PRIMARY KEY, v TEXT)")?;
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            driven.tick(&mut pump, leader);
+            driven.owner_mut(leader).slot_off = true;
+            driven.owner_mut(leader).read_sets_off = off;
+            let last = |driven: &Driven| {
+                driven
+                    .owner(0)
+                    .replica
+                    .core()
+                    .raft
+                    .log()
+                    .last_index()
+                    .unwrap()
+            };
+            let mut outcomes = Vec::new();
+            for (attempt, table) in [(0u64, "u"), (1, "t")] {
+                pump.begin_captures(leader, 1);
+                let follower = submit(&clients[1], driven.until(), move |db| {
+                    db.exec(&format!(
+                        "INSERT INTO {table} VALUES ({}, 'follower')",
+                        10 + attempt
+                    ))?;
+                    Ok(Vec::new())
+                });
+                for _ in 0..ROUNDS {
+                    if pump.captures_ready() {
+                        break;
+                    }
+                    driven.round(&mut pump);
+                }
+                assert!(pump.captures_ready(), "off {off} attempt {attempt}");
+                let before = last(&driven);
+                let own = submit(&clients[0], driven.until(), move |db| {
+                    db.exec(&format!(
+                        "INSERT INTO t VALUES ({}, 'leader')",
+                        20 + attempt
+                    ))?;
+                    Ok(Vec::new())
+                });
+                for _ in 0..ROUNDS {
+                    if last(&driven) > before {
+                        break;
+                    }
+                    driven.round(&mut pump);
+                }
+                assert!(last(&driven) > before, "off {off} attempt {attempt}");
+                pump.release_captures();
+                outcomes.push(driven.settle(&mut pump, &follower));
+                assert_eq!(
+                    driven.settle(&mut pump, &own),
+                    Ok(Vec::new()),
+                    "off {off} attempt {attempt}: the leader's write"
+                );
+            }
+            let stale = |outcome: &Result<Vec<u8>, Refusal>| matches!(outcome, Err(Refusal::Invalid { what, .. }) if what == "prepared transaction");
+            let moved = driven.owner(leader).read_sets_moved;
+            if off {
+                assert!(outcomes.iter().all(stale), "read sets off: {outcomes:?}");
+                assert_eq!(moved, 0);
+            } else {
+                assert_eq!(outcomes[0], Ok(Vec::new()), "read sets on: {outcomes:?}");
+                assert!(stale(&outcomes[1]), "read sets on: {outcomes:?}");
+                assert_eq!(moved, 1, "the first write's base moved, the second's not");
+                let rows = |driven: &mut Driven, owner: usize| {
+                    driven
+                        .owner_mut(owner)
+                        .replica
+                        .machine_mut()
+                        .read_db(|db| {
+                            let mut out = Vec::new();
+                            db.query_owned(
+                                "SELECT k FROM u UNION ALL SELECT k FROM t ORDER BY 1",
+                                [],
+                                |row| {
+                                    out.push(row.get::<i64>(0)?);
+                                    Ok(true)
+                                },
+                            )?;
+                            Ok(out)
+                        })
+                        .unwrap()
+                };
+                driven.quiet(&mut pump);
+                for owner in 0..3 {
+                    assert_eq!(rows(&mut driven, owner), vec![10, 20, 21], "member {owner}");
+                }
+            }
+            driven.quiet(&mut pump);
+            driven.drain(&mut pump);
+            pump.finish();
+        }
+    }
+
+    /// T-T1.8.R5 (AC-T1.8.R2; Elle's list-append): read sets keep every history serializable,
+    /// alone and under the write slot. Do: the leader and two followers each append 15 times to
+    /// 32 lists spread over pages, then to two hot lists, every record delayed up to three relay
+    /// rounds, three seeds each, with the slot off and on. Expect: replicas equal, each list its
+    /// serial replay, no G0, G1c or G2 cycle, none unknown; some base moved (non-vacuity). The
+    /// mutant that moves every stale base unchecked is caught: some run of it breaks the history.
+    #[test]
+    fn r5_read_sets_keep_every_list_append_history_serializable() {
+        let mut moved = 0;
+        for slot_off in [true, false] {
+            for keys in [32, 2] {
+                for seed in 1..=3 {
+                    let run =
+                        list_append_run_with(&[0, 1, 2], slot_off, ReadSets::On, seed, keys, 15);
+                    eprintln!(
+                        "read sets, slot off {slot_off} keys {keys} seed {seed}: committed {:?} refused {:?} in a row {:?} moved {}",
+                        run.committed, run.refused, run.streak, run.moved
+                    );
+                    assert!(
+                        run.violations.is_empty(),
+                        "slot off {slot_off} keys {keys} seed {seed}: {:?}",
+                        run.violations
+                    );
+                    assert_eq!(
+                        run.unknown, 0,
+                        "slot off {slot_off} keys {keys} seed {seed}"
+                    );
+                    moved += run.moved;
+                }
+            }
+        }
+        assert!(
+            moved > 0,
+            "no base moved: the runs never exercised read sets"
+        );
+        let caught = (1..=3).any(|seed| {
+            let run = list_append_run_with(&[0, 1, 2], true, ReadSets::Unchecked, seed, 2, 15);
+            eprintln!(
+                "unchecked seed {seed}: moved {} violations {:?}",
+                run.moved, run.violations
+            );
+            !run.violations.is_empty()
+        });
+        assert!(caught, "the isolation checks missed the unchecked mutant");
     }
 
     /// T-T1.8.W2 (AC-T1.8.W1): two followers and a leader all writing steadily, none missing.

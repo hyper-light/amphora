@@ -165,18 +165,28 @@ deterministic simulator:
 
    Built (lane split-merge-4): the directory is a replicated group's state,
    `reshard::replicated::DirectoryMachine`, a hyper-durable state machine whose entries are the
-   directory's changes; like focal's control groups it keeps nothing durable of its own and is
-   replayed from the log, and every entry is acted on at start. Its leader runs the driver with its
+   directory's changes; it keeps nothing durable of its own but the last image it installed, and
+   is replayed from the log after it, and every entry is acted on at start. Its leader runs the driver with its
    term as the driver's epoch (`DirectoryMachine::lead`). `Groups` routes by the directory
    (`Groups::route` takes a newer generation), and `Groups::start(n)` makes its `n` groups by
    splits of the one group every database starts as. Each group checks every write and read
    against its holding (`Groups::hold` carries out an action on it, under the route's write lock,
    so every batch let in before a fence is queued before it); a refused key is
-   `store::Refused::Away`. Still left of this item: the holding is in the router's memory, not yet
-   durable in the group's own state with its rows; rows by position; the change feed; the old
-   group's log held from `P_1`; and the shell that carries the driver's actions to the groups. A
-   member that installs a directory image holds it in memory only, so it must be caught up again
-   from its leader after a restart: persisting images comes with the holding's durability.
+   `store::Refused::Away`.
+
+   Built (lane split-merge-5): each group's holding is kept by the group's own engine with its rows
+   (`Engine::holding`, `Engine::keep_holding`). A change of it is kept after every batch let in
+   before it, and durable with them, before the group acts on it (`Groups::hold`); if it can't be
+   kept, the group holds what it held and the driver asks again. A group started again answers from
+   what it kept, whatever directory it is started by (T-T1.9.R1, T-T1.9.R3). A directory member
+   keeps the image it installed in a file of its own, replaced whole and flushed before `install`
+   returns (hyper-durable's I8), and opens at it (`DirectoryMachine::open`), so a restart needs no
+   catch-up (T-T1.9.R2). Amphora's own engine (`database::Local`) doesn't keep a holding yet: it
+   becomes a group's with the shell below.
+
+   Still left of this item: rows by position; the change feed; the old group's log held from
+   `P_1`; a split that copies the moving range's rows; and the shell that carries the driver's
+   actions to the groups.
 2. **Load measured from the store's meter.** The writer's busy time per window, a bounded sample
    of written positions for the load cut, and the size cut from the B-tree's middle key. The
    window is the time between planner runs, and shares don't depend on its length.

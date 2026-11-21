@@ -26,6 +26,7 @@ pub mod bootstrap;
 pub(crate) mod class;
 pub(crate) mod closed;
 pub(crate) mod floor;
+pub(crate) mod readsets;
 
 const BASELINE_DELTA: &[u8] = b"amphora.delta.v1\0";
 const BASELINE_SNAPSHOT: &[u8] = b"amphora.snapshot.v1\0";
@@ -53,26 +54,50 @@ pub struct Prepared {
     pages: Vec<(u32, Vec<u8>)>,
     #[serde(skip)]
     baseline: Option<api::replication::Bootstrap>,
+    /// What its session read, carried after its encoding (`readsets`): `None` for a session that
+    /// read more than its entry could carry, and for what isn't a caller's write.
+    #[serde(skip)]
+    reads: Option<readsets::ReadSet>,
 }
 
 impl Prepared {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        base: Point,
+        pages: Vec<(u32, Vec<u8>)>,
+        reads: Option<readsets::ReadSet>,
+    ) -> Self {
+        Self {
+            base_index: base.index,
+            base_term: base.term,
+            pages,
+            baseline: None,
+            reads,
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.pages.is_empty()
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, Refusal> {
-        let bytes = if let Some(declaration) = &self.baseline {
+        let mut bytes = if let Some(declaration) = &self.baseline {
             let mut bytes = BASELINE_DELTA.to_vec();
             bytes.extend(postcard::to_allocvec(&(declaration, self)).map_err(unavailable)?);
             bytes
         } else {
             postcard::to_allocvec(self).map_err(unavailable)?
         };
-        api::bound(
-            "replicated command",
-            bytes.len(),
-            COMMAND_BYTES.saturating_add(ENVELOPE_BYTES),
-        )?;
+        let bound = COMMAND_BYTES.saturating_add(ENVELOPE_BYTES);
+        api::bound("replicated command", bytes.len(), bound)?;
+        // The read set rides after the encoding while the entry keeps its bound; past it, the
+        // write goes without one and the exact base decides it, as for a binary from before.
+        if let Some(reads) = &self.reads {
+            let trailer = postcard::to_allocvec(reads).map_err(unavailable)?;
+            if bytes.len().saturating_add(trailer.len()) <= bound {
+                bytes.extend(trailer);
+            }
+        }
         Ok(bytes)
     }
 
@@ -668,20 +693,31 @@ impl Machine {
         f: impl FnOnce(&mut Db) -> anyhow::Result<R>,
     ) -> Result<(Prepared, R), Refusal> {
         self.require_baseline()?;
-        let (answer, pages) = self
+        // Each page number takes at least one byte of the entry, so a session that read more
+        // pages than the entry has bytes could not carry its read set.
+        let bound = u64::try_from(COMMAND_BYTES.saturating_add(ENVELOPE_BYTES)).unwrap_or(u64::MAX);
+        let (answer, pages, traced) = self
             .db
-            .prepare_pages(COMMAND_BYTES, |db| {
-                let answer = f(db)?;
-                Ok(answer)
-            })
+            .prepare_traced(COMMAND_BYTES, bound, f)
             .map_err(|e| crate::database::refused(&e))?;
         validate_pages(&pages, COMMAND_BYTES)?;
+        let page1 = match pages.iter().find(|(page, _)| *page == 1) {
+            Some((_, image)) => readsets::page1_change(&traced.page_one, image),
+            None => readsets::Page1::Unwritten,
+        };
         Ok((
             Prepared {
                 base_index: self.point.index,
                 base_term: self.point.term,
                 pages,
                 baseline: self.baseline.declaration().cloned(),
+                // Only on a base whose state has the closed time's table: an apply that makes it
+                // (the group's first stamped entry) changes the schema beyond any entry's pages,
+                // so a write prepared before it must not move past it (`readsets`).
+                reads: traced
+                    .reads
+                    .filter(|_| self.time.is_some())
+                    .map(|reads| readsets::ReadSet { reads, page1 }),
             },
             answer,
         ))
@@ -712,6 +748,7 @@ impl Machine {
             base_term: self.point.term,
             pages: image,
             baseline: self.baseline.declaration().cloned(),
+            reads: None,
         };
         // The hard page fence proves the worst-case bound; retain the exact serialization check
         // before proposal as a format-change and arithmetic guard.
@@ -746,26 +783,12 @@ impl Machine {
         &mut self,
         f: impl FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R>,
     ) -> Result<(Prepared, R), Refusal> {
-        self.require_baseline()?;
-        let (answer, pages) = self
-            .db
-            .prepare_pages(COMMAND_BYTES, |db| {
-                let mut connection = crate::sql::Connection::new(db);
-                let value = f(&mut connection)?;
-                connection.finish()?;
-                Ok(value)
-            })
-            .map_err(|e| crate::database::refused(&e))?;
-        validate_pages(&pages, COMMAND_BYTES)?;
-        Ok((
-            Prepared {
-                base_index: self.point.index,
-                base_term: self.point.term,
-                pages,
-                baseline: self.baseline.declaration().cloned(),
-            },
-            answer,
-        ))
+        self.prepare_db(|db| {
+            let mut connection = crate::sql::Connection::new(db);
+            let value = f(&mut connection)?;
+            connection.finish()?;
+            Ok(value)
+        })
     }
 
     /// The owner calls this only after hyper-durable releases the matching ReadIndex context.
@@ -790,6 +813,17 @@ impl Machine {
             ));
         }
         Ok(answer)
+    }
+
+    /// The pages every apply writes (`readsets`): the replica's marker table's and the closed
+    /// time's (`closed::record`).
+    pub(crate) fn applied_pages(&self) -> Result<[u32; 2], Refusal> {
+        let root = |name: &str| {
+            self.db
+                .root_page(name)
+                .map_err(|e| crate::database::refused(&e))
+        };
+        Ok([root("__amphora_replica")?, root("__amphora_closed")?])
     }
 
     /// Applies `pages` at `at`, and flushes the log with them unless `flush` says the owner will.
@@ -1174,9 +1208,12 @@ impl StateMachine for Machine {
         self.record_digest(at.index)?;
         Ok(())
     }
+    /// The raft log is the write-ahead log (CP-T1.8, G12 step 2; replication.md, "The raft log
+    /// as the WAL"): compaction asks this before it moves the raft log's start, and moves it no
+    /// further than [`StateMachine::durable`], what the owner's flushing thread last made durable
+    /// (I8). So nothing is flushed here, on the owner's thread: compaction waits for the engine's
+    /// flush, and the raft log keeps every entry the database's log may still lose.
     fn persist(&mut self) -> Result<(), Fatal> {
-        self.log_flusher()().map_err(failed)?;
-        self.flushed = self.point;
         Ok(())
     }
 }

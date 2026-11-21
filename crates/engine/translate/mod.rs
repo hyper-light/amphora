@@ -141,6 +141,25 @@ pub fn translate(
         .clone()
         .unwrap_or_else(|| Arc::new(crate::plan_cache::PlanValues::generic()));
     resolver.set_plan_values(plan_values.clone());
+    // Amphora (PL.9): the row counts read each table's changes since ANALYZE.
+    plan_values.attach_row_changes(connection.db.row_changes.clone());
+    // Amphora (PL.9): an INSERT or DELETE of a main-database table folds its change count into
+    // that table's counter when it finishes.
+    let write_target = match &stmt {
+        ast::Stmt::Insert { tbl_name, .. } => Some((tbl_name, 1)),
+        ast::Stmt::Delete { tbl_name, .. } => Some((tbl_name, -1)),
+        _ => None,
+    }
+    .filter(|(tbl_name, _)| tbl_name.db_name.is_none())
+    .and_then(|(tbl_name, sign)| {
+        let table =
+            schema.get_btree_table(&crate::util::normalize_ident(tbl_name.name.as_str()))?;
+        Some(crate::row_changes::WriteTarget {
+            counter: connection.db.row_changes.counter(&table.name),
+            changes: connection.db.row_changes.clone(),
+            sign,
+        })
+    });
     // Amphora: what its hash and group tables hold before they spill (executor decision 8).
     resolver.set_statement_memory(connection.get_pager().statement_memory_budget());
     resolver.set_join_methods(connection.join_methods());
@@ -170,6 +189,8 @@ pub fn translate(
 
     program.epilogue(schema);
     program.reads_parameter_values = plan_values.asked();
+    program.planned_tables = plan_values.take_planned();
+    program.write_target = write_target;
 
     program.build(connection, change_cnt_on, input)
 }
