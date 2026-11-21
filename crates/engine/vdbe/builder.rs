@@ -2542,9 +2542,11 @@ impl ProgramBuilder {
             .take()
             .map(|counters| counters.sites)
             .unwrap_or_default();
+        let memory_tables = memory_tables(&self.insns);
         let prepared = PreparedProgram {
             row_count_sites,
             max_registers: self.next_free_register,
+            memory_tables,
             insns: self.insns,
             cursor_ref: self.cursor_ref,
             explain: self.explain,
@@ -2584,6 +2586,27 @@ impl ProgramBuilder {
         let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
     }
+}
+
+/// The distinct hash and group tables `insns` build: each `HashBuild`, `HashDistinct` and
+/// `GroupFind` names its table, and a table built in two places counts once. A loop over the
+/// program's instructions, which are already bounded by the program.
+fn memory_tables(insns: &[(Insn, usize)]) -> usize {
+    let mut hash = Vec::new();
+    let mut group = Vec::new();
+    for (insn, _) in insns {
+        match insn {
+            Insn::HashBuild { data } => hash.push(data.hash_table_id),
+            Insn::HashDistinct { data } => hash.push(data.hash_table_id),
+            Insn::GroupFind { data } => group.push(data.table_id),
+            _ => {}
+        }
+    }
+    hash.sort_unstable();
+    hash.dedup();
+    group.sort_unstable();
+    group.dedup();
+    hash.len().saturating_add(group.len())
 }
 
 pub(crate) trait CursorTypeExt {
