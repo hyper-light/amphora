@@ -2445,7 +2445,7 @@ mod group_holding {
         local.apply(&[command]).unwrap();
         match answer.lock().unwrap().take() {
             Some(Ok(Answer::Rev(at))) => at,
-            other => panic!("{other:?}"),
+            _ => panic!("a Records write not committed"),
         }
     }
 
@@ -2454,9 +2454,15 @@ mod group_holding {
         let rows = keys
             .iter()
             .map(|k| {
-                get(&local.db, "ns", "f", k.as_bytes(), u64::try_from(i64::MAX).unwrap())
-                    .unwrap()
-                    .map(|r| r.value)
+                get(
+                    &local.db,
+                    "ns",
+                    "f",
+                    k.as_bytes(),
+                    u64::try_from(i64::MAX).unwrap(),
+                )
+                .unwrap()
+                .map(|r| r.value)
             })
             .collect();
         let (mut live, mut head) = (0, 0);

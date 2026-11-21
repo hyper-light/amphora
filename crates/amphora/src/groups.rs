@@ -981,7 +981,10 @@ mod tests {
         let mut cost = Cost::default();
         cost.ran(10, Duration::from_micros(10), 10 * 1000);
         // A commit of 1 ms holds 1,000 units of 1 µs: by time, 1,000.
-        assert_eq!(cost.within(Some(1_000_000), u64::MAX, cost.unit_bytes), 1000);
+        assert_eq!(
+            cost.within(Some(1_000_000), u64::MAX, cost.unit_bytes),
+            1000
+        );
         assert_eq!(cost.within(Some(1_000_000), 50_000, cost.unit_bytes), 50);
     }
 

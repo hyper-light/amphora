@@ -213,7 +213,8 @@ fn moved(db: &Db, ids: Vec<(Id, Pos, Seq)>, head: Seq) -> anyhow::Result<Vec<Mov
             )
         };
         let (ns, family, key) = &id;
-        let routing = row_key(ns, family, key).ok_or_else(|| anyhow::anyhow!("a row key too long"))?;
+        let routing =
+            row_key(ns, family, key).ok_or_else(|| anyhow::anyhow!("a row key too long"))?;
         out.push(Moved {
             pos,
             key: hex(&routing),
@@ -373,7 +374,9 @@ fn account(db: &Db, ns: &str, before: bool, now: bool, newest: Option<u64>) -> a
 
 fn drop_key(db: &Db, id: &Id) -> anyhow::Result<()> {
     let (ns, family, key) = id;
-    let params = || -> anyhow::Result<[amphora_engine::Value; 3]> { Ok([text(ns), text(family), blob(key)?]) };
+    let params = || -> anyhow::Result<[amphora_engine::Value; 3]> {
+        Ok([text(ns), text(family), blob(key)?])
+    };
     db.query(
         "DELETE FROM __amphora_versions WHERE namespace = ?1 AND family = ?2 AND key = ?3",
         params()?,
@@ -395,7 +398,8 @@ fn drop_key(db: &Db, id: &Id) -> anyhow::Result<()> {
 pub(super) fn import(db: &Db, moved: &[Moved]) -> anyhow::Result<()> {
     for m in moved {
         let routing = unhex(&m.key)?;
-        let id: Id = row_parts(&routing).ok_or_else(|| anyhow::anyhow!("a moved key that doesn't decode"))?;
+        let id: Id = row_parts(&routing)
+            .ok_or_else(|| anyhow::anyhow!("a moved key that doesn't decode"))?;
         let (ns, family, key) = &id;
         let mut stamp = None;
         db.query(
@@ -415,8 +419,8 @@ pub(super) fn import(db: &Db, moved: &[Moved]) -> anyhow::Result<()> {
             account(db, ns, before, false, None)?;
             continue;
         };
-        let rows: Vec<Version> =
-            postcard::from_bytes(rows).map_err(|_| anyhow::anyhow!("moved versions that don't decode"))?;
+        let rows: Vec<Version> = postcard::from_bytes(rows)
+            .map_err(|_| anyhow::anyhow!("moved versions that don't decode"))?;
         for (at, seq, value) in &rows {
             let value = value
                 .as_deref()

@@ -105,12 +105,12 @@ pub fn row_key(namespace: &str, family: &str, key: &[u8]) -> Option<Vec<u8>> {
 /// The namespace, family and key of a [`row_key`] (None: bytes no `row_key` made).
 #[must_use]
 pub fn row_parts(row_key: &[u8]) -> Option<(String, String, Vec<u8>)> {
-    let part = |at: &[u8]| -> Option<(String, &[u8])> {
+    fn part(at: &[u8]) -> Option<(String, &[u8])> {
         let (len, rest) = at.split_first_chunk::<4>()?;
         let len = usize::try_from(u32::from_le_bytes(*len)).ok()?;
         let (text, rest) = rest.split_at_checked(len)?;
         Some((String::from_utf8(text.to_vec()).ok()?, rest))
-    };
+    }
     let (namespace, rest) = part(row_key)?;
     let (family, key) = part(rest)?;
     Some((namespace, family, key.to_vec()))
