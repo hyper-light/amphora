@@ -131,7 +131,8 @@ fn g6_s5_hash_semi_join_matches_nested_loops_and_the_model() {
     conn.execute("ANALYZE").unwrap();
 
     let one_key = "SELECT a.id FROM a WHERE EXISTS (SELECT 1 FROM s WHERE s.k = a.k)";
-    let two_keys = "SELECT a.id, a.v FROM a WHERE EXISTS (SELECT 1 FROM s WHERE s.k = a.k AND s.m = a.m)";
+    let two_keys =
+        "SELECT a.id, a.v FROM a WHERE EXISTS (SELECT 1 FROM s WHERE s.k = a.k AND s.m = a.m)";
     let correlated_range = "SELECT a.id FROM a WHERE a.v < 70 AND EXISTS (SELECT 1 FROM s WHERE s.k = a.k AND s.v > a.v)";
     let queries = [
         one_key,
@@ -160,9 +161,10 @@ fn g6_s5_hash_semi_join_matches_nested_loops_and_the_model() {
     let want_two_keys = model(&|ra, rs| same(ra.k, rs.k) && same(ra.m, rs.m), &|ra| {
         vec![int(ra.id), int(ra.v)]
     });
-    let want_correlated_range = model(&|ra, rs| ra.v < 70 && same(ra.k, rs.k) && rs.v > ra.v, &|ra| {
-        vec![int(ra.id)]
-    });
+    let want_correlated_range = model(
+        &|ra, rs| ra.v < 70 && same(ra.k, rs.k) && rs.v > ra.v,
+        &|ra| vec![int(ra.id)],
+    );
     assert!(
         !want_one_key.is_empty() && want_one_key.len() < a.len(),
         "the model keeps some rows and drops some"
@@ -173,7 +175,8 @@ fn g6_s5_hash_semi_join_matches_nested_loops_and_the_model() {
     // partitions and the matched bits live in them.
     for cache in [None, Some(8)] {
         if let Some(pages) = cache {
-            conn.execute(format!("PRAGMA cache_size = {pages}")).unwrap();
+            conn.execute(format!("PRAGMA cache_size = {pages}"))
+                .unwrap();
         }
         for sql in queries {
             let mut answers = Vec::new();

@@ -1614,9 +1614,8 @@ pub fn try_hash_join_access_method(
             matches!(
                 hash_join_type,
                 HashJoinType::Inner | HashJoinType::LeftAnti | HashJoinType::LeftSemi
-            )
-                || where_clause[*where_idx].origin.join_origin()
-                    == Some(JoinOrigin::Outer(probe_table.internal_id))
+            ) || where_clause[*where_idx].origin.join_origin()
+                == Some(JoinOrigin::Outer(probe_table.internal_id))
         }),
     );
     tracing::debug!(

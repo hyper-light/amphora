@@ -557,6 +557,14 @@ change, and a power cut leaves the old schema or the new. DROP COLUMN is not yet
   but not merged: with today's join costs it flips `records_plans`' one-row-lookup case to a hash join and a sort
   (the two plans cost about 110 each), so it waits for the learned costs, then the `rhs_has_selective_seek` gate removed, builds over joined inputs, PL.5's Bloom
   filters with LIP and predicate transfer, and sort-merge and prefetched index joins (G6 step 4).
+- **G6 step 5, plans that read less, started** (lane g6s5): an `EXISTS` may now run as a hash semi join, chosen by
+  cost against the nested loop's early out: the outer rows build the hash table, the subquery's table probes it, and
+  `HashMarkFirstMatch` passes each build row on at its first match in a probe pass only (its matched bit, kept in
+  grace partitions when the table spills). `tests/hash_semi_join.rs` runs EXISTS queries with NULL and duplicate
+  keys under all three join methods, in memory and spilled, against a model. Index-only reads were already planned
+  (covering indexes). Left: bitmap-style sorted row fetches (a one-branch RowSet read; the multi-index fetch cost
+  assumes page locality and should be learned first), and the 2x measurements on order_by_sort, exists_subquery
+  and left_join_anti (the coordinator's).
 - **The replicated class** (docs/design/replication.md, "Fast acknowledgement"; Ada's word 2026-11-01): built on
   t1/replicated-line, not on main (fast-ack, class-metrics, class-quorum and disk-stalls, merged in that order). A
   replicated database opened with `Durability::Replicated(Fates)` answers a write once members spanning the fates
