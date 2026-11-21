@@ -98,7 +98,12 @@ pub fn even(node: NodeId, n: usize) -> Result<Directory, reshard::Refused> {
             return Err(reshard::Refused::Invalid("a proposal begins an operation"));
         };
         let (id, made) = (op.id, op.to);
-        for change in [begin, Change::Cutover(id), Change::Flip(id), Change::End(id)] {
+        for change in [
+            begin,
+            Change::Cutover(id),
+            Change::Flip(id),
+            Change::End(id),
+        ] {
             directory.apply(&change)?;
         }
         last = made;
@@ -148,8 +153,7 @@ impl<E: Engine> Groups<E> {
     /// group's, as this member has applied it.
     pub fn route(&self, directory: &Directory) -> Result<(), reshard::Refused> {
         directory.check()?;
-        let mut route = self
-            .route.write().unwrap_or_else(PoisonError::into_inner);
+        let mut route = self.route.write().unwrap_or_else(PoisonError::into_inner);
         if directory.generation() > route.directory.generation() {
             route.directory = directory.clone();
         }
@@ -159,12 +163,20 @@ impl<E: Engine> Groups<E> {
     /// The generation of the directory routed by.
     #[must_use]
     pub fn generation(&self) -> u64 {
-        self.route.read().unwrap_or_else(PoisonError::into_inner).directory.generation()
+        self.route
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .directory
+            .generation()
     }
 
     /// A new group (the driver's `Do::Create`), holding nothing until an operation hands it a
     /// span, its store started on `engine`. Making one that is here already does nothing.
-    pub fn create(&self, group: GroupId, engine: impl FnOnce() -> anyhow::Result<E>) -> anyhow::Result<()> {
+    pub fn create(
+        &self,
+        group: GroupId,
+        engine: impl FnOnce() -> anyhow::Result<E>,
+    ) -> anyhow::Result<()> {
         let mut route = self.route.write().unwrap_or_else(PoisonError::into_inner);
         if route.groups.contains_key(&group) {
             return Ok(());
@@ -188,16 +200,22 @@ impl<E: Engine> Groups<E> {
         group: GroupId,
         f: impl FnOnce(&mut Holding) -> Result<T, reshard::Refused>,
     ) -> Result<T, reshard::Refused> {
-        let mut route = self
-            .route.write().unwrap_or_else(PoisonError::into_inner);
-        let held = route.groups.get_mut(&group).ok_or(reshard::Refused::NoGroup(group))?;
+        let mut route = self.route.write().unwrap_or_else(PoisonError::into_inner);
+        let held = route
+            .groups
+            .get_mut(&group)
+            .ok_or(reshard::Refused::NoGroup(group))?;
         f(&mut held.holding)
     }
 
     /// How many groups are on this node.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.route.read().unwrap_or_else(PoisonError::into_inner).groups.len()
+        self.route
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .groups
+            .len()
     }
 
     /// Whether no group is on this node (every group's span has moved to other nodes).

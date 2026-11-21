@@ -28,15 +28,31 @@ pub type Pos = u64;
 pub type Seq = u64;
 
 /// A group: the unit with one writer, one log and one place. Ids are never used again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct GroupId(pub u64);
 
 /// A machine groups are placed on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct NodeId(pub u64);
 
 /// An operation: a split, a merge or a move. Ids grow from 1, and are never used again (0: none).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct OpId(pub u64);
 
 /// `key`'s position: its FNV-1a hash, finished by MurmurHash3's 64-bit finalizer (`fmix64`,
@@ -57,7 +73,9 @@ pub fn position(key: &str) -> Pos {
 }
 
 /// Positions `lo` to `hi`, both included: never empty.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct Span {
     lo: Pos,
     hi: Pos,

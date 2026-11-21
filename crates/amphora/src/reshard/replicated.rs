@@ -36,7 +36,8 @@ fn decode(bytes: &[u8]) -> Result<Change, Refused> {
             "a directory change larger than a replicated command",
         ));
     }
-    postcard::from_bytes(bytes).map_err(|_| Refused::Invalid("a directory entry that doesn't decode"))
+    postcard::from_bytes(bytes)
+        .map_err(|_| Refused::Invalid("a directory entry that doesn't decode"))
 }
 
 /// The directory group's state machine.
@@ -89,7 +90,11 @@ impl StateMachine for DirectoryMachine {
     /// nothing, so it is the proposer's answer, never a member's failure.
     type Answer = Result<u64, Refused>;
 
-    fn apply(&mut self, entry: &EntryRef<'_>, answers: &mut Vec<Self::Answer>) -> Result<(), Fatal> {
+    fn apply(
+        &mut self,
+        entry: &EntryRef<'_>,
+        answers: &mut Vec<Self::Answer>,
+    ) -> Result<(), Fatal> {
         self.applied = Point {
             index: entry.index,
             term: entry.term,
@@ -148,8 +153,8 @@ impl StateMachine for DirectoryMachine {
         if image.len() > crate::replication::SNAPSHOT_BYTES {
             return Err(Fatal("a directory image larger than a snapshot"));
         }
-        let directory: Directory =
-            postcard::from_bytes(image).map_err(|_| Fatal("a directory image that doesn't decode"))?;
+        let directory: Directory = postcard::from_bytes(image)
+            .map_err(|_| Fatal("a directory image that doesn't decode"))?;
         directory
             .check()
             .map_err(|_| Fatal("a directory image whose spans don't cover every position once"))?;
@@ -250,7 +255,12 @@ mod tests {
     fn value(groups: &Groups<Mem>, key: &str) -> Option<i64> {
         let k = key.to_owned();
         groups
-            .read(key, soon(), |()| Ok(None), move |e| Ok(e.rows.get(&k).copied()))
+            .read(
+                key,
+                soon(),
+                |()| Ok(None),
+                move |e| Ok(e.rows.get(&k).copied()),
+            )
             .unwrap()
     }
 
@@ -305,9 +315,15 @@ mod tests {
 
         // Cutover: the old group fences the range. A write to it is refused, typed; the rest
         // goes on.
-        assert!(log.commit(2, &Change::Cutover(op.id)).iter().all(Result::is_ok));
+        assert!(
+            log.commit(2, &Change::Cutover(op.id))
+                .iter()
+                .all(Result::is_ok)
+        );
         assert_eq!(
-            groups.hold(op.from, |h| h.fence(op.id, op.span, 1)).unwrap(),
+            groups
+                .hold(op.from, |h| h.fence(op.id, op.span, 1))
+                .unwrap(),
             Fenced::New(1)
         );
         assert_eq!(
@@ -318,7 +334,11 @@ mod tests {
 
         // The flip: the range is the new group's. A router still on the old directory sends the
         // write to the old group, which refuses it.
-        assert!(log.commit(2, &Change::Flip(op.id)).iter().all(Result::is_ok));
+        assert!(
+            log.commit(2, &Change::Flip(op.id))
+                .iter()
+                .all(Result::is_ok)
+        );
         groups.hold(op.to, |h| h.activate(op.id)).unwrap();
         groups.hold(op.from, |h| h.release(op.id)).unwrap();
         assert_eq!(

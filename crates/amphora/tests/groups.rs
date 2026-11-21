@@ -157,7 +157,11 @@ fn rows_go_to_their_keys_group_and_read_back_from_it() {
     let mut seen = HashSet::new();
     for (group, keys) in held.iter().enumerate() {
         for key in keys {
-            assert_eq!(groups.group(key), Some(GroupId(u64::try_from(group).unwrap())), "{key} is in group {group}'s file");
+            assert_eq!(
+                groups.group(key),
+                Some(GroupId(u64::try_from(group).unwrap())),
+                "{key} is in group {group}'s file"
+            );
             assert!(seen.insert(key.clone()));
         }
     }
