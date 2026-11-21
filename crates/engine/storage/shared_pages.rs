@@ -150,7 +150,7 @@ impl SharedPages {
     }
 
     /// The frames, if made.
-    fn front_made(&self) -> Option<&Frames> {
+    pub(crate) fn front_made(&self) -> Option<&Frames> {
         self.front.as_ref()?.get()?.as_ref()
     }
 
