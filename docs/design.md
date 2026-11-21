@@ -26,7 +26,7 @@ comparison) is one line under "Sections that are not decisions" instead.
 How a program reaches each system's records, from their specifications (cited as `[pN]`, each a
 quote in [docs/research/client-protocol.md](research/client-protocol.md)). Amphora's decision, embedded first as
 SQLite is [p13] with one framed protocol between processes [p22] [p23], is
-[client-protocol.md, 1](design/client-protocol.md).
+[docs/design/client-protocol.md](design/client-protocol.md).
 
 | | PostgreSQL | MySQL | SQLite | Hrana (libSQL) | Amphora |
 |---|---|---|---|---|---|
