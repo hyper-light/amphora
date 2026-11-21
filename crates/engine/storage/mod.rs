@@ -15,6 +15,7 @@ pub(crate) mod buffer_pool;
 pub(crate) mod changes;
 pub(crate) mod checksum;
 pub mod database;
+pub mod descent_skip;
 pub(crate) mod encryption;
 pub(crate) mod journal_mode;
 pub(crate) mod key_heads;
