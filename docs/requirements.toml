@@ -453,6 +453,20 @@ tests = [
   { id = "T-DQ.1.1", text = "Three members, an election and 20 writes on driven time — passes when every write is answered and some step left more to drive for the next" },
 ]
 
+[[own]]
+id = "WK.1"
+title = "The replicated owner wakes on its events and its next deadline, not a picked 1 ms poll"
+criteria = [
+  { id = "AC-WK.1.1", text = "The owner waits on a bell rung by an input queued, a handle dropped, the replication log's write or compaction done (the bell's waker) and a flush done; a ring before the wait is kept" },
+  { id = "AC-WK.1.2", text = "An owner with nothing to drive waits at most until its next deadline: its next tick, or sooner a queued or pending submit's, a change's, a hand-off's or the write slot's" },
+  { id = "AC-WK.1.3", text = "The owner thread answers a write it waits on the log for, and ends once its last handle is dropped" },
+]
+tests = [
+  { id = "T-WK.1.1", text = "A bell rung, then waited on twice for no time; then waited on for an hour while another thread wakes its waker — passes when the first wait is rung, the second not, the hour's rung" },
+  { id = "T-WK.1.2", text = "A lone member of three stepped, then given a submit due a nanosecond past its clock — passes when its deadline is its next tick, then the submit's" },
+  { id = "T-WK.1.3", text = "A lone voter on the owner thread, a write submitted until answered, every handle dropped — passes when the write is answered and the owner thread ends" },
+]
+
 # lane cc-proto
 # Amphora's own IDs for G8 step 1 (kiln plan 01a16b0f4716761cb68dc0c96863b53b, step 1, under
 # CP-T1.3 and AC-T1.3.6): serializability by precision locking against SSI and OCC, measured.

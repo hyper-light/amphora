@@ -94,7 +94,8 @@ thread the two clocks are one. In a test, a call's deadline is an hour ahead of 
 those checks never fire there: they are hang guards.
 
 The production shell is the owner thread. Its clock is the real one (`Instant::now`), and before
-each step it waits on the bounded channel (`recv_timeout(POLL)`) for the next input. The handle's
+each step it takes the next input queued, or waits on its bell until something wakes it or its next deadline
+comes ("Decision (lane constants): the owner's wakes"). The handle's
 caller-side reads stay on the real clock, because they are the caller's own deadlines:
 - `submit`, and `receive` with its `enqueue_receive`, before enqueueing and while waiting for the
   answer;
@@ -120,7 +121,7 @@ slow work moves the real clock. It relays wire records between steps.
 A test caller enqueues its call and polls the answer between steps; it never blocks on a channel.
 Its deadline is a virtual instant, so it expires only when the test advances a clock past it. The
 hour's lead keeps any real-clock check of a test deadline (a receipt's poll) true for an hour. A
-round with nothing to relay yields `POLL` to the disk, and a counted budget of rounds, about a
+round with nothing to relay yields `POLL` (a test's own pacing; the owner never polls) to the disk, and a counted budget of rounds, about a
 minute of such yields, calls a scenario hung. Both are hang guards, and no test's verdict depends on
 them. The three-owner scenarios move to the test shell. Their thread-shell helpers go with them:
 the relay's blocking call, `seeded_nodes` and `known_leader`, with their five-second budgets of the
@@ -2142,3 +2143,34 @@ some step leaves more to drive for the next. A step that drives until nothing is
 
 **Falsified by:** an input waiting more than one drive while the replica has more to drive; the replicated benches'
 commit latency or throughput worse than at 4e74cee beyond their noise.
+
+## Decision (lane constants): the owner's wakes (2026-11-21)
+
+Ada's rule: no picked numbers. `POLL` (1 ms) was how long the owner thread waited on its input channel before it
+stepped anyway: a poll, so the log's finished writes, its flushes and its deadlines were seen at the next poll, and
+an idle owner woke a thousand times a second for nothing. No measurement made 1 ms.
+
+**The decision.** The owner waits on a bell (`Bell`: a flag and a condition variable) and steps when it rings or when
+its next deadline comes, whichever is first (`run_loop`, `Actor::deadline`). What rings it:
+- an input queued (`ReplicaHandle::enqueue`, after the send);
+- a handle dropped (`Ring`, after the handle's sender is gone), so the last one's drop finds the channel closed;
+- the replication log's write or compaction done: the bell's own `Waker`, which hyper-durable hands to the store
+  (`Store::submit`'s waker, woken when the write lands: its `hyperlog.rs`, `memory.rs`);
+- a flush of the database's log done (the flushing thread, after its answer).
+A ring before the wait is kept, so none is lost between the owner's look at its channel and its wait.
+
+Its next deadline is its next tick, or sooner a deadline it holds: a queued or pending submit's, a change of members',
+a hand-off's, the write slot's end. Everything else it checks by time counts in ticks (elections, heartbeats, the
+quorum check, a bootstrap's hand-off), so is due at a tick. A step that drove and left more steps again at once, as
+before ("one drive a step"). Nothing is left to pick: the waits are the events' own times and the deadlines'.
+
+**What still waits for a tick.** A local reader given back and the host draining the outgoing queue don't ring the
+bell: the owner sees them at its next step, at the latest its next tick, as it did at its next poll. The tick itself
+(`TICK`) is the next constant this lane replaces.
+
+**Tests.** `the_owners_bell_keeps_a_ring_and_its_waker_rings_it` (T-WK.1.1),
+`an_owners_next_deadline_is_its_tick_or_a_sooner_held_deadline` (T-WK.1.2),
+`an_owner_thread_answers_on_its_wakes_and_ends_with_its_last_handle` (T-WK.1.3).
+
+**Falsified by:** a write, flush or input that waits for the owner's next tick to be seen (the replicated benches'
+commit latency worse than at 954ee1d beyond their noise); an idle owner's thread waking more often than its ticks.
