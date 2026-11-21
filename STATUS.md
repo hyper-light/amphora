@@ -265,6 +265,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   0, 2, 4, ... drew the same), and every database checkpoints after its load before any run
   (`settle_s`; Amphora's loader had left the whole load, 7.5 GB, in its log). `--query` runs a
   statement on a database a run left behind.
+- **The leader's write slot** (AC-T1.8.W1, Amphora goal 9c63f7d4; replication.md, "the write slot"): a member
+  whose write is refused at the leader's append gets a slot for its next try, its length learned per member from
+  its retries' gaps (cold start: the core's election timeout). A gap over which the host's detector suspected the
+  member is not learned; no number bounds a gap (lane g-slot-close, 2026-11-21).
 
 - **Groups that split, merge and move themselves** (CP-T1.9, lane split-merge; `crates/amphora/src/reshard/`,
   docs/design/reshard.md): a pure core: a directory of hash spans with every position in exactly one group,
