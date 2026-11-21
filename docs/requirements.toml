@@ -705,6 +705,7 @@ tests = [
   { id = "T-T1.9.R7", text = "A local database as a group's engine, its holding fenced through the shell, then the group started again on the same file — passes when the fenced holding is answered after the restart, kept in the file as the Holding command left it" },
   # lane split-merge-8
   { id = "T-T1.9.R8", text = "Copy-path batches on a node with no commit measured, and batches learned from time with large units — passes when no batch holds more units than the process's memory budget takes at the most bytes a unit has held, and at least one" },
+  { id = "T-T1.9.R9", text = "A local database holding Records rows made a group's, its keys copied by position in batches into another local database, changed and caught up from its log, then swept — passes when the second answers every key as the first, with the same live count and a head no older than every revision moved, a catch-up from before the log was held is refused, and the sweep leaves the first with no key" },
 ]
 
 # lane qs5

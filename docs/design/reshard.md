@@ -294,3 +294,48 @@ whose units are too large is cut to what the memory holds (T-T1.9.R8).
 **Falsified by.** A copy, catch-up or sweep batch whose keys and rows hold more bytes than the
 budget; or, at equal load, a copy slower with the bound than without on a node whose memory the
 batches don't approach (the bound should never bind there).
+
+## Decision (lane split-merge-8): a row routes by its namespace, family and key
+
+A group's rows must be indexed by position, so a span can be copied and swept in position order.
+Amphora's own engine (`database::Local`) routed every command by one key (`"database"`), so a
+database was one position and could never be split. Its Records rows now each have a position:
+the position (`reshard::position_of`) of the row's namespace, family and key, written as one
+string of bytes (`reshard::row_key`: the namespace and the family each preceded by its length as
+a little-endian u32, a format value that makes the three parts unambiguous, then the key).
+
+**Why this key.** It is how Records already addresses a row: a row is a key in a family of a
+namespace (`amphora-api`'s `Records::get(family, key)` on a namespace; `__amphora_versions`'s
+primary key is (namespace, family, key, revision); docs/design/records.md). Every version of a
+key then lands in one group, so a read at any revision, a condition and the feed's order within a
+key are each one group's. Spreading by key, not by namespace or family, spreads one busy
+namespace or family over groups, which a prefix of the key would not (a hash's spans are what the
+planner splits by measured load; decision "split, merge and move as one fenced hand-off").
+
+**Built.** A local database becomes a group's when it first keeps a holding: in that commit its
+log starts and every Records key it holds is indexed by position (`__amphora_positions`); from
+then on each commit is one entry of its log, each Records key a commit writes (through a
+transaction or a bulk import) is indexed, and while the log is held, noted with its entry in the
+change feed (`__amphora_group_feed`). The copy path moves a key's every version; the namespace's
+head is raised to the newest revision moved in, and its live keys are counted again, so the new
+group's next revision is newer than every row it took (`database/group.rs`; T-T1.9.R9). A
+database that is no group's pays one lookup a write of a log row it doesn't have.
+
+**Reversible.** The position is derived, never stored as a key: the index and feed tables are a
+group's alone, rebuilt from `__amphora_versions` when a database becomes a group's. Another
+routing key means another `row_key` and the index built again, with no change to the rows.
+
+**Needs Ada's word.** This is the reversible option the evidence favours, taken by lane
+split-merge-8 without her. What it leaves open:
+- A namespace's revisions are one counter today. Once its keys are in more than one group, each
+  group counts its own: a revision orders the writes of one key, and of one group, but not of the
+  whole namespace, so `changes` and `head` over a namespace split across groups need the
+  cross-group order of CP-T1.10.
+- A Records transaction whose keys fall in more than one group is refused, as any batch across
+  groups is (`store::Refused::Groups`), until CP-T1.10's transactions across groups.
+- SQL tables (`Mutation::Sql`, `Migrate`, sessions) have no row key: they stay in the group the
+  database's first group holds, and don't move.
+
+**Falsified by.** A Records key whose versions are found in two groups, or in none, after a
+split, merge or move; a read at a revision answered differently after a move; a new group's next
+revision of a namespace not newer than one it took.
