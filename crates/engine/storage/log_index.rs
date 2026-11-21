@@ -24,10 +24,10 @@
 //! frames cut or written again are past every committed snapshot, and a restart happens only when
 //! no reader reads the log.
 
-use crate::sync::Mutex;
 use crate::storage::sqlite3_ondisk::WalHeader;
-use crate::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use crate::storage::wal::HeaderCell;
+use crate::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use crate::sync::Mutex;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
@@ -63,14 +63,16 @@ impl LogReadIndex {
     pub fn process_default() -> Self {
         static FROM_ENV: OnceLock<LogReadIndex> = OnceLock::new();
         match PROCESS_DEFAULT.load(Ordering::Relaxed) {
-            UNSET => *FROM_ENV.get_or_init(|| {
-                match std::env::var("AMPHORA_LOG_READ_INDEX").as_deref() {
-                    Ok("filtered") => Self::Filtered,
-                    Ok("published") => Self::Published,
-                    Ok("optimistic") => Self::Optimistic,
-                    _ => Self::Locked,
-                }
-            }),
+            UNSET => {
+                *FROM_ENV.get_or_init(
+                    || match std::env::var("AMPHORA_LOG_READ_INDEX").as_deref() {
+                        Ok("filtered") => Self::Filtered,
+                        Ok("published") => Self::Published,
+                        Ok("optimistic") => Self::Optimistic,
+                        _ => Self::Locked,
+                    },
+                )
+            }
             set => Self::from_u8(set),
         }
     }
@@ -290,7 +292,9 @@ impl Latest {
 
     fn place(&self, page: u64) -> (Option<&Shard>, u64) {
         let hash = page.wrapping_mul(FIBONACCI);
-        let shard = hash.checked_shr(64u32.saturating_sub(self.shard_bits)).unwrap_or(0);
+        let shard = hash
+            .checked_shr(64u32.saturating_sub(self.shard_bits))
+            .unwrap_or(0);
         let shard = usize::try_from(shard)
             .ok()
             .filter(|_| self.shard_bits > 0)
@@ -346,7 +350,8 @@ impl Latest {
             let Ok(index) = usize::try_from(slot) else {
                 return false;
             };
-            let (Some(keys), Some(frames)) = (shard.keys.get(index), shard.frames.get(index)) else {
+            let (Some(keys), Some(frames)) = (shard.keys.get(index), shard.frames.get(index))
+            else {
                 return false;
             };
             let seen = keys.load(Ordering::Relaxed);
@@ -363,7 +368,9 @@ impl Latest {
                 fence(Ordering::Release);
                 frames.store(frame, Ordering::Relaxed);
                 keys.store(key, Ordering::Relaxed);
-                shard.version.store(begun.wrapping_add(1), Ordering::Release);
+                shard
+                    .version
+                    .store(begun.wrapping_add(1), Ordering::Release);
                 return true;
             }
             slot = slot.wrapping_add(1) & mask;
@@ -478,11 +485,12 @@ impl ReadIndex {
     ) {
         let highest = index.keys().copied().max().unwrap_or(0);
         let previous = self.bits.load();
-        let words = PageBits::words_for(highest).max(if grow_bits && previous.generation == generation {
-            previous.words.len().saturating_mul(2)
-        } else {
-            0
-        });
+        let words =
+            PageBits::words_for(highest).max(if grow_bits && previous.generation == generation {
+                previous.words.len().saturating_mul(2)
+            } else {
+                0
+            });
         let bits = PageBits::with_words(generation, words);
         for &page in index.keys() {
             bits.set(page);
@@ -490,11 +498,13 @@ impl ReadIndex {
         if self.mode() == LogReadIndex::Optimistic {
             let previous = self.latest.load();
             let slots: usize = previous.shards.iter().map(|shard| shard.keys.len()).sum();
-            let mut pages = index.len().max(if grow_latest && previous.generation == generation {
-                slots
-            } else {
-                0
-            });
+            let mut pages = index
+                .len()
+                .max(if grow_latest && previous.generation == generation {
+                    slots
+                } else {
+                    0
+                });
             // A shard the hash fills past half takes the table to twice its size: at most one
             // doubling a shard (every page in one shard), so the loop ends.
             for _ in 0..=previous.shards.len().max(1).ilog2().saturating_add(1) {

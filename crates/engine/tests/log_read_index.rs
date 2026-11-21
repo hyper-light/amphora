@@ -6,8 +6,8 @@ use amphora_engine::io::{FileId, FileSyncType};
 use amphora_engine::storage::log_index::LogReadIndex;
 use amphora_engine::{
     Buffer, CheckpointMode, Clock, Completion, ConnectOpts, Connection, Database, DatabaseOpts,
-    File, LimboError, MonotonicInstant, Numeric, OpenFlags, OpenOptions, PlatformIO,
-    SqliteDialect, Value, WallClockInstant, IO,
+    File, LimboError, MonotonicInstant, Numeric, OpenFlags, OpenOptions, PlatformIO, SqliteDialect,
+    Value, WallClockInstant, IO,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -143,14 +143,24 @@ fn connect(db: &Arc<Database>) -> Arc<Connection> {
 type Rows = BTreeMap<i64, Vec<u8>>;
 
 fn body(id: i64, version: u8) -> Vec<u8> {
-    (0..600).map(|i| (id as u8).wrapping_mul(31) ^ (i as u8) ^ version).collect()
+    (0..600)
+        .map(|i| (id as u8).wrapping_mul(31) ^ (i as u8) ^ version)
+        .collect()
 }
 
-fn put(conn: &Arc<Connection>, rows: &mut Rows, ids: &[i64], version: u8) -> amphora_engine::Result<()> {
+fn put(
+    conn: &Arc<Connection>,
+    rows: &mut Rows,
+    ids: &[i64],
+    version: u8,
+) -> amphora_engine::Result<()> {
     conn.execute("BEGIN")?;
     for &id in ids {
-        let hex: String = body(id, version).iter().map(|b| format!("{b:02x}")).collect();
-        conn.execute(&format!("INSERT OR REPLACE INTO t VALUES ({id}, x'{hex}')"))?;
+        let hex: String = body(id, version)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        conn.execute(format!("INSERT OR REPLACE INTO t VALUES ({id}, x'{hex}')"))?;
     }
     conn.execute("COMMIT")?;
     for &id in ids {
@@ -175,7 +185,11 @@ fn table(conn: &Arc<Connection>) -> Rows {
 }
 
 fn integrity(conn: &Arc<Connection>) {
-    let rows = conn.prepare("PRAGMA integrity_check").unwrap().run_collect_rows().unwrap();
+    let rows = conn
+        .prepare("PRAGMA integrity_check")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
     assert!(
         matches!(&rows[..], [row] if matches!(&row[0], Value::Text(t) if t.as_str() == "ok")),
         "integrity_check: {rows:?}"
@@ -191,7 +205,8 @@ fn run(path: &Path, crash: &Arc<Crash>) -> (Vec<Rows>, usize) {
     });
     let db = open_with(io, path);
     let conn = connect(&db);
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)")
+        .unwrap();
     let mut rows = Rows::new();
     for round in 0..4u8 {
         let ids: Vec<i64> = (0..30).map(|i| i64::from(round) * 7 + i).collect();
@@ -200,8 +215,12 @@ fn run(path: &Path, crash: &Arc<Crash>) -> (Vec<Rows>, usize) {
     let mut states = vec![rows.clone()];
     crash.armed.store(true, Ordering::Release);
     let mut steps = 0;
-    let truncate = CheckpointMode::Truncate { upper_bound_inclusive: None };
-    let passive = CheckpointMode::Passive { upper_bound_inclusive: None };
+    let truncate = CheckpointMode::Truncate {
+        upper_bound_inclusive: None,
+    };
+    let passive = CheckpointMode::Passive {
+        upper_bound_inclusive: None,
+    };
     // A checkpoint that restarts the log, a commit into the restarted log, a checkpoint that leaves
     // it whole, and a commit that restarts it from its first frame.
     let outcome = (|| -> amphora_engine::Result<()> {
@@ -259,7 +278,11 @@ fn wal(path: &Path) -> std::path::PathBuf {
 #[test]
 fn g3_2_reads_after_a_crash_in_a_checkpoint_or_log_restart_find_the_last_commit() {
     let dir = tempfile::tempdir().unwrap();
-    for mode in [LogReadIndex::Filtered, LogReadIndex::Published, LogReadIndex::Optimistic] {
+    for mode in [
+        LogReadIndex::Filtered,
+        LogReadIndex::Published,
+        LogReadIndex::Optimistic,
+    ] {
         LogReadIndex::set_process_default(mode);
         // The writes the steps take when nothing crashes.
         let whole = Arc::new(Crash::default());
@@ -273,7 +296,10 @@ fn g3_2_reads_after_a_crash_in_a_checkpoint_or_log_restart_find_the_last_commit(
             let crash = Arc::new(Crash::default());
             crash.budget.store(at, Ordering::Release);
             let (states, steps) = run(&path, &crash);
-            let db = open_with(Arc::new(PlatformIO::new().unwrap()), &path.with_extension("crashed"));
+            let db = open_with(
+                Arc::new(PlatformIO::new().unwrap()),
+                &path.with_extension("crashed"),
+            );
             let conn = connect(&db);
             let read = table(&conn);
             assert!(
@@ -282,10 +308,16 @@ fn g3_2_reads_after_a_crash_in_a_checkpoint_or_log_restart_find_the_last_commit(
                 read.len()
             );
             for (&id, expected) in &read {
-                let mut stmt = conn.prepare(&format!("SELECT body FROM t WHERE id = {id}")).unwrap();
+                let mut stmt = conn
+                    .prepare(format!("SELECT body FROM t WHERE id = {id}"))
+                    .unwrap();
                 let one = stmt.run_collect_rows().unwrap();
                 assert_eq!(one.len(), 1, "{mode:?} at {at}: row {id}");
-                assert_eq!(&one[0][0].to_blob().unwrap().to_vec(), expected, "{mode:?} at {at}: row {id}");
+                assert_eq!(
+                    &one[0][0].to_blob().unwrap().to_vec(),
+                    expected,
+                    "{mode:?} at {at}: row {id}"
+                );
             }
             integrity(&conn);
         }

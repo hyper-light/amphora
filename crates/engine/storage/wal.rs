@@ -21,8 +21,8 @@ use std::{fmt, sync::Arc};
 
 use super::buffer_pool::BufferPool;
 use super::changes::{latest_by_page, ChangeLog};
-use super::log_index::{Lookup, ReadIndex};
 use super::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
+use super::log_index::{Lookup, ReadIndex};
 use super::packed::{self, LogFormat, Record, Records};
 use super::pager::{Logged, PageRef, Pager};
 use super::sqlite3_ondisk::{
@@ -1872,11 +1872,10 @@ impl WalCoordination for InProcessWalCoordination {
                 frame_cache.insert(page_id, vec![frame_id]);
             }
         }
-        shared.runtime.read_index.appended(
-            &frame_cache,
-            &mut std::iter::once(page_id),
-            frame_id,
-        );
+        shared
+            .runtime
+            .read_index
+            .appended(&frame_cache, &mut std::iter::once(page_id), frame_id);
         // Amphora: listed in frame order for readers to forget (decision 18).
         let mut changes = shared.runtime.changes.lock();
         if let Some(from) = cut {
@@ -10039,10 +10038,8 @@ pub mod test {
                             let index = |build: &mut super::super::log_index::FromIndex<'_>| {
                                 let guard = shared.read();
                                 let frame_cache = guard.runtime.frame_cache.lock();
-                                let high_water = guard
-                                    .runtime
-                                    .frame_cache_high_water
-                                    .load(Ordering::Acquire);
+                                let high_water =
+                                    guard.runtime.frame_cache_high_water.load(Ordering::Acquire);
                                 build(&frame_cache, high_water);
                             };
                             reads += 1;
@@ -10068,7 +10065,10 @@ pub mod test {
             }
             // Non-vacuity: the way answers most reads itself (the filter alone answers the pages
             // the log doesn't hold, 8 of every 48 at least).
-            assert!(answered * 6 > reads, "{mode:?} answered {answered} of {reads}");
+            assert!(
+                answered * 6 > reads,
+                "{mode:?} answered {answered} of {reads}"
+            );
         }
     }
 
@@ -10100,10 +10100,14 @@ pub mod test {
                             let max_frame = rng.next_u64() % (upto + 1);
                             let min_frame = 1 + rng.next_u64() % (max_frame + 1);
                             for page in 0..48u64 {
-                                let fast = coordination.find_frame(page, min_frame, max_frame, None);
-                                let locked =
-                                    coordination.find_frame_locked(page, min_frame, max_frame, None);
-                                assert_eq!(fast, locked, "{mode:?} page {page} {min_frame}..={max_frame}");
+                                let fast =
+                                    coordination.find_frame(page, min_frame, max_frame, None);
+                                let locked = coordination
+                                    .find_frame_locked(page, min_frame, max_frame, None);
+                                assert_eq!(
+                                    fast, locked,
+                                    "{mode:?} page {page} {min_frame}..={max_frame}"
+                                );
                             }
                         }
                     });
@@ -10149,7 +10153,13 @@ pub mod test {
                 }
                 let header = coordination.wal_header();
                 assert_eq!(
-                    (header.checkpoint_seq, header.salt_1, header.salt_2, header.checksum_1, header.checksum_2),
+                    (
+                        header.checkpoint_seq,
+                        header.salt_1,
+                        header.salt_2,
+                        header.checksum_1,
+                        header.checksum_2
+                    ),
                     (round, round * 3, round * 7, round * 11, round * 13),
                     "{mode:?}"
                 );
