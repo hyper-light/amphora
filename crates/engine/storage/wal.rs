@@ -4575,7 +4575,9 @@ impl WalFile {
     }
 
     /// Amphora: publishes `records`, each with the pages of `metadata` that map to its first slot,
-    /// then keeps them decoded (`decoded`, as `records`; pages of `page_size`).
+    /// then keeps them decoded (`decoded`, as `records`; pages of `page_size`). The pages are found
+    /// in one pass over `metadata` ordered by frame, not a pass for each record: a commit of decision
+    /// 39 has a record for every slot of its chains' entries (Decision (lane wal-read)).
     fn publish_records(
         coordination: &dyn WalCoordination,
         registry: &SpinLock<Records>,
@@ -4585,11 +4587,20 @@ impl WalFile {
         metadata: &[(PageRef, u64, (u32, u32))],
         page_size: usize,
     ) {
+        // Stable, so a record's pages keep the commit's order.
+        let mut by_frame: Vec<(u64, u64)> = metadata
+            .iter()
+            .map(|(page, frame, _)| (*frame, page.get().id() as u64))
+            .collect();
+        by_frame.sort_by_key(|&(frame, _)| frame);
         for (&(head, slots), record) in records.iter().zip(decoded) {
-            let mut pages = metadata
+            let from = by_frame.partition_point(|&(frame, _)| frame < head);
+            let to = by_frame.partition_point(|&(frame, _)| frame <= head);
+            let mut pages = by_frame
+                .get(from..to)
+                .unwrap_or_default()
                 .iter()
-                .filter(|(_, frame, _)| *frame == head)
-                .map(|(page, _, _)| page.get().id() as u64);
+                .map(|&(_, page)| page);
             coordination.cache_record(head, slots, &mut pages);
             registry
                 .lock()

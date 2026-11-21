@@ -1662,8 +1662,8 @@ the mixed log's existing tests with the new layout's expectations (pages new to 
 frames, records of one slot, spills written over, rows read back through every path and after
 recovery). `storage::packed`'s unit tests: a chain's entries pack into records of one slot within
 first-fit decreasing's bound; an image that fits no slot is left for a page frame while a delta too
-large for one takes a record of its own; and a delta found a cache line at a time rebuilds 400 pages
-changed at random, block edges and the carried tail among the changes.
+large for one takes a record of its own; and a delta found a word at a time rebuilds 400 pages
+changed at random, word edges and the carried tail among the changes.
 
 **Falsified by.** A read past the cache reading more than one frame for an entry of its chain (the
 tests above); the batched leg's log above 4 bytes a byte of rows; a row read back other than as
@@ -1671,3 +1671,57 @@ committed, on a fresh connection, after a checkpoint, after recovery or through 
 (`packed_log.rs`, `shared_pages.rs`, `reader_cache.rs`), or an acknowledged batch lost by a power
 cut (`crates/amphora/tests/crash.rs`); the comprehensive bench's bulk statements slower than
 page-a-frame at 13e385d, interleaved, best of 3.
+
+## Decision (lane wal-read): a commit's records published at a lookup's cost, its deltas found a word at a time
+
+**Decision.** Three costs decision 39 left on the writer of a mixed log, each where it begins, with
+the log's layout and size unchanged:
+- The record registry (`packed::Records`) publishes a record by a lookup. It kept its decoded records
+  in one map keyed by generation and first slot, so publishing a record, which drops whatever was
+  decoded at its first slot, passed over every record kept and over the order they were kept in. It
+  now keys them by first slot, with the generation beside each (a read of another generation finds
+  none), and the order of keeps passes over stale entries, swept once they outnumber the records
+  kept. Slot counts are kept in frame order, so the record that covers a frame is found by a search,
+  not a pass over every record of the generation.
+- A commit's records are given their pages in one pass over its pages ordered by frame
+  (`WalFile::publish_records`), not a pass over all of them for each record.
+- A delta is found a word of 8 bytes at a time (`packed::diff`), each word compared as one integer
+  and its first and last changed bytes read from the XOR's zero bytes, where a byte at a time took up
+  to 16 comparisons a word. Decision 39's `SAME_BLOCK` (64 bytes, a cache line on x86-64, half the M3
+  Ultra's) is gone: the integer's width is the unit, and no size is picked for a machine. The runs
+  are the same bytes as before.
+
+The bench can run the page-a-frame log in the same binary (`AMPHORA_PAGE_LOG=1`), so the bulk
+statements are compared log against log, everything else the same.
+
+**Why.** Decision 39's profile of `insert_batch_100` at 32 clients put the commit at 0.90 samples a
+commit against page-a-frame's 0.59: preparing 0.32 against 0.12 (the diff 0.13, packing 0.07), and
+0.58 against 0.47 outside it. Decision 39 writes a record for each slot of a commit's chains' entries,
+where decision 37 wrote a few records of about 42 slots, so what costs a record grew with it:
+- each record published passed over the decoded records kept, up to the budget of 2,000 pages'
+  bytes (`packed::decoded_budget`), hundreds of one-slot records, and over their order;
+- each record's pages were found by a pass over all of the commit's pages, up to 1,024
+  (`IOV_MAX`).
+
+Both grow with the records a commit writes times what is kept or written. The diff's share is its
+inner loop: a word that changed was searched byte by byte from each end.
+
+**Sources.** Decision 39's profile and counters (adas-mac-studio.local-2, 2026-11-12). Amortized
+analysis of a sweep paid for by what it removes: Tarjan, "Amortized Computational Complexity" (SIAM
+J. Algebraic Discrete Methods 6(2), 1985). The XOR of two words is zero exactly where they agree, and
+`u64::trailing_zeros` and `leading_zeros` count from the lowest and highest bit (the Rust standard
+library's documentation); with the words read little-endian the lowest byte is the first.
+
+**Evidence.** `storage::packed`'s unit tests: `records_published_over_kept_ones_leave_a_bounded_order`
+(5,000 records published over kept ones: the order of keeps never past twice the records kept and
+one more, the bytes always the kept records', another generation's record never given out, a
+rollback leaving no stale keep) and `a_delta_found_word_by_word_rebuilds_every_change` (400 pages
+changed at random, word edges and the carried tail among the changes, each rebuilt from its runs).
+The mixed log's tests (`packed_log.rs`, `shared_pages.rs`, `spilled_log.rs`, `reader_cache.rs`)
+pass unchanged. The bulk statements' interleaved bench, mixed against page-a-frame in one binary:
+the coordinator's, not yet run.
+
+**Falsified by.** The comprehensive bench's `insert_batch_100` or `delete_range_insert` slower on the
+mixed log than on the page-a-frame log of the same binary (`AMPHORA_PAGE_LOG=1`), interleaved, best
+of 3; a profile of the writer still showing the registry's publishing or the commit's pages found
+per record; a row read back other than as committed (the tests above).

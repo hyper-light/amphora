@@ -21,7 +21,7 @@
 //! slot each ([`one_slot_records`]), and a chain may begin at a page frame. A read past the cache
 //! then reads one frame for each entry of its page's chain.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -395,13 +395,6 @@ pub(crate) fn one_slot_records(entries: &[(u32, Body<'_>)], page_size: usize) ->
 /// as much.
 const RUN_GAP: usize = RUN_HEADER;
 
-/// The bytes `diff` compares at once before it looks word by word: a cache line, which the core
-/// reads whole whichever of its words are compared. 64 bytes on x86-64 (Intel's 64 and IA-32
-/// Architectures Optimization Reference Manual), half of the 128 that adas-mac-studio.local-2's
-/// M3 Ultra reports (`sysctl hw.cachelinesize`, 2026-11-12): a page of 4 KiB in which nothing
-/// changed is 64 comparisons, not 512.
-const SAME_BLOCK: usize = 64;
-
 /// The runs that turn `base` into `new` (both a page long, at most 65,536 bytes), the last `tail`
 /// bytes always among them (a page checksum the page's buffer doesn't hold up to date), when they
 /// take fewer than `most` bytes; else none (the page is then written whole).
@@ -415,36 +408,24 @@ pub(crate) fn diff(base: &[u8], new: &[u8], tail: usize, most: usize) -> Option<
     // Runs are written as their ranges close: one buffer, taken at the most a delta may hold.
     let mut runs = Vec::with_capacity(most.min(new.len()));
     let mut open: Option<(usize, usize)> = None;
-    let mut skip = 0usize;
+    // A word of 8 bytes at a time, each compared as one integer (`differing`): a word as it was,
+    // none of it carried, costs one comparison, and a page's changes are a few runs in it
+    // (decision 17), so most words are. No block size is picked: the integer's width is the unit.
     for (word, (a, b)) in base.chunks(8).zip(new.chunks(8)).enumerate() {
         let at = word.checked_mul(8)?;
-        // A block of words that are all as they were, none of them carried, is passed in one
-        // comparison: a page's changes are a few runs in it (decision 17), so most blocks are.
-        if at.checked_rem(SAME_BLOCK) == Some(0) {
-            let block = at.checked_add(SAME_BLOCK)?.min(new.len());
-            if block <= carried && base.get(at..block)? == new.get(at..block)? {
-                skip = block;
-            }
-        }
-        if at < skip {
-            continue;
-        }
         let end = at.checked_add(a.len())?;
         let forced = (end > carried).then(|| carried.max(at).saturating_sub(at));
-        if a == b && forced.is_none() {
+        let Some((differs_first, differs_last)) = differing(a, b).or(forced.map(|f| (f, f))) else {
             continue;
-        }
-        let differs = a.iter().zip(b).position(|(x, y)| x != y);
-        let first = match (differs, forced) {
-            (Some(d), Some(f)) => d.min(f),
-            (Some(d), None) => d,
-            (None, Some(f)) => f,
-            (None, None) => continue,
+        };
+        let first = match forced {
+            Some(f) => differs_first.min(f),
+            None => differs_first,
         };
         // A forced suffix runs to the chunk's end.
         let last = match forced {
             Some(_) => a.len().checked_sub(1)?,
-            None => a.iter().zip(b).rposition(|(x, y)| x != y)?,
+            None => differs_last,
         };
         let (start, stop) = (
             at.checked_add(first)?,
@@ -465,6 +446,30 @@ pub(crate) fn diff(base: &[u8], new: &[u8], tail: usize, most: usize) -> Option<
         put_run(&mut runs, new, closed, most)?;
     }
     Some(runs)
+}
+
+/// The first and last byte at which two chunks of `diff` differ, if any: a whole word of 8 (a
+/// `u64`'s width) is compared as one integer, its first and last differing bytes the trailing and
+/// leading zero bytes of the two XORed (little-endian, so the first byte is the lowest), where a
+/// byte at a time took up to 16 comparisons a word (Decision (lane wal-read)). A chunk shorter than
+/// a word (the end of a page whose size isn't a multiple of 8) is compared byte by byte.
+fn differing(a: &[u8], b: &[u8]) -> Option<(usize, usize)> {
+    match (<[u8; 8]>::try_from(a), <[u8; 8]>::try_from(b)) {
+        (Ok(a), Ok(b)) => {
+            let x = u64::from_le_bytes(a) ^ u64::from_le_bytes(b);
+            if x == 0 {
+                return None;
+            }
+            let first = usize::try_from(x.trailing_zeros() / 8).ok()?;
+            let last = 7usize.checked_sub(usize::try_from(x.leading_zeros() / 8).ok()?)?;
+            Some((first, last))
+        }
+        _ => {
+            let first = a.iter().zip(b).position(|(x, y)| x != y)?;
+            let last = a.iter().zip(b).rposition(|(x, y)| x != y)?;
+            Some((first, last))
+        }
+    }
 }
 
 /// Writes the run of `new`'s bytes `range` covers into `runs`: none (the page is then written
@@ -763,14 +768,39 @@ pub(crate) fn decoded_budget(page_size: usize) -> usize {
 }
 
 /// What the shared log keeps of its packed records: each record's slot count by its first slot
-/// (written before any page maps to the record), and records decoded, keyed by the log's
-/// generation (its header's checkpoint sequence) and first slot, within [`decoded_budget`].
+/// (written before any page maps to the record), and records decoded, each with the log's generation
+/// (its header's checkpoint sequence) it was kept for, within [`decoded_budget`].
+///
+/// Publishing a record, which the writer does for every record it commits, costs a lookup, not a
+/// pass over what is kept: a commit of decision 39 publishes a record for every slot of its chains'
+/// entries, and a pass over the hundreds of records the budget keeps, at each of them, was the
+/// commit's cost (Decision (lane wal-read)).
 #[derive(Debug, Default)]
 pub(crate) struct Records {
-    slots: FxHashMap<u64, u32>,
-    decoded: FxHashMap<(u32, u64), Arc<Record>>,
-    order: VecDeque<(u32, u64)>,
+    /// Slot counts by first slot, in frame order: the record that covers a frame is the last one
+    /// that begins at or before it.
+    slots: BTreeMap<u64, u32>,
+    /// The records kept decoded, by first slot.
+    decoded: FxHashMap<u64, Kept>,
+    /// The first slots in the order their records were kept, each with its keep's number: an entry
+    /// whose record went (published over, dropped, or kept again) no longer matches its number and
+    /// is passed over. Stale entries are swept once they outnumber the records kept: a sweep then
+    /// costs no more than twice the stale entries it removes, so each costs a constant share of
+    /// one, and the order holds at most twice the records kept and one more. No number is picked:
+    /// the bound is where stale entries pass live ones.
+    order: VecDeque<(u64, u64)>,
+    /// The next keep's number.
+    kept: u64,
     bytes: usize,
+}
+
+/// A record [`Records`] keeps decoded: the generation it is of, its keep's number in
+/// `Records::order`, and the record.
+#[derive(Debug)]
+struct Kept {
+    generation: u32,
+    number: u64,
+    record: Arc<Record>,
 }
 
 impl Records {
@@ -778,7 +808,7 @@ impl Records {
     /// (a rollback or a restart can lay a new record in the same slots).
     pub(crate) fn publish(&mut self, head: u64, slots: u32) {
         self.slots.insert(head, slots);
-        self.forget(|(_, h)| h == head);
+        self.release(head);
     }
 
     /// The slots of the record at `head`.
@@ -788,23 +818,21 @@ impl Records {
 
     /// The first slot of the record whose slots hold `frame`, if one does.
     pub(crate) fn covering(&self, frame: u64) -> Option<u64> {
-        self.slots.iter().find_map(|(head, slots)| {
-            let last = head.checked_add(u64::from(*slots))?.checked_sub(1)?;
-            if *head <= frame && frame <= last {
-                Some(*head)
-            } else {
-                None
-            }
-        })
+        let (&head, &slots) = self.slots.range(..=frame).next_back()?;
+        let last = head.checked_add(u64::from(slots))?.checked_sub(1)?;
+        (frame <= last).then_some(head)
     }
 
     /// The record at `head` of `generation`, if it was decoded and kept.
     pub(crate) fn decoded(&self, generation: u32, head: u64) -> Option<Arc<Record>> {
-        self.decoded.get(&(generation, head)).cloned()
+        self.decoded
+            .get(&head)
+            .filter(|kept| kept.generation == generation)
+            .map(|kept| kept.record.clone())
     }
 
     /// Keeps a decoded record of a log of `page_size` pages, the oldest kept going first past the
-    /// budget ([`decoded_budget`]).
+    /// budget ([`decoded_budget`]). One of another generation kept at the same first slot goes.
     pub(crate) fn keep(
         &mut self,
         generation: u32,
@@ -814,26 +842,65 @@ impl Records {
     ) {
         let budget = decoded_budget(page_size);
         let size = record.size();
-        if size > budget || self.decoded.contains_key(&(generation, head)) {
+        if size > budget {
             return;
         }
+        match self.decoded.get(&head) {
+            Some(kept) if kept.generation == generation => return,
+            Some(_) => self.release(head),
+            None => {}
+        }
         while self.bytes.saturating_add(size) > budget {
-            let Some(oldest) = self.order.pop_front() else {
+            let Some((oldest, number)) = self.order.pop_front() else {
                 break;
             };
-            if let Some(gone) = self.decoded.remove(&oldest) {
-                self.bytes = self.bytes.saturating_sub(gone.size());
+            if self
+                .decoded
+                .get(&oldest)
+                .is_some_and(|kept| kept.number == number)
+            {
+                self.release(oldest);
             }
         }
-        self.decoded.insert((generation, head), record);
-        self.order.push_back((generation, head));
+        let number = self.kept;
+        self.kept = self.kept.wrapping_add(1);
+        self.decoded.insert(
+            head,
+            Kept {
+                generation,
+                number,
+                record,
+            },
+        );
+        self.order.push_back((head, number));
         self.bytes = self.bytes.saturating_add(size);
+        if self.order.len() > self.decoded.len().saturating_mul(2) {
+            let decoded = &self.decoded;
+            self.order.retain(|(head, number)| {
+                decoded.get(head).is_some_and(|kept| kept.number == *number)
+            });
+        }
     }
 
     /// Forgets the records past `max_frame` (a rollback's).
     pub(crate) fn drop_after(&mut self, max_frame: u64) {
-        self.slots.retain(|head, _| *head <= max_frame);
-        self.forget(|(_, h)| h > max_frame);
+        let Some(from) = max_frame.checked_add(1) else {
+            return;
+        };
+        drop(self.slots.split_off(&from));
+        let mut freed = 0usize;
+        self.decoded.retain(|head, kept| {
+            if *head > max_frame {
+                freed = freed.saturating_add(kept.record.size());
+                false
+            } else {
+                true
+            }
+        });
+        self.bytes = self.bytes.saturating_sub(freed);
+        let decoded = &self.decoded;
+        self.order
+            .retain(|(head, number)| decoded.get(head).is_some_and(|kept| kept.number == *number));
     }
 
     /// Forgets every record (a restart's or a truncation's).
@@ -844,18 +911,11 @@ impl Records {
         self.bytes = 0;
     }
 
-    fn forget(&mut self, gone: impl Fn((u32, u64)) -> bool) {
-        let mut freed = 0usize;
-        self.decoded.retain(|key, record| {
-            if gone(*key) {
-                freed = freed.saturating_add(record.size());
-                false
-            } else {
-                true
-            }
-        });
-        self.order.retain(|key| !gone(*key));
-        self.bytes = self.bytes.saturating_sub(freed);
+    /// Drops the record decoded at `head`, if one is kept; its entry in `order` goes stale.
+    fn release(&mut self, head: u64) {
+        if let Some(gone) = self.decoded.remove(&head) {
+            self.bytes = self.bytes.saturating_sub(gone.record.size());
+        }
     }
 }
 
@@ -1170,6 +1230,44 @@ mod tests {
         assert_eq!(records.bytes, 0);
     }
 
+    /// Decision (lane wal-read), AC-T1.1.3: do: publish records over kept ones at the same first
+    /// slots, round after round, as a commit's are. Expect: the registry's order of keeps stays at
+    /// most twice the records kept and one more, its bytes are the kept records' sizes, the newest
+    /// are kept, a record of another generation at the same first slot is never given out, and a
+    /// rollback leaves no stale keep listed.
+    #[test]
+    fn records_published_over_kept_ones_leave_a_bounded_order() {
+        let size = 4096;
+        let a = page(1, size);
+        let pages: Vec<(u32, &[u8])> = (1..=2u32).map(|p| (p, &a[..])).collect();
+        let small = Arc::new(encode(&images(&pages), size, true).unwrap().1);
+        let mut records = Records::default();
+        for round in 0..50u64 {
+            for head in 1..=100u64 {
+                records.publish(head, 1);
+                records.keep(1, head, small.clone(), size);
+                assert!(
+                    records.order.len() <= records.decoded.len() * 2 + 1,
+                    "round {round}, head {head}: {} keeps listed for {} kept",
+                    records.order.len(),
+                    records.decoded.len()
+                );
+            }
+        }
+        assert_eq!(records.bytes, records.decoded.len() * small.size());
+        assert!(records.decoded(1, 100).is_some(), "the newest is kept");
+        records.keep(2, 100, small.clone(), size);
+        assert!(
+            records.decoded(1, 100).is_none(),
+            "another generation's record at the same slot replaced it"
+        );
+        assert!(records.decoded(2, 100).is_some());
+        assert_eq!(records.bytes, records.decoded.len() * small.size());
+        records.drop_after(50);
+        assert!(records.decoded(1, 50).is_some() && records.decoded(1, 51).is_none());
+        assert_eq!(records.order.len(), records.decoded.len());
+    }
+
     #[test]
     fn a_frame_is_found_in_the_record_that_covers_it() {
         let mut records = Records::default();
@@ -1224,12 +1322,12 @@ mod tests {
     }
 
     /// Do: change pages of 4 KiB at random places (none, one byte, runs across the edges of the
-    /// blocks diff compares at once, the checksum's tail), diff them against the page before,
+    /// words diff compares at once, the checksum's tail), diff them against the page before,
     /// with a tail carried and without. Expect: the runs turn the page before into the page
     /// after every time, the carried tail among them, and an unchanged page with nothing carried
     /// gives no runs.
     #[test]
-    fn a_delta_found_block_by_block_rebuilds_every_change() {
+    fn a_delta_found_word_by_word_rebuilds_every_change() {
         let size = 4096;
         let mut x = 0x2545_f491_4f6c_dd1du64;
         let mut next = || {
@@ -1249,9 +1347,9 @@ mod tests {
                     *b = b.wrapping_add(1);
                 }
             }
-            // Edges of the blocks compared at once.
+            // Edges of the words compared at once.
             if round % 5 == 0 {
-                let edge = SAME_BLOCK * (1 + (next() as usize) % (size / SAME_BLOCK - 1));
+                let edge = 8 * (1 + (next() as usize) % (size / 8 - 1));
                 new[edge - 1] ^= 0x80;
                 new[edge] ^= 0x40;
             }

@@ -56,6 +56,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   hurts: statements that write hundreds of pages, `insert_batch_100` at 32 clients 392 → 44 a
   second, `delete_range_insert` 2,800 → 1,011 (fedora, 2026-10-22, checks); single-row writes as
   before.
+- **The mixed log's commit costs** (docs/design/store.md, Decision (lane wal-read)): publishing a
+  commit's records costs a lookup each, not a pass over the records kept decoded or over the
+  commit's pages, and deltas are found a word at a time. Built, not merged; whether the bulk
+  statements now match the page-a-frame log (`AMPHORA_PAGE_LOG=1` in the bench) waits on the
+  interleaved bench.
 - **The planner where the suite found it choosing far more work** (docs/design/planner.md,
   `crates/engine/tests/planner.rs`): a closed range with unknown bounds is 0.5% of its table whether
   it drives a seek or filters one, so a join from a key range looks each row's partner up by key; a
