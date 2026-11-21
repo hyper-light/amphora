@@ -3774,6 +3774,7 @@ pub(crate) mod bushy_test_hook {
             ];
             APPLIED.with(|applied| applied.set(0));
             let mut compared = 0;
+            let mut plans = Vec::new();
             for methods in [JoinMethods::ByCost, JoinMethods::HashJoinsOnly] {
                 conn.set_join_methods(methods);
                 for sql in queries {
@@ -3784,12 +3785,19 @@ pub(crate) mod bushy_test_hook {
                     SPLIT.with(|split| split.set(None));
                     assert!(!left_deep.is_empty(), "{sql}");
                     assert_eq!(bushy, left_deep, "{methods:?}: {sql}");
+                    plans.push(format!(
+                        "{methods:?} {:?}",
+                        rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"))
+                    ));
                     compared += 1;
                 }
             }
             assert_eq!(compared, 8);
             // Non-vacuity: some of the plans were run bushy.
-            assert!(APPLIED.with(Cell::get) > 0, "no plan was made bushy");
+            assert!(
+                APPLIED.with(Cell::get) > 0,
+                "no plan was made bushy: {plans:#?}"
+            );
         }
     }
 }
