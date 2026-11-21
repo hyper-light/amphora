@@ -28,11 +28,16 @@ SELECT a FROM t
 /// and how many settles failed (none).
 #[test]
 fn t_g2_7_1_times_name_each_record_and_each_file() {
-    let pool = std::env::temp_dir().join(format!("amphora-corpus-times-{}", std::process::id()));
+    let pool = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("amphora-corpus-times-{}", std::process::id()));
     std::fs::create_dir_all(pool.join("a")).unwrap();
     std::fs::write(pool.join("a/req.test"), FILE).unwrap();
     std::fs::write(pool.join("a/fill.test"), FILE).unwrap();
-    std::fs::write(pool.join("order.tsv"), "required\ta/req.test\nfill\ta/fill.test\n").unwrap();
+    std::fs::write(
+        pool.join("order.tsv"),
+        "required\ta/req.test\nfill\ta/fill.test\n",
+    )
+    .unwrap();
     let times = pool.join("times.jsonl");
     let out = Command::new(env!("CARGO_BIN_EXE_amphora-corpus"))
         .arg("run")
@@ -43,8 +48,15 @@ fn t_g2_7_1_times_name_each_record_and_each_file() {
         .unwrap();
     let text = std::fs::read_to_string(&times).unwrap();
     std::fs::remove_dir_all(&pool).unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
-    let rows: Vec<serde_json::Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let rows: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
     let of = |file: &str, key: &str| -> Vec<String> {
         rows.iter()
             .filter(|r| r["file"] == file && r.get(key).is_some())
