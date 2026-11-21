@@ -354,16 +354,22 @@ fn t_t1_12_d2_a_database_backed_up_ships_as_it_commits() {
 }
 
 /// The digest of a database holding `rows` in table `t`: the source's rows at a second, as the
-/// model kept them.
+/// model kept them, in a database opened as the source was (Amphora's own tables beside them).
 fn oracle_digest(dir: &std::path::Path, name: &str, rows: &Rows) -> backup::RowDigest {
-    let db = Db::open(&dir.join(name)).unwrap();
-    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
-        .unwrap();
+    let path = dir.join(name);
+    let mut sql = String::from("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);");
     for (id, v) in rows {
-        db.exec(&format!("INSERT INTO t (id, v) VALUES ({id}, '{v}')"))
-            .unwrap();
+        sql.push_str(&format!("INSERT INTO t (id, v) VALUES ({id}, '{v}');"));
     }
-    backup::digest(&db).unwrap()
+    let database = Database::open(&path, until()).unwrap();
+    database
+        .call(until(), move |c| {
+            c.execute_batch(&sql)?;
+            Ok(())
+        })
+        .unwrap();
+    drop(database);
+    backup::digest(&Db::open(&path).unwrap()).unwrap()
 }
 
 /// T-T1.12.C1 (AC-T1.12.4): restore-and-check on the folder store. Do: back a database up to a
@@ -504,10 +510,14 @@ fn cross_group_cut(protocol: amphora::xgroup::Protocol) {
                 (b"b".to_vec(), Some(v.to_vec())),
             ],
         };
-        assert!(matches!(
-            cluster.transact(txn, until()).unwrap(),
-            Answer::Committed { .. }
-        ));
+        // The first transaction's resolution may still hold the coordinator's one place.
+        let answer = loop {
+            match cluster.transact(txn.clone(), until()) {
+                Err(amphora_api::Refusal::Full { .. }) => std::thread::yield_now(),
+                other => break other.unwrap(),
+            }
+        };
+        assert!(matches!(answer, Answer::Committed { .. }), "{answer:?}");
     }
     drop(cluster);
     for shipping in [&s0, &s1] {
