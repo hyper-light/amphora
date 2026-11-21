@@ -1381,7 +1381,11 @@ impl BTreeCursor {
     /// Amphora (PR.4): charges a search by `rowid` to the page at `level` and places it against
     /// the page's key heads, once the page has them. None while the page is dirty: its bytes are
     /// changing.
-    fn key_heads_rowid(&self, level: usize, rowid: i64) -> Option<crate::storage::key_heads::Probe> {
+    fn key_heads_rowid(
+        &self,
+        level: usize,
+        rowid: i64,
+    ) -> Option<crate::storage::key_heads::Probe> {
         if !self.key_heads {
             return None;
         }
@@ -2174,9 +2178,7 @@ impl BTreeCursor {
                             } else {
                                 match seek_op {
                                     SeekOp::GT => cell_rowid > rowid,
-                                    SeekOp::GE { .. } | SeekOp::LE { .. } => {
-                                        cell_rowid >= rowid
-                                    }
+                                    SeekOp::GE { .. } | SeekOp::LE { .. } => cell_rowid >= rowid,
                                     SeekOp::LT => cell_rowid + 1 >= rowid,
                                 }
                             }
@@ -2423,9 +2425,7 @@ impl BTreeCursor {
                                 .unwrap()
                                 .cell_read_payload_ptr(cur_cell_idx as usize, payload_limits)?;
 
-                            let cell_payload: &[u8] = if let Some(next_page) =
-                                first_overflow_page
-                            {
+                            let cell_payload: &[u8] = if let Some(next_page) = first_overflow_page {
                                 let res =
                                     self.process_overflow_read(payload, next_page, payload_size)?;
                                 if res.is_io() {
@@ -2625,8 +2625,7 @@ impl BTreeCursor {
         let probe = self.key_heads_rowid(self.stack.current(), rowid);
         let contents = self.stack.top_ref().get_contents();
         let heads = probe.and_then(|probe| Some((contents.key_heads.get()?, probe)));
-        let outcome =
-            Self::tablebtree_leaf_search(rowid, seek_op, contents, &mut search, heads)?;
+        let outcome = Self::tablebtree_leaf_search(rowid, seek_op, contents, &mut search, heads)?;
         self.seek_state = CursorSeekState::LeafPageBinarySearch { state: search };
         self.stack.set_cell_index(outcome.cell_index);
         if let Some(has_record) = outcome.has_record {

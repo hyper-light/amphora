@@ -45,6 +45,7 @@
 //!   learned again by each directory; before the page has had one, every probe is assumed
 //!   decided, so the first directory is the measurement);
 //! - the directory is built once the charges reach `n`.
+//!
 //! That a build's decode costs what a probe's does is the rule's one assumption; the
 //! micro-benchmark measures it (`key_heads_bench`'s `build` mode against its `off` mode).
 //!
@@ -328,7 +329,10 @@ fn record_norm(payload: &[u8], complete: bool, fold: Fold) -> Result<(Norm<'_>, 
 /// form's, read from the page where it is a value's bytes.
 #[derive(Debug, Clone, Copy)]
 enum Prefix {
-    Fixed { bytes: [u8; 9], len: u8 },
+    Fixed {
+        bytes: [u8; 9],
+        len: u8,
+    },
     Page {
         class: u8,
         start: usize,
@@ -381,7 +385,9 @@ impl KeyHeads {
         };
         let cells = contents.cell_count();
         let mut norms = Vec::new();
-        norms.try_reserve_exact(cells).map_err(|_| Refusal::Corrupt)?;
+        norms
+            .try_reserve_exact(cells)
+            .map_err(|_| Refusal::Corrupt)?;
         for cell in 0..cells {
             let rowid = if leaf {
                 contents.cell_table_leaf_read_rowid(cell)
@@ -410,7 +416,9 @@ impl KeyHeads {
         };
         let cells = contents.cell_count();
         let mut norms = Vec::new();
-        norms.try_reserve_exact(cells).map_err(|_| Refusal::Corrupt)?;
+        norms
+            .try_reserve_exact(cells)
+            .map_err(|_| Refusal::Corrupt)?;
         let mut prefix = None;
         for cell in 0..cells {
             let (payload, payload_start, _, overflow) = contents
@@ -573,8 +581,8 @@ enum SlotState {
     /// changed.
     Counting(usize),
     Built(Box<KeyHeads>),
-    /// The page can't have one until it changes.
-    Refused(Refusal),
+    /// The page can't have one until it changes (why is traced when it's refused).
+    Refused,
     #[default]
     Cleared,
 }
@@ -611,7 +619,7 @@ impl KeyHeadsSlot {
     pub(crate) fn get(&self) -> Option<&KeyHeads> {
         match &self.state {
             SlotState::Built(heads) => Some(heads),
-            SlotState::Counting(_) | SlotState::Refused(_) | SlotState::Cleared => None,
+            SlotState::Counting(_) | SlotState::Refused | SlotState::Cleared => None,
         }
     }
 
@@ -656,7 +664,7 @@ impl KeyHeadsSlot {
             // Another order or another cell count: a directory for another search, or a page
             // that changed without saying so. Charged again from nothing.
             SlotState::Built(_) | SlotState::Cleared => 0,
-            SlotState::Refused(_) => return None,
+            SlotState::Refused => return None,
             SlotState::Counting(charged) => *charged,
         };
         let charged = charged.saturating_add(probes(cells));
@@ -666,7 +674,10 @@ impl KeyHeadsSlot {
         }
         self.state = match build() {
             Ok(heads) => SlotState::Built(Box::new(heads)),
-            Err(refusal) => SlotState::Refused(refusal),
+            Err(refusal) => {
+                tracing::debug!(?refusal, cells, "key heads: page searched as today");
+                SlotState::Refused
+            }
         };
         self.get()
     }
@@ -695,13 +706,13 @@ mod tests {
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
 
+    use crate::io::{MemoryIO, IO};
     use crate::storage::btree::{BTreeCursor, CursorTrait};
     use crate::translate::collate::CollationSeq;
     use crate::types::{IndexInfo, KeyInfo, SeekKey, SeekOp, Text, Value};
     use crate::util::IOExt;
     use crate::vdbe::Register;
-    use crate::io::{MemoryIO, IO};
-    use crate::{ConnectOpts, Database, SqliteDialect, StepResult};
+    use crate::{ConnectOpts, Database, SqliteDialect};
 
     thread_local! {
         /// Probes the heads decided on this thread: the model test's non-vacuity count.
@@ -731,7 +742,11 @@ mod tests {
             4 => Value::from_i64(rng.random()),
             5..=7 => {
                 let alphabet = [b'a', b'A', b'b', b' ', 0u8, b'z'];
-                let mut text: Vec<u8> = b"prefix-".iter().copied().take(rng.random_range(0..8)).collect();
+                let mut text: Vec<u8> = b"prefix-"
+                    .iter()
+                    .copied()
+                    .take(rng.random_range(0..8))
+                    .collect();
                 for _ in 0..rng.random_range(0..10) {
                     text.push(alphabet[rng.random_range(0..alphabet.len())]);
                 }
@@ -742,21 +757,31 @@ mod tests {
                 Value::Text(Text::new(String::from_utf8(text).unwrap()))
             }
             _ => {
-                let len = if rng.random_range(0..20) == 0 { 3000 } else { rng.random_range(0..6) };
+                let len = if rng.random_range(0..20) == 0 {
+                    3000
+                } else {
+                    rng.random_range(0..6)
+                };
                 Value::Blob((0..len).map(|_| rng.random_range(0..3u8)).collect())
             }
         }
     }
 
     fn rootpage(conn: &Arc<crate::Connection>, name: &str) -> i64 {
-        let mut stmt = conn
-            .prepare(format!("SELECT rootpage FROM sqlite_schema WHERE name = '{name}'"))
+        let rows = conn
+            .prepare(format!(
+                "SELECT rootpage FROM sqlite_schema WHERE name = '{name}'"
+            ))
+            .unwrap()
+            .run_collect_rows()
             .unwrap();
-        loop {
-            match stmt.step().unwrap() {
-                StepResult::Row => return stmt.row().unwrap().get::<i64>(0).unwrap(),
-                other => panic!("no root page for {name}: {other:?}"),
-            }
+        match rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(Value::as_int)
+        {
+            Some(root) => root,
+            None => panic!("no root page for {name}: {rows:?}"),
         }
     }
 
@@ -769,20 +794,39 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c, d)").unwrap();
-        let indexes: [(&str, &str, Vec<(SortOrder, CollationSeq)>); 5] = [
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c, d)")
+            .unwrap();
+        // An index's name, its columns as CREATE INDEX writes them, and each column's order.
+        type Index = (&'static str, &'static str, Vec<(SortOrder, CollationSeq)>);
+        let indexes: [Index; 5] = [
             ("i_bin", "c", vec![(SortOrder::Asc, CollationSeq::Binary)]),
-            ("i_desc", "c DESC", vec![(SortOrder::Desc, CollationSeq::Binary)]),
-            ("i_nocase", "c COLLATE NOCASE", vec![(SortOrder::Asc, CollationSeq::NoCase)]),
-            ("i_rtrim", "c COLLATE RTRIM", vec![(SortOrder::Asc, CollationSeq::Rtrim)]),
+            (
+                "i_desc",
+                "c DESC",
+                vec![(SortOrder::Desc, CollationSeq::Binary)],
+            ),
+            (
+                "i_nocase",
+                "c COLLATE NOCASE",
+                vec![(SortOrder::Asc, CollationSeq::NoCase)],
+            ),
+            (
+                "i_rtrim",
+                "c COLLATE RTRIM",
+                vec![(SortOrder::Asc, CollationSeq::Rtrim)],
+            ),
             (
                 "i_two",
                 "c, d DESC",
-                vec![(SortOrder::Asc, CollationSeq::Binary), (SortOrder::Desc, CollationSeq::Binary)],
+                vec![
+                    (SortOrder::Asc, CollationSeq::Binary),
+                    (SortOrder::Desc, CollationSeq::Binary),
+                ],
             ),
         ];
         for (name, columns, _) in &indexes {
-            conn.execute(format!("CREATE INDEX {name} ON t ({columns})")).unwrap();
+            conn.execute(format!("CREATE INDEX {name} ON t ({columns})"))
+                .unwrap();
         }
         let mut rng = ChaCha8Rng::seed_from_u64(0x0050_5234);
         let before = DECIDED.with(Cell::get);
@@ -790,10 +834,15 @@ mod tests {
         for round in 0..6 {
             conn.execute("BEGIN").unwrap();
             for _ in 0..600 {
-                let mut stmt = conn.prepare("INSERT INTO t (id, c, d) VALUES (?, ?, ?)").unwrap();
-                stmt.bind_at(NonZero::new(1).unwrap(), Value::from_i64(next_id)).unwrap();
-                stmt.bind_at(NonZero::new(2).unwrap(), value(&mut rng)).unwrap();
-                stmt.bind_at(NonZero::new(3).unwrap(), value(&mut rng)).unwrap();
+                let mut stmt = conn
+                    .prepare("INSERT INTO t (id, c, d) VALUES (?, ?, ?)")
+                    .unwrap();
+                stmt.bind_at(NonZero::new(1).unwrap(), Value::from_i64(next_id))
+                    .unwrap();
+                stmt.bind_at(NonZero::new(2).unwrap(), value(&mut rng))
+                    .unwrap();
+                stmt.bind_at(NonZero::new(3).unwrap(), value(&mut rng))
+                    .unwrap();
                 stmt.run_ignore_rows().unwrap();
                 next_id += rng.random_range(1..4);
             }
@@ -819,8 +868,14 @@ mod tests {
             for _ in 0..3000 {
                 let rowid = rng.random_range(-2..next_id + 2);
                 let op = OPS[rng.random_range(0..OPS.len())];
-                let a = pager.io.block(|| heads.seek(SeekKey::TableRowId(rowid), op)).unwrap();
-                let b = pager.io.block(|| today.seek(SeekKey::TableRowId(rowid), op)).unwrap();
+                let a = pager
+                    .io
+                    .block(|| heads.seek(SeekKey::TableRowId(rowid), op))
+                    .unwrap();
+                let b = pager
+                    .io
+                    .block(|| today.seek(SeekKey::TableRowId(rowid), op))
+                    .unwrap();
                 assert_eq!(a, b, "rowid {rowid} {op:?}");
                 assert_eq!(heads.position(), today.position(), "rowid {rowid} {op:?}");
             }
@@ -858,6 +913,9 @@ mod tests {
             }
             pager.end_read_tx();
         }
-        assert!(DECIDED.with(Cell::get) > before, "the key heads decided no probe");
+        assert!(
+            DECIDED.with(Cell::get) > before,
+            "the key heads decided no probe"
+        );
     }
 }
