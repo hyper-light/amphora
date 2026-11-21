@@ -38,6 +38,7 @@ pub(crate) mod compaction;
 mod guards;
 mod import;
 mod log_bound;
+pub mod online;
 mod patience;
 pub(crate) mod remote;
 pub(crate) mod replicated;
@@ -47,6 +48,7 @@ mod slot;
 mod watch;
 pub use guards::Guards;
 pub(crate) use guards::Owned;
+pub use online::SchemaChange;
 pub use restore::Restore;
 pub use watch::Watch;
 

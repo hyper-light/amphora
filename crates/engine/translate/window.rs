@@ -708,6 +708,7 @@ fn allocate_window_minmax(
             where_clause: None,
             index_method: None,
             on_conflict: None,
+            state: crate::schema::IndexState::Public,
         });
         let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index));
         let registers = program.alloc_registers(3);

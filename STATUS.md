@@ -257,6 +257,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (`settle_s`; Amphora's loader had left the whole load, 7.5 GB, in its log). `--query` runs a
   statement on a database a run left behind.
 
+- **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
+  `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then
+  public, each step a transaction through the writer, with a backfill in batches sized as it runs
+  (a batch holds the writer about as long as it waited for it). Reads use the index only once
+  public; the cutover changes only the catalog. A power cut at every change of a build leaves the
+  old schema or the new; rows that break a unique index undo the change. The 10M-row cutover p99
+  (AC-T1.12.2) is not yet measured; columns and constraints are not yet built.
+
 ## Measured
 
 - **The oracles: wrong answers and slow plans** (G2 step 3; `amphora-bench --oracle`, `bench/src/oracle`,
