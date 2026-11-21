@@ -505,6 +505,8 @@ tests = [
   # lane g7s2-2
   { id = "T-NS.2.4", text = "Values past a page read at every snapshot; rollback and savepoints across them; recovery after a power cut and a crash at each of many writes recovers a prefix of the commits" },
   { id = "T-NS.2.5", text = "Trees made and dropped survive reopens and power cuts; a crash at each write of a workload that makes, fills and drops trees recovers a prefix of its steps" },
+  # lane g7s2-3
+  { id = "T-NS.2.6", text = "SQL end to end through the switch and without it (CREATE TABLE, INSERT, SELECT, transactions) answers alike" },
 ]
 
 # lane follower-reads (G13 step 4, kiln goal 80d4cf5e; docs/design/replication.md, "Follower reads at a
