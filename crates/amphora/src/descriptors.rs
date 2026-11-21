@@ -258,7 +258,7 @@ pub(crate) mod tests {
         if let (Some(current), Some(maximum)) = (was.current, was.maximum)
             && current < maximum
         {
-            let mut raised = was.clone();
+            let mut raised = was;
             raised.current = Some(current + 1);
             setrlimit(Resource::Nofile, raised).unwrap();
             drop(budget.take("a connection", 0).unwrap());
