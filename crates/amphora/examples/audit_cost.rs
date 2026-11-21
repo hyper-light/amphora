@@ -47,9 +47,11 @@ fn args() -> Args {
         found.insert(flag, value);
     }
     let need = |name: &str| {
-        *found
-            .get(name)
-            .unwrap_or_else(|| panic!("usage: audit_cost --events N --bytes B --samples S --repeats R (missing {name})"))
+        *found.get(name).unwrap_or_else(|| {
+            panic!(
+                "usage: audit_cost --events N --bytes B --samples S --repeats R (missing {name})"
+            )
+        })
     };
     Args {
         events: need("--events"),
@@ -77,10 +79,16 @@ fn spread(n: usize, samples: usize) -> Vec<usize> {
 }
 
 /// A lookup of perfect subtrees' hashes that counts the rows it reads.
-fn lookup<'a>(nodes: &'a HashMap<Node, Hash>, read: &'a mut usize) -> impl FnMut(Node) -> Result<Hash, TreeError> + 'a {
+fn lookup<'a>(
+    nodes: &'a HashMap<Node, Hash>,
+    read: &'a mut usize,
+) -> impl FnMut(Node) -> Result<Hash, TreeError> + 'a {
     move |node| {
         *read += 1;
-        nodes.get(&node).copied().ok_or(TreeError::Shape { start: 0, end: 0 })
+        nodes
+            .get(&node)
+            .copied()
+            .ok_or(TreeError::Shape { start: 0, end: 0 })
     }
 }
 
@@ -95,7 +103,15 @@ fn best(repeats: usize, ops: usize, mut f: impl FnMut()) -> f64 {
         .fold(f64::INFINITY, f64::min)
 }
 
-fn line(design: &str, op: &str, events: usize, read: f64, written: f64, hashes: Option<f64>, ns: f64) {
+fn line(
+    design: &str,
+    op: &str,
+    events: usize,
+    read: f64,
+    written: f64,
+    hashes: Option<f64>,
+    ns: f64,
+) {
     let hashes = hashes.map_or("null".to_owned(), |h| format!("{h:.2}"));
     println!(
         "{{\"design\":\"{design}\",\"op\":\"{op}\",\"events\":{events},\"rows_read\":{read:.2},\"rows_written\":{written:.2},\"hashes\":{hashes},\"ns_per_op\":{ns:.1}}}"
@@ -139,7 +155,15 @@ fn chain(a: &Args, events: &[Vec<u8>]) {
         }
     });
     let per = read as f64 / at.len() as f64;
-    line("hash_chain", "prove_one_event", n, per, 0.0, Some(per - 1.0), ns);
+    line(
+        "hash_chain",
+        "prove_one_event",
+        n,
+        per,
+        0.0,
+        Some(per - 1.0),
+        ns,
+    );
 
     // Head n extends head m: hash events m..n on from link m.
     let mut read = 0usize;
@@ -165,7 +189,15 @@ fn chain(a: &Args, events: &[Vec<u8>]) {
         }
         assert_eq!(h, head);
     });
-    line("hash_chain", "audit_all", n, n as f64, 0.0, Some(n as f64), ns);
+    line(
+        "hash_chain",
+        "audit_all",
+        n,
+        n as f64,
+        0.0,
+        Some(n as f64),
+        ns,
+    );
 }
 
 /// RFC 6962's tree as `AuditLog` keeps it: each append writes its event, its leaf hash, the
@@ -188,7 +220,15 @@ fn merkle(a: &Args, events: &[Vec<u8>]) {
             black_box(frontier.root());
         }
     });
-    line("merkle_rfc6962", "append", n, 0.0, written as f64 / n as f64, None, ns);
+    line(
+        "merkle_rfc6962",
+        "append",
+        n,
+        0.0,
+        written as f64 / n as f64,
+        None,
+        ns,
+    );
 
     let size = n as u64;
     let head = tree::root(size, lookup(&nodes, &mut 0)).unwrap();
@@ -209,7 +249,15 @@ fn merkle(a: &Args, events: &[Vec<u8>]) {
         }
     });
     let k = at.len() as f64;
-    line("merkle_rfc6962", "prove_one_event", n, read as f64 / k, 0.0, Some(1.0 + proof_hashes as f64 / k), ns);
+    line(
+        "merkle_rfc6962",
+        "prove_one_event",
+        n,
+        read as f64 / k,
+        0.0,
+        Some(1.0 + proof_hashes as f64 / k),
+        ns,
+    );
 
     // Head n extends head m: the consistency proof's subtrees.
     let olds: Vec<(u64, Hash)> = at
@@ -230,7 +278,15 @@ fn merkle(a: &Args, events: &[Vec<u8>]) {
             assert!(tree::verify_consistency(*m, size, old_root, &head, &proof));
         }
     });
-    line("merkle_rfc6962", "prove_extends", n, read as f64 / k, 0.0, Some(proof_hashes as f64 / k), ns);
+    line(
+        "merkle_rfc6962",
+        "prove_extends",
+        n,
+        read as f64 / k,
+        0.0,
+        Some(proof_hashes as f64 / k),
+        ns,
+    );
 
     // Every event verified as AuditLog reads them: each with its own inclusion proof.
     let mut read = 0usize;

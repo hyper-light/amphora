@@ -28,15 +28,22 @@ fn until() -> Instant {
 
 /// A Records store in memory whose rows a test can change behind the log's back: the get and
 /// commit the audit log uses, with the API's checks and conditions; nothing else.
+/// Each key's value and the revision that wrote it.
+type Table = BTreeMap<Vec<u8>, (Vec<u8>, Rev)>;
+
 #[derive(Default)]
 struct Rows {
-    inner: Mutex<(BTreeMap<Vec<u8>, (Vec<u8>, Rev)>, Rev)>,
+    inner: Mutex<(Table, Rev)>,
 }
 
 impl Rows {
     fn all(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         let inner = self.inner.lock().unwrap();
-        inner.0.iter().map(|(k, (v, _))| (k.clone(), v.clone())).collect()
+        inner
+            .0
+            .iter()
+            .map(|(k, (v, _))| (k.clone(), v.clone()))
+            .collect()
     }
     /// Sets a row's bytes, as someone with the store's files might; the row it displaced, if any.
     fn set(&self, key: &[u8], value: Vec<u8>) -> Option<Vec<u8>> {
@@ -363,7 +370,7 @@ fn al1_the_log_on_amphoras_records() {
             .unwrap()
             .value
     };
-    let event_key = |i: u64| [&[b'e'][..], &i.to_be_bytes()].concat();
+    let event_key = |i: u64| [&b"e"[..], &i.to_be_bytes()].concat();
 
     let original = get(&event_key(5));
     let mut changed = original.clone();
@@ -378,7 +385,7 @@ fn al1_the_log_on_amphoras_records() {
     log.read(5, until()).unwrap();
 
     // Subtree (level 1, index 3) covers events 6 and 7, beside the path of events 4 and 5.
-    let node = [&[b'n', 1][..], &3u64.to_be_bytes()].concat();
+    let node = [&b"n\x01"[..], &3u64.to_be_bytes()].concat();
     let original = get(&node);
     let mut changed = original.clone();
     changed[31] ^= 0xff;

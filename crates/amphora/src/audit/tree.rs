@@ -369,16 +369,13 @@ mod tests {
     use std::collections::HashMap;
 
     fn hex(s: &str) -> Hash {
-        let mut out = [0u8; 32];
-        for (i, b) in out.iter_mut().enumerate() {
-            *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap();
-        }
-        out
+        bytes(s).try_into().unwrap()
     }
 
     fn bytes(s: &str) -> Vec<u8> {
-        (0..s.len() / 2)
-            .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap())
+        s.as_bytes()
+            .chunks(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect()
     }
 
@@ -444,7 +441,13 @@ mod tests {
         while level.len() > 1 {
             level = level
                 .chunks(2)
-                .map(|p| if p.len() == 2 { node_hash(&p[0], &p[1]) } else { p[0] })
+                .map(|p| {
+                    if p.len() == 2 {
+                        node_hash(&p[0], &p[1])
+                    } else {
+                        p[0]
+                    }
+                })
                 .collect();
         }
         level[0]
@@ -463,7 +466,11 @@ mod tests {
         for (size, want) in CT_ROOTS.iter().enumerate() {
             let (frontier, nodes) = build(&all[..size]);
             assert_eq!(frontier.root(), hex(want), "frontier root at {size}");
-            assert_eq!(root(size as u64, lookup(&nodes)).unwrap(), hex(want), "root at {size}");
+            assert_eq!(
+                root(size as u64, lookup(&nodes)).unwrap(),
+                hex(want),
+                "root at {size}"
+            );
         }
         let (_, nodes) = build(&all);
         let level1_1 = hex("5f083f0a1a33ca076a95279832580db3e0ef4584bdff1f54c8a360f50de3031e");
@@ -479,7 +486,10 @@ mod tests {
             consistency_proof(1, 8, lookup(&nodes)).unwrap(),
             vec![leaf1, level1_1, level2_1]
         );
-        assert_eq!(consistency_proof(4, 8, lookup(&nodes)).unwrap(), vec![level2_1]);
+        assert_eq!(
+            consistency_proof(4, 8, lookup(&nodes)).unwrap(),
+            vec![level2_1]
+        );
     }
 
     /// AL.1 (T-AL.1.3): do prove every leaf of every tree up to 70 leaves, and every earlier size of
@@ -491,11 +501,13 @@ mod tests {
         let roots: Vec<Hash> = (0..=all.len()).map(|n| oracle_root(&all[..n])).collect();
         let (_, nodes) = build(&all);
         let mut checked = 0u64;
-        for size in 1..=all.len() as u64 {
-            let r = &roots[size as usize];
+        for n in 1..=all.len() {
+            let size = n as u64;
+            let r = &roots[n];
             assert_eq!(root(size, lookup(&nodes)).unwrap(), *r);
-            for index in 0..size {
-                let leaf = leaf_hash(&all[index as usize]);
+            for (i, event) in all.iter().enumerate().take(n) {
+                let index = i as u64;
+                let leaf = leaf_hash(event);
                 let proof = inclusion_proof(index, size, lookup(&nodes)).unwrap();
                 assert!(verify_inclusion(index, size, &leaf, &proof, r));
                 for i in 0..proof.len() {
@@ -503,25 +515,41 @@ mod tests {
                     bad[i][0] ^= 1;
                     assert!(!verify_inclusion(index, size, &leaf, &bad, r));
                 }
-                assert!(!verify_inclusion(index, size, &leaf_hash(b"other"), &proof, r));
+                assert!(!verify_inclusion(
+                    index,
+                    size,
+                    &leaf_hash(b"other"),
+                    &proof,
+                    r
+                ));
                 if size > 1 {
-                    assert!(!verify_inclusion((index + 1) % size, size, &leaf, &proof, r));
+                    assert!(!verify_inclusion(
+                        (index + 1) % size,
+                        size,
+                        &leaf,
+                        &proof,
+                        r
+                    ));
                 }
                 assert!(!verify_inclusion(index, size + 1, &leaf, &proof, r));
                 checked += 1;
             }
-            for old in 1..=size {
-                let o = &roots[old as usize];
+            for m in 1..=n {
+                let old = m as u64;
+                let o = &roots[m];
                 let proof = consistency_proof(old, size, lookup(&nodes)).unwrap();
-                assert!(verify_consistency(old, size, o, r, &proof), "{old} -> {size}");
+                assert!(
+                    verify_consistency(old, size, o, r, &proof),
+                    "{old} -> {size}"
+                );
                 for i in 0..proof.len() {
                     let mut bad = proof.clone();
                     bad[i][31] ^= 0x80;
                     assert!(!verify_consistency(old, size, o, r, &bad));
                 }
                 if old < size {
-                    assert!(!verify_consistency(old, size, &roots[old as usize - 1], r, &proof));
-                    assert!(!verify_consistency(old, size, o, &roots[size as usize - 1], &proof));
+                    assert!(!verify_consistency(old, size, &roots[m - 1], r, &proof));
+                    assert!(!verify_consistency(old, size, o, &roots[n - 1], &proof));
                 }
                 checked += 1;
             }
@@ -558,12 +586,20 @@ mod tests {
         let mut total = 0usize;
         for i in 0..1024u64 {
             let mut completed = Vec::new();
-            frontier.push(leaf_hash(&i.to_be_bytes()), &mut completed).unwrap();
+            frontier
+                .push(leaf_hash(&i.to_be_bytes()), &mut completed)
+                .unwrap();
             assert_eq!(completed.len(), 1 + (i + 1).trailing_zeros() as usize);
             total += completed.len();
         }
         assert_eq!(total, 2 * 1024 - 1);
-        assert_eq!(subtrees(0, 1024).unwrap(), vec![Node { level: 10, index: 0 }]);
+        assert_eq!(
+            subtrees(0, 1024).unwrap(),
+            vec![Node {
+                level: 10,
+                index: 0
+            }]
+        );
         assert_eq!(
             subtrees(0, 6).unwrap(),
             vec![Node { level: 2, index: 0 }, Node { level: 1, index: 2 }]
