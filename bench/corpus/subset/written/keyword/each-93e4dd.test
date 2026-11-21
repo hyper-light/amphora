@@ -1,0 +1,61 @@
+hash-threshold 8
+
+# written for keyword:EACH: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+statement ok
+CREATE TABLE ke(a)
+
+statement ok
+CREATE TABLE kel(n)
+
+statement ok
+CREATE TRIGGER ke1 AFTER INSERT ON ke FOR EACH ROW BEGIN INSERT INTO kel VALUES (NEW.a); END
+
+statement ok
+INSERT INTO ke VALUES (1), (2)
+
+statement ok
+CREATE TRIGGER ke2 BEFORE UPDATE ON ke FOR EACH ROW WHEN NEW.a > 10 BEGIN SELECT RAISE(IGNORE); END
+
+statement ok
+UPDATE ke SET a = a * 20 WHERE a = 1
+
+statement ok
+UPDATE ke SET a = 5 WHERE a = 2
+
+query I nosort
+SELECT a FROM ke ORDER BY a
+----
+1
+5
+
+statement ok
+CREATE TRIGGER ke3 AFTER DELETE ON ke FOR EACH ROW BEGIN DELETE FROM kel WHERE n = OLD.a; END
+
+statement ok
+DELETE FROM ke WHERE a = 1
+
+query I nosort
+SELECT n FROM kel ORDER BY n
+----
+2
+
+statement error
+CREATE TRIGGER ke4 AFTER DELETE ON ke FOR EACH BEGIN SELECT 1; END
+
+query I rowsort
+SELECT count(*) FROM sqlite_schema WHERE type = 'trigger'
+----
+3

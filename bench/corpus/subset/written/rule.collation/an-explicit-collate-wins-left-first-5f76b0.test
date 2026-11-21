@@ -1,0 +1,87 @@
+hash-threshold 8
+
+# written for rule.collation:an explicit COLLATE wins, left first: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+statement ok
+CREATE TABLE r(b TEXT, n TEXT COLLATE NOCASE, t TEXT COLLATE RTRIM)
+
+statement ok
+INSERT INTO r VALUES ('a', 'a', 'a '), ('B', 'B', 'B'), ('a ', 'A', 'a')
+
+query I rowsort
+SELECT n = 'A' COLLATE BINARY FROM r
+----
+0
+0
+1
+
+query I rowsort
+SELECT b COLLATE NOCASE = n COLLATE BINARY FROM r
+----
+0
+1
+1
+
+query I rowsort
+SELECT 'A' COLLATE NOCASE = b FROM r
+----
+0
+0
+1
+
+query I rowsort
+SELECT b = 'A' COLLATE NOCASE FROM r
+----
+0
+0
+1
+
+query I rowsort
+SELECT t COLLATE BINARY = 'a' FROM r
+----
+0
+0
+1
+
+query I rowsort
+SELECT count(*) FROM r WHERE b = 'A' COLLATE NOCASE
+----
+1
+
+query I rowsort
+SELECT n COLLATE BINARY < 'b' FROM r
+----
+1
+1
+1
+
+query I rowsort
+SELECT 'a ' COLLATE RTRIM = b FROM r
+----
+0
+1
+1
+
+query I rowsort
+SELECT b COLLATE RTRIM = 'a' COLLATE NOCASE FROM r
+----
+0
+1
+1
+
+query I rowsort
+SELECT count(*) FROM r WHERE n = 'a' COLLATE BINARY
+----
+1

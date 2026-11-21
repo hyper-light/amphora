@@ -16,6 +16,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::disallowed_macros))]
 
 mod blink;
+mod cc;
 mod clickhouse;
 mod cluster;
 mod eqp;
@@ -511,6 +512,10 @@ fn main() -> anyhow::Result<()> {
     // Follower reads and search over partitions on three members (`cluster.rs`; AC-T1.10.3, AC-T1.10.4).
     if std::env::args().any(|a| a == "--cluster") {
         return cluster::main();
+    }
+    // The versioned storage's commit validations against each other (`cc.rs`, G8 step 1).
+    if std::env::args().any(|a| a == "--cc") {
+        return cc::main();
     }
     // The versioned storage's B-link tree on its own (`blink.rs`).
     if std::env::args().any(|a| a == "--blink") {

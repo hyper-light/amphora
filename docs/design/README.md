@@ -43,12 +43,14 @@ Kiln vendors it at `vendor/amphora` and reaches it only through kiln-seams' `Rec
 
 ## Decisions
 
+Every decision of every record is indexed in [docs/design.md](../design.md), one line each.
+
 | Decision | Made by | Status |
 |---|---|---|
 | The commit pipeline: adaptive group commit, its batch budget | CP-T1.1, CP-T1.4 | open |
 | The MVCC scheme and the storage under it: in-place versions with undo in one shared buffer pool, B-link trees, row-level redo at commit, serializable by precision locking (`engine.md`) | CP-T1.2, CP-T1.3 | made, being built |
 | I/O per platform: io_uring and direct I/O, `F_BARRIERFSYNC`/`F_FULLFSYNC`, `FlushFileBuffers` | CP-T1.4 | open |
-| The client protocol: libSQL's Hrana, the Postgres wire protocol, or both | CP-T1.2 | open |
+| The client protocol: embedded first, one framed protocol between processes, the network listener (PostgreSQL's wire protocol, Hrana or Amphora's own) left open (`client-protocol.md`, researched in `../design.md`) | CP-T1.2 | proposed |
 | Replication: hyper-raft groups, the Raft log as the write-ahead log, commit classes | CP-T1.8 | open |
 | Placement and sharding: the directory, split and merge thresholds, cells | CP-T1.9 | open |
 | Transactions across groups and follower reads | CP-T1.10 | open |
@@ -57,3 +59,4 @@ Kiln vendors it at `vendor/amphora` and reaches it only through kiln-seams' `Rec
 | The planner where the bench suite found it choosing far more work: closed ranges, sorts, GLOB prefixes, skip-scans, a composite key's columns without statistics (`planner.md`) | CP-T1.2 | made |
 | The executor's work repeated on every run of a statement or row: ephemeral tables kept between runs, an IN subquery's list searched once a row, a subquery run only where it is read (`executor.md`) | CP-T1.2 | made |
 | Where answers depart from SQLite's, each for a stated reason: TEXT is well-formed UTF-8 (`semantics.md`) | G2 step 3 | made |
+| Analytics' columns: a copy derived from the rows, kept from each commit's redo record after the commit, exact at every snapshot, every size learned where it runs (`columnar.md`) | G11 step 1 | made; prototypes next |

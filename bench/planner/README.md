@@ -83,6 +83,29 @@ as in a process started for them. `repeat.py` compares passes timed alike, each 
 end, and such a pass stopped part way starts again from its beginning rather than resuming
 (bench/records/2026-10-26-jupiter-planner-baseline.md).
 
+## Prepared statements (PL.12)
+
+AC-PL.12.1 asks that TPC-H's 22 queries, prepared once and run with qgen's parameters, have no
+query slower than its generic plan. `tpch/prepared/qNN.sql` is each query with its substitution
+parameters as `?N` (TPC-H 3.0.1 §2.4; Q7's and Q8's fixed date ranges stay written in).
+`tpch/qgen_params.py` runs dbgen's qgen with `-l`, which logs each parameter as qgen draws it, once
+a seed, and turns each into the values its template binds (a date plus its interval, a LIKE
+pattern around a word, Q6's discount ±0.01); `test_qgen_params.py` checks it on a log qgen wrote.
+`--prepared` then prepares each query once for each mode `--plan-cache-modes` names (`generic`,
+`auto`, `custom`; generic and auto unless given) and runs every seed's values on each, `--runs`
+passes, the modes' order turning run by run. Each query's `prepared` record keeps each mode's best
+time for each seed, their sum, the custom plans it made, `auto_over_generic` (auto's sum over
+generic's: the criterion holds where it is at most 1 for every query) and the seeds whose answers
+differ between the modes (none, for a correct plan cache).
+
+```
+bench/planner/tpch/dbgen.sh 1 ~/.cache/planner-bench/tpch-sf1
+python3 -I bench/planner/tpch/qgen_params.py ~/.cache/planner-bench/tpch-dbgen 1 1 10 tpch-sf1-params.jsonl
+amphora-bench --planner --bench tpch --sf 1 --data ~/.cache/planner-bench/tpch-sf1 \
+  --queries bench/planner/tpch/queries --dir ~/.cache/planner-bench/db-tpch-sf1 --targets amphora \
+  --prepared bench/planner/tpch/prepared --params tpch-sf1-params.jsonl --runs 3 --out tpch-sf1-prepared.jsonl
+```
+
 ## What is measured
 
 - **A join prefix's rows**: the rows that left a table access into the next level of the join, or
@@ -100,3 +123,8 @@ end, and such a pass stopped part way starts again from its beginning rather tha
   plans and runs in one round trip.
 - **Agreement**: each engine's row count for each query; any query on which they differ is listed.
   With `--answers`, every row of every answer (`answers.py`).
+- **Whole reads in loops** (PL.6): `python3 -I loops.py <records.jsonl>...` counts the plans that
+  read a table whole (a scan, or a hash join's probe) beneath loops that can give more than one row,
+  from each Amphora plan's EXPLAIN QUERY PLAN FORMAT=JSON; a loop counts as one row only where it
+  looks its table up by rowid, so the count is never below the planner's own. `test_loops.py`
+  holds step 3's counts: 30 of JOB's 113 plans, none of TPC-H's.

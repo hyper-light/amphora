@@ -1908,6 +1908,9 @@ impl ExplainState {
 #[derive(Debug, Clone)]
 pub struct PreparedProgram {
     pub max_registers: usize,
+    /// Amphora (docs/design/executor.md, decision 8; QT.5): the hash and group tables the
+    /// program builds, each held to an equal share of the statement's memory budget.
+    pub memory_tables: usize,
     // we store original indices because we don't want to create new vec from
     // ProgramBuilder
     pub insns: Vec<(Insn, usize)>,
@@ -1922,6 +1925,11 @@ pub struct PreparedProgram {
     pub table_references: TableReferences,
     /// The top-level statement's estimated rows (`ProgramBuilder::output_rows`).
     pub output_rows: Option<f64>,
+    /// Amphora (PL.12): the top-level SELECT's estimated cost (`ProgramBuilder::plan_cost`).
+    pub plan_cost: Option<f64>,
+    /// Amphora (PL.12): its plan could differ with its parameters' values
+    /// (`ProgramBuilder::reads_parameter_values`).
+    pub reads_parameter_values: bool,
     pub sql: String,
     /// The statement is ANALYZE, so its completion refreshes the in-memory
     /// planner statistics. Decided once here instead of by scanning the SQL
