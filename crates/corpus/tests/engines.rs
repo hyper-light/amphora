@@ -1,4 +1,4 @@
-//! G2 step 4 (T-G2.4.1): the engine seam. Every engine the step names opens by name; one this
+//! G2 step 4 (T-G2.4.2): the engine seam. Every engine the step names opens by name; one this
 //! machine lacks is refused with a typed error, never passed; the shells' answers read as SQLite's
 //! runner reads them; and where SQLite's own shell is here, a file runs on it through the gate's
 //! code path, a record that can't finish stopped at its bound.
@@ -19,7 +19,7 @@ use amphora_corpus::run::{Limits, Outcome, run_file};
 
 /// Do: open a name no engine has. Expect: Unknown, naming it.
 #[test]
-fn t_g2_4_1_an_unknown_engine_is_refused() {
+fn t_g2_4_2_an_unknown_engine_is_refused() {
     assert_eq!(
         open("oracle").err(),
         Some(Unavailable::Unknown("oracle".into()))
@@ -30,7 +30,7 @@ fn t_g2_4_1_an_unknown_engine_is_refused() {
 /// Do: open each shell engine with a program that isn't there. Expect: each refused as Missing,
 /// naming the engine and the program.
 #[test]
-fn t_g2_4_1_an_engine_whose_program_is_missing_is_refused() {
+fn t_g2_4_2_an_engine_whose_program_is_missing_is_refused() {
     let gone = || "/no/such/dir/corpus-engine".to_owned();
     let specs = [
         sqlite_shell("sqlite", gone()),
@@ -62,7 +62,7 @@ fn t_g2_4_1_an_engine_whose_program_is_missing_is_refused() {
 
 /// Do: open ClickHouse at a port nothing listens on. Expect: Unreachable.
 #[test]
-fn t_g2_4_1_clickhouse_without_its_server_is_refused() {
+fn t_g2_4_2_clickhouse_without_its_server_is_refused() {
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -78,7 +78,7 @@ fn t_g2_4_1_clickhouse_without_its_server_is_refused() {
 /// Do: read SQLite's shell's quote mode. Expect: its types back, a quote doubled inside text, a
 /// line end inside text kept, a bare word as text.
 #[test]
-fn t_g2_4_1_quote_mode_reads_typed() {
+fn t_g2_4_2_quote_mode_reads_typed() {
     let rows = quoted_rows("1,'a''b',NULL,1.5,X'00ff'\n-2,'two\nlines',true,1e300,''").unwrap();
     assert_eq!(
         rows,
@@ -139,7 +139,7 @@ after
 /// here, every record agrees but the endless one, past the budget, and then the shell is gone, so
 /// the next record isn't reached; where it isn't, the engine is refused as Missing (not passed).
 #[test]
-fn t_g2_4_1_a_file_runs_on_sqlites_shell_or_is_refused() {
+fn t_g2_4_2_a_file_runs_on_sqlites_shell_or_is_refused() {
     let mut engine = match open("sqlite") {
         Ok(e) => e,
         Err(Unavailable::Missing { engine, .. }) => {
