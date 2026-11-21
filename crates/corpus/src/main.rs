@@ -4,7 +4,7 @@
 //! Required files run whole; fill files run until the budget, measured on this machine as it runs,
 //! is spent, so the subset's size is what this machine runs in the budget (G2 step 7). `--times`
 //! writes each record's outcome and time, a JSON line each, then a line for the file whole
-//! (`file_ns`, its fresh database and fixture included), for re-ranking the pool from the machines
+//! (`file_ns`, its fresh database and fixture included; `unsettled`, its failed settles), for re-ranking the pool from the machines
 //! that run it (bench/corpus/subset.py). A file `<source>/base.test` is the fixture of every file under `<source>/`
 //! (bench/corpus/build_corpus.py's rule). Exits 1 on any disagreement.
 
@@ -179,9 +179,10 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
         })
         .map_err(|e| format!("{rel}: {e}"))?;
         if let Some(t) = times.as_mut() {
-            // The file whole, its fresh database and fixture included: what it costs a run's budget.
+            // The file whole, its fresh database and fixture included: what it costs a run's budget;
+            // and its failed settles, which fail a run as a disagreement does.
             let ns = u64::try_from(file_began.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            let line = serde_json::json!({ "file": rel, "file_ns": ns, "required": required });
+            let line = serde_json::json!({ "file": rel, "file_ns": ns, "required": required, "unsettled": counts.unsettled });
             writeln!(t, "{line}").map_err(|e| e.to_string())?;
         }
         files = files.saturating_add(1);

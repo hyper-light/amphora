@@ -7,8 +7,8 @@ times machines measured running them (`amphora-corpus run <pool> --times <file>`
   fill      then files by query types (tagger.type_key) not yet covered per measured second, until
             the fastest machine's measured times fill the budget
 
-Only a file every run answered whole and right is chosen: the gate runs a file whole and fails on
-any disagreement, so a file Amphora gets wrong anywhere waits until it's fixed (subset.json lists
+Only a file every run answered whole and right, its settles all reached, is chosen: the gate runs
+a file whole and fails on any disagreement or failed settle, so a file Amphora gets wrong anywhere waits until it's fixed (subset.json lists
 the entries no such file reaches yet). A file's measured second is the median of every complete run
 of it on every machine (its `file_ns`: fresh database and fixture included); the budget is filled
 by the fastest machine's own medians (the machine whose times over the files every machine ran sum
@@ -78,29 +78,41 @@ def times_files(paths):
 def read_runs(runs):
     """Per file: whether every run answered every record it reached right, the lines that ran, and
     each machine's complete runs' times (a run its deadline cut short measures part of the file)."""
-    bad, cut, lines, file_ns = set(), set(), {}, {}
+    bad, cut, lines, file_ns, settled = set(), set(), {}, {}, set()
     for machine, path in runs:
         run_cut, run_ns = set(), {}
         with open(path) as f:
-            for row in f:
-                row = row.strip()
-                if not row:
-                    continue
+            rows = f.read().split("\n")
+        for i, row in enumerate(rows):
+            row = row.strip()
+            if not row:
+                continue
+            try:
                 r = json.loads(row)
-                rel = r["file"]
-                if "file_ns" in r:
-                    run_ns[rel] = r["file_ns"]
-                elif r["outcome"] == "agree":
-                    lines.setdefault(rel, set()).add(r["line"])
-                elif r["outcome"] == "unreached":
-                    run_cut.add(rel)
-                else:
+            except json.JSONDecodeError:
+                if i >= len(rows) - 2:  # a run stopped mid-write (killed at a timeout) ends in part of a line
+                    continue
+                raise
+            rel = r["file"]
+            if "file_ns" in r:
+                # a failed settle fails the gate's run as a disagreement does; a run that doesn't count
+                # them (no `unsettled`) measures the time only
+                if r.get("unsettled", 0):
                     bad.add(rel)
+                elif "unsettled" in r:
+                    settled.add(rel)
+                run_ns[rel] = r["file_ns"]
+            elif r["outcome"] == "agree":
+                lines.setdefault(rel, set()).add(r["line"])
+            elif r["outcome"] == "unreached":
+                run_cut.add(rel)
+            else:
+                bad.add(rel)
         cut |= run_cut
         for rel, ns in run_ns.items():
             if rel not in run_cut:
                 file_ns.setdefault(rel, {}).setdefault(machine, []).append(ns)
-    return bad, cut, lines, file_ns
+    return bad, cut, lines, file_ns, settled
 
 
 def credit_of(corpus):
@@ -154,9 +166,9 @@ def main():
     runs = times_files(paths)
     if not runs:
         sys.exit(f"no times files (<machine>/<run>.jsonl) under {paths}")
-    bad, cut, lines, file_ns = read_runs(runs)
+    bad, cut, lines, file_ns, settled = read_runs(runs)
     machines = sorted({m for ms in file_ns.values() for m in ms})
-    ok = sorted(rel for rel in file_ns if rel not in bad and os.path.exists(os.path.join(corpus, rel)))
+    ok = sorted(rel for rel in file_ns if rel in settled and rel not in bad and os.path.exists(os.path.join(corpus, rel)))
 
     # The fastest machine: least total over the files every machine ran whole.
     common = [rel for rel in ok if all(m in file_ns[rel] for m in machines)]

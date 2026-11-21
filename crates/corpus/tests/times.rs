@@ -24,7 +24,8 @@ SELECT a FROM t
 
 /// Do: run a pool of one required and one fill file with a budget already spent (zero seconds).
 /// Expect: the required file runs whole and agrees, the fill file's records are unreached, every
-/// record has a times line, and each file has one `file_ns` line saying whether it was required.
+/// record has a times line, and each file has one `file_ns` line saying whether it was required
+/// and how many settles failed (none).
 #[test]
 fn t_g2_7_1_times_name_each_record_and_each_file() {
     let pool = std::env::temp_dir().join(format!("amphora-corpus-times-{}", std::process::id()));
@@ -58,4 +59,5 @@ fn t_g2_7_1_times_name_each_record_and_each_file() {
     assert_eq!(whole[0]["required"], true);
     assert_eq!(whole[1]["file"], "a/fill.test");
     assert_eq!(whole[1]["required"], false);
+    assert!(whole.iter().all(|w| w["unsettled"] == 0));
 }
