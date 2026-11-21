@@ -12981,6 +12981,13 @@ pub fn op_idx_delete(
         return Ok(InsnFunctionStepResult::Step);
     }
 
+    // Amphora: an index an online schema change hasn't made public lacks the entries of rows its
+    // backfill hasn't reached, so a delete that finds none there is expected (CP-T1.12).
+    let raise_error_if_no_matching_entry = *raise_error_if_no_matching_entry
+        && !matches!(
+            program.cursor_ref.get(*cursor_id),
+            Some((_, CursorType::BTreeIndex(index))) if !index.is_public()
+        );
     loop {
         #[cfg(debug_assertions)]
         tracing::debug!(
@@ -13020,7 +13027,7 @@ pub fn op_idx_delete(
                     // If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching index entry is found
                     // Also, do not raise this (self-correcting and non-critical) error if in writable_schema mode.
 
-                    if *raise_error_if_no_matching_entry {
+                    if raise_error_if_no_matching_entry {
                         let reg_values = (*start_reg..*start_reg + *num_regs)
                             .map(|i| &state.registers[i])
                             .collect::<Vec<_>>();
@@ -13045,7 +13052,7 @@ pub fn op_idx_delete(
                     }
                 };
 
-                if !positioned && *raise_error_if_no_matching_entry {
+                if !positioned && raise_error_if_no_matching_entry {
                     let reg_values = (*start_reg..*start_reg + *num_regs)
                         .map(|i| &state.registers[i])
                         .collect::<Vec<_>>();
@@ -13119,6 +13126,15 @@ pub fn op_idx_insert(
         state.record_rows_written(1);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
+    }
+
+    // Amphora: a delete-only index takes no entries; deletes alone keep it (CP-T1.12, F1's states).
+    if let Some((_, CursorType::BTreeIndex(index))) = program.cursor_ref.get(cursor_id) {
+        if index.state == crate::schema::IndexState::DeleteOnly {
+            state.active_op_state.clear();
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
     }
 
     let record_to_insert = match &state.registers[record_reg] {

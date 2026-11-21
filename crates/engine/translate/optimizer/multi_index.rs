@@ -1430,6 +1430,7 @@ mod tests {
                 has_rowid: true,
                 index_method: None,
                 on_conflict: None,
+                state: crate::schema::IndexState::Public,
             })]),
         );
 
@@ -1574,6 +1575,7 @@ mod tests {
                 has_rowid: true,
                 index_method: None,
                 on_conflict: None,
+                state: crate::schema::IndexState::Public,
             })]),
         );
 
@@ -1683,6 +1685,7 @@ mod tests {
                 has_rowid: true,
                 index_method: None,
                 on_conflict: None,
+                state: crate::schema::IndexState::Public,
             })]),
         );
 
@@ -1865,6 +1868,7 @@ mod tests {
                 has_rowid: true,
                 index_method: None,
                 on_conflict: None,
+                state: crate::schema::IndexState::Public,
             })]),
         );
 
