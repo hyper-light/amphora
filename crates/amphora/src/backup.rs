@@ -10,6 +10,8 @@
 //!   shipped, until it reaches the most it keeps.
 //! - [`plan`]: the pure core: the archive's keys, which objects restore a second, which expire.
 //! - [`Shipper`] and [`BaseCopy`]: the shell that ships the log and copies bases.
+//! - [`Shipping`]: the thread that ships a database's log and copies its bases as it commits
+//!   ([`crate::database::Database::open_backed_up`]).
 //! - [`restore()`]: the shell that restores a second.
 
 use std::collections::VecDeque;
@@ -19,9 +21,12 @@ mod object;
 pub mod plan;
 mod restore;
 mod ship;
+mod shipping;
 
 pub use restore::{Restored, expire, restore};
 pub use ship::{BaseCopy, Shipped, Shipper};
+pub(crate) use shipping::Prepared;
+pub use shipping::{Archive, Shipping, Status, system_clock};
 
 /// Nanoseconds since the Unix epoch, from the clock the caller gives (the system's in production, a
 /// simulated one in tests).

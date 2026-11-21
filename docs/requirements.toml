@@ -421,6 +421,7 @@ criteria = [
 ]
 tests = [
   { id = "T-T1.12.D1", text = "Restore drills at random seconds of a database written, checkpointed, restarted, shipped and copied at random — passes when every row is equal" },
+  { id = "T-T1.12.D2", text = "A database opened backed up ships as it commits through its own thread, across a close and a reopen — passes when every second after its first base restores with every row equal and no round failed" },
   { id = "T-T1.12.P1", text = "Commits within a second keep one mark, its last; a new second a new mark" },
   { id = "T-T1.12.P2", text = "A clock that steps back holds stamps at the last, each later than the one before, and is counted" },
   { id = "T-T1.12.P3", text = "Past their bound the two oldest marks merge and their seconds are refused as unknown" },

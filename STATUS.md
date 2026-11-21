@@ -272,8 +272,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   durable frames shipped as segments with no timer; bases copied chunk by chunk without a reader;
   log restarts held until shipped; restore to any second by the engine's own recovery, refusing
   seconds the archive can't say exactly. Restore drills at random seconds on the simulator: every row
-  equal (T-T1.12.D1). Not yet: the `Database` owner's shipping thread, kiln's adapter to Mantle, and
-  the 100 GB restore measurement (AC-T1.12.3).
+  equal (T-T1.12.D1). `Database::open_backed_up` backs a local writer up: its commits stamped and a
+  thread that ships and copies bases as it commits, across a close and a reopen (T-T1.12.D2). Not
+  yet: kiln's adapter to Mantle, and the 100 GB restore measurement (AC-T1.12.3).
 
 ## Measured
 

@@ -394,6 +394,14 @@ impl Shipper {
         )
     }
 
+    /// Whether the log's generation now is the one this shipper ships: a base may begin in it
+    /// ([`Shipper::begin_base`]).
+    #[must_use]
+    pub fn ships_current(&self, db: &Db) -> bool {
+        let (seq, _) = db.log_end();
+        self.identity.is_some_and(|i| i.seq == seq)
+    }
+
     /// Marks dropped because their generation ended unshipped.
     #[must_use]
     pub fn lost_marks(&self) -> u64 {

@@ -19,9 +19,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use amphora::backup::{self, BaseCopy, Hooks, SECOND_NS, Shipper, plan::Unrestorable};
+use amphora::backup::{self, Archive, BaseCopy, Hooks, SECOND_NS, Shipper, plan::Unrestorable};
+use amphora::database::Database;
 use amphora::db::Db;
-use amphora_api::blobs::SimBlobs;
+use amphora_api::blobs::{Blobs, SimBlobs};
 use amphora_engine::Value;
 
 struct Rng(u64);
@@ -215,4 +216,93 @@ fn drill(seed: u64) {
         after.unwrap_err().downcast_ref::<Unrestorable>(),
         Some(Unrestorable::NotYetArchived { .. })
     ));
+}
+
+/// Opens `path` backed up to `blobs` under "db", stamped by `now`.
+fn open_backed_up(
+    path: &std::path::Path,
+    blobs: &Arc<SimBlobs>,
+    now: &Arc<AtomicU64>,
+) -> (Database, backup::Shipping) {
+    let read = Arc::clone(now);
+    let archive = Archive {
+        blobs: Arc::clone(blobs) as Arc<dyn Blobs>,
+        prefix: "db".into(),
+        clock: Arc::new(move || read.load(Ordering::SeqCst)),
+        memory: 32 * 1024,
+        patience: Duration::from_secs(60),
+    };
+    Database::open_backed_up(path, archive, until()).unwrap()
+}
+
+/// Writes rows `ids` in one commit each, a second apart, each one's rows kept in `history`.
+fn write_seconds(
+    database: &Database,
+    now: &AtomicU64,
+    ids: std::ops::Range<i64>,
+    model: &mut Rows,
+    history: &mut Vec<(u64, Rows)>,
+) {
+    for id in ids {
+        now.fetch_add(SECOND_NS, Ordering::SeqCst);
+        let v = format!("{id}:{}", "y".repeat(usize::try_from(id).unwrap() * 97 % 3000));
+        let written = v.clone();
+        database
+            .call(until(), move |c| {
+                c.execute(
+                    "INSERT INTO t (id, v) VALUES (?1, ?2)",
+                    vec![amphora_api::Value::Integer(id), amphora_api::Value::Text(written)],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        model.insert(id, v);
+        history.push((now.load(Ordering::SeqCst), model.clone()));
+    }
+}
+
+/// T-T1.12.D2 (AC-T1.12.4): a database opened backed up ships as it commits, through its own
+/// thread, across a close and a reopen. Do: open it backed up, write a table, wait for its first
+/// base; write a row a second; close it; reopen it backed up and write a row a second more; close
+/// it. Expect: every second after the first base restores with every row equal, those of the
+/// reopened database's included, and no round failed.
+#[test]
+fn t_t1_12_d2_a_database_backed_up_ships_as_it_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.db");
+    let blobs = Arc::new(SimBlobs::new(64 * 1024, 1_000_000, 1 << 30));
+    let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+    let mut model = Rows::new();
+    let mut history: Vec<(u64, Rows)> = Vec::new();
+
+    let (database, shipping) = open_backed_up(&path, &blobs, &now);
+    database
+        .call(until(), |c| {
+            c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+            Ok(())
+        })
+        .unwrap();
+    history.push((now.load(Ordering::SeqCst), model.clone()));
+    shipping.wait(until(), |s| s.bases >= 1).unwrap();
+    let based = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+    write_seconds(&database, &now, 1..20, &mut model, &mut history);
+    drop(database);
+    let first = shipping.wait(until(), |s| s.ended).unwrap();
+    assert_eq!(first.failures, 0, "{:?}", first.last_failure);
+    assert!(first.shipped.segments > 0);
+
+    let (database, shipping) = open_backed_up(&path, &blobs, &now);
+    write_seconds(&database, &now, 20..30, &mut model, &mut history);
+    drop(database);
+    let second = shipping.wait(until(), |s| s.ended).unwrap();
+    assert_eq!(second.failures, 0, "{:?}", second.last_failure);
+
+    let last = history.last().unwrap().0.div_ceil(SECOND_NS);
+    for second in based + 1..=last {
+        let target = dir.path().join(format!("restored-{second}.db"));
+        backup::restore(blobs.as_ref(), "db", second, &target, until())
+            .unwrap_or_else(|e| panic!("second {second} refused: {e:#}"));
+        let expected = at(&history, second).cloned().unwrap_or_default();
+        assert_eq!(rows(&Db::open(&target).unwrap()), expected, "second {second}");
+    }
 }

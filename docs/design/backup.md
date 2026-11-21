@@ -38,6 +38,15 @@ point ("Continuous Archiving and Point-in-Time Recovery", postgresql.org/docs/cu
   last outweighs it, after a break, or once restore rates measured by drills say a restore would pass
   AC-T1.12.3's 30 minutes (`plan::base_due`). Marks are kept one a second (the restore target's
   granularity, AC-T1.12.1) and at most as many as the log holds frames between restarts.
+- **The database's shipping thread.** `Database::open_backed_up` stamps the writer's commits as it
+  opens and starts a thread woken by each commit the store makes (and once at its start), never by
+  a timer: a round ships, then moves a due base on by a chunk, chunks following one another without
+  waiting while a base is under way. It ships through a reader on the writer's engine, so the
+  writer never waits on the store; that reader keeps the log on its close too, as it may close
+  last. A failed round is logged (`backup.round_failed`) and counted, and tried again at the next
+  commit; a base under way then starts over. When the database ends the thread ships once more and
+  ends. How long one request to the store may take is the caller's (`Archive::patience`): no
+  measure of the store's answer time stands yet.
 - **Retention.** `plan::expired` lets go of what precedes the base the oldest kept second needs. How
   long to keep is not stated anywhere yet: the caller passes it (Needs Ada's word).
 

@@ -504,8 +504,20 @@ impl Db {
     /// turns both off, so its log starts again only through [`Db::restart_log`] (CP-T1.12,
     /// T-T1.12.D1). Its checkpoints after commits are off already (`wal_autocheckpoint = 0`).
     pub fn back_up(&mut self, hooks: Arc<crate::backup::Hooks>) {
-        self.conn.wal_auto_actions_disable();
+        self.hold_log();
         self.backup = Some(hooks);
+    }
+
+    /// Turns off the engine's own restart of the log at this connection's next write and its
+    /// emptying of the log when this connection closes last ([`Db::back_up`]).
+    pub(crate) fn hold_log(&self) {
+        self.conn.wal_auto_actions_disable();
+    }
+
+    /// The frames of log a restart keeps the log's file for ([`Db::keep_log`]): the most a log
+    /// holds between restarts.
+    pub(crate) fn log_kept_frames(&self) -> u64 {
+        self.log_kept
     }
 
     /// Stamps the commit that just ended, if this database is backed up and one did.
