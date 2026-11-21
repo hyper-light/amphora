@@ -124,31 +124,73 @@ pub(super) fn estimate_scan_cost(
     params: &CostModelParams,
 ) -> Cost {
     let table_pages = (base_row_count / params.rows_per_table_page).max(1.0);
-
-    // First scan reads all pages; subsequent scans benefit from caching
-    let io_cost = if num_scans <= 1.0 {
-        table_pages
-    } else {
-        // First scan + discounted cost for subsequent scans
-        table_pages + (num_scans - 1.0) * table_pages * params.cache_reuse_factor
-    };
+    let io_cost = rescan_reads(table_pages, num_scans, params.cache_pages);
 
     // CPU cost for processing all rows on each scan
     let cpu_cost = num_scans * base_row_count * params.cpu_cost_per_row;
 
-    Cost(io_cost + cpu_cost)
+    Cost(file_reads(io_cost, table_pages, params.cache_pages, params.page_miss) + cpu_cost)
+}
+
+/// Amphora (QT.5): the pages `scans` whole reads of `pages` pages read from a cold cache of
+/// `cache_pages`: the first reads them all, and each after it the part the cache could not keep,
+/// the limit Mackert and Lohman's count (`table_pages_fetched`) reaches for every pass past the
+/// first. A tree the cache holds is read once however often it is scanned.
+pub(super) fn rescan_reads(pages: f64, scans: f64, cache_pages: f64) -> f64 {
+    pages + (scans - 1.0).max(0.0) * (pages - cache_pages).max(0.0)
 }
 
 /// Estimate the work to add every row to a new in-memory index.
 ///
 /// Each insert searches the part of the index that was already built. A
 /// balanced index needs about log2(rows) comparisons per insert.
+///
+/// Amphora (QT.5): and the pages it moves once it outgrows its cache. A statement's ephemeral
+/// index has a pager of its own, given the default page cache (`vdbe/execute.rs`, `OpenEphemeral`:
+/// `PageCache::default()`, `page_cache::DEFAULT_PAGE_CACHE_SIZE_IN_PAGES` pages). Each row's insert
+/// lands on a leaf among the index's `row_count / rows_per_leaf_page` at random, so the leaves it
+/// fetches are Mackert and Lohman's (`table_pages_fetched`). A leaf's first fetch makes it, no read;
+/// a fetch past that reads a leaf the cache dropped; and every fetch once the cache is full drops a
+/// changed page, a write.
 pub(super) fn estimate_ephemeral_index_build_cost(
     row_count: f64,
+    rows_per_leaf_page: f64,
     params: &CostModelParams,
 ) -> Cost {
     let comparisons_per_row = row_count.max(2.0).log2();
-    Cost(row_count * comparisons_per_row * params.cpu_cost_per_seek)
+    let cache = ephemeral_cache_pages();
+    let leaves = (row_count / rows_per_leaf_page.max(1.0)).max(1.0);
+    let fetched = table_pages_fetched(row_count, leaves, cache);
+    let reads = (fetched - leaves).max(0.0);
+    let writes = (fetched - cache).max(0.0);
+    Cost(row_count * comparisons_per_row * params.cpu_cost_per_seek + reads + writes)
+}
+
+/// Amphora (QT.5): `probes` searches of an ephemeral index of `row_count` rows built just before,
+/// `rows_per_probe` rows each: a seek and the rows' visits, and the leaves the cache the build left
+/// behind doesn't hold. The build's last pages are what that cache holds, so of the leaves first
+/// touched, the part the cache has room for is held (`file_reads` with no recent miss).
+pub(super) fn estimate_ephemeral_index_probe_cost(
+    probes: f64,
+    rows_per_probe: f64,
+    row_count: f64,
+    rows_per_leaf_page: f64,
+    params: &CostModelParams,
+) -> Cost {
+    let cache = ephemeral_cache_pages();
+    let leaves = (row_count / rows_per_leaf_page.max(1.0)).max(1.0);
+    let leaves_per_probe = (rows_per_probe / rows_per_leaf_page.max(1.0)).max(1.0);
+    let fetched = table_pages_fetched(probes * leaves_per_probe, leaves, cache);
+    Cost(
+        probes * params.cpu_cost_per_seek
+            + probes * rows_per_probe * params.cpu_cost_per_row
+            + file_reads(fetched, leaves, cache, 0.0),
+    )
+}
+
+/// The pages an ephemeral index's own pager caches (`estimate_ephemeral_index_build_cost`).
+fn ephemeral_cache_pages() -> f64 {
+    crate::storage::page_cache::DEFAULT_PAGE_CACHE_SIZE_IN_PAGES as f64
 }
 
 pub(super) fn estimate_sort_cpu_cost(row_count: f64, params: &CostModelParams) -> Cost {
@@ -200,6 +242,25 @@ pub(super) fn table_pages_fetched(rows: f64, table_pages: f64, cache_pages: f64)
     }
 }
 
+/// Amphora (QT.5): the file reads of `cold_reads`, the pages a plan reads of a tree of
+/// `tree_pages` from a cold cache of `cache_pages`. Of the tree's pages it touches first (at most
+/// all of them), the cache already holds a share: the share of the connection's recent fetches
+/// that found their page held, `1 - page_miss`, of the part of the tree the cache has room for,
+/// `cache_pages / tree_pages` at most 1. Those are no file read: a held page's lookup is part of
+/// the seek or row visit that touches it. The rest, and the pages the cache was too small to keep,
+/// are read.
+pub(super) fn file_reads(
+    cold_reads: f64,
+    tree_pages: f64,
+    cache_pages: f64,
+    page_miss: f64,
+) -> f64 {
+    let tree = tree_pages.max(1.0);
+    let first = cold_reads.min(tree).max(0.0);
+    let held = (1.0 - page_miss.clamp(0.0, 1.0)) * (cache_pages / tree).clamp(0.0, 1.0);
+    cold_reads - first * held
+}
+
 /// Estimate IO and CPU cost for index-based access.
 ///
 /// This properly separates the number of B-tree seeks from the number of rows
@@ -225,46 +286,33 @@ pub fn estimate_index_cost(
     // the entire index, not seeking to specific positions.
     let is_full_scan = (rows_per_seek - base_row_count).abs() < 1.0;
 
-    let seek_cost = if is_full_scan {
-        // Full scan: one seek to start, then sequential reads.
-        // When re-scanned (nested loop inner), first scan is cold, rest are cached.
-        if input_cardinality <= 1.0 {
-            tree_depth
-        } else {
-            tree_depth + (input_cardinality - 1.0) * tree_depth * params.cache_reuse_factor
-        }
-    } else if input_cardinality <= 1.0 {
-        input_cardinality * tree_depth
-    } else {
-        let cached_root_page_cost = params.cache_reuse_factor;
-        let leaf_page_costed_below = if rows_per_seek > 1.0 { 1.0 } else { 0.0 };
-        let repeated_tree_search_cost = (tree_depth - 1.0 + cached_root_page_cost
-            - leaf_page_costed_below)
-            .max(cached_root_page_cost);
-        tree_depth + (input_cardinality - 1.0) * repeated_tree_search_cost
-    };
-
+    // Amphora (QT.5): the pages the searches read from a cold cache, before the cache is counted
+    // below. A whole read of the index is one seek and its leaves in order, read again as the
+    // cache can't keep them (`rescan_reads`). Otherwise each search reads its path and, for a
+    // range, its leaves; the root, which every search reads, stays held after the first.
     let index_leaf_pages_count = (rows_per_seek / index_info.rows_per_leaf_page).max(1.0);
-    let leaf_scan_cost = if is_full_scan {
-        // Full scan of all leaf pages. Repeated scans benefit from caching.
-        if input_cardinality <= 1.0 {
-            index_leaf_pages_count
+    let search_reads = if is_full_scan {
+        rescan_reads(
+            tree_depth + index_leaf_pages_count,
+            input_cardinality,
+            params.cache_pages,
+        )
+    } else if input_cardinality <= 1.0 {
+        // A point lookup's leaf is the last page of its path.
+        let leaves = if rows_per_seek <= 1.0 {
+            0.0
         } else {
             index_leaf_pages_count
-                + (input_cardinality - 1.0) * index_leaf_pages_count * params.cache_reuse_factor
-        }
+        };
+        input_cardinality * tree_depth + leaves
     } else if rows_per_seek <= 1.0 {
-        // Point lookup: the leaf page is the last page of the B-tree traversal,
-        // already counted in seek_cost.
-        0.0
-    } else if input_cardinality <= 1.0 {
-        index_leaf_pages_count
+        tree_depth + (input_cardinality - 1.0) * (tree_depth - 1.0).max(0.0)
     } else {
-        // Range scan in a nested-loop join: after the first iteration the inner
-        // table's pages are largely in the buffer pool.  Apply the same caching
-        // discount as full scans.
-        index_leaf_pages_count
-            + (input_cardinality - 1.0) * index_leaf_pages_count * params.cache_reuse_factor
+        // After the first, a range's path below the root ends at its first leaf, counted with
+        // its leaves.
+        tree_depth
+            + index_leaf_pages_count
+            + (input_cardinality - 1.0) * ((tree_depth - 2.0).max(0.0) + index_leaf_pages_count)
     };
 
     // For non-covering indexes, we need to fetch from the table for each row. Amphora: each row
@@ -274,35 +322,43 @@ pub fn estimate_index_cost(
     } else {
         let table_pages_count = (base_row_count / params.rows_per_table_page).max(1.0);
         let looked_up = input_cardinality * rows_per_seek;
-        table_pages_fetched(looked_up, table_pages_count, params.cache_pages)
-            + looked_up * params.cpu_cost_per_seek
+        file_reads(
+            table_pages_fetched(looked_up, table_pages_count, params.cache_pages),
+            table_pages_count,
+            params.cache_pages,
+            params.page_miss,
+        ) + looked_up * params.cpu_cost_per_seek
     };
 
-    // Amphora: many searches of an index the cache holds whole read each of its pages once at
-    // most (decision 6): its leaves as Mackert and Lohman count them, its inner pages once. One
-    // pass is read in order, and an index bigger than the cache keeps its searches' pages, as
-    // estimated above.
+    // Amphora: many searches of an index read each of its pages once at most while the cache
+    // holds them (decision 6): its leaves as Mackert and Lohman count them, its inner pages once.
+    // One pass is read in order.
     let leaf_pages = (base_row_count / index_info.rows_per_leaf_page).max(1.0);
     let index_pages = leaf_pages + leaf_pages / index_info.rows_per_leaf_page.max(2.0) + tree_depth;
-    let index_io = if input_cardinality > 1.0 && index_pages <= params.cache_pages {
+    // Amphora (QT.5): the inner pages, which every search reads, stay held while the cache has
+    // room for them, and the leaves share what room is left: an index bigger than the cache reads
+    // its leaves again as the cache drops them, not its inner pages too.
+    let inner_pages = index_pages - leaf_pages;
+    let index_io = if input_cardinality > 1.0 && inner_pages < params.cache_pages {
         let reads = table_pages_fetched(
             input_cardinality * index_leaf_pages_count,
             leaf_pages,
-            params.cache_pages,
+            params.cache_pages - inner_pages,
         ) + (tree_depth - 1.0).max(0.0);
-        (seek_cost + leaf_scan_cost).min(reads)
+        search_reads.min(reads)
     } else {
-        seek_cost + leaf_scan_cost
+        search_reads
     };
 
-    let io_cost = index_io + table_lookup_cost;
+    let io_cost =
+        file_reads(index_io, index_pages, params.cache_pages, params.page_miss) + table_lookup_cost;
 
     // CPU cost: key comparisons during seeks + row processing
     let total_rows = input_cardinality * rows_per_seek;
     let cpu_cost =
         input_cardinality * params.cpu_cost_per_seek + total_rows * params.cpu_cost_per_row;
 
-    Cost((io_cost + cpu_cost - params.index_bonus).max(0.001))
+    Cost(io_cost + cpu_cost)
 }
 
 pub(crate) fn is_unique_point_lookup(
@@ -843,6 +899,46 @@ mod tests {
         assert_eq!(table_pages_fetched(0.0, 4_000.0, 2_000.0), 0.0);
     }
 
+    /// Do: 300 cold reads of a tree of 100 pages, the cache holding it, half the connection's
+    /// fetches reading a file, then none, then all; then a tree of 400 pages a cache of 100 holds
+    /// a quarter of. Expect: the 200 reads past the tree's pages read whatever, and of its 100
+    /// half, none and all; of the bigger tree's 300 first reads, a quarter held (T-QT.5.5: a held
+    /// page is no file read; a page the cache can't hold is).
+    #[test]
+    fn t_qt_5_5_held_pages_are_not_read_but_pages_the_cache_drops_are() {
+        assert_eq!(file_reads(300.0, 100.0, 2_000.0, 0.5), 250.0);
+        assert_eq!(file_reads(300.0, 100.0, 2_000.0, 0.0), 200.0);
+        assert_eq!(file_reads(300.0, 100.0, 2_000.0, 1.0), 300.0);
+        assert_eq!(file_reads(300.0, 400.0, 100.0, 0.0), 225.0);
+    }
+
+    /// Do: build an ephemeral index of 1,000 rows, 10 a leaf, and of 10 million, then search each
+    /// a million times. Expect: the small one's build and searches only CPU, its 100 leaves
+    /// within its cache; the big one's build pays a read for each leaf fetched past its first and
+    /// a write for each fetch once the cache is full, and its searches read what the cache the
+    /// build left can't hold (T-QT.5.5: an ephemeral index's pages are priced like a tree's).
+    #[test]
+    fn t_qt_5_5_an_ephemeral_index_past_its_cache_reads_and_writes_its_leaves() {
+        let params = &DEFAULT_PARAMS;
+        let cpu_build = |rows: f64| rows * rows.log2() * params.cpu_cost_per_seek;
+        let small = estimate_ephemeral_index_build_cost(1_000.0, 10.0, params);
+        assert!((small.0 - cpu_build(1_000.0)).abs() < 1e-9);
+        let cpu_probe = 1e6 * (params.cpu_cost_per_seek + params.cpu_cost_per_row);
+        let probes = estimate_ephemeral_index_probe_cost(1e6, 1.0, 1_000.0, 10.0, params);
+        assert!((probes.0 - cpu_probe).abs() < 1e-6, "{probes:?}");
+
+        let cache = ephemeral_cache_pages();
+        let leaves = 1e6;
+        let fetched = table_pages_fetched(1e7, leaves, cache);
+        let big = estimate_ephemeral_index_build_cost(1e7, 10.0, params);
+        let io = (fetched - leaves) + (fetched - cache);
+        assert!((big.0 - cpu_build(1e7) - io).abs() < 1e-3, "{big:?}");
+        let probes = estimate_ephemeral_index_probe_cost(1e6, 1.0, 1e7, 10.0, params);
+        let read = file_reads(table_pages_fetched(1e6, leaves, cache), leaves, cache, 0.0);
+        assert!((probes.0 - cpu_probe - read).abs() < 1e-3, "{probes:?}");
+        assert!(read > 0.0);
+    }
+
     /// Amphora: do: search an index of 1,000 leaf pages 200 times, with a cache that holds it and
     /// with one of a page. Expect: held, no more than its leaf pages and its inner pages once
     /// (decision 6); not held, every search's pages as before.
@@ -852,89 +948,47 @@ mod tests {
         let cost = estimate_index_cost(100_000.0, 4.0, covering_index(), 200.0, 1.0, &held);
         let cpu = 200.0 * held.cpu_cost_per_seek + 200.0 * held.cpu_cost_per_row;
         let reads = table_pages_fetched(200.0, 1_000.0, 100_000.0) + 3.0;
-        assert!(((cost.0 + held.index_bonus - cpu) - reads).abs() < 1e-9);
+        assert!(((cost.0 - cpu) - reads).abs() < 1e-9);
         assert!(reads < 200.0, "{reads}");
         let none = DEFAULT_PARAMS.with_cache_pages(1);
         let uncached = estimate_index_cost(100_000.0, 4.0, covering_index(), 200.0, 1.0, &none);
-        let per_search = 4.0 + 199.0 * (3.0 + none.cache_reuse_factor);
-        assert!(((uncached.0 + none.index_bonus - cpu) - per_search).abs() < 1e-9);
+        let per_search = 4.0 + 199.0 * 3.0;
+        assert!(((uncached.0 - cpu) - per_search).abs() < 1e-9);
         assert!(cost < uncached);
     }
 
+    /// Do: search an index 10 times for one row and for 100, with a cache of one page. Expect:
+    /// each search after the first reads its path but the root, which every search reads; a
+    /// range's leaves each time (decision 6, QT.5).
     #[test]
-    fn repeated_point_seeks_keep_non_root_page_costs() {
-        // Amphora: a cache of one page, which holds none of the index (decision 6).
-        let cost = estimate_index_cost(
-            100_000.0,
-            4.0,
-            covering_index(),
-            10.0,
-            1.0,
-            &DEFAULT_PARAMS.with_cache_pages(1),
-        );
-        let repeated_tree_search_cost = 3.0 + DEFAULT_PARAMS.cache_reuse_factor;
-        let expected_tree_search_cost = 4.0 + 9.0 * repeated_tree_search_cost;
-        let expected_cpu_cost =
-            10.0 * DEFAULT_PARAMS.cpu_cost_per_seek + 10.0 * DEFAULT_PARAMS.cpu_cost_per_row;
-        let expected = expected_tree_search_cost + expected_cpu_cost - DEFAULT_PARAMS.index_bonus;
-        assert!((cost.0 - expected).abs() < f64::EPSILON);
+    fn repeated_searches_read_their_path_below_the_root() {
+        let none = DEFAULT_PARAMS.with_cache_pages(1);
+        let cost = estimate_index_cost(100_000.0, 4.0, covering_index(), 10.0, 1.0, &none);
+        let expected_cpu_cost = 10.0 * none.cpu_cost_per_seek + 10.0 * none.cpu_cost_per_row;
+        assert!((cost.0 - (4.0 + 9.0 * 3.0) - expected_cpu_cost).abs() < 1e-9);
+
+        let cost = estimate_index_cost(100_000.0, 4.0, covering_index(), 10.0, 100.0, &none);
+        let expected_cpu_cost = 10.0 * none.cpu_cost_per_seek + 1_000.0 * none.cpu_cost_per_row;
+        assert!((cost.0 - (4.0 + 1.0 + 9.0 * (2.0 + 1.0)) - expected_cpu_cost).abs() < 1e-9);
     }
 
+    /// Do: scan a table of 2,000 pages 10 times, with a cache that holds it, one that holds half
+    /// of it and one of a page. Expect: read once; then the first scan whole and the half the
+    /// cache can't keep each time after; then nearly whole each time (QT.5: no picked reuse share).
     #[test]
-    fn repeated_range_seeks_reuse_cached_root_and_leaf_pages() {
-        let cost = estimate_index_cost(
-            100_000.0,
-            4.0,
-            covering_index(),
-            10.0,
-            100.0,
-            &DEFAULT_PARAMS.with_cache_pages(1),
+    fn rescans_read_what_the_cache_cannot_keep() {
+        assert_eq!(rescan_reads(2_000.0, 10.0, 2_000.0), 2_000.0);
+        assert_eq!(
+            rescan_reads(2_000.0, 10.0, 1_000.0),
+            2_000.0 + 9.0 * 1_000.0
         );
-        let repeated_tree_search_cost = 2.0 + DEFAULT_PARAMS.cache_reuse_factor;
-        let expected_tree_search_cost = 4.0 + 9.0 * repeated_tree_search_cost;
-        let expected_leaf_cost = 1.0 + 9.0 * DEFAULT_PARAMS.cache_reuse_factor;
-        let expected_cpu_cost =
-            10.0 * DEFAULT_PARAMS.cpu_cost_per_seek + 1_000.0 * DEFAULT_PARAMS.cpu_cost_per_row;
-        let expected = expected_tree_search_cost + expected_leaf_cost + expected_cpu_cost
-            - DEFAULT_PARAMS.index_bonus;
-        assert!((cost.0 - expected).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn lower_cache_reuse_factor_reduces_repeated_read_cost() {
-        let low_reuse_cost = CostModelParams {
-            cache_reuse_factor: 0.8,
-            cache_pages: 1.0,
-            ..DEFAULT_PARAMS.clone()
-        };
-        let high_reuse_cost = CostModelParams {
-            cache_reuse_factor: 0.2,
-            cache_pages: 1.0,
-            ..DEFAULT_PARAMS.clone()
-        };
-
+        assert_eq!(rescan_reads(2_000.0, 10.0, 1.0), 2_000.0 + 9.0 * 1_999.0);
+        assert_eq!(rescan_reads(2_000.0, 1.0, 1.0), 2_000.0);
+        let held = DEFAULT_PARAMS.with_cache_pages(100_000);
+        let small = DEFAULT_PARAMS.with_cache_pages(1);
         assert!(
-            estimate_scan_cost(100_000.0, 10.0, &high_reuse_cost)
-                < estimate_scan_cost(100_000.0, 10.0, &low_reuse_cost)
+            estimate_scan_cost(100_000.0, 10.0, &held)
+                < estimate_scan_cost(100_000.0, 10.0, &small)
         );
-        for rows_per_seek in [1.0, 100.0] {
-            assert!(
-                estimate_index_cost(
-                    100_000.0,
-                    4.0,
-                    covering_index(),
-                    10.0,
-                    rows_per_seek,
-                    &high_reuse_cost,
-                ) < estimate_index_cost(
-                    100_000.0,
-                    4.0,
-                    covering_index(),
-                    10.0,
-                    rows_per_seek,
-                    &low_reuse_cost,
-                )
-            );
-        }
     }
 }

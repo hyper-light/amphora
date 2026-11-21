@@ -65,6 +65,8 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | executor | 5 | An ORDER BY with a LIMIT keeps only the rows its reader takes | [executor.md](design/executor.md#5-an-order-by-with-a-limit-keeps-only-the-rows-its-reader-takes) |
 | executor | 6 | A subquery runs where it is read | [executor.md](design/executor.md#6-a-subquery-runs-where-it-is-read) |
 | executor | 7 | A row's header is parsed once, a cache hit takes no exclusive lock, and the index's terms run before the row is fetched | [executor.md](design/executor.md#7-a-rows-header-is-parsed-once-a-cache-hit-takes-no-exclusive-lock-and-the-indexs-terms-run-before-the-row-is-fetched) |
+| executor | 8 | A scan, its aggregates and a hash join's probe run on every core, in morsels | [executor.md](design/executor.md#8-a-scan-its-aggregates-and-a-hash-joins-probe-run-on-every-core-in-morsels) |
+| executor | 9 | A table scan decodes each leaf once into column batches, behind a switch | [executor.md](design/executor.md#9-a-table-scan-decodes-each-leaf-once-into-column-batches-behind-a-switch) |
 | local-owner-transport | – | Versions (2026-11-06) | [local-owner-transport.md](design/local-owner-transport.md#versions-2026-11-06) |
 | local-owner-transport | – | The tests' budgets (2026-10-31) | [local-owner-transport.md](design/local-owner-transport.md#the-tests-budgets-2026-10-31) |
 | local-owner-transport | – | Owner guards (2026-11-06) | [local-owner-transport.md](design/local-owner-transport.md#owner-guards-2026-11-06) |
@@ -98,9 +100,12 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | planner | – | Decision (lane pl6): No table read whole beneath loops that can give more than one row | [planner.md](design/planner.md#decision-lane-pl6-no-table-read-whole-beneath-loops-that-can-give-more-than-one-row) |
 | planner | – | Decision (lane pl8): a RIGHT JOIN led by one table is planned as its mirrored LEFT JOIN | [planner.md](design/planner.md#decision-lane-pl8-a-right-join-led-by-one-table-is-planned-as-its-mirrored-left-join) |
 | planner | – | Decision (lane pl8-3): a LEFT JOIN's right table follows the tables its ON terms read | [planner.md](design/planner.md#decision-lane-pl8-3-a-left-joins-right-table-follows-the-tables-its-on-terms-read) |
-| planner | – | Decision (lane pl8-4): a hash join's build side can be a run of tables after the loops | [planner.md](design/planner.md#decision-lane-pl8-4-a-hash-joins-build-side-can-be-a-run-of-tables-after-the-loops) |
+| planner | – | Decision (lane pl8-4): an outer join's ON terms on an earlier table count given its filters | [planner.md](design/planner.md#decision-lane-pl8-4-an-outer-joins-on-terms-on-an-earlier-table-count-given-its-filters) |
+| planner | – | Decision (lane pl8-5): a hash join's build side can be a run of tables after the loops | [planner.md](design/planner.md#decision-lane-pl8-5-a-hash-joins-build-side-can-be-a-run-of-tables-after-the-loops) |
 | planner | – | Decision (lane pl12): custom plans, then a generic one, for prepared statements | [planner.md](design/planner.md#decision-lane-pl12-custom-plans-then-a-generic-one-for-prepared-statements) |
 | planner | – | Decision (lane pl9): row counts kept as rows change, statements planned again past their statistics' error | [planner.md](design/planner.md#decision-lane-pl9-row-counts-kept-as-rows-change-statements-planned-again-past-their-statistics-error) |
+| planner | – | Decision (lane pl13): a nested loop that turns into a hash join at the learned costs' break-even, and a plan made again past its estimate's error | [planner.md](design/planner.md#decision-lane-pl13-a-nested-loop-that-turns-into-a-hash-join-at-the-learned-costs-break-even-and-a-plan-made-again-past-its-estimates-error) |
+| planner | – | Decision (lane pl11): degree-sequence upper bounds guard each joined set's estimate | [planner.md](design/planner.md#decision-lane-pl11-degree-sequence-upper-bounds-guard-each-joined-sets-estimate) |
 | records-compaction | – | Durable progress and retention | [records-compaction.md](design/records-compaction.md#durable-progress-and-retention) |
 | records-compaction | – | Dirty-page and serialized bounds | [records-compaction.md](design/records-compaction.md#dirty-page-and-serialized-bounds) |
 | records-compaction | – | Embedded owner compatibility | [records-compaction.md](design/records-compaction.md#embedded-owner-compatibility) |
@@ -130,8 +135,13 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | replication | – | A follower's write that read nothing written since its base: read sets (built 2026-11-21, Amphora goal ceea4e0a) | [replication.md](design/replication.md#a-followers-write-that-read-nothing-written-since-its-base-read-sets-built-2026-11-21-amphora-goal-ceea4e0a) |
 | replication | – | Decision (lane g12s2): the raft log as the WAL (2026-11-21, G12 step 2) | [replication.md](design/replication.md#decision-lane-g12s2-the-raft-log-as-the-wal-2026-11-21-g12-step-2) |
 | replication | – | Decision (lane constants): the owner's tick pace (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-the-owners-tick-pace-2026-11-21) |
+| replication | – | Decision (lane constants): the compaction's expansion learned where it runs (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-the-compactions-expansion-learned-where-it-runs-2026-11-21) |
+| replication | – | Decision (lane constants): an envelope is what its encoding adds (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-an-envelope-is-what-its-encoding-adds-2026-11-21) |
 | regions | – | Decision (lane regions): region-local groups under a global root, placed by declared survival | [regions.md](design/regions.md#decision-lane-regions-region-local-groups-under-a-global-root-placed-by-declared-survival) |
 | reshard | – | Decision (lane split-merge): split, merge and move as one fenced hand-off, decided by measured share | [reshard.md](design/reshard.md#decision-lane-split-merge-split-merge-and-move-as-one-fenced-hand-off-decided-by-measured-share) |
+| reshard | – | Decision (lane split-merge-7): batches learned where they run | [reshard.md](design/reshard.md#decision-lane-split-merge-7-batches-learned-where-they-run) |
+| reshard | – | Decision (lane split-merge-7): retired groups kept | [reshard.md](design/reshard.md#decision-lane-split-merge-7-retired-groups-kept) |
+| reshard | – | Decision (lane split-merge-7): a local database keeps its holding through its command | [reshard.md](design/reshard.md#decision-lane-split-merge-7-a-local-database-keeps-its-holding-through-its-command) |
 | semantics | 1 | TEXT is well-formed UTF-8 | [semantics.md](design/semantics.md#1-text-is-well-formed-utf-8) |
 | semantics | 2 | atanh's last digit is its platform's C library's | [semantics.md](design/semantics.md#2-atanhs-last-digit-is-its-platforms-c-librarys) |
 | store | 1 | A group commit with no timer | [store.md](design/store.md#1-a-group-commit-with-no-timer) |
@@ -175,7 +185,9 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | store | 38 | A page is searched by key heads once its searches have paid for them (prototype, behind a switch) | [store.md](design/store.md#38-a-page-is-searched-by-key-heads-once-its-searches-have-paid-for-them-prototype-behind-a-switch) |
 | store | 39 | A page read past the cache reads its own frames: pages new to a chain are page frames, a chain's entries records of one slot | [store.md](design/store.md#39-a-page-read-past-the-cache-reads-its-own-frames-pages-new-to-a-chain-are-page-frames-a-chains-entries-records-of-one-slot) |
 | store | 40 | A page read finds its frame and the log's header without the shared locks (prototype, behind a switch) | [store.md](design/store.md#40-a-page-read-finds-its-frame-and-the-logs-header-without-the-shared-locks-prototype-behind-a-switch) |
+| store | 41 | Skipping the descent: an adaptive hash against a learned leaf locator (prototypes, behind a switch) | [store.md](design/store.md#41-skipping-the-descent-an-adaptive-hash-against-a-learned-leaf-locator-prototypes-behind-a-switch) |
 | store | – | Decision (lane wal-read): a commit's records published at a lookup's cost, its deltas found a word at a time | [store.md](design/store.md#decision-lane-wal-read-a-commits-records-published-at-a-lookups-cost-its-deltas-found-a-word-at-a-time) |
+| store | 42 | The page path SQLite takes: plain pins, the pool's buffer counted once, misses read in line, checksums once (prototype, behind a switch) | [store.md](design/store.md#42-the-page-path-sqlite-takes-plain-pins-the-pools-buffer-counted-once-misses-read-in-line-checksums-once-prototype-behind-a-switch) |
 | without-rowid | – | Native primary-root query access | [without-rowid.md](design/without-rowid.md#native-primary-root-query-access) |
 | xgroup | – | The two protocols: two-phase commit and Parallel Commits behind a switch, two-phase locking without waiting | [xgroup.md](design/xgroup.md#the-two-protocols) |
 | xgroup | – | Crashes: every decision lives in a group, a new incarnation fences the old and finishes its transactions | [xgroup.md](design/xgroup.md#crashes) |

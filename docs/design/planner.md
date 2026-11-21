@@ -1430,7 +1430,22 @@ placed before other loops (the emitter's no-match path first).
 `answers.py`) for a query with a LEFT JOIN; or such a plan slower than its parent's on the bench
 suite beyond the passes' spread.
 
-## Decision (lane pl8-4): a hash join's build side can be a run of tables after the loops
+## Decision (lane pl8-4): an outer join's ON terms on an earlier table count given its filters
+
+**Decision.** PL.8's estimate (decision 21, CERT). An outer join's ON terms that read only an
+earlier table (lane pl8's `on_elsewhere`) were run over that table's sample apart from its filters,
+so a pair correlated on the sample counted as independent. Their share is now the earlier table's
+sample run with its filters and them together, over its filters alone (`cardinality.rs`,
+`JoinedSetRows::new`): the share of the rows its filters keep that the ON terms match, as the inner
+join reads the same terms together on the same sample.
+
+**Evidence.** `crates/engine/tests/sample_filters.rs`'s
+`an_outer_join_with_sampled_terms_is_estimated_at_least_its_inner_join`: `t0 AS a0 RIGHT JOIN t0 AS
+a1 ON NOT (a1.c0 GLOB 'a%') WHERE a1.c1 >= 3` was estimated at 0.684 against its inner join's 1 on
+main; it passes with the change.
+
+**Falsified by.** A CERT finding where an outer join's ON terms read only an earlier table.
+## Decision (lane pl8-5): a hash join's build side can be a run of tables after the loops
 
 **Decision.** PL.8, the emitter's half of bushy plans. A hash join's operation names a build group
 (`HashJoinOp::build_group`, `plan.rs`): the tables of a bushy plan's run `data[start..end]`
@@ -1458,15 +1473,6 @@ explicit stack with a budget derived from the plan-time target, falling back to 
 semi and anti join tables placed before other loops. The probe is read whole, as a hash join's
 probe is today; a probe that keeps its own access method would let the run's result join a loop
 read by a key.
-
-The estimate follows (decision 21, CERT): an outer join's ON terms that read only an earlier table
-(lane pl8's `on_elsewhere`) were run over that table's sample apart from its filters, so a pair
-correlated on the sample counted as independent. `t0 AS a0 RIGHT JOIN t0 AS a1 ON NOT (a1.c0 GLOB
-'a%') WHERE a1.c1 >= 3` was estimated at 0.684 against its inner join's 1
-(`sample_filters`' `an_outer_join_with_sampled_terms_is_estimated_at_least_its_inner_join`). Their
-share is now the earlier table's sample run with its filters and them together, over its filters
-alone (`cardinality.rs`, `JoinedSetRows::new`): the share of the rows its filters keep that the ON
-terms match, as the inner join reads the same terms together on the same sample.
 
 **Falsified by.** An answer of a plan the hook splits that differs from its left-deep plan's; a CERT
 finding where an outer join's ON terms read only an earlier table.
@@ -1578,6 +1584,65 @@ are the coordinator's.
 - A statement planned again many times as its table grows slowly, each plan the same: the error
   too tight to say when a plan could change.
 
+## Decision (lane pl13): a nested loop that turns into a hash join at the learned costs' break-even, and a plan made again past its estimate's error
+
+**Decision.** PL.13 (docs/research/planner.md section 9, rank 13; `crates/engine/translate/optimizer/adaptive.rs`).
+Two run-time checks, each a pure core the executor drives, each with a fixed few counters:
+- **The join switch.** A nested-loop or index join counts its outer rows. It turns into a hash join
+  at the first outer row whose count reaches the switch point `B x (1 + hash_build) / (seek - hash_probe)`:
+  `B` the inner side's rows, the three weights the learned costs' (decision QT.5,
+  `learned_costs.rs`), in rows' visits. That is the row at which the seeks' extra cost over probes
+  so far equals the cost of reading and building the inner side. Where a probe costs no less than a
+  seek there is no point: the join never switches. A planner that chose the nested loop did so for
+  an estimate below the point, so the switch fires only when the rows outgrow the estimate.
+  Switching there is the ski-rental rule: whatever the outer side's true size, the join costs less
+  than twice the cheaper of the two methods chosen in hindsight. Rows already joined by seeks are
+  not joined again: the probes take the rows after them, so the answer is the same rows.
+- **Re-optimization at a materialization point.** Where a plan holds an intermediate result whole
+  (a hash join's build side, a sorter, a materialized subquery), its rows are counted against the
+  estimate. Outside `estimate / (1 + error)` to `estimate x (1 + error)`, `error` the relative
+  standard error of the statistics the estimate came from (`1 / sqrt(n)` for a sample of `n`, as
+  decision "lane pl9" uses it), the rest of the statement is due to be planned again on the counted
+  rows. Within it, the estimate could not be told apart from its own noise, and nothing changes.
+- **Memory.** The switch's hash table is held to the hash table's share of the statement's budget
+  (`vdbe::hash_table::table_share`), measured before the switch by an upper bound known without
+  reading it (the inner table's pages). A materialization point counts the bytes it holds against
+  its budget. Past either, a typed refusal (`AdaptiveError`): the join stays a nested loop, the
+  plan under way goes on, both always correct answers.
+- Nothing is picked: the point moves with the learned weights and the inner side's rows, the band
+  with the statistics' own sample size.
+
+**Built so far.** The two cores and their tests. The executor's shell is the next piece: a join
+emitted with both inner loops (the seek and the hash probe, `main_loop/hash.rs`'s build emitted
+behind the switch's jump) and an instruction that steps the switch; and a materialization point
+that hands its counted rows to a second prepare of the statement's rest. Until it lands no plan
+switches.
+
+**Why.** Audit row 13 (`bench/planner/audit/10-no-adaptive.sql`): a nested loop chosen for an
+estimate ran on however many rows came, and an estimate wrong by orders of magnitude was never
+corrected within the statement.
+
+**Sources.** SQL Server's batch-mode adaptive joins (Microsoft Learn, intelligent query processing
+details; f32, A): a hash or nested-loop join chosen at run time within one plan, against a threshold
+SQL Server picks, which the learned costs replace here. Perron et al., "How I Learned to Stop
+Worrying and Love Re-optimization", ICDE 2019 (f34, A): re-optimizing at materialization points on
+observed cardinalities cut JOB's 20 longest queries by 27%. Karlin, Manasse, Rudolph and Sleator,
+"Competitive snoopy caching", Algorithmica 3, 1988: the ski-rental rule's bound of 2.
+
+**Evidence.** `adaptive.rs`'s unit tests: answers identical with the switch on and off over 300
+random joins with NULL and repeated keys (T-PL.13.1, against the cores' model join; the engine's
+own differential waits on the shell); the switch fires once past the point and never at an
+estimate below it, its cost under twice the best, refused over budget (T-PL.13.2); a new plan asked
+only outside the band, the bytes held bounded (T-PL.13.3). JOB's 20 slowest queries against the
+parent (AC-PL.13.1) are the coordinator's, once the shell lands.
+
+**Falsified by.**
+- JOB's 20 slowest queries not faster than the parent with the shell in (AC-PL.13.1).
+- A join that switched and ran slower than the nested loop it left, on the same rows: the learned
+  weights wrong for the inner side's access (its pages not cached as the seek weight assumes).
+- A statement planned again whose new plan is the old one, many times over: the band too tight to
+  say when a plan could change.
+
 ## 22. Correlated subqueries unnested by dependent joins taken apart, from a worklist (PL.10)
 
 **Decision.** `optimizer/unnest.rs` keeps its fixed patterns and adds the general forms of Neumann
@@ -1638,3 +1703,68 @@ outermost query, unnests every level. The measurements (AC-PL.10.1, q21 at SF 10
 T-PL.10.1 that differs between the forms; TPC-DS's ten queries no faster unnested; a query of the
 bench whose plan the general form made costlier than the patterns' (the three-way choice should
 make that impossible by estimate; the measurement says whether the estimate holds).
+
+## Decision (lane pl11): degree-sequence upper bounds guard each joined set's estimate
+
+**Decision.** PL.11 (docs/research/planner.md section 9, rank 11). ANALYZE's ordered scan of each
+index without a WHERE, which counts its distinct prefixes for `sqlite_stat1`, also keeps each
+prefix's degree sequence (the rows each distinct value holds) compressed to two norms as the scan
+closes each value's run: the largest degree (ℓ∞) and the sum of squared degrees (ℓ2 squared). ℓ1 is
+the table's rows, already counted. They go in `__turso_internal_column_stats` beside decision 20's
+sketches, `(tbl, index, 'degrees', data)`, 24 bytes a prefix (a u64 and a u128, little-endian: a
+format width), and load into `IndexStat::degrees` (`stats.rs`).
+
+`cardinality.rs`'s `DegreeBound` gives each joined set a proven upper bound: start from one
+table's rows, or from two tables joined on one column with the product of their columns' ℓ2 norms
+(Cauchy-Schwarz, the (2, 2) Hölder pair), then attach each other inner table by the largest degree
+of an index prefix whose every column is in an equivalence class with a table already attached, or
+by its rows where none is. Every order gives a bound; the least of those a greedy search finds from
+each start is kept. `JoinedSetRows::rows` cuts an estimate above it to it; an estimate below it is
+left as it is (the plan step: step 3's 791 underestimates stay).
+
+What the bound will not follow, so as never to claim a bound it hasn't proven:
+- an outer join's table (it keeps rows that match nothing): a set holding one has no bound;
+- a term whose columns differ in affinity or aren't BINARY, or an index column of another
+  collation or an expression: there the index's groups are not the term's;
+- a table without an ANALYZE count (a derived table, a table never analyzed).
+
+A semi or anti join's table never adds rows and counts as one. The rowid is one row a value. Rows
+added since ANALYZE (PL.9's live count) raise each count and each norm by their number:
+‖d + e‖p ≤ ‖d‖p + ‖e‖1.
+
+Of the norms, these three are the ones whose Hölder pairs (1, ∞), (2, 2) and (∞, 1) the kept set
+closes; LpBound keeps more and solves a linear program over them. That is the step to take if the
+coordinator's JOB and TPC-H counts show the bound too loose to matter.
+
+**Why.** At step 3, every prefix the estimates put above their true count is a plan chosen on rows
+that can't exist. An upper bound computed from statistics can't be exceeded by the truth, so a cut
+to it only moves an estimate towards the truth. Underestimates, step 3's majority, are untouched.
+
+**Sources.**
+- Zhang, Mayer, Khamis, Olteanu, Suciu, "LpBound: Pessimistic Cardinality Estimation Using
+  ℓp-Norms of Degree Sequences", SIGMOD 2025 (arXiv:2502.05912): a guaranteed upper bound from ℓp
+  norms of degree sequences, more accurate than mainstream estimators on JOB and STATS (f19, A).
+- Deeds, Suciu, Balazinska, "SafeBound", SIGMOD 2023: compressed degree sequences as bounds, "By
+  never underestimating, this approach allows the optimizer to avoid potentially inefficient plans"
+  (f40, C), and its open problem, updates without recomputing the sequences.
+- Hölder's inequality, Σ_v d_R(v)·d_S(v) ≤ ‖d_R‖p·‖d_S‖q for 1/p + 1/q = 1: the two-table case.
+
+**Evidence.** `cardinality.rs`'s `degree_bound_tests`:
+- `pl11_no_counted_join_exceeds_its_bound` (T-PL.11.1): 400 seeds of two to four random skewed
+  tables with NULLs, joined by chains, stars, cycles and repeated terms; every subset's counted
+  join at or below its bound, every bound finite.
+- `pl11_an_estimate_above_its_bound_is_capped_and_one_below_is_unchanged` (AC-PL.11.1).
+- `pl11_the_accumulator_keeps_each_prefixs_degree_norms`.
+
+`crates/engine/tests/column_stats.rs`'s `pl11_analyze_keeps_each_index_prefixs_degree_norms`:
+ANALYZE's norms equal a GROUP BY's counts on random data; a partial index keeps none.
+
+**Falsified by.**
+- A prefix of any query counted above its bound (the property test, or the coordinator's JOB and
+  TPC-H runs: AC-PL.11.1, prefixes estimated above their bound exactly 0).
+- An underestimate changed by the cut.
+
+**Open.** PL.9 counts rows inserted less rows deleted. An UPDATE that moves rows between values,
+or inserts that deletes cancel, aren't in it, so between ANALYZE runs the bound is proven for the
+net change only. Making it hold through every write takes a count of rows written, PL.9's call. A
+WITHOUT ROWID table's primary key keeps its norms but the bound doesn't yet read them.

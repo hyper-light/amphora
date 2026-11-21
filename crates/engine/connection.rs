@@ -515,6 +515,10 @@ pub struct Connection {
     pub(super) subquery_unnesting_mode: AtomicSubqueryUnnestingMode,
     /// Amphora: see [`Connection::set_join_methods`].
     pub(super) join_methods: AtomicJoinMethods,
+    /// Amphora: see [`Connection::set_sorted_fetches`].
+    pub(super) sorted_fetches: AtomicBool,
+    /// Amphora: see [`Connection::set_vectorized_scans`].
+    pub(super) vectorized_scans: AtomicBool,
     /// Per-connection runtime extension loading flag.
     pub(super) enable_load_extension: AtomicBool,
     /// Cumulative count of autonomous sequence inner-tx retries (each
@@ -964,6 +968,32 @@ impl Connection {
 
     pub(crate) fn join_methods(&self) -> JoinMethods {
         self.join_methods.get()
+    }
+
+    /// Amphora (G6 step 5, a prototype behind this switch, off by default): lets newly prepared
+    /// statements read a non-covering index's rowids into a sorted set and fetch the table's rows
+    /// in rowid order (a bitmap-style sorted fetch), chosen by cost against the plain index read.
+    /// Off until its measurement against the plain read (the coordinator's) says otherwise.
+    pub fn set_sorted_fetches(&self, on: bool) {
+        self.sorted_fetches.store(on, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn sorted_fetches(&self) -> bool {
+        self.sorted_fetches.load(Ordering::Acquire)
+    }
+
+    /// Amphora (query speed step 7, QT.7; a prototype behind this switch, off by default): newly
+    /// prepared read-only statements scan tables by decoding each leaf once into column batches
+    /// (`vdbe/leaf_batch.rs`) instead of each row's columns as they are read. Off until its
+    /// measurement against the row-at-a-time scan (the coordinator's) says otherwise.
+    pub fn set_vectorized_scans(&self, on: bool) {
+        self.vectorized_scans.store(on, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn vectorized_scans(&self) -> bool {
+        self.vectorized_scans.load(Ordering::Acquire)
     }
 
     /// Choose how correlated subqueries are planned in newly prepared statements.

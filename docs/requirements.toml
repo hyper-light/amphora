@@ -385,7 +385,10 @@ title = "Degree-sequence upper bounds as a guard (planner rank 11)"
 criteria = [
   { id = "AC-PL.11.1", text = "JOB and TPC-H prefixes estimated above their bound is exactly 0, with step 3's 791 underestimates left as they are" },
 ]
-tests = []
+# lane pl11
+tests = [
+  { id = "T-PL.11.1", text = "Random skewed tables joined by random = terms, every subset counted — passes when no count exceeds its degree-sequence bound and ANALYZE's norms equal a GROUP BY's counts" },
+]
 
 [[own]]
 id = "PL.12"
@@ -413,6 +416,9 @@ criteria = [
 ]
 tests = [
   { id = "T-PL.13.1", text = "A join whose build side outgrows its estimate mid-query — passes when it switches method within its memory bound and its answer is unchanged" },
+  # lane pl13
+  { id = "T-PL.13.2", text = "The switch fires once, at the first outer row whose count reaches the learned-cost switch point, never at the planner's estimate below it; its cost stays under twice the cheaper method in hindsight; over its memory budget it is refused with a typed error and the join stays a nested loop" },
+  { id = "T-PL.13.3", text = "A materialization point asks for a new plan only when its counted rows fall outside the estimate's band, estimate / (1 + error) to estimate x (1 + error); the rows it holds stay within their budget or are refused with a typed error" },
 ]
 
 # Amphora's own IDs for its query time (Amphora goal 7788ef29, kiln plan
@@ -509,6 +515,18 @@ tests = [
   { id = "T-NS.2.6", text = "SQL end to end through the switch and without it (CREATE TABLE, INSERT, SELECT, transactions) answers alike" },
 ]
 
+# lane g7s3
+[[own]]
+id = "NS.3"
+title = "Three ways to reach a cached page, prototyped against each other (G7 step 3)"
+criteria = [
+  { id = "AC-NS.3.1", text = "the three prototypes' costs on the corpus recorded side by side; the choice made by the numbers and recorded with the losers" },
+  { id = "AC-NS.3.2", text = "cycles per cached-page access with the winner against a hash-table lookup and pin falls by at least 50%" },
+]
+tests = [
+  { id = "T-NS.3.1", text = "The model test with eviction under 32 threads (crates/engine/storage/reach/model.rs) — passes when no stale or torn page read and no use after eviction, every page equal to the reference map" },
+]
+
 # lane follower-reads (G13 step 4, kiln goal 80d4cf5e; docs/design/replication.md, "Follower reads at a
 # closed time" and "Search over partitions"). AC-T1.10.3 and AC-T1.10.4 are the measures; these are what they
 # rest on.
@@ -600,6 +618,32 @@ tests = [
 ]
 
 [[own]]
+id = "CT.1"
+title = "The raft log's compaction due at an expansion learned where it runs, not a picked 128 MiB"
+criteria = [
+  { id = "AC-CT.1.1", text = "The replicated machine reports its image's bytes, so hyper-durable's compaction_due (Ongaro's thesis §5.1.2) weighs the log against the image it opened with, then the image it last made" },
+  { id = "AC-CT.1.2", text = "The owner times each image and each drive that applied entries on its own clock, per byte, with RFC 6298's decaying sums; the expansion is the image's cost over the replay's, raised to a whole factor (ski rental's break-even), one before both are measured; a stall compacts at once" },
+]
+tests = [
+  { id = "T-CT.1.1", text = "Nothing measured, one cost, samples of no time — passes when the factor is one" },
+  { id = "T-CT.1.2", text = "Images four times dearer a byte than replay, a third as dear, then dearer — passes when the factor is four, one, then follows the images up" },
+  { id = "T-CT.1.3", text = "A large and a tiny sample — passes when each weighs by its bytes" },
+  { id = "T-CT.1.4", text = "The driven compaction tests of database::replicated — passes when each compacts by the learned rule" },
+]
+
+[[own]]
+id = "EN.1"
+title = "A replicated command's and an image's envelope is what their encoding adds, not a picked mebibyte"
+criteria = [
+  { id = "AC-EN.1.1", text = "The bound past a command's or an image's page budget is postcard's most for its baseline prefix and declaration, its base, its page list's length and each page's id and length at the one page size admitted" },
+]
+tests = [
+  { id = "T-EN.1.1", text = "The widest prepared transaction at its whole budget — passes when it encodes within its bound, short only by the list length's unused varint bytes" },
+  { id = "T-EN.1.2", text = "The widest image at a lowered budget, and the full budget's arithmetic — passes the same" },
+  { id = "T-EN.1.3", text = "Postcard's varint widths and the declaration's — passes when each matches the encoder" },
+]
+
+[[own]]
 id = "WK.1"
 title = "The replicated owner wakes on its events and its next deadline, not a picked 1 ms poll"
 criteria = [
@@ -685,6 +729,9 @@ tests = [
   { id = "T-T1.9.R5", text = "The split and merge of T-T1.9.R4 with every action carried twice at the real groups, stale actions carried late and the driver restarted from the durable directory at the third action, the sixth, the twelfth and so on — passes when each operation still ends flipped, every acknowledged write is read back from exactly one group, and the one group left holds every row" },
   { id = "T-T1.9.P1", text = "The cutover-pause harness (AC-T1.9.2): one group of AMPHORA_RESHARD_PAUSE_ROWS rows split by the planner while clients write — prints each cutover's pause and the longest a write waited on a refusal; passes when every acknowledged write is read back from exactly one group" },
   { id = "T-T1.9.L1", text = "The lab harness (AC-T1.9.3): AMPHORA_RESHARD_OPS automatic operations chosen by the planner from measured rows, writes and cores, carried out while clients write — passes when writes lost is 0 and every key is in exactly one group's file" },
+  # lane split-merge-7
+  { id = "T-T1.9.R6", text = "A split and a merge back through the shell, the node started again by the directory from before both and the split's Create asked again — passes when the retired group is neither started nor made again but the Create is refused as of an ended operation, and every acknowledged row is in the one group left" },
+  { id = "T-T1.9.R7", text = "A local database as a group's engine, its holding fenced through the shell, then the group started again on the same file — passes when the fenced holding is answered after the restart, kept in the file as the Holding command left it" },
 ]
 
 # lane qs5
@@ -798,9 +845,43 @@ tests = [
   { id = "T-CS.3.1", text = "crates/columnar/tests/round_trip.rs — passes when every random and real-like column, of every size around the group and vector edges, decodes equal to the input in both codecs, every bit width packs and unpacks in both layouts, the schemes follow the data, and damaged encodings are refused" },
 ]
 
+# lane g11s4
+[[own]]
+id = "CS.4"
+title = "Vectorized scans with summaries on every core: granules sized by measurement, min/max and positional summaries, morsel-parallel scans (G11 step 4)"
+criteria = [
+  { id = "AC-CS.4.1", text = "filter_no_index at 1 client against CedarDB's is at least 1.0x (measured by the coordinator)" },
+  { id = "AC-CS.4.2", text = "table_count at 32 clients against ClickHouse's is at least 1.0x (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-CS.4.1", text = "cs4_vectors_equal_rows_every_class_{plain,packed} (crates/engine/storage/versioned/columns/scan.rs) — passes when, with writes between scans, some applied and some queued, rebuilds and held snapshots, every analytic class (filters of each comparison, aggregates, group-by, count) over the copy's granules equals the same statement row by row over the row B-tree, serially, split into partials merged in order, and on the morsel executor's four workers, and the summaries skipped granules" },
+  { id = "T-CS.4.2", text = "cs4_min_max_summaries_skip_granules — passes when a filter outside granules' min/max skips them unread and the answer equals the rows'" },
+  { id = "T-CS.4.3", text = "cs4_vectors_equal_rows_every_class_{plain,packed}, over key ranges — passes when a range scan skips blocks outside the range undecoded (by the blocks' key bounds), its granules hold every key of the range, and each class over the range equals the rows'" },
+]
+
 # lane groupcommit (G8 step 3, the versioned storage's log; docs/design/engine.md decision 11): no new
 # IDs. It serves AC-T1.4.2 and AC-T1.4.3 (`amphora-bench --vlog`) and T-T1.3.1
 # (crates/engine/tests/versioned_crash.rs).
+
+# lane qs6: query speed step 6 (G5 step 3), parallel execution in morsels (docs/design/executor.md
+# section 8).
+[[own]]
+id = "QT.6"
+title = "Parallel execution across cores: morsel-driven scans, hash joins, index lookups and aggregates"
+criteria = [
+  { id = "AC-QT.6.1", text = "TPC-H SF 10 median best time, the threads used stated, is at most 2,328.8 ms, by bench/planner/record.sh on jupiter, best of 3, each run begun at a load under 2" },
+  { id = "AC-QT.6.2", text = "JOB median best time over the parent's (step 5's end) is at most 0.42" },
+  { id = "AC-QT.6.3", text = "JOB's queries that ran in under 20 ms at the parent take at most 1.05 times as long, each query's best of 3" },
+  { id = "AC-QT.6.4", text = "Answers identical at every worker count; the threads used and the class-for-class comparison in the record" },
+]
+tests = [
+  { id = "T-QT.6.1", text = "Random filters, groupings and aggregates over random tables at 2, 3, 4 and 8 workers and random morsel sizes (vdbe/morsel.rs) — passes when every answer equals the serial one value for value" },
+  { id = "T-QT.6.2", text = "Random equi-joins probed in parallel (vdbe/morsel.rs) — passes when the matches equal the serial probe's in order and a nested loop's" },
+  { id = "T-QT.6.3", text = "A REAL sum's terms in several orders and split across partials — passes when one value, bit for bit" },
+  { id = "T-QT.6.4", text = "A statement whose workers together pass its memory budget — passes when refused with the typed error at every worker count and the budget never passed" },
+  { id = "T-QT.6.5", text = "The degree from stated costs — passes when off and short statements are serial, a long one uses more than one worker and no more than the cores, and morsels grow as dispatch grows against a row's cost" },
+  { id = "T-QT.6.6", text = "Every JOB and TPC-H query at 1, 2, 4, 8, 16 and 32 workers (the coordinator's) — passes when identical answers at every count" },
+]
 
 # lane g3s2
 # Amphora's own IDs for G3, point reads (kiln plan 01a16b0f464172dc80c7a3b9a14acbce): G3.n for its step n.
@@ -818,7 +899,57 @@ tests = [
   { id = "T-G3.2.2", text = "crates/engine/tests/log_read_index.rs — passes when, after a crash at every write of a checkpoint and of a log restart, every read through each way returns its page's last committed version" },
 ]
 
+# lane g3s5: G3 step 5 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), skipping the descent.
+[[own]]
+id = "G3.5"
+title = "Skipping the descent: adaptive hash index against a learned leaf locator (G3 step 5; store.md decision 42)"
+criteria = [
+  { id = "AC-G3.5.1", text = "each prototype's lookup and write (upkeep) costs recorded on every point-read and write class (measured by the coordinator)" },
+  { id = "AC-G3.5.2", text = "point_pk at 1 client with the winner rises at least 20% against after steps 2-4 (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-G3.5.1", text = "storage::descent_skip::tests::t_g3_5_1_* — passes when every lookup through the adaptive hash and the learned locator, under random inserts, deletes, splits and merges over pages two tables share, returns the row a plain descent returns" },
+  { id = "T-G3.5.2", text = "storage::descent_skip::tests::t_g3_5_2_* — passes when, over a table's complete fences, the locator names the leaf a descent finds for every covered rowid" },
+  { id = "T-G3.5.3", text = "storage::descent_skip::tests::engine::t_g3_5_3_* — passes when, on a real rowid table through committed rounds of inserts and range deletes, each prototype's page proven by its bytes gives the leaf and cell a cursor's descent stands on, or none when it finds none" },
+  # lane g3s5-2: the cursor hook.
+  { id = "T-G3.5.4", text = "storage::descent_skip::tests::engine::t_g3_5_4_* — passes when, through the real cursor on two connections writing in turns at different snapshots (inserts, splits, range deletes), every seek with each AMPHORA_DESCENT_SKIP setting stands on the leaf and cell, and returns the row, the plain descent does, every step after it reaches the same row, and the hook counts seeks that stood on a named leaf under both prototypes" },
+]
+
 # lane regions (G14 step 1, CP-T1.11; docs/design/regions.md): no new IDs. It serves AC-T1.11.4
 # (crates/amphora/tests/regions.rs, ac_t1_11_4_*: the corpus on the simulated lab at one node, three
 # nodes and three regions) and AC-T1.11.2's lab (crates/amphora/examples/regions_lab.rs; the 60 ms run
 # and its p99 are the coordinator's).
+# lane g3s3
+
+[[own]]
+id = "G3.3"
+title = "The page path SQLite takes: plain pins, recycled buffers, checksums once (G3 step 3; store.md decision 42)"
+criteria = [
+  { id = "AC-G3.3.1", text = "atomic read-modify-writes per point_pk lookup are at most 2 (perf: atomic instructions per statement; measured by the coordinator)" },
+  { id = "AC-G3.3.2", text = "allocations per point_pk lookup are at most 1 (a counting allocator; measured by the coordinator)" },
+  { id = "AC-G3.3.3", text = "page cache, pager, checksums, atomics and I/O completion together are at most 15% of a point read's user cycles (bench/prof_parts.py; measured by the coordinator)" },
+  { id = "AC-G3.3.4", text = "a byte flipped on disk is still refused when read from the file" },
+]
+tests = [
+  { id = "T-G3.3.1", text = "crates/engine/tests/shared_pages.rs g3s3_readers_on_the_plain_page_path_* — passes when the shared-pages model's reads on the plain path are the model's, on page and mixed logs" },
+  { id = "T-G3.3.2", text = "crates/engine/tests/shared_pages.rs g3s3_each_page_path_reads_the_pages_todays_path_reads — passes when the plain path reads today's rows from the log, the file and memory, with and without shared pages" },
+  { id = "T-G3.3.3", text = "crates/engine/tests/shared_pages.rs g3s3_a_byte_flipped_on_disk_is_refused_on_each_page_path — passes when a fresh connection on each path refuses the flipped page with a checksum error" },
+  { id = "T-G3.3.4", text = "storage::pager::tests::g3s3_plain_pins_count_as_atomic_pins_do — passes when plain pins count as atomic pins do" },
+  { id = "T-G3.3.5", text = "crates/engine/tests/shared_pages.rs g3s3_plain_misses_read_into_the_pages_evictions_leave — passes when a table four times the cache reads today's rows on the plain path and its misses read into recycled pages" },
+  { id = "T-G3.3.6", text = "crates/engine/tests/page_path_allocs.rs — passes when the plain path's point lookups that miss allocate less than today's and its hits no more (a counting allocator; --nocapture prints allocations per lookup, AC-G3.3.2's harness)" },
+]
+
+# lane qs7
+[[own]]
+id = "QT.7"
+title = "Vectorized scans on the row store: a leaf decoded once into column batches (query-time step 7; with G5 step 2)"
+criteria = [
+  { id = "AC-QT.7.1", text = "q06 at SF 1 in cache on one thread is at most 41 ns a lineitem row, by q06's best time over 6,001,215 rows, bench/planner/record.sh on jupiter" },
+  { id = "AC-QT.7.2", text = "TPC-H SF 10 median best time on one thread is at most 2,329 ms, by bench/planner/record.sh on jupiter, workers off" },
+  { id = "AC-QT.7.3", text = "JOB median best time over the parent's is at most 1.05, by bench/planner/record.sh on jupiter, change and parent" },
+]
+tests = [
+  { id = "T-QT.7.1", text = "Batched against row-at-a-time on random tables and predicates: NULLs, every storage class, affinities, a collation, overflow pages, deleted rows, columns added after rows were written, ascending and descending scans — passes when identical results and rows were read from batches" },
+  { id = "T-QT.7.2", text = "A batch budget smaller than one page's cells, and one below a single row's charge — passes when the scan decodes several windows a leaf, or falls back to row-at-a-time by its stated rule, with identical results and nothing batched past the budget" },
+  { id = "T-QT.7.3", text = "A program that writes the table it scans, and a statement prepared before the switch turns on — passes when the writing program reads row-at-a-time and the statement is prepared again with batches" },
+]

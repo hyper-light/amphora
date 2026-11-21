@@ -58,6 +58,8 @@ pub(crate) struct JoinPlanningContext<'a> {
     pub allow_automatic_index: bool,
     /// Amphora: the join methods the connection allows (`Connection::set_join_methods`).
     pub join_methods: crate::JoinMethods,
+    /// Amphora: whether a sorted fetch may be planned (`Connection::set_sorted_fetches`).
+    pub sorted_fetches: bool,
     /// Amphora: the rows a LIMIT (and OFFSET) leaves a one-table read to produce before it stops
     /// (`docs/design/planner.md` decisions 16 and 17), None when it reads to its end.
     pub row_goal: Option<RowGoal>,
@@ -72,6 +74,7 @@ impl<'a> JoinPlanningContext<'a> {
             cost_limit: None,
             allow_automatic_index: true,
             join_methods: crate::JoinMethods::ByCost,
+            sorted_fetches: false,
             row_goal: None,
         }
     }
@@ -1037,7 +1040,9 @@ fn join_lhs_and_rhs<'a>(
                                 // Materialize build-side rowids so the hash build only includes
                                 // rows that already match prior join constraints.
                                 *materialize_build_input = true;
-                                let materialize_cost = effective_build_cardinality * 0.003;
+                                // A row's visit each, at the row's learned cost (QT.5).
+                                let materialize_cost =
+                                    effective_build_cardinality * params.cpu_cost_per_row;
                                 hash_join_method.cost =
                                     hash_join_method.cost + Cost(materialize_cost);
                                 // When two materialized hash-join plans have equal cost,

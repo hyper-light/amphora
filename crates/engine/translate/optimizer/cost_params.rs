@@ -57,11 +57,6 @@ pub struct CostModelParams {
     pub in_subquery_rows: f64,
 
     // === Scan/Seek Cost Weights ===
-    /// Cost multiplier for repeated page reads during scans and index searches.
-    /// Range: [0, 1). Lower values assume more cache reuse.
-    /// A value of 0.2 charges a repeated page read at 20% of its first-read cost.
-    pub cache_reuse_factor: f64,
-
     /// CPU cost per row processed (relative to page IO = 1.0).
     pub cpu_cost_per_row: f64,
 
@@ -76,13 +71,17 @@ pub struct CostModelParams {
     /// default page cache, 2,000 pages; planning replaces it with the connection's.
     pub cache_pages: f64,
 
+    /// Amphora (QT.5): the share of the pages a plan would first read from a cold cache that it
+    /// reads from the file: the connection's recent page fetches' share that read a file
+    /// (`Pager::page_miss_ratio`), set as the statement is planned. 1, every such page read, until
+    /// the connection has fetched a page; pages a cache too small for the plan reads again are read
+    /// whatever it is (`cost::file_reads`).
+    pub page_miss: f64,
+
     /// Amphora: the memory a statement's hash and group tables hold together before they spill,
     /// in bytes (`docs/design/executor.md`, decision 8): the connection's own cache
     /// (`Pager::statement_memory_budget`). Planning replaces the default, nothing, with it.
     pub statement_memory: usize,
-
-    /// Bonus subtracted from cost when using an index (encourages index usage).
-    pub index_bonus: f64,
 
     // === Sort Cost ===
     /// CPU cost per row for sorting (used in O(n log n) estimate).
@@ -130,13 +129,12 @@ impl CostModelParams {
             in_subquery_rows: 25.0,
 
             // Scan/Seek costs
-            cache_reuse_factor: 0.2,
             cpu_cost_per_row: 0.003,
             cpu_cost_per_where_step: 0.003,
             cpu_cost_per_seek: 0.01,
             cache_pages: 2000.0,
+            page_miss: 1.0,
             statement_memory: 0,
-            index_bonus: 0.5,
 
             // Sort costs
             sort_cpu_per_row: 0.002,
@@ -220,8 +218,10 @@ impl CostModelParams {
 
     /// Amphora (QT.5): these parameters with the seek's, the hash table's build and probe and the
     /// sort's weights learned where the engine runs (`learned_costs`), each its multiple of a row's
-    /// visit times `cpu_cost_per_row`. The learned build and probe times include hashing the key,
-    /// so `hash_cpu_cost` adds nothing to them. None, a clock that never moved, leaves these.
+    /// visit times `cpu_cost_per_row`; and `cpu_cost_per_row` itself, the row's visit against a
+    /// page read, once the database has timed one. The learned build and probe times include
+    /// hashing the key, so `hash_cpu_cost` adds nothing to them. None, a clock that never moved,
+    /// leaves these.
     pub(crate) fn with_learned(
         &self,
         learned: Option<super::learned_costs::LearnedWeights>,
@@ -229,13 +229,15 @@ impl CostModelParams {
         let Some(learned) = learned else {
             return self.clone();
         };
-        let row = self.cpu_cost_per_row;
+        let row = learned.row_in_pages.unwrap_or(self.cpu_cost_per_row);
         Self {
+            cpu_cost_per_row: row,
             cpu_cost_per_seek: row * learned.seek,
             hash_cpu_cost: 0.0,
             hash_insert_cost: row * learned.hash_build,
             hash_lookup_cost: row * learned.hash_probe,
             sort_cpu_per_row: row * learned.sort,
+            page_miss: learned.page_miss.unwrap_or(1.0),
             ..self.clone()
         }
     }
@@ -339,15 +341,8 @@ impl CostModelParams {
             return Err("in_subquery_rows must be positive".into());
         }
 
-        // Cache reuse factor must be in [0, 1)
         if self.cache_pages < 1.0 {
             return Err("cache_pages must be at least 1".into());
-        }
-        if self.cache_reuse_factor < 0.0 || self.cache_reuse_factor >= 1.0 {
-            return Err(format!(
-                "cache_reuse_factor must be in [0, 1), got {}",
-                self.cache_reuse_factor
-            ));
         }
 
         // Cost multipliers must be non-negative
@@ -410,21 +405,6 @@ mod tests {
             ..Default::default()
         };
         assert!(params.validate().is_err());
-    }
-
-    #[test]
-    fn test_cache_reuse_bounds() {
-        let mut params = CostModelParams {
-            cache_reuse_factor: 1.0,
-            ..Default::default()
-        };
-        assert!(params.validate().is_err());
-
-        params.cache_reuse_factor = -0.1;
-        assert!(params.validate().is_err());
-
-        params.cache_reuse_factor = 0.99;
-        assert!(params.validate().is_ok());
     }
 
     #[cfg(feature = "serde")]

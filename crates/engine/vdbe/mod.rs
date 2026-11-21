@@ -34,7 +34,9 @@ pub mod group_table;
 #[allow(dead_code)]
 pub mod hash_table;
 pub mod insn;
+pub mod leaf_batch;
 pub mod metrics;
+pub mod morsel;
 #[cfg(test)]
 mod native_extension_tests;
 pub mod row_counts;
@@ -957,6 +959,8 @@ pub struct ProgramState {
     /// Amphora: the rows each of the program's counters counted this run, by its slot
     /// (`row_counts.rs`); empty unless the program has counters.
     pub(crate) row_counts: Vec<u64>,
+    /// Amphora (QT.7): this run's column batches (`leaf_batch.rs`).
+    pub(crate) leaf_batches: leaf_batch::LeafBatches,
     op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
@@ -1020,6 +1024,9 @@ pub struct ProgramState {
     /// the statement subtransactionwill roll back.
     fk_immediate_violations_during_stmt: AtomicIsize,
     uses_subjournal: bool,
+    /// Amphora (G7 step 2, `AC-NS.2.1`): this write statement in an explicit transaction opened a
+    /// savepoint of the versioned storage's transaction, to undo it alone.
+    versioned_statement: bool,
     /// Amphora: this write statement in an explicit transaction kept no statement journal (its
     /// connection's are off): undoing it alone means rolling back the whole transaction.
     skipped_subjournal: bool,
@@ -1103,6 +1110,7 @@ impl ProgramState {
             seek_state: OpSeekState::Start,
             metrics: StatementMetrics::new(),
             row_counts: Vec::new(),
+            leaf_batches: leaf_batch::LeafBatches::default(),
             distinct_key_values: Vec::new(),
             op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
@@ -1117,6 +1125,7 @@ impl ProgramState {
             ephemeral_temp_files: HashMap::default(),
             ephemeral_kept: HashMap::default(),
             uses_subjournal: false,
+            versioned_statement: false,
             skipped_subjournal: false,
             is_active_write: false,
             has_stmt_transaction: false,
@@ -1264,6 +1273,7 @@ impl ProgramState {
         } else {
             self.row_counts.fill(0);
         }
+        self.leaf_batches.clear();
         self.deferred_seeks.iter_mut().for_each(|s| *s = None);
         self.ended_coroutine.clear();
         self.once.clear();
@@ -1310,6 +1320,7 @@ impl ProgramState {
                 .retain(|cursor_id, _| kept.contains_key(cursor_id));
         }
         self.uses_subjournal = false;
+        self.versioned_statement = false;
         self.skipped_subjournal = false;
         self.is_active_write = false;
         self.has_stmt_transaction = false;
@@ -1582,6 +1593,10 @@ impl ProgramState {
     ) -> IOResultOr<()> {
         let in_explicit_txn = !connection.auto_commit.load(Ordering::SeqCst);
         if write && in_explicit_txn {
+            if let Some(switch) = connection.versioned.as_ref() {
+                switch.begin_statement()?;
+                self.versioned_statement = true;
+            }
             // Check if MVCC is active - if so, use MVCC savepoints instead of pager savepoints
             if let Some(mv_store) = connection.mv_store().as_ref() {
                 if let Some(tx_id) = connection.get_mv_tx_id() {
@@ -1648,6 +1663,11 @@ impl ProgramState {
 
         // Drain attached pagers upfront so we can clean them up regardless of path.
         let attached_pagers: Vec<Arc<Pager>> = std::mem::take(&mut self.attached_savepoint_pagers);
+        if std::mem::take(&mut self.versioned_statement) {
+            if let Some(switch) = connection.versioned.as_ref() {
+                switch.end_statement(matches!(end_statement, EndStatement::RollbackSavepoint))?;
+            }
+        }
         let result = match end_statement {
             EndStatement::ReleaseSavepoint => {
                 if let Some(mv_store) = connection.mv_store().as_ref() {
@@ -1956,6 +1976,9 @@ pub struct PreparedProgram {
     /// Amphora: the program's row counters, by slot (`row_counts.rs`); empty unless the
     /// connection asked for them when it prepared the program.
     pub row_count_sites: Vec<row_counts::RowCountSite>,
+    /// Amphora (query speed step 7, QT.7): the scanned table cursors whose leaves are decoded
+    /// into column batches, when the connection's switch was on as the program was built.
+    pub leaf_batch_plan: Option<Arc<leaf_batch::BatchPlan>>,
 }
 
 #[derive(Clone)]
