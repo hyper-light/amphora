@@ -4115,6 +4115,17 @@ impl Pager {
     /// Amphora: the pages a read finds without reading the file: this connection's page cache and
     /// the pages its database shares (decision 20), as the planner counts them
     /// (`docs/design/planner.md`, decision 5).
+    /// Amphora (docs/design/executor.md, decision 8; QT.5): the memory a statement's hash and
+    /// group tables hold together before they spill: the connection's own cache in bytes, as
+    /// SQLite sizes its sorter's memory from the connection's `cache_size`
+    /// (`sqlite3VdbeSorterInit`, `src/vdbesort.c`). The process's shared pool is left out: every
+    /// connection's statements would each be given all of it.
+    pub fn statement_memory_budget(&self) -> usize {
+        let pages = self.page_cache.read().capacity();
+        let page_size = usize::try_from(self.shared.page_size.load(Ordering::SeqCst)).unwrap_or(0);
+        pages.saturating_mul(page_size)
+    }
+
     pub fn cached_page_capacity(&self) -> usize {
         let private = self.page_cache.read().capacity();
         let shared = self

@@ -48,7 +48,7 @@ use crate::vdbe::affinity::{
 };
 use crate::vdbe::group_table;
 use crate::vdbe::hash_table::{
-    HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
+    table_share, HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert,
 };
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::metrics::HashJoinMetrics;
@@ -17857,7 +17857,8 @@ pub fn op_hash_build(
     let mem_budget = if matches!(temp_store, crate::TempStore::Memory) {
         usize::MAX
     } else {
-        data.mem_budget
+        // Amphora: the statement's budget at prepare, shared by its tables (decision 8).
+        table_share(data.mem_budget, program.memory_tables)
     };
     if let std::collections::hash_map::Entry::Vacant(e) =
         state.hash_tables.entry(data.hash_table_id)
@@ -17965,7 +17966,8 @@ pub fn op_hash_distinct(
     let mem_budget = if matches!(temp_store, crate::TempStore::Memory) {
         usize::MAX
     } else {
-        DEFAULT_MEM_BUDGET
+        // Amphora: the statement's budget, shared by its tables (decision 8).
+        table_share(pager.statement_memory_budget(), program.memory_tables)
     };
     if let std::collections::hash_map::Entry::Vacant(e) =
         state.hash_tables.entry(data.hash_table_id)
@@ -18049,7 +18051,7 @@ pub fn op_group_find(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Arc<Pager>,
+    pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(GroupFind { data }, insn);
     // A table past its budget sends its new groups' rows to the sorter; with temp_store=memory
@@ -18060,7 +18062,8 @@ pub fn op_group_find(
     ) {
         usize::MAX
     } else {
-        DEFAULT_MEM_BUDGET
+        // Amphora: the statement's budget, shared by its tables (decision 8).
+        table_share(pager.statement_memory_budget(), program.memory_tables)
     };
     let table = state.group_tables.entry(data.table_id).or_insert_with(|| {
         group_table::GroupTable::new(data.num_keys, data.collations.clone(), budget)

@@ -203,6 +203,20 @@ pub struct ReparseSchemaInner {
     phase: ReparsePhase,
 }
 
+/// Amphora: the join methods newly prepared statements may plan (`Connection::set_join_methods`):
+/// by cost, or one method only, for the differential tests that run every join both ways and the
+/// measurement the planner's join costs are derived from (docs/design/executor.md, decision 8;
+/// QT.5).
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum JoinMethods {
+    /// The cheapest by the planner's costs.
+    ByCost = 0,
+    /// Index nested loops wherever a join can take them, with no automatic index or hash join.
+    NestedLoopsOnly = 1,
+    /// A hash join wherever the join can take one.
+    HashJoinsOnly = 2,
+}
+
 /// Test-only control over correlated-subquery rewrites.
 #[cfg(feature = "simulator")]
 #[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
@@ -473,6 +487,8 @@ pub struct Connection {
     /// Simulator-only planner control used by the differential fuzzer.
     #[cfg(feature = "simulator")]
     pub(super) subquery_unnesting_mode: AtomicSubqueryUnnestingMode,
+    /// Amphora: see [`Connection::set_join_methods`].
+    pub(super) join_methods: AtomicJoinMethods,
     /// Per-connection runtime extension loading flag.
     pub(super) enable_load_extension: AtomicBool,
     /// Cumulative count of autonomous sequence inner-tx retries (each
@@ -912,6 +928,16 @@ impl Connection {
     #[inline]
     pub(crate) fn prepare_context_generation(&self) -> u64 {
         self.prepare_context_generation.load(Ordering::Acquire)
+    }
+
+    /// Amphora: chooses the join methods newly prepared statements may plan.
+    pub fn set_join_methods(&self, methods: JoinMethods) {
+        self.join_methods.set(methods);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn join_methods(&self) -> JoinMethods {
+        self.join_methods.get()
     }
 
     /// Choose how correlated subqueries are planned in newly prepared statements.

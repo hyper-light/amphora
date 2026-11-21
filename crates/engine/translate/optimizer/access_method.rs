@@ -23,7 +23,6 @@ use crate::translate::plan::{
 };
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
 use crate::{
     schema::{FromClauseSubquery, Index, IndexColumn, Table},
     translate::plan::{IndexMethodQuery, IterationDirection, JoinOrderMember, JoinedTable},
@@ -1522,6 +1521,7 @@ pub fn try_hash_join_access_method(
     subqueries: &[NonFromClauseSubquery],
     joined_tables: &[JoinedTable],
     params: &CostModelParams,
+    prefer_seeks: bool,
 ) -> Result<Option<AccessMethod>> {
     if probe_table
         .join_info
@@ -1566,8 +1566,9 @@ pub fn try_hash_join_access_method(
         return Ok(None);
     }
 
-    // Prefer nested loops when an index can read the join columns.
-    for join_key in &join_keys {
+    // Prefer nested loops when an index can read the join columns, unless the connection asks for
+    // hash joins only (`prefer_seeks` false; Amphora's executor decision 8).
+    for join_key in join_keys.iter().filter(|_| prefer_seeks) {
         let probe_expr = join_key.get_probe_expr(where_clause);
         if expr_is_simple_column_from_table(probe_expr, probe_table.internal_id)
             && probe_index_can_seek_join_key(
@@ -1646,7 +1647,7 @@ pub fn try_hash_join_access_method(
         probe_cardinality,
         build_cardinality * estimated_rows_per_outer_row * probe_multiplier,
         hash_join_type,
-        DEFAULT_MEM_BUDGET,
+        params.statement_memory,
         probe_multiplier,
         params,
     );
@@ -1661,7 +1662,7 @@ pub fn try_hash_join_access_method(
             build_table_idx,
             probe_table_idx,
             join_keys: join_keys.into_vec(),
-            mem_budget: DEFAULT_MEM_BUDGET,
+            mem_budget: params.statement_memory,
             materialize_build_input: false,
             use_bloom_filter: false,
             join_type: hash_join_type,

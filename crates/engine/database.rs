@@ -2705,6 +2705,9 @@ impl Database {
             subquery_unnesting_mode: crate::connection::AtomicSubqueryUnnestingMode::new(
                 crate::connection::SubqueryUnnestingMode::Auto,
             ),
+            join_methods: crate::connection::AtomicJoinMethods::new(
+                crate::connection::JoinMethods::ByCost,
+            ),
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),

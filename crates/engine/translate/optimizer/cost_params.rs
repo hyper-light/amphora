@@ -76,6 +76,11 @@ pub struct CostModelParams {
     /// default page cache, 2,000 pages; planning replaces it with the connection's.
     pub cache_pages: f64,
 
+    /// Amphora: the memory a statement's hash and group tables hold together before they spill,
+    /// in bytes (`docs/design/executor.md`, decision 8): the connection's own cache
+    /// (`Pager::statement_memory_budget`). Planning replaces the default, nothing, with it.
+    pub statement_memory: usize,
+
     /// Bonus subtracted from cost when using an index (encourages index usage).
     pub index_bonus: f64,
 
@@ -124,6 +129,7 @@ impl CostModelParams {
             cpu_cost_per_where_step: 0.003,
             cpu_cost_per_seek: 0.01,
             cache_pages: 2000.0,
+            statement_memory: 0,
             index_bonus: 0.5,
 
             // Sort costs
@@ -156,6 +162,14 @@ impl CostModelParams {
     pub fn with_cache_pages(&self, pages: usize) -> Self {
         Self {
             cache_pages: pages as f64,
+            ..self.clone()
+        }
+    }
+
+    /// Amphora: these parameters with the statement's memory, `bytes` (executor decision 8).
+    pub fn with_statement_memory(&self, bytes: usize) -> Self {
+        Self {
+            statement_memory: bytes,
             ..self.clone()
         }
     }

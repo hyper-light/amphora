@@ -134,6 +134,9 @@ pub fn translate(
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
     // Amphora: what a table lookup costs depends on what the connection caches (decision 5).
     resolver.set_cache_pages(connection.get_pager().cached_page_capacity());
+    // Amphora: what its hash and group tables hold before they spill (executor decision 8).
+    resolver.set_statement_memory(connection.get_pager().statement_memory_budget());
+    resolver.set_join_methods(connection.join_methods());
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here
