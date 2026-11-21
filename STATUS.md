@@ -466,6 +466,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (PL.7, e0e7a1df), bushy plans with CD-C (PL.8, c837cde3), statistics kept as rows change (PL.9,
   26302efe), unnesting by dependent joins (PL.10, 61c79bd1), upper bounds as a guard (PL.11,
   f4e0bd7f), custom then generic plans (PL.12, aa0541f6) and adaptive joins (PL.13, 4f237e07).
+  PL.12 is built (lane pl12, docs/design/planner.md "custom plans, then a generic one"): a statement
+  whose estimates read a parameter's value is planned with each run's values until its own measured
+  costs say the generic plan does as well; one whose estimates read none keeps its generic plan. Its
+  TPC-H prepared measurement (AC-PL.12.1; its harness, `amphora-bench --planner --prepared` with
+  qgen's parameters, is written: bench/planner/README.md) and the suite's (AC-PL.12.2) are open.
 - **G11, analytics at column-store speed** (docs/design/columnar.md, decision 1; sources in
   docs/research/columnar.md; CS.1): decided, not built. Columns are a copy derived from the rows, fed
   by each commit's redo record after the commit, exact at every snapshot by a journal of changed keys

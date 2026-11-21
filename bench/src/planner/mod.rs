@@ -12,6 +12,7 @@
 mod answers;
 mod data;
 mod engines;
+mod prepared;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -39,6 +40,11 @@ struct Opts {
     out: PathBuf,
     resume: bool,
     answers: Option<PathBuf>,
+    /// PL.12: the prepared templates (`--prepared`), qgen's values for them (`--params`) and the
+    /// plan cache modes each runs under (`--plan-cache-modes`).
+    prepared: Option<PathBuf>,
+    params: Option<PathBuf>,
+    plan_cache_modes: Vec<String>,
 }
 
 fn opts() -> anyhow::Result<Opts> {
@@ -60,6 +66,9 @@ fn opts() -> anyhow::Result<Opts> {
         out: PathBuf::new(),
         resume: false,
         answers: None,
+        prepared: None,
+        params: None,
+        plan_cache_modes: vec!["generic".into(), "auto".into()],
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -83,12 +92,22 @@ fn opts() -> anyhow::Result<Opts> {
             "--out" => o.out = v()?.into(),
             "--resume" => o.resume = true,
             "--answers" => o.answers = Some(v()?.into()),
-            other => anyhow::bail!("unknown argument {other} (--planner takes --bench job|tpch, --data, --queries, --sf, --dir, --targets, --runs, --timeout-s, --count-timeout-s, --dsn, --cache-mib, --only, --max-load, --load-wait-s, --out, --resume, --answers)"),
+            "--prepared" => o.prepared = Some(v()?.into()),
+            "--params" => o.params = Some(v()?.into()),
+            "--plan-cache-modes" => o.plan_cache_modes = v()?.split(',').map(str::to_owned).collect(),
+            other => anyhow::bail!("unknown argument {other} (--planner takes --bench job|tpch, --data, --queries, --sf, --dir, --targets, --runs, --timeout-s, --count-timeout-s, --dsn, --cache-mib, --only, --max-load, --load-wait-s, --out, --resume, --answers, --prepared, --params, --plan-cache-modes)"),
         }
     }
     anyhow::ensure!(matches!(o.bench.as_str(), "job" | "tpch"), "--bench is job or tpch");
     anyhow::ensure!(!o.data.as_os_str().is_empty() && !o.queries.as_os_str().is_empty() && !o.dir.as_os_str().is_empty() && !o.out.as_os_str().is_empty(), "--planner needs --data, --queries, --dir and --out");
     anyhow::ensure!(o.runs > 0, "--runs is at least 1");
+    if o.prepared.is_some() {
+        anyhow::ensure!(o.bench == "tpch" && o.params.is_some() && o.targets == ["amphora"], "--prepared runs TPC-H on amphora alone, with --params");
+        anyhow::ensure!(!o.plan_cache_modes.is_empty(), "--plan-cache-modes names at least one");
+        for m in &o.plan_cache_modes {
+            prepared::mode(m)?;
+        }
+    }
     Ok(o)
 }
 
@@ -353,6 +372,29 @@ pub fn main() -> anyhow::Result<()> {
         "max_load": o.max_load,
         "engines": engines,
     }))?;
+    // --prepared: each query prepared once and run with qgen's parameters under each plan cache
+    // mode (PL.12, AC-PL.12.1; prepared.rs).
+    if let (Some(dir), Some(params)) = (&o.prepared, &o.params) {
+        let params_text = std::fs::read_to_string(params).map_err(|e| anyhow::anyhow!("{}: {e}", params.display()))?;
+        for (name, _) in &b.queries {
+            if !o.only.is_empty() && !o.only.contains(name) {
+                continue;
+            }
+            let path = dir.join(format!("{name}.sql"));
+            let sql = std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+            let sql = for_dialect(sql.trim().trim_end_matches(';'), engines::Dialect::Lite);
+            let sets = prepared::params(&params_text, name)?;
+            anyhow::ensure!(!sets.seeds.is_empty(), "{}: no parameters for {name}", params.display());
+            let Some(amphora) = targets.iter_mut().find_map(|t| t.amphora()) else { anyhow::bail!("--prepared runs on amphora") };
+            let load = quiet(o.max_load, o.load_wait);
+            let mut record = prepared::query(amphora, name, &sql, &sets, &o.plan_cache_modes, o.runs, o.timeout)?;
+            record["load"] = load.into();
+            let total = |m: &str| record["modes"][m]["total_ms"].as_f64().map_or_else(|| "no time".to_owned(), |ms| format!("{ms:.1} ms"));
+            eprintln!("{name} prepared: generic {}, auto {} (auto/generic {}), custom plans {}, answers differ for seeds {}", total("generic"), total("auto"), record["auto_over_generic"], record["modes"]["auto"]["custom_plans"], record["differ"]);
+            write(record)?;
+        }
+        return Ok(());
+    }
     // --answers: a directory for the benchmark (TPC-H's named with its scale factor, tpch-sf1, as
     // record.sh names its benchmarks), and in it one for each query.
     let answers_root = o.answers.as_ref().map(|dir| dir.join(if o.bench == "tpch" { format!("tpch-sf{}", o.sf) } else { o.bench.clone() }));

@@ -192,6 +192,9 @@ pub struct Resolver<'a> {
     /// costs (`docs/design/planner.md`, decision 5): the connection's, set at prepare; the engine's
     /// default page cache until then.
     cache_pages: usize,
+    /// Amphora (PL.12): the values the estimates may read for the statement's parameters (none for
+    /// the generic plan), and where they note that one asked; set at prepare.
+    plan_values: Option<Arc<crate::plan_cache::PlanValues>>,
     /// Amphora: the memory a statement's hash and group tables hold together (decision 8 of
     /// docs/design/executor.md): `Pager::statement_memory_budget`.
     statement_memory: usize,
@@ -324,6 +327,7 @@ impl<'a> Resolver<'a> {
             dialect,
             trigger_context: None,
             cache_pages: crate::storage::page_cache::DEFAULT_PAGE_CACHE_SIZE_IN_PAGES,
+            plan_values: None,
             statement_memory: 0,
             learned_weights: None,
             join_methods: crate::JoinMethods::ByCost,
@@ -359,6 +363,16 @@ impl<'a> Resolver<'a> {
     /// Amphora: sets the pages a read finds without reading the file: the connection's.
     pub(crate) fn set_cache_pages(&mut self, pages: usize) {
         self.cache_pages = pages;
+    }
+
+    /// Amphora (PL.12): the values the statement's estimates may read, if any were set.
+    pub(crate) fn plan_values(&self) -> Option<&Arc<crate::plan_cache::PlanValues>> {
+        self.plan_values.as_ref()
+    }
+
+    /// Amphora (PL.12): sets the values the statement's estimates may read.
+    pub(crate) fn set_plan_values(&mut self, values: Arc<crate::plan_cache::PlanValues>) {
+        self.plan_values = Some(values);
     }
 
     pub fn statement_memory(&self) -> usize {
@@ -414,6 +428,7 @@ impl<'a> Resolver<'a> {
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             cache_pages: self.cache_pages,
+            plan_values: self.plan_values.clone(),
             statement_memory: self.statement_memory,
             learned_weights: self.learned_weights,
             join_methods: self.join_methods,
@@ -445,6 +460,7 @@ impl<'a> Resolver<'a> {
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             cache_pages: self.cache_pages,
+            plan_values: self.plan_values.clone(),
             statement_memory: self.statement_memory,
             learned_weights: self.learned_weights,
             join_methods: self.join_methods,
