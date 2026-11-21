@@ -14,8 +14,14 @@
 //! A mixed generation ([`MIXED_FORMAT`], decision 37) holds page frames and records side by side:
 //! spills write page frames (over the transaction's own, decision 30), commits write records. A
 //! record's first slot carries [`RECORD_HEAD`] with its slot count, apart from page numbers.
+//!
+//! A mixed generation of [`MIXED_FRAMES_FORMAT`] (decision 39) writes a commit's pages by what a
+//! read of them needs: a page the log can't chain from is a page frame, as page-a-frame writes it;
+//! the entries of chains (deltas, and the images that end a chain) are packed into records of one
+//! slot each ([`one_slot_records`]), and a chain may begin at a page frame. A read past the cache
+//! then reads one frame for each entry of its page's chain.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -37,19 +43,36 @@ pub(crate) const PACKED_FORMAT: u32 = 0x414d_5002;
 pub(crate) const MIXED_FORMAT: u32 = 0x414d_5003;
 
 /// The packed format whose chains end where their bytes reach a page (decision 17, 2026-11-11):
-/// what a generation begins with now. A binary from before refuses it as a format it doesn't
+/// what a packed generation begins with now. A binary from before refuses it as a format it doesn't
 /// know, naming the value, never reads it as corrupt.
 pub(crate) const PACKED_CHAINS_FORMAT: u32 = 0x414d_5004;
 
-/// The mixed format whose chains end where their bytes reach a page (decision 17, 2026-11-11).
+/// The mixed format whose chains end where their bytes reach a page (decision 17, 2026-11-11), laid
+/// out as decision 37 has it: read as ever, and written so while a generation begun so goes on.
 pub(crate) const MIXED_CHAINS_FORMAT: u32 = 0x414d_5005;
+
+/// The log header's file format for a mixed generation whose images of pages new to a chain are
+/// page frames, a chain's entries records of one slot, and whose chains may begin at a page frame
+/// (decision 39), its chains ended by their bytes as [`MIXED_CHAINS_FORMAT`]'s are (decision 17):
+/// what a mixed generation begins with now. A binary that knows only [`MIXED_FORMAT`] or
+/// [`MIXED_CHAINS_FORMAT`] refuses it by name rather than misread a chain that begins at a page
+/// frame. (0x414d_5006 is a value no binary writes: tests use it as an unknown format.)
+pub(crate) const MIXED_FRAMES_FORMAT: u32 = 0x414d_5007;
+
+/// Whether a generation of `file_format` writes its pages new to a chain as page frames and its
+/// chains' entries as records of one slot (decision 39); a generation of another format is written
+/// as it began.
+pub(crate) fn images_as_frames(file_format: u32) -> bool {
+    file_format == MIXED_FRAMES_FORMAT
+}
 
 /// Deltas in a row at most in a generation of [`PACKED_FORMAT`] or [`MIXED_FORMAT`]: those
 /// formats' bound, to which binaries from before 2026-11-11 hold what they read.
 pub(crate) const EIGHT_DELTAS: u8 = 8;
 
 /// Deltas in a row at most in a generation of `file_format`: [`EIGHT_DELTAS`] in the formats of
-/// before, the depth field's width ([`MOST_DELTAS`]) in those of chains ended by their bytes.
+/// before, the depth field's width ([`MOST_DELTAS`]) in those of chains ended by their bytes
+/// ([`PACKED_CHAINS_FORMAT`], [`MIXED_CHAINS_FORMAT`], [`MIXED_FRAMES_FORMAT`]).
 pub(crate) fn most_deltas(file_format: u32) -> u8 {
     match file_format {
         PACKED_FORMAT | MIXED_FORMAT => EIGHT_DELTAS,
@@ -79,7 +102,7 @@ impl LogFormat {
         match file_format {
             PAGE_FORMAT => Some(Self::Pages),
             PACKED_FORMAT | PACKED_CHAINS_FORMAT => Some(Self::Packed),
-            MIXED_FORMAT | MIXED_CHAINS_FORMAT => Some(Self::Mixed),
+            MIXED_FORMAT | MIXED_CHAINS_FORMAT | MIXED_FRAMES_FORMAT => Some(Self::Mixed),
             _ => None,
         }
     }
@@ -89,7 +112,7 @@ impl LogFormat {
         match self {
             Self::Pages => PAGE_FORMAT,
             Self::Packed => PACKED_CHAINS_FORMAT,
-            Self::Mixed => MIXED_CHAINS_FORMAT,
+            Self::Mixed => MIXED_FRAMES_FORMAT,
         }
     }
 
@@ -238,7 +261,8 @@ fn raw_len_bound(page_size: usize) -> Result<usize> {
 /// not to try, stored length 0 and the raw bytes as they are (an LZ4 block of anything is never
 /// empty). The raw bytes are [entry
 /// count] then each entry's header ([page][kind][depth][0u16][body length]) then the bodies, in
-/// order, integers big-endian. With it, the record as a read decodes it.
+/// order, integers big-endian. With it, the record as a read decodes it, built from the entries
+/// it was made of rather than parsed again (each was checked as it was laid in).
 pub(crate) fn encode(
     entries: &[(u32, Body<'_>)],
     page_size: usize,
@@ -254,6 +278,12 @@ pub(crate) fn encode(
         .ok_or_else(|| corrupt("record too large"))?;
     let mut raw = Vec::with_capacity(len);
     raw.extend_from_slice(&count.to_be_bytes());
+    let mut made = Vec::with_capacity(entries.len());
+    let mut body_at = entries
+        .len()
+        .checked_mul(ENTRY_HEADER)
+        .and_then(|n| n.checked_add(4))
+        .ok_or_else(|| corrupt("entry headers overflow"))?;
     for (page, body) in entries {
         let (kind, ok) = match body {
             Body::Image(image) => (IMAGE, image.len() == page_size),
@@ -271,6 +301,17 @@ pub(crate) fn encode(
         raw.extend_from_slice(&page.to_be_bytes());
         raw.extend_from_slice(&[kind, body.depth(), 0, 0]);
         raw.extend_from_slice(&body_len.to_be_bytes());
+        let end = body_at
+            .checked_add(body.bytes().len())
+            .ok_or_else(|| corrupt("entry length overflows"))?;
+        made.push(Entry {
+            page: *page,
+            kind,
+            depth: body.depth(),
+            start: body_at,
+            end,
+        });
+        body_at = end;
     }
     for (_, body) in entries {
         raw.extend_from_slice(body.bytes());
@@ -292,7 +333,89 @@ pub(crate) fn encode(
     payload.extend_from_slice(&raw_len.to_be_bytes());
     payload.extend_from_slice(stored);
     drop(compressed);
-    Ok((payload, Record::parse(raw, page_size)?))
+    Ok((payload, Record::index(made, raw)?))
+}
+
+/// What [`one_slot_records`] made of a commit's entries of chains: each record's entries (indexes
+/// into the entries it was given), its payload and the record as a read decodes it; and the images
+/// that take more than a slot alone, which the caller writes as page frames.
+pub(crate) struct OneSlot {
+    pub(crate) records: Vec<(Vec<usize>, Vec<u8>, Record)>,
+    pub(crate) frames: Vec<usize>,
+}
+
+/// A commit's entries of chains (deltas, and the images that end a chain) as records of one slot
+/// each (decision 39), so a read past the cache reads one slot for each entry of its page's chain
+/// where a record of many slots had it read them all. Entries go largest first, each into the
+/// first record with room left for it (first-fit decreasing, which takes at most 11/9 of the fewest
+/// records and one more: Dósa, ESCAPE 2007), an image sized by what LZ4 makes of it alone and a
+/// delta by its bytes. Each record is then LZ4'd where that makes it smaller; an entry its record
+/// can't hold once encoded moves to a record of its own. An image LZ4 can't fit in a slot is left
+/// for a page frame; a delta too large for a slot takes the slots it needs, in a record of its own.
+pub(crate) fn one_slot_records(entries: &[(u32, Body<'_>)], page_size: usize) -> Result<OneSlot> {
+    if entries.len() > MOST_PAGES {
+        return Err(corrupt("a record holds 1 to 1024 pages"));
+    }
+    let fixed = PAYLOAD_HEADER
+        .checked_add(4)
+        .ok_or_else(|| corrupt("record too large"))?;
+    let mut sized = Vec::with_capacity(entries.len());
+    let mut frames = Vec::new();
+    for (index, (_, body)) in entries.iter().enumerate() {
+        let len = match body {
+            Body::Image(image) => lz4_flex::block::compress(image).len().min(image.len()),
+            Body::Delta { runs, .. } => runs.len(),
+        };
+        let size = ENTRY_HEADER
+            .checked_add(len)
+            .ok_or_else(|| corrupt("entry too large"))?;
+        let alone = fixed
+            .checked_add(size)
+            .ok_or_else(|| corrupt("entry too large"))?;
+        if alone > page_size && matches!(body, Body::Image(_)) {
+            frames.push(index);
+        } else {
+            sized.push((index, size, alone));
+        }
+    }
+    sized.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    // Each record's entries and the bytes they take with its header.
+    let mut bins: Vec<(Vec<usize>, usize)> = Vec::new();
+    for (index, size, alone) in sized {
+        let room = bins.iter_mut().find_map(|(held, used)| {
+            let after = used.checked_add(size).filter(|&n| n <= page_size)?;
+            Some((held, used, after))
+        });
+        match room {
+            Some((held, used, after)) => {
+                held.push(index);
+                *used = after;
+            }
+            None => bins.push((vec![index], alone)),
+        }
+    }
+    let mut records = Vec::with_capacity(bins.len());
+    let mut queue: VecDeque<Vec<usize>> = bins.into_iter().map(|(held, _)| held).collect();
+    let mut part: Vec<(u32, Body<'_>)> = Vec::with_capacity(entries.len());
+    // Each pass encodes a record or moves one entry out of it: at most twice the entries.
+    while let Some(mut held) = queue.pop_front() {
+        part.clear();
+        for &index in &held {
+            let entry = entries
+                .get(index)
+                .copied()
+                .ok_or_else(|| corrupt("an entry past the commit's"))?;
+            part.push(entry);
+        }
+        let (payload, record) = encode(&part, page_size, true)?;
+        if payload.len() <= page_size || held.len() == 1 {
+            records.push((held, payload, record));
+        } else if let Some(moved) = held.pop() {
+            queue.push_front(held);
+            queue.push_back(vec![moved]);
+        }
+    }
+    Ok(OneSlot { records, frames })
 }
 
 /// Byte ranges of `new` that differ from `base` closer than this are one run: a run's header costs
@@ -309,51 +432,89 @@ pub(crate) fn diff(base: &[u8], new: &[u8], tail: usize, most: usize) -> Option<
     // The tail counts as changed byte by byte: where the buffer's stale copy happens to equal the
     // new one, the log's copy can still differ.
     let carried = new.len().saturating_sub(tail);
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    // Runs are written as their ranges close: one buffer, taken at the most a delta may hold.
+    let mut runs = Vec::with_capacity(most.min(new.len()));
+    let mut open: Option<(usize, usize)> = None;
+    // A word of 8 bytes at a time, each compared as one integer (`differing`): a word as it was,
+    // none of it carried, costs one comparison, and a page's changes are a few runs in it
+    // (decision 17), so most words are. No block size is picked: the integer's width is the unit.
     for (word, (a, b)) in base.chunks(8).zip(new.chunks(8)).enumerate() {
         let at = word.checked_mul(8)?;
         let end = at.checked_add(a.len())?;
         let forced = (end > carried).then(|| carried.max(at).saturating_sub(at));
-        if a == b && forced.is_none() {
+        let Some((differs_first, differs_last)) =
+            differing(a, b).or_else(|| forced.map(|f| (f, f)))
+        else {
             continue;
-        }
-        let differs = a.iter().zip(b).position(|(x, y)| x != y);
-        let first = match (differs, forced) {
-            (Some(d), Some(f)) => d.min(f),
-            (Some(d), None) => d,
-            (None, Some(f)) => f,
-            (None, None) => continue,
+        };
+        let first = match forced {
+            Some(f) => differs_first.min(f),
+            None => differs_first,
         };
         // A forced suffix runs to the chunk's end.
         let last = match forced {
             Some(_) => a.len().checked_sub(1)?,
-            None => a.iter().zip(b).rposition(|(x, y)| x != y)?,
+            None => differs_last,
         };
         let (start, stop) = (
             at.checked_add(first)?,
             at.checked_add(last)?.checked_add(1)?,
         );
-        match ranges.last_mut() {
-            Some(prev) if start <= prev.1.saturating_add(RUN_GAP) => {
-                prev.0 = prev.0.min(start);
-                prev.1 = prev.1.max(stop);
+        open = match open {
+            Some((from, to)) if start <= to.saturating_add(RUN_GAP) => {
+                Some((from.min(start), to.max(stop)))
             }
-            _ => ranges.push((start, stop)),
-        }
+            Some(closed) => {
+                put_run(&mut runs, new, closed, most)?;
+                Some((start, stop))
+            }
+            None => Some((start, stop)),
+        };
     }
-    let mut runs = Vec::new();
-    for (start, end) in ranges {
-        let len = end.checked_sub(start)?;
-        let offset = u16::try_from(start).ok()?;
-        let less_one = u16::try_from(len.checked_sub(1)?).ok()?;
-        runs.extend_from_slice(&offset.to_be_bytes());
-        runs.extend_from_slice(&less_one.to_be_bytes());
-        runs.extend_from_slice(new.get(start..end)?);
-        if runs.len() >= most {
-            return None;
-        }
+    if let Some(closed) = open {
+        put_run(&mut runs, new, closed, most)?;
     }
     Some(runs)
+}
+
+/// The first and last byte at which two chunks of `diff` differ, if any: a whole word of 8 (a
+/// `u64`'s width) is compared as one integer, its first and last differing bytes the trailing and
+/// leading zero bytes of the two XORed (little-endian, so the first byte is the lowest), where a
+/// byte at a time took up to 16 comparisons a word (Decision (lane wal-read)). A chunk shorter than
+/// a word (the end of a page whose size isn't a multiple of 8) is compared byte by byte.
+fn differing(a: &[u8], b: &[u8]) -> Option<(usize, usize)> {
+    match (<[u8; 8]>::try_from(a), <[u8; 8]>::try_from(b)) {
+        (Ok(a), Ok(b)) => {
+            let x = u64::from_le_bytes(a) ^ u64::from_le_bytes(b);
+            if x == 0 {
+                return None;
+            }
+            let first = usize::try_from(x.trailing_zeros() / 8).ok()?;
+            let last = 7usize.checked_sub(usize::try_from(x.leading_zeros() / 8).ok()?)?;
+            Some((first, last))
+        }
+        _ => {
+            let first = a.iter().zip(b).position(|(x, y)| x != y)?;
+            let last = a.iter().zip(b).rposition(|(x, y)| x != y)?;
+            Some((first, last))
+        }
+    }
+}
+
+/// Writes the run of `new`'s bytes `range` covers into `runs`: none (the page is then written
+/// whole) once they take `most` bytes or more.
+fn put_run(runs: &mut Vec<u8>, new: &[u8], range: (usize, usize), most: usize) -> Option<()> {
+    let (start, end) = range;
+    let len = end.checked_sub(start)?;
+    let offset = u16::try_from(start).ok()?;
+    let less_one = u16::try_from(len.checked_sub(1)?).ok()?;
+    runs.extend_from_slice(&offset.to_be_bytes());
+    runs.extend_from_slice(&less_one.to_be_bytes());
+    runs.extend_from_slice(new.get(start..end)?);
+    if runs.len() >= most {
+        return None;
+    }
+    Some(())
 }
 
 /// Applies a delta's runs to `image`, which they turn into the page's next version.
@@ -568,6 +729,12 @@ impl Record {
         if body_at != raw.len() {
             return Err(corrupt("bytes after the last entry"));
         }
+        Self::index(entries, raw)
+    }
+
+    /// A record of `entries` (each its body's place in `raw`), each found by its page; a page
+    /// twice in it is refused.
+    fn index(entries: Vec<Entry>, raw: Vec<u8>) -> Result<Self> {
         let mut by_page: Vec<(u32, usize)> = entries
             .iter()
             .enumerate()
@@ -618,22 +785,53 @@ impl Record {
     }
 }
 
-/// Bytes the decoded records may hold, the oldest going first past it. The writer keeps each record
-/// it publishes, and reads (a reader's miss, the checkpoint's copies, a page's chain back to its
-/// image) mostly want recent ones: a chain of a page changed at every commit reaches back as many
-/// commits as its deltas take less than the page. Chosen, a group's share of the
-/// memory, not yet measured; a record not kept is read and decoded again.
-pub(crate) const DECODED_BUDGET: usize = 4 << 20;
+/// Bytes the decoded records may hold, the oldest going first past it: what a connection's page
+/// cache holds by default (`page_cache::DEFAULT_PAGE_CACHE_SIZE_IN_PAGES` pages of `page_size`, the
+/// budget Amphora's readers keep, decision 5). A decoded record stands for the pages reads rebuild
+/// from it, so the records kept take no more than the pages a cache keeps (decision 39). The writer
+/// keeps each record it publishes, and reads (a miss's chain back to its image, the checkpoint's
+/// copies) mostly want recent ones: a chain of a page changed at every commit reaches back as many
+/// commits as its deltas take less than the page (decision 17). A record not kept is read again, a
+/// slot (decision 39) or the record it was.
+pub(crate) fn decoded_budget(page_size: usize) -> usize {
+    // A budget past what memory can address is all of it.
+    crate::storage::page_cache::DEFAULT_PAGE_CACHE_SIZE_IN_PAGES.saturating_mul(page_size)
+}
 
 /// What the shared log keeps of its packed records: each record's slot count by its first slot
-/// (written before any page maps to the record), and records decoded, keyed by the log's
-/// generation (its header's checkpoint sequence) and first slot, within [`DECODED_BUDGET`].
+/// (written before any page maps to the record), and records decoded, each with the log's generation
+/// (its header's checkpoint sequence) it was kept for, within [`decoded_budget`].
+///
+/// Publishing a record, which the writer does for every record it commits, costs a lookup, not a
+/// pass over what is kept: a commit of decision 39 publishes a record for every slot of its chains'
+/// entries, and a pass over the hundreds of records the budget keeps, at each of them, was the
+/// commit's cost (Decision (lane wal-read)).
 #[derive(Debug, Default)]
 pub(crate) struct Records {
-    slots: FxHashMap<u64, u32>,
-    decoded: FxHashMap<(u32, u64), Arc<Record>>,
-    order: VecDeque<(u32, u64)>,
+    /// Slot counts by first slot, in frame order: the record that covers a frame is the last one
+    /// that begins at or before it.
+    slots: BTreeMap<u64, u32>,
+    /// The records kept decoded, by first slot.
+    decoded: FxHashMap<u64, Kept>,
+    /// The first slots in the order their records were kept, each with its keep's number: an entry
+    /// whose record went (published over, dropped, or kept again) no longer matches its number and
+    /// is passed over. Stale entries are swept once they outnumber the records kept: a sweep then
+    /// costs no more than twice the stale entries it removes, so each costs a constant share of
+    /// one, and the order holds at most twice the records kept and one more. No number is picked:
+    /// the bound is where stale entries pass live ones.
+    order: VecDeque<(u64, u64)>,
+    /// The next keep's number.
+    kept: u64,
     bytes: usize,
+}
+
+/// A record [`Records`] keeps decoded: the generation it is of, its keep's number in
+/// `Records::order`, and the record.
+#[derive(Debug)]
+struct Kept {
+    generation: u32,
+    number: u64,
+    record: Arc<Record>,
 }
 
 impl Records {
@@ -641,7 +839,7 @@ impl Records {
     /// (a rollback or a restart can lay a new record in the same slots).
     pub(crate) fn publish(&mut self, head: u64, slots: u32) {
         self.slots.insert(head, slots);
-        self.forget(|(_, h)| h == head);
+        self.release(head);
     }
 
     /// The slots of the record at `head`.
@@ -651,44 +849,89 @@ impl Records {
 
     /// The first slot of the record whose slots hold `frame`, if one does.
     pub(crate) fn covering(&self, frame: u64) -> Option<u64> {
-        self.slots.iter().find_map(|(head, slots)| {
-            let last = head.checked_add(u64::from(*slots))?.checked_sub(1)?;
-            if *head <= frame && frame <= last {
-                Some(*head)
-            } else {
-                None
-            }
-        })
+        let (&head, &slots) = self.slots.range(..=frame).next_back()?;
+        let last = head.checked_add(u64::from(slots))?.checked_sub(1)?;
+        (frame <= last).then_some(head)
     }
 
     /// The record at `head` of `generation`, if it was decoded and kept.
     pub(crate) fn decoded(&self, generation: u32, head: u64) -> Option<Arc<Record>> {
-        self.decoded.get(&(generation, head)).cloned()
+        self.decoded
+            .get(&head)
+            .filter(|kept| kept.generation == generation)
+            .map(|kept| kept.record.clone())
     }
 
-    /// Keeps a decoded record, the oldest kept going first past the budget.
-    pub(crate) fn keep(&mut self, generation: u32, head: u64, record: Arc<Record>) {
+    /// Keeps a decoded record of a log of `page_size` pages, the oldest kept going first past the
+    /// budget ([`decoded_budget`]). One of another generation kept at the same first slot goes.
+    pub(crate) fn keep(
+        &mut self,
+        generation: u32,
+        head: u64,
+        record: Arc<Record>,
+        page_size: usize,
+    ) {
+        let budget = decoded_budget(page_size);
         let size = record.size();
-        if size > DECODED_BUDGET || self.decoded.contains_key(&(generation, head)) {
+        if size > budget {
             return;
         }
-        while self.bytes.saturating_add(size) > DECODED_BUDGET {
-            let Some(oldest) = self.order.pop_front() else {
+        match self.decoded.get(&head) {
+            Some(kept) if kept.generation == generation => return,
+            Some(_) => self.release(head),
+            None => {}
+        }
+        while self.bytes.saturating_add(size) > budget {
+            let Some((oldest, number)) = self.order.pop_front() else {
                 break;
             };
-            if let Some(gone) = self.decoded.remove(&oldest) {
-                self.bytes = self.bytes.saturating_sub(gone.size());
+            if self
+                .decoded
+                .get(&oldest)
+                .is_some_and(|kept| kept.number == number)
+            {
+                self.release(oldest);
             }
         }
-        self.decoded.insert((generation, head), record);
-        self.order.push_back((generation, head));
+        let number = self.kept;
+        self.kept = self.kept.wrapping_add(1);
+        self.decoded.insert(
+            head,
+            Kept {
+                generation,
+                number,
+                record,
+            },
+        );
+        self.order.push_back((head, number));
         self.bytes = self.bytes.saturating_add(size);
+        if self.order.len() > self.decoded.len().saturating_mul(2) {
+            let decoded = &self.decoded;
+            self.order.retain(|(head, number)| {
+                decoded.get(head).is_some_and(|kept| kept.number == *number)
+            });
+        }
     }
 
     /// Forgets the records past `max_frame` (a rollback's).
     pub(crate) fn drop_after(&mut self, max_frame: u64) {
-        self.slots.retain(|head, _| *head <= max_frame);
-        self.forget(|(_, h)| h > max_frame);
+        let Some(from) = max_frame.checked_add(1) else {
+            return;
+        };
+        drop(self.slots.split_off(&from));
+        let mut freed = 0usize;
+        self.decoded.retain(|head, kept| {
+            if *head > max_frame {
+                freed = freed.saturating_add(kept.record.size());
+                false
+            } else {
+                true
+            }
+        });
+        self.bytes = self.bytes.saturating_sub(freed);
+        let decoded = &self.decoded;
+        self.order
+            .retain(|(head, number)| decoded.get(head).is_some_and(|kept| kept.number == *number));
     }
 
     /// Forgets every record (a restart's or a truncation's).
@@ -699,18 +942,11 @@ impl Records {
         self.bytes = 0;
     }
 
-    fn forget(&mut self, gone: impl Fn((u32, u64)) -> bool) {
-        let mut freed = 0usize;
-        self.decoded.retain(|key, record| {
-            if gone(*key) {
-                freed = freed.saturating_add(record.size());
-                false
-            } else {
-                true
-            }
-        });
-        self.order.retain(|key| !gone(*key));
-        self.bytes = self.bytes.saturating_sub(freed);
+    /// Drops the record decoded at `head`, if one is kept; its entry in `order` goes stale.
+    fn release(&mut self, head: u64) {
+        if let Some(gone) = self.decoded.remove(&head) {
+            self.bytes = self.bytes.saturating_sub(gone.record.size());
+        }
     }
 }
 
@@ -990,11 +1226,11 @@ mod tests {
         let mut records = Records::default();
         for head in 1..=40u64 {
             records.publish(head * 10, 3);
-            records.keep(1, head * 10, big.clone());
-            assert!(records.bytes <= DECODED_BUDGET);
+            records.keep(1, head * 10, big.clone(), size);
+            assert!(records.bytes <= decoded_budget(size));
         }
         assert!(
-            big.size() * 2 < DECODED_BUDGET,
+            big.size() * 2 < decoded_budget(size),
             "the test keeps two or more"
         );
         assert!(records.decoded(1, 400).is_some(), "the newest is kept");
@@ -1011,6 +1247,44 @@ mod tests {
         records.clear();
         assert_eq!(records.slots_of(10), None);
         assert_eq!(records.bytes, 0);
+    }
+
+    /// Decision (lane wal-read), AC-T1.1.3: do: publish records over kept ones at the same first
+    /// slots, round after round, as a commit's are. Expect: the registry's order of keeps stays at
+    /// most twice the records kept and one more, its bytes are the kept records' sizes, the newest
+    /// are kept, a record of another generation at the same first slot is never given out, and a
+    /// rollback leaves no stale keep listed.
+    #[test]
+    fn records_published_over_kept_ones_leave_a_bounded_order() {
+        let size = 4096;
+        let a = page(1, size);
+        let pages: Vec<(u32, &[u8])> = (1..=2u32).map(|p| (p, &a[..])).collect();
+        let small = Arc::new(encode(&images(&pages), size, true).unwrap().1);
+        let mut records = Records::default();
+        for round in 0..50u64 {
+            for head in 1..=100u64 {
+                records.publish(head, 1);
+                records.keep(1, head, small.clone(), size);
+                assert!(
+                    records.order.len() <= records.decoded.len() * 2 + 1,
+                    "round {round}, head {head}: {} keeps listed for {} kept",
+                    records.order.len(),
+                    records.decoded.len()
+                );
+            }
+        }
+        assert_eq!(records.bytes, records.decoded.len() * small.size());
+        assert!(records.decoded(1, 100).is_some(), "the newest is kept");
+        records.keep(2, 100, small.clone(), size);
+        assert!(
+            records.decoded(1, 100).is_none(),
+            "another generation's record at the same slot replaced it"
+        );
+        assert!(records.decoded(2, 100).is_some());
+        assert_eq!(records.bytes, records.decoded.len() * small.size());
+        records.drop_after(50);
+        assert!(records.decoded(1, 50).is_some() && records.decoded(1, 51).is_none());
+        assert_eq!(records.order.len(), records.decoded.len());
     }
 
     #[test]
@@ -1055,12 +1329,230 @@ mod tests {
         for format in [LogFormat::Pages, LogFormat::Packed, LogFormat::Mixed] {
             assert_eq!(LogFormat::of(format.file_format()), Some(format));
         }
+        // A generation begins with the format of chains ended by their bytes (decision 17); a mixed
+        // one with page frames for images new to a chain too (decision 39). One begun before keeps
+        // its format, read as ever and written as it began, its chains at its format's bound.
+        assert_eq!(LogFormat::Packed.file_format(), PACKED_CHAINS_FORMAT);
+        assert_eq!(LogFormat::Mixed.file_format(), MIXED_FRAMES_FORMAT);
         assert_eq!(LogFormat::of(PACKED_FORMAT), Some(LogFormat::Packed));
         assert_eq!(LogFormat::of(MIXED_FORMAT), Some(LogFormat::Mixed));
+        assert_eq!(LogFormat::of(MIXED_CHAINS_FORMAT), Some(LogFormat::Mixed));
+        assert!(images_as_frames(MIXED_FRAMES_FORMAT));
+        for older in [
+            PAGE_FORMAT,
+            PACKED_FORMAT,
+            MIXED_FORMAT,
+            PACKED_CHAINS_FORMAT,
+            MIXED_CHAINS_FORMAT,
+        ] {
+            assert!(!images_as_frames(older), "{older:#x}");
+        }
         assert_eq!(most_deltas(PACKED_FORMAT), EIGHT_DELTAS);
         assert_eq!(most_deltas(MIXED_FORMAT), EIGHT_DELTAS);
         assert_eq!(most_deltas(PACKED_CHAINS_FORMAT), MOST_DELTAS);
         assert_eq!(most_deltas(MIXED_CHAINS_FORMAT), MOST_DELTAS);
+        assert_eq!(most_deltas(MIXED_FRAMES_FORMAT), MOST_DELTAS);
         assert_eq!(LogFormat::of(0x414d_5006), None);
+    }
+
+    /// Do: change pages of 4 KiB at random places (none, one byte, runs across the edges of the
+    /// words diff compares at once, the checksum's tail), diff them against the page before,
+    /// with a tail carried and without. Expect: the runs turn the page before into the page
+    /// after every time, the carried tail among them, and an unchanged page with nothing carried
+    /// gives no runs.
+    #[test]
+    fn a_delta_found_word_by_word_rebuilds_every_change() {
+        let size = 4096;
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let base = page(9, size);
+        assert_eq!(diff(&base, &base, 0, size), Some(Vec::new()));
+        for round in 0..400 {
+            let mut new = base.clone();
+            for _ in 0..(round % 7) {
+                let at = (next() as usize) % size;
+                let len = 1 + (next() as usize) % 90;
+                for b in new.iter_mut().skip(at).take(len) {
+                    *b = b.wrapping_add(1);
+                }
+            }
+            // Edges of the words compared at once.
+            if round % 5 == 0 {
+                let edge = 8 * (1 + (next() as usize) % (size / 8 - 1));
+                new[edge - 1] ^= 0x80;
+                new[edge] ^= 0x40;
+            }
+            for tail in [0usize, 8] {
+                let Some(runs) = diff(&base, &new, tail, size) else {
+                    continue;
+                };
+                let mut rebuilt = base.clone();
+                apply(&runs, &mut rebuilt).unwrap();
+                assert_eq!(rebuilt, new, "round {round}, tail {tail}");
+                if tail > 0 {
+                    let mut stale = new.clone();
+                    stale[size - tail..].copy_from_slice(&base[size - tail..]);
+                    apply(&runs, &mut stale).unwrap();
+                    assert_eq!(stale, new, "the tail carried, round {round}");
+                }
+            }
+        }
+    }
+
+    /// The records `packed` holds, decoded, with what each holds; every entry once in all.
+    fn unpacked(packed: &OneSlot, entries: &[(u32, Body<'_>)], size: usize) -> Vec<u32> {
+        let mut seen: Vec<usize> = packed.frames.clone();
+        for (held, payload, record) in &packed.records {
+            let decoded = Record::decode(payload, size).unwrap();
+            for &index in held {
+                let (page, body) = entries[index];
+                let got = decoded
+                    .body(page)
+                    .expect("a record holds what it was given");
+                assert_eq!(got.depth(), body.depth());
+                assert_eq!(got.bytes(), body.bytes());
+                assert!(record.body(page).is_some());
+            }
+            assert_eq!(decoded.pages().count(), held.len());
+            seen.extend(held);
+        }
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0..entries.len()).collect::<Vec<_>>(),
+            "each entry once"
+        );
+        packed
+            .records
+            .iter()
+            .map(|(_, payload, _)| slots(payload.len(), size).unwrap())
+            .collect()
+    }
+
+    /// Do: pack a commit's entries of chains (images that LZ4 halves, deltas of a few hundred
+    /// bytes) into records of one slot (decision 39). Expect: every record one slot, each entry in
+    /// one record and decoding as it went in, and no more records than first-fit decreasing's
+    /// bound over the bytes (11/9 of a slot's worth and one more).
+    #[test]
+    fn a_chains_entries_pack_into_records_of_one_slot() {
+        let size = 4096;
+        // Compressible images: a run of zeros past a patterned half.
+        let image = |fill: u8| {
+            let mut p = page(fill, size);
+            p[size / 2..].fill(0);
+            p
+        };
+        let images: Vec<Vec<u8>> = (0..6u8).map(image).collect();
+        let runs: Vec<Vec<u8>> = (0..40u16)
+            .map(|k| {
+                let len = 100 + usize::from(k) * 9;
+                let mut r = Vec::with_capacity(len + 4);
+                r.extend_from_slice(&(k * 10).to_be_bytes());
+                r.extend_from_slice(&u16::try_from(len - 1).unwrap().to_be_bytes());
+                r.extend((0..len).map(|i| (i as u8) ^ (k as u8)));
+                r
+            })
+            .collect();
+        let mut entries: Vec<(u32, Body<'_>)> = images
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (u32::try_from(i).unwrap() + 1, Body::Image(p)))
+            .collect();
+        entries.extend(runs.iter().enumerate().map(|(i, r)| {
+            (
+                u32::try_from(i).unwrap() + 100,
+                Body::Delta {
+                    depth: 1 + (i % 8) as u8,
+                    runs: r,
+                },
+            )
+        }));
+        let packed = one_slot_records(&entries, size).unwrap();
+        assert!(
+            packed.frames.is_empty(),
+            "every image fits a slot once LZ4'd"
+        );
+        let slots = unpacked(&packed, &entries, size);
+        assert!(
+            slots.iter().all(|&s| s == 1),
+            "records of one slot: {slots:?}"
+        );
+        let bytes: usize = images
+            .iter()
+            .map(|p| lz4_flex::block::compress(p).len() + ENTRY_HEADER)
+            .chain(runs.iter().map(|r| r.len() + ENTRY_HEADER))
+            .sum();
+        let fewest = bytes.div_ceil(size - PAYLOAD_HEADER - 4);
+        assert!(
+            packed.records.len() * 9 <= fewest * 11 + 9,
+            "{} records where the bytes take {fewest} slots",
+            packed.records.len()
+        );
+    }
+
+    /// Do: pack an image LZ4 can't shrink below a slot, and a delta near a page long, beside
+    /// small deltas. Expect: the image left for a page frame, the delta in a record of its own of
+    /// the slots it needs, the rest in records of one slot.
+    #[test]
+    fn an_entry_that_fits_no_slot_takes_a_frame_or_a_record_of_its_own() {
+        let size = 4096;
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let noise: Vec<u8> = (0..size)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let mut long = Vec::new();
+        long.extend_from_slice(&0u16.to_be_bytes());
+        long.extend_from_slice(&u16::try_from(size - 8 - 1).unwrap().to_be_bytes());
+        long.extend_from_slice(&noise[..size - 8]);
+        let small: Vec<u8> = [0u8, 5, 0, 2, 1, 2, 3].to_vec();
+        let entries: Vec<(u32, Body<'_>)> = vec![
+            (1, Body::Image(&noise)),
+            (
+                2,
+                Body::Delta {
+                    depth: 1,
+                    runs: &long,
+                },
+            ),
+            (
+                3,
+                Body::Delta {
+                    depth: 2,
+                    runs: &small,
+                },
+            ),
+            (
+                4,
+                Body::Delta {
+                    depth: 1,
+                    runs: &small,
+                },
+            ),
+        ];
+        let packed = one_slot_records(&entries, size).unwrap();
+        assert_eq!(packed.frames, vec![0], "the image a page frame");
+        let slots = unpacked(&packed, &entries, size);
+        let alone = packed
+            .records
+            .iter()
+            .position(|(held, _, _)| held.contains(&1))
+            .unwrap();
+        assert_eq!(packed.records[alone].0, vec![1], "the long delta alone");
+        assert_eq!(slots[alone], 2);
+        for (at, s) in slots.iter().enumerate() {
+            if at != alone {
+                assert_eq!(*s, 1);
+            }
+        }
     }
 }
