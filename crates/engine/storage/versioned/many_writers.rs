@@ -203,10 +203,18 @@ fn draw(class: &str, s: &Sizes, w: u64, shared: bool, rng: &mut u64, next: &Atom
 }
 
 /// Runs one statement, its answer added to `out`.
-fn stmt(conn: &Arc<Connection>, sql: &str, out: &mut Vec<Answer>) -> Result<Vec<Vec<Value>>, LimboError> {
+fn stmt(
+    conn: &Arc<Connection>,
+    sql: &str,
+    out: &mut Vec<Answer>,
+) -> Result<Vec<Vec<Value>>, LimboError> {
     let got = rows(conn, sql)?;
     // A read changes nothing; the count a connection last kept is its own previous write's.
-    let changed = if sql.starts_with("SELECT") { 0 } else { conn.changes() };
+    let changed = if sql.starts_with("SELECT") {
+        0
+    } else {
+        conn.changes()
+    };
     out.push((got.clone(), changed));
     Ok(got)
 }
@@ -220,7 +228,10 @@ fn body(conn: &Arc<Connection>, txn: &Txn, pad: u64) -> Result<Vec<Answer>, Limb
         let (id, v, n) = (int(&row[0]), int(&row[1]), int(&row[2]));
         stmt(
             conn,
-            &format!("INSERT INTO items VALUES ({id}, {v}, {}, printf('%.*c', {pad}, 'y'))", n + 1),
+            &format!(
+                "INSERT INTO items VALUES ({id}, {v}, {}, printf('%.*c', {pad}, 'y'))",
+                n + 1
+            ),
             out,
         )
         .map(drop)
@@ -231,18 +242,42 @@ fn body(conn: &Arc<Connection>, txn: &Txn, pad: u64) -> Result<Vec<Answer>, Limb
                 .iter()
                 .map(|id| format!("({id}, {id}, 0, printf('%.*c', {pad}, 'x'))"))
                 .collect();
-            stmt(conn, &format!("INSERT INTO items VALUES {}", values.join(", ")), &mut out)?;
+            stmt(
+                conn,
+                &format!("INSERT INTO items VALUES {}", values.join(", ")),
+                &mut out,
+            )?;
         }
         Txn::UpdatePlain(id) => {
-            stmt(conn, &format!("SELECT n FROM items WHERE id = {id}"), &mut out)?;
-            stmt(conn, &format!("UPDATE items SET n = n + 1, pad = pad WHERE id = {id}"), &mut out)?;
+            stmt(
+                conn,
+                &format!("SELECT n FROM items WHERE id = {id}"),
+                &mut out,
+            )?;
+            stmt(
+                conn,
+                &format!("UPDATE items SET n = n + 1, pad = pad WHERE id = {id}"),
+                &mut out,
+            )?;
         }
         Txn::UpdateIndexed(id, value) => {
-            stmt(conn, &format!("SELECT v, n FROM items WHERE id = {id}"), &mut out)?;
-            stmt(conn, &format!("UPDATE items SET v = {value}, n = n + 1 WHERE id = {id}"), &mut out)?;
+            stmt(
+                conn,
+                &format!("SELECT v, n FROM items WHERE id = {id}"),
+                &mut out,
+            )?;
+            stmt(
+                conn,
+                &format!("UPDATE items SET v = {value}, n = n + 1 WHERE id = {id}"),
+                &mut out,
+            )?;
         }
         Txn::UpdateRange(a) => {
-            stmt(conn, &format!("SELECT id, n FROM items WHERE id >= {a} ORDER BY id LIMIT {RANGE}"), &mut out)?;
+            stmt(
+                conn,
+                &format!("SELECT id, n FROM items WHERE id >= {a} ORDER BY id LIMIT {RANGE}"),
+                &mut out,
+            )?;
             stmt(
                 conn,
                 &format!("UPDATE items SET n = n + 1 WHERE id IN (SELECT id FROM items WHERE id >= {a} ORDER BY id LIMIT {RANGE})"),
@@ -250,16 +285,35 @@ fn body(conn: &Arc<Connection>, txn: &Txn, pad: u64) -> Result<Vec<Answer>, Limb
             )?;
         }
         Txn::DeleteInsert(id) => {
-            let got = stmt(conn, &format!("SELECT id, v, n FROM items WHERE id = {id}"), &mut out)?;
-            stmt(conn, &format!("DELETE FROM items WHERE id = {id}"), &mut out)?;
+            let got = stmt(
+                conn,
+                &format!("SELECT id, v, n FROM items WHERE id = {id}"),
+                &mut out,
+            )?;
+            stmt(
+                conn,
+                &format!("DELETE FROM items WHERE id = {id}"),
+                &mut out,
+            )?;
             for row in &got {
                 reinsert(&mut out, row)?;
             }
         }
         Txn::DeleteRangeInsert(a) => {
-            let got = stmt(conn, &format!("SELECT id, v, n FROM items WHERE id >= {a} ORDER BY id LIMIT {RANGE}"), &mut out)?;
+            let got = stmt(
+                conn,
+                &format!("SELECT id, v, n FROM items WHERE id >= {a} ORDER BY id LIMIT {RANGE}"),
+                &mut out,
+            )?;
             if let Some(last) = got.last() {
-                stmt(conn, &format!("DELETE FROM items WHERE id >= {a} AND id <= {}", int(&last[0])), &mut out)?;
+                stmt(
+                    conn,
+                    &format!(
+                        "DELETE FROM items WHERE id >= {a} AND id <= {}",
+                        int(&last[0])
+                    ),
+                    &mut out,
+                )?;
             }
             for row in &got {
                 reinsert(&mut out, row)?;
@@ -267,10 +321,22 @@ fn body(conn: &Arc<Connection>, txn: &Txn, pad: u64) -> Result<Vec<Answer>, Limb
         }
         Txn::ReadWrite(a, b, new) => {
             for id in [a, b] {
-                stmt(conn, &format!("SELECT n FROM items WHERE id = {id}"), &mut out)?;
-                stmt(conn, &format!("UPDATE items SET n = n + 1 WHERE id = {id}"), &mut out)?;
+                stmt(
+                    conn,
+                    &format!("SELECT n FROM items WHERE id = {id}"),
+                    &mut out,
+                )?;
+                stmt(
+                    conn,
+                    &format!("UPDATE items SET n = n + 1 WHERE id = {id}"),
+                    &mut out,
+                )?;
             }
-            stmt(conn, &format!("INSERT INTO items VALUES ({new}, {new}, 0, printf('%.*c', {pad}, 'x'))"), &mut out)?;
+            stmt(
+                conn,
+                &format!("INSERT INTO items VALUES ({new}, {new}, 0, printf('%.*c', {pad}, 'x'))"),
+                &mut out,
+            )?;
         }
     }
     Ok(out)
@@ -288,7 +354,11 @@ struct Committed {
 fn state(conn: &Arc<Connection>) -> (Vec<Vec<Value>>, Vec<Vec<Value>>) {
     (
         rows(conn, "SELECT id, v, n, length(pad) FROM items ORDER BY id").unwrap(),
-        rows(conn, "SELECT v, id FROM items INDEXED BY items_v ORDER BY v, id").unwrap(),
+        rows(
+            conn,
+            "SELECT v, id FROM items INDEXED BY items_v ORDER BY v, id",
+        )
+        .unwrap(),
     )
 }
 
@@ -308,7 +378,8 @@ fn run_class(storage: Storage, class: &str, shared: bool, s: &Sizes, seed: u64) 
     let per_writer = s.txns.div_ceil(s.writers);
     let threads: Vec<_> = (0..s.writers)
         .map(|w| {
-            let (db, order, next, class) = (db.clone(), order.clone(), next.clone(), class.to_owned());
+            let (db, order, next, class) =
+                (db.clone(), order.clone(), next.clone(), class.to_owned());
             let sz = *s;
             std::thread::spawn(move || {
                 let conn = connect(&db, storage);
@@ -328,7 +399,12 @@ fn run_class(storage: Storage, class: &str, shared: bool, s: &Sizes, seed: u64) 
                     };
                     let at = order.fetch_add(1, Ordering::SeqCst);
                     match conn.execute("COMMIT") {
-                        Ok(()) => done.push(Committed { order: at, writer: w, txn, answers }),
+                        Ok(()) => done.push(Committed {
+                            order: at,
+                            writer: w,
+                            txn,
+                            answers,
+                        }),
                         Err(e) if refused(&e) => {
                             refusals += 1;
                             roll_back(&conn);
@@ -362,8 +438,14 @@ fn run_class(storage: Storage, class: &str, shared: bool, s: &Sizes, seed: u64) 
         );
     }
     let serial = state(&replay);
-    assert_eq!(concurrent.0, serial.0, "{storage:?} {class} shared={shared}: rows differ from the serial replay's");
-    assert_eq!(concurrent.1, serial.1, "{storage:?} {class} shared={shared}: the index differs from the serial replay's");
+    assert_eq!(
+        concurrent.0, serial.0,
+        "{storage:?} {class} shared={shared}: rows differ from the serial replay's"
+    );
+    assert_eq!(
+        concurrent.1, serial.1,
+        "{storage:?} {class} shared={shared}: the index differs from the serial replay's"
+    );
     Outcome {
         committed: history.len(),
         refused: refusals,
@@ -386,7 +468,10 @@ fn g7_5_many_writers_answer_as_a_serial_replay() {
                     "many_writers {storage:?} {class} shared={shared} writers={} committed={} refused={}",
                     s.writers, o.committed, o.refused
                 );
-                assert!(o.committed > 0, "{storage:?} {class} shared={shared}: nothing committed");
+                assert!(
+                    o.committed > 0,
+                    "{storage:?} {class} shared={shared}: nothing committed"
+                );
             }
         }
     }

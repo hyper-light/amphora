@@ -91,14 +91,21 @@ fn step(
             mops.push(observed(w, key, got.first().and_then(|r| r.first())));
         }
         Plan::Read(key) => {
-            let got = rows(conn, &format!("SELECT k, v FROM {t} WHERE k >= {key} ORDER BY k LIMIT 2"))?;
+            let got = rows(
+                conn,
+                &format!("SELECT k, v FROM {t} WHERE k >= {key} ORDER BY k LIMIT 2"),
+            )?;
             // The span read, as `elle`'s: to the last row given when it gave two, else to the end;
             // keys of it no row holds read as absent.
             let got: BTreeMap<u64, &Value> = got
                 .iter()
                 .map(|r| (u64::try_from(int(&r[0])).unwrap(), &r[1]))
                 .collect();
-            let to = if got.len() == 2 { got.keys().last().copied() } else { None };
+            let to = if got.len() == 2 {
+                got.keys().next_back().copied()
+            } else {
+                None
+            };
             let mut keys: BTreeSet<u64> = got.keys().copied().collect();
             for j in [key, key + 1] {
                 if to.is_none_or(|to| j <= to) {
@@ -126,7 +133,10 @@ fn run(storage: Storage, w: Workload, seed: u64, writers: u64) -> Run {
     let setup = connect(&db, storage);
     let ty = if w.lists { "TEXT" } else { "INTEGER" };
     setup
-        .execute(format!("CREATE TABLE {} (k INTEGER PRIMARY KEY, v {ty} NOT NULL)", table(w)))
+        .execute(format!(
+            "CREATE TABLE {} (k INTEGER PRIMARY KEY, v {ty} NOT NULL)",
+            table(w)
+        ))
         .unwrap();
     let generator = Arc::new(Mutex::new(Gen::new(seed)));
     let ids = Arc::new(AtomicU64::new(1));
@@ -134,8 +144,13 @@ fn run(storage: Storage, w: Workload, seed: u64, writers: u64) -> Run {
     let started = Arc::new(AtomicUsize::new(0));
     let threads: Vec<_> = (0..writers)
         .map(|_| {
-            let (db, generator, ids, order, started) =
-                (db.clone(), generator.clone(), ids.clone(), order.clone(), started.clone());
+            let (db, generator, ids, order, started) = (
+                db.clone(),
+                generator.clone(),
+                ids.clone(),
+                order.clone(),
+                started.clone(),
+            );
             std::thread::spawn(move || {
                 let conn = connect(&db, storage);
                 let mut history = Vec::new();
@@ -148,7 +163,11 @@ fn run(storage: Storage, w: Workload, seed: u64, writers: u64) -> Run {
                             Ok(()) => {}
                             Err(e) if refused(&e) => {
                                 roll_back(&conn);
-                                history.push(Record { mops, committed: false, ts: 0 });
+                                history.push(Record {
+                                    mops,
+                                    committed: false,
+                                    ts: 0,
+                                });
                                 continue 'txns;
                             }
                             Err(e) => panic!("{storage:?} seed {seed}: {e}"),
@@ -156,10 +175,18 @@ fn run(storage: Storage, w: Workload, seed: u64, writers: u64) -> Run {
                     }
                     let ts = order.fetch_add(1, Ordering::SeqCst);
                     match conn.execute("COMMIT") {
-                        Ok(()) => history.push(Record { mops, committed: true, ts }),
+                        Ok(()) => history.push(Record {
+                            mops,
+                            committed: true,
+                            ts,
+                        }),
                         Err(e) if refused(&e) => {
                             roll_back(&conn);
-                            history.push(Record { mops, committed: false, ts: 0 });
+                            history.push(Record {
+                                mops,
+                                committed: false,
+                                ts: 0,
+                            });
                         }
                         Err(e) => panic!("{storage:?} seed {seed}: commit: {e}"),
                     }
@@ -211,7 +238,10 @@ fn g8_4_sql_histories_have_no_anomaly() {
     for storage in storages() {
         for lists in [true, false] {
             for seed in first..first + count {
-                let w = Workload { lists, spans: seed % 2 == 1 };
+                let w = Workload {
+                    lists,
+                    spans: !seed.is_multiple_of(2),
+                };
                 let r = run(storage, w, seed, writers);
                 let found = anomalies(w, &r);
                 eprintln!(
@@ -219,7 +249,10 @@ fn g8_4_sql_histories_have_no_anomaly() {
                     r.committed, r.refused
                 );
                 assert!(found.is_empty(), "{storage:?} {w:?} seed {seed}: {found:?}");
-                assert!(r.committed > 0, "{storage:?} {w:?} seed {seed}: nothing committed");
+                assert!(
+                    r.committed > 0,
+                    "{storage:?} {w:?} seed {seed}: nothing committed"
+                );
             }
         }
     }
@@ -232,7 +265,10 @@ fn g8_4_sql_histories_have_no_anomaly() {
 fn g8_4_a_broken_sql_history_is_caught() {
     let storage = Storage::Pager;
     let writers = env("AMPHORA_ELLE_SQL_WRITERS", WRITERS as u64).max(1);
-    let w = Workload { lists: true, spans: false };
+    let w = Workload {
+        lists: true,
+        spans: false,
+    };
     let mut r = run(storage, w, 2, writers);
     let (_, last) = r
         .finals
