@@ -699,6 +699,14 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   attached table's largest degree, or two tables' ℓ2 norms); underestimates are left as they are
   (docs/design/planner.md, "Decision (lane pl11)"). Open: the bound holds for PL.9's net row
   change, not for updates or cancelled inserts between ANALYZE runs.
+- **PL.7** (b6a2313e, built and tested on t1/lane-pl7, behind a switch, its JOB measurement
+  open): with `Connection::set_fitted_costs` (or `AMPHORA_FITTED_COSTS=1`) on, the database times a
+  share of its statements, the share learned against the timer's cost and the measurement's spread,
+  and fits the planner's weights to their counted work (rows, seeks, hash rows added and looked up,
+  sort work, file page reads) by non-negative least squares with Huber weights, in bounded memory;
+  weights no sample determines keep the learned calibration's (docs/design/planner.md, "Decision
+  (lane pl7)"). Open: tables' pages from the file (T-PL.7.1), the P-error harness (AC-PL.7.2), and
+  AC-PL.7.1's JOB rank correlation with the switch on and off.
 - **PL.6** (5e23ff8b, built and tested on t1/lane-pl6, its measurement open): no table is read whole
   beneath loops that can give more than one row. A scan stays only beneath one-row loops (a lookup by a
   unique key) or where no equality joins the table; elsewhere a seek, an automatic index or a hash join

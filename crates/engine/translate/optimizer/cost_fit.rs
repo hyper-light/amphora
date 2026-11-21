@@ -4,8 +4,8 @@
 //! looked up, sort units, page reads from the file), and the time it ran. A regression of the time
 //! on the counts gives each term's nanoseconds a unit; the planner reads them as multiples of a page
 //! read, its unit (`CostModelParams::with_fitted`). A term with no samples yet, or one the samples
-//! can't tell apart from the others, has no fitted weight and keeps the learned calibration's
-//! (`learned_costs`).
+//! can't tell apart from the others or from nothing, has no fitted weight and keeps the learned
+//! calibration's (`learned_costs`).
 //!
 //! The counts are the work counted as the statement ran, not the planner's estimates of it: the
 //! fit is of the cost model, and estimated rows would fold the cardinality errors into the weights
@@ -311,7 +311,7 @@ impl CostFit {
             self.epoch = if previous.agrees(&current) {
                 self.current.samples.saturating_mul(2)
             } else {
-                self.current.samples / 2
+                self.current.samples.checked_div(2).unwrap_or(0)
             };
         }
         self.previous = self.current;
@@ -551,8 +551,10 @@ fn solve(normal: &Normal) -> Option<Solution> {
             }
         }
     }
+    // A weight the fit holds at zero is the constraint, not a measurement: the samples can't tell
+    // its cost from nothing, so it is left undetermined and keeps its learned value.
     let mut weights = [None; TERMS];
-    for &k in &candidates {
+    for &k in &passive {
         if let (Some(slot), Some(v)) = (weights.get_mut(k), w.get(k)) {
             *slot = Some(*v);
         }
