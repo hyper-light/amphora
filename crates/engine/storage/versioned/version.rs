@@ -160,8 +160,12 @@ impl Reads {
             return Ok(true);
         }
         Ok(spans.any(|s| {
-            s.from.as_deref().is_none_or(|f| cmp(f, key) != Order::Greater)
-                && s.to.as_deref().is_none_or(|t| cmp(key, t) != Order::Greater)
+            s.from
+                .as_deref()
+                .is_none_or(|f| cmp(f, key) != Order::Greater)
+                && s.to
+                    .as_deref()
+                    .is_none_or(|t| cmp(key, t) != Order::Greater)
         }))
     }
 }
@@ -934,7 +938,10 @@ impl Versioned {
             let mut refused = false;
             t.tree
                 .scan_with(&self.pool, d, s.from.as_deref(), |key, cell| {
-                    if s.to.as_deref().is_some_and(|to| cmp(key, to) == Order::Greater) {
+                    if s.to
+                        .as_deref()
+                        .is_some_and(|to| cmp(key, to) == Order::Greater)
+                    {
                         return Ok(false);
                     }
                     if cell.flags.versioned {

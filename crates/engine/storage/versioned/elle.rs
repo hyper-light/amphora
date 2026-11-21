@@ -599,7 +599,14 @@ fn step(
                 t.put(&v.pool, d, &v.clock, txn, &key_bytes(key), &encode(&list))?;
                 mops.push(Mop::Append { key, element: id });
             } else {
-                t.put(&v.pool, d, &v.clock, txn, &key_bytes(key), &id.to_be_bytes())?;
+                t.put(
+                    &v.pool,
+                    d,
+                    &v.clock,
+                    txn,
+                    &key_bytes(key),
+                    &id.to_be_bytes(),
+                )?;
                 mops.push(Mop::Write { key, value: id });
             }
         }
@@ -616,8 +623,10 @@ fn step(
             } else {
                 None
             };
-            let got: BTreeMap<u64, &[u8]> =
-                rows.iter().map(|(k, r)| (key_of(k), r.as_slice())).collect();
+            let got: BTreeMap<u64, &[u8]> = rows
+                .iter()
+                .map(|(k, r)| (key_of(k), r.as_slice()))
+                .collect();
             let mut keys: BTreeSet<u64> = got.keys().copied().collect();
             for j in [key, key + 1] {
                 if to.is_none_or(|to| j <= to) {
@@ -718,7 +727,7 @@ pub fn interleaved(validation: Validation, w: Workload, seed: u64) -> Run {
     }
     let v = database(validation);
     let mut d = Descender::new();
-    let mut gen = Gen::new(seed);
+    let mut generator = Gen::new(seed);
     let mut pick = seed ^ 0x5bd1_e995;
     let ids = AtomicU64::new(1);
     let mut run = Run {
@@ -737,7 +746,7 @@ pub fn interleaved(validation: Validation, w: Workload, seed: u64) -> Run {
                 started += 1;
                 open[at] = Some(Open {
                     txn: v.clock.begin().unwrap(),
-                    plan: gen.txn(),
+                    plan: generator.txn(),
                     at: 0,
                     mops: Vec::new(),
                 });
@@ -772,12 +781,13 @@ pub fn interleaved(validation: Validation, w: Workload, seed: u64) -> Run {
 /// A run on 32 threads at once, each taking its next transaction from the shared generator.
 pub fn threaded(validation: Validation, w: Workload, seed: u64) -> Run {
     let v = Arc::new(database(validation));
-    let gen = Arc::new(Mutex::new(Gen::new(seed)));
+    let generator = Arc::new(Mutex::new(Gen::new(seed)));
     let ids = Arc::new(AtomicU64::new(1));
     let started = Arc::new(AtomicUsize::new(0));
     let threads: Vec<_> = (0..WRITERS)
         .map(|_| {
-            let (v, gen, ids, started) = (v.clone(), gen.clone(), ids.clone(), started.clone());
+            let (v, generator, ids, started) =
+                (v.clone(), generator.clone(), ids.clone(), started.clone());
             std::thread::spawn(move || {
                 let mut d = Descender::new();
                 let mut run = Run {
@@ -788,7 +798,7 @@ pub fn threaded(validation: Validation, w: Workload, seed: u64) -> Run {
                     conflicts: 0,
                 };
                 'txns: while started.fetch_add(1, Ordering::Relaxed) < TXNS {
-                    let plan = gen.lock().unwrap().txn();
+                    let plan = generator.lock().unwrap().txn();
                     let mut txn = v.clock.begin().unwrap();
                     let mut mops = Vec::new();
                     for p in plan {
@@ -852,7 +862,11 @@ mod tests {
     }
 
     fn txn(mops: Vec<Mop>, committed: bool, ts: u64) -> Record {
-        Record { mops, committed, ts }
+        Record {
+            mops,
+            committed,
+            ts,
+        }
     }
     fn app(key: u64, element: u64) -> Mop {
         Mop::Append { key, element }
@@ -982,7 +996,10 @@ mod tests {
                 };
                 let r = run(validation, w, seed);
                 let found = r.anomalies(w);
-                assert!(found.is_empty(), "{validation:?} {w:?} seed {seed}: {found:?}");
+                assert!(
+                    found.is_empty(),
+                    "{validation:?} {w:?} seed {seed}: {found:?}"
+                );
                 sums[0] += r.committed;
                 sums[1] += r.refused;
                 sums[2] += r.conflicts;
@@ -1046,7 +1063,10 @@ mod tests {
             }
         }
         eprintln!("snapshot isolation: G2 in {g2} histories");
-        assert!(g2 > 0, "no write skew found: the checker or the workload is vacuous");
+        assert!(
+            g2 > 0,
+            "no write skew found: the checker or the workload is vacuous"
+        );
     }
 
     /// The generator's key draw: do draw 2,046,000 slots. Expect: slot `i` 2^i/1023 of them
@@ -1062,7 +1082,10 @@ mod tests {
         for (i, c) in counts.iter().enumerate() {
             let p = f64::from(1u32 << i) / 1023.0;
             let (want, sd) = (n as f64 * p, (n as f64 * p * (1.0 - p)).sqrt());
-            assert!((*c as f64 - want).abs() < 6.0 * sd, "slot {i}: {c} against {want}");
+            assert!(
+                (*c as f64 - want).abs() < 6.0 * sd,
+                "slot {i}: {c} against {want}"
+            );
         }
     }
 }
