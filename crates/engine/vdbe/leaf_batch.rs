@@ -1,4 +1,4 @@
-//! Amphora (query speed step 7, QS.7; G5 step 2): a table scan that decodes each leaf once into
+//! Amphora (query speed step 7, QT.7; G5 step 2): a table scan that decodes each leaf once into
 //! column batches.
 //!
 //! When the connection's switch is on (`Connection::set_vectorized_scans`), a read-only program's
@@ -23,7 +23,7 @@
 //! COUNT(*) over a whole table is answered from the leaves' cell counts without decoding a row,
 //! by the `Count` instruction (`translate/select.rs`, `BTreeCursor::count`), switch on or off.
 
-use crate::alloc::{TryClone, TryReserveError};
+use crate::alloc::TryClone;
 use crate::error::LimboError;
 use crate::storage::btree::{BTreeCursor, TableLeafUnderCursor};
 use crate::vdbe::builder::{CursorKey, CursorType};
@@ -371,7 +371,7 @@ fn decode_window(
     Ok(rows)
 }
 
-fn alloc_error(error: TryReserveError) -> LimboError {
+fn alloc_error<E: std::fmt::Display>(error: E) -> LimboError {
     LimboError::InternalError(format!("a column batch could not be allocated: {error}"))
 }
 

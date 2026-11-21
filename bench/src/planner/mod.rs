@@ -267,7 +267,7 @@ fn open(o: &Opts, target: &str) -> anyhow::Result<Box<dyn Target>> {
     let dir = o.dir.join(target);
     Ok(match target {
         "amphora" => Box::new(Amphora::open(&dir, o.cache_kib, false)?),
-        // QS.7: the same engine, its scans by column batches, on a copy of its own.
+        // QT.7: the same engine, its scans by column batches, on a copy of its own.
         "amphora-vectorized" => Box::new(Amphora::open(&dir, o.cache_kib, true)?),
         "sqlite" => Box::new(Sqlite::open(&dir, o.cache_kib)?),
         "duckdb" => Box::new(Duck::open(&dir, Some(1))?),

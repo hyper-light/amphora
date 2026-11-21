@@ -870,7 +870,7 @@ pub trait CursorTrait: Any + Send + Sync {
     // --- end: BTreeCursor specific functions ----
 }
 
-/// Amphora (query speed step 7, QS.7): a table leaf as the cursor on it sees it
+/// Amphora (query speed step 7, QT.7): a table leaf as the cursor on it sees it
 /// ([`BTreeCursor::table_leaf_under_cursor`]).
 pub(crate) struct TableLeafUnderCursor<'a> {
     pub contents: &'a PageContent,
@@ -999,7 +999,7 @@ pub struct BTreeCursor {
     /// unregister_cursor when the bucket crosses the 1↔2 threshold; lets
     /// drive_pending_peer_save skip the registry mutex in the common case.
     has_peers: crate::sync::atomic::AtomicBool,
-    /// Amphora (query speed step 7, QS.7): counts the times another cursor came to share this
+    /// Amphora (query speed step 7, QT.7): counts the times another cursor came to share this
     /// cursor's B-tree. A column batch decoded from a leaf under this cursor
     /// (`vdbe/leaf_batch.rs`) is kept only while the count stands where it was at the decode:
     /// a peer could have written the leaf.
@@ -1375,7 +1375,7 @@ impl BTreeCursor {
         Self::new_with_index_info(pager, root_page, num_columns, Some(index_info))
     }
 
-    /// Amphora (query speed step 7, QS.7): the table leaf under the cursor and the cell it stands
+    /// Amphora (query speed step 7, QT.7): the table leaf under the cursor and the cell it stands
     /// on, for a scan that decodes the leaf once into column batches (`vdbe/leaf_batch.rs`).
     /// None when the cursor isn't on a row of a table leaf, must restore its position first, or
     /// shares its B-tree with another cursor that could write the leaf.

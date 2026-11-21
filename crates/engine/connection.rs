@@ -983,7 +983,7 @@ impl Connection {
         self.sorted_fetches.load(Ordering::Acquire)
     }
 
-    /// Amphora (query speed step 7, QS.7; a prototype behind this switch, off by default): newly
+    /// Amphora (query speed step 7, QT.7; a prototype behind this switch, off by default): newly
     /// prepared read-only statements scan tables by decoding each leaf once into column batches
     /// (`vdbe/leaf_batch.rs`) instead of each row's columns as they are read. Off until its
     /// measurement against the row-at-a-time scan (the coordinator's) says otherwise.

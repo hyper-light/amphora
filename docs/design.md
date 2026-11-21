@@ -65,6 +65,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | executor | 5 | An ORDER BY with a LIMIT keeps only the rows its reader takes | [executor.md](design/executor.md#5-an-order-by-with-a-limit-keeps-only-the-rows-its-reader-takes) |
 | executor | 6 | A subquery runs where it is read | [executor.md](design/executor.md#6-a-subquery-runs-where-it-is-read) |
 | executor | 7 | A row's header is parsed once, a cache hit takes no exclusive lock, and the index's terms run before the row is fetched | [executor.md](design/executor.md#7-a-rows-header-is-parsed-once-a-cache-hit-takes-no-exclusive-lock-and-the-indexs-terms-run-before-the-row-is-fetched) |
+| executor | 9 | A table scan decodes each leaf once into column batches, behind a switch | [executor.md](design/executor.md#9-a-table-scan-decodes-each-leaf-once-into-column-batches-behind-a-switch) |
 | local-owner-transport | – | Versions (2026-11-06) | [local-owner-transport.md](design/local-owner-transport.md#versions-2026-11-06) |
 | local-owner-transport | – | The tests' budgets (2026-10-31) | [local-owner-transport.md](design/local-owner-transport.md#the-tests-budgets-2026-10-31) |
 | local-owner-transport | – | Owner guards (2026-11-06) | [local-owner-transport.md](design/local-owner-transport.md#owner-guards-2026-11-06) |

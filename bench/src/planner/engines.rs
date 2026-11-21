@@ -126,7 +126,7 @@ pub struct Amphora {
     /// A connection whose statements count their rows (`Connection::set_row_counters`).
     counted: Arc<amphora_engine::Connection>,
     cache_kib: i64,
-    /// QS.7: its scans decode each leaf once into column batches (`Connection::set_vectorized_scans`).
+    /// QT.7: its scans decode each leaf once into column batches (`Connection::set_vectorized_scans`).
     vectorized: bool,
 }
 

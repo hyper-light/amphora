@@ -2187,7 +2187,7 @@ fn op_column_fetch(
         .registers
         .get_mut(dest)
         .ok_or_else(|| register_out_of_range("Column", dest))?;
-    // Amphora (QS.7): a scanned table's column comes from its leaf's batch when the program has
+    // Amphora (QT.7): a scanned table's column comes from its leaf's batch when the program has
     // one (`leaf_batch.rs`); otherwise, and for a row the batch left out, the row is read here.
     if let Some(plan) = program.leaf_batch_plan.as_deref() {
         match super::leaf_batch::serve_column(
@@ -2428,7 +2428,7 @@ fn op_column_range_fetch(
         .checked_add(defaults.len())
         .and_then(|end| state.registers.get_mut(dest..end))
         .ok_or_else(|| register_out_of_range("ColumnRange", dest))?;
-    // Amphora (QS.7): as Column does, from the leaf's batch; a row the batch left out is read
+    // Amphora (QT.7): as Column does, from the leaf's batch; a row the batch left out is read
     // whole below.
     if let Some(plan) = program.leaf_batch_plan.as_deref() {
         let mut served = true;

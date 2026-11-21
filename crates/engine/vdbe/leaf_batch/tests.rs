@@ -1,4 +1,4 @@
-//! QS.7 (query speed step 7): the batched scan against the row-at-a-time scan, switch on and off,
+//! QT.7 (query speed step 7): the batched scan against the row-at-a-time scan, switch on and off,
 //! on random tables and predicates: every type, NULLs, affinities, a collation, overflow rows,
 //! deleted rows, columns added after rows were written, ascending and descending scans, and
 //! batch budgets down to below one row.
@@ -48,7 +48,7 @@ impl Rng {
 fn open() -> Arc<Connection> {
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-    db.connect().unwrap()
+    db.connect(crate::ConnectOpts::new()).unwrap()
 }
 
 fn rows(conn: &Arc<Connection>, sql: &str) -> Vec<String> {
@@ -139,11 +139,11 @@ fn differential(seed: u64, budget: Option<usize>) -> usize {
     decoded()
 }
 
-/// T-QS.7.1: batched against row-at-a-time on random tables and predicates (NULLs, affinities,
+/// T-QT.7.1: batched against row-at-a-time on random tables and predicates (NULLs, affinities,
 /// a collation, overflow pages, deleted rows, added columns): identical results, and the batches
 /// were used (non-vacuity).
 #[test]
-fn qs7_batched_scans_answer_as_row_at_a_time_scans() {
+fn qt7_batched_scans_answer_as_row_at_a_time_scans() {
     // A budget of a whole page's rows and more: one window per leaf.
     for seed in 1..=6 {
         let decoded = differential(seed, Some(1 << 20));
@@ -151,11 +151,11 @@ fn qs7_batched_scans_answer_as_row_at_a_time_scans() {
     }
 }
 
-/// T-QS.7.2: a batch budget smaller than one page's cells: the scan decodes several windows a
+/// T-QT.7.2: a batch budget smaller than one page's cells: the scan decodes several windows a
 /// leaf, and below one row's charge falls back to row-at-a-time, by its stated rule, with
 /// identical results.
 #[test]
-fn qs7_budget_below_a_page_falls_back_with_identical_results() {
+fn qt7_budget_below_a_page_falls_back_with_identical_results() {
     for seed in 7..=10 {
         // A few rows' worth: several windows on every leaf.
         let decoded = differential(seed, Some(600));
@@ -166,10 +166,10 @@ fn qs7_budget_below_a_page_falls_back_with_identical_results() {
     }
 }
 
-/// T-QS.7.3: a program that writes keeps the row-at-a-time read, and a statement prepared with
+/// T-QT.7.3: a program that writes keeps the row-at-a-time read, and a statement prepared with
 /// the switch off is prepared again when it turns on.
 #[test]
-fn qs7_writes_read_row_at_a_time_and_the_switch_reprepares() {
+fn qt7_writes_read_row_at_a_time_and_the_switch_reprepares() {
     BUDGET.with(|b| b.set(Some(1 << 20)));
     let conn = open();
     conn.execute("CREATE TABLE t(a, b)").unwrap();
@@ -187,7 +187,7 @@ fn qs7_writes_read_row_at_a_time_and_the_switch_reprepares() {
 
 /// The sizes sysfs writes for a cache parse to bytes; anything else is refused.
 #[test]
-fn qs7_cache_sizes_parse() {
+fn qt7_cache_sizes_parse() {
     assert_eq!(super::cache::parse_size("2048K\n"), Some(2048 * 1024));
     assert_eq!(super::cache::parse_size("1M"), Some(1024 * 1024));
     assert_eq!(super::cache::parse_size("524288"), Some(524_288));

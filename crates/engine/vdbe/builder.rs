@@ -2606,7 +2606,7 @@ impl ProgramBuilder {
     ) -> crate::Result<Program> {
         let prepare_context = PrepareContext::from_connection(&connection);
         let mut prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
-        // Amphora (QS.7): a read-only program's scans read their leaves by column batches when
+        // Amphora (QT.7): a read-only program's scans read their leaves by column batches when
         // the connection's switch is on; a program that writes keeps the row-at-a-time read.
         if connection.vectorized_scans() && prepared.readonly {
             prepared.leaf_batch_plan =

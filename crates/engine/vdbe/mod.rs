@@ -958,7 +958,7 @@ pub struct ProgramState {
     /// Amphora: the rows each of the program's counters counted this run, by its slot
     /// (`row_counts.rs`); empty unless the program has counters.
     pub(crate) row_counts: Vec<u64>,
-    /// Amphora (QS.7): this run's column batches (`leaf_batch.rs`).
+    /// Amphora (QT.7): this run's column batches (`leaf_batch.rs`).
     pub(crate) leaf_batches: leaf_batch::LeafBatches,
     op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
@@ -1961,7 +1961,7 @@ pub struct PreparedProgram {
     /// Amphora: the program's row counters, by slot (`row_counts.rs`); empty unless the
     /// connection asked for them when it prepared the program.
     pub row_count_sites: Vec<row_counts::RowCountSite>,
-    /// Amphora (query speed step 7, QS.7): the scanned table cursors whose leaves are decoded
+    /// Amphora (query speed step 7, QT.7): the scanned table cursors whose leaves are decoded
     /// into column batches, when the connection's switch was on as the program was built.
     pub leaf_batch_plan: Option<Arc<leaf_batch::BatchPlan>>,
 }
