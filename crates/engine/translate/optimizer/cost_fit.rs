@@ -64,6 +64,7 @@ pub(crate) enum Term {
 pub(crate) const TERMS: usize = 6;
 
 impl Term {
+    #[cfg(test)]
     pub(crate) const ALL: [Term; TERMS] = [
         Term::Row,
         Term::Seek,
@@ -96,6 +97,7 @@ impl Counts {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn get(&self, term: Term) -> f64 {
         self.0.get(term.slot()).copied().unwrap_or(0.0)
     }
@@ -910,7 +912,7 @@ mod tests {
         let db =
             crate::Database::open_file(io, ":memory:", crate::sync::Arc::new(crate::SqliteDialect))
                 .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER)")
             .unwrap();
         let rows: Vec<String> = (1..=400).map(|i| format!("({i}, {})", i % 7)).collect();

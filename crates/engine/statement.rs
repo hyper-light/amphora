@@ -631,12 +631,16 @@ impl Statement {
 
     /// Amphora (PL.7): at a run's first step, asks the database's fit whether to time it (never,
     /// with its switch off: one atomic load); within a timed run, the step's start, adding the IO
-    /// wait the last step handed the caller.
+    /// wait the last step handed the caller. Only a read-only statement run as itself (not under
+    /// EXPLAIN) is timed: the planner's terms price reads, and a write's own work (records encoded,
+    /// pages balanced and written) has no term, so its time would be charged to the read terms.
     #[inline]
     fn cost_sample_begin(&mut self) -> Option<std::time::Instant> {
         if self.cost_sample.is_none() {
             if !matches!(self.state.execution_state, ProgramExecutionState::Init)
                 || self.analyze_refresh.is_some()
+                || !matches!(self.query_mode, QueryMode::Normal)
+                || !self.program.is_readonly()
                 || !self.program.connection.db.cost_fit.take()
             {
                 return None;
