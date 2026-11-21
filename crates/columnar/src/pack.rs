@@ -50,7 +50,11 @@ pub fn width_of(span: u64) -> u32 {
 
 /// The mask of a value `w` bits wide.
 const fn mask(w: u32) -> u64 {
-    if w == 0 { 0 } else { u64::MAX.wrapping_shr(WORD_BITS.wrapping_sub(w)) }
+    if w == 0 {
+        0
+    } else {
+        u64::MAX.wrapping_shr(WORD_BITS.wrapping_sub(w))
+    }
 }
 
 /// Bits a whole number of `unit`-value blocks takes for `len` values `width` bits wide.
@@ -66,7 +70,9 @@ pub fn padded_words(layout: Layout, width: u32, len: usize) -> Result<usize, Cod
         Layout::Horizontal => Some(w),
         Layout::Interleaved => w.checked_mul(LANES),
     };
-    per_block.and_then(|p| p.checked_mul(blocks)).ok_or(CodecError::Overflow)
+    per_block
+        .and_then(|p| p.checked_mul(blocks))
+        .ok_or(CodecError::Overflow)
 }
 
 /// Packs `values` (each already a distance from `base`) in `layout`.
@@ -85,20 +91,43 @@ pub fn pack(layout: Layout, base: u64, distances: &[u64]) -> Result<Packed, Code
                     let within = i.wrapping_rem(VECTOR);
                     let lane = within.wrapping_rem(LANES);
                     let row = within.wrapping_div(LANES);
-                    let start = vector.checked_mul(w.checked_mul(LANES).ok_or(CodecError::Overflow)?).and_then(|s| s.checked_add(lane));
-                    (start.ok_or(CodecError::Overflow)?, LANES, row.checked_mul(w))
+                    let start = vector
+                        .checked_mul(w.checked_mul(LANES).ok_or(CodecError::Overflow)?)
+                        .and_then(|s| s.checked_add(lane));
+                    (
+                        start.ok_or(CodecError::Overflow)?,
+                        LANES,
+                        row.checked_mul(w),
+                    )
                 }
             };
             let bit = bit.ok_or(CodecError::Overflow)?;
             put(&mut words, first_word, stride, bit, width, v)?;
         }
     }
-    Ok(Packed { layout, width, base, len: distances.len(), words })
+    Ok(Packed {
+        layout,
+        width,
+        base,
+        len: distances.len(),
+        words,
+    })
 }
 
 /// Writes `v`'s low `width` bits at bit `bit` of the word stream `first, first + stride, ...`.
-fn put(words: &mut [u64], first: usize, stride: usize, bit: usize, width: u32, v: u64) -> Result<(), CodecError> {
-    let word_at = |k: usize| k.checked_mul(stride).and_then(|o| o.checked_add(first)).ok_or(CodecError::Overflow);
+fn put(
+    words: &mut [u64],
+    first: usize,
+    stride: usize,
+    bit: usize,
+    width: u32,
+    v: u64,
+) -> Result<(), CodecError> {
+    let word_at = |k: usize| {
+        k.checked_mul(stride)
+            .and_then(|o| o.checked_add(first))
+            .ok_or(CodecError::Overflow)
+    };
     let k = bit.wrapping_div(GROUP);
     let shift = u32::try_from(bit.wrapping_rem(GROUP)).map_err(|_| CodecError::Overflow)?;
     let lo = words.get_mut(word_at(k)?).ok_or(CodecError::Overflow)?;
@@ -115,7 +144,9 @@ fn put(words: &mut [u64], first: usize, stride: usize, bit: usize, width: u32, v
 pub fn unpack(packed: &Packed, out: &mut Vec<u64>) -> Result<(), CodecError> {
     let need = padded_words(packed.layout, packed.width, packed.len)?;
     if packed.words.len() != need {
-        return Err(CodecError::Corrupt("packed words do not match their width and length"));
+        return Err(CodecError::Corrupt(
+            "packed words do not match their width and length",
+        ));
     }
     out.clear();
     out.resize(need_values(packed)?, packed.base);
@@ -129,8 +160,12 @@ pub fn unpack(packed: &Packed, out: &mut Vec<u64>) -> Result<(), CodecError> {
         };
     }
     match packed.layout {
-        Layout::Horizontal => by_width!(unpack_horizontal; 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64),
-        Layout::Interleaved => by_width!(unpack_interleaved; 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64),
+        Layout::Horizontal => {
+            by_width!(unpack_horizontal; 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64)
+        }
+        Layout::Interleaved => {
+            by_width!(unpack_interleaved; 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64)
+        }
     }
     out.truncate(packed.len);
     Ok(())
@@ -141,7 +176,11 @@ fn need_values(packed: &Packed) -> Result<usize, CodecError> {
         Layout::Horizontal => GROUP,
         Layout::Interleaved => VECTOR,
     };
-    packed.len.div_ceil(unit).checked_mul(unit).ok_or(CodecError::Overflow)
+    packed
+        .len
+        .div_ceil(unit)
+        .checked_mul(unit)
+        .ok_or(CodecError::Overflow)
 }
 
 /// Horizontal groups of 64 values in `W` words each, written over `out` (whole groups long).
@@ -149,13 +188,24 @@ fn need_values(packed: &Packed) -> Result<usize, CodecError> {
 fn unpack_horizontal<const W: u32>(words: &[u64], base: u64, out: &mut [u64]) {
     let m = mask(W);
     let w = W as usize;
-    for (group, dst) in words.chunks_exact(w).zip(out.as_chunks_mut::<GROUP>().0.iter_mut()) {
+    for (group, dst) in words
+        .chunks_exact(w)
+        .zip(out.as_chunks_mut::<GROUP>().0.iter_mut())
+    {
         for (j, o) in (0u32..).zip(dst.iter_mut()) {
             let bit = j.wrapping_mul(W);
             let k = bit.wrapping_shr(6) as usize; // bit / 64
             let shift = bit & 63; // bit mod 64, the word's bits
             let lo = group.get(k).copied().unwrap_or(0).wrapping_shr(shift);
-            let v = if shift.wrapping_add(W) > WORD_BITS { lo | group.get(k.wrapping_add(1)).copied().unwrap_or(0).wrapping_shl(WORD_BITS.wrapping_sub(shift)) } else { lo };
+            let v = if shift.wrapping_add(W) > WORD_BITS {
+                lo | group
+                    .get(k.wrapping_add(1))
+                    .copied()
+                    .unwrap_or(0)
+                    .wrapping_shl(WORD_BITS.wrapping_sub(shift))
+            } else {
+                lo
+            };
             *o = (v & m).wrapping_add(base);
         }
     }
@@ -170,7 +220,10 @@ const ZERO_ROW: [u64; LANES] = [0; LANES];
 fn unpack_interleaved<const W: u32>(words: &[u64], base: u64, out: &mut [u64]) {
     let m = mask(W);
     let per_vector = (W as usize).wrapping_mul(LANES);
-    for (vector, dst) in words.chunks_exact(per_vector).zip(out.as_chunks_mut::<VECTOR>().0.iter_mut()) {
+    for (vector, dst) in words
+        .chunks_exact(per_vector)
+        .zip(out.as_chunks_mut::<VECTOR>().0.iter_mut())
+    {
         let (rows, _) = vector.as_chunks::<LANES>();
         let (dst_rows, _) = dst.as_chunks_mut::<LANES>();
         for (r, row) in (0u32..).zip(dst_rows.iter_mut()) {

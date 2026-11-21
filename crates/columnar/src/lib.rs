@@ -69,7 +69,10 @@ pub struct Strings {
 
 impl Strings {
     pub fn new() -> Self {
-        Strings { bytes: Vec::new(), offsets: vec![0] }
+        Strings {
+            bytes: Vec::new(),
+            offsets: vec![0],
+        }
     }
 
     pub fn push(&mut self, s: &[u8]) {
@@ -101,8 +104,16 @@ impl Strings {
     }
 
     pub(crate) fn check(&self) -> Result<(), CodecError> {
-        if self.offsets.first() != Some(&0) || self.offsets.last() != Some(&self.bytes.len()) || self.offsets.windows(2).any(|w| matches!(w, [s, e] if s > e)) {
-            return Err(CodecError::Invalid("string offsets do not cut their bytes in order"));
+        if self.offsets.first() != Some(&0)
+            || self.offsets.last() != Some(&self.bytes.len())
+            || self
+                .offsets
+                .windows(2)
+                .any(|w| matches!(w, [s, e] if s > e))
+        {
+            return Err(CodecError::Invalid(
+                "string offsets do not cut their bytes in order",
+            ));
         }
         Ok(())
     }
@@ -148,7 +159,9 @@ impl Column {
     }
 
     fn is_valid(&self, i: usize) -> bool {
-        self.valid.as_ref().is_none_or(|v| v.get(i).copied().unwrap_or(false))
+        self.valid
+            .as_ref()
+            .is_none_or(|v| v.get(i).copied().unwrap_or(false))
     }
 
     /// Whether the two columns hold the same rows: the same nulls, and bit-for-bit the same value
@@ -167,7 +180,9 @@ impl Column {
             }
             match (&self.values, &other.values) {
                 (Values::Int(x), Values::Int(y)) => x.get(i) == y.get(i),
-                (Values::Double(x), Values::Double(y)) => x.get(i).map(|v| v.to_bits()) == y.get(i).map(|v| v.to_bits()),
+                (Values::Double(x), Values::Double(y)) => {
+                    x.get(i).map(|v| v.to_bits()) == y.get(i).map(|v| v.to_bits())
+                }
                 (Values::Str(x), Values::Str(y)) => x.get(i) == y.get(i),
                 _ => false,
             }
@@ -211,7 +226,9 @@ impl Encoded {
     pub fn decode(&self) -> Result<Column, CodecError> {
         let values = self.tree.decode()?;
         if values.len() != self.len {
-            return Err(CodecError::Corrupt("decoded length differs from the encoded one"));
+            return Err(CodecError::Corrupt(
+                "decoded length differs from the encoded one",
+            ));
         }
         let valid = match &self.valid {
             None => None,
@@ -236,7 +253,11 @@ pub fn encode(codec: Codec, column: &Column) -> Result<Encoded, CodecError> {
     let len = column.len();
     let (values, valid) = match &column.valid {
         None => (column.values.clone(), None),
-        Some(v) if v.len() != len => return Err(CodecError::Invalid("validity length differs from the values'")),
+        Some(v) if v.len() != len => {
+            return Err(CodecError::Invalid(
+                "validity length differs from the values'",
+            ));
+        }
         Some(v) if v.iter().all(|&b| b) => (column.values.clone(), None),
         Some(v) => (fill_nulls(&column.values, v)?, Some(bitmap(v))),
     };
@@ -244,11 +265,24 @@ pub fn encode(codec: Codec, column: &Column) -> Result<Encoded, CodecError> {
         s.check()?;
     }
     let tree = cascade::encode(codec, values)?;
-    Ok(Encoded { codec, len, valid, tree })
+    Ok(Encoded {
+        codec,
+        len,
+        valid,
+        tree,
+    })
 }
 
 fn bitmap(valid: &[bool]) -> Vec<u64> {
-    valid.chunks(64).map(|c| (0u32..).zip(c).fold(0u64, |w, (b, &on)| if on { w | 1u64.wrapping_shl(b) } else { w })).collect()
+    valid
+        .chunks(64)
+        .map(|c| {
+            (0u32..).zip(c).fold(
+                0u64,
+                |w, (b, &on)| if on { w | 1u64.wrapping_shl(b) } else { w },
+            )
+        })
+        .collect()
 }
 
 /// The values with each null's slot set to the value before it (or the type's zero before the
@@ -262,7 +296,8 @@ fn fill_nulls(values: &Values, valid: &[bool]) -> Result<Values, CodecError> {
             let mut out = Strings::new();
             let mut last: &[u8] = &[];
             for (entry, &ok) in s.iter().zip(valid) {
-                let entry = entry.ok_or(CodecError::Invalid("string offsets do not cut their bytes"))?;
+                let entry =
+                    entry.ok_or(CodecError::Invalid("string offsets do not cut their bytes"))?;
                 if ok {
                     last = entry;
                 }

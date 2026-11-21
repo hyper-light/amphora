@@ -74,19 +74,55 @@ enum Kind {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Node {
     IntRaw(Vec<u64>),
-    IntOne { value: u64, len: usize },
+    IntOne {
+        value: u64,
+        len: usize,
+    },
     IntPacked(Packed),
-    IntDelta { bases: Vec<u64>, deltas: Packed },
-    IntRle { len: usize, values: usize, lengths: usize },
-    IntDict { dict: usize, codes: usize },
+    IntDelta {
+        bases: Vec<u64>,
+        deltas: Packed,
+    },
+    IntRle {
+        len: usize,
+        values: usize,
+        lengths: usize,
+    },
+    IntDict {
+        dict: usize,
+        codes: usize,
+    },
     DblRaw(Vec<f64>),
-    DblOne { value: f64, len: usize },
-    DblRle { len: usize, values: usize, lengths: usize },
-    DblDict { dict: usize, codes: usize },
-    DblDecimal { digits: usize, exponents: usize, patches: Vec<(usize, f64)> },
-    StrRaw { bytes: Vec<u8>, lengths: usize },
-    StrOne { value: Vec<u8>, len: usize },
-    StrDict { dict: usize, codes: usize },
+    DblOne {
+        value: f64,
+        len: usize,
+    },
+    DblRle {
+        len: usize,
+        values: usize,
+        lengths: usize,
+    },
+    DblDict {
+        dict: usize,
+        codes: usize,
+    },
+    DblDecimal {
+        digits: usize,
+        exponents: usize,
+        patches: Vec<(usize, f64)>,
+    },
+    StrRaw {
+        bytes: Vec<u8>,
+        lengths: usize,
+    },
+    StrOne {
+        value: Vec<u8>,
+        len: usize,
+    },
+    StrDict {
+        dict: usize,
+        codes: usize,
+    },
 }
 
 /// An encoded column's nodes; the first is the column.
@@ -121,16 +157,26 @@ impl Tree {
     /// The bytes the nodes take: buffers, plus each node's tag and its lengths and bases.
     pub fn bytes(&self) -> usize {
         self.nodes.iter().fold(0usize, |sum, node| {
-            let packed = |p: &Packed| p.words.len().saturating_mul(8).saturating_add(8 + 1 + LEN_BYTES);
+            let packed = |p: &Packed| {
+                p.words
+                    .len()
+                    .saturating_mul(8)
+                    .saturating_add(8 + 1 + LEN_BYTES)
+            };
             let own = match node {
                 Node::IntRaw(v) => v.len().saturating_mul(8).saturating_add(LEN_BYTES),
                 Node::IntOne { .. } | Node::DblOne { .. } => 8 + LEN_BYTES,
                 Node::IntPacked(p) => packed(p),
-                Node::IntDelta { bases, deltas } => packed(deltas).saturating_add(bases.len().saturating_mul(8)),
+                Node::IntDelta { bases, deltas } => {
+                    packed(deltas).saturating_add(bases.len().saturating_mul(8))
+                }
                 Node::IntRle { .. } | Node::DblRle { .. } => LEN_BYTES,
                 Node::IntDict { .. } | Node::DblDict { .. } | Node::StrDict { .. } => 0,
                 Node::DblRaw(v) => v.len().saturating_mul(8).saturating_add(LEN_BYTES),
-                Node::DblDecimal { patches, .. } => patches.len().saturating_mul(LEN_BYTES + 8).saturating_add(LEN_BYTES),
+                Node::DblDecimal { patches, .. } => patches
+                    .len()
+                    .saturating_mul(LEN_BYTES + 8)
+                    .saturating_add(LEN_BYTES),
                 Node::StrRaw { bytes, .. } => bytes.len(),
                 Node::StrOne { value, .. } => value.len().saturating_add(LEN_BYTES),
             };
@@ -158,9 +204,13 @@ impl Tree {
 /// Takes node `part`'s decoded values, once; a part must come after the node `at` that uses it.
 fn take(done: &mut [Option<Data>], at: usize, part: usize) -> Result<Data, CodecError> {
     if part <= at {
-        return Err(CodecError::Corrupt("a part comes before the node that uses it"));
+        return Err(CodecError::Corrupt(
+            "a part comes before the node that uses it",
+        ));
     }
-    done.get_mut(part).and_then(Option::take).ok_or(CodecError::Corrupt("a part is missing or used twice"))
+    done.get_mut(part)
+        .and_then(Option::take)
+        .ok_or(CodecError::Corrupt("a part is missing or used twice"))
 }
 
 fn take_int(done: &mut [Option<Data>], at: usize, part: usize) -> Result<Vec<u64>, CodecError> {
@@ -187,15 +237,25 @@ fn take_str(done: &mut [Option<Data>], at: usize, part: usize) -> Result<Strings
 /// Run `lengths` expanded: each value repeated its run's length, `len` in all.
 fn expand<T: Copy>(values: &[T], lengths: &[u64], len: usize) -> Result<Vec<T>, CodecError> {
     if values.len() != lengths.len() {
-        return Err(CodecError::Corrupt("run values and lengths differ in number"));
+        return Err(CodecError::Corrupt(
+            "run values and lengths differ in number",
+        ));
     }
-    let total = lengths.iter().try_fold(0u64, |s, &l| s.checked_add(l)).ok_or(CodecError::Overflow)?;
+    let total = lengths
+        .iter()
+        .try_fold(0u64, |s, &l| s.checked_add(l))
+        .ok_or(CodecError::Overflow)?;
     if usize::try_from(total).ok() != Some(len) {
-        return Err(CodecError::Corrupt("run lengths do not add up to the column"));
+        return Err(CodecError::Corrupt(
+            "run lengths do not add up to the column",
+        ));
     }
     let mut out = Vec::with_capacity(len);
     for (&v, &l) in values.iter().zip(lengths) {
-        out.extend(std::iter::repeat_n(v, usize::try_from(l).map_err(|_| CodecError::Overflow)?));
+        out.extend(std::iter::repeat_n(
+            v,
+            usize::try_from(l).map_err(|_| CodecError::Overflow)?,
+        ));
     }
     Ok(out)
 }
@@ -205,22 +265,29 @@ fn lookup<T: Copy + Default>(dict: &[T], codes: &[u64]) -> Result<Vec<T>, CodecE
     let mut bad = false;
     let out = codes
         .iter()
-        .map(|&c| match usize::try_from(c).ok().and_then(|c| dict.get(c)) {
-            Some(&v) => v,
-            None => {
-                bad = true;
-                T::default()
-            }
-        })
+        .map(
+            |&c| match usize::try_from(c).ok().and_then(|c| dict.get(c)) {
+                Some(&v) => v,
+                None => {
+                    bad = true;
+                    T::default()
+                }
+            },
+        )
         .collect();
     if bad {
-        return Err(CodecError::Corrupt("a dictionary code past the dictionary's end"));
+        return Err(CodecError::Corrupt(
+            "a dictionary code past the dictionary's end",
+        ));
     }
     Ok(out)
 }
 
 /// The exact powers of ten in a double: 10^22 is the largest (5^22 < 2^53), a format value.
-const POW10: [f64; 23] = [1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22];
+const POW10: [f64; 23] = [
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+    1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+];
 
 fn decode_node(at: usize, node: &Node, done: &mut [Option<Data>]) -> Result<Data, CodecError> {
     Ok(match node {
@@ -237,7 +304,11 @@ fn decode_node(at: usize, node: &Node, done: &mut [Option<Data>]) -> Result<Data
             pack::delta_decode(&mut out, bases)?;
             Data::Int(out)
         }
-        Node::IntRle { len, values, lengths } => {
+        Node::IntRle {
+            len,
+            values,
+            lengths,
+        } => {
             let lengths = take_int(done, at, *lengths)?;
             let values = take_int(done, at, *values)?;
             Data::Int(expand(&values, &lengths, *len)?)
@@ -249,7 +320,11 @@ fn decode_node(at: usize, node: &Node, done: &mut [Option<Data>]) -> Result<Data
         }
         Node::DblRaw(v) => Data::Dbl(v.clone()),
         Node::DblOne { value, len } => Data::Dbl(vec![*value; *len]),
-        Node::DblRle { len, values, lengths } => {
+        Node::DblRle {
+            len,
+            values,
+            lengths,
+        } => {
             let lengths = take_int(done, at, *lengths)?;
             let values = take_dbl(done, at, *values)?;
             Data::Dbl(expand(&values, &lengths, *len)?)
@@ -259,29 +334,38 @@ fn decode_node(at: usize, node: &Node, done: &mut [Option<Data>]) -> Result<Data
             let dict = take_dbl(done, at, *dict)?;
             Data::Dbl(lookup(&dict, &codes)?)
         }
-        Node::DblDecimal { digits, exponents, patches } => {
+        Node::DblDecimal {
+            digits,
+            exponents,
+            patches,
+        } => {
             let exponents = take_int(done, at, *exponents)?;
             let digits = take_int(done, at, *digits)?;
             if digits.len() != exponents.len() {
-                return Err(CodecError::Corrupt("decimal digits and exponents differ in number"));
+                return Err(CodecError::Corrupt(
+                    "decimal digits and exponents differ in number",
+                ));
             }
             let mut bad = false;
             let mut out: Vec<f64> = digits
                 .iter()
                 .zip(&exponents)
-                .map(|(&d, &e)| match usize::try_from(e).ok().and_then(|e| POW10.get(e)) {
-                    Some(p) => (d.cast_signed() as f64) / p,
-                    None => {
-                        bad = true;
-                        0.0
-                    }
-                })
+                .map(
+                    |(&d, &e)| match usize::try_from(e).ok().and_then(|e| POW10.get(e)) {
+                        Some(p) => (d.cast_signed() as f64) / p,
+                        None => {
+                            bad = true;
+                            0.0
+                        }
+                    },
+                )
                 .collect();
             if bad {
                 return Err(CodecError::Corrupt("a decimal exponent past 22"));
             }
             for &(i, v) in patches {
-                *out.get_mut(i).ok_or(CodecError::Corrupt("a decimal patch past the column's end"))? = v;
+                *out.get_mut(i)
+                    .ok_or(CodecError::Corrupt("a decimal patch past the column's end"))? = v;
             }
             Data::Dbl(out)
         }
@@ -291,16 +375,27 @@ fn decode_node(at: usize, node: &Node, done: &mut [Option<Data>]) -> Result<Data
             offsets.push(0usize);
             let mut end = 0usize;
             for l in lengths {
-                end = usize::try_from(l).ok().and_then(|l| end.checked_add(l)).ok_or(CodecError::Overflow)?;
+                end = usize::try_from(l)
+                    .ok()
+                    .and_then(|l| end.checked_add(l))
+                    .ok_or(CodecError::Overflow)?;
                 offsets.push(end);
             }
             if end != bytes.len() {
-                return Err(CodecError::Corrupt("string lengths do not add up to their bytes"));
+                return Err(CodecError::Corrupt(
+                    "string lengths do not add up to their bytes",
+                ));
             }
-            Data::Str(Strings { bytes: bytes.clone(), offsets })
+            Data::Str(Strings {
+                bytes: bytes.clone(),
+                offsets,
+            })
         }
         Node::StrOne { value, len } => {
-            let mut s = Strings { bytes: Vec::with_capacity(value.len().saturating_mul(*len)), offsets: Vec::with_capacity(len.saturating_add(1)) };
+            let mut s = Strings {
+                bytes: Vec::with_capacity(value.len().saturating_mul(*len)),
+                offsets: Vec::with_capacity(len.saturating_add(1)),
+            };
             s.offsets.push(0);
             for _ in 0..*len {
                 s.push(value);
@@ -310,10 +405,15 @@ fn decode_node(at: usize, node: &Node, done: &mut [Option<Data>]) -> Result<Data
         Node::StrDict { dict, codes } => {
             let codes = take_int(done, at, *codes)?;
             let dict = take_str(done, at, *dict)?;
-            let mut s = Strings { bytes: Vec::new(), offsets: Vec::with_capacity(codes.len().saturating_add(1)) };
+            let mut s = Strings {
+                bytes: Vec::new(),
+                offsets: Vec::with_capacity(codes.len().saturating_add(1)),
+            };
             s.offsets.push(0);
             for c in codes {
-                let entry = usize::try_from(c).ok().and_then(|c| dict.get(c)).ok_or(CodecError::Corrupt("a dictionary code past the dictionary's end"))?;
+                let entry = usize::try_from(c).ok().and_then(|c| dict.get(c)).ok_or(
+                    CodecError::Corrupt("a dictionary code past the dictionary's end"),
+                )?;
                 s.push(entry);
             }
             Data::Str(s)
@@ -339,7 +439,11 @@ pub fn encode(codec: Codec, values: Values) -> Result<Tree, CodecError> {
         Values::Str(s) => Data::Str(s),
     };
     let mut nodes = vec![Node::IntOne { value: 0, len: 0 }];
-    let mut queue = VecDeque::from([Task { at: 0, data: root, used: 0 }]);
+    let mut queue = VecDeque::from([Task {
+        at: 0,
+        data: root,
+        used: 0,
+    }]);
     // Bounded: a part's schemes exclude those used on its way, so no path is longer than the
     // codec's schemes, and each node has at most two parts (CLAUDE.md §2).
     while let Some(task) = queue.pop_front() {
@@ -357,57 +461,103 @@ fn part(nodes: &mut Vec<Node>, queue: &mut VecDeque<Task>, data: Data, used: u8)
     at
 }
 
-fn encode_part(codec: Codec, data: Data, used: u8, nodes: &mut Vec<Node>, queue: &mut VecDeque<Task>) -> Result<Node, CodecError> {
+fn encode_part(
+    codec: Codec,
+    data: Data,
+    used: u8,
+    nodes: &mut Vec<Node>,
+    queue: &mut VecDeque<Task>,
+) -> Result<Node, CodecError> {
     let kind = match &data {
         Data::Int(_) => Kind::Int,
         Data::Dbl(_) => Kind::Double,
         Data::Str(_) => Kind::Str,
     };
-    let offered: Vec<Scheme> = candidates(codec, kind).iter().copied().filter(|s| s.bit() & used == 0).collect();
+    let offered: Vec<Scheme> = candidates(codec, kind)
+        .iter()
+        .copied()
+        .filter(|s| s.bit() & used == 0)
+        .collect();
     let ranked = choose(data.len(), |ranges| rank(&data, ranges, &offered))?;
     // The best scheme that applies to the whole part: a sample can see one value where the part
     // has more.
-    let scheme = ranked.into_iter().find(|&s| s != Scheme::One || is_one(&data)).unwrap_or(Scheme::Raw);
+    let scheme = ranked
+        .into_iter()
+        .find(|&s| s != Scheme::One || is_one(&data))
+        .unwrap_or(Scheme::Raw);
     let used = used | scheme.bit();
     let lay = layout(codec);
     Ok(match (data, scheme) {
-        (Data::Int(v), Scheme::One) => Node::IntOne { value: v.first().copied().unwrap_or(0), len: v.len() },
+        (Data::Int(v), Scheme::One) => Node::IntOne {
+            value: v.first().copied().unwrap_or(0),
+            len: v.len(),
+        },
         (Data::Int(v), Scheme::Packed) => Node::IntPacked(for_pack(lay, &v)?),
         (Data::Int(v), Scheme::Delta) => {
             let (bases, deltas) = pack::delta_encode(&v);
-            Node::IntDelta { bases, deltas: for_pack(Layout::Interleaved, &deltas)? }
+            Node::IntDelta {
+                bases,
+                deltas: for_pack(Layout::Interleaved, &deltas)?,
+            }
         }
         (Data::Int(v), Scheme::Rle) => {
             let len = v.len();
             let (values, lengths) = runs(&v, |a, b| a == b);
             let values = part(nodes, queue, Data::Int(values), used);
             let lengths = part(nodes, queue, Data::Int(lengths), used);
-            Node::IntRle { len, values, lengths }
+            Node::IntRle {
+                len,
+                values,
+                lengths,
+            }
         }
         (Data::Int(v), Scheme::Dict) => {
             let mut dict: Vec<i64> = v.iter().map(|x| x.cast_signed()).collect();
             dict.sort_unstable();
             dict.dedup();
-            let codes = v.iter().map(|x| dict.binary_search(&x.cast_signed()).map_or(0, |c| c as u64)).collect();
-            let dict = part(nodes, queue, Data::Int(dict.into_iter().map(i64::cast_unsigned).collect()), used);
+            let codes = v
+                .iter()
+                .map(|x| dict.binary_search(&x.cast_signed()).map_or(0, |c| c as u64))
+                .collect();
+            let dict = part(
+                nodes,
+                queue,
+                Data::Int(dict.into_iter().map(i64::cast_unsigned).collect()),
+                used,
+            );
             let codes = part(nodes, queue, Data::Int(codes), used);
             Node::IntDict { dict, codes }
         }
         (Data::Int(v), _) => Node::IntRaw(v),
-        (Data::Dbl(v), Scheme::One) => Node::DblOne { value: v.first().copied().unwrap_or(0.0), len: v.len() },
+        (Data::Dbl(v), Scheme::One) => Node::DblOne {
+            value: v.first().copied().unwrap_or(0.0),
+            len: v.len(),
+        },
         (Data::Dbl(v), Scheme::Rle) => {
             let len = v.len();
             let (values, lengths) = runs(&v, |a, b| a.to_bits() == b.to_bits());
             let values = part(nodes, queue, Data::Dbl(values), used);
             let lengths = part(nodes, queue, Data::Int(lengths), used);
-            Node::DblRle { len, values, lengths }
+            Node::DblRle {
+                len,
+                values,
+                lengths,
+            }
         }
         (Data::Dbl(v), Scheme::Dict) => {
             let mut dict: Vec<u64> = v.iter().map(|x| x.to_bits()).collect();
             dict.sort_unstable();
             dict.dedup();
-            let codes = v.iter().map(|x| dict.binary_search(&x.to_bits()).map_or(0, |c| c as u64)).collect();
-            let dict = part(nodes, queue, Data::Dbl(dict.into_iter().map(f64::from_bits).collect()), used);
+            let codes = v
+                .iter()
+                .map(|x| dict.binary_search(&x.to_bits()).map_or(0, |c| c as u64))
+                .collect();
+            let dict = part(
+                nodes,
+                queue,
+                Data::Dbl(dict.into_iter().map(f64::from_bits).collect()),
+                used,
+            );
             let codes = part(nodes, queue, Data::Int(codes), used);
             Node::DblDict { dict, codes }
         }
@@ -431,16 +581,24 @@ fn encode_part(codec: Codec, data: Data, used: u8, nodes: &mut Vec<Node>, queue:
             }
             let digits = part(nodes, queue, Data::Int(digits), used);
             let exponents = part(nodes, queue, Data::Int(exponents), used);
-            Node::DblDecimal { digits, exponents, patches }
+            Node::DblDecimal {
+                digits,
+                exponents,
+                patches,
+            }
         }
         (Data::Dbl(v), _) => Node::DblRaw(v),
-        (Data::Str(s), Scheme::One) => Node::StrOne { value: s.get(0).map(<[u8]>::to_vec).unwrap_or_default(), len: s.len() },
+        (Data::Str(s), Scheme::One) => Node::StrOne {
+            value: s.get(0).map(<[u8]>::to_vec).unwrap_or_default(),
+            len: s.len(),
+        },
         (Data::Str(s), Scheme::Dict) => {
             let mut index: HashMap<&[u8], u64> = HashMap::new();
             let mut dict = Strings::new();
             let mut codes = Vec::with_capacity(s.len());
             for entry in s.iter() {
-                let entry = entry.ok_or(CodecError::Invalid("string offsets do not cut their bytes"))?;
+                let entry =
+                    entry.ok_or(CodecError::Invalid("string offsets do not cut their bytes"))?;
                 let next = dict.len() as u64;
                 let code = *index.entry(entry).or_insert_with(|| {
                     dict.push(entry);
@@ -458,14 +616,22 @@ fn encode_part(codec: Codec, data: Data, used: u8, nodes: &mut Vec<Node>, queue:
                 _ => 0,
             });
             let lengths = part(nodes, queue, Data::Int(lengths.collect()), used);
-            Node::StrRaw { bytes: s.bytes, lengths }
+            Node::StrRaw {
+                bytes: s.bytes,
+                lengths,
+            }
         }
     })
 }
 
 /// Frame of reference: each value's distance from the least (as signed), packed in `layout`.
 fn for_pack(layout: Layout, v: &[u64]) -> Result<Packed, CodecError> {
-    let base = v.iter().map(|x| x.cast_signed()).min().unwrap_or(0).cast_unsigned();
+    let base = v
+        .iter()
+        .map(|x| x.cast_signed())
+        .min()
+        .unwrap_or(0)
+        .cast_unsigned();
     let distances: Vec<u64> = v.iter().map(|x| x.wrapping_sub(base)).collect();
     pack::pack(layout, base, &distances)
 }
@@ -489,7 +655,9 @@ fn runs<T: Copy>(v: &[T], eq: impl Fn(&T, &T) -> bool) -> (Vec<T>, Vec<u64>) {
 fn is_one(data: &Data) -> bool {
     match data {
         Data::Int(v) => v.windows(2).all(|w| matches!(w, [a, b] if a == b)),
-        Data::Dbl(v) => v.windows(2).all(|w| matches!(w, [a, b] if a.to_bits() == b.to_bits())),
+        Data::Dbl(v) => v
+            .windows(2)
+            .all(|w| matches!(w, [a, b] if a.to_bits() == b.to_bits())),
         Data::Str(s) => {
             let first = s.get(0);
             s.iter().all(|e| e == first)
@@ -533,7 +701,11 @@ fn exact_i64(r: f64) -> Option<i64> {
         return None;
     }
     let magnitude = i64::try_from(mantissa.wrapping_shr(shift)).ok()?;
-    Some(if r.is_sign_negative() { magnitude.wrapping_neg() } else { magnitude })
+    Some(if r.is_sign_negative() {
+        magnitude.wrapping_neg()
+    } else {
+        magnitude
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -544,12 +716,19 @@ fn exact_i64(r: f64) -> Option<i64> {
 /// sample is runs of 64 consecutive values (a horizontal group, so runs and deltas inside it are
 /// seen), one from each of as many equal strata as there are runs, as BtrBlocks samples runs from
 /// across a block.
-fn choose(len: usize, rank: impl Fn(&[Range<usize>]) -> Vec<Scheme>) -> Result<Vec<Scheme>, CodecError> {
+fn choose(
+    len: usize,
+    rank: impl Fn(&[Range<usize>]) -> Vec<Scheme>,
+) -> Result<Vec<Scheme>, CodecError> {
     let mut count = 1usize;
     let mut best: Option<Scheme> = None;
     loop {
         let whole = count.saturating_mul(GROUP) >= len;
-        let ranges: Vec<Range<usize>> = if whole { std::iter::once(0..len).collect() } else { strata(len, count)? };
+        let ranges: Vec<Range<usize>> = if whole {
+            std::iter::once(0..len).collect()
+        } else {
+            strata(len, count)?
+        };
         let ranked = rank(&ranges);
         let first = ranked.first().copied();
         if whole || (best.is_some() && best == first) {
@@ -564,7 +743,10 @@ fn choose(len: usize, rank: impl Fn(&[Range<usize>]) -> Vec<Scheme>) -> Result<V
 fn strata(len: usize, count: usize) -> Result<Vec<Range<usize>>, CodecError> {
     (0..count)
         .map(|s| {
-            let start = s.checked_mul(len).and_then(|x| x.checked_div(count)).ok_or(CodecError::Overflow)?;
+            let start = s
+                .checked_mul(len)
+                .and_then(|x| x.checked_div(count))
+                .ok_or(CodecError::Overflow)?;
             let end = start.saturating_add(GROUP).min(len);
             Ok(start..end)
         })
@@ -574,7 +756,10 @@ fn strata(len: usize, count: usize) -> Result<Vec<Range<usize>>, CodecError> {
 /// The offered schemes, fewest estimated bits a value first (ties keep the offered order).
 fn rank(data: &Data, ranges: &[Range<usize>], offered: &[Scheme]) -> Vec<Scheme> {
     let n: usize = ranges.iter().map(|r| r.len()).sum();
-    let mut costs: Vec<(Scheme, f64)> = offered.iter().filter_map(|&s| estimate(data, ranges, n, s).map(|bits| (s, bits))).collect();
+    let mut costs: Vec<(Scheme, f64)> = offered
+        .iter()
+        .filter_map(|&s| estimate(data, ranges, n, s).map(|bits| (s, bits)))
+        .collect();
     costs.sort_by(|a, b| a.1.total_cmp(&b.1));
     costs.into_iter().map(|(s, _)| s).collect()
 }
@@ -590,7 +775,11 @@ fn code_bits(distinct: usize) -> f64 {
 
 fn span_bits(v: impl Iterator<Item = i64>) -> f64 {
     let (lo, hi) = v.fold((i64::MAX, i64::MIN), |(lo, hi), x| (lo.min(x), hi.max(x)));
-    if lo > hi { 0.0 } else { bits(hi.wrapping_sub(lo).cast_unsigned()) }
+    if lo > hi {
+        0.0
+    } else {
+        bits(hi.wrapping_sub(lo).cast_unsigned())
+    }
 }
 
 /// Estimated bits a value `scheme` leaves on the sample, its parts counted as packed; `None` where
@@ -603,21 +792,39 @@ fn estimate(data: &Data, ranges: &[Range<usize>], n: usize, scheme: Scheme) -> O
     match data {
         Data::Int(v) => {
             let sample: Vec<&[u64]> = ranges.iter().filter_map(|r| v.get(r.clone())).collect();
-            let all = || sample.iter().flat_map(|s| s.iter().map(|x| x.cast_signed()));
+            let all = || {
+                sample
+                    .iter()
+                    .flat_map(|s| s.iter().map(|x| x.cast_signed()))
+            };
             match scheme {
                 Scheme::Raw => Some(64.0),
-                Scheme::One => if one(all()) { Some(0.0) } else { None },
+                Scheme::One => {
+                    if one(all()) {
+                        Some(0.0)
+                    } else {
+                        None
+                    }
+                }
                 Scheme::Packed => Some(span_bits(all())),
                 Scheme::Delta => {
                     // Row 0's deltas are zero (its values are the bases).
-                    let deltas = std::iter::once(0).chain(sample.iter().flat_map(|s| s.iter().zip(s.iter().skip(pack::LANES)).map(|(a, b)| b.wrapping_sub(*a).cast_signed())));
+                    let deltas = std::iter::once(0).chain(sample.iter().flat_map(|s| {
+                        s.iter()
+                            .zip(s.iter().skip(pack::LANES))
+                            .map(|(a, b)| b.wrapping_sub(*a).cast_signed())
+                    }));
                     // 16 bases of 64 bits each per 1,024 values: 1 bit a value.
                     Some(span_bits(deltas) + 64.0 * (pack::LANES as f64) / (pack::VECTOR as f64))
                 }
                 Scheme::Rle => {
                     let (vals, lens) = sample_runs(&sample);
                     let r = vals.len() as f64;
-                    Some(r * (span_bits(vals.into_iter()) + bits(lens.into_iter().max().unwrap_or(0))) / nf)
+                    Some(
+                        r * (span_bits(vals.into_iter())
+                            + bits(lens.into_iter().max().unwrap_or(0)))
+                            / nf,
+                    )
                 }
                 Scheme::Dict => {
                     let mut d: Vec<i64> = all().collect();
@@ -631,15 +838,31 @@ fn estimate(data: &Data, ranges: &[Range<usize>], n: usize, scheme: Scheme) -> O
         }
         Data::Dbl(v) => {
             let sample: Vec<&[f64]> = ranges.iter().filter_map(|r| v.get(r.clone())).collect();
-            let all = || sample.iter().flat_map(|s| s.iter().map(|x| x.to_bits().cast_signed()));
+            let all = || {
+                sample
+                    .iter()
+                    .flat_map(|s| s.iter().map(|x| x.to_bits().cast_signed()))
+            };
             match scheme {
                 Scheme::Raw => Some(64.0),
-                Scheme::One => if one(all()) { Some(0.0) } else { None },
+                Scheme::One => {
+                    if one(all()) {
+                        Some(0.0)
+                    } else {
+                        None
+                    }
+                }
                 Scheme::Rle => {
-                    let as_bits: Vec<Vec<u64>> = sample.iter().map(|s| s.iter().map(|x| x.to_bits()).collect()).collect();
+                    let as_bits: Vec<Vec<u64>> = sample
+                        .iter()
+                        .map(|s| s.iter().map(|x| x.to_bits()).collect())
+                        .collect();
                     let refs: Vec<&[u64]> = as_bits.iter().map(Vec::as_slice).collect();
                     let (vals, lens) = sample_runs(&refs);
-                    Some((vals.len() as f64) * (64.0 + bits(lens.into_iter().max().unwrap_or(0))) / nf)
+                    Some(
+                        (vals.len() as f64) * (64.0 + bits(lens.into_iter().max().unwrap_or(0)))
+                            / nf,
+                    )
                 }
                 Scheme::Dict => {
                     let mut d: Vec<i64> = all().collect();
@@ -668,14 +891,23 @@ fn estimate(data: &Data, ranges: &[Range<usize>], n: usize, scheme: Scheme) -> O
             }
         }
         Data::Str(s) => {
-            let entries = || ranges.iter().flat_map(|r| r.clone()).map(|i| s.get(i).unwrap_or_default());
+            let entries = || {
+                ranges
+                    .iter()
+                    .flat_map(|r| r.clone())
+                    .map(|i| s.get(i).unwrap_or_default())
+            };
             let total_bytes: usize = entries().map(<[u8]>::len).sum();
             let max_len = entries().map(<[u8]>::len).max().unwrap_or(0) as u64;
             match scheme {
                 Scheme::Raw => Some(((total_bytes as f64) * 8.0 + nf * bits(max_len)) / nf),
                 Scheme::One => {
                     let first = entries().next();
-                    if entries().all(|e| Some(e) == first) { Some(0.0) } else { None }
+                    if entries().all(|e| Some(e) == first) {
+                        Some(0.0)
+                    } else {
+                        None
+                    }
                 }
                 Scheme::Dict => {
                     let mut d: Vec<&[u8]> = entries().collect();
@@ -683,7 +915,12 @@ fn estimate(data: &Data, ranges: &[Range<usize>], n: usize, scheme: Scheme) -> O
                     d.dedup();
                     let dn = d.len();
                     let dict_bytes: usize = d.iter().map(|e| e.len()).sum();
-                    Some(((dict_bytes as f64) * 8.0 + (dn as f64) * bits(max_len) + nf * code_bits(dn)) / nf)
+                    Some(
+                        ((dict_bytes as f64) * 8.0
+                            + (dn as f64) * bits(max_len)
+                            + nf * code_bits(dn))
+                            / nf,
+                    )
                 }
                 _ => None,
             }
