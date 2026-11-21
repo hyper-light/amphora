@@ -11,7 +11,7 @@
 //! A record: `magic` (`u32`), the body's length (`u32`), the body's XXH3 (`u64`), then the body:
 //! the commit timestamp (`u64`), the change count (`u32`), and each change: the tree (`u64`), its
 //! kind (`u8`: 1 a put, 2 a removal), the key's length (`u32`) and key, and a put's value's length
-//! (`u32`) and value; or a tree made (3) or dropped (4), with an empty key (`NS.2.3`). Recovery
+//! (`u32`) and value; or a tree made (3) or dropped (4), with an empty key (`AC-NS.2.5`). Recovery
 //! reads records until the first that is torn or doesn't check out:
 //! a flush that never ended may leave a prefix of what it wrote.
 
@@ -35,11 +35,11 @@ pub enum Op {
         tree: u64,
         key: Vec<u8>,
     },
-    /// Tree `tree` made, empty (`NS.2.3`): a record of its own.
+    /// Tree `tree` made, empty (`AC-NS.2.5`): a record of its own.
     Made {
         tree: u64,
     },
-    /// Tree `tree` dropped (`NS.2.3`): a record of its own.
+    /// Tree `tree` dropped (`AC-NS.2.5`): a record of its own.
     Dropped {
         tree: u64,
     },

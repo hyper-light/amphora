@@ -413,6 +413,37 @@ its limit, an untyped failure, a scan that isn't its snapshot's, or bytes not gi
 workload whose refusals under the budget a version store out of memory (LeanStore's graveyard)
 would have avoided at a cost the suite accepts (the step this leaves open).
 
+## 11. Large rows as chunk rows of an overflow tree; trees made and dropped as records of their own
+
+(G7 step 2, `AC-NS.2.4`, `AC-NS.2.5`; `crates/engine/storage/versioned/{overflow,durable}.rs`.)
+
+**Decision.** A value with at least as many bytes as its cell has room for beside its key keeps
+exactly that many in its cell; the rest goes, in chunks of the most a cell holds beside the chunk's
+key, into the database's overflow tree under (tree, key, chunk number), written by the same
+transaction. A cell's value of exactly the room is how a reader knows to look for chunks. The room
+and the chunk size come from the page format (`page.rs`: `MAX_CELL`, a quarter page with its slot,
+less the two `u16` lengths); the longest value is SQLite's `SQLITE_MAX_LENGTH`
+(sqlite.org/limits.html), which bounds every walk of a row's chunks. A page splits by bytes, the new
+cell counted, at the first cell past half the bytes: each half then holds at most half plus one cell
+and one bound, which a quarter-page cell keeps within a page. Making or dropping a tree is a redo
+record of its own, durable before it returns, taken with row changes and checkpoints held off; a
+checkpoint lists a dropped tree's root as 0.
+
+**Why.** Chunks as ordinary versioned rows get snapshots, first-writer-wins, rollback, savepoints,
+the redo log, checkpoints' lists and recovery from the code that already does them for rows
+(decisions 4, 6 to 8), where SQLite's overflow page chains (sqlite.org/fileformat2.html, 1.6) would
+need versions, logging and recovery of their own. The other way, a header byte on every value naming
+whether it continues, costs a byte and a branch on every row to serve the few that overflow; it is
+the reversible alternative and Ada's to choose.
+
+**Evidence.** `durable.rs`'s `ns2_4_*` tests (every snapshot, savepoints, recovery, a crash at each
+of many writes) and `ns2_5_*` (reopens, power cuts, a crash at each write of trees made and
+dropped); `page.rs`'s `ns2_4_splits_by_bytes_fit_cells_of_the_largest_size`.
+
+**Falsified by.** The corpus's large-row classes measuring the chunk reads (one descent a chunk)
+slower than the current engine's overflow chains by more than the plan's bar, or a split that finds
+no room for its cell.
+
 ## Stages, each measured
 
 1. The buffer pool and the B-link tree, versioned rows, in memory: concurrent inserts and reads

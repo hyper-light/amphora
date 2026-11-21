@@ -467,9 +467,15 @@ title = "Records, overflow, the catalog and transactions on the new pages (G7 st
 criteria = [
   { id = "AC-NS.2.1", text = "the engine's test suites pass on the new storage" },
   { id = "AC-NS.2.3", text = "A transaction rolls back to a savepoint from its versions: rows first changed after it as before the transaction, rows changed before and after as the savepoint found them, later changes out of its redo record; the savepoint stays good" },
+  # lane g7s2-2
+  { id = "AC-NS.2.4", text = "A value past a cell's room keeps that many bytes in its cell and the rest as versioned chunk rows of the database's overflow tree, written by the same transaction; a page splits by bytes, the new cell counted" },
+  { id = "AC-NS.2.5", text = "Trees are made and dropped while the database runs: each a redo record of its own, durable before it returns; a checkpoint lists a dropped tree's root as 0; recovery replays both; a drop waits while an open transaction changed the tree" },
 ]
 tests = [
   { id = "T-NS.2.1", text = "The shared model test of transactions on both storages — passes when identical answers, no anomaly" },
+  # lane g7s2-2
+  { id = "T-NS.2.4", text = "Values past a page read at every snapshot; rollback and savepoints across them; recovery after a power cut and a crash at each of many writes recovers a prefix of the commits" },
+  { id = "T-NS.2.5", text = "Trees made and dropped survive reopens and power cuts; a crash at each write of a workload that makes, fills and drops trees recovers a prefix of its steps" },
 ]
 
 # lane follower-reads (G13 step 4, kiln goal 80d4cf5e; docs/design/replication.md, "Follower reads at a

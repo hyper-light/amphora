@@ -1147,7 +1147,7 @@ impl VTree {
 pub struct Versioned {
     pub pool: Pool,
     pub clock: Clock,
-    /// Each tree by id; None once dropped (`NS.2.3`). Trees are made and dropped while the
+    /// Each tree by id; None once dropped (`AC-NS.2.5`). Trees are made and dropped while the
     /// database runs ([`Versioned::make_tree`], [`Versioned::set_tree`]); an operation holds its
     /// tree's `Arc`, so a drop never pulls a tree from under one already in it.
     trees: RwLock<Vec<Option<Arc<VTree>>>>,
@@ -1229,7 +1229,7 @@ impl Versioned {
         })
     }
 
-    /// Each tree's root page, by tree; 0 for a tree dropped (`NS.2.3`).
+    /// Each tree's root page, by tree; 0 for a tree dropped (`AC-NS.2.5`).
     pub fn roots(&self) -> Vec<u64> {
         self.trees
             .read()
@@ -1243,7 +1243,7 @@ impl Versioned {
         self.trees.read().iter().flatten().cloned().collect()
     }
 
-    /// Makes an empty tree ordered by `cmp` under the next id, which it returns (`NS.2.3`).
+    /// Makes an empty tree ordered by `cmp` under the next id, which it returns (`AC-NS.2.5`).
     pub fn make_tree(&self, cmp: super::blink::Comparator) -> Result<u64> {
         let mut trees = self.trees.write();
         let id = u64::try_from(trees.len()).map_err(|_| LimboError::IntegerOverflow)?;
@@ -1255,7 +1255,7 @@ impl Versioned {
     }
 
     /// Recovery's replay of a tree made: an empty tree ordered by `cmp` under `id`, at or past the
-    /// next (`NS.2.3`). Ids between are of trees whose making failed before its record was
+    /// next (`AC-NS.2.5`). Ids between are of trees whose making failed before its record was
     /// durable: none of them is a tree.
     pub fn remake_tree(&self, id: u64, cmp: super::blink::Comparator) -> Result<()> {
         let mut trees = self.trees.write();
@@ -1281,7 +1281,7 @@ impl Versioned {
         Ok(())
     }
 
-    /// Drops tree `id` (`NS.2.3`): later operations naming it are refused; its pages stay where
+    /// Drops tree `id` (`AC-NS.2.5`): later operations naming it are refused; its pages stay where
     /// they are, unreferenced.
     pub fn drop_tree(&self, id: u64) -> Result<()> {
         let mut trees = self.trees.write();
@@ -1295,7 +1295,7 @@ impl Versioned {
     }
 
     /// Whether a transaction still open has changed a row of tree `id`: a drop then waits for it
-    /// (`NS.2.3`).
+    /// (`AC-NS.2.5`).
     pub fn open_changes(&self, id: u64) -> Result<bool> {
         let t = self.tree(id)?;
         for shard in &t.heads {

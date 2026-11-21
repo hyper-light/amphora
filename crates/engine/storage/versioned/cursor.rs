@@ -19,7 +19,7 @@
 //! back from its first descends again to the leaf before its lower bound, as a B-link tree links
 //! its leaves only to the right. Every walk is bounded by the pages handed out.
 //!
-//! A row larger than a page's cell keeps its tail in the database's overflow tree (`NS.2.2`): the
+//! A row larger than a page's cell keeps its tail in the database's overflow tree (`AC-NS.2.4`): the
 //! cursor puts it back after copying a leaf, its latch released. What waits for the catalog
 //! (step 2): dropping a tree, and a comparison per tree in one database.
 
@@ -235,7 +235,7 @@ impl Rows {
         self.row(i).map(|(k, _)| k)
     }
 
-    /// Puts back the chunks of the copied rows that continue in the overflow tree (`NS.2.2`), as
+    /// Puts back the chunks of the copied rows that continue in the overflow tree (`AC-NS.2.4`), as
     /// `snap` sees them: after the copy, with the leaf's latch released.
     fn join_chunks(
         &mut self,

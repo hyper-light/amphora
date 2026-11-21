@@ -1,5 +1,5 @@
 //! Amphora: rows larger than a page's cell (kiln plan 01a16b0f46fa72e384b8dd0065dc94f9, step 2,
-//! `NS.2.2`): a large value's tail kept as versioned rows of the database's overflow tree, written
+//! `AC-NS.2.4`): a large value's tail kept as versioned rows of the database's overflow tree, written
 //! by the same transaction as the row.
 //!
 //! A row's value of fewer bytes than its key leaves room for in a cell ([`inline_len`]) is its
@@ -12,7 +12,7 @@
 //!
 //! The other way, a header byte on every stored value naming whether it continues, was not taken:
 //! it costs a byte and a branch on every row to serve the few that overflow. The choice is
-//! reversible (Needs Ada's word, `NS.2.2`).
+//! reversible (Needs Ada's word, `AC-NS.2.4`).
 
 use super::page::MAX_CELL;
 use crate::error::LimboError;
@@ -89,11 +89,11 @@ mod tests {
     use super::*;
     use crate::storage::versioned::page::{fits, Tail};
 
-    /// NS.2.2: a value one byte short of the cell's room is stored whole; at the room and past it,
+    /// AC-NS.2.4: a value one byte short of the cell's room is stored whole; at the room and past it,
     /// the cell holds exactly the room and chunks of the most a cell takes hold the rest, each
     /// chunk's cell fitting a page.
     #[test]
-    fn ns2_2_split_fills_cells_to_the_page_format() {
+    fn ns2_4_split_fills_cells_to_the_page_format() {
         let key = b"row key".to_vec();
         let room = inline_len(&key).unwrap();
         let per = chunk_len(&key).unwrap();
@@ -118,9 +118,9 @@ mod tests {
         assert!(!fits(&ck, Tail::Value(&vec![0u8; per + 1])).unwrap());
     }
 
-    /// NS.2.2: a key that leaves a chunk no room refuses a value past its cell's.
+    /// AC-NS.2.4: a key that leaves a chunk no room refuses a value past its cell's.
     #[test]
-    fn ns2_2_split_refuses_past_the_bounds() {
+    fn ns2_4_split_refuses_past_the_bounds() {
         let wide = vec![0u8; MAX_CELL - CELL_LENGTHS - CHUNK_KEY_EXTRA];
         assert!(chunk_len(&wide).is_none());
         let room = inline_len(&wide).unwrap();
@@ -130,10 +130,10 @@ mod tests {
         ));
     }
 
-    /// NS.2.2: chunk keys of different rows never collide: a key that ends like another's chunk
+    /// AC-NS.2.4: chunk keys of different rows never collide: a key that ends like another's chunk
     /// number is still a different length.
     #[test]
-    fn ns2_2_chunk_keys_are_distinct() {
+    fn ns2_4_chunk_keys_are_distinct() {
         let a = chunk_key(1, b"ab", 0);
         let b = chunk_key(1, b"ab\0\0\0\0", 0);
         let c = chunk_key(2, b"ab", 0);

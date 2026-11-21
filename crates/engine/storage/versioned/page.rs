@@ -491,7 +491,7 @@ struct Moved<'a> {
 /// belongs; returns the separator, `right`'s lower bound. A leaf keeps its separator as `right`'s
 /// first cell; an inner page moves it up, its child becoming `right`'s first child.
 ///
-/// The halves are chosen by bytes, the new cell counted (NS.2.2): the split falls at the first
+/// The halves are chosen by bytes, the new cell counted (AC-NS.2.4): the split falls at the first
 /// cell past half the cells' bytes. Each half then holds at most half the bytes plus one cell and
 /// one bound, which [`MAX_CELL`] (a quarter page with its slot) keeps within a page; a split by
 /// count leaves no room once cells near [`MAX_CELL`] gather on one side.
@@ -777,10 +777,10 @@ mod tests {
 
     /// Do: fill a bounded leaf with small cells and cells of the largest size, gathered at its
     /// upper end, then split it inserting another of the largest at each place. Expect: every
-    /// split fits both halves, its cells all kept in order (NS.2.2: values that overflow fill
+    /// split fits both halves, its cells all kept in order (AC-NS.2.4: values that overflow fill
     /// cells to the largest size).
     #[test]
-    fn ns2_2_splits_by_bytes_fit_cells_of_the_largest_size() {
+    fn ns2_4_splits_by_bytes_fit_cells_of_the_largest_size() {
         let cmp: Compare = &bytes;
         let big = |k: &[u8]| vec![7u8; MAX_CELL - 4 - k.len()];
         for small in [0usize, 1, 3, 10, 40] {

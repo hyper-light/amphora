@@ -215,7 +215,7 @@ pub struct Database {
     /// A column copy's feed, handed each commit's record under the publish lock (G11 decision 1,
     /// part 2): set once, by [`Database::keep_columns`].
     columns: std::sync::OnceLock<Arc<Feed>>,
-    /// The tree that holds large values' chunks ([`overflow`], `NS.2.2`): the one after the
+    /// The tree that holds large values' chunks ([`overflow`], `AC-NS.2.4`): the one after the
     /// `trees` the database was made with, ordered by bytes.
     overflow: u64,
 }
@@ -228,7 +228,7 @@ fn bytes_order() -> Comparator {
 impl Database {
     /// The database `disk` holds, recovered (or made, with `trees` empty trees, if it holds
     /// none), in a pool of `frames` pages; its trees ordered by `cmp`, and after them the
-    /// overflow tree (`NS.2.2`). Reopened with the `trees` it was made with.
+    /// overflow tree (`AC-NS.2.4`). Reopened with the `trees` it was made with.
     pub fn open(
         disk: Arc<dyn Disk>,
         frames: usize,
@@ -380,7 +380,7 @@ impl Database {
         }
     }
 
-    /// Makes an empty tree ordered by `cmp` (`NS.2.3`), logged as a record of its own, durable
+    /// Makes an empty tree ordered by `cmp` (`AC-NS.2.5`), logged as a record of its own, durable
     /// before it returns: its id. Row changes and checkpoints wait for it.
     pub fn make_tree(&self, d: &mut Descender, cmp: Comparator) -> Result<u64> {
         let _alone = self.gate.write();
@@ -393,7 +393,7 @@ impl Database {
         logged.map(|()| id)
     }
 
-    /// Drops tree `tree` (`NS.2.3`), logged as a record of its own, durable before it returns;
+    /// Drops tree `tree` (`AC-NS.2.5`), logged as a record of its own, durable before it returns;
     /// refused (`Busy`) while a transaction still open has changed one of its rows. Its pages
     /// stay in the file, unreferenced: the pool keeps no free list yet. Row changes and
     /// checkpoints wait for it.
@@ -469,7 +469,7 @@ impl Database {
     }
 
     /// The row under `key` in `tree` as `snap` sees it, its chunks put back after its cell's
-    /// value (`NS.2.2`).
+    /// value (`AC-NS.2.4`).
     pub fn get(
         &self,
         d: &mut Descender,
@@ -490,7 +490,7 @@ impl Database {
     }
 
     /// Appends to `value`, a cell's value of the row under `key` in `tree`, the chunks `snap`
-    /// sees, if it continues in any (`NS.2.2`): chunk 0 on, to the first absent.
+    /// sees, if it continues in any (`AC-NS.2.4`): chunk 0 on, to the first absent.
     pub fn join(
         &self,
         d: &mut Descender,
@@ -516,7 +516,7 @@ impl Database {
     }
 
     /// Up to `most` rows of `tree` from `from` on as `snap` sees them, in key order, each with its
-    /// chunks put back (`NS.2.2`).
+    /// chunks put back (`AC-NS.2.4`).
     pub fn scan(
         &self,
         d: &mut Descender,
@@ -537,7 +537,7 @@ impl Database {
     }
 
     /// `txn` puts `value` under `key` in `tree`, its tail past a cell's room as chunks in the
-    /// overflow tree (`NS.2.2`), the previous row's chunks past the new one's removed: the row it
+    /// overflow tree (`AC-NS.2.4`), the previous row's chunks past the new one's removed: the row it
     /// saw there before, if any, whole.
     pub fn put(
         &self,
@@ -600,7 +600,7 @@ impl Database {
         ))
     }
 
-    /// `txn` removes the row under `key` in `tree` and its chunks (`NS.2.2`): the row it saw
+    /// `txn` removes the row under `key` in `tree` and its chunks (`AC-NS.2.4`): the row it saw
     /// there, if any, whole.
     pub fn remove(
         &self,
@@ -1016,9 +1016,9 @@ mod tests {
     /// Do: the crash workload above with values from a few bytes to several pages, so rows'
     /// chunks in the overflow tree are written, replaced and removed by the commits, crashing at
     /// each of many operations. Expect: each reopen's rows, chunks put back, exactly a prefix of
-    /// the commits at least as long as the last acknowledged durable (NS.2.2, T-T1.3.1).
+    /// the commits at least as long as the last acknowledged durable (AC-NS.2.4, T-T1.3.1).
     #[test]
-    fn ns2_2_large_values_recover_a_prefix_at_any_crash() {
+    fn ns2_4_large_values_recover_a_prefix_at_any_crash() {
         let room = overflow::inline_len(&[0]).unwrap();
         crash_recovers_prefixes((5..800).step_by(13), move |seed| match seed % 4 {
             0 => 30,
@@ -1122,9 +1122,9 @@ mod tests {
     /// Do: make trees and write rows to them, drop some, checkpoint between, then reopen, and
     /// reopen again after a power cut. Expect: the trees made and not dropped with their rows, the
     /// dropped ones refused, a write to a dropped tree refused, the next tree made under the next
-    /// id; a drop refused (`Busy`) while an open transaction has changed its rows (NS.2.3).
+    /// id; a drop refused (`Busy`) while an open transaction has changed its rows (AC-NS.2.5).
     #[test]
-    fn ns2_3_trees_made_and_dropped_survive_reopens() {
+    fn ns2_5_trees_made_and_dropped_survive_reopens() {
         let disk = Arc::new(Simulated::new(31));
         let want;
         {
@@ -1174,10 +1174,10 @@ mod tests {
     /// Do: for many crash points, a workload that makes trees, writes long and short rows to them
     /// durably, drops the oldest now and then, and checkpoints, on a disk that crashes after that
     /// many operations; cut the power and reopen. Expect: the trees and their rows exactly as
-    /// after a prefix of the steps, at least as long as the last acknowledged (NS.2.3: a crash at
+    /// after a prefix of the steps, at least as long as the last acknowledged (AC-NS.2.5: a crash at
     /// each write of a tree made or dropped).
     #[test]
-    fn ns2_3_a_crash_at_each_write_of_trees_made_and_dropped() {
+    fn ns2_5_a_crash_at_each_write_of_trees_made_and_dropped() {
         let mut checked = 0;
         for crash in (3..600).step_by(11) {
             let disk = Arc::new(Simulated::new(crash));
@@ -1290,9 +1290,9 @@ mod tests {
     /// Do: commit a row's value at every length that matters, from a few bytes to several pages
     /// and back, keeping a snapshot open after each commit; read each snapshot by get and scan.
     /// Expect: each snapshot reads the whole value committed before it; once the row is short
-    /// again and then removed, the newest snapshot sees no chunk rows (NS.2.2).
+    /// again and then removed, the newest snapshot sees no chunk rows (AC-NS.2.4).
     #[test]
-    fn ns2_2_values_past_a_page_read_at_every_snapshot() {
+    fn ns2_4_values_past_a_page_read_at_every_snapshot() {
         let db = Database::open(Arc::new(Simulated::new(21)), 2_000, 1, cmp).unwrap();
         let mut d = Descender::new();
         let key = b"big".to_vec();
@@ -1337,9 +1337,9 @@ mod tests {
     /// replace it with a short one and then a different long one, roll back to the savepoint;
     /// then replace it again and abort. Expect: the transaction reads the longer value after the
     /// rollback to its savepoint, and every snapshot after the abort the first long value, its
-    /// chunks as many as before (NS.2.2).
+    /// chunks as many as before (AC-NS.2.4).
     #[test]
-    fn ns2_2_rollback_and_savepoints_across_large_values() {
+    fn ns2_4_rollback_and_savepoints_across_large_values() {
         let db = Database::open(Arc::new(Simulated::new(22)), 2_000, 1, cmp).unwrap();
         let mut d = Descender::new();
         let key = b"k".to_vec();
@@ -1381,9 +1381,9 @@ mod tests {
 
     /// Do: commit long values durably, checkpoint with a transaction open that replaced one with
     /// another long value, commit more long values durably, then cut the power and reopen.
-    /// Expect: every committed value whole, the open transaction's absent (NS.2.2, T-T1.3.1).
+    /// Expect: every committed value whole, the open transaction's absent (AC-NS.2.4, T-T1.3.1).
     #[test]
-    fn ns2_2_large_values_survive_recovery() {
+    fn ns2_4_large_values_survive_recovery() {
         let disk = Arc::new(Simulated::new(23));
         let mut want = BTreeMap::new();
         {
