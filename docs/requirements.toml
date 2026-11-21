@@ -871,4 +871,5 @@ tests = [
   { id = "T-G3.3.3", text = "crates/engine/tests/shared_pages.rs g3s3_a_byte_flipped_on_disk_is_refused_on_each_page_path — passes when a fresh connection on each path refuses the flipped page with a checksum error" },
   { id = "T-G3.3.4", text = "storage::pager::tests::g3s3_plain_pins_count_as_atomic_pins_do — passes when plain pins count as atomic pins do" },
   { id = "T-G3.3.5", text = "crates/engine/tests/shared_pages.rs g3s3_plain_misses_read_into_the_pages_evictions_leave — passes when a table four times the cache reads today's rows on the plain path and its misses read into recycled pages" },
+  { id = "T-G3.3.6", text = "crates/engine/tests/page_path_allocs.rs — passes when the plain path's point lookups that miss allocate less than today's and its hits no more (a counting allocator; --nocapture prints allocations per lookup, AC-G3.3.2's harness)" },
 ]
