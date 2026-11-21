@@ -918,16 +918,23 @@ impl Versioned {
 
     /// Silo's read-set check at row grain: refused if a row `txn` read, or one in a span it read
     /// (read again), has a version committed after its snapshot. A head no longer kept was last
-    /// written at or below the low watermark, at or before the snapshot.
+    /// written at or below the low watermark, at or before the snapshot. The newest committed
+    /// version is the head's own when its writer committed, else the newest older one: an open
+    /// writer's change (another's, or `txn`'s own) stands over a commit made since the snapshot
+    /// that `txn` read past, and must not hide it.
     fn occ(&self, txn: &Txn, reads: &Reads, d: &mut Descender) -> Result<()> {
-        let moved = |writer: u64| -> Result<bool> {
-            Ok(matches!(self.clock.resolve(writer)?, Writer::Committed(ts) if ts > txn.start))
+        let moved = |head: &Head| -> Result<bool> {
+            let newest = match self.clock.resolve(head.writer)? {
+                Writer::Committed(ts) => ts,
+                Writer::Open(_) | Writer::Aborted => head.older.first().map_or(0, |o| o.written),
+            };
+            Ok(newest > txn.start)
         };
         for (tree, key) in &reads.points {
             let t = self.tree(*tree)?;
             let heads = t.heads(key)?.lock();
             if let Some(head) = heads.get(key.as_slice()) {
-                if moved(head.writer)? {
+                if moved(head)? {
                     return Err(LimboError::SerializationFailure);
                 }
             }
@@ -947,7 +954,7 @@ impl Versioned {
                     if cell.flags.versioned {
                         let heads = t.heads(key)?.lock();
                         if let Some(head) = heads.get(key) {
-                            refused = moved(head.writer)?;
+                            refused = moved(head)?;
                         }
                     }
                     Ok(!refused)
@@ -1554,6 +1561,33 @@ mod tests {
             t.put(&v.pool, &mut d, &v.clock, &mut a, b"y", b"2")
                 .unwrap();
             v.commit(a, &mut d).unwrap();
+            v.commit(b, &mut d).unwrap();
+        }
+    }
+
+    /// T-G8.1.2: do a transaction read `x`, another write `x` and commit, a third begin after and
+    /// write `x` and stay open, then the first write `y` and commit. Expect: precision locking and
+    /// OCC refuse it as they do with no third (the open writer's change stands over the commit it
+    /// read past, and OCC finds that commit under it); SSI commits it (one antidependency).
+    #[test]
+    fn g8_1_an_open_writer_does_not_hide_a_commit_read_past() {
+        for validation in SERIALIZABLE {
+            let v = xy(validation);
+            let t = v.tree(0).unwrap();
+            let mut d = Descender::new();
+            let mut a = v.clock.begin().unwrap();
+            t.read(&v.pool, &mut d, &v.clock, &mut a, b"x").unwrap();
+            let mut c = v.clock.begin().unwrap();
+            t.put(&v.pool, &mut d, &v.clock, &mut c, b"x", b"2")
+                .unwrap();
+            v.commit(c, &mut d).unwrap();
+            let mut b = v.clock.begin().unwrap();
+            t.put(&v.pool, &mut d, &v.clock, &mut b, b"x", b"3")
+                .unwrap();
+            t.put(&v.pool, &mut d, &v.clock, &mut a, b"y", b"2")
+                .unwrap();
+            let r = v.commit(a, &mut d);
+            assert_eq!(refused(r), validation != Validation::Ssi, "{validation:?}");
             v.commit(b, &mut d).unwrap();
         }
     }
