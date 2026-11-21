@@ -291,6 +291,13 @@ impl LearnedCosts {
         self.rates.lock().rate_mut(work).observe(units, nanos);
     }
 
+    /// Nanoseconds a unit of `work` takes as the rate stands, None before any time was seen: what
+    /// G11 step 5's access paths weigh the column copy's measured scan against
+    /// (`column_path::RowRates::learned`).
+    pub(crate) fn nanos_per(&self, work: Work) -> Option<f64> {
+        self.rates.lock().rate_mut(work).nanos_per_unit()
+    }
+
     /// The weights as they stand, no fetch's miss share given; None only if the clock never moved
     /// while calibrating.
     #[cfg(test)]

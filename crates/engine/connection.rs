@@ -979,6 +979,16 @@ impl Connection {
         self.bump_prepare_context_generation();
     }
 
+    /// Amphora (PL.7, a prototype behind this switch, off by default; `AMPHORA_FITTED_COSTS=1`
+    /// turns it on at open): has the database time its statements and newly prepared statements
+    /// plan with the cost weights fitted to those times (`optimizer::cost_fit`). The switch and
+    /// the fit are the database's, shared by its connections. Off until the coordinator's JOB
+    /// measurement of AC-PL.7.1 says otherwise.
+    pub fn set_fitted_costs(&self, on: bool) {
+        self.db.cost_fit.set_on(on);
+        self.bump_prepare_context_generation();
+    }
+
     pub(crate) fn sorted_fetches(&self) -> bool {
         self.sorted_fetches.load(Ordering::Acquire)
     }
