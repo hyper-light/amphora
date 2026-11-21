@@ -273,34 +273,29 @@ fn calibrate(clock: &mut dyn FnMut() -> f64) -> Rates {
 }
 
 /// Times one page read at a database's open, before it has read a page of its own (QT.5): a
-/// scratch page of `page_size` bytes, written beside the database and read back. Nanoseconds,
-/// or None if no scratch page could be written there (the database's own reads then give the
-/// first time; a database whose directory takes no file is one opened read-only, whose open reads
-/// its file).
+/// scratch page of `page_size` bytes, written beside the database through its own IO and read back
+/// as its pager reads (`read_through_io`). Nanoseconds, or None if no scratch page could be
+/// written there (a database whose directory takes no file is one opened read-only, whose open
+/// reads its own file).
 ///
-/// A page read back right after it was written comes from the OS's cache, a read the database
-/// rarely makes cold. So where the OS has an uncached read the scratch page is read with it:
-/// `O_DIRECT` on Linux, `F_NOCACHE` on macOS and the other Apple systems, `FILE_FLAG_NO_BUFFERING`
-/// on Windows, each with the page in a buffer aligned to its size. Where the OS or the file system
-/// refuses one (Linux's tmpfs refuses `O_DIRECT`), and for a database in memory, the page is
-/// written and read back through the database's own IO, as its pager reads: a cache-hot read for a
-/// file, the read itself in memory. Either way the first epoch of the database's own reads
-/// replaces it (`LearnedCosts::anchor_page_read`).
+/// The read comes from the OS's cache, as the database's own reads do while its pages are cached.
+/// It is not read uncached (`O_DIRECT`, `F_NOCACHE`, `FILE_FLAG_NO_BUFFERING`): that prices a
+/// cached database's page at a device read, which made row visits all but free against it and
+/// flipped the planner's plans for databases held in memory (lane qs5-4, kiln run r326 on Windows:
+/// three of `tests/planner.rs`'s plans). A database whose reads go to the device teaches the
+/// estimator that with its own reads: the first epoch of them replaces this one
+/// (`LearnedCosts::anchor_page_read`).
 pub(crate) fn time_page_read(
     db_path: &str,
     io: &crate::sync::Arc<dyn crate::io::IO>,
     page_size: usize,
 ) -> Option<f64> {
     let page: Vec<u8> = (0..page_size).map(|i| mix(i as u64) as u8).collect();
-    let in_memory = crate::database::is_memory_like(db_path);
-    let scratch = scratch_path(db_path, in_memory);
-    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
-    if !in_memory {
-        match uncached_read(std::path::Path::new(&scratch), &page) {
-            Ok(nanos) => return Some(nanos),
-            Err(err) => tracing::debug!("QT.5: no uncached page read beside {db_path}: {err}"),
-        }
-    }
+    let scratch = if crate::database::is_memory_like(db_path) {
+        format!(":memory:-page-read-{}", uuid::Uuid::new_v4().simple())
+    } else {
+        format!("{db_path}-page-read-{}", uuid::Uuid::new_v4().simple())
+    };
     match read_through_io(io, &scratch, page) {
         Ok(nanos) => Some(nanos),
         Err(err) => {
@@ -308,103 +303,6 @@ pub(crate) fn time_page_read(
             None
         }
     }
-}
-
-/// The scratch page's path: the database's own, with a suffix no other file shares.
-fn scratch_path(db_path: &str, in_memory: bool) -> String {
-    let unique = uuid::Uuid::new_v4().simple();
-    if in_memory {
-        format!(":memory:-page-read-{unique}")
-    } else {
-        format!("{db_path}-page-read-{unique}")
-    }
-}
-
-/// Writes `page` to a new file at `scratch` and reads it back with the OS's uncached read; the
-/// read's nanoseconds. The file is removed whatever happens.
-#[cfg(all(feature = "fs", not(target_family = "wasm")))]
-fn uncached_read(scratch: &std::path::Path, page: &[u8]) -> std::io::Result<f64> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create_new(true);
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_DIRECT);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING);
-    }
-    #[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "no uncached read on this OS",
-        ));
-    }
-    let file = options.open(scratch)?;
-    let timed = (|| -> std::io::Result<f64> {
-        #[cfg(target_vendor = "apple")]
-        rustix::fs::fcntl_nocache(&file, true)?;
-        let mut written = vec![0u8; page.len() * 2];
-        let out = aligned(&mut written, page.len())?;
-        out.copy_from_slice(page);
-        write_at(&file, out)?;
-        let mut read = vec![0u8; page.len() * 2];
-        let back = aligned(&mut read, page.len())?;
-        let start = std::time::Instant::now();
-        read_at(&file, back)?;
-        let nanos = start.elapsed().as_nanos() as f64;
-        if back != page {
-            return Err(std::io::Error::other("the scratch page read back differs"));
-        }
-        Ok(nanos)
-    })();
-    drop(file);
-    let removed = std::fs::remove_file(scratch);
-    let nanos = timed?;
-    removed?;
-    Ok(nanos)
-}
-
-/// `len` bytes of `raw` starting at an address that is a multiple of `len` (a page size, a power
-/// of two, which uncached reads need their buffers aligned to); `raw` holds at least `2 * len`.
-#[cfg(all(feature = "fs", not(target_family = "wasm")))]
-fn aligned(raw: &mut [u8], len: usize) -> std::io::Result<&mut [u8]> {
-    let start = raw.as_ptr().align_offset(len);
-    start
-        .checked_add(len)
-        .and_then(|end| raw.get_mut(start..end))
-        .ok_or_else(|| std::io::Error::other("no aligned page in the scratch buffer"))
-}
-
-#[cfg(all(feature = "fs", unix))]
-fn write_at(file: &std::fs::File, buf: &[u8]) -> std::io::Result<()> {
-    std::os::unix::fs::FileExt::write_all_at(file, buf, 0)
-}
-
-#[cfg(all(feature = "fs", unix))]
-fn read_at(file: &std::fs::File, buf: &mut [u8]) -> std::io::Result<()> {
-    std::os::unix::fs::FileExt::read_exact_at(file, buf, 0)
-}
-
-#[cfg(all(feature = "fs", windows))]
-fn write_at(file: &std::fs::File, buf: &[u8]) -> std::io::Result<()> {
-    let n = std::os::windows::fs::FileExt::seek_write(file, buf, 0)?;
-    if n != buf.len() {
-        return Err(std::io::Error::other("short write of the scratch page"));
-    }
-    Ok(())
-}
-
-#[cfg(all(feature = "fs", windows))]
-fn read_at(file: &std::fs::File, buf: &mut [u8]) -> std::io::Result<()> {
-    let n = std::os::windows::fs::FileExt::seek_read(file, buf, 0)?;
-    if n != buf.len() {
-        return Err(std::io::Error::other("short read of the scratch page"));
-    }
-    Ok(())
 }
 
 /// Writes `page` to `scratch` through `io` and reads it back as the pager reads, from the read's
@@ -416,7 +314,7 @@ fn read_through_io(
 ) -> crate::Result<f64> {
     use crate::io::{Buffer, Completion, OpenFlags};
     use crate::sync::Arc;
-    let file = io.open_file(scratch, OpenFlags::Create, true)?;
+    let file = io.open_file(scratch, OpenFlags::Create, false)?;
     let timed = (|| -> crate::Result<f64> {
         let len = page.len();
         let written = file.pwrite(
