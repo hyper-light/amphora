@@ -3561,9 +3561,10 @@ fn apply_table_access_plan(
     // PL.8: the loops below run a left-deep plan; a bushy one's inner joins are built by the
     // emitter's hash-join build inputs, which the search doesn't choose yet.
     if !best_plan.is_left_deep() {
-        return Err(LimboError::InternalError(
-            "PL.8: a bushy join plan reached the left-deep emitter".to_string(),
-        ));
+        return Err(LimboError::InternalError(format!(
+            "PL.8: the bushy join plan {} reached the left-deep emitter",
+            best_plan.tree_text()?
+        )));
     }
     let (best_access_methods, best_table_numbers) = (
         best_plan.best_access_methods().collect::<Vec<_>>(),

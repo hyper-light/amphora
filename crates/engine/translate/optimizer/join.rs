@@ -346,8 +346,8 @@ pub struct InnerJoin {
 /// the join of an outer node with an inner one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinTreeNode {
-    /// `(table_number, access_method_index)`, as in `JoinN::data`.
-    Table(usize, usize),
+    /// The table at this position of `JoinN::data`.
+    Table(usize),
     /// Indexes of the outer and the inner node in the arena.
     Join { outer: usize, inner: usize },
 }
@@ -393,7 +393,7 @@ impl JoinN {
         // (`None` before its first table). The bottom entry is the whole plan.
         let mut open: Vec<(usize, usize, Option<usize>)> = vec![(0, self.data.len(), None)];
         let mut next_run = runs.iter().peekable();
-        for (position, &(table, access_method)) in self.data.iter().enumerate() {
+        for position in 0..self.data.len() {
             while let Some(run) = next_run.next_if(|run| run.start == position) {
                 // A run starting where the run around it starts is that run's outer side, not
                 // an inner one.
@@ -407,7 +407,7 @@ impl JoinN {
                 }
                 open.push((run.start, run.end, None));
             }
-            nodes.push(JoinTreeNode::Table(table, access_method));
+            nodes.push(JoinTreeNode::Table(position));
             let mut node = nodes.len().saturating_sub(1);
             // Join the table into the innermost run, then close every run that ends after it,
             // its result joining the run around it as an inner side.
@@ -433,6 +433,31 @@ impl JoinN {
             return Err(malformed());
         }
         Ok(nodes)
+    }
+
+    /// PL.8: the plan's tree as text, each table by its number and each join as `(outer inner)`:
+    /// `(((0 1) 2) 3)` for a left-deep plan, `((0 1) (2 3))` for a bushy one. Walked on a stack.
+    pub fn tree_text(&self) -> Result<String> {
+        let nodes = self.tree()?;
+        let mut text = String::new();
+        let mut stack: Vec<Result<usize, &'static str>> = Vec::new();
+        stack.extend(nodes.len().checked_sub(1).map(Ok));
+        while let Some(item) = stack.pop() {
+            match item.map(|node| nodes.get(node)) {
+                Err(close) => text.push_str(close),
+                Ok(Some(JoinTreeNode::Table(position))) => {
+                    if let Some((table, _)) = self.data.get(*position) {
+                        text.push_str(&table.to_string());
+                    }
+                }
+                Ok(Some(JoinTreeNode::Join { outer, inner })) => {
+                    text.push('(');
+                    stack.extend([Err(")"), Ok(*inner), Err(" "), Ok(*outer)]);
+                }
+                Ok(None) => {}
+            }
+        }
+        Ok(text)
     }
 }
 
@@ -2633,47 +2658,28 @@ mod tests {
         }
     }
 
-    /// The tree as text: a table by its number, a join as `(outer inner)`, walked on a stack.
-    fn tree_text(nodes: &[JoinTreeNode]) -> String {
-        let mut text = String::new();
-        let mut stack: Vec<Result<usize, &'static str>> = vec![Ok(nodes.len() - 1)];
-        while let Some(item) = stack.pop() {
-            match item {
-                Err(close) => text.push_str(close),
-                Ok(node) => match nodes[node] {
-                    JoinTreeNode::Table(table, _) => text.push_str(&table.to_string()),
-                    JoinTreeNode::Join { outer, inner } => {
-                        text.push('(');
-                        stack.extend([Err(")"), Ok(inner), Err(" "), Ok(outer)]);
-                    }
-                },
-            }
-        }
-        text
-    }
-
     /// PL.8 (piece 1): a left-deep plan is the bushy shape's special case, a chain; runs of inner
     /// joins nest as subtrees on the inner side; runs that don't nest are refused.
     #[test]
     fn t_pl_8_bushy_shape_holds_left_deep_and_bushy_trees() {
         let left_deep = plan_of(4, &[]);
         assert!(left_deep.is_left_deep());
-        assert_eq!(tree_text(&left_deep.tree().unwrap()), "(((0 1) 2) 3)");
-        assert_eq!(tree_text(&plan_of(1, &[]).tree().unwrap()), "0");
+        assert_eq!(left_deep.tree_text().unwrap(), "(((0 1) 2) 3)");
+        assert_eq!(plan_of(1, &[]).tree_text().unwrap(), "0");
 
         let bushy = plan_of(4, &[(2, 4)]);
         assert!(!bushy.is_left_deep());
-        assert_eq!(tree_text(&bushy.tree().unwrap()), "((0 1) (2 3))");
+        assert_eq!(bushy.tree_text().unwrap(), "((0 1) (2 3))");
         assert_eq!(
-            tree_text(&plan_of(4, &[(2, 4), (1, 4)]).tree().unwrap()),
+            plan_of(4, &[(2, 4), (1, 4)]).tree_text().unwrap(),
             "(0 (1 (2 3)))"
         );
         assert_eq!(
-            tree_text(&plan_of(5, &[(1, 3), (3, 5)]).tree().unwrap()),
+            plan_of(5, &[(1, 3), (3, 5)]).tree_text().unwrap(),
             "((0 (1 2)) (3 4))"
         );
         assert_eq!(
-            tree_text(&plan_of(5, &[(1, 5), (3, 5)]).tree().unwrap()),
+            plan_of(5, &[(1, 5), (3, 5)]).tree_text().unwrap(),
             "(0 ((1 2) (3 4)))"
         );
 
