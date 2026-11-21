@@ -1466,8 +1466,7 @@ impl Namespace {
         let until = Instant::now()
             .checked_add(std::time::Duration::from_secs(2))
             .ok_or(Refusal::Timeout)?;
-        self.resolved(until)?
-            .try_wait_selected(family, after, until)
+        self.changed(family, after, until)
     }
 
     pub(super) fn resolved(&self, until: Instant) -> Result<Namespace, Refusal> {
@@ -1573,6 +1572,10 @@ impl Records for Namespace {
             Answer::Changes(v) => Ok(v),
             _ => Err(unavailable("wrong changes answer")),
         }
+    }
+    fn changed(&self, family: &str, after: Rev, until: Instant) -> Result<Option<Rev>, Refusal> {
+        self.resolved(until)?
+            .try_wait_selected(family, after, until)
     }
     fn head(&self, until: Instant) -> Result<Rev, Refusal> {
         match self.database.submit(&self.name, Operation::Head, until)? {
