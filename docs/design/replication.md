@@ -2105,7 +2105,8 @@ replica's marker table, so a write that read or wrote its page conflicts with ev
 apply still count as written: conservative, never unsound.
 
 **Page 1 merges its size.** Every session reads page 1. An entry that changed it only in the size conflicts only with
-a write that writes page 1 too. Two allocations from one base would allocate the same page, which conflicts on that
+a write that writes page 1 too; one that changed more of it (the schema, its cookie, the free list) conflicts with
+every write, whether or not the write's record caught its read of page 1. Two allocations from one base would allocate the same page, which conflicts on that
 page anyway. An entry with no read set that wrote page 1 counts as more than a size change.
 
 **The window is derived.** It is the leader's log between the write's base and the append, bounded by the log's own
