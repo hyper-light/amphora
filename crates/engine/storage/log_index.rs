@@ -573,7 +573,7 @@ impl ReadIndex {
         generation: u64,
         index: &IndexUnderLock<'_>,
     ) -> Lookup {
-        let mut published = self.published.load_full();
+        let mut published = self.published.load();
         if published.generation != generation || published.upto < max_frame {
             // One reader publishes; the rest read under the lock until it has.
             let Some(_publishing) = self.publishing.try_lock() else {
@@ -595,7 +595,7 @@ impl ReadIndex {
                     pages,
                 }));
             });
-            published = self.published.load_full();
+            published = self.published.load();
             if published.generation != generation || published.upto < max_frame {
                 return Lookup::Ask;
             }
