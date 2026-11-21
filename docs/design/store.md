@@ -1903,9 +1903,10 @@ gone a point read gains at most 1.14-1.30x (Amdahl's bound).
   leaf's cell count (a key hashed per cell). The one assumption, that a hash insert costs what a
   probe does, is measured by `descent_skip_bench`.
 - **E's error bound.** Each segment is the line through its first and last fence; its bound is the
-  largest distance between where the line puts a fence and where it is, the fit's own. A segment is
-  split at its worst fence only while that lowers the expected probes over all fences (a search
-  over the segments plus one over the window), in integers. Learning a leaf refits only the
+  largest distance between where the line puts a fence and where it is, the fit's own. The worst
+  segment is split at its worst fence until all are exact, and the number of splits with the fewest
+  expected probes over all fences (a search over the segments plus one over the window, in
+  integers) is kept: one split at a time stalls where a bit more search buys a bit less window. Learning a leaf refits only the
   segments its fences touched.
 - **Upkeep.** Lazy: paid where a write moved a leaf and a lookup noticed (a refute, then a learn).
   Every freed page drops everything either holds: coarse, and right for a prototype; a per-page

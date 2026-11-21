@@ -34,9 +34,9 @@
 //! E's error bound is its own fit's: each segment is the line through its first and last fence, and
 //! its bound is the largest distance between where the line puts a fence and where the fence is.
 //! How many segments: a lookup pays a binary search over the segments and one over its window of
-//! `2 * err + 3` fences; a segment is split at its worst fence while that lowers the expected
-//! probes over every fence (`bits(segments) * fences + sum(len * bits(window))`, all integers), and
-//! never otherwise. Learning a leaf refits only the segments its fences touched (incremental);
+//! `2 * err + 3` fences. The worst segment is split at its worst fence until every segment is
+//! exact, and the number of splits whose expected probes over every fence
+//! (`bits(segments) * fences + sum(len * bits(window))`, all integers) were fewest is kept. Learning a leaf refits only the segments its fences touched (incremental);
 //! [`LeafLocator::rebuild`] fits a whole table.
 //!
 //! Their memory, bounded. D holds at most `budget` entries (keys hashed plus leaves tracked); a
@@ -48,7 +48,8 @@
 //! cores, sans-IO, their model test against a plain descent and the micro-benchmark of their
 //! lookup and upkeep costs.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::hash::Hash;
 
 /// A leaf as a read of it leaves it: its page, its first and last key, and its cell count.
@@ -435,45 +436,94 @@ impl LeafLocator {
             .saturating_mul(bits(window))
     }
 
-    /// Fits fences `start..start + len` as segments: one line, split at its worst fence while the
-    /// split lowers the expected probes over all fences (`others` segments lie outside the run).
+    /// Fits fences `start..start + len` as segments (`others` segments lie outside the run): the
+    /// worst segment split at its worst fence, again and again until every segment is exact, and
+    /// the split count whose expected probes over all fences were fewest kept. One split at a time
+    /// can't see past a step that costs a bit (a binary search over one more segment) and saves
+    /// one, which many together pay for.
     fn fit_run(&self, start: usize, len: usize, others: usize) -> Option<Vec<Segment>> {
+        let (best, _) = self.split_run(start, len, others, None)?;
+        let (_, run) = self.split_run(start, len, others, Some(best))?;
+        Some(run)
+    }
+
+    /// Splits the run's worst segment at its worst fence `stop` times, or until every segment is
+    /// exact; returns the split count with the fewest expected probes and the segments it ended with.
+    fn split_run(
+        &self,
+        start: usize,
+        len: usize,
+        others: usize,
+        stop: Option<usize>,
+    ) -> Option<(usize, Vec<Segment>)> {
         if len == 0 {
-            return Some(Vec::new());
+            return Some((0, Vec::new()));
         }
         let total = u64::try_from(self.fences.len()).unwrap_or(u64::MAX);
-        let mut run = vec![self.fit(start, len)?];
-        // Each split adds a segment of at least one fence: at most `len` rounds.
-        for _ in 0..len {
-            let Some((at, segment)) = run
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| s.err > 0)
-                .max_by_key(|(_, s)| Self::window_cost(s))
-                .map(|(at, s)| (at, *s))
-            else {
-                break;
-            };
-            let Some(cut) = self.worst(&segment) else {
-                break;
-            };
-            let left_len = cut.checked_sub(segment.start)?;
-            let left = self.fit(segment.start, left_len)?;
-            let right = self.fit(cut, segment.len.checked_sub(left_len)?)?;
-            let count = others.saturating_add(run.len());
-            let before = bits(count)
+        let probes = |count: usize, windows: u64| {
+            bits(others.saturating_add(count))
                 .saturating_mul(total)
-                .saturating_add(Self::window_cost(&segment));
-            let after = bits(count.saturating_add(1))
-                .saturating_mul(total)
-                .saturating_add(Self::window_cost(&left))
-                .saturating_add(Self::window_cost(&right));
-            if after >= before {
+                .saturating_add(windows)
+        };
+        let first = self.fit(start, len)?;
+        let mut windows = Self::window_cost(&first);
+        let mut exact = Vec::new();
+        let mut open = BinaryHeap::new();
+        if first.err > 0 {
+            open.push((windows, Reverse(first.start), first.len, first.err));
+        } else {
+            exact.push(first);
+        }
+        let mut count = 1usize;
+        let mut best = (probes(count, windows), 0usize);
+        // Each split adds a segment of at least one fence: at most `len` of them.
+        for steps in 1..=len {
+            if stop.is_some_and(|stop| steps > stop) {
                 break;
             }
-            run.splice(at..=at, [left, right]);
+            let Some((cost, Reverse(at), seg_len, err)) = open.pop() else {
+                break;
+            };
+            let segment = Segment {
+                start: at,
+                len: seg_len,
+                err,
+            };
+            let Some(cut) = self.worst(&segment) else {
+                exact.push(segment);
+                continue;
+            };
+            let left_len = cut.checked_sub(at)?;
+            let left = self.fit(at, left_len)?;
+            let right = self.fit(cut, seg_len.checked_sub(left_len)?)?;
+            windows = windows
+                .saturating_sub(cost)
+                .saturating_add(Self::window_cost(&left))
+                .saturating_add(Self::window_cost(&right));
+            count = count.saturating_add(1);
+            for part in [left, right] {
+                if part.err > 0 {
+                    open.push((
+                        Self::window_cost(&part),
+                        Reverse(part.start),
+                        part.len,
+                        part.err,
+                    ));
+                } else {
+                    exact.push(part);
+                }
+            }
+            let now = probes(count, windows);
+            if now < best.0 {
+                best = (now, steps);
+            }
         }
-        Some(run)
+        exact.extend(
+            open.into_iter()
+                .map(|(_, Reverse(start), len, err)| Segment { start, len, err }),
+        );
+        exact.sort_unstable_by_key(|s| s.start);
+        Some((best.1, exact))
     }
 
     /// Fits every fence again: a whole table's leaves, in any order.
