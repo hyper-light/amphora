@@ -1385,24 +1385,23 @@ impl BTreeCursor {
     /// Amphora (G3.5): names the leaf for `rowid` through the prototype and stands on it when the
     /// page is clean in the connection's cache and its bytes prove the rowid in range; then the
     /// leaf search runs on it alone. No I/O: a page not in the cache means a descent.
-    fn try_stand_on_named_leaf(&mut self, rowid: i64) -> Result<bool> {
+    fn try_stand_on_named_leaf(&mut self, rowid: i64) -> bool {
         let hook = &self.pager.descent_skip;
         let wal = self.pager.wal_pos();
         let Some(page_id) = hook.name(self.descent_skip, self.root_page, rowid, wal) else {
-            return Ok(false);
+            return false;
         };
+        // A cache lookup that fails is a page not at hand: the descent reads it and reports.
         let Some(page) = usize::try_from(page_id)
             .ok()
-            .map(|id| self.pager.cache_get(id))
-            .transpose()?
-            .flatten()
+            .and_then(|id| self.pager.cache_get(id).ok().flatten())
         else {
             hook.uncached();
-            return Ok(false);
+            return false;
         };
         if !page.is_loaded() || page.is_locked() || page.is_dirty() {
             hook.uncached();
-            return Ok(false);
+            return false;
         }
         let cells =
             match crate::storage::descent_skip::table_leaf_span(page.get_contents(), page_id) {
@@ -1415,10 +1414,13 @@ impl BTreeCursor {
         hook.confirm(self.descent_skip, self.root_page);
         self.stack.clear();
         self.going_upwards = false;
-        self.stack.push(page)?;
+        // A push onto the cleared stack can't overflow it; were it refused, the descent runs.
+        if self.stack.push(page).is_err() {
+            return false;
+        }
         self.stood = Some(rowid);
         self.start_table_leaf_search(cells, SeekOp::GE { eq_only: true });
-        Ok(true)
+        true
     }
 
     /// Amphora (G3.5): a plain descent for `rowid` ended at the leaf on top of the stack: teaches
@@ -2727,24 +2729,26 @@ impl BTreeCursor {
     fn tablebtree_seek(&mut self, rowid: i64, seek_op: SeekOp) -> IOResultOr<SeekResult> {
         let search_tree = if matches!(self.seek_state, CursorSeekState::Start) {
             // Amphora (G3.5): a stack standing on a named leaf holds that leaf alone, so the
-            // current-leaf fast path, which reads the ancestors, can't run on it.
+            // current-leaf fast path, which reads the ancestors, can't run on it: it descends.
             let one_leaf = self.stood.take().is_some() || self.redescent.is_some();
-            if self.descent_skip != crate::storage::descent_skip::Switch::Off
-                && self.redescent.is_none()
-                && self.valid_state == CursorValidState::Valid
-                && matches!(seek_op, SeekOp::GE { eq_only: true })
-                && self.try_stand_on_named_leaf(rowid)?
-            {
-                false
-            } else if one_leaf {
-                true
+            let fast = if one_leaf {
+                CurrentTableLeafSeek::SearchFromRoot
             } else {
-                match self.try_start_seek_on_current_table_leaf(rowid, seek_op)? {
-                    CurrentTableLeafSeek::SearchFromRoot => true,
-                    CurrentTableLeafSeek::SearchCurrentLeaf => false,
-                    CurrentTableLeafSeek::NotFoundAtEnd => {
-                        return Ok(IOResult::Done(SeekResult::NotFound));
-                    }
+                self.try_start_seek_on_current_table_leaf(rowid, seek_op)?
+            };
+            match fast {
+                CurrentTableLeafSeek::SearchCurrentLeaf => false,
+                CurrentTableLeafSeek::NotFoundAtEnd => {
+                    return Ok(IOResult::Done(SeekResult::NotFound));
+                }
+                // Amphora (G3.5): where a descent would run, a read cursor's point seek may
+                // stand on the leaf its prototype names instead.
+                CurrentTableLeafSeek::SearchFromRoot => {
+                    !(self.descent_skip != crate::storage::descent_skip::Switch::Off
+                        && self.redescent.is_none()
+                        && self.valid_state == CursorValidState::Valid
+                        && matches!(seek_op, SeekOp::GE { eq_only: true })
+                        && self.try_stand_on_named_leaf(rowid))
                 }
             }
         } else {
