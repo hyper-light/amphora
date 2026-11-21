@@ -743,6 +743,15 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   the cascade a loop with no fixed depth; integers, doubles, strings and nulls round-trip bit for
   bit (T-CS.3.1). Its decode benchmark (`cargo bench -p amphora-columnar --bench decode`) is not yet
   measured against [c18]'s 8 values a cycle.
+  Step 4 (CS.4, lane g11s4), built, not measured: `columns/scan.rs` scans the copy granule by
+  granule, a granule being one of its blocks decoded into column vectors, so its size is the block
+  size the sizer learns, now charged per row of the table so skipped granules count. Each carries
+  min/max and null counts per column and its key range and position; filters skip granules their
+  summaries exclude and run on whole vectors, as do COUNT, SUM (exact for reals), MIN, MAX and
+  group-by. Blocks no change touches are decoded once a generation. Every class equals the row
+  store's answer with writes between scans (T-CS.4.1, T-CS.4.2). Open: driving `Plan` from the
+  morsel executor once `vdbe/morsel.rs` (lane qs6) is on main, the planner's use (step 5), and the
+  benches against CedarDB and ClickHouse (AC-CS.4.1, AC-CS.4.2).
 
 ## Open
 

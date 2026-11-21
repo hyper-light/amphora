@@ -813,6 +813,19 @@ tests = [
   { id = "T-CS.3.1", text = "crates/columnar/tests/round_trip.rs — passes when every random and real-like column, of every size around the group and vector edges, decodes equal to the input in both codecs, every bit width packs and unpacks in both layouts, the schemes follow the data, and damaged encodings are refused" },
 ]
 
+# lane g11s4
+[[own]]
+id = "CS.4"
+title = "Vectorized scans with summaries on every core: granules sized by measurement, min/max and positional summaries, morsel-parallel scans (G11 step 4)"
+criteria = [
+  { id = "AC-CS.4.1", text = "filter_no_index at 1 client against CedarDB's is at least 1.0x (measured by the coordinator)" },
+  { id = "AC-CS.4.2", text = "table_count at 32 clients against ClickHouse's is at least 1.0x (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-CS.4.1", text = "cs4_vectors_equal_rows_every_class_{plain,packed} (crates/engine/storage/versioned/columns/scan.rs) — passes when, with writes between scans, some applied and some queued, rebuilds and held snapshots, every analytic class (filters of each comparison, aggregates, group-by, count) over the copy's granules equals the same statement row by row over the row B-tree, serially and split into partials merged in order, and the summaries skipped granules" },
+  { id = "T-CS.4.2", text = "cs4_min_max_summaries_skip_granules — passes when a filter outside granules' min/max skips them unread and the answer equals the rows'" },
+]
+
 # lane groupcommit (G8 step 3, the versioned storage's log; docs/design/engine.md decision 11): no new
 # IDs. It serves AC-T1.4.2 and AC-T1.4.3 (`amphora-bench --vlog`) and T-T1.3.1
 # (crates/engine/tests/versioned_crash.rs).

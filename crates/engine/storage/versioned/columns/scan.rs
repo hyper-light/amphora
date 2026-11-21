@@ -92,7 +92,11 @@ fn whole(r: f64) -> Option<i128> {
         }
         v
     };
-    Some(if r < 0.0 { magnitude.checked_neg()? } else { magnitude })
+    Some(if r < 0.0 {
+        magnitude.checked_neg()?
+    } else {
+        magnitude
+    })
 }
 
 /// Two reals by value (-0 equals 0); the engine stores no NaN (`NonNan`), and one would equal all.
@@ -174,7 +178,10 @@ impl Vector {
             Data::Int(v) => v.get(i).map_or(Cell::Null, |x| Cell::Int(*x)),
             Data::Real(v) => v.get(i).map_or(Cell::Null, |x| Cell::Real(*x)),
             Data::Text { bytes, offsets } => {
-                match (offsets.get(i), i.checked_add(1).and_then(|n| offsets.get(n))) {
+                match (
+                    offsets.get(i),
+                    i.checked_add(1).and_then(|n| offsets.get(n)),
+                ) {
                     (Some(s), Some(e)) => bytes
                         .get(*s..*e)
                         .map_or(Cell::Null, |b| Cell::Text(b.to_vec())),
@@ -275,7 +282,10 @@ impl Granule {
         for c in 0..width {
             let cells: Vec<Cell> = decoded
                 .iter_mut()
-                .map(|r| r.get_mut(c).map_or(Cell::Null, |x| std::mem::replace(x, Cell::Null)))
+                .map(|r| {
+                    r.get_mut(c)
+                        .map_or(Cell::Null, |x| std::mem::replace(x, Cell::Null))
+                })
                 .collect();
             let mut s = Summary {
                 min: None,
@@ -287,11 +297,13 @@ impl Granule {
                     s.nulls = s.nulls.saturating_add(1);
                     continue;
                 }
-                if s.min.as_ref().is_none_or(|m| order(cell, m) == Ordering::Less) {
+                if s.min
+                    .as_ref()
+                    .is_none_or(|m| order(cell, m) == Ordering::Less)
+                {
                     s.min = Some(cell.clone());
                 }
-                if s
-                    .max
+                if s.max
                     .as_ref()
                     .is_none_or(|m| order(cell, m) == Ordering::Greater)
                 {
@@ -321,21 +333,20 @@ impl Granule {
             Cell::Text(b) | Cell::Blob(b) => b.len().saturating_add(std::mem::size_of::<Cell>()),
             _ => std::mem::size_of::<Cell>(),
         };
-        self.columns.iter().fold(
-            self.first.len().saturating_add(self.last.len()),
-            |n, v| {
+        self.columns
+            .iter()
+            .fold(self.first.len().saturating_add(self.last.len()), |n, v| {
                 let data = match &v.data {
                     Data::Int(x) => x.len().saturating_mul(8),
                     Data::Real(x) => x.len().saturating_mul(8),
-                    Data::Text { bytes, offsets } => bytes
-                        .len()
-                        .saturating_add(offsets.len().saturating_mul(8)),
+                    Data::Text { bytes, offsets } => {
+                        bytes.len().saturating_add(offsets.len().saturating_mul(8))
+                    }
                     Data::Mixed(x) => x.iter().fold(0usize, |n, c| n.saturating_add(cell(c))),
                 };
                 n.saturating_add(data)
                     .saturating_add(v.valid.as_ref().map_or(0, Vec::len))
-            },
-        )
+            })
     }
 }
 
@@ -475,15 +486,13 @@ impl Filter {
                 .zip(xs)
                 .for_each(|(s, x)| *s &= op.holds(int_real(*y, *x).reverse())),
             (Data::Text { bytes, offsets }, Cell::Text(y)) => {
-                sel.iter_mut()
-                    .zip(offsets.windows(2))
-                    .for_each(|(s, w)| {
-                        let x = match w {
-                            [a, b] => bytes.get(*a..*b).unwrap_or(&[]),
-                            _ => &[],
-                        };
-                        *s &= op.holds(x.cmp(y.as_slice()));
-                    });
+                sel.iter_mut().zip(offsets.windows(2)).for_each(|(s, w)| {
+                    let x = match w {
+                        [a, b] => bytes.get(*a..*b).unwrap_or(&[]),
+                        _ => &[],
+                    };
+                    *s &= op.holds(x.cmp(y.as_slice()));
+                });
             }
             (Data::Mixed(xs), lit) => sel
                 .iter_mut()
@@ -721,7 +730,7 @@ impl Acc {
             _ => {
                 return Err(LimboError::InternalError(
                     "column scan: aggregates of different kinds merged".into(),
-                ))
+                ));
             }
         }
         Ok(())
@@ -831,17 +840,15 @@ pub struct Partial {
 }
 
 fn key_bytes(k: &Key, aggs: usize) -> usize {
-    k.0.iter().fold(
-        aggs.saturating_mul(std::mem::size_of::<Acc>()),
-        |n, c| {
+    k.0.iter()
+        .fold(aggs.saturating_mul(std::mem::size_of::<Acc>()), |n, c| {
             let extra = match c {
                 Cell::Text(b) | Cell::Blob(b) => b.len(),
                 _ => 0,
             };
             n.saturating_add(std::mem::size_of::<Cell>())
                 .saturating_add(extra)
-        },
-    )
+        })
 }
 
 /// The rows a row-at-a-time evaluation folds: the reference the vectors are checked against.
@@ -851,12 +858,11 @@ pub fn evaluate_rows(q: &Query, rows: &[Vec<Cell>]) -> Result<Vec<Vec<Cell>>> {
         if !q.filters.iter().all(|f| f.matches(r)) {
             continue;
         }
-        let key = Key(
-            q.group
-                .iter()
-                .map(|c| r.get(*c).cloned().unwrap_or(Cell::Null))
-                .collect(),
-        );
+        let key = Key(q
+            .group
+            .iter()
+            .map(|c| r.get(*c).cloned().unwrap_or(Cell::Null))
+            .collect());
         let accs = group(q, &mut p, key)?;
         for (acc, a) in accs.iter_mut().zip(&q.aggs) {
             let c = match a.col() {
@@ -886,8 +892,10 @@ fn group<'p>(q: &Query, p: &'p mut Partial, key: Key) -> Result<&'p mut Vec<Acc>
 
 fn finish(q: &Query, mut p: Partial) -> Result<Vec<Vec<Cell>>> {
     if q.group.is_empty() && p.groups.is_empty() {
-        p.groups
-            .insert(Key(Vec::new()), q.aggs.iter().map(|a| Acc::new(*a)).collect());
+        p.groups.insert(
+            Key(Vec::new()),
+            q.aggs.iter().map(|a| Acc::new(*a)).collect(),
+        );
     }
     let mut out = Vec::with_capacity(p.groups.len());
     for (k, accs) in p.groups {
@@ -1009,7 +1017,11 @@ fn fold_vector(acc: &mut Acc, a: Agg, g: &Granule, sel: &[bool], selected: usize
         // Every value NULL: nothing to fold.
         return Ok(());
     };
-    let valid = |i: usize| v.valid.as_ref().is_none_or(|x| x.get(i).copied().unwrap_or(false));
+    let valid = |i: usize| {
+        v.valid
+            .as_ref()
+            .is_none_or(|x| x.get(i).copied().unwrap_or(false))
+    };
     match (acc, &v.data) {
         (Acc::Count(n), _) => {
             let k = match &v.valid {
@@ -1020,12 +1032,7 @@ fn fold_vector(acc: &mut Acc, a: Agg, g: &Granule, sel: &[bool], selected: usize
                 .checked_add(u64::try_from(k).map_err(|_| overflow())?)
                 .ok_or_else(overflow)?;
         }
-        (
-            Acc::Sum {
-                ints, numbers, ..
-            },
-            Data::Int(xs),
-        ) => {
+        (Acc::Sum { ints, numbers, .. }, Data::Int(xs)) => {
             let mut total = 0i128;
             let mut k = 0u64;
             for (i, (x, s)) in xs.iter().zip(sel).enumerate() {
@@ -1280,7 +1287,11 @@ mod tests {
     fn record(k: u32, x: &mut u64) -> Vec<u8> {
         let r = rng(x);
         let a = int(i64::from(k) * 3 + i64::try_from(r % 3).unwrap());
-        let b = if r % 5 == 0 { Value::Null } else { real(f64::from(u32::try_from(r % 1000).unwrap()) / 7.0) };
+        let b = if r % 5 == 0 {
+            Value::Null
+        } else {
+            real(f64::from(u32::try_from(r % 1000).unwrap()) / 7.0)
+        };
         let c = Value::from_text(format!("s{:03}", r % 50));
         let d = match r % 4 {
             0 => int(i64::try_from(r % 9).unwrap()),
@@ -1298,48 +1309,172 @@ mod tests {
 
     fn queries() -> Vec<Query> {
         let budget = usize::MAX;
-        let all = vec![Agg::Count, Agg::CountOf(1), Agg::Sum(0), Agg::Sum(1), Agg::Sum(3), Agg::Min(2), Agg::Max(3), Agg::Min(3), Agg::Max(1)];
+        let all = vec![
+            Agg::Count,
+            Agg::CountOf(1),
+            Agg::Sum(0),
+            Agg::Sum(1),
+            Agg::Sum(3),
+            Agg::Min(2),
+            Agg::Max(3),
+            Agg::Min(3),
+            Agg::Max(1),
+        ];
         let mut qs = vec![
             // count
-            Query { filters: vec![], group: vec![], aggs: vec![Agg::Count], budget },
+            Query {
+                filters: vec![],
+                group: vec![],
+                aggs: vec![Agg::Count],
+                budget,
+            },
             // aggregates
-            Query { filters: vec![], group: vec![], aggs: all.clone(), budget },
+            Query {
+                filters: vec![],
+                group: vec![],
+                aggs: all.clone(),
+                budget,
+            },
             // group-by
-            Query { filters: vec![], group: vec![4], aggs: all.clone(), budget },
-            Query { filters: vec![], group: vec![3], aggs: vec![Agg::Count, Agg::Sum(0)], budget },
-            Query { filters: vec![Filter::Cmp { col: 0, op: Op::Lt, lit: Cell::Int(600) }], group: vec![2, 4], aggs: vec![Agg::Count, Agg::Max(0)], budget },
+            Query {
+                filters: vec![],
+                group: vec![4],
+                aggs: all.clone(),
+                budget,
+            },
+            Query {
+                filters: vec![],
+                group: vec![3],
+                aggs: vec![Agg::Count, Agg::Sum(0)],
+                budget,
+            },
+            Query {
+                filters: vec![Filter::Cmp {
+                    col: 0,
+                    op: Op::Lt,
+                    lit: Cell::Int(600),
+                }],
+                group: vec![2, 4],
+                aggs: vec![Agg::Count, Agg::Max(0)],
+                budget,
+            },
         ];
         // filters, each with the aggregates
         let filters = vec![
-            Filter::Cmp { col: 0, op: Op::Eq, lit: Cell::Int(300) },
-            Filter::Cmp { col: 0, op: Op::Ne, lit: Cell::Int(300) },
-            Filter::Cmp { col: 0, op: Op::Lt, lit: Cell::Int(150) },
-            Filter::Cmp { col: 0, op: Op::Le, lit: Cell::Int(150) },
-            Filter::Cmp { col: 0, op: Op::Gt, lit: Cell::Int(1_000) },
-            Filter::Cmp { col: 0, op: Op::Ge, lit: Cell::Int(1_000) },
-            Filter::Cmp { col: 0, op: Op::Lt, lit: Cell::Real(450.5) },
-            Filter::Cmp { col: 0, op: Op::Eq, lit: Cell::Text(b"x".to_vec()) },
-            Filter::Cmp { col: 0, op: Op::Lt, lit: Cell::Text(b"x".to_vec()) },
-            Filter::Cmp { col: 1, op: Op::Gt, lit: Cell::Real(70.0) },
-            Filter::Cmp { col: 1, op: Op::Le, lit: Cell::Int(20) },
-            Filter::Cmp { col: 2, op: Op::Ge, lit: Cell::Text(b"s025".to_vec()) },
-            Filter::Cmp { col: 2, op: Op::Gt, lit: Cell::Int(3) },
-            Filter::Cmp { col: 3, op: Op::Le, lit: Cell::Int(4) },
-            Filter::Cmp { col: 3, op: Op::Eq, lit: Cell::Real(5.0) },
-            Filter::Cmp { col: 3, op: Op::Gt, lit: Cell::Text(b"4".to_vec()) },
-            Filter::Cmp { col: 0, op: Op::Eq, lit: Cell::Null },
-            Filter::Cmp { col: 9, op: Op::Eq, lit: Cell::Int(1) },
+            Filter::Cmp {
+                col: 0,
+                op: Op::Eq,
+                lit: Cell::Int(300),
+            },
+            Filter::Cmp {
+                col: 0,
+                op: Op::Ne,
+                lit: Cell::Int(300),
+            },
+            Filter::Cmp {
+                col: 0,
+                op: Op::Lt,
+                lit: Cell::Int(150),
+            },
+            Filter::Cmp {
+                col: 0,
+                op: Op::Le,
+                lit: Cell::Int(150),
+            },
+            Filter::Cmp {
+                col: 0,
+                op: Op::Gt,
+                lit: Cell::Int(1_000),
+            },
+            Filter::Cmp {
+                col: 0,
+                op: Op::Ge,
+                lit: Cell::Int(1_000),
+            },
+            Filter::Cmp {
+                col: 0,
+                op: Op::Lt,
+                lit: Cell::Real(450.5),
+            },
+            Filter::Cmp {
+                col: 0,
+                op: Op::Eq,
+                lit: Cell::Text(b"x".to_vec()),
+            },
+            Filter::Cmp {
+                col: 0,
+                op: Op::Lt,
+                lit: Cell::Text(b"x".to_vec()),
+            },
+            Filter::Cmp {
+                col: 1,
+                op: Op::Gt,
+                lit: Cell::Real(70.0),
+            },
+            Filter::Cmp {
+                col: 1,
+                op: Op::Le,
+                lit: Cell::Int(20),
+            },
+            Filter::Cmp {
+                col: 2,
+                op: Op::Ge,
+                lit: Cell::Text(b"s025".to_vec()),
+            },
+            Filter::Cmp {
+                col: 2,
+                op: Op::Gt,
+                lit: Cell::Int(3),
+            },
+            Filter::Cmp {
+                col: 3,
+                op: Op::Le,
+                lit: Cell::Int(4),
+            },
+            Filter::Cmp {
+                col: 3,
+                op: Op::Eq,
+                lit: Cell::Real(5.0),
+            },
+            Filter::Cmp {
+                col: 3,
+                op: Op::Gt,
+                lit: Cell::Text(b"4".to_vec()),
+            },
+            Filter::Cmp {
+                col: 0,
+                op: Op::Eq,
+                lit: Cell::Null,
+            },
+            Filter::Cmp {
+                col: 9,
+                op: Op::Eq,
+                lit: Cell::Int(1),
+            },
             Filter::IsNull(1),
             Filter::NotNull(3),
             Filter::IsNull(9),
         ];
         for f in filters {
-            qs.push(Query { filters: vec![f], group: vec![], aggs: all.clone(), budget });
+            qs.push(Query {
+                filters: vec![f],
+                group: vec![],
+                aggs: all.clone(),
+                budget,
+            });
         }
         qs.push(Query {
             filters: vec![
-                Filter::Cmp { col: 0, op: Op::Ge, lit: Cell::Int(200) },
-                Filter::Cmp { col: 0, op: Op::Lt, lit: Cell::Int(900) },
+                Filter::Cmp {
+                    col: 0,
+                    op: Op::Ge,
+                    lit: Cell::Int(200),
+                },
+                Filter::Cmp {
+                    col: 0,
+                    op: Op::Lt,
+                    lit: Cell::Int(900),
+                },
                 Filter::NotNull(1),
             ],
             group: vec![4],
@@ -1354,11 +1489,16 @@ mod tests {
     fn check(placed: &[Placed], rows: &[Vec<Cell>], x: &mut u64, seen: &mut Counts) {
         for q in queries() {
             let want = evaluate_rows(&q, rows).unwrap();
-            let plan = Plan { granules: placed.to_vec(), query: &q };
+            let plan = Plan {
+                granules: placed.to_vec(),
+                query: &q,
+            };
             let (got, c) = plan.run_all().unwrap();
             assert_eq!(got, want, "{q:?}");
             seen.merge(&c);
-            let mut cuts: Vec<usize> = (0..3).map(|_| usize::try_from(rng(x)).unwrap() % (plan.rows() + 1)).collect();
+            let mut cuts: Vec<usize> = (0..3)
+                .map(|_| usize::try_from(rng(x)).unwrap() % (plan.rows() + 1))
+                .collect();
             cuts.push(0);
             cuts.push(plan.rows());
             cuts.sort_unstable();
@@ -1411,7 +1551,8 @@ mod tests {
         let mut d = Descender::new();
         let mut t = db.begin().unwrap();
         for k in 0..400u32 {
-            db.put(&mut d, &mut t, 0, &k.to_be_bytes(), &record(k, &mut x)).unwrap();
+            db.put(&mut d, &mut t, 0, &k.to_be_bytes(), &record(k, &mut x))
+                .unwrap();
         }
         db.commit(t, &mut d, db.lane(), false).unwrap();
         rebuild(&db, &copy);
@@ -1436,7 +1577,7 @@ mod tests {
                 rebuild(&db, &copy);
             }
             let snap = db.snapshot().unwrap();
-            let mut scan = |snap: &Snapshot, seen: &mut Seen, x: &mut u64| {
+            let scan = |snap: &Snapshot, seen: &mut Seen, x: &mut u64| {
                 let rows = At { db: &db, snap };
                 let began = Instant::now();
                 let (placed, src) = copy.granules(snap.start, &rows, &Records, &cache).unwrap();
@@ -1482,42 +1623,73 @@ mod tests {
     #[test]
     fn cs4_vectors_equal_rows_every_class_plain() {
         let seen = vectors_equal_rows::<Plain>(17);
-        assert!(seen.counts.skipped > 0 && seen.sources.cached > 0 && seen.sources.changed > 0, "{seen:?}");
+        assert!(
+            seen.counts.skipped > 0 && seen.sources.cached > 0 && seen.sources.changed > 0,
+            "{seen:?}"
+        );
     }
 
     /// Do: the same on prototype B's compressed blocks. Expect: the same (T-CS.4.1).
     #[test]
     fn cs4_vectors_equal_rows_every_class_packed() {
         let seen = vectors_equal_rows::<Packed>(23);
-        assert!(seen.counts.skipped > 0 && seen.sources.cached > 0 && seen.sources.changed > 0, "{seen:?}");
+        assert!(
+            seen.counts.skipped > 0 && seen.sources.cached > 0 && seen.sources.changed > 0,
+            "{seen:?}"
+        );
     }
 
     /// Do: cut 100 rows (a = 0..99) into granules of 10 and filter a > 85. Expect: the summaries
     /// skip the eight granules below 80 unread, and the answer equals the rows' (T-CS.4.2).
     #[test]
     fn cs4_min_max_summaries_skip_granules() {
-        let mut x = 5u64;
         let rows: Rowset = (0..100u32)
             .map(|k| {
                 let values = [int(i64::from(k)), real(f64::from(k) / 2.0)];
-                let _ = rng(&mut x);
-                (k.to_be_bytes().to_vec(), ImmutableRecord::from_values(values.iter(), 2).unwrap().get_payload().to_vec())
+                (
+                    k.to_be_bytes().to_vec(),
+                    ImmutableRecord::from_values(values.iter(), 2)
+                        .unwrap()
+                        .get_payload()
+                        .to_vec(),
+                )
             })
             .collect();
         let placed: Vec<Placed> = rows
             .chunks(10)
             .enumerate()
-            .map(|(i, c)| Placed { at: i * 10, block: Some(i), granule: Arc::new(Granule::build(c, &Records).unwrap()) })
+            .map(|(i, c)| Placed {
+                at: i * 10,
+                block: Some(i),
+                granule: Arc::new(Granule::build(c, &Records).unwrap()),
+            })
             .collect();
         let q = Query {
-            filters: vec![Filter::Cmp { col: 0, op: Op::Gt, lit: Cell::Int(85) }],
+            filters: vec![Filter::Cmp {
+                col: 0,
+                op: Op::Gt,
+                lit: Cell::Int(85),
+            }],
             group: vec![],
             aggs: vec![Agg::Count, Agg::Sum(0), Agg::Sum(1), Agg::Min(0)],
             budget: usize::MAX,
         };
-        let (got, c) = Plan { granules: placed, query: &q }.run_all().unwrap();
+        let (got, c) = Plan {
+            granules: placed,
+            query: &q,
+        }
+        .run_all()
+        .unwrap();
         assert_eq!(got, evaluate_rows(&q, &decoded(&rows)).unwrap());
-        assert_eq!(got, vec![vec![Cell::Int(14), Cell::Int((86..100).sum()), Cell::Real(f64::from((86..100).sum::<u32>()) / 2.0), Cell::Int(86)]]);
+        assert_eq!(
+            got,
+            vec![vec![
+                Cell::Int(14),
+                Cell::Int((86..100).sum()),
+                Cell::Real(f64::from((86..100).sum::<u32>()) / 2.0),
+                Cell::Int(86)
+            ]]
+        );
         assert_eq!((c.skipped, c.granules, c.rows, c.selected), (8, 2, 20, 14));
     }
 
@@ -1526,8 +1698,16 @@ mod tests {
     #[test]
     fn cs4_groups_past_budget_are_refused() {
         let rows: Vec<Vec<Cell>> = (0..50).map(|i| vec![Cell::Int(i)]).collect();
-        let q = Query { filters: vec![], group: vec![0], aggs: vec![Agg::Count], budget: 200 };
-        assert!(matches!(evaluate_rows(&q, &rows), Err(LimboError::OutOfMemory)));
+        let q = Query {
+            filters: vec![],
+            group: vec![0],
+            aggs: vec![Agg::Count],
+            budget: 200,
+        };
+        assert!(matches!(
+            evaluate_rows(&q, &rows),
+            Err(LimboError::OutOfMemory)
+        ));
     }
 
     /// Do: compare integers and reals at the edges of a double's precision. Expect: exact answers,
@@ -1537,8 +1717,14 @@ mod tests {
         let two53 = 9_007_199_254_740_992.0f64;
         assert_eq!(int_real(9_007_199_254_740_993, two53), Ordering::Greater);
         assert_eq!(int_real(9_007_199_254_740_992, two53), Ordering::Equal);
-        assert_eq!(int_real(i64::MAX, 9_223_372_036_854_775_808.0), Ordering::Less);
-        assert_eq!(int_real(i64::MIN, -9_223_372_036_854_775_808.0), Ordering::Equal);
+        assert_eq!(
+            int_real(i64::MAX, 9_223_372_036_854_775_808.0),
+            Ordering::Less
+        );
+        assert_eq!(
+            int_real(i64::MIN, -9_223_372_036_854_775_808.0),
+            Ordering::Equal
+        );
         assert_eq!(int_real(3, 3.5), Ordering::Less);
         assert_eq!(int_real(-3, -3.5), Ordering::Greater);
         assert_eq!(int_real(0, -0.0), Ordering::Equal);
