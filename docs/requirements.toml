@@ -856,6 +856,7 @@ criteria = [
 tests = [
   { id = "T-CS.4.1", text = "cs4_vectors_equal_rows_every_class_{plain,packed} (crates/engine/storage/versioned/columns/scan.rs) — passes when, with writes between scans, some applied and some queued, rebuilds and held snapshots, every analytic class (filters of each comparison, aggregates, group-by, count) over the copy's granules equals the same statement row by row over the row B-tree, serially, split into partials merged in order, and on the morsel executor's four workers, and the summaries skipped granules" },
   { id = "T-CS.4.2", text = "cs4_min_max_summaries_skip_granules — passes when a filter outside granules' min/max skips them unread and the answer equals the rows'" },
+  { id = "T-CS.4.4", text = "cs4_granule_cache_keeps_to_its_bound — passes when a cache whose bound holds no granule keeps none, every untouched granule is decoded again and counted, and answers still equal the rows'" },
   { id = "T-CS.4.3", text = "cs4_vectors_equal_rows_every_class_{plain,packed}, over key ranges — passes when a range scan skips blocks outside the range undecoded (by the blocks' key bounds), its granules hold every key of the range, and each class over the range equals the rows'" },
 ]
 

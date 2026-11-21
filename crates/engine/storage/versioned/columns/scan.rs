@@ -1357,14 +1357,24 @@ fn fold_vector(
 }
 
 /// The decoded granules of the blocks no change touches, for the copy's current and previous
-/// generations (bound: their blocks, one granule each), keyed by each generation's id. A copy is
-/// scanned with one [`Decode`] for its life: the cache holds what it decoded.
-#[derive(Default)]
+/// generations, keyed by each generation's id. Bound: at most one granule a block of those two,
+/// and at most `bound` resident bytes, the share of the database's memory budget its caller
+/// charges it to (CLAUDE.md §2); a granule that would pass it isn't kept, and is decoded again by
+/// each scan that reads it (counted in [`Sources::uncached`]). A copy is scanned with one
+/// [`Decode`] for its life: the cache holds what it decoded.
 pub struct Cache {
+    bound: usize,
     slots: Mutex<Vec<Slot>>,
 }
 
 impl Cache {
+    pub fn new(bound: usize) -> Self {
+        Cache {
+            bound,
+            slots: Mutex::new(Vec::new()),
+        }
+    }
+
     fn get(&self, made: u64, j: usize) -> Option<Arc<Granule>> {
         self.slots
             .lock()
@@ -1373,9 +1383,17 @@ impl Cache {
             .and_then(|(_, gs)| gs.get(j).cloned().flatten())
     }
 
-    fn put(&self, made: u64, live: &[u64], blocks: usize, j: usize, g: Arc<Granule>) {
+    /// Keeps `g` as generation `made`'s block `j` (of `blocks`), dropping generations no longer
+    /// `live` first; false when it would pass the bound, and isn't kept.
+    fn put(&self, made: u64, live: &[u64], blocks: usize, j: usize, g: Arc<Granule>) -> bool {
         let mut slots = self.slots.lock();
         slots.retain(|(m, _)| live.contains(m));
+        let fits = resident(&slots)
+            .checked_add(g.resident())
+            .is_some_and(|total| total <= self.bound);
+        if !fits {
+            return false;
+        }
         if !slots.iter().any(|(m, _)| *m == made) {
             slots.push((made, vec![None; blocks]));
         }
@@ -1386,16 +1404,21 @@ impl Cache {
         {
             *slot = Some(g);
         }
+        true
     }
 
     /// The bytes its granules keep resident.
     pub fn resident(&self) -> usize {
-        self.slots.lock().iter().fold(0usize, |n, (_, gs)| {
-            gs.iter()
-                .flatten()
-                .fold(n, |n, g| n.saturating_add(g.resident()))
-        })
+        resident(&self.slots.lock())
     }
+}
+
+fn resident(slots: &[Slot]) -> usize {
+    slots.iter().fold(0usize, |n, (_, gs)| {
+        gs.iter()
+            .flatten()
+            .fold(n, |n, g| n.saturating_add(g.resident()))
+    })
 }
 
 /// One generation's decoded granules, by block, keyed by its id.
@@ -1410,6 +1433,8 @@ pub struct Sources {
     pub decoded: u64,
     /// Granules of blocks with changes at the snapshot, decoded from their rows at it.
     pub changed: u64,
+    /// Granules decoded now that the cache's bound left out.
+    pub uncached: u64,
     /// Scans answered from the rows: no generation answered them exactly.
     pub fallbacks: u64,
     /// Blocks outside the statement's key range, skipped undecoded.
@@ -1488,7 +1513,9 @@ impl<B: Block> Columns<B> {
                         let mut block_rows = Vec::new();
                         g.scan_block(j, s, &skip, &mut block_rows)?;
                         let made = Arc::new(Granule::build(&block_rows, dec)?);
-                        cache.put(g.id, &live, g.blocks.len(), j, made.clone());
+                        if !cache.put(g.id, &live, g.blocks.len(), j, made.clone()) {
+                            src.uncached = src.uncached.saturating_add(1);
+                        }
                         src.decoded = src.decoded.saturating_add(1);
                         made
                     }
@@ -1923,7 +1950,7 @@ mod tests {
         let feed = Arc::new(Feed::new(0, usize::MAX, Box::new(|| 0)));
         db.keep_columns(feed.clone()).unwrap();
         let copy = Columns::<B>::new(feed);
-        let cache = Cache::default();
+        let cache = Cache::new(usize::MAX);
         let mut x = seed | 1;
         let mut d = Descender::new();
         let mut t = db.begin().unwrap();
@@ -2080,6 +2107,52 @@ mod tests {
             ]]
         );
         assert_eq!((c.skipped, c.granules, c.rows, c.selected), (8, 2, 20, 14));
+    }
+
+    /// Do: scan a copy of several blocks through a cache whose bound holds none of them, twice.
+    /// Expect: nothing kept, every untouched granule decoded again and counted, answers still equal
+    /// the rows' (CLAUDE.md §2).
+    #[test]
+    fn cs4_granule_cache_keeps_to_its_bound() {
+        let db = Database::open(Arc::new(Simulated::new(29, 1).unwrap()), 2_000, 1, cmp).unwrap();
+        let feed = Arc::new(Feed::new(0, usize::MAX, Box::new(|| 0)));
+        db.keep_columns(feed.clone()).unwrap();
+        let copy = Columns::<Plain>::new(feed);
+        let mut x = 9u64;
+        let mut d = Descender::new();
+        let mut t = db.begin().unwrap();
+        for k in 0..200u32 {
+            db.put(&mut d, &mut t, 0, &k.to_be_bytes(), &record(k, &mut x))
+                .unwrap();
+        }
+        db.commit(t, &mut d, db.lane(), false).unwrap();
+        rebuild(&db, &copy);
+        let cache = Cache::new(0);
+        for _ in 0..2 {
+            let snap = db.snapshot().unwrap();
+            let rows = At {
+                db: &db,
+                snap: &snap,
+            };
+            let (placed, src) = copy
+                .granules(snap.start, &rows, &Records, &cache, &KeyRange::default())
+                .unwrap();
+            assert_eq!((src.cached, src.uncached), (0, src.decoded));
+            assert!(src.decoded > 0);
+            let q = &queries()[1];
+            let (got, _) = Plan {
+                granules: placed,
+                query: q,
+            }
+            .run_all()
+            .unwrap();
+            assert_eq!(
+                got,
+                evaluate_rows(q, &decoded(&rows.all().unwrap())).unwrap()
+            );
+            db.close_snapshot(snap);
+        }
+        assert_eq!(cache.resident(), 0);
     }
 
     /// Do: group 50 distinct keys under a budget that holds fewer. Expect: a typed refusal, no
