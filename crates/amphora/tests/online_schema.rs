@@ -756,7 +756,10 @@ fn t_t1_12_1_a_drop_is_refused_where_the_engine_refuses_it_and_its_slot_keeps_th
         ("on", "ALTER TABLE o DROP COLUMN x"),
         ("no", "ALTER TABLE t DROP COLUMN z"),
     ] {
-        let refusal = change(name, sql).unwrap_err();
+        let refusal = match change(name, sql) {
+            Ok(done) => panic!("{name}: {sql} went on: {done:?}"),
+            Err(refusal) => refusal,
+        };
         assert!(
             matches!(&refusal, Refusal::Invalid { what, .. } if what != online::BROKEN),
             "{name}: {refusal:?}"
