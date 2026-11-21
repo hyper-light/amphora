@@ -167,7 +167,9 @@ impl Normal {
     /// before any residual.
     fn scale(&self) -> Option<f64> {
         (self.residuals > 0)
-            .then(|| self.abs_residuals / self.residuals as f64 * std::f64::consts::FRAC_PI_2.sqrt())
+            .then(|| {
+                self.abs_residuals / self.residuals as f64 * std::f64::consts::FRAC_PI_2.sqrt()
+            })
             .filter(|s| s.is_finite() && *s > 0.0)
     }
 }
@@ -320,9 +322,7 @@ impl CostFit {
     /// The weights as they stand; None before any term is determined.
     pub(crate) fn weights(&self) -> Option<FittedWeights> {
         let fit = self.fitted.as_ref()?;
-        Some(FittedWeights {
-            nanos: fit.weights,
-        })
+        Some(FittedWeights { nanos: fit.weights })
     }
 
     /// The relative spread of the measurement against the fit, the residuals' scale; None before
@@ -358,7 +358,11 @@ fn identifiable(gram: &Square) -> [bool; TERMS] {
             0.0
         } else {
             match sub_solve(gram, &taken, Some(column)) {
-                Some(x) => taken.iter().zip(x.iter()).map(|(&j, xj)| column.get(j).copied().unwrap_or(0.0) * xj).sum(),
+                Some(x) => taken
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(&j, xj)| column.get(j).copied().unwrap_or(0.0) * xj)
+                    .sum(),
                 None => continue,
             }
         };
@@ -404,7 +408,10 @@ fn sub_solve(gram: &Square, set: &[usize], rhs: Option<&[f64; TERMS]>) -> Option
             .enumerate()
             .skip(col)
             .map(|(r, row)| (r, row.get(col).copied().unwrap_or(0.0).abs()))
-            .fold((col, -1.0), |acc, cur| if cur.1 > acc.1 { cur } else { acc });
+            .fold(
+                (col, -1.0),
+                |acc, cur| if cur.1 > acc.1 { cur } else { acc },
+            );
         m.swap(col, best);
         let pivot_row = m.get(col)?.clone();
         let pivot = *pivot_row.get(col)?;
@@ -436,7 +443,9 @@ fn sub_solve(gram: &Square, set: &[usize], rhs: Option<&[f64; TERMS]>) -> Option
 /// weight's standard error; None if no term is identifiable.
 fn solve(normal: &Normal) -> Option<Solution> {
     let keep = identifiable(&normal.gram);
-    let candidates: Vec<usize> = (0..TERMS).filter(|k| keep.get(*k).copied().unwrap_or(false)).collect();
+    let candidates: Vec<usize> = (0..TERMS)
+        .filter(|k| keep.get(*k).copied().unwrap_or(false))
+        .collect();
     if candidates.is_empty() {
         return None;
     }
@@ -451,7 +460,10 @@ fn solve(normal: &Normal) -> Option<Solution> {
     let most = TERMS.saturating_mul(3);
     for _ in 0..most {
         let gradient = |w: &[f64; TERMS], k: usize| -> f64 {
-            let row = g.get(k).map(|r| r.iter().zip(w.iter()).map(|(a, x)| a * x).sum::<f64>()).unwrap_or(0.0);
+            let row = g
+                .get(k)
+                .map(|r| r.iter().zip(w.iter()).map(|(a, x)| a * x).sum::<f64>())
+                .unwrap_or(0.0);
             b.get(k).copied().unwrap_or(0.0) - row
         };
         let next = candidates
@@ -519,7 +531,11 @@ fn solve(normal: &Normal) -> Option<Solution> {
     let rss = (normal.yty - 2.0 * wb + wgw).max(0.0);
     let dof = normal.samples.saturating_sub(passive.len() as u64);
     // With no degree of freedom left the spread is unknown: the error is unbounded.
-    let variance = if dof > 0 { rss / dof as f64 } else { f64::INFINITY };
+    let variance = if dof > 0 {
+        rss / dof as f64
+    } else {
+        f64::INFINITY
+    };
     let mut errors = [0.0; TERMS];
     for &k in &passive {
         let mut order: Vec<usize> = passive.iter().copied().filter(|&p| p != k).collect();
@@ -527,7 +543,11 @@ fn solve(normal: &Normal) -> Option<Solution> {
         if let Some(col) = sub_solve(g, &order, None) {
             let inv_kk = col.last().copied().unwrap_or(0.0).max(0.0);
             if let Some(e) = errors.get_mut(k) {
-                *e = if inv_kk > 0.0 { (variance * inv_kk).sqrt() } else { f64::INFINITY };
+                *e = if inv_kk > 0.0 {
+                    (variance * inv_kk).sqrt()
+                } else {
+                    f64::INFINITY
+                };
             }
         }
     }
@@ -645,7 +665,10 @@ impl DatabaseFit {
         }
         let mut state = self.state.lock();
         let spread = state.0.spread();
-        state.1.get_or_insert_with(|| Sampler::new(clock_read_nanos())).take(spread)
+        state
+            .1
+            .get_or_insert_with(|| Sampler::new(clock_read_nanos()))
+            .take(spread)
     }
 
     /// Records a timed statement's counted work, the nanoseconds its steps ran, and how many
@@ -671,7 +694,8 @@ impl DatabaseFit {
 /// reads), or the reads number calibration's repetition bound, one per key of a page
 /// (`learned_costs::calibrate`).
 pub(crate) fn clock_read_nanos() -> f64 {
-    let most = crate::storage::buffer_pool::BufferPool::DEFAULT_PAGE_SIZE / std::mem::size_of::<u64>();
+    let most =
+        crate::storage::buffer_pool::BufferPool::DEFAULT_PAGE_SIZE / std::mem::size_of::<u64>();
     let origin = Instant::now();
     let mut reads: usize = 1;
     let mut last: Option<f64> = None;
@@ -719,10 +743,18 @@ mod tests {
         let mut counts = Counts::default();
         for (term, _) in Term::ALL.iter().zip(truth.iter()) {
             // Statements of very different sizes and mixes: each term from none to 10^4 units.
-            let units = if rng.next() < 0.3 { 0.0 } else { (rng.next() * 4.0).exp2().powi(2) * 40.0 };
+            let units = if rng.next() < 0.3 {
+                0.0
+            } else {
+                (rng.next() * 4.0).exp2().powi(2) * 40.0
+            };
             counts.add(*term, units);
         }
-        let exact: f64 = Term::ALL.iter().zip(truth.iter()).map(|(t, w)| counts.get(*t) * w).sum();
+        let exact: f64 = Term::ALL
+            .iter()
+            .zip(truth.iter())
+            .map(|(t, w)| counts.get(*t) * w)
+            .sum();
         (counts, exact * (1.0 + noise * rng.normal()).max(0.05))
     }
 
@@ -744,8 +776,16 @@ mod tests {
         for (k, term) in Term::ALL.iter().enumerate() {
             let got = w.nanos(*term).expect("every term sampled");
             let err = sol.errors[k];
-            assert!((got - truth[k]).abs() <= 4.0 * err, "{term:?}: got {got}, truth {}, se {err}", truth[k]);
-            assert!((got - truth[k]).abs() <= noise * truth[k], "{term:?}: got {got}, truth {}", truth[k]);
+            assert!(
+                (got - truth[k]).abs() <= 4.0 * err,
+                "{term:?}: got {got}, truth {}, se {err}",
+                truth[k]
+            );
+            assert!(
+                (got - truth[k]).abs() <= noise * truth[k],
+                "{term:?}: got {got}, truth {}",
+                truth[k]
+            );
         }
     }
 
@@ -763,7 +803,11 @@ mod tests {
         let w = fit.weights().expect("fitted");
         for (k, term) in Term::ALL.iter().enumerate() {
             let got = w.nanos(*term).expect("sampled");
-            assert!((got - truth[k]).abs() <= 0.05 * truth[k], "{term:?}: got {got}, truth {}", truth[k]);
+            assert!(
+                (got - truth[k]).abs() <= 0.05 * truth[k],
+                "{term:?}: got {got}, truth {}",
+                truth[k]
+            );
         }
     }
 
@@ -779,7 +823,11 @@ mod tests {
             let (mut c, _) = sample(&mut rng, &truth, 0.0);
             c.0[Term::HashBuild.slot()] = 0.0;
             c.0[Term::HashProbe.slot()] = 0.0;
-            let t: f64 = Term::ALL.iter().zip(truth.iter()).map(|(t, w)| c.get(*t) * w).sum();
+            let t: f64 = Term::ALL
+                .iter()
+                .zip(truth.iter())
+                .map(|(t, w)| c.get(*t) * w)
+                .sum();
             fit.observe(&c, t);
         }
         let w = fit.weights().expect("fitted");
@@ -826,7 +874,11 @@ mod tests {
         let w = fit.weights().expect("fitted");
         for (k, term) in Term::ALL.iter().enumerate() {
             let got = w.nanos(*term).expect("sampled");
-            assert!((got - after[k]).abs() <= 0.05 * after[k], "{term:?}: got {got}, after {}", after[k]);
+            assert!(
+                (got - after[k]).abs() <= 0.05 * after[k],
+                "{term:?}: got {got}, after {}",
+                after[k]
+            );
         }
     }
 
@@ -853,12 +905,20 @@ mod tests {
     #[test]
     fn t_pl_7_5_statements_run_with_the_switch_on_fit_weights() {
         let io: crate::sync::Arc<dyn crate::io::IO> = crate::sync::Arc::new(crate::MemoryIO::new());
-        let db = crate::Database::open_file(io, ":memory:", crate::sync::Arc::new(crate::SqliteDialect)).unwrap();
+        let db =
+            crate::Database::open_file(io, ":memory:", crate::sync::Arc::new(crate::SqliteDialect))
+                .unwrap();
         let conn = db.connect().unwrap();
-        conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER)").unwrap();
+        conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER)")
+            .unwrap();
         let rows: Vec<String> = (1..=400).map(|i| format!("({i}, {})", i % 7)).collect();
-        conn.execute(format!("INSERT INTO t VALUES {}", rows.join(","))).unwrap();
-        conn.query("SELECT count(*) FROM t WHERE b = 3").unwrap().unwrap().run_collect_rows().unwrap();
+        conn.execute(format!("INSERT INTO t VALUES {}", rows.join(",")))
+            .unwrap();
+        conn.query("SELECT count(*) FROM t WHERE b = 3")
+            .unwrap()
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
         assert_eq!(db.cost_fit.weights(), None);
         conn.set_fitted_costs(true);
         for i in 0..200 {
@@ -867,7 +927,11 @@ mod tests {
                 1 => format!("SELECT b FROM t WHERE a = {}", 1 + i % 400),
                 _ => format!("SELECT a FROM t WHERE a > {} ORDER BY b", i % 400),
             };
-            conn.query(sql).unwrap().unwrap().run_collect_rows().unwrap();
+            conn.query(sql)
+                .unwrap()
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
         }
         let w = db.cost_fit.weights().expect("fitted");
         assert!(w.nanos(Term::Row).is_some(), "{w:?}");

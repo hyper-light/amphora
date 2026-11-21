@@ -681,15 +681,40 @@ impl Statement {
                 let mut counts = Counts::default();
                 counts.add(
                     Term::Row,
-                    now.btree_next.saturating_add(now.btree_prev).saturating_sub(was.btree_next.saturating_add(was.btree_prev)) as f64,
+                    now.btree_next
+                        .saturating_add(now.btree_prev)
+                        .saturating_sub(was.btree_next.saturating_add(was.btree_prev))
+                        as f64,
                 );
-                counts.add(Term::Seek, now.btree_seeks.saturating_sub(was.btree_seeks) as f64);
-                counts.add(Term::HashBuild, now.hash_join.build_rows.saturating_sub(was.hash_join.build_rows) as f64);
-                counts.add(Term::HashProbe, now.hash_join.probe_calls.saturating_sub(was.hash_join.probe_calls) as f64);
+                counts.add(
+                    Term::Seek,
+                    now.btree_seeks.saturating_sub(was.btree_seeks) as f64,
+                );
+                counts.add(
+                    Term::HashBuild,
+                    now.hash_join
+                        .build_rows
+                        .saturating_sub(was.hash_join.build_rows) as f64,
+                );
+                counts.add(
+                    Term::HashProbe,
+                    now.hash_join
+                        .probe_calls
+                        .saturating_sub(was.hash_join.probe_calls) as f64,
+                );
                 counts.add(Term::Sort, (now.sort_units - was.sort_units).max(0.0));
-                counts.add(Term::PageRead, self.pager.page_file_reads().saturating_sub(sample.page_reads) as f64);
+                counts.add(
+                    Term::PageRead,
+                    self.pager
+                        .page_file_reads()
+                        .saturating_sub(sample.page_reads) as f64,
+                );
                 let reads = sample.steps.saturating_mul(2) as f64;
-                self.program.connection.db.cost_fit.record(&counts, sample.nanos, reads);
+                self.program
+                    .connection
+                    .db
+                    .cost_fit
+                    .record(&counts, sample.nanos, reads);
             }
             Ok(StepResult::Interrupt) | Err(_) => self.cost_sample = None,
         }
