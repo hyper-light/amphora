@@ -139,10 +139,6 @@ pub struct Config {
     pub readers: usize,
     /// How often the checkpointer looks at the log while the log is within its bound.
     pub checkpoint_every: Duration,
-    /// Frames of the log not yet in the file that make the checkpointer copy them while the log is
-    /// within its bound: fewer wait in the log, so a page changed by many commits is copied once
-    /// for them all (decision 35).
-    pub copy_after: u64,
     /// The log's bound, in frames: past it the checkpointer copies without pausing, and once
     /// little is left (a 64th of the bound) the writer starts the log again. The log stops at
     /// twice its bound: the writer starts it again then, however much is left.
@@ -165,10 +161,6 @@ impl Default for Config {
             commit_rows: 512,
             readers: 4,
             checkpoint_every: Duration::from_millis(25),
-            // What a period's pass copied at 32 writers, whose commits wrote about 73 frames each,
-            // about 5,000 a second (decision 4: about 9,000 frames in 25 ms), so no pass copies
-            // more than passes did under that load; a 16th of the log's bound (32 MiB of pages).
-            copy_after: 8_192,
             // Each restart of the log holds the writer for 10-14 ms (on fedora's btrfs: what is
             // left copied, the file flushed, a new header synced). At 32 writers, whose commits
             // write about 73 frames each, a bound of 16,384 restarted 27 times in 20 s, and the
@@ -199,6 +191,9 @@ pub enum Refused {
     Disk,
     /// The batch's rows are in more than one group ([`crate::groups`]): a batch is one group's.
     Groups,
+    /// The key's group doesn't answer it now ([`crate::reshard::holding::Away`]): it is fenced for
+    /// a cutover (ask again once the directory has flipped), or the router's directory is stale.
+    Away(crate::reshard::holding::Away),
 }
 
 impl std::fmt::Display for Refused {
@@ -212,6 +207,12 @@ impl std::fmt::Display for Refused {
                 "a flush of the store's disk failed; nothing more is made durable until it is started again"
             }
             Self::Groups => "the batch's rows are in more than one group; a batch is one group's",
+            Self::Away(crate::reshard::holding::Away::Fenced(_)) => {
+                "the key's group has fenced it for a cutover; ask again once the directory has flipped"
+            }
+            Self::Away(crate::reshard::holding::Away::Elsewhere) => {
+                "the key's group doesn't hold it: the router's directory is stale"
+            }
         })
     }
 }
@@ -793,8 +794,6 @@ struct Checkpointing<R> {
     every: Duration,
     /// The log's bound, in frames.
     bound: u64,
-    /// Frames waiting that make it copy within the bound.
-    after: u64,
 }
 
 impl<R> Checkpointing<R> {
@@ -804,7 +803,6 @@ impl<R> Checkpointing<R> {
             uncopied: E::uncopied,
             every: config.checkpoint_every,
             bound: config.log_frames,
-            after: config.copy_after,
         }
     }
 }
@@ -862,7 +860,6 @@ impl<R: Send + 'static> Readers<R> {
             uncopied,
             every,
             bound,
-            after,
         } = checkpointing;
         *locked(&self.open) = Some(open.clone());
         let checkpointer = match open() {
@@ -899,14 +896,12 @@ impl<R: Send + 'static> Readers<R> {
                             ) {
                                 break;
                             }
-                            // Within its bound, the log is copied once `after` of its frames wait
-                            // (decision 35). An engine that can't tell, or fails to, is copied, and
-                            // the copy says why it fails.
+                            // Within its bound, the log isn't copied: a recovery reads all of it
+                            // whatever was, and a page changed by many commits is copied once for
+                            // them all (decision 35). An engine that can't tell, or fails to, is
+                            // copied, and the copy says why it fails.
                             if !draining
-                                && matches!(
-                                    uncopied(&mut reader),
-                                    Ok(Some(c)) if c.left < after && c.log <= bound
-                                )
+                                && matches!(uncopied(&mut reader), Ok(Some(c)) if c.log <= bound)
                             {
                                 continue;
                             }

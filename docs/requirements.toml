@@ -187,7 +187,7 @@ criteria = [
   { id = "AC-T1.10.5", text = "anomalies across groups is exactly 0, measured by an Elle-style check over 10,000 seeds" },
   # Amphora's own: a local read on a replica (docs/design/replication.md, "A local read on a replica").
   { id = "AC-T1.10.L1", text = "A local read on a replica answers from its own applied state, asking no leader: a prefix of the group's committed history, never older than a local read before it in the same opening, nor after a clean close or a process crash; refused before the group's first image, once its owner ended, and while fenced" },
-  { id = "AC-T1.10.L2", text = "At most CONNECTION_MAX local readers out at once on one replica, every replica's readers charged to the process's page budget; a read past either waits on its caller's thread, never the owner's, until its deadline, and is refused Timeout, or Fenced once the owner ends" },
+  { id = "AC-T1.10.L2", text = "At most as many local readers out at once on one replica as the process's descriptor budget lets clients attach (CONNECTION_MAX until 2026-11-21), every replica's readers charged to the process's page budget; a read past either waits on its caller's thread, never the owner's, until its deadline, and is refused Timeout, or Fenced once the owner ends" },
   { id = "AC-T1.10.L3", text = "An attached client's local read is Request::LocalSession at wire version 6, run read-only on its owner's state: a write in it is refused and nothing of it stays" },
 ]
 tests = [
@@ -199,7 +199,7 @@ tests = [
   { id = "T-T1.10.L4", text = "A local read held open while its replica installs an image, with a checkpoint and a log restart tried meanwhile — passes when it sees the state before the image, whole, and a read after sees the image, whole" },
   { id = "T-T1.10.L5", text = "Superseded by T-T1.10.L8 (2026-11-09, the readers bounded by derivation): four local reads held open and a fifth asked — passed when the fifth was refused Timeout at its deadline while the owner's actor stepped, and answered once one was given back" },
   { id = "T-T1.10.L6", text = "A write read locally under the replicated class, its flush held, the member's power cut — passes when the restarted member's read is never older than its last finished flush, and sees the write once caught up" },
-  { id = "T-T1.10.L8", text = "CONNECTION_MAX local reads held open on one replica and one more asked — passes when every held read has its reader, the one more is refused Timeout at its deadline while the owner's actor steps, and a read answers once one is given back" },
+  { id = "T-T1.10.L8", text = "As many local reads held open on one replica as its descriptor budget's bound, and one more asked — passes when every held read has its reader, the one more is refused Timeout at its deadline while the owner's actor steps, and a read answers once one is given back" },
   { id = "T-T1.10.L9", text = "Two replicas' readers over a budget of two readers' pages — passes when an idle reader of one replica is closed for the other's read, a read past the budget is refused Timeout at its deadline, and the charge never passes the budget" },
   { id = "T-T1.10.L7", text = "An attached client's local read that writes — passes when it is refused, nothing of it stays, and the client is never promoted" },
 ]
@@ -432,6 +432,60 @@ criteria = [
 ]
 tests = [
   { id = "T-NS.1.1", text = "Random operation sequences on both cursors — passes when identical keys, values and positions after each step" },
+
+# lane online-schema: online schema changes (CP-T1.12, kiln goal 496de8d5, G14 step 3); the tests
+# are T-T1.12.1's, by name in crates/amphora/tests/online_schema.rs and crash.rs
+# (t_t1_12_1_a_power_cut_at_every_step_of_an_online_index_leaves_old_or_new).
+
+# lane audit-log: Amphora's own IDs for G10 step 3 (kiln plan 01a16b0f47577325bcd9e51383067e04),
+# serving AC-T1.7.4 (docs/design/audit.md).
+
+[[own]]
+id = "AL.1"
+title = "A Merkle audit log: RFC 6962's tree with inclusion and consistency proofs verified on read (G10 step 3)"
+criteria = [
+  { id = "AC-AL.1.1", text = "Flipping any byte of the audit log is detected on read (AC-T1.7.4)" },
+  { id = "AC-AL.1.2", text = "Hash-chain and Merkle designs measured for append and audit cost (crates/amphora/examples/audit_cost.rs, recorded in bench/records)" },
+]
+tests = [
+  { id = "T-AL.1.1", text = "Flip every byte of a 1,000-event log — passes when every flip detected" },
+  { id = "T-AL.1.2", text = "Certificate Transparency's reference tree — passes when its roots, subtree hashes and proofs are reproduced" },
+  { id = "T-AL.1.3", text = "Every inclusion and consistency proof of every tree up to 70 leaves, and of a 100-event log's checkpoints — passes when each verifies and each altered one fails" },
+  { id = "T-AL.1.4", text = "History rewritten whole, and a log cut back — passes when a reader's earlier checkpoint refuses both" },
+  { id = "T-AL.1.5", text = "The log on Amphora's own Records — passes when reads verify, direct changes are refused as tampering, and a racing append is refused" },
+]
+
+# lane constants
+# Picked constants replaced by derived ones (Ada, 2026-11-11: "learned and stat derived values only"; kiln goal
+# dfabffcc). FD.n: the process's descriptor budget (local-owner-transport.md, "Decision (lane constants): one
+# descriptor budget").
+
+[[own]]
+id = "FD.1"
+title = "One descriptor budget a process: connections bounded by the system's descriptor limit, not a picked 32"
+criteria = [
+  { id = "AC-FD.1.1", text = "No count of connections: each accepted connection charges its socket to the process's descriptor budget (the soft RLIMIT_NOFILE as it stands, read at every charge, less the descriptors open outside the budget, counted again when the limit moves, a charge would be refused or the system refuses one; 2^24 handles on Windows), and one past it is closed unserved with a typed refusal at the client" },
+  { id = "AC-FD.1.2", text = "The listener's backlog is the system's own most (SOMAXCONN semantics), and the listener goes on when the system refuses a descriptor (EMFILE, ENFILE, WSAEMFILE)" },
+  { id = "AC-FD.1.3", text = "A replica's local readers out at once are at most the budget's bound (AC-T1.10.L2)" },
+  # lane constants (2026-11-21): OWNERS_MAX's 4,096 replaced
+  { id = "AC-FD.1.4", text = "No count of owners: each owner charges one descriptor to the process's budget before any probe or lease (a local or replicated owner's lease, a client's socket), held where that file is held and given back once it closes; past the budget an open or attach is refused TooLarge and makes nothing; the drained paths kept are at most the budget's bound" },
+]
+tests = [
+  { id = "T-FD.1.1", text = "A budget of 3 asked for one, two, then one more — passes when the fourth is refused TooLarge naming what it was for, 4 past 3, and two more are held once two are given back" },
+  { id = "T-FD.1.2", text = "The process's budget on Unix, its soft RLIMIT_NOFILE raised by one while it runs and put back — passes when it has room under the limit by stdin, stdout and stderr at least, and its limit follows the raise and the return at its next charge" },
+  { id = "T-FD.1.3", text = "A budget of 1, an owner, one client served and kept, a second asked, the first let go, a third asked — passes when the second is turned away before any challenge and the third is served" },
+  # lane constants (2026-11-21)
+  { id = "T-FD.1.4", text = "A budget of 1, one database opened, a second opened, the first dropped and drained, the second opened again — passes when the first holds 1, the second is refused TooLarge at 1, then served" },
+]
+
+[[own]]
+id = "DQ.1"
+title = "The replicated owner drives once a step, taking turns with its inputs, not a picked 32 drives"
+criteria = [
+  { id = "AC-DQ.1.1", text = "One drive a step, and a step whose drive left more comes again at once without waiting for an input: deficit round robin of inputs and drives, one unit each (Shreedhar and Varghese 1995, Theorem 4.5)" },
+]
+tests = [
+  { id = "T-DQ.1.1", text = "Three members, an election and 20 writes on driven time — passes when every write is answered and some step left more to drive for the next" },
 ]
 
 # lane cc-proto
@@ -449,6 +503,21 @@ tests = [
   { id = "T-G8.1.2", text = "Each validation on hand-made schedules (write skew, a phantom closing a cycle, a lone antidependency, the read-only anomaly, an open writer of a row read) — passes when each refuses exactly what its scheme says" },
 ]
 
+# lane g8-gc
+# Amphora's own IDs for G8 step 2 (kiln plan 01a16b0f4716761cb68dc0c96863b53b, step 2, under
+# CP-T1.3): versions collected, memory bounded, typed refusals.
+[[own]]
+id = "G8.2"
+title = "Versions collected, memory bounded, robust out of memory (G8 step 2)"
+criteria = [
+  { id = "AC-G8.2.1", text = "a reader held open an hour under 32 writers keeps the versioned storage's memory within its budget, refusing typed (MemoryBudget) past it, and its answers stay its snapshot's" },
+]
+tests = [
+  { id = "T-G8.2.1", text = "Soak: one long snapshot, 32 writers, a collector (AMPHORA_G8_SOAK_SECONDS for the hour) — passes when the budget never holds past its limit, every refusal is typed, every scan is the snapshot's, each row keeps at most one older version once collected, and every byte comes back" },
+  { id = "T-G8.2.2", text = "Commits kept for validation only while a transaction begun before them is open, not for a read-only snapshot" },
+  { id = "T-G8.2.3", text = "A transaction's reads past the budget escalate to its whole tree, and its commit is refused at least where the finer record would be" },
+]
+
 # lane split-merge: groups that split, merge and move themselves (kiln goal 49477403, G13 step 2;
 # docs/design/reshard.md). Criteria are CP-T1.9's AC-T1.9.1 to AC-T1.9.3.
 [[own]]
@@ -460,6 +529,8 @@ criteria = [
 ]
 tests = [
   { id = "T-T1.9.S1", text = "Automatic splits, merges and moves in the simulator under writes, driver and group restarts and lost logs — passes when every key is in exactly one group, the directory's, and writes lost is 0" },
+  { id = "T-T1.9.R1", text = "A split carried through the directory group's replicated log while groups route by it — passes when every member holds the same directory, a write to the fenced range is refused typed, a router on the old directory is refused by the old group's holding after the flip, and once routed by the new directory the range is written to and read from the new group" },
+  { id = "T-T1.9.R2", text = "A refused directory change and a directory image — passes when the refusal is alike on every member and changes nothing, an image installs the same directory, and an image that doesn't decode is refused" },
 ]
 
 # lane qs5
@@ -508,6 +579,34 @@ criteria = [
 ]
 tests = [
   { id = "T-CS.1.1", text = "A doc-truth check of its claims (crates/amphora/tests/columnar_decision.rs) — passes when every claim cited: each citation resolves to a quoted, located claim from a graded source, and each number the decision states is in a quote it cites" },
+]
+
+# lane corpus-ci
+# Amphora's own IDs for G2, the competition corpus (kiln plan 01a16b0f461b7065a845f678893846ec):
+# G2.n for its step n.
+
+[[own]]
+id = "G2.4"
+title = "One harness for every engine, each in its steady state (G2 step 4)"
+criteria = [
+  { id = "AC-G2.4.1", text = "every disagreement classified: Amphora bug, competitor bug, dialect difference, or translation gap" },
+  { id = "AC-G2.4.2", text = "competitors the corpus runs against: at least 8" },
+]
+tests = [
+  { id = "T-G2.4.1", text = "a known dialect difference (integer division, NULL ordering) — passes when classified as a dialect difference, not a bug" },
+]
+
+[[own]]
+id = "G2.7"
+title = "In the gate and nightly (G2 step 7)"
+criteria = [
+  { id = "AC-G2.7.1", text = "the subset runs in the gate in under 2 minutes" },
+  { id = "AC-G2.7.2", text = "the nightly run records results every night" },
+]
+tests = [
+  { id = "T-G2.7.1", text = "the pool chosen from measured times (bench/corpus/subset.py) and run with them kept (crates/corpus/tests/times.rs) — passes when each record and each file has its time and fill files stop at the deadline" },
+  { id = "T-G2.7.2", text = "a corpus file run on Amphora through the gate's code path (crates/corpus/tests/amphora_runs.rs) — passes when the wrong answer, and only it, disagrees" },
+  { id = "T-G2.7.3", text = "the whole corpus nightly (.kiln/corpus.yaml, bench/corpus/nightly.sh) — passes when its record, times and re-ranked pool are kept as the run's artifacts" },
 ]
 
 # lane g11-compress

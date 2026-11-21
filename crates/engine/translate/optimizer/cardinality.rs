@@ -858,14 +858,14 @@ fn column_equality(
 /// The terms of `joined` its sample runs, those `takes` names, and the share of the sample they
 /// keep together (docs/design/planner.md, decision 21; PL.4): each whose only columns are the
 /// table's sampled ones, but for an `=` or IN list its column statistics estimate (decision 20),
-/// compiled once and run on each sample row within [SAMPLE_STEPS] steps for the table. Where at
+/// compiled once and run on each sample row: its length times the sample's rows, no more than a
+/// scan of the table takes to run it (decision 21). Where at
 /// least [SAMPLE_HITS] rows pass them all, their share of the sample; where fewer do, the share of
 /// half a row or of the rows that pass, but no more than the terms' own estimates give by
 /// exponential backoff, so a rare value keeps its distinct count's estimate. Each part falls as a
 /// term is added, so the whole never rises (CERT). `None` where the table has no sample or no
 /// term runs on it.
 ///
-/// [SAMPLE_STEPS]: super::sample_filter::SAMPLE_STEPS
 /// [SAMPLE_HITS]: crate::column_stats::SAMPLE_HITS
 fn sampled_filters(
     joined: &JoinedTable,
@@ -896,7 +896,6 @@ fn sampled_filters(
         in_sample: &in_sample,
         values: params.plan_values.as_deref(),
     };
-    let mut budget = super::sample_filter::SAMPLE_STEPS;
     let mut terms: SmallVec<[usize; 8]> = SmallVec::new();
     let mut own: SmallVec<[f64; 8]> = SmallVec::new();
     let mut passing: Vec<bool> = vec![true; n];
@@ -940,7 +939,7 @@ fn sampled_filters(
         };
         let mut passes: Vec<bool> = Vec::with_capacity(n);
         for row in &sample.rows {
-            match program.passes(row, &mut budget) {
+            match program.passes(row) {
                 Some(pass) => passes.push(pass),
                 None => break,
             }
@@ -1009,7 +1008,10 @@ fn column_domain(
     };
     let stats = schema.analyze_stats.table_stats(name);
     let mut distinct = None;
-    for index in schema.get_indices(name).filter(|index| leads(index)) {
+    for index in schema
+        .get_indices(name)
+        .filter(|index| index.is_public() && leads(index))
+    {
         if index.unique && index.columns.len() == 1 {
             return (rows, true);
         }
@@ -1081,7 +1083,11 @@ fn composite_keys(
             }
         }
         for index in schema.get_indices(joined.table.get_name()) {
-            if !index.unique || index.where_clause.is_some() || index.columns.len() < 2 {
+            if !index.is_public()
+                || !index.unique
+                || index.where_clause.is_some()
+                || index.columns.len() < 2
+            {
                 continue;
             }
             let key: Option<SmallVec<[usize; 4]>> = index

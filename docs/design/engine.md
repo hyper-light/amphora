@@ -376,6 +376,43 @@ until then), overflow for rows past a cell's bound (refused now, `TooBig`), the 
 transaction behind `Access::Write` (begin, commit, rollback, savepoints from decision 4's versions),
 and the connection's pager for `get_pager`.
 
+## 10. Memory: versions pruned between snapshots, one budget, typed refusals
+
+**Decision.** Collection keeps, of a row's older versions, only those an open snapshot sees: for
+each open snapshot the newest version at or before it unless it sees the row's newest, every
+version after the last commit read with the snapshots and the newest at or before it (what a
+snapshot opened meanwhile may see), and the version an open writer replaced (its rollback's). A
+long reader so holds one version a row, not one an update. Every byte kept beside the pages (row
+versions and their heads, each transaction's write and read records, the commits kept for
+validation) is charged to one budget, reserved before anything changes and refused past it with a
+typed `MemoryBudget`, the change refused whole. Commits are kept for validation only while a
+transaction begun before them is open: a read-only snapshot never validates. A transaction's reads
+that the budget can't take become its whole tree, one span. The budget is the shell's
+(`Versioned::with_budget`, the process's memory as `crates/amphora/src/memory.rs` learns it where
+it runs); until the shell opens this storage, the pool's own bytes.
+
+**Why.** The low watermark alone bounds versions by the oldest snapshot: one reader held an hour
+keeps every version written since, which no budget survives. Pruning between snapshots bounds them
+by rows times open snapshots; the budget turns what is left into a refusal a caller can handle
+instead of the process running out of memory. Escalation keeps a long serializable reader running:
+a coarser record refuses more, never fewer.
+
+**Sources.** Böttcher, Leis, Neumann, Kemper, "Scalable Garbage Collection for In-Memory MVCC
+Systems", PVLDB 12(6), 2019 (Steam: eager pruning of versions no active snapshot sees). Lee et al.,
+"Hybrid Garbage Collection for Multi-Version Concurrency Control in SAP HANA", SIGMOD 2016
+(interval collection). Alhomssi, Leis, PVLDB 2023 (LeanStore: version records in the buffer
+manager, bounded by it). Ports, Grittner, PVLDB 5(12), 2012 (PostgreSQL SSI: predicate locks
+promoted to coarser grains when memory runs short). The MySQL reference manual, "InnoDB
+Multi-Versioning" (undo in buffer-pool pages).
+
+**Evidence.** `version.rs`'s T-G8.2.1 soak (one reader, 32 writers, a collector; precision locking
+and SSI), T-G8.2.2 and T-G8.2.3.
+
+**Falsified by.** The hour-long soak (`AMPHORA_G8_SOAK_SECONDS=3600`) finding the budget held past
+its limit, an untyped failure, a scan that isn't its snapshot's, or bytes not given back; or a
+workload whose refusals under the budget a version store out of memory (LeanStore's graveyard)
+would have avoided at a cost the suite accepts (the step this leaves open).
+
 ## Stages, each measured
 
 1. The buffer pool and the B-link tree, versioned rows, in memory: concurrent inserts and reads

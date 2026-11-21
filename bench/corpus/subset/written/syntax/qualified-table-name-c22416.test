@@ -1,0 +1,68 @@
+hash-threshold 8
+
+# written for syntax:qualified-table-name: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+statement ok
+CREATE INDEX q1 ON t1(a)
+
+statement ok
+UPDATE t1 INDEXED BY q1 SET b = 'q' WHERE a = 1
+
+statement ok
+DELETE FROM t1 NOT INDEXED WHERE a = 6
+
+statement ok
+UPDATE main.t1 AS x SET c = x.c * 2 WHERE x.a = 2
+
+statement ok
+DELETE FROM main.t1 AS x INDEXED BY q1 WHERE x.a = 3
+
+query ITR nosort
+SELECT a, b, c FROM t1 ORDER BY a
+----
+15 values hashing to 2f51b91a3593e267ff587d327352a019
+
+statement error
+UPDATE t1 INDEXED BY nope SET b = 'z' WHERE a = 1
+
+query I nosort
+SELECT a FROM t1 INDEXED BY q1 WHERE a > 1 ORDER BY a
+----
+2
+4
+5
+
+query I nosort
+SELECT a FROM t1 NOT INDEXED WHERE a > 1 ORDER BY a
+----
+2
+4
+5
+
+query I rowsort
+SELECT a FROM t1 INDEXED BY q1 WHERE b = 'two'
+----
+2
+
+query I rowsort
+SELECT a FROM main.t1 AS m INDEXED BY q1 WHERE m.a = 4
+----
+4
+
+statement ok
+UPDATE t1 NOT INDEXED SET a = a WHERE a = 4
+
+statement ok
+DELETE FROM t1 INDEXED BY q1

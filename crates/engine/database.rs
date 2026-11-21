@@ -1770,6 +1770,19 @@ impl Database {
                         }
                     }
 
+                    // Amphora: the online schema change states, which `make_from_btree` doesn't
+                    // read (CP-T1.12): without them an index a change left delete-only or
+                    // write-only would open public, read before its backfill gave every row its
+                    // entry.
+                    conn.maybe_update_schema();
+                    let states = conn.query_index_states()?;
+                    if !states.is_empty() {
+                        let db = state.db.as_ref().ok_or_else(|| {
+                            LimboError::InternalError("open: no database past Init".into())
+                        })?;
+                        db.with_schema_mut(|schema| schema.set_index_states(states))?;
+                    }
+
                     state.phase = OpenDbAsyncPhase::BootstrapMvStore;
                 }
 
@@ -3236,9 +3249,12 @@ impl Database {
         // are shared (decision 37).
         let packed = {
             let shared = self.shared_wal.read();
-            shared.runtime.format.load(Ordering::Acquire) == crate::storage::packed::PACKED_FORMAT
-                || shared.metadata.wal_header.lock().file_format
-                    == crate::storage::packed::PACKED_FORMAT
+            let packed = |format| {
+                crate::storage::packed::LogFormat::of(format)
+                    == Some(crate::storage::packed::LogFormat::Packed)
+            };
+            packed(shared.runtime.format.load(Ordering::Acquire))
+                || packed(shared.metadata.wal_header.lock().file_format)
         };
         if packed {
             return Err(LimboError::InvalidArgument(

@@ -1,0 +1,80 @@
+hash-threshold 8
+
+# written for keyword:NATURAL: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+query TT nosort
+SELECT a, b FROM t1 NATURAL JOIN t2 ORDER BY a
+----
+
+query I rowsort
+SELECT count(*) FROM t1 NATURAL JOIN t1 AS x
+----
+4
+
+query I nosort
+SELECT a FROM t1 NATURAL LEFT JOIN t2 ORDER BY 1
+----
+NULL
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT a FROM t1 NATURAL RIGHT JOIN t2 ORDER BY 1
+----
+1
+2
+3
+6
+7
+
+query I nosort
+SELECT a FROM t1 NATURAL FULL JOIN t2 ORDER BY 1
+----
+12 values hashing to f49bb8bdb3b28725062db9663585c48e
+
+query I rowsort
+SELECT count(*) FROM t1 NATURAL INNER JOIN t2
+----
+0
+
+query ITT rowsort
+SELECT * FROM (SELECT 1 AS k, 'x' AS v) NATURAL JOIN (SELECT 1 AS k, 'y' AS w)
+----
+1
+x
+y
+
+query II rowsort
+SELECT * FROM (SELECT 1 AS k) NATURAL JOIN (SELECT 2 AS j)
+----
+1
+2
+
+query I rowsort
+SELECT count(*) FROM t1 NATURAL JOIN t2 NATURAL JOIN t1 AS t3
+----
+0
+
+query I nosort
+SELECT k FROM (SELECT 1 AS k UNION SELECT 2) NATURAL JOIN (SELECT 2 AS k) ORDER BY 1
+----
+2
+
+statement error
+SELECT * FROM t1 NATURAL JOIN t2 USING (a)
