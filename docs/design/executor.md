@@ -388,6 +388,7 @@ runs slower than on one, measured class for class.
 **Left.** The pipelines run over rows already read; the VDBE's own loops (cursors over one
 snapshot per worker), a hash table built by all workers, the page cache's miss path sharded, loom
 or shuttle on the dispatcher, and the worker and morsel metrics are the step's next pieces.
+
 ## 9. Skipping rows: zone maps over leaf runs against cracking, behind one switch
 
 G5 step 4 (kiln plan `01a16b0f46ab717ea1e3c87c7f5e0b92`, AC-G5.4.1, T-G5.4.1; lane g5s4). A
