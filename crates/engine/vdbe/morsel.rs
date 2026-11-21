@@ -39,8 +39,14 @@ pub enum ParallelMode {
 /// What a parallel run refuses, and why.
 #[derive(Debug, thiserror::Error)]
 pub enum MorselError {
-    #[error("the statement's memory budget of {budget} bytes would be passed: {asked} more bytes asked with {used} in use")]
-    MemoryBudget { asked: usize, used: usize, budget: usize },
+    #[error(
+        "the statement's memory budget of {budget} bytes would be passed: {asked} more bytes asked with {used} in use"
+    )]
+    MemoryBudget {
+        asked: usize,
+        used: usize,
+        budget: usize,
+    },
     #[error("the machine's core count could not be read: {0}")]
     Cores(std::io::Error),
     #[error("a worker thread could not start: {0}")]
@@ -113,13 +119,23 @@ impl MachineCosts {
     /// Measures this machine: its cores from the OS, one worker started and joined, one dispatch.
     pub fn measure() -> Result<Self, MorselError> {
         let cores = std::thread::available_parallelism().map_err(MorselError::Cores)?;
-        let mut costs = MachineCosts { cores, worker_start: MeanNanos::default(), dispatch: MeanNanos::default() };
+        let mut costs = MachineCosts {
+            cores,
+            worker_start: MeanNanos::default(),
+            dispatch: MeanNanos::default(),
+        };
         let before = Instant::now();
         let began = std::thread::scope(|scope| {
-            let handle = std::thread::Builder::new().spawn_scoped(scope, Instant::now).map_err(MorselError::Spawn)?;
-            handle.join().map_err(|_| MorselError::WorkerLost { worker: 1 })
+            let handle = std::thread::Builder::new()
+                .spawn_scoped(scope, Instant::now)
+                .map_err(MorselError::Spawn)?;
+            handle
+                .join()
+                .map_err(|_| MorselError::WorkerLost { worker: 1 })
         })?;
-        costs.worker_start.record(nanos(began.saturating_duration_since(before)));
+        costs
+            .worker_start
+            .record(nanos(began.saturating_duration_since(before)));
         let next = AtomicUsize::new(0);
         let before = Instant::now();
         next.fetch_add(1, Ordering::Relaxed);
@@ -129,7 +145,11 @@ impl MachineCosts {
 
     /// Costs stated by the caller: a model fed from elsewhere, or a test's fixed machine.
     pub fn stated(cores: NonZeroUsize, worker_start_nanos: f64, dispatch_nanos: f64) -> Self {
-        let mut costs = MachineCosts { cores, worker_start: MeanNanos::default(), dispatch: MeanNanos::default() };
+        let mut costs = MachineCosts {
+            cores,
+            worker_start: MeanNanos::default(),
+            dispatch: MeanNanos::default(),
+        };
         costs.worker_start.record(worker_start_nanos);
         costs.dispatch.record(dispatch_nanos);
         costs
@@ -153,7 +173,10 @@ impl MachineCosts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Degree {
     Serial,
-    Parallel { workers: NonZeroUsize, morsel_rows: NonZeroUsize },
+    Parallel {
+        workers: NonZeroUsize,
+        morsel_rows: NonZeroUsize,
+    },
 }
 
 /// The narrow hook that picks serial or parallel, for `rows` rows still to run at `row_nanos`
@@ -165,7 +188,12 @@ pub enum Degree {
 /// integer nearest the minimum of the last two terms (`m = sqrt(n * d / (k * r))`, bounded so each
 /// worker has a morsel); the `k` with the least time wins, and serial (`W`) wins when no `k` beats
 /// it, so a short statement stays on one thread.
-pub fn choose_degree(mode: ParallelMode, rows: usize, row_nanos: f64, costs: &MachineCosts) -> Degree {
+pub fn choose_degree(
+    mode: ParallelMode,
+    rows: usize,
+    row_nanos: f64,
+    costs: &MachineCosts,
+) -> Degree {
     if mode == ParallelMode::Off || rows < 2 || !row_nanos.is_finite() || row_nanos <= 0.0 {
         return Degree::Serial;
     }
@@ -179,14 +207,20 @@ pub fn choose_degree(mode: ParallelMode, rows: usize, row_nanos: f64, costs: &Ma
     let most = costs.cores.get().min(rows);
     for k in 2..=most {
         let kf = k as f64;
-        let Some(per_worker) = rows.checked_div(k) else { continue };
+        let Some(per_worker) = rows.checked_div(k) else {
+            continue;
+        };
         let m = morsel_rows(n, kf, row_nanos, dispatch, per_worker.max(1));
         let mf = m as f64;
         let time = (kf - 1.0) * start + work / kf + (n / mf) * dispatch / kf + mf * row_nanos;
         if time < best_time {
-            if let (Some(workers), Some(morsel_rows)) = (NonZeroUsize::new(k), NonZeroUsize::new(m)) {
+            if let (Some(workers), Some(morsel_rows)) = (NonZeroUsize::new(k), NonZeroUsize::new(m))
+            {
                 best_time = time;
-                best = Degree::Parallel { workers, morsel_rows };
+                best = Degree::Parallel {
+                    workers,
+                    morsel_rows,
+                };
             }
         }
     }
@@ -223,14 +257,23 @@ pub struct MemoryBudget {
 
 impl MemoryBudget {
     pub fn new(limit: usize) -> Self {
-        MemoryBudget { limit, used: AtomicUsize::new(0) }
+        MemoryBudget {
+            limit,
+            used: AtomicUsize::new(0),
+        }
     }
 
     pub fn charge(&self, bytes: usize) -> Result<(), MorselError> {
         self.used
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| used.checked_add(bytes).filter(|total| *total <= self.limit))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|total| *total <= self.limit)
+            })
             .map(|_| ())
-            .map_err(|used| MorselError::MemoryBudget { asked: bytes, used, budget: self.limit })
+            .map_err(|used| MorselError::MemoryBudget {
+                asked: bytes,
+                used,
+                budget: self.limit,
+            })
     }
 
     pub fn used(&self) -> usize {
@@ -245,9 +288,19 @@ pub trait Pipeline: Sync {
     fn rows(&self) -> usize;
     fn empty(&self) -> Self::Partial;
     /// Folds the rows of `rows` (input row positions) into `partial`.
-    fn run(&self, rows: Range<usize>, partial: &mut Self::Partial, budget: &MemoryBudget) -> Result<(), MorselError>;
+    fn run(
+        &self,
+        rows: Range<usize>,
+        partial: &mut Self::Partial,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError>;
     /// Folds a worker's partial into another.
-    fn merge(&self, into: &mut Self::Partial, from: Self::Partial, budget: &MemoryBudget) -> Result<(), MorselError>;
+    fn merge(
+        &self,
+        into: &mut Self::Partial,
+        from: Self::Partial,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError>;
 }
 
 /// What a run did: the workers that ran, its morsels, and the pilot's share.
@@ -262,11 +315,23 @@ pub struct RunStats {
 /// Runs a pipeline as the switch and the measured costs say: a pilot on the caller's thread first,
 /// in morsels doubling from one row, until it has run as long as starting one worker costs (before
 /// then no parallel plan can win) or the input ends; then the rest at [`choose_degree`]'s degree.
-pub fn execute<P: Pipeline>(pipeline: &P, mode: ParallelMode, costs: &mut MachineCosts, budget: &MemoryBudget) -> Result<(P::Partial, RunStats), MorselError> {
+pub fn execute<P: Pipeline>(
+    pipeline: &P,
+    mode: ParallelMode,
+    costs: &mut MachineCosts,
+    budget: &MemoryBudget,
+) -> Result<(P::Partial, RunStats), MorselError> {
     let total = pipeline.rows();
     let mut partial = pipeline.empty();
-    let mut stats = RunStats { workers: 1, ..RunStats::default() };
-    let Some(start_nanos) = costs.worker_start.mean().filter(|_| mode == ParallelMode::On) else {
+    let mut stats = RunStats {
+        workers: 1,
+        ..RunStats::default()
+    };
+    let Some(start_nanos) = costs
+        .worker_start
+        .mean()
+        .filter(|_| mode == ParallelMode::On)
+    else {
         pipeline.run(0..total, &mut partial, budget)?;
         stats.morsels = 1;
         stats.morsel_rows = total;
@@ -304,15 +369,32 @@ pub fn execute<P: Pipeline>(pipeline: &P, mode: ParallelMode, costs: &mut Machin
 
 /// Runs a pipeline's rows from `first` on at a stated degree; `costs`, when given, learns this
 /// run's worker starts and dispatches.
-pub fn execute_at<P: Pipeline>(pipeline: &P, first: usize, degree: Degree, costs: Option<&mut MachineCosts>, budget: &MemoryBudget) -> Result<(P::Partial, RunStats), MorselError> {
+pub fn execute_at<P: Pipeline>(
+    pipeline: &P,
+    first: usize,
+    degree: Degree,
+    costs: Option<&mut MachineCosts>,
+    budget: &MemoryBudget,
+) -> Result<(P::Partial, RunStats), MorselError> {
     let total = pipeline.rows();
     let rest = total.saturating_sub(first);
     let (workers, morsel_rows) = match degree {
-        Degree::Parallel { workers, morsel_rows } if workers.get() > 1 && rest > 0 => (workers.get(), morsel_rows.get()),
+        Degree::Parallel {
+            workers,
+            morsel_rows,
+        } if workers.get() > 1 && rest > 0 => (workers.get(), morsel_rows.get()),
         _ => {
             let mut partial = pipeline.empty();
             pipeline.run(first..total.max(first), &mut partial, budget)?;
-            return Ok((partial, RunStats { workers: 1, morsels: 1, morsel_rows: rest, pilot_rows: 0 }));
+            return Ok((
+                partial,
+                RunStats {
+                    workers: 1,
+                    morsels: 1,
+                    morsel_rows: rest,
+                    pilot_rows: 0,
+                },
+            ));
         }
     };
     let morsels = rest.div_ceil(morsel_rows);
@@ -332,18 +414,39 @@ pub fn execute_at<P: Pipeline>(pipeline: &P, first: usize, degree: Degree, costs
             if index >= morsels || stop.load(Ordering::Relaxed) {
                 break;
             }
-            let low = index.checked_mul(morsel_rows).and_then(|offset| offset.checked_add(first)).ok_or(MorselError::Overflow { what: "a morsel's first row" });
-            let ran = low.and_then(|low| pipeline.run(low..low.saturating_add(morsel_rows).min(total), &mut partial, budget));
+            let low = index
+                .checked_mul(morsel_rows)
+                .and_then(|offset| offset.checked_add(first))
+                .ok_or(MorselError::Overflow {
+                    what: "a morsel's first row",
+                });
+            let ran = low.and_then(|low| {
+                pipeline.run(
+                    low..low.saturating_add(morsel_rows).min(total),
+                    &mut partial,
+                    budget,
+                )
+            });
             if let Err(error) = ran {
                 stop.store(true, Ordering::Relaxed);
-                return WorkerResult { partial: Err(error), claim_nanos, claims, began: Instant::now() };
+                return WorkerResult {
+                    partial: Err(error),
+                    claim_nanos,
+                    claims,
+                    began: Instant::now(),
+                };
             }
         }
-        WorkerResult { partial: Ok(partial), claim_nanos, claims, began: Instant::now() }
+        WorkerResult {
+            partial: Ok(partial),
+            claim_nanos,
+            claims,
+            began: Instant::now(),
+        }
     };
     let work = &work;
     let mut started = 1usize;
-    let outcome = std::thread::scope(|scope| -> Result<(Vec<WorkerResult<P::Partial>>, Vec<f64>), MorselError> {
+    let outcome = std::thread::scope(|scope| -> Result<Joined<P::Partial>, MorselError> {
         let mut handles = Vec::new();
         handles.try_reserve_exact(workers.saturating_sub(1))?;
         for _ in 1..workers {
@@ -391,7 +494,9 @@ pub fn execute_at<P: Pipeline>(pipeline: &P, first: usize, degree: Degree, costs
         }
         for result in &results {
             if result.claims > 0 {
-                costs.dispatch.record(result.claim_nanos / result.claims as f64);
+                costs
+                    .dispatch
+                    .record(result.claim_nanos / result.claims as f64);
             }
         }
     }
@@ -399,8 +504,19 @@ pub fn execute_at<P: Pipeline>(pipeline: &P, first: usize, degree: Degree, costs
     for result in results {
         pipeline.merge(&mut merged, result.partial?, budget)?;
     }
-    Ok((merged, RunStats { workers: started, morsels, morsel_rows, pilot_rows: 0 }))
+    Ok((
+        merged,
+        RunStats {
+            workers: started,
+            morsels,
+            morsel_rows,
+            pilot_rows: 0,
+        },
+    ))
 }
+
+/// Every worker's result, and each started worker's start latency in nanoseconds.
+type Joined<T> = (Vec<WorkerResult<T>>, Vec<f64>);
 
 struct WorkerResult<T> {
     partial: Result<T, MorselError>,
@@ -431,7 +547,9 @@ impl ExactSum {
         let mut kept = 0usize;
         let count = self.partials.len();
         for j in 0..count {
-            let Some(mut y) = self.partials.get(j).copied() else { break };
+            let Some(mut y) = self.partials.get(j).copied() else {
+                break;
+            };
             if x.abs() < y.abs() {
                 std::mem::swap(&mut x, &mut y);
             }
@@ -472,7 +590,9 @@ impl ExactSum {
             return special;
         }
         let mut rest = self.partials.iter().rev();
-        let Some(mut high) = rest.next().copied() else { return 0.0 };
+        let Some(mut high) = rest.next().copied() else {
+            return 0.0;
+        };
         let mut low = 0.0;
         let mut below = None;
         while let Some(y) = rest.next().copied() {
@@ -539,15 +659,28 @@ fn integral(f: f64) -> Option<i64> {
         return Some(0);
     }
     let bits = f.to_bits();
-    let exponent = i32::try_from((bits >> 52) & 0x7ff).ok()?.checked_sub(1075)?;
+    let exponent = i32::try_from((bits >> 52) & 0x7ff)
+        .ok()?
+        .checked_sub(1075)?;
     let significand = i128::from((bits & 0xf_ffff_ffff_ffff) | 0x10_0000_0000_0000);
-    let magnitude = if exponent >= 0 { significand.checked_shl(u32::try_from(exponent).ok()?)? } else { significand.checked_shr(exponent.unsigned_abs())? };
-    let signed = if bits >> 63 == 1 { magnitude.checked_neg()? } else { magnitude };
+    let magnitude = if exponent >= 0 {
+        significand.checked_shl(u32::try_from(exponent).ok()?)?
+    } else {
+        significand.checked_shr(exponent.unsigned_abs())?
+    };
+    let signed = if bits >> 63 == 1 {
+        magnitude.checked_neg()?
+    } else {
+        magnitude
+    };
     i64::try_from(signed).ok()
 }
 
 fn column(row: &[Value], column: usize) -> Result<&Value, MorselError> {
-    row.get(column).ok_or(MorselError::NoColumn { column, width: row.len() })
+    row.get(column).ok_or(MorselError::NoColumn {
+        column,
+        width: row.len(),
+    })
 }
 
 /// A comparison of a column with a constant.
@@ -565,15 +698,27 @@ pub enum CmpOp {
 #[derive(Clone, Debug)]
 pub enum Predicate {
     /// `column op constant`: false when either side is NULL, values compared as SQLite orders them.
-    Compare { column: usize, op: CmpOp, value: Value },
-    IsNull { column: usize },
-    NotNull { column: usize },
+    Compare {
+        column: usize,
+        op: CmpOp,
+        value: Value,
+    },
+    IsNull {
+        column: usize,
+    },
+    NotNull {
+        column: usize,
+    },
 }
 
 impl Predicate {
     fn holds(&self, row: &[Value]) -> Result<bool, MorselError> {
         Ok(match self {
-            Predicate::Compare { column: at, op, value } => {
+            Predicate::Compare {
+                column: at,
+                op,
+                value,
+            } => {
                 let left = column(row, *at)?;
                 if matches!(left, Value::Null) || matches!(value, Value::Null) {
                     return Ok(false);
@@ -609,22 +754,46 @@ enum Accumulator {
     Count(u64),
     /// Integers summed in 128 bits (no overflow before 2^64 rows), REALs exactly; `seen` is false
     /// while only NULLs have come.
-    Sum { integers: i128, reals: ExactSum, any_real: bool, seen: bool },
+    Sum {
+        integers: i128,
+        reals: ExactSum,
+        any_real: bool,
+        seen: bool,
+    },
     /// The least or greatest value with the row it came from; ties keep the earliest row.
-    Extreme { best: Option<(Value, usize)>, greatest: bool },
+    Extreme {
+        best: Option<(Value, usize)>,
+        greatest: bool,
+    },
 }
 
 impl Accumulator {
     fn new(aggregate: Aggregate) -> Self {
         match aggregate {
             Aggregate::CountStar | Aggregate::Count(_) => Accumulator::Count(0),
-            Aggregate::Sum(_) => Accumulator::Sum { integers: 0, reals: ExactSum::default(), any_real: false, seen: false },
-            Aggregate::Min(_) => Accumulator::Extreme { best: None, greatest: false },
-            Aggregate::Max(_) => Accumulator::Extreme { best: None, greatest: true },
+            Aggregate::Sum(_) => Accumulator::Sum {
+                integers: 0,
+                reals: ExactSum::default(),
+                any_real: false,
+                seen: false,
+            },
+            Aggregate::Min(_) => Accumulator::Extreme {
+                best: None,
+                greatest: false,
+            },
+            Aggregate::Max(_) => Accumulator::Extreme {
+                best: None,
+                greatest: true,
+            },
         }
     }
 
-    fn step(&mut self, aggregate: Aggregate, row: &[Value], position: usize) -> Result<(), MorselError> {
+    fn step(
+        &mut self,
+        aggregate: Aggregate,
+        row: &[Value],
+        position: usize,
+    ) -> Result<(), MorselError> {
         match (self, aggregate) {
             (Accumulator::Count(count), Aggregate::CountStar) => *count = count.saturating_add(1),
             (Accumulator::Count(count), Aggregate::Count(at)) => {
@@ -632,10 +801,23 @@ impl Accumulator {
                     *count = count.saturating_add(1);
                 }
             }
-            (Accumulator::Sum { integers, reals, any_real, seen }, Aggregate::Sum(at)) => match column(row, at)? {
+            (
+                Accumulator::Sum {
+                    integers,
+                    reals,
+                    any_real,
+                    seen,
+                },
+                Aggregate::Sum(at),
+            ) => match column(row, at)? {
                 Value::Null => {}
                 Value::Numeric(Numeric::Integer(i)) => {
-                    *integers = integers.checked_add(i128::from(*i)).ok_or(MorselError::Overflow { what: "an integer sum" })?;
+                    *integers =
+                        integers
+                            .checked_add(i128::from(*i))
+                            .ok_or(MorselError::Overflow {
+                                what: "an integer sum",
+                            })?;
                     *seen = true;
                 }
                 Value::Numeric(Numeric::Float(f)) => {
@@ -661,7 +843,8 @@ impl Accumulator {
                         }
                     };
                     if better {
-                        *best = Some((value.try_clone().map_err(|_| MorselError::Alloc)?, position));
+                        *best =
+                            Some((value.try_clone().map_err(|_| MorselError::Alloc)?, position));
                     }
                 }
             }
@@ -672,26 +855,47 @@ impl Accumulator {
 
     fn merge(&mut self, other: Accumulator) -> Result<(), MorselError> {
         match (self, other) {
-            (Accumulator::Count(count), Accumulator::Count(more)) => *count = count.saturating_add(more),
-            (Accumulator::Sum { integers, reals, any_real, seen }, Accumulator::Sum { integers: more, reals: more_reals, any_real: more_real, seen: more_seen }) => {
-                *integers = integers.checked_add(more).ok_or(MorselError::Overflow { what: "an integer sum" })?;
+            (Accumulator::Count(count), Accumulator::Count(more)) => {
+                *count = count.saturating_add(more)
+            }
+            (
+                Accumulator::Sum {
+                    integers,
+                    reals,
+                    any_real,
+                    seen,
+                },
+                Accumulator::Sum {
+                    integers: more,
+                    reals: more_reals,
+                    any_real: more_real,
+                    seen: more_seen,
+                },
+            ) => {
+                *integers = integers.checked_add(more).ok_or(MorselError::Overflow {
+                    what: "an integer sum",
+                })?;
                 reals.merge(&more_reals)?;
                 *any_real |= more_real;
                 *seen |= more_seen;
             }
-            (Accumulator::Extreme { best, greatest }, Accumulator::Extreme { best: other, .. }) => {
-                if let Some((value, position)) = other {
-                    let better = match best {
-                        None => true,
-                        Some((current, at)) => match value.cmp(current) {
-                            CmpOrdering::Equal => position < *at,
-                            CmpOrdering::Greater => *greatest,
-                            CmpOrdering::Less => !*greatest,
-                        },
-                    };
-                    if better {
-                        *best = Some((value, position));
-                    }
+            (
+                Accumulator::Extreme { best, greatest },
+                Accumulator::Extreme {
+                    best: Some((value, position)),
+                    ..
+                },
+            ) => {
+                let better = match best {
+                    None => true,
+                    Some((current, at)) => match value.cmp(current) {
+                        CmpOrdering::Equal => position < *at,
+                        CmpOrdering::Greater => *greatest,
+                        CmpOrdering::Less => !*greatest,
+                    },
+                };
+                if better {
+                    *best = Some((value, position));
                 }
             }
             _ => {}
@@ -701,17 +905,37 @@ impl Accumulator {
 
     fn finish(self) -> Result<Value, MorselError> {
         Ok(match self {
-            Accumulator::Count(count) => Value::from_i64(i64::try_from(count).map_err(|_| MorselError::IntegerOverflow)?),
+            Accumulator::Count(count) => {
+                Value::from_i64(i64::try_from(count).map_err(|_| MorselError::IntegerOverflow)?)
+            }
             Accumulator::Sum { seen: false, .. } => Value::Null,
-            Accumulator::Sum { integers, any_real: false, .. } => Value::from_i64(i64::try_from(integers).map_err(|_| MorselError::IntegerOverflow)?),
-            Accumulator::Sum { integers, mut reals, any_real: true, .. } => {
+            Accumulator::Sum {
+                integers,
+                any_real: false,
+                ..
+            } => {
+                Value::from_i64(i64::try_from(integers).map_err(|_| MorselError::IntegerOverflow)?)
+            }
+            Accumulator::Sum {
+                integers,
+                mut reals,
+                any_real: true,
+                ..
+            } => {
                 // The integer part enters the exact sum in three pieces each a double holds exactly.
                 // `integers` is top * 2^100 + middle * 2^50 + low, with middle and low in [0, 2^50)
                 // and top within 2^28 of zero: each converts to a double exactly.
                 let piece = |shift: u32, mask: i128| -> Result<f64, MorselError> {
-                    let part = integers.checked_shr(shift).ok_or(MorselError::Overflow { what: "a sum's piece" })? & mask;
-                    let whole = i64::try_from(part).map_err(|_| MorselError::Overflow { what: "a sum's piece" })? as f64;
-                    Ok(whole * 2f64.powi(i32::try_from(shift).map_err(|_| MorselError::Overflow { what: "a sum's piece" })?))
+                    let part = integers.checked_shr(shift).ok_or(MorselError::Overflow {
+                        what: "a sum's piece",
+                    })? & mask;
+                    let whole = i64::try_from(part).map_err(|_| MorselError::Overflow {
+                        what: "a sum's piece",
+                    })? as f64;
+                    Ok(whole
+                        * 2f64.powi(i32::try_from(shift).map_err(|_| MorselError::Overflow {
+                            what: "a sum's piece",
+                        })?))
                 };
                 const LOW_50: i128 = 0x3_ffff_ffff_ffff;
                 reals.add(piece(100, -1)?)?;
@@ -752,7 +976,15 @@ impl ScanAggregate<'_> {
     pub fn finish(&self, partial: AggregatePartial) -> Result<Vec<Vec<Value>>, MorselError> {
         let mut groups: Vec<Group> = partial.groups.into_values().collect();
         if groups.is_empty() && self.group_by.is_empty() {
-            groups.push(Group { first_row: 0, key: Vec::new(), accumulators: self.aggregates.iter().map(|a| Accumulator::new(*a)).collect() });
+            groups.push(Group {
+                first_row: 0,
+                key: Vec::new(),
+                accumulators: self
+                    .aggregates
+                    .iter()
+                    .map(|a| Accumulator::new(*a))
+                    .collect(),
+            });
         }
         groups.sort_by(|a, b| a.key.cmp(&b.key).then(a.first_row.cmp(&b.first_row)));
         let mut out = Vec::new();
@@ -769,9 +1001,13 @@ impl ScanAggregate<'_> {
     }
 
     fn group_bytes(&self) -> usize {
-        let key = std::mem::size_of::<KeyPart>().saturating_add(std::mem::size_of::<Value>()).saturating_mul(self.group_by.len());
+        let key = std::mem::size_of::<KeyPart>()
+            .saturating_add(std::mem::size_of::<Value>())
+            .saturating_mul(self.group_by.len());
         let accumulators = std::mem::size_of::<Accumulator>().saturating_mul(self.aggregates.len());
-        std::mem::size_of::<Group>().saturating_add(key).saturating_add(accumulators)
+        std::mem::size_of::<Group>()
+            .saturating_add(key)
+            .saturating_add(accumulators)
     }
 }
 
@@ -786,9 +1022,18 @@ impl Pipeline for ScanAggregate<'_> {
         AggregatePartial::default()
     }
 
-    fn run(&self, rows: Range<usize>, partial: &mut AggregatePartial, budget: &MemoryBudget) -> Result<(), MorselError> {
+    fn run(
+        &self,
+        rows: Range<usize>,
+        partial: &mut AggregatePartial,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
         let first = rows.start;
-        let Some(morsel) = self.rows.get(rows) else { return Err(MorselError::Overflow { what: "a morsel's rows" }) };
+        let Some(morsel) = self.rows.get(rows) else {
+            return Err(MorselError::Overflow {
+                what: "a morsel's rows",
+            });
+        };
         for (offset, row) in morsel.iter().enumerate() {
             let mut passes = true;
             for term in self.filter {
@@ -813,11 +1058,23 @@ impl Pipeline for ScanAggregate<'_> {
                     let mut values = Vec::new();
                     values.try_reserve_exact(self.group_by.len())?;
                     for at in self.group_by {
-                        values.push(column(row, *at)?.try_clone().map_err(|_| MorselError::Alloc)?);
+                        values.push(
+                            column(row, *at)?
+                                .try_clone()
+                                .map_err(|_| MorselError::Alloc)?,
+                        );
                     }
-                    let accumulators = self.aggregates.iter().map(|a| Accumulator::new(*a)).collect();
+                    let accumulators = self
+                        .aggregates
+                        .iter()
+                        .map(|a| Accumulator::new(*a))
+                        .collect();
                     partial.groups.try_reserve(1)?;
-                    partial.groups.entry(key).or_insert(Group { first_row: position, key: values, accumulators })
+                    partial.groups.entry(key).or_insert(Group {
+                        first_row: position,
+                        key: values,
+                        accumulators,
+                    })
                 }
             };
             for (accumulator, aggregate) in group.accumulators.iter_mut().zip(self.aggregates) {
@@ -827,7 +1084,12 @@ impl Pipeline for ScanAggregate<'_> {
         Ok(())
     }
 
-    fn merge(&self, into: &mut AggregatePartial, from: AggregatePartial, _budget: &MemoryBudget) -> Result<(), MorselError> {
+    fn merge(
+        &self,
+        into: &mut AggregatePartial,
+        from: AggregatePartial,
+        _budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
         into.groups.try_reserve(from.groups.len())?;
         for (key, group) in from.groups {
             match into.groups.get_mut(&key) {
@@ -839,7 +1101,8 @@ impl Pipeline for ScanAggregate<'_> {
                         mine.first_row = group.first_row;
                         mine.key = group.key;
                     }
-                    for (accumulator, other) in mine.accumulators.iter_mut().zip(group.accumulators) {
+                    for (accumulator, other) in mine.accumulators.iter_mut().zip(group.accumulators)
+                    {
                         accumulator.merge(other)?;
                     }
                 }
@@ -863,24 +1126,41 @@ pub type ProbePartial = Vec<(usize, Vec<(usize, usize)>)>;
 
 impl<'a> HashProbe<'a> {
     /// Builds the table from `build`'s rows, charging it to the statement's budget.
-    pub fn build(build: &[Vec<Value>], build_key: &[usize], probe: &'a [Vec<Value>], probe_key: &'a [usize], budget: &MemoryBudget) -> Result<Self, MorselError> {
+    pub fn build(
+        build: &[Vec<Value>],
+        build_key: &[usize],
+        probe: &'a [Vec<Value>],
+        probe_key: &'a [usize],
+        budget: &MemoryBudget,
+    ) -> Result<Self, MorselError> {
         let mut table: HashMap<Vec<KeyPart>, Vec<usize>> = HashMap::new();
-        let entry_bytes = std::mem::size_of::<KeyPart>().saturating_mul(build_key.len()).saturating_add(std::mem::size_of::<usize>());
+        let entry_bytes = std::mem::size_of::<KeyPart>()
+            .saturating_mul(build_key.len())
+            .saturating_add(std::mem::size_of::<usize>());
         for (position, row) in build.iter().enumerate() {
-            let Some(key) = join_key(row, build_key)? else { continue };
+            let Some(key) = join_key(row, build_key)? else {
+                continue;
+            };
             budget.charge(entry_bytes)?;
             table.try_reserve(1)?;
             let matches = table.entry(key).or_default();
             matches.try_reserve(1)?;
             matches.push(position);
         }
-        Ok(HashProbe { probe, probe_key, table })
+        Ok(HashProbe {
+            probe,
+            probe_key,
+            table,
+        })
     }
 
     /// The matches as (probe row, build row), in the serial order.
     pub fn finish(&self, mut partial: ProbePartial) -> Result<Vec<(usize, usize)>, MorselError> {
         partial.sort_by_key(|(first, _)| *first);
-        let total = partial.iter().map(|(_, run)| run.len()).fold(0usize, usize::saturating_add);
+        let total = partial
+            .iter()
+            .map(|(_, run)| run.len())
+            .fold(0usize, usize::saturating_add);
         let mut out = Vec::new();
         out.try_reserve_exact(total)?;
         for (_, run) in partial {
@@ -913,13 +1193,26 @@ impl Pipeline for HashProbe<'_> {
         Vec::new()
     }
 
-    fn run(&self, rows: Range<usize>, partial: &mut ProbePartial, budget: &MemoryBudget) -> Result<(), MorselError> {
+    fn run(
+        &self,
+        rows: Range<usize>,
+        partial: &mut ProbePartial,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
         let first = rows.start;
-        let Some(morsel) = self.probe.get(rows) else { return Err(MorselError::Overflow { what: "a morsel's rows" }) };
+        let Some(morsel) = self.probe.get(rows) else {
+            return Err(MorselError::Overflow {
+                what: "a morsel's rows",
+            });
+        };
         let mut found = Vec::new();
         for (offset, row) in morsel.iter().enumerate() {
-            let Some(key) = join_key(row, self.probe_key)? else { continue };
-            let Some(matches) = self.table.get(&key) else { continue };
+            let Some(key) = join_key(row, self.probe_key)? else {
+                continue;
+            };
+            let Some(matches) = self.table.get(&key) else {
+                continue;
+            };
             budget.charge(std::mem::size_of::<(usize, usize)>().saturating_mul(matches.len()))?;
             found.try_reserve(matches.len())?;
             let position = first.saturating_add(offset);
@@ -930,7 +1223,12 @@ impl Pipeline for HashProbe<'_> {
         Ok(())
     }
 
-    fn merge(&self, into: &mut ProbePartial, from: ProbePartial, _budget: &MemoryBudget) -> Result<(), MorselError> {
+    fn merge(
+        &self,
+        into: &mut ProbePartial,
+        from: ProbePartial,
+        _budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
         into.try_reserve(from.len())?;
         into.extend(from);
         Ok(())
@@ -951,7 +1249,10 @@ mod tests {
         }
         match column {
             0 => Value::from_i64(rng.random_range(-20..20)),
-            1 => Value::from_f64(f64::from(rng.random_range(-1000i32..1000)) / 8.0 + if rng.random_bool(0.3) { 1e15 } else { 0.0 }),
+            1 => Value::from_f64(
+                f64::from(rng.random_range(-1000i32..1000)) / 8.0
+                    + if rng.random_bool(0.3) { 1e15 } else { 0.0 },
+            ),
             2 => {
                 if rng.random_bool(0.5) {
                     Value::from_i64(rng.random_range(i64::MIN / 1024..i64::MAX / 1024))
@@ -964,22 +1265,37 @@ mod tests {
     }
 
     fn random_table(rng: &mut ChaCha8Rng, rows: usize) -> Vec<Vec<Value>> {
-        (0..rows).map(|_| (0..4).map(|c| random_value(rng, c)).collect()).collect()
+        (0..rows)
+            .map(|_| (0..4).map(|c| random_value(rng, c)).collect())
+            .collect()
     }
 
     fn random_query(rng: &mut ChaCha8Rng) -> (Vec<Predicate>, Vec<usize>, Vec<Aggregate>) {
-        let ops = [CmpOp::Lt, CmpOp::Le, CmpOp::Eq, CmpOp::Ne, CmpOp::Gt, CmpOp::Ge];
+        let ops = [
+            CmpOp::Lt,
+            CmpOp::Le,
+            CmpOp::Eq,
+            CmpOp::Ne,
+            CmpOp::Gt,
+            CmpOp::Ge,
+        ];
         let filter = (0..rng.random_range(0..3))
             .map(|_| {
                 let column = rng.random_range(0..4);
                 match rng.random_range(0..4) {
                     0 => Predicate::IsNull { column },
                     1 => Predicate::NotNull { column },
-                    _ => Predicate::Compare { column, op: ops[rng.random_range(0..ops.len())], value: random_value(rng, column) },
+                    _ => Predicate::Compare {
+                        column,
+                        op: ops[rng.random_range(0..ops.len())],
+                        value: random_value(rng, column),
+                    },
                 }
             })
             .collect();
-        let group_by = (0..rng.random_range(0..3)).map(|_| [0, 3, 2][rng.random_range(0..3)]).collect();
+        let group_by = (0..rng.random_range(0..3))
+            .map(|_| [0, 3, 2][rng.random_range(0..3)])
+            .collect();
         let aggregates = (0..rng.random_range(1..5))
             .map(|_| match rng.random_range(0..5) {
                 0 => Aggregate::CountStar,
@@ -993,7 +1309,10 @@ mod tests {
     }
 
     fn degree(workers: usize, morsel_rows: usize) -> Degree {
-        Degree::Parallel { workers: NonZeroUsize::new(workers).unwrap(), morsel_rows: NonZeroUsize::new(morsel_rows).unwrap() }
+        Degree::Parallel {
+            workers: NonZeroUsize::new(workers).unwrap(),
+            morsel_rows: NonZeroUsize::new(morsel_rows).unwrap(),
+        }
     }
 
     /// The same value, REALs by their bits.
@@ -1002,8 +1321,13 @@ mod tests {
             && a.iter().zip(b).all(|(x, y)| {
                 x.len() == y.len()
                     && x.iter().zip(y).all(|(p, q)| match (p, q) {
-                        (Value::Numeric(Numeric::Float(f)), Value::Numeric(Numeric::Float(g))) => f64::from(*f).to_bits() == f64::from(*g).to_bits(),
-                        (Value::Numeric(Numeric::Integer(i)), Value::Numeric(Numeric::Integer(j))) => i == j,
+                        (Value::Numeric(Numeric::Float(f)), Value::Numeric(Numeric::Float(g))) => {
+                            f64::from(*f).to_bits() == f64::from(*g).to_bits()
+                        }
+                        (
+                            Value::Numeric(Numeric::Integer(i)),
+                            Value::Numeric(Numeric::Integer(j)),
+                        ) => i == j,
                         (Value::Numeric(_), Value::Numeric(_)) => false,
                         _ => p == q,
                     })
@@ -1022,20 +1346,30 @@ mod tests {
             let count = rng.random_range(0..600);
             let rows = random_table(&mut rng, count);
             let (filter, group_by, aggregates) = random_query(&mut rng);
-            let pipeline = ScanAggregate { rows: &rows, filter: &filter, group_by: &group_by, aggregates: &aggregates };
+            let pipeline = ScanAggregate {
+                rows: &rows,
+                filter: &filter,
+                group_by: &group_by,
+                aggregates: &aggregates,
+            };
             let budget = MemoryBudget::new(BIG);
-            let serial = execute_at(&pipeline, 0, Degree::Serial, None, &budget).and_then(|(p, _)| pipeline.finish(p));
+            let serial = execute_at(&pipeline, 0, Degree::Serial, None, &budget)
+                .and_then(|(p, _)| pipeline.finish(p));
             for workers in [2, 3, 4, 8] {
                 let morsel = rng.random_range(1..64);
                 let budget = MemoryBudget::new(BIG);
-                let parallel = execute_at(&pipeline, 0, degree(workers, morsel), None, &budget).and_then(|(p, stats)| {
-                    if stats.workers > 1 {
-                        ran_parallel += 1;
-                    }
-                    pipeline.finish(p)
-                });
+                let parallel = execute_at(&pipeline, 0, degree(workers, morsel), None, &budget)
+                    .and_then(|(p, stats)| {
+                        if stats.workers > 1 {
+                            ran_parallel += 1;
+                        }
+                        pipeline.finish(p)
+                    });
                 match (&serial, &parallel) {
-                    (Ok(s), Ok(p)) => assert!(same(s, p), "seed {seed} at {workers} workers, morsels of {morsel}:\n{s:?}\n{p:?}"),
+                    (Ok(s), Ok(p)) => assert!(
+                        same(s, p),
+                        "seed {seed} at {workers} workers, morsels of {morsel}:\n{s:?}\n{p:?}"
+                    ),
                     (Err(s), Err(p)) => assert_eq!(format!("{s}"), format!("{p}"), "seed {seed}"),
                     _ => panic!("seed {seed} at {workers} workers: {serial:?} vs {parallel:?}"),
                 }
@@ -1066,7 +1400,9 @@ mod tests {
             let build = random_table(&mut rng, count);
             let count = rng.random_range(0..400);
             let probe = random_table(&mut rng, count);
-            let keys: Vec<usize> = (0..rng.random_range(1..3)).map(|_| [0, 3, 2][rng.random_range(0..3)]).collect();
+            let keys: Vec<usize> = (0..rng.random_range(1..3))
+                .map(|_| [0, 3, 2][rng.random_range(0..3)])
+                .collect();
             let budget = MemoryBudget::new(BIG);
             let join = HashProbe::build(&build, &keys, &probe, &keys, &budget).unwrap();
             let (partial, _) = execute_at(&join, 0, Degree::Serial, None, &budget).unwrap();
@@ -1074,7 +1410,10 @@ mod tests {
             let mut nested = Vec::new();
             for (p, prow) in probe.iter().enumerate() {
                 for (b, brow) in build.iter().enumerate() {
-                    if keys.iter().all(|k| !matches!(prow[*k], Value::Null) && key_part(&prow[*k]) == key_part(&brow[*k])) {
+                    if keys.iter().all(|k| {
+                        !matches!(prow[*k], Value::Null)
+                            && key_part(&prow[*k]) == key_part(&brow[*k])
+                    }) {
                         nested.push((p, b));
                     }
                 }
@@ -1083,8 +1422,13 @@ mod tests {
             matched += serial.len();
             for workers in [2, 4, 8] {
                 let morsel = rng.random_range(1..50);
-                let (partial, _) = execute_at(&join, 0, degree(workers, morsel), None, &budget).unwrap();
-                assert_eq!(join.finish(partial).unwrap(), serial, "seed {seed} at {workers} workers");
+                let (partial, _) =
+                    execute_at(&join, 0, degree(workers, morsel), None, &budget).unwrap();
+                assert_eq!(
+                    join.finish(partial).unwrap(),
+                    serial,
+                    "seed {seed} at {workers} workers"
+                );
             }
         }
         assert!(matched > 10_000, "{matched}");
@@ -1120,12 +1464,20 @@ mod tests {
         let rows = random_table(&mut rng, 2_000);
         let group_by = [0, 3];
         let aggregates = [Aggregate::CountStar];
-        let pipeline = ScanAggregate { rows: &rows, filter: &[], group_by: &group_by, aggregates: &aggregates };
+        let pipeline = ScanAggregate {
+            rows: &rows,
+            filter: &[],
+            group_by: &group_by,
+            aggregates: &aggregates,
+        };
         let limit = pipeline.group_bytes() * 10;
         for workers in [1, 2, 4, 8] {
             let budget = MemoryBudget::new(limit);
             let result = execute_at(&pipeline, 0, degree(workers, 16), None, &budget);
-            assert!(matches!(result, Err(MorselError::MemoryBudget { .. })), "{workers}: {result:?}");
+            assert!(
+                matches!(result, Err(MorselError::MemoryBudget { .. })),
+                "{workers}: {result:?}"
+            );
             assert!(budget.used() <= limit);
         }
     }
@@ -1137,15 +1489,36 @@ mod tests {
     fn t_qt_6_5_degree_from_measured_costs() {
         let cores = NonZeroUsize::new(16).unwrap();
         let costs = MachineCosts::stated(cores, 50_000.0, 20.0);
-        assert_eq!(choose_degree(ParallelMode::Off, 10_000_000, 50.0, &costs), Degree::Serial);
-        assert_eq!(choose_degree(ParallelMode::On, 100, 50.0, &costs), Degree::Serial);
-        let Degree::Parallel { workers, morsel_rows } = choose_degree(ParallelMode::On, 10_000_000, 50.0, &costs) else { panic!("serial") };
+        assert_eq!(
+            choose_degree(ParallelMode::Off, 10_000_000, 50.0, &costs),
+            Degree::Serial
+        );
+        assert_eq!(
+            choose_degree(ParallelMode::On, 100, 50.0, &costs),
+            Degree::Serial
+        );
+        let Degree::Parallel {
+            workers,
+            morsel_rows,
+        } = choose_degree(ParallelMode::On, 10_000_000, 50.0, &costs)
+        else {
+            panic!("serial")
+        };
         assert!(workers.get() > 1 && workers <= cores);
         let dearer = MachineCosts::stated(cores, 50_000.0, 2_000.0);
-        let Degree::Parallel { morsel_rows: larger, .. } = choose_degree(ParallelMode::On, 10_000_000, 50.0, &dearer) else { panic!("serial") };
+        let Degree::Parallel {
+            morsel_rows: larger,
+            ..
+        } = choose_degree(ParallelMode::On, 10_000_000, 50.0, &dearer)
+        else {
+            panic!("serial")
+        };
         assert!(larger > morsel_rows, "{larger} vs {morsel_rows}");
         let one = MachineCosts::stated(NonZeroUsize::new(1).unwrap(), 1.0, 1.0);
-        assert_eq!(choose_degree(ParallelMode::On, 10_000_000, 50.0, &one), Degree::Serial);
+        assert_eq!(
+            choose_degree(ParallelMode::On, 10_000_000, 50.0, &one),
+            Degree::Serial
+        );
     }
 
     /// T-QT.6.6: the whole path, pilot and measured machine included: the answer equals the serial
@@ -1156,8 +1529,18 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(11);
         let rows = random_table(&mut rng, 50_000);
         let group_by = [3];
-        let aggregates = [Aggregate::CountStar, Aggregate::Sum(1), Aggregate::Min(2), Aggregate::Max(0)];
-        let pipeline = ScanAggregate { rows: &rows, filter: &[], group_by: &group_by, aggregates: &aggregates };
+        let aggregates = [
+            Aggregate::CountStar,
+            Aggregate::Sum(1),
+            Aggregate::Min(2),
+            Aggregate::Max(0),
+        ];
+        let pipeline = ScanAggregate {
+            rows: &rows,
+            filter: &[],
+            group_by: &group_by,
+            aggregates: &aggregates,
+        };
         let budget = MemoryBudget::new(BIG);
         let (serial, _) = execute(&pipeline, ParallelMode::Off, &mut costs, &budget).unwrap();
         let serial = pipeline.finish(serial).unwrap();
