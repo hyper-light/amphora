@@ -9,6 +9,20 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (`CLAUDE.md`), the requirement registry (`docs/requirements.toml`), the design's starting point
   (`docs/design/README.md`), the gate (`scripts/gates.sh`, run by kiln CI from `.kiln/ci.yaml`), and the
   vendoring tool (`scripts/vendor.py`, kiln's).
+- **The audit log** (CP-T1.7, AC-T1.7.4; AL.1, `crates/amphora/src/audit.rs`, docs/design/audit.md):
+  RFC 6962's Merkle tree over any Records store, its head checked against its subtrees on open, a
+  reader's earlier checkpoint checked by a consistency proof, and each event by its leaf hash and
+  inclusion proof on read; every byte of a 1,000-event log flipped is detected. Open: where kiln keeps
+  checkpoints outside the store (signed heads, witnesses), and the audit_cost runs for bench/records.
+- **Records in amphora-api, typed and simulated** (CP-T1.5, kiln goal a1f386fe; lane records-api;
+  docs/design/records.md): the trait's change feed is documented with etcd's watch guarantees and read
+  from the commits' own version rows, and gains `changed` (a wait's answer without waiting);
+  `amphora_api::sim::SimRecords` keeps Amphora's layout in memory, bounded by the caller's
+  `SimLimits`; `amphora_api::index` (index families) and `amphora_api::counter` (counters) type
+  kiln's deploy layout; `amphora_api::conformance` holds kiln-seams' RECORDS-1 to 14, ported, and
+  Amphora's own cases. Amphora (in memory, on a file, through the local owner) and the simulator
+  pass it, and a seeded differential test holds the simulator's answers to Amphora's
+  (`crates/amphora/tests/records_conformance.rs`).
 - **The `amphora` binary** says what it is (`amphora --version`, `amphora --help`), and nothing more yet.
 - **The store's commit pipeline** (CP-T1.1, `crates/amphora/src/store.rs`, docs/design/store.md): one
   writer with a group commit and no timer; durable beside it by a flusher (a write is durable once a
@@ -215,6 +229,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   after it, never an empty database over an existing file. Crash points through commits and
   checkpoints recover a prefix of the commits at least as long as the last acknowledged durable;
   the pool still holds every page, and nothing runs it under SQL yet (stage 3).
+- **Serializable validation, three prototypes behind one switch** (G8 step 1, docs/design/engine.md
+  decision 5, `crates/engine/storage/versioned/{version,elle}.rs`, `amphora-bench --cc`): precision
+  locking (the default), SSI and Silo-style OCC validate commits on the versioned storage's commit
+  path; Elle's list-append and register histories checked for G0, G1a, G1b, G1c, G-single and G2
+  (snapshot isolation the control, showing G2). Not yet: the 10,000-seed runs and the three schemes'
+  throughput, refusals and p99 on the suite's write classes and K0 (the batch's), then the choice.
 - **Ephemeral tables kept between runs** (docs/design/executor.md decision 1,
   `crates/engine/tests/ephemeral_reuse.rs`): a statement keeps each ephemeral table of at most 16
   pages (an IN list's keys, an IN subquery's rows) and empties it on its next run, where building
@@ -256,6 +276,29 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   0, 2, 4, ... drew the same), and every database checkpoints after its load before any run
   (`settle_s`; Amphora's loader had left the whole load, 7.5 GB, in its log). `--query` runs a
   statement on a database a run left behind.
+- **The leader's write slot** (AC-T1.8.W1, Amphora goal 9c63f7d4; replication.md, "the write slot"): a member
+  whose write is refused at the leader's append gets a slot for its next try, its length learned per member from
+  its retries' gaps (cold start: the core's election timeout). A gap over which the host's detector suspected the
+  member is not learned; no number bounds a gap (lane g-slot-close, 2026-11-21).
+
+- **Picked constants replaced by derived ones** (lane constants, kiln goal dfabffcc; Ada, 2026-11-11: "learned and
+  stat derived values only"): a page's chain of deltas ends where its bytes reach a page (store.md decision 17); the
+  store's log is copied past its bound (decision 35); a term runs on the whole sample (planner.md decision 21); a
+  drained lease is probed from the probe's cost to the learned window (J1); a class entry's bound, the patience's
+  voters and a change's charge follow from what they bound; an owner's own session lasts its role's raft timing; and
+  an owner's connections are bounded by the process's descriptor budget, the system's limit less what is open
+  (local-owner-transport.md, "Decision (lane constants): one descriptor budget"; FD.1), with a replica's local
+  readers following it; the replicated owner drives once a step, in turn with its inputs (replication.md, "Decision
+  (lane constants): one drive a step"; DQ.1); and each owner charges its lease, or a client its socket, to the same
+  budget, no count of owners (`OWNERS_MAX` gone; AC-FD.1.4). Left: an owner's other descriptors (endpoint, engine
+  files, a replica's log) charged by kind, the replicated owner's tick and poll, and the rest of the list
+  (handoff/amphora-constants-list.md).
+- **Groups that split, merge and move themselves** (CP-T1.9, lane split-merge; `crates/amphora/src/reshard/`,
+  docs/design/reshard.md): a pure core: a directory of hash spans with every position in exactly one group,
+  each group's own holding (fenced, stale actions refused), a planner deciding from measured load, bytes and
+  cores, and a driver doing copy, catch-up in rounds and a fenced cutover. Tested in a deterministic
+  simulator (T-T1.9.S1). Left: the shell over Amphora's groups and replicated owners, `bench reshard`
+  (AC-T1.9.2) and the three-machine lab (AC-T1.9.3).
 
 ## Measured
 
@@ -302,6 +345,16 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   NOCASE)` is 1 where SQLite says 0 (the left operand's collation decides), and `PRAGMA index_xinfo`
   names the rowid's column '' where SQLite gives NULL. CedarDB's server dies on
   `SELECT 0 OR NULL, 1 OR NULL`, and again when it's tried a second time.
+- **The corpus's runner** (G2 steps 4 and 7, lane corpus-ci; `crates/corpus`, built, not yet in the gate):
+  sqllogictest records read, run, rendered (I, R, T as slt_sqlite.c writes them, REALs through Amphora's
+  port of SQLite's printf), sorted and compared (MD5 past the hash threshold) as SQLite's own runner does,
+  one code path for the gate's subset and the bench's run over every engine; each query after a statement
+  settles the engine first (`PRAGMA wal_checkpoint(TRUNCATE)`), and each disagreement classifies as an
+  Amphora bug, a competitor's bug, a dialect difference or a translation gap. `amphora-corpus run <pool>
+  --budget-s <s>` runs a ranked pool on Amphora: required files whole, the rest until the budget, timed on
+  the machine as it runs, so the subset's size is what that machine runs in the budget. Left: the pool
+  chosen and checked in, its line in `scripts/gates.sh`, the bench's adapters for the other engines, the
+  nightly in `.kiln/`.
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691
@@ -430,6 +483,31 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (PL.7, e0e7a1df), bushy plans with CD-C (PL.8, c837cde3), statistics kept as rows change (PL.9,
   26302efe), unnesting by dependent joins (PL.10, 61c79bd1), upper bounds as a guard (PL.11,
   f4e0bd7f), custom then generic plans (PL.12, aa0541f6) and adaptive joins (PL.13, 4f237e07).
+- **PL.6** (5e23ff8b, built and tested on t1/lane-pl6, its measurement open): no table is read whole
+  beneath loops that can give more than one row. A scan stays only beneath one-row loops (a lookup by a
+  unique key) or where no equality joins the table; elsewhere a seek, an automatic index or a hash join
+  reads it, and a hash
+  join's build input is materialized where its probe would otherwise be read once for each outer row
+  (docs/design/planner.md, "Decision (lane pl6)"). `bench/planner/loops.py` counts such plans in the
+  bench's records: 30 of JOB's 113 at step 3, none of TPC-H's; the target is 0, with JOB's times within
+  the passes' spread of the parent's.
+  PL.12 is built (lane pl12, docs/design/planner.md "custom plans, then a generic one"): a statement
+  whose estimates read a parameter's value is planned with each run's values until its own measured
+  costs say the generic plan does as well; one whose estimates read none keeps its generic plan. Its
+  TPC-H prepared measurement (AC-PL.12.1; its harness, `amphora-bench --planner --prepared` with
+  qgen's parameters, is written: bench/planner/README.md) and the suite's (AC-PL.12.2) are open.
+- **G11, analytics at column-store speed** (docs/design/columnar.md, decision 1; sources in
+  docs/research/columnar.md; CS.1): decided, not built. Columns are a copy derived from the rows, fed
+  by each commit's redo record after the commit, exact at every snapshot by a journal of changed keys
+  read from the rows, never logged, every size and time learned where it runs. Next: step 2
+  prototypes it in memory and as persistent blocks, on CP-T1.3's storage once that runs under SQL.
+  Step 3's two codecs are built (CS.3, crates/columnar, lane g11-compress): BtrBlocks' cascade
+  (one value, run lengths, dictionary, decimal doubles, frame of reference with horizontal packing)
+  and FastLanes' layouts (its interleaved 1,024-value packing, lane-wise DELTA, dictionary,
+  decimal), each scheme chosen per column from a sample that grows until its choice stops changing,
+  the cascade a loop with no fixed depth; integers, doubles, strings and nulls round-trip bit for
+  bit (T-CS.3.1). Its decode benchmark (`cargo bench -p amphora-columnar --bench decode`) is not yet
+  measured against [c18]'s 8 values a cycle.
 
 ## Open
 

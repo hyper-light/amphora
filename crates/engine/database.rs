@@ -2690,6 +2690,7 @@ impl Database {
             has_non_main_pagers: AtomicBool::new(false),
             query_only: AtomicBool::new(false),
             row_counters: AtomicBool::new(false),
+            plan_cache_mode: AtomicU8::new(crate::PlanCacheMode::Auto.to_u8()),
             vdbe_trace: AtomicBool::new(false),
             dml_require_where: AtomicBool::new(false),
             count_changes: AtomicBool::new(false),
@@ -3252,9 +3253,12 @@ impl Database {
         // are shared (decision 37).
         let packed = {
             let shared = self.shared_wal.read();
-            shared.runtime.format.load(Ordering::Acquire) == crate::storage::packed::PACKED_FORMAT
-                || shared.metadata.wal_header.lock().file_format
-                    == crate::storage::packed::PACKED_FORMAT
+            let packed = |format| {
+                crate::storage::packed::LogFormat::of(format)
+                    == Some(crate::storage::packed::LogFormat::Packed)
+            };
+            packed(shared.runtime.format.load(Ordering::Acquire))
+                || packed(shared.metadata.wal_header.lock().file_format)
         };
         if packed {
             return Err(LimboError::InvalidArgument(

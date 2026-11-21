@@ -201,6 +201,22 @@ impl Drop for Permit {
     }
 }
 
+/// Whether `error` is the system refusing a descriptor past its limit: the process's (`EMFILE`,
+/// Winsock's `WSAEMFILE`) or the system's (`ENFILE`).
+fn out_of_descriptors(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    let refusals = [
+        rustix::io::Errno::MFILE.raw_os_error(),
+        rustix::io::Errno::NFILE.raw_os_error(),
+    ];
+    // WSAEMFILE, Winsock's "Too many open files" (Microsoft, Windows Sockets Error Codes).
+    #[cfg(windows)]
+    let refusals = [10024];
+    error
+        .raw_os_error()
+        .is_some_and(|code| refusals.contains(&code))
+}
+
 /// Stored once in the database's shared owner, never on individual clone handles.
 pub struct Owner {
     stop: Arc<AtomicBool>,
@@ -221,7 +237,7 @@ impl Owner {
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         let acquire = Arc::new(acquire);
-        let count = Arc::new(AtomicUsize::new(0));
+        let descriptors = crate::descriptors::process()?;
         let waits = Arc::new(AtomicUsize::new(0));
         let handle = thread::Builder::new()
             .name("amphora.owner".into())
@@ -238,7 +254,10 @@ impl Owner {
                                 tracing::warn!(target:"amphora.transport",event="stream_configuration_failed",%error);
                                 continue;
                             }
-                            let Ok(permit) = Permit::take(&count, CONNECTION_MAX) else {
+                            // Its socket charged to the process's descriptor budget: the
+                            // system's limit bounds the connections, no count of its own
+                            // (local-owner-transport.md, "One descriptor budget").
+                            let Ok(permit) = descriptors.take("open descriptors", 1) else {
                                 tracing::debug!(target: "amphora.transport", event = "connection_refused", reason = "connection_limit");
                                 drop(stream);
                                 continue;
@@ -259,6 +278,18 @@ impl Owner {
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::park_timeout(Duration::from_millis(10))
+                        }
+                        // The system's limit reached by descriptors no budget charges (the
+                        // host's own): the connection waits in the backlog until one is let go,
+                        // and the listener goes on.
+                        Err(error) if out_of_descriptors(&error) => {
+                            tracing::debug!(target: "amphora.transport", event = "connection_refused", reason = "connection_limit", %error);
+                            // More is open outside the budget than it last counted.
+                            if let Err(error) = descriptors.refused_by_system() {
+                                tracing::error!(target: "amphora.transport", event = "listener_failed", %error);
+                                break;
+                            }
                             thread::park_timeout(Duration::from_millis(10))
                         }
                         Err(error) => {
@@ -1054,6 +1085,9 @@ impl Records for Namespace {
             _ => Err(unavailable("unexpected wait response")),
         }
     }
+    fn changed(&self, f: &str, r: api::Rev, u: Instant) -> Result<Option<api::Rev>, Refusal> {
+        self.try_wait(f, r, u)
+    }
     fn head(&self, u: Instant) -> Result<api::Rev, Refusal> {
         match self.request(Record::Head, u)? {
             Answer::Rev(v) => Ok(v),
@@ -1282,6 +1316,40 @@ mod tests {
             drop(client);
             fake.join().unwrap();
         }
+    }
+
+    /// AC-FD.1.1, T-FD.1.3 (local-owner-transport.md, "One descriptor budget"): an owner's connections are
+    /// bounded by the process's descriptor budget, each holding its socket, not by a count of
+    /// their own. Do: a budget of 1; an owner; one client authenticated and kept; a second asked;
+    /// the first let go, and once its descriptor is given back, a third asked. Expect: the first
+    /// authenticated; the second turned away before any challenge; the third authenticated.
+    #[test]
+    fn an_owners_connections_are_bounded_by_the_descriptor_budget() {
+        let budget = crate::descriptors::tests::budget(1);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("db");
+        std::fs::File::create(&path).unwrap();
+        let _owner = Owner::start(&path, || None).unwrap();
+        let client = Client {
+            path: path.canonicalize().unwrap(),
+            application: None,
+        };
+        let first = client.stream(until()).unwrap();
+        assert!(
+            client.stream(until()).is_err(),
+            "a connection past the budget was served"
+        );
+        drop(first);
+        // The first's worker gives its descriptor back once it sees the stream end.
+        let deadline = until();
+        while budget.held() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the first connection's descriptor was kept"
+            );
+            thread::park_timeout(Duration::from_millis(1));
+        }
+        drop(client.stream(until()).unwrap());
     }
 
     #[test]

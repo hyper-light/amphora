@@ -993,13 +993,14 @@ pub fn unpack_tag_pair(tag: u64) -> (u64, u32) {
 }
 
 /// Amphora: a version of a page in a packed log (`storage/packed.rs`): the frame of the record
-/// that holds it, the log's generation (its header's checkpoint sequence), and its depth (deltas
-/// since the page's last whole image there).
+/// that holds it, the log's generation (its header's checkpoint sequence), its depth (deltas
+/// since the page's last whole image there) and those deltas' bytes (their runs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Logged {
     pub frame: u64,
     pub generation: u32,
     pub depth: u8,
+    pub chain: u32,
 }
 
 /// Amphora: the version a page held when it was last made dirty, and its bytes as the page's
@@ -1011,7 +1012,7 @@ pub struct LogBase {
 }
 
 /// Amphora: `PageInner::logged_as` when the buffer holds no version of a packed log (a generation
-/// and depth pack into at most 40 bits).
+/// and depth pack into 40 bits, a chain's bytes, less than a page, into the 24 above them).
 pub const LOGGED_NONE: u64 = u64::MAX;
 
 #[derive(Debug)]
@@ -1310,7 +1311,14 @@ impl Page {
         let inner = self.get();
         inner.logged_as.store(LOGGED_NONE, Ordering::Release);
         inner.logged_frame.store(version.frame, Ordering::Release);
-        let packed = (u64::from(version.generation) << 8) | u64::from(version.depth);
+        // A chain's bytes are under a page, at most 65,536: one that doesn't fit holds no version,
+        // and the page's next entry is its image.
+        if version.chain >= 1 << 24 {
+            return;
+        }
+        let packed = (u64::from(version.chain) << 40)
+            | (u64::from(version.generation) << 8)
+            | u64::from(version.depth);
         inner.logged_as.store(packed, Ordering::Release);
     }
 
@@ -1328,12 +1336,14 @@ impl Page {
             return None;
         }
         let frame = inner.logged_frame.load(Ordering::Acquire);
-        let generation = u32::try_from(packed >> 8).ok()?;
+        let chain = u32::try_from(packed >> 40).ok()?;
+        let generation = u32::try_from((packed >> 8) & u64::from(u32::MAX)).ok()?;
         let depth = u8::try_from(packed & 0xff).ok()?;
         Some(Logged {
             frame,
             generation,
             depth,
+            chain,
         })
     }
 

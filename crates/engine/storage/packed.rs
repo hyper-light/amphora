@@ -4,8 +4,8 @@
 //! page a frame. A prepared batch of pages (a commit's, or a spill's) is cut into records of up to
 //! [`RECORD_BYTES`], each its pages' entries compressed together (LZ4) and laid in as many of the
 //! log's fixed-size frame slots as it takes. An entry is a page's whole image, or the bytes that
-//! changed since the page's last version in the log (a delta, at most [`MOST_DELTAS`] in a row
-//! after an image). Every page of a record maps to the record's first slot, so frame ids keep their
+//! changed since the page's last version in the log (a delta, while the deltas since its image take
+//! less than the page). Every page of a record maps to the record's first slot, so frame ids keep their
 //! meaning everywhere else (read marks, backfill, restarts). The first slot's frame header carries
 //! the record's slot count where a page number would be, the others [`CONTINUATION`]; the record's
 //! last slot carries the commit's database size when it ends one. The slots' checksums chain as
@@ -27,12 +27,35 @@ use crate::Result;
 /// The log header's file format for a generation of one page a frame (SQLite's).
 pub(crate) const PAGE_FORMAT: u32 = 3_007_000;
 
-/// The log header's file format for a packed generation.
+/// The log header's file format for a packed generation whose chains end at [`EIGHT_DELTAS`] in a
+/// row (decision 17, to 2026-11-11): read as ever, and written so while a generation begun so
+/// goes on, so a binary from before reads it.
 pub(crate) const PACKED_FORMAT: u32 = 0x414d_5002;
 
 /// The log header's file format for a mixed generation: page frames and records side by side
-/// (Amphora's docs/design/store.md, decision 37).
+/// (Amphora's docs/design/store.md, decision 37), its chains ending at [`EIGHT_DELTAS`].
 pub(crate) const MIXED_FORMAT: u32 = 0x414d_5003;
+
+/// The packed format whose chains end where their bytes reach a page (decision 17, 2026-11-11):
+/// what a generation begins with now. A binary from before refuses it as a format it doesn't
+/// know, naming the value, never reads it as corrupt.
+pub(crate) const PACKED_CHAINS_FORMAT: u32 = 0x414d_5004;
+
+/// The mixed format whose chains end where their bytes reach a page (decision 17, 2026-11-11).
+pub(crate) const MIXED_CHAINS_FORMAT: u32 = 0x414d_5005;
+
+/// Deltas in a row at most in a generation of [`PACKED_FORMAT`] or [`MIXED_FORMAT`]: those
+/// formats' bound, to which binaries from before 2026-11-11 hold what they read.
+pub(crate) const EIGHT_DELTAS: u8 = 8;
+
+/// Deltas in a row at most in a generation of `file_format`: [`EIGHT_DELTAS`] in the formats of
+/// before, the depth field's width ([`MOST_DELTAS`]) in those of chains ended by their bytes.
+pub(crate) fn most_deltas(file_format: u32) -> u8 {
+    match file_format {
+        PACKED_FORMAT | MIXED_FORMAT => EIGHT_DELTAS,
+        _ => MOST_DELTAS,
+    }
+}
 
 /// The page-number field of a record's slots after its first.
 pub(crate) const CONTINUATION: u32 = u32::MAX;
@@ -55,18 +78,18 @@ impl LogFormat {
     pub(crate) fn of(file_format: u32) -> Option<Self> {
         match file_format {
             PAGE_FORMAT => Some(Self::Pages),
-            PACKED_FORMAT => Some(Self::Packed),
-            MIXED_FORMAT => Some(Self::Mixed),
+            PACKED_FORMAT | PACKED_CHAINS_FORMAT => Some(Self::Packed),
+            MIXED_FORMAT | MIXED_CHAINS_FORMAT => Some(Self::Mixed),
             _ => None,
         }
     }
 
-    /// The log header's file format for this format.
+    /// The log header's file format a generation of this format begins with.
     pub(crate) fn file_format(self) -> u32 {
         match self {
             Self::Pages => PAGE_FORMAT,
-            Self::Packed => PACKED_FORMAT,
-            Self::Mixed => MIXED_FORMAT,
+            Self::Packed => PACKED_CHAINS_FORMAT,
+            Self::Mixed => MIXED_CHAINS_FORMAT,
         }
     }
 
@@ -123,10 +146,10 @@ const MOST_PAGES: usize = 1024;
 /// slots at the 3x measured for whole pages (decision 16), the last slot's padding about 3% of it.
 pub(crate) const RECORD_BYTES: usize = 256 << 10;
 
-/// Deltas in a row before a page's next entry is its whole image: a read of a page applies at most
-/// this many, from as many records. At 8, a page whose changes average 300 bytes costs about a
-/// fifth of its images (decision 17).
-pub(crate) const MOST_DELTAS: u8 = 8;
+/// Deltas in a row at most: the width of an entry's depth field, a format bound. The writer ends a
+/// chain long before it by its bytes (decision 17): a page's deltas since its image take less than
+/// the page, each at least a run's header and a byte.
+pub(crate) const MOST_DELTAS: u8 = u8::MAX;
 
 /// An entry's header: its page, its kind, its depth (deltas since its page's last image), and its
 /// body's length.
@@ -175,7 +198,7 @@ pub(crate) enum Body<'a> {
     Image(&'a [u8]),
     /// What changed since the page's last version in the log: runs of bytes, each its offset, its
     /// length less one (u16s big-endian) and its bytes. `depth` counts the deltas since the page's
-    /// last image, this one included (1 to [`MOST_DELTAS`]).
+    /// last image, this one included (1 to [`MOST_DELTAS`]); their runs take less than a page.
     Delta { depth: u8, runs: &'a [u8] },
 }
 
@@ -597,8 +620,8 @@ impl Record {
 
 /// Bytes the decoded records may hold, the oldest going first past it. The writer keeps each record
 /// it publishes, and reads (a reader's miss, the checkpoint's copies, a page's chain back to its
-/// image) mostly want recent ones: a chain of a page changed at every commit reaches back
-/// [`MOST_DELTAS`] commits, a few hundred KiB at 10,000 writers. Chosen, a group's share of the
+/// image) mostly want recent ones: a chain of a page changed at every commit reaches back as many
+/// commits as its deltas take less than the page. Chosen, a group's share of the
 /// memory, not yet measured; a record not kept is read and decoded again.
 pub(crate) const DECODED_BUDGET: usize = 4 << 20;
 
@@ -813,19 +836,6 @@ mod tests {
             true
         )
         .is_err());
-        let too_deep = MOST_DELTAS + 1;
-        assert!(encode(
-            &[(
-                1,
-                Body::Delta {
-                    depth: too_deep,
-                    runs: &[]
-                }
-            )],
-            size,
-            true
-        )
-        .is_err());
         let many: Vec<(u32, &[u8])> = (1..=1025u32).map(|p| (p, &a[..])).collect();
         assert!(encode(&images(&many), size, true).is_err());
         assert!(encode(&images(&many[..1024]), size, true).is_ok());
@@ -896,7 +906,8 @@ mod tests {
         let v0 = page(5, size);
         let mut versions = vec![v0.clone()];
         let mut runs = Vec::new();
-        for k in 1..=MOST_DELTAS as usize {
+        // Deeper than the eight in a row a chain once ran to (decision 17).
+        for k in 1..=12usize {
             let mut next = versions[k - 1].clone();
             next[k * 50..k * 50 + 20].fill(k as u8);
             runs.push(diff(&versions[k - 1], &next, 0, size).unwrap());
@@ -1044,6 +1055,12 @@ mod tests {
         for format in [LogFormat::Pages, LogFormat::Packed, LogFormat::Mixed] {
             assert_eq!(LogFormat::of(format.file_format()), Some(format));
         }
-        assert_eq!(LogFormat::of(0x414d_5004), None);
+        assert_eq!(LogFormat::of(PACKED_FORMAT), Some(LogFormat::Packed));
+        assert_eq!(LogFormat::of(MIXED_FORMAT), Some(LogFormat::Mixed));
+        assert_eq!(most_deltas(PACKED_FORMAT), EIGHT_DELTAS);
+        assert_eq!(most_deltas(MIXED_FORMAT), EIGHT_DELTAS);
+        assert_eq!(most_deltas(PACKED_CHAINS_FORMAT), MOST_DELTAS);
+        assert_eq!(most_deltas(MIXED_CHAINS_FORMAT), MOST_DELTAS);
+        assert_eq!(LogFormat::of(0x414d_5006), None);
     }
 }

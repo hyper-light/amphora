@@ -52,7 +52,8 @@ an application request that loses its response returns `Refusal::UnknownOutcome`
 replayed. `attach_replicated` lets a host attach before attempting exclusive bootstrap inspection;
 `ensure_owner` lets its carrier coordinator discover local takeover before advertising a carrier.
 
-Resource limits are admission policy, not measured tuning claims: 32 connections, at most eight
+Resource limits are admission policy, not measured tuning claims: connections bounded by the
+process's descriptor budget (below, "One descriptor budget"; 32 a database until 2026-11-21), at most eight
 Records waits, 30 seconds total per authenticated connection, two seconds to authenticate,
 4096 commands per adaptive session, 256 bytes per authentication frame, and at most 33 MiB per
 data frame. Collection decoders bound statement/parameter/transaction arrays before allocation
@@ -60,8 +61,9 @@ and charge SQL result collection overhead as well as value payload. Overload clo
 connection; the client returns a typed connection refusal before submission. The persistent
 accept loop checks shutdown every 10 ms (bounded idle shutdown latency); each admitted worker
 releases its permit on every exit. Waits use existing Namespace waiting outside the SQL writer;
-they cannot consume all connection slots. Frame allocation caps bound per-process transport
-memory at 32 connections times bounded wire and decoded values. Authentication frames have a separate 256-byte cap.
+they cannot consume all connection slots. Frame allocation caps bound each connection's
+transport memory to bounded wire and decoded values; the connections' sum is not yet charged to a
+memory budget (below, "One descriptor budget", what is left). Authentication frames have a separate 256-byte cap.
 
 Adaptive SQL is executed inside existing Database.call. The client closure runs once. Intermediate
 query responses are provisional; Commit ends the closure and the final Done waits until the
@@ -324,9 +326,21 @@ additive constructors carry them, and the existing ones keep their behavior:
     4,096 (the owner bound), the oldest evicted first, and a path's mark cleared once this process
     takes its lease again.
   - A guarded open, a guarded attach or a restore that finds the lease held at a path this process
-    drained waits for it within the caller's deadline, re-probing after 50 µs, doubling to at most
-    1 ms (the measured window, and the drain wait's own 1 ms park), with the owner table unlocked
-    between probes; at the deadline it answers `Refusal::Timeout`. A path with no drain of this
+    drained waits for it within the caller's deadline, with the owner table unlocked between
+    probes; at the deadline it answers `Refusal::Timeout`. Its pauses are learned, not picked
+    (2026-11-11; Ada: "We don't tolerate arbitrary constants, learned and stat derived values
+    only"; they were 50 µs doubling to 1 ms). The first pause is the probe's own measured cost,
+    so probing takes no more time than waiting. Each next pause is twice the last, at least the
+    probe's cost. It is capped at the larger of the window this process last waited out before
+    taking a drained lease (`DRAIN_WINDOW`, from the first probe to the lease taken: one last sample,
+    which bounds how late a probe is, never how long a wait lasts) and this wait so far. So a lease
+    let go within the learned window is taken within it, and a drain that outlasts the window (a
+    lease held to the deadline, K1) goes on doubling instead of probing at the window's pace, about
+    16,000 times a second at 62.8 µs (amphora-seam-owner-2,
+    amphora-owner-t1-constants-code-20261111). Before any window is learned the pauses double to the
+    deadline, so a lease is taken within twice the wait. `database::drain_pause` tests the
+    pure core (`next_pause`). Falsified by a reopen after a drain answering later than one learned
+    window past the lease's release, or probing for longer than it waits. A path with no drain of this
     process behind it keeps the at-once refusal (`remote_owner()`, the restore's "another process
     owns the destination"). An unguarded open already waits: it attaches as a client, the drained
     owner answers nothing, and the open retries the client's `Unavailable` to its deadline.
@@ -379,3 +393,93 @@ endpoint directory at a full owner table, or an unguarded open refused by the ow
 bound or its configuration having made a directory
 (`database::remote::tests::refused_replicated_opens_leave_no_directory_they_made`,
 `opens_refused_at_the_owner_bound_make_no_directory`).
+
+## Decision (lane constants): one descriptor budget (2026-11-21)
+
+Ada's rule: no picked numbers, only learned or derived ones. `CONNECTION_MAX` (32 a database, 2026-10-29) was
+picked: its own paragraph called it admission policy. It bounded three things: the listener's backlog, the
+connections an owner served at once, and, through `READERS`, the local readers out on one replica
+(replication.md, "A replica's local readers bounded by derivation"). amphora-seam-owner-2's ruling (d), 2026-11-11:
+derive it from the process's descriptor limit, as one budget shared by what holds descriptors, never the whole limit
+for each, and with a named Windows source.
+
+**What a connection costs.** One descriptor, its accepted socket, held from `accept` until its worker ends. The
+system refuses a descriptor past the process's limit (`EMFILE`), so that limit is what bounds connections.
+
+**The decision.**
+1. **One budget a process, the system's as it stands** (`crates/amphora/src/descriptors.rs`): the system's limit
+   less the descriptors open outside the budget. Nothing is read once and kept (Ada, 2026-11-21: a value measured
+   once and frozen is a picked constant). The limit is read again at every charge, so a host that raises it while
+   it runs is followed. What is open outside (the host's own, the owners' files) is counted again whenever the
+   limit moves, whenever a charge would be refused (the host may have let some go), and whenever the system refuses
+   a descriptor the budget allowed (`EMFILE` at `accept`). The limit is the soft `RLIMIT_NOFILE` (POSIX
+   `getrlimit`). With none set (`RLIM_INFINITY`) nothing here bounds them, and the kernel's own ceiling (Linux's
+   `fs.nr_open`) refuses past it. Those open are counted from `/dev/fd` (Linux's link to `/proc/self/fd`; macOS's
+   fdesc). A charge between a count's two readings leaves that count off by it once: one too many refuses a charge
+   until the next count (which the refusal itself makes), one too few meets the system's own refusal (item 4). On
+   Windows a process sets no descriptor limit: its handle table holds at most 2^24 handles, a structural limit of
+   the system, and Winsock's sockets come out of the same table (Russinovich; `WSADATA::iMaxSockets` is ignored
+   since Winsock 2). Windows says a process's open handles only through `GetProcessHandleCount`, which needs
+   `unsafe` (CLAUDE.md section 12), so none are counted there.
+2. **A connection charges its socket.** Each accepted connection takes one descriptor from the budget before its
+   worker starts, and gives it back when the worker ends. Past the budget the connection is closed unserved, and the
+   client gets a typed refusal before submission, as before. No count of connections is left.
+3. **The backlog is the system's own most.** `listen` is given `i32::MAX`: Linux truncates it to
+   `net.core.somaxconn` (listen(2)), XNU to `kern.ipc.somaxconn` (`solisten`), and Windows reads `SOMAXCONN`
+   (0x7fffffff) as "a maximum reasonable value" (Microsoft, listen function). A queued connection holds no
+   descriptor of this process until it is accepted.
+4. **The system refusing first is not fatal.** Descriptors no budget charges (the host's own, the owners' files) come
+   out of the same limit, so `accept` can meet `EMFILE`/`ENFILE` (`WSAEMFILE` on Windows) before the budget is
+   spent. The listener then counts again what is open outside the budget, leaves the connection queued and goes
+   on; before this change it stopped for good.
+5. **The local readers follow.** A replica's readers out at once are at most the clients that can be attached at
+   once (replication.md's reasoning, unchanged): now the budget's bound as it stands at each read. Readers hold no
+   descriptor (`a_local_reader_opens_no_file`), so they charge none; their pages stay charged to the page budget,
+   which is what bounds them in practice.
+6. **An owner charges its descriptor; no count of owners** (`OWNERS_MAX`, 4,096 since before 2026-11-11, was
+   picked). Each owner takes one descriptor from the budget at admission, before any probe makes a directory or
+   takes a lease: a local or replicated owner's is its lease, held beside it (`Owned`) and given back once the lease
+   is closed; a client's is the socket its calls open, held by its `Backend` while it lives. The other leases
+   (`Machine::open`, bootstrap's inspections) charge theirs the same way. Past the budget an open or attach is
+   refused `TooLarge` and makes nothing. The owner table's entries each hold such a charge while alive, and the dead
+   are forgotten before each admission, so the budget bounds the table. The drained paths kept (`DRAINED`, J1) are
+   at most the budget's bound as it stands, oldest evicted: each names a lease this process held, one descriptor of
+   it. An evicted mark makes an open that still finds the lease held refuse it as another process's, typed, rather
+   than wait.
+
+**Tests.**
+- `descriptors::tests::a_budget_holds_its_bound_and_takes_back_what_is_given` (T-FD.1.1).
+- `descriptors::tests::the_process_budget_follows_the_systems_limit` (T-FD.1.2): the soft limit raised by one while
+  the process runs, and put back; the budget's limit follows both at its next charge.
+- `transport::common::tests::an_owners_connections_are_bounded_by_the_descriptor_budget` (T-FD.1.3): under a
+  budget of 1, a second client is turned away while the first is served, and served once the first's descriptor is
+  given back. With the old count of 32, the second was served.
+- `replicated::tests::local_readers_are_bounded_by_the_transport_not_four` (T-T1.10.L8): under a budget of 6, six
+  readers out and the seventh waits to its deadline; the bound moves with the budget.
+- `database::remote::tests::an_owner_charges_its_lease_to_the_descriptor_budget` (T-FD.1.4): under a budget of 1, a
+  second database's open is refused while the first is open, and served once the first has drained.
+- `database::remote::tests::opens_refused_at_the_descriptor_budget_make_no_directory` and
+  `attach_refuses_at_the_descriptor_budget_before_it_touches_the_lease` (U05): with the budget spent, open,
+  open_replicated and attach_replicated are refused `TooLarge` and make no directory, endpoint or lease.
+
+**What is left (not in this change).**
+- An owner's other descriptors (the endpoint's lock and listener, the engine's database and log files, a replica's
+  log) are charged by no kind yet: they come out of the same limit as descriptors open outside the budget, counted
+  again at the moments item 1 names. Charging each where it is held, stated by kind and held to the count by a
+  `/dev/fd` test, is the next step.
+- Memory: a connection's frames are bounded each (33 MiB), but their sum across connections is charged to no memory
+  budget. Before, 32 connections a database bounded it loosely (and not across databases). It waits for the
+  process memory budget (the same one `SNAPSHOT_BYTES` waits for).
+- Threads: each connection is a thread. A thread the system refuses is logged (`worker_start_failed`) and its
+  connection closed unserved.
+- A host that wants more connections raises its soft limit (as Go's runtime raises it to the hard limit at start);
+  Amphora, a library in its host's process, doesn't change a process-wide limit.
+
+**Sources.** POSIX `getrlimit` (pubs.opengroup.org, getrlimit, `RLIMIT_NOFILE`); Linux listen(2) and proc(5)
+(`/proc/sys/net/core/somaxconn`, `/proc/sys/fs/nr_open`); XNU `bsd/kern/uipc_socket.c` (`solisten`); Microsoft,
+"listen function (winsock2.h)" and "WSAStartup function" (`iMaxSockets`); Microsoft, "Windows Sockets Error Codes"
+(`WSAEMFILE`, 10024); Mark Russinovich, "Pushing the Limits of Windows: Handles" (Microsoft, 2009).
+
+**Falsified by:** a connection served while the budget's descriptors are all held; a connection refused while the
+budget has room and the system allows it; the listener stopping on `EMFILE`; more readers out on one replica than the
+budget's bound.
