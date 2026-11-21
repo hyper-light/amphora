@@ -14,8 +14,9 @@
 //! started by: never from a router's memory.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, PoisonError, RwLock};
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::meter::Counters;
 use crate::reshard::directory::{Change, Directory, Proposal};
@@ -24,10 +25,11 @@ use crate::reshard::holding::{Away, Fenced, Holding};
 use crate::reshard::{self, GroupId, NodeId, Pos, Span, position};
 use crate::store::{Config, Engine, Refused, Store, Ticket};
 
-/// A group: its store and what it holds.
+/// A group: its store, what it holds, and what the copy path's work has cost its writer.
 struct Group<E: Engine> {
     store: Store<E>,
     holding: Holding,
+    costs: Arc<Mutex<Costs>>,
 }
 
 impl<E: Engine> Clone for Group<E> {
@@ -35,6 +37,83 @@ impl<E: Engine> Clone for Group<E> {
         Self {
             store: self.store.clone(),
             holding: self.holding,
+            costs: Arc::clone(&self.costs),
+        }
+    }
+}
+
+impl<E: Engine> Group<E> {
+    fn new(store: Store<E>, holding: Holding) -> Self {
+        Self {
+            store,
+            holding,
+            costs: Arc::default(),
+        }
+    }
+}
+
+/// The copy path's work on a group's writer (CP-T1.9): reading a span's keys, reading the keys a
+/// run of the log changed, writing moved keys, sweeping.
+#[derive(Debug, Clone, Copy)]
+enum Work {
+    Export,
+    Changed,
+    Import,
+    Sweep,
+}
+
+/// What one kind of work has cost a group's writer, learned from every batch of it run there:
+/// its units (positions read or swept, log entries replayed) and how long they held the writer;
+/// and the units of the last batch.
+#[derive(Debug, Default, Clone, Copy)]
+struct Cost {
+    units: u64,
+    ns: u64,
+    last: u64,
+}
+
+impl Cost {
+    fn ran(&mut self, units: u64, took: Duration) {
+        self.units = self.units.saturating_add(units);
+        self.ns = self
+            .ns
+            .saturating_add(u64::try_from(took.as_nanos()).unwrap_or(u64::MAX));
+        self.last = units;
+    }
+
+    /// The units a batch takes to hold the writer about `target` ns, a commit's mean cost there
+    /// (docs/design/reshard.md, decision "Batches learned where they run"): the target over the
+    /// mean cost of a unit measured so far, at least one. Not yet measured, one unit, and from
+    /// then on learned. No commit measured on the node (no write waits on it), the batch doubles
+    /// from the last, as TCP's slow start probes (RFC 5681, section 3.1), so a batch's size is
+    /// never picked.
+    fn within(&self, target: Option<u128>) -> u64 {
+        match target {
+            Some(t) if self.units > 0 => {
+                let n = t
+                    .saturating_mul(u128::from(self.units))
+                    .checked_div(u128::from(self.ns.max(1)))
+                    .unwrap_or(1);
+                u64::try_from(n).unwrap_or(u64::MAX).max(1)
+            }
+            Some(_) => 1,
+            None => self.last.saturating_mul(2).max(1),
+        }
+    }
+}
+
+/// A group's [`Cost`] of each [`Work`].
+#[derive(Debug, Default)]
+struct Costs([Cost; 4]);
+
+impl Costs {
+    fn of(&mut self, work: Work) -> &mut Cost {
+        let [export, changed, import, sweep] = &mut self.0;
+        match work {
+            Work::Export => export,
+            Work::Changed => changed,
+            Work::Import => import,
+            Work::Sweep => sweep,
         }
     }
 }
@@ -45,10 +124,68 @@ impl<E: Engine> Clone for Group<E> {
 struct Route<E: Engine> {
     directory: Directory,
     groups: BTreeMap<GroupId, Group<E>>,
-    /// Groups retired here since this node started: a release or retire asked of one again is
-    /// done (the driver's contract). After a restart, the directory routed by says the same: a
-    /// group it no longer places, with an id it has given out, was retired.
+    /// Groups retired here that the directory routed by doesn't yet show retired (an id it has
+    /// given out, a group it no longer places): a create, release or retire asked of one again
+    /// is answered as the driver's contract says, never by making an empty group. Kept in `book`
+    /// ([`Book`]) with the directory routed by, before a retire is answered, so a restart keeps
+    /// both; an id leaves it once a directory kept with it shows it retired, so it holds no more
+    /// than the directory lags this node by.
     retired: BTreeSet<GroupId>,
+    book: PathBuf,
+}
+
+impl<E: Engine> Route<E> {
+    /// Whether `group` was retired, here or as the directory routed by shows it.
+    fn was_retired(&self, group: GroupId) -> bool {
+        self.retired.contains(&group) || shows_retired(&self.directory, group)
+    }
+}
+
+/// Whether `directory` shows `group` retired: its id given out and the group placed nowhere.
+fn shows_retired(directory: &Directory, group: GroupId) -> bool {
+    directory.given_out(group) && directory.node_of(group).is_none()
+}
+
+/// What a node keeps of the groups it retired (`Groups::on`'s `retired`): the directory routed by
+/// when it was last kept, and the groups retired here that directory doesn't show retired. A
+/// restart routes by the newer of it and the directory it is started by, so every group retired
+/// here shows retired, by the one or by the other.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct Book {
+    directory: Option<Directory>,
+    retired: Vec<u64>,
+}
+
+/// The book kept in `book` (an empty one: no book yet, a node started now).
+fn read_book(book: &Path) -> anyhow::Result<Book> {
+    match std::fs::read(book) {
+        Ok(bytes) => postcard::from_bytes(&bytes)
+            .map_err(|_| anyhow::anyhow!("a book of retired groups that doesn't decode")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Book::default()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `directory` and the groups of `retired` it doesn't show retired, kept in `book`, replaced whole
+/// and durable before it returns: those it keeps.
+fn keep_book(
+    book: &Path,
+    directory: &Directory,
+    retired: &BTreeSet<GroupId>,
+) -> anyhow::Result<BTreeSet<GroupId>> {
+    let left: BTreeSet<GroupId> = retired
+        .iter()
+        .copied()
+        .filter(|g| !shows_retired(directory, *g))
+        .collect();
+    let kept = Book {
+        directory: Some(directory.clone()),
+        retired: left.iter().map(|g| g.0).collect(),
+    };
+    let bytes = postcard::to_allocvec(&kept)
+        .map_err(|_| anyhow::anyhow!("a book of retired groups that doesn't encode"))?;
+    reshard::replicated::replace(book, &bytes)?;
+    Ok(left)
 }
 
 /// A store in groups: cheap to clone, usable from any thread; clones share one route.
@@ -138,37 +275,58 @@ fn kept<E: Engine>(engine: &mut E, first: Option<Span>) -> anyhow::Result<Holdin
 
 impl<E: Engine> Groups<E> {
     /// `groups` stores (at least one) over equal runs of positions ([`even`]), the `i`th started
-    /// on `engine(i)` with `config`.
+    /// on `engine(i)` with `config`, the groups retired here kept in `retired` ([`Groups::on`]).
     pub fn start(
         groups: usize,
         config: Config,
+        retired: &Path,
         mut engine: impl FnMut(usize) -> anyhow::Result<E>,
     ) -> anyhow::Result<Self> {
         let directory = even(NodeId(0), groups)?;
-        Self::on(&directory, config, |g| {
+        Self::on(&directory, config, retired, |g| {
             engine(usize::try_from(g.0).map_err(|_| anyhow::anyhow!("group {g:?}"))?)
         })
     }
 
     /// A store for each group `directory` places, started on `engine(group)` with `config`,
     /// each holding what its engine kept, or, if it kept nothing (a group made now), its span.
+    /// `retired` is the file this node keeps the groups retired here in (one per node; none yet:
+    /// a node started now): a group retired before a restart stays retired after it.
     pub fn on(
         directory: &Directory,
         config: Config,
+        retired: &Path,
         mut engine: impl FnMut(GroupId) -> anyhow::Result<E>,
     ) -> anyhow::Result<Self> {
         directory.check()?;
+        let book = retired.to_path_buf();
+        let kept_book = read_book(&book)?;
+        let retired: BTreeSet<GroupId> = kept_book.retired.into_iter().map(GroupId).collect();
+        // The directory routed by before a restart, if it is newer than the one started by: a
+        // router never goes back past what it routed by.
+        let directory = match kept_book.directory {
+            Some(d) if d.generation() > directory.generation() => {
+                d.check()?;
+                d
+            }
+            _ => directory.clone(),
+        };
+        let directory = &directory;
         let mut groups = BTreeMap::new();
         for (group, _) in directory.groups() {
+            if retired.contains(&group) {
+                continue;
+            }
             let mut engine = engine(group)?;
             let holding = kept(&mut engine, directory.span_of(group))?;
             let store = Store::start(engine, config)?;
-            groups.insert(group, Group { store, holding });
+            groups.insert(group, Group::new(store, holding));
         }
         let route = Route {
             directory: directory.clone(),
             groups,
-            retired: BTreeSet::new(),
+            retired,
+            book,
         };
         Ok(Self {
             route: Arc::new(RwLock::new(route)),
@@ -183,6 +341,13 @@ impl<E: Engine> Groups<E> {
         let mut route = self.route.write().unwrap_or_else(PoisonError::into_inner);
         if directory.generation() > route.directory.generation() {
             route.directory = directory.clone();
+            // The groups the directory now shows retired leave the book, kept with it. If it
+            // can't be kept, the book keeps the older directory with them all, which is as true:
+            // they leave at the next directory.
+            let shown = route.retired.iter().any(|g| shows_retired(directory, *g));
+            if shown && let Ok(left) = keep_book(&route.book, directory, &route.retired) {
+                route.retired = left;
+            }
         }
         Ok(())
     }
@@ -212,7 +377,7 @@ impl<E: Engine> Groups<E> {
         let mut engine = engine()?;
         let holding = kept(&mut engine, None)?;
         let store = Store::start(engine, self.config)?;
-        route.groups.insert(group, Group { store, holding });
+        route.groups.insert(group, Group::new(store, holding));
         Ok(())
     }
 
@@ -266,10 +431,11 @@ impl<E: Engine> Groups<E> {
     /// copy or catch-up must be on this node (a move to another node carries rows over the
     /// network, not built yet): a group not here is [`Failure::NoGroup`].
     ///
-    /// A batch is as many positions (copy, sweep) or log entries (catch-up) as the store's
-    /// `commit_rows`: the rows one commit of its writer takes at once (decision 23), so a batch
-    /// holds a writer no longer than a commit of its own. An error is the group's (its engine or
-    /// its writer): the driver asks again ([`reshard::driver::Driver::restarted`]).
+    /// A batch is as many positions (copy, sweep) or log entries (catch-up) as hold each writer
+    /// it runs on about as long as a commit there does, learned from the batches run on it before
+    /// ([`Cost::within`]), so a batch delays a write no longer than a commit of its own. An error
+    /// is the group's (its engine or its writer): the driver asks again
+    /// ([`reshard::driver::Driver::restarted`]).
     pub fn carry(
         &self,
         action: &Action,
@@ -277,7 +443,6 @@ impl<E: Engine> Groups<E> {
         engine: impl FnOnce(GroupId) -> anyhow::Result<E>,
     ) -> anyhow::Result<Reply> {
         let op = action.op;
-        let batch = self.config.commit_rows.max(1);
         let refused = |e: anyhow::Error| match e.downcast::<reshard::Refused>() {
             Ok(reshard::Refused::NoGroup(_)) => Ok(Reply::Failed(Failure::NoGroup)),
             Ok(r) => Ok(Reply::Failed(Failure::Refused(r))),
@@ -289,8 +454,7 @@ impl<E: Engine> Groups<E> {
                     .route
                     .read()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .retired
-                    .contains(&group);
+                    .was_retired(group);
                 if retired {
                     return Ok(Reply::Failed(Failure::Refused(reshard::Refused::Ended(op))));
                 }
@@ -311,29 +475,44 @@ impl<E: Engine> Groups<E> {
                     None => Some(span),
                 };
                 let first = progress.first_at.is_none();
+                let batch = self
+                    .batch(from, Work::Export)
+                    .min(self.batch(to, Work::Import));
+                let positions = usize::try_from(batch).unwrap_or(usize::MAX);
                 // The old group's log is held from the first copy's position on, read at the same
                 // entry as the batch, so no entry catch-up needs is let go between them.
-                let exported = src.run(until, move |e| {
+                let (exported, took) = src.run(until, move |e| {
+                    let began = Instant::now();
                     let head = e.head()?;
                     if first {
                         e.keep_log(Some(head))?;
                     }
-                    match rest {
-                        Some(rest) => e.export(rest, batch),
-                        None => Ok(crate::store::Exported {
+                    let exported = match rest {
+                        Some(rest) => e.export(rest, positions)?,
+                        None => crate::store::Exported {
                             keys: Vec::new(),
                             at: head,
                             last: None,
                             done: true,
-                        }),
-                    }
+                        },
+                    };
+                    Ok((exported, began.elapsed()))
                 })?;
+                let units = u64::try_from(exported.keys.len())
+                    .unwrap_or(u64::MAX)
+                    .max(1);
+                self.ran(from, Work::Export, units, took);
                 let dst = self.store_of(to).ok_or(reshard::Refused::NoGroup(to))?;
                 let at = exported.at;
                 let (last, done) = (exported.last, exported.done);
                 if !exported.keys.is_empty() {
                     let keys = exported.keys;
-                    dst.run(until, move |e| e.import(&keys))?;
+                    let took = dst.run(until, move |e| {
+                        let began = Instant::now();
+                        e.import(&keys)?;
+                        Ok(began.elapsed())
+                    })?;
+                    self.ran(to, Work::Import, units, took);
                 }
                 match self.hold(to, until, |h| h.copied(op, last, done, at)) {
                     Ok(progress) => Ok(Reply::Copied { progress, head: at }),
@@ -357,15 +536,28 @@ impl<E: Engine> Groups<E> {
                     return Ok(Reply::Failed(Failure::Refused(reshard::Refused::Ended(op))));
                 };
                 let after = incoming.progress.replayed;
-                let entries = u64::try_from(batch).unwrap_or(u64::MAX);
-                let changed = src.run(until, move |e| e.changed(after, upto, span, entries))?;
+                let entries = self
+                    .batch(from, Work::Changed)
+                    .min(self.batch(to, Work::Import));
+                let (changed, took) = src.run(until, move |e| {
+                    let began = Instant::now();
+                    let changed = e.changed(after, upto, span, entries)?;
+                    Ok((changed, began.elapsed()))
+                })?;
                 let Some(changed) = changed else {
                     return Ok(Reply::Failed(Failure::LogGone));
                 };
                 let (through, head) = (changed.through, changed.head);
+                let units = through.saturating_sub(after).max(1);
+                self.ran(from, Work::Changed, units, took);
                 if !changed.keys.is_empty() {
                     let keys = changed.keys;
-                    dst.run(until, move |e| e.import(&keys))?;
+                    let took = dst.run(until, move |e| {
+                        let began = Instant::now();
+                        e.import(&keys)?;
+                        Ok(began.elapsed())
+                    })?;
+                    self.ran(to, Work::Import, units, took);
                 }
                 match self.hold(to, until, |h| h.replayed(op, through)) {
                     Ok(progress) => Ok(Reply::Replayed { progress, head }),
@@ -416,12 +608,17 @@ impl<E: Engine> Groups<E> {
                 let holding = self
                     .holding_of(group)
                     .ok_or(reshard::Refused::NoGroup(group))?;
-                let done = store.run(until, move |e| {
+                let batch = self.batch(group, Work::Sweep);
+                let positions = usize::try_from(batch).unwrap_or(usize::MAX);
+                let (done, took) = store.run(until, move |e| {
+                    let began = Instant::now();
                     if release {
                         e.keep_log(None)?;
                     }
-                    e.sweep(span, batch, &|pos| holding.garbage(pos))
+                    let done = e.sweep(span, positions, &|pos| holding.garbage(pos))?;
+                    Ok((done, began.elapsed()))
                 })?;
+                self.ran(group, Work::Sweep, batch, took);
                 Ok(if release {
                     Reply::Released { done }
                 } else {
@@ -439,7 +636,12 @@ impl<E: Engine> Groups<E> {
                     }
                     route.groups.remove(&group);
                 }
-                route.retired.insert(group);
+                // Kept before it is answered, with the directory routed by: a create asked again
+                // after a restart is refused, never made an empty group, whatever directory the
+                // node is started by.
+                let mut next = route.retired.clone();
+                next.insert(group);
+                route.retired = keep_book(&route.book, &route.directory, &next)?;
                 Ok(Reply::Retired)
             }
         }
@@ -479,6 +681,45 @@ impl<E: Engine> Groups<E> {
             held.holding = kept;
         }
         Ok(at)
+    }
+
+    /// The units of `work` a batch on `group`'s writer takes ([`Cost::within`]): to hold it
+    /// about as long as a commit of its own does, or, if it has committed nothing yet, a commit
+    /// of this node's groups (one disk, one machine).
+    fn batch(&self, group: GroupId, work: Work) -> u64 {
+        let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
+        let mean = |c: &Counters| {
+            u128::from(c.apply_us)
+                .saturating_mul(1000)
+                .checked_div(u128::from(c.commits))
+        };
+        let Some(held) = route.groups.get(&group) else {
+            return 1;
+        };
+        let target = mean(&held.store.counters()).or_else(|| {
+            let (mut us, mut commits) = (0u64, 0u64);
+            for g in route.groups.values() {
+                let c = g.store.counters();
+                us = us.saturating_add(c.apply_us);
+                commits = commits.saturating_add(c.commits);
+            }
+            mean(&Counters {
+                commits,
+                apply_us: us,
+                ..Counters::default()
+            })
+        });
+        let mut costs = held.costs.lock().unwrap_or_else(PoisonError::into_inner);
+        costs.of(work).within(target)
+    }
+
+    /// `units` of `work` held `group`'s writer for `took`.
+    fn ran(&self, group: GroupId, work: Work, units: u64, took: Duration) {
+        let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
+        if let Some(held) = route.groups.get(&group) {
+            let mut costs = held.costs.lock().unwrap_or_else(PoisonError::into_inner);
+            costs.of(work).ran(units, took);
+        }
     }
 
     /// How many groups are on this node.

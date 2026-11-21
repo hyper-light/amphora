@@ -272,6 +272,11 @@ pub fn postgres(engine: &'static str, program: String, dsn: String) -> ShellSpec
             format!("null={NULL_MARK}"),
             "-v".into(),
             "ON_ERROR_STOP=0".into(),
+            // Its statements from `-f -` (standard input) rather than from standard input as such:
+            // only a file's errors are written `psql:<file>:<line>: ERROR:`, which is how a refusal
+            // is told from a row (psql's documentation of -f; its log_locus_callback).
+            "-f".into(),
+            "-".into(),
             "-d".into(),
             dsn,
         ],
@@ -283,7 +288,14 @@ pub fn postgres(engine: &'static str, program: String, dsn: String) -> ShellSpec
         teardown: vec![format!("DROP SCHEMA {schema} CASCADE")],
         echo: |m| format!("\\echo {m}"),
         terminator_line: true,
-        settle: Some("CHECKPOINT"),
+        // CedarDB (v2026-10-08) answers CHECKPOINT "ERROR: CHECKPOINT not implemented yet" (run on
+        // its image, 2026-11-21) and documents no other statement that settles it, so its settle
+        // runs none, rather than every query after a statement failing its settle.
+        settle: if engine == "cedardb" {
+            None
+        } else {
+            Some("CHECKPOINT")
+        },
         rows: Rows::Delimited {
             field: '\u{1f}',
             null: NULL_MARK,

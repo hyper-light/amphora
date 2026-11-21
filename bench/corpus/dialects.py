@@ -35,14 +35,23 @@ def typed(expression):
     the column has affinity BLOB" (https://www.sqlite.org/datatype3.html#determination_of_column_affinity);
     section 3: "A column with affinity BLOB does not prefer one storage class over another and no
     attempt is made to coerce data from one storage class into another." So an untyped column is
-    declared BLOB, which sqlglot writes as each dialect's binary type (DuckDB's BLOB, PostgreSQL's
-    BYTEA, MySQL's BLOB, ClickHouse's String). A value of another storage class written to it is
+    declared BLOB, as SQLite's own declared BLOB reads, which sqlglot writes as each dialect's
+    binary type (DuckDB's BLOB, PostgreSQL's BYTEA, MySQL's BLOB, ClickHouse's String: a column
+    declared BLOB in the corpus is written the same). A value of another storage class written to it is
     then each engine's to take or refuse, as a BLOB column's would be: no type is picked here."""
     from sqlglot import exp
 
+    # sqlglot reads a column with neither type nor constraint as a bare name in CREATE TABLE's
+    # schema, one with constraints only as a ColumnDef without a kind.
+    for create in expression.find_all(exp.Create):
+        schema = create.this
+        if create.args.get("kind") == "TABLE" and isinstance(schema, exp.Schema):
+            for column in list(schema.expressions):
+                if isinstance(column, exp.Identifier):
+                    column.replace(exp.ColumnDef(this=column.copy()))
     for column in expression.find_all(exp.ColumnDef):
         if column.args.get("kind") is None:
-            column.set("kind", exp.DataType.build("BLOB"))
+            column.set("kind", exp.DataType(this=exp.DataType.Type.BLOB))
     return expression
 
 

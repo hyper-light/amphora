@@ -507,11 +507,19 @@ no room for its cell.
 
 **Decision.** A connection opened with `ConnectOpts::with_versioned_storage`, or any connection
 while `AMPHORA_STORAGE=versioned` is set, puts the database's B-trees on the versioned storage: the
-first such connection makes it (in memory for a memory database, else in `<path>-versioned/`) and
-every connection after it uses it. The executor's `OpenRead` and `OpenWrite` open a
-`VersionedCursor` on the tree whose id is the root page, `CreateBtree` makes a tree, and the SQL
-transaction is one storage transaction, begun by its first cursor and committed (durable before it
-returns) or rolled back where the pager's transaction ends. Tree 0 is never named (SQLite's pages
+first such connection makes it (in memory for a memory database or one on the engine's memory IO,
+else in `<path>-versioned/`) and every connection after it uses it. The executor's `OpenRead` and `OpenWrite` open a
+`VersionedCursor` on the tree whose id is the root page, `CreateBtree` makes a tree, `Destroy`
+drops it once the transaction commits (a tree it made is dropped if it rolls back), and
+`ClearBtree` removes its rows; the SQL transaction is one storage transaction, begun by
+its first cursor and committed (durable before it returns) or rolled back where the pager's
+transaction ends, and each write statement in an explicit transaction holds a savepoint of it
+(SQLite's statement journal), rolled back to if the statement fails. An index's tree (or a WITHOUT
+ROWID table's) is ordered by the key its first cursor brings (`IndexInfo` from the schema): the tree
+is empty until then, so nothing is compared before; the order is kept for the tree and every later
+cursor. The planner prices a page read as resident: the pool keeps every page in a
+frame, and the pager's miss ratio, from fetches it no longer makes, would price each as read from
+the file. Tree 0 is never named (SQLite's pages
 start at 1), tree 1 is `sqlite_schema`, tree 2 the overflow tree, and each tree made later takes the
 next id, which `sqlite_schema` records as its root page. The pager still runs beside it for the
 database header (schema cookie, user version). The pool holds the pager's default page-cache bound

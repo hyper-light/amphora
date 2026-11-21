@@ -101,6 +101,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | planner | – | Decision (lane pl8-3): a LEFT JOIN's right table follows the tables its ON terms read | [planner.md](design/planner.md#decision-lane-pl8-3-a-left-joins-right-table-follows-the-tables-its-on-terms-read) |
 | planner | – | Decision (lane pl12): custom plans, then a generic one, for prepared statements | [planner.md](design/planner.md#decision-lane-pl12-custom-plans-then-a-generic-one-for-prepared-statements) |
 | planner | – | Decision (lane pl9): row counts kept as rows change, statements planned again past their statistics' error | [planner.md](design/planner.md#decision-lane-pl9-row-counts-kept-as-rows-change-statements-planned-again-past-their-statistics-error) |
+| planner | – | Decision (lane pl11): degree-sequence upper bounds guard each joined set's estimate | [planner.md](design/planner.md#decision-lane-pl11-degree-sequence-upper-bounds-guard-each-joined-sets-estimate) |
 | records-compaction | – | Durable progress and retention | [records-compaction.md](design/records-compaction.md#durable-progress-and-retention) |
 | records-compaction | – | Dirty-page and serialized bounds | [records-compaction.md](design/records-compaction.md#dirty-page-and-serialized-bounds) |
 | records-compaction | – | Embedded owner compatibility | [records-compaction.md](design/records-compaction.md#embedded-owner-compatibility) |
@@ -132,6 +133,9 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | replication | – | Decision (lane constants): the owner's tick pace (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-the-owners-tick-pace-2026-11-21) |
 | regions | – | Decision (lane regions): region-local groups under a global root, placed by declared survival | [regions.md](design/regions.md#decision-lane-regions-region-local-groups-under-a-global-root-placed-by-declared-survival) |
 | reshard | – | Decision (lane split-merge): split, merge and move as one fenced hand-off, decided by measured share | [reshard.md](design/reshard.md#decision-lane-split-merge-split-merge-and-move-as-one-fenced-hand-off-decided-by-measured-share) |
+| reshard | – | Decision (lane split-merge-7): batches learned where they run | [reshard.md](design/reshard.md#decision-lane-split-merge-7-batches-learned-where-they-run) |
+| reshard | – | Decision (lane split-merge-7): retired groups kept | [reshard.md](design/reshard.md#decision-lane-split-merge-7-retired-groups-kept) |
+| reshard | – | Decision (lane split-merge-7): a local database keeps its holding through its command | [reshard.md](design/reshard.md#decision-lane-split-merge-7-a-local-database-keeps-its-holding-through-its-command) |
 | semantics | 1 | TEXT is well-formed UTF-8 | [semantics.md](design/semantics.md#1-text-is-well-formed-utf-8) |
 | semantics | 2 | atanh's last digit is its platform's C library's | [semantics.md](design/semantics.md#2-atanhs-last-digit-is-its-platforms-c-librarys) |
 | store | 1 | A group commit with no timer | [store.md](design/store.md#1-a-group-commit-with-no-timer) |
