@@ -257,7 +257,10 @@ const CASES: &[Case] = &[
         sql: "SELECT o_orderstatus, count(*) FROM orders WHERE o_orderdate >= '1994-01-01' AND EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey AND l_commitdate < l_receiptdate) GROUP BY o_orderstatus ORDER BY o_orderstatus" },
     Case { class: "TPC-H Q17", unnests: true,
         sql: "SELECT sum(l_quantity) / 7.0 FROM lineitem, part WHERE p_partkey = l_partkey AND p_brand = 'Brand#3' AND l_quantity < (SELECT 0.8 * avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)" },
-    Case { class: "TPC-H Q20", unnests: true,
+    // Not unnested yet: its scalar `0.5 * total(..)` is 0.0 over no rows, an expression of an
+    // aggregate that isn't NULL on empty input, which `result_on_empty_input` doesn't take (only a
+    // bare aggregate, or one NULL on empty input). Its answers are still checked.
+    Case { class: "TPC-H Q20", unnests: false,
         sql: "SELECT s_name FROM supplier, nation WHERE s_suppkey IN (SELECT ps_suppkey FROM partsupp WHERE ps_partkey IN (SELECT p_partkey FROM part WHERE p_name >= 'forest' AND p_name < 'foresu') AND ps_availqty > (SELECT 0.5 * total(l_quantity) FROM lineitem WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey)) AND s_nationkey = n_nationkey AND n_name <> 'EGYPT' ORDER BY s_name" },
     Case { class: "TPC-H Q21", unnests: true,
         sql: "SELECT s_name, count(*) AS numwait FROM supplier, lineitem l1, orders, nation WHERE s_suppkey = l1.l_suppkey AND o_orderkey = l1.l_orderkey AND o_orderstatus = 'F' AND l1.l_receiptdate > l1.l_commitdate AND EXISTS (SELECT * FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey AND l2.l_suppkey <> l1.l_suppkey) AND NOT EXISTS (SELECT * FROM lineitem l3 WHERE l3.l_orderkey = l1.l_orderkey AND l3.l_suppkey <> l1.l_suppkey AND l3.l_receiptdate > l3.l_commitdate) AND s_nationkey = n_nationkey AND n_name = 'SAUDI ARABIA' GROUP BY s_name ORDER BY numwait DESC, s_name" },
