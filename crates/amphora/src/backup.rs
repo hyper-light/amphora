@@ -13,16 +13,19 @@
 //! - [`Shipping`]: the thread that ships a database's log and copies its bases as it commits
 //!   ([`crate::database::Database::open_backed_up`]).
 //! - [`restore()`]: the shell that restores a second.
+//! - [`FolderBlobs`]: the store Amphora owns: a folder, local or a peer's over a mount.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+mod folder;
 mod object;
 pub mod plan;
 mod restore;
 mod ship;
 mod shipping;
 
+pub use folder::FolderBlobs;
 pub use restore::{Restored, expire, restore};
 pub use ship::{BaseCopy, Shipped, Shipper};
 pub(crate) use shipping::Prepared;
