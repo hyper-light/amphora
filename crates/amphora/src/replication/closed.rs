@@ -136,7 +136,10 @@ pub(crate) fn recorded(db: &Db) -> anyhow::Result<Option<u64>> {
 
 /// Samples the lag keeps: the fewest of which a 99th percentile is one sample short of the
 /// largest, 1 / (1 - 0.99). The quantile is AC-T1.10.3's, which states follower reads' latency at
-/// p99: a read asked at the lag behind now waits for its time no more often than that.
+/// p99: a read asked at the lag behind now waits for its time no more often than that. Not a
+/// tuning value: the quantile fixes it (fewer samples and the "p99" is their maximum; more only
+/// remember older delays longer, a picked trade-off). What is learned is the lag itself, by every
+/// replica from its own delays, continuously.
 pub(crate) const LAG_SAMPLES: usize = 100;
 
 /// A replica's replication delay as it measures it: how far its closed time stood behind its own
