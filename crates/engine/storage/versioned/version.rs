@@ -2303,7 +2303,7 @@ mod tests {
 
     /// Older versions kept beside the pages, in every tree.
     fn older_versions(v: &Versioned) -> usize {
-        v.trees
+        v.live()
             .iter()
             .flat_map(|t| t.heads.iter())
             .map(|s| s.lock().values().map(|h| h.older.len()).sum::<usize>())
