@@ -41,7 +41,54 @@ const META: &str = "CREATE TABLE IF NOT EXISTS __amphora_replica (id INTEGER PRI
 pub const COMMAND_BYTES: usize = api::REQUEST_MAX;
 /// Images are bounded until streaming snapshots are implemented; compaction refuses larger ones.
 pub const SNAPSHOT_BYTES: usize = 256 << 20;
-const ENVELOPE_BYTES: usize = 1 << 20;
+/// Format: a database page's bytes, the only page size `validate_pages` admits.
+const PAGE_BYTES: usize = 4096;
+/// Format (postcard's wire format, "Varint encoded integers"): a `u64` or `usize` takes at most
+/// ten bytes, a `u32` at most five, seven bits a byte.
+const U64_MOST: usize = 10;
+const U32_MOST: usize = 5;
+/// The bytes postcard takes for the varint `n`.
+const fn varint_bytes(n: usize) -> usize {
+    let (mut rest, mut bytes) = (n, 1usize);
+    while let Some(next) = rest.checked_div(128) {
+        if next == 0 {
+            break;
+        }
+        rest = next;
+        bytes = bytes.saturating_add(1);
+    }
+    bytes
+}
+/// The most bytes a declared baseline's encoding takes: its source node's varint and its 32-byte
+/// identity, which postcard writes without a length (`api::replication::Bootstrap`).
+const BOOTSTRAP_MOST: usize = U64_MOST.saturating_add(32);
+/// The bytes an encoding of `budget` bytes of pages takes past the pages themselves (replication.md,
+/// "Decision (lane constants): an envelope is what its encoding adds"; EN.1): the list's length,
+/// and each page's id and length, at most `budget / PAGE_BYTES` pages.
+const fn pages_envelope(budget: usize) -> usize {
+    let pages = match budget.checked_div(PAGE_BYTES) {
+        Some(pages) => pages,
+        None => 0,
+    };
+    let page = U32_MOST.saturating_add(varint_bytes(PAGE_BYTES));
+    U64_MOST.saturating_add(pages.saturating_mul(page))
+}
+/// What a prepared transaction's encoding adds to its pages, at the most: the baseline's prefix and
+/// declaration, its base's index and term, and its pages' envelope. A read set rides in what an
+/// entry leaves of it and of the pages' budget, or goes without one (`Prepared::encode`).
+const COMMAND_ENVELOPE: usize = BASELINE_DELTA
+    .len()
+    .saturating_add(BOOTSTRAP_MOST)
+    .saturating_add(U64_MOST.saturating_mul(2))
+    .saturating_add(pages_envelope(COMMAND_BYTES));
+/// What an image's encoding adds to its `budget` bytes of pages, at the most: the baseline's prefix
+/// and declaration, and its pages' envelope.
+const fn image_envelope(budget: usize) -> usize {
+    BASELINE_SNAPSHOT
+        .len()
+        .saturating_add(BOOTSTRAP_MOST)
+        .saturating_add(pages_envelope(budget))
+}
 /// What the filesystem holding a machine's database has free for this process, in bytes: read on
 /// its owner's flushing thread after each checkpoint pass (replication.md, "A replica's database
 /// log bounded by what it measures").
@@ -88,7 +135,7 @@ impl Prepared {
         } else {
             postcard::to_allocvec(self).map_err(unavailable)?
         };
-        let bound = COMMAND_BYTES.saturating_add(ENVELOPE_BYTES);
+        let bound = COMMAND_BYTES.saturating_add(COMMAND_ENVELOPE);
         api::bound("replicated command", bytes.len(), bound)?;
         // The read set rides after the encoding while the entry keeps its bound; past it, the
         // write goes without one and the exact base decides it, as for a binary from before.
@@ -105,7 +152,7 @@ impl Prepared {
         api::bound(
             "replicated command",
             bytes.len(),
-            COMMAND_BYTES.saturating_add(ENVELOPE_BYTES),
+            COMMAND_BYTES.saturating_add(COMMAND_ENVELOPE),
         )?;
         let prepared: Self = if let Some(payload) = bytes.strip_prefix(BASELINE_DELTA) {
             let (declaration, mut prepared): (api::replication::Bootstrap, Self) =
@@ -149,7 +196,7 @@ pub(crate) fn verdict(data: &[u8], before: Point) -> Result<Result<(), Refusal>,
     api::bound(
         "replicated command",
         data.len(),
-        COMMAND_BYTES.saturating_add(ENVELOPE_BYTES),
+        COMMAND_BYTES.saturating_add(COMMAND_ENVELOPE),
     )?;
     let base: Base = if let Some(payload) = data.strip_prefix(BASELINE_DELTA) {
         let (_, base): (api::replication::Bootstrap, Base) =
@@ -220,6 +267,13 @@ pub struct Machine {
     // A test's hold on this machine's flushes of its database's log.
     #[cfg(test)]
     flush_gate: std::sync::Arc<FlushGate>,
+    // The bytes of the image this machine opened with, its pages as `image` writes them: what the
+    // compaction rule weighs a log never compacted against (`StateMachine::image_bytes`; CT.1).
+    opened_bytes: u64,
+    // The bytes of the last image made, and of every entry applied since the machine opened: what
+    // the owner times its images and its log's replay by (`database::compacting`; CT.1).
+    imaged_bytes: u64,
+    applied_bytes: u64,
     _owner: crate::database::Owned,
 }
 
@@ -306,7 +360,7 @@ fn validate_pages(pages: &[(u32, Vec<u8>)], bound: usize) -> Result<(), Refusal>
     let mut bytes = 0usize;
     let mut previous = 0;
     for (id, page) in pages {
-        if *id <= previous || page.len() != 4096 {
+        if *id <= previous || page.len() != PAGE_BYTES {
             return Err(api::invalid(
                 "replicated pages",
                 "page IDs must be sorted, unique and positive; pages must be 4096 bytes",
@@ -482,6 +536,8 @@ impl Machine {
         db.transaction(|db| marker(db, point, &configuration))
             .map_err(unavailable)?;
         db.flusher()().map_err(unavailable)?;
+        let opened_bytes = db.image_bytes().map_err(unavailable)?;
+        let opened_bytes = u64::try_from(opened_bytes).unwrap_or(u64::MAX);
         Ok(Self {
             db,
             point,
@@ -508,6 +564,9 @@ impl Machine {
             digests: None,
             #[cfg(test)]
             flush_gate: std::sync::Arc::default(),
+            opened_bytes,
+            imaged_bytes: 0,
+            applied_bytes: 0,
             _owner: owner,
         })
     }
@@ -515,6 +574,22 @@ impl Machine {
     /// A member that joins catches up by this machine's image once the log no longer reaches
     /// back, and an image is bounded (replication.md, "Membership"): past its ceiling, a joiner
     /// is refused before it is added, never left unable to catch up.
+    /// Whether an image of the database now is within this machine's image budget: past it,
+    /// `image` refuses, and a compaction, which needs one, waits (CT.1).
+    pub(crate) fn image_fits(&mut self) -> Result<bool, Refusal> {
+        let size = self.db.image_bytes().map_err(unavailable)?;
+        Ok(size <= self.snapshot_bytes)
+    }
+    /// The bytes of the last image this machine made (CT.1).
+    pub(crate) fn imaged_bytes(&self) -> u64 {
+        self.imaged_bytes
+    }
+    /// The bytes of every entry this machine applied since it opened, as the core counts an
+    /// entry's (CT.1).
+    pub(crate) fn applied_bytes(&self) -> u64 {
+        self.applied_bytes
+    }
+
     pub(crate) fn admits_joiner(&mut self) -> Result<(), Refusal> {
         let size = self.db.image_bytes().map_err(unavailable)?;
         api::bound(
@@ -695,7 +770,8 @@ impl Machine {
         self.require_baseline()?;
         // Each page number takes at least one byte of the entry, so a session that read more
         // pages than the entry has bytes could not carry its read set.
-        let bound = u64::try_from(COMMAND_BYTES.saturating_add(ENVELOPE_BYTES)).unwrap_or(u64::MAX);
+        let bound =
+            u64::try_from(COMMAND_BYTES.saturating_add(COMMAND_ENVELOPE)).unwrap_or(u64::MAX);
         let (answer, pages, traced) = self
             .db
             .prepare_traced(COMMAND_BYTES, bound, f)
@@ -1010,6 +1086,7 @@ impl StateMachine for Machine {
         if entry.index <= self.point.index {
             return Err(failed("a committed entry was applied twice"));
         }
+        self.applied_bytes = self.applied_bytes.saturating_add(entry.encoded_bytes());
         let at = Point {
             index: entry.index,
             term: entry.term,
@@ -1151,20 +1228,26 @@ impl StateMachine for Machine {
         api::bound(
             "snapshot",
             bytes.len(),
-            self.snapshot_bytes.saturating_add(ENVELOPE_BYTES),
+            self.snapshot_bytes
+                .saturating_add(image_envelope(self.snapshot_bytes)),
         )
         .map_err(failed)?;
         into.extend_from_slice(&bytes);
+        self.imaged_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         Ok((self.point, self.configuration.clone()))
     }
+    /// The image this machine opened with, its pages' bytes (the postcard framing a page's id and
+    /// length add is not counted): asked when a member opens on a log never compacted, so the log
+    /// is weighed against the state it opened with (CT.1).
     fn image_bytes(&self) -> Option<u64> {
-        None
+        Some(self.opened_bytes)
     }
     fn install(&mut self, image: &[u8], at: Point, configuration: &ConfState) -> Result<(), Fatal> {
         api::bound(
             "snapshot",
             image.len(),
-            self.snapshot_bytes.saturating_add(ENVELOPE_BYTES),
+            self.snapshot_bytes
+                .saturating_add(image_envelope(self.snapshot_bytes)),
         )
         .map_err(failed)?;
         let pages: Vec<(u32, Vec<u8>)> =
@@ -1215,5 +1298,97 @@ impl StateMachine for Machine {
     /// flush, and the raft log keeps every entry the database's log may still lose.
     fn persist(&mut self) -> Result<(), Fatal> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+
+    fn widest_declaration() -> api::replication::Bootstrap {
+        api::replication::Bootstrap {
+            source_node: u64::MAX,
+            source_id: [u8::MAX; 32],
+        }
+    }
+    /// Full pages whose ids each take postcard's widest `u32`.
+    fn widest_pages(budget: usize) -> Vec<(u32, Vec<u8>)> {
+        let count = budget / PAGE_BYTES;
+        (0..count)
+            .map(|at| {
+                (
+                    u32::MAX - u32::try_from(count - at).unwrap() + 1,
+                    vec![0; PAGE_BYTES],
+                )
+            })
+            .collect()
+    }
+
+    /// T-EN.1.1: the widest prepared transaction a command admits: a declared baseline, base index
+    /// and term at `u64::MAX`, its whole page budget in pages with the widest ids — passes when it
+    /// encodes within its bound, short of it only by the list length's unused varint bytes.
+    #[test]
+    fn envelope_a_command_at_its_widest_fits_its_bound_exactly() {
+        let pages = widest_pages(COMMAND_BYTES);
+        let count = pages.len();
+        let prepared = Prepared {
+            base_index: u64::MAX,
+            base_term: u64::MAX,
+            pages,
+            baseline: Some(widest_declaration()),
+            reads: None,
+        };
+        let bytes = prepared.encode().unwrap();
+        let bound = COMMAND_BYTES + COMMAND_ENVELOPE;
+        assert_eq!(bound - bytes.len(), U64_MOST - varint_bytes(count));
+        assert!(Prepared::decode(&bytes).is_ok());
+    }
+
+    /// T-EN.1.2: the widest image of a lowered budget, and of the full one's arithmetic — passes when
+    /// it encodes within its bound, short only by the list length's unused varint bytes.
+    #[test]
+    fn envelope_an_image_at_its_widest_fits_its_bound_exactly() {
+        let budget = 64 * PAGE_BYTES;
+        let pages = widest_pages(budget);
+        let count = pages.len();
+        let mut bytes = BASELINE_SNAPSHOT.to_vec();
+        bytes.extend(
+            postcard::to_allocvec(&BaselineSnapshot {
+                declaration: widest_declaration(),
+                pages,
+            })
+            .unwrap(),
+        );
+        let bound = budget + image_envelope(budget);
+        assert_eq!(bound - bytes.len(), U64_MOST - varint_bytes(count));
+        // The full budget's envelope: its pages' ids and lengths, a few bytes a page, not a
+        // mebibyte.
+        let pages = SNAPSHOT_BYTES / PAGE_BYTES;
+        assert_eq!(
+            image_envelope(SNAPSHOT_BYTES),
+            BASELINE_SNAPSHOT.len() + BOOTSTRAP_MOST + U64_MOST + pages * (U32_MOST + 2)
+        );
+    }
+
+    /// T-EN.1.3: postcard's varint widths.
+    #[test]
+    fn envelope_varints_take_seven_bits_a_byte() {
+        for (n, bytes) in [
+            (0, 1),
+            (127, 1),
+            (128, 2),
+            (4096, 2),
+            (16_383, 2),
+            (16_384, 3),
+        ] {
+            assert_eq!(varint_bytes(n), bytes, "{n}");
+            assert_eq!(postcard::to_allocvec(&n).unwrap().len(), bytes, "{n}");
+        }
+        assert_eq!(
+            postcard::to_allocvec(&widest_declaration()).unwrap().len(),
+            BOOTSTRAP_MOST
+        );
+        assert_eq!(postcard::to_allocvec(&u32::MAX).unwrap().len(), U32_MOST);
+        assert_eq!(postcard::to_allocvec(&u64::MAX).unwrap().len(), U64_MOST);
     }
 }
