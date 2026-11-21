@@ -73,7 +73,10 @@ impl PlanValues {
     }
 
     /// Where the row counts read each table's changes since ANALYZE (PL.9). Set once, at translate.
-    pub(crate) fn attach_row_changes(&self, changes: crate::sync::Arc<crate::row_changes::RowChanges>) {
+    pub(crate) fn attach_row_changes(
+        &self,
+        changes: crate::sync::Arc<crate::row_changes::RowChanges>,
+    ) {
         let _already_attached = self.row_changes.set(changes);
     }
 

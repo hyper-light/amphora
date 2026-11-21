@@ -152,7 +152,8 @@ pub fn translate(
     }
     .filter(|(tbl_name, _)| tbl_name.db_name.is_none())
     .and_then(|(tbl_name, sign)| {
-        let table = schema.get_btree_table(&crate::util::normalize_ident(tbl_name.name.as_str()))?;
+        let table =
+            schema.get_btree_table(&crate::util::normalize_ident(tbl_name.name.as_str()))?;
         Some(crate::row_changes::WriteTarget {
             counter: connection.db.row_changes.counter(&table.name),
             changes: connection.db.row_changes.clone(),

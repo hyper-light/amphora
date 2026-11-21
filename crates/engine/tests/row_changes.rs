@@ -90,12 +90,20 @@ fn t_pl_9_1_a_statement_plans_again_once_its_table_grows_past_its_error() {
     let start = stmt.metrics().reprepares;
     fill(&conn, 1_001, 1_010);
     run(&mut stmt);
-    assert_eq!(stmt.metrics().reprepares, start, "planned again within its error");
+    assert_eq!(
+        stmt.metrics().reprepares,
+        start,
+        "planned again within its error"
+    );
     fill(&conn, 1_011, 10_000);
     let grown = run(&mut stmt);
     assert_eq!(stmt.metrics().reprepares, start + 1, "planned again once");
     let again = run(&mut stmt);
-    assert_eq!(stmt.metrics().reprepares, start + 1, "planned again only once");
+    assert_eq!(
+        stmt.metrics().reprepares,
+        start + 1,
+        "planned again only once"
+    );
     let mut fresh = conn.prepare(COUNT_SOME).unwrap();
     let expected = run(&mut fresh);
     assert_eq!(grown, expected);

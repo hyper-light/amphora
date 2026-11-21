@@ -71,11 +71,11 @@ mod parameters;
 #[cfg(feature = "percentile")]
 mod percentile;
 mod plan_cache;
-mod row_changes;
 mod pragma;
 mod progress;
 mod pseudo;
 mod regexp;
+mod row_changes;
 #[cfg(feature = "series")]
 mod series;
 mod stack;
