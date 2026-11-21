@@ -1104,8 +1104,9 @@ fn a_page_new_to_the_log_is_read_in_one_frame() {
 
 /// Do: in a mixed log, commit 300 rows, then change two bytes of every third row in each of 12
 /// transactions (the rows' pages stay in the writer's cache, so each change is a delta against
-/// the page's last version, decision 17, and a chain runs to its bound and begins again), open the
-/// database again and read every row, then look rows up one at a time. Expect: every read of the
+/// the page's last version, decision 17, its chain growing while its deltas take less than the
+/// page), open the database again and read every row, then look rows up one at a time. Expect:
+/// every read of the
 /// log takes at most one frame (decision 39: a chain's entries are records of one slot, and a
 /// chain may begin at a page frame), where decision 37's log read a whole record for each entry of
 /// a page's chain; every row as last written; deltas in the log, and reads of it.
@@ -1140,9 +1141,12 @@ fn a_pages_chain_is_read_one_frame_an_entry() {
             conn.execute("COMMIT").unwrap();
         }
         let wal = std::fs::read(wal_path(&path)).unwrap();
-        let deltas = entries(&wal).iter().filter(|(kind, _)| *kind == 1).count();
-        // Eleven rounds of twelve at least: a chain that reaches its bound begins again with the
-        // page's image.
+        let deltas = entries(&wal)
+            .iter()
+            .filter(|(_, kind, _, _)| *kind == 1)
+            .count();
+        // Eleven rounds of twelve at least: two bytes a round keep a chain's deltas far under a
+        // page (decision 17), so a chain ends, its page's image beginning it again, at most once.
         assert!(
             deltas >= 100 * 11,
             "{deltas} deltas for 100 rows changed 12 times"
