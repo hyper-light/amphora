@@ -14,12 +14,14 @@
 //!   ([`crate::database::Database::open_backed_up`]).
 //! - [`restore()`]: the shell that restores a second.
 //! - [`restore_and_check`]: restores the newest whole second into a scratch file and checks it.
+//! - [`restore_cut`]: several groups restored to one second, cross-group transactions finished.
 //! - [`FolderBlobs`]: the store Amphora owns: a folder, local or a peer's over a mount.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 mod check;
+mod cut;
 mod folder;
 mod object;
 pub mod plan;
@@ -31,6 +33,7 @@ pub use check::{
     CHECK_METRIC, Check, CheckCounters, CheckFailure, RowDigest, check_due, digest, newest_second,
     restore_and_check,
 };
+pub use cut::restore_cut;
 pub use folder::FolderBlobs;
 pub use restore::{Restored, expire, restore};
 pub use ship::{BaseCopy, Shipped, Shipper};

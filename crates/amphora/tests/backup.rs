@@ -453,3 +453,122 @@ fn t_t1_12_c1_restore_and_check_on_a_folder() {
     assert_eq!(counters.passed.load(Ordering::Relaxed), 1);
     assert_eq!(counters.failed.load(Ordering::Relaxed), 1);
 }
+
+/// T-T1.12.X1 (AC-T1.12.4): one cut across groups. Do: back two groups up to one folder under a
+/// clock that moves a second at every reading, so every commit in either group has a second of its
+/// own; run a cross-group transaction writing a key in each group, then a second one changing both;
+/// then restore both groups to every second from their first bases to the end, each cut finishing
+/// what it left half-done by the coordinator's records. Expect: at every cut the two keys are both
+/// absent, both the first transaction's, or both the second's; never one without the other; never
+/// back once forward; and the last cut holds the second's. Under both protocols.
+#[test]
+fn t_t1_12_x1_cross_group_cut_at_every_second() {
+    for protocol in [
+        amphora::xgroup::Protocol::TwoPhase,
+        amphora::xgroup::Protocol::Parallel,
+    ] {
+        cross_group_cut(protocol);
+    }
+}
+
+fn cross_group_cut(protocol: amphora::xgroup::Protocol) {
+    use amphora::xgroup::{Answer, Cluster, Protocol, Txn};
+    let parallel = matches!(protocol, Protocol::Parallel);
+    let fresh = || match parallel {
+        true => Protocol::Parallel,
+        false => Protocol::TwoPhase,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let blobs =
+        Arc::new(backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap());
+    let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+    let open = |group: usize| {
+        let read = Arc::clone(&now);
+        let archive = Archive {
+            blobs: Arc::clone(&blobs) as Arc<dyn Blobs>,
+            prefix: format!("g{group}"),
+            clock: Arc::new(move || read.fetch_add(SECOND_NS, Ordering::SeqCst) + SECOND_NS),
+            memory: 32 * 1024,
+            patience: Duration::from_secs(60),
+        };
+        Database::open_backed_up(&dir.path().join(format!("g{group}.db")), archive, until())
+            .unwrap()
+    };
+    let (g0, s0) = open(0);
+    let (g1, s1) = open(1);
+    let route: amphora::xgroup::Route = Arc::new(|k: &[u8]| u32::from(k == b"b"));
+    let cluster = Cluster::open(vec![g0, g1], Arc::clone(&route), 7, fresh(), 1, until()).unwrap();
+    s0.wait(until(), |s| s.bases >= 1).unwrap();
+    s1.wait(until(), |s| s.bases >= 1).unwrap();
+    let based = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+    for v in [b"1", b"2"] {
+        let txn = Txn {
+            reads: vec![],
+            writes: vec![
+                (b"a".to_vec(), Some(v.to_vec())),
+                (b"b".to_vec(), Some(v.to_vec())),
+            ],
+        };
+        assert!(matches!(
+            cluster.transact(txn, until()).unwrap(),
+            Answer::Committed { .. }
+        ));
+    }
+    drop(cluster);
+    for shipping in [&s0, &s1] {
+        let status = shipping.wait(until(), |s| s.ended).unwrap();
+        assert_eq!(status.failures, 0, "{:?}", status.last_failure);
+    }
+    let newest = [0, 1]
+        .iter()
+        .map(|g| {
+            backup::newest_second(blobs.as_ref(), &format!("g{g}"), until())
+                .unwrap()
+                .unwrap()
+        })
+        .min()
+        .unwrap();
+    let mut seen: Vec<Option<Vec<u8>>> = Vec::new();
+    for second in based + 1..=newest {
+        let groups: Vec<(String, std::path::PathBuf)> = (0..2)
+            .map(|g| {
+                (
+                    format!("g{g}"),
+                    dir.path().join(format!("cut-{second}-g{g}.db")),
+                )
+            })
+            .collect();
+        backup::restore_cut(blobs.as_ref(), &groups, second, 7, fresh(), until())
+            .unwrap_or_else(|e| panic!("second {second}: {e:#}"));
+        let restored: Vec<Database> = groups
+            .iter()
+            .map(|(_, p)| Database::open(p, until()).unwrap())
+            .collect();
+        let reader = Cluster::open(restored, Arc::clone(&route), 7, fresh(), 1, until()).unwrap();
+        let read = Txn {
+            reads: vec![b"a".to_vec(), b"b".to_vec()],
+            writes: vec![],
+        };
+        let Answer::Committed { reads } = reader.transact(read, until()).unwrap() else {
+            panic!("second {second}: the read didn't commit");
+        };
+        drop(reader);
+        let (a, b) = (reads[0].1.clone(), reads[1].1.clone());
+        assert_eq!(a, b, "second {second}: one group without the other");
+        seen.push(a);
+    }
+    let order = |v: &Option<Vec<u8>>| match v.as_deref() {
+        None => 0,
+        Some(b"1") => 1,
+        Some(_) => 2,
+    };
+    assert!(
+        seen.windows(2).all(|w| order(&w[0]) <= order(&w[1])),
+        "{seen:?}"
+    );
+    assert_eq!(seen.last().cloned().flatten(), Some(b"2".to_vec()));
+    assert!(
+        seen.iter().any(|v| v.as_deref() == Some(b"1")),
+        "non-vacuous: a cut between the two"
+    );
+}
