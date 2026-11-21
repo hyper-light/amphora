@@ -1,6 +1,11 @@
 //! T-G2.7.2: a corpus file run on Amphora through the gate's own code path (amphora-corpus's
 //! runner), SQLite's answers in the file.
-#![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::disallowed_macros
+)]
 
 use amphora_corpus::amphora::{Amphora, AmphoraRender};
 use amphora_corpus::run::{Outcome, run_file};
