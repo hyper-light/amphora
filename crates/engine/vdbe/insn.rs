@@ -724,6 +724,9 @@ pub enum Insn {
         cursor_id: CursorID,
         key_reg: usize,
         num_keys: usize,
+        /// Amphora (PL.5): a hash join's filter, sized when its build ends; none for a filter
+        /// of fixed size.
+        sizing: Option<crate::vdbe::bloom_filter::FilterSizing>,
     },
     // Compare two registers and jump to the given PC if the left-hand side is less than or equal to the right-hand side.
     /// Open a cursor for reading.

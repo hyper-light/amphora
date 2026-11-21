@@ -2218,7 +2218,7 @@ pub fn insn_to_row(
                 *num_keys as i64,
                 format!("if !bloom_filter(r[{}..{}]) goto {}", key_reg, key_reg + num_keys, target_pc.as_debug_int()),
             ),
-            Insn::FilterAdd{cursor_id, key_reg, num_keys} => (
+            Insn::FilterAdd{cursor_id, key_reg, num_keys, ..} => (
                 "FilterAdd",
                 *cursor_id as i64,
                 *key_reg as i64,
