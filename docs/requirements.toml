@@ -432,6 +432,19 @@ tests = [
   { id = "T-QT.3.5", text = "scripts/check-production.sh after the change — passes when it passes, with the ratchet's counts lowered by what the change removed" },
 ]
 
+# lane nscursor
+# Amphora's own IDs for the executor on the new storage (kiln plan 01a16b0f46fa72e384b8dd0065dc94f9,
+# "G7 The executor on the new storage", CP-T1.3 stage 3): NS.n for its step n.
+
+[[own]]
+id = "NS.1"
+title = "The cursor on the versioned storage: the executor's B-tree cursor operations on the B-link trees (G7 step 1)"
+criteria = [
+  { id = "AC-NS.1.1", text = "a conformance suite of cursor operations passes on both storages with identical results" },
+]
+tests = [
+  { id = "T-NS.1.1", text = "Random operation sequences on both cursors — passes when identical keys, values and positions after each step" },
+
 # lane follower-reads (G13 step 4, kiln goal 80d4cf5e; docs/design/replication.md, "Follower reads at a
 # closed time" and "Search over partitions"). AC-T1.10.3 and AC-T1.10.4 are the measures; these are what they
 # rest on.
@@ -611,6 +624,8 @@ criteria = [
 ]
 tests = [
   { id = "T-G2.4.1", text = "a known dialect difference (integer division, NULL ordering) — passes when classified as a dialect difference, not a bug" },
+  # lane corpus-ci-4
+  { id = "T-G2.4.2", text = "the engine seam (crates/corpus/src/engines.rs, crates/corpus/tests/engines.rs): every engine of step 4 opens by name, one whose program or server is missing is refused with a typed error, and a file runs on SQLite's own shell through the gate's code path — passes when each missing engine is refused, never passed" },
 ]
 
 [[own]]
@@ -624,6 +639,8 @@ tests = [
   { id = "T-G2.7.1", text = "the pool chosen from measured times (bench/corpus/subset.py) and run with them kept (crates/corpus/tests/times.rs) — passes when each record and each file has its time and fill files stop at the deadline" },
   { id = "T-G2.7.2", text = "a corpus file run on Amphora through the gate's code path (crates/corpus/tests/amphora_runs.rs) — passes when the wrong answer, and only it, disagrees" },
   { id = "T-G2.7.3", text = "the whole corpus nightly (.kiln/corpus.yaml, bench/corpus/nightly.sh) — passes when its record, times and re-ranked pool are kept as the run's artifacts" },
+  # lane corpus-ci-4
+  { id = "T-G2.7.4", text = "a record that can't finish (a 10-way join of 100 rows) bounded by the run's budget (crates/corpus/tests/amphora_runs.rs, times.rs) — passes when the engine stops it and it is classified past the budget, the next record still runs, and a required record past it fails the run" },
 ]
 
 # lane g11-compress
