@@ -22,6 +22,8 @@ pub mod disk;
 pub mod durable;
 #[cfg(test)]
 mod elle;
+#[cfg(test)]
+mod evict;
 pub mod overflow;
 pub mod page;
 pub mod pool;
