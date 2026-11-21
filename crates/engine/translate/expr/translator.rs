@@ -2223,7 +2223,10 @@ fn translate_function_call_expr(
 
                     Ok(target_register)
                 }
-                ScalarFunc::StatInit | ScalarFunc::StatPush | ScalarFunc::StatGet => {
+                ScalarFunc::StatInit
+                | ScalarFunc::StatPush
+                | ScalarFunc::StatGet
+                | ScalarFunc::StatDegrees => {
                     crate::bail_parse_error!("{} is an internal function used by ANALYZE", srf);
                 }
                 ScalarFunc::ConnTxnId | ScalarFunc::IsAutocommit => {

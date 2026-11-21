@@ -309,11 +309,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   decision 13, `crates/engine/storage/versioned/{switch,sql}.rs`): `ConnectOpts::with_versioned_storage`
   or `AMPHORA_STORAGE=versioned` puts a database's B-trees on the versioned storage; the executor's
   cursors, CREATE/DROP TABLE and INDEX, DELETE without WHERE, `sqlite_schema` (tree 1) and ANALYZE
-  run on it, each SQL transaction one storage transaction. `sql.rs` (`T-NS.2.6`) runs the same SQL
-  on both storages and compares. Not yet: a file database reopened (recovery remakes every tree in
-  rowid order; the header stays the pager's), a statement's own rollback inside a transaction, DROP
-  undone by ROLLBACK, a pool past the page cache's bound; the engine's suites with the switch on are
-  the coordinator's run.
+  run on it, each SQL transaction one storage transaction, a failed statement undone alone by a
+  savepoint. `sql.rs` (`T-NS.2.6`) runs the same SQL on both storages and compares. Not yet: a file
+  database reopened (recovery remakes every tree in rowid order; the header stays the pager's), DROP
+  undone by ROLLBACK, SQL's named SAVEPOINT, a database past the pool's frames or a transaction past
+  its budget (no eviction yet; the budget is the shell's to give); the engine's suites with the
+  switch on are the coordinator's run.
 - **Three ways to reach a cached page** (G7 step 3, `NS.3`; `crates/engine/storage/reach`,
   `amphora-bench --reach`): behind one trait, sharing frames, CLOCK eviction and one miss path, (a) a
   page table in shards with pins and a private pin on a client's current page (PostgreSQL), (b)
@@ -692,6 +693,12 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   (PL.7, e0e7a1df), bushy plans with CD-C (PL.8, c837cde3), statistics kept as rows change (PL.9,
   26302efe), unnesting by dependent joins (PL.10, 61c79bd1), upper bounds as a guard (PL.11,
   f4e0bd7f), custom then generic plans (PL.12, aa0541f6) and adaptive joins (PL.13, 4f237e07).
+- **PL.11** (f4e0bd7f, built and tested on t1/lane-pl11, its JOB and TPC-H counts open): ANALYZE
+  keeps each index prefix's degree sequence as its largest degree and sum of squared degrees, and
+  each joined set's estimate is cut to the upper bound they prove (one table's rows times each
+  attached table's largest degree, or two tables' ℓ2 norms); underestimates are left as they are
+  (docs/design/planner.md, "Decision (lane pl11)"). Open: the bound holds for PL.9's net row
+  change, not for updates or cancelled inserts between ANALYZE runs.
 - **PL.6** (5e23ff8b, built and tested on t1/lane-pl6, its measurement open): no table is read whole
   beneath loops that can give more than one row. A scan stays only beneath one-row loops (a lookup by a
   unique key) or where no equality joins the table; elsewhere a seek, an automatic index or a hash join

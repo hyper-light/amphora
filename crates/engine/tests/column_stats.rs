@@ -236,3 +236,94 @@ fn a_without_rowid_tables_columns_are_sketched_as_stored() {
     assert_eq!(c, 100.0);
     assert!(q_error(e, c) <= 1.25, "{sql}: estimated {e}, counted {c}");
 }
+
+/// Each prefix's `(max, sum of squares)` from a `degrees` row of `__turso_internal_column_stats`
+/// (PL.11): 8 and 16 little-endian bytes a prefix.
+fn degrees(conn: &Arc<Connection>, index: &str) -> Vec<(u64, u128)> {
+    let mut stmt = conn
+        .prepare(format!(
+            "SELECT data FROM __turso_internal_column_stats WHERE kind = 'degrees' AND col = '{index}'"
+        ))
+        .unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 1, "{index}: one degrees row");
+    let amphora_engine::Value::Blob(bytes) = &rows[0][0] else {
+        panic!("{index}: degrees not a blob: {:?}", rows[0][0]);
+    };
+    let (chunks, rest) = bytes.as_chunks::<24>();
+    assert!(rest.is_empty(), "{index}: whole prefixes");
+    chunks
+        .iter()
+        .map(|c| {
+            (
+                u64::from_le_bytes(c[..8].try_into().unwrap()),
+                u128::from_le_bytes(c[8..].try_into().unwrap()),
+            )
+        })
+        .collect()
+}
+
+/// `(max, sum of squares)` of the rows each distinct value of `columns` holds, counted.
+fn counted_degrees(conn: &Arc<Connection>, columns: &str) -> (u64, u128) {
+    let mut stmt = conn
+        .prepare(format!(
+            "SELECT max(n), sum(n * n) FROM (SELECT count(*) AS n FROM t GROUP BY {columns})"
+        ))
+        .unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    (
+        rows[0][0].as_int().unwrap() as u64,
+        rows[0][1].as_int().unwrap() as u128,
+    )
+}
+
+/// Do: fill a table with skewed random values (one in ten NULL), index (a, b) and (b), ANALYZE,
+/// then read the degree norms ANALYZE kept beside the sketches. Expect: each prefix's largest
+/// degree and sum of squared degrees equal to a GROUP BY's counts, and a partial index keeps none
+/// (decision (lane pl11); T-PL.11.1).
+#[test]
+fn pl11_analyze_keeps_each_index_prefixs_degree_norms() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open(dir.path());
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)")
+        .unwrap();
+    let mut state = 7u64;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        state >> 33
+    };
+    let rows: Vec<String> = (0..3_000)
+        .map(|i| {
+            let a = next() % 40;
+            let value = |v: u64| {
+                if v.is_multiple_of(10) {
+                    "NULL".to_string()
+                } else {
+                    v.to_string()
+                }
+            };
+            format!("({i}, {}, {})", value((a * a) % 97), value(next() % 13))
+        })
+        .collect();
+    insert(&conn, "t", &rows);
+    conn.execute("CREATE INDEX t_ab ON t (a, b)").unwrap();
+    conn.execute("CREATE INDEX t_b ON t (b)").unwrap();
+    conn.execute("CREATE INDEX t_part ON t (a) WHERE b > 3")
+        .unwrap();
+    conn.execute("ANALYZE").unwrap();
+    let ab = degrees(&conn, "t_ab");
+    assert_eq!(
+        ab,
+        vec![counted_degrees(&conn, "a"), counted_degrees(&conn, "a, b")]
+    );
+    assert_eq!(degrees(&conn, "t_b"), vec![counted_degrees(&conn, "b")]);
+    let mut stmt = conn
+        .prepare("SELECT count(*) FROM __turso_internal_column_stats WHERE col = 't_part'")
+        .unwrap();
+    assert_eq!(stmt.run_collect_rows().unwrap()[0][0].as_int(), Some(0));
+    // ANALYZE again keeps one row an index, not two.
+    conn.execute("ANALYZE").unwrap();
+    assert_eq!(degrees(&conn, "t_b"), vec![counted_degrees(&conn, "b")]);
+}
