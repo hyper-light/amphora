@@ -100,6 +100,10 @@ pub(super) struct Slots<T> {
 }
 
 impl<T> Slots<T> {
+    /// The bounds as the owner's pace moved: a slot begun after takes them.
+    pub(super) fn bound(&mut self, bounds: Bounds) {
+        self.bounds = bounds;
+    }
     pub(super) fn new(bounds: Bounds) -> Self {
         Self {
             bounds,
