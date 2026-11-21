@@ -439,6 +439,9 @@ pub struct Connection {
     /// was reset or dropped and there was no statement savepoint to undo only
     /// that statement. COMMIT must roll back the whole transaction.
     pub(crate) poisoned_tx: AtomicBool,
+    /// Amphora: whether the statements this connection prepares now are an online schema change's
+    /// own (see [`Connection::set_online_change_own`], CP-T1.12).
+    pub(crate) online_change_own: AtomicBool,
     /// Amphora: whether a write statement in an explicit transaction keeps a statement journal
     /// (see [`Connection::set_statement_journals`]).
     pub(crate) statement_journals: AtomicBool,
@@ -1956,6 +1959,18 @@ impl Connection {
         ))?;
         stmt.run_with_row_callback(|row| constraint_state_row(row, &mut columns))?;
         Ok(columns)
+    }
+
+    /// Amphora: marks the statements this connection prepares from now on as an online schema
+    /// change's own, or not (CP-T1.12). Only the change's own `ALTER COLUMN` redefines a column it
+    /// holds (`__amphora_constraint_states`): a person's is refused, as it would leave the change's
+    /// mark on a definition the change never made.
+    pub fn set_online_change_own(&self, own: bool) {
+        self.online_change_own.store(own, Ordering::SeqCst);
+    }
+
+    pub(crate) fn online_change_own(&self) -> bool {
+        self.online_change_own.load(Ordering::SeqCst)
     }
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {

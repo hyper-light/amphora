@@ -20,6 +20,11 @@
 //! checked from then on while the planner doesn't rely on it; batches check the rows written before
 //! it in rowid order; the cutover removes the mark, a catalog change only. A row that breaks it
 //! undoes the change: the column's old definition back.
+//!
+//! A column is dropped by `ALTER TABLE … DROP COLUMN` PostgreSQL's way: one catalog change names it
+//! in `__amphora_dropped_columns`, a slot the engine hides from names, `*`, inserts and `PRAGMA
+//! table_info` and every write stores NULL in; batches rewrite the rows before it in rowid order,
+//! clearing their values; then the drop is recorded.
 
 use super::*;
 use amphora_engine::schema::IndexState;
@@ -727,7 +732,7 @@ fn begin_constraint(db: &Db, plan: &Plan, column: &str) -> anyhow::Result<Steppe
         |_| Ok(true),
     )?;
     db.restage_schema()?;
-    db.exec(&plan.sql)?;
+    db.exec_as_change(&plan.sql)?;
     let mut until = None;
     db.query_owned(
         &format!("SELECT max(rowid) FROM {}", quoted(&plan.table)),
@@ -862,7 +867,7 @@ fn abandon_constraint(db: &Db, plan: &Plan, column: &str) -> anyhow::Result<()> 
         },
     )?;
     if let Some(old) = old {
-        db.exec(&format!(
+        db.exec_as_change(&format!(
             "ALTER TABLE {} ALTER COLUMN {} TO {old}",
             quoted(&plan.table),
             quoted(column)
@@ -1094,7 +1099,9 @@ impl Database {
     /// (one `ALTER TABLE … ADD COLUMN`) is added in one catalog change, its states run together;
     /// one whose addition would read every row is refused. A NOT NULL or CHECK (one `ALTER TABLE …
     /// ALTER COLUMN c TO` its definition plus the constraint) is checked on writes, then validated
-    /// against the rows before it in batches, then made public by a catalog change. Applied
+    /// against the rows before it in batches, then made public by a catalog change. A column
+    /// (one `ALTER TABLE … DROP COLUMN`) is hidden by a catalog change, its old values cleared
+    /// in batches, then its drop recorded. Applied
     /// once by name, as [`Database::migrate`]. A deadline that passes leaves the change at a
     /// step, invisible to reads; calling again with the same migration carries it on. Rows that
     /// break a unique index or the constraint undo the change and are refused.

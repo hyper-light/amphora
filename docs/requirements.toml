@@ -524,6 +524,8 @@ tests = [
 # (t_t1_12_1_a_power_cut_at_every_step_of_an_online_index_leaves_old_or_new).
 # lane online-schema-6: constraints on existing columns serve the same T-T1.12.1
 # (t_t1_12_1_a_power_cut_at_every_step_of_an_online_constraint_leaves_old_or_new).
+# lane online-schema-7: DROP COLUMN online serves the same T-T1.12.1
+# (t_t1_12_1_a_power_cut_at_every_step_of_an_online_drop_leaves_old_or_new).
 
 # lane audit-log: Amphora's own IDs for G10 step 3 (kiln plan 01a16b0f47577325bcd9e51383067e04),
 # serving AC-T1.7.4 (docs/design/audit.md).

@@ -2682,6 +2682,7 @@ impl Database {
             auto_commit: AtomicBool::new(true),
             transaction_state: AtomicTransactionState::new(TransactionState::None),
             poisoned_tx: AtomicBool::new(false),
+            online_change_own: AtomicBool::new(false),
             statement_journals: AtomicBool::new(true),
             last_insert_rowid: AtomicI64::new(0),
             changes: AtomicI64::new(0),

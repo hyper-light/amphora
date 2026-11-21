@@ -912,18 +912,21 @@ pub fn translate_alter_table(
     }
 
     // Amphora: a table with a column an online schema change is validating is the change's until
-    // it ends (CP-T1.12): only that change's ALTER COLUMN of the column itself goes on (it redefines
-    // it, and undoes that); any other change would leave its mark naming a column that moved.
+    // it ends (CP-T1.12): only that change's own ALTER COLUMN of the column itself goes on (it
+    // redefines it, and undoes that; the change marks its statements, `online_change_own`); any
+    // other change, a person's ALTER COLUMN of it included, would leave its mark naming a column
+    // that moved or a definition it never made.
     if let Some(held) = original_btree
         .columns()
         .iter()
         .find(|column| column.unvalidated())
         .and_then(|column| column.name.clone())
     {
-        let redefines_it = matches!(
-            &alter_table,
-            ast::AlterTableBody::AlterColumn { old, .. } if normalize_ident(old.as_str()) == normalize_ident(&held)
-        );
+        let redefines_it = connection.online_change_own()
+            && matches!(
+                &alter_table,
+                ast::AlterTableBody::AlterColumn { old, .. } if normalize_ident(old.as_str()) == normalize_ident(&held)
+            );
         if !redefines_it {
             crate::bail_parse_error!(
                 "table {table_name} has column {held} held by an online schema change"

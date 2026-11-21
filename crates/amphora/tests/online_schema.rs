@@ -801,3 +801,30 @@ fn t_t1_12_1_a_drop_is_refused_where_the_engine_refuses_it_and_its_slot_keeps_th
     assert!(added.applied);
     assert_eq!(star(&database), 5);
 }
+
+#[test]
+fn t_t1_12_1_a_persons_alter_column_of_a_held_column_is_refused_and_the_changes_own_goes_on() {
+    // CP-T1.12: while NOT NULL is validated on a, a person's ALTER COLUMN of a (the change's own
+    // SQL, the old definition, or another) is refused and leaves the table as it was; the change's
+    // own steps redefine it, and a breaking row's undo puts the old definition back.
+    let (_dir, db) = table(50);
+    let nn = plan("ALTER TABLE t ALTER COLUMN a TO a INTEGER NOT NULL");
+    assert_eq!(
+        db.transaction(|db| online::step(db, &nn, 7)).unwrap(),
+        Stepped::WriteOnly
+    );
+    let held = sql_of_t(&db);
+    for sql in [
+        "ALTER TABLE t ALTER COLUMN a TO a INTEGER NOT NULL",
+        "ALTER TABLE t ALTER COLUMN a TO a INTEGER",
+        "ALTER TABLE t ALTER COLUMN a TO a INTEGER NOT NULL CHECK (a < 1000)",
+    ] {
+        assert!(db.exec(sql).is_err(), "{sql} went on");
+        assert_eq!(sql_of_t(&db), held, "{sql} changed the table");
+    }
+    db.exec("UPDATE __amphora_constraint_states SET tbl = tbl").unwrap();
+    db.transaction(|db| online::abandon(db, &nn)).unwrap();
+    assert!(!sql_of_t(&db).contains("NOT NULL"), "{}", sql_of_t(&db));
+    db.exec("ALTER TABLE t ALTER COLUMN a TO a INTEGER CHECK (a >= 0)")
+        .unwrap();
+}
