@@ -30,9 +30,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use amphora::reshard::directory::{Directory, Kind, Proposal};
 use amphora::reshard::driver::{Action, Answer, Do, Driver, Failure, Out, Reply};
-use amphora::reshard::holding::{replays, Fenced, Holding};
-use amphora::reshard::plan::{cut, plan, GroupLoad, NodeRoom};
-use amphora::reshard::{position, GroupId, NodeId, OpId, Pos, Seq, Span};
+use amphora::reshard::holding::{Fenced, Holding, replays};
+use amphora::reshard::plan::{GroupLoad, NodeRoom, cut, plan};
+use amphora::reshard::{GroupId, NodeId, OpId, Pos, Seq, Span, position};
 
 struct Rng(u64);
 
@@ -45,11 +45,7 @@ impl Rng {
         z ^ (z >> 31)
     }
     fn below(&mut self, n: u64) -> u64 {
-        if n == 0 {
-            0
-        } else {
-            self.next() % n
-        }
+        if n == 0 { 0 } else { self.next() % n }
     }
     fn one_in(&mut self, n: u64) -> bool {
         self.below(n) == 0

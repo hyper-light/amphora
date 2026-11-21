@@ -1,5 +1,5 @@
 # Amphora's gate (CLAUDE.md, "Gates") in kiln CI: every push to main and every pull request runs
-# scripts/gates.sh in a pod, the macOS and Windows lints included.
+# scripts/gates.sh in a pod, the macOS and Windows lints and the corpus subset included.
 name: ci
 on:
   push: { branches: [main] }
@@ -19,6 +19,9 @@ jobs:
       # A pod sees all of its host's CPUs, whatever it requests: builds and tests are held to its request.
       CARGO_BUILD_JOBS: "4"
       RUST_TEST_THREADS: "4"
+    # The corpus subset's times, a JSON line a record (scripts/gates.sh): kept from every run, a
+    # failed one too, for bench/corpus/subset.py to re-rank the gate's pool from (G2 step 7).
+    artifacts: ["target/corpus-times/**"]
     steps:
       - name: python3 and git (the vendor check)
         run: command -v python3 >/dev/null && command -v git >/dev/null || { apt-get update && apt-get install -y --no-install-recommends python3 git; }

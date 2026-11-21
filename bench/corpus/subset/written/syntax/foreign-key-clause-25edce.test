@@ -1,0 +1,114 @@
+hash-threshold 8
+
+# written for syntax:foreign-key-clause: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+statement ok
+PRAGMA foreign_keys = ON
+
+statement ok
+CREATE TABLE fp(k INTEGER PRIMARY KEY, u TEXT UNIQUE)
+
+statement ok
+INSERT INTO fp VALUES (1, 'a'), (2, 'b'), (3, 'c')
+
+statement ok
+CREATE TABLE fc1(r INTEGER REFERENCES fp(k) ON DELETE CASCADE ON UPDATE CASCADE)
+
+statement ok
+CREATE TABLE fc2(r INTEGER REFERENCES fp ON DELETE SET NULL)
+
+statement ok
+CREATE TABLE fc3(r TEXT DEFAULT 'a' REFERENCES fp(u) ON DELETE SET DEFAULT ON UPDATE RESTRICT)
+
+statement ok
+CREATE TABLE fc4(r INTEGER REFERENCES fp(k) ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED)
+
+statement ok
+INSERT INTO fc1 VALUES (1), (2)
+
+statement ok
+INSERT INTO fc2 VALUES (2)
+
+statement ok
+INSERT INTO fc3 VALUES ('c')
+
+statement ok
+INSERT INTO fc4 VALUES (3)
+
+statement error
+INSERT INTO fc1 VALUES (9)
+
+statement ok
+DELETE FROM fp WHERE k = 2
+
+query I nosort
+SELECT r FROM fc1 ORDER BY r
+----
+1
+
+query T rowsort
+SELECT r FROM fc2
+----
+NULL
+
+statement ok
+UPDATE fp SET k = 10 WHERE k = 1
+
+query I rowsort
+SELECT r FROM fc1
+----
+10
+
+statement error
+UPDATE fp SET u = 'z' WHERE k = 3
+
+statement ok
+DELETE FROM fc4
+
+statement ok
+DELETE FROM fp WHERE k = 3
+
+query T rowsort
+SELECT r FROM fc3
+----
+a
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO fc4 VALUES (42)
+
+statement ok
+INSERT INTO fp VALUES (42, 'q')
+
+statement ok
+COMMIT
+
+query I nosort
+SELECT r FROM fc4 ORDER BY r
+----
+42
+
+statement ok
+CREATE TABLE fc5(a, b, FOREIGN KEY (a, b) REFERENCES fp(k, u) MATCH SIMPLE NOT DEFERRABLE INITIALLY IMMEDIATE)
+
+query TTTTTT nosort
+SELECT "table", "from", "to", on_update, on_delete, match FROM pragma_foreign_key_list('fc5') ORDER BY seq
+----
+12 values hashing to c2285547e6830581c07613c37c6300af
+
+statement error
+INSERT INTO fc5 VALUES (1, 'a')
