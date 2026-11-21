@@ -13320,13 +13320,15 @@ mod tests {
                 .unwrap()
         };
         let compact = |driven: &mut Driven, pump: &mut Pump<'_>| {
+            driven.quiet(pump);
             let owner = driven.owner_mut(0);
             let now = owner.now().unwrap();
-            owner
+            let out = owner
                 .replica
                 .compact(0, now, std::task::Waker::noop())
                 .unwrap();
-            quiet(driven, pump);
+            assert!(out, "no compaction went out");
+            driven.quiet(pump);
         };
         let applied = driven.owner(0).replica.applied();
         assert!(applied.index > flushed.index, "2 to 5 weren't applied past the flush");
