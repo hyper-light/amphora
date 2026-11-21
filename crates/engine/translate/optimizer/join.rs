@@ -924,7 +924,9 @@ fn join_lhs_and_rhs<'a>(
                                 // Materialize build-side rowids so the hash build only includes
                                 // rows that already match prior join constraints.
                                 *materialize_build_input = true;
-                                let materialize_cost = effective_build_cardinality * 0.003;
+                                // A row's visit each, at the row's learned cost (QT.5).
+                                let materialize_cost =
+                                    effective_build_cardinality * params.cpu_cost_per_row;
                                 hash_join_method.cost =
                                     hash_join_method.cost + Cost(materialize_cost);
                                 // When two materialized hash-join plans have equal cost,

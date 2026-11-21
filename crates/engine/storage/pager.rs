@@ -1852,6 +1852,22 @@ pub struct Pager {
     /// took (`learned_costs::Work::PageRead`); unset for a pager no database owns.
     learned_costs:
         std::sync::OnceLock<Arc<crate::translate::optimizer::learned_costs::LearnedCosts>>,
+    /// Amphora (QT.5): the pages `read_page` fetched and, of them, those it read from a file (the
+    /// database's or its log), counted since the pager was made; the planner prices its pages by
+    /// their recent share (`page_miss_ratio`).
+    page_fetches: AtomicU64,
+    page_file_reads: AtomicU64,
+    page_miss_window: Mutex<PageMissWindow>,
+}
+
+/// Amphora (QT.5): where the share of fetches that read a file is counted from: the counts at the
+/// start of the epoch under way and of the one before it. An epoch is as many fetches as the
+/// connection's cache holds pages, a turnover of the cache, so the share follows the latest one to
+/// two turnovers and leaves older fetches behind as the working set moves.
+#[derive(Debug, Clone, Copy, Default)]
+struct PageMissWindow {
+    previous: (u64, u64),
+    current: (u64, u64),
 }
 
 /// Retired record buffers kept per pager. Each holds a page-sized allocation.
@@ -2103,6 +2119,9 @@ impl Pager {
             page_cache: Arc::new(RwLock::new(page_cache)),
             io,
             learned_costs: std::sync::OnceLock::new(),
+            page_fetches: AtomicU64::new(0),
+            page_file_reads: AtomicU64::new(0),
+            page_miss_window: Mutex::new(PageMissWindow::default()),
             pending_reads: RwLock::new(HashMap::new()),
             has_pending_reads: AtomicBool::new(false),
             #[cfg(test)]
@@ -3922,6 +3941,7 @@ impl Pager {
             // rather than issuing duplicate IO.
             (pending.page, pending.disk_read, true)
         } else {
+            self.page_fetches.fetch_add(1, Ordering::Relaxed);
             // Fast path: cache hit.
             {
                 let page_key = PageCacheKey::new(page_idx as usize);
@@ -3960,6 +3980,11 @@ impl Pager {
                     (page, Some(c))
                 }
             };
+            // Amphora (QT.5): a fetch the shared pages served read no file; one with a read in
+            // flight did.
+            if c.is_some() {
+                self.page_file_reads.fetch_add(1, Ordering::Relaxed);
+            }
             (page, c, false)
         };
 
@@ -4023,6 +4048,25 @@ impl Pager {
             group,
             self.learned_costs.get().cloned(),
         )
+    }
+
+    /// Amphora (QT.5): the share of this pager's recent page fetches that read a file (the
+    /// window `PageMissWindow` keeps), or None before its first fetch. The planner prices a page
+    /// by it (`LearnedCosts::weights_at`).
+    pub(crate) fn page_miss_ratio(&self) -> Option<f64> {
+        let now = (
+            self.page_fetches.load(Ordering::Relaxed),
+            self.page_file_reads.load(Ordering::Relaxed),
+        );
+        let epoch = u64::try_from(self.cached_page_capacity().max(1)).unwrap_or(u64::MAX);
+        let mut window = self.page_miss_window.lock();
+        if now.0.saturating_sub(window.current.0) >= epoch {
+            window.previous = window.current;
+            window.current = now;
+        }
+        let fetches = now.0.saturating_sub(window.previous.0);
+        let reads = now.1.saturating_sub(window.previous.1).min(fetches);
+        (fetches > 0).then(|| reads as f64 / fetches as f64)
     }
 
     /// Amphora (QT.5): the database's cost estimator, which this pager's page reads inform. Set

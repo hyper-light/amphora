@@ -81,9 +81,6 @@ pub struct CostModelParams {
     /// (`Pager::statement_memory_budget`). Planning replaces the default, nothing, with it.
     pub statement_memory: usize,
 
-    /// Bonus subtracted from cost when using an index (encourages index usage).
-    pub index_bonus: f64,
-
     // === Sort Cost ===
     /// CPU cost per row for sorting (used in O(n log n) estimate).
     /// This is used when estimating the cost saved by using an ordered index.
@@ -136,7 +133,6 @@ impl CostModelParams {
             cpu_cost_per_seek: 0.01,
             cache_pages: 2000.0,
             statement_memory: 0,
-            index_bonus: 0.5,
 
             // Sort costs
             sort_cpu_per_row: 0.002,

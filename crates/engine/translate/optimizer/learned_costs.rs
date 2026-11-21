@@ -104,15 +104,38 @@ impl Rates {
         }
     }
 
-    fn weights(&self) -> Option<LearnedWeights> {
+    /// The weights, the planner's page priced at `miss` of its fetches reading the file
+    /// (`Pager::page_miss_ratio`) and the rest found in the page cache; None for `miss` prices every
+    /// page as a file read, the estimate of a cache that has served no fetch yet.
+    fn weights(&self, miss: Option<f64>) -> Option<LearnedWeights> {
         let row = self.row.nanos_per_unit()?;
+        let probe = self.hash_probe.nanos_per_unit()?;
         Some(LearnedWeights {
-            row_in_pages: self.page.nanos_per_unit().map(|page| row / page),
+            row_in_pages: self
+                .page
+                .nanos_per_unit()
+                .map(|page| row / page_fetch_nanos(page, probe, miss)),
             seek: self.seek.nanos_per_unit()? / row,
             hash_build: self.hash_build.nanos_per_unit()? / row,
-            hash_probe: self.hash_probe.nanos_per_unit()? / row,
+            hash_probe: probe / row,
             sort: self.sort.nanos_per_unit()? / row,
         })
+    }
+}
+
+/// What one of the planner's pages costs, in nanoseconds (QT.5): the planner counts the pages a
+/// plan touches from a cold cache (`cost::table_pages_fetched`, Mackert and Lohman), but a page the
+/// pager's cache holds is not read from the file: its fetch is a lookup of the page cache's hash
+/// table by page number (`PageCache::get`), timed as the hash probe. So a page costs `miss` file
+/// reads, the share of the connection's recent fetches that read the file, and `1 - miss` probes.
+/// Without that share (no fetch yet) every page is a file read.
+fn page_fetch_nanos(read: f64, probe: f64, miss: Option<f64>) -> f64 {
+    match miss {
+        Some(miss) if miss.is_finite() => {
+            let miss = miss.clamp(0.0, 1.0);
+            miss * read + (1.0 - miss) * probe
+        }
+        _ => read,
     }
 }
 
@@ -153,9 +176,16 @@ impl LearnedCosts {
         self.rates.lock().rate_mut(work).observe(units, nanos);
     }
 
-    /// The weights as they stand; None only if the clock never moved while calibrating.
+    /// The weights as they stand, every page priced as a file read; None only if the clock never
+    /// moved while calibrating.
     pub(crate) fn weights(&self) -> Option<LearnedWeights> {
-        self.rates.lock().weights()
+        self.rates.lock().weights(None)
+    }
+
+    /// The weights as they stand for a connection whose recent page fetches read the file `miss`
+    /// of the time (`Pager::page_miss_ratio`; None before its first fetch).
+    pub(crate) fn weights_at(&self, miss: Option<f64>) -> Option<LearnedWeights> {
+        self.rates.lock().weights(miss)
     }
 
     /// Anchors the page read's rate to `reads` page reads timed at open in `nanos`
@@ -490,6 +520,20 @@ mod tests {
         assert_eq!(after.hash_insert_cost, 20.0 / 128.0);
     }
 
+    /// Do: page reads timed at 100 ns and hash probes at 15 ns, then weigh the row for a
+    /// connection none of whose fetches read the file, one half of whose do, and one with no fetch
+    /// yet. Expect: the page priced at a probe, halfway, and at a read (T-QT.5.5: a cached page is
+    /// not charged as a file read).
+    #[test]
+    fn t_qt_5_5_a_cached_page_costs_a_cache_lookup_not_a_read() {
+        let costs = LearnedCosts::from_rates(fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0));
+        costs.anchor_page_read(1.0, 100.0);
+        assert_eq!(costs.weights_at(Some(0.0)).unwrap().row_in_pages, Some(2.0 / 15.0));
+        assert_eq!(costs.weights_at(Some(0.5)).unwrap().row_in_pages, Some(2.0 / 57.5));
+        assert_eq!(costs.weights_at(None).unwrap().row_in_pages, Some(2.0 / 100.0));
+        assert_eq!(costs.weights_at(Some(1.0)), costs.weights());
+    }
+
     /// Do: anchor the page read at 100 ns, as a database's open does, then read pages of its own
     /// at 400 ns each for one epoch. Expect: the row weighed against the anchor at first, then
     /// against the database's own reads alone (the anchor replaced, no fixed number left).
@@ -553,6 +597,6 @@ mod tests {
     #[test]
     fn t_qt_5_5_a_stopped_clock_gives_no_weights() {
         let rates = calibrate(&mut || 0.0);
-        assert_eq!(rates.weights(), None);
+        assert_eq!(rates.weights(None), None);
     }
 }

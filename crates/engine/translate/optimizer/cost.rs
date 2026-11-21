@@ -302,7 +302,7 @@ pub fn estimate_index_cost(
     let cpu_cost =
         input_cardinality * params.cpu_cost_per_seek + total_rows * params.cpu_cost_per_row;
 
-    Cost((io_cost + cpu_cost - params.index_bonus).max(0.001))
+    Cost(io_cost + cpu_cost)
 }
 
 pub(crate) fn is_unique_point_lookup(
@@ -852,12 +852,12 @@ mod tests {
         let cost = estimate_index_cost(100_000.0, 4.0, covering_index(), 200.0, 1.0, &held);
         let cpu = 200.0 * held.cpu_cost_per_seek + 200.0 * held.cpu_cost_per_row;
         let reads = table_pages_fetched(200.0, 1_000.0, 100_000.0) + 3.0;
-        assert!(((cost.0 + held.index_bonus - cpu) - reads).abs() < 1e-9);
+        assert!(((cost.0 - cpu) - reads).abs() < 1e-9);
         assert!(reads < 200.0, "{reads}");
         let none = DEFAULT_PARAMS.with_cache_pages(1);
         let uncached = estimate_index_cost(100_000.0, 4.0, covering_index(), 200.0, 1.0, &none);
         let per_search = 4.0 + 199.0 * (3.0 + none.cache_reuse_factor);
-        assert!(((uncached.0 + none.index_bonus - cpu) - per_search).abs() < 1e-9);
+        assert!(((uncached.0 - cpu) - per_search).abs() < 1e-9);
         assert!(cost < uncached);
     }
 
@@ -876,7 +876,7 @@ mod tests {
         let expected_tree_search_cost = 4.0 + 9.0 * repeated_tree_search_cost;
         let expected_cpu_cost =
             10.0 * DEFAULT_PARAMS.cpu_cost_per_seek + 10.0 * DEFAULT_PARAMS.cpu_cost_per_row;
-        let expected = expected_tree_search_cost + expected_cpu_cost - DEFAULT_PARAMS.index_bonus;
+        let expected = expected_tree_search_cost + expected_cpu_cost;
         assert!((cost.0 - expected).abs() < f64::EPSILON);
     }
 
@@ -895,8 +895,7 @@ mod tests {
         let expected_leaf_cost = 1.0 + 9.0 * DEFAULT_PARAMS.cache_reuse_factor;
         let expected_cpu_cost =
             10.0 * DEFAULT_PARAMS.cpu_cost_per_seek + 1_000.0 * DEFAULT_PARAMS.cpu_cost_per_row;
-        let expected = expected_tree_search_cost + expected_leaf_cost + expected_cpu_cost
-            - DEFAULT_PARAMS.index_bonus;
+        let expected = expected_tree_search_cost + expected_leaf_cost + expected_cpu_cost;
         assert!((cost.0 - expected).abs() < f64::EPSILON);
     }
 
