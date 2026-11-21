@@ -228,8 +228,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   G3 step 5, G3.5): two cores that name a point read's leaf without descending, each answer proven
   by the leaf's own range: InnoDB's adaptive hash index, built a leaf at a time by a ski rental
   counted in probes, and a learned rowid-to-leaf locator whose error bound is its own fit's. Built
-  and model-tested against a plain descent and on the engine's pages against the cursor (T-G3.5.1-3); not yet wired into the cursor
-  or measured (AC-G3.5.1, AC-G3.5.2; `descent_skip_bench` measures the cores).
+  and model-tested against a plain descent and on the engine's pages against the cursor (T-G3.5.1-3).
+  Wired into the cursor behind `AMPHORA_DESCENT_SKIP` = off | hash | locator (default off): a read
+  cursor's point seek stands on a named leaf clean in the connection's cache, stamped by the
+  connection's freed-page count and its snapshot; every other move descends first (T-G3.5.4). Not
+  yet measured (AC-G3.5.1, AC-G3.5.2: `bench/descent_skip.sh`).
 - **A shared page found in one lookup** (docs/design/store.md decision 22): the pool keeps each image
   in its map's entry and counts lookups in each shard, under the lock it holds anyway, where one
   count for the pool moved between 32 readers' cores at every lookup. Sharing 256 MiB at 32 clients:
@@ -421,10 +424,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   worst of the last thousand holds (`log_bound::GENERATION` gone; replication.md, "Decision (lane constants): a
   generation of restarts ends once it covers its spend"; GN.2); and the replicated owner's tick period is learned
   from its voters' round trips, its flushes, its leader's link and its timer by hyper-timing's law, 10 ms only the
-  start state before they are measured (replication.md, "Decision (lane constants): the owner's tick pace"; TP.1).
+  start state before they are measured (replication.md, "Decision (lane constants): the owner's tick pace"; TP.1); and the raft log is compacted by Ongaro's
+  rule at an expansion learned from the owner's own measured image and replay costs a byte, its machine reporting its
+  image's size (replication.md, "Decision (lane constants): the compaction's expansion learned where it runs"; CT.1); and a
+  command's and an image's envelope is what their encoding adds ("Decision (lane constants): an envelope is what its
+  encoding adds"; EN.1).
   Left: an owner's other descriptors (endpoint, engine files, a replica's log) charged by kind, the core's tick
   counts (twenty an election, two a heartbeat: raft-rs's defaults, fixed in tick mode), the owner's queue
-  and outgoing bounds and the log's compaction trigger, and the rest of the list (handoff/amphora-constants-list.md).
+  and outgoing bounds, and the rest of the list (handoff/amphora-constants-list.md).
 - **Region-local groups under a global root** (CP-T1.11, G14 step 1, lane regions; `crates/amphora/src/regions.rs`,
   docs/design/regions.md): members carry a region label; a regional group's voters and lead stay in its home
   region, and the root spreads its voters so losing the regions it survives leaves a quorum (CockroachDB's
@@ -733,6 +740,11 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   costs say the generic plan does as well; one whose estimates read none keeps its generic plan. Its
   TPC-H prepared measurement (AC-PL.12.1; its harness, `amphora-bench --planner --prepared` with
   qgen's parameters, is written: bench/planner/README.md) and the suite's (AC-PL.12.2) are open.
+  PL.13 is started (lane pl13, docs/design/planner.md "Decision (lane pl13)"): its two run-time
+  checks are built as pure cores with their tests (`optimizer/adaptive.rs`): a nested loop that turns
+  into a hash join at the learned costs' break-even, refused over its memory budget, and a
+  materialization point that asks for a new plan only past its estimate's own error. The executor's
+  shell that drives them, and JOB's 20 slowest queries against the parent (AC-PL.13.1), are open.
   PL.8 is started (docs/design/planner.md "Decision (lane pl8)"): a RIGHT JOIN led by one
   table is planned as its mirrored LEFT JOIN, CD-C's commutativity rule, so the tables after it are no
   longer held behind its right table and the audit's 03-right-full-barrier reads tiny first (T-PL.8.1);
@@ -765,6 +777,15 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   the cascade a loop with no fixed depth; integers, doubles, strings and nulls round-trip bit for
   bit (T-CS.3.1). Its decode benchmark (`cargo bench -p amphora-columnar --bench decode`) is not yet
   measured against [c18]'s 8 values a cycle.
+  Step 4 (CS.4, lane g11s4), built, not measured: `columns/scan.rs` scans the copy granule by
+  granule, a granule being one of its blocks decoded into column vectors, so its size is the block
+  size the sizer learns, now charged per row of the table so skipped granules count. Each carries
+  min/max and null counts per column and its key range and position; filters skip granules their
+  summaries exclude and run on whole vectors, as do COUNT, SUM (exact for reals), MIN, MAX and
+  group-by. Blocks no change touches are decoded once a generation. Every class equals the row
+  store's answer with writes between scans (T-CS.4.1, T-CS.4.2). Open: driving `Plan` from the
+  morsel executor once `vdbe/morsel.rs` (lane qs6) is on main, the planner's use (step 5), and the
+  benches against CedarDB and ClickHouse (AC-CS.4.1, AC-CS.4.2).
 
 ## Open
 

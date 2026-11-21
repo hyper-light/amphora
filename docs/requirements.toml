@@ -416,6 +416,9 @@ criteria = [
 ]
 tests = [
   { id = "T-PL.13.1", text = "A join whose build side outgrows its estimate mid-query — passes when it switches method within its memory bound and its answer is unchanged" },
+  # lane pl13
+  { id = "T-PL.13.2", text = "The switch fires once, at the first outer row whose count reaches the learned-cost switch point, never at the planner's estimate below it; its cost stays under twice the cheaper method in hindsight; over its memory budget it is refused with a typed error and the join stays a nested loop" },
+  { id = "T-PL.13.3", text = "A materialization point asks for a new plan only when its counted rows fall outside the estimate's band, estimate / (1 + error) to estimate x (1 + error); the rows it holds stay within their budget or are refused with a typed error" },
 ]
 
 # Amphora's own IDs for its query time (Amphora goal 7788ef29, kiln plan
@@ -612,6 +615,32 @@ tests = [
   { id = "T-TP.1.1", text = "Requests sent and answered in order, behind unanswered ones, and past the core's count for a lost peer — passes when only an unambiguous request's answer is sampled, at its own round trip" },
   { id = "T-TP.1.2", text = "A pace fed nothing, then a quorum and the timer, then a near and a far group's heartbeats — passes when it is the start state until the link is measured, then covers the measured election, the far group's period longer than the near one's and neither the start period" },
   { id = "T-TP.1.3", text = "The driven election, patience and lease tests — passes when each reads its owner's pace and none assumes 10 ms" },
+]
+
+[[own]]
+id = "CT.1"
+title = "The raft log's compaction due at an expansion learned where it runs, not a picked 128 MiB"
+criteria = [
+  { id = "AC-CT.1.1", text = "The replicated machine reports its image's bytes, so hyper-durable's compaction_due (Ongaro's thesis §5.1.2) weighs the log against the image it opened with, then the image it last made" },
+  { id = "AC-CT.1.2", text = "The owner times each image and each drive that applied entries on its own clock, per byte, with RFC 6298's decaying sums; the expansion is the image's cost over the replay's, raised to a whole factor (ski rental's break-even), one before both are measured; a stall compacts at once" },
+]
+tests = [
+  { id = "T-CT.1.1", text = "Nothing measured, one cost, samples of no time — passes when the factor is one" },
+  { id = "T-CT.1.2", text = "Images four times dearer a byte than replay, a third as dear, then dearer — passes when the factor is four, one, then follows the images up" },
+  { id = "T-CT.1.3", text = "A large and a tiny sample — passes when each weighs by its bytes" },
+  { id = "T-CT.1.4", text = "The driven compaction tests of database::replicated — passes when each compacts by the learned rule" },
+]
+
+[[own]]
+id = "EN.1"
+title = "A replicated command's and an image's envelope is what their encoding adds, not a picked mebibyte"
+criteria = [
+  { id = "AC-EN.1.1", text = "The bound past a command's or an image's page budget is postcard's most for its baseline prefix and declaration, its base, its page list's length and each page's id and length at the one page size admitted" },
+]
+tests = [
+  { id = "T-EN.1.1", text = "The widest prepared transaction at its whole budget — passes when it encodes within its bound, short only by the list length's unused varint bytes" },
+  { id = "T-EN.1.2", text = "The widest image at a lowered budget, and the full budget's arithmetic — passes the same" },
+  { id = "T-EN.1.3", text = "Postcard's varint widths and the declaration's — passes when each matches the encoder" },
 ]
 
 [[own]]
@@ -816,6 +845,19 @@ tests = [
   { id = "T-CS.3.1", text = "crates/columnar/tests/round_trip.rs — passes when every random and real-like column, of every size around the group and vector edges, decodes equal to the input in both codecs, every bit width packs and unpacks in both layouts, the schemes follow the data, and damaged encodings are refused" },
 ]
 
+# lane g11s4
+[[own]]
+id = "CS.4"
+title = "Vectorized scans with summaries on every core: granules sized by measurement, min/max and positional summaries, morsel-parallel scans (G11 step 4)"
+criteria = [
+  { id = "AC-CS.4.1", text = "filter_no_index at 1 client against CedarDB's is at least 1.0x (measured by the coordinator)" },
+  { id = "AC-CS.4.2", text = "table_count at 32 clients against ClickHouse's is at least 1.0x (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-CS.4.1", text = "cs4_vectors_equal_rows_every_class_{plain,packed} (crates/engine/storage/versioned/columns/scan.rs) — passes when, with writes between scans, some applied and some queued, rebuilds and held snapshots, every analytic class (filters of each comparison, aggregates, group-by, count) over the copy's granules equals the same statement row by row over the row B-tree, serially and split into partials merged in order, and the summaries skipped granules" },
+  { id = "T-CS.4.2", text = "cs4_min_max_summaries_skip_granules — passes when a filter outside granules' min/max skips them unread and the answer equals the rows'" },
+]
+
 # lane groupcommit (G8 step 3, the versioned storage's log; docs/design/engine.md decision 11): no new
 # IDs. It serves AC-T1.4.2 and AC-T1.4.3 (`amphora-bench --vlog`) and T-T1.3.1
 # (crates/engine/tests/versioned_crash.rs).
@@ -868,6 +910,8 @@ tests = [
   { id = "T-G3.5.1", text = "storage::descent_skip::tests::t_g3_5_1_* — passes when every lookup through the adaptive hash and the learned locator, under random inserts, deletes, splits and merges over pages two tables share, returns the row a plain descent returns" },
   { id = "T-G3.5.2", text = "storage::descent_skip::tests::t_g3_5_2_* — passes when, over a table's complete fences, the locator names the leaf a descent finds for every covered rowid" },
   { id = "T-G3.5.3", text = "storage::descent_skip::tests::engine::t_g3_5_3_* — passes when, on a real rowid table through committed rounds of inserts and range deletes, each prototype's page proven by its bytes gives the leaf and cell a cursor's descent stands on, or none when it finds none" },
+  # lane g3s5-2: the cursor hook.
+  { id = "T-G3.5.4", text = "storage::descent_skip::tests::engine::t_g3_5_4_* — passes when, through the real cursor on two connections writing in turns at different snapshots (inserts, splits, range deletes), every seek with each AMPHORA_DESCENT_SKIP setting stands on the leaf and cell, and returns the row, the plain descent does, every step after it reaches the same row, and the hook counts seeks that stood on a named leaf under both prototypes" },
 ]
 
 # lane regions (G14 step 1, CP-T1.11; docs/design/regions.md): no new IDs. It serves AC-T1.11.4
