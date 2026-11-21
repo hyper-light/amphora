@@ -404,13 +404,11 @@ impl SharedPages {
             hits: self.front_made().map_or(0, Frames::hits),
             ..Counts::default()
         };
-        self.shards
-            .iter()
-            .fold(front, |sum, cell| Counts {
-                hits: sum.hits.wrapping_add(cell.hits.load(Ordering::Relaxed)),
-                misses: sum.misses.wrapping_add(cell.misses.load(Ordering::Relaxed)),
-                added: sum.added.wrapping_add(cell.shard.read().added),
-            })
+        self.shards.iter().fold(front, |sum, cell| Counts {
+            hits: sum.hits.wrapping_add(cell.hits.load(Ordering::Relaxed)),
+            misses: sum.misses.wrapping_add(cell.misses.load(Ordering::Relaxed)),
+            added: sum.added.wrapping_add(cell.shard.read().added),
+        })
     }
 }
 

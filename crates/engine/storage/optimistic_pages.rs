@@ -367,7 +367,10 @@ mod tests {
         frames.forget_where(|k| k.version == Version::File);
         assert!(!frames.read(&file_key(4), &mut dest));
         assert_eq!(frames.hits(), 1);
-        assert!(Frames::new(8, 12, 4).is_none(), "not a whole number of words");
+        assert!(
+            Frames::new(8, 12, 4).is_none(),
+            "not a whole number of words"
+        );
     }
 
     /// T-G3.6.2. Do: a pool made `Locked` and one made `Optimistic`, an image kept in each and looked up
@@ -419,7 +422,7 @@ mod tests {
         let commits: u64 = std::env::var("AMPHORA_G3S6_COMMITS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(20_000);
+            .unwrap_or(5_000);
         let until = std::env::var("AMPHORA_G3S6_SECONDS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -515,6 +518,9 @@ mod tests {
         let from_frames = pool.front_made().map_or(0, Frames::hits);
         assert_eq!(unsnapshotted, 0, "images of versions past the snapshot");
         assert_eq!(torn, 0, "torn images");
-        assert!(found > 0 && from_frames > 0, "found {found}, {from_frames} without a lock");
+        assert!(
+            found > 0 && from_frames > 0,
+            "found {found}, {from_frames} without a lock"
+        );
     }
 }

@@ -15,7 +15,7 @@
 //! the readers' release take every slot, so no read is under way meanwhile.
 
 use std::cell::Cell;
-use std::sync::atomic::{fence, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering, fence};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::Instant;
 
@@ -40,12 +40,12 @@ impl ReadCheckout {
     pub fn process_default() -> Self {
         static FROM_ENV: std::sync::OnceLock<ReadCheckout> = std::sync::OnceLock::new();
         match PROCESS_DEFAULT.load(Ordering::Relaxed) {
-            UNSET => *FROM_ENV.get_or_init(|| {
-                match std::env::var("AMPHORA_READ_CHECKOUT").as_deref() {
+            UNSET => {
+                *FROM_ENV.get_or_init(|| match std::env::var("AMPHORA_READ_CHECKOUT").as_deref() {
                     Ok("slots") => Self::Slots,
                     _ => Self::Pool,
-                }
-            }),
+                })
+            }
             1 => Self::Slots,
             _ => Self::Pool,
         }
@@ -130,11 +130,14 @@ impl<R> Slots<R> {
         let len = self.slots.len();
         let first = thread_number().checked_rem(len).unwrap_or(0);
         let (earlier, from_first) = self.slots.split_at(first.min(len));
-        from_first.iter().chain(earlier).find_map(|slot| match slot.0.try_lock() {
-            Ok(guard) => Some(guard),
-            Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
-            Err(TryLockError::WouldBlock) => None,
-        })
+        from_first
+            .iter()
+            .chain(earlier)
+            .find_map(|slot| match slot.0.try_lock() {
+                Ok(guard) => Some(guard),
+                Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+                Err(TryLockError::WouldBlock) => None,
+            })
     }
 
     /// A slot: a free one at once, or the first given back before `until` (None past it).
@@ -189,10 +192,10 @@ impl<R> Slots<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{locked, Readers, Refused};
+    use super::super::{Readers, Refused, locked};
     use super::ReadCheckout;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{mpsc, Arc};
+    use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
 
     /// A reader: its number, and a flag set while a read uses it.
@@ -245,7 +248,10 @@ mod tests {
                             r.busy.store(false, Ordering::SeqCst);
                             Ok(was)
                         });
-                        assert!(!answer.unwrap().unwrap(), "a reader used by two reads at once");
+                        assert!(
+                            !answer.unwrap().unwrap(),
+                            "a reader used by two reads at once"
+                        );
                     }
                 })
             })
@@ -285,7 +291,14 @@ mod tests {
             std::thread::spawn(move || readers.with(far(), |_| Ok(7)))
         };
         // The waiter counts itself before it waits; let the holder go once it has.
-        while readers.slots.as_ref().unwrap().waiting.load(Ordering::SeqCst) == 0 {
+        while readers
+            .slots
+            .as_ref()
+            .unwrap()
+            .waiting
+            .load(Ordering::SeqCst)
+            == 0
+        {
             std::thread::yield_now();
         }
         hold_tx.send(()).unwrap();
@@ -308,7 +321,10 @@ mod tests {
             }
         });
         readers.release();
-        assert_eq!(dropped.load(Ordering::SeqCst), opened.load(Ordering::SeqCst));
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            opened.load(Ordering::SeqCst)
+        );
         assert!(readers.with(far(), |_| Ok(())).is_none());
     }
 }
