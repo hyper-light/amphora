@@ -361,10 +361,9 @@ fn nested_exists(depth: usize) -> String {
 }
 
 /// T-PL.10.1, depth. Do: EXISTS nested 1 to 24 deep, every level correlated with its parent and the
-/// outermost query. Expect: the same rows nested, forced and as planned, and the first level
-/// unnested. The levels below read the first level's semi-joined table, which the semi-join loops
-/// can't join further (`reads_semi_or_anti_joined_table`): they stay nested, depth bounded by the
-/// worklist, not by recursion.
+/// outermost query. Expect: the same rows nested, forced and as planned, and every level unnested:
+/// the worklist takes each level's subquery in its turn as the splice above brings it up, with no
+/// subquery left in the forced plan.
 #[test]
 fn t_pl10_1_nested_exists_unnest_level_by_level() {
     let dir = tempfile::tempdir().unwrap();
@@ -378,15 +377,9 @@ fn t_pl10_1_nested_exists_unnest_level_by_level() {
         assert_eq!(forced, nested, "depth {depth}: {sql}");
         assert_eq!(auto, nested, "depth {depth}: {sql}");
         let forced_plan = plan(&conn, SubqueryUnnestingMode::Forced, &sql);
-        assert_ne!(
-            forced_plan,
-            plan(&conn, SubqueryUnnestingMode::Disabled, &sql),
-            "depth {depth}: the first level not unnested"
-        );
-        assert_eq!(
-            forced_plan.contains("SUBQUERY"),
-            depth > 1,
-            "depth {depth}:\n{forced_plan}"
+        assert!(
+            !forced_plan.contains("SUBQUERY"),
+            "depth {depth} keeps a subquery:\n{forced_plan}"
         );
     }
 }
