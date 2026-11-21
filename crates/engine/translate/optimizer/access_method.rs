@@ -23,7 +23,6 @@ use crate::translate::plan::{
 };
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
 use crate::{
     schema::{FromClauseSubquery, Index, IndexColumn, Table},
     translate::plan::{IndexMethodQuery, IterationDirection, JoinOrderMember, JoinedTable},
@@ -1648,7 +1647,7 @@ pub fn try_hash_join_access_method(
         probe_cardinality,
         build_cardinality * estimated_rows_per_outer_row * probe_multiplier,
         hash_join_type,
-        DEFAULT_MEM_BUDGET,
+        params.statement_memory,
         probe_multiplier,
         params,
     );
@@ -1663,7 +1662,7 @@ pub fn try_hash_join_access_method(
             build_table_idx,
             probe_table_idx,
             join_keys: join_keys.into_vec(),
-            mem_budget: DEFAULT_MEM_BUDGET,
+            mem_budget: params.statement_memory,
             materialize_build_input: false,
             use_bloom_filter: false,
             join_type: hash_join_type,

@@ -89,6 +89,7 @@ mod cardinality;
 pub(crate) mod constraints;
 pub(crate) mod cost;
 mod cost_params;
+pub(crate) mod learned_costs;
 pub(crate) mod join;
 pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
@@ -1094,7 +1095,10 @@ fn find_select_plan_form(
     #[cfg(not(feature = "optimizer_params"))]
     let base: &cost_params::CostModelParams = &cost_params::DEFAULT_PARAMS;
     // Amphora: what a table lookup costs depends on the connection's cache (decision 5).
-    let params = &base.with_cache_pages(resolver.cache_pages());
+    let params = &base
+        .with_cache_pages(resolver.cache_pages())
+        .with_statement_memory(resolver.statement_memory())
+        .with_learned(resolver.learned_weights());
     plan.estimated_output_rows = None;
     plan.estimated_cost = None;
 
@@ -1316,10 +1320,13 @@ fn required_group_sort_and_read_cost(
 /// Amphora: the groups a GROUP BY over `target`'s columns makes, as ANALYZE counts the distinct
 /// values of an index of their one table that those columns lead, if a hash table of `num_accs`
 /// accumulators holds them within its budget (`docs/design/planner.md` decision 7). None when
-/// ANALYZE doesn't say or they don't fit: not supplying the order is then costed as a sort.
+/// ANALYZE doesn't say or they don't fit: not supplying the order is then costed as a sort. The
+/// budget is the statement's, `statement_memory` (executor decision 8): the most any one of its
+/// tables is given.
 fn estimate_hashed_groups(
     target: &OrderTarget,
     num_accs: usize,
+    statement_memory: usize,
     tables: &TableReferences,
     available_indexes: &AvailableIndexes,
     schema: &Schema,
@@ -1361,7 +1368,7 @@ fn estimate_hashed_groups(
     let room = crate::vdbe::group_table::groups_in_budget(
         leading,
         num_accs,
-        crate::vdbe::hash_table::DEFAULT_MEM_BUDGET,
+        statement_memory,
     ) as f64;
     if groups <= room {
         Some(groups)
@@ -2780,7 +2787,10 @@ fn find_table_access_plan(
     #[cfg(not(feature = "optimizer_params"))]
     let base: &cost_params::CostModelParams = &cost_params::DEFAULT_PARAMS;
     // Amphora: what a table lookup costs depends on the connection's cache (decision 5).
-    let params = &base.with_cache_pages(resolver.cache_pages());
+    let params = &base
+        .with_cache_pages(resolver.cache_pages())
+        .with_statement_memory(resolver.statement_memory())
+        .with_learned(resolver.learned_weights());
 
     if table_references.joined_tables().is_empty() {
         return Ok(None);
@@ -2950,6 +2960,7 @@ fn find_table_access_plan(
             target.hashed_groups = estimate_hashed_groups(
                 target,
                 num_accs,
+                params.statement_memory,
                 table_references,
                 available_indexes,
                 schema,

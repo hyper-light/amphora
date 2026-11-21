@@ -427,4 +427,5 @@ tests = [
   { id = "T-QT.5.2", text = "A build whose input outgrows its estimate tenfold — passes when it spills within its budget with its answer unchanged, and past the spill budget refuses with a typed error naming the budget" },
   { id = "T-QT.5.3", text = "Predicate transfer over a cyclic join graph and over an outer join (transfer in one direction only) — passes when identical results, and the filters' memory within the statement's stated bound" },
   { id = "T-QT.5.4", text = "TPC-H q01 and q06, which join nothing — passes when no filter built, times within the passes' spread of the parent's" },
+  { id = "T-QT.5.5", text = "The seek, hash-build, hash-probe and sort weights, learned per database (calibrated at start, moved by operators' times) — passes when calibration alone gives finite positive weights, observed times move a weight to the observed rate, and meaningless observations leave it" },
 ]
