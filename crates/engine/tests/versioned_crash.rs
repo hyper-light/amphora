@@ -180,11 +180,13 @@ fn one_seed(seed: u64, seen: &Seen) -> Result<(), String> {
     workload(seed, &dry, None);
     let ops = dry.operations();
     for at in 0..=ops {
-        let disk = Arc::new(Simulated::new(seed.wrapping_mul(ops + 1).wrapping_add(at), lanes).unwrap());
+        let disk =
+            Arc::new(Simulated::new(seed.wrapping_mul(ops + 1).wrapping_add(at), lanes).unwrap());
         let run = workload(seed, &disk, Some(at));
         disk.power_cut().unwrap();
-        let db = Database::open(disk.clone(), FRAMES, 1, cmp)
-            .map_err(|e| format!("crash at {at} of {ops}, {lanes} lanes: reopening refused: {e}"))?;
+        let db = Database::open(disk.clone(), FRAMES, 1, cmp).map_err(|e| {
+            format!("crash at {at} of {ops}, {lanes} lanes: reopening refused: {e}")
+        })?;
         let got = rows(&db);
         let mut state = Rows::new();
         let mut n = if got == state { Some(0) } else { None };
@@ -205,7 +207,8 @@ fn one_seed(seed: u64, seen: &Seen) -> Result<(), String> {
             ));
         };
         seen.recoveries.fetch_add(1, Ordering::Relaxed);
-        seen.checkpoints.fetch_add(run.checkpoints, Ordering::Relaxed);
+        seen.checkpoints
+            .fetch_add(run.checkpoints, Ordering::Relaxed);
         seen.acknowledged
             .fetch_add(run.acknowledged as u64, Ordering::Relaxed);
         if lanes > 1 {

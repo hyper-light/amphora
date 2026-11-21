@@ -538,7 +538,12 @@ impl Database {
                 allocated: self.v.pool.allocated(),
                 roots: self.v.roots(),
             };
-            (stamp, self.v.corrections(ts)?, self.v.pool.begin_copy()?, from)
+            (
+                stamp,
+                self.v.corrections(ts)?,
+                self.v.pool.begin_copy()?,
+                from,
+            )
         };
         // Off the commit path: writers go on, each keeping a page's bytes at the pause before its
         // first change of it.
@@ -913,12 +918,9 @@ mod tests {
                 }
                 prefixes.push(state.clone());
             }
-            let n = prefixes
-                .iter()
-                .position(|p| p == &got)
-                .unwrap_or_else(|| {
-                    panic!("crash {crash}, {lanes} lanes: rows match no prefix of the commits")
-                });
+            let n = prefixes.iter().position(|p| p == &got).unwrap_or_else(|| {
+                panic!("crash {crash}, {lanes} lanes: rows match no prefix of the commits")
+            });
             assert!(
                 n >= acknowledged,
                 "crash {crash}, {lanes} lanes: {n} commits recovered, {acknowledged} acknowledged"

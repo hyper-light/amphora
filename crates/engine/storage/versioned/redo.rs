@@ -306,7 +306,8 @@ impl Redo {
     /// timestamp): the turn switched from, which holds only commits up to now.
     pub fn switch(&self) -> usize {
         let from = self.turn.load(Ordering::Acquire);
-        self.turn.store(1usize.saturating_sub(from), Ordering::Release);
+        self.turn
+            .store(1usize.saturating_sub(from), Ordering::Release);
         from
     }
 
@@ -798,7 +799,10 @@ mod tests {
         );
         assert_eq!(merge(read(&disk).unwrap(), 2, 4).unwrap().newest, 6);
         trim(&disk, &replay.ends).unwrap();
-        assert_eq!((held(&disk, 0, 0), held(&disk, 1, 0)), (vec![1, 3], vec![2]));
+        assert_eq!(
+            (held(&disk, 0, 0), held(&disk, 1, 0)),
+            (vec![1, 3], vec![2])
+        );
     }
 
     /// Do: a lane whose records go back in time, and two lanes holding one commit. Expect: each

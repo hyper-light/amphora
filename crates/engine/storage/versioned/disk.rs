@@ -21,7 +21,10 @@ pub enum File {
     Journal,
     JournalNext,
     /// Lane `lane`'s redo files, `turn` 0 or 1 taking turns at checkpoints (decision 6).
-    Redo { lane: usize, turn: usize },
+    Redo {
+        lane: usize,
+        turn: usize,
+    },
 }
 
 /// The files ahead of the redo files.
@@ -522,7 +525,9 @@ mod tests {
         assert_eq!(d.read_at(lane3, 0, &mut buf).unwrap(), 3);
         assert_eq!(&buf, b"rec");
         let s = Simulated::new(1, 2).unwrap();
-        assert!(s.write_at(File::Redo { lane: 2, turn: 0 }, 0, b"x").is_err());
+        assert!(s
+            .write_at(File::Redo { lane: 2, turn: 0 }, 0, b"x")
+            .is_err());
         assert!(Simulated::new(1, 0).is_err() && Files::open(dir.path(), 0).is_err());
     }
 }
