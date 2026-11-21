@@ -108,10 +108,8 @@ impl Events {
     ) -> anyhow::Result<KeysIn> {
         let mut keys: Vec<(String, Pos)> = Vec::new();
         let (mut seen, mut last, mut done) = (0, None, true);
-        self.db.query(
-            IN_SPAN,
-            [sql_pos(span.lo()), sql_pos(span.hi())],
-            |r| {
+        self.db
+            .query(IN_SPAN, [sql_pos(span.lo()), sql_pos(span.hi())], |r| {
                 let key = r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
                 let pos = pos_of(r.get::<i64>(1).map_err(|e| anyhow::anyhow!("{e}"))?);
                 if !keep(pos) {
@@ -129,8 +127,7 @@ impl Events {
                     keys.push((key, pos));
                 }
                 Ok(true)
-            },
-        )?;
+            })?;
         keys.dedup();
         Ok((keys, last, done))
     }
@@ -282,7 +279,9 @@ impl Engine for Events {
                 let key = Value::from_text(m.key.clone());
                 let mut stamp = None;
                 db.query(STAMP, [key.clone()], |r| {
-                    stamp = Some(u64::try_from(r.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?)?);
+                    stamp = Some(u64::try_from(
+                        r.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?,
+                    )?);
                     Ok(false)
                 })?;
                 if !replays(stamp, m.entry) {
@@ -313,7 +312,11 @@ impl Engine for Events {
             (Some(p), Some(f)) => Some(p.min(f)),
             (_, f) => f,
         };
-        let trimmed = if pinned.is_some() { self.trimmed } else { self.head };
+        let trimmed = if pinned.is_some() {
+            self.trimmed
+        } else {
+            self.head
+        };
         let head = self.head;
         self.db.transaction(|db| {
             if pinned.is_none() {
@@ -347,10 +350,12 @@ impl Engine for Events {
 }
 
 const LOG: &str = "SELECT head, pinned, trimmed FROM log WHERE id = 1";
-const SAVE_LOG: &str = "INSERT OR REPLACE INTO log (id, head, pinned, trimmed) VALUES (1, ?1, ?2, ?3)";
+const SAVE_LOG: &str =
+    "INSERT OR REPLACE INTO log (id, head, pinned, trimmed) VALUES (1, ?1, ?2, ?3)";
 const FEED: &str = "INSERT INTO feed (seq, pos, key) VALUES (?1, ?2, ?3)";
 const DROP_FEED: &str = "DELETE FROM feed";
-const CHANGED: &str = "SELECT key, pos, seq FROM feed WHERE seq > ?1 AND seq <= ?2 AND pos >= ?3 AND pos <= ?4";
+const CHANGED: &str =
+    "SELECT key, pos, seq FROM feed WHERE seq > ?1 AND seq <= ?2 AND pos >= ?3 AND pos <= ?4";
 const IN_SPAN: &str = "SELECT key, pos FROM events WHERE pos >= ?1 AND pos <= ?2 ORDER BY pos, key";
 const SEQS: &str = "SELECT seq FROM events WHERE key = ?1";
 const STAMP: &str = "SELECT stamp FROM stamps WHERE key = ?1";
@@ -637,7 +642,15 @@ fn t_t1_9_r4_a_split_copies_the_moving_ranges_rows_and_a_merge_brings_them_back(
             at: 1 << 63,
         })
         .unwrap();
-    let ended = drive(dir.path(), &groups, &mut driver, out, &keys, &mut acked, &mut next);
+    let ended = drive(
+        dir.path(),
+        &groups,
+        &mut driver,
+        out,
+        &keys,
+        &mut acked,
+        &mut next,
+    );
     assert_eq!(ended, 1);
     assert_eq!(groups.len(), 2);
     let moved: Vec<&String> = keys
@@ -657,11 +670,22 @@ fn t_t1_9_r4_a_split_copies_the_moving_ranges_rows_and_a_merge_brings_them_back(
             into: GroupId(0),
         })
         .unwrap();
-    let ended = drive(dir.path(), &groups, &mut driver, out, &keys, &mut acked, &mut next);
+    let ended = drive(
+        dir.path(),
+        &groups,
+        &mut driver,
+        out,
+        &keys,
+        &mut acked,
+        &mut next,
+    );
     assert_eq!(ended, 1);
     assert_eq!(groups.len(), 1);
     assert!(groups.holding_of(GroupId(1)).is_none());
-    assert_eq!(groups.holding_of(GroupId(0)).unwrap().owned(), Some(Span::ALL));
+    assert_eq!(
+        groups.holding_of(GroupId(0)).unwrap().owned(),
+        Some(Span::ALL)
+    );
     every_key_in_its_group(&groups, &keys, &acked);
 }
 
@@ -808,7 +832,11 @@ fn lab_run(keys: usize, preload: usize, clients: usize, target: u64) -> LabRun {
                 .filter(|p| span.contains(*p))
                 .map(|p| (p, 1))
                 .collect();
-            let load: Vec<(Pos, u64)> = w.iter().copied().filter(|(p, _)| span.contains(*p)).collect();
+            let load: Vec<(Pos, u64)> = w
+                .iter()
+                .copied()
+                .filter(|(p, _)| span.contains(*p))
+                .collect();
             loads.push(GroupLoad {
                 group: g,
                 bytes: rows.len() as u64,
@@ -817,7 +845,14 @@ fn lab_run(keys: usize, preload: usize, clients: usize, target: u64) -> LabRun {
                 by_load: cut(&load),
             });
         }
-        let proposals = plan(&dirc, &[NodeRoom { node: NodeId(0), cores }], &loads);
+        let proposals = plan(
+            &dirc,
+            &[NodeRoom {
+                node: NodeId(0),
+                cores,
+            }],
+            &loads,
+        );
         if proposals.is_empty() {
             hot.fetch_add(keys.len() / 7 + 1, Ordering::Relaxed);
         }
