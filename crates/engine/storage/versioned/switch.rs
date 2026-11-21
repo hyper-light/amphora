@@ -15,6 +15,7 @@ use super::blink::{Comparator, Descender};
 use super::cursor::{Access, KeyOrder, SharedTxn, VersionedCursor};
 use super::disk::{Disk, Files, Simulated};
 use super::durable::Database as VDatabase;
+use super::version::Savepoint;
 use crate::error::LimboError;
 use crate::storage::page_cache::DEFAULT_PAGE_CACHE_SIZE_IN_PAGES;
 use crate::sync::{Arc, Mutex, OnceLock};
@@ -93,6 +94,9 @@ pub struct Switch {
     storage: Arc<Storage>,
     db: Arc<VDatabase>,
     txn: Mutex<Option<SharedTxn>>,
+    /// The savepoints of the write statements under way in the transaction, newest last: one a
+    /// statement, so bounded by the statements nested in one another.
+    statements: Mutex<Vec<Savepoint>>,
     d: Mutex<Descender>,
 }
 
@@ -102,6 +106,7 @@ impl Switch {
             db: storage.db.clone(),
             storage,
             txn: Mutex::new(None),
+            statements: Mutex::new(Vec::new()),
             d: Mutex::new(Descender::new()),
         }
     }
@@ -189,9 +194,42 @@ impl Switch {
         cursor.clear_rows()
     }
 
+    /// Opens a savepoint for a write statement in an explicit transaction (SQLite's statement
+    /// journal), so the statement can be undone alone (`AC-NS.2.3`'s savepoints).
+    pub fn begin_statement(&self) -> Result<()> {
+        let shared = self.txn()?;
+        let sp = shared
+            .lock()
+            .as_ref()
+            .ok_or_else(|| LimboError::TxError("versioned storage: no transaction".into()))?
+            .savepoint();
+        self.statements.lock().push(sp);
+        Ok(())
+    }
+
+    /// Ends the newest statement's savepoint: kept, or rolled back to (its changes undone, the
+    /// transaction's earlier ones kept).
+    pub fn end_statement(&self, rollback: bool) -> Result<()> {
+        let Some(sp) = self.statements.lock().pop() else {
+            return Ok(());
+        };
+        if !rollback {
+            return Ok(());
+        }
+        let Some(shared) = self.txn.lock().clone() else {
+            return Ok(());
+        };
+        let mut guard = shared.lock();
+        let Some(txn) = guard.as_mut() else {
+            return Ok(());
+        };
+        self.db.rollback_to(&mut self.d.lock(), txn, sp)
+    }
+
     /// Ends the connection's transaction, if one is open: commits it (durable before it returns),
     /// or rolls it back. A cursor still holding it is refused its next write.
     pub fn finish(&self, rollback: bool) -> Result<()> {
+        self.statements.lock().clear();
         let Some(shared) = self.txn.lock().take() else {
             return Ok(());
         };
