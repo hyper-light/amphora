@@ -201,6 +201,9 @@ pub struct Resolver<'a> {
     /// Amphora (QT.5): the cost weights the connection's database has learned
     /// (`optimizer::learned_costs`), set at prepare.
     learned_weights: Option<crate::translate::optimizer::learned_costs::LearnedWeights>,
+    /// Amphora (PL.7): the weights fitted to the database's measured statement times
+    /// (`optimizer::cost_fit`), set at prepare; None with the switch off.
+    fitted_weights: Option<crate::translate::optimizer::cost_fit::FittedWeights>,
     /// Amphora: the join methods the planner may choose (`Connection::set_join_methods`).
     join_methods: crate::JoinMethods,
     /// Amphora: whether the planner may choose a sorted fetch (`Connection::set_sorted_fetches`).
@@ -332,6 +335,7 @@ impl<'a> Resolver<'a> {
             plan_values: None,
             statement_memory: 0,
             learned_weights: None,
+            fitted_weights: None,
             join_methods: crate::JoinMethods::ByCost,
             sorted_fetches: false,
             has_temp_schema,
@@ -401,6 +405,20 @@ impl<'a> Resolver<'a> {
         self.learned_weights = weights;
     }
 
+    pub(crate) fn fitted_weights(
+        &self,
+    ) -> Option<crate::translate::optimizer::cost_fit::FittedWeights> {
+        self.fitted_weights
+    }
+
+    /// Amphora (PL.7): sets the fitted cost weights the planner reads over the learned ones.
+    pub(crate) fn set_fitted_weights(
+        &mut self,
+        weights: Option<crate::translate::optimizer::cost_fit::FittedWeights>,
+    ) {
+        self.fitted_weights = weights;
+    }
+
     pub(crate) fn join_methods(&self) -> crate::JoinMethods {
         self.join_methods
     }
@@ -442,6 +460,7 @@ impl<'a> Resolver<'a> {
             plan_values: self.plan_values.clone(),
             statement_memory: self.statement_memory,
             learned_weights: self.learned_weights,
+            fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
             sorted_fetches: self.sorted_fetches,
             has_temp_schema: self.has_temp_schema,
@@ -475,6 +494,7 @@ impl<'a> Resolver<'a> {
             plan_values: self.plan_values.clone(),
             statement_memory: self.statement_memory,
             learned_weights: self.learned_weights,
+            fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
             sorted_fetches: self.sorted_fetches,
             has_temp_schema: self.has_temp_schema,
