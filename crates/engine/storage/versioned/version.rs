@@ -1157,17 +1157,17 @@ fn pool_budget(frames: usize) -> u64 {
 }
 
 impl Versioned {
-    /// `trees` empty trees in a pool of `frames` pages.
+    /// `trees` empty trees in a pool of `frames` pages, tree `i` ordered by `cmp(i)`.
     pub fn new(
         frames: usize,
         trees: usize,
-        cmp: impl Fn() -> super::blink::Comparator,
+        cmp: impl Fn(usize) -> super::blink::Comparator,
     ) -> Result<Self> {
         let pool = Pool::new(frames);
         let mut made = Vec::with_capacity(trees);
-        for id in 0..trees {
-            let id = u64::try_from(id).map_err(|_| LimboError::IntegerOverflow)?;
-            made.push(VTree::new(id, Tree::create(&pool, cmp())?));
+        for i in 0..trees {
+            let id = u64::try_from(i).map_err(|_| LimboError::IntegerOverflow)?;
+            made.push(VTree::new(id, Tree::create(&pool, cmp(i))?));
         }
         Ok(Self {
             pool,
@@ -1195,16 +1195,16 @@ impl Versioned {
         self.validation
     }
 
-    /// The trees whose roots are `roots`, in `pool` (recovery).
+    /// The trees whose roots are `roots`, in `pool` (recovery), tree `i` ordered by `cmp(i)`.
     pub fn open(
         pool: Pool,
         roots: &[u64],
-        cmp: impl Fn() -> super::blink::Comparator,
+        cmp: impl Fn(usize) -> super::blink::Comparator,
     ) -> Result<Self> {
         let mut trees = Vec::with_capacity(roots.len());
-        for (id, &root) in roots.iter().enumerate() {
-            let id = u64::try_from(id).map_err(|_| LimboError::IntegerOverflow)?;
-            trees.push(VTree::new(id, Tree::open(root, cmp())));
+        for (i, &root) in roots.iter().enumerate() {
+            let id = u64::try_from(i).map_err(|_| LimboError::IntegerOverflow)?;
+            trees.push(VTree::new(id, Tree::open(root, cmp(i))));
         }
         let budget = pool_budget(pool.capacity());
         Ok(Self {
@@ -1650,7 +1650,7 @@ mod tests {
     use crate::sync::Arc;
 
     fn db() -> Versioned {
-        Versioned::new(20_000, 1, || Box::new(|a: &[u8], b: &[u8]| a.cmp(b))).unwrap()
+        Versioned::new(20_000, 1, |_| Box::new(|a: &[u8], b: &[u8]| a.cmp(b))).unwrap()
     }
 
     /// Do: a transaction changes a row and adds one while another, begun before, reads; then it

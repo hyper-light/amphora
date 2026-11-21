@@ -25,6 +25,7 @@
 use super::blink::{Comparator, Descender};
 use super::columns::Feed;
 use super::disk::{Disk, File};
+use super::overflow;
 use super::page::PAGE_SIZE;
 use super::pool::Pool;
 use super::redo::{self, Op, Redo};
@@ -214,11 +215,20 @@ pub struct Database {
     /// A column copy's feed, handed each commit's record under the publish lock (G11 decision 1,
     /// part 2): set once, by [`Database::keep_columns`].
     columns: std::sync::OnceLock<Arc<Feed>>,
+    /// The tree that holds large values' chunks ([`overflow`], `NS.2.2`): the one after the
+    /// `trees` the database was made with, ordered by bytes.
+    overflow: u64,
+}
+
+/// Orders the overflow tree's keys: by bytes, whatever the database's comparison.
+fn bytes_order() -> Comparator {
+    Box::new(|a: &[u8], b: &[u8]| a.cmp(b))
 }
 
 impl Database {
     /// The database `disk` holds, recovered (or made, with `trees` empty trees, if it holds
-    /// none), in a pool of `frames` pages.
+    /// none), in a pool of `frames` pages; its trees ordered by `cmp`, and after them the
+    /// overflow tree (`NS.2.2`). Reopened with the `trees` it was made with.
     pub fn open(
         disk: Arc<dyn Disk>,
         frames: usize,
@@ -265,7 +275,16 @@ impl Database {
             }
             pool.load(page, &buf)?;
         }
-        let v = Versioned::open(pool, &stamp.roots, cmp)?;
+        if stamp.roots.len() <= trees {
+            return Err(corrupt("fewer trees than the database was opened with"));
+        }
+        let v = Versioned::open(pool, &stamp.roots, |i| {
+            if i == trees {
+                bytes_order()
+            } else {
+                cmp()
+            }
+        })?;
         let mut d = Descender::new();
         for op in &list {
             v.tree(Self::tree_of(op))?
@@ -298,6 +317,7 @@ impl Database {
             gate: RwLock::new(()),
             last: Mutex::new(stamp.seq),
             columns: std::sync::OnceLock::new(),
+            overflow: u64::try_from(trees).map_err(|_| LimboError::IntegerOverflow)?,
         })
     }
 
@@ -308,7 +328,14 @@ impl Database {
         trees: usize,
         cmp: impl Fn() -> Comparator,
     ) -> Result<Self> {
-        let v = Versioned::new(frames, trees, cmp)?;
+        let all = trees.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+        let v = Versioned::new(frames, all, |i| {
+            if i == trees {
+                bytes_order()
+            } else {
+                cmp()
+            }
+        })?;
         let journal = Journal {
             stamp: Stamp {
                 seq: 0,
@@ -330,6 +357,7 @@ impl Database {
             gate: RwLock::new(()),
             last: Mutex::new(0),
             columns: std::sync::OnceLock::new(),
+            overflow: u64::try_from(trees).map_err(|_| LimboError::IntegerOverflow)?,
         })
     }
 
@@ -380,6 +408,18 @@ impl Database {
         self.v.clock.close(snap.start);
     }
 
+    /// A tree the caller may name: any but the overflow tree, whose rows are the database's own.
+    fn user_tree(&self, tree: u64) -> Result<u64> {
+        if tree == self.overflow {
+            return Err(LimboError::InternalError(format!(
+                "versioned storage: tree {tree} is the overflow tree"
+            )));
+        }
+        Ok(tree)
+    }
+
+    /// The row under `key` in `tree` as `snap` sees it, its chunks put back after its cell's
+    /// value (`NS.2.2`).
     pub fn get(
         &self,
         d: &mut Descender,
@@ -387,11 +427,44 @@ impl Database {
         tree: u64,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
-        self.v
+        let tree = self.user_tree(tree)?;
+        let Some(mut value) = self
+            .v
             .tree(tree)?
-            .get(&self.v.pool, d, &self.v.clock, snap, key)
+            .get(&self.v.pool, d, &self.v.clock, snap, key)?
+        else {
+            return Ok(None);
+        };
+        self.join(d, snap, tree, key, &mut value)?;
+        Ok(Some(value))
     }
 
+    /// Appends to `value`, a cell's value of the row under `key` in `tree`, the chunks `snap`
+    /// sees, if it continues in any (`NS.2.2`): chunk 0 on, to the first absent.
+    pub fn join(
+        &self,
+        d: &mut Descender,
+        snap: &Snapshot,
+        tree: u64,
+        key: &[u8],
+        value: &mut Vec<u8>,
+    ) -> Result<()> {
+        if !overflow::continues(key, value) {
+            return Ok(());
+        }
+        let chunks = self.v.tree(self.overflow)?;
+        for i in 0..=overflow::max_chunks(key)? {
+            let ck = overflow::chunk_key(tree, key, i);
+            match chunks.get(&self.v.pool, d, &self.v.clock, snap, &ck)? {
+                Some(chunk) => value.extend_from_slice(&chunk),
+                None => return Ok(()),
+            }
+        }
+        Err(corrupt("a row with more chunks than its longest value takes"))
+    }
+
+    /// Up to `most` rows of `tree` from `from` on as `snap` sees them, in key order, each with its
+    /// chunks put back (`NS.2.2`).
     pub fn scan(
         &self,
         d: &mut Descender,
@@ -400,11 +473,20 @@ impl Database {
         from: Option<&[u8]>,
         most: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.v
+        let tree = self.user_tree(tree)?;
+        let mut rows = self
+            .v
             .tree(tree)?
-            .scan(&self.v.pool, d, &self.v.clock, snap, from, most)
+            .scan(&self.v.pool, d, &self.v.clock, snap, from, most)?;
+        for (key, value) in &mut rows {
+            self.join(d, snap, tree, key, value)?;
+        }
+        Ok(rows)
     }
 
+    /// `txn` puts `value` under `key` in `tree`, its tail past a cell's room as chunks in the
+    /// overflow tree (`NS.2.2`), the previous row's chunks past the new one's removed: the row it
+    /// saw there before, if any, whole.
     pub fn put(
         &self,
         d: &mut Descender,
@@ -413,12 +495,59 @@ impl Database {
         key: &[u8],
         value: &[u8],
     ) -> Result<Option<Vec<u8>>> {
+        let tree = self.user_tree(tree)?;
+        let (head, chunks) = overflow::split(key, value)?;
         let _changing = self.gate.read();
-        self.v
+        let before = self
+            .v
             .tree(tree)?
-            .put(&self.v.pool, d, &self.v.clock, txn, key, value)
+            .put(&self.v.pool, d, &self.v.clock, txn, key, head)?;
+        let had = before.as_ref().is_some_and(|b| overflow::continues(key, b));
+        let mut before = before;
+        let store = self.v.tree(self.overflow)?;
+        let mut i = 0u32;
+        for chunk in chunks {
+            let ck = overflow::chunk_key(tree, key, i);
+            let old = store.put(&self.v.pool, d, &self.v.clock, txn, &ck, chunk)?;
+            if let (true, Some(b), Some(old)) = (had, before.as_mut(), old) {
+                b.extend_from_slice(&old);
+            }
+            i = i.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+        }
+        if had {
+            self.remove_chunks(d, txn, tree, key, i, before.as_mut())?;
+        }
+        Ok(before)
     }
 
+    /// `txn` removes the chunks of the row under `key` in `tree` from chunk `from` on, to the first
+    /// absent; each removed appended to `into`.
+    fn remove_chunks(
+        &self,
+        d: &mut Descender,
+        txn: &mut Txn,
+        tree: u64,
+        key: &[u8],
+        from: u32,
+        mut into: Option<&mut Vec<u8>>,
+    ) -> Result<()> {
+        let store = self.v.tree(self.overflow)?;
+        for i in from..=overflow::max_chunks(key)? {
+            let ck = overflow::chunk_key(tree, key, i);
+            match store.remove(&self.v.pool, d, &self.v.clock, txn, &ck)? {
+                Some(old) => {
+                    if let Some(b) = into.as_deref_mut() {
+                        b.extend_from_slice(&old);
+                    }
+                }
+                None => return Ok(()),
+            }
+        }
+        Err(corrupt("a row with more chunks than its longest value takes"))
+    }
+
+    /// `txn` removes the row under `key` in `tree` and its chunks (`NS.2.2`): the row it saw
+    /// there, if any, whole.
     pub fn remove(
         &self,
         d: &mut Descender,
@@ -426,10 +555,16 @@ impl Database {
         tree: u64,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
+        let tree = self.user_tree(tree)?;
         let _changing = self.gate.read();
-        self.v
+        let mut before = self
+            .v
             .tree(tree)?
-            .remove(&self.v.pool, d, &self.v.clock, txn, key)
+            .remove(&self.v.pool, d, &self.v.clock, txn, key)?;
+        if before.as_ref().is_some_and(|b| overflow::continues(key, b)) {
+            self.remove_chunks(d, txn, tree, key, 0, before.as_mut())?;
+        }
+        Ok(before)
     }
 
     /// Commits `txn`, logged; durable before it returns if `durable`, else once a later
@@ -636,7 +771,11 @@ mod tests {
                 db.commit(t, &mut d, true).unwrap();
                 db.checkpoint().unwrap();
             }
-            assert_eq!(db.v.pool.allocated(), 1, "the rows fit the root leaf");
+            assert_eq!(
+                db.v.pool.allocated(),
+                2,
+                "the rows fit the root leaf; page 2 is the overflow tree's root"
+            );
         }
         disk.write_at(File::Data, page_offset(1).unwrap(), &[0u8; PAGE_SIZE])
             .unwrap();
@@ -817,8 +956,31 @@ mod tests {
     /// last commit acknowledged durable (T-T1.3.1).
     #[test]
     fn a_crash_at_any_operation_recovers_a_prefix_of_commits() {
+        crash_recovers_prefixes((5..400).step_by(7), |_| 30);
+    }
+
+    /// Do: the crash workload above with values from a few bytes to several pages, so rows'
+    /// chunks in the overflow tree are written, replaced and removed by the commits, crashing at
+    /// each of many operations. Expect: each reopen's rows, chunks put back, exactly a prefix of
+    /// the commits at least as long as the last acknowledged durable (NS.2.2, T-T1.3.1).
+    #[test]
+    fn ns2_2_large_values_recover_a_prefix_at_any_crash() {
+        let room = overflow::inline_len(&[0]).unwrap();
+        crash_recovers_prefixes((5..800).step_by(13), move |seed| match seed % 4 {
+            0 => 30,
+            1 => room,
+            2 => room + 1 + usize::try_from(seed % 64).unwrap(),
+            _ => 3 * PAGE_SIZE + usize::try_from(seed % 997).unwrap(),
+        });
+    }
+
+    /// The crash workload: for each crash point, commits of puts (values of `len(seed)` bytes)
+    /// and removals, some durable, and checkpoints, on a disk that crashes after that many
+    /// operations; then a power cut and a reopen, whose rows must be a prefix of the commits at
+    /// least as long as the last acknowledged.
+    fn crash_recovers_prefixes(crashes: impl Iterator<Item = u64>, len: impl Fn(u64) -> usize) {
         let mut checked = 0;
-        for crash in (5..400).step_by(7) {
+        for crash in crashes {
             let disk = Arc::new(Simulated::new(crash));
             let mut commits: Vec<BTreeMap<Vec<u8>, Option<Vec<u8>>>> = Vec::new();
             let mut acknowledged = 0usize;
@@ -841,7 +1003,7 @@ mod tests {
                             }
                             changes.insert(k, None);
                         } else {
-                            let v = vec![u8::try_from(i).unwrap(); 30];
+                            let v = vec![u8::try_from(i).unwrap(); len(seed >> 40)];
                             if db.put(&mut d, &mut t, 0, &k, &v).is_err() {
                                 break 'run;
                             }
@@ -884,5 +1046,129 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 50);
+    }
+
+    /// The overflow tree's rows `snap` sees.
+    fn chunk_rows(db: &Database, snap: &Snapshot) -> usize {
+        let mut d = Descender::new();
+        db.v.tree(db.overflow)
+            .unwrap()
+            .scan(&db.v.pool, &mut d, &db.v.clock, snap, None, usize::MAX)
+            .unwrap()
+            .len()
+    }
+
+    /// Values of every length that matters under `key`: short, one short of the cell's room, the
+    /// room exactly, one past it, and several pages; each filled with `fill`.
+    fn lengths(key: &[u8], fill: u8) -> Vec<Vec<u8>> {
+        let room = overflow::inline_len(key).unwrap();
+        let per = overflow::chunk_len(key).unwrap();
+        [5, room - 1, room, room + 1, room + per, 5 * PAGE_SIZE + 3, 20_000]
+            .into_iter()
+            .map(|n| (0..n).map(|i| fill.wrapping_add(i as u8)).collect())
+            .collect()
+    }
+
+    /// Do: commit a row's value at every length that matters, from a few bytes to several pages
+    /// and back, keeping a snapshot open after each commit; read each snapshot by get and scan.
+    /// Expect: each snapshot reads the whole value committed before it; once the row is short
+    /// again and then removed, the newest snapshot sees no chunk rows (NS.2.2).
+    #[test]
+    fn ns2_2_values_past_a_page_read_at_every_snapshot() {
+        let db = Database::open(Arc::new(Simulated::new(21)), 2_000, 1, cmp).unwrap();
+        let mut d = Descender::new();
+        let key = b"big".to_vec();
+        let mut values = lengths(&key, 1);
+        values.extend(lengths(&key, 101).into_iter().rev());
+        let mut seen = Vec::new();
+        for v in &values {
+            let mut t = db.begin().unwrap();
+            db.put(&mut d, &mut t, 0, &key, v).unwrap();
+            db.put(&mut d, &mut t, 0, b"next", b"n").unwrap();
+            db.commit(t, &mut d, false).unwrap();
+            seen.push((db.snapshot().unwrap(), v.clone()));
+        }
+        for (snap, v) in &seen {
+            assert_eq!(db.get(&mut d, snap, 0, &key).unwrap().as_ref(), Some(v));
+            let all = db.scan(&mut d, snap, 0, None, usize::MAX).unwrap();
+            assert_eq!(all.len(), 2);
+            assert_eq!((&all[0].0, &all[0].1), (&key, v));
+        }
+        let last = seen.last().unwrap();
+        assert_eq!(chunk_rows(&db, &last.0), 0, "a short value leaves no chunks");
+        let long = &seen[5];
+        assert!(chunk_rows(&db, &long.0) > 2);
+        let mut t = db.begin().unwrap();
+        db.put(&mut d, &mut t, 0, &key, &long.1).unwrap();
+        assert_eq!(db.remove(&mut d, &mut t, 0, &key).unwrap(), Some(long.1.clone()));
+        db.commit(t, &mut d, false).unwrap();
+        let snap = db.snapshot().unwrap();
+        assert_eq!(db.get(&mut d, &snap, 0, &key).unwrap(), None);
+        assert_eq!(chunk_rows(&db, &snap), 0, "a removal removes its chunks");
+        assert!(db.get(&mut d, &snap, db.overflow, b"x").is_err());
+    }
+
+    /// Do: commit a long value; in a transaction replace it with a longer one, take a savepoint,
+    /// replace it with a short one and then a different long one, roll back to the savepoint;
+    /// then replace it again and abort. Expect: the transaction reads the longer value after the
+    /// rollback to its savepoint, and every snapshot after the abort the first long value, its
+    /// chunks as many as before (NS.2.2).
+    #[test]
+    fn ns2_2_rollback_and_savepoints_across_large_values() {
+        let db = Database::open(Arc::new(Simulated::new(22)), 2_000, 1, cmp).unwrap();
+        let mut d = Descender::new();
+        let key = b"k".to_vec();
+        let vals = lengths(&key, 7);
+        let (first, longer, other) = (&vals[4], &vals[6], &vals[5]);
+        let mut t = db.begin().unwrap();
+        db.put(&mut d, &mut t, 0, &key, first).unwrap();
+        db.commit(t, &mut d, false).unwrap();
+        let before = chunk_rows(&db, &db.snapshot().unwrap());
+        let mut t = db.begin().unwrap();
+        assert_eq!(db.put(&mut d, &mut t, 0, &key, longer).unwrap().as_ref(), Some(first));
+        let sp = t.savepoint();
+        assert_eq!(db.put(&mut d, &mut t, 0, &key, b"tiny").unwrap().as_ref(), Some(longer));
+        assert_eq!(db.put(&mut d, &mut t, 0, &key, other).unwrap().as_deref(), Some(&b"tiny"[..]));
+        db.rollback_to(&mut d, &mut t, sp).unwrap();
+        let mine = t.snapshot();
+        assert_eq!(db.get(&mut d, &mine, 0, &key).unwrap().as_ref(), Some(longer));
+        db.put(&mut d, &mut t, 0, &key, other).unwrap();
+        db.abort(t, &mut d).unwrap();
+        let snap = db.snapshot().unwrap();
+        assert_eq!(db.get(&mut d, &snap, 0, &key).unwrap().as_ref(), Some(first));
+        assert_eq!(chunk_rows(&db, &snap), before);
+    }
+
+    /// Do: commit long values durably, checkpoint with a transaction open that replaced one with
+    /// another long value, commit more long values durably, then cut the power and reopen.
+    /// Expect: every committed value whole, the open transaction's absent (NS.2.2, T-T1.3.1).
+    #[test]
+    fn ns2_2_large_values_survive_recovery() {
+        let disk = Arc::new(Simulated::new(23));
+        let mut want = BTreeMap::new();
+        {
+            let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
+            let mut d = Descender::new();
+            for (i, v) in lengths(b"a", 3).into_iter().enumerate() {
+                let mut t = db.begin().unwrap();
+                let k = vec![b'a', i as u8];
+                db.put(&mut d, &mut t, 0, &k, &v).unwrap();
+                db.commit(t, &mut d, true).unwrap();
+                want.insert(k, v);
+            }
+            let mut open = db.begin().unwrap();
+            db.put(&mut d, &mut open, 0, &[b'a', 5], &lengths(b"a", 9)[6]).unwrap();
+            db.checkpoint().unwrap();
+            for (i, v) in lengths(b"b", 4).into_iter().enumerate() {
+                let mut t = db.begin().unwrap();
+                let k = vec![b'b', i as u8];
+                db.put(&mut d, &mut t, 0, &k, &v).unwrap();
+                db.commit(t, &mut d, true).unwrap();
+                want.insert(k, v);
+            }
+        }
+        disk.power_cut().unwrap();
+        let db = Database::open(disk, 2_000, 1, cmp).unwrap();
+        assert_eq!(rows(&db), want);
     }
 }
