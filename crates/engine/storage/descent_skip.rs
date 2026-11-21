@@ -1775,6 +1775,21 @@ mod tests {
             assert!(l.hits > 0 && l.built > 0, "locator vacuous: {l:?}");
         }
 
+        /// Steps `cursor` forward (`step` 0) or back (1), else not at all, and reads the rowid it
+        /// reaches.
+        fn step_once(
+            pager: &Arc<Pager>,
+            cursor: &mut BTreeCursor,
+            step: u32,
+        ) -> Option<Option<i64>> {
+            match step {
+                0 => pager.io.block(|| cursor.next()).unwrap(),
+                1 => pager.io.block(|| cursor.prev()).unwrap(),
+                _ => return None,
+            }
+            Some(pager.io.block(|| cursor.rowid()).unwrap())
+        }
+
         /// T-G3.5.4: the cursor hook through the real cursor. Two connections to one WAL database
         /// take turns writing (random inserts, splits, range deletes freeing pages) while the
         /// other reads on at its older snapshot; on each connection a cursor with each switch
@@ -1786,7 +1801,6 @@ mod tests {
         #[test]
         fn t_g3_5_4_cursor_hook_matches_the_plain_descent() {
             use super::super::Switch;
-            use crate::storage::btree::CursorTrait;
 
             let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
             let db = Database::open_file(io, "descent_skip.db", Arc::new(SqliteDialect)).unwrap();
@@ -1852,12 +1866,7 @@ mod tests {
                         let want = pager.io.block(|| plain.seek(key(), op)).unwrap();
                         let want_at = plain.position().last().copied();
                         let want_row = pager.io.block(|| plain.rowid()).unwrap();
-                        let want_step = match step {
-                            0 => Some(pager.io.block(|| plain.next()).map(|_| ()).unwrap()),
-                            1 => Some(pager.io.block(|| plain.prev()).map(|_| ()).unwrap()),
-                            _ => None,
-                        }
-                        .map(|()| pager.io.block(|| plain.rowid()).unwrap());
+                        let want_step = step_once(&pager, &mut plain, step);
                         for (cursor, switch) in cursors.iter_mut().zip(switches) {
                             let got = pager.io.block(|| cursor.seek(key(), op)).unwrap();
                             let why = format!("round {round} reader {reader} {switch:?} {rowid}");
@@ -1868,12 +1877,7 @@ mod tests {
                                 want_row,
                                 "{why}"
                             );
-                            let got_step = match step {
-                                0 => Some(pager.io.block(|| cursor.next()).map(|_| ()).unwrap()),
-                                1 => Some(pager.io.block(|| cursor.prev()).map(|_| ()).unwrap()),
-                                _ => None,
-                            }
-                            .map(|()| pager.io.block(|| cursor.rowid()).unwrap());
+                            let got_step = step_once(&pager, cursor, step);
                             assert_eq!(got_step, want_step, "{why} step {step}");
                         }
                     }
