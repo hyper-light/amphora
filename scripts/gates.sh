@@ -12,4 +12,7 @@ gate cargo clippy --workspace --all-targets --locked --target aarch64-apple-darw
 gate cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings
 gate bash scripts/check-production.sh
 gate cargo test --workspace --locked
+# T-PL.10.1: nested against unnested answers reads the engine's simulator unnesting control, so the
+# test needs that feature (crates/engine/Cargo.toml) and the workspace run above skips it.
+gate cargo test -p amphora-engine --locked --features simulator --test unnesting
 gate python3 scripts/vendor.py check
