@@ -12,9 +12,9 @@
 //! - [`driver`]: each operation's steps, copy, then catch-up in rounds, then a fenced cutover,
 //!   as actions a shell carries out and answers.
 //!
-//! A key's position is its FNV-1a hash, as [`crate::groups`] spreads keys today
-//! (docs/design/store.md, decision 10), so a monotonic key (kiln's time-ordered ids) spreads over
-//! every group instead of piling onto the last.
+//! A key's position is its FNV-1a hash, finished so every byte reaches its high bits
+//! ([`position`]), so a monotonic key (kiln's time-ordered ids) spreads over every group instead of
+//! piling onto the last.
 
 pub mod directory;
 pub mod driver;
@@ -39,10 +39,21 @@ pub struct NodeId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub struct OpId(pub u64);
 
-/// `key`'s position.
+/// `key`'s position: its FNV-1a hash, finished by MurmurHash3's 64-bit finalizer (`fmix64`,
+/// Austin Appleby, SMHasher's `MurmurHash3.cpp`; its shifts and multipliers are that function's,
+/// not tuned here). Spans are runs of positions, so a position's high bits must depend on every
+/// byte of the key: FNV-1a's last multiply carries a change in the key's last byte only into its
+/// low bits and bits 40 to 56, so keys alike but for their ends (kiln's time-ordered ids, `k0` to
+/// `k19`) would all fall in one span. The finalizer is a bijection, so no two hashes meet that
+/// didn't already.
 #[must_use]
 pub fn position(key: &str) -> Pos {
-    crate::groups::fnv(key)
+    let mut h = crate::groups::fnv(key);
+    h ^= h.wrapping_shr(33);
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h.wrapping_shr(33);
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^ h.wrapping_shr(33)
 }
 
 /// Positions `lo` to `hi`, both included: never empty.

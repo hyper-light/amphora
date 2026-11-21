@@ -15,8 +15,10 @@ Amphora's groups and replicated owners is not built yet (see "What is left").
 
 ### The directory
 
-A key's position is its FNV-1a hash: the same hash `crate::groups` spreads keys by today
-(store.md, decision 10). Kiln's ids are time-ordered, so ordering groups by key would send every
+A key's position is its FNV-1a hash (store.md, decision 10) finished by MurmurHash3's
+64-bit finalizer (`fmix64`, SMHasher): spans cut by high bits, and FNV-1a alone leaves a change
+in a key's last byte out of its top bits, so `k0` to `k19` all fell in one quarter of the space
+(found by `tests/groups.rs` once `Groups` routed by spans). Kiln's ids are time-ordered, so ordering groups by key would send every
 new row to the last group, and no split could spread that load. Ordering by hash spreads them.
 A span is a run of positions, `lo` to `hi` inclusive. The directory keeps the spans in position
 order. Each span starts right after the one before it, the first at 0 and the last ending at
