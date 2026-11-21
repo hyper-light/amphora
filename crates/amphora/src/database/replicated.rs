@@ -36,7 +36,6 @@ const MESSAGE_BYTES: usize = crate::replication::COMMAND_BYTES.saturating_add(2 
 // twenty-tick randomized election and two-tick heartbeat use this owner clock, never host votes.
 const TICK: Duration = Duration::from_millis(10);
 const POLL: Duration = Duration::from_millis(1);
-const DRIVE_QUANTUM: usize = 32;
 // The admission charge of a change of members, a hand-off of the lead, a catch-up or an
 // attestation: the bytes the queued input itself takes, its place in the queue's byte budget (an
 // attestation's name is charged beside it). The response channel's own allocation is charged for
@@ -162,7 +161,7 @@ struct Control {
 }
 /// The readers of a replica's local reads (replication.md, "A local read on a replica"):
 /// connections of their own on the machine's database, each on what the machine committed when
-/// its read began. At most `readers` out at once, each charged to the process's page
+/// its read began. At most the descriptor budget's bound out at once, each charged to the process's page
 /// budget; one given back waits in the process's account for the next read (replication.md, "A
 /// replica's local readers bounded by derivation"). While the owner waits to start the database's
 /// log again, no read of this replica begins (replication.md, "A replica's database log").
@@ -176,12 +175,12 @@ struct Local {
     meter: Arc<ReplicaMeter>,
     /// The process's readers and the page budget they are charged to.
     account: Arc<Account>,
-    /// Readers out at once on this replica: the most clients that can be attached at once, each a
-    /// connection running one session at a time, so more readers than that can't be used by them;
-    /// a caller in the process past it waits. A connection holds a descriptor, so that is the
-    /// process's descriptor budget (`descriptors::process`, local-owner-transport.md, "One
-    /// descriptor budget"), read when the owner opens; the readers themselves hold none.
-    readers: usize,
+    /// Bounds the readers out at once on this replica: at most the clients that can be attached
+    /// at once, each a connection running one session at a time, so more readers than that can't
+    /// be used by them; a caller in the process past it waits. A connection holds a descriptor, so
+    /// that is the process's descriptor budget's bound as it stands at each read
+    /// (local-owner-transport.md, "One descriptor budget"); the readers themselves hold none.
+    descriptors: Arc<crate::descriptors::Descriptors>,
 }
 /// Every replica's local readers in the process, and the page budget they are charged to
 /// (replication.md, "A replica's local readers bounded by derivation").
@@ -290,14 +289,14 @@ impl Local {
         open: crate::store::Opener<Db>,
         meter: Arc<ReplicaMeter>,
         account: Arc<Account>,
-        readers: usize,
+        descriptors: Arc<crate::descriptors::Descriptors>,
     ) -> Self {
         Self {
             open: Mutex::new(Some(open)),
             id: account.next.fetch_add(1, Ordering::Relaxed),
             meter,
             account,
-            readers,
+            descriptors,
         }
     }
     /// `f` on a reader: this replica's idle one, one opened now on a charge, one opened after
@@ -325,7 +324,7 @@ impl Local {
                 self.took(&mut ledger)?;
                 break (Some(idle.reader), idle.charge, open);
             }
-            if !held && ledger.out.get(&self.id).copied().unwrap_or(0) < self.readers {
+            if !held && ledger.out.get(&self.id).copied().unwrap_or(0) < self.descriptors.bound() {
                 if let Some(charge) = self.account.pool.charge(pages) {
                     self.took(&mut ledger)?;
                     break (None, charge, open);
@@ -631,6 +630,9 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     clock: Clock,
     started: Instant,
     ticked: Instant,
+    // Whether this step's drive left more to drive without waiting for the log
+    // (`Driven::more`): the next step comes at once, without waiting for an input.
+    driving: bool,
     // The instant this owner last read from its clock: at its step's start, and again after a
     // preparation, whose work takes time of its own.
     at: Instant,
@@ -672,6 +674,9 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     turns: (u64, u64),
     #[cfg(test)]
     turn_context: Option<Vec<u8>>,
+    // The steps whose drive left more to drive (`driving`): read by tests.
+    #[cfg(test)]
+    drove_more: u64,
 }
 
 /// The flushes of the machine's database log, in every class (docs/design/replication.md, "Fast
@@ -1350,8 +1355,12 @@ fn open_on<F: BlockFile + 'static>(
     let group = GroupStore::claim(&log, 1).map_err(unavailable)?;
     let replica =
         Replica::open(&settings, group, machine, Bytes::new(512 << 20)).map_err(unavailable)?;
-    let readers = crate::descriptors::process()?.bound();
-    let local = Local::new(reader, Arc::clone(&meter), account(), readers);
+    let local = Local::new(
+        reader,
+        Arc::clone(&meter),
+        account(),
+        crate::descriptors::process()?,
+    );
     let control = Arc::new(Control {
         admitted: AtomicUsize::new(0),
         attesting: Mutex::new(None),
@@ -1411,12 +1420,15 @@ fn open_on<F: BlockFile + 'static>(
         turns: (0, 0),
         #[cfg(test)]
         turn_context: None,
+        #[cfg(test)]
+        drove_more: 0,
         detected: std::collections::BTreeSet::new(),
         gated: std::collections::BTreeSet::new(),
         class_proposed: None,
         clock,
         started: at,
         ticked: at,
+        driving: false,
         at,
     };
     actor.refresh()?;
@@ -1726,13 +1738,22 @@ impl<F: BlockFile + 'static> Actor<F> {
             }
         }
     }
-    /// The owner thread: each step after waiting up to `POLL` for an input.
+    /// The owner thread: each step after waiting up to `POLL` for an input, or at once while the
+    /// last step's drive left more to drive.
     fn run_loop(&mut self, receiver: &mpsc::Receiver<Envelope>) -> Result<(), Refusal> {
         loop {
-            let input = match receiver.recv_timeout(POLL) {
-                Ok(envelope) => Some(envelope),
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            let input = if self.driving {
+                match receiver.try_recv() {
+                    Ok(envelope) => Some(envelope),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+                }
+            } else {
+                match receiver.recv_timeout(POLL) {
+                    Ok(envelope) => Some(envelope),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                }
             };
             self.run_step(input)?;
         }
@@ -1784,21 +1805,27 @@ impl<F: BlockFile + 'static> Actor<F> {
                 locked(stalls)?.ticked(at);
             }
         }
-        for _ in 0..DRIVE_QUANTUM {
-            let mut output = Output::default();
-            let nanos = self.now()?;
-            let driven = self
-                .replica
-                .drive(nanos, std::task::Waker::noop(), &mut output)
-                .map_err(raft_error)?;
-            #[cfg(test)]
-            if let (Some(stalls), Some((submitted, taken))) = (&self.stalls, driven.flushed) {
-                locked(stalls)?.wrote(Duration::from_nanos(taken.saturating_sub(submitted)));
-            }
-            self.release(output)?;
-            if !driven.more {
-                break;
-            }
+        // One drive a step, which takes at most one `Ready` (hyper-durable's own quantum: its
+        // owner.rs, docs/durable.md section 7), and one input a step: the two take turns, the
+        // deficit round robin of Shreedhar and Varghese ("Efficient Fair Queuing Using Deficit
+        // Round Robin", SIGCOMM 1995, Theorem 4.5: fair within one unit when every quantum is at
+        // least the largest unit, here one `Ready`), so no count of drives is picked. A drive that
+        // leaves more steps again at once (`run_loop`).
+        let mut output = Output::default();
+        let nanos = self.now()?;
+        let driven = self
+            .replica
+            .drive(nanos, std::task::Waker::noop(), &mut output)
+            .map_err(raft_error)?;
+        #[cfg(test)]
+        if let (Some(stalls), Some((submitted, taken))) = (&self.stalls, driven.flushed) {
+            locked(stalls)?.wrote(Duration::from_nanos(taken.saturating_sub(submitted)));
+        }
+        self.release(output)?;
+        self.driving = driven.more;
+        #[cfg(test)]
+        if driven.more {
+            self.drove_more = self.drove_more.saturating_add(1);
         }
         self.answer_committed();
         self.flush()?;
@@ -9374,6 +9401,30 @@ mod tests {
         pump.finish();
     }
 
+    /// CP-T1.8, AC-DQ.1.1 (replication.md, "Decision (lane constants): one drive a step"): an
+    /// owner drives once a step and, while that drive leaves more, steps again at once, so no
+    /// count of drives a step is picked. Do: three members, an election, 20 writes at the leader,
+    /// each step on driven time. Expect: every write answered; some step left more to drive for
+    /// the next (a step that drives until nothing is left, as the 32 drives a step did short of
+    /// their count, leaves none).
+    #[test]
+    fn an_owner_drives_once_a_step_and_steps_again_while_more_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        for value in 1..=20 {
+            write(&mut driven, &mut pump, &clients[leader], value);
+        }
+        let more: u64 = (0..3).map(|owner| driven.owner(owner).drove_more).sum();
+        assert!(more > 0, "no step left more to drive");
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
     /// CP-T1.8 (amphora-seam-owner-2, amphora-owner-t1-constants-721acf2-20261112): an owner's own
     /// session that reaches its lease at its barrier while its member still leads its term is
     /// counted. Do, in a group of three voters: the leader binds kiln.host-store 7 and its keeper
@@ -12413,7 +12464,7 @@ mod tests {
                 db.opener(),
                 Arc::new(ReplicaMeter::default()),
                 Arc::clone(&account),
-                crate::descriptors::process().unwrap().bound(),
+                crate::descriptors::process().unwrap(),
             ));
             (db, local)
         };

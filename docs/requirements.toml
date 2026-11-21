@@ -420,12 +420,22 @@ tests = [
 id = "FD.1"
 title = "One descriptor budget a process: connections bounded by the system's descriptor limit, not a picked 32"
 criteria = [
-  { id = "AC-FD.1.1", text = "No count of connections: each accepted connection charges its socket to the process's descriptor budget (the soft RLIMIT_NOFILE less the descriptors open when first read; 2^24 handles on Windows), and one past it is closed unserved with a typed refusal at the client" },
+  { id = "AC-FD.1.1", text = "No count of connections: each accepted connection charges its socket to the process's descriptor budget (the soft RLIMIT_NOFILE as it stands, read at every charge, less the descriptors open outside the budget, counted again when the limit moves, a charge would be refused or the system refuses one; 2^24 handles on Windows), and one past it is closed unserved with a typed refusal at the client" },
   { id = "AC-FD.1.2", text = "The listener's backlog is the system's own most (SOMAXCONN semantics), and the listener goes on when the system refuses a descriptor (EMFILE, ENFILE, WSAEMFILE)" },
   { id = "AC-FD.1.3", text = "A replica's local readers out at once are at most the budget's bound (AC-T1.10.L2)" },
 ]
 tests = [
   { id = "T-FD.1.1", text = "A budget of 3 asked for one, two, then one more — passes when the fourth is refused TooLarge naming what it was for, 4 past 3, and two more are held once two are given back" },
-  { id = "T-FD.1.2", text = "The process's budget read on Unix — passes when it has room, under the soft RLIMIT_NOFILE by stdin, stdout and stderr at least" },
+  { id = "T-FD.1.2", text = "The process's budget on Unix, its soft RLIMIT_NOFILE raised by one while it runs and put back — passes when it has room under the limit by stdin, stdout and stderr at least, and its limit follows the raise and the return at its next charge" },
   { id = "T-FD.1.3", text = "A budget of 1, an owner, one client served and kept, a second asked, the first let go, a third asked — passes when the second is turned away before any challenge and the third is served" },
+]
+
+[[own]]
+id = "DQ.1"
+title = "The replicated owner drives once a step, taking turns with its inputs, not a picked 32 drives"
+criteria = [
+  { id = "AC-DQ.1.1", text = "One drive a step, and a step whose drive left more comes again at once without waiting for an input: deficit round robin of inputs and drives, one unit each (Shreedhar and Varghese 1995, Theorem 4.5)" },
+]
+tests = [
+  { id = "T-DQ.1.1", text = "Three members, an election and 20 writes on driven time — passes when every write is answered and some step left more to drive for the next" },
 ]

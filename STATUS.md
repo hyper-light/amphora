@@ -264,8 +264,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   voters and a change's charge follow from what they bound; an owner's own session lasts its role's raft timing; and
   an owner's connections are bounded by the process's descriptor budget, the system's limit less what is open
   (local-owner-transport.md, "Decision (lane constants): one descriptor budget"; FD.1), with a replica's local
-  readers following it. Left: the owners' descriptors charged to the same budget (`OWNERS_MAX`), the replicated
-  owner's tick, poll and drive quantum, and the rest of the list (handoff/amphora-constants-list.md).
+  readers following it; the replicated owner drives once a step, in turn with its inputs (replication.md, "Decision
+  (lane constants): one drive a step"; DQ.1). Left: the owners' descriptors charged to the same budget
+  (`OWNERS_MAX`), the replicated owner's tick and poll, and the rest of the list (handoff/amphora-constants-list.md).
 
 ## Measured
 

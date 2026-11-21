@@ -407,13 +407,20 @@ for each, and with a named Windows source.
 system refuses a descriptor past the process's limit (`EMFILE`), so that limit is what bounds connections.
 
 **The decision.**
-1. **One budget a process** (`crates/amphora/src/descriptors.rs`): the system's limit less the descriptors open
-   when it is first asked for. The limit is the soft `RLIMIT_NOFILE` (POSIX `getrlimit`). With none set
-   (`RLIM_INFINITY`) nothing here bounds them, and the kernel's own ceiling (Linux's `fs.nr_open`) refuses past it.
-   Those open are counted from `/dev/fd` (Linux's link to `/proc/self/fd`; macOS's fdesc). On Windows a process sets
-   no descriptor limit: its handle table holds at most 2^24 handles, and Winsock's sockets come out of the same
-   table (Russinovich; `WSADATA::iMaxSockets` is ignored since Winsock 2). Windows says a process's open handles
-   only through `GetProcessHandleCount`, which needs `unsafe` (CLAUDE.md section 12), so none are counted there.
+1. **One budget a process, the system's as it stands** (`crates/amphora/src/descriptors.rs`): the system's limit
+   less the descriptors open outside the budget. Nothing is read once and kept (Ada, 2026-11-21: a value measured
+   once and frozen is a picked constant). The limit is read again at every charge, so a host that raises it while
+   it runs is followed. What is open outside (the host's own, the owners' files) is counted again whenever the
+   limit moves, whenever a charge would be refused (the host may have let some go), and whenever the system refuses
+   a descriptor the budget allowed (`EMFILE` at `accept`). The limit is the soft `RLIMIT_NOFILE` (POSIX
+   `getrlimit`). With none set (`RLIM_INFINITY`) nothing here bounds them, and the kernel's own ceiling (Linux's
+   `fs.nr_open`) refuses past it. Those open are counted from `/dev/fd` (Linux's link to `/proc/self/fd`; macOS's
+   fdesc). A charge between a count's two readings leaves that count off by it once: one too many refuses a charge
+   until the next count (which the refusal itself makes), one too few meets the system's own refusal (item 4). On
+   Windows a process sets no descriptor limit: its handle table holds at most 2^24 handles, a structural limit of
+   the system, and Winsock's sockets come out of the same table (Russinovich; `WSADATA::iMaxSockets` is ignored
+   since Winsock 2). Windows says a process's open handles only through `GetProcessHandleCount`, which needs
+   `unsafe` (CLAUDE.md section 12), so none are counted there.
 2. **A connection charges its socket.** Each accepted connection takes one descriptor from the budget before its
    worker starts, and gives it back when the worker ends. Past the budget the connection is closed unserved, and the
    client gets a typed refusal before submission, as before. No count of connections is left.
@@ -423,15 +430,17 @@ system refuses a descriptor past the process's limit (`EMFILE`), so that limit i
    descriptor of this process until it is accepted.
 4. **The system refusing first is not fatal.** Descriptors no budget charges (the host's own, the owners' files) come
    out of the same limit, so `accept` can meet `EMFILE`/`ENFILE` (`WSAEMFILE` on Windows) before the budget is
-   spent. The listener then leaves the connection queued and goes on; before this change it stopped for good.
+   spent. The listener then counts again what is open outside the budget, leaves the connection queued and goes
+   on; before this change it stopped for good.
 5. **The local readers follow.** A replica's readers out at once are at most the clients that can be attached at
-   once (replication.md's reasoning, unchanged): now the budget's bound, read when the owner opens. Readers hold no
+   once (replication.md's reasoning, unchanged): now the budget's bound as it stands at each read. Readers hold no
    descriptor (`a_local_reader_opens_no_file`), so they charge none; their pages stay charged to the page budget,
    which is what bounds them in practice.
 
 **Tests.**
 - `descriptors::tests::a_budget_holds_its_bound_and_takes_back_what_is_given` (T-FD.1.1).
-- `descriptors::tests::the_process_budget_is_the_systems_limit_less_what_is_open` (T-FD.1.2).
+- `descriptors::tests::the_process_budget_follows_the_systems_limit` (T-FD.1.2): the soft limit raised by one while
+  the process runs, and put back; the budget's limit follows both at its next charge.
 - `transport::common::tests::an_owners_connections_are_bounded_by_the_descriptor_budget` (T-FD.1.3): under a
   budget of 1, a second client is turned away while the first is served, and served once the first's descriptor is
   given back. With the old count of 32, the second was served.

@@ -1634,7 +1634,7 @@ a read answered past its deadline.
 **Amendment (lane constants, 2026-11-21): the count follows the descriptor budget.** `CONNECTION_MAX` is gone
 (local-owner-transport.md, "Decision (lane constants): one descriptor budget"). Connections are bounded by the
 process's descriptor budget, each holding its socket, so the most clients that can be attached at once is the
-budget's bound, and a replica's readers out at once are at most that, read when the owner opens. Nothing else in this
+budget's bound, and a replica's readers out at once are at most that, as it stands at each read. Nothing else in this
 decision changes: readers hold no descriptor and charge none, their pages are charged to the page budget, and a read
 past either waits to its deadline. Where `CONNECTION_MAX` is named above, read the budget's bound. AC-T1.10.L2 and
 T-T1.10.L8 say so; the test sets a budget of its own (6) and holds six readers out, the seventh waiting.
@@ -2114,3 +2114,29 @@ Falsified by:
   (bench/records/2026-11-07-write-starve-model.md) at the release benchmarks' rates and round trips;
 - a leader that holds its writes past a member's learned length for a write that never comes, or at all for a
   member that never comes back after its refusal.
+
+## Decision (lane constants): one drive a step (2026-11-21)
+
+Ada's rule: no picked numbers. `DRIVE_QUANTUM` (32) bounded how many times one step of the owner drove its replica
+while the drive said there was more to do (`Driven::more`). No measurement made 32.
+
+**What it bounds.** One step of the owner takes one input, ticks if a tick is due, drives, then keeps what waits
+(deadlines, the floor, the class, the slots). A drive takes at most one `Ready` and applies at most one page
+(hyper-durable's own quantum: its `owner.rs`, docs/durable.md section 7). Drives and inputs compete for the owner's
+thread: a long run of drives holds inputs back, a short one holds the replica's work back.
+
+**The decision.** One drive a step, and a step whose drive left more comes again at once, without waiting for an
+input (`Actor::driving`, `run_loop`). The input queue and the replica's drives then take turns one unit each: deficit
+round robin with every quantum at least the largest unit (one `Ready`), which Shreedhar and Varghese prove fair to
+within one unit ("Efficient Fair Queuing Using Deficit Round Robin", SIGCOMM 1995, Theorem 4.5). It is also how
+hyper-durable's own owner turns its replicas. No count is left.
+
+**Cost.** A step's keeping (expiry, settling, the status it publishes) now runs once a drive where it ran once per
+up to 32. `more` is true only while a write slot is free and a `Ready` is due, or while applies wait past a drive's
+page, so the runs are short (the core's depth is 1). The batch's replicated benches measure it.
+
+**Test.** `an_owner_drives_once_a_step_and_steps_again_while_more_waits` (T-DQ.1.1): over an election and 20 writes,
+some step leaves more to drive for the next. A step that drives until nothing is left leaves none.
+
+**Falsified by:** an input waiting more than one drive while the replica has more to drive; the replicated benches'
+commit latency or throughput worse than at 4e74cee beyond their noise.

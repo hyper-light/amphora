@@ -285,6 +285,11 @@ impl Owner {
                         // and the listener goes on.
                         Err(error) if out_of_descriptors(&error) => {
                             tracing::debug!(target: "amphora.transport", event = "connection_refused", reason = "connection_limit", %error);
+                            // More is open outside the budget than it last counted.
+                            if let Err(error) = descriptors.refused_by_system() {
+                                tracing::error!(target: "amphora.transport", event = "listener_failed", %error);
+                                break;
+                            }
                             thread::park_timeout(Duration::from_millis(10))
                         }
                         Err(error) => {

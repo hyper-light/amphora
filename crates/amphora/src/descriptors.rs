@@ -1,17 +1,25 @@
 //! The process's descriptor budget (docs/design/local-owner-transport.md, "One descriptor budget"):
-//! the file descriptors this process may still open, read once from the system's own limit, that
+//! the file descriptors this process may still open, from the system's own limit as it stands, that
 //! what Amphora holds open charges as it opens it. Connections accepted by the local owners charge
 //! one each (their socket), so no count of connections is picked: the system's limit is the bound.
 //!
-//! [`Descriptors`] is the pure count; [`process`] reads the system once.
+//! Nothing is read once and kept: the limit is read again at every charge (a host may raise it while
+//! it runs), and the descriptors open outside the budget (the host's own, the owners' files) are
+//! counted again whenever the limit moves, a charge would be refused, or the system refuses a
+//! descriptor the budget allowed (`EMFILE`).
 
 use amphora_api::Refusal;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-/// A count of descriptors that may be held at once, and those held now.
+/// The descriptors that may be held at once against what the system allows, and those held now.
 pub(crate) struct Descriptors {
-    bound: usize,
+    /// The system's, read again as it runs; or a test's fixed limit, with nothing open outside.
+    system: bool,
+    /// The limit as last read.
+    limit: AtomicUsize,
+    /// The descriptors open that this budget doesn't hold, as last counted.
+    outside: AtomicUsize,
     held: AtomicUsize,
 }
 
@@ -22,16 +30,35 @@ pub(crate) struct Held {
 }
 
 impl Descriptors {
-    pub(crate) fn new(bound: usize) -> Arc<Self> {
+    /// The system's budget: its limit and what is open now.
+    fn system() -> Result<Arc<Self>, String> {
+        let budget = Arc::new(Self {
+            system: true,
+            limit: AtomicUsize::new(limit()),
+            outside: AtomicUsize::new(0),
+            held: AtomicUsize::new(0),
+        });
+        budget.recount()?;
+        Ok(budget)
+    }
+
+    /// A budget of `limit` descriptors with none open outside it: a test's.
+    #[cfg(test)]
+    pub(crate) fn fixed(limit: usize) -> Arc<Self> {
         Arc::new(Self {
-            bound,
+            system: false,
+            limit: AtomicUsize::new(limit),
+            outside: AtomicUsize::new(0),
             held: AtomicUsize::new(0),
         })
     }
 
-    /// The most descriptors that may be held at once.
+    /// The most descriptors this budget may hold at once, as it last saw the system: its limit
+    /// less what is open outside it.
     pub(crate) fn bound(&self) -> usize {
-        self.bound
+        self.limit
+            .load(Ordering::Acquire)
+            .saturating_sub(self.outside.load(Ordering::Acquire))
     }
 
     /// The descriptors held now.
@@ -40,24 +67,67 @@ impl Descriptors {
         self.held.load(Ordering::Acquire)
     }
 
-    /// `count` more held, refused typed (`what`, past the bound) when they would pass it.
+    /// `count` more held, refused typed (`what`, past the bound) when they would pass it. The
+    /// system's limit is read first, and what is open outside counted again if it moved; a charge
+    /// that would be refused is tried once more after a fresh count, since the host may have let
+    /// descriptors go.
     pub(crate) fn take(self: &Arc<Self>, what: &str, count: usize) -> Result<Held, Refusal> {
+        if self.system {
+            let now = limit();
+            if self.limit.swap(now, Ordering::AcqRel) != now {
+                self.recount().map_err(Refusal::Unavailable)?;
+            }
+        }
+        let held = match self.try_take(count) {
+            Ok(()) => Ok(()),
+            Err(_) if self.system => {
+                self.recount().map_err(Refusal::Unavailable)?;
+                self.try_take(count)
+            }
+            Err(past) => Err(past),
+        };
+        held.map_err(|past| Refusal::TooLarge {
+            what: what.into(),
+            size: past,
+            limit: self.bound(),
+        })?;
+        Ok(Held {
+            budget: Arc::clone(self),
+            count,
+        })
+    }
+
+    /// The system refused a descriptor this budget allowed (`EMFILE`): more is open outside it
+    /// than last counted, so it is counted again.
+    pub(crate) fn refused_by_system(&self) -> Result<(), Refusal> {
+        if self.system {
+            self.recount().map_err(Refusal::Unavailable)?;
+        }
+        Ok(())
+    }
+
+    /// `count` more held if within the bound; else what the held would come to.
+    fn try_take(&self, count: usize) -> Result<(), usize> {
         let mut past = 0;
         self.held
             .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                 let after = held.checked_add(count);
                 past = after.unwrap_or(usize::MAX);
-                after.filter(|after| *after <= self.bound)
+                after.filter(|after| *after <= self.bound())
             })
-            .map_err(|_| Refusal::TooLarge {
-                what: what.into(),
-                size: past,
-                limit: self.bound,
-            })?;
-        Ok(Held {
-            budget: Arc::clone(self),
-            count,
-        })
+            .map(drop)
+            .map_err(|_| past)
+    }
+
+    /// What is open outside the budget, counted now: what the process holds less what the budget
+    /// does. A charge or give-back between the two readings makes it off by those, for one count:
+    /// one too many held refuses a charge until the next count, one too few meets the system's
+    /// own refusal (`refused_by_system`).
+    fn recount(&self) -> Result<(), String> {
+        let open = open()?;
+        let outside = open.saturating_sub(self.held.load(Ordering::Acquire));
+        self.outside.store(outside, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -73,8 +143,8 @@ impl Drop for Held {
     }
 }
 
-/// The process's budget: the system's limit less the descriptors open when it was first asked
-/// for ([`room`]); a test's own, where it set one for what it opens on its thread.
+/// The process's budget, the system's; a test's own, where it set one for what it opens on its
+/// thread.
 pub(crate) fn process() -> Result<Arc<Descriptors>, Refusal> {
     #[cfg(test)]
     if let Some(budget) = tests::BUDGET.with(|budget| budget.borrow().clone()) {
@@ -82,17 +152,9 @@ pub(crate) fn process() -> Result<Arc<Descriptors>, Refusal> {
     }
     static PROCESS: OnceLock<Result<Arc<Descriptors>, String>> = OnceLock::new();
     PROCESS
-        .get_or_init(|| room().map(Descriptors::new))
+        .get_or_init(Descriptors::system)
         .clone()
         .map_err(Refusal::Unavailable)
-}
-
-/// The descriptors this process may still open: the system's limit (`limit`) less those open now
-/// (`open`). Descriptors opened later by code that charges no budget (the host's own) come out of
-/// the same limit: past it the system refuses the open (EMFILE), an error returned typed where it
-/// happens.
-fn room() -> Result<usize, String> {
-    Ok(limit().saturating_sub(open()?))
 }
 
 /// The soft `RLIMIT_NOFILE` (POSIX `getrlimit`): the most descriptors the system lets this process
@@ -146,18 +208,18 @@ pub(crate) mod tests {
 
     /// Sets this thread's budget to one of `bound` descriptors, for what the test opens on it.
     pub(crate) fn budget(bound: usize) -> Arc<Descriptors> {
-        let budget = Descriptors::new(bound);
+        let budget = Descriptors::fixed(bound);
         BUDGET.with(|set| *set.borrow_mut() = Some(Arc::clone(&budget)));
         budget
     }
 
-    /// AC-FD.1.1, T-FD.1.1 (local-owner-transport.md, "One descriptor budget"): a budget holds what it was
-    /// given and no more. Do: take a budget of 3 one, then two; ask one more; give the two back
-    /// and ask two. Expect: the first three held; the fourth refused, naming what it was for, 4
-    /// past 3; once given back, two more held.
+    /// AC-FD.1.1, T-FD.1.1 (local-owner-transport.md, "One descriptor budget"): a budget holds
+    /// what it was given and no more. Do: take a budget of 3 one, then two; ask one more; give the
+    /// two back and ask two. Expect: the first three held; the fourth refused, naming what it was
+    /// for, 4 past 3; once given back, two more held.
     #[test]
     fn a_budget_holds_its_bound_and_takes_back_what_is_given() {
-        let budget = Descriptors::new(3);
+        let budget = Descriptors::fixed(3);
         let one = budget.take("a connection", 1).unwrap();
         let two = budget.take("a connection", 2).unwrap();
         let refused = budget.take("a connection", 1).err().unwrap();
@@ -175,16 +237,40 @@ pub(crate) mod tests {
         assert!(budget.take("a connection", 2).is_err());
     }
 
-    /// AC-FD.1.1, T-FD.1.2 (local-owner-transport.md, "One descriptor budget"): the process's budget is the
-    /// system's limit less what the process holds. Do: read the budget's room on Unix. Expect: some
-    /// room, under the soft RLIMIT_NOFILE by stdin, stdout and stderr at least.
+    /// AC-FD.1.1, T-FD.1.2 (local-owner-transport.md, "One descriptor budget"): the process's
+    /// budget is the system's limit as it stands less what is open outside it, never a number
+    /// read once. Do: a system budget on Unix; raise the soft RLIMIT_NOFILE by one (where the hard
+    /// limit allows) and charge nothing; put it back and charge nothing; ask for more than any
+    /// limit. Expect: room under the limit by stdin, stdout and stderr at least; the budget's
+    /// limit one more after the raise and back after; the ask refused typed.
     #[cfg(unix)]
     #[test]
-    fn the_process_budget_is_the_systems_limit_less_what_is_open() {
-        let (soft, room) = (limit(), room().unwrap());
+    fn the_process_budget_follows_the_systems_limit() {
+        use rustix::process::{Resource, getrlimit, setrlimit};
+        let budget = Descriptors::system().unwrap();
+        let soft = limit();
+        let room = budget.bound();
         assert!(
             room > 0 && soft.saturating_sub(room) >= 3,
             "room {room} of {soft}"
         );
+        let was = getrlimit(Resource::Nofile);
+        if let (Some(current), Some(maximum)) = (was.current, was.maximum)
+            && current < maximum
+        {
+            let mut raised = was.clone();
+            raised.current = Some(current + 1);
+            setrlimit(Resource::Nofile, raised).unwrap();
+            drop(budget.take("a connection", 0).unwrap());
+            let followed = budget.limit.load(Ordering::Acquire);
+            setrlimit(Resource::Nofile, was).unwrap();
+            assert_eq!(followed, soft + 1, "the raised limit wasn't read");
+            drop(budget.take("a connection", 0).unwrap());
+            assert_eq!(budget.limit.load(Ordering::Acquire), soft);
+        }
+        assert!(matches!(
+            budget.take("a connection", usize::MAX / 2),
+            Err(Refusal::TooLarge { .. })
+        ));
     }
 }
