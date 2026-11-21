@@ -158,7 +158,9 @@ impl Disk for Uring {
                 Ok(results) => results,
                 Err(e) => {
                     r.lost = true;
-                    Box::leak(std::mem::take(&mut r.buf).into_boxed_slice());
+                    // `Vec::leak` keeps the allocation where it is (`into_boxed_slice` would
+                    // shrink it to fit, moving the bytes and freeing the ones the kernel reads).
+                    let _kept: &mut [u8] = std::mem::take(&mut r.buf).leak();
                     return Err(io("an io_uring submission", e));
                 }
             };
