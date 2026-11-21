@@ -488,6 +488,8 @@ fn collect_update_set_clauses(
         .columns()
         .iter()
         .enumerate()
+        // Amphora: a column an online DROP COLUMN dropped answers to no name (CP-T1.12).
+        .filter(|(_, col)| !col.dropped())
         .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
         .collect();
     let mut set_clauses: Vec<UpdateSetClause> = Vec::with_capacity(sets.len());

@@ -36,8 +36,9 @@ use crate::{
             order::{access_method_is_one_row, plan_satisfies_order_target},
         },
         plan::{
-            HashJoinKey, HashJoinType, JoinInfo, JoinOrderMember, JoinOrigin, JoinedTable,
-            NonFromClauseSubquery, SubqueryOrigin, SubqueryState, TableReferences, WhereTerm,
+            HashJoinKey, HashJoinType, JoinInfo, JoinOrderMember, JoinOrigin, JoinType,
+            JoinedTable, NonFromClauseSubquery, SubqueryOrigin, SubqueryState, TableReferences,
+            WhereTerm,
         },
         planner::{expr_reads_an_outer_query, table_mask_from_expr, TableMask},
     },
@@ -57,6 +58,8 @@ pub(crate) struct JoinPlanningContext<'a> {
     pub allow_automatic_index: bool,
     /// Amphora: the join methods the connection allows (`Connection::set_join_methods`).
     pub join_methods: crate::JoinMethods,
+    /// Amphora: whether a sorted fetch may be planned (`Connection::set_sorted_fetches`).
+    pub sorted_fetches: bool,
     /// Amphora: the rows a LIMIT (and OFFSET) leaves a one-table read to produce before it stops
     /// (`docs/design/planner.md` decisions 16 and 17), None when it reads to its end.
     pub row_goal: Option<RowGoal>,
@@ -71,6 +74,7 @@ impl<'a> JoinPlanningContext<'a> {
             cost_limit: None,
             allow_automatic_index: true,
             join_methods: crate::JoinMethods::ByCost,
+            sorted_fetches: false,
             row_goal: None,
         }
     }
@@ -324,6 +328,31 @@ pub struct JoinN {
     pub cost: Cost,
     /// Estimated output rows after each table access in `data`.
     pub prefix_cardinalities: Vec<f64>,
+    /// PL.8: the joins whose inner side is itself a join, so the plan is a bushy tree; empty for a
+    /// left-deep plan, where each table joins the tables before it one at a time. `data` lists the
+    /// tables in the order their reads run; each `InnerJoin` names a run of them joined among
+    /// themselves first, whose result joins the tables before the run.
+    pub inner_joins: Vec<InnerJoin>,
+}
+
+/// PL.8: one join of a bushy plan whose inner side is a join: `data[start..end]` of a [JoinN] is
+/// joined among itself first (with its own runs nested inside it), and its result is joined to
+/// `data[..start]`. The runs of a plan nest or are disjoint, as a tree's subtrees do, so the tree is
+/// the list of tables and these runs, read without recursion (CLAUDE.md §11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InnerJoin {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// PL.8: a node of a join tree, in an arena (`JoinN::tree`): a table read by an access method, or
+/// the join of an outer node with an inner one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinTreeNode {
+    /// The table at this position of `JoinN::data`.
+    Table(usize),
+    /// Indexes of the outer and the inner node in the arena.
+    Join { outer: usize, inner: usize },
 }
 
 struct WhereTermInfo {
@@ -345,6 +374,93 @@ impl JoinN {
         self.data
             .iter()
             .map(|(_, access_method_index)| *access_method_index)
+    }
+
+    /// PL.8: whether each table joins the tables before it one at a time (no inner side is a join).
+    pub fn is_left_deep(&self) -> bool {
+        self.inner_joins.is_empty()
+    }
+
+    /// PL.8: the plan as a join tree, in an arena whose last node is the root. A left-deep plan is
+    /// the chain `((t0 ⋈ t1) ⋈ t2) ⋈ ...`; a run of `inner_joins` is a subtree on the inner side.
+    /// Built on an explicit stack, without recursion: each open run keeps the node of the tables
+    /// joined so far within it, and a run that ends joins its node as the inner side of the run (or
+    /// the plan) around it. Runs that neither nest nor stay apart, or are shorter than two tables or
+    /// past the list's end, are a typed error.
+    pub fn tree(&self) -> Result<Vec<JoinTreeNode>> {
+        let malformed = || LimboError::InternalError("PL.8: malformed bushy join plan".to_string());
+        let mut runs: Vec<InnerJoin> = self.inner_joins.clone();
+        runs.sort_by_key(|run| run.start);
+        let mut nodes: Vec<JoinTreeNode> = Vec::with_capacity(self.data.len().saturating_mul(2));
+        // The open runs: each with its start, its end and the node of its tables joined so far
+        // (`None` before its first table). The bottom entry is the whole plan.
+        let mut open: Vec<(usize, usize, Option<usize>)> = vec![(0, self.data.len(), None)];
+        let mut next_run = runs.iter().peekable();
+        for position in 0..self.data.len() {
+            while let Some(run) = next_run.next_if(|run| run.start == position) {
+                // A run starting where the run around it starts is that run's outer side, not
+                // an inner one.
+                let (enclosing_start, enclosing_end) =
+                    open.last().map_or((0, 0), |(start, end, _)| (*start, *end));
+                if run.start == enclosing_start
+                    || run.end > enclosing_end
+                    || run.end < run.start.saturating_add(2)
+                {
+                    return Err(malformed());
+                }
+                open.push((run.start, run.end, None));
+            }
+            nodes.push(JoinTreeNode::Table(position));
+            let mut node = nodes.len().saturating_sub(1);
+            // Join the table into the innermost run, then close every run that ends after it,
+            // its result joining the run around it as an inner side.
+            loop {
+                let Some((_, end, joined)) = open.last_mut() else {
+                    return Err(malformed());
+                };
+                node = match *joined {
+                    None => node,
+                    Some(outer) => {
+                        nodes.push(JoinTreeNode::Join { outer, inner: node });
+                        nodes.len().saturating_sub(1)
+                    }
+                };
+                *joined = Some(node);
+                if *end != position + 1 || open.len() == 1 {
+                    break;
+                }
+                open.pop();
+            }
+        }
+        if next_run.next().is_some() || open.len() != 1 {
+            return Err(malformed());
+        }
+        Ok(nodes)
+    }
+
+    /// PL.8: the plan's tree as text, each table by its number and each join as `(outer inner)`:
+    /// `(((0 1) 2) 3)` for a left-deep plan, `((0 1) (2 3))` for a bushy one. Walked on a stack.
+    pub fn tree_text(&self) -> Result<String> {
+        let nodes = self.tree()?;
+        let mut text = String::new();
+        let mut stack: Vec<Result<usize, &'static str>> = Vec::new();
+        stack.extend(nodes.len().checked_sub(1).map(Ok));
+        while let Some(item) = stack.pop() {
+            match item.map(|node| nodes.get(node)) {
+                Err(close) => text.push_str(close),
+                Ok(Some(JoinTreeNode::Table(position))) => {
+                    if let Some((table, _)) = self.data.get(*position) {
+                        text.push_str(&table.to_string());
+                    }
+                }
+                Ok(Some(JoinTreeNode::Join { outer, inner })) => {
+                    text.push('(');
+                    stack.extend([Err(")"), Ok(*inner), Err(" "), Ok(*outer)]);
+                }
+                Ok(None) => {}
+            }
+        }
+        Ok(text)
     }
 }
 
@@ -924,7 +1040,9 @@ fn join_lhs_and_rhs<'a>(
                                 // Materialize build-side rowids so the hash build only includes
                                 // rows that already match prior join constraints.
                                 *materialize_build_input = true;
-                                let materialize_cost = effective_build_cardinality * 0.003;
+                                // A row's visit each, at the row's learned cost (QT.5).
+                                let materialize_cost =
+                                    effective_build_cardinality * params.cpu_cost_per_row;
                                 hash_join_method.cost =
                                     hash_join_method.cost + Cost(materialize_cost);
                                 // When two materialized hash-join plans have equal cost,
@@ -1043,6 +1161,7 @@ fn join_lhs_and_rhs<'a>(
         output_cardinality,
         cost,
         prefix_cardinalities,
+        inner_joins: Vec::new(),
     }))
 }
 
@@ -1278,7 +1397,8 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
     // If there are outer joins in the plan, ensure correct ordering.
     let (left_join_illegal_map, required_lhs_by_table) = {
-        let required_lhs_by_table = required_lhs_by_table(joined_tables)?;
+        let required_lhs_by_table =
+            required_lhs_by_table(joined_tables, where_clause, &where_terms)?;
         if required_lhs_by_table.iter().all(TableMask::is_empty) {
             (None, None)
         } else {
@@ -1821,11 +1941,12 @@ fn compute_greedy_join_order<'a>(
         return Ok(None);
     }
 
-    let left_join_deps: HashMap<usize, TableMask> = required_lhs_by_table(joined_tables)?
-        .into_iter()
-        .enumerate()
-        .filter(|(_, required)| !required.is_empty())
-        .collect();
+    let left_join_deps: HashMap<usize, TableMask> =
+        required_lhs_by_table(joined_tables, where_clause, where_terms)?
+            .into_iter()
+            .enumerate()
+            .filter(|(_, required)| !required.is_empty())
+            .collect();
 
     let mut remaining: TableMask = (0..num_tables).try_collect()?;
     let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
@@ -1975,19 +2096,51 @@ fn left_join_illegal_map(required_lhs_by_table: &[TableMask]) -> Result<HashMap<
 }
 
 /// For each table, the tables that must come before it in any join order.
-fn required_lhs_by_table(joined_tables: &[JoinedTable]) -> Result<Vec<TableMask>> {
+///
+/// PL.8, CD-C's conflict rules (Moerkotte, Fender and Eich, SIGMOD 2013) for the left-deep orders
+/// the search makes. A LEFT JOIN's right table must follow the tables its ON terms read (its
+/// syntactic eligibility set): the left-asscom rule `(e1 LEFT JOIN e2) op e3 = (e1 op e3) LEFT JOIN
+/// e2`, which holds for op an inner, left, semi or anti join whose term doesn't read e2, lets every
+/// other table of its left side move after it. A later table whose term reads the right table
+/// follows it by that term; a WHERE term on it runs after its NULL row, at the later table's loop.
+/// When the ON terms read no table of its left side (`ON 1`, `ON b.x = 5`), CD-C's rule keeps its
+/// whole left side before it, as it keeps every table before a semi, anti, FULL, CROSS or LATERAL
+/// join's: the emitter runs a semi or anti join's table as the last loops (its no-match path enters
+/// the row's body), so their order stays as it was.
+fn required_lhs_by_table(
+    joined_tables: &[JoinedTable],
+    where_clause: &[WhereTerm],
+    where_terms: &[WhereTermInfo],
+) -> Result<Vec<TableMask>> {
     let mut required_lhs_by_table = vec![TableMask::default(); joined_tables.len()];
-    for (j, joined_table) in joined_tables.iter().enumerate() {
-        // LEFT/FULL OUTER, SEMI, and ANTI joins all require the RHS table
-        // to appear after the LHS table in the join order.
-        if joined_table
-            .join_info
-            .as_ref()
-            .is_some_and(|j| j.is_ordering_constrained())
-        {
-            for i in 0..j {
-                required_lhs_by_table[j].set(i)?;
+    for (j, (joined_table, required)) in joined_tables
+        .iter()
+        .zip(required_lhs_by_table.iter_mut())
+        .enumerate()
+    {
+        let Some(join_info) = joined_table.join_info.as_ref() else {
+            continue;
+        };
+        if !join_info.is_ordering_constrained() {
+            continue;
+        }
+        let left_join_free = join_info.join_type == JoinType::LeftOuter
+            && !join_info.no_reorder
+            && !join_info.lateral;
+        if left_join_free {
+            let on_origin = JoinOrigin::Outer(joined_table.internal_id);
+            let mut read = TableMask::default();
+            for (term, info) in where_clause.iter().zip(where_terms) {
+                if term.origin.join_origin() == Some(on_origin) {
+                    read.union_with(&info.table_mask)?;
+                }
             }
+            for table in read.iter().filter(|&table| table < j) {
+                required.set(table)?;
+            }
+        }
+        if required.is_empty() {
+            *required = (0..j).try_collect()?;
         }
     }
     // A RIGHT or FULL JOIN is a reordering barrier in both directions.
@@ -2496,6 +2649,56 @@ mod tests {
         vdbe::builder::TableRefIdCounter,
         MAIN_DB_ID,
     };
+
+    fn plan_of(tables: usize, inner_joins: &[(usize, usize)]) -> JoinN {
+        JoinN {
+            data: (0..tables).map(|table| (table, table)).collect(),
+            output_cardinality: 1.0,
+            cost: Cost(1.0),
+            prefix_cardinalities: vec![1.0; tables],
+            inner_joins: inner_joins
+                .iter()
+                .map(|&(start, end)| InnerJoin { start, end })
+                .collect(),
+        }
+    }
+
+    /// PL.8 (piece 1): a left-deep plan is the bushy shape's special case, a chain; runs of inner
+    /// joins nest as subtrees on the inner side; runs that don't nest are refused.
+    #[test]
+    fn t_pl_8_bushy_shape_holds_left_deep_and_bushy_trees() {
+        let left_deep = plan_of(4, &[]);
+        assert!(left_deep.is_left_deep());
+        assert_eq!(left_deep.tree_text().unwrap(), "(((0 1) 2) 3)");
+        assert_eq!(plan_of(1, &[]).tree_text().unwrap(), "0");
+
+        let bushy = plan_of(4, &[(2, 4)]);
+        assert!(!bushy.is_left_deep());
+        assert_eq!(bushy.tree_text().unwrap(), "((0 1) (2 3))");
+        assert_eq!(
+            plan_of(4, &[(2, 4), (1, 4)]).tree_text().unwrap(),
+            "(0 (1 (2 3)))"
+        );
+        assert_eq!(
+            plan_of(5, &[(1, 3), (3, 5)]).tree_text().unwrap(),
+            "((0 (1 2)) (3 4))"
+        );
+        assert_eq!(
+            plan_of(5, &[(1, 5), (3, 5)]).tree_text().unwrap(),
+            "(0 ((1 2) (3 4)))"
+        );
+
+        for malformed in [
+            &[(0, 2)][..],
+            &[(1, 2)],
+            &[(1, 5)],
+            &[(4, 6)],
+            &[(1, 3), (2, 4)],
+            &[(1, 4), (1, 3)],
+        ] {
+            assert!(plan_of(4, malformed).tree().is_err(), "{malformed:?}");
+        }
+    }
 
     #[test]
     fn hash_join_cost_includes_probe_scan() {
@@ -3789,41 +3992,17 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        // Put the table with no filter first. The two inner tables can then
-        // build an automatic index once instead of scanning once per outer row.
-        assert_eq!(best_plan.table_numbers().collect::<Vec<_>>(), vec![2, 1, 0]);
+        // Amphora (QT.5): an automatic index on a table of the fallback's million rows outgrows
+        // its cache, so it pays for the pages it writes and reads again; building two of them under
+        // the unfiltered table costs more than reading the table the equality filter keeps fewest
+        // rows of first, the range filter's next, and the unfiltered one last.
+        assert_eq!(best_plan.table_numbers().collect::<Vec<_>>(), vec![1, 0, 2]);
 
         let access_method = &access_methods_arena[best_plan.data[0].1];
         let (iter_dir, index, constraint_refs) = _as_btree(access_method);
         assert!(constraint_refs.is_empty());
         assert!(iter_dir == IterationDirection::Forwards);
         assert!(index.is_none());
-
-        let access_method = &access_methods_arena[best_plan.data[1].1];
-        let (iter_dir, index, constraint_refs) = _as_btree(access_method);
-        assert!(constraint_refs.is_empty());
-        assert!(iter_dir == IterationDirection::Forwards);
-        assert!(index.is_none());
-        assert!(matches!(
-            access_method.params,
-            AccessMethodParams::BTreeTable {
-                build_index: true,
-                ..
-            }
-        ));
-
-        let access_method = &access_methods_arena[best_plan.data[2].1];
-        let (iter_dir, index, constraint_refs) = _as_btree(access_method);
-        assert!(constraint_refs.is_empty());
-        assert!(iter_dir == IterationDirection::Forwards);
-        assert!(index.is_none());
-        assert!(matches!(
-            access_method.params,
-            AccessMethodParams::BTreeTable {
-                build_index: true,
-                ..
-            }
-        ));
     }
 
     #[test]

@@ -2728,6 +2728,15 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
+        Insn::HashMarkFirstMatch { hash_table_id, target_pc } => (
+            "HashMarkFirstMatch",
+            *hash_table_id as i64,
+            target_pc.as_debug_int() as i64,
+            0,
+            Value::build_text(""),
+            0,
+            format!("if hash_table[{hash_table_id}] match already marked goto {}", target_pc.as_debug_int()),
+        ),
         Insn::HashResetMatched { hash_table_id } => (
             "HashResetMatched",
             *hash_table_id as i64,

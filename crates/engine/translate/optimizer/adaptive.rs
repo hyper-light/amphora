@@ -265,10 +265,12 @@ mod tests {
 
     fn weights(seek: f64, build: f64, probe: f64) -> LearnedWeights {
         LearnedWeights {
+            row_in_pages: None,
             seek,
             hash_build: build,
             hash_probe: probe,
             sort: 1.0,
+            page_miss: None,
         }
     }
 
