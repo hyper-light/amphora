@@ -226,7 +226,16 @@ pub fn translate_create_index(
         where_clause: where_clause.clone(),
         index_method: index_method.clone(),
         on_conflict: None,
+        state: resolver.with_schema(database_id, |s| s.index_state(&idx_name)),
     });
+    // Amphora: a name an online schema change has staged gets its index empty, in that state, for
+    // the change's backfill to fill (CP-T1.12, F1's states).
+    if !idx.is_public() && (!tbl.has_rowid || idx.index_method.is_some()) {
+        crate::bail_parse_error!(
+            "an online schema change builds indexes on rowid tables only, without index methods: {}",
+            idx_name
+        );
+    }
 
     if !idx.validate_where_expr(&table, resolver) {
         crate::bail_parse_error!(
@@ -280,16 +289,18 @@ pub fn translate_create_index(
         Some(sql),
     )?;
 
-    emit_refill_index(
-        program,
-        resolver,
-        database_id,
-        &tbl,
-        &idx,
-        index_cursor_id,
-        RegisterOrLiteral::Register(root_page_reg),
-        None,
-    )?;
+    if idx.is_public() {
+        emit_refill_index(
+            program,
+            resolver,
+            database_id,
+            &tbl,
+            &idx,
+            index_cursor_id,
+            RegisterOrLiteral::Register(root_page_reg),
+            None,
+        )?;
+    }
 
     let current_schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
@@ -664,6 +675,235 @@ pub(crate) fn emit_refill_index(
     }
 
     program.close_cursors(&[sorter_cursor_id, table_cursor_id, index_cursor_id]);
+    Ok(())
+}
+
+/// Amphora: one batch of an online index build's backfill (CP-T1.12; Rae et al., "Online,
+/// Asynchronous Schema Change in F1", section 4.3's reorganization): the rows of a write-only
+/// index's table after rowid `after` (from the first without it), at most `rows` of them in rowid
+/// order, each given its entry unless it has one (a write since the index went write-only gave
+/// it). A unique index's entry whose key another row's entry holds stops the batch with a UNIQUE
+/// error: the change can't finish, and its driver undoes it. The program's one row is the last
+/// rowid it visited (NULL: none past `after`, the backfill is done) and how many it visited.
+pub(crate) fn emit_index_backfill(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    index_name: &str,
+    after: Option<i64>,
+    rows: u64,
+) -> crate::Result<()> {
+    let idx_name = normalize_ident(index_name);
+    let schema_cookie = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
+    program.begin_write_on_database(MAIN_DB_ID, schema_cookie)?;
+    let found = resolver.with_schema(MAIN_DB_ID, |s| {
+        s.indexes
+            .values()
+            .flat_map(|indexes| indexes.iter())
+            .find(|index| index.name == idx_name)
+            .cloned()
+    });
+    let Some(idx) = found else {
+        bail_parse_error!("no such index: {}", idx_name);
+    };
+    if idx.state != crate::schema::IndexState::WriteOnly {
+        bail_parse_error!(
+            "index {} is {:?}: only a write-only index is backfilled",
+            idx_name,
+            idx.state
+        );
+    }
+    let Some(tbl) = resolver.with_schema(MAIN_DB_ID, |s| s.get_btree_table(&idx.table_name)) else {
+        bail_parse_error!("no such table: {}", idx.table_name);
+    };
+    if !tbl.has_rowid || idx.index_method.is_some() {
+        bail_parse_error!(
+            "an online schema change builds indexes on rowid tables only, without index methods: {}",
+            idx_name
+        );
+    }
+    let rows = i64::try_from(rows)
+        .ok()
+        .filter(|rows| *rows > 0)
+        .ok_or_else(|| LimboError::ParseError(format!("backfill batch of {rows} rows")))?;
+
+    let table_ref = program.table_reference_counter.next();
+    let table_cursor_id = program.alloc_cursor_id_keyed(
+        CursorKey::table(table_ref),
+        CursorType::BTreeTable(tbl.clone()),
+    );
+    let index_cursor_id = program.alloc_cursor_index(None, &idx)?;
+    let physical_columns = idx.physical_columns(&tbl)?;
+    let record_count = physical_columns
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| LimboError::ParseError("index field count overflow".to_string()))?;
+    let mut table_references = TableReferences::new(
+        vec![JoinedTable {
+            op: Operation::Scan(Scan::BTreeTable {
+                iter_dir: IterationDirection::Forwards,
+                index: None,
+            }),
+            unmatched_right_rows_plan: None,
+            table: Table::BTree(tbl.clone()),
+            identifier: normalize_ident(tbl.name.as_str()),
+            internal_id: table_ref,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id: MAIN_DB_ID,
+            indexed: None,
+            plan_estimate: None,
+        }],
+        vec![],
+    );
+    let where_clause = idx.bind_where_expr(Some(&mut table_references), resolver)?;
+
+    // The answer: the last rowid visited, then how many were.
+    let answer_reg = program.alloc_registers(2);
+    let last_reg = answer_reg;
+    let visited_reg = answer_reg
+        .checked_add(1)
+        .ok_or_else(|| LimboError::ParseError("register overflow".to_string()))?;
+    program.emit_null(last_reg, None);
+    program.emit_int(0, visited_reg);
+    let left_reg = program.alloc_register();
+    program.emit_int(rows, left_reg);
+
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: table_cursor_id,
+        root_page: tbl.root_page,
+        db: MAIN_DB_ID,
+    });
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: index_cursor_id,
+        root_page: RegisterOrLiteral::Literal(idx.root_page),
+        db: MAIN_DB_ID,
+    });
+
+    let loop_start = program.allocate_label();
+    let loop_end = program.allocate_label();
+    let next_row = program.allocate_label();
+    match after {
+        Some(after) => {
+            let after_reg = program.alloc_register();
+            program.emit_int(after, after_reg);
+            program.emit_insn(Insn::SeekGT {
+                is_index: false,
+                cursor_id: table_cursor_id,
+                start_reg: after_reg,
+                num_regs: 1,
+                target_pc: loop_end,
+            });
+        }
+        None => program.emit_insn(Insn::Rewind {
+            cursor_id: table_cursor_id,
+            pc_if_empty: loop_end,
+        }),
+    }
+    program.preassign_label_to_next_insn(loop_start);
+    program.emit_insn(Insn::RowId {
+        cursor_id: table_cursor_id,
+        dest: last_reg,
+    });
+    program.emit_insn(Insn::AddImm {
+        register: visited_reg,
+        value: 1,
+    });
+    if let Some(where_clause) = where_clause {
+        let condition_true = program.allocate_label();
+        translate_condition_expr(
+            program,
+            &table_references,
+            &where_clause,
+            ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_false: next_row,
+                jump_target_when_true: condition_true,
+                jump_target_when_null: next_row,
+            },
+            resolver,
+        )?;
+        program.preassign_label_to_next_insn(condition_true);
+    }
+    let start_reg = program.alloc_registers(record_count);
+    for (i, col) in physical_columns.iter().enumerate() {
+        emit_index_column_value_from_cursor(
+            program,
+            resolver,
+            &mut table_references,
+            table_cursor_id,
+            &tbl,
+            col,
+            start_reg
+                .checked_add(i)
+                .ok_or_else(|| LimboError::ParseError("index register overflow".to_string()))?,
+        )?;
+    }
+    let rowid_reg = start_reg
+        .checked_add(physical_columns.len())
+        .ok_or_else(|| LimboError::ParseError("index register overflow".to_string()))?;
+    program.emit_insn(Insn::Copy {
+        src_reg: last_reg,
+        dst_reg: rowid_reg,
+        extra_amount: 0,
+    });
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(start_reg),
+        count: to_u32(record_count),
+        dest_reg: to_u32(record_reg),
+        index_name: Some(idx.name.clone()),
+        affinity_str: None,
+    });
+    // An entry for this very row: a write since the index went write-only made it.
+    program.emit_insn(Insn::Found {
+        cursor_id: index_cursor_id,
+        target_pc: next_row,
+        record_reg: start_reg,
+        num_regs: record_count,
+    });
+    if idx.unique {
+        // Another row's entry under the same key (NULLs never conflict): the rows already break
+        // the constraint the index would add.
+        let insert = program.allocate_label();
+        program.emit_insn(Insn::NoConflict {
+            cursor_id: index_cursor_id,
+            target_pc: insert,
+            record_reg: start_reg,
+            num_regs: physical_columns.len(),
+        });
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_UNIQUE,
+            description: format_unique_violation_desc(tbl.name.as_str(), &idx),
+            on_error: None,
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(insert);
+    }
+    program.emit_insn(Insn::IdxInsert {
+        cursor_id: index_cursor_id,
+        record_reg,
+        unpacked_start: Some(start_reg),
+        unpacked_count: Some(to_u32(record_count)),
+        flags: IdxInsertFlags::new().use_seek(false),
+    });
+    program.preassign_label_to_next_insn(next_row);
+    program.emit_insn(Insn::DecrJumpZero {
+        reg: left_reg,
+        target_pc: loop_end,
+    });
+    program.emit_insn(Insn::Next {
+        cursor_id: table_cursor_id,
+        pc_if_next: loop_start,
+        fullscan: false,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(loop_end);
+    program.emit_result_row(answer_reg, 2);
+    program.add_pragma_result_column("last".to_string());
+    program.add_pragma_result_column("visited".to_string());
+    program.close_cursors(&[table_cursor_id, index_cursor_id]);
     Ok(())
 }
 
@@ -1292,6 +1532,14 @@ pub fn translate_drop_index(
                     .to_string(),
             ));
         }
+    }
+    // Amphora: an index in an online schema change is the change's to finish or undo; dropped
+    // here, its state would stay staged for the next index of its name (CP-T1.12).
+    if let Some(idx) = maybe_index.as_ref().filter(|idx| !idx.is_public()) {
+        return Err(crate::error::LimboError::InvalidArgument(format!(
+            "index {} is held by an online schema change",
+            idx.name
+        )));
     }
 
     let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;

@@ -916,6 +916,61 @@ impl Db {
         self.query_owned(sql, params, each)
     }
 
+    /// The schema cookie moved on and this writer's schema read again inside its transaction, for an
+    /// online schema change's state rows (`amphora_engine::schema::INDEX_STATES_TABLE`) to take:
+    /// the writer sees them at once, every other connection at the cookie when this commits
+    /// (CP-T1.12, docs/design/online-schema.md). The caller holds the write transaction.
+    pub(crate) fn restage_schema(&self) -> anyhow::Result<()> {
+        let mut version = None;
+        self.query("PRAGMA schema_version", [], |row| {
+            version = Some(row.get::<i64>(0).map_err(fail)?);
+            Ok(false)
+        })?;
+        // The cookie is a 32-bit field of the database header (sqlite.org/fileformat2.html, offset
+        // 40), which the engine's SetCookie writes as an i32.
+        let next = version
+            .and_then(|v| v.checked_add(1))
+            .filter(|v| i32::try_from(*v).is_ok())
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| anyhow::anyhow!("the schema cookie can't move past {version:?}"))?;
+        // Not `PRAGMA schema_version = n`: the engine makes that a no-op (SQLite's defensive mode),
+        // so the cookie would stay, and readers would keep the schema from before the step. This
+        // writes the header's cookie, marks the transaction's schema changed (published to every
+        // connection when it commits) and reads this writer's schema again.
+        self.conn.write_schema_version(next).map_err(fail)?;
+        self.statements.schema(self.conn.current_schema())?;
+        Ok(())
+    }
+
+    /// One batch of a write-only index's backfill (CP-T1.12): the rows after rowid `after`, at most
+    /// `rows`, each given its entry. The last rowid it visited (None: none was past `after`) and
+    /// how many it visited. The caller holds the write transaction.
+    pub(crate) fn index_backfill(
+        &self,
+        index: &str,
+        after: Option<i64>,
+        rows: u64,
+    ) -> anyhow::Result<(Option<i64>, u64)> {
+        self.ensure_unfenced()?;
+        let mut stmt = self
+            .conn
+            .prepare_index_backfill(index, after, rows)
+            .map_err(fail)?;
+        let mut answer = None;
+        step(self.io.as_ref(), &mut stmt, [], |row| {
+            let last = match row.get::<&Value>(0).map_err(fail)? {
+                Value::Null => None,
+                _ => Some(row.get::<i64>(0).map_err(fail)?),
+            };
+            let visited = u64::try_from(row.get::<i64>(1).map_err(fail)?)?;
+            answer = Some((last, visited));
+            // Run on to its Halt: a write statement stopped at its row is abandoned unfinished,
+            // and the engine then refuses the transaction's commit.
+            Ok(true)
+        })?;
+        answer.ok_or_else(|| anyhow::anyhow!("the backfill of {index} answered nothing"))
+    }
+
     /// `f` in one transaction: committed if it returns Ok and the commit goes through, rolled back
     /// whole if not (a commit that fails can leave the transaction open; the next would then
     /// refuse to begin).
