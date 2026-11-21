@@ -165,6 +165,14 @@ fn qt7_batched_scans_answer_as_row_at_a_time_scans() {
         let decoded = differential(seed, Some(1 << 20));
         assert!(decoded > 0, "seed {seed}: no row was read from a batch");
     }
+    // The budget as it runs: the measured L2 cache and the statement's memory budget. Where the
+    // cache size can't be read the scan reads row-at-a-time, with the same answers.
+    let decoded = differential(11, None);
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        assert!(decoded > 0, "the measured budget batched no row");
+    } else {
+        assert_eq!(decoded, 0, "batched without a measured cache size");
+    }
 }
 
 /// T-QT.7.2: a batch budget smaller than one page's cells: the scan decodes several windows a
