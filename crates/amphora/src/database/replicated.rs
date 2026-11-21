@@ -1288,10 +1288,10 @@ fn open(
     )
 }
 
-/// The write slot's bounds, stated from the quorum patience's (`patience`), so the slot adds no
-/// number of its own: a member's first slot is the core's election timeout in this owner's ticks,
-/// a retry slower than the patience's measured ceiling is not learned, and a learned gap is
-/// believed for the patience's generations.
+/// The write slot's bounds, stated from the core's and the quorum patience's (`patience`), so the
+/// slot adds no number of its own: a member's first slot is the core's election timeout in this
+/// owner's ticks, and a learned gap is believed for the patience's generations. A retry is not
+/// learned when the host's detector suspected its member meanwhile (`slot::Slots::keep`).
 fn slot_bounds(election_tick: usize) -> Result<super::slot::Bounds, Refusal> {
     let ticks = |count: Option<u32>| {
         count
@@ -1300,7 +1300,6 @@ fn slot_bounds(election_tick: usize) -> Result<super::slot::Bounds, Refusal> {
     };
     Ok(super::slot::Bounds {
         election: ticks(u32::try_from(election_tick).ok())?,
-        ceiling: ticks(u32::try_from(super::patience::QUORUM_CEILING).ok())?,
         generation: ticks(u32::try_from(super::patience::GENERATION).ok())?,
     })
 }

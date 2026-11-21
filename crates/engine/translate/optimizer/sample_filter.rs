@@ -3,9 +3,11 @@
 //! of the sample's rows that pass them all. A pure core: each term is compiled once into a flat
 //! program (a loop over an explicit stack, CLAUDE.md §11), then run a row at a time (§2: an
 //! operation for each node of the term, on each of the sample's rows, so the work is the term's
-//! length times the sample's rows, never more than a scan of the table runs the term). A term this evaluator doesn't run (a parameter, a function, a
-//! subquery, another table's column) or that raises an error on a sample row is left to the
-//! planner's other estimates.
+//! length times the sample's rows, never more than a scan of the table runs the term). A term this
+//! evaluator doesn't run (a function, a subquery, another table's column, a parameter with no value
+//! bound) or that raises an error on a sample row is left to the planner's other estimates. A
+//! parameter's value is read where the statement is planned with its run's values (a custom plan,
+//! PL.12).
 
 use crate::numeric::Numeric;
 use crate::schema::Column;
@@ -71,6 +73,8 @@ pub(crate) struct Target<'a> {
     pub table: TableInternalId,
     pub columns: &'a [Column],
     pub in_sample: &'a [Option<usize>],
+    /// The values the statement is planned with (PL.12), where its parameters' values are read.
+    pub values: Option<&'a crate::plan_cache::PlanValues>,
 }
 
 enum Visit<'a> {
@@ -136,7 +140,11 @@ impl Target<'_> {
     /// `expr` compiled into a program over the sample's rows, `None` where it reads anything but
     /// this table's sampled columns and constants. Each node of the term is entered once and
     /// emits at most one operation, so the loop ends within the term's nodes.
+    /// A parameter with no value bound leaves the term unrun, but a term that would compile with
+    /// one notes that its estimate asked for it (PL.12): a plan made with a value could differ.
     pub(crate) fn compile(&self, expr: &ast::Expr) -> Option<Program> {
+        let mut parameters = false;
+        let mut unbound = false;
         let mut ops = Vec::new();
         let mut stack = vec![Visit::Enter(expr)];
         while let Some(visit) = stack.pop() {
@@ -154,6 +162,12 @@ impl Target<'_> {
                 },
                 ast::Expr::Collate(inner, _) => stack.push(Visit::Enter(inner)),
                 ast::Expr::Literal(literal) => ops.push(Op::Value(literal_value(literal)?)),
+                ast::Expr::Variable(variable) => {
+                    let value = self.values.and_then(|values| values.value(variable));
+                    parameters = true;
+                    unbound |= value.is_none();
+                    ops.push(Op::Value(value.cloned().unwrap_or(Value::Null)));
+                }
                 ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => {
                     let ast::Expr::Literal(literal) = operand(inner).0 else {
                         return None;
@@ -263,6 +277,14 @@ impl Target<'_> {
                 }
                 _ => return None,
             }
+        }
+        if parameters {
+            if let Some(values) = self.values {
+                values.note_asked();
+            }
+        }
+        if unbound {
+            return None;
         }
         Some(Program(ops))
     }

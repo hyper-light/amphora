@@ -1283,3 +1283,60 @@ independent; an OR no constraint takes was not counted at all.
   (the bound above assumes the scan runs the same operations the sample does; an IN list the
   executor probes through an index and the sample walks value by value breaks it).
 - A CERT failure in the oracles.
+
+## Decision (lane pl12): custom plans, then a generic one, for prepared statements
+
+**Decision.** PL.12 (docs/research/planner.md section 9, rank 12; `crates/engine/plan_cache.rs`).
+A prepared statement is planned at prepare without values, its generic plan, as before. While it
+is planned, every estimate that would take a parameter's value notes that it asked: an `=` or IN
+list on a column whose ANALYZE sample keeps common values (decision 20), and a term run over a
+table's sample (decision 21). A statement none asked of keeps its generic plan for good: a plan
+made with values would be the same plan, so it pays no planning (a key lookup, a table without
+statistics, a column whose values are about equally common). For the others, each run with a value
+bound chooses:
+- With no custom run measured, a custom plan: the statement parsed and planned again with the run's
+  values, which the estimates read as they read literals. The program still reads its parameters
+  from their registers, so a plan made for one value answers correctly for any.
+- After that, the generic plan once its estimated cost is not above the custom plans' average
+  raised by their planning: `generic x T <= average x (T + P)`, with `T` the custom runs' running
+  time and `P` their planning time (parse, plan and code), both measured by the statement on the
+  run itself (the connection's monotonic clock), summed over its custom runs. This is
+  PostgreSQL's `choose_custom_plan` comparison, with its planning cost measured where PostgreSQL
+  writes `1000 * cpu_operator_cost * (nrelations + 1) * nrelations`, and without its five runs:
+  the comparison is made from the first custom run on. Nothing in it is a constant: every input
+  is the statement's own estimate or its own measurement, on the host it runs on, as it runs.
+- A statement keeps two plans at most: the generic one, and the current run's custom one.
+- A schema change or ANALYZE plans the statement again (the existing reprepare, OP_Expire for
+  ANALYZE) and starts its choice again, its earlier measurements being of the old statistics.
+- `Connection::set_plan_cache_mode` (PostgreSQL's `plan_cache_mode`): `Auto` (the default),
+  `ForceGeneric`, `ForceCustom`, which the bench needs to time each plan. An EXPLAIN with values
+  bound shows the plan they give, as SQLite's re-prepare with bound values does.
+- Scope: SELECT statements (their plans carry an estimated cost); UPDATE and DELETE keep the
+  generic plan. A bound LIMIT keeps decision 17's q-middle: its value is not read here.
+
+**Why.** Audit row 8 (`bench/planner/audit/08-fixed-at-prepare.sql`): `WHERE k = ?` had one plan and
+one estimate, 1,000 rows, where k = 1 counts 1,000 and k = 9 none. kiln binds every value.
+
+**Sources.** PostgreSQL `src/backend/utils/cache/plancache.c`, `choose_custom_plan` ("Generate
+custom plans until we have done at least 5 (arbitrary)"; generic when its cost is below the custom
+plans' average plus planning) and `cached_plan_cost`; PostgreSQL docs, PREPARE and 19.7
+`plan_cache_mode`; CockroachDB, Query plan type (f35, A); SQLite `sqlite3_prepare_v2` item 3,
+recompiling on a bound value that could change the plan.
+
+**Evidence.** `crates/engine/tests/plan_cache.rs` (T-PL.12.3 to T-PL.12.6) and `plan_cache.rs`'s
+unit tests (T-PL.12.1, T-PL.12.2). The TPC-H prepared measurement (AC-PL.12.1) and the suite's
+(AC-PL.12.2) are the coordinator's.
+
+**Falsified by.**
+- A TPC-H query, prepared and run with qgen's parameters, slower under `Auto` than under
+  `ForceGeneric` (AC-PL.12.1).
+- The bench suite's prepared statements more than 2% slower than the parent (AC-PL.12.2): their
+  planning share kept them custom when it shouldn't.
+- A statement switched to generic on its first custom run whose later values would have gained
+  more than their planning (the comparison judged on one run): seen as runs under `Auto` slower
+  than under `ForceCustom` for a skewed parameter stream.
+
+**For PL.9** (statistics kept as rows change, statements re-planned): it should bump the
+connection's prepare generation where it re-plans, which resets each statement's choice
+(`Statement::reprepare`); a re-plan that keeps statistics close may want to keep the measurements
+instead, which is PL.9's call; `PlanValues` is how an estimate reads a bound value.
