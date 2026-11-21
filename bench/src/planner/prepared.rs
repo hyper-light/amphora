@@ -26,6 +26,7 @@ pub fn mode(name: &str) -> anyhow::Result<PlanCacheMode> {
 }
 
 /// One query's parameter sets, by seed, in the order `--params` lists them.
+#[derive(Debug)]
 pub struct Params {
     pub seeds: Vec<(u64, Vec<Value>)>,
 }
@@ -96,8 +97,10 @@ pub fn query(amphora: &mut Amphora, name: &str, sql: &str, params: &Params, mode
                         if let Some(best) = m.best_ms.get_mut(i) {
                             *best = Some(best.map_or(ms, |b| b.min(ms)));
                         }
-                        if let Some(answer @ None) = m.answer.get_mut(i) {
-                            *answer = Some((run.rows, run.first));
+                        if let Some(answer) = m.answer.get_mut(i) {
+                            if answer.is_none() {
+                                *answer = Some((run.rows, run.first));
+                            }
                         }
                     }
                     Outcome::TimedOut => m.stopped = Some("timed out".into()),
