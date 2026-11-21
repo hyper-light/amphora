@@ -164,9 +164,11 @@ impl InitLoop {
                     t_ctx.meta_right_joins[table_index] =
                         Some(right_join_metadata(program, table)?);
                 }
-                let is_hash_anti = matches!(table.op, Operation::HashJoin(ref hj) if
-                    hj.join_type == HashJoinType::LeftAnti);
-                if join_info.is_semi_or_anti() && !is_hash_anti {
+                // A hash semi or anti join decides with the hash table's matched bits, not with
+                // the nested loop's early-out labels.
+                let is_hash_semi_or_anti = matches!(table.op, Operation::HashJoin(ref hj) if
+                    matches!(hj.join_type, HashJoinType::LeftAnti | HashJoinType::LeftSemi));
+                if join_info.is_semi_or_anti() && !is_hash_semi_or_anti {
                     let join_idx = join_order
                         .iter()
                         .position(|m| m.original_idx == table_index)

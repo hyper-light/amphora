@@ -395,6 +395,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   Left: an owner's other descriptors (endpoint, engine files, a replica's log) charged by kind, the core's tick
   counts (twenty an election, two a heartbeat: raft-rs's defaults, fixed in tick mode), the owner's queue
   and outgoing bounds and the log's compaction trigger, and the rest of the list (handoff/amphora-constants-list.md).
+- **Region-local groups under a global root** (CP-T1.11, G14 step 1, lane regions; `crates/amphora/src/regions.rs`,
+  docs/design/regions.md): members carry a region label; a regional group's voters and lead stay in its home
+  region, and the root spreads its voters so losing the regions it survives leaves a quorum (CockroachDB's
+  survival goals); a lost member is replaced from its region, never from another. Regional rows route to their
+  home region's directory, and reads try the reader's region first. The simulated lab (`regions::lab`, latencies
+  as its input) gives the same answers and rows at one node, three nodes and three regions. Open: the SQL corpus
+  at three regions on the replicated shell, the 60 ms lab's p99 (the coordinator's), the region-loss drill.
 - **Groups that split, merge and move themselves** (CP-T1.9, lane split-merge; `crates/amphora/src/reshard/`,
   docs/design/reshard.md): a pure core: a directory of hash spans with every position in exactly one group,
   each group's own holding (fenced, stale actions refused), a planner deciding from measured load, bytes and
@@ -425,7 +432,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   row is refused. NOT NULL and CHECK are added to an existing column (`ALTER COLUMN c TO` its own
 definition plus the constraint) write-only, then validated in learned rowid batches, then public by
 a catalog change; the planner doesn't rely on an unvalidated NOT NULL, a breaking row undoes the
-change, and a power cut leaves the old schema or the new. DROP COLUMN is not yet built.
+change, and a power cut leaves the old schema or the new. DROP COLUMN is built PostgreSQL's way: one
+catalog change hides the column as a slot (no name finds it, `*` and inserts pass it, every write
+stores NULL in it), learned rowid batches clear its old values, then the drop is recorded.
 
 ## Measured
 
@@ -567,6 +576,14 @@ change, and a power cut leaves the old schema or the new. DROP COLUMN is not yet
   but not merged: with today's join costs it flips `records_plans`' one-row-lookup case to a hash join and a sort
   (the two plans cost about 110 each), so it waits for the learned costs, then the `rhs_has_selective_seek` gate removed, builds over joined inputs, PL.5's Bloom
   filters with LIP and predicate transfer, and sort-merge and prefetched index joins (G6 step 4).
+- **G6 step 5, plans that read less, started** (lane g6s5): an `EXISTS` may now run as a hash semi join, chosen by
+  cost against the nested loop's early out: the outer rows build the hash table, the subquery's table probes it, and
+  `HashMarkFirstMatch` passes each build row on at its first match in a probe pass only (its matched bit, kept in
+  grace partitions when the table spills). `tests/hash_semi_join.rs` runs EXISTS queries with NULL and duplicate
+  keys under all three join methods, in memory and spilled, against a model. Index-only reads were already planned
+  (covering indexes). Left: bitmap-style sorted row fetches (a one-branch RowSet read; the multi-index fetch cost
+  assumes page locality and should be learned first), and the 2x measurements on order_by_sort, exists_subquery
+  and left_join_anti (the coordinator's).
 - **The replicated class** (docs/design/replication.md, "Fast acknowledgement"; Ada's word 2026-11-01): built on
   t1/replicated-line, not on main (fast-ack, class-metrics, class-quorum and disk-stalls, merged in that order). A
   replicated database opened with `Durability::Replicated(Fates)` answers a write once members spanning the fates
@@ -649,8 +666,11 @@ change, and a power cut leaves the old schema or the new. DROP COLUMN is not yet
   table is planned as its mirrored LEFT JOIN, CD-C's commutativity rule, so the tables after it are no
   longer held behind its right table and the audit's 03-right-full-barrier reads tiny first (T-PL.8.1);
   an outer join's ON term that reads only earlier tables now counts in its join's estimate.
-  Not built: bushy plans over connected complement pairs with a composite hash-join build, and CD-C's
-  rules for outer, semi and anti joins in place of `required_lhs_by_table`; JOB's AC-PL.8.1 is open.
+  Lane pl8-3 (docs/design/planner.md "Decision (lane pl8-3)"): a LEFT JOIN's right table follows only
+  the tables its ON terms read (CD-C's left-asscom rule), answers held against SQLite (T-PL.8.2), and
+  `JoinN` carries a bushy shape (`inner_joins`) that left-deep plans leave empty.
+  Not built: bushy plans over connected complement pairs with a composite hash-join build, and semi
+  and anti joins placed before other loops (the emitter's no-match path); JOB's AC-PL.8.1 is open.
   PL.9 is built (lane pl9, docs/design/planner.md "row counts kept as rows change"): each table's
   rows inserted less deleted since ANALYZE are kept as writes finish (one atomic add a statement),
   the planner's row count follows them, and a prepared statement plans again once a table it counted

@@ -530,6 +530,8 @@ tests = [
 # (t_t1_12_1_a_power_cut_at_every_step_of_an_online_index_leaves_old_or_new).
 # lane online-schema-6: constraints on existing columns serve the same T-T1.12.1
 # (t_t1_12_1_a_power_cut_at_every_step_of_an_online_constraint_leaves_old_or_new).
+# lane online-schema-7: DROP COLUMN online serves the same T-T1.12.1
+# (t_t1_12_1_a_power_cut_at_every_step_of_an_online_drop_leaves_old_or_new).
 
 # lane audit-log: Amphora's own IDs for G10 step 3 (kiln plan 01a16b0f47577325bcd9e51383067e04),
 # serving AC-T1.7.4 (docs/design/audit.md).
@@ -813,3 +815,8 @@ tests = [
   { id = "T-G3.2.1", text = "storage::wal::tests::g3_2_* — passes when every page read through each lock-free way (filtered, published, optimistic), at random snapshots while frames are appended, rewound, rolled back, checkpointed and the log restarted, and beside a writer thread, finds the frame the index read under its lock finds, or none" },
   { id = "T-G3.2.2", text = "crates/engine/tests/log_read_index.rs — passes when, after a crash at every write of a checkpoint and of a log restart, every read through each way returns its page's last committed version" },
 ]
+
+# lane regions (G14 step 1, CP-T1.11; docs/design/regions.md): no new IDs. It serves AC-T1.11.4
+# (crates/amphora/tests/regions.rs, ac_t1_11_4_*: the corpus on the simulated lab at one node, three
+# nodes and three regions) and AC-T1.11.2's lab (crates/amphora/examples/regions_lab.rs; the 60 ms run
+# and its p99 are the coordinator's).
