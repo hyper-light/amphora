@@ -53,7 +53,7 @@ pub struct Shipper {
     prefix: String,
     hooks: Arc<Hooks>,
     /// The archive's count of the log's generations, and the one shipped now.
-    gen: u64,
+    generation: u64,
     identity: Option<Identity>,
     header: Vec<u8>,
     /// Frames of `identity` shipped.
@@ -147,7 +147,7 @@ impl Shipper {
         let mut shipper = Self {
             prefix: prefix.into(),
             hooks,
-            gen: 0,
+            generation: 0,
             identity: None,
             header: Vec::new(),
             shipped: 0,
@@ -165,7 +165,7 @@ impl Shipper {
         if let Some((key, _)) = segments.last() {
             let last = SegmentKey::parse(prefix, key)?;
             let body: Segment = object::decode(key, &blobs.get(key, until)?)?;
-            shipper.gen = last.gen;
+            shipper.generation = last.generation;
             shipper.archived_through = last.through;
             shipper.unknown = Some(last.through);
             if let Some(head) = db.read_log(0, usize::try_from(LOG_HEADER_BYTES)?)?
@@ -188,10 +188,10 @@ impl Shipper {
             shipper.broken = false;
             for (key, bytes) in &segments {
                 let s = SegmentKey::parse(prefix, key)?;
-                if (s.gen, s.last) > base.end {
+                if (s.generation, s.last) > base.end {
                     shipper.since_base = shipper.since_base.saturating_add(*bytes);
                 }
-                if s.link == Some(Link::Gap) && s.gen > base.end.0 {
+                if s.link == Some(Link::Gap) && s.generation > base.end.0 {
                     shipper.broken = true;
                 }
             }
@@ -252,8 +252,11 @@ impl Shipper {
         // it are in the next mark's second, or weren't drained yet.
         let through = match self.pending.front() {
             Some(next) => {
-                let second_before = second_of(next.ns).saturating_sub(1).saturating_mul(SECOND_NS);
-                next.unknown_from.map_or(second_before, |u| u.min(second_before))
+                let second_before = second_of(next.ns)
+                    .saturating_sub(1)
+                    .saturating_mul(SECOND_NS);
+                next.unknown_from
+                    .map_or(second_before, |u| u.min(second_before))
             }
             None => self.through,
         };
@@ -276,15 +279,15 @@ impl Shipper {
         };
         if link == Link::Gap {
             self.broken = true;
-            if self.gen > 0 {
+            if self.generation > 0 {
                 self.unknown = Some(
                     self.unknown
                         .map_or(self.archived_through, |u| u.min(self.archived_through)),
                 );
             }
         }
-        self.gen = self
-            .gen
+        self.generation = self
+            .generation
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("the archive's generations overflow"))?;
         self.identity = Some(identity);
@@ -317,7 +320,7 @@ impl Shipper {
             .collect();
         let mut body = Segment {
             format: FORMAT,
-            gen: self.gen,
+            generation: self.generation,
             identity,
             first: self.shipped.saturating_add(1),
             header: self.header.clone(),
@@ -345,7 +348,7 @@ impl Shipper {
                 )?
                 .ok_or_else(|| anyhow::anyhow!("the log's file is gone"))?;
             let key = SegmentKey {
-                gen: self.gen,
+                generation: self.generation,
                 first: body.first,
                 last: to,
                 marks: if is_last {
@@ -359,7 +362,11 @@ impl Shipper {
                 } else {
                     None
                 },
-                link: if body.first == 1 { self.next_link } else { None },
+                link: if body.first == 1 {
+                    self.next_link
+                } else {
+                    None
+                },
             };
             let marks_kept = std::mem::take(&mut body.marks);
             if is_last {
@@ -401,7 +408,12 @@ impl Shipper {
     /// `memory` allow: a chunk is a request, and a restore's fetch moves more bytes a second the
     /// fewer requests it waits on. Refused until the log's generation now has been seen by
     /// [`Shipper::ship`].
-    pub fn begin_base(&mut self, db: &Db, blobs: &dyn Blobs, memory: usize) -> anyhow::Result<BaseCopy> {
+    pub fn begin_base(
+        &mut self,
+        db: &Db,
+        blobs: &dyn Blobs,
+        memory: usize,
+    ) -> anyhow::Result<BaseCopy> {
         let (seq, _) = db.log_end();
         if self.identity.is_none_or(|i| i.seq != seq) {
             anyhow::bail!("ship the log's generation before copying a base in it");
@@ -420,7 +432,7 @@ impl Shipper {
         };
         Ok(BaseCopy {
             id,
-            start_gen: self.gen,
+            start_gen: self.generation,
             chunk_bytes,
             file_bytes: db.file_bytes()?,
             next: 0,
@@ -472,7 +484,7 @@ impl Shipper {
             format: FORMAT,
             id: copy.id,
             start_gen: copy.start_gen,
-            end: (self.gen, end),
+            end: (self.generation, end),
             file_bytes: copy.file_bytes,
             chunk_bytes: copy.chunk_bytes,
             chunks: copy.next,
@@ -482,7 +494,12 @@ impl Shipper {
             start_gen: manifest.start_gen,
             id: manifest.id,
         };
-        create(blobs, &key.key(&self.prefix), &object::encode(&manifest)?, until)?;
+        create(
+            blobs,
+            &key.key(&self.prefix),
+            &object::encode(&manifest)?,
+            until,
+        )?;
         self.base_bytes = Some(copy.file_bytes);
         self.since_base = 0;
         self.broken = false;

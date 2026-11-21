@@ -319,7 +319,11 @@ pub fn conformance(store: &dyn Blobs, prefix: &str, until: Instant) -> Result<()
         }
     }
     // AMPHORA-BLOBS-7: a malformed key is refused Invalid.
-    for key in [format!("{prefix}//e"), format!("{prefix}/e\n"), format!("{prefix}\\e")] {
+    for key in [
+        format!("{prefix}//e"),
+        format!("{prefix}/e\n"),
+        format!("{prefix}\\e"),
+    ] {
         match store.create(&key, b"", until) {
             Err(BlobRefusal::Invalid { .. }) => {}
             other => return fail("create at a malformed key", format!("{other:?}")),
@@ -353,9 +357,15 @@ mod tests {
         let store = SimBlobs::new(16, 2, 20);
         let until = Instant::now() + std::time::Duration::from_secs(10);
         store.create("a", &[0; 16], until).unwrap();
-        assert!(matches!(store.create("b", &[0; 16], until), Err(BlobRefusal::Full { .. })));
+        assert!(matches!(
+            store.create("b", &[0; 16], until),
+            Err(BlobRefusal::Full { .. })
+        ));
         store.create("b", &[0; 4], until).unwrap();
-        assert!(matches!(store.create("c", &[], until), Err(BlobRefusal::Full { .. })));
+        assert!(matches!(
+            store.create("c", &[], until),
+            Err(BlobRefusal::Full { .. })
+        ));
         assert_eq!(store.bytes().unwrap(), 20);
     }
 }

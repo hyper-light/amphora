@@ -30,7 +30,7 @@ pub(super) struct StoredMark {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Segment {
     pub format: u8,
-    pub gen: u64,
+    pub generation: u64,
     pub identity: Identity,
     pub first: u64,
     pub header: Vec<u8>,

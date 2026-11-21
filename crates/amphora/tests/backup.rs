@@ -68,7 +68,11 @@ fn at(history: &[(u64, Rows)], second: u64) -> Option<&Rows> {
 /// T-T1.12.D1 (AC-T1.12.4): restore drills at random seconds pass when every row is equal.
 #[test]
 fn t_t1_12_d1_restore_drills_at_random_seconds() {
-    for seed in [0x9e37_79b9_7f4a_7c15u64, 0x2545_f491_4f6c_dd1d, 0x1234_5678_9abc_def1] {
+    for seed in [
+        0x9e37_79b9_7f4a_7c15u64,
+        0x2545_f491_4f6c_dd1d,
+        0x1234_5678_9abc_def1,
+    ] {
         drill(seed);
     }
 }
@@ -106,7 +110,11 @@ fn drill(seed: u64) {
                         let id = rng.below(300) as i64;
                         version += 1;
                         if rng.below(5) == 0 {
-                            db.query_owned("DELETE FROM t WHERE id = ?1", [Value::from_i64(id)], |_| Ok(true))?;
+                            db.query_owned(
+                                "DELETE FROM t WHERE id = ?1",
+                                [Value::from_i64(id)],
+                                |_| Ok(true),
+                            )?;
                             next.remove(&id);
                         } else {
                             let v = format!("{version}:{}", "x".repeat(rng.below(2500) as usize));
@@ -161,7 +169,9 @@ fn drill(seed: u64) {
     tick(&mut rng);
     shipper.ship(&db, &blobs, until()).unwrap();
     let last = history.last().unwrap().0;
-    let from = first_base_end.expect("a base was copied").div_ceil(SECOND_NS);
+    let from = first_base_end
+        .expect("a base was copied")
+        .div_ceil(SECOND_NS);
     let to = last.div_ceil(SECOND_NS);
     assert!(to > from, "the drill spans seconds after its first base");
     let mut restored = 0;
@@ -178,7 +188,10 @@ fn drill(seed: u64) {
                     .filter(|(k, v)| got.get(k) != Some(v))
                     .count()
                     + got.keys().filter(|k| !expected.contains_key(k)).count();
-                assert_eq!(different, 0, "seed {seed:#x}, second {second}: rows different");
+                assert_eq!(
+                    different, 0,
+                    "seed {seed:#x}, second {second}: rows different"
+                );
                 restored += 1;
             }
             Err(e) => panic!("seed {seed:#x}: second {second} refused: {e:#}"),
@@ -191,7 +204,13 @@ fn drill(seed: u64) {
         before.unwrap_err().downcast_ref::<Unrestorable>(),
         Some(Unrestorable::BeforeArchive(_) | Unrestorable::NoBase(_))
     ));
-    let after = backup::restore(&blobs, "db", to + 10_000, &dir.path().join("after.db"), until());
+    let after = backup::restore(
+        &blobs,
+        "db",
+        to + 10_000,
+        &dir.path().join("after.db"),
+        until(),
+    );
     assert!(matches!(
         after.unwrap_err().downcast_ref::<Unrestorable>(),
         Some(Unrestorable::NotYetArchived { .. })

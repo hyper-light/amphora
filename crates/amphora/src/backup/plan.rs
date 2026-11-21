@@ -3,8 +3,8 @@
 //! which objects a retention lets go ([`expired`]), and when a new base is due ([`base_due`]).
 //!
 //! The archive under a prefix `p`:
-//! - `p/log/{gen}/{first}/{last}/{first_ns}/{last_ns}/{through}/{unknown}/{link}`: a segment, the
-//!   frames `first..=last` of log generation `gen` (the archive's count of the log's generations),
+//! - `p/log/{generation}/{first}/{last}/{first_ns}/{last_ns}/{through}/{unknown}/{link}`: a segment, the
+//!   frames `first..=last` of log generation `generation` (the archive's count of the log's generations),
 //!   holding the marks of the commits it ends ([`super::Mark`]) from `first_ns` to `last_ns`
 //!   (`part` for a piece of a segment split by the store's object size, which ends at no mark);
 //!   every commit stamped at or before `through` is in it or before it; `unknown`, the first
@@ -25,7 +25,9 @@ pub enum Unrestorable {
     BeforeArchive(u64),
     #[error("second {asked} isn't archived yet: the archive is whole through {through} ns")]
     NotYetArchived { asked: u64, through: u64 },
-    #[error("which commits were made by second {asked} isn't known: commits after {from} ns weren't stamped one by one")]
+    #[error(
+        "which commits were made by second {asked} isn't known: commits after {from} ns weren't stamped one by one"
+    )]
     Inexact { asked: u64, from: u64 },
     #[error("generation {0} of the log isn't archived whole")]
     Gap(u64),
@@ -46,7 +48,7 @@ pub enum Link {
 /// A segment as its key names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentKey {
-    pub gen: u64,
+    pub generation: u64,
     pub first: u64,
     pub last: u64,
     /// The stamps of its first and last marks; None for a part, which ends at no mark.
@@ -86,7 +88,7 @@ impl SegmentKey {
         };
         format!(
             "{prefix}/log/{}/{}/{}/{first_ns}/{last_ns}/{}/{}/{link}",
-            pad(self.gen),
+            pad(self.generation),
             pad(self.first),
             pad(self.last),
             pad(self.through),
@@ -104,7 +106,17 @@ impl SegmentKey {
             .and_then(|k| k.strip_prefix("/log/"))
             .ok_or_else(|| bad("not a segment's key"))?;
         let parts: Vec<&str> = rest.split('/').collect();
-        let [gen, first, last, first_ns, last_ns, through, unknown, link] = parts.as_slice() else {
+        let [
+            generation,
+            first,
+            last,
+            first_ns,
+            last_ns,
+            through,
+            unknown,
+            link,
+        ] = parts.as_slice()
+        else {
             return Err(bad("not eight fields"));
         };
         let num = |s: &str| s.parse::<u64>().map_err(|_| bad("a field isn't a number"));
@@ -113,7 +125,7 @@ impl SegmentKey {
             (a, b) => Some((num(a)?, num(b)?)),
         };
         Ok(Self {
-            gen: num(gen)?,
+            generation: num(generation)?,
             first: num(first)?,
             last: num(last)?,
             marks,
@@ -222,7 +234,10 @@ pub fn locate(segments: &[SegmentKey], second: u64) -> Result<usize, Unrestorabl
         if let Some(from) = next.and_then(|s| s.unknown)
             && from < t
         {
-            return Err(Unrestorable::Inexact { asked: second, from });
+            return Err(Unrestorable::Inexact {
+                asked: second,
+                from,
+            });
         }
     }
     Ok(at)
@@ -241,7 +256,10 @@ pub fn cut_in(marks: &[super::Mark], second: u64) -> Result<u64, Unrestorable> {
         && let Some(from) = next.unknown_from
         && from < t
     {
-        return Err(Unrestorable::Inexact { asked: second, from });
+        return Err(Unrestorable::Inexact {
+            asked: second,
+            from,
+        });
     }
     marks
         .get(at)
@@ -270,23 +288,23 @@ pub fn chain(
     second: u64,
 ) -> Result<Plan, Unrestorable> {
     let segment = segments.get(at).ok_or(Unrestorable::NoBase(second))?;
-    let cut = (segment.gen, frame);
+    let cut = (segment.generation, frame);
     // Walk back from the cut: each generation's segments must run from frame 1 without a hole,
     // and a generation reached from the one after it only where that one's link says whole.
-    let mut gen = segment.gen;
+    let mut generation = segment.generation;
     let mut expect_last: Option<u64> = None;
-    let mut earliest = gen;
+    let mut earliest = generation;
     let mut index = at;
     let mut taken = Vec::new();
     loop {
         let Some(s) = segments.get(index) else { break };
-        if s.gen != gen {
-            // `s` ends the generation before, which `gen`'s link said was whole through its last
+        if s.generation != generation {
+            // `s` ends the generation before, which `generation`'s link said was whole through its last
             // frame: reachable only then.
-            if s.gen.checked_add(1) != Some(gen) {
+            if s.generation.checked_add(1) != Some(generation) {
                 break;
             }
-            gen = s.gen;
+            generation = s.generation;
         }
         if let Some(expected) = expect_last
             && s.last != expected
@@ -295,7 +313,7 @@ pub fn chain(
         }
         taken.push(index);
         if s.first == 1 {
-            earliest = gen;
+            earliest = generation;
             let Some(Link::Whole(last)) = s.link else {
                 break;
             };
@@ -305,7 +323,7 @@ pub fn chain(
             expect_last = Some(last);
             // Only the generation before, from its last segment back.
             match segments.get(index.saturating_sub(1)) {
-                Some(prev) if prev.gen.checked_add(1) == Some(gen) => {}
+                Some(prev) if prev.generation.checked_add(1) == Some(generation) => {}
                 _ => break,
             }
         } else {
@@ -321,7 +339,7 @@ pub fn chain(
     if !taken
         .iter()
         .filter_map(|i| segments.get(*i))
-        .any(|s| s.gen == earliest && s.first == 1)
+        .any(|s| s.generation == earliest && s.first == 1)
     {
         return Err(Unrestorable::Gap(earliest));
     }
@@ -333,7 +351,11 @@ pub fn chain(
         .ok_or(Unrestorable::NoBase(second))?;
     let segments = taken
         .into_iter()
-        .filter(|i| segments.get(*i).is_some_and(|s| s.gen >= base.start_gen))
+        .filter(|i| {
+            segments
+                .get(*i)
+                .is_some_and(|s| s.generation >= base.start_gen)
+        })
         .collect();
     Ok(Plan {
         base,
@@ -367,7 +389,7 @@ pub fn expired(
     let keep_from = plan.base.start_gen;
     let mut gone: Vec<String> = segments
         .iter()
-        .filter(|s| s.gen < keep_from)
+        .filter(|s| s.generation < keep_from)
         .map(|s| s.key(prefix))
         .collect();
     let old: Vec<&BaseKey> = bases
@@ -431,15 +453,27 @@ mod tests {
     use super::*;
     use crate::backup::Mark;
 
-    fn seg(gen: u64, first: u64, last: u64, marks: Option<(u64, u64)>, through: u64) -> SegmentKey {
+    fn seg(
+        generation: u64,
+        first: u64,
+        last: u64,
+        marks: Option<(u64, u64)>,
+        through: u64,
+    ) -> SegmentKey {
         SegmentKey {
-            gen,
+            generation,
             first,
             last,
             marks,
             through,
             unknown: None,
-            link: (first == 1).then(|| if gen == 1 { Link::Gap } else { Link::Whole(20) }),
+            link: (first == 1).then(|| {
+                if generation == 1 {
+                    Link::Gap
+                } else {
+                    Link::Whole(20)
+                }
+            }),
         }
     }
 
@@ -505,10 +539,17 @@ mod tests {
             ns,
             unknown_from,
         };
-        let marks = vec![m(3, 2 * S, None), m(7, 4 * S, None), m(9, 6 * S, Some(4 * S + 1))];
+        let marks = vec![
+            m(3, 2 * S, None),
+            m(7, 4 * S, None),
+            m(9, 6 * S, Some(4 * S + 1)),
+        ];
         assert_eq!(cut_in(&marks, 3), Ok(3));
         assert_eq!(cut_in(&marks, 4), Ok(7));
-        assert!(matches!(cut_in(&marks, 5), Err(Unrestorable::Inexact { .. })));
+        assert!(matches!(
+            cut_in(&marks, 5),
+            Err(Unrestorable::Inexact { .. })
+        ));
         assert_eq!(cut_in(&marks, 6), Ok(9));
         assert_eq!(cut_in(&marks, 1), Err(Unrestorable::BeforeArchive(1)));
     }
@@ -523,11 +564,7 @@ mod tests {
             seg(2, 1, 5, Some((3 * S, 3 * S)), 3 * S),
             seg(2, 6, 8, Some((4 * S, 4 * S)), 4 * S),
         ];
-        let base = |end, start_gen, id| BaseKey {
-            end,
-            start_gen,
-            id,
-        };
+        let base = |end, start_gen, id| BaseKey { end, start_gen, id };
         let bases = vec![base((1, 12), 1, 1), base((2, 3), 2, 2), base((2, 7), 2, 3)];
         let plan = chain(&segments, &bases, 3, 7, 4).unwrap();
         assert_eq!(plan.base.id, 3);
@@ -577,11 +614,19 @@ mod tests {
                 id: 2,
             },
         ];
-        let chunks = vec![(1, chunk_key("p", 1, 0)), (2, chunk_key("p", 2, 0)), (3, chunk_key("p", 3, 0))];
+        let chunks = vec![
+            (1, chunk_key("p", 1, 0)),
+            (2, chunk_key("p", 2, 0)),
+            (3, chunk_key("p", 3, 0)),
+        ];
         let gone = expired("p", &segments, &bases, &chunks, 4 * S, S);
         assert_eq!(
             gone,
-            vec![segments[0].key("p"), bases[0].key("p"), chunk_key("p", 1, 0)]
+            vec![
+                segments[0].key("p"),
+                bases[0].key("p"),
+                chunk_key("p", 1, 0)
+            ]
         );
         assert!(expired("p", &segments, &bases, &chunks, 4 * S, 10 * S).is_empty());
     }

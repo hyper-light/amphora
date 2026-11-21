@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 pub use amphora_engine::LogFormat;
 use amphora_engine::io::FileSyncType;
 use amphora_engine::{
-    Buffer, CheckpointMode, Completion, CompletionError, ConnectOpts, Connection, Database, DatabaseOpts,
-    IO, IOExt, LimboError, OpenFlags, OpenOptions, PlatformIO, Row, SqliteDialect, Statement,
-    StepResult, Value,
+    Buffer, CheckpointMode, Completion, CompletionError, ConnectOpts, Connection, Database,
+    DatabaseOpts, IO, IOExt, LimboError, OpenFlags, OpenOptions, PlatformIO, Row, SqliteDialect,
+    Statement, StepResult, Value,
 };
 
 use crate::store::{Checkpointed, Config, Flush, Opener};

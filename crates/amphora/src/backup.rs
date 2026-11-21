@@ -15,8 +15,8 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-pub mod plan;
 mod object;
+pub mod plan;
 mod restore;
 mod ship;
 
@@ -109,9 +109,7 @@ impl Marks {
             .marks
             .back()
             .is_some_and(|last| last.seq == seq && last.frame >= frame)
-            || state
-                .drained
-                .is_some_and(|(s, f)| s == seq && f >= frame)
+            || state.drained.is_some_and(|(s, f)| s == seq && f >= frame)
         {
             return Ok(());
         }

@@ -8,9 +8,9 @@ use std::time::Instant;
 
 use amphora_api::blobs::Blobs;
 
+use super::Mark;
 use super::object::{self, Manifest, Segment};
 use super::plan::{self, BaseKey, SegmentKey};
-use super::Mark;
 use super::ship::{FRAME_BYTES, list_all};
 use crate::db::Db;
 
@@ -88,7 +88,7 @@ pub fn restore(
     // Each generation's log, replayed whole but the last, which ends at the cut.
     let mut index = 0usize;
     while let Some(first) = plan.segments.get(index) {
-        let gen = segments.get(*first).map_or(0, |s| s.gen);
+        let generation = segments.get(*first).map_or(0, |s| s.generation);
         let mut log = std::fs::File::create_new(wal_path(path))?;
         let mut written = 0u64;
         let mut header_written = false;
@@ -96,7 +96,7 @@ pub fn restore(
             let Some((key, name)) = keys.get(*i) else {
                 anyhow::bail!("segment {i} is gone");
             };
-            if key.gen != gen {
+            if key.generation != generation {
                 break;
             }
             index = index.saturating_add(1);
@@ -114,7 +114,7 @@ pub fn restore(
                 log.write_all(&body.header)?;
                 header_written = true;
             }
-            let end = if gen == plan.cut.0 {
+            let end = if generation == plan.cut.0 {
                 key.last.min(plan.cut.1)
             } else {
                 key.last
@@ -126,7 +126,7 @@ pub fn restore(
                 .ok_or_else(|| anyhow::anyhow!("segment {name} holds fewer frames than it says"))?;
             log.write_all(frames)?;
             written = end;
-            if gen == plan.cut.0 && written >= plan.cut.1 {
+            if generation == plan.cut.0 && written >= plan.cut.1 {
                 break;
             }
         }
@@ -135,9 +135,12 @@ pub fn restore(
         let mut db = Db::open(path)?;
         db.fold_log()?;
         drop(db);
-        if gen == plan.cut.0 {
+        if generation == plan.cut.0 {
             if written != plan.cut.1 {
-                anyhow::bail!("the archive's log ends at frame {written}, before the cut at {}", plan.cut.1);
+                anyhow::bail!(
+                    "the archive's log ends at frame {written}, before the cut at {}",
+                    plan.cut.1
+                );
             }
             break;
         }
