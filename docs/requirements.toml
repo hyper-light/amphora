@@ -437,6 +437,32 @@ tests = [
   { id = "T-QT.3.5", text = "scripts/check-production.sh after the change — passes when it passes, with the ratchet's counts lowered by what the change removed" },
 ]
 
+# lane pitr: CP-T1.12's backups and point-in-time recovery (docs/design/backup.md)
+[[own]]
+id = "PITR"
+title = "Backups and point-in-time recovery to Mantle (G14 step 4)"
+criteria = [
+  { id = "AC-T1.12.3", text = "time to restore 100 GB from Mantle is at most 30 min, measured by a restore drill" },
+  { id = "AC-T1.12.4", text = "difference between a restored point and the source at that point is exactly 0 rows, measured by a row-by-row comparison" },
+]
+tests = [
+  { id = "T-T1.12.D1", text = "Restore drills at random seconds of a database written, checkpointed, restarted, shipped and copied at random — passes when every row is equal" },
+  { id = "T-T1.12.D2", text = "A database opened backed up ships as it commits through its own thread, across a close and a reopen — passes when every second after its first base restores with every row equal and no round failed" },
+  { id = "T-T1.12.P1", text = "Commits within a second keep one mark, its last; a new second a new mark" },
+  { id = "T-T1.12.P2", text = "A clock that steps back holds stamps at the last, each later than the one before, and is counted" },
+  { id = "T-T1.12.P3", text = "Past their bound the two oldest marks merge and their seconds are refused as unknown" },
+  { id = "T-T1.12.P4", text = "Archive keys round-trip through their text, in the store's order" },
+  { id = "T-T1.12.P5", text = "A second is located in the segment whose marks reach it, or in the quiet stretch before the next segment's first mark; before the first mark, past what is whole, and in an unstamped stretch it is refused" },
+  { id = "T-T1.12.P6", text = "The cut is the last mark at or before the second; an unstamped stretch after it is refused" },
+  { id = "T-T1.12.P7", text = "The chain takes the latest base on an unbroken log; a gap or a missing tail ends the walk" },
+  { id = "T-T1.12.P8", text = "Retention lets go of what precedes the base the oldest kept second needs" },
+  { id = "T-T1.12.P9", text = "A base is due with none, after a break, once the log outweighs it, and once a restore at measured rates would pass 30 minutes" },
+  { id = "T-T1.12.P10", text = "An archive object round-trips; a changed byte is refused" },
+  { id = "T-T1.12.P11", text = "A log started again twice with no write between keeps its link whole; a restart forced before its frames were shipped, or one the fence wasn't told of, breaks it" },
+  { id = "T-T1.12.P12", text = "A through mark makes the seconds after the last segment's whole through its time; one that doesn't end at a segment says nothing" },
+  { id = "AMPHORA-BLOBS", text = "The Blobs seam's conformance suite (AMPHORA-BLOBS-1 to 7) passes on SimBlobs" },
+]
+
 # lane keyheads: G3 step 4 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), searching a page by key heads.
 [[own]]
 id = "PR.4"
@@ -743,3 +769,7 @@ criteria = [
 tests = [
   { id = "T-CS.3.1", text = "crates/columnar/tests/round_trip.rs — passes when every random and real-like column, of every size around the group and vector edges, decodes equal to the input in both codecs, every bit width packs and unpacks in both layouts, the schemes follow the data, and damaged encodings are refused" },
 ]
+
+# lane groupcommit (G8 step 3, the versioned storage's log; docs/design/engine.md decision 11): no new
+# IDs. It serves AC-T1.4.2 and AC-T1.4.3 (`amphora-bench --vlog`) and T-T1.3.1
+# (crates/engine/tests/versioned_crash.rs).

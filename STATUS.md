@@ -57,6 +57,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   flight so commits land during flushes. 10,000 seeds: no acknowledged batch lost, no refused batch
   kept, no batch torn, the integrity check passing (2026-10-20). Every gate runs 200. A test holds a
   flush and commits during it: no checkpoint copies that commit before a later flush (decision 15).
+- **The versioned storage's log in lanes** (CP-T1.3's log, `crates/engine/storage/versioned`,
+  docs/design/engine.md decision 11): one group-committed log or a log a writer, merged by commit
+  timestamp; a commit acknowledged once every lane is durable through it; recovery replays to the
+  first missing commit, reading and replaying side by side (SiloR), and cuts each lane there; on Linux
+  a flush is one io_uring submission (the engine's `io_uring` feature). Checkpoints copy pages by
+  copy-on-update after a pause that only lists rows with versions (decision 7). T-T1.3.1, a crash at
+  every disk operation of each seed's workload: 200 seeds in every gate; the 10,000 and
+  `amphora-bench --vlog` (AC-T1.4.2, AC-T1.4.3) not yet run.
 - **Stores on the engine** (`crates/amphora/src/db.rs`): a database opened for the pipeline, its
   readers, its flusher, its checkpoints and its log's restart.
 - **Amphora's engine** (`crates/engine*`, its `ORIGIN.md`): Turso's four crates (core, sqlite/parser,
@@ -337,6 +345,16 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   moves the raft log's start no further than what the flushing thread made durable (T-T1.8.L1). The Records suite
   and seeded histories run on one harness at one voter and three, with identical transcripts (T-T1.8.L2; lane
   g12s2, 2026-11-21).
+
+- **Backups and point-in-time recovery to Mantle, the mechanism** (CP-T1.12, lane pitr,
+  `crates/amphora/src/backup*`, docs/design/backup.md): the object-store seam (`amphora_api::blobs`,
+  its simulator and conformance suite); commits stamped by the writer (one mark a second); the log's
+  durable frames shipped as segments with no timer; bases copied chunk by chunk without a reader;
+  log restarts held until shipped; restore to any second by the engine's own recovery, refusing
+  seconds the archive can't say exactly. Restore drills at random seconds on the simulator: every row
+  equal (T-T1.12.D1). `Database::open_backed_up` backs a local writer up: its commits stamped and a
+  thread that ships and copies bases as it commits, across a close and a reopen (T-T1.12.D2). Not
+  yet: kiln's adapter to Mantle, and the 100 GB restore measurement (AC-T1.12.3).
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and

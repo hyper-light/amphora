@@ -1059,7 +1059,7 @@ mod tests {
     /// rebuilds when it pays, and a reader scans the copy at fresh snapshots and at snapshots held
     /// across rebuilds: every scan equals the rows at its snapshot.
     fn scans_equal_rows<B: Block>(bound: usize, seed: u64) -> Seen {
-        let db = Database::open(Arc::new(Simulated::new(seed)), 4_000, 1, cmp).unwrap();
+        let db = Database::open(Arc::new(Simulated::new(seed, 1).unwrap()), 4_000, 1, cmp).unwrap();
         let ticks = Arc::new(AtomicU64::new(0));
         let t2 = ticks.clone();
         let feed = Arc::new(Feed::new(
@@ -1076,7 +1076,7 @@ mod tests {
             db.put(&mut d, &mut t, 0, &k.to_be_bytes(), &[1; 8])
                 .unwrap();
         }
-        db.commit(t, &mut d, false).unwrap();
+        db.commit(t, &mut d, db.lane(), false).unwrap();
         rebuild(&db, &copy, 0);
         let stop = AtomicBool::new(false);
         let writers_left = AtomicU64::new(4);
@@ -1108,7 +1108,7 @@ mod tests {
                             }
                         }
                         if ok {
-                            db.commit(t, &mut d, false).unwrap();
+                            db.commit(t, &mut d, db.lane(), false).unwrap();
                         } else {
                             db.abort(t, &mut d).unwrap();
                         }
@@ -1203,7 +1203,7 @@ mod tests {
     /// equal the rows; at a later one it is refused, for a rebuild (T-CS.2.3).
     #[test]
     fn cs2_packed_copy_reused_at_open_only_when_current() {
-        let db = Database::open(Arc::new(Simulated::new(9)), 2_000, 1, cmp).unwrap();
+        let db = Database::open(Arc::new(Simulated::new(9, 1).unwrap()), 2_000, 1, cmp).unwrap();
         let feed = Arc::new(Feed::new(0, usize::MAX, Box::new(|| 0)));
         db.keep_columns(feed.clone()).unwrap();
         let copy = Columns::<Packed>::new(feed);
@@ -1218,7 +1218,7 @@ mod tests {
                     db.put(&mut d, &mut t, 0, &[k], &[round, k]).unwrap();
                 }
             }
-            db.commit(t, &mut d, false).unwrap();
+            db.commit(t, &mut d, db.lane(), false).unwrap();
         }
         let shelf = MemShelf::default();
         copy.persist(db.newest(), &shelf, 0).unwrap();

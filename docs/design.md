@@ -55,6 +55,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | engine | 8 | Recovery: the file's pages, the last journal, its list, then the redo after T | [engine.md](design/engine.md#8-recovery-the-files-pages-the-last-journal-its-list-then-the-redo-after-t) |
 | engine | 9 | Beside the engine it replaces, behind the cursor the SQL layer already uses | [engine.md](design/engine.md#9-beside-the-engine-it-replaces-behind-the-cursor-the-sql-layer-already-uses) |
 | engine | 10 | Memory: versions pruned between snapshots, one budget, typed refusals | [engine.md](design/engine.md#10-memory-versions-pruned-between-snapshots-one-budget-typed-refusals) |
+| engine | 11 | The log in lanes: one group-committed log, or a log a writer | [engine.md](design/engine.md#11-the-log-in-lanes-one-group-committed-log-or-a-log-a-writer) |
 | executor | 1 | A statement keeps its small ephemeral tables from one run to the next | [executor.md](design/executor.md#1-a-statement-keeps-its-small-ephemeral-tables-from-one-run-to-the-next) |
 | executor | 2 | `IN (SELECT ...)` answers a row with one search of its list | [executor.md](design/executor.md#2-in-select--answers-a-row-with-one-search-of-its-list) |
 | executor | 3 | LIKE jumps to where the literal after a `%` can match | [executor.md](design/executor.md#3-like-jumps-to-where-the-literal-after-a--can-match) |
