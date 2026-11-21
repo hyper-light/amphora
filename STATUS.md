@@ -629,8 +629,11 @@ change, and a power cut leaves the old schema or the new. DROP COLUMN is not yet
   table is planned as its mirrored LEFT JOIN, CD-C's commutativity rule, so the tables after it are no
   longer held behind its right table and the audit's 03-right-full-barrier reads tiny first (T-PL.8.1);
   an outer join's ON term that reads only earlier tables now counts in its join's estimate.
-  Not built: bushy plans over connected complement pairs with a composite hash-join build, and CD-C's
-  rules for outer, semi and anti joins in place of `required_lhs_by_table`; JOB's AC-PL.8.1 is open.
+  Lane pl8-3 (docs/design/planner.md "Decision (lane pl8-3)"): a LEFT JOIN's right table follows only
+  the tables its ON terms read (CD-C's left-asscom rule), answers held against SQLite (T-PL.8.2), and
+  `JoinN` carries a bushy shape (`inner_joins`) that left-deep plans leave empty.
+  Not built: bushy plans over connected complement pairs with a composite hash-join build, and semi
+  and anti joins placed before other loops (the emitter's no-match path); JOB's AC-PL.8.1 is open.
   PL.9 is built (lane pl9, docs/design/planner.md "row counts kept as rows change"): each table's
   rows inserted less deleted since ANALYZE are kept as writes finish (one atomic add a statement),
   the planner's row count follows them, and a prepared statement plans again once a table it counted

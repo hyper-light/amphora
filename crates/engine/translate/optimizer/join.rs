@@ -36,8 +36,9 @@ use crate::{
             order::{access_method_is_one_row, plan_satisfies_order_target},
         },
         plan::{
-            HashJoinKey, HashJoinType, JoinInfo, JoinOrderMember, JoinOrigin, JoinedTable,
-            NonFromClauseSubquery, SubqueryOrigin, SubqueryState, TableReferences, WhereTerm,
+            HashJoinKey, HashJoinType, JoinInfo, JoinOrderMember, JoinOrigin, JoinType,
+            JoinedTable, NonFromClauseSubquery, SubqueryOrigin, SubqueryState, TableReferences,
+            WhereTerm,
         },
         planner::{expr_reads_an_outer_query, table_mask_from_expr, TableMask},
     },
@@ -1366,7 +1367,8 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
     // If there are outer joins in the plan, ensure correct ordering.
     let (left_join_illegal_map, required_lhs_by_table) = {
-        let required_lhs_by_table = required_lhs_by_table(joined_tables)?;
+        let required_lhs_by_table =
+            required_lhs_by_table(joined_tables, where_clause, &where_terms)?;
         if required_lhs_by_table.iter().all(TableMask::is_empty) {
             (None, None)
         } else {
@@ -1909,11 +1911,12 @@ fn compute_greedy_join_order<'a>(
         return Ok(None);
     }
 
-    let left_join_deps: HashMap<usize, TableMask> = required_lhs_by_table(joined_tables)?
-        .into_iter()
-        .enumerate()
-        .filter(|(_, required)| !required.is_empty())
-        .collect();
+    let left_join_deps: HashMap<usize, TableMask> =
+        required_lhs_by_table(joined_tables, where_clause, where_terms)?
+            .into_iter()
+            .enumerate()
+            .filter(|(_, required)| !required.is_empty())
+            .collect();
 
     let mut remaining: TableMask = (0..num_tables).try_collect()?;
     let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
@@ -2063,19 +2066,51 @@ fn left_join_illegal_map(required_lhs_by_table: &[TableMask]) -> Result<HashMap<
 }
 
 /// For each table, the tables that must come before it in any join order.
-fn required_lhs_by_table(joined_tables: &[JoinedTable]) -> Result<Vec<TableMask>> {
+///
+/// PL.8, CD-C's conflict rules (Moerkotte, Fender and Eich, SIGMOD 2013) for the left-deep orders
+/// the search makes. A LEFT JOIN's right table must follow the tables its ON terms read (its
+/// syntactic eligibility set): the left-asscom rule `(e1 LEFT JOIN e2) op e3 = (e1 op e3) LEFT JOIN
+/// e2`, which holds for op an inner, left, semi or anti join whose term doesn't read e2, lets every
+/// other table of its left side move after it. A later table whose term reads the right table
+/// follows it by that term; a WHERE term on it runs after its NULL row, at the later table's loop.
+/// When the ON terms read no table of its left side (`ON 1`, `ON b.x = 5`), CD-C's rule keeps its
+/// whole left side before it, as it keeps every table before a semi, anti, FULL, CROSS or LATERAL
+/// join's: the emitter runs a semi or anti join's table as the last loops (its no-match path enters
+/// the row's body), so their order stays as it was.
+fn required_lhs_by_table(
+    joined_tables: &[JoinedTable],
+    where_clause: &[WhereTerm],
+    where_terms: &[WhereTermInfo],
+) -> Result<Vec<TableMask>> {
     let mut required_lhs_by_table = vec![TableMask::default(); joined_tables.len()];
-    for (j, joined_table) in joined_tables.iter().enumerate() {
-        // LEFT/FULL OUTER, SEMI, and ANTI joins all require the RHS table
-        // to appear after the LHS table in the join order.
-        if joined_table
-            .join_info
-            .as_ref()
-            .is_some_and(|j| j.is_ordering_constrained())
-        {
-            for i in 0..j {
-                required_lhs_by_table[j].set(i)?;
+    for (j, (joined_table, required)) in joined_tables
+        .iter()
+        .zip(required_lhs_by_table.iter_mut())
+        .enumerate()
+    {
+        let Some(join_info) = joined_table.join_info.as_ref() else {
+            continue;
+        };
+        if !join_info.is_ordering_constrained() {
+            continue;
+        }
+        let left_join_free = join_info.join_type == JoinType::LeftOuter
+            && !join_info.no_reorder
+            && !join_info.lateral;
+        if left_join_free {
+            let on_origin = JoinOrigin::Outer(joined_table.internal_id);
+            let mut read = TableMask::default();
+            for (term, info) in where_clause.iter().zip(where_terms) {
+                if term.origin.join_origin() == Some(on_origin) {
+                    read.union_with(&info.table_mask)?;
+                }
             }
+            for table in read.iter().filter(|&table| table < j) {
+                required.set(table)?;
+            }
+        }
+        if required.is_empty() {
+            *required = (0..j).try_collect()?;
         }
     }
     // A RIGHT or FULL JOIN is a reordering barrier in both directions.
