@@ -318,6 +318,16 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   NOCASE)` is 1 where SQLite says 0 (the left operand's collation decides), and `PRAGMA index_xinfo`
   names the rowid's column '' where SQLite gives NULL. CedarDB's server dies on
   `SELECT 0 OR NULL, 1 OR NULL`, and again when it's tried a second time.
+- **The corpus's runner** (G2 steps 4 and 7, lane corpus-ci; `crates/corpus`, built, not yet in the gate):
+  sqllogictest records read, run, rendered (I, R, T as slt_sqlite.c writes them, REALs through Amphora's
+  port of SQLite's printf), sorted and compared (MD5 past the hash threshold) as SQLite's own runner does,
+  one code path for the gate's subset and the bench's run over every engine; each query after a statement
+  settles the engine first (`PRAGMA wal_checkpoint(TRUNCATE)`), and each disagreement classifies as an
+  Amphora bug, a competitor's bug, a dialect difference or a translation gap. `amphora-corpus run <pool>
+  --budget-s <s>` runs a ranked pool on Amphora: required files whole, the rest until the budget, timed on
+  the machine as it runs, so the subset's size is what that machine runs in the budget. Left: the pool
+  chosen and checked in, its line in `scripts/gates.sh`, the bench's adapters for the other engines, the
+  nightly in `.kiln/`.
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691
