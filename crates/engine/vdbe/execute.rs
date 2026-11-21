@@ -18624,6 +18624,31 @@ pub fn op_hash_mark_matched(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// G6 step 5's hash semi join: emit a build row at its first match only.
+pub fn op_hash_mark_first_match(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        HashMarkFirstMatch {
+            hash_table_id,
+            target_pc,
+        },
+        insn
+    );
+    let hash_table = state.hash_tables.get_mut(hash_table_id).ok_or_else(|| {
+        LimboError::InternalError(format!("Hash table not found with ID: {hash_table_id}"))
+    })?;
+    if hash_table.mark_current_matched_first()? {
+        state.pc += 1;
+    } else {
+        state.pc = target_pc.as_offset_int();
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_hash_scan_unmatched(
     _program: &Program,
     state: &mut ProgramState,

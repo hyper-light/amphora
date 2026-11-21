@@ -83,6 +83,7 @@ dependencies = [
  "hyper-durable",
  "hyper-log",
  "hyper-raft",
+ "hyper-timing",
  "postcard",
  "private-fs",
  "rustix",

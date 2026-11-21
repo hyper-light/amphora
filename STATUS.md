@@ -86,6 +86,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   hurts: statements that write hundreds of pages, `insert_batch_100` at 32 clients 392 → 44 a
   second, `delete_range_insert` 2,800 → 1,011 (fedora, 2026-10-22, checks); single-row writes as
   before.
+- **Page reads without the log's shared locks** (G3 step 2, docs/design/store.md decision 40,
+  `crates/engine/storage/log_index.rs`), a prototype behind `AMPHORA_LOG_READ_INDEX`, off by
+  default: the log's header read from a seqlocked copy; a page the log doesn't hold answered from an
+  exact bitmap; the frame index read from a copy published per generation (`published`) or from
+  sharded latest-frame tables under version checks (`optimistic`). Built and tested (a model against
+  the locked index, crashes at every write of a checkpoint and restart); not yet measured, nor a way
+  chosen.
 - **The mixed log's commit costs** (docs/design/store.md, Decision (lane wal-read)): publishing a
   commit's records costs a lookup each, not a pass over the records kept decoded or over the
   commit's pages, and deltas are found a word at a time. Built, not merged; whether the bulk
@@ -390,8 +397,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   quorum patience's and the write slot's generations are learned from their own events (GN.1); and a generation of
   the database log's restarts ends once it alone covers its own spend at the p99.9, the next restart guessed by the
   worst of the last thousand holds (`log_bound::GENERATION` gone; replication.md, "Decision (lane constants): a
-  generation of restarts ends once it covers its spend"; GN.2). Left: an owner's other descriptors (endpoint, engine
-  files, a replica's log) charged by kind, the replicated owner's tick (`TICK`, twenty ticks an election), its queue
+  generation of restarts ends once it covers its spend"; GN.2); and the replicated owner's tick period is learned
+  from its voters' round trips, its flushes, its leader's link and its timer by hyper-timing's law, 10 ms only the
+  start state before they are measured (replication.md, "Decision (lane constants): the owner's tick pace"; TP.1).
+  Left: an owner's other descriptors (endpoint, engine files, a replica's log) charged by kind, the core's tick
+  counts (twenty an election, two a heartbeat: raft-rs's defaults, fixed in tick mode), the owner's queue
   and outgoing bounds and the log's compaction trigger, and the rest of the list (handoff/amphora-constants-list.md).
 - **Groups that split, merge and move themselves** (CP-T1.9, lane split-merge; `crates/amphora/src/reshard/`,
   docs/design/reshard.md): a pure core: a directory of hash spans with every position in exactly one group,
@@ -408,7 +418,7 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   split-merge-6): an engine keeps a log of its commits and copies a span by position (`Engine::head`,
   `export`, `changed`, `import`, `keep_log`, `sweep`); the old group's log is held from the first copy
   until the operation ends; `Groups::carry` carries every driver action to this node's groups, so a split
-  or merge moves the range's rows (T-T1.9.R4), with the cutover-pause and lab harnesses (T-T1.9.P1, L1).
+  or merge moves the range's rows, through repeated actions and driver restarts (T-T1.9.R4, R5), with the cutover-pause and lab harnesses (T-T1.9.P1, L1).
   Left: `database::Local` as a group (its holding and log through a replicated command), moves across
   nodes, load from the store's meter, and the full AC-T1.9.2 and AC-T1.9.3 runs.
 
@@ -423,7 +433,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   row is refused. NOT NULL and CHECK are added to an existing column (`ALTER COLUMN c TO` its own
 definition plus the constraint) write-only, then validated in learned rowid batches, then public by
 a catalog change; the planner doesn't rely on an unvalidated NOT NULL, a breaking row undoes the
-change, and a power cut leaves the old schema or the new. DROP COLUMN is not yet built.
+change, and a power cut leaves the old schema or the new. DROP COLUMN is built PostgreSQL's way: one
+catalog change hides the column as a slot (no name finds it, `*` and inserts pass it, every write
+stores NULL in it), learned rowid batches clear its old values, then the drop is recorded.
 
 ## Measured
 
@@ -565,6 +577,14 @@ change, and a power cut leaves the old schema or the new. DROP COLUMN is not yet
   but not merged: with today's join costs it flips `records_plans`' one-row-lookup case to a hash join and a sort
   (the two plans cost about 110 each), so it waits for the learned costs, then the `rhs_has_selective_seek` gate removed, builds over joined inputs, PL.5's Bloom
   filters with LIP and predicate transfer, and sort-merge and prefetched index joins (G6 step 4).
+- **G6 step 5, plans that read less, started** (lane g6s5): an `EXISTS` may now run as a hash semi join, chosen by
+  cost against the nested loop's early out: the outer rows build the hash table, the subquery's table probes it, and
+  `HashMarkFirstMatch` passes each build row on at its first match in a probe pass only (its matched bit, kept in
+  grace partitions when the table spills). `tests/hash_semi_join.rs` runs EXISTS queries with NULL and duplicate
+  keys under all three join methods, in memory and spilled, against a model. Index-only reads were already planned
+  (covering indexes). Left: bitmap-style sorted row fetches (a one-branch RowSet read; the multi-index fetch cost
+  assumes page locality and should be learned first), and the 2x measurements on order_by_sort, exists_subquery
+  and left_join_anti (the coordinator's).
 - **The replicated class** (docs/design/replication.md, "Fast acknowledgement"; Ada's word 2026-11-01): built on
   t1/replicated-line, not on main (fast-ack, class-metrics, class-quorum and disk-stalls, merged in that order). A
   replicated database opened with `Durability::Replicated(Fates)` answers a write once members spanning the fates
@@ -647,8 +667,11 @@ change, and a power cut leaves the old schema or the new. DROP COLUMN is not yet
   table is planned as its mirrored LEFT JOIN, CD-C's commutativity rule, so the tables after it are no
   longer held behind its right table and the audit's 03-right-full-barrier reads tiny first (T-PL.8.1);
   an outer join's ON term that reads only earlier tables now counts in its join's estimate.
-  Not built: bushy plans over connected complement pairs with a composite hash-join build, and CD-C's
-  rules for outer, semi and anti joins in place of `required_lhs_by_table`; JOB's AC-PL.8.1 is open.
+  Lane pl8-3 (docs/design/planner.md "Decision (lane pl8-3)"): a LEFT JOIN's right table follows only
+  the tables its ON terms read (CD-C's left-asscom rule), answers held against SQLite (T-PL.8.2), and
+  `JoinN` carries a bushy shape (`inner_joins`) that left-deep plans leave empty.
+  Not built: bushy plans over connected complement pairs with a composite hash-join build, and semi
+  and anti joins placed before other loops (the emitter's no-match path); JOB's AC-PL.8.1 is open.
   PL.9 is built (lane pl9, docs/design/planner.md "row counts kept as rows change"): each table's
   rows inserted less deleted since ANALYZE are kept as writes finish (one atomic add a statement),
   the planner's row count follows them, and a prepared statement plans again once a table it counted
