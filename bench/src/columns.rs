@@ -26,7 +26,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use amphora_engine::storage::versioned::blink::{Comparator, Descender};
-use amphora_engine::storage::versioned::columns::{Block, Columns, Feed, Packed, Plain, Rows, ScanCounts};
+use amphora_engine::storage::versioned::columns::{
+    Block, Columns, Feed, Packed, Plain, Rows, ScanCounts,
+};
 use amphora_engine::storage::versioned::disk::Files;
 use amphora_engine::storage::versioned::durable::Database;
 use amphora_engine::storage::versioned::version::Snapshot;
@@ -53,7 +55,8 @@ impl Rows for At<'_> {
         self.db.get(&mut Descender::new(), self.snap, 0, key)
     }
     fn all(&self) -> amphora_engine::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.db.scan(&mut Descender::new(), self.snap, 0, None, usize::MAX)
+        self.db
+            .scan(&mut Descender::new(), self.snap, 0, None, usize::MAX)
     }
 }
 
@@ -90,7 +93,10 @@ pub fn main() -> anyhow::Result<()> {
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        let mut v = || args.next().ok_or_else(|| anyhow::anyhow!("{a} takes a value"));
+        let mut v = || {
+            args.next()
+                .ok_or_else(|| anyhow::anyhow!("{a} takes a value"))
+        };
         match a.as_str() {
             "--columns" => {}
             "--dir" => o.dir = v()?.into(),
@@ -122,7 +128,8 @@ fn rebuild<B: Block>(db: &Database, copy: &Columns<B>, epoch: Instant) -> anyhow
     let t = Instant::now();
     let snap = db.snapshot().map_err(e)?;
     let rows = At { db, snap: &snap }.all().map_err(e)?;
-    copy.rebuild(snap.start, &rows, epoch.elapsed().as_nanos() as u64).map_err(e)?;
+    copy.rebuild(snap.start, &rows, epoch.elapsed().as_nanos() as u64)
+        .map_err(e)?;
     db.close_snapshot(snap);
     let took = t.elapsed().as_nanos();
     copy.rebuilt(took);
@@ -139,7 +146,13 @@ fn run<B: Block + 'static>(o: &Opts, name: &str, clients: usize, keep: bool) -> 
     // for the preload and what the run adds.
     let row = 8 + o.value as u64 + 6;
     let frames = usize::try_from((o.rows * 4) * row / 1_500 + 1_000)?;
-    let db = Database::open(Arc::new(Files::open(&dir).map_err(e)?), frames, 1, || -> Comparator { Box::new(|a: &[u8], b: &[u8]| a.cmp(b)) }).map_err(e)?;
+    let db = Database::open(
+        Arc::new(Files::open(&dir).map_err(e)?),
+        frames,
+        1,
+        || -> Comparator { Box::new(|a: &[u8], b: &[u8]| a.cmp(b)) },
+    )
+    .map_err(e)?;
     let v = vec![7u8; o.value];
     let mut d = Descender::new();
     let mut i = 0;
@@ -147,7 +160,8 @@ fn run<B: Block + 'static>(o: &Opts, name: &str, clients: usize, keep: bool) -> 
         let mut t = db.begin().map_err(e)?;
         let end = (i + 1_000).min(o.rows);
         for k in i..end {
-            db.put(&mut d, &mut t, 0, &mix(k).to_be_bytes(), &v).map_err(e)?;
+            db.put(&mut d, &mut t, 0, &mix(k).to_be_bytes(), &v)
+                .map_err(e)?;
         }
         db.commit(t, &mut d, false).map_err(e)?;
         i = end;
@@ -155,7 +169,11 @@ fn run<B: Block + 'static>(o: &Opts, name: &str, clients: usize, keep: bool) -> 
     db.sync().map_err(e)?;
     let epoch = Instant::now();
     let copy = if keep {
-        let feed = Arc::new(Feed::new(0, o.queue_bytes, Box::new(move || epoch.elapsed().as_nanos() as u64)));
+        let feed = Arc::new(Feed::new(
+            0,
+            o.queue_bytes,
+            Box::new(move || epoch.elapsed().as_nanos() as u64),
+        ));
         db.keep_columns(feed.clone()).map_err(e)?;
         let c = Columns::<B>::new(feed);
         rebuild(&db, &c, epoch)?;
@@ -191,7 +209,10 @@ fn run<B: Block + 'static>(o: &Opts, name: &str, clients: usize, keep: bool) -> 
                     mine.push(t0.elapsed().as_nanos() as u64);
                     commits.fetch_add(1, Ordering::Relaxed);
                 }
-                latencies.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.extend(mine);
+                latencies
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("poisoned"))?
+                    .extend(mine);
                 Ok(())
             }));
         }
@@ -222,7 +243,9 @@ fn run<B: Block + 'static>(o: &Opts, name: &str, clients: usize, keep: bool) -> 
                     let (_, k) = c.scan(snap.start, &At { db, snap: &snap }).map_err(e)?;
                     c.measured(t.elapsed().as_nanos(), &k);
                     db.close_snapshot(snap);
-                    let mut s = scan_counts.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
+                    let mut s = scan_counts
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("poisoned"))?;
                     s.queued += k.queued;
                     s.fallbacks += k.fallbacks;
                     s.copy += 1;
@@ -235,20 +258,26 @@ fn run<B: Block + 'static>(o: &Opts, name: &str, clients: usize, keep: bool) -> 
         }
         stop.store(true, Ordering::Relaxed);
         for h in handles {
-            h.join().map_err(|_| anyhow::anyhow!("a writer panicked"))??;
+            h.join()
+                .map_err(|_| anyhow::anyhow!("a writer panicked"))??;
         }
         if let Some(h) = worker {
-            let (l, r) = h.join().map_err(|_| anyhow::anyhow!("the copy's worker panicked"))??;
+            let (l, r) = h
+                .join()
+                .map_err(|_| anyhow::anyhow!("the copy's worker panicked"))??;
             lags = l;
             rebuilds = r;
         }
         if let Some(h) = reader {
-            h.join().map_err(|_| anyhow::anyhow!("the reader panicked"))??;
+            h.join()
+                .map_err(|_| anyhow::anyhow!("the reader panicked"))??;
         }
         Ok(())
     })?;
     let secs = began.elapsed().as_secs_f64();
-    let mut lat = latencies.into_inner().map_err(|_| anyhow::anyhow!("poisoned"))?;
+    let mut lat = latencies
+        .into_inner()
+        .map_err(|_| anyhow::anyhow!("poisoned"))?;
     // Scans with writers stopped: the copy (caught up) and the rows, best of --scans.
     let mut best_copy = f64::INFINITY;
     let mut best_rows = f64::INFINITY;
@@ -263,7 +292,10 @@ fn run<B: Block + 'static>(o: &Opts, name: &str, clients: usize, keep: bool) -> 
     }
     for _ in 0..o.scans {
         let snap = db.snapshot().map_err(e)?;
-        let at = At { db: &db, snap: &snap };
+        let at = At {
+            db: &db,
+            snap: &snap,
+        };
         let t = Instant::now();
         let rows = at.all().map_err(e)?;
         best_rows = best_rows.min(t.elapsed().as_secs_f64());
@@ -272,12 +304,18 @@ fn run<B: Block + 'static>(o: &Opts, name: &str, clients: usize, keep: bool) -> 
             let t = Instant::now();
             let (got, k) = c.scan(snap.start, &at).map_err(e)?;
             best_copy = best_copy.min(t.elapsed().as_secs_f64());
-            anyhow::ensure!(got == rows && k.fallbacks == 0, "the copy's scan differs from the rows at {}", snap.start);
+            anyhow::ensure!(
+                got == rows && k.fallbacks == 0,
+                "the copy's scan differs from the rows at {}",
+                snap.start
+            );
         }
         db.close_snapshot(snap);
     }
     let own = n_rows as f64 * (8 + o.value) as f64;
-    let sc = scan_counts.into_inner().map_err(|_| anyhow::anyhow!("poisoned"))?;
+    let sc = scan_counts
+        .into_inner()
+        .map_err(|_| anyhow::anyhow!("poisoned"))?;
     let counts = copy.as_ref().map(|c| c.feed().counts()).unwrap_or_default();
     println!(
         "{}",

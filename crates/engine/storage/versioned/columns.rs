@@ -205,10 +205,9 @@ impl Block for Plain {
         Ok(())
     }
     fn resident(&self) -> usize {
-        self.keys
-            .iter()
-            .chain(&self.values)
-            .fold(0usize, |n, c| n.saturating_add(c.len()).saturating_add(VEC_HEAD))
+        self.keys.iter().chain(&self.values).fold(0usize, |n, c| {
+            n.saturating_add(c.len()).saturating_add(VEC_HEAD)
+        })
     }
 }
 
@@ -232,7 +231,9 @@ fn read_leb(bytes: &[u8], at: &mut usize) -> Result<usize> {
     let mut v = 0usize;
     let mut shift = 0u32;
     loop {
-        let b = *bytes.get(*at).ok_or_else(|| corrupt("a length past the end"))?;
+        let b = *bytes
+            .get(*at)
+            .ok_or_else(|| corrupt("a length past the end"))?;
         *at = at.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
         let part = usize::from(b & 0x7f)
             .checked_shl(shift)
@@ -462,12 +463,7 @@ impl<B: Block> Generation<B> {
 
     /// The rows at `s` (made at or before it), but for the keys in `skip`, into `out`, in key
     /// order: how many delta versions the scan looked at.
-    fn scan(
-        &self,
-        s: Ts,
-        skip: &BTreeSet<Vec<u8>>,
-        out: &mut Rowset,
-    ) -> Result<u64> {
+    fn scan(&self, s: Ts, skip: &BTreeSet<Vec<u8>>, out: &mut Rowset) -> Result<u64> {
         let mut looked = 0u64;
         let emit = |k: &[u8], v: &[u8], out: &mut Rowset| {
             if !skip.contains(k) {
@@ -525,7 +521,10 @@ pub struct Sizer {
 
 impl Sizer {
     fn cost(&self, size: usize) -> Option<(u128, u128)> {
-        self.measured.get(&size).copied().filter(|(_, rows)| *rows > 0)
+        self.measured
+            .get(&size)
+            .copied()
+            .filter(|(_, rows)| *rows > 0)
     }
 
     /// The size to cut a generation of `rows` rows at.
@@ -536,9 +535,7 @@ impl Sizer {
             .measured
             .iter()
             .filter(|(size, (_, r))| **size <= rows && *r > 0)
-            .min_by(|(_, (a, ra)), (_, (b, rb))| {
-                a.saturating_mul(*rb).cmp(&b.saturating_mul(*ra))
-            })
+            .min_by(|(_, (a, ra)), (_, (b, rb))| a.saturating_mul(*rb).cmp(&b.saturating_mul(*ra)))
             .map(|(size, _)| *size);
         let size = match best {
             None => rows,
@@ -560,7 +557,8 @@ impl Sizer {
         if let Some(size) = self.current {
             let e = self.measured.entry(size).or_insert((0, 0));
             e.0 = e.0.saturating_add(nanos);
-            e.1 = e.1.saturating_add(u128::try_from(rows).unwrap_or(u128::MAX));
+            e.1 =
+                e.1.saturating_add(u128::try_from(rows).unwrap_or(u128::MAX));
         }
     }
 
@@ -650,7 +648,10 @@ impl<B: Block> Columns<B> {
         let records: Vec<Queued> = q.records.drain(..).collect();
         q.bytes = 0;
         if let Some((first, last)) = q.lost.take() {
-            st.behind = Some(st.behind.map_or((first, last), |(f, l)| (f.min(first), l.max(last))));
+            st.behind = Some(
+                st.behind
+                    .map_or((first, last), |(f, l)| (f.min(first), l.max(last))),
+            );
         }
         drop(q);
         let n = records.len();
@@ -912,7 +913,10 @@ impl Columns<Packed> {
         for b in &g.blocks {
             b.encode(&mut out);
         }
-        let versions = g.deltas.values().fold(0usize, |n, v| n.saturating_add(v.len()));
+        let versions = g
+            .deltas
+            .values()
+            .fold(0usize, |n, v| n.saturating_add(v.len()));
         push_leb(&mut out, versions);
         for ((_, _, key), vs) in &g.deltas {
             for (vts, value) in vs {
@@ -1069,7 +1073,8 @@ mod tests {
         let mut d = Descender::new();
         let mut t = db.begin().unwrap();
         for k in 0..200u16 {
-            db.put(&mut d, &mut t, 0, &k.to_be_bytes(), &[1; 8]).unwrap();
+            db.put(&mut d, &mut t, 0, &k.to_be_bytes(), &[1; 8])
+                .unwrap();
         }
         db.commit(t, &mut d, false).unwrap();
         rebuild(&db, &copy, 0);
@@ -1222,7 +1227,10 @@ mod tests {
             .unwrap()
             .expect("current");
         let snap = db.snapshot().unwrap();
-        let rows = At { db: &db, snap: &snap };
+        let rows = At {
+            db: &db,
+            snap: &snap,
+        };
         let (got, c) = again.scan(snap.start, &rows).unwrap();
         assert_eq!(got, rows.all().unwrap());
         assert_eq!(c.fallbacks, 0);
