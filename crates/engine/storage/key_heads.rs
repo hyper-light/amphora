@@ -857,10 +857,17 @@ mod tests {
             }
             conn.execute("COMMIT").unwrap();
 
+            // The root pages, read through the connection before the cursors' read transaction
+            // (a statement opens its own; the pager holds one at a time).
+            let table_root = rootpage(&conn, "t");
+            let index_roots: Vec<i64> = indexes
+                .iter()
+                .map(|(name, _, _)| rootpage(&conn, name))
+                .collect();
             let pager = conn.pager.load().clone();
             pager.begin_read_tx().unwrap();
             // The table, by rowid.
-            let root = rootpage(&conn, "t");
+            let root = table_root;
             let mut heads = BTreeCursor::new_table(pager.clone(), root, 3);
             let mut today = BTreeCursor::new_table(pager.clone(), root, 3);
             heads.set_key_heads(true);
@@ -880,7 +887,7 @@ mod tests {
                 assert_eq!(heads.position(), today.position(), "rowid {rowid} {op:?}");
             }
             // Each index, by keys of one or two values.
-            for (name, _, key_info) in &indexes {
+            for ((name, _, key_info), &root) in indexes.iter().zip(&index_roots) {
                 let info = Arc::new(
                     IndexInfo::new(
                         key_info.iter().map(|(sort_order, collation)| KeyInfo {
@@ -894,7 +901,6 @@ mod tests {
                     )
                     .unwrap(),
                 );
-                let root = rootpage(&conn, name);
                 let mut heads = BTreeCursor::new_index_for_test(pager.clone(), root, info.clone());
                 let mut today = BTreeCursor::new_index_for_test(pager.clone(), root, info.clone());
                 heads.set_key_heads(true);
@@ -917,5 +923,194 @@ mod tests {
             DECIDED.with(Cell::get) > before,
             "the key heads decided no probe"
         );
+    }
+    /// A workload size from the environment, else `default`: the bench's input, not a tuning value.
+    fn bench_size(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    }
+
+    /// The micro-benchmark behind AC-PR.4.1 and the ski rental's one assumption (that a build's
+    /// decode costs what a probe's does). Run it, release, nothing else building:
+    /// `cargo test -p amphora-engine --release --lib key_heads_bench -- --ignored --nocapture`
+    /// (`AMPHORA_KEY_HEADS_BENCH_ROWS`, `AMPHORA_KEY_HEADS_BENCH_SEEKS` size it). It prints, for the
+    /// table by rowid and a text index like the suite's:
+    /// - `off`: nanoseconds a seek and a probe with today's search (probes counted as the bit
+    ///   length of each visited page's cell count, the most a binary search makes);
+    /// - `on`: the same with the key heads, directories built by the ski rental, and the share
+    ///   of probes the heads decided;
+    /// - `build`: nanoseconds a cell decoded building the directories of the pages the seeks
+    ///   visited, to set against `off`'s nanoseconds a probe.
+    /// It asserts nothing about time (the seeks it makes are checked equal across modes); the
+    /// coordinator records its numbers in `bench/`.
+    #[test]
+    #[ignore = "micro-benchmark: run on a quiet machine, release"]
+    fn key_heads_bench() {
+        use std::time::Instant;
+
+        use crate::storage::btree::PayloadLimits;
+        use crate::storage::sqlite3_ondisk::PageType;
+
+        let rows = bench_size("AMPHORA_KEY_HEADS_BENCH_ROWS", 100_000);
+        let seeks = bench_size("AMPHORA_KEY_HEADS_BENCH_SEEKS", 200_000);
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_name ON t (name)").unwrap();
+        let mut rng = ChaCha8Rng::seed_from_u64(0x0050_5234_4245);
+        let mut names = Vec::with_capacity(rows);
+        conn.execute("BEGIN").unwrap();
+        for id in 0..rows {
+            let name = format!("user-{:016x}", rng.random::<u64>());
+            let mut stmt = conn
+                .prepare("INSERT INTO t (id, name) VALUES (?, ?)")
+                .unwrap();
+            stmt.bind_at(NonZero::new(1).unwrap(), Value::from_i64(id as i64))
+                .unwrap();
+            stmt.bind_at(
+                NonZero::new(2).unwrap(),
+                Value::Text(Text::new(name.clone())),
+            )
+            .unwrap();
+            stmt.run_ignore_rows().unwrap();
+            names.push(name);
+        }
+        conn.execute("COMMIT").unwrap();
+
+        let table_root = rootpage(&conn, "t");
+        let index_root = rootpage(&conn, "t_name");
+        let pager = conn.pager.load().clone();
+        pager.begin_read_tx().unwrap();
+        let name_key = KeyInfo {
+            sort_order: SortOrder::Asc,
+            collation: CollationSeq::Binary,
+            nulls_order: None,
+        };
+        let info = Arc::new(
+            IndexInfo::new(
+                [name_key],
+                true,
+                2,
+                false,
+            )
+            .unwrap(),
+        );
+        let keys: Vec<usize> = (0..seeks).map(|_| rng.random_range(0..rows)).collect();
+        let cell_count = |page: usize| -> usize {
+            let (page, _) = pager.io.block(|| pager.read_page(page as i64)).unwrap();
+            while page.is_locked() {
+                pager.io.step().unwrap();
+            }
+            page.get_contents().cell_count()
+        };
+
+        // Each mode's seeks: nanoseconds a seek, probes a seek, and where each seek stood.
+        let run = |index: bool, on: bool| -> (f64, f64, Vec<Vec<(usize, i32)>>) {
+            let mut cursor = if index {
+                BTreeCursor::new_index_for_test(pager.clone(), index_root, info.clone())
+            } else {
+                BTreeCursor::new_table(pager.clone(), table_root, 2)
+            };
+            cursor.set_key_heads(on);
+            let op = SeekOp::GE { eq_only: true };
+            // A warm pass, so both modes search a cached tree (and `on`'s directories are built).
+            for &key in &keys {
+                if index {
+                    let reg = [Register::Value(Value::Text(Text::new(names[key].clone())))];
+                    pager.io.block(|| cursor.seek_unpacked(&reg, op)).unwrap();
+                } else {
+                    let rowid = SeekKey::TableRowId(key as i64);
+                    pager.io.block(|| cursor.seek(rowid, op)).unwrap();
+                }
+            }
+            // The index's keys made before the clock starts.
+            let registers: Vec<[Register; 1]> = keys
+                .iter()
+                .map(|&key| [Register::Value(Value::Text(Text::new(names[key].clone())))])
+                .collect();
+            let mut positions = Vec::with_capacity(keys.len());
+            let started = Instant::now();
+            for (&key, reg) in keys.iter().zip(&registers) {
+                if index {
+                    pager.io.block(|| cursor.seek_unpacked(reg, op)).unwrap();
+                } else {
+                    let rowid = SeekKey::TableRowId(key as i64);
+                    pager.io.block(|| cursor.seek(rowid, op)).unwrap();
+                }
+                positions.push(cursor.position());
+            }
+            let elapsed = started.elapsed().as_nanos() as f64;
+            let probes: usize = positions
+                .iter()
+                .flat_map(|levels| levels.iter().map(|(page, _)| probes(cell_count(*page))))
+                .sum();
+            let per_seek = elapsed / keys.len() as f64;
+            (per_seek, probes as f64 / keys.len() as f64, positions)
+        };
+
+        let limits = PayloadLimits::new(pager.usable_space());
+        for (label, index) in [("table by rowid", false), ("text index", true)] {
+            let (off_ns, probes_a_seek, off_at) = run(index, false);
+            let decided_before = DECIDED.with(Cell::get);
+            let (on_ns, _, on_at) = run(index, true);
+            let decided = DECIDED.with(Cell::get) - decided_before;
+            assert_eq!(off_at, on_at, "{label}: the modes stood at different cells");
+            // `on` ran its seeks twice (warm and timed): the share is over both.
+            let decided_share = decided as f64 / (2.0 * probes_a_seek * keys.len() as f64);
+
+            // The directories of the pages the seeks visited, built a round at a time until the
+            // cells decoded reach the probes the seeks made.
+            let pages: Vec<usize> = {
+                let mut seen: Vec<usize> = off_at
+                    .iter()
+                    .flat_map(|levels| levels.iter().map(|(page, _)| *page))
+                    .collect();
+                seen.sort_unstable();
+                seen.dedup();
+                seen
+            };
+            let loaded: Vec<_> = pages
+                .iter()
+                .map(|&page| {
+                    let (page, _) = pager.io.block(|| pager.read_page(page as i64)).unwrap();
+                    while page.is_locked() {
+                        pager.io.step().unwrap();
+                    }
+                    page
+                })
+                .collect();
+            let target = (probes_a_seek * keys.len() as f64) as usize;
+            let mut decoded = 0usize;
+            let started = Instant::now();
+            while decoded < target {
+                for page in &loaded {
+                    let contents = page.get_contents();
+                    let built = match contents.page_type().unwrap() {
+                        PageType::TableLeaf | PageType::TableInterior => {
+                            KeyHeads::build_rowids(contents)
+                        }
+                        PageType::IndexLeaf | PageType::IndexInterior => {
+                            KeyHeads::build_index(contents, limits, &name_key)
+                        }
+                    };
+                    decoded += std::hint::black_box(built).map_or(0, |heads| heads.cells());
+                }
+            }
+            let build_ns = started.elapsed().as_nanos() as f64 / decoded as f64;
+            println!(
+                "key_heads_bench {label}: rows {rows} seeks {seeks} probes/seek {probes_a_seek:.2} \
+                 | off {off_ns:.1} ns/seek {:.2} ns/probe | on {on_ns:.1} ns/seek {:.2} ns/probe, \
+                 decided {:.3} of the most probes | build {build_ns:.2} ns/cell ({} pages)",
+                off_ns / probes_a_seek,
+                on_ns / probes_a_seek,
+                decided_share,
+                loaded.len(),
+            );
+        }
+        pager.end_read_tx();
     }
 }
