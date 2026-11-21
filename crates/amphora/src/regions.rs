@@ -264,7 +264,9 @@ pub fn check(members: &Members, rule: &Rule, placement: &Placement) -> Result<()
     match rule {
         Rule::Home { region, survive } => {
             if by_region.keys().any(|r| *r != region) || lead_region != region {
-                return Err(Refused::Breaks("a voter or the lead outside the home region"));
+                return Err(Refused::Breaks(
+                    "a voter or the lead outside the home region",
+                ));
             }
             if placement.voters.len() != quorum_of(*survive)? {
                 return Err(Refused::Breaks("not the rule's count of voters"));
@@ -291,7 +293,9 @@ pub fn check(members: &Members, rule: &Rule, placement: &Placement) -> Result<()
             let lost: usize = counts.iter().take(*survive_regions).sum();
             let left = placement.voters.len().saturating_sub(lost);
             if left.checked_mul(2).ok_or(Refused::Overflow("voters"))? <= placement.voters.len() {
-                return Err(Refused::Breaks("losing a region it survives leaves no quorum"));
+                return Err(Refused::Breaks(
+                    "losing a region it survives leaves no quorum",
+                ));
             }
         }
     }
@@ -301,7 +305,11 @@ pub fn check(members: &Members, rule: &Rule, placement: &Placement) -> Result<()
 /// Whether a majority of `placement`'s voters is live: whether it can commit now.
 #[must_use]
 pub fn quorate(members: &Members, placement: &Placement) -> bool {
-    let live = placement.voters.iter().filter(|v| members.live(**v)).count();
+    let live = placement
+        .voters
+        .iter()
+        .filter(|v| members.live(**v))
+        .count();
     live.checked_mul(2)
         .is_some_and(|l| l > placement.voters.len())
 }
@@ -339,7 +347,10 @@ impl Atlas {
     pub fn directory(&self, scope: &Scope) -> Result<&Directory, Refused> {
         match scope {
             Scope::Global => Ok(&self.root),
-            Scope::Region(r) => self.regions.get(r).ok_or_else(|| Refused::NoRegion(r.clone())),
+            Scope::Region(r) => self
+                .regions
+                .get(r)
+                .ok_or_else(|| Refused::NoRegion(r.clone())),
         }
     }
 

@@ -392,6 +392,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   generation of restarts ends once it covers its spend"; GN.2). Left: an owner's other descriptors (endpoint, engine
   files, a replica's log) charged by kind, the replicated owner's tick (`TICK`, twenty ticks an election), its queue
   and outgoing bounds and the log's compaction trigger, and the rest of the list (handoff/amphora-constants-list.md).
+- **Region-local groups under a global root** (CP-T1.11, G14 step 1, lane regions; `crates/amphora/src/regions.rs`,
+  docs/design/regions.md): members carry a region label; a regional group's voters and lead stay in its home
+  region, and the root spreads its voters so losing the regions it survives leaves a quorum (CockroachDB's
+  survival goals); a lost member is replaced from its region, never from another. Regional rows route to their
+  home region's directory, and reads try the reader's region first. The simulated lab (`regions::lab`, latencies
+  as its input) gives the same answers and rows at one node, three nodes and three regions. Open: the SQL corpus
+  at three regions on the replicated shell, the 60 ms lab's p99 (the coordinator's), the region-loss drill.
 - **Groups that split, merge and move themselves** (CP-T1.9, lane split-merge; `crates/amphora/src/reshard/`,
   docs/design/reshard.md): a pure core: a directory of hash spans with every position in exactly one group,
   each group's own holding (fenced, stale actions refused), a planner deciding from measured load, bytes and

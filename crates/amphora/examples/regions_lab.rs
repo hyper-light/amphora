@@ -27,8 +27,7 @@ fn main() -> ExitCode {
     }
 }
 
-const USAGE: &str =
-    "usage: regions_lab <within-region RTT µs> <between-region RTT µs> <ops> <keys> <groups> <seed>";
+const USAGE: &str = "usage: regions_lab <within-region RTT µs> <between-region RTT µs> <ops> <keys> <groups> <seed>";
 
 fn arg(n: usize) -> Result<u64, String> {
     std::env::args()

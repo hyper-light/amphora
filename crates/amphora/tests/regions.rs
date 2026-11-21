@@ -122,11 +122,7 @@ fn ac_t1_11_4_corpus_identical_at_one_node_three_nodes_three_regions() {
         // Non-vacuity: the corpus read something back, and wrote rows in every scope.
         assert!(outcomes[0].answers.iter().any(Option::is_some));
         assert!(outcomes[0].answers.iter().any(Option::is_none));
-        for scope in [
-            Scope::Global,
-            Scope::Region(r("a")),
-            Scope::Region(r("b")),
-        ] {
+        for scope in [Scope::Global, Scope::Region(r("a")), Scope::Region(r("b"))] {
             assert!(outcomes[0].rows.keys().any(|(s, _)| *s == scope));
         }
         for o in &outcomes[1..] {
@@ -155,10 +151,7 @@ fn routing_reads_try_the_readers_region_first() {
             .collect();
         assert_eq!(rest, expect);
     }
-    assert_eq!(
-        atlas.read(&r("z"), "k"),
-        Err(Refused::NoRegion(r("z")))
-    );
+    assert_eq!(atlas.read(&r("z"), "k"), Err(Refused::NoRegion(r("z"))));
 }
 
 #[test]
@@ -262,11 +255,15 @@ fn the_root_spans_regions_and_survives_losing_one() {
 #[test]
 fn lab_placements_hold_under_member_and_region_loss() {
     let mut lab = Lab::new(&three_regions(), latency()).unwrap();
-    // Add nothing: three members a region, so losing one leaves two, fewer than three voters.
+    // Three members a region, so losing one leaves two, fewer than the three voters both region
+    // b's groups and the root's share of b need: refused, nothing placed outside the rules.
+    let before: Vec<_> = lab.placements().map(|(_, _, p)| p.clone()).collect();
     assert!(matches!(
         lab.lose(NodeId(4)),
-        Err(Refused::TooFewMembers { .. })
+        Err(Refused::TooFewMembers { .. } | Refused::TooFewRegions { .. })
     ));
+    let after: Vec<_> = lab.placements().map(|(_, _, p)| p.clone()).collect();
+    assert_eq!(before, after);
 
     let shape = Shape {
         members: vec![(r("a"), 4), (r("b"), 4), (r("c"), 4)],

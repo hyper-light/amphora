@@ -223,7 +223,11 @@ impl Lab {
             return Err(Refused::Breaks("the group has no live quorum"));
         }
         let mut acks: Vec<Duration> = Vec::new();
-        for v in p.voters.iter().filter(|v| **v != p.lead && self.members.live(**v)) {
+        for v in p
+            .voters
+            .iter()
+            .filter(|v| **v != p.lead && self.members.live(**v))
+        {
             let r = self.members.region_of(*v).ok_or(Refused::Unknown(*v))?;
             acks.push(self.latency.rtt(&lead, r));
         }
