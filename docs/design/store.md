@@ -1940,3 +1940,54 @@ gone a point read gains at most 1.14-1.30x (Amdahl's bound).
   (`table_leaf_span`) gives the leaf and cell a cursor's descent stands on. Measured by
   `descent_skip_bench` (the model: lookups, builds, upkeep a write) and `descent_skip_engine_bench`
   (the engine's pages: lookups and E's rebuild).
+
+## 42. The page path SQLite takes: plain pins, the pool's buffer counted once, misses read in line, checksums once (prototype, behind a switch)
+
+G3 step 3 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), read-path.md fix 2: the page cache and pager
+are 15.6-21.4% of a point read's user cycles at one client, checksums 2.9-4.1%, atomics 1.6-2.3% and
+I/O completion 2.7-3.6%, together 23.0-30.3%; SQLite's page cache and pager are 1.8-4.6% of its own
+(bench/records/2026-10-23-adacachy-read-path.md).
+
+- **What.** `PagePath::Plain` beside today's path (`crates/engine/storage/pager.rs`):
+  - *Plain pins.* A page a connection makes on this path is pinned with a load and a store, no
+    read-modify-write: SQLite's `nRef` (`pcache.c`, `sqlite3PcacheRef`, `sqlite3PcacheRelease`).
+    Only the connection that made a page pins it, one thread at a time; the flag is set when the
+    page is made, never after, so a page's pins are of one kind all its life.
+  - *Shared pages counted once.* A page the pool keeps is taken as the pool's own buffer, its
+    count taken once as the page enters the connection's cache, its later pins the connection's
+    own: PostgreSQL's private refcounts (`bufmgr.c`, `PrivateRefCountEntry`: a backend's first pin
+    touches the shared buffer header, the rest its own array). Today's path copies the image out
+    (decision 29) and the plain path is measured against it. A write copies a shared buffer first
+    (`Pager::add_dirty`, decision 20), so a counted image never changes.
+  - *Misses read in line.* A page the log doesn't hold, from a backend that completes reads in line
+    (`File::pread_inline`: one `pread(2)` on Unix), with no completion, closure or wrapper
+    completion for the checksum; other backends (io_uring, Windows, a codec) answer `None` and read
+    as today. It reads into the page the cache's last eviction left, with its buffer, when no one
+    else holds them: `pcache1` recycles the page a fetch evicts (`pcache1FetchStage2`). The cache
+    keeps at most that one spare, the page an eviction frees, taken by the read that follows it.
+    The log's frames are read as today: the log's read path is G3 step 2's (decision 40).
+  - *Checksums once.* Checked as the page enters the process from the file (`read_page_inline`,
+    PostgreSQL's rule: a page is verified as it is read into shared buffers, never while it stays
+    there), then trusted while the pool or the connection's cache keeps it; a page that fails is
+    neither cached nor shared.
+- **Switch.** `AMPHORA_PAGE_PATH=plain` in the environment for every pager the process opens;
+  `Pager::set_page_path` for one connection's.
+- **Not yet.** A miss with no spare (a cache not yet full) still allocates the page and its
+  buffer's `Arc`; every miss still allocates the cache's entry (`Box<PageCacheEntry>`); a cache hit
+  still clones the page's `Arc` (one read-modify-write). The plan's bars (at most 2 atomic
+  read-modify-writes and 1 allocation per `point_pk` lookup) are measured on what this builds first.
+- **Falsified if** the page cache, pager, checksums, atomics and I/O completion together stay above
+  15% of a point read's user cycles with the switch on (read-path.md), or the plain path's point
+  reads are not faster than today's at one client, or counting the pool's buffer once costs more at
+  32 clients than decision 29's copy (perf c2c on the pool's buffers).
+- **Tested.** T-G3.3.1-3 (`crates/engine/tests/shared_pages.rs`, `g3s3_*`): the shared-pages model
+  on the plain path (16 seeds, page and mixed logs); each path reads the rows today's reads, from
+  the log, the file and memory, with and without shared pages; a byte flipped in the file is
+  refused with a checksum error through a fresh connection on each path. T-G3.3.4
+  (`storage::pager::tests::g3s3_plain_pins_count_as_atomic_pins_do`). T-G3.3.5
+  (`g3s3_plain_misses_read_into_the_pages_evictions_leave`): a table four times a 200-page cache
+  read twice on each path: the same rows, the plain path's misses in recycled pages. T-G3.3.6
+  (`crates/engine/tests/page_path_allocs.rs`, a counting allocator): allocations per point lookup
+  by a prepared statement, one small run on adacachy (debug build, 2026-11-21, f046bc1, one run, a
+  smoke check, not a benchmark): misses without shared pages 15.98 today against 6.00 plain, with
+  shared pages 7.99 against 7.00; hits 5.00 on both (the statement's own: its row vectors).

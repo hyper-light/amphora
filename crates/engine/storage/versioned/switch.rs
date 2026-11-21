@@ -15,6 +15,7 @@ use super::blink::{Comparator, Descender};
 use super::cursor::{Access, KeyOrder, SharedTxn, VersionedCursor};
 use super::disk::{Disk, Files, Simulated};
 use super::durable::Database as VDatabase;
+use super::version::Savepoint;
 use crate::error::LimboError;
 use crate::storage::page_cache::DEFAULT_PAGE_CACHE_SIZE_IN_PAGES;
 use crate::sync::{Arc, Mutex, OnceLock};
@@ -44,13 +45,13 @@ pub struct Storage {
     orders: Mutex<HashMap<u64, Arc<OnceLock<KeyOrder>>>>,
 }
 
-/// The versioned storage of the database at `path`: in memory for a memory database, else in the
-/// directory `<path>-versioned`. Its pool holds as many pages as the pager's page cache does by
+/// The versioned storage of the database at `path`: in memory for a memory database or one whose
+/// files the engine keeps in memory (`memory`), else in the directory `<path>-versioned`. Its pool holds as many pages as the pager's page cache does by
 /// default (`DEFAULT_PAGE_CACHE_SIZE_IN_PAGES`, the engine's bound on the pages it keeps), and its
 /// redo log takes a lane per thread the machine runs (decision 11).
-pub fn open(path: &str) -> Result<Arc<Storage>> {
+pub fn open(path: &str, memory: bool) -> Result<Arc<Storage>> {
     let lanes = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let disk: Arc<dyn Disk> = if crate::database::is_memory_like(path) {
+    let disk: Arc<dyn Disk> = if memory || crate::database::is_memory_like(path) {
         Arc::new(Simulated::new(0, lanes)?)
     } else {
         let dir = std::path::PathBuf::from(format!("{path}-versioned"));
@@ -93,6 +94,13 @@ pub struct Switch {
     storage: Arc<Storage>,
     db: Arc<VDatabase>,
     txn: Mutex<Option<SharedTxn>>,
+    /// The savepoints of the write statements under way in the transaction, newest last: one a
+    /// statement, so bounded by the statements nested in one another.
+    statements: Mutex<Vec<Savepoint>>,
+    /// Trees the transaction made, dropped if it rolls back, and trees it dropped, dropped once it
+    /// commits (making and dropping a tree is durable alone, decision 12): one a DDL statement.
+    made: Mutex<Vec<u64>>,
+    dropped: Mutex<Vec<u64>>,
     d: Mutex<Descender>,
 }
 
@@ -102,6 +110,9 @@ impl Switch {
             db: storage.db.clone(),
             storage,
             txn: Mutex::new(None),
+            statements: Mutex::new(Vec::new()),
+            made: Mutex::new(Vec::new()),
+            dropped: Mutex::new(Vec::new()),
             d: Mutex::new(Descender::new()),
         }
     }
@@ -158,15 +169,23 @@ impl Switch {
             orders.insert(id, slot);
             id
         };
+        self.made.lock().push(id);
         i64::try_from(id).map_err(|_| LimboError::IntegerOverflow)
     }
 
-    /// Drops the tree at `root_page` (DROP TABLE, DROP INDEX): durable before it returns, as
-    /// decision 12 makes it, not undone by a rollback.
+    /// Drops the tree at `root_page` (DROP TABLE, DROP INDEX) once the transaction commits, so a
+    /// rollback keeps it.
     pub fn drop_tree(&self, root_page: i64) -> Result<()> {
-        let tree = tree_of(root_page)?;
-        self.db.drop_tree(&mut self.d.lock(), tree)?;
-        self.storage.orders.lock().remove(&tree);
+        self.dropped.lock().push(tree_of(root_page)?);
+        Ok(())
+    }
+
+    /// Drops `trees` now, each durable before the next.
+    fn drop_now(&self, trees: Vec<u64>) -> Result<()> {
+        for tree in trees {
+            self.db.drop_tree(&mut self.d.lock(), tree)?;
+            self.storage.orders.lock().remove(&tree);
+        }
         Ok(())
     }
 
@@ -189,22 +208,55 @@ impl Switch {
         cursor.clear_rows()
     }
 
+    /// Opens a savepoint for a write statement in an explicit transaction (SQLite's statement
+    /// journal), so the statement can be undone alone (`AC-NS.2.3`'s savepoints).
+    pub fn begin_statement(&self) -> Result<()> {
+        let shared = self.txn()?;
+        let sp = shared
+            .lock()
+            .as_ref()
+            .ok_or_else(|| LimboError::TxError("versioned storage: no transaction".into()))?
+            .savepoint();
+        self.statements.lock().push(sp);
+        Ok(())
+    }
+
+    /// Ends the newest statement's savepoint: kept, or rolled back to (its changes undone, the
+    /// transaction's earlier ones kept).
+    pub fn end_statement(&self, rollback: bool) -> Result<()> {
+        let Some(sp) = self.statements.lock().pop() else {
+            return Ok(());
+        };
+        if !rollback {
+            return Ok(());
+        }
+        let Some(shared) = self.txn.lock().clone() else {
+            return Ok(());
+        };
+        let mut guard = shared.lock();
+        let Some(txn) = guard.as_mut() else {
+            return Ok(());
+        };
+        self.db.rollback_to(&mut self.d.lock(), txn, sp)
+    }
+
     /// Ends the connection's transaction, if one is open: commits it (durable before it returns),
     /// or rolls it back. A cursor still holding it is refused its next write.
+    /// Trees the transaction made are dropped if it rolls back; trees it dropped, once it commits.
     pub fn finish(&self, rollback: bool) -> Result<()> {
-        let Some(shared) = self.txn.lock().take() else {
-            return Ok(());
-        };
-        let Some(txn) = shared.lock().take() else {
-            return Ok(());
-        };
-        let mut d = self.d.lock();
-        if rollback {
-            self.db.abort(txn, &mut d)
-        } else {
-            self.db
-                .commit(txn, &mut d, self.db.lane(), true)
-                .map(|_| ())
+        self.statements.lock().clear();
+        let made = std::mem::take(&mut *self.made.lock());
+        let dropped = std::mem::take(&mut *self.dropped.lock());
+        let shared = self.txn.lock().take();
+        let txn = shared.and_then(|s| s.lock().take());
+        if let Some(txn) = txn {
+            let mut d = self.d.lock();
+            if rollback {
+                self.db.abort(txn, &mut d)?;
+            } else {
+                self.db.commit(txn, &mut d, self.db.lane(), true)?;
+            }
         }
+        self.drop_now(if rollback { made } else { dropped })
     }
 }

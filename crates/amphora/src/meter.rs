@@ -116,6 +116,9 @@ pub struct Counters {
     pub jobs: u64,
     pub busy_ms: u64,
     pub apply_ms: u64,
+    /// How long its commits held the writer, in µs: with `commits`, a commit's mean cost, what a
+    /// batch of a split's, merge's or move's copy path holds a writer no longer than (CP-T1.9).
+    pub apply_us: u64,
     pub flushes: u64,
     pub flush_ms: u64,
     pub dropped: u64,
@@ -215,6 +218,7 @@ impl Meter {
             jobs: self.jobs.load(Ordering::Relaxed),
             busy_ms: self.busy_us.load(Ordering::Relaxed) / 1000,
             apply_ms: self.apply_us.load(Ordering::Relaxed) / 1000,
+            apply_us: self.apply_us.load(Ordering::Relaxed),
             flushes: self.flushes.load(Ordering::Relaxed),
             flush_ms: self.flush_us.load(Ordering::Relaxed) / 1000,
             dropped: self.dropped.load(Ordering::Relaxed),
