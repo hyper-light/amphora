@@ -22,6 +22,10 @@ pub mod disk;
 pub mod durable;
 #[cfg(test)]
 mod elle;
+#[cfg(test)]
+mod elle_sql;
+#[cfg(test)]
+mod many_writers;
 pub mod overflow;
 pub mod page;
 pub mod pool;
