@@ -29,21 +29,18 @@ const COMMANDS: usize = 64;
 const QUEUED_BYTES: usize = 512 << 20;
 const OUTGOING_BYTES: usize = 512 << 20;
 const OUTGOING_MESSAGES: usize = 4096;
-const MEMBERS: usize = 64;
+pub(crate) const MEMBERS: usize = 64;
 const WIRE_BYTES: usize = crate::replication::SNAPSHOT_BYTES.saturating_add(2 << 20);
 const MESSAGE_BYTES: usize = crate::replication::COMMAND_BYTES.saturating_add(2 << 20);
 // Ticks are the pinned core's documented tick election mode (raft.rs, Elections::Ticks). Its
 // twenty-tick randomized election and two-tick heartbeat use this owner clock, never host votes.
 const TICK: Duration = Duration::from_millis(10);
 const POLL: Duration = Duration::from_millis(1);
-const DRIVE_QUANTUM: usize = 32;
-// The admission charge of a change of members or a hand-off of the lead: policy, not a measured
-// size. Each is a few bytes; the charge holds its place in the queue's byte budget.
-const CHANGE_BYTES: usize = 1024;
-// The lease of one of the floor keeper's own sessions: policy, not a measured number, the same
-// finite lease the seed's internal attempt has (`bootstrap`); a session past it ends unapplied and
-// is made again.
-const FLOOR_SESSION: Duration = Duration::from_secs(60);
+// The admission charge of a change of members, a hand-off of the lead, a catch-up or an
+// attestation: the bytes the queued input itself takes, its place in the queue's byte budget (an
+// attestation's name is charged beside it). The response channel's own allocation is charged for
+// no input, as before.
+const CHANGE_BYTES: usize = std::mem::size_of::<Input>();
 
 /// One of the floor's own sessions: the work it does on the database at its base.
 type FloorSession = Box<dyn FnOnce(&mut Db) -> anyhow::Result<()> + Send>;
@@ -164,7 +161,7 @@ struct Control {
 }
 /// The readers of a replica's local reads (replication.md, "A local read on a replica"):
 /// connections of their own on the machine's database, each on what the machine committed when
-/// its read began. At most `CONNECTION_MAX` out at once, each charged to the process's page
+/// its read began. At most the descriptor budget's bound out at once, each charged to the process's page
 /// budget; one given back waits in the process's account for the next read (replication.md, "A
 /// replica's local readers bounded by derivation"). While the owner waits to start the database's
 /// log again, no read of this replica begins (replication.md, "A replica's database log").
@@ -178,11 +175,13 @@ struct Local {
     meter: Arc<ReplicaMeter>,
     /// The process's readers and the page budget they are charged to.
     account: Arc<Account>,
+    /// Bounds the readers out at once on this replica: at most the clients that can be attached
+    /// at once, each a connection running one session at a time, so more readers than that can't
+    /// be used by them; a caller in the process past it waits. A connection holds a descriptor, so
+    /// that is the process's descriptor budget's bound as it stands at each read
+    /// (local-owner-transport.md, "One descriptor budget"); the readers themselves hold none.
+    descriptors: Arc<crate::descriptors::Descriptors>,
 }
-/// Readers out at once on one replica: policy, the transport's bound on attached clients, each a
-/// connection running one session at a time (`transport::CONNECTION_MAX`), so more readers than
-/// that can't be used by them; a caller in the process past it waits.
-const READERS: usize = crate::transport::CONNECTION_MAX;
 /// Every replica's local readers in the process, and the page budget they are charged to
 /// (replication.md, "A replica's local readers bounded by derivation").
 struct Account {
@@ -290,12 +289,14 @@ impl Local {
         open: crate::store::Opener<Db>,
         meter: Arc<ReplicaMeter>,
         account: Arc<Account>,
+        descriptors: Arc<crate::descriptors::Descriptors>,
     ) -> Self {
         Self {
             open: Mutex::new(Some(open)),
             id: account.next.fetch_add(1, Ordering::Relaxed),
             meter,
             account,
+            descriptors,
         }
     }
     /// `f` on a reader: this replica's idle one, one opened now on a charge, one opened after
@@ -323,7 +324,7 @@ impl Local {
                 self.took(&mut ledger)?;
                 break (Some(idle.reader), idle.charge, open);
             }
-            if !held && ledger.out.get(&self.id).copied().unwrap_or(0) < READERS {
+            if !held && ledger.out.get(&self.id).copied().unwrap_or(0) < self.descriptors.bound() {
                 if let Some(charge) = self.account.pool.charge(pages) {
                     self.took(&mut ledger)?;
                     break (None, charge, open);
@@ -600,6 +601,11 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     // many passes failed short of fencing. Counters read by tests.
     floor_inflight: bool,
     floor_ended: u64,
+    // The owner's own sessions that reached their lease at their barrier while this member stayed
+    // leader in their term (`Actor::own_session_lease`'s falsifier: a patience too short), the
+    // running count the `replica.own_session_expired` event carries; the meter's
+    // `amphora_replica_own_sessions_expired_total` counts the same.
+    own_sessions_expired: u64,
     floor_failures: u64,
     // Whether the floor session in hand is a request to attest again, and how this owner's
     // requests ended: applied, or refused by the stale-base rule and proposed again on a later pass.
@@ -624,6 +630,9 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     clock: Clock,
     started: Instant,
     ticked: Instant,
+    // Whether this step's drive left more to drive without waiting for the log
+    // (`Driven::more`): the next step comes at once, without waiting for an input.
+    driving: bool,
     // The instant this owner last read from its clock: at its step's start, and again after a
     // preparation, whose work takes time of its own.
     at: Instant,
@@ -674,6 +683,9 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     turns: (u64, u64),
     #[cfg(test)]
     turn_context: Option<Vec<u8>>,
+    // The steps whose drive left more to drive (`driving`): read by tests.
+    #[cfg(test)]
+    drove_more: u64,
 }
 
 /// The flushes of the machine's database log, in every class (docs/design/replication.md, "Fast
@@ -1106,11 +1118,12 @@ impl ReplicaHandle {
         if attesting.as_ref() == Some(&application) {
             return Ok(());
         }
+        let charge = CHANGE_BYTES.saturating_add(application.name.len());
         self.enqueue(
             Input::Attest {
                 application: application.clone(),
             },
-            CHANGE_BYTES,
+            charge,
         )?;
         *attesting = Some(application);
         Ok(())
@@ -1284,10 +1297,10 @@ fn open(
     )
 }
 
-/// The write slot's bounds, stated from the quorum patience's (`patience`), so the slot adds no
-/// number of its own: a member's first slot is the core's election timeout in this owner's ticks,
-/// a retry slower than the patience's measured ceiling is not learned, and a learned gap is
-/// believed for the patience's generations.
+/// The write slot's bounds, stated from the core's and the quorum patience's (`patience`), so the
+/// slot adds no number of its own: a member's first slot is the core's election timeout in this
+/// owner's ticks, and a learned gap is believed for the patience's generations. A retry is not
+/// learned when the host's detector suspected its member meanwhile (`slot::Slots::keep`).
 fn slot_bounds(election_tick: usize) -> Result<super::slot::Bounds, Refusal> {
     let ticks = |count: Option<u32>| {
         count
@@ -1296,7 +1309,6 @@ fn slot_bounds(election_tick: usize) -> Result<super::slot::Bounds, Refusal> {
     };
     Ok(super::slot::Bounds {
         election: ticks(u32::try_from(election_tick).ok())?,
-        ceiling: ticks(u32::try_from(super::patience::QUORUM_CEILING).ok())?,
         generation: ticks(u32::try_from(super::patience::GENERATION).ok())?,
     })
 }
@@ -1351,7 +1363,12 @@ fn open_on<F: BlockFile + 'static>(
     let group = GroupStore::claim(&log, 1).map_err(unavailable)?;
     let replica =
         Replica::open(&settings, group, machine, Bytes::new(512 << 20)).map_err(unavailable)?;
-    let local = Local::new(reader, Arc::clone(&meter), account());
+    let local = Local::new(
+        reader,
+        Arc::clone(&meter),
+        account(),
+        crate::descriptors::process()?,
+    );
     let control = Arc::new(Control {
         admitted: AtomicUsize::new(0),
         attesting: Mutex::new(None),
@@ -1385,6 +1402,7 @@ fn open_on<F: BlockFile + 'static>(
         floor_requests: 0,
         floor_inflight: false,
         floor_ended: 0,
+        own_sessions_expired: 0,
         floor_failures: 0,
         floor_requesting: false,
         tail: None,
@@ -1416,12 +1434,15 @@ fn open_on<F: BlockFile + 'static>(
         turns: (0, 0),
         #[cfg(test)]
         turn_context: None,
+        #[cfg(test)]
+        drove_more: 0,
         detected: std::collections::BTreeSet::new(),
         gated: std::collections::BTreeSet::new(),
         class_proposed: None,
         clock,
         started: at,
         ticked: at,
+        driving: false,
         at,
     };
     actor.refresh()?;
@@ -1731,13 +1752,22 @@ impl<F: BlockFile + 'static> Actor<F> {
             }
         }
     }
-    /// The owner thread: each step after waiting up to `POLL` for an input.
+    /// The owner thread: each step after waiting up to `POLL` for an input, or at once while the
+    /// last step's drive left more to drive.
     fn run_loop(&mut self, receiver: &mpsc::Receiver<Envelope>) -> Result<(), Refusal> {
         loop {
-            let input = match receiver.recv_timeout(POLL) {
-                Ok(envelope) => Some(envelope),
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            let input = if self.driving {
+                match receiver.try_recv() {
+                    Ok(envelope) => Some(envelope),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+                }
+            } else {
+                match receiver.recv_timeout(POLL) {
+                    Ok(envelope) => Some(envelope),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                }
             };
             self.run_step(input)?;
         }
@@ -1789,21 +1819,27 @@ impl<F: BlockFile + 'static> Actor<F> {
                 locked(stalls)?.ticked(at);
             }
         }
-        for _ in 0..DRIVE_QUANTUM {
-            let mut output = Output::default();
-            let nanos = self.now()?;
-            let driven = self
-                .replica
-                .drive(nanos, std::task::Waker::noop(), &mut output)
-                .map_err(raft_error)?;
-            #[cfg(test)]
-            if let (Some(stalls), Some((submitted, taken))) = (&self.stalls, driven.flushed) {
-                locked(stalls)?.wrote(Duration::from_nanos(taken.saturating_sub(submitted)));
-            }
-            self.release(output)?;
-            if !driven.more {
-                break;
-            }
+        // One drive a step, which takes at most one `Ready` (hyper-durable's own quantum: its
+        // owner.rs, docs/durable.md section 7), and one input a step: the two take turns, the
+        // deficit round robin of Shreedhar and Varghese ("Efficient Fair Queuing Using Deficit
+        // Round Robin", SIGCOMM 1995, Theorem 4.5: fair within one unit when every quantum is at
+        // least the largest unit, here one `Ready`), so no count of drives is picked. A drive that
+        // leaves more steps again at once (`run_loop`).
+        let mut output = Output::default();
+        let nanos = self.now()?;
+        let driven = self
+            .replica
+            .drive(nanos, std::task::Waker::noop(), &mut output)
+            .map_err(raft_error)?;
+        #[cfg(test)]
+        if let (Some(stalls), Some((submitted, taken))) = (&self.stalls, driven.flushed) {
+            locked(stalls)?.wrote(Duration::from_nanos(taken.saturating_sub(submitted)));
+        }
+        self.release(output)?;
+        self.driving = driven.more;
+        #[cfg(test)]
+        if driven.more {
+            self.drove_more = self.drove_more.saturating_add(1);
         }
         self.answer_committed();
         self.flush()?;
@@ -2021,6 +2057,14 @@ impl<F: BlockFile + 'static> Actor<F> {
                 if expired {
                     if let Some(response) = pending.response.take() {
                         answer(response, Err(Refusal::Timeout));
+                    }
+                    if matches!(pending.author, Author::Owner)
+                        && !changed_term
+                        && self.replica.is_leader()
+                    {
+                        self.own_sessions_expired = self.own_sessions_expired.saturating_add(1);
+                        self.control.meter.own_session_expired();
+                        tracing::info!(target: "amphora.replica", event = "replica.own_session_expired", term = self.replica.term(), expired = self.own_sessions_expired, "an owner's session reached its lease at its barrier while this member led its term");
                     }
                 } else {
                     self.requeue(pending);
@@ -3165,10 +3209,11 @@ impl<F: BlockFile + 'static> Actor<F> {
             .bootstrap_source()
             .ok_or_else(|| fenced("pending bootstrap has no designated source"))?;
         if source != self.replica.id() || !self.replica.is_leader() {
-            // A failed transfer can be requested again after the core's twenty-tick election
-            // period. At most one such request is made per period, never a host election.
-            let period = TICK
-                .checked_mul(20)
+            // A failed transfer can be requested again after the core's election timeout. At most
+            // one such request is made per period, never a host election.
+            let period = u32::try_from(self.replica.core().raft.config().election_tick)
+                .ok()
+                .and_then(|ticks| TICK.checked_mul(ticks))
                 .ok_or_else(|| fenced("tick period overflow"))?;
             let due = self.transferred.is_none_or(|(term, at)| {
                 term != self.replica.term() || self.at.saturating_duration_since(at) >= period
@@ -3184,11 +3229,12 @@ impl<F: BlockFile + 'static> Actor<F> {
         }
         let context = self.context()?;
         self.replica.read(context.clone()).map_err(raft_error)?;
-        // One internal attempt has a finite lease; committed chunk progress survives its expiry.
-        // User requests retain their own deadlines in the bounded waiting queue throughout.
+        // One internal attempt has a finite lease, its role's (`own_session_lease`); committed
+        // chunk progress survives its expiry. User requests retain their own deadlines in the
+        // bounded waiting queue throughout.
         let until = self
             .at
-            .checked_add(Duration::from_secs(60))
+            .checked_add(self.own_session_lease()?)
             .ok_or_else(|| fenced("bootstrap deadline overflow"))?;
         self.pending = Some(Pending {
             context,
@@ -3314,6 +3360,36 @@ impl<F: BlockFile + 'static> Actor<F> {
         self.floor_requesting = true;
         Ok(())
     }
+    /// The lease of one of the owner's own sessions (a floor session, the seed's attempt), read
+    /// from its role's raft timing when it is made (replication.md, "Attestation";
+    /// amphora-seam-owner-2, amphora-owner-t1-constants-floor-session-20261111). A leader's is two
+    /// of its quorum checks, 2 × (election_tick + quorum_patience) ticks: the check runs on its own
+    /// counter and clears the answers' marks only when it runs, so a stall that begins just after
+    /// an answer passes the next check and steps the leader down at the one after (raft.rs,
+    /// `quorum_due`, `tick_heartbeat`). A follower's is its own election bound and stall
+    /// patience, (2 × election_tick + patience) ticks: it campaigns within a randomized timeout
+    /// below twice election_tick, plus its patience (`tick_election`). Past it a session is in a
+    /// role that has moved on, where it can't apply. A live-quorum leader's session can still
+    /// reach it, behind a slow flush or a ReadIndex backlog, and then ends unapplied: safe, since
+    /// the stale-base rule refuses a late apply and the keeper makes it again. Those are counted
+    /// (`own_sessions_expired`), since many would mean the patience is too short.
+    fn own_session_lease(&self) -> Result<Duration, Refusal> {
+        let raft = &self.replica.core().raft;
+        let election = raft.config().election_tick;
+        let ticks = if self.replica.is_leader() {
+            election
+                .checked_add(raft.quorum_patience())
+                .and_then(|due| due.checked_mul(2))
+        } else {
+            election
+                .checked_mul(2)
+                .and_then(|bound| bound.checked_add(raft.patience()))
+        };
+        ticks
+            .and_then(|ticks| u32::try_from(ticks).ok())
+            .and_then(|ticks| TICK.checked_mul(ticks))
+            .ok_or_else(|| fenced("own session lease overflow"))
+    }
     /// One of the floor's own sessions, through the same barrier and proposal as a call; it has no
     /// caller, and one that ends without applying is made again on the keeper's next pass.
     fn submit_floor(&mut self, session: FloorSession) -> Result<(), Refusal> {
@@ -3325,7 +3401,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         self.replica.read(context.clone()).map_err(raft_error)?;
         let until = self
             .at
-            .checked_add(FLOOR_SESSION)
+            .checked_add(self.own_session_lease()?)
             .ok_or_else(|| fenced("floor session deadline overflow"))?;
         let call: Call = Box::new(move |db| {
             session(db)?;
@@ -4314,7 +4390,7 @@ mod tests {
             durability: Durability,
         ) -> Client {
             let path = dir.join(format!("state-{node_id}.db"));
-            let lease = Owned::new(lease(&path), None);
+            let lease = Owned::unbudgeted(lease(&path), None);
             let (reading, clock) = self.reading();
             let (client, actor, receiver) = super::open(
                 &path,
@@ -4350,7 +4426,7 @@ mod tests {
             drop(self.owners.get_mut(owner).unwrap().take());
             let node_id = u64::try_from(owner + 1).unwrap();
             let path = dir.join(format!("state-{node_id}.db"));
-            let lease = Owned::new(lease(&path), None);
+            let lease = Owned::unbudgeted(lease(&path), None);
             let (base, read) = (self.base, Arc::clone(self.clocks.get(owner).unwrap()));
             let (client, actor, receiver) = super::open(
                 &path,
@@ -4945,7 +5021,7 @@ mod tests {
             reading: Arc<AtomicU64>,
         ) -> (Client, (Actor<F>, mpsc::Receiver<Envelope>)) {
             let machine_lease =
-                Owned::new(lease(&dir.join(format!("state-{node_id}.lease"))), None);
+                Owned::unbudgeted(lease(&dir.join(format!("state-{node_id}.lease"))), None);
             let log_owner =
                 Arc::try_unwrap(lease(&dir.join(format!("raft-{node_id}.lease")))).unwrap();
             let replicated = matches!(durability, Durability::Replicated(_));
@@ -6550,7 +6626,7 @@ mod tests {
                 },
                 durability,
                 Arc::new(Changed::default()),
-                Owned::new(lease(&path), None),
+                Owned::unbudgeted(lease(&path), None),
                 driven.until(),
                 clock,
             )
@@ -6734,7 +6810,7 @@ mod tests {
             },
             wider.clone(),
             Arc::new(Changed::default()),
-            Owned::new(lease(&path), None),
+            Owned::unbudgeted(lease(&path), None),
             driven.until(),
             clock,
         )
@@ -9356,6 +9432,135 @@ mod tests {
         }
         assert!(driven.owner_mut(follower).floor_ended > ended);
         assert_eq!(attested(&mut driven, leader, member).unwrap().highest, 7);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// The floor session `owner`'s keeper has in hand at its barrier, after rounds: its deadline
+    /// less the owner's time when it was made.
+    fn session_lease(driven: &mut Driven, owner: usize) -> Duration {
+        for _ in 0..ROUNDS {
+            if driven.owner_mut(owner).floor_inflight {
+                break;
+            }
+            driven.step();
+        }
+        let actor = driven.owner_mut(owner);
+        let pending = actor.pending.as_ref().expect("a floor session in hand");
+        assert!(
+            matches!(pending.phase, Phase::Barrier(_)),
+            "the session left its barrier"
+        );
+        pending.until.saturating_duration_since(actor.at)
+    }
+
+    /// CP-T1.8 (replication.md, "Attestation"; amphora-seam-owner-2,
+    /// amphora-owner-t1-constants-floor-session-20261111): an owner's own session lasts what its
+    /// role's raft timing says, read when it is made, not a picked 60 s. Do, in a group of three
+    /// voters: a follower binds kiln.host-store 7 and its keeper makes a session; then the
+    /// leader binds it and its keeper makes one; then the leader's voters stall (nothing relayed)
+    /// while its clock moves a tick at a time. Expect: the follower's lease is its election bound
+    /// and stall patience, (2 x election_tick + patience) ticks; the leader's two quorum checks,
+    /// 2 x (election_tick + quorum_patience) ticks; and under the stall the leader's session ends
+    /// within its lease.
+    #[test]
+    fn an_owners_session_lasts_its_roles_raft_timing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let follower = (leader + 1) % 3;
+        quiet(&mut driven, &mut pump);
+        let ticks = |n: usize| TICK * u32::try_from(n).unwrap();
+
+        clients[follower].handle().attest(kiln(7)).unwrap();
+        let lease = session_lease(&mut driven, follower);
+        let raft = &driven.owner(follower).replica.core().raft;
+        let want = ticks(2 * raft.config().election_tick + raft.patience());
+        assert_eq!(lease, want, "the follower's session lease");
+        for _ in 0..ROUNDS {
+            if attested(&mut driven, leader, u64::try_from(follower + 1).unwrap()).is_some() {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+
+        clients[leader].handle().attest(kiln(7)).unwrap();
+        let lease = session_lease(&mut driven, leader);
+        let raft = &driven.owner(leader).replica.core().raft;
+        let want = ticks(2 * (raft.config().election_tick + raft.quorum_patience()));
+        assert_eq!(lease, want, "the leader's session lease");
+        let mut waited = Duration::ZERO;
+        while driven.owner_mut(leader).pending.is_some() {
+            assert!(waited <= lease, "a stalled leader's session past its lease");
+            driven.advance(leader, TICK);
+            waited += TICK;
+            driven.step();
+        }
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// CP-T1.8, AC-DQ.1.1 (replication.md, "Decision (lane constants): one drive a step"): an
+    /// owner drives once a step and, while that drive leaves more, steps again at once, so no
+    /// count of drives a step is picked. Do: three members, an election, 20 writes at the leader,
+    /// each step on driven time. Expect: every write answered; some step left more to drive for
+    /// the next (a step that drives until nothing is left, as the 32 drives a step did short of
+    /// their count, leaves none).
+    #[test]
+    fn an_owner_drives_once_a_step_and_steps_again_while_more_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        for value in 1..=20 {
+            write(&mut driven, &mut pump, &clients[leader], value);
+        }
+        let more: u64 = (0..3).map(|owner| driven.owner(owner).drove_more).sum();
+        assert!(more > 0, "no step left more to drive");
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// CP-T1.8 (amphora-seam-owner-2, amphora-owner-t1-constants-721acf2-20261112): an owner's own
+    /// session that reaches its lease at its barrier while its member still leads its term is
+    /// counted. Do, in a group of three voters: the leader binds kiln.host-store 7 and its keeper
+    /// makes a session; bring its deadline to now, as a ReadIndex backlog behind a live quorum
+    /// would leave it, and step. Expect: that session ended (any in hand after is the keeper's next,
+    /// with a lease of its own), the leader still leading the same term, and
+    /// `amphora_replica_own_sessions_expired_total` at 1.
+    #[test]
+    fn a_live_leaders_session_past_its_lease_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        quiet(&mut driven, &mut pump);
+        clients[leader].handle().attest(kiln(7)).unwrap();
+        session_lease(&mut driven, leader);
+        let term = driven.owner(leader).replica.term();
+        assert_eq!(clients[leader].handle().counters().own_sessions_expired, 0);
+        let actor = driven.owner_mut(leader);
+        let now = actor.at;
+        actor.pending.as_mut().unwrap().until = now;
+        driven.step();
+        let actor = driven.owner(leader);
+        assert!(actor.replica.is_leader() && actor.replica.term() == term);
+        // Ended; the keeper may have made the next at once, with a lease of its own.
+        assert!(
+            actor.pending.as_ref().is_none_or(|p| p.until > now),
+            "the session past its lease ended"
+        );
+        assert_eq!(clients[leader].handle().counters().own_sessions_expired, 1);
         driven.drain(&mut pump);
         pump.finish();
     }
@@ -12242,21 +12447,23 @@ mod tests {
     }
 
     /// AC-T1.10.L2, T-T1.10.L8 (replication.md, "A replica's local readers bounded by
-    /// derivation"), on driven time: at most `CONNECTION_MAX` local readers at once, the most
-    /// attached clients that can read at once, and one more waits on its caller's thread up to its
-    /// own deadline. Do: one voter, 1 written; `CONNECTION_MAX` local reads held open on threads
+    /// derivation"), on driven time: at most as many local readers at once as the process's
+    /// descriptor budget lets clients attach, and one more waits on its caller's thread up to its
+    /// own deadline. Do: a descriptor budget of 6, one voter, 1 written; 6 local reads held open on threads
     /// of their own; one more asked on a thread of its own, its deadline FIFTH_WAIT away, while the
     /// owner answers a call; one of the held let go and a read asked; one held again and a read
     /// waiting with a long deadline; the owner dropped without its loop's end. Expect: every held
     /// read has its reader; the call answered while they are out; the one more refused Timeout no
     /// sooner than its deadline; the read after the let-go answers 1; the waiting read refused
-    /// Fenced once the owner is gone; the meter counting `CONNECTION_MAX` readers in use while
+    /// Fenced once the owner is gone; the meter counting 6 readers in use while
     /// they are held, every read that had a reader, one refused timeout and one fenced, and none
     /// in use at the end.
     #[test]
     fn local_readers_are_bounded_by_the_transport_not_four() {
         let dir = tempfile::tempdir().unwrap();
-        let most = crate::transport::CONNECTION_MAX;
+        // The bound moves with the budget: a budget of its own, small enough that the readers
+        // reach it, for the owner this thread opens.
+        let most = crate::descriptors::tests::budget(6).bound();
         // An account of the test's own, with room for one reader more than the bound, so the
         // count is what holds the one more back, never the budget (or another test's readers).
         let reader = usize::try_from(crate::db::READER_PAGES).unwrap();
@@ -12360,6 +12567,7 @@ mod tests {
                 db.opener(),
                 Arc::new(ReplicaMeter::default()),
                 Arc::clone(&account),
+                crate::descriptors::process().unwrap(),
             ));
             (db, local)
         };
@@ -13735,7 +13943,7 @@ mod tests {
                 },
                 Durability::Persisted,
                 Arc::new(Changed::default()),
-                Owned::new(lease(&path), None),
+                Owned::unbudgeted(lease(&path), None),
                 until,
                 Arc::new(Instant::now),
             )

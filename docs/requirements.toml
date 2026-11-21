@@ -146,7 +146,7 @@ tests = [
   { id = "T-T1.8.W1", text = "The leader and one follower writing steadily, records delayed - passes when no follower write is refused twice in a row and the history is serializable; and, in an interleaving the test builds, today's rule refuses the follower twice in a row where the slot lands its retry" },
   { id = "T-T1.8.W2", text = "Two followers and the leader writing steadily - passes when every write commits within its deadline, no follower write is refused more than twice in a row, no write the leader makes in its turn after a slot is refused, and the history is serializable" },
   { id = "T-T1.8.W3", text = "A follower's retry racing its slot's start, the leader's last entry neither committed nor sent to it - passes when its barrier waits for that entry's commit and its write applies" },
-  { id = "T-T1.8.W4", text = "The write slot's pure core: its queue and the leader's turn, held forwards, a second forward, expiry and a late retry learned, the ceiling, generations, the term and members, and the held barrier" },
+  { id = "T-T1.8.W4", text = "The write slot's pure core: its queue and the leader's turn, held forwards, a second forward, expiry and a late retry learned, a retry its member was suspected through not learned, generations, the term and members, and the held barrier" },
   # lane d-readsets: read sets.
   { id = "T-T1.8.R1", text = "The leader's check over pages: a page read, one written, the marker page and an opaque entry conflict; one that touched nothing of the write doesn't" },
   { id = "T-T1.8.R2", text = "Page 1: a size change merges with a write that only read page 1 and conflicts with one that allocates; only the size and checksum changed is an allocation" },
@@ -197,7 +197,7 @@ criteria = [
   { id = "AC-T1.10.5", text = "anomalies across groups is exactly 0, measured by an Elle-style check over 10,000 seeds" },
   # Amphora's own: a local read on a replica (docs/design/replication.md, "A local read on a replica").
   { id = "AC-T1.10.L1", text = "A local read on a replica answers from its own applied state, asking no leader: a prefix of the group's committed history, never older than a local read before it in the same opening, nor after a clean close or a process crash; refused before the group's first image, once its owner ended, and while fenced" },
-  { id = "AC-T1.10.L2", text = "At most CONNECTION_MAX local readers out at once on one replica, every replica's readers charged to the process's page budget; a read past either waits on its caller's thread, never the owner's, until its deadline, and is refused Timeout, or Fenced once the owner ends" },
+  { id = "AC-T1.10.L2", text = "At most as many local readers out at once on one replica as the process's descriptor budget lets clients attach (CONNECTION_MAX until 2026-11-21), every replica's readers charged to the process's page budget; a read past either waits on its caller's thread, never the owner's, until its deadline, and is refused Timeout, or Fenced once the owner ends" },
   { id = "AC-T1.10.L3", text = "An attached client's local read is Request::LocalSession at wire version 6, run read-only on its owner's state: a write in it is refused and nothing of it stays" },
 ]
 tests = [
@@ -209,7 +209,7 @@ tests = [
   { id = "T-T1.10.L4", text = "A local read held open while its replica installs an image, with a checkpoint and a log restart tried meanwhile — passes when it sees the state before the image, whole, and a read after sees the image, whole" },
   { id = "T-T1.10.L5", text = "Superseded by T-T1.10.L8 (2026-11-09, the readers bounded by derivation): four local reads held open and a fifth asked — passed when the fifth was refused Timeout at its deadline while the owner's actor stepped, and answered once one was given back" },
   { id = "T-T1.10.L6", text = "A write read locally under the replicated class, its flush held, the member's power cut — passes when the restarted member's read is never older than its last finished flush, and sees the write once caught up" },
-  { id = "T-T1.10.L8", text = "CONNECTION_MAX local reads held open on one replica and one more asked — passes when every held read has its reader, the one more is refused Timeout at its deadline while the owner's actor steps, and a read answers once one is given back" },
+  { id = "T-T1.10.L8", text = "As many local reads held open on one replica as its descriptor budget's bound, and one more asked — passes when every held read has its reader, the one more is refused Timeout at its deadline while the owner's actor steps, and a read answers once one is given back" },
   { id = "T-T1.10.L9", text = "Two replicas' readers over a budget of two readers' pages — passes when an idle reader of one replica is closed for the other's read, a read past the budget is refused Timeout at its deadline, and the charge never passes the budget" },
   { id = "T-T1.10.L7", text = "An attached client's local read that writes — passes when it is refused, nothing of it stays, and the client is never promoted" },
 ]
@@ -387,7 +387,16 @@ criteria = [
   { id = "AC-PL.12.1", text = "TPC-H's 22 queries prepared once and run with qgen's parameters: no query slower than its generic plan (measured on the parent first)" },
   { id = "AC-PL.12.2", text = "The bench suite's prepared statements are within 2% of the parent" },
 ]
-tests = []
+# lane pl12
+tests = [
+  { id = "T-PL.12.1", text = "The choice: custom with no run measured; generic once its cost is not above the custom average raised by measured planning over running (plan_cache.rs unit tests)" },
+  { id = "T-PL.12.2", text = "An estimate reads a bound value only when one is bound and not NULL" },
+  { id = "T-PL.12.3", text = "EXPLAIN with a value bound estimates that value: k = 1 its 4,500 rows, a rare k a few, a sampled range its rows" },
+  { id = "T-PL.12.4", text = "Custom and generic plans forced answer as the literal query, a custom plan made for each forced run" },
+  { id = "T-PL.12.5", text = "A statement no estimate reads a value for (a key lookup, no statistics, nothing bound) is never planned again" },
+  { id = "T-PL.12.6", text = "Auto: the first run is custom, ANALYZE starts the choice again, every run answers as the generic plan, a custom run reset part way runs again" },
+  { id = "T-PL.12.7", text = "AC-PL.12.1's harness: qgen's logged parameters bound to each prepared template's ?N, TPC-H's arithmetic on them, and --params read by JSON type (test_qgen_params.py, bench prepared.rs)" },
+]
 
 [[own]]
 id = "PL.13"
@@ -419,6 +428,54 @@ tests = [
   { id = "T-QT.3.3", text = "Concurrent hits, insertions and evictions on the page cache under shuttle — passes when no held page is evicted, no hit counts none, and no data race" },
   { id = "T-QT.3.4", text = "A loop over a non-covering index with a term on the index's columns and one on the table's — passes when the answer is unchanged and the table rows fetched are only those the index's term keeps, whatever order the terms are written in" },
   { id = "T-QT.3.5", text = "scripts/check-production.sh after the change — passes when it passes, with the ratchet's counts lowered by what the change removed" },
+]
+
+# lane constants
+# Picked constants replaced by derived ones (Ada, 2026-11-11: "learned and stat derived values only"; kiln goal
+# dfabffcc). FD.n: the process's descriptor budget (local-owner-transport.md, "Decision (lane constants): one
+# descriptor budget").
+
+[[own]]
+id = "FD.1"
+title = "One descriptor budget a process: connections bounded by the system's descriptor limit, not a picked 32"
+criteria = [
+  { id = "AC-FD.1.1", text = "No count of connections: each accepted connection charges its socket to the process's descriptor budget (the soft RLIMIT_NOFILE as it stands, read at every charge, less the descriptors open outside the budget, counted again when the limit moves, a charge would be refused or the system refuses one; 2^24 handles on Windows), and one past it is closed unserved with a typed refusal at the client" },
+  { id = "AC-FD.1.2", text = "The listener's backlog is the system's own most (SOMAXCONN semantics), and the listener goes on when the system refuses a descriptor (EMFILE, ENFILE, WSAEMFILE)" },
+  { id = "AC-FD.1.3", text = "A replica's local readers out at once are at most the budget's bound (AC-T1.10.L2)" },
+  # lane constants (2026-11-21): OWNERS_MAX's 4,096 replaced
+  { id = "AC-FD.1.4", text = "No count of owners: each owner charges one descriptor to the process's budget before any probe or lease (a local or replicated owner's lease, a client's socket), held where that file is held and given back once it closes; past the budget an open or attach is refused TooLarge and makes nothing; the drained paths kept are at most the budget's bound" },
+]
+tests = [
+  { id = "T-FD.1.1", text = "A budget of 3 asked for one, two, then one more — passes when the fourth is refused TooLarge naming what it was for, 4 past 3, and two more are held once two are given back" },
+  { id = "T-FD.1.2", text = "The process's budget on Unix, its soft RLIMIT_NOFILE raised by one while it runs and put back — passes when it has room under the limit by stdin, stdout and stderr at least, and its limit follows the raise and the return at its next charge" },
+  { id = "T-FD.1.3", text = "A budget of 1, an owner, one client served and kept, a second asked, the first let go, a third asked — passes when the second is turned away before any challenge and the third is served" },
+  # lane constants (2026-11-21)
+  { id = "T-FD.1.4", text = "A budget of 1, one database opened, a second opened, the first dropped and drained, the second opened again — passes when the first holds 1, the second is refused TooLarge at 1, then served" },
+]
+
+[[own]]
+id = "DQ.1"
+title = "The replicated owner drives once a step, taking turns with its inputs, not a picked 32 drives"
+criteria = [
+  { id = "AC-DQ.1.1", text = "One drive a step, and a step whose drive left more comes again at once without waiting for an input: deficit round robin of inputs and drives, one unit each (Shreedhar and Varghese 1995, Theorem 4.5)" },
+]
+tests = [
+  { id = "T-DQ.1.1", text = "Three members, an election and 20 writes on driven time — passes when every write is answered and some step left more to drive for the next" },
+]
+
+# lane cc-proto
+# Amphora's own IDs for G8 step 1 (kiln plan 01a16b0f4716761cb68dc0c96863b53b, step 1, under
+# CP-T1.3 and AC-T1.3.6): serializability by precision locking against SSI and OCC, measured.
+[[own]]
+id = "G8.1"
+title = "Serializability: precision locking against SSI and OCC, measured (G8 step 1)"
+criteria = [
+  { id = "AC-G8.1.1", text = "anomalies over 10,000 Elle seeds with the chosen validation is exactly 0" },
+  { id = "AC-G8.1.2", text = "the three validations' throughput, refusal rates and p99 on the suite's write classes and K0 at 32 writers recorded (amphora-bench --cc)" },
+]
+tests = [
+  { id = "T-G8.1.1", text = "Elle list-append and rw-register histories, 10,000 seeds — passes when no G0, G1a, G1b, G1c, G-single or G2" },
+  { id = "T-G8.1.2", text = "Each validation on hand-made schedules (write skew, a phantom closing a cycle, a lone antidependency, the read-only anomaly, an open writer of a row read) — passes when each refuses exactly what its scheme says" },
 ]
 
 # lane split-merge: groups that split, merge and move themselves (kiln goal 49477403, G13 step 2;
@@ -480,4 +537,16 @@ criteria = [
 ]
 tests = [
   { id = "T-CS.1.1", text = "A doc-truth check of its claims (crates/amphora/tests/columnar_decision.rs) — passes when every claim cited: each citation resolves to a quoted, located claim from a graded source, and each number the decision states is in a quote it cites" },
+]
+
+# lane g11-compress
+[[own]]
+id = "CS.3"
+title = "BtrBlocks against FastLanes: column codecs decoded in vectorizable safe Rust, each scheme chosen from a sample (G11 step 3)"
+criteria = [
+  { id = "AC-CS.3.1", text = "Both codecs (crates/columnar) round-trip integers, doubles, strings and nulls bit for bit, each column's schemes chosen from samples of it, no depth or sample size fixed" },
+  { id = "AC-CS.3.2", text = "Values decoded per cycle with the winner is at least 8, and bytes per value, on the corpus's columns (benches/decode.rs; measured by the coordinator)" },
+]
+tests = [
+  { id = "T-CS.3.1", text = "crates/columnar/tests/round_trip.rs — passes when every random and real-like column, of every size around the group and vector edges, decodes equal to the input in both codecs, every bit width packs and unpacks in both layouts, the schemes follow the data, and damaged encodings are refused" },
 ]
