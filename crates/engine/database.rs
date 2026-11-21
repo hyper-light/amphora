@@ -2782,6 +2782,7 @@ impl Database {
             join_methods: crate::connection::AtomicJoinMethods::new(
                 crate::connection::JoinMethods::ByCost,
             ),
+            sorted_fetches: AtomicBool::new(false),
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
@@ -2815,7 +2816,10 @@ impl Database {
     ) -> Result<Option<Arc<crate::storage::versioned::switch::Storage>>> {
         let mut slot = self.versioned.lock();
         if slot.is_none() && ask {
-            *slot = Some(crate::storage::versioned::switch::open(&self.path)?);
+            *slot = Some(crate::storage::versioned::switch::open(
+                &self.path,
+                self.io.is_memory(),
+            )?);
         }
         Ok(slot.clone())
     }

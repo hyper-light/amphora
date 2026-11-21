@@ -42,7 +42,8 @@ use super::{
     },
     join::JoinPlanningContext,
     multi_index::{
-        consider_multi_index_intersection, consider_multi_index_union, MultiIndexBranchParams,
+        consider_multi_index_intersection, consider_multi_index_union, consider_sorted_fetch,
+        MultiIndexBranchParams,
     },
     order::{
         btree_access_order_consumed, subquery_intrinsic_order_consumed, ColumnTarget,
@@ -985,6 +986,7 @@ pub fn find_best_access_method_for_join_order(
             planning_context.maybe_order_target,
             planning_context.allow_automatic_index,
             planning_context.row_goal,
+            planning_context.sorted_fetches,
             where_clause,
             ready_where,
             available_indexes,
@@ -1045,6 +1047,7 @@ fn find_best_access_method_for_btree(
     maybe_order_target: Option<&OrderTarget>,
     allow_automatic_index: bool,
     row_goal: Option<RowGoal>,
+    sorted_fetches: bool,
     where_clause: &[WhereTerm],
     ready_where: &[(usize, usize)],
     available_indexes: &AvailableIndexes,
@@ -1330,6 +1333,33 @@ fn find_best_access_method_for_btree(
                 params,
                 whole_reads,
             );
+        }
+
+        if sorted_fetches {
+            if let Some(sorted_fetch) = consider_sorted_fetch(
+                rhs_table,
+                rhs_constraints,
+                &best_access_method,
+                table_references,
+                available_indexes,
+                subqueries,
+                schema,
+                input_cardinality,
+                base_row_count,
+                params,
+                alternative_cost_limit(&best_access_method, best_cost_with_filters),
+                analyze_stats,
+            )? {
+                replace_if_cheaper(
+                    &mut best_access_method,
+                    &mut best_cost_with_filters,
+                    sorted_fetch,
+                    ready_where,
+                    input_cardinality,
+                    params,
+                    whole_reads,
+                );
+            }
         }
 
         if !has_two_local_constraint_terms(rhs_constraints, where_clause) {

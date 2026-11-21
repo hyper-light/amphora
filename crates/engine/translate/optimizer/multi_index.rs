@@ -982,6 +982,107 @@ fn analyze_and_terms_for_multi_index(
     })
 }
 
+/// A sorted fetch (G6 step 5; behind `Connection::set_sorted_fetches`): the chosen read of a
+/// non-covering index, run as a one-branch intersection: the index's rowids go into a RowSet,
+/// which gives them back sorted, and the table's rows are fetched in rowid order, as PostgreSQL's
+/// bitmap heap scan fetches its pages in physical order. The branch seeks exactly as the plain
+/// read does (its constraints and their refs) and consumes the terms the plain read consumed; it
+/// is costed by the existing intersection cost and kept only when cheaper. A rowid read, a
+/// covering index, an index method, an automatic index or a scan with no seek keeps the plain
+/// read: sorting their rowids saves no table read.
+#[allow(clippy::too_many_arguments)]
+pub fn consider_sorted_fetch(
+    rhs_table: &JoinedTable,
+    rhs_constraints: &TableConstraints,
+    plain: &AccessMethod,
+    table_references: &TableReferences,
+    available_indexes: &AvailableIndexes,
+    subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+    best_cost: Cost,
+    analyze_stats: &AnalyzeStats,
+) -> Result<Option<AccessMethod>> {
+    let AccessMethodParams::BTreeTable {
+        index: Some(index),
+        build_index: false,
+        constraint_refs,
+        ..
+    } = &plain.params
+    else {
+        return Ok(None);
+    };
+    if constraint_refs.is_empty()
+        || index.index_method.is_some()
+        || rhs_table.index_is_covering(index)
+    {
+        return Ok(None);
+    }
+    let mut consumed = plain.consumed_where_terms.iter();
+    let Some(where_term_idx) = consumed.next() else {
+        return Ok(None);
+    };
+    let additional_consumed_terms: BitSet = consumed.try_collect()?;
+    let constraints = rhs_constraints.constraints.clone();
+    let Some(index_info) = index_info_for_branch(
+        Some(index.as_ref()),
+        rhs_table,
+        BranchReadMode::RowIdOnly,
+        params.rows_per_table_page,
+    ) else {
+        return Ok(None);
+    };
+    let analyze_ctx = AnalyzeCtx {
+        rhs_table,
+        index: Some(index),
+        stats: analyze_stats,
+    };
+    let branch = MultiIdxBranch {
+        index: Some(index.clone()),
+        cost: estimate_cost_for_scan_or_seek(
+            Some(index_info),
+            &constraints,
+            constraint_refs,
+            1.0,
+            base_row_count,
+            false,
+            params,
+            Some(&analyze_ctx),
+        ),
+        estimated_rows: estimate_rows_per_seek(
+            index_info,
+            &constraints,
+            constraint_refs,
+            base_row_count,
+            Some(&analyze_ctx),
+            params,
+        ),
+        access: MultiIdxBranchAccess::Seek {
+            constraints,
+            constraint_refs: constraint_refs.clone(),
+        },
+        union_prepost_filters: None,
+    };
+    evaluate_multi_index_branches(
+        vec![branch],
+        SetOperation::Intersection {
+            additional_consumed_terms,
+        },
+        where_term_idx,
+        rhs_table,
+        table_references,
+        available_indexes,
+        subqueries,
+        schema,
+        base_row_count,
+        input_cardinality,
+        params,
+        best_cost,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Analyze OR clauses for OR-by-union optimization.
 ///
