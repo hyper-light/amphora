@@ -44,9 +44,14 @@
 //! budget is refused ([`Refusal::Budget`]). E holds at most `budget` fences and refuses a leaf past
 //! it. The caller derives both budgets from the memory it grants (its page cache's).
 //!
-//! Wiring into `BTreeCursor`'s seek, behind a switch, is the next piece: this module is the two
-//! cores, sans-IO, their model test against a plain descent and the micro-benchmark of their
-//! lookup and upkeep costs.
+//! The cursor hook ([`Hook`], held by each connection's pager), behind the switch
+//! `AMPHORA_DESCENT_SKIP` = `off` | `hash` | `locator` (default `off`): a read-only cursor's point
+//! seek asks the prototype for a leaf, takes it only if the page is clean in the connection's own
+//! cache and proves the key ([`table_leaf_span`]), and then stands on that leaf alone; every other
+//! move descends again first (`BTreeCursor::leave_stood_leaf`). The stamp is the connection's own
+//! count of pages that left their tree (freed, or restored by a rollback) together with its
+//! snapshot's identity (its WAL position), so a page learned under one snapshot is never trusted
+//! under another; everything learned is dropped when the stamp moves.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -321,7 +326,7 @@ struct Segment {
 }
 
 /// The probes a binary search over `n` items makes at most: the bit length of `n`.
-fn bits(n: usize) -> u64 {
+pub(crate) fn bits(n: usize) -> u64 {
     u64::from(usize::BITS.saturating_sub(n.leading_zeros()))
 }
 
@@ -707,6 +712,250 @@ pub fn table_leaf_span(contents: &PageContent, page: u64) -> Option<LeafSpan<i64
         last,
         cells,
     })
+}
+
+/// Which prototype the cursor hook consults: `AMPHORA_DESCENT_SKIP` = `off` | `hash` | `locator`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Switch {
+    Off,
+    Hash,
+    Locator,
+}
+
+/// The switch as the environment sets it, read once; anything but `hash` or `locator` is off.
+pub(crate) fn switched() -> Switch {
+    static ON: crate::sync::LazyLock<Switch> = crate::sync::LazyLock::new(|| {
+        match std::env::var("AMPHORA_DESCENT_SKIP").as_deref() {
+            Ok("hash") => Switch::Hash,
+            Ok("locator") => Switch::Locator,
+            _ => Switch::Off,
+        }
+    });
+    *ON
+}
+
+/// A snapshot's identity and the connection's pages-left count: what a learned page is valid under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    left: u64,
+    wal: (u32, u64),
+}
+
+/// What the cursor hook counted, for its tests and the bench.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HookCounts {
+    /// Seeks that stood on a leaf the hash named, without descending.
+    pub stood_hash: u64,
+    /// Seeks that stood on a leaf the locator named, without descending.
+    pub stood_locator: u64,
+    /// Named pages not used because they weren't clean in the cache (not a refutation).
+    pub uncached: u64,
+    /// Learned leaves dropped because the stamp moved.
+    pub stamp_drops: u64,
+}
+
+#[derive(Debug, Default)]
+struct Store {
+    stamp: Option<Stamp>,
+    /// Raised each time the stamp moves: the prototypes' own stamp.
+    generation: u64,
+    /// Prototype D over every tree: a key is its tree's root and its rowid.
+    hash: Option<AdaptiveHash<(i64, i64)>>,
+    /// Prototype E, one locator a tree, by root page.
+    locators: HashMap<i64, LeafLocator>,
+    /// Fences the locators hold together, kept within the page budget.
+    fences: usize,
+    counts: HookCounts,
+}
+
+impl Store {
+    /// Moves to `stamp`, dropping everything learned under another.
+    fn sync(&mut self, stamp: Stamp) {
+        if self.stamp == Some(stamp) {
+            return;
+        }
+        if self.stamp.is_some() {
+            self.counts.stamp_drops = self.counts.stamp_drops.saturating_add(1);
+        }
+        self.stamp = Some(stamp);
+        self.generation = self.generation.saturating_add(1);
+        self.hash = None;
+        self.locators.clear();
+        self.fences = 0;
+    }
+}
+
+/// The cursor hook's state for one connection, held by its pager.
+///
+/// Its bounds come from the connection's page cache, since only a page clean in that cache is
+/// ever used: the locators hold at most a fence per cached page together, and the hash at most
+/// as many keys as the cached pages can hold cells (SQLite's `MX_CELL`, `(usable - 8) / 6`,
+/// btreeInt.h: a cell takes at least 4 bytes plus its 2-byte pointer, after an 8-byte header).
+#[derive(Debug, Default)]
+pub struct Hook {
+    /// Pages this connection freed or restored (a rollback), raised before the change.
+    left: crate::sync::atomic::AtomicU64,
+    store: crate::sync::Mutex<Store>,
+}
+
+impl Hook {
+    /// A page leaves its tree (freed), or pages go back to what they were (a rollback).
+    pub(crate) fn page_left(&self) {
+        self.left
+            .fetch_add(1, crate::sync::atomic::Ordering::AcqRel);
+    }
+
+    fn stamp(&self, wal: (u32, u64)) -> Stamp {
+        Stamp {
+            left: self.left.load(crate::sync::atomic::Ordering::Acquire),
+            wal,
+        }
+    }
+
+    pub fn counts(&self) -> HookCounts {
+        self.store.lock().counts
+    }
+
+    /// The prototype's counts under `switch`: the hash's, or the locators' summed.
+    pub fn prototype_counts(&self, switch: Switch) -> Counts {
+        let store = self.store.lock();
+        match switch {
+            Switch::Off => Counts::default(),
+            Switch::Hash => store.hash.as_ref().map(|h| h.counts()).unwrap_or_default(),
+            Switch::Locator => store.locators.values().fold(Counts::default(), |sum, l| {
+                let c = l.counts();
+                Counts {
+                    hits: sum.hits.saturating_add(c.hits),
+                    refuted: sum.refuted.saturating_add(c.refuted),
+                    built: sum.built.saturating_add(c.built),
+                    upkeep: sum.upkeep.saturating_add(c.upkeep),
+                    evicted: sum.evicted.saturating_add(c.evicted),
+                    stamp_drops: sum.stamp_drops.saturating_add(c.stamp_drops),
+                }
+            }),
+        }
+    }
+
+    /// The leaf the prototype names for `rowid` in the tree at `root`, for the cursor to prove.
+    pub(crate) fn name(&self, switch: Switch, root: i64, rowid: i64, wal: (u32, u64)) -> Option<u64> {
+        let stamp = self.stamp(wal);
+        let mut store = self.store.lock();
+        store.sync(stamp);
+        let generation = store.generation;
+        match switch {
+            Switch::Off => None,
+            Switch::Hash => store.hash.as_mut()?.lookup(&(root, rowid), generation),
+            Switch::Locator => store.locators.get_mut(&root)?.lookup(rowid, generation),
+        }
+    }
+
+    /// The named page proved the key: the cursor stands on it.
+    pub(crate) fn confirm(&self, switch: Switch, root: i64) {
+        let mut store = self.store.lock();
+        match switch {
+            Switch::Off => {}
+            Switch::Hash => {
+                store.counts.stood_hash = store.counts.stood_hash.saturating_add(1);
+                if let Some(hash) = store.hash.as_mut() {
+                    hash.confirm();
+                }
+            }
+            Switch::Locator => {
+                store.counts.stood_locator = store.counts.stood_locator.saturating_add(1);
+                if let Some(locator) = store.locators.get_mut(&root) {
+                    locator.confirm();
+                }
+            }
+        }
+    }
+
+    /// The named page wasn't clean in the cache: the cursor descends, the prototype keeps it.
+    pub(crate) fn uncached(&self) {
+        let mut store = self.store.lock();
+        store.counts.uncached = store.counts.uncached.saturating_add(1);
+    }
+
+    /// The named page didn't prove the key: the prototype forgets it.
+    pub(crate) fn refute(&self, switch: Switch, root: i64, page: u64) {
+        let mut store = self.store.lock();
+        match switch {
+            Switch::Off => {}
+            Switch::Hash => {
+                if let Some(hash) = store.hash.as_mut() {
+                    hash.refute(page);
+                }
+            }
+            Switch::Locator => {
+                let Some(locator) = store.locators.get_mut(&root) else {
+                    return;
+                };
+                let before = locator.fences();
+                locator.refute(page);
+                let after = locator.fences();
+                store.fences = store.fences.saturating_sub(before).saturating_add(after);
+            }
+        }
+    }
+
+    /// A plain descent for `rowid` in the tree at `root` ended at the clean `leaf` after `above`
+    /// probes over interior pages: teaches the prototype. `pages` is the connection's cache
+    /// capacity and `usable` its page's usable bytes, the bounds' sources.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn descended(
+        &self,
+        switch: Switch,
+        root: i64,
+        rowid: i64,
+        leaf: &LeafSpan<i64>,
+        above: u64,
+        wal: (u32, u64),
+        pages: usize,
+        usable: usize,
+        keys: impl FnOnce() -> Vec<i64>,
+    ) {
+        let stamp = self.stamp(wal);
+        let mut store = self.store.lock();
+        store.sync(stamp);
+        let generation = store.generation;
+        match switch {
+            Switch::Off => {}
+            Switch::Hash => {
+                let cells = usable.saturating_sub(8).checked_div(6).unwrap_or(0);
+                let budget = pages.saturating_mul(cells);
+                let hash = store
+                    .hash
+                    .get_or_insert_with(|| AdaptiveHash::new(budget, generation));
+                let span = LeafSpan {
+                    page: leaf.page,
+                    first: (root, leaf.first),
+                    last: (root, leaf.last),
+                    cells: leaf.cells,
+                };
+                hash.descended(&(root, rowid), &span, above, generation, || {
+                    keys().into_iter().map(|key| (root, key)).collect()
+                });
+            }
+            Switch::Locator => {
+                let held = store.fences;
+                if !store.locators.contains_key(&root) && held >= pages {
+                    return;
+                }
+                let locator = store
+                    .locators
+                    .entry(root)
+                    .or_insert_with(|| LeafLocator::new(pages, generation));
+                let before = locator.fences();
+                // The locators together hold at most a fence a cached page.
+                let room = pages.saturating_sub(held).saturating_add(before);
+                if before >= room {
+                    return;
+                }
+                locator.learn(leaf, generation);
+                let after = locator.fences();
+                store.fences = held.saturating_sub(before).saturating_add(after);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1519,6 +1768,118 @@ mod tests {
             let (h, l) = (hash.counts(), locator.counts());
             assert!(h.hits > 0 && h.built > 0, "hash vacuous: {h:?}");
             assert!(l.hits > 0 && l.built > 0, "locator vacuous: {l:?}");
+        }
+
+        /// T-G3.5.4: the cursor hook through the real cursor. Two connections to one WAL database
+        /// take turns writing (random inserts, splits, range deletes freeing pages) while the
+        /// other reads on at its older snapshot; on each connection a cursor with each switch
+        /// setting (off, hash, locator) seeks random rowids, present and absent, and then steps
+        /// once forward or back. Every seek stands where the plain descent stands (leaf and cell),
+        /// with the same result, and every step after it reaches the same row: a cursor standing on
+        /// a named leaf descends again before it moves. The hook's counts show seeks stood on a
+        /// named leaf, under both prototypes, and that the stamp moved with the snapshots.
+        #[test]
+        fn t_g3_5_4_cursor_hook_matches_the_plain_descent() {
+            use super::super::Switch;
+            use crate::storage::btree::CursorTrait;
+
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, "descent_skip.db", Arc::new(SqliteDialect)).unwrap();
+            let conns = [
+                db.connect(ConnectOpts::new()).unwrap(),
+                db.connect(ConnectOpts::new()).unwrap(),
+            ];
+            conns[0]
+                .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v)")
+                .unwrap();
+            let mut rng = ChaCha8Rng::seed_from_u64(0x0050_5235_0004);
+            let mut next = 0i64;
+            let mut reading = [false, false];
+            let switches = [Switch::Off, Switch::Hash, Switch::Locator];
+            for round in 0..8usize {
+                let writer = round % 2;
+                let pager = conns[writer].pager.load().clone();
+                if reading[writer] {
+                    pager.end_read_tx();
+                    reading[writer] = false;
+                }
+                conns[writer].execute("BEGIN").unwrap();
+                for _ in 0..1200 {
+                    let rowid = if rng.random_range(0..2) == 0 {
+                        next += rng.random_range(1..4);
+                        next
+                    } else {
+                        rng.random_range(0..next + 1)
+                    };
+                    insert(&conns[writer], rowid, rng.random());
+                }
+                let from = rng.random_range(0..next + 1);
+                conns[writer]
+                    .execute(format!("DELETE FROM t WHERE id BETWEEN {from} AND {}", from + 300))
+                    .unwrap();
+                conns[writer].execute("COMMIT").unwrap();
+                let root = root(&conns[writer]);
+                pager.begin_read_tx().unwrap();
+                reading[writer] = true;
+                // Both connections read: the writer at the new snapshot, the other at its older one.
+                for reader in 0..2 {
+                    if !reading[reader] {
+                        continue;
+                    }
+                    let pager = conns[reader].pager.load().clone();
+                    let mut cursors: Vec<BTreeCursor> = switches
+                        .iter()
+                        .map(|&switch| {
+                            let mut cursor = BTreeCursor::new_table(pager.clone(), root, 2);
+                            cursor.set_descent_skip(switch);
+                            cursor
+                        })
+                        .collect();
+                    let mut plain = BTreeCursor::new_table(pager.clone(), root, 2);
+                    for _ in 0..3000 {
+                        let rowid = rng.random_range(-3..next + 3);
+                        let step = rng.random_range(0..8);
+                        let key = || SeekKey::TableRowId(rowid);
+                        let op = SeekOp::GE { eq_only: true };
+                        let want = pager.io.block(|| plain.seek(key(), op)).unwrap();
+                        let want_at = plain.position().last().copied();
+                        let want_row = pager.io.block(|| plain.rowid()).unwrap();
+                        let want_step = match step {
+                            0 => Some(pager.io.block(|| plain.next()).map(|_| ()).unwrap()),
+                            1 => Some(pager.io.block(|| plain.prev()).map(|_| ()).unwrap()),
+                            _ => None,
+                        }
+                        .map(|()| pager.io.block(|| plain.rowid()).unwrap());
+                        for (cursor, switch) in cursors.iter_mut().zip(switches) {
+                            let got = pager.io.block(|| cursor.seek(key(), op)).unwrap();
+                            let why = format!("round {round} reader {reader} {switch:?} {rowid}");
+                            assert_eq!(got, want, "{why}");
+                            assert_eq!(cursor.position().last().copied(), want_at, "{why}");
+                            assert_eq!(pager.io.block(|| cursor.rowid()).unwrap(), want_row, "{why}");
+                            let got_step = match step {
+                                0 => Some(pager.io.block(|| cursor.next()).map(|_| ()).unwrap()),
+                                1 => Some(pager.io.block(|| cursor.prev()).map(|_| ()).unwrap()),
+                                _ => None,
+                            }
+                            .map(|()| pager.io.block(|| cursor.rowid()).unwrap());
+                            assert_eq!(got_step, want_step, "{why} step {step}");
+                        }
+                    }
+                }
+            }
+            for (at, conn) in conns.iter().enumerate() {
+                let hook = &conn.pager.load().descent_skip;
+                let counts = hook.counts();
+                let (hash, locator) = (
+                    hook.prototype_counts(Switch::Hash),
+                    hook.prototype_counts(Switch::Locator),
+                );
+                // The prototypes' own counts are the last stamp's; the hook's span every stamp.
+                assert!(counts.stood_hash > 0, "connection {at}: hash never stood: {counts:?}");
+                assert!(counts.stood_locator > 0, "connection {at}: locator never stood: {counts:?}");
+                assert!(counts.stamp_drops > 0, "connection {at}'s stamp never moved: {counts:?}");
+                println!("connection {at}: {counts:?} hash {hash:?} locator {locator:?}");
+            }
         }
 
         /// The lookup costs on the engine's pages, behind AC-G3.5.1: nanoseconds a point lookup by

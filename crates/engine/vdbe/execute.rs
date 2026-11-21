@@ -1483,11 +1483,13 @@ pub fn op_open_read(
                 .into());
             }
             let btree_cursor: Box<BTreeCursor> = if table.has_rowid {
+                // Amphora (G3.5): a cursor opened to read may stand on a named leaf.
                 BTreeCursor::new_table(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                     num_columns,
                 )
+                .open_read()
                 .into_boxed()
             } else {
                 BTreeCursor::new_without_rowid_table(

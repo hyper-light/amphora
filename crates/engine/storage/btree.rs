@@ -952,6 +952,14 @@ pub struct BTreeCursor {
     /// Amphora: whether this cursor searches pages by their key heads (`storage/key_heads.rs`,
     /// PR.4): the prototype's switch, `AMPHORA_KEY_HEADS=1`.
     key_heads: bool,
+    /// Amphora (G3.5): the descent-skip prototype this cursor consults: off unless it was opened
+    /// to read (`open_read`), then `AMPHORA_DESCENT_SKIP`'s.
+    descent_skip: crate::storage::descent_skip::Switch,
+    /// Amphora (G3.5): the rowid of the seek that stood this cursor on a named leaf without
+    /// descending; its stack then holds that leaf alone, so every move but a seek descends first.
+    stood: Option<i64>,
+    /// Amphora (G3.5): the rowid a move re-descends to before it runs, while that descent yields.
+    redescent: Option<i64>,
     /// Per-cell access cache for incremental blob I/O. Caches the leaf cell's payload
     /// layout, the overflow-page-number array (Turso's runtime reconstruction of
     /// SQLite's `aOverflow`), and the byte range of the most recently accessed column,
@@ -1263,6 +1271,9 @@ impl BTreeCursor {
             skip_advance: false,
             reusable_cell_payload: crate::alloc::vec![],
             key_heads: crate::storage::key_heads::switched_on(),
+            descent_skip: crate::storage::descent_skip::Switch::Off,
+            stood: None,
+            redescent: None,
             blob_cache: BlobCellCache::default(),
             blob_pinned_rowid: None,
             blob_expired: false,
@@ -1356,6 +1367,133 @@ impl BTreeCursor {
     ) -> Self {
         let num_columns = index_info.num_cols;
         Self::new_with_index_info(pager, root_page, num_columns, Some(index_info))
+    }
+
+    /// Amphora (G3.5): a cursor that only reads consults the descent-skip prototype the switch
+    /// names; a cursor that writes never does.
+    pub(crate) fn open_read(mut self) -> Self {
+        self.descent_skip = crate::storage::descent_skip::switched();
+        self
+    }
+
+    /// Amphora (G3.5): sets this read cursor's descent-skip prototype, whatever the switch says.
+    #[cfg(test)]
+    pub(crate) fn set_descent_skip(&mut self, switch: crate::storage::descent_skip::Switch) {
+        self.descent_skip = switch;
+    }
+
+    /// Amphora (G3.5): names the leaf for `rowid` through the prototype and stands on it when the
+    /// page is clean in the connection's cache and its bytes prove the rowid in range; then the
+    /// leaf search runs on it alone. No I/O: a page not in the cache means a descent.
+    fn try_stand_on_named_leaf(&mut self, rowid: i64) -> Result<bool> {
+        let hook = &self.pager.descent_skip;
+        let wal = self.pager.wal_pos();
+        let Some(page_id) = hook.name(self.descent_skip, self.root_page, rowid, wal) else {
+            return Ok(false);
+        };
+        let Some(page) = usize::try_from(page_id)
+            .ok()
+            .map(|id| self.pager.cache_get(id))
+            .transpose()?
+            .flatten()
+        else {
+            hook.uncached();
+            return Ok(false);
+        };
+        if !page.is_loaded() || page.is_locked() || page.is_dirty() {
+            hook.uncached();
+            return Ok(false);
+        }
+        let cells = match crate::storage::descent_skip::table_leaf_span(page.get_contents(), page_id)
+        {
+            Some(leaf) if leaf.covers(&rowid) => leaf.cells,
+            _ => {
+                hook.refute(self.descent_skip, self.root_page, page_id);
+                return Ok(false);
+            }
+        };
+        hook.confirm(self.descent_skip, self.root_page);
+        self.stack.clear();
+        self.going_upwards = false;
+        self.stack.push(page)?;
+        self.stood = Some(rowid);
+        self.start_table_leaf_search(cells, SeekOp::GE { eq_only: true });
+        Ok(true)
+    }
+
+    /// Amphora (G3.5): a plain descent for `rowid` ended at the leaf on top of the stack: teaches
+    /// the prototype that leaf, when it is clean, with the probes the descent made above it.
+    fn teach_descent_skip(&self, rowid: i64) {
+        let level = self.stack.current();
+        let Some(page) = self.stack.get_page_at_level(level) else {
+            return;
+        };
+        if page.is_dirty() {
+            return;
+        }
+        let page_id = page.get().id() as u64;
+        let contents = page.get_contents();
+        let Some(leaf) = crate::storage::descent_skip::table_leaf_span(contents, page_id) else {
+            return;
+        };
+        let above = (0..level)
+            .filter_map(|at| self.stack.get_page_contents_at_level(at))
+            .map(|interior| crate::storage::descent_skip::bits(interior.cell_count()))
+            .fold(0u64, u64::saturating_add);
+        self.pager.descent_skip.descended(
+            self.descent_skip,
+            self.root_page,
+            rowid,
+            &leaf,
+            above,
+            self.pager.wal_pos(),
+            self.pager.cached_page_capacity(),
+            self.usable_space_cached,
+            || {
+                (0..leaf.cells)
+                    .map_while(|cell| contents.cell_table_leaf_read_rowid(cell).ok())
+                    .collect()
+            },
+        );
+    }
+
+    /// Amphora (G3.5): a cursor standing on a named leaf descends to where it stands before any
+    /// move but a seek: to its row's rowid, or, with no row under it, the rowid its seek sought,
+    /// which puts it where that seek's plain descent would have. A position saved for a peer's
+    /// write is the restore's to take back.
+    #[inline]
+    fn leave_stood_leaf(&mut self) -> IOResultOr<()> {
+        if self.stood.is_none() && self.redescent.is_none() {
+            return Ok(IOResult::Done(()));
+        }
+        self.leave_stood_leaf_slow()
+    }
+
+    #[inline(never)]
+    fn leave_stood_leaf_slow(&mut self) -> IOResultOr<()> {
+        if let Some(sought) = self.stood.take() {
+            if self.needs_restore() {
+                return Ok(IOResult::Done(()));
+            }
+            let under = if self.has_record && self.stack.current_page >= 0 {
+                let contents = self.stack.top_ref().get_contents();
+                usize::try_from(self.stack.current_cell_index())
+                    .ok()
+                    .filter(|cell| *cell < contents.cell_count())
+                    .and_then(|cell| contents.cell_table_leaf_read_rowid(cell).ok())
+            } else {
+                None
+            };
+            self.redescent = Some(under.unwrap_or(sought));
+            self.seek_state = CursorSeekState::Start;
+        }
+        let Some(rowid) = self.redescent else {
+            return Ok(IOResult::Done(()));
+        };
+        return_if_io!(self.tablebtree_seek(rowid, SeekOp::GE { eq_only: true }));
+        self.seek_state = CursorSeekState::Start;
+        self.redescent = None;
+        Ok(IOResult::Done(()))
     }
 
     /// Amphora (PR.4): turns the key heads on or off for this cursor, whatever the switch says.
@@ -1980,6 +2118,8 @@ impl BTreeCursor {
     /// `move_to_root`.
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn move_to_root_nonblock(&mut self) -> IOResultOr<Option<Completion>> {
+        // Amphora (G3.5): the stack is rebuilt from the root, so it no longer stands on a named leaf.
+        self.stood = None;
         self.seek_state = CursorSeekState::Start;
         self.going_upwards = false;
         tracing::trace!(root_page = self.root_page);
@@ -2586,12 +2726,26 @@ impl BTreeCursor {
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn tablebtree_seek(&mut self, rowid: i64, seek_op: SeekOp) -> IOResultOr<SeekResult> {
         let search_tree = if matches!(self.seek_state, CursorSeekState::Start) {
+            // Amphora (G3.5): a stack standing on a named leaf holds that leaf alone, so the
+            // current-leaf fast path, which reads the ancestors, can't run on it.
+            let one_leaf = self.stood.take().is_some() || self.redescent.is_some();
+            if self.descent_skip != crate::storage::descent_skip::Switch::Off
+                && self.redescent.is_none()
+                && self.valid_state == CursorValidState::Valid
+                && matches!(seek_op, SeekOp::GE { eq_only: true })
+                && self.try_stand_on_named_leaf(rowid)?
+            {
+                false
+            } else if one_leaf {
+                true
+            } else {
             match self.try_start_seek_on_current_table_leaf(rowid, seek_op)? {
                 CurrentTableLeafSeek::SearchFromRoot => true,
                 CurrentTableLeafSeek::SearchCurrentLeaf => false,
                 CurrentTableLeafSeek::NotFoundAtEnd => {
                     return Ok(IOResult::Done(SeekResult::NotFound));
                 }
+            }
             }
         } else {
             matches!(
@@ -2602,6 +2756,11 @@ impl BTreeCursor {
         };
         if search_tree {
             return_if_io!(self.move_to(SeekKey::TableRowId(rowid), seek_op));
+            if self.descent_skip != crate::storage::descent_skip::Switch::Off
+                && matches!(seek_op, SeekOp::GE { eq_only: true })
+            {
+                self.teach_descent_skip(rowid);
+            }
             let page = self.stack.top_ref();
             let contents = page.get_contents();
             turso_assert!(
@@ -6799,6 +6958,7 @@ impl CursorTrait for BTreeCursor {
     }
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn next(&mut self) -> IOResultOr<()> {
+        return_if_io!(self.leave_stood_leaf());
         if self.can_advance_within_leaf() {
             self.stack.advance();
             self.invalidate_record();
@@ -6895,6 +7055,7 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn prev(&mut self) -> IOResultOr<()> {
+        return_if_io!(self.leave_stood_leaf());
         loop {
             match self.advance_state {
                 AdvanceState::Start => {
@@ -7047,6 +7208,7 @@ impl CursorTrait for BTreeCursor {
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn insert(&mut self, key: &BTreeKey) -> IOResultOr<()> {
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
+        return_if_io!(self.leave_stood_leaf());
         self.forget_noted_payload();
         // saveAllCursors at the head of sqlite3BtreeInsert (btree.c:9348).
         return_if_io!(self.drive_pending_peer_save(key.maybe_rowid()));
@@ -7072,6 +7234,7 @@ impl CursorTrait for BTreeCursor {
     /// 9. SeekAfterBalancing -> adjust the cursor to a node that is closer to the deleted value. go to Finish
     /// 10. Finish -> Delete operation is done. Return CursorResult(Ok())
     fn delete(&mut self) -> IOResultOr<()> {
+        return_if_io!(self.leave_stood_leaf());
         self.forget_noted_payload();
         if let CursorState::None = &self.state {
             // saveAllCursors at the head of sqlite3BtreeDelete (btree.c:9841). The
