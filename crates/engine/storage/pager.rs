@@ -1953,6 +1953,9 @@ pub struct Pager {
     /// represent case where value is not set.
     schema_cookie: AtomicU64,
     free_page_state: RwLock<FreePageState>,
+    /// Amphora (G3.5): the descent-skip hook's state for this connection: what its read cursors
+    /// learned, and the count of pages that left their tree that stamps it (`descent_skip.rs`).
+    pub(crate) descent_skip: crate::storage::descent_skip::Hook,
     /// State machine for async cache spilling.
     spill_state: RwLock<SpillState>,
     /// State machine for async cacheflush operation.
@@ -2291,6 +2294,7 @@ impl Pager {
             reserved_space: AtomicU16::new(RESERVED_SPACE_NOT_SET),
             schema_cookie: AtomicU64::new(Self::SCHEMA_COOKIE_NOT_SET),
             free_page_state: RwLock::new(FreePageState::Start),
+            descent_skip: crate::storage::descent_skip::Hook::default(),
             spill_state: RwLock::new(SpillState::Idle),
             cacheflush_state: RwLock::new(CacheFlushState::default()),
             allocate_page_state: RwLock::new(AllocatePageState::Start),
@@ -2865,6 +2869,8 @@ impl Pager {
         savepoint: &SavepointSnapshot,
         journal_end_offset: u64,
     ) -> Result<()> {
+        // Amphora (G3.5): pages go back to the savepoint's; what the descent skip learned is stale.
+        self.descent_skip.page_left();
         self.reset_internal_states();
 
         let subjournal = self.subjournal.read();
@@ -6321,6 +6327,8 @@ impl Pager {
     }
 
     pub fn clear_page_cache(&self, clear_dirty: bool) {
+        // Amphora (G3.5): dirty pages go back to what they were (a rollback).
+        self.descent_skip.page_left();
         self.invalidate_all_cursors();
         let dirty_pages = self.dirty_pages.write();
         let mut cache = self.page_cache.write();
@@ -6415,6 +6423,8 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn free_page(&self, mut page: Option<PageRef>, page_id: usize) -> IOResultOr<()> {
         tracing::trace!("free_page(page_id={})", page_id);
+        // Amphora (G3.5): the page leaves its tree; what the descent skip learned is stale.
+        self.descent_skip.page_left();
         // Number of reserved slots in trunk header (next pointer + leaf count)
         const RESERVED_SLOTS: usize = 2;
 
