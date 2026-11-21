@@ -143,9 +143,9 @@ impl Write {
         match page1 {
             Page1::Unwritten => true,
             Page1::Size => self.read.page1 == Page1::Unwritten,
-            Page1::Other => {
-                self.read.page1 == Page1::Unwritten && self.read.reads.binary_search(&1).is_err()
-            }
+            // Every session depends on page 1 beyond its size (the schema and its cookie), whether
+            // or not its record caught the read: more than a size change conflicts.
+            Page1::Other => false,
         }
     }
 }
