@@ -2,14 +2,35 @@
 //! Methods block until their deadline. Async hosts call them on their blocking pool. A timeout
 //! after submission leaves the outcome unknown: the transaction may subsequently commit.
 //! The embedded implementation currently promises local disk durability, not a replicated quorum.
+//!
+//! Records: every record by family and key, each at the revision of the commit that last wrote
+//! it ([`Records`]). Two implementations pass one conformance suite ([`conformance`], kiln-seams'
+//! Records cases ported, plus Amphora's own): Amphora's `Namespace`, and [`sim::SimRecords`], which
+//! keeps the same layout in memory. Index families ([`index`]) and counters ([`counter`]) are rows
+//! of ordinary families, written in the commit that needs them.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::disallowed_macros
+    )
+)]
 
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 pub mod blobs;
+pub mod conformance;
+pub mod counter;
 pub mod import;
+pub mod index;
 pub mod replication;
 pub mod restore;
+pub mod sim;
 pub mod sql;
 
 pub type Rev = u64;
@@ -175,6 +196,19 @@ pub enum Refusal {
     Fenced(String),
 }
 
+/// One namespace's records.
+///
+/// The change feed (`changes`, `wait`, `changed`) is read from the version rows the commits
+/// themselves wrote, as PostgreSQL's logical decoding reads the changes from the write-ahead log
+/// (docs/design/records.md): it can't disagree with the rows, and nothing beside a commit writes
+/// it. Its guarantees are etcd's for watches:
+/// - ordered: a family's changes come by revision, a commit's in the order of its writes (a key
+///   written twice in one commit once, at its last write's place);
+/// - reliable: from any revision at or after the feed's horizon, no change is skipped;
+/// - atomic: a page of changes never ends inside a commit, so the last revision of a page is a
+///   cursor that loses nothing;
+/// - bounded: from before the horizon (a compaction's revision less one), `changes`, `wait` and
+///   `changed` are refused `Compacted`, naming the horizon, never answered from a partial history.
 pub trait Records: Send + Sync {
     fn get(
         &self,
@@ -185,6 +219,10 @@ pub trait Records: Send + Sync {
     ) -> Result<Option<Row>, Refusal>;
     fn scan(&self, family: &str, scan: Scan, until: Instant) -> Result<Page, Refusal>;
     fn commit(&self, tx: Tx, until: Instant) -> Result<Rev, Refusal>;
+    /// Changes to `family` committed after `after`, oldest first, at most `limit` (capped at
+    /// `SCAN_MAX`), never ending inside a commit: a page holds whole commits only, and when the
+    /// first commit after `after` alone has more changes than `limit`, it is refused `Invalid`.
+    /// `head` is the newest commit of any family when they were read.
     fn changes(
         &self,
         family: &str,
@@ -192,7 +230,13 @@ pub trait Records: Send + Sync {
         limit: usize,
         until: Instant,
     ) -> Result<Changes, Refusal>;
+    /// The newest revision of a change to `family` once one is committed after `after` (at once
+    /// when one already is), or `Timeout` at `until`.
     fn wait(&self, family: &str, after: Rev, until: Instant) -> Result<Rev, Refusal>;
+    /// `wait`'s answer if it has one now, without waiting: the newest revision of a change to
+    /// `family` after `after`, or `None` while there is none. A caller that registers for the next
+    /// change itself (an async watch, a driver's event loop) checks this first.
+    fn changed(&self, family: &str, after: Rev, until: Instant) -> Result<Option<Rev>, Refusal>;
     fn head(&self, until: Instant) -> Result<Rev, Refusal>;
     fn compact(&self, before: Rev, until: Instant) -> Result<(), Refusal>;
     /// One recoverable step through the existing writer. Unsupported owners must refuse before
