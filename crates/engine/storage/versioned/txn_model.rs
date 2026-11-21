@@ -172,7 +172,10 @@ impl Pair {
                 .unwrap()
                 .map(|v| vec![(rowid_key(k).to_vec(), v)])
                 .unwrap_or_default(),
-            None => self.vdb.scan(&mut self.d, &snap, 0, None, usize::MAX).unwrap(),
+            None => self
+                .vdb
+                .scan(&mut self.d, &snap, 0, None, usize::MAX)
+                .unwrap(),
         };
         if self.txn.is_none() {
             self.vdb.close_snapshot(snap);
@@ -246,7 +249,11 @@ impl Pair {
 
     fn check_snapshots(&mut self, seed: u64, step: usize) {
         for (snap, want) in &self.snaps {
-            let seen = decode(self.vdb.scan(&mut self.d, snap, 0, None, usize::MAX).unwrap());
+            let seen = decode(
+                self.vdb
+                    .scan(&mut self.d, snap, 0, None, usize::MAX)
+                    .unwrap(),
+            );
             assert_eq!(
                 &seen, want,
                 "seed {seed} step {step}: a snapshot sees other than what was committed when it opened"
@@ -366,7 +373,10 @@ fn ns2_rollback_to_restores_rows_as_the_savepoint_found_them() {
     vdb.put(&mut d, &mut txn, 0, &rowid_key(3), b"d").unwrap();
     vdb.rollback_to(&mut d, &mut txn, sp).unwrap();
     vdb.commit(txn, &mut d, false).unwrap();
-    assert_eq!(vdb.scan(&mut d, &before, 0, None, usize::MAX).unwrap(), vec![]);
+    assert_eq!(
+        vdb.scan(&mut d, &before, 0, None, usize::MAX).unwrap(),
+        vec![]
+    );
     let after = vdb.snapshot().unwrap();
     assert_eq!(
         vdb.scan(&mut d, &after, 0, None, usize::MAX).unwrap(),
@@ -391,7 +401,8 @@ fn ns2_rollback_to_refuses_a_savepoint_not_its_own() {
     vdb.rollback_to(&mut d, &mut txn, early).unwrap();
     assert!(vdb.rollback_to(&mut d, &mut txn, late).is_err());
     assert_eq!(
-        vdb.scan(&mut d, &txn.snapshot(), 0, None, usize::MAX).unwrap(),
+        vdb.scan(&mut d, &txn.snapshot(), 0, None, usize::MAX)
+            .unwrap(),
         vec![]
     );
     vdb.abort(txn, &mut d).unwrap();

@@ -377,6 +377,9 @@ pub struct Savepoint {
     changed: usize,
 }
 
+/// A row: its tree and its key.
+type Row<'a> = (u64, &'a [u8]);
+
 /// The bytes a change's record took from the budget ([`VTree::put`], [`VTree::remove`]).
 fn op_bytes(op: &Op) -> u64 {
     let n = match op {
@@ -1525,19 +1528,21 @@ impl Versioned {
         }
         let (kept, later) = txn.ops.split_at(sp.ops);
         let fresh = txn.changed.get(sp.changed..).unwrap_or_default();
-        let fresh_rows: FxHashSet<(u64, &[u8])> =
+        let fresh_rows: FxHashSet<Row<'_>> =
             fresh.iter().map(|(t, k)| (*t, k.as_slice())).collect();
         // Each row's last value before the savepoint (none: removed).
-        let mut then: FxHashMap<(u64, &[u8]), Option<&[u8]>> = FxHashMap::default();
+        let mut then: FxHashMap<Row<'_>, Option<&[u8]>> = FxHashMap::default();
         for op in kept {
             match op {
-                Op::Put { tree, key, value } => then.insert((*tree, key.as_slice()), Some(value.as_slice())),
+                Op::Put { tree, key, value } => {
+                    then.insert((*tree, key.as_slice()), Some(value.as_slice()))
+                }
                 Op::Remove { tree, key } => then.insert((*tree, key.as_slice()), None),
             };
         }
         // Rows changed before the savepoint and after it, each once, with that value.
-        let mut again: Vec<(u64, &[u8], Option<&[u8]>)> = Vec::new();
-        let mut seen: FxHashSet<(u64, &[u8])> = FxHashSet::default();
+        let mut again: Vec<(Row<'_>, Option<&[u8]>)> = Vec::new();
+        let mut seen: FxHashSet<Row<'_>> = FxHashSet::default();
         for op in later {
             let row = match op {
                 Op::Put { tree, key, .. } | Op::Remove { tree, key } => (*tree, key.as_slice()),
@@ -1551,9 +1556,9 @@ impl Versioned {
                         .into(),
                 )
             })?;
-            again.push((row.0, row.1, value));
+            again.push((row, value));
         }
-        for (tree, key, then) in &again {
+        for ((tree, key), then) in &again {
             self.tree(*tree)?
                 .reset_own(&self.pool, d, txn, key, *then)?;
         }
