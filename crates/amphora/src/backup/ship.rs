@@ -167,7 +167,6 @@ impl Shipper {
             let body: Segment = object::decode(key, &blobs.get(key, until)?)?;
             shipper.generation = last.generation;
             shipper.archived_through = last.through;
-            shipper.unknown = Some(last.through);
             if let Some(head) = db.read_log(0, usize::try_from(LOG_HEADER_BYTES)?)?
                 && identity_of(&head)? == body.identity
             {
@@ -198,6 +197,12 @@ impl Shipper {
         }
         let (seq, end) = db.log_end();
         if end > shipper.shipped {
+            // Commits the archive doesn't hold, made while nothing stamped them: when, since the
+            // archive's last through, isn't known. A log shipped whole leaves no such commits, and
+            // the seconds after a clean close stay exact (T-T1.12.D2).
+            if !segments.is_empty() {
+                shipper.unknown = Some(shipper.archived_through);
+            }
             shipper.hooks.marks.committed(seq, end)?;
         }
         Ok(shipper)

@@ -233,11 +233,9 @@ pub fn locate(segments: &[SegmentKey], second: u64) -> Result<usize, Unrestorabl
         let through = next
             .and_then(|n| n.marks)
             .map_or(segment.through, |(first, _)| {
-                segment.through.max(
-                    second_of(first)
-                        .saturating_sub(1)
-                        .saturating_mul(SECOND_NS),
-                )
+                segment
+                    .through
+                    .max(second_of(first).saturating_sub(1).saturating_mul(SECOND_NS))
             });
         if through < t {
             return Err(Unrestorable::NotYetArchived {

@@ -100,6 +100,13 @@ fn drill(seed: u64) {
     let mut copy: Option<BaseCopy> = None;
     let mut first_base_end: Option<u64> = None;
     let mut version = 0u64;
+    // A restart forced while commits weren't shipped breaks the log (backup.md): from the last ship
+    // before it until a base begun after it ends, seconds are refused, not restored wrong.
+    let mut dirty = false;
+    let mut shipped_at = now.load(Ordering::SeqCst);
+    let mut breaks: Vec<(u64, u64)> = Vec::new();
+    let mut bases: Vec<(u64, u64)> = Vec::new();
+    let mut base_began = 0u64;
     for _ in 0..600 {
         tick(&mut rng);
         match rng.below(20) {
@@ -132,6 +139,7 @@ fn drill(seed: u64) {
                 .unwrap();
                 model = next;
                 history.push((stamp, model.clone()));
+                dirty = true;
             }
             11 | 12 => (db.flusher())().unwrap(),
             13 => {
@@ -140,21 +148,28 @@ fn drill(seed: u64) {
             }
             14 => {
                 // Refused while the log isn't shipped whole: tried again later, as the store does.
-                let _ = db.restart_log().unwrap();
+                if db.restart_log().unwrap() && dirty {
+                    breaks.push((shipped_at, now.load(Ordering::SeqCst)));
+                }
             }
             15 | 16 => {
                 shipper.ship(&db, &blobs, until()).unwrap();
+                (dirty, shipped_at) = (false, now.load(Ordering::SeqCst));
             }
             _ => match copy.as_mut() {
                 None => {
                     shipper.ship(&db, &blobs, until()).unwrap();
+                    (dirty, shipped_at) = (false, now.load(Ordering::SeqCst));
                     copy = shipper.begin_base(&db, &blobs, 32 * 1024).ok();
+                    base_began = now.load(Ordering::SeqCst);
                 }
                 Some(c) => {
                     if !shipper.copy_base(&db, &blobs, c, until()).unwrap() {
                         let c = copy.take().unwrap();
                         shipper.end_base(&db, &blobs, c, until()).unwrap();
+                        (dirty, shipped_at) = (false, now.load(Ordering::SeqCst));
                         first_base_end.get_or_insert(now.load(Ordering::SeqCst));
+                        bases.push((base_began, now.load(Ordering::SeqCst)));
                     }
                 }
             },
@@ -166,6 +181,7 @@ fn drill(seed: u64) {
         while shipper.copy_base(&db, &blobs, &mut c, until()).unwrap() {}
         shipper.end_base(&db, &blobs, c, until()).unwrap();
         first_base_end.get_or_insert(now.load(Ordering::SeqCst));
+        bases.push((base_began, now.load(Ordering::SeqCst)));
     }
     tick(&mut rng);
     shipper.ship(&db, &blobs, until()).unwrap();
@@ -175,6 +191,16 @@ fn drill(seed: u64) {
         .div_ceil(SECOND_NS);
     let to = last.div_ceil(SECOND_NS);
     assert!(to > from, "the drill spans seconds after its first base");
+    let broken = |second: u64| {
+        breaks.iter().any(|&(b, at)| {
+            let mended = bases
+                .iter()
+                .filter(|(began, _)| *began > at)
+                .map(|(_, ended)| ended.div_ceil(SECOND_NS))
+                .min();
+            second >= b.div_ceil(SECOND_NS) && mended.is_none_or(|m| second <= m)
+        })
+    };
     let mut restored = 0;
     for n in 0..12 {
         let second = from + rng.below(to - from + 1);
@@ -195,10 +221,17 @@ fn drill(seed: u64) {
                 );
                 restored += 1;
             }
+            Err(e) if broken(second) => assert!(
+                matches!(
+                    e.downcast_ref::<Unrestorable>(),
+                    Some(Unrestorable::NoBase(_) | Unrestorable::Inexact { .. })
+                ),
+                "seed {seed:#x}: second {second}, across a break, refused for another reason: {e:#}"
+            ),
             Err(e) => panic!("seed {seed:#x}: second {second} refused: {e:#}"),
         }
     }
-    assert_eq!(restored, 12);
+    assert!(restored > 0, "seed {seed:#x}: no second restored");
     // Before the archive's first commit and past what it holds, a second is refused.
     let before = backup::restore(&blobs, "db", 999, &dir.path().join("before.db"), until());
     assert!(matches!(
@@ -292,6 +325,8 @@ fn t_t1_12_d2_a_database_backed_up_ships_as_it_commits() {
     shipping.wait(until(), |s| s.bases >= 1).unwrap();
     let based = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
     write_seconds(&database, &now, 1..20, &mut model, &mut history);
+    // The close ships a second on: the archive is whole through the last commit's second.
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
     drop(database);
     let first = shipping.wait(until(), |s| s.ended).unwrap();
     assert_eq!(first.failures, 0, "{:?}", first.last_failure);
@@ -299,6 +334,7 @@ fn t_t1_12_d2_a_database_backed_up_ships_as_it_commits() {
 
     let (database, shipping) = open_backed_up(&path, &blobs, &now);
     write_seconds(&database, &now, 20..30, &mut model, &mut history);
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
     drop(database);
     let second = shipping.wait(until(), |s| s.ended).unwrap();
     assert_eq!(second.failures, 0, "{:?}", second.last_failure);
