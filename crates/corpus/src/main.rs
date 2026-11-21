@@ -9,7 +9,8 @@
 //! writes each record's outcome and time, a JSON line each, then a line for the file whole
 //! (`file_ns`, its fresh database and fixture included; `unsettled`, its failed settles), for re-ranking the pool from the machines
 //! that run it (bench/corpus/subset.py). A file `<source>/base.test` is the fixture of every file under `<source>/`
-//! (bench/corpus/build_corpus.py's rule). Exits 1 on any disagreement.
+//! (bench/corpus/build_corpus.py's rule). Exits 1 on any disagreement, 2 when the run itself fails,
+//! and 3 when the engine can't run on this machine (its program missing, its server not reached).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -118,11 +119,18 @@ fn fixture(pool: &Path, file: &Path) -> Option<PathBuf> {
     }
 }
 
+/// What starts the error of an engine that can't run here (exit 3).
+const UNAVAILABLE: &str = "the engine can't run here: ";
+
 fn main() -> ExitCode {
     let mut out = std::io::stdout().lock();
     match go(&mut out) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(1),
+        Err(e) if e.starts_with(UNAVAILABLE) => {
+            let _ = writeln!(out, "amphora-corpus: {e}");
+            ExitCode::from(3)
+        }
         Err(e) => {
             let _ = writeln!(out, "amphora-corpus: {e}");
             ExitCode::from(2)
@@ -158,7 +166,7 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
             .display()
             .to_string();
         let file_began = Instant::now();
-        let mut engine = amphora_corpus::engines::open(&a.engine).map_err(|e| e.to_string())?;
+        let mut engine = amphora_corpus::engines::open(&a.engine).map_err(|e| format!("{UNAVAILABLE}{e}"))?;
         // Fill files stop at the deadline; every record, required ones too, is stopped once it has
         // run as long as the whole budget.
         let limits = Limits {
