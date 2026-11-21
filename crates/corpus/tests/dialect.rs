@@ -162,3 +162,37 @@ fn t_g2_4_2_each_engine_has_its_dialect() {
     assert!(Translation::parse(r#"{"line": 1, "sql": "x", "untranslatable": "y"}"#).is_err());
     assert!(Translation::parse(r#"{"line": 1}"#).is_err());
 }
+
+/// Do: a statement the engine refuses in its dialect (a table it won't make), then a query on it.
+/// Expect: the statement disagrees; the query after it, resting on it, is untranslatable.
+#[test]
+fn t_g2_4_2_records_resting_on_a_statement_refused_in_the_dialect_are_classified() {
+    let translation = Translation::parse(
+        r#"{"line": 1, "sql": "REFUSE CREATE"}
+{"line": 4, "sql": "SELECT a FROM t"}
+"#,
+    )
+    .unwrap();
+    let mut render = AmphoraRender::new().unwrap();
+    let mut seen = Vec::new();
+    let file = "statement ok\nCREATE TABLE t(a)\n\nquery I nosort\nSELECT a FROM t\n----\n1\n";
+    let counts = run_file(
+        &mut Kept::default(),
+        &mut render,
+        file,
+        None,
+        Some(Translated {
+            file: &translation,
+            fixture: None,
+        }),
+        Limits::default(),
+        &mut |r| seen.push(r.outcome),
+    )
+    .unwrap();
+    assert_eq!(seen[0], Outcome::Refused("no".into()));
+    assert!(
+        matches!(&seen[1], Outcome::Untranslatable(why) if why.contains("line 1, refused")),
+        "{seen:?}"
+    );
+    assert_eq!((counts.disagree, counts.untranslatable), (1, 1));
+}

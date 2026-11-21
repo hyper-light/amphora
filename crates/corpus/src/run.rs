@@ -62,8 +62,9 @@ pub enum Outcome {
     Unreached,
     /// The record ran past its bound and the engine stopped it.
     PastBudget,
-    /// The record has no translation into the engine's dialect, or it came after a statement of
-    /// the file (or its fixture) that has none, which it may rest on: not a disagreement (G2 step 4).
+    /// The record has no translation into the engine's dialect, or it disagrees after a statement
+    /// of the file (or its fixture) that has none or that the engine refused in its dialect, which
+    /// it may rest on: not a disagreement (G2 step 4).
     Untranslatable(String),
 }
 
@@ -270,6 +271,15 @@ pub fn run_file(
             )),
             (o, _) => o,
         };
+        // A statement the file rests on, refused in the engine's dialect: it is this record's
+        // disagreement (classify.rs says whose), and the later records' disagreements rest on it.
+        if translated.is_some()
+            && let (Kind::Statement { ok: true }, Outcome::Refused(e)) = (&record.kind, &outcome)
+        {
+            untranslated.get_or_insert_with(|| {
+                format!("line {}, refused in the dialect: {e}", record.line)
+            });
+        }
         let nanos = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
         if outcome == Outcome::Agree {
             counts.agree = counts.agree.saturating_add(1);
