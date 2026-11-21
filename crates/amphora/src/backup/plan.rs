@@ -296,8 +296,7 @@ pub fn chain(
     let mut earliest = generation;
     let mut index = at;
     let mut taken = Vec::new();
-    loop {
-        let Some(s) = segments.get(index) else { break };
+    while let Some(s) = segments.get(index) {
         if s.generation != generation {
             // `s` ends the generation before, which `generation`'s link said was whole through its last
             // frame: reachable only then.
@@ -467,13 +466,13 @@ mod tests {
             marks,
             through,
             unknown: None,
-            link: (first == 1).then(|| {
-                if generation == 1 {
-                    Link::Gap
-                } else {
-                    Link::Whole(20)
-                }
-            }),
+            link: if first != 1 {
+                None
+            } else if generation == 1 {
+                Some(Link::Gap)
+            } else {
+                Some(Link::Whole(20))
+            },
         }
     }
 
