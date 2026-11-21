@@ -13331,8 +13331,14 @@ mod tests {
             driven.quiet(pump);
         };
         let applied = driven.owner(0).replica.applied();
-        assert!(applied.index > flushed.index, "2 to 5 weren't applied past the flush");
-        assert!(start(&driven) <= flushed.index, "the raft log already started past the flush");
+        assert!(
+            applied.index > flushed.index,
+            "2 to 5 weren't applied past the flush"
+        );
+        assert!(
+            start(&driven) <= flushed.index,
+            "the raft log already started past the flush"
+        );
         compact(&mut driven, &mut pump);
         assert_eq!(
             start(&driven),

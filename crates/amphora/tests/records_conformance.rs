@@ -335,8 +335,7 @@ impl Group {
 
 impl Drop for Group {
     fn drop(&mut self) {
-        self.stop
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(relay) = self.relay.take() {
             let _ = relay.join();
         }
@@ -361,8 +360,17 @@ fn said_at(voters: u64) -> Vec<String> {
         },
         HANG,
     );
-    let mut said: Vec<String> = report.passed.iter().map(|c| format!("passed {c}")).collect();
-    said.extend(report.failed.iter().map(|(c, f)| format!("failed {c}: {f:?}")));
+    let mut said: Vec<String> = report
+        .passed
+        .iter()
+        .map(|c| format!("passed {c}"))
+        .collect();
+    said.extend(
+        report
+            .failed
+            .iter()
+            .map(|(c, f)| format!("failed {c}: {f:?}")),
+    );
     for seed in 0..seeds {
         let amphora = db.namespace(&format!("seed-{seed}")).unwrap();
         let sim = SimRecords::new(SimLimits {
