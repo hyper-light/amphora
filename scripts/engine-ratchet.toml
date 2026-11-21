@@ -5,12 +5,12 @@
 [left.x86_64-unknown-linux-gnu]
 "clippy::panic" = 199
 "clippy::unwrap_used" = 450
-"clippy::expect_used" = 865
+"clippy::expect_used" = 864
 "clippy::unreachable" = 459
 "clippy::todo" = 11
 "clippy::unimplemented" = 0
-"clippy::indexing_slicing" = 3192
-"clippy::arithmetic_side_effects" = 3390
+"clippy::indexing_slicing" = 3193
+"clippy::arithmetic_side_effects" = 3392
 "clippy::string_slice" = 101
 "clippy::cast_possible_truncation" = 559
 "clippy::cast_sign_loss" = 254
