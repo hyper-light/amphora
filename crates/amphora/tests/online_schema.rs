@@ -625,6 +625,28 @@ fn rows_of(db: &Db, sql: &str) -> Vec<String> {
     rows
 }
 
+/// [`write`]'s insert, update and delete, naming no `b`.
+fn write_without_b(db: &mut Db, i: i64) {
+    db.transaction(|db| {
+        db.query(
+            "INSERT INTO t (a) VALUES (?1)",
+            [Value::from_i64(i % 97)],
+            |_| Ok(true),
+        )?;
+        db.query(
+            "UPDATE t SET a = ?1 WHERE id = ?2",
+            [Value::from_i64((i * 7) % 97), Value::from_i64(i * 13 + 1)],
+            |_| Ok(true),
+        )?;
+        db.query(
+            "DELETE FROM t WHERE id = ?1",
+            [Value::from_i64(i * 17 + 2)],
+            |_| Ok(true),
+        )
+    })
+    .unwrap();
+}
+
 #[test]
 fn t_t1_12_1_a_dropped_column_is_hidden_while_its_values_are_cleared_then_recorded() {
     // CP-T1.12: drop b of 1,000 rows online in batches of 7 while each step's gap inserts,
@@ -676,7 +698,7 @@ fn t_t1_12_1_a_dropped_column_is_hidden_while_its_values_are_cleared_then_record
             0,
             "migrated before the clear ended"
         );
-        write(&mut db, steps);
+        write_without_b(&mut db, steps);
         assert!(steps < 1000, "the change never ended");
     }
     assert!(

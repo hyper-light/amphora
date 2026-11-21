@@ -56,6 +56,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | engine | 9 | Beside the engine it replaces, behind the cursor the SQL layer already uses | [engine.md](design/engine.md#9-beside-the-engine-it-replaces-behind-the-cursor-the-sql-layer-already-uses) |
 | engine | 10 | Memory: versions pruned between snapshots, one budget, typed refusals | [engine.md](design/engine.md#10-memory-versions-pruned-between-snapshots-one-budget-typed-refusals) |
 | engine | 11 | The log in lanes: one group-committed log, or a log a writer | [engine.md](design/engine.md#11-the-log-in-lanes-one-group-committed-log-or-a-log-a-writer) |
+| engine | 12 | Large rows as chunk rows of an overflow tree; trees made and dropped as records of their own | [engine.md](design/engine.md#12-large-rows-as-chunk-rows-of-an-overflow-tree-trees-made-and-dropped-as-records-of-their-own) |
 | executor | 1 | A statement keeps its small ephemeral tables from one run to the next | [executor.md](design/executor.md#1-a-statement-keeps-its-small-ephemeral-tables-from-one-run-to-the-next) |
 | executor | 2 | `IN (SELECT ...)` answers a row with one search of its list | [executor.md](design/executor.md#2-in-select--answers-a-row-with-one-search-of-its-list) |
 | executor | 3 | LIKE jumps to where the literal after a `%` can match | [executor.md](design/executor.md#3-like-jumps-to-where-the-literal-after-a--can-match) |
@@ -177,6 +178,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | local-owner-transport | – | Embedded local owner transport: one owner process, an authenticated local client for the rest | [local-owner-transport.md](design/local-owner-transport.md) |
 | records-compaction | – | Bounded Records compaction on the namespace writer, step by recoverable step | [records-compaction.md](design/records-compaction.md) |
 | without-rowid | – | WITHOUT ROWID tables keep their primary-key index as the table | [without-rowid.md](design/without-rowid.md) |
+| backup | – | Decision (lane pitr): backups and point-in-time recovery to Mantle (CP-T1.12, G14 step 4) | [backup.md](design/backup.md) |
 
 ## Sections that are not decisions
 
