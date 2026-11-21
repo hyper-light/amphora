@@ -587,6 +587,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   costs say the generic plan does as well; one whose estimates read none keeps its generic plan. Its
   TPC-H prepared measurement (AC-PL.12.1; its harness, `amphora-bench --planner --prepared` with
   qgen's parameters, is written: bench/planner/README.md) and the suite's (AC-PL.12.2) are open.
+  PL.9 is built (lane pl9, docs/design/planner.md "row counts kept as rows change"): each table's
+  rows inserted less deleted since ANALYZE are kept as writes finish (one atomic add a statement),
+  the planner's row count follows them, and a prepared statement plans again once a table it counted
+  has moved past its statistics' own error. CH-benCHmark (AC-PL.9.1) and the suite's writes
+  (AC-PL.9.2) are open.
 - **G11, analytics at column-store speed** (docs/design/columnar.md, decision 1; sources in
   docs/research/columnar.md; CS.1): decided, not built. Columns are a copy derived from the rows, fed
   by each commit's redo record after the commit, exact at every snapshot by a journal of changed keys
