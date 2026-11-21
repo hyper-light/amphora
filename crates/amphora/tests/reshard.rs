@@ -420,10 +420,13 @@ impl Sim {
             Do::Release { group, span } | Do::Discard { group, span } => {
                 let release = matches!(a.what, Do::Release { .. });
                 let Some(g) = self.groups.get_mut(&group) else {
-                    return if release {
-                        Reply::Failed(Failure::NoGroup)
-                    } else {
-                        Reply::Discarded { done: true }
+                    // A retired group held nothing when it was retired: a release asked of it
+                    // again (the driver restarted between the retire and the operation's end) is
+                    // done. A group never made has nothing to discard.
+                    return match (release, self.retired.contains(&group)) {
+                        (true, true) => Reply::Released { done: true },
+                        (true, false) => Reply::Failed(Failure::NoGroup),
+                        (false, _) => Reply::Discarded { done: true },
                     };
                 };
                 let r = if release {
@@ -598,7 +601,15 @@ impl Sim {
             || self.queues.values().any(|q| !q.is_empty())
         {
             steps += 1;
-            assert!(steps < 10_000_000, "quiescing didn't end");
+            assert!(
+                steps < 10_000_000,
+                "quiescing didn't end: {:?}\n{:?}",
+                self.driver,
+                self.groups
+                    .iter()
+                    .map(|(id, g)| (*id, g.holding))
+                    .collect::<Vec<_>>()
+            );
             if self.rng.one_in(2) {
                 if !self.deliver_action() {
                     self.deliver_answer(false);
@@ -722,7 +733,7 @@ fn run(seed: u64, target: u64) {
         if sim.window_writes >= 200 {
             sim.plan();
         }
-        sim.check(step % 64 == 0);
+        sim.check(step.is_multiple_of(64));
         if sim.ended >= next_quiet {
             next_quiet += 50;
             assert_eq!(sim.quiesce(), 0, "seed {seed}: writes lost");

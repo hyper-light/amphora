@@ -141,10 +141,10 @@ impl Holding {
         if self.fenced.is_some() {
             return Err(Refused::Invalid("the group is giving up a span"));
         }
-        if let Some(owned) = self.owned {
-            if owned.join(&span).is_none() {
-                return Err(Refused::Invalid("a span taken in must adjoin the one held"));
-            }
+        if let Some(owned) = self.owned
+            && owned.join(&span).is_none()
+        {
+            return Err(Refused::Invalid("a span taken in must adjoin the one held"));
         }
         self.incoming = Some(Incoming {
             op,

@@ -18,6 +18,9 @@
 //! - Every action is idempotent at its group, and an action from an operation that has ended there
 //!   is refused ([`super::holding`]), so actions from a driver that has since restarted are
 //!   harmless.
+//! - A retired group answers a [`Do::Release`] or a [`Do::Retire`] asked of it again as done: it
+//!   held nothing when it was retired, and a driver that restarted between the retire and the
+//!   operation's end asks them again.
 //! - The old group keeps its log from the first copy's position until the operation ends, or
 //!   answers [`Failure::LogGone`], and the operation is given up.
 
