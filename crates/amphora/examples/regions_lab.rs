@@ -30,8 +30,10 @@ fn main() -> ExitCode {
 const USAGE: &str = "usage: regions_lab <within-region RTT µs> <between-region RTT µs> <ops> <keys> <groups> <seed>";
 
 fn arg(n: usize) -> Result<u64, String> {
-    std::env::args()
+    std::env::args_os()
         .nth(n)
+        .ok_or(USAGE)?
+        .to_str()
         .ok_or(USAGE)?
         .parse()
         .map_err(|_| USAGE.to_owned())
@@ -66,9 +68,9 @@ fn run() -> Result<(), String> {
         .map(|_| {
             let x = splitmix(&mut seed);
             let client = usize::try_from(x % 9).unwrap_or(0);
-            let key = format!("k{}", x.wrapping_shr(8) % keys);
-            let global = x.wrapping_shr(16) % 5 == 0;
-            if x.wrapping_shr(24) % 3 == 0 {
+            let key = format!("k{}", x.wrapping_shr(8).checked_rem(keys).unwrap_or(0));
+            let global = x.wrapping_shr(16).is_multiple_of(5);
+            if x.wrapping_shr(24).is_multiple_of(3) {
                 Op::Get {
                     client,
                     key,

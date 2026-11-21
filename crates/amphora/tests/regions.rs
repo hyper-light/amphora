@@ -90,10 +90,10 @@ fn corpus(seed: u64, n: usize) -> Vec<Op> {
     (0..n)
         .map(|_| {
             let x = next();
-            let client = (x % 6) as usize;
+            let client = usize::try_from(x % 6).unwrap();
             let key = format!("k{}", (x >> 8) % 40);
-            let global = (x >> 16) % 5 == 0;
-            if (x >> 24) % 3 == 0 {
+            let global = (x >> 16).is_multiple_of(5);
+            if (x >> 24).is_multiple_of(3) {
                 Op::Get {
                     client,
                     key,
