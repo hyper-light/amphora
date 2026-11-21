@@ -890,6 +890,34 @@ impl Database {
         Self::open_owned(path, until, false, None, |_| Ok(()))
     }
 
+    /// [`Database::open`], its writer backed up to `archive` (CP-T1.12; docs/design/backup.md):
+    /// each commit stamped as it is made, the log started again only once shipped, and a thread
+    /// that ships the log and copies bases as the database commits, until the database ends. A
+    /// live owner of the database in this process is refused: it must drain first, as only the
+    /// writer's own open can back it up.
+    pub fn open_backed_up(
+        path: &Path,
+        archive: crate::backup::Archive,
+        until: Instant,
+    ) -> Result<(Self, crate::backup::Shipping), Refusal> {
+        let mut prepared = None;
+        let database = Self::open_owned(path, until, false, None, |db| {
+            prepared =
+                Some(crate::backup::Prepared::on(db, archive, until).map_err(|e| refused(&e))?);
+            Ok(())
+        })?;
+        let (Some(prepared), Writer::Local(store)) = (prepared, &database.shared.writer) else {
+            return Err(api::invalid(
+                "backup",
+                "a live owner of this database isn't backed up: it must drain first",
+            ));
+        };
+        let shipping = prepared
+            .start(|watcher| store.on_commit(watcher))
+            .map_err(|e| refused(&e))?;
+        Ok((database, shipping))
+    }
+
     /// [`Database::open`], this process owning the database with `guards` kept beside its lease
     /// until the owner has drained (local-owner-transport.md, "Owner guards"). It makes no
     /// directory: a missing parent is refused. A live owner in this process is reused only if
