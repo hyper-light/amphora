@@ -294,8 +294,9 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
 /// committed, then the database closed and opened again; and the same database's files copied
 /// while it was still open, as a crash leaves them, and the copy opened. Expect: both open with
 /// every table and index, read the committed rows through each index in its order, and refuse a
-/// duplicate through the UNIQUE index: each tree's order was recorded and the schema read from the
-/// storage's `sqlite_schema`.
+/// duplicate through the UNIQUE index, and check whole (`PRAGMA integrity_check` reads each tree
+/// in its order): each tree's order was recorded and the schema read from the storage's
+/// `sqlite_schema`.
 #[test]
 fn ns_2_1_a_file_database_reopens_after_a_close_and_a_crash() {
     let dir = tempfile::tempdir().unwrap();
@@ -369,4 +370,8 @@ fn ns_2_1_a_file_database_reopens_after_a_close_and_a_crash() {
     for (q, w) in queries.iter().zip(&want) {
         assert_eq!(&rows(&conn, q), w, "after a crash: {q}");
     }
+    assert_eq!(
+        rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::build_text("ok")]]
+    );
 }

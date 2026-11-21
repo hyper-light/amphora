@@ -351,6 +351,65 @@ impl Switch {
         Ok(())
     }
 
+    /// `PRAGMA integrity_check` on the versioned storage (G7 step 2, `AC-NS.2.1`): reads every
+    /// committed row of each tree at `roots` and checks each key follows the one before in the
+    /// tree's order. What it found wrong, at most `most`, as the pragma's lines. It reads a batch
+    /// of rows at a time, as many as the pool has frames, so what it holds is bounded by the pool.
+    pub fn check(&self, roots: &[i64], most: usize) -> Result<Vec<String>> {
+        let batch = self.db.v.pool.capacity().max(2);
+        let snap = self.db.snapshot()?;
+        let mut d = Descender::new();
+        let mut found = Vec::new();
+        let checked = (|| -> Result<()> {
+            for &root in roots {
+                let tree = tree_of(root)?;
+                let slot = self.storage.orders.lock().get(&tree).cloned();
+                let order = match slot.as_ref().and_then(|s| s.get()) {
+                    Some(order) => order.clone(),
+                    None => KeyOrder::rowid(),
+                };
+                let mut last: Option<Vec<u8>> = None;
+                let mut row = 0u64;
+                loop {
+                    let rows = match self.db.scan(&mut d, &snap, tree, last.as_deref(), batch) {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            found.push(format!("tree at root page {root}: unreadable: {e}"));
+                            break;
+                        }
+                    };
+                    let mut fresh = 0usize;
+                    for (key, _) in rows {
+                        if let Some(prev) = &last {
+                            match order.compare(prev, &key) {
+                                std::cmp::Ordering::Less => {}
+                                // The batch's first row is the last one read before.
+                                std::cmp::Ordering::Equal if fresh == 0 => continue,
+                                _ => found.push(format!(
+                                    "tree at root page {root}: row {row} out of order"
+                                )),
+                            }
+                        }
+                        fresh = fresh.saturating_add(1);
+                        row = row.saturating_add(1);
+                        last = Some(key);
+                        if found.len() >= most {
+                            return Ok(());
+                        }
+                    }
+                    if fresh == 0 {
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        self.db.close_snapshot(snap);
+        checked?;
+        found.truncate(most);
+        Ok(found)
+    }
+
     /// Removes every row of the tree at `root_page` in the connection's transaction: how many.
     pub fn clear(&self, root_page: i64, pager: Arc<Pager>) -> Result<u64> {
         let tree = tree_of(root_page)?;
