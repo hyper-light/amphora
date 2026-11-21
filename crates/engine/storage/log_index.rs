@@ -24,7 +24,7 @@
 //! frames cut or written again are past every committed snapshot, and a restart happens only when
 //! no reader reads the log.
 
-use crate::fast_lock::SpinLock;
+use crate::sync::Mutex;
 use crate::storage::sqlite3_ondisk::WalHeader;
 use crate::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use crate::storage::wal::HeaderCell;
@@ -378,7 +378,7 @@ pub(crate) struct ReadIndex {
     published: ArcSwap<Published>,
     latest: ArcSwap<Latest>,
     /// Held by the reader publishing a new copy (way (a)); others read under the lock meanwhile.
-    publishing: SpinLock<()>,
+    publishing: Mutex<()>,
     /// The log's header as the shared state holds it, set wherever that `Arc` is replaced.
     header: ArcSwapOption<HeaderCell>,
 }
@@ -398,7 +398,7 @@ impl ReadIndex {
             bits: ArcSwap::from_pointee(PageBits::with_words(0, 0)),
             published: ArcSwap::from_pointee(Published::default()),
             latest: ArcSwap::from_pointee(Latest::sized(0, 0)),
-            publishing: SpinLock::new(()),
+            publishing: Mutex::new(()),
             header: ArcSwapOption::empty(),
         }
     }

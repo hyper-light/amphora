@@ -9969,6 +9969,8 @@ pub mod test {
     /// under its lock gives, or none, for every read; most reads answered without the lock.
     #[test]
     fn g3_2_lock_free_page_reads_find_the_frame_the_locked_index_finds() {
+        use super::super::log_index::Lookup;
+        use rustc_hash::FxHashMap;
         use rand_chacha::{
             rand_core::{RngCore, SeedableRng},
             ChaCha8Rng,
@@ -10076,6 +10078,7 @@ pub mod test {
     /// Expect: the frame the index read under its lock gives, or none, for every read.
     #[test]
     fn g3_2_readers_beside_a_writer_find_the_frame_the_locked_index_finds() {
+        use crate::sync::atomic::{AtomicBool, AtomicU64};
         use rand_chacha::{
             rand_core::{RngCore, SeedableRng},
             ChaCha8Rng,
