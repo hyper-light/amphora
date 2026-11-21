@@ -460,6 +460,18 @@ tests = [
   { id = "T-NS.1.1", text = "Random operation sequences on both cursors — passes when identical keys, values and positions after each step" },
 ]
 
+# lane g7s2
+[[own]]
+id = "NS.2"
+title = "Records, overflow, the catalog and transactions on the new pages (G7 step 2)"
+criteria = [
+  { id = "AC-NS.2.1", text = "the engine's test suites pass on the new storage" },
+  { id = "AC-NS.2.3", text = "A transaction rolls back to a savepoint from its versions: rows first changed after it as before the transaction, rows changed before and after as the savepoint found them, later changes out of its redo record; the savepoint stays good" },
+]
+tests = [
+  { id = "T-NS.2.1", text = "The shared model test of transactions on both storages — passes when identical answers, no anomaly" },
+]
+
 # lane follower-reads (G13 step 4, kiln goal 80d4cf5e; docs/design/replication.md, "Follower reads at a
 # closed time" and "Search over partitions"). AC-T1.10.3 and AC-T1.10.4 are the measures; these are what they
 # rest on.
@@ -481,6 +493,8 @@ tests = [
 # lane online-schema: online schema changes (CP-T1.12, kiln goal 496de8d5, G14 step 3); the tests
 # are T-T1.12.1's, by name in crates/amphora/tests/online_schema.rs and crash.rs
 # (t_t1_12_1_a_power_cut_at_every_step_of_an_online_index_leaves_old_or_new).
+# lane online-schema-6: constraints on existing columns serve the same T-T1.12.1
+# (t_t1_12_1_a_power_cut_at_every_step_of_an_online_constraint_leaves_old_or_new).
 
 # lane audit-log: Amphora's own IDs for G10 step 3 (kiln plan 01a16b0f47577325bcd9e51383067e04),
 # serving AC-T1.7.4 (docs/design/audit.md).
@@ -557,6 +571,16 @@ criteria = [
 tests = [
   { id = "T-GN.1.1", text = "Patience: two gaps of 50 ticks 99 apart, then prompt answers; a suspected voter answering 200 late — passes when the second gap is believed 98 ticks on and forgotten 100 later, and the suspected gap refused and not learned" },
   { id = "T-GN.1.2", text = "Slot: a gap of 40 ms after a member's first slot, then none — passes when it is believed at 40 and 79 ms and forgotten at 80 ms" },
+]
+
+[[own]]
+id = "GN.2"
+title = "The log restarts' generation ends once it covers its own spend at the quantile: not a picked 3,000-tick window"
+criteria = [
+  { id = "AC-GN.2.1", text = "A generation runs from a restart to the restart made once it alone covers its held, its base tail and the next restart's guess strictly below 1 - q of what it applied; the one ended is forgotten; the guess is the worst of the last 1 / (1 - q) holds; no tick or time constant" },
+]
+tests = [
+  { id = "T-GN.2.1", text = "A restart holding 50, then 99,950 and 1 more applied; 1,000 holds of 1 after one of 9 — passes when due at 100,001 and not 100,000, the next at 51,001 and not 51,000, and the guess 9 through the 999th and 1 at the 1,000th" },
 ]
 
 # lane cc-proto

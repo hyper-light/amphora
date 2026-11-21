@@ -1846,7 +1846,12 @@ pub fn translate_alter_table(
                 )));
             };
 
-            if btree.get_column(col_name).is_some() {
+            // Amphora: a column may keep its own name (CP-T1.12: an online schema change adds a
+            // constraint to a column by redefining it under the same name).
+            if btree
+                .get_column(col_name)
+                .is_some_and(|(at, _)| at != column_index)
+            {
                 return Err(LimboError::ParseError(format!(
                     "duplicate column name: \"{col_name}\""
                 )));
@@ -2297,15 +2302,24 @@ pub fn translate_alter_table(
 
             if let Some(altered_table) = altered_table {
                 let altered_table = Arc::new(altered_table);
-                emit_column_constraints_validation(
-                    program,
-                    &altered_table,
-                    &altered_table.columns()[column_index],
-                    &definition.constraints,
-                    resolver,
-                    connection,
-                    database_id,
-                )?;
+                // Amphora: a column an online schema change is validating has its rows checked
+                // by that change's batches, not by one scan holding the writer (CP-T1.12,
+                // schema::CONSTRAINT_STATES_TABLE).
+                let validated_online = original_btree
+                    .columns()
+                    .get(column_index)
+                    .is_some_and(|column| column.unvalidated());
+                if !validated_online {
+                    emit_column_constraints_validation(
+                        program,
+                        &altered_table,
+                        &altered_table.columns()[column_index],
+                        &definition.constraints,
+                        resolver,
+                        connection,
+                        database_id,
+                    )?;
+                }
                 if rewrites_physical_layout {
                     let original_columns = original_btree.columns();
                     let source_column_by_schema_idx: Vec<Option<usize>> = altered_table
