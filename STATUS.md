@@ -298,6 +298,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   its retries' gaps (cold start: the core's election timeout). A gap over which the host's detector suspected the
   member is not learned; no number bounds a gap (lane g-slot-close, 2026-11-21).
 
+- **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
+  over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
+  on a group's database (`Cluster`, each step one call to the group). A crashed coordinator's next incarnation fences
+  the old one and finishes what it left. Tested: a crash at every step (T-T1.10.1) and seeded runs with lost and late
+  steps and crashes, Elle-style. Left: the LAN p99 (AC-T1.10.2) on multi-node groups and the 10,000-seed run, which
+  decide between the two; SQL sessions across groups (AC-T1.10.1).
 - **Picked constants replaced by derived ones** (lane constants, kiln goal dfabffcc; Ada, 2026-11-11: "learned and
   stat derived values only"): a page's chain of deltas ends where its bytes reach a page (store.md decision 17); the
   store's log is copied past its bound (decision 35); a term runs on the whole sample (planner.md decision 21); a
@@ -450,6 +456,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Next
 
+- **Follower reads at a closed time and search over partitions** (G13 step 4; replication.md, "Follower reads at a
+  closed time" and "Search over partitions"; lane follower-reads): built and unit-tested, not measured. Every proposed
+  entry carries its proposer's clock; every member applies it at the larger of that and one past the time before it,
+  so times rise along the log whoever leads. `Database::query_closed` answers at the replica's closed time once it is
+  at least the time asked; `follower_read_micros` is now less the replica's measured p99 lag. `amphora::search` asks
+  partitions at once and merges newest first. Closes with: AC-T1.10.3 and AC-T1.10.4 measured (`amphora-bench
+  --cluster`), an idle group's time closed on demand, and the attached client's request on the wire.
 - **Query speed step 5 (QT.5), started** (lane qs5): `Connection::set_join_methods` plans a connection's new
   statements by cost, with index nested loops only, or with hash joins only; `tests/join_methods.rs` (T-QT.5.1) runs
   inner, left, semi and anti joins with NULL and duplicate keys all three ways and against a model. The harness

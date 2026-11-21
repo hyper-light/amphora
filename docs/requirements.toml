@@ -192,6 +192,8 @@ criteria = [
 ]
 tests = [
   { id = "T-T1.10.1", text = "A coordinator crash at every step of a cross-group transaction, then recovery — passes when it ends committed or aborted everywhere" },
+  # lane xgroup-txn: transactions across groups (docs/design/xgroup.md).
+  { id = "T-T1.10.C", text = "A group's steps of a cross-group transaction on the simulator's tablet and on a group's database — passes when both answer the same: locks conflict and share, staging, prevention, decisions that stand, fencing and the floor" },
   # Amphora's own: a local read on a replica (docs/design/replication.md, "A local read on a replica").
   { id = "T-T1.10.L1", text = "A learner of a voter that is then gone reads locally — passes when it answers what was written and caught up, while a call waits for the leader" },
   { id = "T-T1.10.L2", text = "Local reads within a preparation and while a write is proposed and uncommitted — passes when each sees only what was committed, and the write once applied" },
@@ -418,6 +420,24 @@ tests = [
   { id = "T-QT.3.3", text = "Concurrent hits, insertions and evictions on the page cache under shuttle — passes when no held page is evicted, no hit counts none, and no data race" },
   { id = "T-QT.3.4", text = "A loop over a non-covering index with a term on the index's columns and one on the table's — passes when the answer is unchanged and the table rows fetched are only those the index's term keeps, whatever order the terms are written in" },
   { id = "T-QT.3.5", text = "scripts/check-production.sh after the change — passes when it passes, with the ratchet's counts lowered by what the change removed" },
+]
+
+# lane follower-reads (G13 step 4, kiln goal 80d4cf5e; docs/design/replication.md, "Follower reads at a
+# closed time" and "Search over partitions"). AC-T1.10.3 and AC-T1.10.4 are the measures; these are what they
+# rest on.
+[[own]]
+id = "FR.1"
+title = "Follower reads at a closed time, and search over partitions asked at once (G13 step 4; CP-T1.10)"
+criteria = [
+  { id = "AC-T1.10.C1", text = "Every entry an owner proposes carries its proposer's clock; every member applies it at the larger of that stamp and one microsecond past the time before it, recorded in the entry's own transaction: times rise strictly along the committed log whoever leads and whatever their clocks say" },
+  { id = "AC-T1.10.C2", text = "A follower read (Database::query_closed) answers at its replica's closed time, once that is at least the time it asked: the state it read is its group's at that time, every write at it or before and none after; it waits on its caller's thread until its deadline, refused Timeout past it, and Fenced once the owner ended" },
+  { id = "AC-T1.10.C3", text = "The time a follower read can ask without waiting (Database::follower_read_micros) is now less the lag the replica measured at runtime: the nearest-rank p99 of how far its closed time stood behind its clock over its last 100 moves (1 / (1 - 0.99), AC-T1.10.3's quantile), refused before it measured any" },
+  { id = "AC-T1.10.S1", text = "A search asks every partition at once, one thread each, and merges their answers newest first to its limit (amphora::search)" },
+]
+tests = [
+  { id = "T-T1.10.C1", text = "Reads under leader changes: three voters whose wall clocks stand an hour apart, the lead passed 1, 2, 3, 1, each leader writing; every member reads at its closed time before and after catching up — passes when no read sees a version past its timestamp nor misses one before it (each sees 1..=k, a later time never less, the same time the same) and a lifted stamp was counted" },
+  { id = "T-T1.10.C2", text = "A follower read asked past its replica's closed time, then a write — passes when it is answered once the write applies, at a time at least the one asked, with the write; and one asked an hour ahead is refused Timeout at its deadline" },
+  { id = "T-T1.10.S1", text = "Partitions' answers merged — passes when the merge equals the sorted union cut to the limit over 500 random shapes, and every partition is asked while every other is (each ask waits for all to begin)" },
 ]
 
 # lane online-schema: online schema changes (CP-T1.12, kiln goal 496de8d5, G14 step 3); the tests
