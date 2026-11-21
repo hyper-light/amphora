@@ -329,7 +329,7 @@ fn model(seed: u64, format: LogFormat) {
     model_on(seed, format, PagePath::Today);
 }
 
-/// The model with every connection's reads on `path` (G3 step 3, decision 41).
+/// The model with every connection's reads on `path` (G3 step 3, decision 42).
 fn model_on(seed: u64, format: LogFormat, path: PagePath) {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), true);
@@ -523,7 +523,7 @@ fn databases_sharing_one_pool_read_only_their_own_pages() {
     assert_eq!(a.shared_page_counts(), b.shared_page_counts());
 }
 
-/// G3 step 3 (decision 41): do the shared-pages model's 300 steps for 16 seeds with every
+/// G3 step 3 (decision 42): do the shared-pages model's 300 steps for 16 seeds with every
 /// connection on the plain page path (plain pins, the pool's buffer counted once, misses read in
 /// line). Expect: every read the model's, and pages shared.
 #[test]

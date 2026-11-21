@@ -179,7 +179,7 @@ pub trait File: Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion>;
-    /// Amphora (G3 step 3, decision 41): reads into `dest` at `pos` now, in line, when this
+    /// Amphora (G3 step 3, decision 42): reads into `dest` at `pos` now, in line, when this
     /// backend completes its reads in line: the bytes read, or `None` when it completes them
     /// later (then `pread`, with its completion, is the read).
     fn pread_inline(&self, _pos: u64, _dest: &mut [u8]) -> Result<Option<usize>> {

@@ -27,6 +27,25 @@ DIALECTS = ("duckdb", "postgres", "mysql", "clickhouse")
 logging.getLogger("sqlglot").setLevel(logging.ERROR)  # its "falling back to a Command" notes
 
 
+def typed(expression):
+    """`expression` with each column declared without a type given the type SQLite's affinity rules
+    give it, so engines that require a column's type (DuckDB, PostgreSQL, MySQL, ClickHouse) take the
+    table. SQLite's "Datatypes In SQLite", section 3.1 "Determination Of Column Affinity", rule 3:
+    "If the declared type for a column contains the string "BLOB" or if no type is specified then
+    the column has affinity BLOB" (https://www.sqlite.org/datatype3.html#determination_of_column_affinity);
+    section 3: "A column with affinity BLOB does not prefer one storage class over another and no
+    attempt is made to coerce data from one storage class into another." So an untyped column is
+    declared BLOB, which sqlglot writes as each dialect's binary type (DuckDB's BLOB, PostgreSQL's
+    BYTEA, MySQL's BLOB, ClickHouse's String). A value of another storage class written to it is
+    then each engine's to take or refuse, as a BLOB column's would be: no type is picked here."""
+    from sqlglot import exp
+
+    for column in expression.find_all(exp.ColumnDef):
+        if column.args.get("kind") is None:
+            column.set("kind", exp.DataType.build("BLOB"))
+    return expression
+
+
 def translate(sql, dialect):
     """`sql`, in SQLite's dialect, in `dialect`: (text, None), or (None, why) when sqlglot can't say
     it there. The one translation the corpus's tools share (probe.py's too)."""
@@ -35,7 +54,11 @@ def translate(sql, dialect):
     import sqlglot
 
     try:
-        out = sqlglot.transpile(sql, read="sqlite", write=dialect, unsupported_level=sqlglot.ErrorLevel.RAISE)
+        # sqlglot.transpile's steps, each statement given its untyped columns' types between them.
+        out = [
+            typed(e).sql(dialect=dialect, unsupported_level=sqlglot.ErrorLevel.RAISE) if e else ""
+            for e in sqlglot.parse(sql, read="sqlite")
+        ]
     except Exception as e:  # sqlglot can't say it in this dialect
         return None, f"untranslatable: {type(e).__name__}: {str(e)[:200]}"
     if dialect == "clickhouse":

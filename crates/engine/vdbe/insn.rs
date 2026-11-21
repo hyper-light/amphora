@@ -2130,6 +2130,14 @@ pub enum Insn {
         hash_table_id: usize,
     },
 
+    /// A hash semi join's first-match test (G6 step 5): when the current match entry is already
+    /// marked, jump to target_pc (its row was emitted at its first match); otherwise mark it and
+    /// fall through, so each build row is emitted once per probe pass.
+    HashMarkFirstMatch {
+        hash_table_id: usize,
+        target_pc: BranchOffset,
+    },
+
     /// Reset all matched_bits in a hash table to false.
     /// Emitted at the start of each outer-loop iteration so that marks from
     /// a previous probe pass don't suppress NULL-fill rows in the current one.
@@ -2461,6 +2469,7 @@ impl InsnVariants {
             InsnVariants::HashClear => execute::op_hash_clear,
             InsnVariants::HashMarkMatched => execute::op_hash_mark_matched,
             InsnVariants::HashResetMatched => execute::op_hash_reset_matched,
+            InsnVariants::HashMarkFirstMatch => execute::op_hash_mark_first_match,
             InsnVariants::HashScanUnmatched => execute::op_hash_scan_unmatched,
             InsnVariants::HashNextUnmatched => execute::op_hash_next_unmatched,
             InsnVariants::HashGraceInit => execute::op_hash_grace_init,

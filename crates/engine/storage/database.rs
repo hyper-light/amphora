@@ -122,7 +122,7 @@ pub trait DatabaseStorage: Send + Sync {
     fn read_header(&self, c: Completion) -> Result<Completion>;
 
     fn read_page(&self, page_idx: usize, io_ctx: &IOContext, c: Completion) -> Result<Completion>;
-    /// Amphora (G3 step 3, decision 41): reads page `page_idx` into `dest` now, in line, its
+    /// Amphora (G3 step 3, decision 42): reads page `page_idx` into `dest` now, in line, its
     /// checksum checked as it enters the process, when the storage completes reads in line: the
     /// bytes read, or `None` when it doesn't (then `read_page` is the read).
     fn read_page_inline(

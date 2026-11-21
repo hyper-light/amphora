@@ -313,7 +313,7 @@ impl File for UnixFile {
         Ok(())
     }
 
-    /// Amphora (decision 41): `pread` completes in line here, so the plain page path reads with
+    /// Amphora (decision 42): `pread` completes in line here, so the plain page path reads with
     /// no completion: one `pread(2)`, as `pread` does.
     fn pread_inline(&self, pos: u64, dest: &mut [u8]) -> Result<Option<usize>> {
         use std::os::unix::fs::FileExt;

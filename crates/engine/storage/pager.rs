@@ -1059,7 +1059,7 @@ crate::assert::assert_send_sync!(Page);
 // because that is bad bad.
 pub type PageRef = Arc<Page>;
 
-/// Amphora (G3 step 3, `docs/design/store.md` decision 41): which path a pager's page reads take.
+/// Amphora (G3 step 3, `docs/design/store.md` decision 42): which path a pager's page reads take.
 /// A prototype behind a switch, against today's path: `AMPHORA_PAGE_PATH=plain` in the
 /// environment sets it for every pager the process opens; `Database::set_page_path` for the
 /// connections a database opens after.
@@ -1115,7 +1115,7 @@ const PAGE_SPILLED: usize = 0b100000;
 /// Amphora: the page's buffer is one the shared pages hold (`storage/shared_pages.rs`): every
 /// connection's, so written only as a copy (`Pager::add_dirty`).
 const PAGE_SHARED: usize = 0b1000000;
-/// Amphora (G3 step 3, decision 41): the page belongs to a pager on the plain page path, so its
+/// Amphora (G3 step 3, decision 42): the page belongs to a pager on the plain page path, so its
 /// pins are plain counts (`Page::pin`). Set when the page is made, never after.
 const PAGE_PLAIN: usize = 0b10000000;
 
@@ -1127,7 +1127,7 @@ impl Page {
         }
     }
 
-    /// Amphora (G3 step 3, decision 41): a page whose pins are plain counts, as SQLite's `nRef`
+    /// Amphora (G3 step 3, decision 42): a page whose pins are plain counts, as SQLite's `nRef`
     /// (`pcache.c`, `sqlite3PcacheRef`: `p->nRef++`). Only the connection that made it ever pins
     /// it, one thread at a time, so its count needs no read-modify-write.
     pub fn new_plain(id: usize) -> Self {
@@ -1138,7 +1138,7 @@ impl Page {
         }
     }
 
-    /// Amphora: whether the page's pins are plain counts (decision 41).
+    /// Amphora: whether the page's pins are plain counts (decision 42).
     #[inline]
     pub fn is_plain(&self) -> bool {
         self.get().flags.load(Ordering::Relaxed) & PAGE_PLAIN != 0
@@ -1290,7 +1290,7 @@ impl Page {
     pub fn pin(&self) {
         let count = &self.get().pin_count;
         if self.is_plain() {
-            // Amphora (decision 41): a load and a store, no read-modify-write.
+            // Amphora (decision 42): a load and a store, no read-modify-write.
             count.store(
                 count.load(Ordering::Relaxed).saturating_add(1),
                 Ordering::Relaxed,
@@ -1319,7 +1319,7 @@ impl Page {
     #[allow(deprecated)] // kiln: `fetch_update`, kept for older Rust
     pub fn try_unpin(&self) -> bool {
         if self.is_plain() {
-            // Amphora (decision 41): the plain count's unpin, as `sqlite3PcacheRelease`'s `nRef--`.
+            // Amphora (decision 42): the plain count's unpin, as `sqlite3PcacheRelease`'s `nRef--`.
             let count = &self.get().pin_count;
             return match count.load(Ordering::Relaxed).checked_sub(1) {
                 Some(left) => {
@@ -1902,7 +1902,7 @@ pub struct Pager {
     /// lock, so a reader that sees false can skip the lock: every page read
     /// checks for a pending entry first.
     has_pending_reads: AtomicBool,
-    /// Amphora (G3 step 3, decision 41): which page path this pager's reads take.
+    /// Amphora (G3 step 3, decision 42): which page path this pager's reads take.
     page_path: AtomicU8,
     #[cfg(test)]
     spill_yield: SpillYieldHook,
@@ -3859,6 +3859,14 @@ impl Pager {
             // Parent statement will handle the transaction rollback.
             return;
         }
+        // Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage's transaction rolls back with
+        // the pager's, on every path that ends one. This returns no error, so a failed rollback
+        // is reported here.
+        if let Some(switch) = connection.versioned.as_ref() {
+            if let Err(e) = switch.finish(true) {
+                tracing::error!(target: "amphora.versioned", event = "rollback_failed", error = %e);
+            }
+        }
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
             return;
@@ -3948,19 +3956,19 @@ impl Pager {
         }
     }
 
-    /// Amphora (decision 41): sets the page path this pager's reads take from now on. Pages
+    /// Amphora (decision 42): sets the page path this pager's reads take from now on. Pages
     /// already cached keep the pins they were made with.
     pub fn set_page_path(&self, path: PagePath) {
         self.page_path.store(path.to_u8(), Ordering::Relaxed);
     }
 
-    /// Amphora (decision 41): the page path this pager's reads take.
+    /// Amphora (decision 42): the page path this pager's reads take.
     #[inline]
     pub fn page_path(&self) -> PagePath {
         PagePath::from_u8(self.page_path.load(Ordering::Relaxed))
     }
 
-    /// Amphora (decision 41): a page this pager reads into: plain pins on the plain path.
+    /// Amphora (decision 42): a page this pager reads into: plain pins on the plain path.
     #[inline]
     fn new_read_page(&self, page_idx: i64) -> Result<PageRef> {
         Ok(Arc::new(match self.page_path() {
@@ -3971,7 +3979,7 @@ impl Pager {
         }))
     }
 
-    /// Amphora (decision 41): the plain path's miss: page `page_idx` read from the database file
+    /// Amphora (decision 42): the plain path's miss: page `page_idx` read from the database file
     /// now, in line, into a buffer from the connection's pool (pooled pages, as `pcache1` recycles
     /// its own), its checksum checked as it enters the process, then loaded and shared as a
     /// completed read is (`finish_read_page`): no completion, no callback. False, the page
@@ -4166,7 +4174,7 @@ impl Pager {
     }
 
     /// `read_page_no_cache` for a cache miss: on the plain path a page the log doesn't hold is
-    /// read in line, with no completion (decision 41).
+    /// read in line, with no completion (decision 42).
     fn read_page_uncached(
         &self,
         page_idx: i64,
@@ -4626,7 +4634,7 @@ impl Pager {
         };
         let key = shared.key(page_no, version);
         let page = self.new_read_page(page_idx)?;
-        // Amphora (decision 41): on the plain path the pool's own buffer, its count taken once as
+        // Amphora (decision 42): on the plain path the pool's own buffer, its count taken once as
         // the page enters this connection's cache; the pins after are this connection's
         // (PostgreSQL's private refcounts). The image was checked as it entered the process and is
         // trusted while the pool keeps it; a write copies it first (`Pager::add_dirty`).
@@ -7838,7 +7846,7 @@ mod ptrmap_tests {
         );
     }
 
-    /// G3 step 3 (decision 41): do pin a plain page twice and unpin it three times. Expect: pinned
+    /// G3 step 3 (decision 42): do pin a plain page twice and unpin it three times. Expect: pinned
     /// until the second unpin, the third refused, as an atomic page's pins are.
     #[test]
     fn g3s3_plain_pins_count_as_atomic_pins_do() {
