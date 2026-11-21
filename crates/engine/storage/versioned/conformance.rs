@@ -8,6 +8,12 @@
 //! back starts from a row or from a write just made, and a seek's `TryAdvance` is followed by the
 //! step its direction names (`seek_internal`). After an exact seek that finds nothing only the
 //! answer is compared: the executor reads no row there.
+//!
+//! After a delete no position is compared until the next `next` or `prev`: SQLite documents the
+//! cursor's place after `sqlite3BtreeDelete` as only good for the step that follows (the
+//! executor's `OP_Delete` is followed by `OP_Next`/`OP_Prev`, never by a read or a second
+//! delete). That step is checked against a plain ordered model of the rows too: the row after the
+//! deleted one, or the one before it.
 
 use super::cursor::{Access, KeyOrder, VersionedCursor};
 use super::disk::Simulated;
@@ -18,7 +24,10 @@ use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::{Arc, Mutex};
 use crate::translate::collate::CollationSeq;
-use crate::types::{ImmutableRecord, IndexInfo, SeekKey, SeekOp, SeekResult};
+use crate::types::{
+    compare_immutable_iter, ImmutableRecord, ImmutableRecordRef, IndexInfo, SeekKey, SeekOp,
+    SeekResult,
+};
 use crate::util::IOExt;
 use crate::vdbe::Register;
 use crate::{ConnectOpts, Connection, Database, Pager, SqliteDialect, Value, WalAutoActions};
@@ -294,13 +303,100 @@ fn all(c: &mut dyn CursorTrait, pager: &Pager) -> Vec<Seen> {
     out
 }
 
+/// The rows of a tree in order, kept apart from both storages: each row's key (a table's
+/// [`rowid_key`](super::cursor::rowid_key), an index's record) and its record.
+struct Model {
+    /// The index whose columns order the rows, or `None` for a table (ordered by key bytes).
+    index: Option<Arc<IndexInfo>>,
+    rows: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl Model {
+    fn new(kind: Kind) -> Self {
+        let index = match kind {
+            Kind::Table => None,
+            Kind::Index { desc, nocase } => Some(Arc::new(
+                IndexInfo::new_from_index(&index_def(desc, nocase)).unwrap(),
+            )),
+        };
+        Self {
+            index,
+            rows: Vec::new(),
+        }
+    }
+
+    fn cmp(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        match &self.index {
+            None => a.cmp(b),
+            // Equal on every column, the rowid among them, is the same row: an insert of it
+            // replaces the old one, as both storages do.
+            Some(info) => compare_immutable_iter(
+                ImmutableRecordRef::from_bin_record(a).iter().unwrap(),
+                ImmutableRecordRef::from_bin_record(b).iter().unwrap(),
+                &info.key_info,
+            )
+            .unwrap(),
+        }
+    }
+
+    fn find(&self, key: &[u8]) -> std::result::Result<usize, usize> {
+        self.rows.binary_search_by(|(k, _)| self.cmp(k, key))
+    }
+
+    fn insert(&mut self, key: Vec<u8>, record: Vec<u8>) {
+        match self.find(&key) {
+            Ok(i) => self.rows[i] = (key, record),
+            Err(i) => self.rows.insert(i, (key, record)),
+        }
+    }
+
+    fn remove(&mut self, key: &[u8]) {
+        let i = self.find(key).expect("the model holds the row deleted");
+        self.rows.remove(i);
+    }
+
+    /// The row a step from a deleted `key` lands on: the first after it, or the last before it.
+    fn step_from(&self, key: &[u8], forward: bool) -> Option<&[u8]> {
+        let i = match self.find(key) {
+            Ok(i) | Err(i) => i,
+        };
+        let at = if forward { Some(i) } else { i.checked_sub(1) };
+        at.and_then(|i| self.rows.get(i)).map(|(_, r)| r.as_slice())
+    }
+
+    /// The key of the row a cursor shows.
+    fn key_of(&self, row: &Seen) -> Vec<u8> {
+        let (rowid, record) = row.row.as_ref().expect("a row");
+        match self.index {
+            None => super::cursor::rowid_key(rowid.expect("a table's row has a rowid")).to_vec(),
+            Some(_) => record.clone(),
+        }
+    }
+}
+
+/// Where the driven cursors stand, as the executor would know it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// Nowhere a step or delete may follow: not on a row, or after a write that moved them.
+    Unplaced,
+    /// On the same row (compared).
+    OnRow,
+    /// Just after a delete: only a step may follow.
+    Deleted,
+}
+
 /// One run of `ops` random operations on both cursors of `kind`, compared after each.
 fn run(kind: Kind, seed: u64, ops: usize) {
     let mut rng = Rng(seed);
     let (mut b, mut v, pager, _keep) = pair(kind, seed);
     let (b, v) = (b.as_mut(), v.as_mut());
-    // Whether a step may follow: the cursor is on a row, or has just deleted one.
-    let mut may_step = false;
+    let mut model = Model::new(kind);
+    let mut place = Place::Unplaced;
+    // The key of the row last deleted, while `place` is `Deleted`.
+    let mut deleted: Vec<u8> = Vec::new();
+    // Steps where the reference's `prev` after deleting the last row left it elsewhere than the
+    // model's row (btree.rs; see `step_after_delete`), counted so the report can name them.
+    let mut reference_diverged = 0usize;
     let mut next_rowid = 1i64;
     // The operations so far, the last few of which a failure names.
     let mut trail: Vec<String> = Vec::new();
@@ -343,27 +439,36 @@ fn run(kind: Kind, seed: u64, ops: usize) {
                 Key::Rowid(r) => BTreeKey::new_table_rowid(*r, Some(&bkey_record)),
                 Key::Record(_) => BTreeKey::new_index_key(bkey_record.as_record_ref()),
             };
+            let model_key = match &key {
+                Key::Rowid(r) => super::cursor::rowid_key(*r).to_vec(),
+                Key::Record(rec) => rec.get_payload().to_vec(),
+            };
+            model.insert(model_key, bkey_record.get_payload().to_vec());
             pager.io.block(|| b.insert(&bkey)).unwrap();
             pager.io.block(|| v.insert(&bkey)).unwrap();
             // sqlite3BtreeInsert leaves the cursor at an arbitrary place unless told to save its
             // position (BTREE_SAVEPOSITION), and the executor seeks before it reads or steps
             // again: no position is compared until the next placing move (T-NS.1.1).
-            may_step = false;
+            place = Place::Unplaced;
         } else if roll < 43 {
-            if !(b.has_record() && may_step) {
+            if place != Place::OnRow {
                 continue;
             }
-            assert_eq!(seen(b, &pager), seen(v, &pager), "{at}: the row deleted");
+            let row = seen(b, &pager);
+            assert_eq!(row, seen(v, &pager), "{at}: the row deleted");
             trail.push("delete".into());
             pager.io.block(|| b.delete()).unwrap();
             pager.io.block(|| v.delete()).unwrap();
-            may_step = true;
+            deleted = model.key_of(&row);
+            model.remove(&deleted);
+            place = Place::Deleted;
         } else if roll < 63 {
-            if !may_step {
+            if place == Place::Unplaced {
                 continue;
             }
             let forward = rng.chance(70);
-            trail.push(if forward { "next" } else { "prev" }.into());
+            let name = if forward { "next" } else { "prev" };
+            trail.push(name.into());
             if forward {
                 pager.io.block(|| b.next()).unwrap();
                 pager.io.block(|| v.next()).unwrap();
@@ -372,8 +477,36 @@ fn run(kind: Kind, seed: u64, ops: usize) {
                 pager.io.block(|| v.prev()).unwrap();
             }
             let (sb, sv) = (seen(b, &pager), seen(v, &pager));
-            assert_eq!(sb, sv, "{at}: {}", if forward { "next" } else { "prev" });
-            may_step = sb.row.is_some();
+            if place == Place::Deleted {
+                let want = model.step_from(&deleted, forward);
+                let record = |s: &Seen| s.row.as_ref().map(|(_, r)| r.clone());
+                assert_eq!(
+                    record(&sv).as_deref(),
+                    want,
+                    "{at}: {name} after a delete, against the ordered model"
+                );
+                if record(&sb).as_deref() != want {
+                    // The reference's own divergence, known in one case only: `prev` after
+                    // deleting the last row (btree.rs, shared engine code this suite doesn't
+                    // change). Anywhere else it fails the run. Both cursors are placed afresh
+                    // before anything is compared again.
+                    let was_last = model.step_from(&deleted, true).is_none();
+                    assert!(
+                        !forward && was_last,
+                        "{at}: the reference's {name} after a delete left the ordered model: \
+                         reference {sb:?}, versioned {sv:?}"
+                    );
+                    reference_diverged += 1;
+                    place = Place::Unplaced;
+                    continue;
+                }
+            }
+            assert_eq!(sb, sv, "{at}: {name}");
+            place = if sb.row.is_some() {
+                Place::OnRow
+            } else {
+                Place::Unplaced
+            };
         } else if roll < 88 {
             let op = seek_op(&mut rng);
             let key = match kind {
@@ -411,31 +544,51 @@ fn run(kind: Kind, seed: u64, ops: usize) {
                     "{at}: the row seek {op:?} found"
                 );
             }
-            may_step = fb;
+            place = if fb { Place::OnRow } else { Place::Unplaced };
         } else if roll < 93 {
             trail.push("rewind".into());
             pager.io.block(|| b.rewind()).unwrap();
             pager.io.block(|| v.rewind()).unwrap();
             let (sb, sv) = (seen(b, &pager), seen(v, &pager));
             assert_eq!(sb, sv, "{at}: rewind");
-            may_step = sb.row.is_some();
+            place = if sb.row.is_some() {
+                Place::OnRow
+            } else {
+                Place::Unplaced
+            };
         } else if roll < 98 {
             trail.push("last".into());
             pager.io.block(|| b.last()).unwrap();
             pager.io.block(|| v.last()).unwrap();
             let (sb, sv) = (seen(b, &pager), seen(v, &pager));
             assert_eq!(sb, sv, "{at}: last");
-            may_step = sb.row.is_some();
+            place = if sb.row.is_some() {
+                Place::OnRow
+            } else {
+                Place::Unplaced
+            };
         } else {
             trail.push("count".into());
             let nb = pager.io.block(|| b.count()).unwrap();
             let nv = pager.io.block(|| v.count()).unwrap();
             assert_eq!(nb, nv, "{at}: count");
-            may_step = false;
+            place = Place::Unplaced;
         }
     }
     let (rows_b, rows_v) = (all(b, &pager), all(v, &pager));
     assert_eq!(rows_b, rows_v, "{kind:?} seed {seed}: every row at the end");
+    let records: Vec<&[u8]> = rows_v
+        .iter()
+        .filter_map(|s| s.row.as_ref().map(|(_, r)| r.as_slice()))
+        .collect();
+    let modelled: Vec<&[u8]> = model.rows.iter().map(|(_, r)| r.as_slice()).collect();
+    assert_eq!(records, modelled, "{kind:?} seed {seed}: the model's rows at the end");
+    if reference_diverged > 0 {
+        eprintln!(
+            "{kind:?} seed {seed}: the reference's prev after deleting the last row left the \
+             ordered model {reference_diverged} times (versioned matched it)"
+        );
+    }
     assert!(
         rows_b.len() > 100,
         "{kind:?} seed {seed}: a run that left {} rows tests little",
