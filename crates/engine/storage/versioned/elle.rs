@@ -493,7 +493,7 @@ impl Gen {
         (0..len)
             .map(|_| {
                 let i = self.slot();
-                if self.next() % 2 == 0 {
+                if self.next().is_multiple_of(2) {
                     return Plan::Read(self.slots[i].key);
                 }
                 if self.slots[i].written >= self.slots[i].budget {
