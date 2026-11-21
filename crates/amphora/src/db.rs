@@ -704,6 +704,16 @@ impl Db {
         result
     }
 
+    /// [`Db::exec`] of an online schema change's own statement (CP-T1.12): the engine lets only
+    /// the change's own `ALTER COLUMN` redefine a column it holds. The mark is off again however
+    /// the statement ends.
+    pub(crate) fn exec_as_change(&self, sql: &str) -> anyhow::Result<()> {
+        self.conn.set_online_change_own(true);
+        let result = self.exec(sql);
+        self.conn.set_online_change_own(false);
+        result
+    }
+
     /// Owned/dynamic SQL without an unbounded statement cache (U05). The caller bounds results.
     /// It keeps its cache entry's validation mark and never sets one: only the session validates.
     pub fn query_owned(

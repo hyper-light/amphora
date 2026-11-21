@@ -157,6 +157,14 @@ pub const INDEX_STATES_TABLE: &str = "__amphora_index_states";
 /// [`INDEX_STATES_TABLE`] is. A column without a row is validated.
 pub const CONSTRAINT_STATES_TABLE: &str = "__amphora_constraint_states";
 
+/// Amphora: the table that holds each column an online `DROP COLUMN` dropped (CP-T1.12,
+/// PostgreSQL's `pg_attribute.attisdropped`; Amphora's `docs/design/online-schema.md`). A row names
+/// a table and a column: the column stays in its table's `CREATE TABLE` as a slot, so the rows'
+/// layout holds, but the engine hides it from name lookup, `*`, inserts and `PRAGMA table_info`,
+/// and every write stores NULL in it. Read whenever a connection parses its schema, as
+/// [`CONSTRAINT_STATES_TABLE`] is. The row stays: the slot is the table's for good.
+pub const DROPPED_COLUMNS_TABLE: &str = "__amphora_dropped_columns";
+
 /// Amphora: where an index stands in an online schema change, by Rae et al., "Online, Asynchronous
 /// Schema Change in F1" (PVLDB 6(11), 2013), section 4: an index goes absent, delete-only,
 /// write-only, then public once a backfill has given every row its entry. Only a public index is
@@ -1628,6 +1636,45 @@ impl Schema {
             if let Some(column) = staged.columns_mut().get_mut(at) {
                 column.set_unvalidated(true);
             }
+            self.tables
+                .insert(table.clone(), Arc::new(Table::BTree(Arc::new(staged))));
+        }
+        Ok(())
+    }
+
+    /// Amphora: marks each column a row of [`DROPPED_COLUMNS_TABLE`] names dropped, on a copy of
+    /// its table (CP-T1.12): hidden (so `*` and an insert without a column list pass it, and an
+    /// insert stores NULL in it), found by no name, and without NOT NULL (a write stores NULL in
+    /// it). The first column of the name is the slot: one added later under the same name comes
+    /// after it. A row naming no table or column of this schema marks nothing.
+    pub fn set_dropped_columns(&mut self, columns: &[(String, String)]) -> Result<()> {
+        for (table, column) in columns {
+            let Some(entry) = self.tables.get(table) else {
+                continue;
+            };
+            let Table::BTree(btree) = entry.as_ref() else {
+                continue;
+            };
+            let Some(at) = btree.columns().iter().position(|c| {
+                c.name
+                    .as_ref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(column))
+            }) else {
+                continue;
+            };
+            let mut staged = btree.as_ref().try_clone()?;
+            if let Some(slot) = staged.columns_mut().get_mut(at) {
+                slot.info.set_dropped(true);
+                slot.set_hidden(true);
+                slot.set_notnull(false);
+            }
+            // Its own CHECK goes with it: a write stores NULL in the slot, and no name finds it.
+            staged.check_constraints.retain(|check| {
+                !check
+                    .column
+                    .as_ref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(column))
+            });
             self.tables
                 .insert(table.clone(), Arc::new(Table::BTree(Arc::new(staged))));
         }
@@ -3741,11 +3788,25 @@ impl BTreeTable {
     /// E.g. if table is CREATE TABLE t (a, b, c)
     /// then get_column("b") returns (1, &Column { .. })
     pub fn get_column(&self, name: &str) -> Option<(usize, &Column)> {
+        // Amphora: a column an online DROP COLUMN dropped answers to no name (CP-T1.12).
         self.columns.iter().enumerate().find(|(_, column)| {
-            column
-                .name
-                .as_ref()
-                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            !column.dropped()
+                && column
+                    .name
+                    .as_ref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        })
+    }
+
+    /// Amphora: whether a column an online DROP COLUMN dropped keeps `name` (CP-T1.12): its slot
+    /// stays in the table's `CREATE TABLE`, so no other column may take the name.
+    pub fn has_dropped_column(&self, name: &str) -> bool {
+        self.columns.iter().any(|column| {
+            column.dropped()
+                && column
+                    .name
+                    .as_ref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
         })
     }
 
@@ -5969,6 +6030,12 @@ impl Column {
     pub fn set_unvalidated(&mut self, v: bool) {
         self.info.set_unvalidated(v)
     }
+    /// Amphora: whether an online `DROP COLUMN` dropped this column ([`DROPPED_COLUMNS_TABLE`],
+    /// CP-T1.12): a slot no name finds and every write stores NULL in.
+    #[inline]
+    pub fn dropped(&self) -> bool {
+        self.info.dropped()
+    }
     /// Amphora: NOT NULL that every row is known to keep: declared, and not still being
     /// validated by an online schema change (CP-T1.12). What the planner and the integrity check
     /// may rely on; writes check [`Self::notnull`].
@@ -8162,6 +8229,9 @@ mod column_info {
     // Bit 26, Amphora: the column's constraints are still being validated (CP-T1.12).
     const F_UNVALIDATED: u32 = 1 << (ARRAY_DIM_SHIFT + 3);
 
+    // Bit 27, Amphora: an online DROP COLUMN dropped the column (CP-T1.12).
+    const F_DROPPED: u32 = 1 << (ARRAY_DIM_SHIFT + 4);
+
     /// ColumnInfo packs information on a [Column] into a single `u32`.
     #[derive(Clone, Debug)]
     pub struct ColumnInfo(u32);
@@ -8233,6 +8303,16 @@ mod column_info {
         #[inline]
         pub fn set_unvalidated(&mut self, v: bool) {
             self.set_flag(F_UNVALIDATED, v);
+        }
+
+        #[inline]
+        pub fn dropped(&self) -> bool {
+            self.0 & F_DROPPED != 0
+        }
+
+        #[inline]
+        pub fn set_dropped(&mut self, v: bool) {
+            self.set_flag(F_DROPPED, v);
         }
 
         #[inline]

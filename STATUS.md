@@ -425,7 +425,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   row is refused. NOT NULL and CHECK are added to an existing column (`ALTER COLUMN c TO` its own
 definition plus the constraint) write-only, then validated in learned rowid batches, then public by
 a catalog change; the planner doesn't rely on an unvalidated NOT NULL, a breaking row undoes the
-change, and a power cut leaves the old schema or the new. DROP COLUMN is not yet built.
+change, and a power cut leaves the old schema or the new. DROP COLUMN is built PostgreSQL's way: one
+catalog change hides the column as a slot (no name finds it, `*` and inserts pass it, every write
+stores NULL in it), learned rowid batches clear its old values, then the drop is recorded.
 
 ## Measured
 
