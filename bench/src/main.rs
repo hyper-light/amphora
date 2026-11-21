@@ -28,6 +28,7 @@ mod planner;
 mod pool;
 mod probe;
 mod query;
+mod reach;
 mod schema;
 mod sqlapi;
 mod store;
@@ -526,6 +527,10 @@ fn main() -> anyhow::Result<()> {
     // The versioned storage's log: one group-committed log against per-thread logs (`vlog.rs`).
     if std::env::args().any(|a| a == "--vlog") {
         return vlog::main();
+    }
+    // G7 step 3's three ways to reach a cached page (`reach.rs`).
+    if std::env::args().any(|a| a == "--reach") {
+        return reach::main();
     }
     // G11 step 2's column copies, A and B, against none (`columns.rs`).
     if std::env::args().any(|a| a == "--columns") {
