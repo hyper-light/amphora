@@ -416,6 +416,9 @@ criteria = [
 ]
 tests = [
   { id = "T-PL.13.1", text = "A join whose build side outgrows its estimate mid-query — passes when it switches method within its memory bound and its answer is unchanged" },
+  # lane pl13
+  { id = "T-PL.13.2", text = "The switch fires once, at the first outer row whose count reaches the learned-cost switch point, never at the planner's estimate below it; its cost stays under twice the cheaper method in hindsight; over its memory budget it is refused with a typed error and the join stays a nested loop" },
+  { id = "T-PL.13.3", text = "A materialization point asks for a new plan only when its counted rows fall outside the estimate's band, estimate / (1 + error) to estimate x (1 + error); the rows it holds stay within their budget or are refused with a typed error" },
 ]
 
 # Amphora's own IDs for its query time (Amphora goal 7788ef29, kiln plan
@@ -908,6 +911,8 @@ tests = [
   { id = "T-G3.5.1", text = "storage::descent_skip::tests::t_g3_5_1_* — passes when every lookup through the adaptive hash and the learned locator, under random inserts, deletes, splits and merges over pages two tables share, returns the row a plain descent returns" },
   { id = "T-G3.5.2", text = "storage::descent_skip::tests::t_g3_5_2_* — passes when, over a table's complete fences, the locator names the leaf a descent finds for every covered rowid" },
   { id = "T-G3.5.3", text = "storage::descent_skip::tests::engine::t_g3_5_3_* — passes when, on a real rowid table through committed rounds of inserts and range deletes, each prototype's page proven by its bytes gives the leaf and cell a cursor's descent stands on, or none when it finds none" },
+  # lane g3s5-2: the cursor hook.
+  { id = "T-G3.5.4", text = "storage::descent_skip::tests::engine::t_g3_5_4_* — passes when, through the real cursor on two connections writing in turns at different snapshots (inserts, splits, range deletes), every seek with each AMPHORA_DESCENT_SKIP setting stands on the leaf and cell, and returns the row, the plain descent does, every step after it reaches the same row, and the hook counts seeks that stood on a named leaf under both prototypes" },
 ]
 
 # lane regions (G14 step 1, CP-T1.11; docs/design/regions.md): no new IDs. It serves AC-T1.11.4
