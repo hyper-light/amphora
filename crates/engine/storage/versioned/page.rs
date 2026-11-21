@@ -479,53 +479,109 @@ pub fn set_high(p: &mut [u8], high: Option<&[u8]>) -> Result<()> {
     set_u16(p, 6, to_u16(at)?)
 }
 
-/// Splits a full page in two: the upper half of its cells goes to `right`, a fresh page numbered
-/// `right_no`, which takes its upper bound and right sibling; the page keeps the lower half, bound
-/// by the separator, its right sibling now `right_no`. The separator is returned for the parent:
-/// a leaf's is the right page's first key; an inner page's moves up, its child becoming the right
-/// page's first.
-pub fn split(p: &mut [u8], right: &mut [u8], right_no: u64) -> Result<Vec<u8>> {
+/// A cell of a page being split.
+struct Moved<'a> {
+    key: &'a [u8],
+    tail: Tail<'a>,
+    flags: Flags,
+}
+
+/// Splits the full page `p` into it and `right` (page `right_no`, which takes the upper keys, the
+/// right link and the upper bound) with the cell of `key`, `tail` and `flags` inserted where it
+/// belongs; returns the separator, `right`'s lower bound. A leaf keeps its separator as `right`'s
+/// first cell; an inner page moves it up, its child becoming `right`'s first child.
+///
+/// The halves are chosen by bytes, the new cell counted (NS.2.2): the split falls at the first
+/// cell past half the cells' bytes. Each half then holds at most half the bytes plus one cell and
+/// one bound, which [`MAX_CELL`] (a quarter page with its slot) keeps within a page; a split by
+/// count leaves no room once cells near [`MAX_CELL`] gather on one side.
+pub fn split(
+    p: &mut [u8],
+    right: &mut [u8],
+    right_no: u64,
+    new: (&[u8], Tail, Flags),
+    cmp: Compare,
+) -> Result<Vec<u8>> {
     let image = p.to_vec();
     let kind = kind(&image)?;
     let n = count(&image)?;
-    if n < 2 {
-        return Err(corrupt("a split of fewer than two cells"));
+    let mut cells = Vec::with_capacity(n.saturating_add(1));
+    for i in 0..n {
+        cells.push(Moved {
+            key: key(&image, i)?,
+            tail: match kind {
+                Kind::Leaf => Tail::Value(value(&image, i)?),
+                Kind::Inner => Tail::Child(child(&image, i)?),
+            },
+            flags: flags(&image, i)?,
+        });
     }
-    let mid = n / 2;
-    let separator = key(&image, mid)?.to_vec();
-    let (right_first, from) = match kind {
-        Kind::Leaf => (0, mid),
-        Kind::Inner => (
-            child(&image, mid)?,
-            mid.checked_add(1).ok_or(LimboError::IntegerOverflow)?,
-        ),
+    let at = match search(&image, new.0, cmp)? {
+        Ok(_) => return Err(corrupt("a split inserting a key the page holds")),
+        Err(i) => i,
     };
+    if at > cells.len() {
+        return Err(corrupt("a split's cell past the page"));
+    }
+    cells.insert(
+        at,
+        Moved {
+            key: new.0,
+            tail: new.1,
+            flags: new.2,
+        },
+    );
+    let mut sizes = Vec::with_capacity(cells.len());
+    for c in &cells {
+        sizes.push(
+            cell_len(c.key, c.tail)?
+                .checked_add(SLOT)
+                .ok_or(LimboError::IntegerOverflow)?,
+        );
+    }
+    let total: usize = sizes.iter().sum();
+    let last = cells
+        .len()
+        .checked_sub(1)
+        .filter(|&l| l >= 1)
+        .ok_or_else(|| corrupt("a split of fewer than two cells"))?;
+    let mut mid = 0;
+    let mut before = 0usize;
+    for &size in &sizes {
+        let next = before.checked_add(size).ok_or(LimboError::IntegerOverflow)?;
+        if next > total / 2 {
+            break;
+        }
+        before = next;
+        mid = mid.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+    }
+    let mid = mid.clamp(1, last);
+    let sep = cells
+        .get(mid)
+        .ok_or_else(|| corrupt("a split point past the cells"))?;
+    let separator = sep.key.to_vec();
+    let (right_first, from) = match (kind, sep.tail) {
+        (Kind::Leaf, _) => (0, mid),
+        (Kind::Inner, Tail::Child(c)) => (c, mid.checked_add(1).ok_or(LimboError::IntegerOverflow)?),
+        (Kind::Inner, _) => return Err(corrupt("an inner page's cell without a child")),
+    };
+    let full = || corrupt("half a split page without room for its cell");
     init(right, kind, right_first)?;
     set_level(right, level(&image)?)?;
     set_right(right, self::right(&image)?)?;
     set_high(right, high(&image)?)?;
-    for (j, i) in (from..n).enumerate() {
-        let k = key(&image, i)?;
-        let tail = match kind {
-            Kind::Leaf => Tail::Value(value(&image, i)?),
-            Kind::Inner => Tail::Child(child(&image, i)?),
-        };
-        if !insert_flagged(right, j, k, tail, flags(&image, i)?)? {
-            return Err(corrupt("half a page that doesn't fit one"));
+    for (j, c) in cells.get(from..).unwrap_or_default().iter().enumerate() {
+        if !insert_flagged(right, j, c.key, c.tail, c.flags)? {
+            return Err(full());
         }
     }
     init(p, kind, first(&image)?)?;
     set_level(p, level(&image)?)?;
     set_right(p, Some(right_no))?;
     set_high(p, Some(&separator))?;
-    for i in 0..mid {
-        let k = key(&image, i)?;
-        let tail = match kind {
-            Kind::Leaf => Tail::Value(value(&image, i)?),
-            Kind::Inner => Tail::Child(child(&image, i)?),
-        };
-        if !insert_flagged(p, i, k, tail, flags(&image, i)?)? {
-            return Err(corrupt("half a page that doesn't fit one"));
+    for (j, c) in cells.get(..mid).unwrap_or_default().iter().enumerate() {
+        if !insert_flagged(p, j, c.key, c.tail, c.flags)? {
+            return Err(full());
         }
     }
     Ok(separator)
@@ -612,11 +668,13 @@ mod tests {
         {
             i += 1;
         }
-        let all = cells(&p);
+        let mut all = cells(&p);
+        all.push((b"k9999".to_vec(), vec![1; 30]));
         let mut r = vec![0u8; PAGE_SIZE];
-        let sep = split(&mut p, &mut r, 5).unwrap();
+        let sep = split(&mut p, &mut r, 5, (b"k9999", Tail::Value(&[1; 30]), Flags::default()), cmp).unwrap();
         let (left, right_cells) = (cells(&p), cells(&r));
         assert_eq!([left.clone(), right_cells.clone()].concat(), all);
+        assert!(left.len().abs_diff(right_cells.len()) <= 1, "equal cells split evenly");
         assert_eq!(sep, right_cells[0].0);
         assert_eq!(high(&p).unwrap(), Some(sep.as_slice()));
         assert_eq!(right(&p).unwrap(), Some(5));
@@ -637,10 +695,11 @@ mod tests {
             .unwrap();
         }
         let mut r = vec![0u8; PAGE_SIZE];
-        let sep = split(&mut inner, &mut r, 6).unwrap();
+        let sep = split(&mut inner, &mut r, 6, (b"s10", Tail::Child(20), Flags::default()), cmp).unwrap();
         assert_eq!(sep, b"s05");
         assert_eq!(first(&r).unwrap(), 15);
-        assert_eq!(count(&inner).unwrap() + count(&r).unwrap(), 9);
+        assert_eq!(count(&inner).unwrap() + count(&r).unwrap(), 10);
+        assert_eq!(route(&r, b"s10", cmp).unwrap(), 20);
         assert_eq!(route(&inner, b"s00", cmp).unwrap(), 10);
         assert_eq!(route(&inner, b"a", cmp).unwrap(), 1);
         assert_eq!(route(&r, b"s07", cmp).unwrap(), 17);
@@ -679,12 +738,53 @@ mod tests {
         };
         check(&p);
         let mut r = vec![0u8; PAGE_SIZE];
-        split(&mut p, &mut r, 2).unwrap();
+        let new = format!("k{:04}", 9998);
+        split(&mut p, &mut r, 2, (new.as_bytes(), Tail::Value(&[2; 20]), flag(9998)), &bytes).unwrap();
         check(&p);
         check(&r);
         set_flags(&mut r, 0, Flags::default()).unwrap();
         assert_eq!(flags(&r, 0).unwrap(), Flags::default());
         assert!(key(&r, 0).unwrap().starts_with(b"k"));
+    }
+
+    /// Do: fill a bounded leaf with small cells and cells of the largest size, gathered at its
+    /// upper end, then split it inserting another of the largest at each place. Expect: every
+    /// split fits both halves, its cells all kept in order (NS.2.2: values that overflow fill
+    /// cells to the largest size).
+    #[test]
+    fn ns2_2_splits_by_bytes_fit_cells_of_the_largest_size() {
+        let cmp: Compare = &bytes;
+        let big = |k: &[u8]| vec![7u8; MAX_CELL - 4 - k.len()];
+        for small in [0usize, 1, 3, 10, 40] {
+            let mut p = leaf();
+            set_high(&mut p, Some(&[b'z'; 200])).unwrap();
+            let mut n = 0;
+            for i in 0..small {
+                let k = format!("a{i:04}");
+                if !insert(&mut p, n, k.as_bytes(), Tail::Value(&[1; 8])).unwrap() {
+                    break;
+                }
+                n += 1;
+            }
+            for i in 0..4 {
+                let k = format!("m{i:04}");
+                if !insert(&mut p, n, k.as_bytes(), Tail::Value(&big(k.as_bytes()))).unwrap() {
+                    break;
+                }
+                n += 1;
+            }
+            for new in ["a", "a00005", "m00005", "y"] {
+                let mut q = p.clone();
+                let mut r = vec![0u8; PAGE_SIZE];
+                let v = big(new.as_bytes());
+                let sep = split(&mut q, &mut r, 3, (new.as_bytes(), Tail::Value(&v), Flags::default()), cmp).unwrap();
+                let mut want = cells(&p);
+                want.push((new.as_bytes().to_vec(), v.clone()));
+                want.sort();
+                assert_eq!([cells(&q), cells(&r)].concat(), want, "{small} small, {new}");
+                assert_eq!(sep, cells(&r)[0].0);
+            }
+        }
     }
 
     /// Do: read a page whose header points past its end. Expect: a typed error, no panic.

@@ -323,20 +323,7 @@ impl Tree {
         let cmp = self.compare();
         let right_no = pool.allocate()?;
         let mut right = pool.write(right_no)?;
-        let separator = page::split(w, &mut right, right_no)?;
-        let target: &mut [u8] = if cmp(key, &separator) == Order::Less {
-            w
-        } else {
-            &mut right
-        };
-        let at = match page::search(target, key, cmp)? {
-            Ok(i) | Err(i) => i,
-        };
-        if !page::insert_flagged(target, at, key, Tail::Value(value), flags)? {
-            return Err(LimboError::Corrupt(
-                "versioned storage: half a split page without room for its cell".into(),
-            ));
-        }
+        let separator = page::split(w, &mut right, right_no, (key, Tail::Value(value), flags), cmp)?;
         let level = page::level(w)?;
         Ok(Split {
             left: no,
@@ -392,20 +379,13 @@ impl Tree {
         let cmp = self.compare();
         let right_no = pool.allocate()?;
         let mut right = pool.write(right_no)?;
-        let separator = page::split(w, &mut right, right_no)?;
-        let target: &mut [u8] = if cmp(&child.separator, &separator) == Order::Less {
-            w
-        } else {
-            &mut right
-        };
-        let at = match page::search(target, &child.separator, cmp)? {
-            Ok(i) | Err(i) => i,
-        };
-        if !page::insert(target, at, &child.separator, Tail::Child(child.right))? {
-            return Err(LimboError::Corrupt(
-                "versioned storage: half a split inner page without room for its cell".into(),
-            ));
-        }
+        let separator = page::split(
+            w,
+            &mut right,
+            right_no,
+            (&child.separator, Tail::Child(child.right), page::Flags::default()),
+            cmp,
+        )?;
         let level = page::level(w)?;
         Ok(Split {
             left: no,
