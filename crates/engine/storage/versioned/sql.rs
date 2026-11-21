@@ -290,7 +290,7 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
 }
 
 /// Do (`AC-NS.2.1`, G7 step 2): on a file database on the versioned storage, tables with indexes
-/// (a descending NOCASE one, a UNIQUE autoindex, a WITHOUT ROWID table), rows written and
+/// (a descending NOCASE one, a UNIQUE autoindex, one of two columns), rows written and
 /// committed, then the database closed and opened again; and the same database's files copied
 /// while it was still open, as a crash leaves them, and the copy opened. Expect: both open with
 /// every table and index, read the committed rows through each index in its order, and refuse a
@@ -304,7 +304,7 @@ fn ns_2_1_a_file_database_reopens_after_a_close_and_a_crash() {
         "SELECT a, b, c FROM t ORDER BY a",
         "SELECT b FROM t INDEXED BY tb ORDER BY b COLLATE NOCASE DESC",
         "SELECT c, a FROM t INDEXED BY tc WHERE c >= 20 ORDER BY c",
-        "SELECT k, v FROM w ORDER BY k",
+        "SELECT k, v FROM w INDEXED BY wkv WHERE k > 'k8' ORDER BY k, v DESC",
         "SELECT name FROM sqlite_schema ORDER BY name",
     ];
     let want = {
@@ -313,7 +313,8 @@ fn ns_2_1_a_file_database_reopens_after_a_close_and_a_crash() {
             "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT UNIQUE, c INTEGER)",
             "CREATE INDEX tc ON t (c)",
             "CREATE INDEX tb ON t (b COLLATE NOCASE DESC)",
-            "CREATE TABLE w (k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+            "CREATE TABLE w (k TEXT, v INTEGER)",
+            "CREATE INDEX wkv ON w (k, v DESC)",
         ] {
             run(&conn, sql);
         }
