@@ -15,8 +15,14 @@
 //! began, is refused (`WriteWriteConflict`): the first writer wins. Versions no snapshot can see go:
 //! the low watermark is the oldest open snapshot's timestamp ([`Clock::low_watermark`]).
 //!
-//! Locks are always taken page latch, then a head's shard, then a transaction's state, so readers,
-//! writers, rollbacks, cleanups and collections never wait on each other in a cycle.
+//! A serializable transaction reads through [`VTree::read`] and [`VTree::read_range`], which keep
+//! what it read; its commit is validated by the database's [`Validation`] under the publish lock,
+//! and refused with `SerializationFailure` where serializability asks (decision 5, and the
+//! prototypes G8 step 1 measures against each other).
+//!
+//! Locks are always taken the publish lock, then the recent commits', then a page latch, then a
+//! head's shard, then a transaction's state, so readers, writers, rollbacks, cleanups, collections
+//! and validations never wait on each other in a cycle.
 
 use super::blink::{Cell, Change, Descender, Tree};
 use super::page::Flags;
@@ -27,7 +33,8 @@ use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::Mutex;
 use crate::Result;
 use rustc_hash::FxHashMap;
-use std::collections::BTreeMap;
+use std::cmp::Ordering as Order;
+use std::collections::{BTreeMap, VecDeque};
 
 /// Ids at or above this name a transaction; below it, a commit timestamp.
 const TX: u64 = 1 << 63;
@@ -91,6 +98,86 @@ pub struct Txn {
     changed: Vec<(u64, Vec<u8>)>,
     /// Its changes in the order made: its redo record (decision 6).
     ops: Vec<Op>,
+    /// What it read through [`VTree::read`] and [`VTree::read_range`]: its commit's validation.
+    reads: Reads,
+}
+
+/// How a database validates a commit (decision 5). Each one is the floor, snapshot isolation with
+/// the first writer winning, and what it adds; G8 step 1 measures the three that make it
+/// serializable against each other on the same commit path, and keeps one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Validation {
+    /// Nothing: snapshot isolation, which allows write skew. The Elle checks' control.
+    Snapshot,
+    /// Precision locking as HyPer adapts it (Neumann, Mühlbauer, Kemper, SIGMOD 2015): a
+    /// transaction that wrote checks the rows and spans it read against the rows written by the
+    /// commits since its snapshot; any match refuses it. One that only read commits as of its
+    /// snapshot, unchecked.
+    #[default]
+    Precision,
+    /// Serializable snapshot isolation as PostgreSQL makes it (Cahill, Röhm, Fekete, SIGMOD 2008;
+    /// Ports, Grittner, PVLDB 5(12), 2012): read-write antidependencies among concurrent
+    /// transactions, refusing one only where it would complete a dangerous structure
+    /// `in -> pivot -> out` whose `out` committed first. Every commit's reads are kept while a
+    /// concurrent transaction is open.
+    Ssi,
+    /// Optimistic validation as Silo makes it (Tu, Zheng, Kohler, Liskov, Madden, SOSP 2013): each
+    /// row read is checked in its tree, by the version its head names, for a commit since the
+    /// snapshot; each span is read again for one (Silo's node set, at row grain: an open writer's
+    /// in-place change moves a leaf's version, which would refuse its own readers). Nothing is
+    /// kept between commits.
+    Occ,
+}
+
+/// What a transaction read: rows by key, and spans of keys, each in its tree.
+#[derive(Default)]
+struct Reads {
+    points: Vec<(u64, Vec<u8>)>,
+    spans: Vec<Span>,
+}
+
+/// The keys of a tree from `from` to `to`, both included (none: from the least, to the greatest).
+struct Span {
+    tree: u64,
+    from: Option<Vec<u8>>,
+    to: Option<Vec<u8>>,
+}
+
+impl Reads {
+    fn is_empty(&self) -> bool {
+        self.points.is_empty() && self.spans.is_empty()
+    }
+
+    /// Whether these reads saw `key` of tree `tree`: a row read under it, or a span holding it.
+    fn covers(&self, v: &Versioned, tree: u64, key: &[u8]) -> Result<bool> {
+        let mut points = self.points.iter().filter(|(t, _)| *t == tree).peekable();
+        let mut spans = self.spans.iter().filter(|s| s.tree == tree).peekable();
+        if points.peek().is_none() && spans.peek().is_none() {
+            return Ok(false);
+        }
+        let cmp = v.tree(tree)?.tree.compare();
+        if points.any(|(_, k)| cmp(k, key) == Order::Equal) {
+            return Ok(true);
+        }
+        Ok(spans.any(|s| {
+            s.from
+                .as_deref()
+                .is_none_or(|f| cmp(f, key) != Order::Greater)
+                && s.to
+                    .as_deref()
+                    .is_none_or(|t| cmp(key, t) != Order::Greater)
+        }))
+    }
+}
+
+/// A commit precision locking or SSI keeps while a transaction concurrent with it is open: its
+/// timestamp, the rows it wrote, and for SSI what it read and the earliest commit it read past
+/// that came before its own (its `out` edge to a transaction that committed first).
+struct Committed {
+    ts: Ts,
+    writes: Vec<(u64, Vec<u8>)>,
+    reads: Reads,
+    out_first: Option<Ts>,
 }
 
 impl Txn {
@@ -128,11 +215,16 @@ impl Clock {
         })
     }
 
-    fn open_at(&self, start: Ts) -> Result<()> {
+    /// A snapshot of every commit published now, open: read under the open snapshots' lock, so
+    /// a low watermark taken at once either counts it or is at most its timestamp (read before
+    /// the lock, a commit and a collection between the read and the count could drop versions it
+    /// sees, and the commits a validation needs for it).
+    fn open_now(&self) -> Result<Ts> {
         let mut open = self.open.lock();
+        let start = self.visible.load(Ordering::Acquire);
         let n = open.entry(start).or_insert(0);
         *n = n.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
-        Ok(())
+        Ok(start)
     }
 
     /// Ends a snapshot that began at `start` ([`Clock::snapshot`], [`Clock::begin`]).
@@ -148,8 +240,7 @@ impl Clock {
 
     /// A read-only snapshot of every commit published now; [`Clock::close`] it.
     pub fn snapshot(&self) -> Result<Snapshot> {
-        let start = self.visible.load(Ordering::Acquire);
-        self.open_at(start)?;
+        let start = self.open_now()?;
         Ok(Snapshot { start, own: None })
     }
 
@@ -160,14 +251,14 @@ impl Clock {
             return Err(LimboError::IntegerOverflow);
         }
         let id = TX | n;
-        let start = self.visible.load(Ordering::Acquire);
-        self.open_at(start)?;
+        let start = self.open_now()?;
         self.states(id)?.lock().insert(id, State::Open);
         Ok(Txn {
             id,
             start,
             changed: Vec::new(),
             ops: Vec::new(),
+            reads: Reads::default(),
         })
     }
 
@@ -232,10 +323,9 @@ impl Clock {
     /// The oldest open snapshot's timestamp, or the last commit's with none open: versions older
     /// than the newest one committed at or before it no snapshot can see.
     pub fn low_watermark(&self) -> Ts {
+        let open = self.open.lock();
         let visible = self.visible.load(Ordering::Acquire);
-        self.open
-            .lock()
-            .keys()
+        open.keys()
             .next()
             .copied()
             .map_or(visible, |oldest| oldest.min(visible))
@@ -360,6 +450,49 @@ impl VTree {
             Ok(out.len() < most)
         })?;
         Ok(out)
+    }
+
+    /// The row under `key` as `txn` sees it, the read kept for its commit's validation: a
+    /// serializable read (decision 5). `get` with `txn`'s snapshot reads without keeping it.
+    pub fn read(
+        &self,
+        pool: &Pool,
+        d: &mut Descender,
+        clock: &Clock,
+        txn: &mut Txn,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        let row = self.get(pool, d, clock, &txn.snapshot(), key)?;
+        txn.reads.points.push((self.id, key.to_vec()));
+        Ok(row)
+    }
+
+    /// Up to `most` rows from `from` on as `txn` sees them, in key order, the span read kept for
+    /// its commit's validation: up to the last row given when there are `most`, else to the end.
+    pub fn read_range(
+        &self,
+        pool: &Pool,
+        d: &mut Descender,
+        clock: &Clock,
+        txn: &mut Txn,
+        from: Option<&[u8]>,
+        most: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if most == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = self.scan(pool, d, clock, &txn.snapshot(), from, most)?;
+        let to = if rows.len() < most {
+            None
+        } else {
+            rows.last().map(|(k, _)| k.clone())
+        };
+        txn.reads.spans.push(Span {
+            tree: self.id,
+            from: from.map(<[u8]>::to_vec),
+            to,
+        });
+        Ok(rows)
     }
 
     /// `txn` takes the row under `key` (its leaf latched, `cell` its cell): refused if another
@@ -571,11 +704,17 @@ impl VTree {
     }
 }
 
-/// A database's versioned trees, their pool and their clock.
+/// A database's versioned trees, their pool, their clock, and how its commits are validated.
 pub struct Versioned {
     pub pool: Pool,
     pub clock: Clock,
     trees: Vec<VTree>,
+    validation: Validation,
+    /// The commits a validation may still check against, oldest first: each later than the low
+    /// watermark, so bounded as the versions are (every row one of them wrote keeps its head
+    /// until its newest version is at or below the watermark). Locked only under the publish
+    /// lock.
+    recent: Mutex<VecDeque<Committed>>,
 }
 
 impl Versioned {
@@ -595,7 +734,19 @@ impl Versioned {
             pool,
             clock: Clock::new(),
             trees: made,
+            validation: Validation::default(),
+            recent: Mutex::new(VecDeque::new()),
         })
+    }
+
+    /// The same database, its commits validated by `validation`.
+    pub fn with_validation(mut self, validation: Validation) -> Self {
+        self.validation = validation;
+        self
+    }
+
+    pub fn validation(&self) -> Validation {
+        self.validation
     }
 
     /// The trees whose roots are `roots`, in `pool` (recovery).
@@ -613,6 +764,8 @@ impl Versioned {
             pool,
             clock: Clock::new(),
             trees,
+            validation: Validation::default(),
+            recent: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -654,14 +807,24 @@ impl Versioned {
     }
 
     /// [`Versioned::commit`], `log` given the timestamp and the changes under the publish lock
-    /// (the redo log's append, in timestamp order); a failure of `log` rolls `txn` back.
+    /// (the redo log's append, in timestamp order); a failure of `log` rolls `txn` back. Validated
+    /// first, under the same lock, so no commit lands between its check and its timestamp: a
+    /// refusal (`SerializationFailure`) rolls `txn` back.
     pub fn commit_logged(
         &self,
-        txn: Txn,
+        mut txn: Txn,
         d: &mut Descender,
         log: impl FnOnce(Ts, &[Op]) -> Result<()>,
     ) -> Result<Ts> {
-        let ts = match self.clock.commit(&txn, log) {
+        let reads = std::mem::take(&mut txn.reads);
+        let published = self.clock.commit(&txn, |ts, ops| {
+            let mut recent = self.recent.lock();
+            let out_first = self.validate(&txn, &reads, &recent, d)?;
+            log(ts, ops)?;
+            self.remember(&mut recent, &txn, reads, ts, out_first);
+            Ok(())
+        });
+        let ts = match published {
             Ok(ts) => ts,
             Err(e) => {
                 self.abort(txn, d)?;
@@ -679,6 +842,162 @@ impl Versioned {
         }
         self.clock.forget(&txn)?;
         Ok(ts)
+    }
+
+    /// Whether `txn`'s commit may go ahead (decision 5), for SSI with the earliest commit it read
+    /// past; refused with `SerializationFailure`. Under the publish lock, `recent` locked.
+    fn validate(
+        &self,
+        txn: &Txn,
+        reads: &Reads,
+        recent: &VecDeque<Committed>,
+        d: &mut Descender,
+    ) -> Result<Option<Ts>> {
+        // Since the snapshot, newest first.
+        let since = || recent.iter().rev().take_while(|c| c.ts > txn.start);
+        match self.validation {
+            Validation::Snapshot => Ok(None),
+            // One that only read is serialized at its snapshot, a prefix of the commit order.
+            Validation::Precision | Validation::Occ if txn.changed.is_empty() => Ok(None),
+            Validation::Precision => {
+                if reads.is_empty() {
+                    return Ok(None);
+                }
+                for c in since() {
+                    for (tree, key) in &c.writes {
+                        if reads.covers(self, *tree, key)? {
+                            return Err(LimboError::SerializationFailure);
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Validation::Occ => {
+                self.occ(txn, reads, d)?;
+                Ok(None)
+            }
+            Validation::Ssi => {
+                // `txn -> c` where it read past a row `c` wrote; `c -> txn` where `c` read past
+                // one `txn` wrote. Each pair is seen at the later commit of the two, so only
+                // committed transactions need checking (Fekete et al.'s theorem: every cycle
+                // has a dangerous structure whose `out` commits first).
+                let mut out_first: Option<Ts> = None;
+                let mut in_last: Option<Ts> = None;
+                for c in since() {
+                    let mut out = false;
+                    for (tree, key) in &c.writes {
+                        if reads.covers(self, *tree, key)? {
+                            out = true;
+                            break;
+                        }
+                    }
+                    if out {
+                        // `txn -> c -> o` with `o` committed before `c`, and so before `txn`.
+                        if c.out_first.is_some() {
+                            return Err(LimboError::SerializationFailure);
+                        }
+                        out_first = Some(out_first.map_or(c.ts, |o| o.min(c.ts)));
+                    }
+                    for (tree, key) in &txn.changed {
+                        if c.reads.covers(self, *tree, key)? {
+                            in_last = Some(in_last.map_or(c.ts, |i| i.max(c.ts)));
+                            break;
+                        }
+                    }
+                }
+                // `c -> txn -> o` with `o` committed no later than `c` (the same, a two-cycle).
+                if let (Some(o), Some(i)) = (out_first, in_last) {
+                    if i >= o {
+                        return Err(LimboError::SerializationFailure);
+                    }
+                }
+                Ok(out_first)
+            }
+        }
+    }
+
+    /// Silo's read-set check at row grain: refused if a row `txn` read, or one in a span it read
+    /// (read again), has a version committed after its snapshot. A head no longer kept was last
+    /// written at or below the low watermark, at or before the snapshot. The newest committed
+    /// version is the head's own when its writer committed, else the newest older one: an open
+    /// writer's change (another's, or `txn`'s own) stands over a commit made since the snapshot
+    /// that `txn` read past, and must not hide it.
+    fn occ(&self, txn: &Txn, reads: &Reads, d: &mut Descender) -> Result<()> {
+        let moved = |head: &Head| -> Result<bool> {
+            let newest = match self.clock.resolve(head.writer)? {
+                Writer::Committed(ts) => ts,
+                Writer::Open(_) | Writer::Aborted => head.older.first().map_or(0, |o| o.written),
+            };
+            Ok(newest > txn.start)
+        };
+        for (tree, key) in &reads.points {
+            let t = self.tree(*tree)?;
+            let heads = t.heads(key)?.lock();
+            if let Some(head) = heads.get(key.as_slice()) {
+                if moved(head)? {
+                    return Err(LimboError::SerializationFailure);
+                }
+            }
+        }
+        for s in &reads.spans {
+            let t = self.tree(s.tree)?;
+            let cmp = t.tree.compare();
+            let mut refused = false;
+            t.tree
+                .scan_with(&self.pool, d, s.from.as_deref(), |key, cell| {
+                    if s.to
+                        .as_deref()
+                        .is_some_and(|to| cmp(key, to) == Order::Greater)
+                    {
+                        return Ok(false);
+                    }
+                    if cell.flags.versioned {
+                        let heads = t.heads(key)?.lock();
+                        if let Some(head) = heads.get(key) {
+                            refused = moved(head)?;
+                        }
+                    }
+                    Ok(!refused)
+                })?;
+            if refused {
+                return Err(LimboError::SerializationFailure);
+            }
+        }
+        Ok(())
+    }
+
+    /// Keeps `txn`'s commit at `ts` for the validations of transactions concurrent with it, and
+    /// lets go of those no open transaction began before.
+    fn remember(
+        &self,
+        recent: &mut VecDeque<Committed>,
+        txn: &Txn,
+        reads: Reads,
+        ts: Ts,
+        out_first: Option<Ts>,
+    ) {
+        let lwm = self.clock.low_watermark();
+        while recent.front().is_some_and(|c| c.ts <= lwm) {
+            recent.pop_front();
+        }
+        let (keep, reads) = match self.validation {
+            Validation::Precision => (!txn.changed.is_empty(), Reads::default()),
+            Validation::Ssi => (!txn.changed.is_empty() || !reads.is_empty(), reads),
+            Validation::Snapshot | Validation::Occ => (false, Reads::default()),
+        };
+        if keep {
+            recent.push_back(Committed {
+                ts,
+                writes: txn.changed.clone(),
+                reads,
+                out_first,
+            });
+        }
+    }
+
+    /// Commits kept for validations: a measure of [`Versioned`]'s `recent`.
+    pub fn recent_commits(&self) -> usize {
+        self.recent.lock().len()
     }
 
     /// Rolls `txn` back: each row it changed as it was before, last change first.
@@ -1070,5 +1389,238 @@ mod tests {
             .unwrap();
         assert_eq!(rows.iter().map(|(_, b)| amount(b)).sum::<u64>(), total);
         v.clock.close(snap.start);
+    }
+
+    const SERIALIZABLE: [Validation; 3] = [Validation::Precision, Validation::Ssi, Validation::Occ];
+    const EVERY: [Validation; 4] = [
+        Validation::Snapshot,
+        Validation::Precision,
+        Validation::Ssi,
+        Validation::Occ,
+    ];
+
+    /// A database validating by `validation`, with rows `x` and `y` at 1.
+    fn xy(validation: Validation) -> Versioned {
+        let v = db().with_validation(validation);
+        let t = v.tree(0).unwrap();
+        let mut d = Descender::new();
+        let mut setup = v.clock.begin().unwrap();
+        for k in [b"x", b"y"] {
+            t.put(&v.pool, &mut d, &v.clock, &mut setup, k, b"1")
+                .unwrap();
+        }
+        v.commit(setup, &mut d).unwrap();
+        v
+    }
+
+    fn refused(r: Result<Ts>) -> bool {
+        matches!(r, Err(LimboError::SerializationFailure))
+    }
+
+    /// G8 step 1 (T-G8.1.2): do two transactions each read `x` and `y` and write the one the
+    /// other didn't, both from the same snapshot. Expect: snapshot isolation commits both (write
+    /// skew, G2); each serializable validation refuses the second, its write rolled back.
+    #[test]
+    fn g8_1_write_skew_is_refused_by_each_serializable_validation() {
+        for validation in EVERY {
+            let v = xy(validation);
+            let t = v.tree(0).unwrap();
+            let mut d = Descender::new();
+            let mut a = v.clock.begin().unwrap();
+            let mut b = v.clock.begin().unwrap();
+            for txn in [&mut a, &mut b] {
+                for k in [b"x", b"y"] {
+                    t.read(&v.pool, &mut d, &v.clock, txn, k).unwrap();
+                }
+            }
+            t.put(&v.pool, &mut d, &v.clock, &mut a, b"x", b"0")
+                .unwrap();
+            t.put(&v.pool, &mut d, &v.clock, &mut b, b"y", b"0")
+                .unwrap();
+            v.commit(a, &mut d).unwrap();
+            let second = v.commit(b, &mut d);
+            if validation == Validation::Snapshot {
+                assert!(second.is_ok(), "{validation:?}: {second:?}");
+            } else {
+                assert!(refused(second), "{validation:?}");
+                let snap = v.clock.snapshot().unwrap();
+                assert_eq!(
+                    t.get(&v.pool, &mut d, &v.clock, &snap, b"y").unwrap(),
+                    Some(b"1".to_vec()),
+                    "{validation:?}: the refused write rolled back"
+                );
+                v.clock.close(snap.start);
+            }
+        }
+    }
+
+    /// T-G8.1.2: do a transaction read every row from `a` on (fewer than it asked for), another
+    /// read `x`, insert `m` into that span and commit, then the first write `x` and commit.
+    /// Expect: refused by each serializable validation (each read past the other's write, a
+    /// cycle through a phantom), committed under snapshot isolation.
+    #[test]
+    fn g8_1_a_phantom_in_a_span_read_is_refused() {
+        for validation in EVERY {
+            let v = xy(validation);
+            let t = v.tree(0).unwrap();
+            let mut d = Descender::new();
+            let mut a = v.clock.begin().unwrap();
+            let rows = t
+                .read_range(&v.pool, &mut d, &v.clock, &mut a, Some(b"a"), 10)
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            let mut b = v.clock.begin().unwrap();
+            t.read(&v.pool, &mut d, &v.clock, &mut b, b"x").unwrap();
+            t.put(&v.pool, &mut d, &v.clock, &mut b, b"m", b"1")
+                .unwrap();
+            v.commit(b, &mut d).unwrap();
+            t.put(&v.pool, &mut d, &v.clock, &mut a, b"x", b"2")
+                .unwrap();
+            let r = v.commit(a, &mut d);
+            assert_eq!(
+                refused(r),
+                validation != Validation::Snapshot,
+                "{validation:?}"
+            );
+        }
+    }
+
+    /// T-G8.1.2: do a transaction read `x`, another write `x` and commit, then the first write
+    /// `y` and commit. Expect: precision locking and OCC refuse it (a row it read changed since
+    /// its snapshot); SSI commits it (one antidependency, no dangerous structure): what makes
+    /// SSI's aborts fewer.
+    #[test]
+    fn g8_1_a_lone_antidependency_commits_under_ssi_alone() {
+        for validation in SERIALIZABLE {
+            let v = xy(validation);
+            let t = v.tree(0).unwrap();
+            let mut d = Descender::new();
+            let mut a = v.clock.begin().unwrap();
+            t.read(&v.pool, &mut d, &v.clock, &mut a, b"x").unwrap();
+            let mut b = v.clock.begin().unwrap();
+            t.put(&v.pool, &mut d, &v.clock, &mut b, b"x", b"2")
+                .unwrap();
+            v.commit(b, &mut d).unwrap();
+            t.put(&v.pool, &mut d, &v.clock, &mut a, b"y", b"2")
+                .unwrap();
+            let r = v.commit(a, &mut d);
+            assert_eq!(refused(r), validation != Validation::Ssi, "{validation:?}");
+        }
+    }
+
+    /// T-G8.1.2: Fekete, O'Neil and O'Neil's read-only anomaly ("A Read-Only Transaction Anomaly
+    /// Under Snapshot Isolation", SIGMOD Record 33(3), 2004). Do: `w` reads `x` and `y`; `d`
+    /// writes `y` and commits; a reader begins after, reads both and commits; `w` writes `x` and
+    /// commits. Expect: the reader commits under every validation; `w` is refused by each
+    /// serializable one (under SSI as the pivot of `reader -> w -> d`, `d` committed first).
+    #[test]
+    fn g8_1_the_read_only_anomaly_is_refused() {
+        for validation in EVERY {
+            let v = xy(validation);
+            let t = v.tree(0).unwrap();
+            let mut desc = Descender::new();
+            let d = &mut desc;
+            let mut w = v.clock.begin().unwrap();
+            t.read(&v.pool, d, &v.clock, &mut w, b"x").unwrap();
+            t.read(&v.pool, d, &v.clock, &mut w, b"y").unwrap();
+            let mut deposit = v.clock.begin().unwrap();
+            t.read(&v.pool, d, &v.clock, &mut deposit, b"y").unwrap();
+            t.put(&v.pool, d, &v.clock, &mut deposit, b"y", b"21")
+                .unwrap();
+            v.commit(deposit, d).unwrap();
+            let mut reader = v.clock.begin().unwrap();
+            t.read(&v.pool, d, &v.clock, &mut reader, b"x").unwrap();
+            t.read(&v.pool, d, &v.clock, &mut reader, b"y").unwrap();
+            v.commit(reader, d).unwrap();
+            t.put(&v.pool, d, &v.clock, &mut w, b"x", b"-10").unwrap();
+            let r = v.commit(w, d);
+            assert_eq!(
+                refused(r),
+                validation != Validation::Snapshot,
+                "{validation:?}"
+            );
+        }
+    }
+
+    /// T-G8.1.2: do a transaction read `x` while another changes `x` and stays open, then the
+    /// first write `y` and commit. Expect: committed under each validation: the open writer
+    /// commits after it, so it reads before that writer in the serial order (Silo's refusal of a
+    /// read row locked by a writer is for its validation outside a publish lock, which this
+    /// commit path doesn't have).
+    #[test]
+    fn g8_1_an_open_writer_of_a_row_read_refuses_nothing() {
+        for validation in EVERY {
+            let v = xy(validation);
+            let t = v.tree(0).unwrap();
+            let mut d = Descender::new();
+            let mut a = v.clock.begin().unwrap();
+            t.read(&v.pool, &mut d, &v.clock, &mut a, b"x").unwrap();
+            let mut b = v.clock.begin().unwrap();
+            t.put(&v.pool, &mut d, &v.clock, &mut b, b"x", b"2")
+                .unwrap();
+            t.put(&v.pool, &mut d, &v.clock, &mut a, b"y", b"2")
+                .unwrap();
+            v.commit(a, &mut d).unwrap();
+            v.commit(b, &mut d).unwrap();
+        }
+    }
+
+    /// T-G8.1.2: do a transaction read `x`, another write `x` and commit, a third begin after and
+    /// write `x` and stay open, then the first write `y` and commit. Expect: precision locking and
+    /// OCC refuse it as they do with no third (the open writer's change stands over the commit it
+    /// read past, and OCC finds that commit under it); SSI commits it (one antidependency).
+    #[test]
+    fn g8_1_an_open_writer_does_not_hide_a_commit_read_past() {
+        for validation in SERIALIZABLE {
+            let v = xy(validation);
+            let t = v.tree(0).unwrap();
+            let mut d = Descender::new();
+            let mut a = v.clock.begin().unwrap();
+            t.read(&v.pool, &mut d, &v.clock, &mut a, b"x").unwrap();
+            let mut c = v.clock.begin().unwrap();
+            t.put(&v.pool, &mut d, &v.clock, &mut c, b"x", b"2")
+                .unwrap();
+            v.commit(c, &mut d).unwrap();
+            let mut b = v.clock.begin().unwrap();
+            t.put(&v.pool, &mut d, &v.clock, &mut b, b"x", b"3")
+                .unwrap();
+            t.put(&v.pool, &mut d, &v.clock, &mut a, b"y", b"2")
+                .unwrap();
+            let r = v.commit(a, &mut d);
+            assert_eq!(refused(r), validation != Validation::Ssi, "{validation:?}");
+            v.commit(b, &mut d).unwrap();
+        }
+    }
+
+    /// T-G8.1.2: do 100 commits one after another, then 100 with a snapshot held open from the
+    /// first, then one after it closes. Expect: the commits kept for validation are the last one
+    /// alone with nothing open, every one since the held snapshot while it is, and the last alone
+    /// again once it closes (the bound of `recent`: the low watermark's).
+    #[test]
+    fn g8_1_commits_are_kept_only_while_a_snapshot_before_them_is_open() {
+        for validation in [Validation::Precision, Validation::Ssi] {
+            let v = db().with_validation(validation);
+            let t = v.tree(0).unwrap();
+            let mut d = Descender::new();
+            let mut write = |n: u8| {
+                let mut txn = v.clock.begin().unwrap();
+                t.read(&v.pool, &mut d, &v.clock, &mut txn, &[n]).unwrap();
+                t.put(&v.pool, &mut d, &v.clock, &mut txn, &[n], &[n])
+                    .unwrap();
+                v.commit(txn, &mut d).unwrap();
+            };
+            for n in 0..100 {
+                write(n);
+            }
+            assert_eq!(v.recent_commits(), 1, "{validation:?}");
+            let held = v.clock.snapshot().unwrap();
+            for n in 0..100 {
+                write(n);
+            }
+            assert_eq!(v.recent_commits(), 100, "{validation:?}");
+            v.clock.close(held.start);
+            write(0);
+            assert_eq!(v.recent_commits(), 1, "{validation:?}");
+        }
     }
 }

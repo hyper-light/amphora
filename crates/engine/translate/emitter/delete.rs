@@ -241,7 +241,7 @@ fn emit_row_loop_delete(
         emit_explain!(
             program,
             true,
-            eqp_detail_for_table_op(table_ref, None, None)
+            eqp_detail_for_table_op(table_ref, None, None, None)
         );
 
         // Set up main query execution loop

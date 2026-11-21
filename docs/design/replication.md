@@ -1010,6 +1010,32 @@ Attestation is the owner's own act when a handle binds, so it has no call of its
 stays as it is, the same proof over one member. New rows ride in resolved pages, and the origin check reads context
 bytes that already exist, so no wire format changes.
 
+**The owner's own sessions last their role's raft timing (2026-11-11).** A floor session and the seed's internal
+attempt each had a picked 60 s lease. Each now takes its role's timing, read from the core when it is made
+(`Actor::own_session_lease`; amphora-seam-owner-2, amphora-owner-t1-constants-floor-session-20261111). On a leader
+that is two quorum checks, 2 × (election_tick + quorum_patience) ticks. The check runs on its own counter and clears
+the answers' marks only when it runs, so a stall that begins just after an answer passes the next check and steps
+the leader down at the one after (hyper-raft's raft.rs, `quorum_due`, `tick_heartbeat`, `MsgCheckQuorum`). On a
+follower it is its election bound and its stall patience, (2 × election_tick + patience) ticks: it campaigns within
+a randomized timeout below twice election_tick, plus its patience (`tick_election`). Past either, the session's role
+has moved on, and it can't apply there. A live-quorum leader's session can still reach its lease, behind a slow flush
+or a ReadIndex backlog. It then ends unapplied: safe, since the stale-base rule refuses a late apply and the keeper
+makes it again. That is the falsifier's case, so each such end is counted and logged, as Kiln Metrics agreed them
+(amphora-constants/names/v1): the counter `amphora_replica_own_sessions_expired_total` (no labels, one per replica
+owner), and the event `replica.own_session_expired` at info on target `amphora.replica`, with its term and the
+running count as fields. `amphora.replica` carries no spans, so kiln's observe can take it at INFO.
+
+| panel | PromQL | kiln |
+|---|---|---|
+| Own sessions expired (patience too short), bars, beside quorum patience | `sum by (db) (increase(amphora_replica_own_sessions_expired_total[15m]))` | `sum:amphora_replica_own_sessions_expired_total{$host} by {db}.as_count()` |
+
+Its monitor warns on any increase in 15 minutes: each one is a falsifier. The re-request period of a failed seed transfer is the election
+timeout read from the core, where it was a bare 20 ticks. `an_owners_session_lasts_its_roles_raft_timing`: a
+follower's and a leader's sessions take their role's lease (red at 490ea83: "left: 60s, right: 400ms"), and a
+stalled leader's ends within its lease. Falsified by a floor or seed session that would have applied ending
+unapplied again and again under a loaded but live quorum: many `replica.own_session_expired` events in one term mean the
+patience is too short, and the fix belongs there.
+
 **Decided (2026-11-06), a to d.** Codex's agent ended before it answered, so Amphora's membership-floor agent
 decided them from the sources below and the code, and amphora-seam-owner agreed each (its record:
 codex-notices/OWNER.md, section 7).
@@ -1406,7 +1432,11 @@ held quorum can then sit within one real fate.
 **The decision.** The class is stated once, in the group's log, and every member holds itself to it:
 - **The entry.** A class entry is a log entry of its own kind: the prefix `amphora.class.v1\0`, then the postcard
   encoding of the class as `api::replication::Durability`, its fates in canonical order (`database::canonical`,
-  sorted by member). A leader proposes it in its term whenever its machine records no class: at bootstrap that is
+  sorted by member). It holds at most what the largest class encodes to (`ENTRY_BYTES`, 2026-11-11, in place of a
+  picked 64 KiB): postcard's varints (postcard.jamesmunns.com, "Wire Format": a tag or u32 at most 5 bytes, a length
+  or u64 at most 10) for the tag, the fates' length, two u64s for each of the most members (`replicated::MEMBERS`)
+  and the span: 1,317 bytes with the 17-byte prefix; a class past the members is refused
+  (`a_class_entry_holds_the_most_members_and_no_more`). A leader proposes it in its term whenever its machine records no class: at bootstrap that is
   the group's first leader; for a group from before this change, the first leader that runs it. Two leaders may
   each propose one. A second entry stating the same class applies as nothing.
 - **Recorded with the state.** A member applies the entry in one transaction with its applied marker. That
@@ -1600,6 +1630,14 @@ take no descriptor.
 **Falsified by:** more than `CONNECTION_MAX` readers out on one replica; readers' charged pages plus the pool's kept
 pages above the pool's budget; a read refused while an idle reader of another replica held the charge it needed;
 a read answered past its deadline.
+
+**Amendment (lane constants, 2026-11-21): the count follows the descriptor budget.** `CONNECTION_MAX` is gone
+(local-owner-transport.md, "Decision (lane constants): one descriptor budget"). Connections are bounded by the
+process's descriptor budget, each holding its socket, so the most clients that can be attached at once is the
+budget's bound, and a replica's readers out at once are at most that, as it stands at each read. Nothing else in this
+decision changes: readers hold no descriptor and charge none, their pages are charged to the page budget, and a read
+past either waits to its deadline. Where `CONNECTION_MAX` is named above, read the budget's bound. AC-T1.10.L2 and
+T-T1.10.L8 say so; the test sets a budget of its own (6) and holds six readers out, the seventh waiting.
 
 ## A replica's database log: copied, bounded, and flushed off the owner (2026-11-09)
 
@@ -2000,9 +2038,11 @@ learns quorum gaps (`patience`), and adds no number. For each member, the leader
 that member's slot to its next forward, and keeps the longest gap of this generation and of the one before
 (`patience::GENERATION`, 30 s). A member's slot is the larger of those two. A retry that arrives after its slot expired
 is still measured, so an expiry teaches the next slot rather than censoring it. Before a member's first measured gap,
-its slot is the core's election timeout in the owner's ticks (`election_tick × TICK`), the derived first value. A gap
-past `patience::QUORUM_CEILING` (owner-stalls.md's measured quorum tail) is refused, typed (`slot::Unmeasured`), and
-not learned: a member that slow is gone, not slow. TICK and the twenty-tick election timeout are the pinned core's
+its slot is the core's election timeout in the owner's ticks (`election_tick × TICK`), the derived first value. No
+number bounds a gap: a gap over which the host's detector suspected its member is refused, typed
+(`slot::Unmeasured::Suspected`), logged (`write_slot_unmeasured`) and not learned: that member was gone, not slow. The
+detector's verdict is learned where it runs; the slot no longer borrows `patience::QUORUM_CEILING`, a tail measured
+once on one host (Ada's word, 2026-11-21: such a value is picked). TICK and the twenty-tick election timeout are the pinned core's
 documented tick mode, not measured. They are noted for amphora-constants, and the slot inherits them only as its
 first value.
 
@@ -2076,3 +2116,29 @@ Falsified by:
   (bench/records/2026-11-07-write-starve-model.md) at the release benchmarks' rates and round trips;
 - a leader that holds its writes past a member's learned length for a write that never comes, or at all for a
   member that never comes back after its refusal.
+
+## Decision (lane constants): one drive a step (2026-11-21)
+
+Ada's rule: no picked numbers. `DRIVE_QUANTUM` (32) bounded how many times one step of the owner drove its replica
+while the drive said there was more to do (`Driven::more`). No measurement made 32.
+
+**What it bounds.** One step of the owner takes one input, ticks if a tick is due, drives, then keeps what waits
+(deadlines, the floor, the class, the slots). A drive takes at most one `Ready` and applies at most one page
+(hyper-durable's own quantum: its `owner.rs`, docs/durable.md section 7). Drives and inputs compete for the owner's
+thread: a long run of drives holds inputs back, a short one holds the replica's work back.
+
+**The decision.** One drive a step, and a step whose drive left more comes again at once, without waiting for an
+input (`Actor::driving`, `run_loop`). The input queue and the replica's drives then take turns one unit each: deficit
+round robin with every quantum at least the largest unit (one `Ready`), which Shreedhar and Varghese prove fair to
+within one unit ("Efficient Fair Queuing Using Deficit Round Robin", SIGCOMM 1995, Theorem 4.5). It is also how
+hyper-durable's own owner turns its replicas. No count is left.
+
+**Cost.** A step's keeping (expiry, settling, the status it publishes) now runs once a drive where it ran once per
+up to 32. `more` is true only while a write slot is free and a `Ready` is due, or while applies wait past a drive's
+page, so the runs are short (the core's depth is 1). The batch's replicated benches measure it.
+
+**Test.** `an_owner_drives_once_a_step_and_steps_again_while_more_waits` (T-DQ.1.1): over an election and 20 writes,
+some step leaves more to drive for the next. A step that drives until nothing is left leaves none.
+
+**Falsified by:** an input waiting more than one drive while the replica has more to drive; the replicated benches'
+commit latency or throughput worse than at 4e74cee beyond their noise.

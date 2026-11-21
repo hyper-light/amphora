@@ -18,6 +18,8 @@
 //!   no checkpoint in a commit's way.
 //! - [`groups`]: a store in groups on one node, keys spread over them by hash, so writes go on in
 //!   parallel.
+//! - [`reshard`]: groups that split, merge and move themselves by measured size and load, fenced,
+//!   by copy, catch-up and a brief cutover (CP-T1.9).
 //! - [`db`]: stores on Amphora's engine (`crates/engine`).
 //! - [`meter`]: what a store counts.
 //! - [`memory`]: the memory this process may use, as the system says (the process's page pool is a
@@ -28,10 +30,12 @@
 pub mod audit;
 pub mod database;
 pub mod db;
+mod descriptors;
 pub mod groups;
 pub mod memory;
 pub mod meter;
 pub mod replication;
+pub mod reshard;
 pub mod sql;
 pub mod store;
 pub mod transport;
