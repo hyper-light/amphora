@@ -800,3 +800,21 @@ tests = [
   { id = "T-G3.2.1", text = "storage::wal::tests::g3_2_* — passes when every page read through each lock-free way (filtered, published, optimistic), at random snapshots while frames are appended, rewound, rolled back, checkpointed and the log restarted, and beside a writer thread, finds the frame the index read under its lock finds, or none" },
   { id = "T-G3.2.2", text = "crates/engine/tests/log_read_index.rs — passes when, after a crash at every write of a checkpoint and of a log restart, every read through each way returns its page's last committed version" },
 ]
+
+# lane g3s3
+
+[[own]]
+id = "G3.3"
+title = "The page path SQLite takes: plain pins, recycled buffers, checksums once (G3 step 3; store.md decision 41)"
+criteria = [
+  { id = "AC-G3.3.1", text = "atomic read-modify-writes per point_pk lookup are at most 2 (perf: atomic instructions per statement; measured by the coordinator)" },
+  { id = "AC-G3.3.2", text = "allocations per point_pk lookup are at most 1 (a counting allocator; measured by the coordinator)" },
+  { id = "AC-G3.3.3", text = "page cache, pager, checksums, atomics and I/O completion together are at most 15% of a point read's user cycles (bench/prof_parts.py; measured by the coordinator)" },
+  { id = "AC-G3.3.4", text = "a byte flipped on disk is still refused when read from the file" },
+]
+tests = [
+  { id = "T-G3.3.1", text = "crates/engine/tests/shared_pages.rs g3s3_readers_on_the_plain_page_path_* — passes when the shared-pages model's reads on the plain path are the model's, on page and mixed logs" },
+  { id = "T-G3.3.2", text = "crates/engine/tests/shared_pages.rs g3s3_each_page_path_reads_the_pages_todays_path_reads — passes when the plain path reads today's rows from the log, the file and memory, with and without shared pages" },
+  { id = "T-G3.3.3", text = "crates/engine/tests/shared_pages.rs g3s3_a_byte_flipped_on_disk_is_refused_on_each_page_path — passes when a fresh connection on each path refuses the flipped page with a checksum error" },
+  { id = "T-G3.3.4", text = "storage::pager::tests::g3s3_plain_pins_count_as_atomic_pins_do — passes when plain pins count as atomic pins do" },
+]

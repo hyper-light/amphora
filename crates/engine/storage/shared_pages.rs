@@ -175,7 +175,7 @@ impl SharedPages {
         found
     }
 
-    /// Amphora (G3 step 3, decision 40): the image of `key` itself, if one is kept, with a count
+    /// Amphora (G3 step 3, decision 41): the image of `key` itself, if one is kept, with a count
     /// on it: the plain page path's lookup, taken once as a page enters a connection's cache, its
     /// later pins that connection's own (PostgreSQL's private refcounts). The image never changes
     /// while counted: a writer copies a shared buffer before it writes (`Pager::add_dirty`).

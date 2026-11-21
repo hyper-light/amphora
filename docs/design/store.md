@@ -1880,3 +1880,45 @@ removed, as the numbers favour. Falsified, as read-path.md has it, if with the l
 settle `point_pk`'s instructions per statement at one client fall by less than 15%, or if
 `table_count` at 32 clients rises less than 3x. The step's own bars: the log's and locks' share of
 point reads at 32 clients is at most 5%, and `point_pk` at 32 clients is at least 4x one client.
+
+## 41. The page path SQLite takes: plain pins, the pool's buffer counted once, misses read in line, checksums once (prototype, behind a switch)
+
+G3 step 3 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), read-path.md fix 2: the page cache and pager
+are 15.6-21.4% of a point read's user cycles at one client, checksums 2.9-4.1%, atomics 1.6-2.3% and
+I/O completion 2.7-3.6%, together 23.0-30.3%; SQLite's page cache and pager are 1.8-4.6% of its own
+(bench/records/2026-10-23-adacachy-read-path.md).
+
+- **What.** `PagePath::Plain` beside today's path (`crates/engine/storage/pager.rs`):
+  - *Plain pins.* A page a connection makes on this path is pinned with a load and a store, no
+    read-modify-write: SQLite's `nRef` (`pcache.c`, `sqlite3PcacheRef`, `sqlite3PcacheRelease`).
+    Only the connection that made a page pins it, one thread at a time; the flag is set when the
+    page is made, never after, so a page's pins are of one kind all its life.
+  - *Shared pages counted once.* A page the pool keeps is taken as the pool's own buffer, its
+    count taken once as the page enters the connection's cache, its later pins the connection's
+    own: PostgreSQL's private refcounts (`bufmgr.c`, `PrivateRefCountEntry`: a backend's first pin
+    touches the shared buffer header, the rest its own array). Today's path copies the image out
+    (decision 29) and the plain path is measured against it. A write copies a shared buffer first
+    (`Pager::add_dirty`, decision 20), so a counted image never changes.
+  - *Misses read in line.* A page the log doesn't hold, from a backend that completes reads in line
+    (`File::pread_inline`: one `pread(2)` on Unix), is read into a buffer from the connection's pool
+    with no completion, closure or wrapper completion for the checksum, as `pcache1` reads into
+    recycled pages; other backends (io_uring, Windows, a codec) answer `None` and read as today.
+    The log's frames are read as today: the log's read path is G3 step 2's (decision 40).
+  - *Checksums once.* Checked as the page enters the process from the file (`read_page_inline`,
+    PostgreSQL's rule: a page is verified as it is read into shared buffers, never while it stays
+    there), then trusted while the pool or the connection's cache keeps it; a page that fails is
+    neither cached nor shared.
+- **Switch.** `AMPHORA_PAGE_PATH=plain` in the environment for every pager the process opens;
+  `Pager::set_page_path` for one connection's.
+- **Not yet.** The miss path still allocates the page (`Arc<Page>`) and its buffer's `Arc`; a cache
+  hit still clones the page's `Arc` (one read-modify-write). The plan's bars (at most 2 atomic
+  read-modify-writes and 1 allocation per `point_pk` lookup) are measured on what this builds first.
+- **Falsified if** the page cache, pager, checksums, atomics and I/O completion together stay above
+  15% of a point read's user cycles with the switch on (read-path.md), or the plain path's point
+  reads are not faster than today's at one client, or counting the pool's buffer once costs more at
+  32 clients than decision 29's copy (perf c2c on the pool's buffers).
+- **Tested.** T-G3.3.1-3 (`crates/engine/tests/shared_pages.rs`, `g3s3_*`): the shared-pages model
+  on the plain path (16 seeds, page and mixed logs); each path reads the rows today's reads, from
+  the log, the file and memory, with and without shared pages; a byte flipped in the file is
+  refused with a checksum error through a fresh connection on each path. T-G3.3.4
+  (`storage::pager::tests::g3s3_plain_pins_count_as_atomic_pins_do`).
