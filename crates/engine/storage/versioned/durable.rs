@@ -23,11 +23,12 @@
 //! sequence number's parity, so a checkpoint never writes over the journal recovery may need.
 
 use super::blink::{Comparator, Descender};
+use super::columns::Feed;
 use super::disk::{Disk, File};
 use super::page::PAGE_SIZE;
 use super::pool::Pool;
 use super::redo::{self, Op, Redo};
-use super::version::{Snapshot, Ts, Txn, Versioned};
+use super::version::{Savepoint, Snapshot, Ts, Txn, Versioned};
 use crate::error::LimboError;
 use crate::sync::{Arc, Mutex, RwLock};
 use crate::Result;
@@ -210,6 +211,9 @@ pub struct Database {
     gate: RwLock<()>,
     /// The last checkpoint's sequence number; held by the checkpoint under way.
     last: Mutex<u64>,
+    /// A column copy's feed, handed each commit's record under the publish lock (G11 decision 1,
+    /// part 2): set once, by [`Database::keep_columns`].
+    columns: std::sync::OnceLock<Arc<Feed>>,
 }
 
 impl Database {
@@ -293,6 +297,7 @@ impl Database {
             redo: Redo::new(current, ends, newest),
             gate: RwLock::new(()),
             last: Mutex::new(stamp.seq),
+            columns: std::sync::OnceLock::new(),
         })
     }
 
@@ -324,6 +329,7 @@ impl Database {
             redo: Redo::new(0, [0, 0], 0),
             gate: RwLock::new(()),
             last: Mutex::new(0),
+            columns: std::sync::OnceLock::new(),
         })
     }
 
@@ -433,13 +439,37 @@ impl Database {
         // rollback a failed append makes, which changes pages.
         let ts = {
             let _changing = self.gate.read();
-            self.v
-                .commit_logged(txn, d, |ts, ops| self.redo.append(ts, ops))?
+            self.v.commit_logged(txn, d, |ts, ops| {
+                self.redo.append(ts, ops)?;
+                if let Some(feed) = self.columns.get() {
+                    feed.offer(ts, ops);
+                }
+                Ok(())
+            })?
         };
         if durable {
             self.redo.sync(&*self.disk, ts)?;
         }
         Ok(ts)
+    }
+
+    /// Rolls `txn` back to `sp` ([`Versioned::rollback_to`]).
+    pub fn rollback_to(&self, d: &mut Descender, txn: &mut Txn, sp: Savepoint) -> Result<()> {
+        let _changing = self.gate.read();
+        self.v.rollback_to(txn, sp, d)
+    }
+
+    /// From the next commit on, hands each commit's record to `feed` as it is appended to the redo
+    /// log (G11 decision 1, part 2). One feed a database: a second is refused.
+    pub fn keep_columns(&self, feed: Arc<Feed>) -> Result<()> {
+        self.columns.set(feed).map_err(|_| {
+            LimboError::InternalError("versioned storage: a column copy is already kept".into())
+        })
+    }
+
+    /// The newest commit published: what a column copy kept as a file must be current as of.
+    pub fn newest(&self) -> Ts {
+        self.v.clock.at_publish(|ts| ts)
     }
 
     pub fn abort(&self, txn: Txn, d: &mut Descender) -> Result<()> {

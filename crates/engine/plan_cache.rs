@@ -52,6 +52,10 @@ pub(crate) struct PlanValues {
     /// By parameter index less one, as `ProgramState::parameters` keeps them.
     bound: Vec<Value>,
     asked: AtomicBool,
+    /// Amphora (PL.9): each table's changes since ANALYZE, which the row counts read, and the
+    /// tables the plan counted, so the statement can tell when they have moved past its estimates.
+    row_changes: crate::sync::OnceLock<crate::sync::Arc<crate::row_changes::RowChanges>>,
+    planned: crate::sync::Mutex<Vec<crate::row_changes::PlannedTable>>,
 }
 
 impl PlanValues {
@@ -64,8 +68,46 @@ impl PlanValues {
     pub(crate) fn bound(bound: Vec<Value>) -> Self {
         Self {
             bound,
-            asked: AtomicBool::new(false),
+            ..Self::default()
         }
+    }
+
+    /// Where the row counts read each table's changes since ANALYZE (PL.9). Set once, at translate.
+    pub(crate) fn attach_row_changes(
+        &self,
+        changes: crate::sync::Arc<crate::row_changes::RowChanges>,
+    ) {
+        let _already_attached = self.row_changes.set(changes);
+    }
+
+    /// The rows `table` holds now by its statistics, ANALYZE's `analyzed_rows` with the changes
+    /// since, noted as a table the plan counted (PL.9). Without the counters attached (a plan made
+    /// outside a connection), ANALYZE's count.
+    pub(crate) fn live_rows(&self, table: &str, analyzed_rows: f64, error: f64) -> f64 {
+        let Some(changes) = self.row_changes.get() else {
+            return analyzed_rows;
+        };
+        let mut planned = self.planned.lock();
+        if let Some(noted) = planned.iter().find(|noted| noted.table == table) {
+            return noted.planned_rows();
+        }
+        let counter = changes.counter(table);
+        let planned_changes = counter.load(crate::sync::atomic::Ordering::Acquire);
+        let noted = crate::row_changes::PlannedTable {
+            table: table.to_string(),
+            counter,
+            analyzed_rows,
+            planned_changes,
+            error,
+        };
+        let rows = noted.planned_rows();
+        planned.push(noted);
+        rows
+    }
+
+    /// The tables the plan counted (PL.9), taken once the statement is planned.
+    pub(crate) fn take_planned(&self) -> Vec<crate::row_changes::PlannedTable> {
+        std::mem::take(&mut *self.planned.lock())
     }
 
     /// The value bound to `variable`, `None` when it has none: the generic plan's, an unbound

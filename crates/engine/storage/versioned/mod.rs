@@ -6,10 +6,17 @@
 //! the current engine stays the default until the comprehensive suite says otherwise. This stage:
 //! the page format ([`page`]), the buffer pool ([`pool`]), B-link trees on it ([`blink`]) and row
 //! versions on them ([`version`]: snapshots, first-writer-wins, rollback, collection); then their
-//! files ([`disk`]), the redo log ([`redo`]), and checkpoints and recovery ([`durable`]); and the
-//! commit validations' Elle-style isolation checks (`elle`, G8 step 1).
+//! files ([`disk`]), the redo log ([`redo`]), and checkpoints and recovery ([`durable`]); the
+//! commit validations' Elle-style isolation checks (`elle`, G8 step 1); and a table's column copy
+//! ([`columns`], G11). Stage 3 begins with the executor's cursor on the trees ([`cursor`]), then
+//! transactions' savepoints ([`version`]), checked against the current engine by the shared model
+//! test of transactions (`txn_model`).
 
 pub mod blink;
+pub mod columns;
+#[cfg(test)]
+mod conformance;
+pub mod cursor;
 pub mod disk;
 pub mod durable;
 #[cfg(test)]
@@ -17,4 +24,6 @@ mod elle;
 pub mod page;
 pub mod pool;
 pub mod redo;
+#[cfg(test)]
+mod txn_model;
 pub mod version;
