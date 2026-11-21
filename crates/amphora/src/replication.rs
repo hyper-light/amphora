@@ -220,6 +220,13 @@ pub struct Machine {
     // A test's hold on this machine's flushes of its database's log.
     #[cfg(test)]
     flush_gate: std::sync::Arc<FlushGate>,
+    // The bytes of the image this machine opened with, its pages as `image` writes them: what the
+    // compaction rule weighs a log never compacted against (`StateMachine::image_bytes`; CT.1).
+    opened_bytes: u64,
+    // The bytes of the last image made, and of every entry applied since the machine opened: what
+    // the owner times its images and its log's replay by (`database::compacting`; CT.1).
+    imaged_bytes: u64,
+    applied_bytes: u64,
     _owner: crate::database::Owned,
 }
 
@@ -482,6 +489,8 @@ impl Machine {
         db.transaction(|db| marker(db, point, &configuration))
             .map_err(unavailable)?;
         db.flusher()().map_err(unavailable)?;
+        let opened_bytes = db.image_bytes().map_err(unavailable)?;
+        let opened_bytes = u64::try_from(opened_bytes).unwrap_or(u64::MAX);
         Ok(Self {
             db,
             point,
@@ -508,6 +517,9 @@ impl Machine {
             digests: None,
             #[cfg(test)]
             flush_gate: std::sync::Arc::default(),
+            opened_bytes,
+            imaged_bytes: 0,
+            applied_bytes: 0,
             _owner: owner,
         })
     }
@@ -515,6 +527,16 @@ impl Machine {
     /// A member that joins catches up by this machine's image once the log no longer reaches
     /// back, and an image is bounded (replication.md, "Membership"): past its ceiling, a joiner
     /// is refused before it is added, never left unable to catch up.
+    /// The bytes of the last image this machine made (CT.1).
+    pub(crate) fn imaged_bytes(&self) -> u64 {
+        self.imaged_bytes
+    }
+    /// The bytes of every entry this machine applied since it opened, as the core counts an
+    /// entry's (CT.1).
+    pub(crate) fn applied_bytes(&self) -> u64 {
+        self.applied_bytes
+    }
+
     pub(crate) fn admits_joiner(&mut self) -> Result<(), Refusal> {
         let size = self.db.image_bytes().map_err(unavailable)?;
         api::bound(
@@ -1010,6 +1032,7 @@ impl StateMachine for Machine {
         if entry.index <= self.point.index {
             return Err(failed("a committed entry was applied twice"));
         }
+        self.applied_bytes = self.applied_bytes.saturating_add(entry.encoded_bytes());
         let at = Point {
             index: entry.index,
             term: entry.term,
@@ -1155,10 +1178,14 @@ impl StateMachine for Machine {
         )
         .map_err(failed)?;
         into.extend_from_slice(&bytes);
+        self.imaged_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         Ok((self.point, self.configuration.clone()))
     }
+    /// The image this machine opened with, its pages' bytes (the postcard framing a page's id and
+    /// length add is not counted): asked when a member opens on a log never compacted, so the log
+    /// is weighed against the state it opened with (CT.1).
     fn image_bytes(&self) -> Option<u64> {
-        None
+        Some(self.opened_bytes)
     }
     fn install(&mut self, image: &[u8], at: Point, configuration: &ConfState) -> Result<(), Fatal> {
         api::bound(

@@ -793,6 +793,10 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     // What this owner's restarts of its database's log held, against what it applied
     // (replication.md, "A replica's database log bounded by what it measures").
     spacing: log_bound::Spacing,
+    // What this owner's images and its log's replay cost a byte, which its compactions follow
+    // (replication.md, "Decision (lane constants): the compaction's expansion learned where it
+    // runs"; CT.1).
+    compacting: super::compacting::Costs,
     // While the database's log is past its room: why, for the submits this member refuses.
     log_full: Option<String>,
     // The input queued as this step began, its own envelope among it: what a restart in the
@@ -1017,6 +1021,11 @@ fn room(
 /// An owner's time, from its shell: the real clock for the owner thread, one its test moves for a
 /// test shell.
 type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+/// The nanoseconds from `from` to `to` on the owner's clock, none if it went back.
+fn nanos_between(from: Instant, to: Instant) -> u64 {
+    u64::try_from(to.saturating_duration_since(from).as_nanos()).unwrap_or(u64::MAX)
+}
 
 fn fenced(reason: impl std::fmt::Display) -> Refusal {
     Refusal::Fenced(reason.to_string())
@@ -1584,6 +1593,7 @@ fn open_on<F: BlockFile + 'static>(
         serial: 0,
         transferred: None,
         spacing: log_bound::Spacing::default(),
+        compacting: super::compacting::Costs::default(),
         log_full: None,
         step_queued: 0,
         answers: patience::Answers::new(election),
@@ -2077,10 +2087,15 @@ impl<F: BlockFile + 'static> Actor<F> {
         // leaves more steps again at once (`run_loop`).
         let mut output = Output::default();
         let nanos = self.now()?;
+        let (began, applying) = ((self.clock)(), self.replica.machine().applied_bytes());
         let driven = self
             .replica
             .drive(nanos, &self.waker, &mut output)
             .map_err(raft_error)?;
+        // What the drive applied, and the time it took: a byte of log's replay (CT.1).
+        let replayed = self.replica.machine().applied_bytes().saturating_sub(applying);
+        self.compacting
+            .replayed(replayed, nanos_between(began, (self.clock)()));
         if let Some((submitted, taken)) = driven.flushed {
             self.pace.flushed(submitted, taken);
         }
@@ -2124,13 +2139,24 @@ impl<F: BlockFile + 'static> Actor<F> {
                 "bootstrap exhausted replication log admission before publication",
             ));
         }
+        // The log is due by Ongaro's rule at the expansion this owner learned from its own images
+        // and replays (`compacting`; replication.md, "Decision (lane constants): the compaction's
+        // expansion learned where it runs"; CT.1), or at once while it stalls admission: a
+        // compaction is what frees its room.
         if !self.replica.machine().bootstrap_pending()
-            && (self.replica.compactable_bytes() >= 128 << 20 || self.replica.is_stalled())
+            && (self.replica.compaction_due(self.compacting.rule()) || self.replica.is_stalled())
         {
             let nanos = self.now()?;
-            self.replica
+            let began = (self.clock)();
+            let imaged = self
+                .replica
                 .compact(0, nanos, &self.waker)
                 .map_err(raft_error)?;
+            if imaged {
+                let bytes = self.replica.machine().imaged_bytes();
+                self.compacting
+                    .imaged(bytes, nanos_between(began, (self.clock)()));
+            }
         }
         #[cfg(test)]
         if let Some(stalls) = &self.stalls {
