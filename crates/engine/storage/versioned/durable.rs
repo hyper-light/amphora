@@ -1022,7 +1022,8 @@ mod tests {
                 }
             }
             disk.power_cut().unwrap();
-            let db = Database::open(disk.clone(), 4_000, 1, cmp).unwrap();
+            let db = Database::open(disk.clone(), 4_000, 1, cmp)
+                .unwrap_or_else(|e| panic!("crash {crash}: reopen: {e}"));
             let got = rows(&db);
             let mut state: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
             let mut prefixes = vec![state.clone()];
