@@ -2146,10 +2146,13 @@ impl<F: BlockFile + 'static> Actor<F> {
         // The log is due by Ongaro's rule at the expansion this owner learned from its own images
         // and replays (`compacting`; replication.md, "Decision (lane constants): the compaction's
         // expansion learned where it runs"; CT.1), or at once while it stalls admission: a
-        // compaction is what frees its room.
-        if !self.replica.machine().bootstrap_pending()
-            && (self.replica.compaction_due(self.compacting.rule()) || self.replica.is_stalled())
-        {
+        // compaction is what frees its room. An image past its budget is refused (`SNAPSHOT_BYTES`),
+        // so a due compaction waits for one within it; a stall still compacts, and fences on it.
+        let ready = !self.replica.machine().bootstrap_pending();
+        let due = ready
+            && self.replica.compaction_due(self.compacting.rule())
+            && self.replica.machine_mut().image_fits()?;
+        if due || (ready && self.replica.is_stalled()) {
             let nanos = self.now()?;
             let began = (self.clock)();
             let imaged = self

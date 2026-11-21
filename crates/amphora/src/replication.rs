@@ -574,6 +574,12 @@ impl Machine {
     /// A member that joins catches up by this machine's image once the log no longer reaches
     /// back, and an image is bounded (replication.md, "Membership"): past its ceiling, a joiner
     /// is refused before it is added, never left unable to catch up.
+    /// Whether an image of the database now is within this machine's image budget: past it,
+    /// `image` refuses, and a compaction, which needs one, waits (CT.1).
+    pub(crate) fn image_fits(&mut self) -> Result<bool, Refusal> {
+        let size = self.db.image_bytes().map_err(unavailable)?;
+        Ok(size <= self.snapshot_bytes)
+    }
     /// The bytes of the last image this machine made (CT.1).
     pub(crate) fn imaged_bytes(&self) -> u64 {
         self.imaged_bytes
