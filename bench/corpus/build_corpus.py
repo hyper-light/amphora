@@ -49,12 +49,6 @@ TAGGER = None
 WRITTEN = None  # written/index.json: file -> the entry its cases were written for, and their first line
 
 
-def type_key(feats, shape):
-    """A query type: its shape and the entries it exercises, keywords aside (the syntax they make is
-    already there)."""
-    return json.dumps([list(shape), sorted(x for x in feats if not x.startswith("keyword:"))])
-
-
 def text_hash(sql):
     return int.from_bytes(hashlib.blake2b(" ".join(sql.split()).encode(), digest_size=8).digest(), "big")
 
@@ -79,7 +73,7 @@ class Tally:
             s = self.distinct.setdefault(e, set())
             if len(s) < CAP:
                 s.add(h)
-        k = type_key(feats, shape)
+        k = tagmod.type_key(feats, shape)
         if k in self.types:
             self.types[k][0] += 1
         else:

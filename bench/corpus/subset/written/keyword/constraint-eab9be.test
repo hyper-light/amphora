@@ -1,0 +1,65 @@
+hash-threshold 8
+
+# written for keyword:CONSTRAINT: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+statement ok
+CREATE TABLE ks1(a INTEGER CONSTRAINT pk PRIMARY KEY, b TEXT CONSTRAINT nn NOT NULL CONSTRAINT dflt DEFAULT 'd')
+
+statement ok
+INSERT INTO ks1(a) VALUES (1)
+
+statement error
+INSERT INTO ks1(a, b) VALUES (2, NULL)
+
+statement ok
+CREATE TABLE ks2(a, b, CONSTRAINT u_ab UNIQUE (a, b), CONSTRAINT ck CHECK (a < b))
+
+statement ok
+INSERT INTO ks2 VALUES (1, 2)
+
+statement error
+INSERT INTO ks2 VALUES (1, 2)
+
+statement error
+INSERT INTO ks2 VALUES (3, 2)
+
+statement ok
+CREATE TABLE ks3(a CONSTRAINT c1 CHECK (a > 0) CONSTRAINT c2 CHECK (a < 10))
+
+statement error
+INSERT INTO ks3 VALUES (11)
+
+statement ok
+INSERT INTO ks3 VALUES (5)
+
+query IT nosort
+SELECT a, b FROM ks1 ORDER BY a
+----
+1
+d
+
+statement ok
+CREATE TABLE ks4(a, CONSTRAINT fk FOREIGN KEY (a) REFERENCES ks1(a))
+
+statement error
+CREATE TABLE ks5(a CONSTRAINT)
+
+statement ok
+CREATE TABLE ks6(a CONSTRAINT x COLLATE NOCASE)
+
+query I rowsort
+SELECT count(*) FROM ks2
+----
+1
