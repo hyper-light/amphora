@@ -129,3 +129,32 @@ against rows that differ; the counters say one of each. T-T1.12.C2: the cadence 
 
 **Falsified by.** A check that passes on an archive whose restore differs from the source at that
 second; a check that never comes due while bases land.
+
+## One cut across groups
+
+**Decision.** Several groups restore to one second by restoring each group's archive to that second
+and then finishing every cross-group transaction the cut left half-done exactly as a crashed
+coordinator's are finished (docs/design/xgroup.md, "Crashes"): `backup::restore_cut` opens the
+coordinator's next incarnation over the restored groups, which scans every group and commits or
+aborts each transaction by its anchor's decision record (no record: aborted; under Parallel
+Commits, a staging record commits only if every intent is there). The cut needs no protocol of its
+own: a restore to a second is a crash at that second, and the protocol already survives a crash at
+every step. This is the consistent cut Chandy and Lamport define ("Distributed Snapshots", ACM TOCS
+3(1), 1985): no group holds the effect of a decision another group's cut has not yet reached once the
+records finish it.
+
+- **The groups' clocks.** A cut is one second in every group, so every group's commits must be
+  stamped by one clock. Groups on one node share it. Across nodes, a participant's intent stamped
+  later than its anchor's decision by clock skew would be cut away while the decision stays: open,
+  not built (the stamps would need a bound on skew, as Spanner's commit wait gives, or a hybrid
+  logical clock carried in each step).
+
+**Evidence.** T-T1.12.X1: two groups backed up to one folder under a clock that moves a second at
+every reading, so every commit in either group has its own second; two transactions across both
+groups; then both restored to every second from their first bases to the end, under two-phase
+commit and under Parallel Commits. At every cut the two keys are both absent, both the first
+transaction's or both the second's, never moving back, the last cut holding the second's, and some
+cut between the two (non-vacuous).
+
+**Falsified by.** A cut at which one group holds a transaction's write and another doesn't after
+`restore_cut`; a cut whose restore is refused while each group's archive holds the second whole.
