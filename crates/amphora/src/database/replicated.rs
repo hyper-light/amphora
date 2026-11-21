@@ -760,6 +760,15 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     // While set, this leader holds no write slot: today's rule alone, a test's control.
     #[cfg(test)]
     slot_off: bool,
+    // While set, this leader moves no stale base by its read set: the exact base alone, a test's
+    // control; and the mutant the isolation checks must catch, which moves every one unchecked.
+    #[cfg(test)]
+    read_sets_off: bool,
+    #[cfg(test)]
+    read_sets_unchecked: bool,
+    // Stale bases this leader moved by their read sets. Read by tests: non-vacuity.
+    #[cfg(test)]
+    read_sets_moved: u64,
     // The leader's writes made in its turn after a slot, and those refused as stale; and the one
     // in flight. Read by tests: a turn is a turn in fact.
     #[cfg(test)]
@@ -1512,6 +1521,12 @@ fn open_on<F: BlockFile + 'static>(
         class_held: false,
         #[cfg(test)]
         slot_off: false,
+        #[cfg(test)]
+        read_sets_off: false,
+        #[cfg(test)]
+        read_sets_unchecked: false,
+        #[cfg(test)]
+        read_sets_moved: 0,
         #[cfg(test)]
         turns: (0, 0),
         #[cfg(test)]
@@ -2768,6 +2783,18 @@ impl<F: BlockFile + 'static> Actor<F> {
                 _ => {}
             }
         }
+        let mut message = message;
+        if self.replica.is_leader()
+            && message.msg_type == hyper_raft::proto::MessageType::MsgPropose
+        {
+            let log = self.replica.core().raft.log();
+            let last = log.last_index().map_err(unavailable)?;
+            let before = Point {
+                index: last,
+                term: log.term(last).map_err(unavailable)?,
+            };
+            self.rebase_forward(&mut message, before)?;
+        }
         self.replica.step(message).map_err(raft_error)
     }
     /// Steps a member's forwarded proposal into the leading core, and tells the slot what it
@@ -2777,13 +2804,14 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// property, Ongaro and Ousterhout, USENIX ATC 2014, figure 3) and the slots die with the
     /// term, so the refusal seen at the append is the one the commit decides; seen here, it
     /// comes before any member can learn of it (amphora-seam-owner-2's ruling, Q2).
-    fn step_forward(&mut self, from: u64, message: Message) -> Result<(), Refusal> {
+    fn step_forward(&mut self, from: u64, mut message: Message) -> Result<(), Refusal> {
         let log = self.replica.core().raft.log();
         let last = log.last_index().map_err(unavailable)?;
         let mut before = Point {
             index: last,
             term: log.term(last).map_err(unavailable)?,
         };
+        self.rebase_forward(&mut message, before)?;
         let term = self.replica.term();
         let mut refused = false;
         for entry in &message.entries {
@@ -2811,6 +2839,87 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.slots.refused(from);
         }
         Ok(())
+    }
+    /// The write `data`, prepared on a base older than `before`, with its base moved to `before`
+    /// if no entry the leader's log holds after its base wrote a page it read or wrote; `None`
+    /// leaves it to the exact base, which refuses it at apply. The walk is over the log between
+    /// the base and `before`, which the log's own bound bounds, one entry at a time, ending at the
+    /// first conflict (replication.md, "A follower's write that read nothing written since its
+    /// base: read sets"; goal ceea4e0a).
+    fn rebase(&mut self, data: &[u8], before: Point) -> Result<Option<Vec<u8>>, Refusal> {
+        use crate::replication::readsets;
+        let Some(write) = readsets::Write::decode(data) else {
+            return Ok(None);
+        };
+        if write.base.index >= before.index {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        if self.read_sets_off {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        if self.read_sets_unchecked {
+            self.read_sets_moved += 1;
+            return Ok(write.rebased(data, before));
+        }
+        // A leader without the closed time's table holds no write that carries a read set
+        // (`Machine::prepare_db`): its refusal leaves the write to the exact base.
+        let Ok(applied) = self.replica.machine().applied_pages() else {
+            Self::read_set_event("unknown_base", write.base, before);
+            return Ok(None);
+        };
+        let log = self.replica.core().raft.log();
+        let held = log.first_index().map_err(unavailable)?.saturating_sub(1);
+        if write.base.index < held
+            || log.term(write.base.index).map_err(unavailable)? != write.base.term
+        {
+            Self::read_set_event("unknown_base", write.base, before);
+            return Ok(None);
+        }
+        let bound = u64::try_from(crate::replication::COMMAND_BYTES).unwrap_or(u64::MAX);
+        let high = before.index.saturating_add(1);
+        let mut low = write.base.index.saturating_add(1);
+        while low < high {
+            let entries = log.slice(low, high, bound).map_err(unavailable)?;
+            let Some(last) = entries.last().map(|entry| entry.index) else {
+                return Ok(None);
+            };
+            for entry in &entries {
+                let wrote = if entry.entry_type == hyper_raft::proto::EntryType::EntryNormal {
+                    readsets::wrote(&entry.data)
+                } else {
+                    readsets::Wrote::Opaque
+                };
+                if !write.untouched_by(&wrote, &applied) {
+                    Self::read_set_event("conflict", write.base, before);
+                    return Ok(None);
+                }
+            }
+            low = last.saturating_add(1);
+        }
+        Self::read_set_event("rebased", write.base, before);
+        #[cfg(test)]
+        {
+            self.read_sets_moved += 1;
+        }
+        Ok(write.rebased(data, before))
+    }
+    /// A member's forwarded proposal, at the leader: one write forwarded alone appends right after
+    /// `before`, the leader's last entry, so a stale base that read nothing written since moves
+    /// to it (`readsets`).
+    fn rebase_forward(&mut self, message: &mut Message, before: Point) -> Result<(), Refusal> {
+        if let [entry] = message.entries.as_mut_slice()
+            && entry.entry_type == hyper_raft::proto::EntryType::EntryNormal
+            && let Ok(Err(_)) = crate::replication::verdict(&entry.data, before)
+            && let Some(data) = self.rebase(&entry.data, before)?
+        {
+            entry.data = data;
+        }
+        Ok(())
+    }
+    fn read_set_event(outcome: &'static str, base: Point, before: Point) {
+        tracing::debug!(target: "amphora.replication", event = "replication.read_set", outcome, base = base.index, before = before.index, "a write prepared on an older base was checked against its read set");
     }
     /// Steps what the write slot released, in the order it arrived. At a member that no longer
     /// leads, none is stepped: its core would forward it again under its sender's name, which
@@ -14144,6 +14253,8 @@ mod tests {
         unknown: u64,
         // The leader's writes in its turn after a slot, and those refused.
         turns: (u64, u64),
+        // Stale bases the leader moved by their read sets.
+        moved: u64,
     }
     type Answering = mpsc::Receiver<Result<Answer, Refusal>>;
     fn list(db: &mut Db, key: u64) -> anyhow::Result<Vec<String>> {
@@ -14170,6 +14281,24 @@ mod tests {
         keys: u64,
         ops: u64,
     ) -> ListRun {
+        list_append_run_with(writers, slot_off, ReadSets::On, seed, keys, ops)
+    }
+    /// How a list-append run's leader treats read sets: as built, off (the exact base alone), or
+    /// the mutant that moves every stale base unchecked.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum ReadSets {
+        On,
+        Off,
+        Unchecked,
+    }
+    fn list_append_run_with(
+        writers: &[usize],
+        slot_off: bool,
+        read_sets: ReadSets,
+        seed: u64,
+        keys: u64,
+        ops: u64,
+    ) -> ListRun {
         let dir = tempfile::tempdir().unwrap();
         let mut driven = Driven::new();
         let clients: Vec<Client> = (1..=3)
@@ -14191,6 +14320,8 @@ mod tests {
             .unwrap();
         driven.tick(&mut pump, leader);
         driven.owner_mut(leader).slot_off = slot_off;
+        driven.owner_mut(leader).read_sets_off = read_sets == ReadSets::Off;
+        driven.owner_mut(leader).read_sets_unchecked = read_sets == ReadSets::Unchecked;
         pump.delay = Some(Delay::new(seed, 3));
         let mut state = seed;
         let mut history: Vec<Append> = Vec::new();
@@ -14203,6 +14334,7 @@ mod tests {
             streak: vec![0; writers.len()],
             unknown: 0,
             turns: (0, 0),
+            moved: 0,
         };
         let mut rounds = 0;
         while run.committed.iter().any(|done| *done < ops) {
@@ -14275,6 +14407,7 @@ mod tests {
             .collect();
         run.violations = list_violations(&history, &finals);
         run.turns = driven.owner(leader).turns;
+        run.moved = driven.owner(leader).read_sets_moved;
         driven.drain(&mut pump);
         pump.finish();
         run
@@ -14527,6 +14660,168 @@ mod tests {
             driven.drain(&mut pump);
             pump.finish();
         }
+    }
+
+    /// T-T1.8.R4 (AC-T1.8.R1; goal ceea4e0a): a follower's write that read nothing written since
+    /// its base lands on its first try. Do, with the write slot off so read sets act alone: the
+    /// follower's write to table `u` forwarded and held in transit while the leader appends a
+    /// write of its own to table `t` on the same base, then let through; then the same with both
+    /// writing `t`. Expect, with read sets on: the first applied (its base moved, counted), the
+    /// second refused, stale, as its page changed. With read sets off: both refused.
+    #[test]
+    fn r4_a_follower_write_on_pages_nothing_since_wrote_lands_on_its_first_try() {
+        for off in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut driven = Driven::new();
+            let clients: Vec<Client> = (1..=3)
+                .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+                .collect();
+            let mut pump = Pump::new(&clients);
+            let leader = driven.elect(&mut pump, &clients, 0, 1);
+            assert_eq!(leader, 0);
+            driven
+                .call(&mut pump, &clients[0], |db| {
+                    db.exec("CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)")?;
+                    db.exec("CREATE TABLE u(k INTEGER PRIMARY KEY, v TEXT)")?;
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            driven.tick(&mut pump, leader);
+            driven.owner_mut(leader).slot_off = true;
+            driven.owner_mut(leader).read_sets_off = off;
+            let last = |driven: &Driven| {
+                driven
+                    .owner(0)
+                    .replica
+                    .core()
+                    .raft
+                    .log()
+                    .last_index()
+                    .unwrap()
+            };
+            let mut outcomes = Vec::new();
+            for (attempt, table) in [(0u64, "u"), (1, "t")] {
+                pump.begin_captures(leader, 1);
+                let follower = submit(&clients[1], driven.until(), move |db| {
+                    db.exec(&format!(
+                        "INSERT INTO {table} VALUES ({}, 'follower')",
+                        10 + attempt
+                    ))?;
+                    Ok(Vec::new())
+                });
+                for _ in 0..ROUNDS {
+                    if pump.captures_ready() {
+                        break;
+                    }
+                    driven.round(&mut pump);
+                }
+                assert!(pump.captures_ready(), "off {off} attempt {attempt}");
+                let before = last(&driven);
+                let own = submit(&clients[0], driven.until(), move |db| {
+                    db.exec(&format!(
+                        "INSERT INTO t VALUES ({}, 'leader')",
+                        20 + attempt
+                    ))?;
+                    Ok(Vec::new())
+                });
+                for _ in 0..ROUNDS {
+                    if last(&driven) > before {
+                        break;
+                    }
+                    driven.round(&mut pump);
+                }
+                assert!(last(&driven) > before, "off {off} attempt {attempt}");
+                pump.release_captures();
+                outcomes.push(driven.settle(&mut pump, &follower));
+                assert_eq!(
+                    driven.settle(&mut pump, &own),
+                    Ok(Vec::new()),
+                    "off {off} attempt {attempt}: the leader's write"
+                );
+            }
+            let stale = |outcome: &Result<Vec<u8>, Refusal>| matches!(outcome, Err(Refusal::Invalid { what, .. }) if what == "prepared transaction");
+            let moved = driven.owner(leader).read_sets_moved;
+            if off {
+                assert!(outcomes.iter().all(stale), "read sets off: {outcomes:?}");
+                assert_eq!(moved, 0);
+            } else {
+                assert_eq!(outcomes[0], Ok(Vec::new()), "read sets on: {outcomes:?}");
+                assert!(stale(&outcomes[1]), "read sets on: {outcomes:?}");
+                assert_eq!(moved, 1, "the first write's base moved, the second's not");
+                let rows = |driven: &mut Driven, owner: usize| {
+                    driven
+                        .owner_mut(owner)
+                        .replica
+                        .machine_mut()
+                        .read_db(|db| {
+                            let mut out = Vec::new();
+                            db.query_owned(
+                                "SELECT k FROM u UNION ALL SELECT k FROM t ORDER BY 1",
+                                [],
+                                |row| {
+                                    out.push(row.get::<i64>(0)?);
+                                    Ok(true)
+                                },
+                            )?;
+                            Ok(out)
+                        })
+                        .unwrap()
+                };
+                driven.quiet(&mut pump);
+                for owner in 0..3 {
+                    assert_eq!(rows(&mut driven, owner), vec![10, 20, 21], "member {owner}");
+                }
+            }
+            driven.quiet(&mut pump);
+            driven.drain(&mut pump);
+            pump.finish();
+        }
+    }
+
+    /// T-T1.8.R5 (AC-T1.8.R2; Elle's list-append): read sets keep every history serializable,
+    /// alone and under the write slot. Do: the leader and two followers each append 15 times to
+    /// 32 lists spread over pages, then to two hot lists, every record delayed up to three relay
+    /// rounds, three seeds each, with the slot off and on. Expect: replicas equal, each list its
+    /// serial replay, no G0, G1c or G2 cycle, none unknown; some base moved (non-vacuity). The
+    /// mutant that moves every stale base unchecked is caught: some run of it breaks the history.
+    #[test]
+    fn r5_read_sets_keep_every_list_append_history_serializable() {
+        let mut moved = 0;
+        for slot_off in [true, false] {
+            for keys in [32, 2] {
+                for seed in 1..=3 {
+                    let run =
+                        list_append_run_with(&[0, 1, 2], slot_off, ReadSets::On, seed, keys, 15);
+                    eprintln!(
+                        "read sets, slot off {slot_off} keys {keys} seed {seed}: committed {:?} refused {:?} in a row {:?} moved {}",
+                        run.committed, run.refused, run.streak, run.moved
+                    );
+                    assert!(
+                        run.violations.is_empty(),
+                        "slot off {slot_off} keys {keys} seed {seed}: {:?}",
+                        run.violations
+                    );
+                    assert_eq!(
+                        run.unknown, 0,
+                        "slot off {slot_off} keys {keys} seed {seed}"
+                    );
+                    moved += run.moved;
+                }
+            }
+        }
+        assert!(
+            moved > 0,
+            "no base moved: the runs never exercised read sets"
+        );
+        let caught = (1..=3).any(|seed| {
+            let run = list_append_run_with(&[0, 1, 2], true, ReadSets::Unchecked, seed, 2, 15);
+            eprintln!(
+                "unchecked seed {seed}: moved {} violations {:?}",
+                run.moved, run.violations
+            );
+            !run.violations.is_empty()
+        });
+        assert!(caught, "the isolation checks missed the unchecked mutant");
     }
 
     /// T-T1.8.W2 (AC-T1.8.W1): two followers and a leader all writing steadily, none missing.

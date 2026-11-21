@@ -2251,3 +2251,63 @@ some step leaves more to drive for the next. A step that drives until nothing is
 
 **Falsified by:** an input waiting more than one drive while the replica has more to drive; the replicated benches'
 commit latency or throughput worse than at 4e74cee beyond their noise.
+
+## A follower's write that read nothing written since its base: read sets (built 2026-11-21, Amphora goal ceea4e0a)
+
+D of goal 9c63f7d4, on top of the write slot (above). In the release A/B, D halved G's write gaps
+(bench/records/2026-11-09-write-starve-*; docs/research/follower-write-starvation.md). The slot makes a refused write's
+next try land; read sets keep most writes from being refused at all, when they touched pages nothing since wrote.
+
+**The read set.** The pager records the pages a prepared session reads (`Pager::record_access`, from its `BEGIN
+IMMEDIATE` to before its capture, which reads every dirty page again). The write states what it did to page 1: nothing,
+only the database's size and the checksum trailer (an allocation), or more. The record's bound is the entry's own
+bound in bytes, since each page number takes at least one byte in the entry: a session that read more could not carry
+its read set, and goes without one.
+
+**On the wire: append-only.** The read set rides after the write's `Prepared` encoding, as a postcard trailer
+(`replication::readsets`). A binary from before it decodes the `Prepared` and ignores what follows (postcard's
+`from_bytes` reads a value's prefix), so a mixed group decides every entry the same way. A write whose trailer would
+pass the entry's bound goes without one: the exact base decides it.
+
+**The leader decides, once.** As the leader steps a member's forwarded write (`step_forward`), the entry before the
+append is its own last entry. If the write's base is older, the leader walks its log from the entry after the base to
+that last entry. If none wrote a page the write read or wrote, it moves the write's base to its last entry, rewriting
+the two numbers in place. Every member then applies the entry by the exact base, as before, so no member keeps state of
+its own for the decision and none can decide it differently: a restart, an image or a binary from before changes
+nothing. That is Kung and Robinson's backward validation (research f4, f5), over pages. An entry that no page list
+describes (a change of members, a class entry, a seed, one the leader can't read) conflicts. Every apply writes the
+replica's marker table and the closed time's table ("Follower reads at a closed time"), so a write that read or wrote
+either page conflicts with every entry. The leader reads a write inside its proposer's closed-time stamp, and moving its
+base keeps the stamp as it was. The group's first stamped entry makes the closed time's table at apply, a schema change
+no page list shows, so a follower carries a read set only on a base whose state already has that table. Entries refused
+at their own apply still count as written: conservative, never unsound.
+
+**Page 1 merges its size.** Every session reads page 1. An entry that changed it only in the size conflicts only with
+a write that writes page 1 too; one that changed more of it (the schema, its cookie, the free list) conflicts with
+every write, whether or not the write's record caught its read of page 1. Two allocations from one base would allocate the same page, which conflicts on that
+page anyway. An entry with no read set that wrote page 1 counts as more than a size change.
+
+**The window is derived.** It is the leader's log between the write's base and the append, bounded by the log's own
+bound: what it holds since its last compaction. A base the log no longer holds, or whose term differs from the log's, is left to the exact base,
+which refuses it. There is no window constant and no cap on age. The walk reads the log in slices of one command's
+bytes and ends at the first conflict. A write forwarded with others in one message is left to the exact base.
+
+**Why it is serializable.** A write admitted this way read, at its base, exactly what it would have read at the
+leader's last entry: no page it read changed in between, and page 1 changed at most in the size, which it didn't
+write. Its pages overwrite none that changed. So it is equivalent to the same session run at the entry before it.
+
+**Observability.** A debug event `replication.read_set` (`outcome` = rebased, conflict or unknown_base, with the base
+and the leader's last index). The names go to Kiln Metrics before any metric is added.
+
+**Requirements and tests.** AC-T1.8.R1 to R3 (docs/requirements.toml):
+- T-T1.8.R1 to R3, the core's tests in `replication::readsets`;
+- T-T1.8.R4, `r4_a_follower_write_on_pages_nothing_since_wrote_lands_on_its_first_try`, an interleaving the test
+  builds with the slot off: the follower's write on another table lands on its first try, one on the leader's table is
+  refused, and with read sets off both are refused;
+- T-T1.8.R5, `r5_read_sets_keep_every_list_append_history_serializable`, Elle's list-append runs with the slot off and
+  on. The mutant that moves every stale base unchecked must be caught there.
+The W tests run with read sets on.
+
+Falsified by: a non-serializable history with read sets on; a release A/B against G where read sets don't cut G's
+write gaps; a `conflict` share near one on workloads whose writes touch different pages (the read set too wide: the
+recorder catching reads the session didn't make).
