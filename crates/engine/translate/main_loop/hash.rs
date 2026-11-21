@@ -466,7 +466,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                 collations: config.collations,
                 payload_start_reg,
                 num_payload,
-                track_matched: planner.hash_join_op.join_type.keeps_unmatched_build_rows(),
+                track_matched: planner.hash_join_op.join_type.tracks_matched(),
             }),
         });
         if config.use_bloom_filter {
@@ -678,8 +678,9 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         let hash_table_id: usize = build_table.internal_id.into();
         let num_keys = self.hash_join_op.join_keys.len();
 
-        // A prior probe pass must not hide unmatched build rows in this pass.
-        if self.hash_join_op.join_type.keeps_unmatched_build_rows() {
+        // A prior probe pass must not hide unmatched build rows in this pass, nor a semi join's
+        // build rows matched in it.
+        if self.hash_join_op.join_type.tracks_matched() {
             self.program
                 .emit_insn(Insn::HashResetMatched { hash_table_id });
         }

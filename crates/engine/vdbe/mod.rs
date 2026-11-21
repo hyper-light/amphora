@@ -2948,6 +2948,11 @@ impl Program {
             let transaction_finished = self.connection.auto_commit.load(Ordering::SeqCst)
                 && self.connection.get_tx_state() == TransactionState::None;
             if transaction_finished {
+                // Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage's transaction ends
+                // where the pager's does.
+                if let Some(switch) = self.connection.versioned.as_ref() {
+                    switch.finish(rollback)?;
+                }
                 // Finalize the in-memory TEMP schema only when the outer
                 // transaction actually finishes. Updating the committed temp
                 // snapshot after every statement inside an explicit

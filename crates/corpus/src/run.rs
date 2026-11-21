@@ -35,9 +35,17 @@ pub trait Engine {
         rows: usize,
         until: Option<Instant>,
     ) -> Result<Vec<Vec<Value>>, Stop>;
-    /// Copies the log into the database and empties it; an error says the steady state wasn't
-    /// reached.
-    fn settle(&mut self) -> Result<(), String>;
+    /// Copies the log into the database and empties it, stopped at `until` as a statement is
+    /// ([`Stop::PastBudget`]); a refusal says the steady state wasn't reached.
+    fn settle(&mut self, until: Option<Instant>) -> Result<(), Stop>;
+    /// For an engine whose answers can't carry every text whole (a shell writing values between
+    /// separators with no escapes: Turso's list mode), how many rows `sql` answers, by the engine's
+    /// own count; None for an engine whose answers read whole. A disagreeing answer whose rows read
+    /// back as more or fewer than that, or as rows of the wrong width, held a separator or a line
+    /// end in its text: it is unreadable, not a disagreement (G2 step 4).
+    fn recount(&mut self, _sql: &str, _until: Option<Instant>) -> Option<Result<u64, Stop>> {
+        None
+    }
     /// Whether stopping a statement ended the engine's database (a shell's process stopped): the
     /// file's later records aren't run (Unreached).
     fn ended(&self) -> bool {
@@ -62,6 +70,9 @@ pub enum Outcome {
     Unreached,
     /// The record ran past its bound and the engine stopped it.
     PastBudget,
+    /// The engine's answer can't be read back as it wrote it (text holding its separators, which
+    /// its output doesn't escape): neither an agreement nor a disagreement.
+    Unreadable(String),
     /// The record has no translation into the engine's dialect, or it disagrees after a statement
     /// of the file (or its fixture) that has none or that the engine refused in its dialect, which
     /// it may rest on: not a disagreement (G2 step 4).
@@ -107,6 +118,8 @@ pub struct Counts {
     pub unsettled: u64,
     /// Records with no translation into the engine's dialect, or resting on one that has none.
     pub untranslatable: u64,
+    /// Answers the engine's output couldn't carry whole (Outcome::Unreadable).
+    pub unreadable: u64,
 }
 
 /// Runs `text` (after `fixture`'s statements, a file of tables a source's files share) on `engine`,
@@ -235,10 +248,17 @@ pub fn run_file(
                 sort,
                 expected,
             } => {
+                // The settle is bounded as the record is: a settle past it stops the record.
+                let mut settled = Ok(());
                 if dirty {
-                    if engine.settle().is_err() {
-                        counts.unsettled = counts.unsettled.saturating_add(1);
-                    }
+                    settled = match engine.settle(until) {
+                        Err(Stop::PastBudget) => Err(Stop::PastBudget),
+                        Err(Stop::Refused(_)) => {
+                            counts.unsettled = counts.unsettled.saturating_add(1);
+                            Ok(())
+                        }
+                        Ok(()) => Ok(()),
+                    };
                     dirty = !record.reads_only();
                 }
                 // One row past the right answer's values already disagrees.
@@ -246,7 +266,7 @@ pub fn run_file(
                 let keep = expected.as_ref().map_or(usize::MAX, |e| {
                     expected_values(e).div_ceil(width).saturating_add(1)
                 });
-                match engine.run(sql, keep, until) {
+                match settled.and_then(|()| engine.run(sql, keep, until)) {
                     Err(Stop::PastBudget) => Outcome::PastBudget,
                     Err(Stop::Refused(e)) => Outcome::Refused(e),
                     Ok(rows) => {
@@ -255,7 +275,15 @@ pub fn run_file(
                             None => Outcome::Agree,
                             Some(want) => match compare(want, &got, threshold) {
                                 Ok(()) => Outcome::Agree,
-                                Err((want, got)) => Outcome::Answer { want, got },
+                                Err((want, got)) => {
+                                    match misread(engine, sql, &rows, width, keep, until) {
+                                        Some(Ok(why)) => Outcome::Unreadable(why),
+                                        Some(Err(Stop::PastBudget)) => Outcome::PastBudget,
+                                        Some(Err(Stop::Refused(_))) | None => {
+                                            Outcome::Answer { want, got }
+                                        }
+                                    }
+                                }
                             },
                         }
                     }
@@ -287,6 +315,8 @@ pub fn run_file(
             counts.past_budget = counts.past_budget.saturating_add(1);
         } else if matches!(outcome, Outcome::Untranslatable(_)) {
             counts.untranslatable = counts.untranslatable.saturating_add(1);
+        } else if matches!(outcome, Outcome::Unreadable(_)) {
+            counts.unreadable = counts.unreadable.saturating_add(1);
         } else {
             counts.disagree = counts.disagree.saturating_add(1);
         }
@@ -297,4 +327,36 @@ pub fn run_file(
         });
     }
     Ok(counts)
+}
+
+/// Whether a disagreeing answer was misread (Engine::recount): its rows aren't all `width` wide
+/// (a separator in a text), or there are more or fewer of them than the engine counts (a line end
+/// in a text). `kept` is how many rows were kept: as many read means more may have been dropped.
+/// None when the engine's answers read whole, or when the count itself wasn't answered.
+fn misread(
+    engine: &mut dyn Engine,
+    sql: &str,
+    rows: &[Vec<Value>],
+    width: usize,
+    kept: usize,
+    until: Option<Instant>,
+) -> Option<Result<String, Stop>> {
+    let counted = match engine.recount(sql, until)? {
+        Ok(n) => n,
+        Err(e) => return Some(Err(e)),
+    };
+    if let Some(r) = rows.iter().find(|r| r.len() != width) {
+        return Some(Ok(format!(
+            "a row read as {} values, not {width}: a text holding the output's separator",
+            r.len()
+        )));
+    }
+    let read = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+    let all_read = rows.len() < kept;
+    if (all_read && read != counted) || (!all_read && counted < read) {
+        return Some(Ok(format!(
+            "{read} rows read, {counted} counted: a text holding a line end"
+        )));
+    }
+    None
 }

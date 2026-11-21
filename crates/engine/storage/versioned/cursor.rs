@@ -119,13 +119,18 @@ impl KeyOrder {
     /// ordered by its bytes and marked.
     pub fn comparator(&self) -> Comparator {
         let order = self.clone();
-        Box::new(move |a: &[u8], b: &[u8]| match order.order(a, b) {
+        Box::new(move |a: &[u8], b: &[u8]| order.compare(a, b))
+    }
+
+    /// [`KeyOrder::order`], a record it can't read ordered by its bytes and marked.
+    pub fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
+        match self.order(a, b) {
             Ok(o) => o,
             Err(_) => {
-                order.unreadable.store(true, AtomicOrdering::Release);
+                self.unreadable.store(true, AtomicOrdering::Release);
                 a.cmp(b)
             }
-        })
+        }
     }
 
     /// Refuses once the tree's comparison has met a record it can't read.
@@ -301,11 +306,19 @@ impl Rows {
     }
 }
 
+/// A transaction the cursors of one connection write in: `None` once it has ended (committed or
+/// rolled back while a cursor still held it), which a cursor's write is refused for.
+pub type SharedTxn = Arc<Mutex<Option<Txn>>>;
+
 /// What a cursor may do: read as a snapshot sees the tree, or also write in a transaction (whose
 /// snapshot it reads as).
 pub enum Access {
     Read(Snapshot),
-    Write(Arc<Mutex<Txn>>),
+    Write(SharedTxn),
+}
+
+fn ended() -> LimboError {
+    LimboError::TxError("versioned cursor: its transaction has ended".into())
 }
 
 /// Where a cursor is.
@@ -329,7 +342,7 @@ pub struct VersionedCursor {
     root_page: i64,
     order: KeyOrder,
     snap: Snapshot,
-    txn: Option<Arc<Mutex<Txn>>>,
+    txn: Option<SharedTxn>,
     /// The connection's pager, which the executor asks a cursor for; this storage keeps no page
     /// in it.
     pager: Arc<Pager>,
@@ -355,7 +368,7 @@ impl VersionedCursor {
         let (snap, txn) = match access {
             Access::Read(snap) => (snap, None),
             Access::Write(txn) => {
-                let snap = txn.lock().snapshot();
+                let snap = txn.lock().as_ref().ok_or_else(ended)?.snapshot();
                 (snap, Some(txn))
             }
         };
@@ -644,21 +657,23 @@ impl VersionedCursor {
     }
 
     /// The transaction the cursor writes in: refused (`ReadOnly`) for a reading cursor.
-    fn txn(&self) -> Result<Arc<Mutex<Txn>>> {
+    fn txn(&self) -> Result<SharedTxn> {
         self.txn.clone().ok_or(LimboError::ReadOnly)
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         let txn = self.txn()?;
         let mut txn = txn.lock();
-        self.db.put(&mut self.d, &mut txn, self.tree, key, value)?;
+        let txn = txn.as_mut().ok_or_else(ended)?;
+        self.db.put(&mut self.d, txn, self.tree, key, value)?;
         self.order.check()
     }
 
     fn remove(&mut self, key: &[u8]) -> Result<()> {
         let txn = self.txn()?;
         let mut txn = txn.lock();
-        self.db.remove(&mut self.d, &mut txn, self.tree, key)?;
+        let txn = txn.as_mut().ok_or_else(ended)?;
+        self.db.remove(&mut self.d, txn, self.tree, key)?;
         self.order.check()
     }
 
@@ -740,7 +755,7 @@ impl VersionedCursor {
     }
 
     /// Removes every row the snapshot sees, in the cursor's transaction: how many.
-    fn clear_rows(&mut self) -> Result<u64> {
+    pub(crate) fn clear_rows(&mut self) -> Result<u64> {
         self.record_stale();
         let mut n = 0u64;
         let mut keys: Vec<Vec<u8>> = Vec::new();

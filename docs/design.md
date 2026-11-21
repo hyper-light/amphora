@@ -56,6 +56,8 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | engine | 9 | Beside the engine it replaces, behind the cursor the SQL layer already uses | [engine.md](design/engine.md#9-beside-the-engine-it-replaces-behind-the-cursor-the-sql-layer-already-uses) |
 | engine | 10 | Memory: versions pruned between snapshots, one budget, typed refusals | [engine.md](design/engine.md#10-memory-versions-pruned-between-snapshots-one-budget-typed-refusals) |
 | engine | 11 | The log in lanes: one group-committed log, or a log a writer | [engine.md](design/engine.md#11-the-log-in-lanes-one-group-committed-log-or-a-log-a-writer) |
+| engine | 12 | Large rows as chunk rows of an overflow tree; trees made and dropped as records of their own | [engine.md](design/engine.md#12-large-rows-as-chunk-rows-of-an-overflow-tree-trees-made-and-dropped-as-records-of-their-own) |
+| engine | 13 | The switch: a connection's B-trees on the versioned storage, the pager beside it | [engine.md](design/engine.md#13-the-switch-a-connections-b-trees-on-the-versioned-storage-the-pager-beside-it) |
 | executor | 1 | A statement keeps its small ephemeral tables from one run to the next | [executor.md](design/executor.md#1-a-statement-keeps-its-small-ephemeral-tables-from-one-run-to-the-next) |
 | executor | 2 | `IN (SELECT ...)` answers a row with one search of its list | [executor.md](design/executor.md#2-in-select--answers-a-row-with-one-search-of-its-list) |
 | executor | 3 | LIKE jumps to where the literal after a `%` can match | [executor.md](design/executor.md#3-like-jumps-to-where-the-literal-after-a--can-match) |
@@ -71,6 +73,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | online-schema | – | Decision (lane online-schema): an index is built absent, delete-only, write-only, public | [online-schema.md](design/online-schema.md#decision-lane-online-schema-an-index-is-built-absent-delete-only-write-only-public) |
 | online-schema | – | Decision (lane online-schema-5): a column is added with its states run together | [online-schema.md](design/online-schema.md#decision-lane-online-schema-5-a-column-is-added-with-its-states-run-together) |
 | online-schema | – | Decision (lane online-schema-6): a constraint is added write-only, validated, then public | [online-schema.md](design/online-schema.md#decision-lane-online-schema-6-a-constraint-is-added-write-only-validated-then-public) |
+| online-schema | – | Decision (lane online-schema-7): a column is dropped as a hidden slot, cleared in batches | [online-schema.md](design/online-schema.md#decision-lane-online-schema-7-a-column-is-dropped-as-a-hidden-slot-cleared-in-batches) |
 | planner | 1 | A closed range is half a percent of its table, whether it seeks or filters | [planner.md](design/planner.md#1-a-closed-range-is-half-a-percent-of-its-table-whether-it-seeks-or-filters) |
 | planner | 2 | The sort is charged to the candidate that needs it, on the rows it sorts | [planner.md](design/planner.md#2-the-sort-is-charged-to-the-candidate-that-needs-it-on-the-rows-it-sorts) |
 | planner | 3 | A GLOB's literal prefix is a range of the index; a BLOB matches no GLOB or LIKE | [planner.md](design/planner.md#3-a-globs-literal-prefix-is-a-range-of-the-index-a-blob-matches-no-glob-or-like) |
@@ -94,6 +97,8 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | planner | 21 | A table's filters are estimated together on its sample, and otherwise combine by backoff | [planner.md](design/planner.md#21-a-tables-filters-are-estimated-together-on-its-sample-and-otherwise-combine-by-backoff) |
 | planner | 22 | Correlated subqueries unnested by dependent joins taken apart, from a worklist (PL.10) | [planner.md](design/planner.md#22-correlated-subqueries-unnested-by-dependent-joins-taken-apart-from-a-worklist-pl10) |
 | planner | – | Decision (lane pl6): No table read whole beneath loops that can give more than one row | [planner.md](design/planner.md#decision-lane-pl6-no-table-read-whole-beneath-loops-that-can-give-more-than-one-row) |
+| planner | – | Decision (lane pl8): a RIGHT JOIN led by one table is planned as its mirrored LEFT JOIN | [planner.md](design/planner.md#decision-lane-pl8-a-right-join-led-by-one-table-is-planned-as-its-mirrored-left-join) |
+| planner | – | Decision (lane pl8-3): a LEFT JOIN's right table follows the tables its ON terms read | [planner.md](design/planner.md#decision-lane-pl8-3-a-left-joins-right-table-follows-the-tables-its-on-terms-read) |
 | planner | – | Decision (lane pl12): custom plans, then a generic one, for prepared statements | [planner.md](design/planner.md#decision-lane-pl12-custom-plans-then-a-generic-one-for-prepared-statements) |
 | planner | – | Decision (lane pl9): row counts kept as rows change, statements planned again past their statistics' error | [planner.md](design/planner.md#decision-lane-pl9-row-counts-kept-as-rows-change-statements-planned-again-past-their-statistics-error) |
 | records-compaction | – | Durable progress and retention | [records-compaction.md](design/records-compaction.md#durable-progress-and-retention) |
@@ -124,6 +129,8 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | replication | – | Decision (lane constants): a generation of restarts ends once it covers its spend (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-a-generation-of-restarts-ends-once-it-covers-its-spend-2026-11-21) |
 | replication | – | A follower's write that read nothing written since its base: read sets (built 2026-11-21, Amphora goal ceea4e0a) | [replication.md](design/replication.md#a-followers-write-that-read-nothing-written-since-its-base-read-sets-built-2026-11-21-amphora-goal-ceea4e0a) |
 | replication | – | Decision (lane g12s2): the raft log as the WAL (2026-11-21, G12 step 2) | [replication.md](design/replication.md#decision-lane-g12s2-the-raft-log-as-the-wal-2026-11-21-g12-step-2) |
+| replication | – | Decision (lane constants): the owner's tick pace (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-the-owners-tick-pace-2026-11-21) |
+| regions | – | Decision (lane regions): region-local groups under a global root, placed by declared survival | [regions.md](design/regions.md#decision-lane-regions-region-local-groups-under-a-global-root-placed-by-declared-survival) |
 | reshard | – | Decision (lane split-merge): split, merge and move as one fenced hand-off, decided by measured share | [reshard.md](design/reshard.md#decision-lane-split-merge-split-merge-and-move-as-one-fenced-hand-off-decided-by-measured-share) |
 | semantics | 1 | TEXT is well-formed UTF-8 | [semantics.md](design/semantics.md#1-text-is-well-formed-utf-8) |
 | semantics | 2 | atanh's last digit is its platform's C library's | [semantics.md](design/semantics.md#2-atanhs-last-digit-is-its-platforms-c-librarys) |
@@ -167,6 +174,8 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | store | 37 | A commit logs its pages' changes: a log of both kinds of slot | [store.md](design/store.md#37-a-commit-logs-its-pages-changes-a-log-of-both-kinds-of-slot) |
 | store | 38 | A page is searched by key heads once its searches have paid for them (prototype, behind a switch) | [store.md](design/store.md#38-a-page-is-searched-by-key-heads-once-its-searches-have-paid-for-them-prototype-behind-a-switch) |
 | store | 39 | A page read past the cache reads its own frames: pages new to a chain are page frames, a chain's entries records of one slot | [store.md](design/store.md#39-a-page-read-past-the-cache-reads-its-own-frames-pages-new-to-a-chain-are-page-frames-a-chains-entries-records-of-one-slot) |
+| store | 40 | A page read finds its frame and the log's header without the shared locks (prototype, behind a switch) | [store.md](design/store.md#40-a-page-read-finds-its-frame-and-the-logs-header-without-the-shared-locks-prototype-behind-a-switch) |
+| store | 41 | Skipping the descent: an adaptive hash against a learned leaf locator (prototypes, not yet wired) | [store.md](design/store.md#41-skipping-the-descent-an-adaptive-hash-against-a-learned-leaf-locator-prototypes-not-yet-wired) |
 | store | – | Decision (lane wal-read): a commit's records published at a lookup's cost, its deltas found a word at a time | [store.md](design/store.md#decision-lane-wal-read-a-commits-records-published-at-a-lookups-cost-its-deltas-found-a-word-at-a-time) |
 | without-rowid | – | Native primary-root query access | [without-rowid.md](design/without-rowid.md#native-primary-root-query-access) |
 | xgroup | – | The two protocols: two-phase commit and Parallel Commits behind a switch, two-phase locking without waiting | [xgroup.md](design/xgroup.md#the-two-protocols) |
@@ -175,6 +184,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | local-owner-transport | – | Embedded local owner transport: one owner process, an authenticated local client for the rest | [local-owner-transport.md](design/local-owner-transport.md) |
 | records-compaction | – | Bounded Records compaction on the namespace writer, step by recoverable step | [records-compaction.md](design/records-compaction.md) |
 | without-rowid | – | WITHOUT ROWID tables keep their primary-key index as the table | [without-rowid.md](design/without-rowid.md) |
+| backup | – | Decision (lane pitr): backups and point-in-time recovery to Mantle (CP-T1.12, G14 step 4) | [backup.md](design/backup.md) |
 
 ## Sections that are not decisions
 

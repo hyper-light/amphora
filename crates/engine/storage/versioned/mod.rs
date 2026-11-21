@@ -10,7 +10,8 @@
 //! and checkpoints and recovery ([`durable`]); the commit validations' Elle-style isolation checks
 //! (`elle`, G8 step 1); and a table's column copy ([`columns`], G11). Stage 3 begins with the
 //! executor's cursor on the trees ([`cursor`]), then transactions' savepoints ([`version`]),
-//! checked against the current engine by the shared model test of transactions (`txn_model`).
+//! checked against the current engine by the shared model test of transactions (`txn_model`); and
+//! the switch that puts a connection's B-trees on this storage ([`switch`]).
 
 pub mod blink;
 pub mod columns;
@@ -25,6 +26,9 @@ pub mod overflow;
 pub mod page;
 pub mod pool;
 pub mod redo;
+#[cfg(test)]
+mod sql;
+pub mod switch;
 #[cfg(test)]
 mod txn_model;
 #[cfg(all(target_os = "linux", feature = "io_uring"))]

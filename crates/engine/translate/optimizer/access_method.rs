@@ -36,9 +36,9 @@ use super::{
     },
     cost::{
         constraints_selectivity, estimate_btree_depth, estimate_cost_for_scan_or_seek,
-        estimate_ephemeral_index_build_cost, estimate_index_cost, estimate_ordered_cost_to_goal,
-        estimate_rows_per_seek, estimate_scan_cost, estimate_skip_scan_cost, AnalyzeCtx, Cost,
-        IndexInfo, RowGoal,
+        estimate_ephemeral_index_build_cost, estimate_ephemeral_index_probe_cost,
+        estimate_index_cost, estimate_ordered_cost_to_goal, estimate_rows_per_seek,
+        estimate_scan_cost, estimate_skip_scan_cost, AnalyzeCtx, Cost, IndexInfo, RowGoal,
     },
     join::JoinPlanningContext,
     multi_index::{
@@ -1217,10 +1217,17 @@ fn find_best_access_method_for_btree(
                 params,
                 None,
             );
-            let build_cost = estimate_ephemeral_index_build_cost(*base_row_count, params);
-            let seek_cost = Cost(
-                input_cardinality * params.cpu_cost_per_seek
-                    + input_cardinality * rows_per_seek * params.cpu_cost_per_row,
+            let build_cost = estimate_ephemeral_index_build_cost(
+                *base_row_count,
+                index_info.rows_per_leaf_page,
+                params,
+            );
+            let seek_cost = estimate_ephemeral_index_probe_cost(
+                input_cardinality,
+                rows_per_seek,
+                *base_row_count,
+                index_info.rows_per_leaf_page,
+                params,
             );
             let cost = scan_cost + build_cost + seek_cost;
             let temporary_index = AccessMethod {
@@ -1610,10 +1617,12 @@ pub fn try_hash_join_access_method(
         probe_table.internal_id,
         equal_terms.filter(|(where_idx, _, _)| {
             // A LEFT JOIN can use only its own ON terms to decide which rows matched.
-            // An anti-join gets its match terms from the NOT EXISTS subquery.
-            matches!(hash_join_type, HashJoinType::Inner | HashJoinType::LeftAnti)
-                || where_clause[*where_idx].origin.join_origin()
-                    == Some(JoinOrigin::Outer(probe_table.internal_id))
+            // A semi or anti join gets its match terms from the EXISTS or NOT EXISTS subquery.
+            matches!(
+                hash_join_type,
+                HashJoinType::Inner | HashJoinType::LeftAnti | HashJoinType::LeftSemi
+            ) || where_clause[*where_idx].origin.join_origin()
+                == Some(JoinOrigin::Outer(probe_table.internal_id))
         }),
     );
     tracing::debug!(
@@ -1706,15 +1715,22 @@ pub fn try_hash_join_access_method(
         HashJoinType::Inner => rows_per_build_row,
         HashJoinType::LeftOuter => rows_per_build_row.max(1.0),
         HashJoinType::LeftAnti => 1.0,
+        // Each build row goes on at most once, at its first match.
+        HashJoinType::LeftSemi => rows_per_build_row.min(1.0),
         HashJoinType::FullOuter => rows_per_build_row
             .max(1.0)
             .max(probe_cardinality / build_cardinality.max(1.0)),
     };
 
+    // A semi join still visits every matching pair to find each build row's first match.
+    let visited_per_outer_row = match hash_join_type {
+        HashJoinType::LeftSemi => rows_per_build_row,
+        _ => estimated_rows_per_outer_row,
+    };
     let cost = estimate_hash_join_cost(
         build_cardinality,
         probe_cardinality,
-        build_cardinality * estimated_rows_per_outer_row * probe_multiplier,
+        build_cardinality * visited_per_outer_row * probe_multiplier,
         hash_join_type,
         params.statement_memory,
         probe_multiplier,
@@ -1766,17 +1782,14 @@ fn should_not_use_hash_join(
         // would ignore the user's requested scan shape.
         build_table.indexed.is_some() || probe_table.indexed.is_some()
     };
-    let any_side_is_semi_or_build_side_is_anti = || -> bool {
-        // A left anti hash join emits unmatched build rows after the probe scan.
-        // Semi joins still use a nested loop because they can stop at one match.
-        probe_table
+    let build_side_is_semi_or_anti = || -> bool {
+        // A semi or anti join's own table is only ever the probe side: a left anti hash join
+        // emits unmatched build rows after the probe scan, and a left semi hash join emits a
+        // build row at its first match (G6 step 5).
+        build_table
             .join_info
             .as_ref()
-            .is_some_and(|ji| ji.is_semi())
-            || build_table
-                .join_info
-                .as_ref()
-                .is_some_and(|ji| ji.is_semi_or_anti())
+            .is_some_and(|ji| ji.is_semi_or_anti())
     };
     let build_table_is_null_row = || -> bool {
         // Can't build from a NullRow'd table — the hash table would hold real data
@@ -1826,7 +1839,7 @@ fn should_not_use_hash_join(
     !both_sides_have_rowid()
         || both_tables_are_the_same_table()
         || has_indexed_by_directives()
-        || any_side_is_semi_or_build_side_is_anti()
+        || build_side_is_semi_or_anti()
         || build_table_is_null_row()
         || is_using_or_natural_join()
         || some_correlated_subqueries_reference_the_joined_tables()
@@ -1840,6 +1853,12 @@ fn hash_join_type(probe_table: &JoinedTable) -> HashJoinType {
         .is_some_and(|ji| ji.is_anti())
     {
         HashJoinType::LeftAnti
+    } else if probe_table
+        .join_info
+        .as_ref()
+        .is_some_and(|ji| ji.is_semi())
+    {
+        HashJoinType::LeftSemi
     } else if probe_table
         .join_info
         .as_ref()
@@ -2231,7 +2250,13 @@ fn find_best_access_method_for_subquery(
         };
     let one_pass_scan_cost =
         estimate_cost_for_scan_or_seek(None, &[], &[], 1.0, base_row_count, false, params, None);
-    let append_build_cost = estimate_ephemeral_index_build_cost(*base_row_count, params);
+    let rows_per_leaf_page = rows_per_leaf_page_for_index(
+        ephemeral_index.columns.len(),
+        rhs_table,
+        params.rows_per_table_page,
+    );
+    let append_build_cost =
+        estimate_ephemeral_index_build_cost(*base_row_count, rows_per_leaf_page, params);
     let seek_setup_cost = if table_materialization_required || can_direct_materialize_index {
         // Both table-backed materialization and direct-index materialization avoid
         // the extra "scan table into probe index" pass. They differ in storage,
@@ -2243,9 +2268,12 @@ fn find_best_access_method_for_subquery(
         // index used by SEARCH.
         one_pass_scan_cost + one_pass_scan_cost + append_build_cost
     };
-    let seek_cost = Cost(
-        input_cardinality * params.cpu_cost_per_seek
-            + input_cardinality * estimated_rows_per_outer_row * params.cpu_cost_per_row,
+    let seek_cost = estimate_ephemeral_index_probe_cost(
+        input_cardinality,
+        estimated_rows_per_outer_row,
+        *base_row_count,
+        rows_per_leaf_page,
+        params,
     );
     let total_cost = Cost(subquery_cost) + seek_setup_cost + seek_cost;
     let scan_method = AccessMethod {

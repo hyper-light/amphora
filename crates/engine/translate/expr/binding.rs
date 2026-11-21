@@ -51,10 +51,12 @@ pub(super) fn resolve_qualified_on_ref(
     internal_id: TableInternalId,
     normalized_id: &str,
 ) -> Result<Option<QualifiedMatch>> {
+    // Amphora: a column an online DROP COLUMN dropped answers to no name (CP-T1.12).
     if let Some(col_idx) = table.columns().iter().position(|c| {
-        c.name
-            .as_ref()
-            .is_some_and(|name| name.eq_ignore_ascii_case(normalized_id))
+        !c.dropped()
+            && c.name
+                .as_ref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(normalized_id))
     }) {
         let col = table.columns().get(col_idx).unwrap();
         return Ok(Some(QualifiedMatch::Column {
@@ -408,9 +410,10 @@ pub fn bind_and_rewrite_expr<'a>(
 
                         if let Some(table) = table {
                             let col_idx = table.columns().iter().position(|c| {
-                                c.name.as_ref().is_some_and(|name| {
-                                    name.eq_ignore_ascii_case(&normalized_col_name)
-                                })
+                                !c.dropped()
+                                    && c.name.as_ref().is_some_and(|name| {
+                                        name.eq_ignore_ascii_case(&normalized_col_name)
+                                    })
                             });
 
                             if let Some(col_idx) = col_idx {
@@ -448,9 +451,10 @@ pub fn bind_and_rewrite_expr<'a>(
                             .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
                         if let Some((tbl_id, tbl)) = matching_tbl {
                             let col_idx = tbl.columns().iter().position(|c| {
-                                c.name
-                                    .as_ref()
-                                    .is_some_and(|n| n.eq_ignore_ascii_case(&normalized_col))
+                                !c.dropped()
+                                    && c.name
+                                        .as_ref()
+                                        .is_some_and(|n| n.eq_ignore_ascii_case(&normalized_col))
                             });
                             if let Some(col_idx) = col_idx {
                                 let col = &tbl.columns()[col_idx];

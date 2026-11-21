@@ -111,11 +111,51 @@ more than twice its p99 without one, measured by bench `online_ddl`.
 its cost grows with the schema's size, not the table's. `SchemaChange::cutover` says how long it held
 the writer; the 10,000,000-row measurement is the coordinator's.
 
-**Left.** Foreign keys and a generated column's constraints added online; DROP COLUMN (rows
-can't be rewritten to a new layout in batches while old rows keep the old one in the same table:
-the column must stay as a hidden slot, written NULL from the drop on and cleared in batches, as
-PostgreSQL's `attisdropped` keeps it, which needs the engine to hide a column from name resolution,
-`*` and inserts); indexes on WITHOUT ROWID
+**Left.** Foreign keys and a generated column's constraints added online; a dropped column's
+slot freed of its name (PostgreSQL renames it), and its bytes reclaimed by a rewrite; a drop on a
+table with triggers or WITHOUT ROWID; indexes on WITHOUT ROWID
 tables (no rowid order to backfill by: refused typed); routing `migrate`'s index builds on large
 tables here; undoing a big index drops its pages in one transaction; metrics, to be agreed with
 Kiln Metrics.
+
+## Decision (lane online-schema-7): a column is dropped as a hidden slot, cleared in batches
+
+`Database::change_schema` takes one `ALTER TABLE t DROP COLUMN c`. A row can't be rewritten to a
+new layout in batches while the rows not yet reached keep the old one in the same table, so the
+column stays as a slot, as PostgreSQL's `pg_attribute.attisdropped` keeps a dropped column
+(PostgreSQL documentation, ALTER TABLE: "The DROP COLUMN form does not physically remove the
+column, but simply makes it invisible to SQL operations. Subsequent insert and update operations
+in the table will store a null value for the column",
+https://www.postgresql.org/docs/current/sql-altertable.html, Notes). F1's states for removing a column (public,
+write-only, delete-only, absent: section 4, run in reverse to add's) run together in the first
+step for the same reason they do for `ADD COLUMN`: with one writer the drain is the commit, and
+nothing must be read before the column goes. The steps, each one transaction through the writer:
+
+1. **The switch-over**, a catalog change: a row of `__amphora_dropped_columns` (table, column)
+   names the slot, read whenever a connection parses its schema (a reparse phase after the
+   constraint states', and on open) and set on the column as `Column::dropped`. From this commit
+   no name finds it (`BTreeTable::get_column` and the binder's qualified lookups pass it), `*`, an
+   insert without a column list and `PRAGMA table_info`/`table_xinfo` pass it (it is hidden), an
+   insert or update naming it is refused as naming no column, and every insert and update stores
+   NULL in it: its NOT NULL and its own CHECK are off on the engine's copy, and an update writes
+   NULL where it would carry the old value. The change records the table's largest rowid.
+2. **The clear**: batches rewrite the rows up to that rowid in rowid order, at most the batch's
+   rows, each by setting a plain column to itself, which stores NULL in the slot. Batches are
+   sized by the same learned `Sizer` as an index's backfill; too many dirty pages halves one.
+3. **The record**: the change's row goes and the migration is recorded, in one transaction.
+
+The slot's row stays: the slot is the table's for good, and keeps its name (an `ADD COLUMN` or a
+rename to it is refused as a duplicate), as the `CREATE TABLE` text in `sqlite_schema` keeps the
+column for the rows' layout. A drop has no breaking row, so once begun it only goes on: a power cut
+leaves the column found by name and unrecorded (old) or hidden (new), unrecorded while the clear is
+under way and recorded once it ends, never found by name with its drop recorded:
+`crates/amphora/tests/crash.rs`'s `t_t1_12_1_a_power_cut_at_every_step_of_an_online_drop_leaves_old_or_new`.
+
+Refused before anything changes: whatever the engine's own `DROP COLUMN` refuses (its statement is
+prepared and never run: a key, UNIQUE, an index, a CHECK or generated column naming it, a foreign
+key, a view or a trigger naming it, the only column), a WITHOUT ROWID table (no rowid order to clear
+by), a table with triggers (the clear's updates would fire them), and a table with no other plain
+column (not generated, not a key) for the clear to rewrite rows by. What would falsify it: a query,
+an insert or an update that reads or writes the slot by name after the switch-over, or a row whose
+slot holds a value after the record (`t_t1_12_1_a_dropped_column_is_hidden_while_its_values_are_cleared_then_recorded`
+reopens the database without the mark and counts them).
