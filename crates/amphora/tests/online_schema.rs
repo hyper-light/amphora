@@ -368,14 +368,10 @@ fn t_t1_12_1_a_column_is_added_in_one_catalog_change_and_its_constraints_hold_fr
 
 fn sql_of_t(db: &Db) -> String {
     let mut sql = String::new();
-    db.query_owned(
-        "SELECT sql FROM sqlite_schema WHERE name = 't'",
-        [],
-        |r| {
-            sql = r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
-            Ok(false)
-        },
-    )
+    db.query_owned("SELECT sql FROM sqlite_schema WHERE name = 't'", [], |r| {
+        sql = r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(false)
+    })
     .unwrap();
     sql
 }
@@ -421,14 +417,28 @@ fn t_t1_12_1_a_constraint_is_enforced_on_writes_while_rows_are_validated_then_pu
         write(&mut db, steps);
         assert!(steps < 1000, "the change never ended");
     }
-    assert!(visited >= 1000, "the batches visited {visited} rows");
+    // Each step's write deletes at most one row, perhaps before its batch reached it.
+    assert!(
+        visited >= 1000 - steps as u64,
+        "the batches visited {visited} rows in {steps} steps"
+    );
     assert!(steps > 100, "validated in {steps} steps, not batches of 7");
     assert_eq!(
-        count(&db, "SELECT count(*) FROM __amphora_constraint_states", vec![]).unwrap(),
+        count(
+            &db,
+            "SELECT count(*) FROM __amphora_constraint_states",
+            vec![]
+        )
+        .unwrap(),
         0
     );
     assert_eq!(
-        count(&db, "SELECT count(*) FROM __amphora_migrations WHERE name = 'ix'", vec![]).unwrap(),
+        count(
+            &db,
+            "SELECT count(*) FROM __amphora_migrations WHERE name = 'ix'",
+            vec![]
+        )
+        .unwrap(),
         1
     );
     assert_eq!(integrity(&db), "ok");
@@ -481,7 +491,12 @@ fn t_t1_12_1_an_unvalidated_not_null_is_not_relied_on_and_a_breaking_row_undoes_
     db.transaction(|db| online::abandon(db, &nn)).unwrap();
     assert!(!sql_of_t(&db).contains("NOT NULL"), "{}", sql_of_t(&db));
     assert_eq!(
-        count(&db, "SELECT count(*) FROM __amphora_constraint_states", vec![]).unwrap(),
+        count(
+            &db,
+            "SELECT count(*) FROM __amphora_constraint_states",
+            vec![]
+        )
+        .unwrap(),
         0
     );
     assert_eq!(
@@ -505,7 +520,9 @@ fn t_t1_12_1_a_constraint_change_is_refused_unless_it_only_adds_the_constraint()
         })
         .is_err()
     };
-    assert!(refused("ALTER TABLE t ALTER COLUMN a TO z INTEGER NOT NULL"));
+    assert!(refused(
+        "ALTER TABLE t ALTER COLUMN a TO z INTEGER NOT NULL"
+    ));
     assert!(refused("ALTER TABLE t ALTER COLUMN a TO a TEXT"));
     let dir = tempfile::tempdir().unwrap();
     let until = || Instant::now() + Duration::from_secs(60);
@@ -531,11 +548,10 @@ fn t_t1_12_1_a_constraint_change_is_refused_unless_it_only_adds_the_constraint()
     let table_sql = || {
         database
             .call(until(), |c| {
-                let sql: String = c.query_row(
-                    "SELECT sql FROM sqlite_schema WHERE name = 't'",
-                    [],
-                    |r| r.get(0usize),
-                )?;
+                let sql: String =
+                    c.query_row("SELECT sql FROM sqlite_schema WHERE name = 't'", [], |r| {
+                        r.get(0usize)
+                    })?;
                 Ok(sql)
             })
             .unwrap()
@@ -544,7 +560,10 @@ fn t_t1_12_1_a_constraint_change_is_refused_unless_it_only_adds_the_constraint()
     for (name, sql) in [
         ("ty", "ALTER TABLE t ALTER COLUMN a TO a TEXT NOT NULL"),
         ("dr", "ALTER TABLE t ALTER COLUMN b TO b TEXT NOT NULL"),
-        ("tw", "ALTER TABLE t ALTER COLUMN c TO c INTEGER NOT NULL DEFAULT 0 NOT NULL"),
+        (
+            "tw",
+            "ALTER TABLE t ALTER COLUMN c TO c INTEGER NOT NULL DEFAULT 0 NOT NULL",
+        ),
     ] {
         let refusal = change(name, sql).unwrap_err();
         assert!(

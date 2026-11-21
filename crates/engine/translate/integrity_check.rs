@@ -348,7 +348,20 @@ fn translate_integrity_check_for_schema(
         }
 
         let mut bound_checks = Vec::with_capacity(btree_table.check_constraints.len());
-        for check in &btree_table.check_constraints {
+        // Amphora: a column's CHECK an online schema change is still validating isn't one every
+        // row is known to keep (CP-T1.12, schema::CONSTRAINT_STATES_TABLE).
+        let validating = |check: &&crate::schema::CheckConstraint| {
+            check.column.as_deref().is_some_and(|name| {
+                btree_table
+                    .get_column(name)
+                    .is_some_and(|(_, column)| column.unvalidated())
+            })
+        };
+        for check in btree_table
+            .check_constraints
+            .iter()
+            .filter(|check| !validating(check))
+        {
             bound_checks.push(bind_expr_for_table(
                 &check.expr,
                 &mut table_references,

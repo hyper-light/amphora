@@ -594,7 +594,11 @@ fn constraint_step(
 }
 
 /// The definition `column` has in its table's `CREATE TABLE`, and whether the table has a rowid.
-fn column_definition(db: &Db, table: &str, column: &str) -> anyhow::Result<(ColumnDefinition, bool)> {
+fn column_definition(
+    db: &Db,
+    table: &str,
+    column: &str,
+) -> anyhow::Result<(ColumnDefinition, bool)> {
     let mut sql = None;
     db.query(
         "SELECT sql FROM sqlite_schema WHERE type = 'table' AND lower(name) = ?1",
@@ -604,14 +608,14 @@ fn column_definition(db: &Db, table: &str, column: &str) -> anyhow::Result<(Colu
             Ok(false)
         },
     )?;
-    let refuse = |why: String| -> anyhow::Error { api::invalid("online schema change", &why).into() };
+    let refuse =
+        |why: String| -> anyhow::Error { api::invalid("online schema change", &why).into() };
     let sql = sql.ok_or_else(|| refuse(format!("no table {table}")))?;
     let mut parser = Parser::new(sql.as_bytes());
     let Some(Cmd::Stmt(Stmt::CreateTable {
-        body:
-            CreateTableBody::ColumnsAndConstraints {
-                columns, options, ..
-            },
+        body: CreateTableBody::ColumnsAndConstraints {
+            columns, options, ..
+        },
         ..
     })) = parser.next_cmd().map_err(|e| refuse(e.to_string()))?
     else {
@@ -643,10 +647,29 @@ fn adds_only_constraints(old: &ColumnDefinition, new: &ColumnDefinition) -> bool
         )
     };
     old.col_type == new.col_type
-        && head == old.constraints.as_slice()
+        && head.len() == old.constraints.len()
+        && head
+            .iter()
+            .zip(&old.constraints)
+            .all(|(new, old)| same_constraint(new, old))
         && !added.is_empty()
         && added.iter().all(|c| constrains(&c.constraint))
         && !(old.constraints.iter().any(|c| not_null(&c)) && added.iter().any(|c| not_null(&c)))
+}
+
+/// Whether two column constraints say the same: equal, or CHECKs of one name over expressions
+/// that render the same (the catalog may keep a table's SQL with the expression's source text
+/// spaced differently from the migration's).
+fn same_constraint(
+    new: &amphora_engine_parser::ast::NamedColumnConstraint,
+    old: &amphora_engine_parser::ast::NamedColumnConstraint,
+) -> bool {
+    match (&new.constraint, &old.constraint) {
+        (ColumnConstraint::Check { expr: a, .. }, ColumnConstraint::Check { expr: b, .. }) => {
+            new.name == old.name && a.to_string() == b.to_string()
+        }
+        _ => new == old,
+    }
 }
 
 /// Absent to write-only for a constraint, in one transaction: the column marked unvalidated (its
@@ -731,8 +754,7 @@ fn breaks(column: &str, definition: &ColumnDefinition) -> String {
         .iter()
         .filter_map(|c| match &c.constraint {
             ColumnConstraint::NotNull {
-                nullable: false,
-                ..
+                nullable: false, ..
             } => Some(format!("{} IS NULL", quoted(column))),
             ColumnConstraint::Check { expr, .. } => Some(format!("coalesce(NOT ({expr}), 0)")),
             _ => None,
