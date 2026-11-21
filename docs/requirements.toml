@@ -410,3 +410,15 @@ tests = [
   { id = "T-QT.3.4", text = "A loop over a non-covering index with a term on the index's columns and one on the table's — passes when the answer is unchanged and the table rows fetched are only those the index's term keeps, whatever order the terms are written in" },
   { id = "T-QT.3.5", text = "scripts/check-production.sh after the change — passes when it passes, with the ratchet's counts lowered by what the change removed" },
 ]
+
+# lane keyheads: G3 step 4 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), searching a page by key heads.
+[[own]]
+id = "PR.4"
+title = "Searching a page by key heads (G3 point reads, step 4; prototype C)"
+criteria = [
+  { id = "AC-PR.4.1", text = "cycles per in-page search on the corpus's index lookups fall by at least 30% against today's cell-pointer search" },
+  { id = "AC-PR.4.2", text = "B-tree search's share of point_text's user cycles falls by at least 30% against step 1 (read-path.md: falsified if it doesn't fall)" },
+]
+tests = [
+  { id = "T-PR.4.1", text = "A model test: random keys, page splits and deletes, the directory against a plain binary search — passes when identical positions always" },
+]

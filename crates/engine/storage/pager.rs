@@ -171,6 +171,9 @@ mod page_inner {
                 crate::storage::shared_pages::Key,
             )>,
         >,
+        /// Amphora: the page's directory of key heads, once its searches have paid for one
+        /// (`storage/key_heads.rs`, PR.4).
+        pub key_heads: crate::storage::key_heads::KeyHeadsSlot,
     }
 
     // SAFETY: data_ptr and data_len only cache the address and length of the
@@ -209,6 +212,7 @@ mod page_inner {
                 data_len: 0,
                 overflow_cells: crate::alloc::vec![],
                 publish: None,
+                key_heads: crate::storage::key_heads::KeyHeadsSlot::default(),
             }
         }
 
@@ -225,6 +229,7 @@ mod page_inner {
             self.data_len = buffer.len();
             self.buffer = Some(buffer);
             self.flags.fetch_and(!PAGE_SHARED, Ordering::AcqRel);
+            self.key_heads.reset();
         }
 
         /// Removes the page data buffer, leaving the page unloaded.
@@ -232,6 +237,7 @@ mod page_inner {
             self.data_ptr = std::ptr::NonNull::dangling();
             self.data_len = 0;
             self.flags.fetch_and(!PAGE_SHARED, Ordering::AcqRel);
+            self.key_heads.reset();
             self.buffer.take()
         }
 
@@ -272,6 +278,7 @@ mod page_inner {
             // record shares its frame, so another page's version could pass for this one's.
             self.logged_as.store(super::LOGGED_NONE, Ordering::Release);
             self.log_base = None;
+            self.key_heads.reset();
         }
 
         const fn header_offset_of(id: usize) -> u8 {
@@ -1124,6 +1131,8 @@ impl Page {
         tracing::debug!("set_dirty(page={})", self.get().id());
         self.clear_wal_tag();
         self.clear_logged();
+        // Amphora: the page's bytes are about to change, so its key heads go (PR.4).
+        self.get().key_heads.changed();
         // Clear spilled flag since page is being modified again
         self.get().flags.fetch_and(!PAGE_SPILLED, Ordering::Release);
         self.get().flags.fetch_or(PAGE_DIRTY, Ordering::Release);
@@ -5342,6 +5351,8 @@ impl Pager {
         )?;
         if let Some(page) = self.cache_get(header.page_number as usize)? {
             let content = page.get_contents();
+            // Amphora: written over in place, never made dirty: its key heads go (PR.4).
+            content.key_heads.changed();
             content.as_ptr().copy_from_slice(raw_page);
             turso_assert!(
                 page.get().id() == header.page_number as usize,

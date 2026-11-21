@@ -163,6 +163,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 - **A reader's snapshot takes no lock** (docs/design/store.md decision 28): the log's generation is
   read from a copy every header guard refreshes, and spin locks test before they take. Point reads
   at 32 clients, ten million rows, no pool: 701,613 → 1,572,331 a second.
+- **Key heads for in-page search** (docs/design/store.md decision 38, `crates/engine/storage/key_heads.rs`;
+  G3 step 4, PR.4), a prototype behind `AMPHORA_KEY_HEADS=1`: a directory of 4-byte key heads
+  beside a cached page, built once the page's searches have paid for it, replaces a probe's decode
+  and compare when the heads order the cell. Built and model-tested (T-PR.4.1); not yet measured
+  (AC-PR.4.1, AC-PR.4.2).
 - **A shared page found in one lookup** (docs/design/store.md decision 22): the pool keeps each image
   in its map's entry and counts lookups in each shard, under the lock it holds anyway, where one
   count for the pool moved between 32 readers' cores at every lookup. Sharing 256 MiB at 32 clients:
