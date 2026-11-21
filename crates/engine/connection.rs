@@ -517,6 +517,11 @@ pub struct Connection {
     pub(super) join_methods: AtomicJoinMethods,
     /// Amphora: see [`Connection::set_sorted_fetches`].
     pub(super) sorted_fetches: AtomicBool,
+    /// Amphora: see [`Connection::set_adaptive_joins`].
+    pub(super) adaptive_joins: AtomicBool,
+    /// Amphora (PL.13): how many joins switched from seeks to a hash table while running; see
+    /// [`Connection::adaptive_join_switches`].
+    pub(super) adaptive_join_switches: AtomicU64,
     /// Per-connection runtime extension loading flag.
     pub(super) enable_load_extension: AtomicBool,
     /// Cumulative count of autonomous sequence inner-tx retries (each
@@ -979,6 +984,28 @@ impl Connection {
 
     pub(crate) fn sorted_fetches(&self) -> bool {
         self.sorted_fetches.load(Ordering::Acquire)
+    }
+
+    /// Amphora (PL.13, `docs/design/planner.md`, "Decision (lane pl13)"): lets newly prepared
+    /// statements emit an index nested-loop join with a hash join beside it, switching to the hash
+    /// join at the learned costs' break-even when the outer rows outgrow the estimate. Off by
+    /// default until the coordinator's measurement of it says otherwise.
+    pub fn set_adaptive_joins(&self, on: bool) {
+        self.adaptive_joins.store(on, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn adaptive_joins(&self) -> bool {
+        self.adaptive_joins.load(Ordering::Acquire)
+    }
+
+    /// Amphora (PL.13): how many adaptive joins on this connection have switched to a hash join.
+    pub fn adaptive_join_switches(&self) -> u64 {
+        self.adaptive_join_switches.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn count_adaptive_join_switch(&self) {
+        self.adaptive_join_switches.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Choose how correlated subqueries are planned in newly prepared statements.

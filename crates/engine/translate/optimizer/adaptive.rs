@@ -97,6 +97,19 @@ pub(crate) fn switch_point(
     }
 }
 
+/// The weights a switch reads (the seek's, the hash table's build and probe), as an instruction
+/// carries them from prepare; the rest are not read here.
+pub(crate) fn weights(seek: f64, hash_build: f64, hash_probe: f64) -> LearnedWeights {
+    LearnedWeights {
+        row_in_pages: None,
+        seek,
+        hash_build,
+        hash_probe,
+        sort: 0.0,
+        page_miss: None,
+    }
+}
+
 /// What the join does for the outer row just counted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JoinStep {
@@ -172,6 +185,12 @@ impl JoinSwitch {
                 _ => Ok(JoinStep::NestedLoop),
             },
         }
+    }
+
+    /// Takes back a switch the executor could not carry out (its hash table spilled past its
+    /// share of memory): nested loops from here to the end.
+    pub(crate) fn refuse(&mut self) {
+        self.mode = Mode::Refused;
     }
 
     /// Whether the join switched to a hash join.

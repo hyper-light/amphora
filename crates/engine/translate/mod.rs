@@ -164,6 +164,7 @@ pub fn translate(
     resolver.set_statement_memory(connection.get_pager().statement_memory_budget());
     resolver.set_join_methods(connection.join_methods());
     resolver.set_sorted_fetches(connection.sorted_fetches());
+    resolver.set_adaptive_joins(connection.adaptive_joins());
     // Amphora: what a seek, a hash table and a sort cost, as this database has timed them (QT.5).
     // A page is priced by how often the connection's recent fetches read a file (QT.5).
     // On the versioned storage (G7 step 2) every page is resident in its pool (`pool.rs`: a page

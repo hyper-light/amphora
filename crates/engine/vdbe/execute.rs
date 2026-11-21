@@ -18613,6 +18613,126 @@ pub fn op_hash_close(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Amphora (PL.13): counts an outer row of an adaptive join and sends it to the seek, the hash
+/// table's build (once, when the switch comes) or the probe (`optimizer::adaptive::JoinSwitch`).
+/// The switch is made at the first row, with the hash table's share of the statement's memory as
+/// it is then; a refusal (over that share) leaves the join a nested loop, a correct answer.
+pub fn op_join_switch_step(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
+    use crate::translate::optimizer::adaptive::{weights, JoinStep, JoinSwitch};
+    load_insn!(JoinSwitchStep { data }, insn);
+    let switch = match state.join_switches.entry(data.switch_id) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            // As HashBuild sizes its table: no limit where temporary storage is memory.
+            let budget = if matches!(program.connection.get_temp_store(), crate::TempStore::Memory)
+            {
+                u64::MAX
+            } else {
+                u64::try_from(table_share(
+                    pager.statement_memory_budget(),
+                    program.memory_tables,
+                ))
+                .unwrap_or(u64::MAX)
+            };
+            let made = JoinSwitch::new(
+                &weights(data.seek, data.hash_build, data.hash_probe),
+                data.build_rows,
+                data.build_bytes,
+                budget,
+            );
+            if let Err(refused) = &made {
+                tracing::debug!(switch = data.switch_id, %refused, "adaptive join stays a nested loop");
+            }
+            entry.insert(made.ok())
+        }
+    };
+    let step = match switch {
+        Some(switch) => switch.outer_row(),
+        None => Ok(JoinStep::NestedLoop),
+    };
+    state.pc = match step {
+        Ok(JoinStep::NestedLoop) => state.pc + 1,
+        Ok(JoinStep::SwitchNow) => data.build_pc.as_offset_int(),
+        Ok(JoinStep::Hash) => data.probe_pc.as_offset_int(),
+        Err(refused) => {
+            tracing::debug!(switch = data.switch_id, %refused, "adaptive join stays a nested loop");
+            state.pc + 1
+        }
+    };
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Amphora (PL.13): jumps if the adaptive join has switched to its hash table.
+pub fn op_join_switch_hash(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        JoinSwitchHash {
+            switch_id,
+            target_pc
+        },
+        insn
+    );
+    let switched = state
+        .join_switches
+        .get(switch_id)
+        .is_some_and(|switch| switch.as_ref().is_some_and(|switch| switch.switched()));
+    state.pc = if switched {
+        target_pc.as_offset_int()
+    } else {
+        state.pc + 1
+    };
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Amphora (PL.13): an adaptive join's hash table, built: kept for probing if it fits its share
+/// of memory, else freed and the switch refused (a probe of a spilled table needs the grace
+/// loop a hash join plans, which an adaptive join has not), the join going on as a nested loop.
+pub fn op_join_switch_built(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        JoinSwitchBuilt {
+            switch_id,
+            hash_table_id,
+            target_pc
+        },
+        insn
+    );
+    let spilled = state
+        .hash_tables
+        .get(hash_table_id)
+        .is_some_and(|table| table.has_spilled());
+    if spilled {
+        if let Some(mut table) = state.hash_tables.remove(hash_table_id) {
+            table.close();
+        }
+        if let Some(Some(switch)) = state.join_switches.get_mut(switch_id) {
+            switch.refuse();
+        }
+        tracing::debug!(
+            switch = switch_id,
+            "adaptive join's hash table spilled: it stays a nested loop"
+        );
+        state.pc = target_pc.as_offset_int();
+    } else {
+        program.connection.count_adaptive_join_switch();
+        state.pc += 1;
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_hash_clear(
     _program: &Program,
     state: &mut ProgramState,

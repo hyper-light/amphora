@@ -270,6 +270,24 @@ pub struct HashBuildData {
     pub track_matched: bool,
 }
 
+/// Amphora (PL.13): one adaptive join's switch (boxed to keep Insn small). The three weights are
+/// the learned costs' at prepare (`optimizer::learned_costs`), in rows' visits; `build_rows` the
+/// inner table's rows as the statistics count them.
+#[derive(Debug, Clone)]
+pub struct JoinSwitchData {
+    pub switch_id: usize,
+    pub seek: f64,
+    pub hash_build: f64,
+    pub hash_probe: f64,
+    pub build_rows: f64,
+    /// The bytes the hash table over the inner table would hold, by the estimate.
+    pub build_bytes: u64,
+    /// Where the hash table's build begins: run once, when the switch comes.
+    pub build_pc: BranchOffset,
+    /// Where an outer row probes the hash table once it is built.
+    pub probe_pc: BranchOffset,
+}
+
 /// Key columns of a seek that use `IS` instead of `=`, so NULL may match in
 /// them. Most seeks have no such columns, so the empty mask is a null pointer
 /// and only IS-seeks allocate (boxed to keep Insn small).
@@ -2232,6 +2250,29 @@ pub enum Insn {
         version: crate::CdcVersion,
         cdc_mode: String,
     },
+
+    /// Amphora (PL.13): counts an outer row of an adaptive join and says how to join it: falls
+    /// through to the index seek, jumps to `build_pc` to build the hash table once the outer rows
+    /// pass the learned costs' break-even, or to `probe_pc` once it is built.
+    JoinSwitchStep {
+        data: Box<JoinSwitchData>,
+    },
+
+    /// Amphora (PL.13): jumps to `target_pc` if the adaptive join `switch_id` has switched to its
+    /// hash table, so the shared body's next row comes from the table, not the index.
+    JoinSwitchHash {
+        switch_id: usize,
+        target_pc: BranchOffset,
+    },
+
+    /// Amphora (PL.13): after an adaptive join's hash table is built: if it spilled past its share
+    /// of memory, the switch is refused (the table freed, the join a nested loop from this row on,
+    /// `target_pc` its seek); else on to the probe.
+    JoinSwitchBuilt {
+        switch_id: usize,
+        hash_table_id: usize,
+        target_pc: BranchOffset,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2479,6 +2520,9 @@ impl InsnVariants {
             InsnVariants::VacuumInto => execute::op_vacuum_into,
             InsnVariants::Vacuum => execute::op_vacuum,
             InsnVariants::InitCdcVersion => execute::op_init_cdc_version,
+            InsnVariants::JoinSwitchStep => execute::op_join_switch_step,
+            InsnVariants::JoinSwitchHash => execute::op_join_switch_hash,
+            InsnVariants::JoinSwitchBuilt => execute::op_join_switch_built,
         }
     }
 }

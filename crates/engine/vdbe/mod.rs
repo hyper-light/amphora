@@ -968,6 +968,9 @@ pub struct ProgramState {
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
     hash_tables: HashMap<usize, HashTable>,
+    /// Amphora (PL.13): each adaptive join's switch, by switch id; None for one that cannot
+    /// switch (`optimizer::adaptive::JoinSwitch`).
+    join_switches: HashMap<usize, Option<crate::translate::optimizer::adaptive::JoinSwitch>>,
     /// Amphora: each hash-aggregated GROUP BY's groups (`group_table.rs`), by table id.
     group_tables: HashMap<usize, group_table::GroupTable>,
     /// TempFile handles for ephemeral cursors, keyed by cursor_id.
@@ -1117,6 +1120,7 @@ impl ProgramState {
             spare_agg_payloads: Vec::new(),
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
+            join_switches: HashMap::default(),
             group_tables: HashMap::default(),
             ephemeral_temp_files: HashMap::default(),
             ephemeral_kept: HashMap::default(),
@@ -1305,6 +1309,9 @@ impl ProgramState {
         }
         if !self.hash_tables.is_empty() {
             self.hash_tables.clear();
+        }
+        if !self.join_switches.is_empty() {
+            self.join_switches.clear();
         }
         if !self.group_tables.is_empty() {
             self.group_tables.clear();
