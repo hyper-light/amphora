@@ -385,6 +385,20 @@ unmeasured.
 statement whose workers together pass its budget; a statement the model sends to more workers that
 runs slower than on one, measured class for class.
 
-**Left.** The pipelines run over rows already read; the VDBE's own loops (cursors over one
-snapshot per worker), a hash table built by all workers, the page cache's miss path sharded, loom
+**Reading the table in morsels.** `vdbe/morsel_scan.rs` gives the pipelines a table's own pages
+as their input. A morsel is a run of leaf pages, so the unit the pilot measures and
+`choose_degree` sizes is a page. The leaves come from the table's interior pages, read level by
+level in key order (no recursion; the walk is refused past the database's page count), each leaf
+keeping its parent's divider as its greatest rowid. A worker opens its own cursor through the
+statement's pager, so every worker reads the statement's one snapshot; it seeks past the divider
+below its first leaf and reads until a rowid passes the divider above its last, so every row is
+read by exactly one morsel. A row's position, by which MIN, MAX and a group's key values break
+ties, is its rowid's place in rowid order. Evidence: random filters, groupings and aggregates over
+tables of many leaves, sparse and negative rowids among them, at 1 to 8 workers and several morsel
+sizes equal the VDBE's serial SQL answers (T-QT.6.7); a probe read in leaf morsels equals the
+VDBE's join in its order (T-QT.6.8); an INTEGER PRIMARY KEY reads its rowid (T-QT.6.9).
+
+**Left.** The planner and VDBE handing a qualifying loop (a scan with its filter and aggregates, a
+hash join's probe) to these pipelines with each worker running its own copy of the program's loop
+body, a hash table built by all workers, the page cache's miss path sharded, loom
 or shuttle on the dispatcher, and the worker and morsel metrics are the step's next pieces.
