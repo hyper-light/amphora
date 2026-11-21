@@ -332,6 +332,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   whose write is refused at the leader's append gets a slot for its next try, its length learned per member from
   its retries' gaps (cold start: the core's election timeout). A gap over which the host's detector suspected the
   member is not learned; no number bounds a gap (lane g-slot-close, 2026-11-21).
+- **The raft log as the WAL** (G12 step 2, AC-T1.8.L1 and L2; replication.md, "The raft log as the WAL"): the engine
+  applies committed entries without flushing its log per commit; compaction asks nothing of the owner's thread and
+  moves the raft log's start no further than what the flushing thread made durable (T-T1.8.L1). The Records suite
+  and seeded histories run on one harness at one voter and three, with identical transcripts (T-T1.8.L2; lane
+  g12s2, 2026-11-21).
 
 - **Backups and point-in-time recovery to Mantle, the mechanism** (CP-T1.12, lane pitr,
   `crates/amphora/src/backup*`, docs/design/backup.md): the object-store seam (`amphora_api::blobs`,
@@ -358,9 +363,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (local-owner-transport.md, "Decision (lane constants): one descriptor budget"; FD.1), with a replica's local
   readers following it; the replicated owner drives once a step, in turn with its inputs (replication.md, "Decision
   (lane constants): one drive a step"; DQ.1); and each owner charges its lease, or a client its socket, to the same
-  budget, no count of owners (`OWNERS_MAX` gone; AC-FD.1.4). Left: an owner's other descriptors (endpoint, engine
-  files, a replica's log) charged by kind, the replicated owner's tick and poll, and the rest of the list
-  (handoff/amphora-constants-list.md).
+  budget, no count of owners (`OWNERS_MAX` gone; AC-FD.1.4); the owner wakes on its inputs, not a poll (WK.1); the
+  quorum patience's and the write slot's generations are learned from their own events (GN.1); and a generation of
+  the database log's restarts ends once it alone covers its own spend at the p99.9, the next restart guessed by the
+  worst of the last thousand holds (`log_bound::GENERATION` gone; replication.md, "Decision (lane constants): a
+  generation of restarts ends once it covers its spend"; GN.2). Left: an owner's other descriptors (endpoint, engine
+  files, a replica's log) charged by kind, the replicated owner's tick (`TICK`, twenty ticks an election), its queue
+  and outgoing bounds and the log's compaction trigger, and the rest of the list (handoff/amphora-constants-list.md).
 - **Groups that split, merge and move themselves** (CP-T1.9, lane split-merge; `crates/amphora/src/reshard/`,
   docs/design/reshard.md): a pure core: a directory of hash spans with every position in exactly one group,
   each group's own holding (fenced, stale actions refused), a planner deciding from measured load, bytes and
