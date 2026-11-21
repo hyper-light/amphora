@@ -158,3 +158,46 @@ cut between the two (non-vacuous).
 
 **Falsified by.** A cut at which one group holds a transaction's write and another doesn't after
 `restore_cut`; a cut whose restore is refused while each group's archive holds the second whole.
+
+## Incremental bases
+
+**Decision.** A new base keeps the latest base's chunks whose pages the log didn't change, and
+copies only the rest, so bases can come often and a restore replays a short log (restore time is the
+usual failure: GitLab 2017, GitHub 2018, Atlassian 2022; research/backup-single-node.md §0.2), as
+PostgreSQL 17's incremental `pg_basebackup` copies only blocks its WAL summaries say changed
+(postgresql.org/docs/17/release-17.html) and pgBackRest's block incremental does (research §1.2,
+§1.3). A base's manifest names, in runs, the base each chunk is stored under (manifest format 2;
+format 1 manifests still read, every chunk their own).
+
+- **Which chunks changed.** A restore replays the log from the first frame of the generation its
+  base began in, and a log only starts again once every frame is in the file. So a chunk of the
+  latest base whose pages no frame wrote in the generations from that base's beginning up to the
+  new base's is the same bytes in the file now; frames of the new base's own generation are
+  replayed over it in any case. The shipper reads each frame's page number as it ships it (the
+  frame header's first field, sqlite.org/fileformat2.html) into a bitmap a bit a page, bounded by
+  the database's pages: one for the generation shipped now and one for those before it since the
+  latest base began.
+- **When it may.** Only with every frame since the latest base began seen (not after the shipper
+  opened on an archive, nor after a gap in the log), a generation since it, and the same chunk
+  size; otherwise the base copies the whole file. A chunk is kept only if the latest base holds the
+  same byte range of the file.
+  A base's own generation counts as changed for the next, frames before the base began included,
+  so a base begun just after the log starts again leaves the least for the next to copy.
+- **When one is due.** `plan::base_due` compares the log shipped since the latest base with what a
+  new base would copy (the changed chunks' bytes, measured from the bitmap as the log runs), no
+  longer with the whole file, so a base comes as soon as making it costs less than the log it
+  spares every later restore; the restore-rate rule stands.
+- **Retention.** A chunk a kept base reuses stays when the base that stored it expires.
+
+**Evidence.** T-T1.12.I1: 400 rows, the log started again, and a base; 5 rows changed over two generations of the log; the
+second base keeps most of the first's chunks and copies the changed ones; seconds across both
+restore with every row equal, from both bases; after the first base expires, the newest and the
+oldest kept seconds still restore equal. T-T1.12.D1's random drills (log restarts between bases)
+now take incremental bases. T-T1.12.I2: manifest formats; T-T1.12.I3: the due rule.
+
+**Falsified by.** A restore from an incremental base whose rows differ from the source's; a kept
+chunk whose pages a frame in the traced generations wrote; a chunk deleted while a kept base
+reuses it.
+
+**Open.** After the shipper opens on an archive, the first base is whole: reading the shipped
+segments since the latest base to rebuild the bitmap is not built.

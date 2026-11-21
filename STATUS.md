@@ -408,8 +408,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   integrity-checked and its rows compared with the source's, typed and counted, due on the archive's
   cadence (T-T1.12.C1, C2). One cut across groups (`backup::restore_cut`): every group restored to
   one second, half-done cross-group transactions finished by their records (T-T1.12.X1). Not yet:
-  the source's digest taken by the shipping thread itself; incremental bases; cuts across nodes'
-  clocks.
+  the source's digest taken by the shipping thread itself; cuts across nodes' clocks. Incremental
+  bases (T-T1.12.I1 to I3): a new base keeps the latest's chunks the log left unchanged, due once the
+  log outweighs what it would copy; after a reopen the first base is still whole.
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and

@@ -38,8 +38,12 @@ pub(super) struct Segment {
     pub frames: Vec<u8>,
 }
 
+/// The manifest's own format: a format value. 1 had no `from` (every chunk its base's own); 2
+/// names the base each chunk is stored under, so a base reuses an earlier base's unchanged chunks.
+pub(super) const MANIFEST_FORMAT: u8 = 2;
+
 /// A base: its pages are in `chunks` objects of `chunk_bytes` (the last shorter), `file_bytes` in
-/// all.
+/// all. `from`: the base each chunk is stored under, in runs of (base id, chunks), in chunk order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Manifest {
     pub format: u8,
@@ -49,6 +53,74 @@ pub(super) struct Manifest {
     pub file_bytes: u64,
     pub chunk_bytes: u64,
     pub chunks: u64,
+    pub from: Vec<(u64, u64)>,
+}
+
+/// A manifest of format 1, as archives made before format 2 hold them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ManifestV1 {
+    format: u8,
+    id: u64,
+    start_gen: u64,
+    end: (u64, u64),
+    file_bytes: u64,
+    chunk_bytes: u64,
+    chunks: u64,
+}
+
+impl Manifest {
+    /// The base each chunk is stored under, chunk by chunk.
+    pub fn chunk_bases(&self) -> anyhow::Result<Vec<u64>> {
+        if self.from.is_empty() {
+            return Ok(vec![self.id; usize::try_from(self.chunks)?]);
+        }
+        let mut out = Vec::with_capacity(usize::try_from(self.chunks)?);
+        for &(base, run) in &self.from {
+            if u64::try_from(out.len())?.saturating_add(run) > self.chunks {
+                anyhow::bail!("base {}'s manifest names more chunks than it has", self.id);
+            }
+            out.extend(std::iter::repeat_n(base, usize::try_from(run)?));
+        }
+        if u64::try_from(out.len())? != self.chunks {
+            anyhow::bail!("base {}'s manifest names fewer chunks than it has", self.id);
+        }
+        Ok(out)
+    }
+}
+
+/// `bases` (one per chunk) as runs of (base, chunks in a row).
+pub(super) fn runs(bases: &[u64]) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for &base in bases {
+        match out.last_mut() {
+            Some((b, n)) if *b == base => *n = n.saturating_add(1),
+            _ => out.push((base, 1)),
+        }
+    }
+    out
+}
+
+/// A manifest of either format.
+pub(super) fn manifest(key: &str, object: &[u8]) -> anyhow::Result<Manifest> {
+    let body = opened(key, object)?;
+    let bad = |e: postcard::Error| anyhow::anyhow!("archive object {key} doesn't decode: {e}");
+    match body.first() {
+        Some(1) => {
+            let v1: ManifestV1 = postcard::from_bytes(body).map_err(bad)?;
+            Ok(Manifest {
+                format: v1.format,
+                id: v1.id,
+                start_gen: v1.start_gen,
+                end: v1.end,
+                file_bytes: v1.file_bytes,
+                chunk_bytes: v1.chunk_bytes,
+                chunks: v1.chunks,
+                from: Vec::new(),
+            })
+        }
+        Some(&MANIFEST_FORMAT) => postcard::from_bytes(body).map_err(bad),
+        other => anyhow::bail!("archive object {key} is a manifest of no known format ({other:?})"),
+    }
 }
 
 /// A through mark ([`super::plan::ThroughKey`]): the log shipped through frame `last` of
@@ -116,19 +188,60 @@ mod tests {
     #[test]
     fn t_t1_12_p10_sealed_objects() {
         let m = Manifest {
-            format: FORMAT,
+            format: MANIFEST_FORMAT,
             id: 1,
             start_gen: 2,
             end: (3, 4),
             file_bytes: 8192,
             chunk_bytes: 4096,
             chunks: 2,
+            from: vec![(1, 2)],
         };
         let mut bytes = encode(&m).unwrap();
-        assert_eq!(decode::<Manifest>("k", &bytes).unwrap(), m);
+        assert_eq!(manifest("k", &bytes).unwrap(), m);
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
         assert!(decode::<Manifest>("k", &bytes).is_err());
         assert!(opened("k", &[0; 3]).is_err());
+    }
+
+    /// T-T1.12.I2: a manifest of format 1 still reads, every chunk its own base's; a format 2
+    /// manifest's runs give each chunk's base, and runs that don't add up to its chunks are refused.
+    #[test]
+    fn t_t1_12_i2_manifest_formats() {
+        let v1 = ManifestV1 {
+            format: 1,
+            id: 7,
+            start_gen: 1,
+            end: (1, 9),
+            file_bytes: 3 * 4096,
+            chunk_bytes: 4096,
+            chunks: 3,
+        };
+        let read = manifest("k", &encode(&v1).unwrap()).unwrap();
+        assert_eq!(read.chunk_bases().unwrap(), vec![7, 7, 7]);
+        let bases = [3, 3, 9, 3, 9, 9];
+        let m = Manifest {
+            format: MANIFEST_FORMAT,
+            id: 9,
+            start_gen: 2,
+            end: (2, 1),
+            file_bytes: 6 * 4096,
+            chunk_bytes: 4096,
+            chunks: 6,
+            from: runs(&bases),
+        };
+        assert_eq!(m.from, vec![(3, 2), (9, 1), (3, 1), (9, 2)]);
+        assert_eq!(m.chunk_bases().unwrap(), bases.to_vec());
+        let short = Manifest {
+            from: vec![(3, 2)],
+            ..m.clone()
+        };
+        assert!(short.chunk_bases().is_err());
+        let long = Manifest {
+            from: vec![(3, 7)],
+            ..m
+        };
+        assert!(long.chunk_bases().is_err());
     }
 }
