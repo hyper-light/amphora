@@ -29,6 +29,9 @@ use std::time::{Duration, Instant};
 use crate::meter::{Counters, Meter};
 use crate::reshard::{Pos, Seq, Span};
 
+mod checkout;
+pub use checkout::ReadCheckout;
+
 /// Flushes what an engine has committed to its disk, from the store's flusher thread.
 pub type Flush = Box<dyn Fn() -> std::io::Result<()> + Send + Sync>;
 
@@ -942,6 +945,9 @@ struct Readers<R> {
     /// The checkpointer found the log past its bound: the writer starts it again.
     restart: Arc<AtomicBool>,
     meter: Arc<Meter>,
+    /// G3 step 6 (prototype F): a slot a reader, taken without a lock every reader shares; the
+    /// pool, `open` aside, unused then. None: the pool (`ReadCheckout`).
+    slots: Option<checkout::Slots<R>>,
 }
 
 /// The readers not reading, how many are reading, and which database they were opened on (a reader
@@ -954,6 +960,10 @@ struct Pool<R> {
 
 impl<R: Send + 'static> Readers<R> {
     fn new(most: usize, meter: Arc<Meter>) -> Self {
+        Self::with_checkout(most, meter, ReadCheckout::process_default())
+    }
+
+    fn with_checkout(most: usize, meter: Arc<Meter>, checkout: ReadCheckout) -> Self {
         Self {
             open: Mutex::new(None),
             pool: Mutex::new(Pool {
@@ -967,6 +977,10 @@ impl<R: Send + 'static> Readers<R> {
             gate: Arc::new(RwLock::new(())),
             restart: Arc::new(AtomicBool::new(false)),
             meter,
+            slots: match checkout {
+                ReadCheckout::Pool => None,
+                ReadCheckout::Slots => Some(checkout::Slots::new(most)),
+            },
         }
     }
 
@@ -1075,6 +1089,12 @@ impl<R: Send + 'static> Readers<R> {
                     .unwrap_or_else(PoisonError::into_inner);
             }
         }
+        // Each slot once its read is done: `open` is gone, so none is opened in it again.
+        if let Some(slots) = &self.slots {
+            for mut slot in slots.take_all() {
+                *slot = None;
+            }
+        }
         if let Some((tx, handle)) = locked(&self.checkpointer).take() {
             drop(tx);
             let _ = handle.join();
@@ -1089,6 +1109,8 @@ impl<R: Send + 'static> Readers<R> {
         }
         let asked = Instant::now();
         let _alone = self.gate.write().unwrap_or_else(PoisonError::into_inner);
+        // Slot readers hold no gate: holding every slot holds them back.
+        let _slots = self.slots.as_ref().map(checkout::Slots::take_all);
         let began = Instant::now();
         let restarted = restart();
         self.meter
@@ -1109,6 +1131,9 @@ impl<R: Send + 'static> Readers<R> {
         until: Instant,
         f: impl FnOnce(&mut R) -> anyhow::Result<T>,
     ) -> Option<anyhow::Result<T>> {
+        if let Some(slots) = &self.slots {
+            return self.with_slot(slots, until, f);
+        }
         let (mut reader, generation) = {
             let mut pool = locked(&self.pool);
             loop {
@@ -1146,6 +1171,28 @@ impl<R: Send + 'static> Readers<R> {
         };
         self.give_back(Some(reader), generation);
         Some(answer)
+    }
+
+    /// `with` on a slot's reader (`ReadCheckout::Slots`): the slot this thread takes, its reader
+    /// opened in it the first time; None when there are no readers now.
+    fn with_slot<T>(
+        &self,
+        slots: &checkout::Slots<R>,
+        until: Instant,
+        f: impl FnOnce(&mut R) -> anyhow::Result<T>,
+    ) -> Option<anyhow::Result<T>> {
+        let Some(mut taken) = slots.take(until) else {
+            return Some(Err(Refused::Timeout.into()));
+        };
+        let slot = taken.reader()?;
+        if slot.is_none() {
+            let open = locked(&self.open).clone()?;
+            match open() {
+                Ok(r) => *slot = Some(r),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        slot.as_mut().map(f)
     }
 
     fn give_back(&self, reader: Option<R>, generation: u64) {

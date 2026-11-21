@@ -99,6 +99,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (Unix), the checksum checked once as a page enters the process. Built and tested (the shared-pages
   model on the plain path; each path reads today's rows; a flipped byte refused on each path); not
   yet measured. The miss still allocates the page and its buffer's `Arc`.
+- **Point readers that write no shared line** (G3 step 6, docs/design/store.md decision 43), two
+  prototypes, each behind its switch and off by default: `AMPHORA_READ_CHECKOUT=slots` takes a
+  store's reader from a slot of its own, with no pool mutex or shared gate per read;
+  `AMPHORA_SHARED_PAGE_READS=optimistic` reads shared pages from frames of atomic words under a
+  version check, without the shard's lock. Built and tested (slot readers, and 32 readers and a
+  writer under the model: no image past a reader's snapshot, none torn); not yet measured (60 s
+  run, perf c2c and the 32-client suite are the coordinator's).
 - **The mixed log's commit costs** (docs/design/store.md, Decision (lane wal-read)): publishing a
   commit's records costs a lookup each, not a pass over the records kept decoded or over the
   commit's pages, and deltas are found a word at a time. Built, not merged; whether the bulk
