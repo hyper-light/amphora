@@ -551,7 +551,7 @@ pub struct OverflowCell {
 /// when given, before it is submitted. Amphora (QT.5): a whole page read tells `learned`, when
 /// given, how long it took from submission to completion (`learned_costs::Work::PageRead`).
 #[allow(clippy::too_many_arguments)]
-pub fn begin_read_page(
+pub(crate) fn begin_read_page(
     db_file: &dyn DatabaseStorage,
     buffer_pool: &BufferPool,
     page: PageRef,

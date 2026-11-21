@@ -291,9 +291,7 @@ pub(crate) fn time_page_read(
     io: &crate::sync::Arc<dyn crate::io::IO>,
     page_size: usize,
 ) -> Option<f64> {
-    let page: Vec<u8> = (0..page_size)
-        .map(|i| mix(i as u64) as u8)
-        .collect();
+    let page: Vec<u8> = (0..page_size).map(|i| mix(i as u64) as u8).collect();
     let in_memory = crate::database::is_memory_like(db_path);
     let scratch = scratch_path(db_path, in_memory);
     #[cfg(all(feature = "fs", not(target_family = "wasm")))]
@@ -421,21 +419,23 @@ fn read_through_io(
     let file = io.open_file(scratch, OpenFlags::Create, true)?;
     let timed = (|| -> crate::Result<f64> {
         let len = page.len();
-        let written = file.pwrite(0, Arc::new(Buffer::new(page)), Completion::new_write(|_| {}))?;
+        let written = file.pwrite(
+            0,
+            Arc::new(Buffer::new(page)),
+            Completion::new_write(|_| {}),
+        )?;
         io.wait_for_completion(written)?;
         let start = std::time::Instant::now();
         let read = file.pread(
             0,
-            Completion::new_read(Arc::new(Buffer::new(vec![0; len])), move |res| {
-                match res {
-                    Ok((_, n)) if n as usize == len => None,
-                    Ok((_, n)) => Some(crate::error::CompletionError::ShortRead {
-                        page_idx: 0,
-                        expected: len,
-                        actual: n.max(0) as usize,
-                    }),
-                    Err(err) => Some(err),
-                }
+            Completion::new_read(Arc::new(Buffer::new(vec![0; len])), move |res| match res {
+                Ok((_, n)) if n as usize == len => None,
+                Ok((_, n)) => Some(crate::error::CompletionError::ShortRead {
+                    page_idx: 0,
+                    expected: len,
+                    actual: n.max(0) as usize,
+                }),
+                Err(err) => Some(err),
             }),
         )?;
         io.wait_for_completion(read)?;
@@ -588,8 +588,7 @@ mod tests {
     /// own IO.
     #[test]
     fn t_qt_5_5_a_scratch_page_read_is_timed_in_memory() {
-        let io: crate::sync::Arc<dyn crate::io::IO> =
-            crate::sync::Arc::new(crate::MemoryIO::new());
+        let io: crate::sync::Arc<dyn crate::io::IO> = crate::sync::Arc::new(crate::MemoryIO::new());
         let nanos = time_page_read(":memory:", &io, 4096).unwrap();
         assert!(nanos.is_finite() && nanos > 0.0, "{nanos}");
     }
