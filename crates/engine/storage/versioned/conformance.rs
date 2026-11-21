@@ -20,15 +20,15 @@
 use super::cursor::{Access, KeyOrder, VersionedCursor};
 use super::disk::Simulated;
 use super::durable::Database as VDatabase;
-use crate::io::{IO, MemoryIO};
+use crate::io::{MemoryIO, IO};
 use crate::schema::{Index, IndexColumn};
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::{Arc, Mutex};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
-    ImmutableRecord, ImmutableRecordRef, IndexInfo, SeekKey, SeekOp, SeekResult,
-    compare_immutable_iter,
+    compare_immutable_iter, ImmutableRecord, ImmutableRecordRef, IndexInfo, SeekKey, SeekOp,
+    SeekResult,
 };
 use crate::util::IOExt;
 use crate::vdbe::Register;
