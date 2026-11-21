@@ -228,7 +228,7 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   G3 step 5, G3.5): two cores that name a point read's leaf without descending, each answer proven
   by the leaf's own range: InnoDB's adaptive hash index, built a leaf at a time by a ski rental
   counted in probes, and a learned rowid-to-leaf locator whose error bound is its own fit's. Built
-  and model-tested against a plain descent (T-G3.5.1, T-G3.5.2); not yet wired into the cursor
+  and model-tested against a plain descent and on the engine's pages against the cursor (T-G3.5.1-3); not yet wired into the cursor
   or measured (AC-G3.5.1, AC-G3.5.2; `descent_skip_bench` measures the cores).
 - **A shared page found in one lookup** (docs/design/store.md decision 22): the pool keeps each image
   in its map's entry and counts lookups in each shard, under the lock it holds anyway, where one
@@ -596,6 +596,16 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   but not merged: with today's join costs it flips `records_plans`' one-row-lookup case to a hash join and a sort
   (the two plans cost about 110 each), so it waits for the learned costs, then the `rhs_has_selective_seek` gate removed, builds over joined inputs, PL.5's Bloom
   filters with LIP and predicate transfer, and sort-merge and prefetched index joins (G6 step 4).
+  Lane qs5-6: the planner no longer prices pages its cache holds as file reads. A tree's first reads are held at the
+  share of the connection's recent fetches that found their page cached (`Pager::page_miss_ratio`, over one to two
+  cache turnovers) times the part of the tree the cache has room for; reads past what the cache can keep are charged
+  whatever (`cost::file_reads`). `index_bonus` (a picked half page) is removed. `records_plans`' one-row-lookup join
+  now picks the scan and index searches it measured faster (1.75 ms against the hash join's 3.05 ms, jupiter, release).
+  Lane qs5-7: an automatic index, and a subquery's probe index, past its own cache (the default page cache its pager
+  gets) pays for the leaves it writes out and reads again, as a hash join's spill already paid; a search of an index
+  bigger than the cache keeps its inner pages held while they fit. Before, the automatic index cost CPU only and,
+  against a measured page read, beat a unique key's search and a hash join on tables the cache can't hold.
+  Left: `cache_reuse_factor` (a picked 0.2) and multi-index table fetches through `file_reads`; sampled operator times.
 - **G6 step 5, plans that read less, started** (lane g6s5): an `EXISTS` may now run as a hash semi join, chosen by
   cost against the nested loop's early out: the outer rows build the hash table, the subquery's table probes it, and
   `HashMarkFirstMatch` passes each build row on at its first match in a probe pass only (its matched bit, kept in
