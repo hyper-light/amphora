@@ -1736,13 +1736,18 @@ features, summed over the plan rather than convolved over its tree).
 
 The model is Bayesian linear regression of a run's log time on those features, in constant memory
 (the sufficient statistics: a 16 x 16 matrix, a vector and two sums, whatever the number of runs).
+Features and times are centered on the runs' means before the fit, so the intercept is the mean
+time rather than a weight the prior shrinks (Bishop §3.1.1); uncentered, the features every plan
+shares (a join's row estimates) set the prior's scale and the evidence shrank the differences
+between plans to nothing (lane g6s3b found the fixed point stuck there on a test's two plans).
 Its two precisions are learned from the runs, not picked: the evidence approximation's fixed point,
 one step a run, from the unit-information prior. A training run's mask is chosen by Thompson
 sampling from the posterior; its measured time trains the model, every run, none chosen out.
 
 The guard keeps the cost model's plan for each query class until a hint set's held-out runs (runs
 that never train the model) beat it: the hinted mean log time plus its standard error below the
-unhinted mean less its standard error. It drops the hint set when its held-out mean lies above the
+unhinted mean less its standard error (the one-standard-error rule, Breiman, Friedman, Olshen and
+Stone, "Classification and Regression Trees", 1984, §3.4.3). It drops the hint set when its held-out mean lies above the
 unhinted mean plus that standard error, and a dropped set stays dropped. A plan equal to the
 unhinted one is no hint. The guard holds as many classes as its caller gives it room for, the least
 recently used evicted past it.
@@ -1766,6 +1771,8 @@ what bounds a regression.
   Machine Learning" §3.5.2: the evidence approximation's precisions.
 - Kass and Wasserman, "A Reference Bayesian Test for Nested Hypotheses...", JASA 1995: the
   unit-information prior the fixed point starts from.
+- Breiman, Friedman, Olshen and Stone, "Classification and Regression Trees", 1984: the
+  one-standard-error rule the guard compares held-out means by.
 
 **Evidence.** `optimizer::plan_hints::tests` (the guard admits then drops a regressing hint,
 T-G6.3.2; memory bounded over 20,000 runs and classes, T-G6.3.3; the model learns the faster plan)

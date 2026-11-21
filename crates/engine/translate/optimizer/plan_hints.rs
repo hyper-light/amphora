@@ -339,6 +339,18 @@ fn times(m: &Matrix, v: &[f64; FEATURES]) -> [f64; FEATURES] {
 struct Posterior {
     mean: [f64; FEATURES],
     spread: Matrix,
+    /// The runs' mean features and mean log time, the point the weights pivot on.
+    mean_x: [f64; FEATURES],
+    mean_y: f64,
+}
+
+/// The model's sufficient statistics centered on the runs' means (`HintModel::centered`).
+struct Centered {
+    gram: Matrix,
+    xty: [f64; FEATURES],
+    yty: f64,
+    mean_x: [f64; FEATURES],
+    mean_y: f64,
 }
 
 /// Bayesian linear regression of a run's log time on its plan's features, in constant memory: the
@@ -406,68 +418,91 @@ impl HintModel {
         Ok(())
     }
 
+    /// The runs' features and log times centered on their means: the Gram matrix of the centered
+    /// features, their products with the centered times, the centered times' sum of squares, and
+    /// the means. The constant term (feature 0, 1 on every run) centers to nothing, so its row and
+    /// column are zero: the intercept is the times' mean, not a weight the prior shrinks (Bishop,
+    /// PRML §3.1.1). Without centering, features every plan shares (a join's row estimates) swamp
+    /// the prior's scale and the differences between plans, the signal, are shrunk away.
+    fn centered(&self) -> Option<Centered> {
+        if self.runs < 2 {
+            return None;
+        }
+        let n = self.runs as f64;
+        let sums = self.xtx.first().copied()?;
+        let mut mean_x = [0.0; FEATURES];
+        for (m, sum) in mean_x.iter_mut().zip(sums) {
+            *m = sum / n;
+        }
+        let mean_y = self.xty.first().copied()? / n;
+        let mut gram = [[0.0; FEATURES]; FEATURES];
+        let mut xty = [0.0; FEATURES];
+        for i in 1..FEATURES {
+            let mi = *mean_x.get(i)?;
+            *xty.get_mut(i)? = self.xty.get(i)? - n * mi * mean_y;
+            for j in 1..FEATURES {
+                *gram.get_mut(i)?.get_mut(j)? =
+                    self.xtx.get(i)?.get(j)? - n * mi * mean_x.get(j)?;
+            }
+        }
+        let yty = self.yty - n * mean_y * mean_y;
+        Some(Centered {
+            gram,
+            xty,
+            yty,
+            mean_x,
+            mean_y,
+        })
+    }
+
     /// One evidence step: the posterior under the current precisions, then the precisions the
     /// evidence approximation gives from it (MacKay 1992), the posterior again under those.
     fn refit(&mut self) {
-        let n = self.runs as f64;
-        if self.runs < 2 {
+        let Some(c) = self.centered() else {
             return;
-        }
-        // Times are centered on their mean, so the weights model how plans differ (the constant
-        // term's sum of features is row 0: its feature is 1 on every run).
-        let mean_y = self.xty.first().copied().unwrap_or(0.0) / n;
-        let mut centered = [0.0; FEATURES];
-        for (slot, (xty, sum_x)) in centered
-            .iter_mut()
-            .zip(self.xty.iter().zip(self.xtx.first().copied().unwrap_or([0.0; FEATURES])))
-        {
-            *slot = xty - mean_y * sum_x;
-        }
-        let centered_yty = self.yty - n * mean_y * mean_y;
-        if !(centered_yty.is_finite() && centered_yty > 0.0) {
+        };
+        let n = self.runs as f64;
+        if !(c.yty.is_finite() && c.yty > 0.0) {
             return;
         }
         let (alpha, beta) = self.precisions.unwrap_or_else(|| {
             // The unit-information prior (Kass and Wasserman 1995): the noise precision is the
-            // inverse of the times' variance, and each weight's prior is worth one average run.
-            let beta = n / centered_yty;
-            let trace: f64 = (0..FEATURES)
-                .filter_map(|i| self.xtx.get(i).and_then(|row| row.get(i)))
+            // inverse of the times' variance, and each weight's prior is worth one average run
+            // of its centered feature (the constant term is not a weight: FEATURES - 1 of them).
+            let beta = n / c.yty;
+            let trace: f64 = (1..FEATURES)
+                .filter_map(|i| c.gram.get(i).and_then(|row| row.get(i)))
                 .sum();
-            (beta * trace / (n * FEATURES as f64), beta)
+            (beta * trace / (n * (FEATURES - 1) as f64), beta)
         });
-        let Some((posterior, trace_covariance)) = self.posterior(alpha, beta, &centered) else {
+        let Some((posterior, trace_covariance)) = Self::posterior(&c, alpha, beta) else {
             return;
         };
-        // MacKay's fixed point: gamma, the weights the data determine, sets both precisions.
+        // MacKay's fixed point: gamma, the weights the data determine, sets both precisions. The
+        // constant term's weight is the prior's alone (its centered feature is zero), so it adds
+        // nothing to gamma: FEATURES less alpha times the covariance's trace counts it out.
         let gamma = FEATURES as f64 - alpha * trace_covariance;
         let weight_norm = dot(&posterior.mean, &posterior.mean);
-        let fit = times(&self.xtx, &posterior.mean);
-        let residual = centered_yty - 2.0 * dot(&posterior.mean, &centered)
-            + dot(&posterior.mean, &fit);
+        let fit = times(&c.gram, &posterior.mean);
+        let residual = c.yty - 2.0 * dot(&posterior.mean, &c.xty) + dot(&posterior.mean, &fit);
         let next = (gamma / weight_norm, (n - gamma) / residual);
         let next_ok = next.0.is_finite() && next.0 > 0.0 && next.1.is_finite() && next.1 > 0.0;
         let (alpha, beta) = if next_ok { next } else { (alpha, beta) };
         self.precisions = Some((alpha, beta));
-        self.posterior = self.posterior(alpha, beta, &centered).map(|(p, _)| p);
+        self.posterior = Self::posterior(&c, alpha, beta).map(|(p, _)| p);
     }
 
     /// The weights' posterior under prior precision `alpha` and noise precision `beta`, and the
     /// trace of its covariance.
-    fn posterior(
-        &self,
-        alpha: f64,
-        beta: f64,
-        centered: &[f64; FEATURES],
-    ) -> Option<(Posterior, f64)> {
+    fn posterior(c: &Centered, alpha: f64, beta: f64) -> Option<(Posterior, f64)> {
         let mut precision = [[0.0; FEATURES]; FEATURES];
-        for (i, (row, data)) in precision.iter_mut().zip(&self.xtx).enumerate() {
+        for (i, (row, data)) in precision.iter_mut().zip(&c.gram).enumerate() {
             for (j, (cell, x)) in row.iter_mut().zip(data).enumerate() {
                 *cell = beta * x + if i == j { alpha } else { 0.0 };
             }
         }
         let covariance = inverse_from_cholesky(&cholesky(&precision)?)?;
-        let mut mean = times(&covariance, centered);
+        let mut mean = times(&covariance, &c.xty);
         for w in &mut mean {
             *w *= beta;
         }
@@ -475,12 +510,21 @@ impl HintModel {
             .filter_map(|i| covariance.get(i).and_then(|row| row.get(i)))
             .sum();
         let spread = cholesky(&covariance)?;
-        Some((Posterior { mean, spread }, trace))
+        Some((
+            Posterior {
+                mean,
+                spread,
+                mean_x: c.mean_x,
+                mean_y: c.mean_y,
+            },
+            trace,
+        ))
     }
 
-    /// The posterior mean's predicted log time of a plan (centered), None before the model is fit.
+    /// The posterior mean's predicted log time (natural log of nanoseconds) of a plan, None before
+    /// the model is fit.
     pub fn predict(&self, features: &PlanFeatures) -> Option<f64> {
-        self.posterior.map(|p| dot(&p.mean, &features.0))
+        self.posterior.map(|p| p.mean_y + dot(&p.mean, &features.0) - dot(&p.mean, &p.mean_x))
     }
 
     /// Weights drawn from the posterior (Thompson sampling), None before the model is fit.
@@ -854,8 +898,8 @@ mod tests {
     }
 
     /// AC-G6.3.1: do train on runs where hash-join plans take a tenth of the time of plans
-    /// without; expect the posterior mean to choose the hash join's hint set, and sampling to
-    /// choose it most of the time.
+    /// without; expect the posterior mean to predict each plan's time and choose the hash join's
+    /// hint set, and sampling to choose it most of the time.
     #[test]
     fn ac_g6_3_1_the_model_learns_which_plan_is_faster() {
         let mut chooser = HintChooser::new(5, 4).unwrap();
@@ -870,6 +914,16 @@ mod tests {
             chooser.model.observe(&hashes, 1_000.0 * noise).unwrap();
         }
         assert_eq!(chooser.best(&candidates), HintSet::ARMS[6]);
+        // Each plan's predicted log time lies among its own runs' (their noise is up to a tenth):
+        // the prior doesn't shrink the difference between the plans away, the features every
+        // plan shares (rows 13 and 15) notwithstanding.
+        for (features, nanos) in [(&loops, 10_000.0f64), (&hashes, 1_000.0f64)] {
+            let predicted = chooser.model.predict(features).unwrap();
+            assert!(
+                (nanos.ln()..=(nanos * 1.1).ln()).contains(&predicted),
+                "predicted {predicted} for runs of {nanos} ns to a tenth more"
+            );
+        }
         let chosen = (0..100)
             .filter(|_| chooser.explore(&candidates) == HintSet::ARMS[6])
             .count();
