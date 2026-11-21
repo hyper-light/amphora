@@ -9,6 +9,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (`CLAUDE.md`), the requirement registry (`docs/requirements.toml`), the design's starting point
   (`docs/design/README.md`), the gate (`scripts/gates.sh`, run by kiln CI from `.kiln/ci.yaml`), and the
   vendoring tool (`scripts/vendor.py`, kiln's).
+- **The audit log** (CP-T1.7, AC-T1.7.4; AL.1, `crates/amphora/src/audit.rs`, docs/design/audit.md):
+  RFC 6962's Merkle tree over any Records store, its head checked against its subtrees on open, a
+  reader's earlier checkpoint checked by a consistency proof, and each event by its leaf hash and
+  inclusion proof on read; every byte of a 1,000-event log flipped is detected. Open: where kiln keeps
+  checkpoints outside the store (signed heads, witnesses), and the audit_cost runs for bench/records.
 - **Records in amphora-api, typed and simulated** (CP-T1.5, kiln goal a1f386fe; lane records-api;
   docs/design/records.md): the trait's change feed is documented with etcd's watch guarantees and read
   from the commits' own version rows, and gains `changed` (a wait's answer without waiting);
