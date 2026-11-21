@@ -615,7 +615,10 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   gets) pays for the leaves it writes out and reads again, as a hash join's spill already paid; a search of an index
   bigger than the cache keeps its inner pages held while they fit. Before, the automatic index cost CPU only and,
   against a measured page read, beat a unique key's search and a hash join on tables the cache can't hold.
-  Left: `cache_reuse_factor` (a picked 0.2) and multi-index table fetches through `file_reads`; sampled operator times.
+  `cache_reuse_factor` (a picked 0.2) is removed: a repeated whole read pays for what the cache can't keep, a
+  repeated search for its path below the root; multi-index fetches go through `file_reads`. Seeks, hash builds and
+  hash probes time sampled runs into the learned rates, one run in k with k set by each one's spread against the
+  timing's own cost (step 3a). Left: SQLite's skip-scan factor 1.375 (Ada's call), the row visit's own observed time.
 - **G6 step 5, plans that read less, started** (lane g6s5): an `EXISTS` may now run as a hash semi join, chosen by
   cost against the nested loop's early out: the outer rows build the hash table, the subquery's table probes it, and
   `HashMarkFirstMatch` passes each build row on at its first match in a probe pass only (its matched bit, kept in
