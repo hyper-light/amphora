@@ -420,6 +420,24 @@ tests = [
   { id = "T-QT.3.5", text = "scripts/check-production.sh after the change — passes when it passes, with the ratchet's counts lowered by what the change removed" },
 ]
 
+# lane audit-log: Amphora's own IDs for G10 step 3 (kiln plan 01a16b0f47577325bcd9e51383067e04),
+# serving AC-T1.7.4 (docs/design/audit.md).
+
+[[own]]
+id = "AL.1"
+title = "A Merkle audit log: RFC 6962's tree with inclusion and consistency proofs verified on read (G10 step 3)"
+criteria = [
+  { id = "AC-AL.1.1", text = "Flipping any byte of the audit log is detected on read (AC-T1.7.4)" },
+  { id = "AC-AL.1.2", text = "Hash-chain and Merkle designs measured for append and audit cost (crates/amphora/examples/audit_cost.rs, recorded in bench/records)" },
+]
+tests = [
+  { id = "T-AL.1.1", text = "Flip every byte of a 1,000-event log — passes when every flip detected" },
+  { id = "T-AL.1.2", text = "Certificate Transparency's reference tree — passes when its roots, subtree hashes and proofs are reproduced" },
+  { id = "T-AL.1.3", text = "Every inclusion and consistency proof of every tree up to 70 leaves, and of a 100-event log's checkpoints — passes when each verifies and each altered one fails" },
+  { id = "T-AL.1.4", text = "History rewritten whole, and a log cut back — passes when a reader's earlier checkpoint refuses both" },
+  { id = "T-AL.1.5", text = "The log on Amphora's own Records — passes when reads verify, direct changes are refused as tampering, and a racing append is refused" },
+]
+
 # lane constants
 # Picked constants replaced by derived ones (Ada, 2026-11-11: "learned and stat derived values only"; kiln goal
 # dfabffcc). FD.n: the process's descriptor budget (local-owner-transport.md, "Decision (lane constants): one
@@ -494,6 +512,8 @@ criteria = [
 ]
 tests = [
   { id = "T-T1.9.S1", text = "Automatic splits, merges and moves in the simulator under writes, driver and group restarts and lost logs — passes when every key is in exactly one group, the directory's, and writes lost is 0" },
+  { id = "T-T1.9.R1", text = "A split carried through the directory group's replicated log while groups route by it — passes when every member holds the same directory, a write to the fenced range is refused typed, a router on the old directory is refused by the old group's holding after the flip, and once routed by the new directory the range is written to and read from the new group" },
+  { id = "T-T1.9.R2", text = "A refused directory change and a directory image — passes when the refusal is alike on every member and changes nothing, an image installs the same directory, and an image that doesn't decode is refused" },
 ]
 
 # lane qs5
