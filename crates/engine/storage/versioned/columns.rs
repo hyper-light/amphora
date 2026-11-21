@@ -46,7 +46,6 @@ struct Queued {
     /// The caller's tick when it was offered: what the freshness lag is measured from.
     at: u64,
     changes: Vec<Change>,
-    bytes: usize,
 }
 
 #[derive(Default)]
@@ -127,12 +126,7 @@ impl Feed {
         let mut counts = self.counts.lock();
         if fits {
             q.bytes = q.bytes.saturating_add(bytes);
-            q.records.push_back(Queued {
-                ts,
-                at,
-                changes,
-                bytes,
-            });
+            q.records.push_back(Queued { ts, at, changes });
             counts.offered = counts.offered.saturating_add(1);
         } else {
             q.lost = Some(q.lost.map_or((ts, ts), |(first, _)| (first, ts)));
@@ -150,6 +144,12 @@ impl Feed {
     }
 }
 
+/// Rows in key order: each key and its row.
+pub type Rowset = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// What a block's rows are handed to: each row's position, key and row; false stops.
+pub type RowVisit<'a> = dyn FnMut(usize, &[u8], &[u8]) -> Result<bool> + 'a;
+
 /// One block's rows as a format holds them, cut in key order.
 pub trait Block: Send + Sync + Sized {
     /// The block of `rows` (in key order, none empty of keys).
@@ -163,7 +163,7 @@ pub trait Block: Send + Sync + Sized {
     /// How many of its keys sort before `key`: where `key` is, or would be, in the block.
     fn rank(&self, key: &[u8]) -> Result<usize>;
     /// Each row in order, with its position, while `f` returns true.
-    fn rows(&self, f: &mut dyn FnMut(usize, &[u8], &[u8]) -> Result<bool>) -> Result<()>;
+    fn rows(&self, f: &mut RowVisit<'_>) -> Result<()>;
     /// The bytes it keeps resident.
     fn resident(&self) -> usize;
 }
@@ -196,7 +196,7 @@ impl Block for Plain {
     fn rank(&self, key: &[u8]) -> Result<usize> {
         Ok(self.keys.partition_point(|k| k.as_slice() < key))
     }
-    fn rows(&self, f: &mut dyn FnMut(usize, &[u8], &[u8]) -> Result<bool>) -> Result<()> {
+    fn rows(&self, f: &mut RowVisit<'_>) -> Result<()> {
         for (i, (k, v)) in self.keys.iter().zip(&self.values).enumerate() {
             if !f(i, k, v)? {
                 break;
@@ -365,7 +365,7 @@ impl Block for Packed {
         })?;
         Ok(rank)
     }
-    fn rows(&self, f: &mut dyn FnMut(usize, &[u8], &[u8]) -> Result<bool>) -> Result<()> {
+    fn rows(&self, f: &mut RowVisit<'_>) -> Result<()> {
         let mut vat = self.values_at;
         let bytes = &self.bytes;
         self.keys(&mut |i, k| {
@@ -466,10 +466,10 @@ impl<B: Block> Generation<B> {
         &self,
         s: Ts,
         skip: &BTreeSet<Vec<u8>>,
-        out: &mut Vec<(Vec<u8>, Vec<u8>)>,
+        out: &mut Rowset,
     ) -> Result<u64> {
         let mut looked = 0u64;
-        let emit = |k: &[u8], v: &[u8], out: &mut Vec<(Vec<u8>, Vec<u8>)>| {
+        let emit = |k: &[u8], v: &[u8], out: &mut Rowset| {
             if !skip.contains(k) {
                 out.push((k.to_vec(), v.to_vec()));
             }
@@ -598,7 +598,7 @@ struct State<B> {
 /// The rows a scan falls back to, at the scan's snapshot.
 pub trait Rows {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
-    fn all(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    fn all(&self) -> Result<Rowset>;
 }
 
 /// Where a scan's rows came from.
@@ -722,7 +722,7 @@ impl<B: Block> Columns<B> {
 
     /// The rows at snapshot `s`, in key order; `rows` the row B-tree at `s`. Never waits for the
     /// copy: what it hasn't applied yet is read from the rows.
-    pub fn scan(&self, s: Ts, rows: &dyn Rows) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, ScanCounts)> {
+    pub fn scan(&self, s: Ts, rows: &dyn Rows) -> Result<(Rowset, ScanCounts)> {
         let st = self.state.read();
         let mut counts = ScanCounts::default();
         let queue = self.feed.queue.lock();
@@ -1008,7 +1008,7 @@ mod tests {
         fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
             self.db.get(&mut Descender::new(), self.snap, 0, key)
         }
-        fn all(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        fn all(&self) -> Result<Rowset> {
             self.db
                 .scan(&mut Descender::new(), self.snap, 0, None, usize::MAX)
         }
@@ -1091,7 +1091,7 @@ mod tests {
                         let mut ok = true;
                         for _ in 0..1 + rng(&mut x) % 4 {
                             let k = u16::try_from(rng(&mut x) % 400).unwrap().to_be_bytes();
-                            let r = if rng(&mut x) % 4 == 0 {
+                            let r = if rng(&mut x).is_multiple_of(4) {
                                 db.remove(&mut d, &mut t, 0, &k).map(|_| ())
                             } else {
                                 let v = rng(&mut x).to_le_bytes();
@@ -1129,7 +1129,7 @@ mod tests {
                 let done = writers_left.load(Ordering::Acquire) == 0;
                 let snap = db.snapshot().unwrap();
                 let mut check = |snap: &Snapshot, old: bool| {
-                    let rows = At { db: &db, snap };
+                    let rows = At { db, snap };
                     let t = Instant::now();
                     let (got, c) = copy.scan(snap.start, &rows).unwrap();
                     copy.measured(t.elapsed().as_nanos(), &c);
@@ -1142,12 +1142,12 @@ mod tests {
                     seen.old_snapshots += u64::from(old && c.fallbacks == 0);
                 };
                 check(&snap, false);
-                if rng(&mut x) % 8 == 0 && held.len() < 4 {
+                if rng(&mut x).is_multiple_of(8) && held.len() < 4 {
                     held.push(snap);
                 } else {
                     db.close_snapshot(snap);
                 }
-                if !held.is_empty() && rng(&mut x) % 3 == 0 {
+                if !held.is_empty() && rng(&mut x).is_multiple_of(3) {
                     let i = usize::try_from(rng(&mut x)).unwrap() % held.len();
                     let s = held.swap_remove(i);
                     check(&s, true);
