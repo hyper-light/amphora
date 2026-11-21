@@ -1,0 +1,51 @@
+hash-threshold 8
+
+# written for keyword:PLAN: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+statement ok
+EXPLAIN QUERY PLAN SELECT * FROM t1
+
+statement ok
+EXPLAIN QUERY PLAN SELECT * FROM t1 WHERE a = 1
+
+statement ok
+EXPLAIN QUERY PLAN SELECT * FROM t2 WHERE a = 1
+
+statement ok
+EXPLAIN QUERY PLAN SELECT t1.a FROM t1 JOIN t2 USING (a)
+
+statement ok
+EXPLAIN QUERY PLAN SELECT a FROM t1 ORDER BY a
+
+statement ok
+EXPLAIN QUERY PLAN SELECT count(*) FROM t1 GROUP BY b
+
+statement ok
+EXPLAIN QUERY PLAN SELECT a FROM t1 UNION SELECT a FROM t2
+
+statement ok
+EXPLAIN QUERY PLAN SELECT * FROM t1 WHERE a IN (SELECT a FROM t2)
+
+statement ok
+EXPLAIN QUERY PLAN UPDATE t2 SET c = 1 WHERE a = 2
+
+statement ok
+EXPLAIN QUERY PLAN DELETE FROM t1 WHERE b = 'x'
+
+statement ok
+EXPLAIN QUERY PLAN WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT * FROM c
+
+statement error
+EXPLAIN PLAN SELECT 1

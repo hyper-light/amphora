@@ -1,0 +1,74 @@
+hash-threshold 8
+
+# written for keyword:RIGHT: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+query II nosort
+SELECT t1.a, t2.a FROM t1 RIGHT JOIN t2 ON t1.a = t2.a ORDER BY 2
+----
+10 values hashing to 0900d2165c9c41e49c298771b2f2bdb0
+
+query I nosort
+SELECT t2.a FROM t1 RIGHT JOIN t2 ON t1.a = t2.a WHERE t1.a IS NULL ORDER BY 1
+----
+7
+
+query I rowsort
+SELECT count(t1.a) FROM t1 RIGHT OUTER JOIN t2 USING (a)
+----
+4
+
+query IR nosort
+SELECT t2.a, t1.c FROM t1 RIGHT JOIN t2 ON t1.a = t2.a AND t1.c > 2 ORDER BY 1
+----
+10 values hashing to be59fb55665bef8ee79d59e1ba202bb8
+
+query I rowsort
+SELECT count(*) FROM t1 RIGHT JOIN t2 ON 0
+----
+5
+
+query I nosort
+SELECT a FROM t1 NATURAL RIGHT JOIN t2 ORDER BY 1
+----
+1
+2
+3
+6
+7
+
+query II nosort
+SELECT t1.a, t2.a FROM t2 RIGHT JOIN t1 ON t1.a = t2.a ORDER BY 1
+----
+14 values hashing to 5638be5a6e9a8dc68c516a3d082817e4
+
+query II nosort
+SELECT x.a, y.a FROM t2 AS x RIGHT JOIN t2 AS y ON y.a = x.a + 1 ORDER BY 2
+----
+10 values hashing to 4115b224f0c798910396c91502091659
+
+query IT nosort
+SELECT t2.a, coalesce(t1.b, '-') FROM t1 RIGHT JOIN t2 USING (a) ORDER BY 1
+----
+10 values hashing to df516aab271ee0c5c8fecc865db26c75
+
+query III nosort
+SELECT t1.a, t2.a, t3.a FROM t1 RIGHT JOIN t2 ON t1.a = t2.a RIGHT JOIN t2 AS t3 ON t3.a = t2.a ORDER BY 3
+----
+15 values hashing to 2bd231d64f1b2b0b6127f615c7af6470
+
+query II nosort
+SELECT t1.a, t2.a FROM t1 LEFT JOIN t2 ON t1.a = t2.a RIGHT JOIN t1 AS t3 ON t3.a = t1.a ORDER BY 1
+----
+14 values hashing to 5638be5a6e9a8dc68c516a3d082817e4

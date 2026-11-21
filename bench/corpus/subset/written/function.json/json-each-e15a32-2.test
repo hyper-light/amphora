@@ -1,0 +1,193 @@
+hash-threshold 8
+
+# written for function.json:json_each: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+statement ok
+CREATE TABLE doc(id INTEGER PRIMARY KEY, body TEXT)
+
+statement ok
+INSERT INTO doc VALUES (1, '{"name":"a","tags":["x","y"],"n":1}'), (2, '{"name":"b","tags":[],"n":2.5}'), (3, '{"name":null,"tags":["z"],"nested":{"k":[1,2,3]}}'), (4, 'not json')
+
+query IT nosort
+SELECT id, body ->> '$.name' FROM doc WHERE json_valid(body) ORDER BY id
+----
+1
+a
+2
+b
+3
+NULL
+
+query IT nosort
+SELECT id, body -> '$.tags' FROM doc WHERE json_valid(body) ORDER BY id
+----
+1
+["x","y"]
+2
+[]
+3
+["z"]
+
+query II nosort
+SELECT id, json_array_length(body, '$.tags') FROM doc WHERE json_valid(body) ORDER BY id
+----
+1
+2
+2
+0
+3
+1
+
+query IT nosort
+SELECT doc.id, j.value FROM doc, json_each(doc.body, '$.tags') AS j WHERE json_valid(doc.body) ORDER BY doc.id, j.key
+----
+1
+x
+1
+y
+3
+z
+
+query I rowsort
+SELECT count(*) FROM doc, json_tree(doc.body) WHERE json_valid(doc.body) AND json_tree.type = 'integer'
+----
+4
+
+query I nosort
+SELECT id FROM doc WHERE json_valid(body) AND body ->> '$.n' > 1 ORDER BY id
+----
+2
+
+query T rowsort
+SELECT json_group_array(body ->> '$.name') FROM (SELECT body FROM doc WHERE json_valid(body) ORDER BY id)
+----
+["a","b",null]
+
+query T rowsort
+SELECT json_group_object(id, body -> '$.n') FROM (SELECT id, body FROM doc WHERE json_valid(body) ORDER BY id)
+----
+{"1":1,"2":2.5,"3":null}
+
+query T rowsort
+UPDATE doc SET body = json_set(body, '$.n', 10) WHERE id = 1 RETURNING body
+----
+{"name":"a","tags":["x","y"],"n":10}
+
+query T rowsort
+UPDATE doc SET body = json_insert(body, '$.tags[#]', 'w') WHERE id = 2 RETURNING body
+----
+{"name":"b","tags":["w"],"n":2.5}
+
+query TI rowsort
+SELECT body -> '$.nested.k[1]', body ->> '$.nested.k[#-1]' FROM doc WHERE id = 3
+----
+2
+3
+
+query IT nosort
+SELECT id, json_type(body, '$.n') FROM doc WHERE json_valid(body) ORDER BY id
+----
+1
+integer
+2
+real
+3
+NULL
+
+statement error
+SELECT body -> '$.name' FROM doc WHERE id = 4
+
+query T rowsort
+SELECT json_extract(body, '$.name', '$.n') FROM doc WHERE id = 1
+----
+["a",10]
+
+query I rowsort
+SELECT id FROM doc WHERE json_valid(body) AND EXISTS (SELECT 1 FROM json_each(body, '$.tags') WHERE value = 'z')
+----
+3
+
+query TI nosort
+SELECT json_each.key, json_each.value FROM json_each('{"b":2,"a":1}') ORDER BY key
+----
+a
+1
+b
+2
+
+query TTI nosort
+SELECT fullkey, path, atom FROM json_tree('{"a":[1,{"b":2}]}') ORDER BY id
+----
+15 values hashing to 95ad24b5bd45808bfefa6f297aa01a4d
+
+statement error
+CREATE INDEX doc_name ON doc(body ->> '$.name')
+
+statement ok
+DELETE FROM doc WHERE NOT json_valid(body)
+
+statement ok
+CREATE INDEX doc_name ON doc(body ->> '$.name')
+
+query I rowsort
+SELECT id FROM doc WHERE body ->> '$.name' = 'b'
+----
+2
+
+query I rowsort
+SELECT jsonb(body) = jsonb(body) FROM doc WHERE id = 1
+----
+1
+
+query T rowsort
+SELECT json(jsonb(body)) FROM doc WHERE id = 2
+----
+{"name":"b","tags":["w"],"n":2.5}
+
+query T rowsort
+SELECT body ->> 'name' FROM doc WHERE id = 1
+----
+a
+
+query T rowsort
+SELECT body -> 0 FROM doc WHERE id = 1
+----
+NULL
+
+query TI rowsort
+SELECT '[10,20,30]' -> 1, '[10,20,30]' ->> -1
+----
+20
+30
+
+query TT nosort
+SELECT key, value FROM doc, json_each(doc.body) WHERE doc.id = 3 ORDER BY key
+----
+name
+NULL
+nested
+{"k":[1,2,3]}
+tags
+["z"]
+
+query T rowsort
+SELECT json_remove(body, '$.tags', '$.nested') FROM doc WHERE id = 3
+----
+{"name":null}
+
+query T rowsort
+SELECT json_patch(body, '{"n":null,"extra":true}') FROM doc WHERE id = 1
+----
+{"name":"a","tags":["x","y"],"extra":true}

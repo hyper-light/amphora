@@ -9,6 +9,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (`CLAUDE.md`), the requirement registry (`docs/requirements.toml`), the design's starting point
   (`docs/design/README.md`), the gate (`scripts/gates.sh`, run by kiln CI from `.kiln/ci.yaml`), and the
   vendoring tool (`scripts/vendor.py`, kiln's).
+- **The audit log** (CP-T1.7, AC-T1.7.4; AL.1, `crates/amphora/src/audit.rs`, docs/design/audit.md):
+  RFC 6962's Merkle tree over any Records store, its head checked against its subtrees on open, a
+  reader's earlier checkpoint checked by a consistency proof, and each event by its leaf hash and
+  inclusion proof on read; every byte of a 1,000-event log flipped is detected. Open: where kiln keeps
+  checkpoints outside the store (signed heads, witnesses), and the audit_cost runs for bench/records.
 - **Records in amphora-api, typed and simulated** (CP-T1.5, kiln goal a1f386fe; lane records-api;
   docs/design/records.md): the trait's change feed is documented with etcd's watch guarantees and read
   from the commits' own version rows, and gains `changed` (a wait's answer without waiting);
@@ -230,6 +235,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   path; Elle's list-append and register histories checked for G0, G1a, G1b, G1c, G-single and G2
   (snapshot isolation the control, showing G2). Not yet: the 10,000-seed runs and the three schemes'
   throughput, refusals and p99 on the suite's write classes and K0 (the batch's), then the choice.
+- **Versions collected, memory bounded** (G8 step 2, docs/design/engine.md decision 10,
+  `crates/engine/storage/versioned/version.rs`): collection keeps of each row only the versions some
+  open snapshot sees, so a long reader holds one version a row; versions, transactions' records and
+  commits kept for validation are charged to one budget (by default the pool's bytes, or the shell's
+  `with_budget`) and refused past it with a typed `MemoryBudget`; commits are kept only while a
+  transaction begun before them is open; reads past the budget escalate to the whole tree. Tested by
+  a short soak (one reader, 32 writers). Not yet: versions moved out of memory for long readers
+  (LeanStore's graveyard), the hour-long soak (`AMPHORA_G8_SOAK_SECONDS=3600`, the batch's), and the
+  shell passing a budget learned from the process's memory once it opens this storage.
 - **Ephemeral tables kept between runs** (docs/design/executor.md decision 1,
   `crates/engine/tests/ephemeral_reuse.rs`): a statement keeps each ephemeral table of at most 16
   pages (an IN list's keys, an IN subquery's rows) and empties it on its next run, where building
@@ -292,8 +306,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   docs/design/reshard.md): a pure core: a directory of hash spans with every position in exactly one group,
   each group's own holding (fenced, stale actions refused), a planner deciding from measured load, bytes and
   cores, and a driver doing copy, catch-up in rounds and a fenced cutover. Tested in a deterministic
-  simulator (T-T1.9.S1). Left: the shell over Amphora's groups and replicated owners, `bench reshard`
-  (AC-T1.9.2) and the three-machine lab (AC-T1.9.3).
+  simulator (T-T1.9.S1). Connected (lane split-merge-4): the directory is a replicated group's state
+  (`reshard::replicated::DirectoryMachine`, a hyper-durable state machine of directory changes; its
+  leader runs the driver under its term), and `Groups` routes by the directory instead of `fnv % n`, each
+  group checking every write and read against its holding (`store::Refused::Away`) (T-T1.9.R1, R2).
+  Left: each group's holding kept durable in its own state with its rows (it is in the router's memory
+  now), rows indexed by position for copy and sweep, the old group's log held through the operation,
+  the shell carrying the driver's actions to groups, `bench reshard` (AC-T1.9.2) and the three-machine
+  lab (AC-T1.9.3).
 
 ## Measured
 
@@ -340,16 +360,21 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   NOCASE)` is 1 where SQLite says 0 (the left operand's collation decides), and `PRAGMA index_xinfo`
   names the rowid's column '' where SQLite gives NULL. CedarDB's server dies on
   `SELECT 0 OR NULL, 1 OR NULL`, and again when it's tried a second time.
-- **The corpus's runner** (G2 steps 4 and 7, lane corpus-ci; `crates/corpus`, built, not yet in the gate):
+- **The corpus's runner** (G2 steps 4 and 7, lane corpus-ci; `crates/corpus`, in the gate):
   sqllogictest records read, run, rendered (I, R, T as slt_sqlite.c writes them, REALs through Amphora's
   port of SQLite's printf), sorted and compared (MD5 past the hash threshold) as SQLite's own runner does,
   one code path for the gate's subset and the bench's run over every engine; each query after a statement
   settles the engine first (`PRAGMA wal_checkpoint(TRUNCATE)`), and each disagreement classifies as an
   Amphora bug, a competitor's bug, a dialect difference or a translation gap. `amphora-corpus run <pool>
   --budget-s <s>` runs a ranked pool on Amphora: required files whole, the rest until the budget, timed on
-  the machine as it runs, so the subset's size is what that machine runs in the budget. Left: the pool
-  chosen and checked in, its line in `scripts/gates.sh`, the bench's adapters for the other engines, the
-  nightly in `.kiln/`.
+  the machine as it runs, so the subset's size is what that machine runs in the budget. The gate's pool
+  (`bench/corpus/subset`, chosen by `bench/corpus/subset.py` from measured times: required files reach
+  every entry Amphora answers right somewhere, then query types per measured second up to the plan's 2
+  minutes) runs in `scripts/gates.sh`, its times kept as CI artifacts; `.kiln/corpus.yaml`
+  (`bench/corpus/nightly.sh`) builds and runs the whole corpus nightly and re-ranks the pool. Left: the
+  adapters for the other engines (only Amphora has one), a bound on one record's time (a select5 join
+  ran past 12 minutes on a debug build, and the deadline is checked only between records), and kiln's
+  queries in the pool (kiln_queries.py needs sqlglot).
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691

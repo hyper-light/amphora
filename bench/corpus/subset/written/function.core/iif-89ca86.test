@@ -1,0 +1,65 @@
+hash-threshold 8
+
+# written for function.core:iif: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+query T rowsort
+SELECT iif(1, 'a', 'b')
+----
+a
+
+query T rowsort
+SELECT iif(0, 'a', 'b')
+----
+b
+
+query T rowsort
+SELECT iif(NULL, 'a', 'b')
+----
+b
+
+query I rowsort
+SELECT iif('x', 1, 2)
+----
+2
+
+query T rowsort
+SELECT iif(2 > 1, 'y', 'n')
+----
+y
+
+query T rowsort
+SELECT iif(1 = 2, NULL, 'z')
+----
+z
+
+query I rowsort
+SELECT iif(0.5, 1, 0)
+----
+1
+
+query T rowsort
+SELECT iif('0', 'a', 'b')
+----
+b
+
+query I rowsort
+SELECT iif(1, 2)
+----
+2
+
+query I rowsort
+SELECT iif(0, 1, 0, 2, 3)
+----
+3
