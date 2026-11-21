@@ -273,6 +273,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   0, 2, 4, ... drew the same), and every database checkpoints after its load before any run
   (`settle_s`; Amphora's loader had left the whole load, 7.5 GB, in its log). `--query` runs a
   statement on a database a run left behind.
+- **The leader's write slot** (AC-T1.8.W1, Amphora goal 9c63f7d4; replication.md, "the write slot"): a member
+  whose write is refused at the leader's append gets a slot for its next try, its length learned per member from
+  its retries' gaps (cold start: the core's election timeout). A gap over which the host's detector suspected the
+  member is not learned; no number bounds a gap (lane g-slot-close, 2026-11-21).
 
 - **Groups that split, merge and move themselves** (CP-T1.9, lane split-merge; `crates/amphora/src/reshard/`,
   docs/design/reshard.md): a pure core: a directory of hash spans with every position in exactly one group,
@@ -464,11 +468,23 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (PL.7, e0e7a1df), bushy plans with CD-C (PL.8, c837cde3), statistics kept as rows change (PL.9,
   26302efe), unnesting by dependent joins (PL.10, 61c79bd1), upper bounds as a guard (PL.11,
   f4e0bd7f), custom then generic plans (PL.12, aa0541f6) and adaptive joins (PL.13, 4f237e07).
+  PL.12 is built (lane pl12, docs/design/planner.md "custom plans, then a generic one"): a statement
+  whose estimates read a parameter's value is planned with each run's values until its own measured
+  costs say the generic plan does as well; one whose estimates read none keeps its generic plan. Its
+  TPC-H prepared measurement (AC-PL.12.1; its harness, `amphora-bench --planner --prepared` with
+  qgen's parameters, is written: bench/planner/README.md) and the suite's (AC-PL.12.2) are open.
 - **G11, analytics at column-store speed** (docs/design/columnar.md, decision 1; sources in
   docs/research/columnar.md; CS.1): decided, not built. Columns are a copy derived from the rows, fed
   by each commit's redo record after the commit, exact at every snapshot by a journal of changed keys
   read from the rows, never logged, every size and time learned where it runs. Next: step 2
   prototypes it in memory and as persistent blocks, on CP-T1.3's storage once that runs under SQL.
+  Step 3's two codecs are built (CS.3, crates/columnar, lane g11-compress): BtrBlocks' cascade
+  (one value, run lengths, dictionary, decimal doubles, frame of reference with horizontal packing)
+  and FastLanes' layouts (its interleaved 1,024-value packing, lane-wise DELTA, dictionary,
+  decimal), each scheme chosen per column from a sample that grows until its choice stops changing,
+  the cascade a loop with no fixed depth; integers, doubles, strings and nulls round-trip bit for
+  bit (T-CS.3.1). Its decode benchmark (`cargo bench -p amphora-columnar --bench decode`) is not yet
+  measured against [c18]'s 8 values a cycle.
 
 ## Open
 

@@ -2000,9 +2000,11 @@ learns quorum gaps (`patience`), and adds no number. For each member, the leader
 that member's slot to its next forward, and keeps the longest gap of this generation and of the one before
 (`patience::GENERATION`, 30 s). A member's slot is the larger of those two. A retry that arrives after its slot expired
 is still measured, so an expiry teaches the next slot rather than censoring it. Before a member's first measured gap,
-its slot is the core's election timeout in the owner's ticks (`election_tick × TICK`), the derived first value. A gap
-past `patience::QUORUM_CEILING` (owner-stalls.md's measured quorum tail) is refused, typed (`slot::Unmeasured`), and
-not learned: a member that slow is gone, not slow. TICK and the twenty-tick election timeout are the pinned core's
+its slot is the core's election timeout in the owner's ticks (`election_tick × TICK`), the derived first value. No
+number bounds a gap: a gap over which the host's detector suspected its member is refused, typed
+(`slot::Unmeasured::Suspected`), logged (`write_slot_unmeasured`) and not learned: that member was gone, not slow. The
+detector's verdict is learned where it runs; the slot no longer borrows `patience::QUORUM_CEILING`, a tail measured
+once on one host (Ada's word, 2026-11-21: such a value is picked). TICK and the twenty-tick election timeout are the pinned core's
 documented tick mode, not measured. They are noted for amphora-constants, and the slot inherits them only as its
 first value.
 

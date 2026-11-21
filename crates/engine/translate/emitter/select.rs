@@ -75,6 +75,7 @@ fn emit_program_for_select_with_inputs(
         emit_query(program, &mut plan, &mut t_ctx)
     })?;
 
+    program.plan_cost = plan.estimated_cost;
     program.output_rows = select_output_rows(&plan).or_else(|| {
         plan.table_references
             .joined_tables()
