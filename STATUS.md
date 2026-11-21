@@ -677,8 +677,11 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   Lane pl8-3 (docs/design/planner.md "Decision (lane pl8-3)"): a LEFT JOIN's right table follows only
   the tables its ON terms read (CD-C's left-asscom rule), answers held against SQLite (T-PL.8.2), and
   `JoinN` carries a bushy shape (`inner_joins`) that left-deep plans leave empty.
-  Not built: bushy plans over connected complement pairs with a composite hash-join build, and semi
-  and anti joins placed before other loops (the emitter's no-match path); JOB's AC-PL.8.1 is open.
+  Lane pl8-4 (docs/design/planner.md "Decision (lane pl8-4)"): a hash join's build side can be a
+  run of tables joined among themselves while the loops before the probe stay loops; the emitter
+  runs such bushy plans and refuses other shapes with a typed error.
+  Not built: the search over connected complement pairs (DPccp) that would choose bushy plans, and
+  semi and anti joins placed before other loops (the emitter's no-match path); JOB's AC-PL.8.1 is open.
   PL.9 is built (lane pl9, docs/design/planner.md "row counts kept as rows change"): each table's
   rows inserted less deleted since ANALYZE are kept as writes finish (one atomic add a statement),
   the planner's row count follows them, and a prepared statement plans again once a table it counted

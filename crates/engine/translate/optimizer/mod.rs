@@ -2,11 +2,11 @@ use super::{
     collate::get_collseq_from_expr,
     emitter::Resolver,
     plan::{
-        DeletePlan, GroupBy, HashJoinType, InSeekSource, IterationDirection, JoinInfo, JoinOrderMember,
-        JoinOrigin, JoinType, JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp,
-        Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate,
-        TablePlanEstimate, TableReferences, UnmatchedRightRowsPlan, UpdatePlan, WhereTerm,
-        WhereTermOrigin,
+        DeletePlan, GroupBy, HashJoinType, InSeekSource, IterationDirection, JoinInfo,
+        JoinOrderMember, JoinOrigin, JoinType, JoinedTable, MinMaxDef, MultiIndexBranch,
+        MultiIndexScanOp, Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, SetOperation,
+        SimpleAggregate, TablePlanEstimate, TableReferences, UnmatchedRightRowsPlan, UpdatePlan,
+        WhereTerm, WhereTermOrigin,
     },
 };
 use crate::alloc::TursoIteratorExt;
@@ -3545,9 +3545,10 @@ fn bushy_build_groups(
         return refuse("it has a RIGHT or FULL JOIN");
     }
     for run in plan.inner_joins.iter() {
-        let nested = plan.inner_joins.iter().any(|other| {
-            other != run && other.start <= run.start && run.end <= other.end
-        });
+        let nested = plan
+            .inner_joins
+            .iter()
+            .any(|other| other != run && other.start <= run.start && run.end <= other.end);
         if nested {
             return refuse("a run nests in another");
         }
@@ -3558,18 +3559,21 @@ fn bushy_build_groups(
         else {
             return refuse("a run is empty");
         };
-        let probe_is_group_hash_join = access_methods_arena.get(probe_method).is_some_and(|method| {
-            matches!(
-                method.params,
-                AccessMethodParams::HashJoin {
-                    build_table_idx,
-                    probe_table_idx,
-                    materialize_build_input: true,
-                    join_type: HashJoinType::Inner,
-                    ..
-                } if build_table_idx == last_table && probe_table_idx == probe_table
-            )
-        });
+        let probe_is_group_hash_join =
+            access_methods_arena
+                .get(probe_method)
+                .is_some_and(|method| {
+                    matches!(
+                        method.params,
+                        AccessMethodParams::HashJoin {
+                            build_table_idx,
+                            probe_table_idx,
+                            materialize_build_input: true,
+                            join_type: HashJoinType::Inner,
+                            ..
+                        } if build_table_idx == last_table && probe_table_idx == probe_table
+                    )
+                });
         if !probe_is_group_hash_join {
             return refuse("a run's probe is not an inner hash join built from its last table");
         }
@@ -3632,7 +3636,7 @@ pub(crate) mod bushy_test_hook {
     /// the hash join at `probe`, the split from `SPLIT` on: a bushy plan of the same tables.
     pub(crate) fn split_build_side(
         plan: JoinN,
-        access_methods_arena: &[AccessMethod],
+        access_methods_arena: &mut [AccessMethod],
         table_references: &TableReferences,
         sort_eliminated: bool,
     ) -> JoinN {
@@ -3643,18 +3647,46 @@ pub(crate) mod bushy_test_hook {
             return plan;
         }
         for probe in 0..plan.data.len() {
+            // The hand-built plan materializes the probe's build input from the run.
+            let Some(&(_, probe_method)) = plan.data.get(probe) else {
+                continue;
+            };
+            let materialized = match access_methods_arena
+                .get_mut(probe_method)
+                .map(|method| &mut method.params)
+            {
+                Some(AccessMethodParams::HashJoin {
+                    materialize_build_input,
+                    ..
+                }) => std::mem::replace(materialize_build_input, true),
+                _ => continue,
+            };
             for split in first_split.max(1)..probe.saturating_sub(1) {
                 let mut bushy = plan.clone();
                 bushy.inner_joins.push(join::InnerJoin {
                     start: split,
                     end: probe,
                 });
-                if bushy_build_groups(&bushy, access_methods_arena, table_references, sort_eliminated)
-                    .is_ok()
+                if bushy_build_groups(
+                    &bushy,
+                    access_methods_arena,
+                    table_references,
+                    sort_eliminated,
+                )
+                .is_ok()
                 {
                     APPLIED.with(|applied| applied.set(applied.get() + 1));
                     return bushy;
                 }
+            }
+            if let Some(AccessMethodParams::HashJoin {
+                materialize_build_input,
+                ..
+            }) = access_methods_arena
+                .get_mut(probe_method)
+                .map(|method| &mut method.params)
+            {
+                *materialize_build_input = materialized;
             }
         }
         plan
@@ -3662,7 +3694,11 @@ pub(crate) mod bushy_test_hook {
 
     #[cfg(test)]
     mod tests {
-        #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+        #![allow(
+            clippy::unwrap_used,
+            clippy::indexing_slicing,
+            clippy::arithmetic_side_effects
+        )]
         use super::{APPLIED, SPLIT};
         use crate::io::MemoryIO;
         use crate::sync::Arc;
@@ -3675,7 +3711,12 @@ pub(crate) mod bushy_test_hook {
                 .run_collect_rows()
                 .unwrap()
                 .into_iter()
-                .map(|row| row.iter().map(|value| value.to_string()).collect::<Vec<_>>().join(","))
+                .map(|row| {
+                    row.iter()
+                        .map(|value| value.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
                 .collect();
             rows.sort();
             rows
@@ -3699,16 +3740,28 @@ pub(crate) mod bushy_test_hook {
                 conn.execute(sql).unwrap();
             }
             for id in 1..=6 {
-                conn.execute(format!("INSERT INTO a VALUES ({id}, {id})")).unwrap();
+                conn.execute(format!("INSERT INTO a VALUES ({id}, {id})"))
+                    .unwrap();
             }
             for id in 1..=12 {
-                conn.execute(format!("INSERT INTO b VALUES ({id}, {}, {})", id % 5, id % 3)).unwrap();
+                conn.execute(format!(
+                    "INSERT INTO b VALUES ({id}, {}, {})",
+                    id % 5,
+                    id % 3
+                ))
+                .unwrap();
             }
             for id in 1..=15 {
-                conn.execute(format!("INSERT INTO c VALUES ({id}, {}, {})", id % 3, id % 4)).unwrap();
+                conn.execute(format!(
+                    "INSERT INTO c VALUES ({id}, {}, {})",
+                    id % 3,
+                    id % 4
+                ))
+                .unwrap();
             }
             for id in 1..=20 {
-                conn.execute(format!("INSERT INTO p VALUES ({id}, {}, {id})", id % 4)).unwrap();
+                conn.execute(format!("INSERT INTO p VALUES ({id}, {}, {id})", id % 4))
+                    .unwrap();
             }
             let queries = [
                 "SELECT a.id, b.id, c.id, p.id FROM a JOIN b ON b.x > a.x JOIN c ON c.y = b.y \
@@ -3790,7 +3843,7 @@ fn apply_table_access_plan(
     #[cfg(test)]
     let best_plan = bushy_test_hook::split_build_side(
         best_plan,
-        &access_methods_arena,
+        &mut access_methods_arena,
         table_references,
         sort_eliminated,
     );

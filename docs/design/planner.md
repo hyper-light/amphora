@@ -1430,6 +1430,37 @@ placed before other loops (the emitter's no-match path first).
 `answers.py`) for a query with a LEFT JOIN; or such a plan slower than its parent's on the bench
 suite beyond the passes' spread.
 
+## Decision (lane pl8-4): a hash join's build side can be a run of tables after the loops
+
+**Decision.** PL.8, the emitter's half of bushy plans. A hash join's operation names a build group
+(`HashJoinOp::build_group`, `plan.rs`): the tables of a bushy plan's run `data[start..end]`
+(`JoinN::inner_joins`). Its materialized build input (`emitter/select.rs`,
+`materialization_prefix`) joins the group's tables among themselves, where a left-deep plan's joins
+the tables before the probe; the loops before the probe outside the group stay loops of the main
+plan, and the probe reads the group's rows from the payload, so a term between the group and those
+loops runs at the probe (`loop_index_for_table_row`). The emitter runs a bushy plan whose runs stand
+apart, each followed by an inner hash join built from the run's last table, with no table of the run
+probing a hash table built outside it or from a materialized input, no join in it or at the probe
+that keeps its place (outer, semi, anti, lateral), no RIGHT or FULL JOIN in the query, and no sort
+removed by the plan's order (`optimizer/mod.rs`, `bushy_build_groups`); any other bushy plan is a
+typed error naming its tree. For inner joins the run joined among itself and then probed is the
+same rows as the left-deep order of the same tables (associativity and commutativity of inner joins,
+f25).
+
+**Evidence.** `optimizer::bushy_test_hook::tests::t_pl_8_2_a_bushy_build_group_answers_as_the_left_deep_plan`
+(T-PL.8.2): four inner joins of four tables (a range join before the run, a WHERE term between the
+run and the loop before it, an aggregate, a probe term reading the loop before the run), each run
+left-deep and with its build side split into a run after the first table, by cost and with hash
+joins only, give the same rows; a counter shows the hook made plans bushy.
+
+**Not yet built.** The search does not make bushy plans: DPccp's connected complement pairs on an
+explicit stack with a budget derived from the plan-time target, falling back to today's search; and
+semi and anti join tables placed before other loops. The probe is read whole, as a hash join's
+probe is today; a probe that keeps its own access method would let the run's result join a loop
+read by a key.
+
+**Falsified by.** An answer of a plan the hook splits that differs from its left-deep plan's.
+
 ## Decision (lane pl12): custom plans, then a generic one, for prepared statements
 
 **Decision.** PL.12 (docs/research/planner.md section 9, rank 12; `crates/engine/plan_cache.rs`).

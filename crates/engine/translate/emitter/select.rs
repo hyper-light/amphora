@@ -396,7 +396,9 @@ pub(crate) fn emit_materialized_build_inputs(
                 &plan.table_references,
                 &plan.non_from_clause_subqueries,
             )?;
-            if mask.iter().any(|table_idx| hash_join_op.build_group.get(table_idx))
+            if mask
+                .iter()
+                .any(|table_idx| hash_join_op.build_group.get(table_idx))
                 && !hash_join_op.build_group.contains_all_set_bits_of(&mask)
             {
                 group_terms.push(term_idx);
