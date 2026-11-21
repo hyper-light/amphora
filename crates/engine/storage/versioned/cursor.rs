@@ -407,7 +407,7 @@ impl VersionedCursor {
         let mut leaves = 0u64;
         loop {
             vt.tree().read_leaf(pool, leaf, low, &mut before, |l| {
-                rows.copy(vt, db, snap, l, true)
+                rows.copy(&vt, db, snap, l, true)
             })?;
             rows.join_chunks(db, d, snap, *tree)?;
             if !rows.is_empty() {
@@ -456,7 +456,7 @@ impl VersionedCursor {
                 };
                 let (leaf, low) = vt.tree().leaf_for(pool, d, &mut before)?;
                 vt.tree().read_leaf(pool, leaf, low, &mut before, |l| {
-                    rows.copy(vt, db, snap, l, false)
+                    rows.copy(&vt, db, snap, l, false)
                 })?;
                 rows.join_chunks(db, d, snap, *tree)?;
             }

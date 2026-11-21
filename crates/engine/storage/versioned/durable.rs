@@ -287,7 +287,7 @@ impl Database {
         })?;
         let mut d = Descender::new();
         for op in &list {
-            v.tree(Self::tree_of(op))?
+            v.tree(Self::tree_of(op)?)?
                 .apply_plain(&v.pool, &mut d, op)?;
         }
         // A checkpoint that switched redo files and never finished leaves commits after T in
@@ -301,8 +301,13 @@ impl Database {
         let mut newest = stamp.ts;
         for record in &after {
             for op in &record.ops {
-                v.tree(Self::tree_of(op))?
-                    .apply_plain(&v.pool, &mut d, op)?;
+                match op {
+                    Op::Made { tree } => v.remake_tree(*tree, cmp())?,
+                    Op::Dropped { tree } => v.drop_tree(*tree)?,
+                    Op::Put { tree, .. } | Op::Remove { tree, .. } => {
+                        v.tree(*tree)?.apply_plain(&v.pool, &mut d, op)?
+                    }
+                }
             }
             newest = record.ts;
         }
@@ -361,10 +366,51 @@ impl Database {
         })
     }
 
-    fn tree_of(op: &Op) -> u64 {
+    /// The tree of a checkpoint's correction: a row change.
+    fn tree_of(op: &Op) -> Result<u64> {
         match op {
-            Op::Put { tree, .. } | Op::Remove { tree, .. } => *tree,
+            Op::Put { tree, .. } | Op::Remove { tree, .. } => Ok(*tree),
+            Op::Made { .. } | Op::Dropped { .. } => {
+                Err(corrupt("a checkpoint's list naming a tree made or dropped"))
+            }
         }
+    }
+
+    /// Makes an empty tree ordered by `cmp` (`NS.2.3`), logged as a record of its own, durable
+    /// before it returns: its id. Row changes and checkpoints wait for it.
+    pub fn make_tree(&self, d: &mut Descender, cmp: Comparator) -> Result<u64> {
+        let _alone = self.gate.write();
+        self.redo.usable()?;
+        let id = self.v.make_tree(cmp)?;
+        let logged = self.log_alone(d, Op::Made { tree: id });
+        if logged.is_err() {
+            self.v.drop_tree(id)?;
+        }
+        logged.map(|()| id)
+    }
+
+    /// Drops tree `tree` (`NS.2.3`), logged as a record of its own, durable before it returns;
+    /// refused (`Busy`) while a transaction still open has changed one of its rows. Its pages
+    /// stay in the file, unreferenced: the pool keeps no free list yet. Row changes and
+    /// checkpoints wait for it.
+    pub fn drop_tree(&self, d: &mut Descender, tree: u64) -> Result<()> {
+        let tree = self.user_tree(tree)?;
+        let _alone = self.gate.write();
+        self.redo.usable()?;
+        if self.v.open_changes(tree)? {
+            return Err(LimboError::Busy);
+        }
+        self.log_alone(d, Op::Dropped { tree })?;
+        self.v.drop_tree(tree)
+    }
+
+    /// Logs `op` alone at the next timestamp, durable, under the gate held exclusive.
+    fn log_alone(&self, d: &mut Descender, op: Op) -> Result<()> {
+        let txn = self.v.clock.begin()?;
+        let ts = self.v.commit_logged(txn, d, |ts, _| {
+            self.redo.append(ts, std::slice::from_ref(&op))
+        })?;
+        self.redo.sync(&*self.disk, ts).map(|_| ())
     }
 
     fn write_header(disk: &dyn Disk, stamp: &Stamp) -> Result<()> {
@@ -1047,6 +1093,158 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 50);
+    }
+
+    /// Every tree's rows from id 2 on (after tree 0 and the overflow tree) up to `ids`: None for a
+    /// tree that isn't there.
+    fn made_trees(db: &Database, ids: u64) -> Vec<Option<BTreeMap<Vec<u8>, Vec<u8>>>> {
+        let mut d = Descender::new();
+        let snap = db.snapshot().unwrap();
+        let out = (2..ids)
+            .map(|t| {
+                db.scan(&mut d, &snap, t, None, usize::MAX)
+                    .ok()
+                    .map(|rows| rows.into_iter().collect())
+            })
+            .collect();
+        db.close_snapshot(snap);
+        out
+    }
+
+    /// Do: make trees and write rows to them, drop some, checkpoint between, then reopen, and
+    /// reopen again after a power cut. Expect: the trees made and not dropped with their rows, the
+    /// dropped ones refused, a write to a dropped tree refused, the next tree made under the next
+    /// id; a drop refused (`Busy`) while an open transaction has changed its rows (NS.2.3).
+    #[test]
+    fn ns2_3_trees_made_and_dropped_survive_reopens() {
+        let disk = Arc::new(Simulated::new(31));
+        let want;
+        {
+            let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
+            let mut d = Descender::new();
+            let a = db.make_tree(&mut d, cmp()).unwrap();
+            let b = db.make_tree(&mut d, cmp()).unwrap();
+            assert_eq!((a, b), (2, 3));
+            for (t, n) in [(a, 1u8), (b, 2)] {
+                let mut txn = db.begin().unwrap();
+                db.put(&mut d, &mut txn, t, b"k", &[n; 3]).unwrap();
+                db.put(&mut d, &mut txn, t, b"long", &vec![n; 3 * PAGE_SIZE]).unwrap();
+                db.commit(txn, &mut d, true).unwrap();
+            }
+            let mut open = db.begin().unwrap();
+            db.put(&mut d, &mut open, a, b"k", b"open").unwrap();
+            assert!(matches!(db.drop_tree(&mut d, a), Err(LimboError::Busy)));
+            db.abort(open, &mut d).unwrap();
+            db.drop_tree(&mut d, a).unwrap();
+            let mut txn = db.begin().unwrap();
+            assert!(db.put(&mut d, &mut txn, a, b"k", b"x").is_err());
+            db.abort(txn, &mut d).unwrap();
+            db.checkpoint().unwrap();
+            let c = db.make_tree(&mut d, cmp()).unwrap();
+            assert_eq!(c, 4);
+            let mut txn = db.begin().unwrap();
+            db.put(&mut d, &mut txn, c, b"c", b"3").unwrap();
+            db.commit(txn, &mut d, true).unwrap();
+            db.drop_tree(&mut d, b).unwrap();
+            want = made_trees(&db, 6);
+            assert_eq!(want[0], None);
+            assert_eq!(want[1], None);
+            assert_eq!(want[2].as_ref().map(BTreeMap::len), Some(1));
+            assert_eq!(want[3], None);
+        }
+        let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
+        assert_eq!(made_trees(&db, 6), want);
+        drop(db);
+        disk.power_cut().unwrap();
+        let db = Database::open(disk, 2_000, 1, cmp).unwrap();
+        assert_eq!(made_trees(&db, 6), want);
+        let mut d = Descender::new();
+        assert_eq!(db.make_tree(&mut d, cmp()).unwrap(), 5);
+    }
+
+    /// Do: for many crash points, a workload that makes trees, writes long and short rows to them
+    /// durably, drops the oldest now and then, and checkpoints, on a disk that crashes after that
+    /// many operations; cut the power and reopen. Expect: the trees and their rows exactly as
+    /// after a prefix of the steps, at least as long as the last acknowledged (NS.2.3: a crash at
+    /// each write of a tree made or dropped).
+    #[test]
+    fn ns2_3_a_crash_at_each_write_of_trees_made_and_dropped() {
+        let mut checked = 0;
+        for crash in (3..600).step_by(11) {
+            let disk = Arc::new(Simulated::new(crash));
+            let mut states = vec![vec![None; 38]];
+            let mut acknowledged = 1usize;
+            {
+                let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
+                disk.crash_after(crash);
+                let mut d = Descender::new();
+                let mut live: Vec<u64> = Vec::new();
+                let mut state: BTreeMap<u64, BTreeMap<Vec<u8>, Vec<u8>>> = BTreeMap::new();
+                let snapshot = |state: &BTreeMap<u64, BTreeMap<Vec<u8>, Vec<u8>>>| {
+                    (2..40u64).map(|t| state.get(&t).cloned()).collect::<Vec<_>>()
+                };
+                'run: for i in 0..18u64 {
+                    let Ok(t) = db.make_tree(&mut d, cmp()) else {
+                        // Its record may have reached the disk: the tree, empty, under the next id.
+                        let mut s = state.clone();
+                        s.insert(i + 2, BTreeMap::new());
+                        states.push(snapshot(&s));
+                        break 'run;
+                    };
+                    assert_eq!(t, i + 2);
+                    live.push(t);
+                    state.insert(t, BTreeMap::new());
+                    states.push(snapshot(&state));
+                    acknowledged = states.len();
+                    let mut txn = db.begin().unwrap();
+                    let len = if i % 2 == 0 { 2 * PAGE_SIZE + 5 } else { 9 };
+                    let v = vec![u8::try_from(i).unwrap(); len];
+                    if db.put(&mut d, &mut txn, t, b"row", &v).is_err() {
+                        break 'run;
+                    }
+                    if db.commit(txn, &mut d, true).is_err() {
+                        states.push({
+                            let mut s = state.clone();
+                            s.entry(t).or_default().insert(b"row".to_vec(), v.clone());
+                            snapshot(&s)
+                        });
+                        break 'run;
+                    }
+                    state.entry(t).or_default().insert(b"row".to_vec(), v);
+                    states.push(snapshot(&state));
+                    acknowledged = states.len();
+                    if i % 3 == 2 {
+                        let old = live.remove(0);
+                        if db.drop_tree(&mut d, old).is_err() {
+                            let mut s = state.clone();
+                            s.remove(&old);
+                            states.push(snapshot(&s));
+                            break 'run;
+                        }
+                        state.remove(&old);
+                        states.push(snapshot(&state));
+                        acknowledged = states.len();
+                    }
+                    if i % 4 == 3 && db.checkpoint().is_err() {
+                        break 'run;
+                    }
+                }
+            }
+            disk.power_cut().unwrap();
+            let db = Database::open(disk.clone(), 2_000, 1, cmp)
+                .unwrap_or_else(|e| panic!("crash {crash}: reopen: {e}"));
+            let got = made_trees(&db, 40);
+            let n = states
+                .iter()
+                .rposition(|s| s == &got)
+                .unwrap_or_else(|| panic!("crash {crash}: trees match no prefix of the steps"));
+            assert!(
+                n + 1 >= acknowledged,
+                "crash {crash}: step {n} recovered, {acknowledged} acknowledged"
+            );
+            checked += 1;
+        }
+        assert!(checked > 40);
     }
 
     /// The overflow tree's rows `snap` sees.
