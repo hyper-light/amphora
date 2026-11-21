@@ -136,10 +136,7 @@ fn t_pl_8_1_the_right_join_reads_tiny_first() {
     let steps = plan(&conn, sql);
     assert_eq!(steps.len(), 3, "{steps:?}");
     assert_eq!(step_of(&steps, "tiny"), 0, "{steps:?}");
-    assert!(
-        step_of(&steps, "mid") < step_of(&steps, "big"),
-        "{steps:?}"
-    );
+    assert!(step_of(&steps, "mid") < step_of(&steps, "big"), "{steps:?}");
     assert_eq!(answers(&conn, sql), ["1"]);
 }
 

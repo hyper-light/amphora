@@ -3382,10 +3382,6 @@ fn operation_for_unmatched_right_rows(
     }
 }
 
-/// Change an outer-join origin to an inner-join origin.
-///
-/// SQLite keeps its `EP_InnerON` marker after it reduces the join. A later
-/// RIGHT JOIN must still know that the term came from ON or USING.
 /// Turn a RIGHT JOIN whose left side is the FROM list's first table alone into the LEFT JOIN of
 /// the same two tables the other way round: `t0 RIGHT JOIN t1 ON p` is `t1 LEFT JOIN t0 ON p`
 /// (Moerkotte, Fender and Eich, "On the correct and complete enumeration of the core search
@@ -3395,7 +3391,10 @@ fn operation_for_unmatched_right_rows(
 /// (`is_left_of_right_or_full_join`, `outer_join_may_null_extend`) reads it live, so each table is
 /// null-extended exactly where it was. Only B-tree tables are swapped: a table function's
 /// arguments or a FROM subquery may read the table written before it.
-fn commute_leading_right_join(table_references: &mut TableReferences, where_clause: &mut [WhereTerm]) {
+fn commute_leading_right_join(
+    table_references: &mut TableReferences,
+    where_clause: &mut [WhereTerm],
+) {
     let tables = table_references.joined_tables_mut();
     let is_leading_right_join = match tables.as_slice() {
         [left, right, ..] => {
@@ -3434,6 +3433,10 @@ fn commute_leading_right_join(table_references: &mut TableReferences, where_clau
     }
 }
 
+/// Change an outer-join origin to an inner-join origin.
+///
+/// SQLite keeps its `EP_InnerON` marker after it reduces the join. A later
+/// RIGHT JOIN must still know that the term came from ON or USING.
 fn change_join_origin_to_inner(where_clause: &mut [WhereTerm], table_id: ast::TableInternalId) {
     for term in where_clause {
         term.origin = match term.origin {
