@@ -39,6 +39,7 @@ mod guards;
 mod import;
 mod log_bound;
 pub mod online;
+mod pace;
 mod patience;
 pub(crate) mod remote;
 pub(crate) mod replicated;
