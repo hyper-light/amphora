@@ -1854,6 +1854,10 @@ fn emit_columns_for_table_info(
     // Therefore, we enumerate only after filtering out hidden columns (if extended set to false).
     let mut cid = 0;
     for column in columns.iter() {
+        // Amphora: a column an online DROP COLUMN dropped is no column of the table's (CP-T1.12).
+        if column.dropped() {
+            continue;
+        }
         // Determine column type which will be used for filtering in table_info pragma or as "hidden" column for table_xinfo pragma.
         //
         // SQLite docs about table_xinfo:

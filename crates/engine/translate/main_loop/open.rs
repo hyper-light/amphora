@@ -274,6 +274,20 @@ impl OpenLoop {
             )
             .emit()?;
 
+            // HASH SEMI-JOIN (G6 step 5): all conditions passed means the build row matched; it
+            // goes on only at its first match in this probe pass, and later matches move on to the
+            // next hash match.
+            if let Operation::HashJoin(hj) = &table.op {
+                if hj.join_type == HashJoinType::LeftSemi {
+                    let build_table = &table_references.joined_tables()[hj.build_table_idx];
+                    let hash_table_id: usize = build_table.internal_id.into();
+                    program.emit_insn(Insn::HashMarkFirstMatch {
+                        hash_table_id,
+                        target_pc: condition_fail_target,
+                    });
+                }
+            }
+
             // ANTI-JOIN: all conditions passed means a match was found.
             // Skip the outer row by jumping to the outer loop's Next.
             // label_body is resolved later in emit_loop, right before the body is emitted.

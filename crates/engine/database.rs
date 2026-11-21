@@ -1792,6 +1792,13 @@ impl Database {
                         })?;
                         db.with_schema_mut(|schema| schema.set_constraint_states(&columns))?;
                     }
+                    let dropped = conn.query_dropped_columns()?;
+                    if !dropped.is_empty() {
+                        let db = state.db.as_ref().ok_or_else(|| {
+                            LimboError::InternalError("open: no database past Init".into())
+                        })?;
+                        db.with_schema_mut(|schema| schema.set_dropped_columns(&dropped))?;
+                    }
 
                     state.phase = OpenDbAsyncPhase::BootstrapMvStore;
                 }
@@ -2675,6 +2682,7 @@ impl Database {
             auto_commit: AtomicBool::new(true),
             transaction_state: AtomicTransactionState::new(TransactionState::None),
             poisoned_tx: AtomicBool::new(false),
+            online_change_own: AtomicBool::new(false),
             statement_journals: AtomicBool::new(true),
             last_insert_rowid: AtomicI64::new(0),
             changes: AtomicI64::new(0),
