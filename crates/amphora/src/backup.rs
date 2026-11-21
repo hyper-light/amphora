@@ -352,7 +352,10 @@ mod tests {
         fence.shipped(4, 9).unwrap();
         fence.ended(4, 9, false).unwrap();
         assert!(fence.ended_whole(4, 9, 5).unwrap());
-        assert!(!fence.ended_whole(4, 8, 5).unwrap(), "ended past what was shipped");
+        assert!(
+            !fence.ended_whole(4, 8, 5).unwrap(),
+            "ended past what was shipped"
+        );
         // Generation 5 holds nothing and starts again: 4 still reaches 6 whole, and so does 5.
         fence.ended(5, 0, false).unwrap();
         assert!(fence.ended_whole(4, 9, 6).unwrap());

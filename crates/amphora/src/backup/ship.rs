@@ -565,9 +565,16 @@ impl Shipper {
         }
         self.ship(db, blobs, until)?;
         let (seq, end) = db.log_end();
-        if self.identity.is_none_or(|i| i.seq != seq) {
-            anyhow::bail!("ship the log's generation before ending a base in it");
-        }
+        let end = match self.identity {
+            Some(i) if i.seq == seq => end,
+            // The log started again, shipped whole, and nothing is in it yet (its header isn't
+            // even written): the file holds all the shipped generation did, so the base ends
+            // where that generation did.
+            Some(i) if end == 0 && self.hooks.fence.ended_whole(i.seq, self.shipped, seq)? => {
+                self.shipped
+            }
+            _ => anyhow::bail!("ship the log's generation before ending a base in it"),
+        };
         let manifest = Manifest {
             format: FORMAT,
             id: copy.id,
