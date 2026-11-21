@@ -908,8 +908,7 @@ fn join_lhs_and_rhs<'a>(
                         input_cardinality,
                         params,
                     );
-                    let forced =
-                        planning_context.join_methods == crate::JoinMethods::HashJoinsOnly;
+                    let forced = planning_context.join_methods == crate::JoinMethods::HashJoinsOnly;
                     if hash_join_allowed
                         && (forced || hash_join_method.cost < best_access_method.cost)
                     {
