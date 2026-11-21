@@ -505,6 +505,64 @@ impl<'a> JoinedSetRows<'a> {
                 on_elsewhere,
             });
         }
+        // PL.8: an outer join's ON terms that read only an earlier table decide which of its rows
+        // match, among the rows its filters keep: their share is the earlier table's sample run
+        // with its filters and them together, over its filters alone (the filters' share counts at
+        // the earlier table). Run apart they would count as independent of the filters, and a
+        // correlated pair would put the outer join below its inner join, which runs them together
+        // on the same sample (CERT, decision 21).
+        let mut conditional: Vec<(usize, usize, f64)> = Vec::new();
+        for (later, table) in tables.iter().enumerate() {
+            for (entry, e) in table.on_elsewhere.iter().enumerate() {
+                let (Some(on), Some(filters), Some(earlier), Some(table_constraints)) = (
+                    e.sampled.as_ref(),
+                    tables.get(e.table).and_then(|t| t.sampled.as_ref()),
+                    joined_tables.get(e.table),
+                    constraints.get(e.table),
+                ) else {
+                    continue;
+                };
+                if filters.selectivity <= 0.0 {
+                    continue;
+                }
+                let both_constraints: Vec<Constraint> = table_constraints
+                    .constraints
+                    .iter()
+                    .chain(table_constraints.on_elsewhere.iter())
+                    .cloned()
+                    .collect();
+                let together = sampled_filters(
+                    earlier,
+                    &both_constraints,
+                    where_clause,
+                    &|pos| {
+                        if filters.terms.contains(&pos) {
+                            Some(true)
+                        } else {
+                            on.terms.contains(&pos).then_some(false)
+                        }
+                    },
+                    schema,
+                    params,
+                );
+                if let Some(together) = together {
+                    conditional.push((
+                        later,
+                        entry,
+                        (together.selectivity / filters.selectivity).clamp(0.0, 1.0),
+                    ));
+                }
+            }
+        }
+        for (later, entry, share) in conditional {
+            if let Some(sampled) = tables
+                .get_mut(later)
+                .and_then(|t| t.on_elsewhere.get_mut(entry))
+                .and_then(|e| e.sampled.as_mut())
+            {
+                sampled.selectivity = share;
+            }
+        }
         // A WHERE term no row passes (`WHERE NULL`) leaves no rows in any set, whether or not
         // the parser folded it into a constant-false WHERE, which plans no table at all; an ON
         // term so makes its join's right table match nothing (`matches_none`).
