@@ -706,6 +706,8 @@ pub struct Database<
     // Shared structures of a Database are the parts that are common to multiple threads that might
     // create DB connections.
     _shared_page_cache: Arc<RwLock<PageCache>>,
+    /// Amphora (QT.5): what its operators' work costs, learned as its queries run.
+    pub(crate) learned_costs: crate::translate::optimizer::learned_costs::LearnedCosts,
 
     /// Optional per-database MVCC durable storage override.
     ///
@@ -859,6 +861,7 @@ impl Database {
                 s
             }))),
             _shared_page_cache: shared_page_cache,
+            learned_costs: crate::translate::optimizer::learned_costs::LearnedCosts::new(),
             shared_wal,
             #[cfg(host_shared_wal)]
             shared_wal_coordination: OnceLock::new(),
@@ -2683,6 +2686,7 @@ impl Database {
             has_non_main_pagers: AtomicBool::new(false),
             query_only: AtomicBool::new(false),
             row_counters: AtomicBool::new(false),
+            plan_cache_mode: AtomicU8::new(crate::PlanCacheMode::Auto.to_u8()),
             vdbe_trace: AtomicBool::new(false),
             dml_require_where: AtomicBool::new(false),
             count_changes: AtomicBool::new(false),
@@ -2717,6 +2721,9 @@ impl Database {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::connection::AtomicSubqueryUnnestingMode::new(
                 crate::connection::SubqueryUnnestingMode::Auto,
+            ),
+            join_methods: crate::connection::AtomicJoinMethods::new(
+                crate::connection::JoinMethods::ByCost,
             ),
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),
@@ -3242,9 +3249,12 @@ impl Database {
         // are shared (decision 37).
         let packed = {
             let shared = self.shared_wal.read();
-            shared.runtime.format.load(Ordering::Acquire) == crate::storage::packed::PACKED_FORMAT
-                || shared.metadata.wal_header.lock().file_format
-                    == crate::storage::packed::PACKED_FORMAT
+            let packed = |format| {
+                crate::storage::packed::LogFormat::of(format)
+                    == Some(crate::storage::packed::LogFormat::Packed)
+            };
+            packed(shared.runtime.format.load(Ordering::Acquire))
+                || packed(shared.metadata.wal_header.lock().file_format)
         };
         if packed {
             return Err(LimboError::InvalidArgument(

@@ -1149,7 +1149,7 @@ mod tests {
                 engine: Arc::downgrade(&db.db),
                 dropped: sender,
             };
-            db.hold_owner(crate::database::Owned::new(
+            db.hold_owner(crate::database::Owned::unbudgeted(
                 Arc::new(std::fs::File::create(dir.path().join("lease")).unwrap()),
                 Some(crate::database::Guards::new([7; 32], Arc::new(witness))),
             ));

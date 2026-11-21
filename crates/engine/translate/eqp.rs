@@ -268,6 +268,10 @@ pub enum EqpDetail {
     /// Probe a hash table built from another table's rows.
     HashJoin {
         table: EqpTable,
+        /// Amphora (PL.6): the table the hash table is built from. Its read is listed in the same
+        /// block after the probe, but it runs once, before the first probe (`Insn::Once`), not
+        /// for each row of the loops before it: JSON's `build` names it so a reader can tell.
+        build: Option<EqpTable>,
         join: Option<EqpJoin>,
         subquery: Option<EqpSubquery>,
         estimate: Option<TablePlanEstimate>,
@@ -530,9 +534,11 @@ fn eqp_index(index: &Index, table: &JoinedTable) -> EqpIndex {
     }
 }
 
-/// Build the [EqpDetail] for a joined table.
+/// Build the [EqpDetail] for a joined table. `build_table` is the table a hash join's probe
+/// (`table`) builds its hash table from; only a hash join's detail uses it.
 pub(crate) fn eqp_detail_for_table_op(
     table: &JoinedTable,
+    build_table: Option<&JoinedTable>,
     join: Option<EqpJoin>,
     subquery: Option<EqpSubquery>,
 ) -> EqpDetail {
@@ -630,6 +636,7 @@ pub(crate) fn eqp_detail_for_table_op(
         },
         Operation::HashJoin(_) => EqpDetail::HashJoin {
             table: eqp_table,
+            build: build_table.map(EqpTable::from_joined),
             join,
             subquery,
             estimate: table.plan_estimate,
@@ -869,12 +876,14 @@ impl EqpDetail {
             }
             Self::HashJoin {
                 table,
+                build,
                 join,
                 subquery,
                 estimate,
             } => {
                 obj.str("type", "hash_join");
                 Self::write_table_fields(&mut obj, table, *join, subquery.as_ref());
+                obj.opt_str("build", build.as_ref().map(EqpTable::identifier));
                 Self::write_estimate(&mut obj, estimate.as_ref());
             }
             Self::RightJoin { table } => {
@@ -947,7 +956,7 @@ pub(crate) fn eqp_details_for_right_join(table: &JoinedTable) -> (EqpDetail, Eqp
         .unwrap_or_else(|| Operation::default_scan_for(&table.table));
     (
         EqpDetail::RightJoin { table: eqp_table },
-        eqp_detail_for_table_op(&unmatched_table, None, None),
+        eqp_detail_for_table_op(&unmatched_table, None, None, None),
     )
 }
 

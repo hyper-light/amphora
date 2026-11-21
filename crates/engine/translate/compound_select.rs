@@ -204,6 +204,11 @@ pub fn emit_program_for_compound_select(
     // Its arms' estimates, read before emission takes the arms apart; set once they're emitted,
     // after any subquery of theirs set its own.
     let output_rows = compound_output_rows(left, right_most, limit_owned.as_deref());
+    let plan_cost = left
+        .iter()
+        .map(|(plan, _)| plan.estimated_cost)
+        .chain(core::iter::once(right_most.estimated_cost))
+        .try_fold(0.0, |total, cost| cost.map(|cost| total + cost));
 
     program.with_scoped_result_cols_start(|program| {
         emit_compound_select(
@@ -221,6 +226,7 @@ pub fn emit_program_for_compound_select(
     })?;
     program.pop_current_parent_explain();
     program.output_rows = output_rows;
+    program.plan_cost = plan_cost;
 
     // Install the compound query's result columns. Emission of nested subqueries above may
     // have overwritten `program.result_columns` (each `emit_program_for_select` call sets

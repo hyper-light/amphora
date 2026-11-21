@@ -1750,7 +1750,7 @@ pub fn emit_from_clause_subqueries(
 
     for table_index in visit_order {
         allocate_cursors_read_by_lateral_subquery(program, t_ctx, tables, join_order, table_index)?;
-        let table_reference = &mut tables.joined_tables_mut()[table_index];
+        let table_reference = &tables.joined_tables()[table_index];
         let execution_mode = match &table_reference.table {
             Table::FromClauseSubquery(from_clause_subquery) => {
                 Some(choose_from_clause_subquery_execution_mode(
@@ -1774,9 +1774,17 @@ pub fn emit_from_clause_subqueries(
             {
                 eqp_detail_for_rowid_search(table_reference, eqp_join, eqp_subquery)
             } else {
-                eqp_detail_for_table_op(table_reference, eqp_join, eqp_subquery)
+                let build_table = match &table_reference.op {
+                    Operation::HashJoin(hash_join_op) => {
+                        tables.joined_tables().get(hash_join_op.build_table_idx)
+                    }
+                    _ => None,
+                };
+                eqp_detail_for_table_op(table_reference, build_table, eqp_join, eqp_subquery)
             }
         });
+
+        let table_reference = &mut tables.joined_tables_mut()[table_index];
 
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
             let execution_mode =

@@ -7,10 +7,10 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::sync::{OnceLock, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use amphora_api::{
     self as api, Change, Changes, Cond, Consistency, Migration, Mutation, Page, Records, Refusal,
@@ -119,16 +119,17 @@ struct Owner {
 static OWNERS: OnceLock<Mutex<BTreeMap<PathBuf, Owner>>> = OnceLock::new();
 /// The paths whose owner this process drained, the latest last. A lease there may still read held
 /// for a moment: a child this process forked shares it until its exec (local-owner-transport.md,
-/// "Owner guards", J1). At most `DRAINED_MAX`, the oldest evicted first; a path's mark goes once
-/// this process takes its lease again.
+/// "Owner guards", J1). A mark names a lease this process held, one descriptor of the process's
+/// descriptor budget, so the marks kept are at most that budget's bound as it stands, the oldest
+/// evicted first (local-owner-transport.md, "One descriptor budget", item 6). An evicted mark
+/// makes an open that still finds the lease held refuse it as another process's, typed, rather
+/// than wait. A path's mark goes once this process takes its lease again.
 static DRAINED: OnceLock<Mutex<std::collections::VecDeque<PathBuf>>> = OnceLock::new();
-/// The owner table's own bound (`open database owners`): no more paths can have drained at once.
-const DRAINED_MAX: usize = 4096;
-/// The first pause before a drained path's lease is probed again: the measured window, 62.8 µs
-/// on fedora (t1/guards-flake), rounded down. Each pause doubles, up to `LONGEST_PAUSE`.
-const FIRST_PAUSE: std::time::Duration = std::time::Duration::from_micros(50);
-/// The drain wait's own park: no probe waits longer between looks.
-const LONGEST_PAUSE: std::time::Duration = std::time::Duration::from_millis(1);
+/// The window this process last waited out for a drained path's lease, from its first probe to
+/// taking it, in nanoseconds (0: none waited yet): how long a child it forked held the lease until
+/// its exec, learned (J1; 62.8 µs once measured on fedora, t1/guards-flake). One last sample: it
+/// bounds how late a probe is, never how long a wait lasts (the caller's deadline does).
+static DRAIN_WINDOW: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 pub(crate) struct Changed {
@@ -357,12 +358,11 @@ fn forget_drained(owners: &mut BTreeMap<PathBuf, Owner>) -> Result<(), Refusal> 
     if gone.is_empty() {
         return Ok(());
     }
+    let most = crate::descriptors::process()?.bound();
     let mut drained = locked(DRAINED.get_or_init(Mutex::default))?;
     for path in gone {
         drained.retain(|marked| *marked != path);
-        if drained.len() >= DRAINED_MAX {
-            drained.pop_front();
-        }
+        while drained.len() >= most && drained.pop_front().is_some() {}
         drained.try_reserve(1).map_err(unavailable)?;
         drained.push_back(path);
     }
@@ -388,11 +388,43 @@ fn lease_held_since_drain(path: &Path) {
     tracing::warn!(target: "amphora.records", event = "records.lease_held_since_drain", path = %path.display(), "the lease is still held since this process drained it: a child this process forked may share it until its exec");
 }
 
-/// Parks before the next probe of a drained path's lease, no later than `until`, and doubles
-/// `pause` up to `LONGEST_PAUSE`.
-fn pause_for_lease(pause: &mut std::time::Duration, until: Instant) {
-    std::thread::park_timeout(until.saturating_duration_since(Instant::now()).min(*pause));
-    *pause = pause.saturating_mul(2).min(LONGEST_PAUSE);
+/// The pause before the next probe of a drained path's lease: the probe's own cost the first
+/// time, so probing takes at most as long as waiting; then twice the last (and never less than
+/// the probe). It's no longer than the larger of the window the last drain took (`window`) and
+/// this wait so far (`waited`): a lease let go within the learned window is taken within it, and
+/// one held past it is taken within twice the wait, so a drain that outlasts the window doesn't
+/// spin at the window's pace. Before any window is known it doubles to the deadline.
+fn next_pause(
+    last: Option<Duration>,
+    probe: Duration,
+    window: Option<Duration>,
+    waited: Duration,
+) -> Duration {
+    // A probe the clock can't see takes its least step, so the pauses still grow.
+    let probe = probe.max(Duration::from_nanos(1));
+    match last {
+        None => probe,
+        Some(last) => {
+            let doubled = last.saturating_mul(2).max(probe);
+            window.map_or(doubled, |window| doubled.min(window.max(waited).max(probe)))
+        }
+    }
+}
+
+/// Parks before the next probe of a drained path's lease, no later than `until`, for
+/// [`next_pause`] after `pause`, given the probe began at `probed` and the wait at `since`.
+fn pause_for_lease(pause: &mut Option<Duration>, probed: Instant, since: Instant, until: Instant) {
+    let nanos = DRAIN_WINDOW.load(Ordering::Relaxed);
+    let window = (nanos > 0).then(|| Duration::from_nanos(nanos));
+    let next = next_pause(*pause, probed.elapsed(), window, since.elapsed());
+    *pause = Some(next);
+    std::thread::park_timeout(until.saturating_duration_since(Instant::now()).min(next));
+}
+
+/// A drained path's lease taken after waiting since `since`: the window learned.
+fn drain_window_taken(since: Instant) {
+    let nanos = u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    DRAIN_WINDOW.store(nanos, Ordering::Relaxed);
 }
 
 fn remote_owner() -> Refusal {
@@ -640,11 +672,12 @@ impl Database {
             // Its parent is made by the lease, past every refusal before it.
             None => resolved_path(path)?,
         };
-        let mut pause = FIRST_PAUSE;
-        let mut waited = false;
+        let mut pause = None;
+        let mut waited: Option<Instant> = None;
         loop {
-            if Instant::now() >= until {
-                if waited {
+            let probed = Instant::now();
+            if probed >= until {
+                if waited.is_some() {
                     lease_held_since_drain(&path);
                 }
                 return Err(Refusal::Timeout);
@@ -726,7 +759,10 @@ impl Database {
                     continue;
                 }
             }
-            api::bound("open database owners", owners.len().saturating_add(1), 4096)?;
+            // The owner table holds no count of its own: each owner charges the descriptor it
+            // holds, its lease or, a client's, the socket its calls open, to the process's
+            // descriptor budget (local-owner-transport.md, "One descriptor budget", item 6).
+            let descriptor = crate::descriptors::process()?.take("open descriptors", 1)?;
             let lease = match guards {
                 // The path is canonical and its parent exists: the lease makes no directory above.
                 Some(_) => crate::transport::try_lease(&path)?,
@@ -738,8 +774,8 @@ impl Database {
                 // process's. An unguarded open waits as a client, below.
                 if (guards.is_some() || restoring) && drained_here(&path)? {
                     drop(owners);
-                    waited = true;
-                    pause_for_lease(&mut pause, until);
+                    let since = *waited.get_or_insert(probed);
+                    pause_for_lease(&mut pause, probed, since, until);
                     continue;
                 }
                 if guards.is_some() {
@@ -751,7 +787,7 @@ impl Database {
                         "another process owns the destination",
                     ));
                 }
-                match remote::attach(&path, replica, until) {
+                match remote::attach(&path, replica, descriptor, until) {
                     Ok(database) => {
                         owners.insert(
                             path,
@@ -777,8 +813,11 @@ impl Database {
                 }
             };
             owned_again(&path)?;
+            if let Some(since) = waited {
+                drain_window_taken(since);
+            }
             let key = guards.as_ref().map(Guards::key);
-            let owner = Owned::new(Arc::new(lease), guards);
+            let owner = Owned::new(Arc::new(lease), descriptor, guards);
             let database = create(&path, owner.clone())?;
             remote::publish(&database, &path)?;
             let identity = file_identity(&path)?;
@@ -1354,8 +1393,7 @@ impl Namespace {
         let until = Instant::now()
             .checked_add(std::time::Duration::from_secs(2))
             .ok_or(Refusal::Timeout)?;
-        self.resolved(until)?
-            .try_wait_selected(family, after, until)
+        self.changed(family, after, until)
     }
 
     pub(super) fn resolved(&self, until: Instant) -> Result<Namespace, Refusal> {
@@ -1461,6 +1499,10 @@ impl Records for Namespace {
             Answer::Changes(v) => Ok(v),
             _ => Err(unavailable("wrong changes answer")),
         }
+    }
+    fn changed(&self, family: &str, after: Rev, until: Instant) -> Result<Option<Rev>, Refusal> {
+        self.resolved(until)?
+            .try_wait_selected(family, after, until)
     }
     fn head(&self, until: Instant) -> Result<Rev, Refusal> {
         match self.database.submit(&self.name, Operation::Head, until)? {
@@ -2028,4 +2070,65 @@ pub(crate) fn in_child(test: &str) -> bool {
         .unwrap();
     assert!(status.success(), "{test} in a child process: {status}");
     false
+}
+
+#[cfg(test)]
+mod drain_pause {
+    use super::next_pause;
+    use std::time::Duration;
+
+    /// Do: ask the pauses of a drained path's lease, before any window is learned and after one
+    /// is. Expect: the first pause the probe's own cost, then each twice the last, no longer than
+    /// the learned window (or the probe, where that is longer); before any window, doubling
+    /// without one; a probe the clock can't see still grows (J1, 2026-11-11: no picked 50 µs or
+    /// 1 ms; CP-T1.5 U05).
+    #[test]
+    fn a_drained_lease_is_probed_from_its_probes_cost_to_the_learned_window() {
+        let probe = Duration::from_micros(3);
+        let window = Duration::from_micros(40);
+        let early = Duration::from_micros(10);
+        assert_eq!(next_pause(None, probe, None, early), probe);
+        assert_eq!(next_pause(None, probe, Some(window), early), probe);
+        let mut pause = None;
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            let next = next_pause(pause, probe, Some(window), early);
+            seen.push(next.as_micros());
+            pause = Some(next);
+        }
+        assert_eq!(seen, [3, 6, 12, 24, 40, 40]);
+        assert_eq!(
+            next_pause(Some(Duration::from_millis(8)), probe, None, early),
+            Duration::from_millis(16)
+        );
+        let slow = Duration::from_micros(90);
+        assert_eq!(next_pause(Some(window), slow, Some(window), early), slow);
+        let unseen = next_pause(None, Duration::ZERO, None, Duration::ZERO);
+        assert!(next_pause(Some(unseen), Duration::ZERO, None, Duration::ZERO) > unseen);
+    }
+
+    /// Do: ask the pauses of a wait that has outlasted the learned window: a lease held to the
+    /// deadline (K1) after a drain of 40 µs was learned. Expect: the pauses go on doubling past
+    /// the window, each at most the wait so far, so a second of waiting takes about twenty probes,
+    /// not the 25,000 a window's pace would (amphora-seam-owner-2's ruling,
+    /// amphora-owner-t1-constants-code-20261111; CP-T1.5 U05).
+    #[test]
+    fn a_wait_that_outlasts_the_learned_window_keeps_doubling() {
+        let probe = Duration::from_micros(3);
+        let window = Duration::from_micros(40);
+        let mut waited = Duration::ZERO;
+        let mut pause = None;
+        let mut probes = 0u32;
+        while waited < Duration::from_secs(1) {
+            let next = next_pause(pause, probe, Some(window), waited);
+            assert!(
+                next <= window.max(waited).max(probe),
+                "{next:?} at {waited:?}"
+            );
+            waited += next + probe;
+            pause = Some(next);
+            probes += 1;
+        }
+        assert!(probes < 40, "{probes} probes in a second");
+    }
 }

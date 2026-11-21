@@ -611,22 +611,23 @@ fn one_seed(seed: u64) -> Result<Seen, String> {
         Db::open_with_sharing(path, disk.clone(), &sharing).map_err(|e| format!("open: {e:#}"))?;
     db.log_format(format)
         .map_err(|e| format!("log format: {e:#}"))?;
+    // Each seed's log has a bound of its own, 8 to 23 frames, so cuts land with frames left
+    // uncopied across commits at every depth of a log within its bound (decision 35: nothing is
+    // copied before the bound).
+    let bound = 8 + seed % 16;
     // Every third seed keeps no more log than its bound across a restart, so each restart, past
     // the bound, cuts the log's file to nothing (docs/design/store.md, decision 31); the others keep
     // their logs' files (decision 13).
     if seed.is_multiple_of(3) {
-        db.keep_log(16);
+        db.keep_log(bound);
     }
     db.exec("CREATE TABLE events (key TEXT, seq INTEGER CHECK (seq >= 0), batch INTEGER); CREATE INDEX by_key ON events (key, seq)")
         .map_err(|e| format!("schema: {e:#}"))?;
     // The schema durable first: the crash point is drawn among the workload's changes.
     db.flusher()().map_err(|e| format!("flush: {e}"))?;
     let config = Config {
-        log_frames: 16,
+        log_frames: bound,
         checkpoint_every: Duration::from_millis(1),
-        // Each seed's checkpointer copies once its own count of frames wait (none: at every
-        // period), so cuts land with frames left uncopied across commits (decision 35).
-        copy_after: seed % 8,
         ..Config::default()
     };
     let store = Store::start(Events { db }, config).map_err(|e| format!("start: {e:#}"))?;

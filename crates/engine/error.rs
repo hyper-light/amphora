@@ -107,6 +107,10 @@ pub enum LimboError {
     TxTerminated,
     #[error("Write-write conflict")]
     WriteWriteConflict,
+    /// Amphora: a serializable transaction's commit refused by its validation (the versioned
+    /// storage, docs/design/engine.md decision 5): its caller rolls back and runs it again.
+    #[error("Serialization failure: run the transaction again")]
+    SerializationFailure,
     #[error("Commit dependency aborted")]
     CommitDependencyAborted,
     #[error("No such transaction ID: {0}")]

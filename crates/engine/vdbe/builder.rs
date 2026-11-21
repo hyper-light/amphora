@@ -327,6 +327,12 @@ pub struct ProgramBuilder {
     /// `compound_output_rows`). Set as each SELECT's plan is emitted, so the top-level statement,
     /// emitted after the subqueries it holds, sets it last.
     pub(crate) output_rows: Option<f64>,
+    /// Amphora (PL.12): the top-level SELECT's estimated cost (`SelectPlan::estimated_cost`, a
+    /// compound's arms summed), set as `output_rows` is, so the top-level statement sets it last.
+    pub(crate) plan_cost: Option<f64>,
+    /// Amphora (PL.12): an estimate asked for a parameter's value while the statement was planned,
+    /// so a plan made with a run's values could differ from this one (`plan_cache.rs`).
+    pub(crate) reads_parameter_values: bool,
     pub resolve_type: ResolveType,
     /// When set, all triggers fired from this program should use this conflict resolution.
     /// This is used in UPSERT DO UPDATE context to ensure nested trigger's OR IGNORE/REPLACE
@@ -765,6 +771,8 @@ impl ProgramBuilder {
             mode: BuilderQueryMode::new(query_mode),
             reg_result_cols_start: None,
             output_rows: None,
+            plan_cost: None,
+            reads_parameter_values: false,
             flags: ProgramBuilderFlags::new(is_subprogram),
             emitted_function_call: false,
             trigger,
@@ -2542,9 +2550,11 @@ impl ProgramBuilder {
             .take()
             .map(|counters| counters.sites)
             .unwrap_or_default();
+        let memory_tables = memory_tables(&self.insns);
         let prepared = PreparedProgram {
             row_count_sites,
             max_registers: self.next_free_register,
+            memory_tables,
             insns: self.insns,
             cursor_ref: self.cursor_ref,
             explain: self.explain,
@@ -2554,6 +2564,8 @@ impl ProgramBuilder {
             result_columns: self.result_columns,
             table_references: self.table_references,
             output_rows: self.output_rows,
+            plan_cost: self.plan_cost,
+            reads_parameter_values: self.reads_parameter_values,
             sql: sql.to_string(),
             refreshes_analyze_stats: sql
                 .trim_start()
@@ -2584,6 +2596,27 @@ impl ProgramBuilder {
         let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
     }
+}
+
+/// The distinct hash and group tables `insns` build: each `HashBuild`, `HashDistinct` and
+/// `GroupFind` names its table, and a table built in two places counts once. A loop over the
+/// program's instructions, which are already bounded by the program.
+fn memory_tables(insns: &[(Insn, usize)]) -> usize {
+    let mut hash = Vec::new();
+    let mut group = Vec::new();
+    for (insn, _) in insns {
+        match insn {
+            Insn::HashBuild { data } => hash.push(data.hash_table_id),
+            Insn::HashDistinct { data } => hash.push(data.hash_table_id),
+            Insn::GroupFind { data } => group.push(data.table_id),
+            _ => {}
+        }
+    }
+    hash.sort_unstable();
+    hash.dedup();
+    group.sort_unstable();
+    group.dedup();
+    hash.len().saturating_add(group.len())
 }
 
 pub(crate) trait CursorTypeExt {

@@ -2,11 +2,16 @@
 use super::*;
 use amphora_engine::LimboError;
 
-// Worst-case postcard envelope (including the optional bootstrap declaration) and 4096-byte
-// page entry. See docs/design/records-compaction.md: 8178 pages fit REQUEST_MAX.
+// Worst-case postcard envelope (including the optional bootstrap declaration) and page entry:
+// formats, not tunings. See docs/design/records-compaction.md: 8178 pages fit REQUEST_MAX.
 const ENVELOPE: usize = 81;
-const PAGE_ENTRY: usize = 4103; // 5-byte ID + 2-byte length + 4096-byte page.
-const MIN_ROOM: usize = 4184; // Envelope and one page.
+// A page's entry: its ID as a postcard varint of a u32 (at most 5 bytes), its length (4096 as a
+// postcard varint, 2 bytes), and the page itself.
+const PAGE_ENTRY: usize = 5usize.saturating_add(2).saturating_add(PAGE);
+// The envelope and one page.
+const MIN_ROOM: usize = ENVELOPE.saturating_add(PAGE_ENTRY);
+// The page every replicated image holds (`replication::validate_pages`).
+const PAGE: usize = 4096;
 
 pub(crate) fn page_limit(room: usize) -> Result<usize, Refusal> {
     let room = room.min(api::REQUEST_MAX);

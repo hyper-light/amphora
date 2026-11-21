@@ -48,7 +48,7 @@ use crate::vdbe::affinity::{
 };
 use crate::vdbe::group_table;
 use crate::vdbe::hash_table::{
-    HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
+    table_share, HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert,
 };
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::metrics::HashJoinMetrics;
@@ -9445,7 +9445,7 @@ pub fn op_sorter_insert(
 }
 
 pub fn op_sorter_sort(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -9457,15 +9457,25 @@ pub fn op_sorter_sort(
         },
         insn
     );
-    let (is_empty, did_sort) = {
+    let (is_empty, did_sort, timed) = {
         let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_sorter_mut();
         let is_empty = cursor.is_empty();
         if !is_empty {
             return_if_io!(state, cursor.sort());
         }
-        (is_empty, !is_empty)
+        (is_empty, !is_empty, cursor.take_in_memory_sort())
     };
+    // Amphora (QT.5): the sort's time moves the database's learned sort cost, in the planner's
+    // unit, rows times log2 rows (`cost::estimate_sort_cpu_cost`).
+    if let Some((rows, nanos)) = timed {
+        let rows = rows as f64;
+        program.connection.db.learned_costs.observe(
+            crate::translate::optimizer::learned_costs::Work::Sort,
+            rows * rows.max(1.0).log2(),
+            nanos,
+        );
+    }
     // Increment metrics for sort operation after cursor is dropped
     if did_sort {
         state.metrics.sort_operations = state.metrics.sort_operations.wrapping_add(1);
@@ -17873,7 +17883,9 @@ pub fn op_hash_build(
     let mem_budget = if matches!(temp_store, crate::TempStore::Memory) {
         usize::MAX
     } else {
-        data.mem_budget
+        // Amphora: the statement's budget, shared by its tables (decision 8): read as the
+        // distinct and group tables read it, from the connection's cache as it is now.
+        table_share(pager.statement_memory_budget(), program.memory_tables)
     };
     if let std::collections::hash_map::Entry::Vacant(e) =
         state.hash_tables.entry(data.hash_table_id)
@@ -17981,7 +17993,8 @@ pub fn op_hash_distinct(
     let mem_budget = if matches!(temp_store, crate::TempStore::Memory) {
         usize::MAX
     } else {
-        DEFAULT_MEM_BUDGET
+        // Amphora: the statement's budget, shared by its tables (decision 8).
+        table_share(pager.statement_memory_budget(), program.memory_tables)
     };
     if let std::collections::hash_map::Entry::Vacant(e) =
         state.hash_tables.entry(data.hash_table_id)
@@ -18065,7 +18078,7 @@ pub fn op_group_find(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Arc<Pager>,
+    pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(GroupFind { data }, insn);
     // A table past its budget sends its new groups' rows to the sorter; with temp_store=memory
@@ -18076,7 +18089,8 @@ pub fn op_group_find(
     ) {
         usize::MAX
     } else {
-        DEFAULT_MEM_BUDGET
+        // Amphora: the statement's budget, shared by its tables (decision 8).
+        table_share(pager.statement_memory_budget(), program.memory_tables)
     };
     let table = state.group_tables.entry(data.table_id).or_insert_with(|| {
         group_table::GroupTable::new(data.num_keys, data.collations.clone(), budget)
