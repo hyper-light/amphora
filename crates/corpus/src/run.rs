@@ -4,7 +4,7 @@
 //! statement the engine settles into its steady state (its log copied into the file and emptied),
 //! so what a query reads, and what it costs, is the database's, not a leftover log's (G2 step 4).
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::answer::{Render, Value, answer, compare, expected_values};
 use crate::complete::split;
@@ -13,14 +13,35 @@ use crate::slt::{Item, Kind, Record, parse};
 /// The engine whose conditions the corpus's records follow: every answer in it is SQLite's.
 pub const AS_ENGINE: &str = "sqlite";
 
-/// One engine, a fresh database per file.
+/// Why a statement didn't run to its end.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Stop {
+    /// The engine's error.
+    Refused(String),
+    /// Its bound came first: the engine stopped it (its interrupt, or its process ended).
+    PastBudget,
+}
+
+/// One engine, a fresh database per file (the seam every adapter fills: crate::engines).
 pub trait Engine {
     /// Runs one statement to its end; its rows, at most `rows` of them kept (past that, the rest
-    /// are counted and dropped, and the answer already disagrees), or the engine's error.
-    fn run(&mut self, sql: &str, rows: usize) -> Result<Vec<Vec<Value>>, String>;
+    /// are counted and dropped, and the answer already disagrees), or why it stopped short. When
+    /// `until` comes first the engine stops the statement itself (G2 step 7: one record can't hold
+    /// a run past its budget) and answers [`Stop::PastBudget`].
+    fn run(
+        &mut self,
+        sql: &str,
+        rows: usize,
+        until: Option<Instant>,
+    ) -> Result<Vec<Vec<Value>>, Stop>;
     /// Copies the log into the database and empties it; an error says the steady state wasn't
     /// reached.
     fn settle(&mut self) -> Result<(), String>;
+    /// Whether stopping a statement ended the engine's database (a shell's process stopped): the
+    /// file's later records aren't run (Unreached).
+    fn ended(&self) -> bool {
+        false
+    }
 }
 
 /// What became of one record.
@@ -38,6 +59,28 @@ pub enum Outcome {
     Accepted,
     /// The run's deadline came first: the record wasn't run.
     Unreached,
+    /// The record ran past its bound and the engine stopped it.
+    PastBudget,
+}
+
+/// The time a file's records may take, both from the run's own budget (never a picked number).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Limits {
+    /// Records not yet begun at it aren't run (Unreached): the fill's end.
+    pub deadline: Option<Instant>,
+    /// A begun record is stopped this long after it began, or at the deadline if that's sooner: a
+    /// record past the whole budget can't be in it.
+    pub record: Option<Duration>,
+}
+
+impl Limits {
+    fn until(&self, began: Instant) -> Option<Instant> {
+        let own = self.record.and_then(|r| began.checked_add(r));
+        match (own, self.deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
 }
 
 pub struct Ran<'a> {
@@ -53,18 +96,21 @@ pub struct Counts {
     pub disagree: u64,
     pub skipped: u64,
     pub unreached: u64,
+    /// Records the engine stopped at their bound.
+    pub past_budget: u64,
     /// Settles that failed (the steady state not reached before a query).
     pub unsettled: u64,
 }
 
 /// Runs `text` (after `fixture`'s statements, a file of tables a source's files share) on `engine`,
-/// handing each record's outcome to `each`. Records after `deadline` aren't run (Unreached).
+/// handing each record's outcome to `each`. Records after the deadline aren't run (Unreached), and
+/// a record past its bound is stopped by the engine (PastBudget).
 pub fn run_file(
     engine: &mut dyn Engine,
     render: &mut dyn Render,
     text: &str,
     fixture: Option<&str>,
-    deadline: Option<Instant>,
+    limits: Limits,
     each: &mut dyn FnMut(Ran<'_>),
 ) -> Result<Counts, String> {
     let mut counts = Counts::default();
@@ -75,8 +121,8 @@ pub fn run_file(
             {
                 for part in split(&r.sql) {
                     engine
-                        .run(&part, 0)
-                        .map_err(|e| format!("the fixture's line {}: {e}", r.line))?;
+                        .run(&part, 0, None)
+                        .map_err(|e| format!("the fixture's line {}: {e:?}", r.line))?;
                 }
             }
         }
@@ -107,7 +153,7 @@ pub fn run_file(
             counts.skipped = counts.skipped.saturating_add(1);
             continue;
         }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
+        if engine.ended() || limits.deadline.is_some_and(|d| Instant::now() >= d) {
             counts.unreached = counts.unreached.saturating_add(1);
             each(Ran {
                 record: &record,
@@ -117,16 +163,18 @@ pub fn run_file(
             continue;
         }
         let began = Instant::now();
+        let until = limits.until(began);
         let outcome = match &record.kind {
             Kind::Statement { ok } => {
                 dirty = true;
                 let ran = split(&record.sql)
                     .iter()
-                    .try_for_each(|part| engine.run(part, 0).map(drop));
+                    .try_for_each(|part| engine.run(part, 0, until).map(drop));
                 match (ran, ok) {
-                    (Ok(()), true) | (Err(_), false) => Outcome::Agree,
+                    (Err(Stop::PastBudget), _) => Outcome::PastBudget,
+                    (Ok(()), true) | (Err(Stop::Refused(_)), false) => Outcome::Agree,
                     (Ok(()), false) => Outcome::Accepted,
-                    (Err(e), true) => Outcome::Refused(e),
+                    (Err(Stop::Refused(e)), true) => Outcome::Refused(e),
                 }
             }
             Kind::Query {
@@ -145,8 +193,9 @@ pub fn run_file(
                 let keep = expected.as_ref().map_or(usize::MAX, |e| {
                     expected_values(e).div_ceil(width).saturating_add(1)
                 });
-                match engine.run(&record.sql, keep) {
-                    Err(e) => Outcome::Refused(e),
+                match engine.run(&record.sql, keep, until) {
+                    Err(Stop::PastBudget) => Outcome::PastBudget,
+                    Err(Stop::Refused(e)) => Outcome::Refused(e),
                     Ok(rows) => {
                         let got = answer(&rows, types, *sort, render)?;
                         match expected {
@@ -163,6 +212,8 @@ pub fn run_file(
         let nanos = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
         if outcome == Outcome::Agree {
             counts.agree = counts.agree.saturating_add(1);
+        } else if outcome == Outcome::PastBudget {
+            counts.past_budget = counts.past_budget.saturating_add(1);
         } else {
             counts.disagree = counts.disagree.saturating_add(1);
         }
