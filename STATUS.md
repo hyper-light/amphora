@@ -24,6 +24,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   pass it, and a seeded differential test holds the simulator's answers to Amphora's
   (`crates/amphora/tests/records_conformance.rs`).
 - **The `amphora` binary** says what it is (`amphora --version`, `amphora --help`), and nothing more yet.
+- **The design's index and the README** (AC-T1.2.3, T-T1.13.2; lane docs): `docs/design.md` gives every
+  decision of `docs/design/` one line and a link, held to the records by
+  `crates/amphora/tests/design_index.rs` (a decision without a line, or a line that points nowhere,
+  fails it); it compares the client protocol with PostgreSQL's, MySQL's, SQLite's API and Hrana from
+  `docs/research/client-protocol.md`, and `docs/design/client-protocol.md` proposes the decision
+  (embedded first; the network listener open). `README.md` takes a fresh clone to a build, a working
+  database (`cargo run -p amphora --example quickstart`) and the gates. Built and merged; a fresh
+  agent following it on a clean machine (T-T1.13.2's run) is still to do.
 - **The store's commit pipeline** (CP-T1.1, `crates/amphora/src/store.rs`, docs/design/store.md): one
   writer with a group commit and no timer; durable beside it by a flusher (a write is durable once a
   flush begun after its commit ends, `Store::durable` by its batch's ticket); readers of their own on
@@ -298,6 +306,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   its retries' gaps (cold start: the core's election timeout). A gap over which the host's detector suspected the
   member is not learned; no number bounds a gap (lane g-slot-close, 2026-11-21).
 
+- **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
+  over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
+  on a group's database (`Cluster`, each step one call to the group). A crashed coordinator's next incarnation fences
+  the old one and finishes what it left. Tested: a crash at every step (T-T1.10.1) and seeded runs with lost and late
+  steps and crashes, Elle-style. Left: the LAN p99 (AC-T1.10.2) on multi-node groups and the 10,000-seed run, which
+  decide between the two; SQL sessions across groups (AC-T1.10.1).
 - **Picked constants replaced by derived ones** (lane constants, kiln goal dfabffcc; Ada, 2026-11-11: "learned and
   stat derived values only"): a page's chain of deltas ends where its bytes reach a page (store.md decision 17); the
   store's log is copied past its bound (decision 35); a term runs on the whole sample (planner.md decision 21); a
@@ -322,6 +336,16 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   now), rows indexed by position for copy and sweep, the old group's log held through the operation,
   the shell carrying the driver's actions to groups, `bench reshard` (AC-T1.9.2) and the three-machine
   lab (AC-T1.9.3).
+
+- **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
+  `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then
+  public, each step a transaction through the writer, with a backfill in batches sized as it runs
+  (a batch holds the writer about as long as it waited for it). Reads use the index only once
+  public; the cutover changes only the catalog. A power cut at every change of a build leaves the
+  old schema or the new; rows that break a unique index undo the change. The 10M-row cutover p99
+  (AC-T1.12.2) is not yet measured. A column (`ALTER TABLE … ADD COLUMN`) is added in one catalog
+  change, its states run together, as no row is rewritten or read; one whose addition reads every
+  row is refused. Constraints on existing columns and DROP COLUMN are not yet built.
 
 ## Measured
 
@@ -440,6 +464,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Next
 
+- **Follower reads at a closed time and search over partitions** (G13 step 4; replication.md, "Follower reads at a
+  closed time" and "Search over partitions"; lane follower-reads): built and unit-tested, not measured. Every proposed
+  entry carries its proposer's clock; every member applies it at the larger of that and one past the time before it,
+  so times rise along the log whoever leads. `Database::query_closed` answers at the replica's closed time once it is
+  at least the time asked; `follower_read_micros` is now less the replica's measured p99 lag. `amphora::search` asks
+  partitions at once and merges newest first. Closes with: AC-T1.10.3 and AC-T1.10.4 measured (`amphora-bench
+  --cluster`), an idle group's time closed on demand, and the attached client's request on the wire.
 - **Query speed step 5 (QT.5), started** (lane qs5): `Connection::set_join_methods` plans a connection's new
   statements by cost, with index nested loops only, or with hash joins only; `tests/join_methods.rs` (T-QT.5.1) runs
   inner, left, semi and anti joins with NULL and duplicate keys all three ways and against a model. The harness

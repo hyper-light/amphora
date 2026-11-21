@@ -118,7 +118,7 @@ fn resolve_targets_in_db(
             for (table_name, indexes) in schema.indexes.iter() {
                 if let Some(index) = indexes
                     .iter()
-                    .find(|idx| idx.name.eq_ignore_ascii_case(name))
+                    .find(|idx| idx.is_public() && idx.name.eq_ignore_ascii_case(name))
                 {
                     if let Some(table) = schema.get_btree_table(table_name) {
                         return Some((table, index.clone()));
@@ -297,7 +297,9 @@ pub fn translate_analyze(
                         .into_iter()
                         .chain(
                             s.get_indices(&target_table.name)
-                                .filter(|idx| idx.index_method.is_none()) // skip custom for now
+                                // Amphora: an index an online schema change hasn't made public lacks
+                                // entries, so its statistics would mislead the plans made after (CP-T1.12).
+                                .filter(|idx| idx.index_method.is_none() && idx.is_public()) // skip custom for now
                                 .cloned(),
                         )
                         .collect()
