@@ -455,9 +455,12 @@ commit; the slots' checksums chain as frames' do, and every page of a record map
 slot, so frame numbers keep their meaning for read marks, backfill, the durable mark (decision 15)
 and restarts. The log header's file format says which a generation is, and a generation keeps the
 format it began with, so a log is always read as it was written and a page-a-frame log from before
-reads as ever. Packed generations begun since 2026-11-11 carry 0x414d_5004, mixed ones 0x414d_5005
-(decision 17's chains ended by their bytes); 0x414d_5002 and 0x414d_5003 are read and continued as
-before, and an older binary refuses the new values by name; to downgrade, checkpoint first. Records are kept decoded (4 MiB a database, the oldest dropped first past that; the
+reads as ever. Packed generations begun since 2026-11-11 carry 0x414d_5004 (decision 17's chains
+ended by their bytes), mixed ones 0x414d_5007 (decision 39's layout, its chains ended so too);
+0x414d_5002, 0x414d_5003 and 0x414d_5005 (a mixed generation of chains ended by their bytes in
+decision 37's layout) are read and continued as before, and an older binary refuses the new values
+by name; to downgrade, checkpoint first. Records are kept decoded (a page cache's worth of bytes,
+`packed::decoded_budget` (decision 39), the oldest dropped first past that; the
 writer keeps those it writes), the checkpoint reads a record once for all the pages it copies from
 it, and recovery reads record by record: a record whose slots don't all hold ends the log there, as
 a torn frame does; one whose slots all hold but that doesn't decode refuses the log, since no torn
@@ -576,7 +579,8 @@ and checks the log holds chains deeper than 8 (red at the old bound: "chains of 
 
 Chains past 8 come with new header format values (Amphora agent, 2026-11-12; CLAUDE.md §3, formats
 change append-only): a generation begun now is `packed::PACKED_CHAINS_FORMAT` (0x414d_5004) or
-`MIXED_CHAINS_FORMAT` (0x414d_5005). A generation begun under 0x414d_5002 or 0x414d_5003 keeps its
+`MIXED_CHAINS_FORMAT` (0x414d_5005; since decision 39 a mixed generation begins
+`MIXED_FRAMES_FORMAT`, 0x414d_5007, whose chains are ended by their bytes too). A generation begun under 0x414d_5002 or 0x414d_5003 keeps its
 format, and its chains keep that format's bound of 8 (`packed::most_deltas`), so a binary from
 before still reads it. A binary from before refuses a log of the new values as a format it doesn't
 know, naming the value ("the log's format 0x414d5004 isn't known"), never as corrupt. The remedy for
@@ -586,7 +590,8 @@ that refusal, a downgrade, is a checkpoint that empties the log on the newer bin
 8.
 
 What the bytes rule doesn't price is the number of records a cold read decodes: a chain of small
-deltas may reach 255 records back, each read once and kept decoded (decision 16's 4 MiB). If a
+deltas may reach 255 records back, each read once and kept decoded (within `packed::decoded_budget`,
+decision 39). If a
 cold read's latency on such a chain beats the image's bytes as the cost, the rule must count
 records too.
 
@@ -1641,8 +1646,11 @@ record's slot, where decision 37's read the whole record that held each entry. T
 decoded take at most what a connection's page cache holds by default (`packed::decoded_budget`:
 Turso's 2,000 pages, the budget Amphora's readers keep, times the page size), where 4 MiB was
 picked. A generation begun before keeps its format and is written and read as it began (0x414d5002
-and 0x414d5003 as decisions 16 and 37 have them); a chain that begins at a page frame is a fault
-there. A binary that knows only 0x414d5003 refuses a log of 0x414d5007 by name.
+and 0x414d5003 as decisions 16 and 37 have them, 0x414d5004 and 0x414d5005 as decision 17's chains
+ended by their bytes have them); a chain that begins at a page frame is a fault there. A binary that
+knows only 0x414d5003 or 0x414d5005 refuses a log of 0x414d5007 by name. A chain of 0x414d5007 ends
+as decision 17 has it: a delta while the chain's deltas, this one included, take less than the page,
+the depth field's width (255) its format bound.
 
 **Why.** Decision 37's interleaved rerun found the bulk statements slower than page-a-frame, the
 writer's time in reads past the cache from a record and in packing. Counted on adas-mac-studio.local-2
@@ -1691,7 +1699,8 @@ entries in records of one slot packed greedily in the order given 14,958 (4.21, 
 leg's images were 4,346 of pages new to a chain and 8,286 that ended chains: compressing the second
 keeps the bound, and packing them largest first leaves less of each slot unused than packing them
 in order. A read past the cache reads at most one frame for each entry of its chain, and a chain
-holds at most `packed::MOST_DELTAS` deltas and its image.
+holds its image and deltas whose bytes take less than the page (decision 17), at most
+`packed::MOST_DELTAS` of them.
 
 **Evidence.** On the batched leg the log takes 3.9 bytes a byte of rows (14,644,960 bytes of rows,
 56,967,240 of log; 3.0 at 930ac68), within the bound. The suite's bulk statements, a quick check on
@@ -1747,6 +1756,12 @@ the log's layout and size unchanged:
 
 The bench can run the page-a-frame log in the same binary (`AMPHORA_PAGE_LOG=1`), so the bulk
 statements are compared log against log, everything else the same.
+
+Merged with decision 17's chains ended by their bytes (main's 0x414d_5004 and 0x414d_5005): a mixed
+generation begun now is decision 39's 0x414d_5007, and its layout (`WalFile::lay_out`) ends a chain
+by decision 17's rule as `prepare_records` does, the writer carrying each chain's bytes
+(`Logged::chain`) through the publishing above; the half page decision 39's layout still took as a
+delta's most is gone with it.
 
 **Why.** Decision 39's profile of `insert_batch_100` at 32 clients put the commit at 0.90 samples a
 commit against page-a-frame's 0.59: preparing 0.32 against 0.12 (the diff 0.13, packing 0.07), and
