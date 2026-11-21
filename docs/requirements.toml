@@ -361,6 +361,8 @@ criteria = [
 ]
 tests = [
   { id = "T-PL.9.1", text = "A table grown tenfold after its statement was prepared — passes when the statement plans again once and its answer is unchanged" },
+  # lane pl9
+  { id = "T-PL.9.2", text = "Writes that change rows, writes that change none, and reads — passes when each write that changed rows adds to its table's count exactly once and nothing else does" },
 ]
 
 [[own]]
@@ -458,6 +460,18 @@ tests = [
   { id = "T-NS.1.1", text = "Random operation sequences on both cursors — passes when identical keys, values and positions after each step" },
 ]
 
+# lane g7s2
+[[own]]
+id = "NS.2"
+title = "Records, overflow, the catalog and transactions on the new pages (G7 step 2)"
+criteria = [
+  { id = "AC-NS.2.1", text = "the engine's test suites pass on the new storage" },
+  { id = "AC-NS.2.3", text = "A transaction rolls back to a savepoint from its versions: rows first changed after it as before the transaction, rows changed before and after as the savepoint found them, later changes out of its redo record; the savepoint stays good" },
+]
+tests = [
+  { id = "T-NS.2.1", text = "The shared model test of transactions on both storages — passes when identical answers, no anomaly" },
+]
+
 # lane follower-reads (G13 step 4, kiln goal 80d4cf5e; docs/design/replication.md, "Follower reads at a
 # closed time" and "Search over partitions"). AC-T1.10.3 and AC-T1.10.4 are the measures; these are what they
 # rest on.
@@ -479,6 +493,8 @@ tests = [
 # lane online-schema: online schema changes (CP-T1.12, kiln goal 496de8d5, G14 step 3); the tests
 # are T-T1.12.1's, by name in crates/amphora/tests/online_schema.rs and crash.rs
 # (t_t1_12_1_a_power_cut_at_every_step_of_an_online_index_leaves_old_or_new).
+# lane online-schema-6: constraints on existing columns serve the same T-T1.12.1
+# (t_t1_12_1_a_power_cut_at_every_step_of_an_online_constraint_leaves_old_or_new).
 
 # lane audit-log: Amphora's own IDs for G10 step 3 (kiln plan 01a16b0f47577325bcd9e51383067e04),
 # serving AC-T1.7.4 (docs/design/audit.md).

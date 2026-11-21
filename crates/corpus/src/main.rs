@@ -166,7 +166,8 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
             .display()
             .to_string();
         let file_began = Instant::now();
-        let mut engine = amphora_corpus::engines::open(&a.engine).map_err(|e| format!("{UNAVAILABLE}{e}"))?;
+        let mut engine =
+            amphora_corpus::engines::open(&a.engine).map_err(|e| format!("{UNAVAILABLE}{e}"))?;
         // Fill files stop at the deadline; every record, required ones too, is stopped once it has
         // run as long as the whole budget.
         let limits = Limits {

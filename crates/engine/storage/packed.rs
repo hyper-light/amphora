@@ -851,7 +851,11 @@ impl Records {
     pub(crate) fn covering(&self, frame: u64) -> Option<u64> {
         let (&head, &slots) = self.slots.range(..=frame).next_back()?;
         let last = head.checked_add(u64::from(slots))?.checked_sub(1)?;
-        (frame <= last).then_some(head)
+        if frame <= last {
+            Some(head)
+        } else {
+            None
+        }
     }
 
     /// The record at `head` of `generation`, if it was decoded and kept.

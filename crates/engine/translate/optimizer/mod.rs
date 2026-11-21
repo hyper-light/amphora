@@ -1031,8 +1031,21 @@ fn optimize_select_plan_with_cache(
     // that it needs are ready. It can then compare that step with the added
     // join tables in one search. Until then, both forms need their own search.
     let mut rewritten = plan.clone();
-    if !unnest::rewrite_correlated_subqueries(&mut rewritten, resolver)? {
+    let rewrites =
+        unnest::rewrite_correlated_subqueries(&mut rewritten, resolver, unnest::Reach::General)?;
+    if !rewrites.any {
         return optimize_select_plan_form(plan, resolver, cache);
+    }
+    // PL.10: where the general forms went further than the fixed patterns, the patterns' form is
+    // planned too, and kept where it is the cheapest: a query the patterns served keeps its plan
+    // when a general form would cost more.
+    let mut patterns = None;
+    if rewrites.general {
+        let mut form = plan.clone();
+        if unnest::rewrite_correlated_subqueries(&mut form, resolver, unnest::Reach::Patterns)?.any
+        {
+            patterns = Some(form);
+        }
     }
 
     #[cfg(feature = "simulator")]
@@ -1069,6 +1082,34 @@ fn optimize_select_plan_with_cache(
         use_rewritten,
         "correlated-subquery form cost comparison"
     );
+    if let Some(mut form) = patterns {
+        let best_cost = if use_rewritten {
+            rewritten.estimated_cost
+        } else {
+            plan.estimated_cost
+        };
+        let form_table_plan =
+            find_select_plan_form(&mut form, resolver, cache, false, best_cost.map(Cost))?;
+        // At equal cost the form with fewer subqueries left wins, as below: the general form over
+        // the patterns', the patterns' over the written one.
+        let wins = |form_cost: f64, best_cost: f64| {
+            if use_rewritten {
+                form_cost < best_cost
+            } else {
+                form_cost <= best_cost
+            }
+        };
+        if rewritten_form_is_emittable(&form)
+            && matches!(
+                (best_cost, form.estimated_cost),
+                (Some(best_cost), Some(form_cost)) if wins(form_cost, best_cost)
+            )
+        {
+            *plan = form;
+            apply_select_table_plan(plan, form_table_plan, resolver)?;
+            return Ok(());
+        }
+    }
     if use_rewritten {
         // Equal work is better without one subquery call per outer row.
         *plan = rewritten;
@@ -2277,7 +2318,18 @@ fn base_row_estimate(
                         .values()
                         .find_map(|idx_stat| idx_stat.total_rows)
                 }) {
-                    return RowCountEstimate::AnalyzeStats(rows as f64);
+                    // Amphora (PL.9, decision (lane pl9)): ANALYZE's count with the rows inserted less
+                    // those deleted since, so the count follows the table between ANALYZE runs.
+                    let analyzed = rows as f64;
+                    let rows = match params.plan_values.as_deref() {
+                        Some(values) => values.live_rows(
+                            &btree.name,
+                            analyzed,
+                            crate::row_changes::statistics_error(stats, analyzed),
+                        ),
+                        None => analyzed,
+                    };
+                    return RowCountEstimate::AnalyzeStats(rows);
                 }
             }
             RowCountEstimate::hardcoded_fallback(params)
@@ -4371,7 +4423,7 @@ impl Optimizable for ast::Expr {
                 let column = &columns[*column];
                 // Only INTEGER PRIMARY KEY (rowid alias) is implicitly NOT NULL.
                 // Other PRIMARY KEY types (e.g., TEXT PRIMARY KEY) can contain NULL.
-                column.is_rowid_alias() || column.notnull()
+                column.is_rowid_alias() || column.trusted_notnull()
             }
             // A rowid is not NULL for a real table row. An outer join can
             // replace that row with a synthetic row whose rowid is NULL.

@@ -1141,7 +1141,7 @@ fn null_test_of_never_null(
         table
             .table
             .get_column_at(column_pos)
-            .is_some_and(|column| column.is_rowid_alias() || column.notnull())
+            .is_some_and(|column| column.is_rowid_alias() || column.trusted_notnull())
     })
 }
 
