@@ -347,6 +347,47 @@ without rewriting the newest journal, making a database whenever the header is u
 checkpoints that don't stop the log when they fail, redo tails left uncut, and versions left on
 recovered cells (which fails five).
 
+**The cursor** (stage 3's first step, NS.1, `storage/versioned/cursor.rs`). `VersionedCursor`
+implements `CursorTrait` on one tree of a `durable::Database`, reading as a snapshot sees it and
+writing in a transaction (`Access`), so the executor reaches it through the `Cursor::Dyn` slot the
+MVCC cursor uses. Keys: a table's are its rowids, 8 bytes big-endian with the sign bit flipped (a
+format value: the bytes order as the integers); an index's (and a WITHOUT ROWID table's) are its
+records with an empty value, ordered by the index's columns and then by the record's bytes, so a
+cell's key is exactly the record put. A record equal on the columns but not in its bytes (another
+spelling under NOCASE, a WITHOUT ROWID row's other columns) replaces the one the executor's seek
+placed the cursor on by removal and insertion, so each snapshot sees the record it saw: a B-link
+cell's key never changes in place. The cursor holds no latch between calls. It copies the rows of
+one leaf its snapshot sees, under the leaf's shared latch, with the frame's version, and while the
+version stays the copy is the leaf; once it moves (any write to the leaf) the cursor finds its row
+again by its key. That is how it sees its transaction's writes through another cursor, as SQLite's
+cursors do after `saveAllCursors`. Moving on from a copy's last row follows the right link; moving
+back from its first descends to the leaf just short of its lower bound, as the leaves link only to
+the right. A seek is a point between keys: a table's just short of or just past its rowid's key, an
+index's placed by the executor's record comparison with SQLite's tie-breakers
+(`get_tie_breaker_from_seek_op`). An exact seek is placed as its inexact kind is, then asked whether
+the record found equals the key. A delete leaves the cursor in the removed row's gap: the next row is
+the first after it, the previous the last before it.
+
+*Evidence.* `storage/versioned/conformance.rs`: random sequences of 2,000 operations each, in the
+executor's grammar (an insert after the seek for its key, a delete of the row the cursor is on, steps
+from a row or a write, every seek kind with `TryAdvance` followed by its step), on the current
+engine's B-tree cursor and the versioned one through `CursorTrait`, compared after every step (the
+seek's answer, whether the cursor is on a row, its rowid and record) and in full at the end. It runs
+on a table, an ascending binary index of (a, b, rowid), and an index whose first column descends and
+whose second compares under NOCASE, with records that differ only in case put over each other. Beside
+it: a reading cursor walks and seeks its snapshot exactly while 4 writers commit rows into its leaves
+and split them; a cursor sees writes made through another cursor of its transaction; a reading
+cursor refuses writes (`ReadOnly`).
+
+*Falsified by.* A sequence of the executor's operations after which the two cursors differ; a
+snapshot's walk that misses or repeats a row while other transactions split its leaves.
+
+*What step 2 needs from it.* A comparison per tree (`Database::open` takes one for all trees; an
+index's is `KeyOrder::index`), trees made and dropped by the catalog (`btree_destroy` is refused
+until then), overflow for rows past a cell's bound (refused now, `TooBig`), the connection's
+transaction behind `Access::Write` (begin, commit, rollback, savepoints from decision 4's versions),
+and the connection's pager for `get_pager`.
+
 ## 10. Memory: versions pruned between snapshots, one budget, typed refusals
 
 **Decision.** Collection keeps, of a row's older versions, only those an open snapshot sees: for

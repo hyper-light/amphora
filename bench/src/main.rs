@@ -18,6 +18,7 @@
 mod blink;
 mod cc;
 mod clickhouse;
+mod cluster;
 mod eqp;
 mod mysql;
 mod oracle;
@@ -508,6 +509,10 @@ fn main() -> anyhow::Result<()> {
     // kiln's hot statements through Amphora's public SQL API, timed per execute (`sqlapi.rs`).
     if std::env::args().any(|a| a == "--sql-api") {
         return sqlapi::main();
+    }
+    // Follower reads and search over partitions on three members (`cluster.rs`; AC-T1.10.3, AC-T1.10.4).
+    if std::env::args().any(|a| a == "--cluster") {
+        return cluster::main();
     }
     // The versioned storage's commit validations against each other (`cc.rs`, G8 step 1).
     if std::env::args().any(|a| a == "--cc") {

@@ -8,9 +8,12 @@
 //! versions on them ([`version`]: snapshots, first-writer-wins, rollback, collection); then their
 //! files ([`disk`]; on Linux, `uring`: the engine's `io_uring` feature), the redo log ([`redo`]),
 //! and checkpoints and recovery ([`durable`]); and the commit validations' Elle-style isolation
-//! checks (`elle`, G8 step 1).
+//! checks (`elle`, G8 step 1). Stage 3 begins with the executor's cursor on the trees ([`cursor`]).
 
 pub mod blink;
+#[cfg(test)]
+mod conformance;
+pub mod cursor;
 pub mod disk;
 pub mod durable;
 #[cfg(test)]
