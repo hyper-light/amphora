@@ -120,6 +120,9 @@ impl Records for Rows {
     fn wait(&self, _: &str, _: Rev, _: Instant) -> Result<Rev, Refusal> {
         Err(api::invalid("wait", "not in this test's store"))
     }
+    fn changed(&self, _: &str, _: Rev, _: Instant) -> Result<Option<Rev>, Refusal> {
+        Err(api::invalid("changed", "not in this test's store"))
+    }
     fn head(&self, _: Instant) -> Result<Rev, Refusal> {
         Ok(self.inner.lock().unwrap().1)
     }
