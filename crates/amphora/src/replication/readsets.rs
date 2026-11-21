@@ -222,11 +222,20 @@ mod tests {
         let w = write(&[1, 3, 5], &[5, 9], Page1::Unwritten);
         let marker = 2;
         assert!(w.untouched_by(&pages(&[7, 11], Page1::Unwritten), marker));
-        assert!(!w.untouched_by(&pages(&[3], Page1::Unwritten), marker), "a page read");
-        assert!(!w.untouched_by(&pages(&[9], Page1::Unwritten), marker), "a page written, not read");
+        assert!(
+            !w.untouched_by(&pages(&[3], Page1::Unwritten), marker),
+            "a page read"
+        );
+        assert!(
+            !w.untouched_by(&pages(&[9], Page1::Unwritten), marker),
+            "a page written, not read"
+        );
         assert!(!w.untouched_by(&Wrote::Opaque, marker));
         let reads_marker = write(&[1, 2], &[2], Page1::Unwritten);
-        assert!(!reads_marker.untouched_by(&pages(&[], Page1::Unwritten), marker), "every apply writes the marker");
+        assert!(
+            !reads_marker.untouched_by(&pages(&[], Page1::Unwritten), marker),
+            "every apply writes the marker"
+        );
     }
 
     /// AC-T1.8.R1 (research f9): do an entry that changed page 1 only in its size, and one that
@@ -262,9 +271,23 @@ mod tests {
         assert_eq!(w.base, Point { index: 4, term: 2 });
         assert_eq!(w.pages, vec![6]);
         assert_eq!(w.read.reads, vec![1, 6]);
-        let moved = w.rebased(&data, Point { index: 300, term: 3 }).unwrap();
+        let moved = w
+            .rebased(
+                &data,
+                Point {
+                    index: 300,
+                    term: 3,
+                },
+            )
+            .unwrap();
         let again = Write::decode(&moved).unwrap();
-        assert_eq!(again.base, Point { index: 300, term: 3 });
+        assert_eq!(
+            again.base,
+            Point {
+                index: 300,
+                term: 3
+            }
+        );
         assert_eq!(again.pages, w.pages);
         assert_eq!(again.read, w.read);
         let old: (u64, u64, Vec<(u32, Vec<u8>)>) = postcard::from_bytes(&moved).unwrap();
@@ -275,10 +298,17 @@ mod tests {
             pages(&[6], Page1::Size),
             "an entry's own read set says what it did to page 1"
         );
-        let bare = super::super::Prepared::for_test(Point { index: 4, term: 2 }, vec![(1, vec![0; 8])], None)
-            .encode()
-            .unwrap();
-        assert!(Write::decode(&bare).is_none(), "no read set: the exact base decides");
+        let bare = super::super::Prepared::for_test(
+            Point { index: 4, term: 2 },
+            vec![(1, vec![0; 8])],
+            None,
+        )
+        .encode()
+        .unwrap();
+        assert!(
+            Write::decode(&bare).is_none(),
+            "no read set: the exact base decides"
+        );
         assert_eq!(wrote(&bare), pages(&[], Page1::Other));
     }
 

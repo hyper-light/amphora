@@ -2713,7 +2713,9 @@ impl<F: BlockFile + 'static> Actor<F> {
         let marker = self.replica.machine().marker_page()?;
         let log = self.replica.core().raft.log();
         let held = log.first_index().map_err(unavailable)?.saturating_sub(1);
-        if write.base.index < held || log.term(write.base.index).map_err(unavailable)? != write.base.term {
+        if write.base.index < held
+            || log.term(write.base.index).map_err(unavailable)? != write.base.term
+        {
             Self::read_set_event("unknown_base", write.base, before);
             return Ok(None);
         }
@@ -14395,10 +14397,14 @@ mod tests {
                         .machine_mut()
                         .read_db(|db| {
                             let mut out = Vec::new();
-                            db.query_owned("SELECT k FROM u UNION ALL SELECT k FROM t ORDER BY 1", [], |row| {
-                                out.push(row.get::<i64>(0)?);
-                                Ok(true)
-                            })?;
+                            db.query_owned(
+                                "SELECT k FROM u UNION ALL SELECT k FROM t ORDER BY 1",
+                                [],
+                                |row| {
+                                    out.push(row.get::<i64>(0)?);
+                                    Ok(true)
+                                },
+                            )?;
                             Ok(out)
                         })
                         .unwrap()
@@ -14426,7 +14432,8 @@ mod tests {
         for slot_off in [true, false] {
             for keys in [32, 2] {
                 for seed in 1..=3 {
-                    let run = list_append_run_with(&[0, 1, 2], slot_off, ReadSets::On, seed, keys, 15);
+                    let run =
+                        list_append_run_with(&[0, 1, 2], slot_off, ReadSets::On, seed, keys, 15);
                     eprintln!(
                         "read sets, slot off {slot_off} keys {keys} seed {seed}: committed {:?} refused {:?} in a row {:?} moved {}",
                         run.committed, run.refused, run.streak, run.moved
@@ -14436,15 +14443,24 @@ mod tests {
                         "slot off {slot_off} keys {keys} seed {seed}: {:?}",
                         run.violations
                     );
-                    assert_eq!(run.unknown, 0, "slot off {slot_off} keys {keys} seed {seed}");
+                    assert_eq!(
+                        run.unknown, 0,
+                        "slot off {slot_off} keys {keys} seed {seed}"
+                    );
                     moved += run.moved;
                 }
             }
         }
-        assert!(moved > 0, "no base moved: the runs never exercised read sets");
+        assert!(
+            moved > 0,
+            "no base moved: the runs never exercised read sets"
+        );
         let caught = (1..=3).any(|seed| {
             let run = list_append_run_with(&[0, 1, 2], true, ReadSets::Unchecked, seed, 2, 15);
-            eprintln!("unchecked seed {seed}: moved {} violations {:?}", run.moved, run.violations);
+            eprintln!(
+                "unchecked seed {seed}: moved {} violations {:?}",
+                run.moved, run.violations
+            );
             !run.violations.is_empty()
         });
         assert!(caught, "the isolation checks missed the unchecked mutant");
