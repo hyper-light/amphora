@@ -1273,3 +1273,54 @@ independent; an OR no constraint takes was not counted at all.
 - JOB's median planning time over twice step 3's 1.9 ms (the sample's run, at most 1,048,576 steps
   a table, is the cost to watch).
 - A CERT failure in the oracles.
+
+## 22. Correlated subqueries unnested by dependent joins taken apart, from a worklist (PL.10)
+
+**Decision.** `optimizer/unnest.rs` keeps its fixed patterns and adds the general forms of Neumann
+and Kemper's dependent join, each taken from a worklist with a counted bound, never by recursion
+(CLAUDE.md §11, §2):
+
+- **Pulling the correlated predicates up** ("pull predicates up to eliminate correlations", Neumann
+  and Kemper's BTW 2015 talk, slide 8): an `EXISTS`, `NOT EXISTS`, `IN` or `NOT IN` conjunct of
+  `WHERE` whose subquery reads several tables, or has `DISTINCT` or `ORDER BY`, becomes a semi- or
+  anti-join with a derived table: the subquery without its correlated conjuncts, reading no outer
+  row, run once; the conjuncts join it, reading its tables through its columns.
+- **`NOT IN`** becomes an anti-join whose condition is `x = y OR x IS NULL OR y IS NULL`, the parts a
+  NOT NULL column can't meet left out: in `WHERE` a NULL test fails the row as FALSE does (SQLite's
+  lang_expr.html, "The IN and NOT IN operators"), and an empty subquery passes every row.
+- **A mark join** for an `EXISTS` no semi-join can take (under `OR`, in the `SELECT` list), correlated
+  by `=` with one outer table: a left join with the subquery grouped by its correlation columns, and
+  the test `key IS NOT NULL`. This is the domain `D` inferred from the equivalent inner attributes
+  (slide 18: "Instead of joining with D, we can often infer the attributes from D") with the grouping
+  pushed below the join (slide 11: `D ⋈ Γ` is `Γ` over `A ∪ A(D)`), the form the one-value aggregate
+  already had.
+- **Top-down** (Neumann, arXiv:2412.04294, section 5: "visits each operator at most once, starting
+  from dependent joins in top-to-bottom order"): the query's own subqueries are taken first; a
+  subquery spliced in brings its own correlated subqueries into the query, and they join the end of
+  the list. A derived table's own subqueries are unnested when the planner plans it, after this
+  query. The bound is twice the correlated subqueries nested in the query's subqueries: each is
+  taken at most once as a join and once as a value.
+
+The derived and grouped forms run the subquery's conditions over every row of its tables, where the
+correlated form ran them only on the rows each outer row selects; a spliced subquery's own
+subqueries may run on rows in another order. So a form is taken only where nothing it moves can fail
+or change between calls (`expression_can_fail_on_input`, nondeterministic functions), and a derived
+table's own subqueries may read none of the outer query's tables.
+
+The planner keeps choosing by cost: the written form, the patterns' form (as before PL.10) and,
+where the general forms went further, the general one are each searched, and the cheapest kept, at
+equal cost the one with fewer subqueries left. A query the patterns served keeps its plan when a
+general form would cost more.
+
+**Evidence.** T-PL.10.1 (`crates/engine/tests/unnesting.rs`, run with `--features simulator`): 39
+classes, the corpus's (bench/planner/audit/07-unnesting.sql), TPC-H Q2, Q4, Q17, Q20, Q21, Q22 and
+each new form with NULLs, loose types, collations, outer joins inside and around, answer the same
+nested (`SubqueryUnnestingMode::Disabled`), forced and as planned; each class marked to unnest plans
+otherwise when forced; EXISTS nested 1 to 24 deep, each level correlated with its parent and the
+outermost query, unnests every level. The measurements (AC-PL.10.1, q21 at SF 10 under PostgreSQL's
+1.195e+04 ms; AC-PL.10.2, TPC-DS's ten queries on the parent first) are the batch's.
+
+**Falsified by.** An answer of the oracles (TLP, NoREC, DQP, the differential check) or of
+T-PL.10.1 that differs between the forms; TPC-DS's ten queries no faster unnested; a query of the
+bench whose plan the general form made costlier than the patterns' (the three-way choice should
+make that impossible by estimate; the measurement says whether the estimate holds).

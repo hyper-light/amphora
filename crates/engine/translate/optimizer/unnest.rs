@@ -103,8 +103,29 @@
 //! They keep an inner `WHERE` expression in the subquery if it can fail.
 //! A join can skip a row that the subquery tests and hide an error.
 //! Aggregate rewrites only move direct `=` checks between inner and outer columns.
-//! `NOT IN` stays as a subquery because NULL values can change its result.
 //! A one-value subquery stays as it is unless its result for an empty input is known.
+//!
+//! The forms above are the fixed patterns ([`Reach::Patterns`]). PL.10 adds the general forms
+//! ([`Reach::General`]), Neumann and Kemper's dependent join taken apart by pulling the correlated
+//! predicates up out of the subquery ("pull predicates up to eliminate correlations", slide 8 of
+//! the talk cited below) and, where a predicate can't be pulled above the subquery's own operators,
+//! by joining on the columns that stand in for the outer values (slide 18: the domain `D` "inferred"
+//! from equivalent attributes, a superset the final join trims):
+//!
+//! - `NOT IN` in a `WHERE` conjunct becomes an anti-join whose condition also holds where a NULL
+//!   would make the test NULL (`x = y OR x IS NULL OR y IS NULL`, the parts a NOT NULL column can't
+//!   meet left out): in `WHERE` a NULL test fails the row as FALSE does.
+//! - An `EXISTS`, `NOT EXISTS`, `IN` or `NOT IN` conjunct whose subquery the splice can't take
+//!   (several tables, `DISTINCT`, `ORDER BY`) becomes a semi- or anti-join with a derived table: the
+//!   subquery with its correlated conjuncts lifted out, reading no outer row, run once.
+//! - An `EXISTS` anywhere else (under `OR`, in the `SELECT` list) correlated by `=` alone becomes a
+//!   left join with its keys grouped, one row each, and the test `key IS NOT NULL`: a mark join.
+//!
+//! Each subquery is taken from a worklist, the query's own first (top-down, Neumann's 2025 order:
+//! each operator visited once), with a counted bound, never by recursion (CLAUDE.md §11). A
+//! derived table's own correlated subqueries are unnested when the planner plans it, after this
+//! query: top-down again. A subquery none of the forms takes stays correlated, and EXPLAIN shows it
+//! as a correlated subquery.
 //!
 //! References:
 //! - SQLite subquery results: <https://sqlite.org/lang_expr.html#subquery_expressions>
@@ -118,6 +139,8 @@
 //! - Neumann and Kemper, Unnesting Arbitrary Queries: <https://db.cs.tum.edu/teaching/ws2122/foundationsde/unnesting.pdf>
 //! - Neumann, A Formalization of Top-Down Unnesting: <https://arxiv.org/abs/2412.04294>
 
+use std::collections::VecDeque;
+
 use amphora_engine_parser::ast::{
     self, Expr, FunctionTail, Name, SortOrder, TableInternalId, UnaryOperator,
 };
@@ -126,6 +149,7 @@ use smallvec::SmallVec;
 
 use crate::translate::plan::Plan;
 
+use super::Optimizable;
 use crate::function::AggFunc;
 use crate::schema::Table;
 use crate::sync::Arc;
@@ -138,66 +162,168 @@ use crate::translate::{
         in_compares_as_equality, walk_expr, walk_expr_mut, WalkControl,
     },
     plan::{
-        plan_is_correlated, Distinctness, GroupBy, JoinInfo, JoinOrigin, JoinType, JoinedTable,
+        outer_columns_read, plan_is_correlated, Distinctness, GroupBy, JoinInfo, JoinOrigin, JoinType, JoinedTable,
         QueryDestination, ResultSetColumn, SelectPlan, SubqueryState, TableReferences, WhereTerm,
         WhereTermOrigin,
     },
 };
 use crate::util::exprs_are_equivalent;
-use crate::Result;
+use crate::{LimboError, Result};
 
-/// Try each supported rewrite and return whether the plan changed.
-pub fn rewrite_correlated_subqueries(
+/// How far a pass unnests (PL.10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reach {
+    /// The fixed patterns alone, as before PL.10: the planner plans this form beside the general
+    /// one, so a query the patterns served keeps its plan when the general form costs more.
+    Patterns,
+    /// The patterns, and the general forms where the patterns refuse.
+    General,
+}
+
+/// What a pass changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Rewrites {
+    /// A subquery was unnested.
+    pub any: bool,
+    /// A subquery was unnested by a general form, one the patterns refuse.
+    pub general: bool,
+}
+
+/// Which rewrite a worklist entry tries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// An `EXISTS` or `NOT EXISTS` conjunct of `WHERE`, as a semi- or anti-join.
+    Join,
+    /// The rest: `IN`, `NOT IN`, a one-value aggregate, and an `EXISTS` no join took (General).
+    Value,
+}
+
+/// Unnest the correlated subqueries of `plan` as far as `reach` goes, and say what changed.
+///
+/// The subqueries are taken from a worklist in this order: every correlated `EXISTS` first, in the
+/// order written, then the rest and each `EXISTS` no semi- or anti-join took (the order the patterns
+/// have always been tried in, so [`Reach::Patterns`] gives the plan it gave before PL.10). A
+/// subquery spliced in (General) brings its own correlated subqueries into `plan`, and they join
+/// the end of the list: the next level down, after this one (top-down). A derived table keeps its
+/// own. So each entry is a correlated subquery nested in `plan`'s subqueries, each taken at most
+/// once a step, and the loop is bounded by twice their number (CLAUDE.md §2, §11).
+pub(crate) fn rewrite_correlated_subqueries(
     plan: &mut SelectPlan,
     resolver: &Resolver<'_>,
-) -> Result<bool> {
+    reach: Reach,
+) -> Result<Rewrites> {
+    let mut rewrites = Rewrites::default();
     if plan.table_references.has_right_or_full_join() {
         // SQLite keeps correlated subqueries inside the shared join body. A
         // later semi-join cannot take part in the unmatched-right scan.
-        return Ok(false);
+        return Ok(rewrites);
     }
-    let mut changed = false;
-    let mut subquery_index = 0;
-    while subquery_index < plan.non_from_clause_subqueries.len() {
-        let subquery = &plan.non_from_clause_subqueries[subquery_index];
-        if !subquery.correlated || !matches!(subquery.query_type, ast::SubqueryType::Exists { .. })
-        {
-            subquery_index += 1;
-            continue;
-        }
-        if try_rewrite_exists(plan, subquery_index, resolver)? {
-            changed = true;
-            continue;
-        }
-        subquery_index += 1;
-    }
+    let is_exists =
+        |query_type: &ast::SubqueryType| matches!(query_type, ast::SubqueryType::Exists { .. });
+    let correlated = || plan.non_from_clause_subqueries.iter().filter(|s| s.correlated);
+    let mut worklist: VecDeque<(TableInternalId, Step)> = correlated()
+        .filter(|s| is_exists(&s.query_type))
+        .map(|s| (s.internal_id, Step::Join))
+        .chain(
+            correlated()
+                .filter(|s| !is_exists(&s.query_type))
+                .map(|s| (s.internal_id, Step::Value)),
+        )
+        .collect();
+    let mut seen: Vec<TableInternalId> = worklist.iter().map(|(id, _)| *id).collect();
+    // Saturating: a bound past usize::MAX is one no statement's subqueries reach.
+    let mut budget = correlated_subqueries_within(plan).saturating_mul(2);
 
     let mut aggregate_replacements = HashMap::default();
-    let mut subquery_index = 0;
-    while subquery_index < plan.non_from_clause_subqueries.len() {
-        let subquery = &plan.non_from_clause_subqueries[subquery_index];
-        if !subquery.correlated {
-            subquery_index += 1;
+    while let Some((subquery_id, step)) = worklist.pop_front() {
+        let Some(left) = budget.checked_sub(1) else {
+            break;
+        };
+        budget = left;
+        let Some(subquery_index) = plan
+            .non_from_clause_subqueries
+            .iter()
+            .position(|s| s.internal_id == subquery_id)
+        else {
             continue;
-        }
+        };
+        let Some(subquery) = plan.non_from_clause_subqueries.get(subquery_index) else {
+            continue;
+        };
         let query_type = subquery.query_type.clone();
-        let subquery_id = subquery.internal_id;
         let same_query = subquery.same_query;
-        match query_type {
-            ast::SubqueryType::In { .. } => {
-                if try_rewrite_in(plan, subquery_index, resolver)? {
-                    changed = true;
+        match (step, query_type) {
+            (Step::Join, _) => {
+                if try_rewrite_exists(plan, subquery_index, resolver, Reach::Patterns)? {
+                    rewrites.any = true;
+                    queue_new_subqueries(plan, &mut worklist, &mut seen);
                     continue;
                 }
+                if reach == Reach::Patterns {
+                    continue;
+                }
+                if try_rewrite_exists(plan, subquery_index, resolver, Reach::General)? {
+                    rewrites = Rewrites {
+                        any: true,
+                        general: true,
+                    };
+                    queue_new_subqueries(plan, &mut worklist, &mut seen);
+                    continue;
+                }
+                if let Some(term) = find_exists_in_where(&plan.where_clause, subquery_id) {
+                    let join_type = if term.negated {
+                        JoinType::Anti
+                    } else {
+                        JoinType::Semi
+                    };
+                    if rewrite_through_derived_table(
+                        plan,
+                        subquery_index,
+                        term.index,
+                        join_type,
+                        None,
+                        resolver,
+                    )? {
+                        rewrites = Rewrites {
+                            any: true,
+                            general: true,
+                        };
+                        continue;
+                    }
+                }
+                worklist.push_back((subquery_id, Step::Value));
             }
-            ast::SubqueryType::RowValue { num_regs: 1, .. } => {
+            (Step::Value, ast::SubqueryType::Exists { .. }) => {
+                if reach == Reach::General
+                    && try_rewrite_exists_as_grouped_join(plan, subquery_index, resolver)?
+                {
+                    rewrites = Rewrites {
+                        any: true,
+                        general: true,
+                    };
+                }
+            }
+            (Step::Value, ast::SubqueryType::In { .. }) => {
+                match try_rewrite_in(plan, subquery_index, resolver, reach)? {
+                    Some(Reach::Patterns) => rewrites.any = true,
+                    Some(Reach::General) => {
+                        rewrites = Rewrites {
+                            any: true,
+                            general: true,
+                        }
+                    }
+                    None => continue,
+                }
+                queue_new_subqueries(plan, &mut worklist, &mut seen);
+            }
+            (Step::Value, ast::SubqueryType::RowValue { num_regs: 1, .. }) => {
                 if let Some(replacement) = same_query
                     .and_then(|same_query| aggregate_replacements.get(&same_query))
                     .cloned()
                 {
-                    if replace_subquery_value(plan, subquery_id, &replacement)? {
+                    if replace_subquery_result(plan, subquery_id, &replacement, Answer::Value)? {
                         plan.non_from_clause_subqueries.remove(subquery_index);
-                        changed = true;
+                        rewrites.any = true;
                         continue;
                     }
                 }
@@ -207,20 +333,146 @@ pub fn rewrite_correlated_subqueries(
                     if let AggregateRewrite::GroupedTable(replacement) = rewrite {
                         aggregate_replacements.insert(subquery_id, replacement);
                     }
-                    changed = true;
-                    continue;
+                    rewrites.any = true;
                 }
             }
-            _ => {}
+            (Step::Value, ast::SubqueryType::RowValue { .. }) => {}
         }
-        subquery_index += 1;
     }
-    Ok(changed)
+    Ok(rewrites)
+}
+
+/// Queue each correlated subquery of `plan` the worklist hasn't seen: those a splice brought in.
+fn queue_new_subqueries(
+    plan: &SelectPlan,
+    worklist: &mut VecDeque<(TableInternalId, Step)>,
+    seen: &mut Vec<TableInternalId>,
+) {
+    for subquery in plan.non_from_clause_subqueries.iter().filter(|s| s.correlated) {
+        if seen.contains(&subquery.internal_id) {
+            continue;
+        }
+        seen.push(subquery.internal_id);
+        let step = if matches!(subquery.query_type, ast::SubqueryType::Exists { .. }) {
+            Step::Join
+        } else {
+            Step::Value
+        };
+        worklist.push_back((subquery.internal_id, step));
+    }
+}
+
+/// The correlated subqueries nested in `plan`'s own subqueries (FROM subqueries are planned
+/// apart), `plan`'s included, counted from a stack (CLAUDE.md §11).
+fn correlated_subqueries_within(plan: &SelectPlan) -> usize {
+    let mut count: usize = 0;
+    let mut selects: Vec<&SelectPlan> = vec![plan];
+    while let Some(select) = selects.pop() {
+        for subquery in &select.non_from_clause_subqueries {
+            if subquery.correlated {
+                // Saturating: a count past usize::MAX is a bound no loop reaches.
+                count = count.saturating_add(1);
+            }
+            if let SubqueryState::Unevaluated {
+                plan: Some(inner), ..
+            } = &subquery.state
+            {
+                if let Plan::Select(inner) = inner.as_ref() {
+                    selects.push(inner);
+                }
+            }
+        }
+    }
+    count
+}
+
+/// Whether the SELECTs nested in `plan`'s subqueries and FROM subqueries (not `plan` itself) may
+/// run where an unnested form runs them: none reads a table of `outside`, and none holds an
+/// expression that can fail or change between calls, since the unnested form may run them on rows,
+/// or in an order, the nested one didn't. Walked from a stack, each nested plan once (§11).
+fn nested_selects_allow(
+    plan: &SelectPlan,
+    outside: &[TableInternalId],
+    resolver: &Resolver<'_>,
+) -> Result<bool> {
+    let mut plans: Vec<&Plan> = Vec::new();
+    let mut selects: Vec<&SelectPlan> = Vec::new();
+    fn push_children<'a>(select: &'a SelectPlan, plans: &mut Vec<&'a Plan>) {
+        for subquery in &select.non_from_clause_subqueries {
+            if let SubqueryState::Unevaluated {
+                plan: Some(inner), ..
+            } = &subquery.state
+            {
+                plans.push(inner.as_ref());
+            }
+        }
+        for joined in select.table_references.joined_tables() {
+            if let Table::FromClauseSubquery(subquery) = &joined.table {
+                plans.push(subquery.plan.as_ref());
+            }
+        }
+    }
+    push_children(plan, &mut plans);
+    while let Some(next) = plans.pop() {
+        match next {
+            Plan::Select(select) => selects.push(select),
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                selects.extend(left.iter().map(|(select, _)| select));
+                selects.push(right_most);
+            }
+            Plan::RecursiveCte(recursive) => {
+                plans.push(&recursive.initial_query);
+                plans.push(&recursive.recursive_query);
+            }
+            Plan::Delete(_) | Plan::Update(_) => return Ok(false),
+        }
+        while let Some(select) = selects.pop() {
+            if select
+                .table_references
+                .outer_query_refs()
+                .iter()
+                .any(|outer| outer.is_used() && outside.contains(&outer.internal_id))
+            {
+                return Ok(false);
+            }
+            let group = select.group_by.as_ref();
+            let exprs = select
+                .where_clause
+                .iter()
+                .map(|term| &term.expr)
+                .chain(select.result_columns.iter().map(|column| &column.expr))
+                .chain(
+                    select
+                        .aggregates
+                        .iter()
+                        .flat_map(|aggregate| aggregate.args.iter().chain(&aggregate.filter_expr)),
+                )
+                .chain(group.into_iter().flat_map(|group| group.exprs.iter()))
+                .chain(
+                    group
+                        .and_then(|group| group.having.as_ref())
+                        .into_iter()
+                        .flatten(),
+                )
+                .chain(select.order_by.iter().map(|(expr, _, _)| expr.as_ref()));
+            for expr in exprs {
+                if expression_can_fail_on_input(expr)
+                    || expr_contains_nondeterministic_scalar_function(expr, resolver)?
+                {
+                    return Ok(false);
+                }
+            }
+            push_children(select, &mut plans);
+        }
+    }
+    Ok(true)
 }
 
 /// Return the SELECT plan for a subquery that has not run yet.
 fn select_subquery_plan(plan: &SelectPlan, subquery_index: usize) -> Option<&SelectPlan> {
-    let subquery = &plan.non_from_clause_subqueries[subquery_index];
+    let subquery = plan.non_from_clause_subqueries.get(subquery_index)?;
     let SubqueryState::Unevaluated { plan: inner } = &subquery.state else {
         return None;
     };
@@ -230,16 +482,27 @@ fn select_subquery_plan(plan: &SelectPlan, subquery_index: usize) -> Option<&Sel
     Some(inner)
 }
 
-/// Take a SELECT plan after all rewrite checks have passed.
-fn take_select_subquery_plan(plan: &mut SelectPlan, subquery_index: usize) -> Box<SelectPlan> {
-    let subquery = &mut plan.non_from_clause_subqueries[subquery_index];
+/// Take a SELECT plan after all rewrite checks have passed. The checks found it with
+/// [`select_subquery_plan`], so its absence is an internal error, before anything changed.
+fn take_select_subquery_plan(
+    plan: &mut SelectPlan,
+    subquery_index: usize,
+) -> Result<Box<SelectPlan>> {
+    let missing = || LimboError::InternalError("an unnested subquery has no SELECT plan".into());
+    let subquery = plan
+        .non_from_clause_subqueries
+        .get_mut(subquery_index)
+        .ok_or_else(missing)?;
     let SubqueryState::Unevaluated { plan: inner } = &mut subquery.state else {
-        unreachable!("a checked subquery must not have run")
+        return Err(missing());
     };
-    let Plan::Select(inner) = *inner.take().expect("a checked subquery must have a plan") else {
-        unreachable!("a checked subquery must be a SELECT")
-    };
-    inner
+    if !matches!(inner.as_deref(), Some(Plan::Select(_))) {
+        return Err(missing());
+    }
+    match inner.take().map(|inner| *inner) {
+        Some(Plan::Select(inner)) => Ok(inner),
+        _ => Err(missing()),
+    }
 }
 
 /// Try to change one `EXISTS` or `NOT EXISTS` into a join.
@@ -247,8 +510,12 @@ fn try_rewrite_exists(
     plan: &mut SelectPlan,
     subquery_index: usize,
     resolver: &Resolver<'_>,
+    reach: Reach,
 ) -> Result<bool> {
-    let subquery_id = plan.non_from_clause_subqueries[subquery_index].internal_id;
+    let Some(subquery) = plan.non_from_clause_subqueries.get(subquery_index) else {
+        return Ok(false);
+    };
+    let subquery_id = subquery.internal_id;
 
     let Some(term) = find_exists_in_where(&plan.where_clause, subquery_id) else {
         return Ok(false);
@@ -266,31 +533,53 @@ fn try_rewrite_exists(
         JoinType::Semi
     };
 
-    rewrite_as_semi_or_anti_join(plan, subquery_index, term.index, join_type, None, resolver)
+    rewrite_as_semi_or_anti_join(
+        plan,
+        subquery_index,
+        term.index,
+        join_type,
+        None,
+        resolver,
+        reach,
+    )
 }
 
-/// Turn a direct `IN` test that is not `NOT IN` into a semi-join.
+/// Turn a direct `IN` test into a semi-join, and (General) a direct `NOT IN` test into an
+/// anti-join, by splicing the subquery's one table in or through a derived table. Say which reach
+/// the rewrite needed, or `None` when the test stays a subquery.
 fn try_rewrite_in(
     plan: &mut SelectPlan,
     subquery_index: usize,
     resolver: &Resolver<'_>,
-) -> Result<bool> {
-    let subquery_id = plan.non_from_clause_subqueries[subquery_index].internal_id;
-    let Some((where_term_index, left)) = find_in_term(&plan.where_clause, subquery_id) else {
-        return Ok(false);
+    reach: Reach,
+) -> Result<Option<Reach>> {
+    let Some(subquery) = plan.non_from_clause_subqueries.get(subquery_index) else {
+        return Ok(None);
     };
+    let subquery_id = subquery.internal_id;
+    let Some(InTerm {
+        index: where_term_index,
+        left,
+        not_in,
+    }) = find_in_term(&plan.where_clause, subquery_id)
+    else {
+        return Ok(None);
+    };
+    if not_in && reach == Reach::Patterns {
+        return Ok(None);
+    }
     if plan.table_references.joined_tables().is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(inner_plan) = select_subquery_plan(plan, subquery_index) else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(right) = inner_plan
         .result_columns
         .first()
         .map(|column| column.expr.clone())
     else {
-        return Ok(false);
+        return Ok(None);
     };
     // A semi-join changes which expressions run and how many times they run:
     //
@@ -310,7 +599,7 @@ fn try_rewrite_in(
         || expression_can_fail_on_input(&left)
         || expression_can_fail_on_input(&right)
     {
-        return Ok(false);
+        return Ok(None);
     }
     // Amphora: the semi-join compares by `=`, which may convert otherwise than IN: an integer probe
     // of a lone REAL column IN makes a REAL, `=` compares exactly. Where they differ, IN stays.
@@ -318,22 +607,109 @@ fn try_rewrite_in(
         get_expr_affinity(&left, Some(&plan.table_references), None),
         get_expr_affinity(&right, Some(&inner_plan.table_references), None),
     ) {
-        return Ok(false);
+        return Ok(None);
     }
-
+    let test = InTest {
+        left_nonnull: column_is_nonnull(&left, &plan.table_references),
+        right_nonnull: column_is_nonnull(&right, &inner_plan.table_references),
+        left,
+        not_in,
+    };
+    let join_type = if not_in {
+        JoinType::Anti
+    } else {
+        JoinType::Semi
+    };
     let extra_term = WhereTerm {
-        expr: Expr::Binary(Box::new(left), ast::Operator::Equals, Box::new(right)),
+        expr: test.join_condition(right),
         origin: WhereTermOrigin::Where,
         consumed: false,
     };
-    rewrite_as_semi_or_anti_join(
-        plan,
-        subquery_index,
-        where_term_index,
-        JoinType::Semi,
-        Some(extra_term),
-        resolver,
-    )
+    // NOT IN needs the general reach; IN tries the patterns' splice first.
+    let reaches: &[Reach] = match (not_in, reach) {
+        (false, Reach::Patterns) => &[Reach::Patterns],
+        (false, Reach::General) => &[Reach::Patterns, Reach::General],
+        (true, _) => &[Reach::General],
+    };
+    for &splice_reach in reaches {
+        if rewrite_as_semi_or_anti_join(
+            plan,
+            subquery_index,
+            where_term_index,
+            join_type,
+            Some(extra_term.clone()),
+            resolver,
+            splice_reach,
+        )? {
+            return Ok(Some(splice_reach));
+        }
+    }
+    if reach == Reach::General
+        && rewrite_through_derived_table(
+            plan,
+            subquery_index,
+            where_term_index,
+            join_type,
+            Some(test),
+            resolver,
+        )?
+    {
+        return Ok(Some(Reach::General));
+    }
+    Ok(None)
+}
+
+/// The `IN` or `NOT IN` test a join takes over.
+struct InTest {
+    /// The test's left side, read in the outer query.
+    left: Expr,
+    /// Whether the test is `NOT IN`.
+    not_in: bool,
+    /// The left side is a column that can't be NULL.
+    left_nonnull: bool,
+    /// The subquery's value is a column that can't be NULL.
+    right_nonnull: bool,
+}
+
+impl InTest {
+    /// The join's condition for one subquery value `right`: `left = right` for `IN`. For `NOT IN`,
+    /// whose row passes only when no value equals it and neither it nor a value is NULL (SQLite's
+    /// lang_expr.html "The IN and NOT IN operators" table; in `WHERE` a NULL test fails the row),
+    /// the anti-join's condition is any value that keeps the test from being TRUE:
+    /// `left = right OR left IS NULL OR right IS NULL`, less the parts a NOT NULL column can't meet.
+    /// An empty subquery still passes every row, a NULL left side included, as `NOT IN ()` does.
+    fn join_condition(&self, right: Expr) -> Expr {
+        let equal = Expr::Binary(
+            Box::new(self.left.clone()),
+            ast::Operator::Equals,
+            Box::new(right.clone()),
+        );
+        if !self.not_in {
+            return equal;
+        }
+        let mut condition = equal;
+        let null_sides = [
+            (self.left_nonnull, self.left.clone()),
+            (self.right_nonnull, right),
+        ];
+        for (nonnull, side) in null_sides {
+            if !nonnull {
+                condition = Expr::Binary(
+                    Box::new(condition),
+                    ast::Operator::Or,
+                    Box::new(Expr::IsNull(Box::new(side))),
+                );
+            }
+        }
+        condition
+    }
+}
+
+/// Whether `expr` is a column that can't be NULL where `tables` read it: declared NOT NULL and not
+/// on the side of an outer join that fills it with NULL (`Optimizable::is_nonnull`). Any other
+/// expression may be NULL, as far as this says.
+fn column_is_nonnull(expr: &Expr, tables: &TableReferences) -> bool {
+    matches!(expr, Expr::Column { .. }) && expr.is_nonnull(tables)
 }
 
 /// Move one simple subquery into the outer query as a semi-join or anti-join.
@@ -344,6 +720,7 @@ fn rewrite_as_semi_or_anti_join(
     join_type: JoinType,
     extra_term: Option<WhereTerm>,
     resolver: &Resolver<'_>,
+    reach: Reach,
 ) -> Result<bool> {
     // A semi join needs a left table. Keep the subquery when the outer SELECT
     // has no FROM clause.
@@ -354,7 +731,7 @@ fn rewrite_as_semi_or_anti_join(
     let Some(inner_plan) = select_subquery_plan(plan, subquery_index) else {
         return Ok(false);
     };
-    if !can_rewrite_as_semi_join(inner_plan, resolver)? {
+    if !can_rewrite_as_semi_join(inner_plan, resolver, reach)? {
         return Ok(false);
     }
 
@@ -372,7 +749,7 @@ fn rewrite_as_semi_or_anti_join(
         .collect();
 
     for term in inner_plan.where_clause.iter().chain(extra_term.iter()) {
-        if !can_move_join_term(&term.expr, &outer_table_ids, &inner_table_ids) {
+        if !can_move_join_term(&term.expr, &outer_table_ids, &inner_table_ids)? {
             return Ok(false);
         }
     }
@@ -381,7 +758,7 @@ fn rewrite_as_semi_or_anti_join(
     // term into the outer query would reject a row that NOT EXISTS keeps.
     if join_type == JoinType::Anti {
         for term in inner_plan.where_clause.iter().chain(extra_term.iter()) {
-            let tables = collect_table_refs(&term.expr);
+            let tables = collect_table_refs(&term.expr)?;
             if !tables.iter().any(|table| inner_table_ids.contains(table)) {
                 return Ok(false);
             }
@@ -390,28 +767,12 @@ fn rewrite_as_semi_or_anti_join(
 
     // Keep a link to a table that an outer join may fill with NULL. Moving the
     // link into a later join could remove that row too early.
-    let mut outer_table_ids_that_may_be_null: Vec<TableInternalId> = Vec::new();
-    let outer_tables = plan.table_references.joined_tables();
-    for table in outer_tables {
-        if let Some(join_info) = &table.join_info {
-            if join_info.is_outer() && !join_info.is_full_outer() {
-                outer_table_ids_that_may_be_null.push(table.internal_id);
-            }
-        }
-    }
-    if !outer_table_ids_that_may_be_null.is_empty() {
-        for term in inner_plan.where_clause.iter().chain(extra_term.iter()) {
-            let tables = collect_table_refs(&term.expr);
-            if tables
-                .iter()
-                .any(|table| outer_table_ids_that_may_be_null.contains(table))
-            {
-                return Ok(false);
-            }
-        }
+    let terms = inner_plan.where_clause.iter().chain(extra_term.iter());
+    if reads_table_an_outer_join_may_null(plan, terms.map(|term| &term.expr))? {
+        return Ok(false);
     }
 
-    let mut inner_plan = take_select_subquery_plan(plan, subquery_index);
+    let mut inner_plan = take_select_subquery_plan(plan, subquery_index)?;
     if let Some(extra_term) = extra_term {
         inner_plan.where_clause.push(extra_term);
     }
@@ -435,34 +796,573 @@ fn rewrite_as_semi_or_anti_join(
     }
 
     for inner_subquery in inner_plan.non_from_clause_subqueries {
+        // A subquery correlated with the spliced table now reads a table of this query: its
+        // columns are this query's to read (as the binder marks an outer query's columns).
+        if let SubqueryState::Unevaluated {
+            plan: Some(subquery_plan),
+        } = &inner_subquery.state
+        {
+            for read in outer_columns_read(subquery_plan, &plan.table_references) {
+                if let Expr::Column { table, column, .. } = read {
+                    if let Some(joined) = plan
+                        .table_references
+                        .find_joined_table_by_internal_id_mut(table)
+                    {
+                        joined.mark_column_used(column);
+                    }
+                }
+            }
+        }
         plan.non_from_clause_subqueries.push(inner_subquery);
     }
 
     // EXISTS ignores its SELECT list. Keep any parameters from that list so
     // callers can still bind them.
-    if matches!(
-        plan.non_from_clause_subqueries[subquery_index].query_type,
-        ast::SubqueryType::Exists { .. }
-    ) {
-        for result_column in &inner_plan.result_columns {
-            walk_expr(
-                &result_column.expr,
-                &mut |expr: &Expr| -> Result<WalkControl> {
-                    if let Expr::Variable(variable) = expr {
-                        plan.phantom_params.push(variable.clone());
-                    }
-                    Ok(WalkControl::Continue)
-                },
-            )
-            .expect("walking a result expression cannot fail");
-        }
+    if plan
+        .non_from_clause_subqueries
+        .get(subquery_index)
+        .is_some_and(|subquery| matches!(subquery.query_type, ast::SubqueryType::Exists { .. }))
+    {
+        keep_parameters(
+            &mut plan.phantom_params,
+            inner_plan.result_columns.iter().map(|column| &column.expr),
+        )?;
     }
 
-    replace_subquery_term_with_true(&mut plan.where_clause, where_term_index);
+    replace_subquery_term_with_true(&mut plan.where_clause, where_term_index)?;
 
     plan.non_from_clause_subqueries.remove(subquery_index);
 
     Ok(true)
+}
+
+/// Unnest one `EXISTS`, `NOT EXISTS`, `IN` or `NOT IN` conjunct of `WHERE` (at `where_term_index`)
+/// through a derived table: the subquery with its correlated conjuncts lifted out, so that it reads
+/// no outer row and runs once, joined by a semi- or anti-join on those conjuncts (Neumann and
+/// Kemper's simple unnesting, "pull predicates up to eliminate correlations", for a subquery of
+/// any number of tables).
+///
+/// ```sql
+/// -- Before
+/// SELECT c.id FROM c WHERE EXISTS (
+///   SELECT * FROM o JOIN l ON l.o = o.id WHERE o.c = c.id AND l.qty > 5);
+/// -- After
+/// SELECT c.id FROM c SEMI JOIN (
+///   SELECT o.c AS unnested_0 FROM o JOIN l ON l.o = o.id WHERE l.qty > 5) d
+/// WHERE d.unnested_0 = c.id;
+/// ```
+///
+/// A lifted conjunct reads the subquery's tables through the derived table's columns. It stays
+/// where the subquery's operators could change which rows it sees, so the subquery must be one
+/// block of tables and conditions: no `GROUP BY`, aggregate, window, `LIMIT` or `OFFSET`.
+/// `DISTINCT` and `ORDER BY` change no answer of these tests and are dropped. The derived table runs
+/// its conditions over every row of its tables, where the subquery ran them only on the rows the
+/// outer row selects, so none may fail or change between calls (`derived_table_can_hold`).
+fn rewrite_through_derived_table(
+    plan: &mut SelectPlan,
+    subquery_index: usize,
+    where_term_index: usize,
+    join_type: JoinType,
+    in_test: Option<InTest>,
+    resolver: &Resolver<'_>,
+) -> Result<bool> {
+    if plan.table_references.joined_tables().is_empty() {
+        return Ok(false);
+    }
+    let Some(subquery) = plan.non_from_clause_subqueries.get(subquery_index) else {
+        return Ok(false);
+    };
+    let subquery_id = subquery.internal_id;
+    let is_exists = matches!(subquery.query_type, ast::SubqueryType::Exists { .. });
+    let Some(inner_plan) = select_subquery_plan(plan, subquery_index) else {
+        return Ok(false);
+    };
+    if !derived_table_can_hold(inner_plan, resolver)?
+        || !nested_selects_allow(inner_plan, &tables_outside(plan), resolver)?
+    {
+        return Ok(false);
+    }
+    let outer_table_ids: Vec<TableInternalId> = plan
+        .table_references
+        .joined_tables()
+        .iter()
+        .map(|table| table.internal_id)
+        .collect();
+    let inner_table_ids: Vec<TableInternalId> = inner_plan
+        .table_references
+        .joined_tables()
+        .iter()
+        .map(|table| table.internal_id)
+        .collect();
+    // A lifted conjunct is read in this query, so it may read this query's tables only.
+    if inner_plan
+        .table_references
+        .outer_query_refs()
+        .iter()
+        .any(|outer| outer.is_used() && !outer_table_ids.contains(&outer.internal_id))
+    {
+        return Ok(false);
+    }
+
+    let mut lifted: Vec<Expr> = Vec::new();
+    let mut kept: Vec<WhereTerm> = Vec::new();
+    for term in &inner_plan.where_clause {
+        let tables = collect_table_refs(&term.expr)?;
+        if !tables.iter().any(|table| outer_table_ids.contains(table)) {
+            let mut term = term.clone();
+            term.consumed = false;
+            kept.push(term);
+            continue;
+        }
+        // An outer join's condition can't leave its join; a conjunct with no inner column has no
+        // derived column to join on (and under NOT EXISTS would reject what the anti-join keeps).
+        if term.origin.is_outer_join()
+            || expr_references_any_subquery(&term.expr)
+            || !tables.iter().any(|table| inner_table_ids.contains(table))
+        {
+            return Ok(false);
+        }
+        lifted.push(term.expr.clone());
+    }
+    if lifted.is_empty() {
+        return Ok(false);
+    }
+    let right = match &in_test {
+        Some(_) => {
+            let Some(column) = inner_plan.result_columns.first() else {
+                return Ok(false);
+            };
+            if collect_table_refs(&column.expr)?
+                .iter()
+                .any(|table| outer_table_ids.contains(table))
+            {
+                return Ok(false);
+            }
+            Some(column.expr.clone())
+        }
+        None => None,
+    };
+    let left = in_test.as_ref().map(|test| &test.left);
+    if reads_table_an_outer_join_may_null(plan, lifted.iter().chain(left))? {
+        return Ok(false);
+    }
+
+    let mut inner_plan = take_select_subquery_plan(plan, subquery_index)?;
+    // EXISTS ignores its SELECT list, and none of these tests reads ORDER BY: keep the parameters
+    // they held so callers can still bind them.
+    let dropped = inner_plan.order_by.iter().map(|(expr, _, _)| expr.as_ref());
+    if is_exists {
+        let results = inner_plan.result_columns.iter().map(|column| &column.expr);
+        keep_parameters(&mut plan.phantom_params, dropped.chain(results))?;
+    } else {
+        keep_parameters(&mut plan.phantom_params, dropped)?;
+    }
+
+    // The derived table's columns: the IN value first, then each inner column a lifted conjunct
+    // reads, once.
+    let mut columns: Vec<Expr> = right.into_iter().collect();
+    for expr in &mut lifted {
+        walk_expr_mut(expr, &mut |expr: &mut Expr| -> Result<WalkControl> {
+            let (Expr::Column { table, .. } | Expr::RowId { table, .. }) = expr else {
+                return Ok(WalkControl::Continue);
+            };
+            if !inner_table_ids.contains(table) {
+                return Ok(WalkControl::Continue);
+            }
+            let column = match columns
+                .iter()
+                .position(|existing| exprs_are_equivalent(existing, &*expr))
+            {
+                Some(column) => column,
+                None => {
+                    let column = columns.len();
+                    columns.push(expr.clone());
+                    column
+                }
+            };
+            *expr = Expr::Column {
+                database: None,
+                table: subquery_id,
+                column,
+                is_rowid_alias: false,
+            };
+            Ok(WalkControl::SkipChildren)
+        })?;
+    }
+
+    inner_plan.where_clause = kept;
+    inner_plan.result_columns = columns
+        .into_iter()
+        .enumerate()
+        .map(|(index, expr)| ResultSetColumn {
+            expr,
+            alias: Some(format!("unnested_{index}")),
+            implicit_column_name: None,
+            contains_aggregates: false,
+        })
+        .collect();
+    inner_plan.order_by.clear();
+    inner_plan.distinctness = Distinctness::NonDistinct;
+    inner_plan.query_destination = QueryDestination::placeholder_for_subquery();
+    inner_plan.simple_aggregate = None;
+    inner_plan.input_cardinality_hint = None;
+    inner_plan.estimated_output_rows = None;
+    inner_plan.estimated_cost = None;
+    inner_plan.table_references.clear_outer_query_refs();
+
+    let mut derived = JoinedTable::new_subquery(
+        format!("unnested_subquery_{subquery_id}"),
+        *inner_plan,
+        Some(JoinInfo {
+            join_type,
+            using: vec![],
+            no_reorder: false,
+            lateral: false,
+        }),
+        subquery_id,
+    )?;
+    for column in 0..derived.columns().len() {
+        derived.mark_column_used(column);
+    }
+    plan.table_references.add_joined_table(derived);
+    for expr in lifted {
+        plan.where_clause.push(WhereTerm {
+            expr,
+            origin: WhereTermOrigin::Where,
+            consumed: false,
+        });
+    }
+    if let Some(test) = in_test {
+        let value = Expr::Column {
+            database: None,
+            table: subquery_id,
+            column: 0,
+            is_rowid_alias: false,
+        };
+        plan.where_clause.push(WhereTerm {
+            expr: test.join_condition(value),
+            origin: WhereTermOrigin::Where,
+            consumed: false,
+        });
+    }
+    replace_subquery_term_with_true(&mut plan.where_clause, where_term_index)?;
+    plan.non_from_clause_subqueries.remove(subquery_index);
+    Ok(true)
+}
+
+/// Unnest one correlated `EXISTS` that no semi- or anti-join can take (under `OR`, in the `SELECT`
+/// list, beside another test) as a mark join: a left join with the subquery grouped by the inner
+/// columns its `=` conjuncts match to one outer table, one row a key, and the test replaced by
+/// `key IS NOT NULL`. This is Neumann and Kemper's domain `D` inferred from the equivalent inner
+/// attributes (slide 18) and the grouping pushed below the join (slide 11: `D ⋈ Γ` is
+/// `Γ` over `A ∪ A(D)`), the form [`try_rewrite_single_value_aggregate`] gives an aggregate.
+///
+/// ```sql
+/// -- Before
+/// SELECT c.id FROM c WHERE c.vip OR EXISTS (SELECT * FROM o WHERE o.c = c.id AND o.total > 5);
+/// -- After
+/// SELECT c.id FROM c LEFT JOIN (SELECT o.c FROM o WHERE o.total > 5 GROUP BY o.c) d ON d.c = c.id
+/// WHERE c.vip OR d.c IS NOT NULL;
+/// ```
+///
+/// A matched key equals a non-NULL outer value, so it is never NULL itself; an unmatched row reads
+/// NULL. The grouping runs its conditions over every key, so they must not fail or change between
+/// calls, and the keys must group as the `=` compares (`column_pair_compares_the_same`).
+fn try_rewrite_exists_as_grouped_join(
+    plan: &mut SelectPlan,
+    subquery_index: usize,
+    resolver: &Resolver<'_>,
+) -> Result<bool> {
+    // A window plan keeps another copy of its expressions (try_rewrite_single_value_aggregate).
+    if plan.window.is_some() || plan.table_references.joined_tables().is_empty() {
+        return Ok(false);
+    }
+    let Some(subquery) = plan.non_from_clause_subqueries.get(subquery_index) else {
+        return Ok(false);
+    };
+    let subquery_id = subquery.internal_id;
+    // The test's value must be known before an outer join decides on its NULL row.
+    if plan.where_clause.iter().any(|term| {
+        term.origin.is_outer_join() && expr_references_subquery_id(&term.expr, subquery_id)
+    }) {
+        return Ok(false);
+    }
+    let Some(inner_plan) = select_subquery_plan(plan, subquery_index) else {
+        return Ok(false);
+    };
+    if !derived_table_can_hold(inner_plan, resolver)?
+        || !nested_selects_allow(inner_plan, &tables_outside(plan), resolver)?
+    {
+        return Ok(false);
+    }
+    let Some(outer_table_id) = single_outer_table(plan, inner_plan) else {
+        return Ok(false);
+    };
+    let outer_table_ids = [outer_table_id];
+    let inner_table_ids: Vec<TableInternalId> = inner_plan
+        .table_references
+        .joined_tables()
+        .iter()
+        .map(|table| table.internal_id)
+        .collect();
+    let mut pairs = Vec::new();
+    let mut kept = Vec::new();
+    for term in &inner_plan.where_clause {
+        let tables = collect_table_refs(&term.expr)?;
+        if !tables.iter().any(|table| outer_table_ids.contains(table)) {
+            let mut term = term.clone();
+            term.consumed = false;
+            kept.push(term);
+            continue;
+        }
+        if term.origin.is_outer_join() {
+            return Ok(false);
+        }
+        let Some(pair) = read_column_pair(&term.expr, &outer_table_ids, &inner_table_ids) else {
+            return Ok(false);
+        };
+        if !column_pair_compares_the_same(&pair, &inner_plan.table_references)? {
+            return Ok(false);
+        }
+        pairs.push(pair);
+    }
+    if pairs.is_empty() {
+        return Ok(false);
+    }
+
+    let key = Expr::Column {
+        database: None,
+        table: subquery_id,
+        column: 0,
+        is_rowid_alias: false,
+    };
+    let replacement = Expr::NotNull(Box::new(key));
+    if !replace_subquery_result(plan, subquery_id, &replacement, Answer::Exists)? {
+        return Ok(false);
+    }
+    let mut inner_plan = take_select_subquery_plan(plan, subquery_index)?;
+    let dropped = inner_plan
+        .order_by
+        .iter()
+        .map(|(expr, _, _)| expr.as_ref())
+        .chain(inner_plan.result_columns.iter().map(|column| &column.expr));
+    keep_parameters(&mut plan.phantom_params, dropped)?;
+
+    let mut group_columns: Vec<Expr> = Vec::new();
+    let mut positions = Vec::with_capacity(pairs.len());
+    for pair in &pairs {
+        let position = match group_columns
+            .iter()
+            .position(|existing| exprs_are_equivalent(existing, &pair.inner))
+        {
+            Some(position) => position,
+            None => {
+                let position = group_columns.len();
+                group_columns.push(pair.inner.clone());
+                position
+            }
+        };
+        positions.push(position);
+    }
+    inner_plan.where_clause = kept;
+    inner_plan.result_columns = group_columns
+        .iter()
+        .enumerate()
+        .map(|(index, expr)| ResultSetColumn {
+            expr: expr.clone(),
+            alias: Some(format!("correlation_key_{index}")),
+            implicit_column_name: None,
+            contains_aggregates: false,
+        })
+        .collect();
+    let column_count = group_columns.len();
+    inner_plan.group_by = Some(GroupBy {
+        exprs: group_columns,
+        sort_order: vec![SortOrder::Asc; column_count],
+        nulls_order: vec![None; column_count],
+        sort_elided: false,
+        having: None,
+        carried: Vec::new(),
+    });
+    inner_plan.order_by.clear();
+    inner_plan.distinctness = Distinctness::NonDistinct;
+    inner_plan.query_destination = QueryDestination::placeholder_for_subquery();
+    inner_plan.simple_aggregate = None;
+    inner_plan.input_cardinality_hint = None;
+    inner_plan.estimated_output_rows = None;
+    inner_plan.estimated_cost = None;
+    inner_plan.table_references.clear_outer_query_refs();
+
+    let mut grouped = JoinedTable::new_subquery(
+        format!("exists_subquery_{subquery_id}"),
+        *inner_plan,
+        Some(JoinInfo {
+            join_type: JoinType::LeftOuter,
+            using: vec![],
+            no_reorder: false,
+            lateral: false,
+        }),
+        subquery_id,
+    )?;
+    for column in 0..grouped.columns().len() {
+        grouped.mark_column_used(column);
+    }
+    for (pair, column) in pairs.into_iter().zip(positions) {
+        let key = Expr::Column {
+            database: None,
+            table: subquery_id,
+            column,
+            is_rowid_alias: false,
+        };
+        let (left, right) = if pair.inner_was_left {
+            (key, pair.outer)
+        } else {
+            (pair.outer, key)
+        };
+        plan.where_clause.push(WhereTerm {
+            expr: Expr::Binary(Box::new(left), ast::Operator::Equals, Box::new(right)),
+            origin: WhereTermOrigin::Join(JoinOrigin::Outer(subquery_id)),
+            consumed: false,
+        });
+    }
+    plan.table_references.add_joined_table(grouped);
+    plan.non_from_clause_subqueries.remove(subquery_index);
+    Ok(true)
+}
+
+/// Whether a subquery can become a derived table that runs once over all its rows: one block of
+/// tables and conditions (no grouping, aggregate, window, `VALUES`, `LIMIT` or `OFFSET`), reading
+/// no virtual table and no correlated FROM subquery, and with no condition that can fail or that
+/// may change between calls. Its conditions then run on rows the correlated subquery never read,
+/// which must not raise an error the query didn't. Its own subqueries stay in it, unnested when
+/// the planner plans it, if they read none of the outer query's tables and hold nothing that can
+/// fail ([`nested_selects_allow`], with [`tables_outside`]).
+fn derived_table_can_hold(plan: &SelectPlan, resolver: &Resolver<'_>) -> Result<bool> {
+    if plan.table_references.joined_tables().is_empty()
+        || plan.group_by.is_some()
+        || !plan.aggregates.is_empty()
+        || plan.window.is_some()
+        || !plan.values.is_empty()
+        || plan.limit.is_some()
+        || plan.offset.is_some()
+    {
+        return Ok(false);
+    }
+    if plan
+        .table_references
+        .joined_tables()
+        .iter()
+        .any(|table| match &table.table {
+            Table::Virtual(_) => true,
+            Table::FromClauseSubquery(subquery) => plan_is_correlated(&subquery.plan),
+            _ => false,
+        })
+    {
+        return Ok(false);
+    }
+    for term in &plan.where_clause {
+        if expression_can_fail_on_input(&term.expr)
+            || expr_contains_nondeterministic_scalar_function(&term.expr, resolver)?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The tables a derived table made in `plan` must not read: `plan`'s own and those it reads from
+/// further out.
+fn tables_outside(plan: &SelectPlan) -> Vec<TableInternalId> {
+    plan.table_references
+        .joined_tables()
+        .iter()
+        .map(|table| table.internal_id)
+        .chain(
+            plan.table_references
+                .outer_query_refs()
+                .iter()
+                .map(|outer| outer.internal_id),
+        )
+        .collect()
+}
+
+/// The one table of `plan` that `inner` reads as an outer reference, if it reads exactly one and
+/// that one is `plan`'s own (not a table further out). A grouped table linked to more than one
+/// outer table can move before one of those tables after its left join becomes an inner join.
+fn single_outer_table(plan: &SelectPlan, inner: &SelectPlan) -> Option<TableInternalId> {
+    let mut used = inner
+        .table_references
+        .outer_query_refs()
+        .iter()
+        .filter(|outer| outer.is_used());
+    let outer = used.next()?;
+    if used.next().is_some()
+        || outer.scope_depth != 0
+        || plan
+            .table_references
+            .find_joined_table_by_internal_id(outer.internal_id)
+            .is_none()
+    {
+        return None;
+    }
+    Some(outer.internal_id)
+}
+
+/// Whether any of `exprs` reads a table of `plan` that an outer join may fill with NULL. A term
+/// joined later could then remove that row before the outer join keeps it.
+fn reads_table_an_outer_join_may_null<'a>(
+    plan: &SelectPlan,
+    exprs: impl Iterator<Item = &'a Expr>,
+) -> Result<bool> {
+    let may_be_null: Vec<TableInternalId> = plan
+        .table_references
+        .joined_tables()
+        .iter()
+        .filter(|table| {
+            table
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.is_outer() && !join_info.is_full_outer())
+        })
+        .map(|table| table.internal_id)
+        .collect();
+    if may_be_null.is_empty() {
+        return Ok(false);
+    }
+    for expr in exprs {
+        if collect_table_refs(expr)?
+            .iter()
+            .any(|table| may_be_null.contains(table))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Keep the parameters of expressions a rewrite drops, so callers can still bind them.
+fn keep_parameters<'a>(
+    params: &mut Vec<ast::Variable>,
+    exprs: impl Iterator<Item = &'a Expr>,
+) -> Result<()> {
+    for expr in exprs {
+        walk_expr(expr, &mut |expr: &Expr| -> Result<WalkControl> {
+            if let Expr::Variable(variable) = expr {
+                params.push(variable.clone());
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    Ok(())
+}
+
+/// Which answer of a subquery [`replace_subquery_result`] replaces.
+#[derive(Clone, Copy)]
+enum Answer {
+    /// A one-value subquery's value.
+    Value,
+    /// An `EXISTS` test's truth.
+    Exists,
 }
 
 /// The value returned when no input row matches.
@@ -516,7 +1416,10 @@ fn try_rewrite_single_value_aggregate(
         return Ok(None);
     }
 
-    let subquery_id = plan.non_from_clause_subqueries[subquery_index].internal_id;
+    let Some(subquery) = plan.non_from_clause_subqueries.get(subquery_index) else {
+        return Ok(None);
+    };
+    let subquery_id = subquery.internal_id;
 
     // A value used by an outer join condition must be ready before that join
     // decides whether to fill its right side with NULL values.
@@ -568,7 +1471,7 @@ fn try_rewrite_single_value_aggregate(
     let mut pairs = Vec::new();
     let mut inner_where = Vec::new();
     for term in &inner_plan.where_clause {
-        let tables = collect_table_refs(&term.expr);
+        let tables = collect_table_refs(&term.expr)?;
         if !tables.iter().any(|table| outer_table_ids.contains(table)) {
             let mut term = term.clone();
             term.consumed = false;
@@ -586,7 +1489,7 @@ fn try_rewrite_single_value_aggregate(
         }
         pairs.push(pair);
     }
-    if pairs.is_empty() || uses_outer_tables_outside_where(inner_plan, &outer_table_ids) {
+    if pairs.is_empty() || uses_outer_tables_outside_where(inner_plan, &outer_table_ids)? {
         return Ok(None);
     }
 
@@ -594,7 +1497,7 @@ fn try_rewrite_single_value_aggregate(
         return rewrite_aggregate_as_join_then_group(plan, subquery_index, subquery_id, resolver);
     }
 
-    let mut inner_plan = *take_select_subquery_plan(plan, subquery_index);
+    let mut inner_plan = *take_select_subquery_plan(plan, subquery_index)?;
     inner_plan.where_clause = inner_where;
     inner_plan.limit = None;
     inner_plan.query_destination = QueryDestination::placeholder_for_subquery();
@@ -607,14 +1510,22 @@ fn try_rewrite_single_value_aggregate(
     let mut group_columns: Vec<Expr> = Vec::new();
     let mut result_positions = Vec::with_capacity(pairs.len());
     for pair in &pairs {
-        let column_index = group_columns
+        let column_index = match group_columns
             .iter()
             .position(|existing| exprs_are_equivalent(existing, &pair.inner))
-            .unwrap_or_else(|| {
+        {
+            Some(column_index) => column_index,
+            None => {
+                let column_index = group_columns.len();
                 group_columns.push(pair.inner.clone());
-                group_columns.len() - 1
-            });
-        result_positions.push(column_index + 1);
+                column_index
+            }
+        };
+        // The aggregate is the grouped table's first column, the keys after it.
+        let position = column_index.checked_add(1).ok_or_else(|| {
+            LimboError::InternalError("too many correlation keys to number".into())
+        })?;
+        result_positions.push(position);
     }
 
     for (index, column) in group_columns.iter().enumerate() {
@@ -648,13 +1559,17 @@ fn try_rewrite_single_value_aggregate(
     )?;
     // A scalar subquery result has no text order. Do not give its replacement
     // the text order of the grouped table's first result column.
-    let Table::FromClauseSubquery(grouped_subquery) = &mut grouped_table.table else {
-        unreachable!("a grouped table must hold a subquery")
+    let first_column = match &mut grouped_table.table {
+        Table::FromClauseSubquery(grouped_subquery) => Arc::get_mut(grouped_subquery)
+            .and_then(|grouped_subquery| grouped_subquery.columns.first_mut()),
+        _ => None,
     };
-    Arc::get_mut(grouped_subquery)
-        .expect("a new grouped subquery is not shared")
-        .columns[0]
-        .set_collation(None);
+    let Some(first_column) = first_column else {
+        return Err(LimboError::InternalError(
+            "a new grouped table holds no subquery of its own".into(),
+        ));
+    };
+    first_column.set_collation(None);
     for column in 0..grouped_table.columns().len() {
         grouped_table.mark_column_used(column);
     }
@@ -670,7 +1585,7 @@ fn try_rewrite_single_value_aggregate(
         EmptyInputValue::IntegerZero => coalesce_with_zero(result_column, "0"),
         EmptyInputValue::RealZero => coalesce_with_zero(result_column, "0.0"),
     };
-    if !replace_subquery_value(plan, subquery_id, &replacement)? {
+    if !replace_subquery_result(plan, subquery_id, &replacement, Answer::Value)? {
         return Ok(None);
     }
 
@@ -752,7 +1667,9 @@ fn rewrite_aggregate_as_join_then_group(
         return Ok(None);
     }
 
-    let outer_table = &plan.table_references.joined_tables()[0];
+    let Some(outer_table) = plan.table_references.joined_tables().first() else {
+        return Ok(None);
+    };
     if !matches!(&outer_table.table, Table::BTree(table) if table.has_rowid) {
         return Ok(None);
     }
@@ -763,25 +1680,28 @@ fn rewrite_aggregate_as_join_then_group(
     };
     if inner_plan.table_references.joined_tables().len() != 1
         || !matches!(
-            &inner_plan.table_references.joined_tables()[0].table,
-            Table::BTree(table) if table.has_rowid
+            inner_plan.table_references.joined_tables().first().map(|table| &table.table),
+            Some(Table::BTree(table)) if table.has_rowid
         )
     {
         return Ok(None);
     }
 
-    let result = inner_plan.result_columns[0].expr.clone();
+    let Some(result) = inner_plan.result_columns.first() else {
+        return Ok(None);
+    };
+    let result = result.expr.clone();
     let Some((where_index, having)) =
         find_direct_aggregate_comparison(plan, subquery_id, &result, resolver)?
     else {
         return Ok(None);
     };
 
-    let mut inner_plan = *take_select_subquery_plan(plan, subquery_index);
+    let mut inner_plan = *take_select_subquery_plan(plan, subquery_index)?;
     let mut inner_tables = std::mem::take(inner_plan.table_references.joined_tables_mut());
-    let mut inner_table = inner_tables
-        .pop()
-        .expect("a checked aggregate subquery must have one table");
+    let mut inner_table = inner_tables.pop().ok_or_else(|| {
+        LimboError::InternalError("a checked aggregate subquery has no table".into())
+    })?;
     let inner_table_id = inner_table.internal_id;
     inner_table.join_info = Some(JoinInfo {
         join_type: JoinType::LeftOuter,
@@ -1040,7 +1960,7 @@ fn aggregate_can_run_for_unused_rows(plan: &SelectPlan) -> bool {
 
 /// Return the result for no input rows, if it is known.
 fn result_on_empty_input(plan: &SelectPlan) -> Option<EmptyInputValue> {
-    let expr = &plan.result_columns[0].expr;
+    let expr = &plan.result_columns.first()?.expr;
     for aggregate in &plan.aggregates {
         if !exprs_are_equivalent(expr, &aggregate.original_expr) {
             continue;
@@ -1060,45 +1980,57 @@ fn result_on_empty_input(plan: &SelectPlan) -> Option<EmptyInputValue> {
     is_null_on_empty_input(expr, &plan.aggregates).then_some(EmptyInputValue::Null)
 }
 
-/// Return whether an expression must be NULL when its input is empty.
+/// Return whether an expression must be NULL when its input is empty: it is, or passes through
+/// arithmetic, a unary operator, a cast, a collation or parentheses, an aggregate that is NULL over
+/// no rows. Walked from a stack, each node of the expression once (CLAUDE.md §11).
 fn is_null_on_empty_input(expr: &Expr, aggregates: &[crate::translate::plan::Aggregate]) -> bool {
-    if aggregates.iter().any(|aggregate| {
-        exprs_are_equivalent(expr, &aggregate.original_expr)
-            && matches!(
-                aggregate.func,
-                AggFunc::Avg
-                    | AggFunc::GroupConcat
-                    | AggFunc::Max
-                    | AggFunc::Min
-                    | AggFunc::StringAgg
-                    | AggFunc::Sum
-            )
-    }) {
-        return true;
-    }
-    match expr {
-        Expr::Binary(
-            left,
-            ast::Operator::Add
-            | ast::Operator::Subtract
-            | ast::Operator::Multiply
-            | ast::Operator::Divide
-            | ast::Operator::Modulus
-            | ast::Operator::BitwiseAnd
-            | ast::Operator::BitwiseOr
-            | ast::Operator::LeftShift
-            | ast::Operator::RightShift
-            | ast::Operator::Concat,
-            right,
-        ) => is_null_on_empty_input(left, aggregates) || is_null_on_empty_input(right, aggregates),
-        Expr::Unary(_, inner) | Expr::Cast { expr: inner, .. } | Expr::Collate(inner, _) => {
-            is_null_on_empty_input(inner, aggregates)
+    let mut pending: SmallVec<[&Expr; 4]> = SmallVec::new();
+    pending.push(expr);
+    while let Some(expr) = pending.pop() {
+        if aggregates.iter().any(|aggregate| {
+            exprs_are_equivalent(expr, &aggregate.original_expr)
+                && matches!(
+                    aggregate.func,
+                    AggFunc::Avg
+                        | AggFunc::GroupConcat
+                        | AggFunc::Max
+                        | AggFunc::Min
+                        | AggFunc::StringAgg
+                        | AggFunc::Sum
+                )
+        }) {
+            return true;
         }
-        Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            is_null_on_empty_input(&exprs[0], aggregates)
+        match expr {
+            Expr::Binary(
+                left,
+                ast::Operator::Add
+                | ast::Operator::Subtract
+                | ast::Operator::Multiply
+                | ast::Operator::Divide
+                | ast::Operator::Modulus
+                | ast::Operator::BitwiseAnd
+                | ast::Operator::BitwiseOr
+                | ast::Operator::LeftShift
+                | ast::Operator::RightShift
+                | ast::Operator::Concat,
+                right,
+            ) => {
+                pending.push(right);
+                pending.push(left);
+            }
+            Expr::Unary(_, inner) | Expr::Cast { expr: inner, .. } | Expr::Collate(inner, _) => {
+                pending.push(inner);
+            }
+            Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+                if let Some(inner) = exprs.first() {
+                    pending.push(inner);
+                }
+            }
+            _ => {}
         }
-        _ => false,
     }
+    false
 }
 
 /// Read an `=` check between one inner column and one outer column.
@@ -1164,25 +2096,34 @@ fn column_pair_compares_the_same(pair: &ColumnPair, tables: &TableReferences) ->
 }
 
 /// Return whether the plan uses an outer table outside its `WHERE` clause.
-fn uses_outer_tables_outside_where(plan: &SelectPlan, outer_table_ids: &[TableInternalId]) -> bool {
-    let uses_outer = |expr: &Expr| {
-        collect_table_refs(expr)
+fn uses_outer_tables_outside_where(
+    plan: &SelectPlan,
+    outer_table_ids: &[TableInternalId],
+) -> Result<bool> {
+    let group = plan.group_by.as_ref();
+    let exprs = plan
+        .result_columns
+        .iter()
+        .map(|column| &column.expr)
+        .chain(plan.order_by.iter().map(|(expr, _, _)| expr.as_ref()))
+        .chain(plan.limit.as_deref())
+        .chain(plan.offset.as_deref())
+        .chain(group.into_iter().flat_map(|group| group.exprs.iter()))
+        .chain(
+            group
+                .and_then(|group| group.having.as_ref())
+                .into_iter()
+                .flatten(),
+        );
+    for expr in exprs {
+        if collect_table_refs(expr)?
             .iter()
             .any(|table| outer_table_ids.contains(table))
-    };
-    plan.result_columns
-        .iter()
-        .any(|column| uses_outer(&column.expr))
-        || plan.order_by.iter().any(|(expr, _, _)| uses_outer(expr))
-        || plan.limit.as_deref().is_some_and(uses_outer)
-        || plan.offset.as_deref().is_some_and(uses_outer)
-        || plan.group_by.as_ref().is_some_and(|group| {
-            group.exprs.iter().any(&uses_outer)
-                || group
-                    .having
-                    .as_ref()
-                    .is_some_and(|having| having.iter().any(&uses_outer))
-        })
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Keep the zero that `count` and `total` return for an empty input.
@@ -1204,21 +2145,30 @@ fn coalesce_with_zero(value: Expr, zero: &str) -> Expr {
 }
 
 /// Replace each use of one subquery value with a joined column.
-fn replace_subquery_value(
+fn replace_subquery_result(
     plan: &mut SelectPlan,
     subquery_id: TableInternalId,
     replacement: &Expr,
+    answer: Answer,
 ) -> Result<bool> {
     let mut found = false;
     let mut replace = |expr: &mut Expr| -> Result<WalkControl> {
-        if matches!(
-            expr,
-            Expr::SubqueryResult {
-                subquery_id: id,
-                query_type: ast::SubqueryType::RowValue { num_regs: 1, .. },
-                ..
-            } if *id == subquery_id
-        ) {
+        let Expr::SubqueryResult {
+            subquery_id: id,
+            query_type,
+            lhs,
+            ..
+        } = expr
+        else {
+            return Ok(WalkControl::Continue);
+        };
+        let answers = match answer {
+            Answer::Value => matches!(query_type, ast::SubqueryType::RowValue { num_regs: 1, .. }),
+            Answer::Exists => {
+                lhs.is_none() && matches!(query_type, ast::SubqueryType::Exists { .. })
+            }
+        };
+        if *id == subquery_id && answers {
             *expr = replacement.clone();
             found = true;
             return Ok(WalkControl::SkipChildren);
@@ -1269,7 +2219,16 @@ fn replace_subquery_value(
 }
 
 /// Return whether a subquery is simple enough for a semi-join or anti-join.
-fn can_rewrite_as_semi_join(plan: &SelectPlan, resolver: &Resolver<'_>) -> Result<bool> {
+///
+/// The patterns take no subquery that holds a correlated subquery of its own. The general reach
+/// takes one, its own subqueries moving into the outer query with its table, where the worklist
+/// takes them next (top-down), when nothing they hold can fail or change between calls: the join
+/// may run them on rows in another order than the subquery did.
+fn can_rewrite_as_semi_join(
+    plan: &SelectPlan,
+    resolver: &Resolver<'_>,
+    reach: Reach,
+) -> Result<bool> {
     // The current semi-join and anti-join loops stop after a match in one table.
     // A joined inner query needs a separate implementation.
     if plan.table_references.joined_tables().len() != 1 {
@@ -1295,6 +2254,7 @@ fn can_rewrite_as_semi_join(plan: &SelectPlan, resolver: &Resolver<'_>) -> Resul
         .non_from_clause_subqueries
         .iter()
         .any(|subquery| subquery.correlated)
+        && (reach == Reach::Patterns || !nested_selects_allow(plan, &[], resolver)?)
     {
         return Ok(false);
     }
@@ -1376,7 +2336,7 @@ fn find_exists_in_where(
 }
 
 /// Find a direct IN term. IN under OR and NOT IN stay as subqueries.
-fn find_in_term(where_clause: &[WhereTerm], subquery_id: TableInternalId) -> Option<(usize, Expr)> {
+fn find_in_term(where_clause: &[WhereTerm], subquery_id: TableInternalId) -> Option<InTerm> {
     where_clause.iter().enumerate().find_map(|(index, term)| {
         if term.origin.is_outer_join() {
             return None;
@@ -1384,14 +2344,28 @@ fn find_in_term(where_clause: &[WhereTerm], subquery_id: TableInternalId) -> Opt
         let Expr::SubqueryResult {
             subquery_id: id,
             lhs: Some(left),
-            not_in: false,
+            not_in,
             query_type: ast::SubqueryType::In { .. },
         } = &term.expr
         else {
             return None;
         };
-        (*id == subquery_id).then(|| (index, left.as_ref().clone()))
+        (*id == subquery_id).then(|| InTerm {
+            index,
+            left: left.as_ref().clone(),
+            not_in: *not_in,
+        })
     })
+}
+
+/// A direct `IN` or `NOT IN` conjunct of `WHERE`.
+struct InTerm {
+    /// The term's position in the `WHERE` list.
+    index: usize,
+    /// The test's left side.
+    left: Expr,
+    /// Whether the test is `NOT IN`.
+    not_in: bool,
 }
 
 /// Return whether an inner `WHERE` term can move into the outer query.
@@ -1399,22 +2373,13 @@ fn can_move_join_term(
     expr: &Expr,
     outer_table_ids: &[TableInternalId],
     inner_table_ids: &[TableInternalId],
-) -> bool {
-    let mut has_outer_ref = false;
-    walk_expr(expr, &mut |expr: &Expr| -> Result<WalkControl> {
-        if let Expr::Column { table, .. } | Expr::RowId { table, .. } = expr {
-            if outer_table_ids.contains(table) {
-                has_outer_ref = true;
-            }
-        }
-        Ok(WalkControl::Continue)
-    })
-    .expect("walking a WHERE expression cannot fail");
-
+) -> Result<bool> {
+    let has_outer_ref = collect_table_refs(expr)?
+        .iter()
+        .any(|table| outer_table_ids.contains(table));
     if !has_outer_ref {
-        return true;
+        return Ok(true);
     }
-
     is_inner_outer_comparison(expr, outer_table_ids, inner_table_ids)
 }
 
@@ -1423,16 +2388,16 @@ fn is_inner_outer_comparison(
     expr: &Expr,
     outer_table_ids: &[TableInternalId],
     inner_table_ids: &[TableInternalId],
-) -> bool {
+) -> Result<bool> {
     let Expr::Binary(left, operator, right) = expr else {
-        return false;
+        return Ok(false);
     };
     if !operator.is_comparison() {
-        return false;
+        return Ok(false);
     }
 
-    let left_tables = collect_table_refs(left);
-    let right_tables = collect_table_refs(right);
+    let left_tables = collect_table_refs(left)?;
+    let right_tables = collect_table_refs(right)?;
 
     let left_is_outer = left_tables
         .iter()
@@ -1451,11 +2416,11 @@ fn is_inner_outer_comparison(
         .all(|table| inner_table_ids.contains(table))
         && !right_tables.is_empty();
 
-    (left_is_outer && right_is_inner) || (left_is_inner && right_is_outer)
+    Ok((left_is_outer && right_is_inner) || (left_is_inner && right_is_outer))
 }
 
 /// Return each table used by an expression.
-fn collect_table_refs(expr: &Expr) -> SmallVec<[TableInternalId; 2]> {
+fn collect_table_refs(expr: &Expr) -> Result<SmallVec<[TableInternalId; 2]>> {
     let mut tables = SmallVec::new();
     walk_expr(expr, &mut |expr: &Expr| -> Result<WalkControl> {
         if let Expr::Column { table, .. } | Expr::RowId { table, .. } = expr {
@@ -1464,12 +2429,15 @@ fn collect_table_refs(expr: &Expr) -> SmallVec<[TableInternalId; 2]> {
             }
         }
         Ok(WalkControl::Continue)
-    })
-    .expect("walking an expression cannot fail");
-    tables
+    })?;
+    Ok(tables)
 }
 
 /// Replace a WHERE term after its join now performs the same test.
-fn replace_subquery_term_with_true(where_clause: &mut [WhereTerm], index: usize) {
-    where_clause[index].expr = Expr::Literal(ast::Literal::Numeric("1".to_string()));
+fn replace_subquery_term_with_true(where_clause: &mut [WhereTerm], index: usize) -> Result<()> {
+    let term = where_clause.get_mut(index).ok_or_else(|| {
+        LimboError::InternalError("an unnested subquery's WHERE term is gone".into())
+    })?;
+    term.expr = Expr::Literal(ast::Literal::Numeric("1".to_string()));
+    Ok(())
 }
