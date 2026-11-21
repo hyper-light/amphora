@@ -80,12 +80,20 @@ impl Index {
                 Some((_, &ESCAPE)) => term.push(0),
                 Some((_, &END)) => {
                     let rest = index_key
-                        .get(at.checked_add(2).ok_or_else(|| invalid("index key", "size overflow"))?..)
+                        .get(
+                            at.checked_add(2)
+                                .ok_or_else(|| invalid("index key", "size overflow"))?..,
+                        )
                         .ok_or_else(|| invalid("index key", "it ends at its terminator"))?;
                     key(rest)?;
                     return Ok((term, rest.to_vec()));
                 }
-                _ => return Err(invalid("index key", "a 0x00 neither escaped nor ending the term")),
+                _ => {
+                    return Err(invalid(
+                        "index key",
+                        "a 0x00 neither escaped nor ending the term",
+                    ));
+                }
             }
         }
         Err(invalid("index key", "its term has no terminator"))
@@ -111,7 +119,12 @@ impl Index {
     /// The writes that keep this index in step with the row at `indexed` as its terms go from
     /// `had` to `has`: a delete for each term it no longer has, a put for each it gained, nothing
     /// for a term it kept. They go into the commit that writes the row.
-    pub fn moved(&self, indexed: &[u8], had: &[&[u8]], has: &[&[u8]]) -> Result<Vec<Write>, Refusal> {
+    pub fn moved(
+        &self,
+        indexed: &[u8],
+        had: &[&[u8]],
+        has: &[&[u8]],
+    ) -> Result<Vec<Write>, Refusal> {
         bound("index terms", had.len().saturating_add(has.len()), TX_MAX)?;
         let had: BTreeSet<&[u8]> = had.iter().copied().collect();
         let has: BTreeSet<&[u8]> = has.iter().copied().collect();
@@ -164,8 +177,16 @@ mod tests {
                     for kb in keys {
                         let x = Index::key(a, ka).unwrap();
                         let y = Index::key(b, kb).unwrap();
-                        assert_eq!(x.cmp(&y), (a, ka).cmp(&(b, kb)), "{a:?}/{ka:?} against {b:?}/{kb:?}");
-                        assert_eq!(y.starts_with(&pa), a == b, "{a:?}'s prefix against {b:?}/{kb:?}");
+                        assert_eq!(
+                            x.cmp(&y),
+                            (a, ka).cmp(&(b, kb)),
+                            "{a:?}/{ka:?} against {b:?}/{kb:?}"
+                        );
+                        assert_eq!(
+                            y.starts_with(&pa),
+                            a == b,
+                            "{a:?}'s prefix against {b:?}/{kb:?}"
+                        );
                     }
                 }
             }
@@ -177,20 +198,35 @@ mod tests {
     fn index_keys_split_back_and_damaged_ones_are_refused() {
         for t in terms() {
             for k in [&b"\x00"[..], b"\x00\x01", b"k"] {
-                assert_eq!(Index::split(&Index::key(&t, k).unwrap()).unwrap(), (t.clone(), k.to_vec()));
+                assert_eq!(
+                    Index::split(&Index::key(&t, k).unwrap()).unwrap(),
+                    (t.clone(), k.to_vec())
+                );
             }
         }
         for bad in [&b"ab"[..], b"a\x00", b"a\x00\x02k", b"a\x00\x01"] {
-            assert!(matches!(Index::split(bad), Err(Refusal::Invalid { .. })), "{bad:?}");
+            assert!(
+                matches!(Index::split(bad), Err(Refusal::Invalid { .. })),
+                "{bad:?}"
+            );
         }
     }
 
     /// CP-T1.5: a term and key over KEY_MAX together are refused TooLarge.
     #[test]
     fn index_keys_are_bounded_as_keys_are() {
-        assert!(matches!(Index::key(&[b'a'; KEY_MAX], b"k"), Err(Refusal::TooLarge { .. })));
-        assert!(matches!(Index::key(b"t", &[b'k'; KEY_MAX]), Err(Refusal::TooLarge { .. })));
-        assert!(matches!(Index::key(b"t", b""), Err(Refusal::Invalid { .. })));
+        assert!(matches!(
+            Index::key(&[b'a'; KEY_MAX], b"k"),
+            Err(Refusal::TooLarge { .. })
+        ));
+        assert!(matches!(
+            Index::key(b"t", &[b'k'; KEY_MAX]),
+            Err(Refusal::TooLarge { .. })
+        ));
+        assert!(matches!(
+            Index::key(b"t", b""),
+            Err(Refusal::Invalid { .. })
+        ));
     }
 
     /// CP-T1.6: moving a row between terms deletes what it left, puts what it gained, and keeps
@@ -198,7 +234,9 @@ mod tests {
     #[test]
     fn moved_writes_only_the_difference() {
         let index = Index::new("deploy.release-by-state").unwrap();
-        let writes = index.moved(b"r1", &[b"queued", b"app"], &[b"running", b"app"]).unwrap();
+        let writes = index
+            .moved(b"r1", &[b"queued", b"app"], &[b"running", b"app"])
+            .unwrap();
         assert_eq!(
             writes,
             vec![
@@ -206,6 +244,9 @@ mod tests {
                 index.put(b"running", b"r1").unwrap()
             ]
         );
-        assert_eq!(index.moved(b"r1", &[b"app"], &[b"app"]).unwrap(), Vec::new());
+        assert_eq!(
+            index.moved(b"r1", &[b"app"], &[b"app"]).unwrap(),
+            Vec::new()
+        );
     }
 }

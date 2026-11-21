@@ -148,7 +148,10 @@ impl State {
         let mut rows = Vec::new();
         let mut last: Option<&Vec<u8>> = None;
         let start = (family.to_owned(), lower.clone(), 0);
-        for ((f, k, _), _) in self.versions.range((Bound::Included(start), Bound::Unbounded)) {
+        for ((f, k, _), _) in self
+            .versions
+            .range((Bound::Included(start), Bound::Unbounded))
+        {
             if f != family || !k.starts_with(&scan.prefix) {
                 break;
             }
@@ -183,7 +186,11 @@ impl State {
                 head,
             });
         }
-        let from = (family.to_owned(), after.checked_add(1).ok_or_else(|| overflow("revision"))?, 0);
+        let from = (
+            family.to_owned(),
+            after.checked_add(1).ok_or_else(|| overflow("revision"))?,
+            0,
+        );
         let mut changes = Vec::new();
         for ((f, rev, _), k) in self.by_rev.range(from..) {
             if f != family || changes.len() > limit {
@@ -192,7 +199,9 @@ impl State {
             let value = self
                 .versions
                 .get(&(f.clone(), k.clone(), *rev))
-                .ok_or_else(|| Refusal::Unavailable("the feed names a version that is gone".into()))?
+                .ok_or_else(|| {
+                    Refusal::Unavailable("the feed names a version that is gone".into())
+                })?
                 .value
                 .clone();
             changes.push(Change {
@@ -286,7 +295,12 @@ impl State {
 
     /// The first version after `cursor` at or before `cutoff`, in (family, key, revision) order,
     /// and whether it is a delete.
-    fn next(&self, cutoff: Rev, cursor: Option<&At>, until: Instant) -> Result<Option<(At, bool)>, Refusal> {
+    fn next(
+        &self,
+        cutoff: Rev,
+        cursor: Option<&At>,
+        until: Instant,
+    ) -> Result<Option<(At, bool)>, Refusal> {
         let from = match cursor {
             Some(c) => Bound::Excluded(c.clone()),
             None => Bound::Unbounded,
@@ -329,18 +343,28 @@ impl State {
                 let mut obsolete = *revision < latest;
                 if !obsolete && tombstone && *revision < cutoff {
                     // Revisions start at 1, so a version before this one is at or before r - 1.
-                    obsolete = self.version(family, key, revision.saturating_sub(1)).is_none();
+                    obsolete = self
+                        .version(family, key, revision.saturating_sub(1))
+                        .is_none();
                 }
                 if obsolete && let Some(v) = self.versions.remove(&at) {
                     self.by_rev.remove(&(family.clone(), *revision, v.seq));
-                    deleted = deleted.checked_add(1).ok_or_else(|| overflow("deleted count"))?;
+                    deleted = deleted
+                        .checked_add(1)
+                        .ok_or_else(|| overflow("deleted count"))?;
                 }
                 cursor = Some(at);
-                visited = visited.checked_add(1).ok_or_else(|| overflow("visited count"))?;
+                visited = visited
+                    .checked_add(1)
+                    .ok_or_else(|| overflow("visited count"))?;
             }
             if self.next(cutoff, cursor.as_ref(), until)?.is_none() {
                 completed = cutoff;
-                target = if completed < horizon { Some(horizon) } else { None };
+                target = if completed < horizon {
+                    Some(horizon)
+                } else {
+                    None
+                };
                 cursor = None;
             }
         }
@@ -389,7 +413,13 @@ impl SimRecords {
 }
 
 impl Records for SimRecords {
-    fn get(&self, f: &str, k: &[u8], at: Consistency, _until: Instant) -> Result<Option<Row>, Refusal> {
+    fn get(
+        &self,
+        f: &str,
+        k: &[u8],
+        at: Consistency,
+        _until: Instant,
+    ) -> Result<Option<Row>, Refusal> {
         family(f)?;
         key(k)?;
         let st = self.state()?;
@@ -431,7 +461,12 @@ impl Records for SimRecords {
                 .checked_duration_since(Instant::now())
                 .filter(|d| !d.is_zero())
                 .ok_or(Refusal::Timeout)?;
-            st = self.inner.changed.wait_timeout(st, left).map_err(poisoned)?.0;
+            st = self
+                .inner
+                .changed
+                .wait_timeout(st, left)
+                .map_err(poisoned)?
+                .0;
         }
     }
 
@@ -504,48 +539,114 @@ mod tests {
     /// a compaction frees the versions it drops, and the commit then goes in.
     #[test]
     fn its_rows_and_versions_are_bounded_and_say_so() {
-        let r = SimRecords::new(SimLimits { rows: 2, versions: 4 });
-        let first = r.commit(tx(vec![put("a", "1"), put("b", "1")]), until()).unwrap();
-        assert_eq!(r.commit(tx(vec![put("c", "1")]), until()), Err(Refusal::Full { limit: 2 }));
+        let r = SimRecords::new(SimLimits {
+            rows: 2,
+            versions: 4,
+        });
+        let first = r
+            .commit(tx(vec![put("a", "1"), put("b", "1")]), until())
+            .unwrap();
+        assert_eq!(
+            r.commit(tx(vec![put("c", "1")]), until()),
+            Err(Refusal::Full { limit: 2 })
+        );
         // A delete and a put in one commit stay within the rows.
-        r.commit(tx(vec![Write::Delete { family: "f".into(), key: b"b".to_vec() }, put("c", "1")]), until()).unwrap();
+        r.commit(
+            tx(vec![
+                Write::Delete {
+                    family: "f".into(),
+                    key: b"b".to_vec(),
+                },
+                put("c", "1"),
+            ]),
+            until(),
+        )
+        .unwrap();
         // Four versions held: a fifth is refused, and the head stays.
         let head = r.head(until()).unwrap();
-        assert_eq!(r.commit(tx(vec![put("a", "2")]), until()), Err(Refusal::Full { limit: 4 }));
+        assert_eq!(
+            r.commit(tx(vec![put("a", "2")]), until()),
+            Err(Refusal::Full { limit: 4 })
+        );
         assert_eq!(r.head(until()).unwrap(), head);
-        assert_eq!(r.get("f", b"a", Consistency::Snapshot(first), until()).unwrap().map(|x| x.value), Some(b"1".to_vec()));
+        assert_eq!(
+            r.get("f", b"a", Consistency::Snapshot(first), until())
+                .unwrap()
+                .map(|x| x.value),
+            Some(b"1".to_vec())
+        );
         // Compacted to the head: b's put, hidden by its delete, goes (the delete, at the target,
         // stays).
         r.compact(head, until()).unwrap();
         r.commit(tx(vec![put("a", "2")]), until()).unwrap();
-        assert_eq!(r.get("f", b"a", Consistency::Linearizable, until()).unwrap().map(|x| x.value), Some(b"2".to_vec()));
+        assert_eq!(
+            r.get("f", b"a", Consistency::Linearizable, until())
+                .unwrap()
+                .map(|x| x.value),
+            Some(b"2".to_vec())
+        );
     }
 
     /// CP-T1.5: a compaction steps at most TX_MAX versions at a time, keeps each key's version at
     /// its target and the deletes at it, and its horizons refuse what's before them.
     #[test]
     fn compaction_steps_are_bounded_and_keep_the_target_s_reads() {
-        let r = SimRecords::new(SimLimits { rows: TX_MAX, versions: 3 * TX_MAX });
+        let r = SimRecords::new(SimLimits {
+            rows: TX_MAX,
+            versions: 3 * TX_MAX,
+        });
         let keys: Vec<String> = (0..TX_MAX).map(|i| format!("k{i:04}")).collect();
-        r.commit(tx(keys.iter().map(|k| put(k, "1")).collect()), until()).unwrap();
-        let second = r.commit(tx(keys.iter().map(|k| put(k, "2")).collect()), until()).unwrap();
+        r.commit(tx(keys.iter().map(|k| put(k, "1")).collect()), until())
+            .unwrap();
+        let second = r
+            .commit(tx(keys.iter().map(|k| put(k, "2")).collect()), until())
+            .unwrap();
         let first = r.compact_step(second, until()).unwrap();
-        assert_eq!((first.visited, first.deleted, first.more), (TX_MAX, TX_MAX / 2, true));
+        assert_eq!(
+            (first.visited, first.deleted, first.more),
+            (TX_MAX, TX_MAX / 2, true)
+        );
         assert_eq!(first.horizon, second);
         assert_eq!(first.feed, second - 1);
         let rest = r.compact_step(second, until()).unwrap();
-        assert_eq!((rest.visited, rest.deleted, rest.more, rest.completed), (TX_MAX, TX_MAX / 2, false, second));
-        assert_eq!(r.get("f", b"k0000", Consistency::Snapshot(second), until()).unwrap().map(|x| x.value), Some(b"2".to_vec()));
-        assert!(matches!(r.get("f", b"k0000", Consistency::Snapshot(second - 1), until()), Err(Refusal::Compacted { .. })));
-        assert_eq!(r.changes("f", second - 1, TX_MAX, until()).unwrap().changes.len(), TX_MAX);
-        assert!(matches!(r.changes("f", 0, 10, until()), Err(Refusal::Compacted { asked: 0, .. })));
+        assert_eq!(
+            (rest.visited, rest.deleted, rest.more, rest.completed),
+            (TX_MAX, TX_MAX / 2, false, second)
+        );
+        assert_eq!(
+            r.get("f", b"k0000", Consistency::Snapshot(second), until())
+                .unwrap()
+                .map(|x| x.value),
+            Some(b"2".to_vec())
+        );
+        assert!(matches!(
+            r.get("f", b"k0000", Consistency::Snapshot(second - 1), until()),
+            Err(Refusal::Compacted { .. })
+        ));
+        assert_eq!(
+            r.changes("f", second - 1, TX_MAX, until())
+                .unwrap()
+                .changes
+                .len(),
+            TX_MAX
+        );
+        assert!(matches!(
+            r.changes("f", 0, 10, until()),
+            Err(Refusal::Compacted { asked: 0, .. })
+        ));
     }
 
     /// CP-T1.5: a wait left waiting when a compaction moves the feed past it is refused then.
     #[test]
     fn a_wait_overtaken_by_a_compaction_is_refused() {
         let r = SimRecords::new(roomy());
-        let other = |v: &str| tx(vec![Write::Put { family: "other".into(), key: b"x".to_vec(), value: v.as_bytes().to_vec() }]);
+        let other = |v: &str| {
+            tx(vec![Write::Put {
+                family: "other".into(),
+                key: b"x".to_vec(),
+                value: v.as_bytes().to_vec(),
+            }])
+        };
         r.commit(other("1"), until()).unwrap();
         r.commit(other("2"), until()).unwrap();
         let head = r.commit(other("3"), until()).unwrap();
@@ -554,6 +655,12 @@ mod tests {
             r.compact(head, until()).unwrap();
             waiter.join().unwrap()
         });
-        assert_eq!(waited, Err(Refusal::Compacted { asked: 0, horizon: head - 1 }));
+        assert_eq!(
+            waited,
+            Err(Refusal::Compacted {
+                asked: 0,
+                horizon: head - 1
+            })
+        );
     }
 }

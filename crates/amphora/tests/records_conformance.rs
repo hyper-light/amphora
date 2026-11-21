@@ -26,9 +26,17 @@ fn until() -> Instant {
     Instant::now() + HANG
 }
 
-fn passes_every_case<R: Records>(what: &str, cases: &[Case], make: impl FnMut() -> Result<R, amphora_api::Refusal>) {
+fn passes_every_case<R: Records>(
+    what: &str,
+    cases: &[Case],
+    make: impl FnMut() -> Result<R, amphora_api::Refusal>,
+) {
     let report = run(cases, make, HANG);
-    assert!(report.is_ok() && report.passed.len() == cases.len(), "{what}: {:?}", report.failed);
+    assert!(
+        report.is_ok() && report.passed.len() == cases.len(),
+        "{what}: {:?}",
+        report.failed
+    );
 }
 
 /// AC-T1.5.3: Amphora in memory passes every case, a namespace of its own for each.
@@ -78,8 +86,12 @@ impl Choices {
         self.0 ^= self.0 >> 27;
         self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % n.max(1)
     }
+    /// A choice below `n`, as an index.
+    fn index(&mut self, n: usize) -> usize {
+        usize::try_from(self.below(u64::try_from(n).unwrap())).unwrap()
+    }
     fn pick<'a, T>(&mut self, of: &'a [T]) -> &'a T {
-        &of[self.below(of.len() as u64) as usize]
+        &of[self.index(of.len())]
     }
 }
 
@@ -97,52 +109,97 @@ fn step(c: &mut Choices, amphora: &dyn Records, sim: &dyn Records) -> String {
             for _ in 0..c.below(3) {
                 let (f, k) = (*c.pick(&FAMILIES), c.pick(&KEYS).to_vec());
                 tx.conds.push(if c.below(2) == 0 {
-                    Cond::Absent { family: f.into(), key: k }
+                    Cond::Absent {
+                        family: f.into(),
+                        key: k,
+                    }
                 } else {
-                    Cond::At { family: f.into(), key: k, rev }
+                    Cond::At {
+                        family: f.into(),
+                        key: k,
+                        rev,
+                    }
                 });
             }
             for _ in 0..c.below(4) {
                 let (f, k) = (*c.pick(&FAMILIES), c.pick(&KEYS).to_vec());
                 tx.writes.push(if c.below(3) == 0 {
-                    Write::Delete { family: f.into(), key: k }
+                    Write::Delete {
+                        family: f.into(),
+                        key: k,
+                    }
                 } else {
-                    Write::Put { family: f.into(), key: k, value: c.below(4).to_be_bytes().to_vec() }
+                    Write::Put {
+                        family: f.into(),
+                        key: k,
+                        value: c.below(4).to_be_bytes().to_vec(),
+                    }
                 });
             }
-            let (a, s) = (amphora.commit(tx.clone(), until()), sim.commit(tx.clone(), until()));
+            let (a, s) = (
+                amphora.commit(tx.clone(), until()),
+                sim.commit(tx.clone(), until()),
+            );
             assert_eq!(a, s, "commit {tx:?}");
             format!("commit {tx:?}: {s:?}")
         }
         2 => {
             let key = c.pick(&KEYS);
-            let at = if c.below(2) == 0 { Consistency::Linearizable } else { Consistency::Snapshot(rev) };
-            let (a, s) = (amphora.get(family, key, at, until()), sim.get(family, key, at, until()));
+            let at = if c.below(2) == 0 {
+                Consistency::Linearizable
+            } else {
+                Consistency::Snapshot(rev)
+            };
+            let (a, s) = (
+                amphora.get(family, key, at, until()),
+                sim.get(family, key, at, until()),
+            );
             assert_eq!(a, s, "get {family} {key:?} {at:?}");
             format!("get {family} {key:?} {at:?}: {s:?}")
         }
         3 => {
-            let prefix = c.pick(&KEYS)[..c.below(2) as usize].to_vec();
+            let prefix = c.pick(&KEYS)[..c.index(2)].to_vec();
             let after = (c.below(2) == 0).then(|| c.pick(&KEYS).to_vec());
-            let at = if c.below(2) == 0 { Consistency::Linearizable } else { Consistency::Snapshot(rev) };
-            let scan = Scan { prefix, after, limit: c.below(4) as usize, at };
-            let (a, s) = (amphora.scan(family, scan.clone(), until()), sim.scan(family, scan.clone(), until()));
+            let at = if c.below(2) == 0 {
+                Consistency::Linearizable
+            } else {
+                Consistency::Snapshot(rev)
+            };
+            let scan = Scan {
+                prefix,
+                after,
+                limit: c.index(4),
+                at,
+            };
+            let (a, s) = (
+                amphora.scan(family, scan.clone(), until()),
+                sim.scan(family, scan.clone(), until()),
+            );
             assert_eq!(a, s, "scan {family} {scan:?}");
             format!("scan {family} {scan:?}: {s:?}")
         }
         4 => {
-            let limit = c.below(5) as usize;
-            let (a, s) = (amphora.changes(family, rev, limit, until()), sim.changes(family, rev, limit, until()));
+            let limit = c.index(5);
+            let (a, s) = (
+                amphora.changes(family, rev, limit, until()),
+                sim.changes(family, rev, limit, until()),
+            );
             assert_eq!(a, s, "changes {family} after {rev} limit {limit}");
             format!("changes {family} {rev} {limit}: {s:?}")
         }
         5 => {
-            let (a, s) = (amphora.changed(family, rev, until()), sim.changed(family, rev, until()));
+            let (a, s) = (
+                amphora.changed(family, rev, until()),
+                sim.changed(family, rev, until()),
+            );
             assert_eq!(a, s, "changed {family} after {rev}");
             format!("changed {family} {rev}: {s:?}")
         }
         _ => {
-            let (a, s) = (amphora.compact_step(rev, until()), sim.compact_step(rev, until()));
+            let (a, s) = (
+                amphora.compact_step(rev, until()),
+                sim.compact_step(rev, until()),
+            );
             assert_eq!(a, s, "compact_step {rev}");
             format!("compact_step {rev}: {s:?}")
         }
@@ -161,22 +218,40 @@ fn the_simulator_answers_as_amphora_does() {
     let mut kinds = std::collections::BTreeMap::<String, u64>::new();
     for seed in 0..seeds {
         let amphora = db.namespace(&format!("seed-{seed}")).unwrap();
-        let sim = SimRecords::new(SimLimits { rows: TX_MAX, versions: TX_MAX * TX_MAX });
+        let sim = SimRecords::new(SimLimits {
+            rows: TX_MAX,
+            versions: TX_MAX * TX_MAX,
+        });
         let mut c = Choices(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
         for _ in 0..steps {
             let said = step(&mut c, &amphora, &sim);
             let kind = said.split([' ', ':']).next().unwrap_or("").to_owned();
             let refused = said.contains("Err(");
-            *kinds.entry(format!("{kind}{}", if refused { " refused" } else { "" })).or_default() += 1;
+            *kinds
+                .entry(format!("{kind}{}", if refused { " refused" } else { "" }))
+                .or_default() += 1;
         }
         let head: Rev = sim.head(until()).unwrap();
         assert_eq!(amphora.head(until()).unwrap(), head);
     }
     // Not vacuous: every kind of request was made, answered and refused.
-    for kind in ["commit", "get", "scan", "changes", "changed", "compact_step"] {
-        assert!(kinds.get(kind).copied().unwrap_or(0) > 0, "no {kind} answered: {kinds:?}");
+    for kind in [
+        "commit",
+        "get",
+        "scan",
+        "changes",
+        "changed",
+        "compact_step",
+    ] {
+        assert!(
+            kinds.get(kind).copied().unwrap_or(0) > 0,
+            "no {kind} answered: {kinds:?}"
+        );
     }
     for kind in ["commit refused", "get refused", "changes refused"] {
-        assert!(kinds.get(kind).copied().unwrap_or(0) > 0, "no {kind}: {kinds:?}");
+        assert!(
+            kinds.get(kind).copied().unwrap_or(0) > 0,
+            "no {kind}: {kinds:?}"
+        );
     }
 }

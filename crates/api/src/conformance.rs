@@ -91,7 +91,9 @@ pub fn fine<T>(what: &str, v: Result<T, Refusal>) -> Result<T, Failure> {
 /// The refusal `v` should have been, or a failure saying it wasn't.
 pub fn refused<T: std::fmt::Debug>(what: &str, v: Result<T, Refusal>) -> Result<Refusal, Failure> {
     match v {
-        Ok(t) => Err(format!("{what}: accepted ({t:?}), should have been refused")),
+        Ok(t) => Err(format!(
+            "{what}: accepted ({t:?}), should have been refused"
+        )),
         Err(e) => Ok(e),
     }
 }
@@ -160,7 +162,10 @@ fn c2(r: &dyn Records, until: Instant) -> Result<(), Failure> {
     let start = fine("head", r.head(until))?;
     let mut last = start;
     for i in 0..5 {
-        let rev = fine("commit", r.commit(tx(vec![put(&format!("k{i}"), "v")]), until))?;
+        let rev = fine(
+            "commit",
+            r.commit(tx(vec![put(&format!("k{i}"), "v")]), until),
+        )?;
         ensure(rev > last, || {
             format!("commit {i} got revision {rev}, not above {last}")
         })?;
@@ -397,11 +402,7 @@ fn c10(r: &dyn Records, until: Instant) -> Result<(), Failure> {
     });
     let r2 = fine("commit", committed)?;
     let waited = waited.map_err(|_| "the waiting thread panicked".to_owned())?;
-    same(
-        "the wait, once a newer change is committed",
-        waited,
-        Ok(r2),
-    )
+    same("the wait, once a newer change is committed", waited, Ok(r2))
 }
 
 fn c11(r: &dyn Records, until: Instant) -> Result<(), Failure> {
@@ -441,7 +442,12 @@ fn c11(r: &dyn Records, until: Instant) -> Result<(), Failure> {
     let head = fine("head", r.head(until))?;
     let e = refused(
         "a snapshot ahead of the head",
-        r.get(F, b"a", Consistency::Snapshot(head.saturating_add(1)), until),
+        r.get(
+            F,
+            b"a",
+            Consistency::Snapshot(head.saturating_add(1)),
+            until,
+        ),
     )?;
     ensure(matches!(e, Refusal::Ahead { .. }), || {
         format!("refused as {e:?}, not Ahead")
@@ -491,7 +497,10 @@ fn c12(r: &dyn Records, until: Instant) -> Result<(), Failure> {
         value: vec![0; VALUE_MAX.saturating_add(1)],
     };
     ensure(
-        matches!(r.commit(tx(vec![big]), until), Err(Refusal::TooLarge { .. })),
+        matches!(
+            r.commit(tx(vec![big]), until),
+            Err(Refusal::TooLarge { .. })
+        ),
         || "a value over the limit wasn't refused TooLarge".into(),
     )?;
     let many = tx((0..=TX_MAX).map(|i| put(&format!("k{i}"), "v")).collect());
@@ -609,9 +618,9 @@ fn c14(r: &dyn Records, until: Instant) -> Result<(), Failure> {
     match r.changed(F, from, until) {
         Err(Refusal::Compacted { .. }) => Ok(()),
         Ok(Some(rev)) if rev == r2 => Ok(()),
-        Ok(None) => Err(
-            "a wait from before the compaction, for a change made then, didn't complete".into(),
-        ),
+        Ok(None) => {
+            Err("a wait from before the compaction, for a change made then, didn't complete".into())
+        }
         other => Err(format!("a wait from before the compaction: {other:?}")),
     }
 }
@@ -639,7 +648,10 @@ fn feed_1(r: &dyn Records, until: Instant) -> Result<(), Failure> {
     let rest = fine("changes after the page", r.changes(F, r1, 2, until))?;
     same(
         "the commit after the page, whole",
-        rest.changes.iter().map(|c| (c.rev, c.key.clone())).collect::<Vec<_>>(),
+        rest.changes
+            .iter()
+            .map(|c| (c.rev, c.key.clone()))
+            .collect::<Vec<_>>(),
         vec![(r2, b"b".to_vec()), (r2, b"c".to_vec())],
     )
 }
@@ -653,7 +665,12 @@ fn index_1(r: &dyn Records, until: Instant) -> Result<(), Failure> {
     };
     // "run" is a prefix of "running", and "a\0" holds the escaped byte.
     let mut writes = vec![row("r1", "run"), row("r2", "running"), row("r3", "run")];
-    let terms: [(&str, &[u8]); 4] = [("r1", b"run"), ("r2", b"running"), ("r3", b"run"), ("r4", b"a\0")];
+    let terms: [(&str, &[u8]); 4] = [
+        ("r1", b"run"),
+        ("r2", b"running"),
+        ("r3", b"run"),
+        ("r4", b"a\0"),
+    ];
     for (id, term) in terms {
         writes.push(fine("an index write", index.put(term, id.as_bytes()))?);
     }
@@ -683,14 +700,15 @@ fn index_1(r: &dyn Records, until: Instant) -> Result<(), Failure> {
         under(b"run")?,
         vec![b"r1".to_vec(), b"r3".to_vec()],
     )?;
-    same("rows under running", under(b"running")?, vec![b"r2".to_vec()])?;
+    same(
+        "rows under running",
+        under(b"running")?,
+        vec![b"r2".to_vec()],
+    )?;
     same("rows under a\\0", under(b"a\0")?, vec![b"r4".to_vec()])?;
     same("rows under a", under(b"a")?, Vec::<Vec<u8>>::new())?;
     // r1 moves from run to running in the commit that changes it.
-    let mut moved = fine(
-        "a move",
-        index.moved(b"r1", &[b"run"], &[b"running"]),
-    )?;
+    let mut moved = fine("a move", index.moved(b"r1", &[b"run"], &[b"running"]))?;
     moved.push(row("r1", "running"));
     fine("a row and its index moved", r.commit(tx(moved), until))?;
     same("rows under run after", under(b"run")?, vec![b"r3".to_vec()])?;
@@ -716,7 +734,10 @@ fn counter_1(r: &dyn Records, until: Instant) -> Result<(), Failure> {
     };
     let first = fine("the first number", counter.take(r, until))?;
     same("the first number", first.value, 1)?;
-    fine("a commit taking it", r.commit(release(first.value, &first), until))?;
+    fine(
+        "a commit taking it",
+        r.commit(release(first.value, &first), until),
+    )?;
     // Two takers from one reading: one commits, the other is refused and writes nothing.
     let a = fine("a taker", counter.take(r, until))?;
     let b = fine("another taker", counter.take(r, until))?;
@@ -728,15 +749,18 @@ fn counter_1(r: &dyn Records, until: Instant) -> Result<(), Failure> {
     })?;
     let again = fine("the second taker, read again", counter.take(r, until))?;
     same("its number, read again", again.value, 3)?;
-    fine("the second taker's commit", r.commit(release(again.value, &again), until))?;
-    let taken = fine(
-        "the numbers taken",
-        r.scan(F, scan("", None, 10), until),
+    fine(
+        "the second taker's commit",
+        r.commit(release(again.value, &again), until),
     )?;
+    let taken = fine("the numbers taken", r.scan(F, scan("", None, 10), until))?;
     same(
         "each number once",
         taken.rows.iter().map(|x| x.key.clone()).collect::<Vec<_>>(),
-        [1u64, 2, 3].iter().map(|n| n.to_be_bytes().to_vec()).collect::<Vec<_>>(),
+        [1u64, 2, 3]
+            .iter()
+            .map(|n| n.to_be_bytes().to_vec())
+            .collect::<Vec<_>>(),
     )
 }
 

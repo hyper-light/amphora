@@ -94,7 +94,11 @@ impl Counter {
     }
 
     /// Reads the counter's row and takes the number after it ([`Counter::after`]).
-    pub fn take(&self, records: &(impl Records + ?Sized), until: Instant) -> Result<Taken, Refusal> {
+    pub fn take(
+        &self,
+        records: &(impl Records + ?Sized),
+        until: Instant,
+    ) -> Result<Taken, Refusal> {
         let current = records.get(&self.family, &self.key, Consistency::Linearizable, until)?;
         self.after(current.as_ref())
     }
@@ -151,19 +155,34 @@ mod tests {
     #[test]
     fn exhausted_malformed_and_foreign_rows_are_refused() {
         let counter = Counter::new("deploy.counter", b"n").unwrap();
-        assert!(matches!(counter.after(Some(&row(u64::MAX, 1))), Err(Refusal::Invalid { .. })));
+        assert!(matches!(
+            counter.after(Some(&row(u64::MAX, 1))),
+            Err(Refusal::Invalid { .. })
+        ));
         let short = Row {
             key: b"n".to_vec(),
             value: vec![1, 2, 3],
             rev: 1,
         };
-        assert!(matches!(counter.after(Some(&short)), Err(Refusal::Invalid { .. })));
+        assert!(matches!(
+            counter.after(Some(&short)),
+            Err(Refusal::Invalid { .. })
+        ));
         let foreign = Row {
             key: b"m".to_vec(),
             ..row(1, 1)
         };
-        assert!(matches!(counter.after(Some(&foreign)), Err(Refusal::Invalid { .. })));
-        assert!(matches!(Counter::new("Bad!", b"n"), Err(Refusal::Invalid { .. })));
-        assert!(matches!(Counter::new("ok", b""), Err(Refusal::Invalid { .. })));
+        assert!(matches!(
+            counter.after(Some(&foreign)),
+            Err(Refusal::Invalid { .. })
+        ));
+        assert!(matches!(
+            Counter::new("Bad!", b"n"),
+            Err(Refusal::Invalid { .. })
+        ));
+        assert!(matches!(
+            Counter::new("ok", b""),
+            Err(Refusal::Invalid { .. })
+        ));
     }
 }
