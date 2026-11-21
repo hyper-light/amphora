@@ -4,9 +4,9 @@
 //! graded table of the sources. Do: read both. Expect: every citation resolves to a claim and every
 //! claim is cited; every claim's source is in the table with a locator and a grade from A to F, and
 //! every source there is used; every paragraph, list item and table row of the decision that states
-//! a number cites a claim, and each such number is in a quote it cites; every paragraph of the
-//! sections that describe Amphora and the six designs, and every cell of the comparison after its
-//! first column, cites a claim. That the quotes are the sources' own words, on the pages given, was
+//! a number cites a claim, and each such number is in a quote it cites (in the comparison, a quote
+//! its own cell cites); every paragraph of the sections that describe Amphora and the six designs,
+//! and every cell of the comparison after its first column, cites a claim. That the quotes are the sources' own words, on the pages given, was
 //! checked against the sources when the note was written (its "How to read this").
 
 #![allow(
@@ -304,23 +304,41 @@ fn faults(design: &str, note: &str) -> Vec<String> {
             continue;
         }
         let ids = cites(&unit.text);
-        let stated_numbers = numbers(&stated(&unit.text), false);
-        let held: BTreeSet<String> = ids
-            .iter()
-            .filter_map(|id| claims.get(id))
-            .flat_map(|c| numbers(&c.quote, true))
-            .collect();
-        let head: String = unit.text.chars().take(70).collect();
-        for n in stated_numbers.iter().filter(|n| !held.contains(*n)) {
-            faults.push(format!("{n} is in no quote cited by: {head}"));
+        let comparison = unit.section.starts_with("## The comparison") && unit.row;
+        // A comparison cell's numbers are held to the quotes that cell cites: a row's other cells
+        // cite other claims, whose quotes may hold the same number by chance.
+        let cells: Vec<&str> = unit.text.split('|').collect();
+        let pieces: Vec<&str> = if comparison {
+            cells
+                .iter()
+                .skip(1)
+                .take(cells.len().saturating_sub(2))
+                .copied()
+                .collect()
+        } else {
+            vec![unit.text.as_str()]
+        };
+        for piece in pieces {
+            let held: BTreeSet<String> = cites(piece)
+                .iter()
+                .filter_map(|id| claims.get(id))
+                .flat_map(|c| numbers(&c.quote, true))
+                .collect();
+            let head: String = piece.trim().chars().take(70).collect();
+            for n in numbers(&stated(piece), false)
+                .iter()
+                .filter(|n| !held.contains(*n))
+            {
+                faults.push(format!("{n} is in no quote cited by: {head}"));
+            }
         }
+        let head: String = unit.text.chars().take(70).collect();
         let described = unit.section.starts_with("## What a design must fit")
             || unit.section.starts_with("## The six designs");
         if described && ids.is_empty() {
             faults.push(format!("uncited: {head}"));
         }
-        if unit.section.starts_with("## The comparison") && unit.row {
-            let cells: Vec<&str> = unit.text.split('|').collect();
+        if comparison {
             for cell in cells.iter().skip(2).take(cells.len().saturating_sub(3)) {
                 if cites(cell).is_empty() {
                     faults.push(format!(
@@ -353,7 +371,7 @@ fn cs_1_a_number_no_cited_quote_holds_is_a_fault() {
     let changed = DESIGN.replacen("36.8 a second", "36.9 a second", 1);
     assert_ne!(changed, DESIGN);
     let faults = faults(&changed, NOTE);
-    assert!(faults.iter().any(|f| f.starts_with("369 ")), "{faults:?}");
+    assert!(faults.iter().any(|f| f.starts_with("36.9 ")), "{faults:?}");
 }
 
 #[test]
