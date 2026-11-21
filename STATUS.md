@@ -743,6 +743,12 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   the cascade a loop with no fixed depth; integers, doubles, strings and nulls round-trip bit for
   bit (T-CS.3.1). Its decode benchmark (`cargo bench -p amphora-columnar --bench decode`) is not yet
   measured against [c18]'s 8 values a cycle.
+- **G5 step 4, skipping rows** (docs/design/executor.md decision 8; AC-G5.4.1, T-G5.4.1; lane
+  g5s4): built, not measured, not wired. `crates/engine/skipping` holds zone maps over leaf runs and
+  database cracking behind one switch, each kept from the write path through one hook; with writes
+  between scans each names exactly what a plain scan finds (T-G5.4.1). Open: the scan and write
+  costs (`crates/engine/tests/skipping_bench.rs`), the choice they make, and the VDBE's scan and
+  write opcodes calling the switch.
 
 ## Open
 

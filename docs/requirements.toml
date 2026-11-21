@@ -869,3 +869,15 @@ tests = [
   { id = "T-G3.3.4", text = "storage::pager::tests::g3s3_plain_pins_count_as_atomic_pins_do — passes when plain pins count as atomic pins do" },
   { id = "T-G3.3.5", text = "crates/engine/tests/shared_pages.rs g3s3_plain_misses_read_into_the_pages_evictions_leave — passes when a table four times the cache reads today's rows on the plain path and its misses read into recycled pages" },
 ]
+
+# lane g5s4: G5 step 4 (kiln plan 01a16b0f46ab717ea1e3c87c7f5e0b92), skipping rows.
+[[own]]
+id = "G5.4"
+title = "Skipping rows: zone maps over leaf runs against cracking (G5 step 4; executor.md decision 8)"
+criteria = [
+  { id = "AC-G5.4.1", text = "both prototypes' scan and write costs recorded on filter_no_index-like classes with writes interleaved (crates/engine/tests/skipping_bench.rs; measured by the coordinator)" },
+  { id = "AC-G5.4.2", text = "filter_no_index at 1 client with the winner rises at least 1000% against step 3 (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-G5.4.1", text = "skipping::tests::t_g5_4_1_* — passes when, with writes between scans, each prototype's candidates hold exactly a plain scan's rows, no row missed and none stale" },
+]
