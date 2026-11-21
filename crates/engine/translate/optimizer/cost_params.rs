@@ -248,6 +248,26 @@ impl CostModelParams {
         }
     }
 
+    /// Amphora (PL.7): these parameters with the weights fitted to the database's measured
+    /// statement times (`cost_fit`), read after the learned ones: each fitted weight in page reads,
+    /// and each weight with no samples as it stands (the learned calibration's). None, the switch
+    /// off or nothing fitted yet, leaves these.
+    pub(crate) fn with_fitted(&self, fitted: Option<super::cost_fit::FittedWeights>) -> Self {
+        use super::cost_fit::Term;
+        let Some(f) = fitted else {
+            return self.clone();
+        };
+        let row = f.in_pages(Term::Row, self.cpu_cost_per_row, self.cpu_cost_per_row);
+        Self {
+            cpu_cost_per_row: row,
+            cpu_cost_per_seek: f.in_pages(Term::Seek, self.cpu_cost_per_seek, row),
+            hash_insert_cost: f.in_pages(Term::HashBuild, self.hash_insert_cost, row),
+            hash_lookup_cost: f.in_pages(Term::HashProbe, self.hash_lookup_cost, row),
+            sort_cpu_per_row: f.in_pages(Term::Sort, self.sort_cpu_per_row, row),
+            ..self.clone()
+        }
+    }
+
     /// Amphora: these parameters with the statement's memory, `bytes` (executor decision 8).
     pub fn with_statement_memory(&self, bytes: usize) -> Self {
         Self {

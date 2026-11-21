@@ -9477,11 +9477,14 @@ pub fn op_sorter_sort(
     // unit, rows times log2 rows (`cost::estimate_sort_cpu_cost`).
     if let Some((rows, nanos)) = timed {
         let rows = rows as f64;
+        let units = rows * rows.max(1.0).log2();
         program.connection.db.learned_costs.observe(
             crate::translate::optimizer::learned_costs::Work::Sort,
-            rows * rows.max(1.0).log2(),
+            units,
             nanos,
         );
+        // Amphora (PL.7): the statement's sort work, a term of the fitted cost model.
+        state.metrics.sort_units += units;
     }
     // Increment metrics for sort operation after cursor is dropped
     if did_sort {
@@ -18065,7 +18068,10 @@ pub fn op_hash_build(
             payload_values: std::mem::replace(&mut op_state.payload_values, crate::alloc::vec![]),
         };
         match ht.insert_pending(pending, Some(&mut state.metrics.hash_join))? {
-            HashInsertResult::Done => {}
+            HashInsertResult::Done => {
+                state.metrics.hash_join.build_rows =
+                    state.metrics.hash_join.build_rows.saturating_add(1);
+            }
             HashInsertResult::IO { io, pending } => {
                 op_state.key_values = pending.key_values;
                 op_state.payload_values = pending.payload_values;

@@ -333,6 +333,23 @@ pub struct Statement {
     plan_choice: PlanChoice,
     /// Amphora (PL.12): the custom run under way, measured until it ends.
     custom_run: Option<OpenCustomRun>,
+    /// Amphora (PL.7): the run under way, when the database's fit chose to time it.
+    cost_sample: Option<CostSample>,
+}
+
+/// Amphora (PL.7): a run timed for the fitted cost model (`optimizer::cost_fit`): its counters
+/// when it began, and the nanoseconds it has run. A run's time is its steps' time and its waits on
+/// IO between them; the caller's time between a row and the next step, and a busy handler's sleep,
+/// are not the statement's work.
+#[derive(Debug, Clone)]
+struct CostSample {
+    metrics: vdbe::metrics::StatementMetrics,
+    page_reads: u64,
+    nanos: f64,
+    /// The steps timed: each made two clock reads.
+    steps: u64,
+    /// When a step that handed the caller IO to wait on ended.
+    io_since: Option<std::time::Instant>,
 }
 
 /// Amphora (PL.12): a custom run under way: its plan's estimated cost, the time its planning took,
@@ -426,6 +443,7 @@ impl Statement {
             generic: None,
             plan_choice: PlanChoice::default(),
             custom_run: None,
+            cost_sample: None,
         }
     }
 
@@ -599,12 +617,82 @@ impl Statement {
     /// gated behind cheap flag tests and kept out of line. A row in the middle
     /// of a scan runs only the interpreter call and the result-row bookkeeping.
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        let timed = self.cost_sample_begin();
         let result = self.step_inner(waker);
+        if let Some(began) = timed {
+            self.cost_sample_end(began, &result);
+        }
         // Amphora (PL.12): a custom run's running ends with its last step, or its error.
         if self.custom_run.is_some() && matches!(result, Ok(StepResult::Done) | Err(_)) {
             self.close_custom_run();
         }
         result
+    }
+
+    /// Amphora (PL.7): at a run's first step, asks the database's fit whether to time it (never,
+    /// with its switch off: one atomic load); within a timed run, the step's start, adding the IO
+    /// wait the last step handed the caller.
+    #[inline]
+    fn cost_sample_begin(&mut self) -> Option<std::time::Instant> {
+        if self.cost_sample.is_none() {
+            if !matches!(self.state.execution_state, ProgramExecutionState::Init)
+                || self.analyze_refresh.is_some()
+                || !self.program.connection.db.cost_fit.take()
+            {
+                return None;
+            }
+            self.cost_sample = Some(CostSample {
+                metrics: self.state.metrics(),
+                page_reads: self.pager.page_file_reads(),
+                nanos: 0.0,
+                steps: 0,
+                io_since: None,
+            });
+        }
+        let now = std::time::Instant::now();
+        if let Some(sample) = self.cost_sample.as_mut() {
+            if let Some(since) = sample.io_since.take() {
+                sample.nanos += now.saturating_duration_since(since).as_nanos() as f64;
+            }
+        }
+        Some(now)
+    }
+
+    /// Amphora (PL.7): ends a timed step; at the run's end, gives the fit its counted work and
+    /// time. A run that fails or is interrupted is dropped: its work is not all counted.
+    #[inline(never)]
+    fn cost_sample_end(&mut self, began: std::time::Instant, result: &Result<StepResult>) {
+        use crate::translate::optimizer::cost_fit::{Counts, Term};
+        let ended = std::time::Instant::now();
+        let Some(sample) = self.cost_sample.as_mut() else {
+            return;
+        };
+        sample.nanos += ended.saturating_duration_since(began).as_nanos() as f64;
+        sample.steps = sample.steps.saturating_add(1);
+        match result {
+            Ok(StepResult::IO | StepResult::Yield) => sample.io_since = Some(ended),
+            Ok(StepResult::Row | StepResult::Busy | StepResult::Sleep { .. }) => {}
+            Ok(StepResult::Done) => {
+                let Some(sample) = self.cost_sample.take() else {
+                    return;
+                };
+                let now = self.state.metrics();
+                let was = &sample.metrics;
+                let mut counts = Counts::default();
+                counts.add(
+                    Term::Row,
+                    now.btree_next.saturating_add(now.btree_prev).saturating_sub(was.btree_next.saturating_add(was.btree_prev)) as f64,
+                );
+                counts.add(Term::Seek, now.btree_seeks.saturating_sub(was.btree_seeks) as f64);
+                counts.add(Term::HashBuild, now.hash_join.build_rows.saturating_sub(was.hash_join.build_rows) as f64);
+                counts.add(Term::HashProbe, now.hash_join.probe_calls.saturating_sub(was.hash_join.probe_calls) as f64);
+                counts.add(Term::Sort, (now.sort_units - was.sort_units).max(0.0));
+                counts.add(Term::PageRead, self.pager.page_file_reads().saturating_sub(sample.page_reads) as f64);
+                let reads = sample.steps.saturating_mul(2) as f64;
+                self.program.connection.db.cost_fit.record(&counts, sample.nanos, reads);
+            }
+            Ok(StepResult::Interrupt) | Err(_) => self.cost_sample = None,
+        }
     }
 
     fn step_inner(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
@@ -1740,6 +1828,8 @@ impl Statement {
         }
 
         let mut reset_error: Option<LimboError> = None;
+        // Amphora (PL.7): a run reset before its end is not timed.
+        self.cost_sample = None;
 
         // Abandon an in-flight post-ANALYZE stats refresh. Its nested statement
         // is a read-only SELECT, so dropping it never has to block.

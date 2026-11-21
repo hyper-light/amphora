@@ -721,6 +721,9 @@ pub struct Database<
     pub(crate) learned_costs: Arc<crate::translate::optimizer::learned_costs::LearnedCosts>,
     /// Amphora (PL.9): each table's rows inserted less rows deleted since ANALYZE counted it.
     pub(crate) row_changes: Arc<crate::row_changes::RowChanges>,
+    /// Amphora (PL.7): the cost weights fitted to its statements' measured times, and the switch
+    /// the planner reads them behind.
+    pub(crate) cost_fit: Arc<crate::translate::optimizer::cost_fit::DatabaseFit>,
 
     /// Optional per-database MVCC durable storage override.
     ///
@@ -898,6 +901,7 @@ impl Database {
             _shared_page_cache: shared_page_cache,
             learned_costs,
             row_changes: Arc::new(crate::row_changes::RowChanges::new()),
+            cost_fit: Arc::new(crate::translate::optimizer::cost_fit::DatabaseFit::new()),
             shared_wal,
             #[cfg(host_shared_wal)]
             shared_wal_coordination: OnceLock::new(),
