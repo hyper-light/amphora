@@ -3331,6 +3331,7 @@ mod tests {
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            state: crate::schema::IndexState::Public,
         });
         available_indexes.insert_for_table_name(
             table_references.joined_tables(),
@@ -3422,6 +3423,7 @@ mod tests {
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            state: crate::schema::IndexState::Public,
         });
         available_indexes.insert_for_table_name(&joined_tables, "table1", VecDeque::from([index1]));
 
@@ -3559,6 +3561,7 @@ mod tests {
                     has_rowid: true,
                     index_method: None,
                     on_conflict: None,
+                    state: crate::schema::IndexState::Public,
                 });
                 available_indexes.insert_for_table_name(
                     &joined_tables,
@@ -3577,6 +3580,7 @@ mod tests {
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            state: crate::schema::IndexState::Public,
         });
         let order_id_idx = Arc::new(Index {
             name: "order_items_order_id_idx".to_string(),
@@ -3589,6 +3593,7 @@ mod tests {
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            state: crate::schema::IndexState::Public,
         });
 
         available_indexes.push_front_for_table_name(&joined_tables, "orders", customer_id_idx);
@@ -4091,6 +4096,7 @@ mod tests {
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            state: crate::schema::IndexState::Public,
         });
 
         let mut available_indexes = AvailableIndexes::default();
@@ -4192,6 +4198,7 @@ mod tests {
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            state: crate::schema::IndexState::Public,
         });
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
@@ -4307,6 +4314,7 @@ mod tests {
             unique: false,
             index_method: None,
             on_conflict: None,
+            state: crate::schema::IndexState::Public,
         });
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
@@ -4492,6 +4500,7 @@ mod tests {
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            state: crate::schema::IndexState::Public,
         })
     }
 
@@ -4637,6 +4646,7 @@ mod tests {
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            state: crate::schema::IndexState::Public,
         });
         available_indexes.insert_for_table_name(&joined_tables, "t2", VecDeque::from([index_t2_a]));
 
@@ -4775,6 +4785,7 @@ mod tests {
                 has_rowid: true,
                 index_method: None,
                 on_conflict: None,
+                state: crate::schema::IndexState::Public,
             });
             available_indexes.insert_for_table_name(&joined_tables, "t2", VecDeque::from([key]));
             let equal = |column| {
