@@ -90,7 +90,10 @@ impl Cost {
     fn within(&self, target: Option<u128>) -> u64 {
         match target {
             Some(t) if self.units > 0 => {
-                let n = t.saturating_mul(u128::from(self.units)) / u128::from(self.ns.max(1));
+                let n = t
+                    .saturating_mul(u128::from(self.units))
+                    .checked_div(u128::from(self.ns.max(1)))
+                    .unwrap_or(1);
                 u64::try_from(n).unwrap_or(u64::MAX).max(1)
             }
             Some(_) => 1,
@@ -471,7 +474,9 @@ impl<E: Engine> Groups<E> {
                     };
                     Ok((exported, began.elapsed()))
                 })?;
-                let units = u64::try_from(exported.keys.len()).unwrap_or(u64::MAX).max(1);
+                let units = u64::try_from(exported.keys.len())
+                    .unwrap_or(u64::MAX)
+                    .max(1);
                 self.ran(from, Work::Export, units, took);
                 let dst = self.store_of(to).ok_or(reshard::Refused::NoGroup(to))?;
                 let at = exported.at;
@@ -662,8 +667,9 @@ impl<E: Engine> Groups<E> {
     fn batch(&self, group: GroupId, work: Work) -> u64 {
         let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
         let mean = |c: &Counters| {
-            (c.commits > 0)
-                .then(|| u128::from(c.apply_us).saturating_mul(1000) / u128::from(c.commits))
+            u128::from(c.apply_us)
+                .saturating_mul(1000)
+                .checked_div(u128::from(c.commits))
         };
         let Some(held) = route.groups.get(&group) else {
             return 1;

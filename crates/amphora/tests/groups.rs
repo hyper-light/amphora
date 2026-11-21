@@ -727,14 +727,30 @@ fn t_t1_9_r6_a_retired_group_stays_retired_across_a_restart() {
             _ => None,
         })
         .unwrap();
-    let mut ended = drive(dir.path(), &groups, &mut driver, out, &keys, &mut acked, &mut next);
+    let mut ended = drive(
+        dir.path(),
+        &groups,
+        &mut driver,
+        out,
+        &keys,
+        &mut acked,
+        &mut next,
+    );
     let out = driver
         .begin(&Proposal::Merge {
             from: GroupId(1),
             into: GroupId(0),
         })
         .unwrap();
-    ended += drive(dir.path(), &groups, &mut driver, out, &keys, &mut acked, &mut next);
+    ended += drive(
+        dir.path(),
+        &groups,
+        &mut driver,
+        out,
+        &keys,
+        &mut acked,
+        &mut next,
+    );
     assert_eq!(ended, 2);
     assert!(groups.holding_of(GroupId(1)).is_none());
     groups.sync(soon()).unwrap();
@@ -747,7 +763,9 @@ fn t_t1_9_r6_a_retired_group_stays_retired_across_a_restart() {
         .unwrap();
     assert_eq!(
         reply,
-        Reply::Failed(Failure::Refused(amphora::reshard::Refused::Ended(create.op)))
+        Reply::Failed(Failure::Refused(amphora::reshard::Refused::Ended(
+            create.op
+        )))
     );
     assert_eq!(again.len(), 1);
     again.route(driver.directory()).unwrap();
