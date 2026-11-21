@@ -853,6 +853,7 @@ criteria = [
 tests = [
   { id = "T-CS.4.1", text = "cs4_vectors_equal_rows_every_class_{plain,packed} (crates/engine/storage/versioned/columns/scan.rs) — passes when, with writes between scans, some applied and some queued, rebuilds and held snapshots, every analytic class (filters of each comparison, aggregates, group-by, count) over the copy's granules equals the same statement row by row over the row B-tree, serially and split into partials merged in order, and the summaries skipped granules" },
   { id = "T-CS.4.2", text = "cs4_min_max_summaries_skip_granules — passes when a filter outside granules' min/max skips them unread and the answer equals the rows'" },
+  { id = "T-CS.4.3", text = "cs4_vectors_equal_rows_every_class_{plain,packed}, over key ranges — passes when a range scan skips blocks outside the range undecoded (by the blocks' key bounds), its granules hold every key of the range, and each class over the range equals the rows'" },
 ]
 
 # lane groupcommit (G8 step 3, the versioned storage's log; docs/design/engine.md decision 11): no new

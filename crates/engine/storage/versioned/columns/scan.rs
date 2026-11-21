@@ -35,7 +35,7 @@ use crate::types::{ImmutableRecordRef, ValueRef};
 use crate::Result;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Range;
+use std::ops::{Bound, Range};
 
 /// One column's value in a row.
 #[derive(Clone, Debug, PartialEq)]
@@ -262,6 +262,8 @@ pub struct Granule {
     pub first: Vec<u8>,
     pub last: Vec<u8>,
     pub rows: usize,
+    /// Each row's key, in order: what a key range's boundary granules are filtered by.
+    pub keys: KeyColumn,
     pub columns: Vec<Vector>,
     pub summaries: Vec<Summary>,
 }
@@ -313,10 +315,15 @@ impl Granule {
             columns.push(Vector::of(cells));
             summaries.push(s);
         }
+        let mut keys = KeyColumn::default();
+        for (k, _) in rows {
+            keys.push(k);
+        }
         Ok(Granule {
             first: rows.first().map(|(k, _)| k.clone()).unwrap_or_default(),
             last: rows.last().map(|(k, _)| k.clone()).unwrap_or_default(),
             rows: rows.len(),
+            keys,
             columns,
             summaries,
         })
@@ -333,9 +340,12 @@ impl Granule {
             Cell::Text(b) | Cell::Blob(b) => b.len().saturating_add(std::mem::size_of::<Cell>()),
             _ => std::mem::size_of::<Cell>(),
         };
-        self.columns
-            .iter()
-            .fold(self.first.len().saturating_add(self.last.len()), |n, v| {
+        self.columns.iter().fold(
+            self.first
+                .len()
+                .saturating_add(self.last.len())
+                .saturating_add(self.keys.resident()),
+            |n, v| {
                 let data = match &v.data {
                     Data::Int(x) => x.len().saturating_mul(8),
                     Data::Real(x) => x.len().saturating_mul(8),
@@ -346,7 +356,109 @@ impl Granule {
                 };
                 n.saturating_add(data)
                     .saturating_add(v.valid.as_ref().map_or(0, Vec::len))
-            })
+            },
+        )
+    }
+}
+
+/// A granule's keys as one buffer cut by offsets: key `i` is `bytes[ends[i - 1]..ends[i]]`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct KeyColumn {
+    bytes: Vec<u8>,
+    ends: Vec<usize>,
+}
+
+impl KeyColumn {
+    fn push(&mut self, k: &[u8]) {
+        self.bytes.extend_from_slice(k);
+        self.ends.push(self.bytes.len());
+    }
+
+    /// Key `i`, or None past the end.
+    pub fn get(&self, i: usize) -> Option<&[u8]> {
+        let start = match i.checked_sub(1) {
+            None => 0,
+            Some(before) => *self.ends.get(before)?,
+        };
+        self.bytes.get(start..*self.ends.get(i)?)
+    }
+
+    fn resident(&self) -> usize {
+        self.bytes
+            .len()
+            .saturating_add(self.ends.len().saturating_mul(std::mem::size_of::<usize>()))
+    }
+}
+
+/// The keys a statement reads, bytewise as the copy orders them: a whole-table scan is unbounded
+/// both ways, a wide-range one bounded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyRange {
+    pub lo: Bound<Vec<u8>>,
+    pub hi: Bound<Vec<u8>>,
+}
+
+impl Default for KeyRange {
+    fn default() -> Self {
+        KeyRange {
+            lo: Bound::Unbounded,
+            hi: Bound::Unbounded,
+        }
+    }
+}
+
+impl KeyRange {
+    pub fn contains(&self, k: &[u8]) -> bool {
+        let above = match &self.lo {
+            Bound::Included(l) => k >= l.as_slice(),
+            Bound::Excluded(l) => k > l.as_slice(),
+            Bound::Unbounded => true,
+        };
+        let below = match &self.hi {
+            Bound::Included(h) => k <= h.as_slice(),
+            Bound::Excluded(h) => k < h.as_slice(),
+            Bound::Unbounded => true,
+        };
+        above && below
+    }
+
+    fn is_full(&self) -> bool {
+        matches!((&self.lo, &self.hi), (Bound::Unbounded, Bound::Unbounded))
+    }
+
+    /// Whether no key after `after` (None: from the start) and up to `upto` (None: to the end)
+    /// is in the range: a block whose keys all fall there is skipped before it is decoded.
+    fn misses(&self, after: Option<&[u8]>, upto: Option<&[u8]>) -> bool {
+        let below = match (&self.lo, upto) {
+            (Bound::Included(l), Some(u)) => u < l.as_slice(),
+            (Bound::Excluded(l), Some(u)) => u <= l.as_slice(),
+            _ => false,
+        };
+        let above = match (&self.hi, after) {
+            (Bound::Included(h) | Bound::Excluded(h), Some(a)) => a >= h.as_slice(),
+            _ => false,
+        };
+        below || above
+    }
+
+    /// Whether a granule from `first` to `last` holds no key in the range.
+    fn excludes(&self, first: &[u8], last: &[u8]) -> bool {
+        let below = match &self.lo {
+            Bound::Included(l) => last < l.as_slice(),
+            Bound::Excluded(l) => last <= l.as_slice(),
+            Bound::Unbounded => false,
+        };
+        let above = match &self.hi {
+            Bound::Included(h) => first > h.as_slice(),
+            Bound::Excluded(h) => first >= h.as_slice(),
+            Bound::Unbounded => false,
+        };
+        below || above
+    }
+
+    /// Whether every key from `first` to `last` is in the range.
+    fn covers(&self, first: &[u8], last: &[u8]) -> bool {
+        self.contains(first) && self.contains(last)
     }
 }
 
@@ -807,6 +919,8 @@ pub struct Query {
     /// The bytes the groups may take: the statement's share of the memory budget (CLAUDE.md §2).
     /// A group past it is refused.
     pub budget: usize,
+    /// The keys it reads.
+    pub keys: KeyRange,
 }
 
 /// What a scan counted.
@@ -851,11 +965,12 @@ fn key_bytes(k: &Key, aggs: usize) -> usize {
         })
 }
 
-/// The rows a row-at-a-time evaluation folds: the reference the vectors are checked against.
-pub fn evaluate_rows(q: &Query, rows: &[Vec<Cell>]) -> Result<Vec<Vec<Cell>>> {
+/// The statement row by row over `rows` (each key and its cells, in key order): the reference
+/// the vectors are checked against.
+pub fn evaluate_rows(q: &Query, rows: &[(Vec<u8>, Vec<Cell>)]) -> Result<Vec<Vec<Cell>>> {
     let mut p = Partial::default();
-    for r in rows {
-        if !q.filters.iter().all(|f| f.matches(r)) {
+    for (k, r) in rows {
+        if !q.keys.contains(k) || !q.filters.iter().all(|f| f.matches(r)) {
             continue;
         }
         let key = Key(q
@@ -936,7 +1051,7 @@ impl Plan<'_> {
         let mut sel = Vec::new();
         for placed in granules {
             let g = &*placed.granule;
-            if q.filters.iter().any(|f| f.excludes(g)) {
+            if q.keys.excludes(&g.first, &g.last) || q.filters.iter().any(|f| f.excludes(g)) {
                 p.counts.skipped = p.counts.skipped.saturating_add(1);
                 continue;
             }
@@ -947,6 +1062,11 @@ impl Plan<'_> {
                 .saturating_add(u64::try_from(g.rows).unwrap_or(u64::MAX));
             sel.clear();
             sel.resize(g.rows, true);
+            if !q.keys.covers(&g.first, &g.last) {
+                for (i, s) in sel.iter_mut().enumerate() {
+                    *s = g.keys.get(i).is_some_and(|k| q.keys.contains(k));
+                }
+            }
             for f in &q.filters {
                 f.apply(g, &mut sel);
             }
@@ -1147,18 +1267,23 @@ pub struct Sources {
     pub changed: u64,
     /// Scans answered from the rows: no generation answered them exactly.
     pub fallbacks: u64,
+    /// Blocks outside the statement's key range, skipped undecoded.
+    pub skipped: u64,
 }
 
 impl<B: Block> Columns<B> {
     /// The granules of the rows at snapshot `s`, in key order: one for each of the copy's blocks,
     /// its summaries with it; `rows` the row B-tree at `s`, read for what the copy hasn't applied.
-    /// A scan no generation answers exactly reads the rows, cut at the current block size.
+    /// A scan no generation answers exactly reads the rows, cut at the current block size. Blocks
+    /// whose keys all fall outside `keys` (by the blocks' key bounds) are skipped undecoded, so
+    /// `at` counts the rows of the granules returned.
     pub fn granules(
         &self,
         s: Ts,
         rows: &dyn Rows,
         dec: &dyn Decode,
         cache: &Cache,
+        keys: &KeyRange,
     ) -> Result<(Vec<Placed>, Sources)> {
         let st = self.state.read();
         let mut src = Sources::default();
@@ -1189,7 +1314,21 @@ impl<B: Block> Columns<B> {
             .flatten()
             .map(|g| g.id)
             .collect();
+        let last_block = g.blocks.len().saturating_sub(1);
         for j in 0..g.blocks.len() {
+            // Block j holds the keys after block j - 1's last and up to its own last (the last
+            // block, every key after): where `locate` files a change.
+            if !keys.is_full() {
+                let after = j
+                    .checked_sub(1)
+                    .and_then(|i| g.blocks.get(i))
+                    .map(|b| b.last());
+                let upto = g.blocks.get(j).filter(|_| j < last_block).map(|b| b.last());
+                if keys.misses(after, upto) {
+                    src.skipped = src.skipped.saturating_add(1);
+                    continue;
+                }
+            }
             let touched = g
                 .block_deltas(j)
                 .any(|(_, versions)| versions.iter().any(|(ts, _)| *ts <= s));
@@ -1330,6 +1469,7 @@ mod tests {
                 group: vec![],
                 aggs: vec![Agg::Count],
                 budget,
+                keys: KeyRange::default(),
             },
             // aggregates
             Query {
@@ -1337,6 +1477,7 @@ mod tests {
                 group: vec![],
                 aggs: all.clone(),
                 budget,
+                keys: KeyRange::default(),
             },
             // group-by
             Query {
@@ -1344,12 +1485,14 @@ mod tests {
                 group: vec![4],
                 aggs: all.clone(),
                 budget,
+                keys: KeyRange::default(),
             },
             Query {
                 filters: vec![],
                 group: vec![3],
                 aggs: vec![Agg::Count, Agg::Sum(0)],
                 budget,
+                keys: KeyRange::default(),
             },
             Query {
                 filters: vec![Filter::Cmp {
@@ -1360,6 +1503,7 @@ mod tests {
                 group: vec![2, 4],
                 aggs: vec![Agg::Count, Agg::Max(0)],
                 budget,
+                keys: KeyRange::default(),
             },
         ];
         // filters, each with the aggregates
@@ -1464,6 +1608,7 @@ mod tests {
                 group: vec![],
                 aggs: all.clone(),
                 budget,
+                keys: KeyRange::default(),
             });
         }
         qs.push(Query {
@@ -1483,13 +1628,14 @@ mod tests {
             group: vec![4],
             aggs: all,
             budget,
+            keys: KeyRange::default(),
         });
         qs
     }
 
     /// Every query on `placed` granules, serially and split at random points into partials merged
     /// in order (as morsel workers would run them): each equal to the row-at-a-time answer.
-    fn check(placed: &[Placed], rows: &[Vec<Cell>], x: &mut u64, seen: &mut Counts) {
+    fn check(placed: &[Placed], rows: &[(Vec<u8>, Vec<Cell>)], x: &mut u64, seen: &mut Counts) {
         for q in queries() {
             let want = evaluate_rows(&q, rows).unwrap();
             let plan = Plan {
@@ -1515,14 +1661,80 @@ mod tests {
         }
     }
 
-    fn decoded(rows: &Rowset) -> Vec<Vec<Cell>> {
+    fn decoded(rows: &Rowset) -> Vec<(Vec<u8>, Vec<Cell>)> {
         rows.iter()
             .map(|(k, v)| {
                 let mut cells = Vec::new();
                 Records.decode(k, v, &mut cells).unwrap();
-                cells
+                (k.clone(), cells)
             })
             .collect()
+    }
+
+    /// Key ranges a wide-range statement reads: each kind of bound, and an empty range.
+    fn ranges() -> Vec<KeyRange> {
+        let k = |n: u32| n.to_be_bytes().to_vec();
+        vec![
+            KeyRange {
+                lo: Bound::Included(k(100)),
+                hi: Bound::Excluded(k(300)),
+            },
+            KeyRange {
+                lo: Bound::Excluded(k(350)),
+                hi: Bound::Unbounded,
+            },
+            KeyRange {
+                lo: Bound::Unbounded,
+                hi: Bound::Included(k(40)),
+            },
+            KeyRange {
+                lo: Bound::Included(k(200)),
+                hi: Bound::Included(k(201)),
+            },
+            KeyRange {
+                lo: Bound::Excluded(k(250)),
+                hi: Bound::Excluded(k(250)),
+            },
+        ]
+    }
+
+    /// Each range's statements over the granules a range scan returns: equal to the rows', and the
+    /// granules hold every key of the range.
+    fn check_ranges<B: Block>(
+        copy: &Columns<B>,
+        snap: Ts,
+        rows: &dyn Rows,
+        cache: &Cache,
+        all: &[(Vec<u8>, Vec<Cell>)],
+        seen: &mut Seen,
+    ) {
+        for range in ranges() {
+            let (placed, src) = copy.granules(snap, rows, &Records, cache, &range).unwrap();
+            seen.sources.skipped += src.skipped;
+            let got_keys: Vec<&[u8]> = placed
+                .iter()
+                .flat_map(|p| (0..p.granule.rows).map(move |i| p.granule.keys.get(i).unwrap()))
+                .filter(|k| range.contains(k))
+                .collect();
+            let want_keys: Vec<&[u8]> = all
+                .iter()
+                .map(|(k, _)| k.as_slice())
+                .filter(|k| range.contains(k))
+                .collect();
+            assert_eq!(got_keys, want_keys, "{range:?}");
+            for mut q in queries().into_iter().take(6) {
+                q.keys = range.clone();
+                let want = evaluate_rows(&q, all).unwrap();
+                let (got, c) = Plan {
+                    granules: placed.clone(),
+                    query: &q,
+                }
+                .run_all()
+                .unwrap();
+                assert_eq!(got, want, "{range:?} {q:?}");
+                seen.counts.merge(&c);
+            }
+        }
     }
 
     fn rebuild<B: Block>(db: &Database, copy: &Columns<B>) {
@@ -1583,7 +1795,9 @@ mod tests {
             let scan = |snap: &Snapshot, seen: &mut Seen, x: &mut u64| {
                 let rows = At { db: &db, snap };
                 let began = Instant::now();
-                let (placed, src) = copy.granules(snap.start, &rows, &Records, &cache).unwrap();
+                let (placed, src) = copy
+                    .granules(snap.start, &rows, &Records, &cache, &KeyRange::default())
+                    .unwrap();
                 let all = rows.all().unwrap();
                 copy.measured_scan(began.elapsed().as_nanos(), all.len());
                 // Positional summaries: each granule's first row is where it says, keys in order.
@@ -1595,7 +1809,9 @@ mod tests {
                     assert_eq!(all[at - 1].0, p.granule.last);
                 }
                 assert_eq!(at, all.len());
-                check(&placed, &decoded(&all), x, &mut seen.counts);
+                let cells = decoded(&all);
+                check(&placed, &cells, x, &mut seen.counts);
+                check_ranges(&copy, snap.start, &rows, &cache, &cells, seen);
                 seen.sources.cached += src.cached;
                 seen.sources.decoded += src.decoded;
                 seen.sources.changed += src.changed;
@@ -1620,14 +1836,18 @@ mod tests {
         seen
     }
 
-    /// Do: the differential on prototype A's copy. Expect: every class identical to the rows; the
-    /// summaries skipped granules, granules were reused from the cache and decoded for changes
-    /// (T-CS.4.1, non-vacuity counters).
+    /// Do: the differential on prototype A's copy, whole-table and over key ranges. Expect: every
+    /// class identical to the rows; the summaries skipped granules, key ranges skipped blocks
+    /// undecoded, granules were reused from the cache and decoded for changes (T-CS.4.1, T-CS.4.3,
+    /// non-vacuity counters).
     #[test]
     fn cs4_vectors_equal_rows_every_class_plain() {
         let seen = vectors_equal_rows::<Plain>(17);
         assert!(
-            seen.counts.skipped > 0 && seen.sources.cached > 0 && seen.sources.changed > 0,
+            seen.counts.skipped > 0
+                && seen.sources.skipped > 0
+                && seen.sources.cached > 0
+                && seen.sources.changed > 0,
             "{seen:?}"
         );
     }
@@ -1637,7 +1857,10 @@ mod tests {
     fn cs4_vectors_equal_rows_every_class_packed() {
         let seen = vectors_equal_rows::<Packed>(23);
         assert!(
-            seen.counts.skipped > 0 && seen.sources.cached > 0 && seen.sources.changed > 0,
+            seen.counts.skipped > 0
+                && seen.sources.skipped > 0
+                && seen.sources.cached > 0
+                && seen.sources.changed > 0,
             "{seen:?}"
         );
     }
@@ -1676,6 +1899,7 @@ mod tests {
             group: vec![],
             aggs: vec![Agg::Count, Agg::Sum(0), Agg::Sum(1), Agg::Min(0)],
             budget: usize::MAX,
+            keys: KeyRange::default(),
         };
         let (got, c) = Plan {
             granules: placed,
@@ -1700,12 +1924,15 @@ mod tests {
     /// group past the budget (CLAUDE.md §2).
     #[test]
     fn cs4_groups_past_budget_are_refused() {
-        let rows: Vec<Vec<Cell>> = (0..50).map(|i| vec![Cell::Int(i)]).collect();
+        let rows: Vec<(Vec<u8>, Vec<Cell>)> = (0..50u8)
+            .map(|i| (vec![i], vec![Cell::Int(i64::from(i))]))
+            .collect();
         let q = Query {
             filters: vec![],
             group: vec![0],
             aggs: vec![Agg::Count],
             budget: 200,
+            keys: KeyRange::default(),
         };
         assert!(matches!(
             evaluate_rows(&q, &rows),
