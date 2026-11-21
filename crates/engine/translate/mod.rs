@@ -163,8 +163,15 @@ pub fn translate(
     // Amphora: what its hash and group tables hold before they spill (executor decision 8).
     resolver.set_statement_memory(connection.get_pager().statement_memory_budget());
     resolver.set_join_methods(connection.join_methods());
+    resolver.set_sorted_fetches(connection.sorted_fetches());
     // Amphora: what a seek, a hash table and a sort cost, as this database has timed them (QT.5).
-    resolver.set_learned_weights(connection.db.learned_costs.weights());
+    // A page is priced by how often the connection's recent fetches read a file (QT.5).
+    resolver.set_learned_weights(
+        connection
+            .db
+            .learned_costs
+            .weights_at(connection.get_pager().page_miss_ratio()),
+    );
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here

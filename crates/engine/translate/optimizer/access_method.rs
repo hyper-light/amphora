@@ -36,13 +36,14 @@ use super::{
     },
     cost::{
         constraints_selectivity, estimate_btree_depth, estimate_cost_for_scan_or_seek,
-        estimate_ephemeral_index_build_cost, estimate_index_cost, estimate_ordered_cost_to_goal,
-        estimate_rows_per_seek, estimate_scan_cost, estimate_skip_scan_cost, AnalyzeCtx, Cost,
-        IndexInfo, RowGoal,
+        estimate_ephemeral_index_build_cost, estimate_ephemeral_index_probe_cost,
+        estimate_index_cost, estimate_ordered_cost_to_goal, estimate_rows_per_seek,
+        estimate_scan_cost, estimate_skip_scan_cost, AnalyzeCtx, Cost, IndexInfo, RowGoal,
     },
     join::JoinPlanningContext,
     multi_index::{
-        consider_multi_index_intersection, consider_multi_index_union, MultiIndexBranchParams,
+        consider_multi_index_intersection, consider_multi_index_union, consider_sorted_fetch,
+        MultiIndexBranchParams,
     },
     order::{
         btree_access_order_consumed, subquery_intrinsic_order_consumed, ColumnTarget,
@@ -985,6 +986,7 @@ pub fn find_best_access_method_for_join_order(
             planning_context.maybe_order_target,
             planning_context.allow_automatic_index,
             planning_context.row_goal,
+            planning_context.sorted_fetches,
             where_clause,
             ready_where,
             available_indexes,
@@ -1045,6 +1047,7 @@ fn find_best_access_method_for_btree(
     maybe_order_target: Option<&OrderTarget>,
     allow_automatic_index: bool,
     row_goal: Option<RowGoal>,
+    sorted_fetches: bool,
     where_clause: &[WhereTerm],
     ready_where: &[(usize, usize)],
     available_indexes: &AvailableIndexes,
@@ -1217,10 +1220,17 @@ fn find_best_access_method_for_btree(
                 params,
                 None,
             );
-            let build_cost = estimate_ephemeral_index_build_cost(*base_row_count, params);
-            let seek_cost = Cost(
-                input_cardinality * params.cpu_cost_per_seek
-                    + input_cardinality * rows_per_seek * params.cpu_cost_per_row,
+            let build_cost = estimate_ephemeral_index_build_cost(
+                *base_row_count,
+                index_info.rows_per_leaf_page,
+                params,
+            );
+            let seek_cost = estimate_ephemeral_index_probe_cost(
+                input_cardinality,
+                rows_per_seek,
+                *base_row_count,
+                index_info.rows_per_leaf_page,
+                params,
             );
             let cost = scan_cost + build_cost + seek_cost;
             let temporary_index = AccessMethod {
@@ -1323,6 +1333,33 @@ fn find_best_access_method_for_btree(
                 params,
                 whole_reads,
             );
+        }
+
+        if sorted_fetches {
+            if let Some(sorted_fetch) = consider_sorted_fetch(
+                rhs_table,
+                rhs_constraints,
+                &best_access_method,
+                table_references,
+                available_indexes,
+                subqueries,
+                schema,
+                input_cardinality,
+                base_row_count,
+                params,
+                alternative_cost_limit(&best_access_method, best_cost_with_filters),
+                analyze_stats,
+            )? {
+                replace_if_cheaper(
+                    &mut best_access_method,
+                    &mut best_cost_with_filters,
+                    sorted_fetch,
+                    ready_where,
+                    input_cardinality,
+                    params,
+                    whole_reads,
+                );
+            }
         }
 
         if !has_two_local_constraint_terms(rhs_constraints, where_clause) {
@@ -2243,7 +2280,13 @@ fn find_best_access_method_for_subquery(
         };
     let one_pass_scan_cost =
         estimate_cost_for_scan_or_seek(None, &[], &[], 1.0, base_row_count, false, params, None);
-    let append_build_cost = estimate_ephemeral_index_build_cost(*base_row_count, params);
+    let rows_per_leaf_page = rows_per_leaf_page_for_index(
+        ephemeral_index.columns.len(),
+        rhs_table,
+        params.rows_per_table_page,
+    );
+    let append_build_cost =
+        estimate_ephemeral_index_build_cost(*base_row_count, rows_per_leaf_page, params);
     let seek_setup_cost = if table_materialization_required || can_direct_materialize_index {
         // Both table-backed materialization and direct-index materialization avoid
         // the extra "scan table into probe index" pass. They differ in storage,
@@ -2255,9 +2298,12 @@ fn find_best_access_method_for_subquery(
         // index used by SEARCH.
         one_pass_scan_cost + one_pass_scan_cost + append_build_cost
     };
-    let seek_cost = Cost(
-        input_cardinality * params.cpu_cost_per_seek
-            + input_cardinality * estimated_rows_per_outer_row * params.cpu_cost_per_row,
+    let seek_cost = estimate_ephemeral_index_probe_cost(
+        input_cardinality,
+        estimated_rows_per_outer_row,
+        *base_row_count,
+        rows_per_leaf_page,
+        params,
     );
     let total_cost = Cost(subquery_cost) + seek_setup_cost + seek_cost;
     let scan_method = AccessMethod {

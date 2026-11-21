@@ -181,3 +181,26 @@ fn t_ns_2_6_analyze_answers_alike() {
     let q = "SELECT count(*) FROM t WHERE b = 3 AND c = 'c1'";
     assert_eq!(rows(&other_v, q), rows(&other_p, q));
 }
+
+/// Do: in an explicit transaction, a statement that writes a row and then fails on a duplicate key,
+/// between two that succeed, then COMMIT. Expect: only the failed statement undone, on both
+/// storages.
+#[test]
+fn t_ns_2_6_a_failed_statement_is_undone_alone() {
+    let (_pdb, pager) = connect(false);
+    let (_vdb, versioned) = connect(true);
+    for conn in [&pager, &versioned] {
+        run(conn, "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)");
+        run(conn, "BEGIN");
+        run(conn, "INSERT INTO t VALUES (1, 'first')");
+        assert!(conn
+            .execute("INSERT INTO t VALUES (2, 'undone'), (1, 'duplicate')")
+            .is_err());
+        run(conn, "INSERT INTO t VALUES (3, 'third')");
+        run(conn, "COMMIT");
+    }
+    let q = "SELECT a, b FROM t ORDER BY a";
+    let want = rows(&pager, q);
+    assert_eq!(want.len(), 2);
+    assert_eq!(rows(&versioned, q), want);
+}
