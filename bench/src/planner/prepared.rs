@@ -148,11 +148,11 @@ pub fn query(amphora: &mut Amphora, name: &str, sql: &str, params: &Params, mode
 mod tests {
     use super::*;
 
-    /// T-PL.12.1 (the harness): do: read `--params` lines for q06 among others' and a malformed
+    /// T-PL.12.7: do: read `--params` lines for q06 among others' and a malformed
     /// value. Expect: q06's sets alone, in order, integers as INTEGER, decimals as REAL, dates as
     /// TEXT; a value neither number nor string refused with its line.
     #[test]
-    fn t_pl_12_1_params_bind_by_their_json_type() {
+    fn t_pl_12_7_params_bind_by_their_json_type() {
         let text = concat!(
             r#"{"query": "q06", "seed": 1, "params": ["1994-01-01", "1995-01-01", 0.05, 0.07, 24]}"#,
             "\n",

@@ -385,6 +385,7 @@ tests = [
   { id = "T-PL.12.4", text = "Custom and generic plans forced answer as the literal query, a custom plan made for each forced run" },
   { id = "T-PL.12.5", text = "A statement no estimate reads a value for (a key lookup, no statistics, nothing bound) is never planned again" },
   { id = "T-PL.12.6", text = "Auto: the first run is custom, ANALYZE starts the choice again, every run answers as the generic plan, a custom run reset part way runs again" },
+  { id = "T-PL.12.7", text = "AC-PL.12.1's harness: qgen's logged parameters bound to each prepared template's ?N, TPC-H's arithmetic on them, and --params read by JSON type (test_qgen_params.py, bench prepared.rs)" },
 ]
 
 [[own]]

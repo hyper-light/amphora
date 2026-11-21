@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""qgen_params.py, TPC-H's parameters bound to the prepared templates (PL.12, AC-PL.12.1's harness),
+"""qgen_params.py, TPC-H's parameters bound to the prepared templates (PL.12, AC-PL.12.1's harness, T-PL.12.7),
 on the log qgen -l wrote for seed 7 at scale factor 1 (electrum/tpch-dbgen 32f1c1b).
 
 usage: python3 -I bench/planner/tpch/test_qgen_params.py
@@ -29,7 +29,7 @@ LOG = "\n".join([
 
 
 class Bound(unittest.TestCase):
-    def test_pl_12_1_each_query_binds_what_its_template_asks(self):
+    def test_pl_12_7_each_query_binds_what_its_template_asks(self):
         """Do: bind seed 7's log. Expect: for each of the 22, as many values as its template's
         highest ?N, the template being read from bench/planner/tpch/prepared."""
         logged = qgen_params.parse(LOG)
@@ -41,7 +41,7 @@ class Bound(unittest.TestCase):
             self.assertEqual(len(values), highest, f"q{q:02}")
             self.assertEqual(qgen_params.ARITY[q], highest, f"q{q:02}")
 
-    def test_pl_12_1_the_spec_arithmetic_on_a_parameter(self):
+    def test_pl_12_7_the_spec_arithmetic_on_a_parameter(self):
         """Do: bind Q1, Q4, Q6, Q13, Q16 and Q20. Expect: TPC-H §2.4's dates, ranges and patterns."""
         logged = dict(qgen_params.parse(LOG))
         self.assertEqual(qgen_params.bound(1, logged[1]), ["1998-08-07"])
