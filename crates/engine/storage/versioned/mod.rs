@@ -21,6 +21,7 @@ pub mod disk;
 pub mod durable;
 #[cfg(test)]
 mod elle;
+pub mod overflow;
 pub mod page;
 pub mod pool;
 pub mod redo;

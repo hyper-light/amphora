@@ -672,7 +672,7 @@ fn database(validation: Validation) -> Versioned {
     // A page holds four of the largest cells (page.rs, MAX_CELL) and a split leaves at least two:
     // a leaf for every two keys a seed can make, and fewer inner pages than leaves.
     let frames = KEYS + TXNS * MAX_LEN as usize;
-    Versioned::new(frames, 1, || Box::new(|a: &[u8], b: &[u8]| a.cmp(b)))
+    Versioned::new(frames, 1, |_| Box::new(|a: &[u8], b: &[u8]| a.cmp(b)))
         .unwrap()
         .with_validation(validation)
 }

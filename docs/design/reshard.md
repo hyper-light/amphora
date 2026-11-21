@@ -184,9 +184,26 @@ deterministic simulator:
    catch-up (T-T1.9.R2). Amphora's own engine (`database::Local`) doesn't keep a holding yet: it
    becomes a group's with the shell below.
 
-   Still left of this item: rows by position; the change feed; the old group's log held from
-   `P_1`; a split that copies the moving range's rows; and the shell that carries the driver's
-   actions to the groups.
+   Built (lane split-merge-6): the copy path. An engine that can be a group's keeps a log of its
+   commits: each commit of rows, and each kept holding (a fence's entry), is one entry numbered in
+   order (`Engine::head`). It reads a span's keys in position order (`Engine::export`, rows indexed
+   by position), and the keys a run of its entries changed, as they stand now, stamped with its head
+   (`Engine::changed`, the change feed by log position, or none once the log no longer reaches back);
+   the new group writes a key only over an older stamp (`Engine::import`, `holding::replays`). The old
+   group's log is held from the first copy's read (`Engine::keep_log`), on the same turn of its
+   writer as that read, and let go when it releases or unfences. A key read as it stands at head `H`
+   is the key as of every entry up to `H`, so the feed needs only the keys, not their values.
+   `Groups::carry` is the shell: it carries each of the driver's actions to this node's groups
+   (create, copy, catch-up, fence, activate, release with its sweep, unfence, discard, retire) and
+   answers it. A fence's entry is numbered on the group's writer, after every batch let in before
+   it. A batch is as many positions or entries as the store's `commit_rows`, the rows one commit of
+   its writer takes, so a batch holds a writer no longer than a commit does. A split or merge carried
+   through it moves the range's rows while writes go on (T-T1.9.R4), and the harnesses for the
+   cutover pause (T-T1.9.P1, AC-T1.9.2) and the operations' lab (T-T1.9.L1, AC-T1.9.3) run on it.
+
+   Still left of this item: `database::Local` as a group's engine, its holding and log kept through
+   a replicated command; moves to another node (the copy and catch-up over the network); a retired
+   group's files, which the shell's caller deletes.
 2. **Load measured from the store's meter.** The writer's busy time per window, a bounded sample
    of written positions for the load cut, and the size cut from the B-tree's middle key. The
    window is the time between planner runs, and shares don't depend on its length.

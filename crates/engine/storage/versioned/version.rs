@@ -47,7 +47,7 @@ use super::pool::Pool;
 use super::redo::Op;
 use crate::error::LimboError;
 use crate::sync::atomic::{AtomicU64, Ordering};
-use crate::sync::Mutex;
+use crate::sync::{Arc, Mutex, RwLock};
 use crate::Result;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering as Order;
@@ -305,7 +305,8 @@ impl Reads {
         if points.peek().is_none() && spans.peek().is_none() {
             return Ok(false);
         }
-        let cmp = v.tree(tree)?.tree.compare();
+        let t = v.tree(tree)?;
+        let cmp = t.tree.compare();
         if points.any(|(_, k)| cmp(k, key) == Order::Equal) {
             return Ok(true);
         }
@@ -377,6 +378,10 @@ pub struct Savepoint {
     changed: usize,
 }
 
+fn no_tree(id: u64) -> LimboError {
+    LimboError::InternalError(format!("versioned storage: no tree {id}"))
+}
+
 /// A row: its tree and its key.
 type Row<'a> = (u64, &'a [u8]);
 
@@ -387,6 +392,7 @@ fn op_bytes(op: &Op) -> u64 {
             .saturating_add(key.len())
             .saturating_add(value.len()),
         Op::Remove { key, .. } => size_of::<Op>().saturating_add(key.len()),
+        Op::Made { .. } | Op::Dropped { .. } => size_of::<Op>(),
     };
     u64::try_from(n).unwrap_or(u64::MAX)
 }
@@ -968,6 +974,9 @@ impl VTree {
                 })
             }
             Op::Remove { key, .. } => self.tree.modify(pool, d, key, |_| Ok((Change::Remove, ()))),
+            Op::Made { .. } | Op::Dropped { .. } => Err(LimboError::InternalError(
+                "versioned storage: a tree made or dropped replayed as a row change".into(),
+            )),
         }
     }
 
@@ -1138,7 +1147,10 @@ impl VTree {
 pub struct Versioned {
     pub pool: Pool,
     pub clock: Clock,
-    trees: Vec<VTree>,
+    /// Each tree by id; None once dropped (`AC-NS.2.5`). Trees are made and dropped while the
+    /// database runs ([`Versioned::make_tree`], [`Versioned::set_tree`]); an operation holds its
+    /// tree's `Arc`, so a drop never pulls a tree from under one already in it.
+    trees: RwLock<Vec<Option<Arc<VTree>>>>,
     validation: Validation,
     /// The commits a validation may still check against, oldest first: each later than the low
     /// watermark, so bounded as the versions are (every row one of them wrote keeps its head
@@ -1157,22 +1169,22 @@ fn pool_budget(frames: usize) -> u64 {
 }
 
 impl Versioned {
-    /// `trees` empty trees in a pool of `frames` pages.
+    /// `trees` empty trees in a pool of `frames` pages, tree `i` ordered by `cmp(i)`.
     pub fn new(
         frames: usize,
         trees: usize,
-        cmp: impl Fn() -> super::blink::Comparator,
+        cmp: impl Fn(usize) -> super::blink::Comparator,
     ) -> Result<Self> {
         let pool = Pool::new(frames);
         let mut made = Vec::with_capacity(trees);
-        for id in 0..trees {
-            let id = u64::try_from(id).map_err(|_| LimboError::IntegerOverflow)?;
-            made.push(VTree::new(id, Tree::create(&pool, cmp())?));
+        for i in 0..trees {
+            let id = u64::try_from(i).map_err(|_| LimboError::IntegerOverflow)?;
+            made.push(Some(Arc::new(VTree::new(id, Tree::create(&pool, cmp(i))?))));
         }
         Ok(Self {
             pool,
             clock: Clock::new(pool_budget(frames)),
-            trees: made,
+            trees: RwLock::new(made),
             validation: Validation::default(),
             recent: Mutex::new(VecDeque::new()),
         })
@@ -1195,36 +1207,111 @@ impl Versioned {
         self.validation
     }
 
-    /// The trees whose roots are `roots`, in `pool` (recovery).
+    /// The trees whose roots are `roots`, in `pool` (recovery), tree `i` ordered by `cmp(i)`.
     pub fn open(
         pool: Pool,
         roots: &[u64],
-        cmp: impl Fn() -> super::blink::Comparator,
+        cmp: impl Fn(usize) -> super::blink::Comparator,
     ) -> Result<Self> {
         let mut trees = Vec::with_capacity(roots.len());
-        for (id, &root) in roots.iter().enumerate() {
-            let id = u64::try_from(id).map_err(|_| LimboError::IntegerOverflow)?;
-            trees.push(VTree::new(id, Tree::open(root, cmp())));
+        for (i, &root) in roots.iter().enumerate() {
+            let id = u64::try_from(i).map_err(|_| LimboError::IntegerOverflow)?;
+            // Root 0, the data file's header, is never a tree's: the tree was dropped.
+            trees.push((root != 0).then(|| Arc::new(VTree::new(id, Tree::open(root, cmp(i))))));
         }
         let budget = pool_budget(pool.capacity());
         Ok(Self {
             pool,
             clock: Clock::new(budget),
-            trees,
+            trees: RwLock::new(trees),
             validation: Validation::default(),
             recent: Mutex::new(VecDeque::new()),
         })
     }
 
-    /// Each tree's root page, by tree.
+    /// Each tree's root page, by tree; 0 for a tree dropped (`AC-NS.2.5`).
     pub fn roots(&self) -> Vec<u64> {
-        self.trees.iter().map(VTree::root).collect()
+        self.trees
+            .read()
+            .iter()
+            .map(|t| t.as_ref().map_or(0, |t| t.root()))
+            .collect()
+    }
+
+    /// The trees not dropped.
+    fn live(&self) -> Vec<Arc<VTree>> {
+        self.trees.read().iter().flatten().cloned().collect()
+    }
+
+    /// Makes an empty tree ordered by `cmp` under the next id, which it returns (`AC-NS.2.5`).
+    pub fn make_tree(&self, cmp: super::blink::Comparator) -> Result<u64> {
+        let mut trees = self.trees.write();
+        let id = u64::try_from(trees.len()).map_err(|_| LimboError::IntegerOverflow)?;
+        trees.push(Some(Arc::new(VTree::new(
+            id,
+            Tree::create(&self.pool, cmp)?,
+        ))));
+        Ok(id)
+    }
+
+    /// Recovery's replay of a tree made: an empty tree ordered by `cmp` under `id`, at or past the
+    /// next (`AC-NS.2.5`). Ids between are of trees whose making failed before its record was
+    /// durable: none of them is a tree.
+    pub fn remake_tree(&self, id: u64, cmp: super::blink::Comparator) -> Result<()> {
+        let mut trees = self.trees.write();
+        let at = usize::try_from(id).map_err(|_| LimboError::IntegerOverflow)?;
+        if at < trees.len() {
+            return Err(LimboError::Corrupt(format!(
+                "versioned storage: tree {id} made twice"
+            )));
+        }
+        // Each id between was handed out by a making that took a page for its root, and a
+        // making that fails stops the database's durability (the redo log's poison), so a gap
+        // wider than the pool's frames is damage, refused.
+        if at.saturating_sub(trees.len()) > self.pool.capacity() {
+            return Err(LimboError::Corrupt(format!(
+                "versioned storage: tree {id} made past every tree the pages could hold"
+            )));
+        }
+        trees.resize(at, None);
+        trees.push(Some(Arc::new(VTree::new(
+            id,
+            Tree::create(&self.pool, cmp)?,
+        ))));
+        Ok(())
+    }
+
+    /// Drops tree `id` (`AC-NS.2.5`): later operations naming it are refused; its pages stay where
+    /// they are, unreferenced.
+    pub fn drop_tree(&self, id: u64) -> Result<()> {
+        let mut trees = self.trees.write();
+        let slot = usize::try_from(id)
+            .ok()
+            .and_then(|i| trees.get_mut(i))
+            .filter(|t| t.is_some())
+            .ok_or_else(|| no_tree(id))?;
+        *slot = None;
+        Ok(())
+    }
+
+    /// Whether a transaction still open has changed a row of tree `id`: a drop then waits for it
+    /// (`AC-NS.2.5`).
+    pub fn open_changes(&self, id: u64) -> Result<bool> {
+        let t = self.tree(id)?;
+        for shard in &t.heads {
+            for head in shard.lock().values() {
+                if matches!(self.clock.resolve(head.writer)?, Writer::Open(_)) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Clears the versions on every tree's cells, dropping removed rows' (recovery, which starts
     /// with no heads: each cell is every snapshot's).
     pub fn clear_versions(&self, d: &mut Descender) -> Result<()> {
-        for t in &self.trees {
+        for t in &self.live() {
             t.tree.clear_versions(&self.pool, d)?;
         }
         Ok(())
@@ -1233,17 +1320,17 @@ impl Versioned {
     /// Every tree's rows whose cell isn't their version as of `ts`, with that version (decision 7).
     pub fn corrections(&self, ts: Ts) -> Result<Vec<Op>> {
         let mut out = Vec::new();
-        for t in &self.trees {
+        for t in &self.live() {
             t.corrections(&self.clock, ts, &mut out)?;
         }
         Ok(out)
     }
 
-    pub fn tree(&self, id: u64) -> Result<&VTree> {
+    pub fn tree(&self, id: u64) -> Result<Arc<VTree>> {
         usize::try_from(id)
             .ok()
-            .and_then(|i| self.trees.get(i))
-            .ok_or_else(|| LimboError::InternalError(format!("versioned storage: no tree {id}")))
+            .and_then(|i| self.trees.read().get(i).cloned().flatten())
+            .ok_or_else(|| no_tree(id))
     }
 
     /// Commits `txn`: its changes visible to every snapshot from its timestamp on, which it
@@ -1538,6 +1625,8 @@ impl Versioned {
                     then.insert((*tree, key.as_slice()), Some(value.as_slice()))
                 }
                 Op::Remove { tree, key } => then.insert((*tree, key.as_slice()), None),
+                // A transaction's changes are rows only: trees are made and dropped alone.
+                Op::Made { .. } | Op::Dropped { .. } => continue,
             };
         }
         // Rows changed before the savepoint and after it, each once, with that value.
@@ -1546,6 +1635,7 @@ impl Versioned {
         for op in later {
             let row = match op {
                 Op::Put { tree, key, .. } | Op::Remove { tree, key } => (*tree, key.as_slice()),
+                Op::Made { .. } | Op::Dropped { .. } => continue,
             };
             if fresh_rows.contains(&row) || !seen.insert(row) {
                 continue;
@@ -1585,7 +1675,7 @@ impl Versioned {
         let (open, visible) = self.clock.open_starts();
         let lwm = open.first().map_or(visible, |&oldest| oldest.min(visible));
         let mut collected = 0usize;
-        for t in &self.trees {
+        for t in &self.live() {
             let mut ripe = Vec::new();
             for shard in &t.heads {
                 let mut heads = shard.lock();
@@ -1637,7 +1727,7 @@ impl Versioned {
 
     /// Rows with versions kept beside the pages, in every tree.
     pub fn versioned_rows(&self) -> usize {
-        self.trees
+        self.live()
             .iter()
             .map(|t| t.heads.iter().map(|s| s.lock().len()).sum::<usize>())
             .sum()
@@ -1650,7 +1740,7 @@ mod tests {
     use crate::sync::Arc;
 
     fn db() -> Versioned {
-        Versioned::new(20_000, 1, || Box::new(|a: &[u8], b: &[u8]| a.cmp(b))).unwrap()
+        Versioned::new(20_000, 1, |_| Box::new(|a: &[u8], b: &[u8]| a.cmp(b))).unwrap()
     }
 
     /// Do: a transaction changes a row and adds one while another, begun before, reads; then it
@@ -2213,7 +2303,7 @@ mod tests {
 
     /// Older versions kept beside the pages, in every tree.
     fn older_versions(v: &Versioned) -> usize {
-        v.trees
+        v.live()
             .iter()
             .flat_map(|t| t.heads.iter())
             .map(|s| s.lock().values().map(|h| h.older.len()).sum::<usize>())

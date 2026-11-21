@@ -186,12 +186,23 @@ pub fn sqlite_shell(engine: &'static str, program: String) -> ShellSpec {
     }
 }
 
-/// DuckDB's shell (SQLite's shell's descendant: the same `.mode quote` and `.print`).
+/// DuckDB's shell (SQLite's shell's descendant: the same `.mode quote` and `.print`). Its quote mode
+/// writes a header line and puts its column separator (`|` by default) between values, so both are
+/// set as SQLite's shell has them (checked on DuckDB 2.0.1's release CLI).
 pub fn duckdb(program: String) -> ShellSpec {
     ShellSpec {
         engine: "duckdb",
         program,
-        args: ["-batch", "-quote", ":memory:"].map(String::from).to_vec(),
+        args: [
+            "-batch",
+            "-noheader",
+            "-quote",
+            "-separator",
+            ",",
+            ":memory:",
+        ]
+        .map(String::from)
+        .to_vec(),
         settle: Some("CHECKPOINT"),
         // Its errors are "<Kind> Error: ..." (Parser, Catalog, Binder, Conversion, ...).
         error: |l| !l.starts_with('\'') && (l.contains("Error: ") || l.starts_with("Error")),
@@ -199,7 +210,10 @@ pub fn duckdb(program: String) -> ShellSpec {
     }
 }
 
-/// Turso's shell (`tursodb`), its list mode with `|` between values and NULL as nothing.
+/// Turso's shell (`tursodb`), its list mode with `|` between values. Its NULL is nothing there, as
+/// empty text is, so `.nullvalue` makes it [`NULL_MARK`]. Its shell has no quote mode and no
+/// `.separator` (tursodb 0.8.4: list, pretty and line only), so a text value holding `|` or a line
+/// end reads as more values or rows than it is: such an answer disagrees.
 pub fn turso(program: String) -> ShellSpec {
     ShellSpec {
         engine: "turso",
@@ -207,17 +221,18 @@ pub fn turso(program: String) -> ShellSpec {
         args: ["--quiet", "--output-mode", "list", ":memory:"]
             .map(String::from)
             .to_vec(),
-        setup: Vec::new(),
+        setup: vec![format!(".nullvalue {NULL_MARK}")],
         teardown: Vec::new(),
-        echo: |m| format!("SELECT '{m}'"),
+        // A SELECT of its own, ended: the line after a statement isn't read until its `;`.
+        echo: |m| format!("SELECT '{m}';"),
         terminator_line: true,
         settle: Some("PRAGMA wal_checkpoint(TRUNCATE)"),
         rows: Rows::Delimited {
             field: '|',
-            null: "",
+            null: NULL_MARK,
             escapes: false,
         },
-        // Its errors are miette reports: "× <kind> error: ...", or "Error: ...".
+        // Its errors are miette reports, "  × Parse error: no such table: nope", or "Error: ...".
         error: |l| {
             let t = l.trim_start();
             t.starts_with('×') || t.starts_with("Error") || t.starts_with("Parse error")
