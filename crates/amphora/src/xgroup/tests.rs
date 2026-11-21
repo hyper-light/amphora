@@ -310,6 +310,12 @@ struct Sim {
     inputs: u64,
     applied_reads: BTreeMap<TxnId, Reads>,
     finished: BTreeMap<TxnId, Outcome>,
+    /// What the groups applied: each transaction's resolution, the truth the check reads. A
+    /// coordinator that crashes after its resolutions land never reports the transaction
+    /// [`Event::Finished`], and no later incarnation finds it (nothing of it is left open).
+    resolved: BTreeMap<TxnId, Outcome>,
+    /// Transactions resolved one way in one group and the other way in another.
+    split: BTreeSet<TxnId>,
     answers: BTreeMap<TxnId, (Answer, u64, u32)>,
     rounds: Vec<u32>,
 }
@@ -335,6 +341,8 @@ impl Sim {
             inputs: 0,
             applied_reads: BTreeMap::new(),
             finished: BTreeMap::new(),
+            resolved: BTreeMap::new(),
+            split: BTreeSet::new(),
             answers: BTreeMap::new(),
             rounds: Vec::new(),
         }
@@ -455,6 +463,12 @@ impl Sim {
                     .get_mut(usize::try_from(send.group).unwrap())
                     .unwrap();
                 let reply = apply(send.group, group, &send.envelope).unwrap();
+                if let (Step::Resolve { txn, outcome }, Reply::Resolved) =
+                    (&send.envelope.step, &reply)
+                    && *self.resolved.entry(*txn).or_insert(*outcome) != *outcome
+                {
+                    self.split.insert(*txn);
+                }
                 if let (Some(txn), Reply::Locked { reads }) = (send.envelope.step.txn(), &reply) {
                     self.applied_reads
                         .entry(txn)
@@ -655,9 +669,22 @@ fn check(sim: &Sim, ops: &[Op]) -> Vec<String> {
             writer.insert(value.clone(), op.id);
         }
     }
-    let outcome = |id: &TxnId| sim.finished.get(id).copied().unwrap_or(Outcome::Aborted);
+    // What the groups applied decides; a transaction no group resolved committed is aborted.
+    let outcome = |id: &TxnId| sim.resolved.get(id).copied().unwrap_or(Outcome::Aborted);
+    for id in &sim.split {
+        anomalies.push(format!("{id:?} committed in one group, aborted in another"));
+    }
     let mut reads: BTreeMap<TxnId, BTreeMap<Vec<u8>, Option<Vec<u8>>>> = BTreeMap::new();
     for op in ops {
+        if let Some(finished) = sim.finished.get(&op.id)
+            && *finished != outcome(&op.id)
+        {
+            anomalies.push(format!(
+                "{:?} finished {finished:?}, its groups resolved it {:?}",
+                op.id,
+                outcome(&op.id)
+            ));
+        }
         let answered = sim.answers.get(&op.id).map(|(a, _, _)| a);
         match (answered, outcome(&op.id)) {
             (Some(Answer::Committed { .. }), Outcome::Aborted) => {
@@ -893,7 +920,7 @@ fn run_seed(seed: u64, protocol: Protocol) -> Ran {
     );
     let committed: Vec<&Op> = ops
         .iter()
-        .filter(|op| sim.finished.get(&op.id) == Some(&Outcome::Committed))
+        .filter(|op| sim.resolved.get(&op.id) == Some(&Outcome::Committed))
         .collect();
     let route = |k: &Vec<u8>| u32::from(k[0]) % groups;
     Ran {
@@ -955,8 +982,8 @@ fn ac_t1_10_5_the_check_finds_a_lost_update_and_a_partial_commit() {
         epoch: 1,
         seq: 1,
     };
-    sim.finished.insert(a, Outcome::Committed);
-    sim.finished.insert(b, Outcome::Committed);
+    sim.resolved.insert(a, Outcome::Committed);
+    sim.resolved.insert(b, Outcome::Committed);
     sim.applied_reads.insert(a, vec![(vec![0], None)]);
     sim.applied_reads.insert(b, vec![(vec![0], None)]);
     sim.groups[0].set_value(&[0], Some(b"b")).unwrap();
@@ -979,7 +1006,7 @@ fn ac_t1_10_5_the_check_finds_a_lost_update_and_a_partial_commit() {
     );
     // One write of a committed two-key transaction missing.
     let mut sim = Sim::new(0, 2, Protocol::Parallel, 0, 1);
-    sim.finished.insert(a, Outcome::Committed);
+    sim.resolved.insert(a, Outcome::Committed);
     sim.applied_reads
         .insert(a, vec![(vec![0], None), (vec![1], None)]);
     sim.groups[0].set_value(&[0], Some(b"a")).unwrap();
@@ -989,4 +1016,47 @@ fn ac_t1_10_5_the_check_finds_a_lost_update_and_a_partial_commit() {
         writes: [(vec![0], b"a".to_vec()), (vec![1], b"c".to_vec())].into(),
     }];
     assert!(!check(&sim, &ops).is_empty());
+}
+
+/// AC-T1.10.5, seed 0's interleaving: the client heard committed, every resolution landed, and the
+/// coordinator crashed before their replies came back. Nothing of the transaction is left open, so
+/// the next incarnation finds nothing to recover and no coordinator reports it finished; the
+/// groups hold it committed, and the check must read it so (reading the coordinator's report, it
+/// called it aborted, the reads of its writes G1a, and its edges a cycle).
+#[test]
+fn ac_t1_10_5_a_crash_after_every_resolution_landed_leaves_it_committed() {
+    for protocol in [Protocol::TwoPhase, Protocol::Parallel] {
+        let mut sim = Sim::new(1, 2, protocol, 0, 1);
+        sim.start();
+        while !sim.ready() {
+            assert!(sim.step());
+        }
+        let writes = [(vec![0], b"a".to_vec()), (vec![1], b"b".to_vec())];
+        let t = Txn {
+            reads: vec![vec![0], vec![1]],
+            writes: writes
+                .iter()
+                .map(|(k, v)| (k.clone(), Some(v.clone())))
+                .collect(),
+        };
+        let id = sim.begin(t).unwrap();
+        while !sim.answers.contains_key(&id) {
+            assert!(sim.step());
+        }
+        assert!(matches!(sim.answers[&id].0, Answer::Committed { .. }));
+        // The crash: every step it had out (each group's resolution) lands; no reply is heard.
+        sim.crash();
+        while sim.step() {}
+        sim.start();
+        sim.settle();
+        sim.assert_settled();
+        assert!(!sim.finished.contains_key(&id), "{protocol:?}");
+        assert_eq!(sim.resolved.get(&id), Some(&Outcome::Committed));
+        let ops = vec![Op {
+            id,
+            invoke: 0,
+            writes: writes.into_iter().collect(),
+        }];
+        assert_eq!(check(&sim, &ops), Vec::<String>::new(), "{protocol:?}");
+    }
 }
