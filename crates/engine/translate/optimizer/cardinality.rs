@@ -170,6 +170,10 @@ struct Elsewhere {
     counted: SmallVec<[(usize, Option<f64>); 2]>,
     /// Those terms its sample ran, as a right table's ON terms are (decision 21).
     sampled: Option<Sampled>,
+    /// One of them is `col IS NULL` of a column never NULL in a row of the table, which no join
+    /// has null-extended where the ON terms run: no left row matches, as with a right table's
+    /// `matches_none`.
+    never: bool,
 }
 
 /// Which of a table's terms its sample runs: its filters, or its own outer join's ON terms.
@@ -715,6 +719,9 @@ impl<'a> JoinedSetRows<'a> {
         };
         let mut selectivity = own;
         for e in t.on_elsewhere.iter().filter(|e| ready.get(e.table)) {
+            if e.never {
+                return 0.0;
+            }
             let Some(table_constraints) = self.constraints.get(e.table) else {
                 continue;
             };
@@ -1112,6 +1119,7 @@ fn on_elsewhere(
                     table,
                     counted,
                     sampled: None,
+                    never: false,
                 });
             }
         }
@@ -1128,6 +1136,29 @@ fn on_elsewhere(
             .filter_map(|(at, _)| table_constraints.on_elsewhere.get(*at))
             .map(|c| c.where_clause_pos.0)
             .collect();
+        // Whether a join null-extends the earlier table before this join's ON terms run: its own
+        // LEFT or FULL JOIN, or a RIGHT or FULL JOIN after it and before this one.
+        let at = joined_tables
+            .iter()
+            .position(|t| t.internal_id == joined.internal_id)
+            .unwrap_or(joined_tables.len());
+        let join_type = |t: &JoinedTable| t.join_info.as_ref().map(|info| info.join_type);
+        let null_extended = matches!(
+            join_type(earlier),
+            Some(JoinType::LeftOuter | JoinType::FullOuter)
+        ) || joined_tables.iter().take(at).skip(e.table + 1).any(|t| {
+            matches!(
+                join_type(t),
+                Some(JoinType::RightOuter | JoinType::FullOuter)
+            )
+        });
+        e.never = !null_extended
+            && e.counted.iter().any(|(at, _)| {
+                table_constraints
+                    .on_elsewhere
+                    .get(*at)
+                    .is_some_and(|c| null_test_of_never_null(c, where_clause, earlier))
+            });
         e.sampled = sampled_filters(
             earlier,
             &table_constraints.on_elsewhere,

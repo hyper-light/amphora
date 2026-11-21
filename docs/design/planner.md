@@ -1359,16 +1359,20 @@ swapped, and CD-C reorders outer joins by such rules, correct and complete. Its 
 `(e1 LEFT JOIN e2) JOIN e3 = (e1 JOIN e3) LEFT JOIN e2` when e3's term doesn't read e2, is what
 lets tiny move ahead of the LEFT JOIN, which the search already allowed.
 
-**Open, so not on main.** The estimate does not follow the swap yet (decision 13,
-`cardinality.rs`): an outer join's ON term that reads only the tables before it (`y.c = 3` in
-`y LEFT JOIN x ON y.c = 3`, which `x RIGHT JOIN y ON y.c = 3` becomes) is counted nowhere, so the
-RIGHT JOIN's estimate rises above its FULL JOIN's (`crates/engine/tests/planner.rs`,
-`an_outer_join_is_estimated_at_least_its_inner_join`: right 10^12, full 10^11). Such a term makes
-no constraint on its right table, so the estimate must read it from the WHERE terms at the join
-(by its origin), not from the right table's constraints; a first attempt through the constraints
-found nothing to count.
+The estimate follows (decision 13): an outer join's ON term that reads none of its right table's
+columns, only tables before it (`y.c = 3` in `y LEFT JOIN x ON y.c = 3`, which `x RIGHT JOIN y ON
+y.c = 3` becomes), was counted nowhere: `constraints_from_where_clause` dropped an outer join's ON
+term on every table but its right table, and the right table has no constraint of it. Such terms
+now keep their constraints on the earlier tables apart, in `TableConstraints::on_elsewhere`, which
+no access path reads. The estimate finds a join's ON terms by their origin among the WHERE terms
+and counts those its right table holds no constraint of by those constraints and the earlier
+table's sample, at the join (`cardinality.rs`, `on_selectivity`), as a right table's ON terms are
+counted. So the RIGHT JOIN turned LEFT keeps its RIGHT JOIN's estimate, and a LEFT JOIN written
+that way is no longer estimated as if its ON term were absent.
 
-**Evidence.** `crates/engine/tests/join_search.rs`: `t_pl_8_1_the_right_join_reads_tiny_first`
+**Evidence.** `crates/engine/tests/planner.rs`'s `an_outer_join_is_estimated_at_least_its_inner_join`
+failed with the swap alone (`t0 RIGHT JOIN t1 ON y.c = 3`: right 10^12, full 10^11) and passes
+with the estimate's change. `crates/engine/tests/join_search.rs`: `t_pl_8_1_the_right_join_reads_tiny_first`
 (T-PL.8.1) plans tiny first and mid before big; `t_pl_8_2_a_right_join_turned_left_keeps_its_answers`
 (T-PL.8.2) answers eight RIGHT JOINs (`*`, a WHERE on the null-extended table, USING, a later inner,
 LEFT and RIGHT JOIN, an aggregate, an ON term on the left table) as SQLite does, worked by hand

@@ -516,9 +516,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   costs say the generic plan does as well; one whose estimates read none keeps its generic plan. Its
   TPC-H prepared measurement (AC-PL.12.1; its harness, `amphora-bench --planner --prepared` with
   qgen's parameters, is written: bench/planner/README.md) and the suite's (AC-PL.12.2) are open.
-  PL.8 is started on t1/lane-pl8, not on main (docs/design/planner.md "Decision (lane pl8)"): a RIGHT JOIN led by one
+  PL.8 is started (docs/design/planner.md "Decision (lane pl8)"): a RIGHT JOIN led by one
   table is planned as its mirrored LEFT JOIN, CD-C's commutativity rule, so the tables after it are no
-  longer held behind its right table and the audit's 03-right-full-barrier reads tiny first (T-PL.8.1).
+  longer held behind its right table and the audit's 03-right-full-barrier reads tiny first (T-PL.8.1);
+  an outer join's ON term that reads only earlier tables now counts in its join's estimate.
   Not built: bushy plans over connected complement pairs with a composite hash-join build, and CD-C's
   rules for outer, semi and anti joins in place of `required_lhs_by_table`; JOB's AC-PL.8.1 is open.
 - **G11, analytics at column-store speed** (docs/design/columnar.md, decision 1; sources in
