@@ -778,9 +778,9 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   group-by. A key range (a wide-range statement) skips blocks outside it undecoded, by the blocks'
   key bounds, and filters its boundary granules by their key column. Blocks no change touches are
   decoded once a generation. Every class equals the row store's answer, whole-table and over key
-  ranges, with writes between scans (T-CS.4.1 to T-CS.4.3). Open: driving `Plan` from the
-  morsel executor once `vdbe/morsel.rs` (lane qs6) is on main, the planner's use (step 5), and the
-  benches against CedarDB and ClickHouse (AC-CS.4.1, AC-CS.4.2).
+  ranges, with writes between scans, serially and on the morsel executor's workers (`Plan` is a
+  `vdbe/morsel.rs` pipeline, granules its unit) (T-CS.4.1 to T-CS.4.3). Open: the planner's use
+  (step 5), and the benches against CedarDB and ClickHouse (AC-CS.4.1, AC-CS.4.2).
 
 ## Open
 
