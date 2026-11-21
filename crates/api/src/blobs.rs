@@ -128,7 +128,8 @@ impl SimBlobs {
 
     /// The bytes it holds, all objects together.
     pub fn bytes(&self) -> Result<usize, BlobRefusal> {
-        held(&self.objects()?)
+        let objects = self.objects()?;
+        held(&objects)
     }
 }
 
@@ -311,7 +312,7 @@ pub fn conformance(store: &dyn Blobs, prefix: &str, until: Instant) -> Result<()
         let d = format!("{prefix}/d");
         match store.create(&d, &vec![0u8; over], until) {
             Err(BlobRefusal::TooLarge { .. }) => {}
-            other => return fail("create over the most", format!("{:?}", other.map(|()| ()))),
+            other => return fail("create over the most", format!("{other:?}")),
         }
         match store.get(&d, until) {
             Err(BlobRefusal::NotFound(_)) => {}
@@ -338,7 +339,7 @@ pub fn conformance(store: &dyn Blobs, prefix: &str, until: Instant) -> Result<()
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::disallowed_macros)]
 mod tests {
     use super::*;
 
