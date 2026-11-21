@@ -5,8 +5,8 @@
 //! and left joins must equal a nested loop computed here from the rows themselves.
 
 use amphora_engine::{
-    ConnectOpts, Connection, Database, DatabaseOpts, JoinMethods, Numeric, OpenOptions,
-    PlatformIO, SqliteDialect, Value,
+    ConnectOpts, Connection, Database, DatabaseOpts, JoinMethods, Numeric, OpenOptions, PlatformIO,
+    SqliteDialect, Value,
 };
 use std::sync::Arc;
 
@@ -18,7 +18,11 @@ fn key(state: &mut u64) -> Option<i64> {
     *state ^= *state >> 7;
     *state ^= *state << 17;
     let draw = (*state % 220) as i64;
-    (draw < 200).then_some(draw % 20)
+    if draw < 200 {
+        Some(draw % 20)
+    } else {
+        None
+    }
 }
 
 fn sql_value(v: Option<i64>) -> String {
@@ -56,8 +60,10 @@ fn t_qt_5_1_every_join_run_both_ways_gives_one_answer() {
     let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
     let db = Database::open(io, dir.path().join("joins.db").to_str().unwrap(), options).unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
-    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, k, x)").unwrap();
-    conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, k, y)").unwrap();
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, k, x)")
+        .unwrap();
+    conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, k, y)")
+        .unwrap();
     conn.execute("CREATE INDEX b_k ON b (k)").unwrap();
     conn.execute("CREATE TABLE c (k, z)").unwrap();
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
@@ -68,9 +74,23 @@ fn t_qt_5_1_every_join_run_both_ways_gives_one_answer() {
         let x = (id * 37) % 100;
         a.push((id, ak));
         b.push((id, bk));
-        conn.execute(format!("INSERT INTO a VALUES ({id}, {}, {x})", sql_value(ak))).unwrap();
-        conn.execute(format!("INSERT INTO b VALUES ({id}, {}, {})", sql_value(bk), id % 7)).unwrap();
-        conn.execute(format!("INSERT INTO c VALUES ({}, {})", sql_value(ck), (id * 13) % 100)).unwrap();
+        conn.execute(format!(
+            "INSERT INTO a VALUES ({id}, {}, {x})",
+            sql_value(ak)
+        ))
+        .unwrap();
+        conn.execute(format!(
+            "INSERT INTO b VALUES ({id}, {}, {})",
+            sql_value(bk),
+            id % 7
+        ))
+        .unwrap();
+        conn.execute(format!(
+            "INSERT INTO c VALUES ({}, {})",
+            sql_value(ck),
+            (id * 13) % 100
+        ))
+        .unwrap();
     }
     conn.execute("ANALYZE").unwrap();
 
@@ -103,7 +123,11 @@ fn t_qt_5_1_every_join_run_both_ways_gives_one_answer() {
         for &bid in &matches {
             want_inner.push(format!("{:?}", vec![int(aid), int(bid)]));
         }
-        want_left.extend(matches.iter().map(|&bid| format!("{:?}", vec![int(aid), int(bid)])));
+        want_left.extend(
+            matches
+                .iter()
+                .map(|&bid| format!("{:?}", vec![int(aid), int(bid)])),
+        );
         if matches.is_empty() {
             want_left.push(format!("{:?}", vec![int(aid), Value::Null]));
         }
@@ -115,20 +139,38 @@ fn t_qt_5_1_every_join_run_both_ways_gives_one_answer() {
     let mut wrong = Vec::new();
     for sql in queries {
         let mut answers = Vec::new();
-        for methods in [JoinMethods::NestedLoopsOnly, JoinMethods::HashJoinsOnly, JoinMethods::ByCost] {
+        for methods in [
+            JoinMethods::NestedLoopsOnly,
+            JoinMethods::HashJoinsOnly,
+            JoinMethods::ByCost,
+        ] {
             conn.set_join_methods(methods);
             answers.push((methods, plan(&conn, sql), rows(&conn, sql)));
         }
         let (_, _, first) = &answers[0];
         for (methods, plan, got) in &answers[1..] {
             if got != first {
-                wrong.push(format!("{sql}\n  {methods:?} ({plan}) gives {} rows, nested loops {}", got.len(), first.len()));
+                wrong.push(format!(
+                    "{sql}\n  {methods:?} ({plan}) gives {} rows, nested loops {}",
+                    got.len(),
+                    first.len()
+                ));
             }
         }
-        let model = if sql == inner { Some(&want_inner) } else if sql == left { Some(&want_left) } else { None };
+        let model = if sql == inner {
+            Some(&want_inner)
+        } else if sql == left {
+            Some(&want_left)
+        } else {
+            None
+        };
         if let Some(model) = model {
             if first != model {
-                wrong.push(format!("{sql}\n  gives {} rows, the model {}", first.len(), model.len()));
+                wrong.push(format!(
+                    "{sql}\n  gives {} rows, the model {}",
+                    first.len(),
+                    model.len()
+                ));
             }
         }
     }
@@ -136,7 +178,15 @@ fn t_qt_5_1_every_join_run_both_ways_gives_one_answer() {
 
     // Non-vacuity: the switch does choose the method.
     conn.set_join_methods(JoinMethods::HashJoinsOnly);
-    assert!(plan(&conn, inner).contains("HASH JOIN"), "hash joins only: {}", plan(&conn, inner));
+    assert!(
+        plan(&conn, inner).contains("HASH JOIN"),
+        "hash joins only: {}",
+        plan(&conn, inner)
+    );
     conn.set_join_methods(JoinMethods::NestedLoopsOnly);
-    assert!(!plan(&conn, inner).contains("HASH JOIN"), "nested loops only: {}", plan(&conn, inner));
+    assert!(
+        !plan(&conn, inner).contains("HASH JOIN"),
+        "nested loops only: {}",
+        plan(&conn, inner)
+    );
 }
