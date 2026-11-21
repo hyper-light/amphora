@@ -410,3 +410,16 @@ tests = [
   { id = "T-QT.3.4", text = "A loop over a non-covering index with a term on the index's columns and one on the table's — passes when the answer is unchanged and the table rows fetched are only those the index's term keeps, whatever order the terms are written in" },
   { id = "T-QT.3.5", text = "scripts/check-production.sh after the change — passes when it passes, with the ratchet's counts lowered by what the change removed" },
 ]
+
+# lane split-merge: groups that split, merge and move themselves (kiln goal 49477403, G13 step 2;
+# docs/design/reshard.md). Criteria are CP-T1.9's AC-T1.9.1 to AC-T1.9.3.
+[[own]]
+id = "RS.1"
+title = "Split, merge and move as one fenced hand-off: copy, catch-up in rounds, a brief cutover, decided by measured share"
+criteria = [
+  { id = "AC-RS.1.1", text = "Every position in exactly one group's span after every directory change; a change that would break it refused whole" },
+  { id = "AC-RS.1.2", text = "Split past one core's share of load or bytes, merge at half a core's share together, move only without overshoot: every value measured as it runs or the split's own factor of two" },
+]
+tests = [
+  { id = "T-T1.9.S1", text = "Automatic splits, merges and moves in the simulator under writes, driver and group restarts and lost logs — passes when every key is in exactly one group, the directory's, and writes lost is 0" },
+]

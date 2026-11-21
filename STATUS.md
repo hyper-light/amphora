@@ -257,6 +257,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (`settle_s`; Amphora's loader had left the whole load, 7.5 GB, in its log). `--query` runs a
   statement on a database a run left behind.
 
+- **Groups that split, merge and move themselves** (CP-T1.9, lane split-merge; `crates/amphora/src/reshard/`,
+  docs/design/reshard.md): a pure core: a directory of hash spans with every position in exactly one group,
+  each group's own holding (fenced, stale actions refused), a planner deciding from measured load, bytes and
+  cores, and a driver doing copy, catch-up in rounds and a fenced cutover. Tested in a deterministic
+  simulator (T-T1.9.S1). Left: the shell over Amphora's groups and replicated owners, `bench reshard`
+  (AC-T1.9.2) and the three-machine lab (AC-T1.9.3).
+
 ## Measured
 
 - **The oracles: wrong answers and slow plans** (G2 step 3; `amphora-bench --oracle`, `bench/src/oracle`,
