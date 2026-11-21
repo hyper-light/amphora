@@ -19,7 +19,7 @@ pub enum Away {
 }
 
 /// A fence: from `at`, a fence entry in the group's own log, nothing in `span` is written here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Fence {
     pub op: OpId,
     pub span: Span,
@@ -27,7 +27,7 @@ pub struct Fence {
 }
 
 /// How far a span being taken in has come: copied, then caught up from the old group's log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Progress {
     /// The last position whose rows are all copied, if any.
     pub copied: Option<Pos>,
@@ -40,7 +40,7 @@ pub struct Progress {
 }
 
 /// A span being taken in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Incoming {
     pub op: OpId,
     pub span: Span,
@@ -57,7 +57,7 @@ pub enum Fenced {
 }
 
 /// What a group holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Holding {
     owned: Option<Span>,
     fenced: Option<Fence>,

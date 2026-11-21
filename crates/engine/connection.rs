@@ -4120,6 +4120,18 @@ impl Connection {
         self.plan_cache_mode.store(mode.to_u8(), Ordering::Relaxed);
     }
 
+    /// Amphora (PL.9): rows inserted less rows deleted in `table` (its schema name) since ANALYZE
+    /// last counted it, as the planner's row count adds them.
+    pub fn changes_since_analyze(&self, table: &str) -> i64 {
+        self.db.row_changes.changed_since_analyze(table)
+    }
+
+    /// Amphora (PL.9, T-PL.9.2): how many finished writes have added their rows to a table's count
+    /// since the database opened: the write path's whole overhead, one atomic add each.
+    pub fn row_change_folds(&self) -> u64 {
+        self.db.row_changes.folds()
+    }
+
     pub fn plan_cache_mode(&self) -> crate::PlanCacheMode {
         crate::PlanCacheMode::from_u8(self.plan_cache_mode.load(Ordering::Relaxed))
     }

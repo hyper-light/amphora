@@ -75,6 +75,7 @@ mod pragma;
 mod progress;
 mod pseudo;
 mod regexp;
+mod row_changes;
 #[cfg(feature = "series")]
 mod series;
 mod stack;

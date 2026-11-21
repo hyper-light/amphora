@@ -35,7 +35,6 @@ const MESSAGE_BYTES: usize = crate::replication::COMMAND_BYTES.saturating_add(2 
 // Ticks are the pinned core's documented tick election mode (raft.rs, Elections::Ticks). Its
 // twenty-tick randomized election and two-tick heartbeat use this owner clock, never host votes.
 const TICK: Duration = Duration::from_millis(10);
-const POLL: Duration = Duration::from_millis(1);
 // The admission charge of a change of members, a hand-off of the lead, a catch-up or an
 // attestation: the bytes the queued input itself takes, its place in the queue's byte budget (an
 // attestation's name is charged beside it). The response channel's own allocation is charged for
@@ -51,7 +50,60 @@ type Response<T> = mpsc::SyncSender<Result<T, Refusal>>;
 #[derive(Clone)]
 pub struct ReplicaHandle {
     sender: mpsc::SyncSender<Envelope>,
+    // Declared after `sender`, so it rings once the sender is gone: the last handle's drop wakes
+    // the owner to find its channel closed.
+    _ring: Ring,
     shared: Arc<Control>,
+}
+
+/// What wakes the owner thread (replication.md, "Decision (lane constants): the owner's wakes"): an input queued, a handle
+/// dropped, the log's write or compaction done (its [`std::task::Waker`]), or a flush done. The
+/// owner waits on it only until its next deadline, so a wake is never needed for a deadline.
+struct Bell {
+    rung: Mutex<bool>,
+    ringing: std::sync::Condvar,
+}
+impl Bell {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            rung: Mutex::new(false),
+            ringing: std::sync::Condvar::new(),
+        })
+    }
+    /// Wakes the owner, or its next wait if it isn't waiting. A poisoned bell only rings for an
+    /// owner whose own wait fails on that poison and fences, so nothing is left to wake.
+    fn ring(&self) {
+        if let Ok(mut rung) = self.rung.lock() {
+            *rung = true;
+            self.ringing.notify_one();
+        }
+    }
+    /// Waits until the bell rings or `wait` passes, whichever is first, and takes the ring:
+    /// whether it rang.
+    fn wait(&self, wait: Duration) -> Result<bool, Refusal> {
+        let rung = locked(&self.rung)?;
+        let (mut rung, _) = self
+            .ringing
+            .wait_timeout_while(rung, wait, |rung| !*rung)
+            .map_err(|_| fenced("the owner's bell was poisoned"))?;
+        Ok(std::mem::take(&mut *rung))
+    }
+}
+impl std::task::Wake for Bell {
+    fn wake(self: Arc<Self>) {
+        self.ring();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.ring();
+    }
+}
+/// A handle's ring as it drops.
+#[derive(Clone)]
+struct Ring(Arc<Bell>);
+impl Drop for Ring {
+    fn drop(&mut self) {
+        self.0.ring();
+    }
 }
 
 /// Completion of a bounded queued wire record. Admission transfers byte ownership only;
@@ -234,6 +286,7 @@ struct Control {
     status: Mutex<Result<ReplicaStatus, Refusal>>,
     meter: Arc<ReplicaMeter>,
     local: Local,
+    bell: Arc<Bell>,
     // This replica's closed time and measured lag, as its owner published them after its last
     // step; told on `moved` whenever the time moves or the owner ends (replication.md, "Follower
     // reads at a closed time").
@@ -725,6 +778,8 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     // Whether this step's drive left more to drive without waiting for the log
     // (`Driven::more`): the next step comes at once, without waiting for an input.
     driving: bool,
+    // The log's writes and compactions wake the owner through this, its bell's waker.
+    waker: std::task::Waker,
     // The instant this owner last read from its clock: at its step's start, and again after a
     // preparation, whose work takes time of its own.
     at: Instant,
@@ -847,6 +902,7 @@ impl Flushing {
         machine: &crate::replication::Machine,
         meter: Arc<ReplicaMeter>,
         account: Arc<Account>,
+        bell: Arc<Bell>,
     ) -> Result<Self, Refusal> {
         let flush = machine.log_flusher();
         let mut copier = machine.reader()().map_err(|error| refused(&error))?;
@@ -908,6 +964,7 @@ impl Flushing {
                     if finished.send(result).is_err() {
                         return;
                     }
+                    bell.ring();
                 }
             })
             .map_err(unavailable)?;
@@ -1034,12 +1091,16 @@ impl ReplicaHandle {
                 bytes,
             },
         };
-        self.sender.try_send(envelope).map_err(|error| match error {
-            mpsc::TrySendError::Full(_) => Refusal::Full { limit: COMMANDS },
-            mpsc::TrySendError::Disconnected(_) => {
-                fenced("replica owner ended; reopen from durable state")
-            }
-        })
+        self.sender
+            .try_send(envelope)
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => Refusal::Full { limit: COMMANDS },
+                mpsc::TrySendError::Disconnected(_) => {
+                    fenced("replica owner ended; reopen from durable state")
+                }
+            })?;
+        self.shared.bell.ring();
+        Ok(())
     }
 
     pub(super) fn submit(
@@ -1389,19 +1450,16 @@ fn open(
     )
 }
 
-/// The write slot's bounds, stated from the core's and the quorum patience's (`patience`), so the
-/// slot adds no number of its own: a member's first slot is the core's election timeout in this
-/// owner's ticks, and a learned gap is believed for the patience's generations. A retry is not
-/// learned when the host's detector suspected its member meanwhile (`slot::Slots::keep`).
+/// The write slot's bounds, stated from the core's, so the slot adds no number of its own: a
+/// member's first slot is the core's election timeout in this owner's ticks; a learned gap is
+/// believed for one to two of its member's own recurrences (`slot`). A retry is not learned when
+/// the host's detector suspected its member meanwhile (`slot::Slots::keep`).
 fn slot_bounds(election_tick: usize) -> Result<super::slot::Bounds, Refusal> {
-    let ticks = |count: Option<u32>| {
-        count
-            .and_then(|count| TICK.checked_mul(count))
-            .ok_or_else(|| fenced("the write slot's bounds overflowed"))
-    };
     Ok(super::slot::Bounds {
-        election: ticks(u32::try_from(election_tick).ok())?,
-        generation: ticks(u32::try_from(super::patience::GENERATION).ok())?,
+        election: u32::try_from(election_tick)
+            .ok()
+            .and_then(|count| TICK.checked_mul(count))
+            .ok_or_else(|| fenced("the write slot's bounds overflowed"))?,
     })
 }
 
@@ -1423,7 +1481,8 @@ fn open_on<F: BlockFile + 'static>(
     machine.state_class(&durability)?;
     let settings = settings(config.node_id, &durability)?;
     let meter = Arc::new(ReplicaMeter::default());
-    let flushing = Flushing::start(&machine, Arc::clone(&meter), account())?;
+    let bell = Bell::new();
+    let flushing = Flushing::start(&machine, Arc::clone(&meter), account(), Arc::clone(&bell))?;
     let reader = machine.reader();
     let log_config = hyper_log::Config {
         segment_bytes: 64 << 20,
@@ -1471,13 +1530,15 @@ fn open_on<F: BlockFile + 'static>(
         status: Mutex::new(Ok(status(&replica))),
         meter,
         local,
+        bell: Arc::clone(&bell),
         closed: Mutex::new(Closed {
             time: replica.machine().closed(),
             lag: None,
         }),
         moved: std::sync::Condvar::new(),
     });
-    let slots = super::slot::Slots::new(slot_bounds(replica.core().raft.config().election_tick)?);
+    let election = replica.core().raft.config().election_tick;
+    let slots = super::slot::Slots::new(slot_bounds(election)?);
     let (sender, receiver) = mpsc::sync_channel(COMMANDS);
     let at = clock();
     let mut actor = Actor {
@@ -1514,7 +1575,7 @@ fn open_on<F: BlockFile + 'static>(
         spacing: log_bound::Spacing::default(),
         log_full: None,
         step_queued: 0,
-        answers: patience::Answers::default(),
+        answers: patience::Answers::new(election),
         #[cfg(test)]
         stalls: None,
         #[cfg(test)]
@@ -1542,6 +1603,7 @@ fn open_on<F: BlockFile + 'static>(
         lag: crate::replication::closed::Lag::default(),
         ticked: at,
         driving: false,
+        waker: std::task::Waker::from(Arc::clone(&bell)),
         at,
     };
     actor.refresh()?;
@@ -1552,6 +1614,7 @@ fn open_on<F: BlockFile + 'static>(
     let client = Client {
         handle: ReplicaHandle {
             sender,
+            _ring: Ring(bell),
             shared: control,
         },
     };
@@ -1860,25 +1923,52 @@ impl<F: BlockFile + 'static> Actor<F> {
             }
         }
     }
-    /// The owner thread: each step after waiting up to `POLL` for an input, or at once while the
-    /// last step's drive left more to drive.
+    /// The owner thread: a step for each input queued, at once while the last step's drive left
+    /// more to drive, and otherwise once its bell rings or its next deadline comes, whichever is
+    /// first (replication.md, "Decision (lane constants): the owner's wakes"). It ends once every handle is gone.
     fn run_loop(&mut self, receiver: &mpsc::Receiver<Envelope>) -> Result<(), Refusal> {
         loop {
-            let input = if self.driving {
-                match receiver.try_recv() {
-                    Ok(envelope) => Some(envelope),
-                    Err(mpsc::TryRecvError::Empty) => None,
-                    Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
-                }
-            } else {
-                match receiver.recv_timeout(POLL) {
-                    Ok(envelope) => Some(envelope),
-                    Err(mpsc::RecvTimeoutError::Timeout) => None,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            let input = match receiver.try_recv() {
+                Ok(envelope) => Some(envelope),
+                Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+                Err(mpsc::TryRecvError::Empty) if self.driving => None,
+                Err(mpsc::TryRecvError::Empty) => {
+                    let wait = self.deadline().saturating_duration_since((self.clock)());
+                    self.control.bell.wait(wait)?;
+                    match receiver.try_recv() {
+                        Ok(envelope) => Some(envelope),
+                        Err(mpsc::TryRecvError::Empty) => None,
+                        Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+                    }
                 }
             };
             self.run_step(input)?;
         }
+    }
+    /// The owner's next deadline: its next tick, or sooner a deadline of what it holds (a queued
+    /// or pending submit's, a change's, a hand-off's, the write slot's). Every other timed check
+    /// counts in ticks (elections, heartbeats, the quorum check, a bootstrap's hand-off), so it
+    /// is due at a tick.
+    fn deadline(&self) -> Instant {
+        let tick = self.ticked.checked_add(TICK).unwrap_or(self.at);
+        let waiting = self
+            .waiting
+            .iter()
+            .filter_map(|envelope| match &envelope.command {
+                Input::Submit { until, .. } => Some(*until),
+                _ => None,
+            });
+        let held = [
+            self.pending.as_ref().map(|pending| pending.until),
+            self.changing.as_ref().map(|changing| changing.until),
+            self.transferring
+                .as_ref()
+                .map(|transferring| transferring.until),
+            self.slots.until(),
+        ];
+        waiting
+            .chain(held.into_iter().flatten())
+            .fold(tick, Instant::min)
     }
     /// One step at its clock's reading: the input first, then a tick if one is due, the core's
     /// work, deadlines, and what waits.
@@ -1907,6 +1997,10 @@ impl<F: BlockFile + 'static> Actor<F> {
             let configuration = self.replica.core().raft.configuration();
             let (voters, outgoing) = (configuration.voters(), configuration.outgoing());
             self.answers.tick(leading, voters, outgoing)?;
+            // A voter the host's detector suspects is gone, not slow: its gap isn't learned.
+            for voter in &self.detected {
+                self.answers.suspected(*voter);
+            }
             self.spacing.tick()?;
             let election = self.replica.core().raft.config().election_tick;
             let patience = self
@@ -1937,7 +2031,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         let nanos = self.now()?;
         let driven = self
             .replica
-            .drive(nanos, std::task::Waker::noop(), &mut output)
+            .drive(nanos, &self.waker, &mut output)
             .map_err(raft_error)?;
         #[cfg(test)]
         if let (Some(stalls), Some((submitted, taken))) = (&self.stalls, driven.flushed) {
@@ -1984,7 +2078,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         {
             let nanos = self.now()?;
             self.replica
-                .compact(0, nanos, std::task::Waker::noop())
+                .compact(0, nanos, &self.waker)
                 .map_err(raft_error)?;
         }
         #[cfg(test)]
@@ -2746,7 +2840,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             && self.replica.core().raft.configuration().votes(from)
             && let Err(unmeasured) = self.answers.heard(from, message.term)
         {
-            if matches!(unmeasured, patience::Unmeasured::PastCeiling { .. }) {
+            if matches!(unmeasured, patience::Unmeasured::Suspected { .. }) {
                 self.control.meter.refused();
             }
             tracing::warn!(target: "amphora.replica", event = "quorum_patience_refused", error = %unmeasured, "an answer gap was not learned for the leader's quorum patience");
@@ -3816,6 +3910,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
 
+    /// A test relay's yield to the disk when it had nothing to move: a hang guard on the test's
+    /// own pacing, which no verdict depends on (replication.md, "The owner's time"). The owner
+    /// itself waits on its bell, never on this.
+    const POLL: Duration = Duration::from_millis(1);
     // Follower reads at a closed time, under leader changes (replication.md, "Follower reads at a
     // closed time"): in a file of its own, on this module's driven shell.
     mod closed_reads;
@@ -6299,6 +6397,7 @@ mod tests {
             owner.replica.machine(),
             Arc::clone(&owner.control.meter),
             account(),
+            Arc::clone(&owner.control.bell),
         )
         .unwrap();
         driven.owner_mut(leader).flushing = thread;
@@ -7621,8 +7720,8 @@ mod tests {
     /// CP-T1.8, kiln goals 6b112f14 and 867fa589 (replication.md, "The leader's quorum patience",
     /// its metrics; CLAUDE.md section 10): the patience and its refusals as the host reads them.
     /// Do: the leader measures a gap of `HELD` ticks in its followers' answers (`measured_lead`)
-    /// and ticks on; then one follower's answers are held past the ceiling while the other's flow,
-    /// and let go. Expect: the leader's `amphora_replica_quorum_patience_seconds` is its core's
+    /// and ticks on; then the host's detector suspects one follower, whose answers are held while
+    /// the other's flow, then trusts it again, and its answers are let go (T-GN.1.1). Expect: the leader's `amphora_replica_quorum_patience_seconds` is its core's
     /// patience in ticks of `TICK`, its followers' zero, and nothing refused; then the leader still
     /// leads and has refused that one gap.
     #[test]
@@ -7649,10 +7748,13 @@ mod tests {
         }
 
         let late = (leader + 1) % 3;
+        let late_id = u64::try_from(late + 1).unwrap();
+        tell(&mut driven, &clients, leader, Verdict::Suspected(late_id)).unwrap();
         pump.held = vec![late];
-        for _ in 0..=patience::QUORUM_CEILING {
+        for _ in 0..HELD {
             driven.tick(&mut pump, leader);
         }
+        tell(&mut driven, &clients, leader, Verdict::Trusted(late_id)).unwrap();
         pump.held.clear();
         driven.tick(&mut pump, leader);
         assert!(
@@ -7686,10 +7788,7 @@ mod tests {
         driven.tick(&mut pump, leader);
         let raft = &driven.owner(leader).replica.core().raft;
         let (election, patience) = (raft.config().election_tick, raft.quorum_patience());
-        assert!(
-            patience <= patience::QUORUM_CEILING - election,
-            "{patience}"
-        );
+        assert!(patience <= HELD + 1 - election, "{patience}");
         let due = election + patience;
         for _ in 1..due - 1 {
             driven.tick(&mut pump, leader);
@@ -7700,7 +7799,7 @@ mod tests {
             Ok(vec![1])
         });
         let mut after = None;
-        for count in due - 1..=due + election + patience::QUORUM_CEILING {
+        for count in due - 1..=due + election + patience {
             if clients
                 .get(leader)
                 .unwrap()
@@ -7767,28 +7866,14 @@ mod tests {
             .unwrap()
             .core
             .election_tick;
-        let ceiling = patience::QUORUM_CEILING;
         let tick = TICK.as_millis();
-        let seconds = |ticks: usize| {
-            let ms = u128::try_from(ticks).unwrap() * tick;
-            format!("{}", f64::from(u32::try_from(ms).unwrap()) / 1000.0)
-        };
-        let generation = usize::try_from(patience::GENERATION).unwrap();
         let own = [
             tick.to_string(),
-            ceiling.to_string(),
-            (ceiling - election).to_string(),
-            seconds(ceiling),
-            (2 * ceiling).to_string(),
-            seconds(2 * ceiling),
             (2 * election).to_string(),
             (2 * u128::try_from(election).unwrap() * tick).to_string(),
-            format!("{},{:03}", generation / 1000, generation % 1000),
-            seconds(generation),
-            seconds(2 * generation),
         ];
         assert!(requirements.contains("failover p99 is at most 1000 ms"));
-        let cited = ["1000", "2014", "2017", "2018", "2026-11-06"];
+        let cited = ["1000", "2014", "2017", "2018", "2026-11-06", "2026-11-21"];
         let stray: Vec<&str> = numbers(decision)
             .into_iter()
             .filter(|n| !record.contains(n) && !own.iter().any(|o| o == n) && !cited.contains(n))
@@ -9687,6 +9772,100 @@ mod tests {
         assert!(more > 0, "no step left more to drive");
         driven.drain(&mut pump);
         pump.finish();
+    }
+
+    /// CP-T1.8, AC-WK.1.1 (replication.md, "Decision (lane constants): the owner's wakes"): the owner's bell keeps a ring
+    /// given before its wait, and its waker rings it from another thread. Do: ring, then wait not
+    /// at all, twice; then wait an hour while another thread wakes the bell's waker. Expect: the
+    /// first wait finds the ring and the second none; the hour's wait ends rung.
+    #[test]
+    fn the_owners_bell_keeps_a_ring_and_its_waker_rings_it() {
+        let bell = Bell::new();
+        bell.ring();
+        assert!(bell.wait(Duration::ZERO).unwrap(), "a ring before the wait");
+        assert!(!bell.wait(Duration::ZERO).unwrap(), "a ring taken twice");
+        let waker = std::task::Waker::from(Arc::clone(&bell));
+        let ringer = std::thread::spawn(move || waker.wake());
+        assert!(
+            bell.wait(Duration::from_secs(3600)).unwrap(),
+            "the waker's ring"
+        );
+        ringer.join().unwrap();
+    }
+
+    /// CP-T1.8, AC-WK.1.2: an owner with nothing to do waits until its next deadline: its next
+    /// tick, or sooner the deadline of a submit it holds. Do: a lone member of three (no leader),
+    /// stepped with its clock standing still; then a submit due a nanosecond past its clock, which
+    /// it holds for want of a leader. Expect: its deadline is its next tick, then the submit's.
+    #[test]
+    fn an_owners_next_deadline_is_its_tick_or_a_sooner_held_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
+        driven.step();
+        let owner = driven.owner(0);
+        assert_eq!(owner.deadline(), owner.ticked + TICK);
+        let due = owner.at + Duration::from_nanos(1);
+        let _answer = submit(&client, due, |_| Ok(Vec::new()));
+        driven.step();
+        assert_eq!(
+            driven.owner(0).deadline(),
+            due,
+            "the held submit's deadline"
+        );
+    }
+
+    /// CP-T1.8, AC-WK.1.3: the owner thread wakes on events, not on a poll. Do: a lone voter on
+    /// the owner thread and the real clock; a write submitted until it is answered (it waits on
+    /// the log's write, which wakes the owner); then every handle dropped. Expect: the write
+    /// answered, and the owner thread ended once the last handle went.
+    #[test]
+    fn an_owner_thread_answers_on_its_wakes_and_ends_with_its_last_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let (client, mut actor, receiver) = super::open(
+            &path,
+            &dir.path().join("raft.log"),
+            ReplicaConfig {
+                node_id: 1,
+                voters: vec![1],
+                learners: Vec::new(),
+                bootstrap: None,
+            },
+            Durability::Persisted,
+            Arc::new(Changed::default()),
+            Owned::unbudgeted(lease(&path), None),
+            Instant::now() + Duration::from_secs(60),
+            Arc::new(Instant::now),
+        )
+        .unwrap();
+        let owner = std::thread::spawn(move || actor.run(receiver));
+        let mut answered = None;
+        for _ in 0..ROUNDS {
+            let until = Instant::now() + Duration::from_secs(30);
+            let receiver = submit(&client, until, |db| {
+                db.exec(
+                    "CREATE TABLE IF NOT EXISTS woken(n INTEGER); INSERT INTO woken VALUES (1)",
+                )?;
+                Ok(Vec::new())
+            });
+            match receiver.recv_timeout(Duration::from_secs(30)).unwrap() {
+                Err(Refusal::NotLeader { .. } | Refusal::Unavailable(_)) => {
+                    std::thread::park_timeout(POLL)
+                }
+                other => {
+                    answered = Some(other);
+                    break;
+                }
+            }
+        }
+        assert!(
+            matches!(answered, Some(Ok(_))),
+            "the write's answer: {:?}",
+            answered.as_ref().map(|answer| answer.as_ref().err())
+        );
+        drop(client);
+        owner.join().unwrap();
     }
 
     /// CP-T1.8 (amphora-seam-owner-2, amphora-owner-t1-constants-721acf2-20261112): an owner's own
@@ -13587,7 +13766,7 @@ mod tests {
             driven.round(&mut pump);
         }
         assert_eq!(handle.counters().database_log_restarts, restarts);
-        for _ in 0..2 * patience::GENERATION {
+        for _ in 0..2 * log_bound::GENERATION {
             driven.owner_mut(1).spacing.tick().unwrap();
         }
         write(&mut driven, &mut pump, &clients[0], 22);

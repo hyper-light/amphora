@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 
 use amphora::db::Db;
 use amphora::groups::Groups;
-use amphora::reshard::GroupId;
+use amphora::reshard::holding::{Away, Fenced};
+use amphora::reshard::{GroupId, OpId, Span, position};
 use amphora::store::{Checkpointed, Config, Engine, Flush, Opener, Refused};
 use amphora_engine::Value;
 
@@ -70,7 +71,28 @@ impl Engine for Events {
     fn restart_log(&mut self) -> anyhow::Result<bool> {
         self.db.restart_log()
     }
+
+    fn holding(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+        let mut kept = None;
+        self.db.query(KEPT, [], |r| {
+            kept = r.get_value(0).to_blob().map(<[u8]>::to_vec);
+            Ok(false)
+        })?;
+        Ok(kept)
+    }
+
+    fn keep_holding(&mut self, holding: &[u8]) -> anyhow::Result<()> {
+        let bytes = Value::from_slice(holding).map_err(|e| anyhow::anyhow!("{e}"))?;
+        self.db
+            .transaction(|db| db.query(KEEP, [bytes], |_| Ok(true)))?;
+        (self.db.flusher())()?;
+        Ok(())
+    }
 }
+
+/// The group's holding, kept with its rows (CP-T1.9).
+const KEPT: &str = "SELECT bytes FROM holding WHERE id = 1";
+const KEEP: &str = "INSERT OR REPLACE INTO holding (id, bytes) VALUES (1, ?1)";
 
 fn soon() -> Instant {
     Instant::now() + Duration::from_secs(10)
@@ -89,7 +111,9 @@ fn lab(dir: &std::path::Path) -> Groups<Events> {
     Groups::start(GROUPS, Config::default(), |i| {
         let db = Db::open(&dir.join(format!("events-{i}.db")))?;
         db.exec(
-            "CREATE TABLE events (key TEXT, seq INTEGER); CREATE INDEX by_key ON events (key)",
+            "CREATE TABLE IF NOT EXISTS events (key TEXT, seq INTEGER);
+             CREATE INDEX IF NOT EXISTS by_key ON events (key);
+             CREATE TABLE IF NOT EXISTS holding (id INTEGER PRIMARY KEY, bytes BLOB)",
         )?;
         Ok(Events { db })
     })
@@ -187,4 +211,37 @@ fn a_batch_spanning_groups_is_refused_and_writes_nothing() {
     groups.sync(soon()).unwrap();
     assert_eq!(count(&groups, &a), 0);
     assert_eq!(count(&groups, &b), 0);
+}
+
+/// T-T1.9.R3 (CP-T1.9; docs/design/reshard.md, "A group's holding"): fence one key's position
+/// at its group, then start the groups again on the same files; expect the group to answer from
+/// the holding its own database kept with its rows: the fenced key still refused, typed, and the
+/// group's other keys still taken, with no router's memory carried over.
+#[test]
+fn t_t1_9_r3_a_groups_holding_is_kept_with_its_rows_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let groups = lab(dir.path());
+    let key = "k0";
+    let group = groups.group(key).unwrap();
+    let other = (1..)
+        .map(|i| format!("k{i}"))
+        .find(|k| groups.group(k) == Some(group))
+        .unwrap();
+    let pos = position(key);
+    let span = Span::new(pos, pos).unwrap();
+    let fenced = groups
+        .hold(group, soon(), |h| h.fence(OpId(1), span, 1))
+        .unwrap();
+    assert_eq!(fenced, Fenced::New(1));
+    let away = Some(Refused::Away(Away::Fenced(OpId(1))));
+    assert_eq!(groups.put(vec![row(key, 1)]).err(), away);
+    groups.sync(soon()).unwrap();
+    drop(groups);
+
+    let again = lab(dir.path());
+    assert_eq!(again.put(vec![row(key, 2)]).err(), away);
+    let t = again.put(vec![row(&other, 3)]).unwrap();
+    assert_eq!(t.group(), group);
+    again.durable(&t, soon()).unwrap();
+    assert_eq!(count(&again, &other), 1);
 }

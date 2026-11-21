@@ -364,6 +364,8 @@ criteria = [
 ]
 tests = [
   { id = "T-PL.9.1", text = "A table grown tenfold after its statement was prepared — passes when the statement plans again once and its answer is unchanged" },
+  # lane pl9
+  { id = "T-PL.9.2", text = "Writes that change rows, writes that change none, and reads — passes when each write that changed rows adds to its table's count exactly once and nothing else does" },
 ]
 
 [[own]]
@@ -461,6 +463,18 @@ tests = [
   { id = "T-NS.1.1", text = "Random operation sequences on both cursors — passes when identical keys, values and positions after each step" },
 ]
 
+# lane g7s2
+[[own]]
+id = "NS.2"
+title = "Records, overflow, the catalog and transactions on the new pages (G7 step 2)"
+criteria = [
+  { id = "AC-NS.2.1", text = "the engine's test suites pass on the new storage" },
+  { id = "AC-NS.2.3", text = "A transaction rolls back to a savepoint from its versions: rows first changed after it as before the transaction, rows changed before and after as the savepoint found them, later changes out of its redo record; the savepoint stays good" },
+]
+tests = [
+  { id = "T-NS.2.1", text = "The shared model test of transactions on both storages — passes when identical answers, no anomaly" },
+]
+
 # lane follower-reads (G13 step 4, kiln goal 80d4cf5e; docs/design/replication.md, "Follower reads at a
 # closed time" and "Search over partitions"). AC-T1.10.3 and AC-T1.10.4 are the measures; these are what they
 # rest on.
@@ -534,6 +548,32 @@ tests = [
   { id = "T-DQ.1.1", text = "Three members, an election and 20 writes on driven time — passes when every write is answered and some step left more to drive for the next" },
 ]
 
+[[own]]
+id = "WK.1"
+title = "The replicated owner wakes on its events and its next deadline, not a picked 1 ms poll"
+criteria = [
+  { id = "AC-WK.1.1", text = "The owner waits on a bell rung by an input queued, a handle dropped, the replication log's write or compaction done (the bell's waker) and a flush done; a ring before the wait is kept" },
+  { id = "AC-WK.1.2", text = "An owner with nothing to drive waits at most until its next deadline: its next tick, or sooner a queued or pending submit's, a change's, a hand-off's or the write slot's" },
+  { id = "AC-WK.1.3", text = "The owner thread answers a write it waits on the log for, and ends once its last handle is dropped" },
+]
+tests = [
+  { id = "T-WK.1.1", text = "A bell rung, then waited on twice for no time; then waited on for an hour while another thread wakes its waker — passes when the first wait is rung, the second not, the hour's rung" },
+  { id = "T-WK.1.2", text = "A lone member of three stepped, then given a submit due a nanosecond past its clock — passes when its deadline is its next tick, then the submit's" },
+  { id = "T-WK.1.3", text = "A lone voter on the owner thread, a write submitted until answered, every handle dropped — passes when the write is answered and the owner thread ends" },
+]
+
+[[own]]
+id = "GN.1"
+title = "Windows' generations learned from their own events where they run, and gone-not-slow the detector's verdict: not a picked 3,000-tick generation or 165-tick ceiling"
+criteria = [
+  { id = "AC-GN.1.1", text = "The quorum patience believes each voter's gap for one to two of that voter's own generations, each as long as its last two gaps past the election timeout were apart; a gap over which the host's detector suspected the voter is refused Suspected, counted and not learned; no ceiling" },
+  { id = "AC-GN.1.2", text = "The write slot believes each member's learned gap for one to two of its own generations, each as long as its last two learned gaps were apart" },
+]
+tests = [
+  { id = "T-GN.1.1", text = "Patience: two gaps of 50 ticks 99 apart, then prompt answers; a suspected voter answering 200 late — passes when the second gap is believed 98 ticks on and forgotten 100 later, and the suspected gap refused and not learned" },
+  { id = "T-GN.1.2", text = "Slot: a gap of 40 ms after a member's first slot, then none — passes when it is believed at 40 and 79 ms and forgotten at 80 ms" },
+]
+
 # lane cc-proto
 # Amphora's own IDs for G8 step 1 (kiln plan 01a16b0f4716761cb68dc0c96863b53b, step 1, under
 # CP-T1.3 and AC-T1.3.6): serializability by precision locking against SSI and OCC, measured.
@@ -576,7 +616,9 @@ criteria = [
 tests = [
   { id = "T-T1.9.S1", text = "Automatic splits, merges and moves in the simulator under writes, driver and group restarts and lost logs — passes when every key is in exactly one group, the directory's, and writes lost is 0" },
   { id = "T-T1.9.R1", text = "A split carried through the directory group's replicated log while groups route by it — passes when every member holds the same directory, a write to the fenced range is refused typed, a router on the old directory is refused by the old group's holding after the flip, and once routed by the new directory the range is written to and read from the new group" },
-  { id = "T-T1.9.R2", text = "A refused directory change and a directory image — passes when the refusal is alike on every member and changes nothing, an image installs the same directory, and an image that doesn't decode is refused" },
+  { id = "T-T1.9.R2", text = "A refused directory change and a directory image — passes when the refusal is alike on every member and changes nothing, an image installs the same directory and a member reopened opens at the image it kept, and an image that doesn't decode, installed or kept, is refused" },
+  # lane split-merge-5
+  { id = "T-T1.9.R3", text = "A group's holding kept by its own database with its rows: a key fenced, then the groups started again on the same files — passes when the fenced key is still refused, typed, and the group's other keys are still taken" },
 ]
 
 # lane qs5
@@ -625,6 +667,22 @@ criteria = [
 ]
 tests = [
   { id = "T-CS.1.1", text = "A doc-truth check of its claims (crates/amphora/tests/columnar_decision.rs) — passes when every claim cited: each citation resolves to a quoted, located claim from a graded source, and each number the decision states is in a quote it cites" },
+]
+
+# lane g11-copies
+
+[[own]]
+id = "CS.2"
+title = "In-memory columns against persistent column blocks: both prototypes behind one core, measured, the choice made by the numbers (G11 step 2)"
+criteria = [
+  { id = "AC-CS.2.1", text = "Prototype A (blocks in memory, unlogged, rebuilt from the rows) and prototype B (compressed blocks with positional deltas kept as a file, reused at open when current) share one core fed by each commit's redo record" },
+  { id = "AC-CS.2.2", text = "Both prototypes' numbers recorded (write throughput and commit latency at 1 and 32 clients with and without the copy, freshness lag p50 to p99.9, bytes a row, scan speed, the learned block size); the choice made by them; write throughput at 32 clients with the chosen copy kept falls by no more than 5%" },
+]
+tests = [
+  { id = "T-CS.2.1", text = "cs2_scan_at_each_snapshot_equals_rows_{plain,packed} (crates/engine/storage/versioned/columns.rs) — passes when, under concurrent writers and the copy's own rebuilds, every scan of the copy at a fresh or held snapshot equals the rows at that snapshot, and some were answered by the copy with deltas" },
+  { id = "T-CS.2.2", text = "cs2_full_queue_falls_back_to_rows_and_stays_exact — passes when, with a queue too small for most records, no commit is refused and every scan still equals the rows at its snapshot" },
+  { id = "T-CS.2.3", text = "cs2_packed_copy_reused_at_open_only_when_current — passes when prototype B's file is reused at the commit it was written at, scans equal the rows, and it is refused at a later commit" },
+  { id = "T-CS.2.4", text = "amphora-bench --columns (bench/src/columns.rs) — one JSON line a copy and client count with the four measures; passes when recorded under bench/records with hardware, commit, date and load" },
 ]
 
 # lane corpus-ci
