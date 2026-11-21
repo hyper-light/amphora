@@ -377,7 +377,15 @@ criteria = [
   { id = "AC-PL.12.1", text = "TPC-H's 22 queries prepared once and run with qgen's parameters: no query slower than its generic plan (measured on the parent first)" },
   { id = "AC-PL.12.2", text = "The bench suite's prepared statements are within 2% of the parent" },
 ]
-tests = []
+# lane pl12
+tests = [
+  { id = "T-PL.12.1", text = "The choice: custom with no run measured; generic once its cost is not above the custom average raised by measured planning over running (plan_cache.rs unit tests)" },
+  { id = "T-PL.12.2", text = "An estimate reads a bound value only when one is bound and not NULL" },
+  { id = "T-PL.12.3", text = "EXPLAIN with a value bound estimates that value: k = 1 its 4,500 rows, a rare k a few, a sampled range its rows" },
+  { id = "T-PL.12.4", text = "Custom and generic plans forced answer as the literal query, a custom plan made for each forced run" },
+  { id = "T-PL.12.5", text = "A statement no estimate reads a value for (a key lookup, no statistics, nothing bound) is never planned again" },
+  { id = "T-PL.12.6", text = "Auto: the first run is custom, ANALYZE starts the choice again, every run answers as the generic plan, a custom run reset part way runs again" },
+]
 
 [[own]]
 id = "PL.13"

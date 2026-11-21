@@ -2,9 +2,10 @@
 //! (decision 20), so ranges, LIKE, ORs and correlated columns are estimated together, by the share
 //! of the sample's rows that pass them all. A pure core: each term is compiled once into a flat
 //! program (a loop over an explicit stack, CLAUDE.md §11), then run a row at a time within a
-//! counted budget of steps (§2). A term this evaluator doesn't run (a parameter, a function, a
-//! subquery, another table's column) or that raises an error on a sample row is left to the
-//! planner's other estimates.
+//! counted budget of steps (§2). A term this evaluator doesn't run (a function, a subquery, another
+//! table's column, a parameter with no value bound) or that raises an error on a sample row is left
+//! to the planner's other estimates. A parameter's value is read where the statement is planned
+//! with its run's values (a custom plan, PL.12).
 
 use crate::numeric::Numeric;
 use crate::schema::Column;
@@ -78,6 +79,8 @@ pub(crate) struct Target<'a> {
     pub table: TableInternalId,
     pub columns: &'a [Column],
     pub in_sample: &'a [Option<usize>],
+    /// The values the statement is planned with (PL.12), where its parameters' values are read.
+    pub values: Option<&'a crate::plan_cache::PlanValues>,
 }
 
 enum Visit<'a> {
@@ -142,7 +145,11 @@ impl Target<'_> {
 
     /// `expr` compiled into a program over the sample's rows, `None` where it reads anything but
     /// this table's sampled columns and constants, or is longer than [MAX_OPS].
+    /// A parameter with no value bound leaves the term unrun, but a term that would compile with
+    /// one notes that its estimate asked for it (PL.12): a plan made with a value could differ.
     pub(crate) fn compile(&self, expr: &ast::Expr) -> Option<Program> {
+        let mut parameters = false;
+        let mut unbound = false;
         let mut ops = Vec::new();
         let mut stack = vec![Visit::Enter(expr)];
         while let Some(visit) = stack.pop() {
@@ -163,6 +170,12 @@ impl Target<'_> {
                 },
                 ast::Expr::Collate(inner, _) => stack.push(Visit::Enter(inner)),
                 ast::Expr::Literal(literal) => ops.push(Op::Value(literal_value(literal)?)),
+                ast::Expr::Variable(variable) => {
+                    let value = self.values.and_then(|values| values.value(variable));
+                    parameters = true;
+                    unbound |= value.is_none();
+                    ops.push(Op::Value(value.cloned().unwrap_or(Value::Null)));
+                }
                 ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => {
                     let ast::Expr::Literal(literal) = operand(inner).0 else {
                         return None;
@@ -273,11 +286,18 @@ impl Target<'_> {
                 _ => return None,
             }
         }
-        if ops.len() <= MAX_OPS {
-            Some(Program(ops))
-        } else {
-            None
+        if ops.len() > MAX_OPS {
+            return None;
         }
+        if parameters {
+            if let Some(values) = self.values {
+                values.note_asked();
+            }
+        }
+        if unbound {
+            return None;
+        }
+        Some(Program(ops))
     }
 }
 

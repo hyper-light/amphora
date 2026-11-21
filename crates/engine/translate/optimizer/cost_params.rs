@@ -96,6 +96,12 @@ pub struct CostModelParams {
 
     /// Estimated bytes per row for hash table spill estimation.
     pub hash_bytes_per_row: f64,
+
+    /// Amphora (PL.12): the values the estimates may read for the statement's parameters, a run's
+    /// for a custom plan and none for the generic one, where they note that one asked
+    /// (`plan_cache.rs`). Not a tuning parameter: set as the statement is planned.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) plan_values: Option<crate::sync::Arc<crate::plan_cache::PlanValues>>,
 }
 
 impl CostModelParams {
@@ -134,6 +140,8 @@ impl CostModelParams {
             hash_insert_cost: 0.002,
             hash_lookup_cost: 0.003,
             hash_bytes_per_row: 100.0,
+
+            plan_values: None,
         }
     }
 }
@@ -157,6 +165,50 @@ impl CostModelParams {
         Self {
             cache_pages: pages as f64,
             ..self.clone()
+        }
+    }
+
+    /// Amphora (PL.12): these parameters with the statement's parameter values, `values`.
+    pub(crate) fn with_plan_values(
+        self,
+        values: Option<&crate::sync::Arc<crate::plan_cache::PlanValues>>,
+    ) -> Self {
+        Self {
+            plan_values: values.cloned(),
+            ..self
+        }
+    }
+
+    /// Amphora (PL.12): the value an estimate takes for `expr`: a literal's own, a parameter's
+    /// bound value (noting that an estimate asked for it), else `None`.
+    pub(crate) fn constant_value(
+        &self,
+        expr: &amphora_engine_parser::ast::Expr,
+    ) -> Option<crate::Value> {
+        use amphora_engine_parser::ast;
+        let mut expr = expr;
+        // A parenthesis of one expression is that expression: walked in a loop, not by recursion
+        // (CLAUDE.md §11); the AST is finite, so the loop ends.
+        while let ast::Expr::Parenthesized(exprs) = expr {
+            let [only] = exprs.as_slice() else {
+                return None;
+            };
+            expr = only;
+        }
+        match expr {
+            ast::Expr::Literal(ast::Literal::Numeric(n)) => match n.parse::<i64>() {
+                Ok(i) => Some(crate::Value::from_i64(i)),
+                Err(_) => n.parse::<f64>().ok().map(crate::Value::from_f64),
+            },
+            ast::Expr::Literal(ast::Literal::String(s)) => Some(crate::Value::build_text(
+                crate::translate::expr::sanitize_string(s),
+            )),
+            ast::Expr::Variable(variable) => {
+                let values = self.plan_values.as_deref()?;
+                values.note_asked();
+                values.value(variable).cloned()
+            }
+            _ => None,
         }
     }
 }

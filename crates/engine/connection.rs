@@ -176,6 +176,8 @@ impl Drop for SchemaReparseGuard {
 #[derive(Debug, Default)]
 pub struct PrepareOptions {
     pub unqualified_database_search_path: Option<Vec<String>>,
+    /// Amphora (PL.12): a run's bound values, for a custom plan; `None` plans the generic one.
+    pub(crate) plan_values: Option<Arc<crate::plan_cache::PlanValues>>,
 }
 
 /// Re-entrant state for [`Connection::reparse_schema_nonblock`] and the
@@ -453,6 +455,9 @@ pub struct Connection {
     /// Amphora: statements prepared from now on count the rows of their table accesses and
     /// joins (`vdbe/row_counts.rs`).
     pub(super) row_counters: AtomicBool,
+    /// Amphora (PL.12): what prepared statements plan each run with (`plan_cache.rs`), as
+    /// [crate::PlanCacheMode::to_u8] gives it.
+    pub(super) plan_cache_mode: AtomicU8,
     pub(super) vdbe_trace: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
     pub(super) dml_require_where: AtomicBool,
@@ -3986,6 +3991,17 @@ impl Connection {
 
     pub(crate) fn row_counters(&self) -> bool {
         self.row_counters.load(Ordering::SeqCst)
+    }
+
+    /// Amphora (PL.12): what this connection's prepared statements plan each run with, read as
+    /// each run starts: custom plans while they pay for their planning, then the generic one
+    /// ([crate::PlanCacheMode::Auto], the default), or always one of them.
+    pub fn set_plan_cache_mode(&self, mode: crate::PlanCacheMode) {
+        self.plan_cache_mode.store(mode.to_u8(), Ordering::Relaxed);
+    }
+
+    pub fn plan_cache_mode(&self) -> crate::PlanCacheMode {
+        crate::PlanCacheMode::from_u8(self.plan_cache_mode.load(Ordering::Relaxed))
     }
 
     pub fn set_vdbe_trace(&self, value: bool) {

@@ -192,6 +192,9 @@ pub struct Resolver<'a> {
     /// costs (`docs/design/planner.md`, decision 5): the connection's, set at prepare; the engine's
     /// default page cache until then.
     cache_pages: usize,
+    /// Amphora (PL.12): the values the estimates may read for the statement's parameters (none for
+    /// the generic plan), and where they note that one asked; set at prepare.
+    plan_values: Option<Arc<crate::plan_cache::PlanValues>>,
     /// Cached flag: true when this connection has an active temp database.
     ///
     /// Computed once at Resolver construction to avoid repeated
@@ -316,6 +319,7 @@ impl<'a> Resolver<'a> {
             dialect,
             trigger_context: None,
             cache_pages: crate::storage::page_cache::DEFAULT_PAGE_CACHE_SIZE_IN_PAGES,
+            plan_values: None,
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
             unqualified_database_search_path: unqualified_database_search_path.clone(),
@@ -350,6 +354,16 @@ impl<'a> Resolver<'a> {
         self.cache_pages = pages;
     }
 
+    /// Amphora (PL.12): the values the statement's estimates may read, if any were set.
+    pub(crate) fn plan_values(&self) -> Option<&Arc<crate::plan_cache::PlanValues>> {
+        self.plan_values.as_ref()
+    }
+
+    /// Amphora (PL.12): sets the values the statement's estimates may read.
+    pub(crate) fn set_plan_values(&mut self, values: Arc<crate::plan_cache::PlanValues>) {
+        self.plan_values = Some(values);
+    }
+
     pub fn fork(&self) -> Resolver<'a> {
         Resolver {
             schema: self.schema,
@@ -372,6 +386,7 @@ impl<'a> Resolver<'a> {
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             cache_pages: self.cache_pages,
+            plan_values: self.plan_values.clone(),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
@@ -400,6 +415,7 @@ impl<'a> Resolver<'a> {
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             cache_pages: self.cache_pages,
+            plan_values: self.plan_values.clone(),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),

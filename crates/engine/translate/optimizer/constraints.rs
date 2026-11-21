@@ -1496,7 +1496,7 @@ pub fn constraints_from_where_clause(
             }
         }
 
-        apply_column_stats(&mut cs.constraints, table_reference, where_clause, schema);
+        apply_column_stats(&mut cs.constraints, table_reference, where_clause, schema, params);
         for candidate in cs.candidates.iter_mut() {
             // Sort by index_col_pos, ascending -- index columns must be consumed in contiguous order.
             candidate.refs.sort_by_key(|cref| cref.index_col_pos);
@@ -2695,16 +2695,19 @@ fn find_best_index_for_constraint(
 /// against constants takes ANALYZE's column statistics where it kept them. A value the sample
 /// holds as a common one ([common_kept]) takes its share of the sample; another takes the share
 /// the common values leave of the column's non-NULL rows, over the distinct values they leave
-/// (PostgreSQL's `var_eq_const`), at most the least common value's; a bound parameter's value,
-/// unknown at prepare, and a column of a collation other than BINARY, the share of the non-NULL
-/// rows over the distinct count. An IN list takes the sum of its values', at most one. A unique
-/// key keeps its one row a value, a join term its equivalence class (decision 18), and every
-/// other constraint what it had.
+/// (PostgreSQL's `var_eq_const`), at most the least common value's; a parameter the share of the
+/// value bound to it where the statement is planned with its run's values (a custom plan, PL.12),
+/// and otherwise, as a column of a collation other than BINARY, the share of the non-NULL rows
+/// over the distinct count. An IN list takes the sum of its values', at most one. A unique key
+/// keeps its one row a value, a join term its equivalence class (decision 18), and every other
+/// constraint what it had. Only a column with common values tells one value from another, so only
+/// there does a parameter's value count as asked for.
 fn apply_column_stats(
     constraints: &mut [Constraint],
     table: &JoinedTable,
     where_clause: &[WhereTerm],
     schema: &Schema,
+    params: &CostModelParams,
 ) {
     let Some(stats) = schema.analyze_stats.table_stats(table.table.get_name()) else {
         return;
@@ -2763,8 +2766,11 @@ fn apply_column_stats(
             let share = left / (counted.distinct - common.len() as f64).max(1.0);
             least.map_or(share, |least| share.min(least as f64 / n))
         });
-        let share = |value: Option<crate::Value>| -> f64 {
-            let (Some(value), Some((n, common))) = (value, sample) else {
+        let share = |operand: &ast::Expr| -> f64 {
+            let Some((n, common)) = sample.filter(|(_, common)| !common.is_empty()) else {
+                return per_distinct;
+            };
+            let Some(value) = params.constant_value(operand) else {
                 return per_distinct;
             };
             let value = match column.affinity().convert_for_compare(&value) {
@@ -2794,11 +2800,11 @@ fn apply_column_stats(
                 } else {
                     rhs
                 };
-                share(literal_value(other))
+                share(&**other)
             }
             (ConstraintOperator::In { not: false, .. }, ast::Expr::InList { rhs, .. }) => rhs
                 .iter()
-                .map(|value| share(literal_value(value)))
+                .map(|value| share(&**value))
                 .sum::<f64>()
                 .min(1.0),
             _ => continue,
@@ -2848,23 +2854,3 @@ fn common_kept(common: &[(u64, usize)], n: f64, total: f64, distinct: f64, nulls
     kept
 }
 
-/// The value a literal is, `None` for anything else (a parameter, a column, an expression).
-fn literal_value(expr: &ast::Expr) -> Option<crate::Value> {
-    match expr {
-        ast::Expr::Literal(ast::Literal::Numeric(n)) => {
-            if let Ok(i) = n.parse::<i64>() {
-                Some(crate::Value::from_i64(i))
-            } else {
-                n.parse::<f64>().ok().map(crate::Value::from_f64)
-            }
-        }
-        ast::Expr::Literal(ast::Literal::String(s)) => Some(crate::Value::build_text(
-            crate::translate::expr::sanitize_string(s),
-        )),
-        ast::Expr::Parenthesized(exprs) => match exprs.as_slice() {
-            [only] => literal_value(only),
-            _ => None,
-        },
-        _ => None,
-    }
-}

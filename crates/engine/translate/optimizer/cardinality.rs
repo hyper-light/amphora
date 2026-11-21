@@ -442,6 +442,7 @@ impl<'a> JoinedSetRows<'a> {
                             Which::Both => filter(pos).or_else(|| on(pos)),
                         },
                         schema,
+                        params,
                     )
                 };
                 let on_terms = where_clause
@@ -872,6 +873,7 @@ fn sampled_filters(
     where_clause: &[WhereTerm],
     takes: &impl Fn(usize) -> Option<bool>,
     schema: &Schema,
+    params: &CostModelParams,
 ) -> Option<Sampled> {
     let btree = joined.table.btree()?;
     let stats = schema.analyze_stats.table_stats(&btree.name)?;
@@ -892,6 +894,7 @@ fn sampled_filters(
         table: joined.internal_id,
         columns,
         in_sample: &in_sample,
+        values: params.plan_values.as_deref(),
     };
     let mut budget = super::sample_filter::SAMPLE_STEPS;
     let mut terms: SmallVec<[usize; 8]> = SmallVec::new();
