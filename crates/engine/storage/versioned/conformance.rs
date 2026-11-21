@@ -15,7 +15,7 @@
 //! delete). That step is checked against a plain ordered model of the rows too: the row after the
 //! deleted one, or the one before it. Every step is: the versioned cursor must match the model;
 //! the reference (btree.rs) is known to leave it on `prev` (after a delete, and from the first
-//! row), so there the model alone decides.
+//! row) and on an index's `next` from the last row, so there the model alone decides.
 
 use super::cursor::{Access, KeyOrder, VersionedCursor};
 use super::disk::Simulated;
@@ -411,8 +411,7 @@ fn run(kind: Kind, seed: u64, ops: usize) {
     let mut place = Place::Unplaced;
     // The key of the row the cursors are on, or of the row just deleted.
     let mut current: Vec<u8> = Vec::new();
-    // Steps where the reference's `prev` left it elsewhere than the model's row (btree.rs),
-    // counted so a run names them.
+    // Steps where the reference left the model's row (btree.rs), counted so a run names them.
     let mut reference_diverged = 0usize;
     let mut next_rowid = 1i64;
     // The operations so far, the last few of which a failure names.
@@ -502,18 +501,19 @@ fn run(kind: Kind, seed: u64, ops: usize) {
                 "{at}: {name}, against the ordered model"
             );
             if record(&sb).as_deref() != want {
-                // The reference's own divergence, known for `prev` only (btree.rs, shared
-                // engine code this suite doesn't change): after a delete it can land elsewhere
-                // than the row before the deleted one, and from the first row it can land on a
-                // row. A `next` that leaves the model fails the run. Both cursors are placed
-                // afresh before anything is compared again.
+                // The reference's own divergences, known in these cases only (btree.rs, shared
+                // engine code this suite doesn't change): its `prev` after a delete can land
+                // elsewhere than the row before the deleted one, and from the first row on a
+                // row; on an index its `next` from the last row can land on a row. Any other
+                // step that leaves the model fails the run. Both cursors are placed afresh
+                // before anything is compared again.
                 assert!(
-                    !forward,
+                    !forward || want.is_none(),
                     "{at}: the reference's {name} left the ordered model: reference {sb:?}, \
                      versioned {sv:?}"
                 );
                 eprintln!(
-                    "{at}: reference prev from {current:?} (deleted: {}) landed on {:?}, the \
+                    "{at}: reference {name} from {current:?} (deleted: {}) landed on {:?}, the \
                      model's row {want:?}",
                     place == Place::Deleted,
                     record(&sb)
@@ -598,7 +598,7 @@ fn run(kind: Kind, seed: u64, ops: usize) {
     assert_eq!(records, modelled, "{kind:?} seed {seed}: the model's rows at the end");
     if reference_diverged > 0 {
         eprintln!(
-            "{kind:?} seed {seed}: the reference's prev left the ordered model \
+            "{kind:?} seed {seed}: the reference's step left the ordered model \
              {reference_diverged} times (versioned matched it)"
         );
     }
