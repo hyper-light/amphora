@@ -321,7 +321,8 @@ fn units(text: &str) -> Vec<String> {
     let mut current: Option<String> = None;
     for line in text.lines() {
         let item = line.trim_start().starts_with("- ");
-        let breaks = line.starts_with('#') || line.trim().is_empty() || line.starts_with('|') || item;
+        let breaks =
+            line.starts_with('#') || line.trim().is_empty() || line.starts_with('|') || item;
         if breaks && let Some(t) = current.take() {
             out.push(t);
         }
@@ -394,7 +395,10 @@ fn protocol_faults(index: &str, record: &str, note: &str) -> Vec<String> {
                 .filter_map(|id| claims.get(id))
                 .flat_map(|(_, _, quote)| numbers(quote))
                 .collect();
-            for n in numbers(&stated(piece)).iter().filter(|n| !held.contains(*n)) {
+            for n in numbers(&stated(piece))
+                .iter()
+                .filter(|n| !held.contains(*n))
+            {
                 faults.push(format!(
                     "{n} is in no quote cited by: {}",
                     piece.trim().chars().take(70).collect::<String>()
@@ -428,7 +432,10 @@ fn ac_t1_2_3_a_decision_without_a_line_is_a_fault() {
         "{faults:?}"
     );
     // A new record without sections of its own is one decision.
-    records.insert("new-area".to_owned(), "# A new area\n\nIts words.\n".to_owned());
+    records.insert(
+        "new-area".to_owned(),
+        "# A new area\n\nIts words.\n".to_owned(),
+    );
     let faults = index_faults(INDEX, &records);
     assert!(
         faults.contains(&"new-area.md has no line in the index".to_owned()),
@@ -441,7 +448,8 @@ fn ac_t1_2_3_adding_a_decision_is_one_line() {
     let mut records = records();
     let semantics = records.get_mut("semantics").unwrap();
     semantics.push_str("\n## 3. A new decision\n\nIts words.\n");
-    let line = "| semantics | 3 | A new decision | [semantics.md](design/semantics.md#3-a-new-decision) |";
+    let line =
+        "| semantics | 3 | A new decision | [semantics.md](design/semantics.md#3-a-new-decision) |";
     // The one line, after the table's first row.
     let first = "| Area | No. | Decision | Record |\n|---|---|---|---|\n";
     let fixed = INDEX.replacen(first, &format!("{first}{line}\n"), 1);
@@ -465,7 +473,9 @@ fn ac_t1_2_3_a_line_that_points_nowhere_is_a_fault() {
         "{faults:?}"
     );
     assert!(
-        faults.contains(&"semantics.md#1-text-is-well-formed-utf-8 has no line in the index".to_owned()),
+        faults.contains(
+            &"semantics.md#1-text-is-well-formed-utf-8 has no line in the index".to_owned()
+        ),
         "{faults:?}"
     );
     let no_record = INDEX.replacen("](design/semantics.md#1-", "](design/semantic.md#1-", 1);
@@ -478,14 +488,17 @@ fn ac_t1_2_3_a_line_that_points_nowhere_is_a_fault() {
     assert_ne!(renumbered, INDEX);
     let faults = index_faults(&renumbered, &records);
     assert!(
-        faults.contains(&"semantics.md#1-text-is-well-formed-utf-8 is number 1, its line says 7".to_owned()),
+        faults.contains(
+            &"semantics.md#1-text-is-well-formed-utf-8 is number 1, its line says 7".to_owned()
+        ),
         "{faults:?}"
     );
 }
 
 #[test]
 fn ac_t1_2_3_a_section_indexed_twice_is_a_fault() {
-    let line = "- semantics: TEXT ([semantics.md](design/semantics.md#1-text-is-well-formed-utf-8))";
+    let line =
+        "- semantics: TEXT ([semantics.md](design/semantics.md#1-text-is-well-formed-utf-8))";
     let twice = format!("{INDEX}\n{line}\n");
     let faults = index_faults(&twice, &records());
     assert!(
@@ -496,8 +509,14 @@ fn ac_t1_2_3_a_section_indexed_twice_is_a_fault() {
 
 #[test]
 fn ac_t1_2_3_anchors_are_githubs() {
-    assert_eq!(slug("2. `IN (SELECT ...)` answers a row"), "2-in-select--answers-a-row");
-    assert_eq!(slug("The owner's time (2026-10-31)"), "the-owners-time-2026-10-31");
+    assert_eq!(
+        slug("2. `IN (SELECT ...)` answers a row"),
+        "2-in-select--answers-a-row"
+    );
+    assert_eq!(
+        slug("The owner's time (2026-10-31)"),
+        "the-owners-time-2026-10-31"
+    );
     let found = sections("# T\n## A\n### A\n```\n## not a heading\n```\n## A\n## 4. B\n");
     let anchors: Vec<&str> = found.iter().map(|s| s.anchor.as_str()).collect();
     assert_eq!(anchors, ["a", "a-2", "4-b"]);
@@ -515,7 +534,10 @@ fn ac_t1_2_3_the_client_protocol_is_held_to_its_sources() {
     let faults = protocol_faults(INDEX, &record, NOTE);
     assert!(faults.is_empty(), "{}", faults.join("\n"));
     // Non-vacuity: the comparison's rows and the note's claims were seen.
-    let rows = units(section(INDEX, COMPARISON)).iter().filter(|u| u.starts_with('|')).count();
+    let rows = units(section(INDEX, COMPARISON))
+        .iter()
+        .filter(|u| u.starts_with('|'))
+        .count();
     assert!(rows >= 7, "the comparison has {rows} rows");
     assert!(claims(NOTE).unwrap().len() >= 25);
 }
@@ -527,25 +549,55 @@ fn ac_t1_2_3_an_uncited_row_number_or_claim_is_a_fault() {
     let changed = INDEX.replacen("at most 16 MByte", "at most 17 MByte", 1);
     assert_ne!(changed, INDEX);
     let f = protocol_faults(&changed, &record, NOTE);
-    assert!(f.iter().any(|f| f.starts_with("17 is in no quote")), "{f:?}");
+    assert!(
+        f.iter().any(|f| f.starts_with("17 is in no quote")),
+        "{f:?}"
+    );
     // A row of the comparison that cites nothing.
-    let changed = INDEX.replacen("\n\n## The decisions", "\n| Uncited | a | b | c | d | e |\n\n## The decisions", 1);
+    let changed = INDEX.replacen(
+        "\n\n## The decisions",
+        "\n| Uncited | a | b | c | d | e |\n\n## The decisions",
+        1,
+    );
     let f = protocol_faults(&changed, &record, NOTE);
-    assert!(f.iter().any(|f| f.starts_with("uncited in the comparison: | Uncited")), "{f:?}");
+    assert!(
+        f.iter()
+            .any(|f| f.starts_with("uncited in the comparison: | Uncited")),
+        "{f:?}"
+    );
     // A claim nobody cites, and a citation without a claim.
     let changed = INDEX.replace("[p20]", "[p999]");
     let f = protocol_faults(&changed, &record, NOTE);
-    assert!(f.contains(&"p20 is in the note but cited nowhere".to_owned()), "{f:?}");
-    assert!(f.contains(&"p999 is cited but has no claim line".to_owned()), "{f:?}");
+    assert!(
+        f.contains(&"p20 is in the note but cited nowhere".to_owned()),
+        "{f:?}"
+    );
+    assert!(
+        f.contains(&"p999 is cited but has no claim line".to_owned()),
+        "{f:?}"
+    );
     // A source without a grade.
-    let ungraded = NOTE.replacen("| specification | A | Framing", "| specification | ? | Framing", 1);
+    let ungraded = NOTE.replacen(
+        "| specification | A | Framing",
+        "| specification | ? | Framing",
+        1,
+    );
     assert_ne!(ungraded, NOTE);
     let f = protocol_faults(INDEX, &record, &ungraded);
-    assert!(f.iter().any(|f| f.contains("lacks a locator or a grade")), "{f:?}");
+    assert!(
+        f.iter().any(|f| f.contains("lacks a locator or a grade")),
+        "{f:?}"
+    );
 }
 
 #[test]
 fn ac_t1_2_3_numbers_skip_names_and_dates() {
-    assert_eq!(numbers("CP-T1.2 on 2026-11-21, x86_64 p99 §5"), Vec::<String>::new());
-    assert_eq!(numbers("at most 16 MByte, 2,197 and 3.5"), ["16", "2197", "3.5"]);
+    assert_eq!(
+        numbers("CP-T1.2 on 2026-11-21, x86_64 p99 §5"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        numbers("at most 16 MByte, 2,197 and 3.5"),
+        ["16", "2197", "3.5"]
+    );
 }
