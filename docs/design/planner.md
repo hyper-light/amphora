@@ -1459,7 +1459,17 @@ semi and anti join tables placed before other loops. The probe is read whole, as
 probe is today; a probe that keeps its own access method would let the run's result join a loop
 read by a key.
 
-**Falsified by.** An answer of a plan the hook splits that differs from its left-deep plan's.
+The estimate follows (decision 21, CERT): an outer join's ON terms that read only an earlier table
+(lane pl8's `on_elsewhere`) were run over that table's sample apart from its filters, so a pair
+correlated on the sample counted as independent. `t0 AS a0 RIGHT JOIN t0 AS a1 ON NOT (a1.c0 GLOB
+'a%') WHERE a1.c1 >= 3` was estimated at 0.684 against its inner join's 1
+(`sample_filters`' `an_outer_join_with_sampled_terms_is_estimated_at_least_its_inner_join`). Their
+share is now the earlier table's sample run with its filters and them together, over its filters
+alone (`cardinality.rs`, `JoinedSetRows::new`): the share of the rows its filters keep that the ON
+terms match, as the inner join reads the same terms together on the same sample.
+
+**Falsified by.** An answer of a plan the hook splits that differs from its left-deep plan's; a CERT
+finding where an outer join's ON terms read only an earlier table.
 
 ## Decision (lane pl12): custom plans, then a generic one, for prepared statements
 
