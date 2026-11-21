@@ -20,8 +20,9 @@ use crate::translate::optimizer::constraints::{
     TableConstraints,
 };
 use crate::translate::optimizer::cost::{
-    estimate_cost_for_scan_or_seek, estimate_rows_per_seek, rows_per_leaf_page_for_index,
-    where_expr_steps, AnalyzeCtx, Cost, IndexInfo, RowCountEstimate,
+    estimate_cost_for_scan_or_seek, estimate_rows_per_seek, file_reads,
+    rows_per_leaf_page_for_index, table_pages_fetched, where_expr_steps, AnalyzeCtx, Cost,
+    IndexInfo, RowCountEstimate,
 };
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::optimizer::AvailableIndexes;
@@ -231,14 +232,21 @@ fn estimate_multi_index_scan_cost(
     // RowSet operations do an insert and membership test per candidate rowid.
     let rowset_ops_cost = total_rows_before_dedup * params.cpu_cost_per_row * 2.0;
 
-    // Table fetch cost mirrors single-index lookup costing, assuming some
-    // locality benefit from rowid-ordered access after RowSet deduplication.
+    // The surviving rowids are fetched in rowid order after RowSet deduplication.
     let table_pages = (base_row_count / params.rows_per_table_page).max(1.0);
-    let selectivity = estimated_unique_rows / base_row_count.max(1.0);
-    let table_fetch_cost = selectivity * table_pages;
+    let table_fetch_cost = rowid_ordered_fetch_reads(estimated_unique_rows, table_pages, params);
     let total_cost = (branch_scan_cost + rowset_ops_cost + table_fetch_cost) * input_cardinality;
 
     (Cost(total_cost), estimated_unique_rows)
+}
+
+/// Amphora (QT.5): the file reads of fetching `rows` rows by rowid in rowid order from a table of
+/// `table_pages` pages: the pages they fall on, as Mackert and Lohman count them
+/// (`cost::table_pages_fetched`), at most each page once as the order never comes back to one,
+/// less those the cache holds (`cost::file_reads`).
+fn rowid_ordered_fetch_reads(rows: f64, table_pages: f64, params: &CostModelParams) -> f64 {
+    let fetched = table_pages_fetched(rows, table_pages, params.cache_pages).min(table_pages);
+    file_reads(fetched, table_pages, params.cache_pages, params.page_miss)
 }
 
 /// Estimate the cost of a multi-index intersection (AND-by-intersection).
@@ -274,11 +282,10 @@ fn estimate_multi_index_intersection_cost(
     let rowset_ops_cost =
         (first_branch_rows + subsequent_branch_rows) * params.cpu_cost_per_row * 1.5;
 
-    // Table fetch cost mirrors single-index lookup costing, assuming some
-    // locality benefit from rowid-ordered access after intersection.
+    // The surviving rowids are fetched in rowid order after intersection.
     let table_pages = (base_row_count / params.rows_per_table_page).max(1.0);
-    let selectivity = estimated_intersection_rows / base_row_count.max(1.0);
-    let table_fetch_cost = selectivity * table_pages;
+    let table_fetch_cost =
+        rowid_ordered_fetch_reads(estimated_intersection_rows, table_pages, params);
     let total_cost = (branch_scan_cost + rowset_ops_cost + table_fetch_cost) * input_cardinality;
 
     (Cost(total_cost), estimated_intersection_rows)
