@@ -1,0 +1,65 @@
+hash-threshold 8
+
+# written for function.window:percent_rank: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+query IR nosort
+SELECT a, percent_rank() OVER (ORDER BY a) FROM t1 ORDER BY a
+----
+14 values hashing to adc1deaa32878f852c66b58604085857
+
+query IR nosort
+SELECT a, percent_rank() OVER (ORDER BY a DESC) FROM t1 ORDER BY a
+----
+14 values hashing to 5bfa140a5c81417e9ae683ab80c6bde5
+
+query IR nosort
+SELECT a, percent_rank() OVER (PARTITION BY a % 2 ORDER BY a) FROM t1 ORDER BY a
+----
+14 values hashing to e2fe9d323057fde200809d281eff9e1d
+
+query IR nosort
+SELECT a, percent_rank() OVER (ORDER BY b) FROM t1 ORDER BY a
+----
+14 values hashing to 8400e8aa931c5584a45a137685936f90
+
+query IR nosort
+SELECT a, percent_rank() OVER (ORDER BY c NULLS FIRST) FROM t1 ORDER BY a
+----
+14 values hashing to 8cb189a678a680547ce1e2cd39937971
+
+query IR nosort
+SELECT a, percent_rank() OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t1 ORDER BY a
+----
+14 values hashing to adc1deaa32878f852c66b58604085857
+
+query IR nosort
+SELECT a, percent_rank() OVER (ORDER BY a RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t1 ORDER BY a
+----
+14 values hashing to adc1deaa32878f852c66b58604085857
+
+query IR nosort
+SELECT a, percent_rank() OVER (ORDER BY a GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM t1 ORDER BY a
+----
+14 values hashing to adc1deaa32878f852c66b58604085857
+
+query IR nosort
+SELECT a, percent_rank() OVER (PARTITION BY b IS NULL ORDER BY a) FROM t1 ORDER BY a
+----
+14 values hashing to f2f81ac6303c79927c09a9ae9977916b
+
+query IR nosort
+SELECT a, percent_rank() OVER (ORDER BY e) FROM t1 ORDER BY a
+----
+14 values hashing to 3247bd601a2223334ae05585f2a93a31

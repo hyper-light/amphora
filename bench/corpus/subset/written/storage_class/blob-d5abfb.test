@@ -1,0 +1,74 @@
+hash-threshold 8
+
+# written for storage_class:BLOB: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+query TT rowsort
+SELECT typeof(x'01'), quote(x'01')
+----
+blob
+X'01'
+
+query TT rowsort
+SELECT typeof(x''), quote(x'')
+----
+blob
+X''
+
+query TT rowsort
+SELECT typeof(zeroblob(2)), quote(zeroblob(2))
+----
+blob
+X'0000'
+
+query TT rowsort
+SELECT typeof(CAST('a' AS BLOB)), quote(CAST('a' AS BLOB))
+----
+blob
+X'61'
+
+query T rowsort
+SELECT typeof(randomblob(0))
+----
+blob
+
+query TT rowsort
+SELECT typeof(x'00ff'), quote(x'00ff')
+----
+blob
+X'00FF'
+
+query TT rowsort
+SELECT typeof(unhex('41')), quote(unhex('41'))
+----
+blob
+X'41'
+
+query TT rowsort
+SELECT typeof((SELECT d FROM t1 LIMIT 1)), quote((SELECT d FROM t1 LIMIT 1))
+----
+blob
+X'01'
+
+query TT rowsort
+SELECT typeof(jsonb('1')), quote(jsonb('1'))
+----
+blob
+X'1331'
+
+query TT rowsort
+SELECT typeof(x'414243'), quote(x'414243')
+----
+blob
+X'414243'

@@ -1,0 +1,85 @@
+hash-threshold 8
+
+# written for function.json:json_tree: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+query TTTT nosort
+SELECT key, value, type, fullkey FROM json_tree('{"a":1,"b":[1,2,{"c":3}],"d":null}') ORDER BY id
+----
+32 values hashing to cf36f06f0bcf83659dd3ffcd9cb9020f
+
+query ITTT nosort
+SELECT key, value, type, fullkey FROM json_tree('[1,2,3]') ORDER BY id
+----
+16 values hashing to fdba856f04be724c9a97f06da7df3c6e
+
+query TTTT nosort
+SELECT key, value, type, fullkey FROM json_tree('{"x":{"y":{"z":true}}}') ORDER BY id
+----
+16 values hashing to 63835fcf9b491350961cadfe60b91121
+
+query TTTT nosort
+SELECT key, value, type, fullkey FROM json_tree('[]') ORDER BY id
+----
+NULL
+[]
+array
+$
+
+query TTTT nosort
+SELECT key, value, type, fullkey FROM json_tree('{}') ORDER BY id
+----
+NULL
+{}
+object
+$
+
+query TTTT nosort
+SELECT key, value, type, fullkey FROM json_tree('"str"') ORDER BY id
+----
+NULL
+str
+text
+$
+
+query TITT nosort
+SELECT key, value, type, fullkey FROM json_tree('42') ORDER BY id
+----
+NULL
+42
+integer
+$
+
+query TTTT nosort
+SELECT key, value, type, fullkey FROM json_tree('null') ORDER BY id
+----
+NULL
+NULL
+null
+$
+
+query TTTT nosort
+SELECT key, value, type, fullkey FROM json_tree('[{"k":1},{"k":2}]') ORDER BY id
+----
+20 values hashing to 1abaccce79eec01b8f429008f073e4ac
+
+query TTTT nosort
+SELECT key, value, type, fullkey FROM json_tree('{"a":"text","n":-1.5}') ORDER BY id
+----
+12 values hashing to e8e12f1cd669a11f01008cb660924638
+
+query TTTT nosort
+SELECT key, value, type, fullkey FROM json_tree('{"a":[[]]}') ORDER BY id
+----
+12 values hashing to bab0774213f964f6e9a1fb275146cf3d
