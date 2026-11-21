@@ -19,7 +19,7 @@ use super::{
 use crate::schema::{Schema, Table as SchemaTable};
 use crate::translate::{
     expr::{literal_truth, simplified_and_or},
-    plan::{JoinOrigin, JoinType, JoinedTable, Plan, WhereTerm, WhereTermOrigin},
+    plan::{JoinType, JoinedTable, Plan, WhereTerm, WhereTermOrigin},
     planner::TableMask,
 };
 
@@ -155,11 +155,6 @@ struct Table {
     /// restricts to reads it for the same terms (CERT).
     sampled_on: Option<Sampled>,
     sampled_both: Option<Sampled>,
-    /// The ON terms of its own outer join that read none of its columns, only tables before it
-    /// (`y LEFT JOIN x ON y.c = 3`, which a RIGHT JOIN led by one table becomes, PL.8): each as
-    /// the table whose constraint it is, the constraint's index there and its pair selectivity.
-    /// They decide which left rows match as its own ON terms do.
-    on_elsewhere: SmallVec<[(usize, usize, Option<f64>); 2]>,
 }
 
 /// Which of a table's terms its sample runs: its filters, or its own outer join's ON terms.
@@ -299,7 +294,6 @@ impl<'a> JoinedSetRows<'a> {
             class_terms.push(pos);
         }
         let unique_keys = composite_keys(joined_tables, &kinds, &columns, schema);
-        let mut on_elsewhere: SmallVec<[(usize, usize, usize, Option<f64>); 2]> = SmallVec::new();
         for ((table_idx, joined), keys) in joined_tables.iter().enumerate().zip(keys_by_table) {
             let kind = kinds.get(table_idx).copied().unwrap_or(Kind::Inner);
             let rows = table_rows(table_idx);
@@ -356,23 +350,6 @@ impl<'a> JoinedSetRows<'a> {
                     }
                     continue;
                 }
-                let pair = pair_terms
-                    .iter()
-                    .find(|(pos, _)| *pos == constraint.where_clause_pos.0)
-                    .map(|(_, selectivity)| *selectivity);
-                // An ON term of a later outer join that reads none of its right table's columns
-                // decides that join's matches, not this table's rows: it is counted there.
-                if let Some(right) = term
-                    .origin
-                    .join_origin()
-                    .and_then(JoinOrigin::outer_table)
-                    .filter(|right| *right != joined.internal_id)
-                    .and_then(|right| joined_tables.iter().position(|t| t.internal_id == right))
-                    .filter(|right| !constraint.lhs_mask.get(*right))
-                {
-                    on_elsewhere.push((right, table_idx, constraint_idx, pair));
-                    continue;
-                }
                 let class = if term.origin.is_outer_join() {
                     // Constraints from an outer join's ON terms exist only on its right table,
                     // whose rows the ON terms see before any is null-extended.
@@ -398,6 +375,10 @@ impl<'a> JoinedSetRows<'a> {
                 } else {
                     Class::Never
                 };
+                let pair = pair_terms
+                    .iter()
+                    .find(|(pos, _)| *pos == constraint.where_clause_pos.0)
+                    .map(|(_, selectivity)| *selectivity);
                 counted.push(Counted {
                     constraint: constraint_idx,
                     class,
@@ -483,13 +464,7 @@ impl<'a> JoinedSetRows<'a> {
                 sampled,
                 sampled_on,
                 sampled_both,
-                on_elsewhere: SmallVec::new(),
             });
-        }
-        for (right, owner, constraint, pair) in on_elsewhere {
-            if let Some(t) = tables.get_mut(right) {
-                t.on_elsewhere.push((owner, constraint, pair));
-            }
         }
         // A WHERE term no row passes (`WHERE NULL`) leaves no rows in any set, whether or not
         // the parser folded it into a constant-false WHERE, which plans no table at all; an ON
@@ -695,29 +670,6 @@ impl<'a> JoinedSetRows<'a> {
             )
     }
 
-    /// The share of the pairs of an outer join's left rows and `table`'s rows its ON terms keep:
-    /// its own constraints' and those of its ON terms that read only tables before it, each once
-    /// its tables are ready.
-    fn on_selectivity(&self, table: usize, ready: &TableMask) -> f64 {
-        let own = self.selectivity(table, Class::On, ready);
-        let Some(t) = self.tables.get(table) else {
-            return own;
-        };
-        t.on_elsewhere
-            .iter()
-            .filter(|(owner, _, _)| ready.get(*owner))
-            .filter_map(|(owner, constraint, pair)| {
-                let constraint = self.constraints.get(*owner)?.constraints.get(*constraint)?;
-                constraint
-                    .lhs_mask
-                    .iter()
-                    .all(|other| ready.get(other))
-                    .then(|| pair.unwrap_or(constraint.selectivity))
-            })
-            .product::<f64>()
-            * own
-    }
-
     /// The share of an outer join's matches its other filters keep: what they restrict beyond its
     /// ON terms, `sel(ON and filters) / sel(ON)`, so a filter bounding a column its ON terms bound
     /// makes one range with them, and the matches are never more than the inner join's rows.
@@ -751,7 +703,7 @@ impl<'a> JoinedSetRows<'a> {
             Kind::Left => {
                 // Statistics give an average match count, not its distribution: a Poisson model
                 // gives the chance that a left row matches nothing, and that row is kept once.
-                let matches = t.rows * self.on_selectivity(table, ready);
+                let matches = t.rows * self.selectivity(table, Class::On, ready);
                 let unmatched = (-matches).exp();
                 let only_unmatched = t
                     .counted
@@ -795,7 +747,7 @@ impl<'a> JoinedSetRows<'a> {
         let Some(t) = self.tables.get(table) else {
             return left;
         };
-        let pair = self.on_selectivity(table, ready);
+        let pair = self.selectivity(table, Class::On, ready);
         let matched = left * t.rows * pair;
         let unmatched_right = t.rows * (-(left * pair)).exp();
         let unmatched_left = if t.kind == Kind::Full {
