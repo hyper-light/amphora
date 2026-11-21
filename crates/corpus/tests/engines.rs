@@ -163,7 +163,7 @@ fn t_g2_4_1_a_file_runs_on_sqlites_shell_or_is_refused() {
     )
     .unwrap();
     assert_eq!(seen.len(), 6, "{seen:?}");
-    assert_eq!(&seen[..4], &[Outcome::Agree; 4], "{seen:?}");
+    assert!(seen[..4].iter().all(|o| *o == Outcome::Agree), "{seen:?}");
     assert_eq!(seen[4], Outcome::PastBudget);
     assert_eq!(seen[5], Outcome::Unreached);
 }

@@ -371,10 +371,17 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (`bench/corpus/subset`, chosen by `bench/corpus/subset.py` from measured times: required files reach
   every entry Amphora answers right somewhere, then query types per measured second up to the plan's 2
   minutes) runs in `scripts/gates.sh`, its times kept as CI artifacts; `.kiln/corpus.yaml`
-  (`bench/corpus/nightly.sh`) builds and runs the whole corpus nightly and re-ranks the pool. Left: the
-  adapters for the other engines (only Amphora has one), a bound on one record's time (a select5 join
-  ran past 12 minutes on a debug build, and the deadline is checked only between records), and kiln's
-  queries in the pool (kiln_queries.py needs sqlglot).
+  (`bench/corpus/nightly.sh`) builds and runs the whole corpus nightly and re-ranks the pool. No record
+  runs past the budget (lane corpus-ci-4): the engine stops it (Amphora through its own query deadline,
+  which its VM checks as it steps; a shell by its process ended; ClickHouse by its max_execution_time)
+  and it counts as past the budget, which fails the gate for a required file. The engine seam
+  (`crates/corpus/src/engines.rs`, `--engine <name>`) opens every engine of step 4: Amphora in-process,
+  SQLite, DuckDB and Turso through their own shells, PostgreSQL, OrioleDB and CedarDB through `psql`,
+  MySQL through `mysql`, ClickHouse through its HTTP interface, each kept open for a file and settled
+  before each query; an engine a machine lacks is refused (exit 3), and the nightly runs every one,
+  each on its share of the night's budget, and fails when any couldn't run. Left: the adapters other
+  than SQLite's run only where their programs are (none ran yet: the lane's machine had none), and
+  kiln's queries in the pool (kiln_queries.py needs sqlglot).
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691
