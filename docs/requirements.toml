@@ -467,6 +467,10 @@ tests = [
   { id = "T-T1.12.P11", text = "A log started again twice with no write between keeps its link whole; a restart forced before its frames were shipped, or one the fence wasn't told of, breaks it" },
   { id = "T-T1.12.P12", text = "A through mark makes the seconds after the last segment's whole through its time; one that doesn't end at a segment says nothing" },
   { id = "AMPHORA-BLOBS", text = "The Blobs seam's conformance suite (AMPHORA-BLOBS-1 to 7) passes on SimBlobs" },
+  # lane pitr-7
+  { id = "AMPHORA-BLOBS-8", text = "The folder store passes AMPHORA-BLOBS-1 to 7, keeps keys apart under case folding and path names, and answers random operations as SimBlobs does" },
+  { id = "T-T1.12.C1", text = "Restore-and-check on a folder passes at the newest whole second against the source's rows and fails naming the rows against rows that differ" },
+  { id = "T-T1.12.C2", text = "A check is due at the first, at each new base, and once the log since the last check outweighs what it replayed" },
 ]
 
 # lane keyheads: G3 step 4 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), searching a page by key heads.

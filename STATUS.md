@@ -402,6 +402,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   equal (T-T1.12.D1). `Database::open_backed_up` backs a local writer up: its commits stamped and a
   thread that ships and copies bases as it commits, across a close and a reopen (T-T1.12.D2). Not
   yet: kiln's adapter to Mantle, and the 100 GB restore measurement (AC-T1.12.3).
+  The folder store (`backup::FolderBlobs`, lane pitr-7): the owned default, a peer's folder over a
+  mount the same, passing the seam's suite and answering as the simulator (AMPHORA-BLOBS-8).
+  Restore-and-check (`backup::restore_and_check`): the newest whole second restored to a scratch file,
+  integrity-checked and its rows compared with the source's, typed and counted, due on the archive's
+  cadence (T-T1.12.C1, C2). Not yet: the source's digest taken by the shipping thread itself.
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and

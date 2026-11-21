@@ -39,12 +39,16 @@ pub fn digest(db: &Db) -> anyhow::Result<RowDigest> {
         let quoted = table.replace('"', "\"\"");
         let mut hash = Sha256::new();
         let mut rows = 0u64;
-        db.query_owned(&format!("SELECT * FROM \"{quoted}\" ORDER BY rowid"), [], |r| {
-            let values = r.get_values().map_err(|e| anyhow::anyhow!("{e}"))?;
-            hash.update(format!("{values:?}\n").as_bytes());
-            rows = rows.saturating_add(1);
-            Ok(true)
-        })?;
+        db.query_owned(
+            &format!("SELECT * FROM \"{quoted}\" ORDER BY rowid"),
+            [],
+            |r| {
+                let values: Vec<_> = r.get_values().collect();
+                hash.update(format!("{values:?}\n").as_bytes());
+                rows = rows.saturating_add(1);
+                Ok(true)
+            },
+        )?;
         out.push((table, rows, hash.finalize().into()));
     }
     Ok(RowDigest(out))
@@ -68,10 +72,18 @@ pub enum CheckFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Check {
     /// The second restored, whole and equal to the source.
-    Passed { second: u64, restored: Restored },
-    Failed { second: u64, why: CheckFailure },
+    Passed {
+        second: u64,
+        restored: Restored,
+    },
+    Failed {
+        second: u64,
+        why: CheckFailure,
+    },
     /// The source could no longer say its rows at the second (it moved on since): nothing compared.
-    SourceMoved { second: u64 },
+    SourceMoved {
+        second: u64,
+    },
     /// The archive holds no second whole yet.
     Empty,
 }
@@ -105,7 +117,11 @@ impl CheckCounters {
 
 /// The newest second the archive under `prefix` holds whole: the last second its through point
 /// covers, none before its first mark.
-pub fn newest_second(blobs: &dyn Blobs, prefix: &str, until: Instant) -> anyhow::Result<Option<u64>> {
+pub fn newest_second(
+    blobs: &dyn Blobs,
+    prefix: &str,
+    until: Instant,
+) -> anyhow::Result<Option<u64>> {
     let mut segments = Vec::new();
     for (key, _) in list_all(blobs, &format!("{prefix}/log/"), until)? {
         segments.push(SegmentKey::parse(prefix, &key)?);
@@ -115,7 +131,11 @@ pub fn newest_second(blobs: &dyn Blobs, prefix: &str, until: Instant) -> anyhow:
         .map(|(m, _)| m)
         .collect();
     plan::raise_through(&mut segments, &marks);
-    let Some(first) = segments.iter().find_map(|s| s.marks).map(|(first, _)| first) else {
+    let Some(first) = segments
+        .iter()
+        .find_map(|s| s.marks)
+        .map(|(first, _)| first)
+    else {
         return Ok(None);
     };
     let through = segments.iter().map(|s| s.through).max().unwrap_or(0);

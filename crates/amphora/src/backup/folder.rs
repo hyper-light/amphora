@@ -131,7 +131,10 @@ impl FolderBlobs {
     pub fn open(root: &Path, object_max: usize) -> Result<Self, BlobRefusal> {
         fs::create_dir_all(root).map_err(|e| unavailable(root, &e))?;
         if !root.is_dir() {
-            return Err(invalid("folder", format!("{} isn't a folder", root.display())));
+            return Err(invalid(
+                "folder",
+                format!("{} isn't a folder", root.display()),
+            ));
         }
         Ok(Self {
             root: root.to_path_buf(),
@@ -143,7 +146,9 @@ impl FolderBlobs {
     fn names(key: &str) -> Result<(Vec<String>, String), BlobRefusal> {
         check_key(key)?;
         let mut segments: Vec<&str> = key.split('/').collect();
-        let last = segments.pop().ok_or_else(|| invalid("key", "empty".into()))?;
+        let last = segments
+            .pop()
+            .ok_or_else(|| invalid("key", "empty".into()))?;
         let dirs = segments
             .into_iter()
             .map(|s| encode('d', s))
@@ -352,7 +357,8 @@ impl Blobs for FolderBlobs {
                 if kind == 'd' {
                     let key = format!("{folder_key}{segment}/");
                     let reaches = key.starts_with(prefix) || prefix.starts_with(&key);
-                    let all_passed = after.is_some_and(|a| a > key.as_str() && !a.starts_with(&key));
+                    let all_passed =
+                        after.is_some_and(|a| a > key.as_str() && !a.starts_with(&key));
                     if reaches && !all_passed {
                         children.push(Item::Folder(key, path));
                     }
@@ -419,12 +425,19 @@ mod tests {
     fn amphora_blobs_8_folder_names_never_collide() {
         let dir = tempfile::tempdir().unwrap();
         let store = FolderBlobs::open(dir.path(), 16).unwrap();
-        let keys = ["A", "a", "a/b", "a/B", ".", "../x", "CON", "con/nul", "a.b", "a%2f"];
+        let keys = [
+            "A", "a", "a/b", "a/B", ".", "../x", "CON", "con/nul", "a.b", "a%2f",
+        ];
         for (i, key) in keys.iter().enumerate() {
-            store.create(key, &[u8::try_from(i).unwrap()], until()).unwrap();
+            store
+                .create(key, &[u8::try_from(i).unwrap()], until())
+                .unwrap();
         }
         for (i, key) in keys.iter().enumerate() {
-            assert_eq!(store.get(key, until()).unwrap(), vec![u8::try_from(i).unwrap()]);
+            assert_eq!(
+                store.get(key, until()).unwrap(),
+                vec![u8::try_from(i).unwrap()]
+            );
         }
         let listed: Vec<String> = store
             .list("", None, 100, until())
@@ -505,7 +518,10 @@ mod tests {
                     _ => assert_eq!(folder.get(&k, until()), sim.get(&k, until())),
                 }
                 let full = key(&mut rng);
-                let prefix: String = full.chars().take(rng.below(full.chars().count() + 1)).collect();
+                let prefix: String = full
+                    .chars()
+                    .take(rng.below(full.chars().count() + 1))
+                    .collect();
                 let after = if rng.below(2) == 0 {
                     None
                 } else {

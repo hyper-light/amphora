@@ -374,7 +374,8 @@ fn oracle_digest(dir: &std::path::Path, name: &str, rows: &Rows) -> backup::RowD
 fn t_t1_12_c1_restore_and_check_on_a_folder() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("source.db");
-    let blobs = Arc::new(backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap());
+    let blobs =
+        Arc::new(backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap());
     let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
     let mut model = Rows::new();
     let mut history: Vec<(u64, Rows)> = Vec::new();
@@ -397,12 +398,19 @@ fn t_t1_12_c1_restore_and_check_on_a_folder() {
     let newest = backup::newest_second(blobs.as_ref(), "db", until())
         .unwrap()
         .unwrap();
-    assert!(newest >= last, "newest {newest} before the last write's {last}");
+    assert!(
+        newest >= last,
+        "newest {newest} before the last write's {last}"
+    );
     let counters = backup::CheckCounters::default();
     let oracle_dir = tempfile::tempdir().unwrap();
     let source = |second: u64| -> anyhow::Result<Option<backup::RowDigest>> {
         let rows = at(&history, second).cloned().unwrap_or_default();
-        Ok(Some(oracle_digest(oracle_dir.path(), &format!("o{second}.db"), &rows)))
+        Ok(Some(oracle_digest(
+            oracle_dir.path(),
+            &format!("o{second}.db"),
+            &rows,
+        )))
     };
     let check = backup::restore_and_check(
         blobs.as_ref(),
@@ -413,7 +421,10 @@ fn t_t1_12_c1_restore_and_check_on_a_folder() {
         until(),
     )
     .unwrap();
-    assert!(matches!(check, backup::Check::Passed { second, .. } if second == newest), "{check:?}");
+    assert!(
+        matches!(check, backup::Check::Passed { second, .. } if second == newest),
+        "{check:?}"
+    );
 
     let mut wrong = model.clone();
     wrong.insert(1, "changed".into());
@@ -430,7 +441,13 @@ fn t_t1_12_c1_restore_and_check_on_a_folder() {
     )
     .unwrap();
     assert!(
-        matches!(check, backup::Check::Failed { why: backup::CheckFailure::Rows { .. }, .. }),
+        matches!(
+            check,
+            backup::Check::Failed {
+                why: backup::CheckFailure::Rows { .. },
+                ..
+            }
+        ),
         "{check:?}"
     );
     assert_eq!(counters.passed.load(Ordering::Relaxed), 1);
