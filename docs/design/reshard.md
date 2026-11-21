@@ -265,3 +265,32 @@ table of its own, replaced whole. So a replicated database keeps a holding throu
 any write, and a local one as one commit of its writer, flushed with every commit before it
 before the shell acts on it (`Engine::keep_holding`). A remote client can't send it: a holding is
 the group's own engine's.
+
+## Decision (lane split-merge-8): a batch bounded by the process's memory
+
+A copy, catch-up or sweep batch is held in memory whole: its keys and rows are read out of one
+group and written into another. A batch learned from time is bounded by the time a commit takes,
+but on a node where nothing has committed a batch doubles from the last with no end, so a long
+copy on an idle node would grow its batch until the process runs out of memory: a resource with no
+bound (CLAUDE.md §2). Now every batch also holds no more units than the process's memory budget
+takes at the most bytes a unit of that work has held here.
+
+- The budget is the one the process already sets aside for what its databases hold in memory at
+  once: its pool of pages, a quarter of the memory the process may use, from its control groups'
+  limits and its machine's memory, with that decision's fallback where the system doesn't say
+  (docs/design/store.md, decision 26; `crate::memory::limit`). It is measured where the process
+  runs, at start, never picked.
+- A unit's bytes are learned from the batches run: each moved key's size and its rows' bytes, the
+  most a unit held in any batch of that work on that group, so a batch of larger rows is smaller.
+  A sweep's position holds the keys the group's own copies moved, so it is bounded by the most a
+  unit of any work there held.
+- The first batch of a work is one unit, as before, so its bytes are measured before the bound
+  applies; a unit larger than the whole budget is still taken one at a time.
+
+**Evidence.** `groups::tests`: with no commit measured, sixty-four batches of 4 KiB units under a
+budget of 1 MiB double 1, 2, 4, 8 and stop at 256 units, never past it; a batch learned from time
+whose units are too large is cut to what the memory holds (T-T1.9.R8).
+
+**Falsified by.** A copy, catch-up or sweep batch whose keys and rows hold more bytes than the
+budget; or, at equal load, a copy slower with the bound than without on a node whose memory the
+batches don't approach (the bound should never bind there).

@@ -64,21 +64,25 @@ enum Work {
 
 /// What one kind of work has cost a group's writer, learned from every batch of it run there:
 /// its units (positions read or swept, log entries replayed) and how long they held the writer;
-/// and the units of the last batch.
+/// the units of the last batch; and the most bytes a unit has held in memory in any batch (the
+/// keys and rows it moved).
 #[derive(Debug, Default, Clone, Copy)]
 struct Cost {
     units: u64,
     ns: u64,
     last: u64,
+    unit_bytes: u64,
 }
 
 impl Cost {
-    fn ran(&mut self, units: u64, took: Duration) {
+    fn ran(&mut self, units: u64, took: Duration, bytes: u64) {
         self.units = self.units.saturating_add(units);
         self.ns = self
             .ns
             .saturating_add(u64::try_from(took.as_nanos()).unwrap_or(u64::MAX));
         self.last = units;
+        let per_unit = bytes.div_ceil(units.max(1));
+        self.unit_bytes = self.unit_bytes.max(per_unit);
     }
 
     /// The units a batch takes to hold the writer about `target` ns, a commit's mean cost there
@@ -86,9 +90,11 @@ impl Cost {
     /// mean cost of a unit measured so far, at least one. Not yet measured, one unit, and from
     /// then on learned. No commit measured on the node (no write waits on it), the batch doubles
     /// from the last, as TCP's slow start probes (RFC 5681, section 3.1), so a batch's size is
-    /// never picked.
-    fn within(&self, target: Option<u128>) -> u64 {
-        match target {
+    /// never picked. Either way no more units than `memory` bytes hold at `unit_bytes` a unit, the
+    /// most a unit has held in a batch of this work here (decision "A batch bounded by the
+    /// process's memory"): at least one unit, whatever a unit holds.
+    fn within(&self, target: Option<u128>, memory: u64, unit_bytes: u64) -> u64 {
+        let by_time = match target {
             Some(t) if self.units > 0 => {
                 let n = t
                     .saturating_mul(u128::from(self.units))
@@ -98,7 +104,9 @@ impl Cost {
             }
             Some(_) => 1,
             None => self.last.saturating_mul(2).max(1),
-        }
+        };
+        let by_memory = memory.checked_div(unit_bytes.max(1)).unwrap_or(1).max(1);
+        by_time.min(by_memory)
     }
 }
 
@@ -107,6 +115,12 @@ impl Cost {
 struct Costs([Cost; 4]);
 
 impl Costs {
+    /// The most bytes a unit of any work has held here: what a sweep's position is bounded by,
+    /// since the keys it sweeps are those this group's copies moved.
+    fn unit_bytes(&self) -> u64 {
+        self.0.iter().map(|c| c.unit_bytes).max().unwrap_or(0)
+    }
+
     fn of(&mut self, work: Work) -> &mut Cost {
         let [export, changed, import, sweep] = &mut self.0;
         match work {
@@ -192,6 +206,8 @@ fn keep_book(
 pub struct Groups<E: Engine> {
     route: Arc<RwLock<Route<E>>>,
     config: Config,
+    /// The bytes a copy-path batch may hold in memory ([`batch_memory`]).
+    memory: u64,
 }
 
 impl<E: Engine> Clone for Groups<E> {
@@ -199,6 +215,7 @@ impl<E: Engine> Clone for Groups<E> {
         Self {
             route: Arc::clone(&self.route),
             config: self.config,
+            memory: self.memory,
         }
     }
 }
@@ -254,6 +271,33 @@ pub fn even(node: NodeId, n: usize) -> Result<Directory, reshard::Refused> {
         last = made;
     }
     Ok(directory)
+}
+
+/// The bytes a copy-path batch may hold in memory, given the bytes the process may use
+/// ([`crate::memory::limit`], measured where it runs: its control groups' limits and its machine's
+/// memory; none where the system doesn't say): the budget the process sets aside for what its
+/// databases hold in memory at once, its pool of pages (docs/design/store.md, decision 26, with
+/// that decision's fallback where the system doesn't say). A batch's keys and rows are such data,
+/// read out of one group and written into another (docs/design/reshard.md, decision "A batch
+/// bounded by the process's memory").
+fn batch_memory(limit: Option<u64>) -> u64 {
+    u64::try_from(crate::db::default_pages(limit))
+        .unwrap_or(u64::MAX)
+        .saturating_mul(crate::db::PAGE_BYTES)
+}
+
+/// The bytes `moved` holds in memory: each key and its rows.
+fn moved_bytes(moved: &[crate::store::Moved]) -> u64 {
+    moved
+        .iter()
+        .map(|m| {
+            let rows = m.rows.as_ref().map_or(0, Vec::len);
+            let size = std::mem::size_of::<crate::store::Moved>()
+                .saturating_add(m.key.len())
+                .saturating_add(rows);
+            u64::try_from(size).unwrap_or(u64::MAX)
+        })
+        .fold(0u64, u64::saturating_add)
 }
 
 /// `holding` as an engine keeps it.
@@ -331,6 +375,7 @@ impl<E: Engine> Groups<E> {
         Ok(Self {
             route: Arc::new(RwLock::new(route)),
             config,
+            memory: batch_memory(crate::memory::limit()),
         })
     }
 
@@ -501,7 +546,8 @@ impl<E: Engine> Groups<E> {
                 let units = u64::try_from(exported.keys.len())
                     .unwrap_or(u64::MAX)
                     .max(1);
-                self.ran(from, Work::Export, units, took);
+                let bytes = moved_bytes(&exported.keys);
+                self.ran(from, Work::Export, units, took, bytes);
                 let dst = self.store_of(to).ok_or(reshard::Refused::NoGroup(to))?;
                 let at = exported.at;
                 let (last, done) = (exported.last, exported.done);
@@ -512,7 +558,7 @@ impl<E: Engine> Groups<E> {
                         e.import(&keys)?;
                         Ok(began.elapsed())
                     })?;
-                    self.ran(to, Work::Import, units, took);
+                    self.ran(to, Work::Import, units, took, bytes);
                 }
                 match self.hold(to, until, |h| h.copied(op, last, done, at)) {
                     Ok(progress) => Ok(Reply::Copied { progress, head: at }),
@@ -549,7 +595,8 @@ impl<E: Engine> Groups<E> {
                 };
                 let (through, head) = (changed.through, changed.head);
                 let units = through.saturating_sub(after).max(1);
-                self.ran(from, Work::Changed, units, took);
+                let bytes = moved_bytes(&changed.keys);
+                self.ran(from, Work::Changed, units, took, bytes);
                 if !changed.keys.is_empty() {
                     let keys = changed.keys;
                     let took = dst.run(until, move |e| {
@@ -557,7 +604,7 @@ impl<E: Engine> Groups<E> {
                         e.import(&keys)?;
                         Ok(began.elapsed())
                     })?;
-                    self.ran(to, Work::Import, units, took);
+                    self.ran(to, Work::Import, units, took, bytes);
                 }
                 match self.hold(to, until, |h| h.replayed(op, through)) {
                     Ok(progress) => Ok(Reply::Replayed { progress, head }),
@@ -618,7 +665,7 @@ impl<E: Engine> Groups<E> {
                     let done = e.sweep(span, positions, &|pos| holding.garbage(pos))?;
                     Ok((done, began.elapsed()))
                 })?;
-                self.ran(group, Work::Sweep, batch, took);
+                self.ran(group, Work::Sweep, batch, took, 0);
                 Ok(if release {
                     Reply::Released { done }
                 } else {
@@ -710,15 +757,21 @@ impl<E: Engine> Groups<E> {
             })
         });
         let mut costs = held.costs.lock().unwrap_or_else(PoisonError::into_inner);
-        costs.of(work).within(target)
+        // A sweep holds the keys it deletes, which this group's copies moved: a position of it
+        // holds no more than the most a moved one held here.
+        let unit_bytes = match work {
+            Work::Sweep => costs.unit_bytes(),
+            _ => costs.of(work).unit_bytes,
+        };
+        costs.of(work).within(target, self.memory, unit_bytes)
     }
 
-    /// `units` of `work` held `group`'s writer for `took`.
-    fn ran(&self, group: GroupId, work: Work, units: u64, took: Duration) {
+    /// `units` of `work`, holding `bytes` in memory, held `group`'s writer for `took`.
+    fn ran(&self, group: GroupId, work: Work, units: u64, took: Duration, bytes: u64) {
         let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
         if let Some(held) = route.groups.get(&group) {
             let mut costs = held.costs.lock().unwrap_or_else(PoisonError::into_inner);
-            costs.of(work).ran(units, took);
+            costs.of(work).ran(units, took, bytes);
         }
     }
 
@@ -883,5 +936,58 @@ impl<E: Engine> Groups<E> {
     #[must_use]
     pub fn counters(&self) -> Vec<Counters> {
         self.stores().iter().map(Store::counters).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Do: run a node's first sixty-four batches of one work with no commit measured anywhere
+    /// (so each doubles from the last), each unit holding 4 KiB, under a budget of 1 MiB. Expect:
+    /// the batches grow from one unit by doubling, and never past the 256 units the budget holds,
+    /// nor below one, however long they go on; with a budget a unit can't fit in, one unit a
+    /// batch (T-T1.9.R8: every resource bounded, docs/design/reshard.md, decision "A batch bounded
+    /// by the process's memory").
+    #[test]
+    fn batches_with_no_commit_double_only_as_far_as_the_memory_holds() {
+        let memory = 1 << 20;
+        let mut cost = Cost::default();
+        let mut sizes = Vec::new();
+        for _ in 0..64 {
+            let units = cost.within(None, memory, cost.unit_bytes);
+            sizes.push(units);
+            cost.ran(units, Duration::from_micros(1), units * 4096);
+        }
+        assert_eq!(sizes.get(..4), Some(&[1, 2, 4, 8][..]));
+        assert_eq!(sizes.iter().max(), Some(&256));
+        assert_eq!(sizes.last(), Some(&256));
+        assert!(sizes.iter().all(|&n| n >= 1));
+        assert_eq!(cost.within(None, 100, cost.unit_bytes), 1);
+        // With room for every batch, the doubling alone would have gone on past the bound.
+        assert!(cost.within(None, u64::MAX, 1) > 256);
+    }
+
+    /// Do: learn a batch from the time it took (a commit's mean known) while each unit holds more
+    /// bytes than the budget leaves room for. Expect: the memory's bound, not the time's
+    /// (T-T1.9.R8).
+    #[test]
+    fn a_batch_learned_from_time_is_still_bounded_by_memory() {
+        let mut cost = Cost::default();
+        cost.ran(10, Duration::from_micros(10), 10 * 1000);
+        // A commit of 1 ms holds 1,000 units of 1 µs: by time, 1,000.
+        assert_eq!(cost.within(Some(1_000_000), u64::MAX, cost.unit_bytes), 1000);
+        assert_eq!(cost.within(Some(1_000_000), 50_000, cost.unit_bytes), 50);
+    }
+
+    /// Do: size the batches' budget from a process limit of 64 GiB, and with no limit said.
+    /// Expect: decision 26's pool, a quarter of the limit; its fallback where none is said.
+    #[test]
+    fn a_batch_is_bounded_by_the_process_pool_of_pages() {
+        assert_eq!(batch_memory(Some(64 << 30)), 16 << 30);
+        assert_eq!(
+            batch_memory(None),
+            u64::try_from(crate::db::default_pages(None)).unwrap() * crate::db::PAGE_BYTES
+        );
     }
 }

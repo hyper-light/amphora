@@ -448,6 +448,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   `export`, `changed`, `import`, `keep_log`, `sweep`); the old group's log is held from the first copy
   until the operation ends; `Groups::carry` carries every driver action to this node's groups, so a split
   or merge moves the range's rows, through repeated actions and driver restarts (T-T1.9.R4, R5), with the cutover-pause and lab harnesses (T-T1.9.P1, L1).
+  Bounded (lane split-merge-8): every copy-path batch holds no more units than the process's memory
+  budget (its pool of pages, decision 26) takes at the most bytes a unit has held, so a batch doubling on
+  an idle node stops there (T-T1.9.R8).
   Left: `database::Local` as a group (its holding and log through a replicated command), moves across
   nodes, load from the store's meter, and the full AC-T1.9.2 and AC-T1.9.3 runs.
 
