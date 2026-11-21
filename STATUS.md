@@ -428,7 +428,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   rule at an expansion learned from the owner's own measured image and replay costs a byte, its machine reporting its
   image's size (replication.md, "Decision (lane constants): the compaction's expansion learned where it runs"; CT.1); and a
   command's and an image's envelope is what their encoding adds ("Decision (lane constants): an envelope is what its
-  encoding adds"; EN.1).
+  encoding adds"; EN.1); and the process has one memory budget, its limit read where it runs (cgroups and RSS on
+  Linux, the platform's readings on macOS and Windows, a typed refusal where none can be read) and shared out by
+  measured use (store.md, "Decision (lane constants): one process memory budget"; MB.1), an image bounded by its room
+  for one in place of `SNAPSHOT_BYTES` (replication.md, "Decision (lane constants): an image is bounded by the memory
+  budget's room for one"; SB.1).
   Left: an owner's other descriptors (endpoint, engine files, a replica's log) charged by kind, the core's tick
   counts (twenty an election, two a heartbeat: raft-rs's defaults, fixed in tick mode), the owner's queue
   and outgoing bounds, and the rest of the list (handoff/amphora-constants-list.md).

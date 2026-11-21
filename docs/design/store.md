@@ -1991,3 +1991,29 @@ I/O completion 2.7-3.6%, together 23.0-30.3%; SQLite's page cache and pager are 
   by a prepared statement, one small run on adacachy (debug build, 2026-11-21, f046bc1, one run, a
   smoke check, not a benchmark): misses without shared pages 15.98 today against 6.00 plain, with
   shared pages 7.99 against 7.00; hits 5.00 on both (the statement's own: its row vectors).
+
+## Decision (lane constants): one process memory budget (2026-11-21)
+
+Ada's rule: no picked numbers. The process's memory bounds (an image's 256 MiB, the owners' queues' 512 MiB each)
+were each picked, and nothing knew what the process may hold where it runs: decision 26 read the limit on Linux
+only, and a caller fell back to a number of its own elsewhere.
+
+**The decision (MB.1).** `memory::limit` is the smallest limit the platform states: on Linux the limits of the
+control groups the process runs in (v2, else v1) and `/proc/meminfo`'s `MemTotal`; on macOS `hw.memsize` and on
+Windows `GlobalMemoryStatusEx`'s physical memory (the engine makes those two calls, `io::system_memory`, since
+Amphora's crate denies `unsafe`); and on Unix the process's own soft `RLIMIT_AS`, `RLIMIT_DATA` and `RLIMIT_RSS`.
+`memory::resident` is the bytes the process holds resident (memory-stats: `/proc/self/statm`, `task_info`,
+`GetProcessMemoryInfo`). `memory::Budget` shares the limit out by measured use, no share picked: a use (the owners'
+queues, images, caches) charges what it holds as it takes it and gives it back when the charge drops; its room is the
+limit less what the rest of the process holds, the larger of the resident bytes and every charge counted, its own
+given back. Both readings are taken again at every ask, so a limit moved while the process runs is followed. Where
+the limit can't be read the budget refuses, `Unavailable`, naming the platform: there is no fallback.
+
+**What is left.** A Windows job object's memory limit isn't read (`QueryInformationJobObject`): the machine's memory
+bounds such a process from above. The owners' queues don't charge the budget yet (their piece, next in the goal's
+list: `QUEUED_BYTES`, `OUTGOING_BYTES`, `OUTGOING_MESSAGES`).
+
+**Tests.** In `memory::tests`: `mb1_a_uses_room_is_what_the_rest_of_the_process_leaves` (T-MB.1.1),
+`mb1_no_limit_read_is_a_typed_refusal_and_the_limit_is_read_again` (T-MB.1.2),
+`mb1_unread_resident_bytes_fall_to_the_charges_counted` (T-MB.1.3), `mb1_this_process_reads_its_limit_and_resident_bytes`
+(T-MB.1.4, on Linux, macOS and Windows); the engine's `io::system_memory::tests::the_platform_says_its_physical_memory`.

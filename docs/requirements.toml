@@ -648,6 +648,35 @@ tests = [
   { id = "T-EN.1.3", text = "Postcard's varint widths and the declaration's — passes when each matches the encoder" },
 ]
 
+# lane constants-10 (2026-11-21): MB.1, the process memory budget (store.md, "Decision (lane constants): one process
+# memory budget"); SB.1, an image bounded by its room for one (replication.md, "Decision (lane constants): an image is
+# bounded by the memory budget's room for one").
+[[own]]
+id = "MB.1"
+title = "One process memory budget, learned where it runs and shared out by measured use, not picked bounds"
+criteria = [
+  { id = "AC-MB.1.1", text = "The limit is the smallest the platform states (Linux: cgroup v2 or v1 limits and MemTotal; macOS: hw.memsize; Windows: GlobalMemoryStatusEx; Unix: soft RLIMIT_AS, RLIMIT_DATA, RLIMIT_RSS), read again at every ask; where none can be read the budget refuses Unavailable naming the platform, with no fallback" },
+  { id = "AC-MB.1.2", text = "A use's room is the limit less what the rest of the process holds: the larger of its resident bytes and every charge counted, its own charge given back; a take past it is refused TooLarge naming the use and its room; a charge is given back when it drops" },
+]
+tests = [
+  { id = "T-MB.1.1", text = "A 1 GiB limit, 100 MiB resident, queue then image bytes taken and the queue's dropped: passes when each room is the limit less the rest's hold, a take past it is refused TooLarge at that room, and a dropped charge is given back" },
+  { id = "T-MB.1.2", text = "A limit unread, then read, then lowered, then below the resident bytes: passes when unread is Unavailable naming the platform, the room follows the limit, and is zero, never negative" },
+  { id = "T-MB.1.3", text = "Resident bytes unread: passes when the charges counted stand for the rest's use" },
+  { id = "T-MB.1.4", text = "This process on Linux, macOS and Windows: passes when its limit and resident bytes are both read and the image's room is not refused" },
+]
+
+[[own]]
+id = "SB.1"
+title = "An image is bounded by the memory budget's room for one, not a picked 256 MiB"
+criteria = [
+  { id = "AC-SB.1.1", text = "Every image made, fitted, installed, captured or received as a baseline, or kept by the reshard directory, is bounded by the memory budget's room for an image read at that moment, no more than its carrier's bound; unread, it is refused Unavailable" },
+  { id = "AC-SB.1.2", text = "A replica's database log leaves the image's room free on its filesystem, passed to log_room" },
+]
+tests = [
+  { id = "T-SB.1.1", text = "A machine over a 128 KiB row, its budget fed room to spare, 64 KiB of room, an unread limit, then a 32 KiB carrier: passes when the image fits and a joiner is admitted, then refused TooLarge at 64 KiB, then Unavailable, then refused at 32 KiB" },
+  { id = "T-SB.1.2", text = "log_room with the image's room passed: passes when each log has its file and an equal share of what is free past one image" },
+]
+
 [[own]]
 id = "WK.1"
 title = "The replicated owner wakes on its events and its next deadline, not a picked 1 ms poll"

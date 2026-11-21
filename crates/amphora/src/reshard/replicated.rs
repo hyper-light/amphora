@@ -17,14 +17,14 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use hyper_durable::{EntryRef, Fatal, Point, StateMachine};
+use hyper_raft::proto::{ConfChangeV2, ConfState};
+
 /// The memory budget's room for one image now (SB.1), as the directory's machine fails: a budget
 /// that can't be read stops the machine as a directory image past it would.
 fn image_room() -> Result<usize, Fatal> {
     crate::replication::image_room().map_err(|_| Fatal("the process's memory budget can't be read"))
 }
-
-use hyper_durable::{EntryRef, Fatal, Point, StateMachine};
-use hyper_raft::proto::{ConfChangeV2, ConfState};
 
 use super::directory::{Change, Directory};
 use super::driver::{Driver, Out};

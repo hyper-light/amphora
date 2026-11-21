@@ -1444,7 +1444,10 @@ mod image_room_tests {
 
         fed.set(None, Some(1 << 20));
         assert!(matches!(machine.image_fits(), Err(Refusal::Unavailable(_))));
-        assert!(matches!(machine.admits_joiner(), Err(Refusal::Unavailable(_))));
+        assert!(matches!(
+            machine.admits_joiner(),
+            Err(Refusal::Unavailable(_))
+        ));
 
         fed.set(Some(1 << 30), Some(1 << 20));
         machine.set_snapshot_bytes(32 << 10);

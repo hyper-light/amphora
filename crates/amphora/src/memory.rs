@@ -138,7 +138,7 @@ fn platform_limits() -> Vec<u64> {
 /// `RLIMIT_DATA`, and `RLIMIT_RSS` where the system enforces it), each where one is set.
 #[cfg(unix)]
 fn process_limits() -> Vec<u64> {
-    use rustix::process::{getrlimit, Resource};
+    use rustix::process::{Resource, getrlimit};
     [Resource::As, Resource::Data, Resource::Rss]
         .into_iter()
         .filter_map(|resource| getrlimit(resource).current)
@@ -170,14 +170,6 @@ pub enum Use {
 
 impl Use {
     const ALL: [Self; 3] = [Self::Queues, Self::Images, Self::Caches];
-
-    fn index(self) -> usize {
-        match self {
-            Self::Queues => 0,
-            Self::Images => 1,
-            Self::Caches => 2,
-        }
-    }
 
     fn name(self) -> &'static str {
         match self {
@@ -239,11 +231,12 @@ impl Charge {
 
 impl Drop for Charge {
     fn drop(&mut self) {
-        let _ = self.budget.held[self.used.index()].fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |held| Some(held.saturating_sub(self.bytes)),
-        );
+        let _ =
+            self.budget
+                .slot(self.used)
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                    Some(held.saturating_sub(self.bytes))
+                });
     }
 }
 
@@ -257,10 +250,20 @@ impl Budget {
         })
     }
 
+    /// The counter of what `used` holds.
+    fn slot(&self, used: Use) -> &AtomicU64 {
+        let [queues, images, caches] = &self.held;
+        match used {
+            Use::Queues => queues,
+            Use::Images => images,
+            Use::Caches => caches,
+        }
+    }
+
     /// The bytes `used` holds now, as charged.
     #[must_use]
     pub fn held(&self, used: Use) -> u64 {
-        self.held[used.index()].load(Ordering::Acquire)
+        self.slot(used).load(Ordering::Acquire)
     }
 
     /// The bytes `used` may hold at most now: the limit less what the rest of the process holds
@@ -281,8 +284,8 @@ impl Budget {
     /// use and the room) when they would pass it.
     pub fn take(self: &Arc<Self>, used: Use, bytes: u64) -> Result<Charge, Refusal> {
         let room = self.room(used)?;
-        self.held[used.index()]
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+        self.slot(used)
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                 held.checked_add(bytes).filter(|after| *after <= room)
             })
             .map_err(|held| Refusal::TooLarge {
@@ -323,7 +326,9 @@ pub fn process() -> Arc<Budget> {
         return budget;
     }
     static PROCESS: OnceLock<Arc<Budget>> = OnceLock::new();
-    PROCESS.get_or_init(|| Budget::new(Box::new(System))).clone()
+    PROCESS
+        .get_or_init(|| Budget::new(Box::new(System)))
+        .clone()
 }
 
 #[cfg(test)]
