@@ -266,7 +266,9 @@ fn sh(cmd: &str) -> String {
 fn open(o: &Opts, target: &str) -> anyhow::Result<Box<dyn Target>> {
     let dir = o.dir.join(target);
     Ok(match target {
-        "amphora" => Box::new(Amphora::open(&dir, o.cache_kib)?),
+        "amphora" => Box::new(Amphora::open(&dir, o.cache_kib, false)?),
+        // QS.7: the same engine, its scans by column batches, on a copy of its own.
+        "amphora-vectorized" => Box::new(Amphora::open(&dir, o.cache_kib, true)?),
         "sqlite" => Box::new(Sqlite::open(&dir, o.cache_kib)?),
         "duckdb" => Box::new(Duck::open(&dir, Some(1))?),
         // A database of its own: DuckDB locks its file to one database a process.
@@ -280,7 +282,7 @@ fn open(o: &Opts, target: &str) -> anyhow::Result<Box<dyn Target>> {
             }
             Box::new(Postgres::open(&format!("{} dbname={name}", o.dsn))?)
         }
-        t => anyhow::bail!("--planner runs amphora, sqlite, duckdb, duckdb-mt or postgres, not {t}"),
+        t => anyhow::bail!("--planner runs amphora, amphora-vectorized, sqlite, duckdb, duckdb-mt or postgres, not {t}"),
     })
 }
 
