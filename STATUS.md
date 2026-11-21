@@ -350,10 +350,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (`reshard::replicated::DirectoryMachine`, a hyper-durable state machine of directory changes; its
   leader runs the driver under its term), and `Groups` routes by the directory instead of `fnv % n`, each
   group checking every write and read against its holding (`store::Refused::Away`) (T-T1.9.R1, R2).
-  Left: each group's holding kept durable in its own state with its rows (it is in the router's memory
-  now), rows indexed by position for copy and sweep, the old group's log held through the operation,
-  the shell carrying the driver's actions to groups, `bench reshard` (AC-T1.9.2) and the three-machine
-  lab (AC-T1.9.3).
+  Kept (lane split-merge-5): each group's holding is kept by its own engine with its rows
+  (`Engine::holding`/`keep_holding`), durable before the group acts on it, and a group started again
+  answers from it whatever directory it is started by; a directory member keeps the image it installed
+  (`DirectoryMachine::open`), so a restart needs no catch-up (T-T1.9.R1 to R3). Left: rows indexed by
+  position for copy and sweep, the change feed by log position, the old group's log held through the
+  operation, a split copying the range's rows, the shell carrying the driver's actions to groups,
+  `bench reshard` (AC-T1.9.2) and the three-machine lab (AC-T1.9.3).
 
 - **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
   `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then
@@ -588,6 +591,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   by each commit's redo record after the commit, exact at every snapshot by a journal of changed keys
   read from the rows, never logged, every size and time learned where it runs. Next: step 2
   prototypes it in memory and as persistent blocks, on CP-T1.3's storage once that runs under SQL.
+  Step 2 (CS.2), built, not measured: `crates/engine/storage/versioned/columns.rs` keeps a tree's
+  copy fed by the versioned storage's commits (`Database::keep_columns`), with prototype A (`Plain`,
+  in memory) and B (`Packed`, front-coded blocks and positional deltas in a file, reused at open when
+  current) behind one core; a scan at any snapshot equals the rows there under concurrent writes and
+  a full queue (T-CS.2.1 to T-CS.2.3). Block size and rebuilds follow measured scan and rebuild cost.
+  Open: the numbers (`amphora-bench --columns`, T-CS.2.4) and the choice they make.
   Step 3's two codecs are built (CS.3, crates/columnar, lane g11-compress): BtrBlocks' cascade
   (one value, run lengths, dictionary, decimal doubles, frame of reference with horizontal packing)
   and FastLanes' layouts (its interleaved 1,024-value packing, lane-wise DELTA, dictionary,
