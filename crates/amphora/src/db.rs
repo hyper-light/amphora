@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 pub use amphora_engine::LogFormat;
 use amphora_engine::io::FileSyncType;
 use amphora_engine::{
-    CheckpointMode, Completion, CompletionError, ConnectOpts, Connection, Database, DatabaseOpts,
+    Buffer, CheckpointMode, Completion, CompletionError, ConnectOpts, Connection, Database, DatabaseOpts,
     IO, IOExt, LimboError, OpenFlags, OpenOptions, PlatformIO, Row, SqliteDialect, Statement,
     StepResult, Value,
 };
@@ -153,6 +153,8 @@ pub struct Db {
     fenced: Arc<AtomicBool>,
     /// The frames of log a restart keeps the log's file for ([`Db::keep_log`]).
     log_kept: u64,
+    /// What a backup asks of this database's writer ([`Db::back_up`]); readers have none.
+    backup: Option<Arc<crate::backup::Hooks>>,
 }
 
 /// What a reader's opener and the flusher keep of their database: the engine's handles, then the
@@ -212,6 +214,7 @@ impl Db {
             owner: None,
             fenced: Arc::new(AtomicBool::new(false)),
             log_kept: log_kept(),
+            backup: None,
         })
     }
 
@@ -307,6 +310,7 @@ impl Db {
             owner: None,
             fenced: Arc::new(AtomicBool::new(false)),
             log_kept: log_kept(),
+            backup: None,
         };
         d.exec("PRAGMA synchronous = NORMAL")?;
         d.exec("PRAGMA foreign_keys = ON")?;
@@ -344,6 +348,7 @@ impl Db {
             owner: self.owner.clone(),
             fenced: Arc::clone(&self.fenced),
             log_kept: self.log_kept,
+            backup: None,
         };
         r.keep_pages(READER_PAGES)?;
         Ok(r)
@@ -373,6 +378,7 @@ impl Db {
                 owner: held.owner.clone(),
                 fenced: Arc::clone(&fenced),
                 log_kept,
+                backup: None,
             };
             r.keep_pages(READER_PAGES)?;
             Ok(r)
@@ -454,9 +460,22 @@ impl Db {
     /// and starts the log from its beginning: whether it did. The log's file keeps its length
     /// (decision 13), unless it holds room for more frames than [`Db::keep_log`] keeps: then it is
     /// cut to nothing, once every frame is in the file (docs/design/store.md, decision 31).
+    ///
+    /// A database backed up ([`Db::back_up`]) starts its log again only once the backup has shipped
+    /// all of it, until the log is past what a restart keeps (decision 31): then it starts again
+    /// and the backup is told its log broke there (docs/design/backup.md).
     pub fn restart_log(&mut self) -> anyhow::Result<bool> {
         self.ensure_unfenced()?;
-        let mode = if self.log_frames()? > self.log_kept {
+        let over = self.log_frames()? > self.log_kept;
+        let (seq, frame) = self.db.wal_end();
+        let shipped = match &self.backup {
+            Some(hooks) => hooks.fence.holds(seq, frame)?,
+            None => true,
+        };
+        if !shipped && !over {
+            return Ok(false);
+        }
+        let mode = if over {
             CheckpointMode::Truncate {
                 upper_bound_inclusive: None,
             }
@@ -464,10 +483,109 @@ impl Db {
             CheckpointMode::Restart
         };
         match self.conn.checkpoint(mode) {
-            Ok(_) => Ok(true),
+            Ok(_) => {
+                if let Some(hooks) = &self.backup {
+                    hooks.fence.ended(seq, frame, !shipped)?;
+                }
+                Ok(true)
+            }
             Err(LimboError::Busy) => Ok(false),
             Err(e) => Err(fail(e)),
         }
+    }
+
+    /// Backs this database up through `hooks` (docs/design/backup.md): each commit made on this
+    /// connection is stamped, and its log starts again only once shipped ([`Db::restart_log`]).
+    /// Only the writer is backed up: it makes every commit.
+    pub fn back_up(&mut self, hooks: Arc<crate::backup::Hooks>) {
+        self.backup = Some(hooks);
+    }
+
+    /// Stamps the commit that just ended, if this database is backed up and one did.
+    fn marked(&self) -> anyhow::Result<()> {
+        if let Some(hooks) = &self.backup
+            && self.conn.get_auto_commit()
+        {
+            let (seq, frame) = self.db.wal_end();
+            if frame > 0 {
+                hooks.marks.committed(seq, frame)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The log's generation and its last committed frame.
+    pub(crate) fn log_end(&self) -> (u32, u64) {
+        self.db.wal_end()
+    }
+
+    /// `len` bytes of the log's file from `offset`; None when there is no log file.
+    pub(crate) fn read_log(&self, offset: u64, len: usize) -> anyhow::Result<Option<Vec<u8>>> {
+        self.read_at(&wal_path(&self.path).display().to_string(), offset, len)
+    }
+
+    /// `len` bytes of the database's file from `offset`.
+    pub(crate) fn read_file(&self, offset: u64, len: usize) -> anyhow::Result<Vec<u8>> {
+        self.read_at(&self.path.display().to_string(), offset, len)?
+            .ok_or_else(|| anyhow::anyhow!("{} is gone", self.path.display()))
+    }
+
+    /// The bytes the database's file holds.
+    pub(crate) fn file_bytes(&self) -> anyhow::Result<u64> {
+        let file = self
+            .io
+            .open_file(&self.path.display().to_string(), OpenFlags::NoLock, false)
+            .map_err(fail)?;
+        file.size().map_err(fail)
+    }
+
+    fn read_at(&self, path: &str, offset: u64, len: usize) -> anyhow::Result<Option<Vec<u8>>> {
+        let file = match self.io.open_file(path, OpenFlags::NoLock, false) {
+            Ok(file) => file,
+            Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::NotFound,
+                _,
+            ))) => return Ok(None),
+            Err(e) => return Err(fail(e)),
+        };
+        if len == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let got: Arc<std::sync::Mutex<Option<Vec<u8>>>> = Arc::default();
+        let into = Arc::clone(&got);
+        let completion = Completion::new_read(Arc::new(Buffer::new_temporary(len)), move |read| {
+            if let Ok((buffer, n)) = read
+                && let Ok(n) = usize::try_from(n)
+                && let Some(bytes) = buffer.as_slice().get(..n)
+                && let Ok(mut slot) = into.lock()
+            {
+                *slot = Some(bytes.to_vec());
+            }
+            None
+        });
+        let completion = file.pread(offset, completion).map_err(fail)?;
+        self.io.wait_for_completion(completion).map_err(fail)?;
+        let bytes = got
+            .lock()
+            .map_err(|_| anyhow::anyhow!("a read's lock was poisoned"))?
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("reading {path} failed"))?;
+        if bytes.len() != len {
+            anyhow::bail!("{path} held {} bytes at {offset}, not {len}", bytes.len());
+        }
+        Ok(Some(bytes))
+    }
+
+    /// Copies the whole log into the file and empties it, with no reader reading: a restore's
+    /// replay of one generation (docs/design/backup.md).
+    pub(crate) fn fold_log(&mut self) -> anyhow::Result<()> {
+        self.ensure_unfenced()?;
+        self.conn
+            .checkpoint(CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            })
+            .map(|_| ())
+            .map_err(fail)
     }
 
     /// The frames the log holds now, as this connection last saw it: for a writer, all of them.
@@ -556,6 +674,7 @@ impl Db {
         // A failed script may have executed DDL before refusing. Invalidate on its actual schema,
         // including rollback and raw-image reparses, without flushing every BEGIN/COMMIT.
         self.statements.schema(self.conn.current_schema())?;
+        self.marked()?;
         result
     }
 
@@ -582,7 +701,7 @@ impl Db {
         if same_schema(&schema, &current) {
             self.statements.put(sql, stmt, marked)?;
         }
-        Ok(())
+        self.marked()
     }
 
     pub fn changes(&self) -> i64 {
@@ -888,6 +1007,7 @@ impl Db {
         match result {
             Ok(answer) => {
                 self.conn.wal_insert_end(true).map_err(fail)?;
+                self.marked()?;
                 // An installed image can replace a catalog at an equal or older schema cookie.
                 // Publish that exact committed schema so readers cannot re-adopt the old one.
                 self.conn

@@ -257,6 +257,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (`settle_s`; Amphora's loader had left the whole load, 7.5 GB, in its log). `--query` runs a
   statement on a database a run left behind.
 
+- **Backups and point-in-time recovery to Mantle, the mechanism** (CP-T1.12, lane pitr,
+  `crates/amphora/src/backup*`, docs/design/backup.md): the object-store seam (`amphora_api::blobs`,
+  its simulator and conformance suite); commits stamped by the writer (one mark a second); the log's
+  durable frames shipped as segments with no timer; bases copied chunk by chunk without a reader;
+  log restarts held until shipped; restore to any second by the engine's own recovery, refusing
+  seconds the archive can't say exactly. Restore drills at random seconds on the simulator: every row
+  equal (T-T1.12.D1). Not yet: the `Database` owner's shipping thread, kiln's adapter to Mantle, and
+  the 100 GB restore measurement (AC-T1.12.3).
+
 ## Measured
 
 - **The oracles: wrong answers and slow plans** (G2 step 3; `amphora-bench --oracle`, `bench/src/oracle`,

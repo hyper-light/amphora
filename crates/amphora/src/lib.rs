@@ -24,6 +24,7 @@
 //!
 //! The `amphora` binary says what it is ([`reply`]).
 
+pub mod backup;
 pub mod database;
 pub mod db;
 pub mod groups;

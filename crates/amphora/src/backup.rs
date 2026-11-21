@@ -1,0 +1,295 @@
+//! Backups and point-in-time recovery to Mantle (CP-T1.12, AC-T1.12.3, AC-T1.12.4;
+//! docs/design/backup.md). A database's log is shipped to an object store ([`amphora_api::blobs`],
+//! Mantle behind it) one second of commits to an object, as the second ends; a base is a copy of
+//! its file, made consistent by the log shipped beside it, as PostgreSQL's base backups are; a
+//! restore writes a base and replays the log after it, through the engine's own recovery, up to the
+//! last commit of the second asked for.
+//!
+//! - [`Hooks`]: what a database's writer tells the backup: when each commit was made ([`Marks`])
+//!   and whether its log may start again ([`Fence`]): a log only starts again once what it holds is
+//!   shipped, until it reaches the most it keeps.
+//! - [`plan`]: the pure core: the archive's keys, which objects restore a second, which expire.
+//! - [`Shipper`] and [`BaseCopy`]: the shell that ships the log and copies bases.
+//! - [`restore()`]: the shell that restores a second.
+
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+pub mod plan;
+mod object;
+mod restore;
+mod ship;
+
+pub use restore::{Restored, expire, restore};
+pub use ship::{BaseCopy, Shipped, Shipper};
+
+/// Nanoseconds since the Unix epoch, from the clock the caller gives (the system's in production, a
+/// simulated one in tests).
+pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// The nanoseconds of a second: what "any second" is counted in (AC-T1.12.1).
+pub const SECOND_NS: u64 = 1_000_000_000;
+
+/// The second a stamp falls in, counted as restore targets are: a commit stamped in
+/// `(s - 1, s]` seconds is in second `s`, so restoring to `s` keeps it.
+#[must_use]
+pub fn second_of(ns: u64) -> u64 {
+    ns.div_ceil(SECOND_NS)
+}
+
+/// The last commit of a second the writer made, where its log held it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mark {
+    /// The log's generation (its header's checkpoint sequence).
+    pub seq: u32,
+    /// The commit's last frame.
+    pub frame: u64,
+    /// When it was committed.
+    pub ns: u64,
+    /// Set when marks were merged to stay within their bound: the commits up to `frame` were made
+    /// after this and at or before `ns`, but which of them by which second isn't known.
+    pub unknown_from: Option<u64>,
+}
+
+#[derive(Default)]
+struct MarkState {
+    marks: VecDeque<Mark>,
+    /// The latest stamp or drain: the next is later (a clock that steps back is held at it).
+    last: u64,
+    held_back: u64,
+    merged: u64,
+    /// The newest mark drained: a statement that commits nothing after it makes none.
+    drained: Option<(u32, u64)>,
+}
+
+/// When each commit was made: the last commit of each second, in commit order, until the shipper
+/// takes them. One mark a second, at most `capacity`; past it the two oldest merge, the second
+/// between them then refused as unknown rather than restored wrong (CLAUDE.md §2, §3).
+pub struct Marks {
+    state: Mutex<MarkState>,
+    capacity: usize,
+    clock: Clock,
+}
+
+/// What the shipper takes from [`Marks`]: the marks, and the time every commit stamped at or
+/// before is among them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Drained {
+    pub marks: Vec<Mark>,
+    pub through: u64,
+}
+
+impl Marks {
+    fn state(&self) -> anyhow::Result<MutexGuard<'_, MarkState>> {
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the backup's marks lock was poisoned"))
+    }
+
+    /// A stamp later than every one before: a clock that steps back is held at the last.
+    fn stamp(&self, state: &mut MarkState) -> u64 {
+        let now = (self.clock)();
+        let next = state.last.saturating_add(1);
+        let ns = if now < next {
+            state.held_back = state.held_back.saturating_add(1);
+            next
+        } else {
+            now
+        };
+        state.last = ns;
+        ns
+    }
+
+    /// A commit ended at `frame` of generation `seq`: stamped now, under the lock the shipper
+    /// drains by, so a drain at `t` has every commit stamped at or before `t`.
+    pub fn committed(&self, seq: u32, frame: u64) -> anyhow::Result<()> {
+        let mut state = self.state()?;
+        // A statement that committed nothing (a read, a BEGIN) leaves the log where it was.
+        if state
+            .marks
+            .back()
+            .is_some_and(|last| last.seq == seq && last.frame >= frame)
+            || state
+                .drained
+                .is_some_and(|(s, f)| s == seq && f >= frame)
+        {
+            return Ok(());
+        }
+        let ns = self.stamp(&mut state);
+        if let Some(last) = state.marks.back_mut()
+            && last.seq == seq
+            && second_of(last.ns) == second_of(ns)
+        {
+            last.frame = last.frame.max(frame);
+            last.ns = ns;
+            return Ok(());
+        }
+        if state.marks.len() >= self.capacity
+            && let Some(oldest) = state.marks.pop_front()
+            && let Some(next) = state.marks.front_mut()
+        {
+            // Merging marks of two generations would claim a frame of one for the other: the
+            // older is dropped then, its second unknown as a merged one's is.
+            let from = oldest.unknown_from.unwrap_or(oldest.ns);
+            next.unknown_from = Some(next.unknown_from.map_or(from, |f| f.min(from)));
+            state.merged = state.merged.saturating_add(1);
+        }
+        state.marks.push_back(Mark {
+            seq,
+            frame,
+            ns,
+            unknown_from: None,
+        });
+        Ok(())
+    }
+
+    /// Takes every mark made so far, and the time through which they are all of them.
+    pub fn drain(&self) -> anyhow::Result<Drained> {
+        let mut state = self.state()?;
+        let through = self.stamp(&mut state);
+        if let Some(last) = state.marks.back() {
+            state.drained = Some((last.seq, last.frame));
+        }
+        Ok(Drained {
+            marks: state.marks.drain(..).collect(),
+            through,
+        })
+    }
+
+    /// How often the clock stepped back and was held, and how many marks were merged.
+    pub fn counts(&self) -> anyhow::Result<(u64, u64)> {
+        let state = self.state()?;
+        Ok((state.held_back, state.merged))
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct FenceState {
+    /// The last frame shipped, of generation `.0`.
+    shipped: Option<(u32, u64)>,
+    /// How the last generation that ended ended: its sequence, its last frame, and whether it was
+    /// started again before all of it was shipped.
+    ended: Option<(u32, u64, bool)>,
+}
+
+/// What a log restart asks of the backup: whether all the log holds is shipped.
+#[derive(Default)]
+pub struct Fence {
+    state: Mutex<FenceState>,
+}
+
+impl Fence {
+    fn state(&self) -> anyhow::Result<MutexGuard<'_, FenceState>> {
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the backup's fence lock was poisoned"))
+    }
+
+    pub(crate) fn shipped(&self, seq: u32, frame: u64) -> anyhow::Result<()> {
+        self.state()?.shipped = Some((seq, frame));
+        Ok(())
+    }
+
+    /// Whether the log, at `frame` of generation `seq`, is shipped whole.
+    pub(crate) fn holds(&self, seq: u32, frame: u64) -> anyhow::Result<bool> {
+        Ok(frame == 0
+            || self
+                .state()?
+                .shipped
+                .is_some_and(|(s, f)| s == seq && f >= frame))
+    }
+
+    pub(crate) fn ended(&self, seq: u32, frame: u64, forced: bool) -> anyhow::Result<()> {
+        self.state()?.ended = Some((seq, frame, forced));
+        Ok(())
+    }
+
+    /// Whether generation `seq` ended at `frame`, shipped whole.
+    pub(crate) fn ended_whole(&self, seq: u32, frame: u64) -> anyhow::Result<bool> {
+        Ok(self.state()?.ended == Some((seq, frame, false)))
+    }
+}
+
+/// What a database's writer tells its backup ([`crate::db::Db::back_up`]).
+pub struct Hooks {
+    pub marks: Marks,
+    pub fence: Fence,
+}
+
+impl Hooks {
+    /// Hooks stamping commits by `clock`, keeping at most `capacity` marks between drains: the
+    /// frames a log holds at most between restarts (decision 31's [`crate::db::Db::keep_log`]),
+    /// since a mark is a commit and a commit at least a frame.
+    #[must_use]
+    pub fn new(clock: Clock, capacity: u64) -> Arc<Self> {
+        Arc::new(Self {
+            marks: Marks {
+                state: Mutex::new(MarkState::default()),
+                capacity: usize::try_from(capacity).unwrap_or(usize::MAX).max(2),
+                clock,
+            },
+            fence: Fence::default(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn clock() -> (Arc<AtomicU64>, Clock) {
+        let now = Arc::new(AtomicU64::new(10 * SECOND_NS));
+        let read = Arc::clone(&now);
+        (now, Arc::new(move || read.load(Ordering::SeqCst)))
+    }
+
+    /// T-T1.12.P1: commits within a second keep one mark, its last; a new second a new mark.
+    #[test]
+    fn t_t1_12_p1_one_mark_a_second() {
+        let (now, clock) = clock();
+        let hooks = Hooks::new(clock, 100);
+        hooks.marks.committed(1, 3).unwrap();
+        now.fetch_add(SECOND_NS / 2, Ordering::SeqCst);
+        hooks.marks.committed(1, 5).unwrap();
+        now.fetch_add(SECOND_NS, Ordering::SeqCst);
+        hooks.marks.committed(1, 9).unwrap();
+        let drained = hooks.marks.drain().unwrap();
+        assert_eq!(
+            drained.marks.iter().map(|m| m.frame).collect::<Vec<_>>(),
+            vec![5, 9]
+        );
+        assert!(drained.through > drained.marks[1].ns);
+    }
+
+    /// T-T1.12.P2: a clock that steps back holds stamps at the last, each later than the one
+    /// before, and is counted.
+    #[test]
+    fn t_t1_12_p2_clock_held_back() {
+        let (now, clock) = clock();
+        let hooks = Hooks::new(clock, 100);
+        hooks.marks.committed(1, 1).unwrap();
+        now.fetch_sub(5 * SECOND_NS, Ordering::SeqCst);
+        hooks.marks.committed(1, 2).unwrap();
+        let drained = hooks.marks.drain().unwrap();
+        assert_eq!(drained.marks.len(), 1);
+        assert_eq!(drained.marks[0].frame, 2);
+        assert_eq!(hooks.marks.counts().unwrap().0, 2);
+    }
+
+    /// T-T1.12.P3: past its bound the two oldest marks merge and their seconds are unknown.
+    #[test]
+    fn t_t1_12_p3_marks_merge_at_their_bound() {
+        let (now, clock) = clock();
+        let hooks = Hooks::new(clock, 2);
+        for frame in 1..=3 {
+            hooks.marks.committed(1, frame).unwrap();
+            now.fetch_add(SECOND_NS, Ordering::SeqCst);
+        }
+        let drained = hooks.marks.drain().unwrap();
+        assert_eq!(drained.marks.len(), 2);
+        assert_eq!(drained.marks[0].frame, 2);
+        assert_eq!(drained.marks[0].unknown_from, Some(10 * SECOND_NS));
+        assert_eq!(hooks.marks.counts().unwrap().1, 1);
+    }
+}

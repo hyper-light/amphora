@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
+pub mod blobs;
 pub mod import;
 pub mod replication;
 pub mod restore;
