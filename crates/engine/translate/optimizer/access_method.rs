@@ -985,6 +985,7 @@ pub fn find_best_access_method_for_join_order(
             planning_context.maybe_order_target,
             planning_context.allow_automatic_index,
             planning_context.row_goal,
+            planning_context.sorted_fetches,
             where_clause,
             ready_where,
             available_indexes,
@@ -1045,6 +1046,7 @@ fn find_best_access_method_for_btree(
     maybe_order_target: Option<&OrderTarget>,
     allow_automatic_index: bool,
     row_goal: Option<RowGoal>,
+    sorted_fetches: bool,
     where_clause: &[WhereTerm],
     ready_where: &[(usize, usize)],
     available_indexes: &AvailableIndexes,
@@ -1325,7 +1327,9 @@ fn find_best_access_method_for_btree(
             );
         }
 
-        if !has_two_local_constraint_terms(rhs_constraints, where_clause) {
+        // A sorted fetch (G6 step 5) is a one-branch intersection: one index's rowids, sorted, then
+        // the rows fetched in rowid order.
+        if !sorted_fetches && !has_two_local_constraint_terms(rhs_constraints, where_clause) {
             return Ok(Some(best_access_method));
         }
         if let Some(multi_idx_and_method) = consider_multi_index_intersection(
@@ -1341,6 +1345,7 @@ fn find_best_access_method_for_btree(
             alternative_cost_limit(&best_access_method, best_cost_with_filters),
             lhs_mask,
             analyze_stats,
+            sorted_fetches,
         )? {
             replace_if_cheaper(
                 &mut best_access_method,

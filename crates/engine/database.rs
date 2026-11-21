@@ -2743,6 +2743,7 @@ impl Database {
             join_methods: crate::connection::AtomicJoinMethods::new(
                 crate::connection::JoinMethods::ByCost,
             ),
+            sorted_fetches: AtomicBool::new(false),
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),

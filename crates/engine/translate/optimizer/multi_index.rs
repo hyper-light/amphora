@@ -831,6 +831,7 @@ fn analyze_and_terms_for_multi_index(
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
+    min_branches: usize,
 ) -> Option<AndClauseDecomposition> {
     let table_id = table_reference.internal_id;
     let indexes = available_indexes.indexes_for_table(table_reference.internal_id);
@@ -879,7 +880,7 @@ fn analyze_and_terms_for_multi_index(
         });
     }
 
-    if candidate_branches.len() < 2 {
+    if candidate_branches.len() < min_branches {
         return None;
     }
 
@@ -936,7 +937,7 @@ fn analyze_and_terms_for_multi_index(
         selected_branches.push(branch);
     }
 
-    if selected_branches.len() < 2 {
+    if selected_branches.len() < min_branches {
         return None;
     }
 
@@ -1137,7 +1138,11 @@ pub fn consider_multi_index_intersection(
     best_cost: Cost,
     lhs_mask: &TableMask,
     analyze_stats: &AnalyzeStats,
+    sorted_fetches: bool,
 ) -> Result<Option<AccessMethod>> {
+    // A sorted fetch (G6 step 5) takes one branch: a non-covering index's rowids, sorted, then
+    // the table's rows in rowid order. Without it an intersection takes two or more.
+    let min_branches = if sorted_fetches { 1 } else { 2 };
     let Some(decomposition) = analyze_and_terms_for_multi_index(
         rhs_table,
         where_clause,
@@ -1146,12 +1151,23 @@ pub fn consider_multi_index_intersection(
         subqueries,
         schema,
         params,
+        min_branches,
     ) else {
         return Ok(None);
     };
 
-    if decomposition.branches.len() < 2 {
+    if decomposition.branches.len() < min_branches {
         return Ok(None);
+    }
+    if let [only] = decomposition.branches.as_slice() {
+        // Sorting a rowid range or a covering index's rowids saves no table read.
+        if only
+            .index
+            .as_ref()
+            .is_none_or(|index| rhs_table.index_is_covering(index))
+        {
+            return Ok(None);
+        }
     }
 
     let all_usable = decomposition
@@ -1616,6 +1632,7 @@ mod tests {
             Cost(f64::INFINITY),
             &TableMask::default(),
             &AnalyzeStats::default(),
+            false,
         )
         .unwrap()
         .expect("rowid and secondary-index terms should be eligible for intersection");

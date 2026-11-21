@@ -58,6 +58,8 @@ pub(crate) struct JoinPlanningContext<'a> {
     pub allow_automatic_index: bool,
     /// Amphora: the join methods the connection allows (`Connection::set_join_methods`).
     pub join_methods: crate::JoinMethods,
+    /// Amphora: whether a sorted fetch may be planned (`Connection::set_sorted_fetches`).
+    pub sorted_fetches: bool,
     /// Amphora: the rows a LIMIT (and OFFSET) leaves a one-table read to produce before it stops
     /// (`docs/design/planner.md` decisions 16 and 17), None when it reads to its end.
     pub row_goal: Option<RowGoal>,
@@ -72,6 +74,7 @@ impl<'a> JoinPlanningContext<'a> {
             cost_limit: None,
             allow_automatic_index: true,
             join_methods: crate::JoinMethods::ByCost,
+            sorted_fetches: false,
             row_goal: None,
         }
     }
