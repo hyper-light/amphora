@@ -9829,6 +9829,12 @@ pub mod test {
     #[test]
     fn in_process_frame_lookups_compare_few_frames_when_a_page_has_many_frames() {
         let shared = WalFileShared::new_noop();
+        // The index read under its lock, whatever `AMPHORA_LOG_READ_INDEX` says (decision 40).
+        shared
+            .read()
+            .runtime
+            .read_index
+            .set_mode(super::super::log_index::LogReadIndex::Locked);
         let coordination = make_test_coordination(&shared);
         let frame_count = 1000u64;
         for frame_id in 1..=frame_count {
