@@ -35,6 +35,7 @@ pub(crate) fn installed_floor(db: &Db) -> anyhow::Result<Option<Application>> {
 }
 pub use application::WriterBoundary;
 
+mod compacting;
 pub(crate) mod compaction;
 mod group;
 mod guards;

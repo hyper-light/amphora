@@ -166,12 +166,15 @@ pub fn translate(
     resolver.set_sorted_fetches(connection.sorted_fetches());
     // Amphora: what a seek, a hash table and a sort cost, as this database has timed them (QT.5).
     // A page is priced by how often the connection's recent fetches read a file (QT.5).
-    resolver.set_learned_weights(
-        connection
-            .db
-            .learned_costs
-            .weights_at(connection.get_pager().page_miss_ratio()),
-    );
+    // On the versioned storage (G7 step 2) every page is resident in its pool (`pool.rs`: a page
+    // number is its frame), so no fetch reads a file; the pager, which then reads no table's
+    // pages, has no recent fetches to say otherwise.
+    let page_miss = if connection.versioned.is_some() {
+        Some(0.0)
+    } else {
+        connection.get_pager().page_miss_ratio()
+    };
+    resolver.set_learned_weights(connection.db.learned_costs.weights_at(page_miss));
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here
