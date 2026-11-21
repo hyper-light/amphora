@@ -57,11 +57,6 @@ pub struct CostModelParams {
     pub in_subquery_rows: f64,
 
     // === Scan/Seek Cost Weights ===
-    /// Cost multiplier for repeated page reads during scans and index searches.
-    /// Range: [0, 1). Lower values assume more cache reuse.
-    /// A value of 0.2 charges a repeated page read at 20% of its first-read cost.
-    pub cache_reuse_factor: f64,
-
     /// CPU cost per row processed (relative to page IO = 1.0).
     pub cpu_cost_per_row: f64,
 
@@ -134,7 +129,6 @@ impl CostModelParams {
             in_subquery_rows: 25.0,
 
             // Scan/Seek costs
-            cache_reuse_factor: 0.2,
             cpu_cost_per_row: 0.003,
             cpu_cost_per_where_step: 0.003,
             cpu_cost_per_seek: 0.01,
@@ -367,15 +361,8 @@ impl CostModelParams {
             return Err("in_subquery_rows must be positive".into());
         }
 
-        // Cache reuse factor must be in [0, 1)
         if self.cache_pages < 1.0 {
             return Err("cache_pages must be at least 1".into());
-        }
-        if self.cache_reuse_factor < 0.0 || self.cache_reuse_factor >= 1.0 {
-            return Err(format!(
-                "cache_reuse_factor must be in [0, 1), got {}",
-                self.cache_reuse_factor
-            ));
         }
 
         // Cost multipliers must be non-negative
@@ -438,21 +425,6 @@ mod tests {
             ..Default::default()
         };
         assert!(params.validate().is_err());
-    }
-
-    #[test]
-    fn test_cache_reuse_bounds() {
-        let mut params = CostModelParams {
-            cache_reuse_factor: 1.0,
-            ..Default::default()
-        };
-        assert!(params.validate().is_err());
-
-        params.cache_reuse_factor = -0.1;
-        assert!(params.validate().is_err());
-
-        params.cache_reuse_factor = 0.99;
-        assert!(params.validate().is_ok());
     }
 
     #[cfg(feature = "serde")]

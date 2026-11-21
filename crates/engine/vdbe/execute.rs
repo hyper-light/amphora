@@ -2189,6 +2189,25 @@ fn op_column_fetch(
         .registers
         .get_mut(dest)
         .ok_or_else(|| register_out_of_range("Column", dest))?;
+    // Amphora (QT.7): a scanned table's column comes from its leaf's batch when the program has
+    // one (`leaf_batch.rs`); otherwise, and for a row the batch left out, the row is read here.
+    if let Some(plan) = program.leaf_batch_plan.as_deref() {
+        match super::leaf_batch::serve_column(
+            &mut state.leaf_batches,
+            plan,
+            cursor_id,
+            cursor,
+            column,
+            dest_reg,
+        )? {
+            super::leaf_batch::Served::Value => return Ok(InsnFunctionStepResult::Step),
+            super::leaf_batch::Served::PastEnd => {
+                apply_column_default(default, dest_reg)?;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+            super::leaf_batch::Served::RowAtATime => {}
+        }
+    }
     let Some((payload, header)) = return_if_io!(state, cursor.record_payload_with_header()) else {
         // A null-row cursor, or one that is not positioned on a valid row
         // (e.g., empty table). Return NULL, not the column's default value.
@@ -2411,6 +2430,34 @@ fn op_column_range_fetch(
         .checked_add(defaults.len())
         .and_then(|end| state.registers.get_mut(dest..end))
         .ok_or_else(|| register_out_of_range("ColumnRange", dest))?;
+    // Amphora (QT.7): as Column does, from the leaf's batch; a row the batch left out is read
+    // whole below.
+    if let Some(plan) = program.leaf_batch_plan.as_deref() {
+        let mut served = true;
+        for (offset, (default, reg)) in defaults.iter().zip(dest_regs.iter_mut()).enumerate() {
+            let column = start_column
+                .checked_add(offset)
+                .ok_or(LimboError::IntegerOverflow)?;
+            match super::leaf_batch::serve_column(
+                &mut state.leaf_batches,
+                plan,
+                cursor_id,
+                cursor,
+                column,
+                reg,
+            )? {
+                super::leaf_batch::Served::Value => {}
+                super::leaf_batch::Served::PastEnd => apply_column_default(default, reg)?,
+                super::leaf_batch::Served::RowAtATime => {
+                    served = false;
+                    break;
+                }
+            }
+        }
+        if served {
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
     let Some((payload, header)) = return_if_io!(state, cursor.record_payload_with_header()) else {
         dest_regs.iter_mut().for_each(Register::set_null);
         return Ok(InsnFunctionStepResult::Step);
@@ -6503,6 +6550,40 @@ pub enum OpSeekState {
 }
 
 pub fn op_seek(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
+    timed_run(
+        program,
+        crate::translate::optimizer::learned_costs::Work::Seek,
+        || seek_run(program, state, insn, pager),
+    )
+}
+
+/// Amphora (QT.5, step 3a): runs `run`, one run of `work`, timing it when the database's
+/// estimator samples this one (`LearnedCosts::sampled`). A run that waits on IO is not timed:
+/// its time is its page reads', which the pager times (`Work::PageRead`), and its resumption's
+/// would be part of the work.
+fn timed_run(
+    program: &Program,
+    work: crate::translate::optimizer::learned_costs::Work,
+    run: impl FnOnce() -> InsnResult,
+) -> InsnResult {
+    let costs = &program.connection.db.learned_costs;
+    if !costs.sampled(work) {
+        return run();
+    }
+    let started = std::time::Instant::now();
+    let result = run();
+    if matches!(result, Ok(InsnFunctionStepResult::Step)) {
+        costs.observe_sampled(work, started.elapsed().as_nanos() as f64);
+    }
+    result
+}
+
+fn seek_run(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
@@ -17969,6 +18050,19 @@ pub fn op_hash_build(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
+    timed_run(
+        program,
+        crate::translate::optimizer::learned_costs::Work::HashBuild,
+        || hash_build_run(program, state, insn, pager),
+    )
+}
+
+fn hash_build_run(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
     load_insn!(HashBuild { data }, insn);
 
     let mut op_state = match state.active_op_state.hash_build().take().filter(|s| {
@@ -18402,6 +18496,19 @@ fn write_hash_payload_to_registers(
 }
 
 pub fn op_hash_probe(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
+    timed_run(
+        program,
+        crate::translate::optimizer::learned_costs::Work::HashProbe,
+        || hash_probe_run(program, state, insn, pager),
+    )
+}
+
+fn hash_probe_run(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,

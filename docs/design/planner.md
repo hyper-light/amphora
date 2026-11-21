@@ -1430,6 +1430,22 @@ placed before other loops (the emitter's no-match path first).
 `answers.py`) for a query with a LEFT JOIN; or such a plan slower than its parent's on the bench
 suite beyond the passes' spread.
 
+## Decision (lane pl8-4): an outer join's ON terms on an earlier table count given its filters
+
+**Decision.** PL.8's estimate (decision 21, CERT). An outer join's ON terms that read only an
+earlier table (lane pl8's `on_elsewhere`) were run over that table's sample apart from its filters,
+so a pair correlated on the sample counted as independent. Their share is now the earlier table's
+sample run with its filters and them together, over its filters alone (`cardinality.rs`,
+`JoinedSetRows::new`): the share of the rows its filters keep that the ON terms match, as the inner
+join reads the same terms together on the same sample.
+
+**Evidence.** `crates/engine/tests/sample_filters.rs`'s
+`an_outer_join_with_sampled_terms_is_estimated_at_least_its_inner_join`: `t0 AS a0 RIGHT JOIN t0 AS
+a1 ON NOT (a1.c0 GLOB 'a%') WHERE a1.c1 >= 3` was estimated at 0.684 against its inner join's 1 on
+main; it passes with the change.
+
+**Falsified by.** A CERT finding where an outer join's ON terms read only an earlier table.
+
 ## Decision (lane pl12): custom plans, then a generic one, for prepared statements
 
 **Decision.** PL.12 (docs/research/planner.md section 9, rank 12; `crates/engine/plan_cache.rs`).
