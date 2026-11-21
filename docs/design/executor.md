@@ -325,3 +325,116 @@ reading a row's column from another row's header; a held or pinned page evicted,
 that a page used since the sweep last passed is evicted first; a query whose answer changes with its
 terms' order beyond what SQLite's own order changes (which error a row raises first); q06 or JOB 5a
 and 5b no faster per row than on the parent.
+
+## 8. A scan, its aggregates and a hash join's probe run on every core, in morsels
+
+**Decision.** Behind a switch (`vdbe/morsel.rs`, `ParallelMode`, off by default), a pipeline (a
+scan with its filter and its grouped or whole-table aggregates, or a hash join's probe side) runs
+morsel by morsel on several threads (QT.6, the query-time plan's step 6; G5 step 3). A dispatcher,
+one atomic counter, hands the next morsel (a contiguous run of input rows) to whichever worker
+asks, so a slow worker takes fewer morsels. Each worker folds its morsels into its own partial
+state; the partials merge once every worker ends. The workers are scoped std threads, the caller's
+thread among them, never more than the machine's cores (the same code on every platform). One
+memory budget, the statement's, is charged by every worker's new group and every match, and a
+charge that would pass it is refused with `MorselError::MemoryBudget`, so the workers together never
+hold more than the statement may. A worker that ends without an answer is `MorselError::WorkerLost`.
+No loop recurses; each worker's loop ends when the morsel indexes run out.
+
+The worker count and the morsel size are no picked numbers: `choose_degree`, the one hook that
+picks serial or parallel, minimizes a cost model whose terms are measured where it runs. With `k`
+workers, morsels of `m` rows and `n` rows at `r` each, a run costs `(k - 1) * s` to start workers,
+`n * r / k` of work, `(n / m) * d / k` to claim morsels and up to `m * r` waiting on the last one;
+for each `k` up to the cores, `m` minimizes the last two (`sqrt(n * d / (k * r))`), and the least
+time wins against the serial `n * r`. `s` (a worker started) and `d` (a morsel claimed) are
+measured on the machine at start (`MachineCosts::measure`) and again by every parallel run (a
+running mean, every sample alike); `r` is measured per statement by a pilot on the caller's thread,
+morsels doubling from one row, run until it has taken as long as starting one worker (before then
+no parallel plan can win) or the input ends. A statement that ends inside its pilot never starts a
+worker.
+
+Answers are the same at every worker count and morsel size: counts and INTEGER sums are exact (128
+bits); a REAL sum is kept exact until its one rounding (Shewchuk's non-overlapping partials, as
+Python's `math.fsum`), so its value does not depend on the order its terms arrive in; MIN and MAX
+break ties by the earliest row; a group's key values are its earliest row's; groups come out in key
+order; a join's matches come out in probe-row order, each probe row's in build-row order.
+
+**Why.** Every query ran on one thread of 32 (the plan's "Where step 3's time goes"); TPC-H SF 10's
+median is a whole scan of lineitem, a scan rate the plan puts at a tenth of today's, which one core
+does not reach (f3, f5). A REAL sum summed in another order can differ in its last bits, and the
+plan asks that answers be identical at every worker count or within a stated tolerance; the exact
+sum makes them identical (Ada's word on this choice is asked for).
+
+**Sources.** Leis, Boncz, Kemper, Neumann, "Morsel-Driven Parallelism: A NUMA-Aware Query
+Evaluation Framework for the Many-Core Age" (SIGMOD 2014): morsels handed out by a dispatcher,
+workers running a pipeline to its breaker, partial aggregation per worker then a merge (§3, §4.4;
+`docs/research/read-path.md`, "Use every core: morsels"). Shewchuk, "Adaptive Precision
+Floating-Point Arithmetic and Fast Robust Geometric Predicates" (Discrete & Computational Geometry
+18, 1997): the non-overlapping expansion and its exact sum. DuckDB's degree per pipeline from its
+rows (research f44) is the same rule as the model's serial bound.
+
+**Evidence.** `vdbe/morsel.rs`'s tests: 300 random filters, groupings and aggregates over random
+tables (NULLs, integers past 2^53, REALs whose order changes their naive sum, text) at 2, 3, 4 and
+8 workers with random morsel sizes equal the serial answer value for value (T-QT.6.1); 200 random
+one- and two-column equi-joins' parallel matches equal the serial probe's in order and a nested
+loop's (T-QT.6.2); the exact sum is order-free (T-QT.6.3); a statement past its budget is refused
+at every worker count with the budget never passed (T-QT.6.4); the degree follows the costs
+(T-QT.6.5). Times are the coordinator's (AC-QT.6.1 to AC-QT.6.3); until recorded the change is
+unmeasured.
+
+**Falsified by.** A parallel answer that differs from the serial one; a morsel lost or run twice; a
+statement whose workers together pass its budget; a statement the model sends to more workers that
+runs slower than on one, measured class for class.
+
+**Left.** The pipelines run over rows already read; the VDBE's own loops (cursors over one
+snapshot per worker), a hash table built by all workers, the page cache's miss path sharded, loom
+or shuttle on the dispatcher, and the worker and morsel metrics are the step's next pieces.
+
+## 9. A table scan decodes each leaf once into column batches, behind a switch
+
+**Decision.** With `Connection::set_vectorized_scans` on (off by default; QT.7, the query-time
+plan's step 7, with G5 step 2), a read-only statement's scanned table cursors, those it rewinds or
+moves to their last row and never seeks, read their columns from a batch (`vdbe/leaf_batch.rs`).
+When a Column or ColumnRange reads a row the cursor's batch doesn't hold, the cells of the leaf
+under the cursor, from its cell onward (backward for a descending scan), are decoded together:
+each record's header parsed once, only the columns the statement reads (found once as the program
+is built, `BatchPlan`), into one vector per column. Every Column on the following rows copies its
+value out of the vector. Filters and aggregates read those values through the VDBE's one evaluator
+of each expression (CLAUDE.md §13); the record format is unchanged.
+
+A batch holds as many rows as fit in the smaller of the core's second-level cache, read from the
+operating system where the engine runs (Linux's sysfs `cache/index*/{level,type,size}`, macOS's
+`hw.perflevel0.l2cachesize` or `hw.l2cachesize`), and the statement's memory budget
+(`Pager::statement_memory_budget`, QT.5's) shared among its batched cursors. Each row is
+charged its own record bytes on the page, an upper bound of its decoded text and blob bytes, plus
+one value slot for each column read, so the batch never holds more than its budget. The stated
+fallbacks: a record that spills to overflow pages, or a row whose charge alone exceeds the budget,
+is read row-at-a-time as before; where the cache size can't be read (Windows, which needs an OS
+call this crate makes only through unsafe code, CLAUDE.md §12) every scan reads row-at-a-time.
+
+A batch is kept while its cursor is on the same leaf and no other cursor has come to share its
+B-tree since the decode (`BTreeCursor::peers_epoch`, bumped as the pager sets the cursor's
+`has_peers`); while a peer is there, the cursor reads row-at-a-time. A statement that writes reads
+row-at-a-time.
+
+COUNT(*) over a whole table is answered from its leaves' cell counts without decoding a row, as
+before (`Count`, `BTreeCursor::count`).
+
+**Why.** Step 3 made a Column parse each header once a row (decision 7), but each Column still
+locates the payload and decodes one value, an interpreter dispatch a value. A scan reading k
+columns of n rows does that n·k times; decoded by leaf, the parse and the payload's location are
+paid once a row in one tight loop, and the values a filter or aggregate reads sit together in cache.
+
+**Sources.** Boncz, Zukowski and Nes, "MonetDB/X100: Hyper-Pipelining Query Execution" (CIDR
+2005): vectors of values that stay in the CPU cache amortize interpretation, with 128 to 8K values
+working and about 1,000 best on their hardware (research finding f29). Kersten, Leis, Kemper,
+Neumann, Pavlo and Boncz, "Everything You Always Wanted to Know About Compiled and Vectorized
+Queries But Were Afraid to Ask" (PVLDB 11(13), 2018): a vector's working set must fit the cache,
+under 64 or over 64K values lose, and compiled pipelines win on computation where vectors win on
+memory stalls (f30). Both fix the batch by the cache, which is why it is measured here and not
+picked.
+
+**Falsified by.** Any answer that differs with the switch on (`vdbe/leaf_batch/tests.rs`,
+T-QT.7.1 to T-QT.7.3); a batch holding more than its budget; q06 at SF 1 not faster per row with
+the switch on than off (AC-QT.7.1, the coordinator's run with `amphora-bench --planner` targets
+`amphora,amphora-vectorized`); or G5 step 2 measuring compiled pipelines faster on the same scans,
+in which case they replace this.
