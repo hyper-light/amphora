@@ -2001,7 +2001,6 @@ impl<F: BlockFile + 'static> Actor<F> {
             for voter in &self.detected {
                 self.answers.suspected(*voter);
             }
-            self.spacing.tick()?;
             let election = self.replica.core().raft.config().election_tick;
             let patience = self
                 .answers
@@ -2171,7 +2170,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                     {
                         pass.caught_up = false;
                         pass.busy = false;
-                        self.spacing.restarted(queued);
+                        self.spacing.restarted(queued)?;
                         self.control.meter.restarted();
                     }
                 }
@@ -13642,12 +13641,12 @@ mod tests {
 
     /// AC-T1.8.D1, T-T1.8.D3 (replication.md, "A replica's database log bounded by what it
     /// measures", A): the first restart is free, a restart that held entries spaces the next by a
-    /// thousand times them, and the window forgets after two generations. Do: a voter and its
-    /// learner, the room the filesystem's own; 1 written and flushed, rounds until the learner
-    /// restarts; its count then told of a restart that held one entry; 2 to 21 written and
-    /// flushed; then two generations of the learner's ticks, 22 written, rounds. Expect: a
-    /// restart after 1 (on b151af0 none: its bound was 131,072 frames); none while 2 to 21
-    /// applied; one after the window forgot.
+    /// thousand times them and the guess. Do: a voter and its learner, the room the filesystem's
+    /// own; 1 written and flushed, rounds until the learner restarts; its count then told of a
+    /// restart that held one entry; 2 to 21 written and flushed; then its count told of a million
+    /// entries applied (its generation covering its spend), 22 written, rounds. Expect: a restart
+    /// after 1 (on b151af0 none: its bound was 131,072 frames); none while 2 to 21 applied; one
+    /// once its generation covered its spend.
     #[test]
     fn the_first_restart_is_free_and_the_next_waits_on_its_share() {
         own_account();
@@ -13673,7 +13672,7 @@ mod tests {
             handle.counters()
         );
         let spacing = &mut driven.owner_mut(1).spacing;
-        spacing.restarted(0);
+        spacing.restarted(0).unwrap();
         spacing.stepped(1, Duration::ZERO, 1).unwrap();
         spacing.stepped(0, Duration::ZERO, 0).unwrap();
         let restarts = handle.counters().database_log_restarts;
@@ -13685,14 +13684,16 @@ mod tests {
             driven.round(&mut pump);
         }
         assert_eq!(handle.counters().database_log_restarts, restarts);
-        for _ in 0..2 * log_bound::GENERATION {
-            driven.owner_mut(1).spacing.tick().unwrap();
-        }
+        driven
+            .owner_mut(1)
+            .spacing
+            .stepped(1_000_000, Duration::ZERO, 0)
+            .unwrap();
         write(&mut driven, &mut pump, &clients[0], 22);
         settle_log(&mut driven, &mut pump, &clients);
         assert!(
             restarted(&mut driven, &mut pump, restarts),
-            "no restart once the window forgot: {:?}",
+            "no restart once its generation covered its spend: {:?}",
             handle.counters()
         );
         driven.drain(&mut pump);
@@ -13718,7 +13719,7 @@ mod tests {
         settle_log(&mut driven, &mut pump, &clients);
         // Its share spent, so the log holds 2's frames when the test makes a restart due.
         let spacing = &mut driven.owner_mut(1).spacing;
-        spacing.restarted(0);
+        spacing.restarted(0).unwrap();
         spacing.stepped(1_000_000, Duration::ZERO, 1).unwrap();
         write(&mut driven, &mut pump, &clients[0], 2);
         settle_log(&mut driven, &mut pump, &clients);
@@ -13784,7 +13785,7 @@ mod tests {
         write(&mut driven, &mut pump, voter, 1);
         settle_log(&mut driven, &mut pump, &clients);
         let spacing = &mut driven.owner_mut(0).spacing;
-        spacing.restarted(0);
+        spacing.restarted(0).unwrap();
         spacing.stepped(1_000_000, Duration::ZERO, 1).unwrap();
         driven
             .owner(0)
