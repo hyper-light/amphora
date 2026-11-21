@@ -395,6 +395,10 @@ fn t_t1_12_1_a_constraint_is_enforced_on_writes_while_rows_are_validated_then_pu
     assert!(db.exec("INSERT INTO t (a, b) VALUES (-1, 'x')").is_err());
     assert!(db.exec("UPDATE t SET a = NULL WHERE id = 3").is_err());
     db.exec("INSERT INTO t (a, b) VALUES (5, 'x')").unwrap();
+    // A table with a column in a change is the change's: it neither drops nor alters otherwise.
+    assert!(db.exec("DROP TABLE t").is_err());
+    assert!(db.exec("ALTER TABLE t DROP COLUMN b").is_err());
+    assert!(db.exec("ALTER TABLE t ADD COLUMN z INTEGER").is_err());
     let mut steps = 0;
     let mut visited = 0;
     loop {

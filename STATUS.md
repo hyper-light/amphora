@@ -57,6 +57,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   flight so commits land during flushes. 10,000 seeds: no acknowledged batch lost, no refused batch
   kept, no batch torn, the integrity check passing (2026-10-20). Every gate runs 200. A test holds a
   flush and commits during it: no checkpoint copies that commit before a later flush (decision 15).
+- **The versioned storage's log in lanes** (CP-T1.3's log, `crates/engine/storage/versioned`,
+  docs/design/engine.md decision 11): one group-committed log or a log a writer, merged by commit
+  timestamp; a commit acknowledged once every lane is durable through it; recovery replays to the
+  first missing commit, reading and replaying side by side (SiloR), and cuts each lane there; on Linux
+  a flush is one io_uring submission (the engine's `io_uring` feature). Checkpoints copy pages by
+  copy-on-update after a pause that only lists rows with versions (decision 7). T-T1.3.1, a crash at
+  every disk operation of each seed's workload: 200 seeds in every gate; the 10,000 and
+  `amphora-bench --vlog` (AC-T1.4.2, AC-T1.4.3) not yet run.
 - **Stores on the engine** (`crates/amphora/src/db.rs`): a database opened for the pipeline, its
   readers, its flusher, its checkpoints and its log's restart.
 - **Amphora's engine** (`crates/engine*`, its `ORIGIN.md`): Turso's four crates (core, sqlite/parser,
@@ -261,8 +269,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   latch and finds its row again by key once the leaf's version moves, so it sees its own
   transaction's writes through other cursors. A conformance suite (`conformance.rs`) drives it and
   the current engine's B-tree cursor through the same random operation sequences on a table and two
-  indexes (one descending and NOCASE) and compares every step. Not yet: overflow rows (refused,
-  `TooBig`), dropping a tree, a comparison per tree in one database, the connection's wiring (step 2).
+  indexes (one descending and NOCASE) and compares every step. It puts back a large row's overflow
+  chunks after each leaf's copy (`AC-NS.2.4`). Not yet: a comparison per tree in one database, the
+  connection's wiring (step 2).
 - **Savepoints on the versioned storage** (G7 step 2 in part, `NS.2`;
   `crates/engine/storage/versioned/{version,txn_model}.rs`): a transaction rolls back to a savepoint
   from its versions (rows first changed after it as before the transaction, rows changed before and
@@ -270,8 +279,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   transactions (`txn_model.rs`, `T-NS.2.1`) runs the same random transactions with savepoints on the
   current engine through SQL and on the versioned storage, every read and scan compared, and checks
   each snapshot sees exactly what was committed when it opened (300 seeds pass; the 10,000 are the
-  batch's). Not yet: overflow rows, the catalog (`sqlite_schema`, DDL, trees made and dropped at run
-  time) and ANALYZE, the connection's wiring, so the engine's suites don't yet run on it.
+  batch's). Overflow rows (`AC-NS.2.4`, `overflow.rs`): a value past a cell's room keeps that many
+  bytes in its cell and the rest as versioned chunk rows of the database's overflow tree, written by
+  the same transaction, so snapshots, rollback, savepoints, the redo log and recovery carry them; a
+  page now splits by bytes with the new cell counted (a split by count found no room once cells
+  near the largest size gathered on one side). Trees made and dropped while running (`AC-NS.2.5`): a
+  redo record each, a dropped tree's root listed as 0 in the checkpoint, both replayed; dropped
+  trees' pages stay unreferenced (the pool has no free list yet). Not yet: `sqlite_schema`, DDL and
+  ANALYZE on those trees, the connection's wiring, so the engine's suites don't yet run on it.
 - **Serializable validation, three prototypes behind one switch** (G8 step 1, docs/design/engine.md
   decision 5, `crates/engine/storage/versioned/{version,elle}.rs`, `amphora-bench --cc`): precision
   locking (the default), SSI and Silo-style OCC validate commits on the versioned storage's commit
@@ -332,6 +347,21 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   whose write is refused at the leader's append gets a slot for its next try, its length learned per member from
   its retries' gaps (cold start: the core's election timeout). A gap over which the host's detector suspected the
   member is not learned; no number bounds a gap (lane g-slot-close, 2026-11-21).
+- **The raft log as the WAL** (G12 step 2, AC-T1.8.L1 and L2; replication.md, "The raft log as the WAL"): the engine
+  applies committed entries without flushing its log per commit; compaction asks nothing of the owner's thread and
+  moves the raft log's start no further than what the flushing thread made durable (T-T1.8.L1). The Records suite
+  and seeded histories run on one harness at one voter and three, with identical transcripts (T-T1.8.L2; lane
+  g12s2, 2026-11-21).
+
+- **Backups and point-in-time recovery to Mantle, the mechanism** (CP-T1.12, lane pitr,
+  `crates/amphora/src/backup*`, docs/design/backup.md): the object-store seam (`amphora_api::blobs`,
+  its simulator and conformance suite); commits stamped by the writer (one mark a second); the log's
+  durable frames shipped as segments with no timer; bases copied chunk by chunk without a reader;
+  log restarts held until shipped; restore to any second by the engine's own recovery, refusing
+  seconds the archive can't say exactly. Restore drills at random seconds on the simulator: every row
+  equal (T-T1.12.D1). `Database::open_backed_up` backs a local writer up: its commits stamped and a
+  thread that ships and copies bases as it commits, across a close and a reopen (T-T1.12.D2). Not
+  yet: kiln's adapter to Mantle, and the 100 GB restore measurement (AC-T1.12.3).
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
@@ -605,6 +635,12 @@ change, and a power cut leaves the old schema or the new. DROP COLUMN is not yet
   costs say the generic plan does as well; one whose estimates read none keeps its generic plan. Its
   TPC-H prepared measurement (AC-PL.12.1; its harness, `amphora-bench --planner --prepared` with
   qgen's parameters, is written: bench/planner/README.md) and the suite's (AC-PL.12.2) are open.
+  PL.8 is started (docs/design/planner.md "Decision (lane pl8)"): a RIGHT JOIN led by one
+  table is planned as its mirrored LEFT JOIN, CD-C's commutativity rule, so the tables after it are no
+  longer held behind its right table and the audit's 03-right-full-barrier reads tiny first (T-PL.8.1);
+  an outer join's ON term that reads only earlier tables now counts in its join's estimate.
+  Not built: bushy plans over connected complement pairs with a composite hash-join build, and CD-C's
+  rules for outer, semi and anti joins in place of `required_lhs_by_table`; JOB's AC-PL.8.1 is open.
   PL.9 is built (lane pl9, docs/design/planner.md "row counts kept as rows change"): each table's
   rows inserted less deleted since ANALYZE are kept as writes finish (one atomic add a statement),
   the planner's row count follows them, and a prepared statement plans again once a table it counted

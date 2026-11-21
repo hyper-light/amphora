@@ -61,6 +61,7 @@ fn t_g2_7_2_a_file_runs_on_amphora_as_sqlite_runs_it() {
         &mut render,
         &wrong_hash,
         None,
+        None,
         Limits::default(),
         &mut |r| {
             if r.outcome != Outcome::Agree {
@@ -78,6 +79,7 @@ fn t_g2_7_2_a_file_runs_on_amphora_as_sqlite_runs_it() {
         &mut Amphora::in_memory().unwrap(),
         &mut render,
         &fixed,
+        None,
         None,
         Limits::default(),
         &mut |r| {
@@ -100,6 +102,7 @@ fn records_past_the_deadline_are_unreached_not_failed() {
         &mut Amphora::in_memory().unwrap(),
         &mut render,
         FILE,
+        None,
         None,
         Limits {
             deadline: Some(past),
@@ -134,6 +137,7 @@ fn t_g2_7_4_a_record_that_cant_finish_is_stopped_and_classified() {
         &mut Amphora::in_memory().unwrap(),
         &mut render,
         &endless(),
+        None,
         None,
         Limits {
             deadline: None,

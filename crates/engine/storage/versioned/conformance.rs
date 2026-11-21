@@ -164,7 +164,7 @@ fn pair(
         }
     };
     let vdb = Arc::new(
-        VDatabase::open(Arc::new(Simulated::new(seed)), 4_000, 1, || {
+        VDatabase::open(Arc::new(Simulated::new(seed, 1).unwrap()), 4_000, 1, || {
             order.comparator()
         })
         .unwrap(),
@@ -258,7 +258,13 @@ fn value(rng: &mut Rng) -> Value {
             Value::from_text(text(rng, len))
         }
         _ => {
-            let len = usize::try_from(rng.below(200)).unwrap();
+            // Now and then one past a page, its record kept in overflow on both storages
+            // (AC-NS.2.4).
+            let len = if rng.chance(10) {
+                usize::try_from(4_000 + rng.below(9_000)).unwrap()
+            } else {
+                usize::try_from(rng.below(200)).unwrap()
+            };
             Value::from_slice(&vec![u8::try_from(rng.below(256)).unwrap(); len]).unwrap()
         }
     }
@@ -623,9 +629,9 @@ fn seeds() -> u64 {
 }
 
 /// Do: 2,000 random operations (inserts after their seeks, deletes, steps, seeks of every kind,
-/// rewinds, lasts, counts) on a table's tree through both storages' cursors, for each seed.
-/// Expect: identical seek answers, rows, rowids and records after every step, and the same rows at
-/// the end (T-NS.1.1, AC-NS.1.1).
+/// rewinds, lasts, counts) on a table's tree through both storages' cursors, for each seed, some
+/// records past a page. Expect: identical seek answers, rows, rowids and records after every step,
+/// and the same rows at the end (T-NS.1.1, AC-NS.1.1, AC-NS.2.4).
 #[test]
 fn ns_1_1_table_cursors_agree_step_by_step() {
     for seed in 0..seeds() {
@@ -706,7 +712,10 @@ fn backward(c: &mut VersionedCursor) -> Vec<i64> {
 fn ns_1_1_a_reading_cursor_sees_its_snapshot_while_writers_split_leaves() {
     let order = KeyOrder::rowid();
     let vdb = Arc::new(
-        VDatabase::open(Arc::new(Simulated::new(9)), 8_000, 1, || order.comparator()).unwrap(),
+        VDatabase::open(Arc::new(Simulated::new(9, 1).unwrap()), 8_000, 1, || {
+            order.comparator()
+        })
+        .unwrap(),
     );
     let (pager, _db, _conn) = engine();
     let mut d = super::blink::Descender::new();
@@ -723,7 +732,7 @@ fn ns_1_1_a_reading_cursor_sees_its_snapshot_while_writers_split_leaves() {
         )
         .unwrap();
     }
-    vdb.commit(txn, &mut d, false).unwrap();
+    vdb.commit(txn, &mut d, vdb.lane(), false).unwrap();
     let snap = vdb.snapshot().unwrap();
     let mut reader =
         VersionedCursor::new(vdb.clone(), 0, order, Access::Read(snap), pager).unwrap();
@@ -742,7 +751,7 @@ fn ns_1_1_a_reading_cursor_sees_its_snapshot_while_writers_split_leaves() {
                     let gone = (w + 4 * batch) * 2;
                     vdb.remove(&mut d, &mut txn, 0, &super::cursor::rowid_key(gone))
                         .unwrap();
-                    vdb.commit(txn, &mut d, false).unwrap();
+                    vdb.commit(txn, &mut d, vdb.lane(), false).unwrap();
                 }
             })
         })
@@ -779,7 +788,10 @@ fn ns_1_1_a_reading_cursor_sees_its_snapshot_while_writers_split_leaves() {
 fn ns_1_1_a_cursor_sees_writes_through_another_cursor_of_its_transaction() {
     let order = KeyOrder::rowid();
     let vdb = Arc::new(
-        VDatabase::open(Arc::new(Simulated::new(3)), 2_000, 1, || order.comparator()).unwrap(),
+        VDatabase::open(Arc::new(Simulated::new(3, 1).unwrap()), 2_000, 1, || {
+            order.comparator()
+        })
+        .unwrap(),
     );
     let (pager, _db, _conn) = engine();
     let txn = Arc::new(Mutex::new(vdb.begin().unwrap()));
@@ -824,7 +836,10 @@ fn ns_1_1_a_cursor_sees_writes_through_another_cursor_of_its_transaction() {
 fn ns_1_1_a_reading_cursor_refuses_writes() {
     let order = KeyOrder::rowid();
     let vdb = Arc::new(
-        VDatabase::open(Arc::new(Simulated::new(4)), 100, 1, || order.comparator()).unwrap(),
+        VDatabase::open(Arc::new(Simulated::new(4, 1).unwrap()), 100, 1, || {
+            order.comparator()
+        })
+        .unwrap(),
     );
     let (pager, _db, _conn) = engine();
     let snap = vdb.snapshot().unwrap();

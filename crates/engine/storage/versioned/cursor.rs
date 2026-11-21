@@ -19,11 +19,13 @@
 //! back from its first descends again to the leaf before its lower bound, as a B-link tree links
 //! its leaves only to the right. Every walk is bounded by the pages handed out.
 //!
-//! What waits for the catalog (step 2): overflow (a row larger than a page's cell is refused,
-//! `TooBig`), dropping a tree, and a comparison per tree in one database.
+//! A row larger than a page's cell keeps its tail in the database's overflow tree (`AC-NS.2.4`): the
+//! cursor puts it back after copying a leaf, its latch released. What waits for the catalog
+//! (step 2): dropping a tree, and a comparison per tree in one database.
 
 use super::blink::{Comparator, Descender, Leaf};
 use super::durable::Database;
+use super::overflow;
 use super::version::{Snapshot, Txn, VTree};
 use crate::error::LimboError;
 use crate::numeric::Numeric;
@@ -233,6 +235,39 @@ impl Rows {
         self.row(i).map(|(k, _)| k)
     }
 
+    /// Puts back the chunks of the copied rows that continue in the overflow tree (`AC-NS.2.4`), as
+    /// `snap` sees them: after the copy, with the leaf's latch released.
+    fn join_chunks(
+        &mut self,
+        db: &Database,
+        d: &mut Descender,
+        snap: &Snapshot,
+        tree: u64,
+    ) -> Result<()> {
+        let mut long = false;
+        for i in 0..self.len() {
+            let (k, v) = self.row(i)?;
+            long |= overflow::continues(k, v);
+        }
+        if !long {
+            return Ok(());
+        }
+        let mut bytes = Vec::with_capacity(self.bytes.len());
+        let mut at = Vec::with_capacity(self.at.len());
+        for i in 0..self.len() {
+            let (k, v) = self.row(i)?;
+            let start = bytes.len();
+            bytes.extend_from_slice(k);
+            let mut value = v.to_vec();
+            db.join(d, snap, tree, k, &mut value)?;
+            bytes.extend_from_slice(&value);
+            at.push((start, k.len(), value.len()));
+        }
+        self.bytes = bytes;
+        self.at = at;
+        Ok(())
+    }
+
     /// Copies `leaf`'s rows on `after`'s side of the point it was read for, as `snap` sees them.
     fn copy(
         &mut self,
@@ -372,8 +407,9 @@ impl VersionedCursor {
         let mut leaves = 0u64;
         loop {
             vt.tree().read_leaf(pool, leaf, low, &mut before, |l| {
-                rows.copy(vt, db, snap, l, true)
+                rows.copy(&vt, db, snap, l, true)
             })?;
+            rows.join_chunks(db, d, snap, *tree)?;
             if !rows.is_empty() {
                 self.at = At::Row(0);
                 return Ok(true);
@@ -420,8 +456,9 @@ impl VersionedCursor {
                 };
                 let (leaf, low) = vt.tree().leaf_for(pool, d, &mut before)?;
                 vt.tree().read_leaf(pool, leaf, low, &mut before, |l| {
-                    rows.copy(vt, db, snap, l, false)
+                    rows.copy(&vt, db, snap, l, false)
                 })?;
+                rows.join_chunks(db, d, snap, *tree)?;
             }
             if let Some(last) = rows.len().checked_sub(1) {
                 self.at = At::Row(last);

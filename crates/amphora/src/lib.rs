@@ -29,6 +29,7 @@
 //! The `amphora` binary says what it is ([`reply`]).
 
 pub mod audit;
+pub mod backup;
 pub mod database;
 pub mod db;
 mod descriptors;

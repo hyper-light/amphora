@@ -132,6 +132,9 @@ criteria = [
   { id = "AC-T1.8.R2", text = "Read sets keep every history serializable, alone and under the write slot" },
   { id = "AC-T1.8.R3", text = "The read set travels with the write as an append-only change: a binary from before it decodes the write and ignores the read set" },
   { id = "AC-T1.8.D2", text = "No class's owner flushes an ordinary entry's database log on its own thread: a flush that stands still stands no owner step still" },
+  # lane g12s2: the raft log as the WAL (G12 step 2; docs/design/replication.md, "The raft log as the WAL").
+  { id = "AC-T1.8.L1", text = "Writes are durable once a quorum's raft logs are flushed; the engine applies committed entries without its log fsyncing per commit, and the raft log is compacted no further than what the engine's log made durable" },
+  { id = "AC-T1.8.L2", text = "The store's tests give identical results at one voter and at three, from one harness whose only parameter is the group's size" },
 ]
 tests = [
   { id = "T-T1.8.1", text = "A laptop offline writes to its outbox, then reconnects — passes when every write commits, in order, with no duplicate" },
@@ -434,6 +437,32 @@ tests = [
   { id = "T-QT.3.5", text = "scripts/check-production.sh after the change — passes when it passes, with the ratchet's counts lowered by what the change removed" },
 ]
 
+# lane pitr: CP-T1.12's backups and point-in-time recovery (docs/design/backup.md)
+[[own]]
+id = "PITR"
+title = "Backups and point-in-time recovery to Mantle (G14 step 4)"
+criteria = [
+  { id = "AC-T1.12.3", text = "time to restore 100 GB from Mantle is at most 30 min, measured by a restore drill" },
+  { id = "AC-T1.12.4", text = "difference between a restored point and the source at that point is exactly 0 rows, measured by a row-by-row comparison" },
+]
+tests = [
+  { id = "T-T1.12.D1", text = "Restore drills at random seconds of a database written, checkpointed, restarted, shipped and copied at random — passes when every row is equal" },
+  { id = "T-T1.12.D2", text = "A database opened backed up ships as it commits through its own thread, across a close and a reopen — passes when every second after its first base restores with every row equal and no round failed" },
+  { id = "T-T1.12.P1", text = "Commits within a second keep one mark, its last; a new second a new mark" },
+  { id = "T-T1.12.P2", text = "A clock that steps back holds stamps at the last, each later than the one before, and is counted" },
+  { id = "T-T1.12.P3", text = "Past their bound the two oldest marks merge and their seconds are refused as unknown" },
+  { id = "T-T1.12.P4", text = "Archive keys round-trip through their text, in the store's order" },
+  { id = "T-T1.12.P5", text = "A second is located in the segment whose marks reach it, or in the quiet stretch before the next segment's first mark; before the first mark, past what is whole, and in an unstamped stretch it is refused" },
+  { id = "T-T1.12.P6", text = "The cut is the last mark at or before the second; an unstamped stretch after it is refused" },
+  { id = "T-T1.12.P7", text = "The chain takes the latest base on an unbroken log; a gap or a missing tail ends the walk" },
+  { id = "T-T1.12.P8", text = "Retention lets go of what precedes the base the oldest kept second needs" },
+  { id = "T-T1.12.P9", text = "A base is due with none, after a break, once the log outweighs it, and once a restore at measured rates would pass 30 minutes" },
+  { id = "T-T1.12.P10", text = "An archive object round-trips; a changed byte is refused" },
+  { id = "T-T1.12.P11", text = "A log started again twice with no write between keeps its link whole; a restart forced before its frames were shipped, or one the fence wasn't told of, breaks it" },
+  { id = "T-T1.12.P12", text = "A through mark makes the seconds after the last segment's whole through its time; one that doesn't end at a segment says nothing" },
+  { id = "AMPHORA-BLOBS", text = "The Blobs seam's conformance suite (AMPHORA-BLOBS-1 to 7) passes on SimBlobs" },
+]
+
 # lane keyheads: G3 step 4 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), searching a page by key heads.
 [[own]]
 id = "PR.4"
@@ -467,9 +496,15 @@ title = "Records, overflow, the catalog and transactions on the new pages (G7 st
 criteria = [
   { id = "AC-NS.2.1", text = "the engine's test suites pass on the new storage" },
   { id = "AC-NS.2.3", text = "A transaction rolls back to a savepoint from its versions: rows first changed after it as before the transaction, rows changed before and after as the savepoint found them, later changes out of its redo record; the savepoint stays good" },
+  # lane g7s2-2
+  { id = "AC-NS.2.4", text = "A value past a cell's room keeps that many bytes in its cell and the rest as versioned chunk rows of the database's overflow tree, written by the same transaction; a page splits by bytes, the new cell counted" },
+  { id = "AC-NS.2.5", text = "Trees are made and dropped while the database runs: each a redo record of its own, durable before it returns; a checkpoint lists a dropped tree's root as 0; recovery replays both; a drop waits while an open transaction changed the tree" },
 ]
 tests = [
   { id = "T-NS.2.1", text = "The shared model test of transactions on both storages — passes when identical answers, no anomaly" },
+  # lane g7s2-2
+  { id = "T-NS.2.4", text = "Values past a page read at every snapshot; rollback and savepoints across them; recovery after a power cut and a crash at each of many writes recovers a prefix of the commits" },
+  { id = "T-NS.2.5", text = "Trees made and dropped survive reopens and power cuts; a crash at each write of a workload that makes, fills and drops trees recovers a prefix of its steps" },
 ]
 
 # lane follower-reads (G13 step 4, kiln goal 80d4cf5e; docs/design/replication.md, "Follower reads at a
@@ -727,6 +762,9 @@ tests = [
   { id = "T-G2.7.1", text = "the pool chosen from measured times (bench/corpus/subset.py) and run with them kept (crates/corpus/tests/times.rs) — passes when each record and each file has its time and fill files stop at the deadline" },
   { id = "T-G2.7.2", text = "a corpus file run on Amphora through the gate's code path (crates/corpus/tests/amphora_runs.rs) — passes when the wrong answer, and only it, disagrees" },
   { id = "T-G2.7.3", text = "the whole corpus nightly (.kiln/corpus.yaml, bench/corpus/nightly.sh) — passes when its record, times and re-ranked pool are kept as the run's artifacts" },
+  # lane g12s2: the raft log as the WAL.
+  { id = "T-T1.8.L1", text = "A voter's flushes held, 1 flushed and 2 to 5 applied, its raft log compacted - passes when the start stops at the flushed point, the compaction flushed nothing, and after the flush a compaction reaches the last entry applied" },
+  { id = "T-T1.8.L2", text = "The Records suite and seeded histories on a group of one voter and of three - passes when every case passes, every answer equals the simulator's, and the two transcripts are identical" },
   # lane corpus-ci-4
   { id = "T-G2.7.4", text = "a record that can't finish (a 10-way join of 100 rows) bounded by the run's budget (crates/corpus/tests/amphora_runs.rs, times.rs) — passes when the engine stops it and it is classified past the budget, the next record still runs, and a required record past it fails the run" },
 ]
@@ -742,3 +780,7 @@ criteria = [
 tests = [
   { id = "T-CS.3.1", text = "crates/columnar/tests/round_trip.rs — passes when every random and real-like column, of every size around the group and vector edges, decodes equal to the input in both codecs, every bit width packs and unpacks in both layouts, the schemes follow the data, and damaged encodings are refused" },
 ]
+
+# lane groupcommit (G8 step 3, the versioned storage's log; docs/design/engine.md decision 11): no new
+# IDs. It serves AC-T1.4.2 and AC-T1.4.3 (`amphora-bench --vlog`) and T-T1.3.1
+# (crates/engine/tests/versioned_crash.rs).

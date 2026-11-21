@@ -255,3 +255,152 @@ fn the_simulator_answers_as_amphora_does() {
         );
     }
 }
+
+/// A group of `voters` voters on this host (CP-T1.8, G12 step 2: one code path at 1 voter and 3),
+/// each a replicated database of its own whose raft log is its write-ahead log, their records
+/// relayed in-process until the group is dropped.
+struct Group {
+    databases: Vec<Database>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    relay: Option<std::thread::JoinHandle<()>>,
+    _dir: tempfile::TempDir,
+}
+
+impl Group {
+    fn new(voters: u64) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let databases: Vec<Database> = (1..=voters)
+            .map(|node_id| {
+                Database::open_replicated(
+                    &dir.path().join(format!("state-{node_id}.db")),
+                    &dir.path().join(format!("raft-{node_id}.log")),
+                    amphora_api::replication::ReplicaConfig {
+                        node_id,
+                        voters: (1..=voters).collect(),
+                        learners: Vec::new(),
+                        bootstrap: None,
+                    },
+                    until(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let handles: Vec<_> = databases.iter().map(|d| d.replica().unwrap()).collect();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let relay = {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let mut moved = 0;
+                    for (from, handle) in (1u64..).zip(&handles) {
+                        for record in handle.drain(1024).unwrap_or_default() {
+                            let to = usize::try_from(record.to - 1).unwrap();
+                            // A record a member can't take now is lost, as on a network: Raft
+                            // sends it again.
+                            let _ = handles[to].receive(from, record.bytes, until());
+                            moved += 1;
+                        }
+                    }
+                    if moved == 0 {
+                        std::thread::park_timeout(Duration::from_millis(1));
+                    }
+                }
+            })
+        };
+        Self {
+            databases,
+            stop,
+            relay: Some(relay),
+            _dir: dir,
+        }
+    }
+
+    /// The member that leads, once one does and its group's seed is in.
+    fn leader(&self) -> &Database {
+        let deadline = until();
+        loop {
+            for database in &self.databases {
+                let status = database.replica_status(deadline).unwrap().unwrap();
+                assert!(status.fenced.is_none(), "fenced: {:?}", status.fenced);
+                if status.leader == status.node_id && !status.bootstrapping {
+                    return database;
+                }
+            }
+            assert!(Instant::now() < deadline, "no member led");
+            std::thread::park_timeout(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(relay) = self.relay.take() {
+            let _ = relay.join();
+        }
+    }
+}
+
+/// What the Records suite and seeded histories said on a group of `voters` voters, every answer
+/// checked against the simulator's as it came: the cases passed and failed, then each request
+/// and its answer. The seeds are `AMPHORA_GROUP_SEEDS` (default 4), each `AMPHORA_GROUP_STEPS`
+/// requests (default 200).
+fn said_at(voters: u64) -> Vec<String> {
+    let seeds: u64 = std::env::var("AMPHORA_GROUP_SEEDS").map_or(4, |v| v.parse().unwrap());
+    let steps: u64 = std::env::var("AMPHORA_GROUP_STEPS").map_or(200, |v| v.parse().unwrap());
+    let group = Group::new(voters);
+    let db = group.leader();
+    let mut n = 0;
+    let report = run(
+        &cases(),
+        || {
+            n += 1;
+            db.namespace(&format!("case-{n}"))
+        },
+        HANG,
+    );
+    let mut said: Vec<String> = report
+        .passed
+        .iter()
+        .map(|c| format!("passed {c}"))
+        .collect();
+    said.extend(
+        report
+            .failed
+            .iter()
+            .map(|(c, f)| format!("failed {c}: {f:?}")),
+    );
+    for seed in 0..seeds {
+        let amphora = db.namespace(&format!("seed-{seed}")).unwrap();
+        let sim = SimRecords::new(SimLimits {
+            rows: TX_MAX,
+            versions: TX_MAX * TX_MAX,
+        });
+        let mut c = Choices(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        for _ in 0..steps {
+            said.push(step(&mut c, &amphora, &sim));
+        }
+        assert_eq!(amphora.head(until()).unwrap(), sim.head(until()).unwrap());
+    }
+    said
+}
+
+/// AC-T1.8.L2, T-T1.8.L2 (CP-T1.8, G12 step 2: the store's tests at 1 voter and 3): one harness,
+/// the group's size its only parameter. Do: the Records suite and seeded histories on a group of
+/// one voter, then on a group of three, each at its leader. Expect: every case passes at both,
+/// every answer equal to the simulator's, and the two transcripts identical.
+#[test]
+fn the_records_suite_answers_alike_at_one_voter_and_three() {
+    let one = said_at(1);
+    assert!(
+        one.iter().all(|line| !line.starts_with("failed ")),
+        "at one voter: {one:?}"
+    );
+    assert!(one.len() > cases().len(), "no history ran");
+    let three = said_at(3);
+    assert_eq!(one.len(), three.len());
+    for (a, b) in one.iter().zip(&three) {
+        assert_eq!(a, b, "one voter and three answered differently");
+    }
+}
