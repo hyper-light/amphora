@@ -24,8 +24,6 @@ pub const GROUP: usize = 64;
 pub const LANES: usize = 16;
 /// Values in a FastLanes vector [c89].
 pub const VECTOR: usize = 1024;
-/// Rows of a FastLanes vector: 1,024 values over 16 lanes.
-const ROWS: usize = 64;
 
 /// Where a packed value's bits go.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,7 +149,7 @@ fn need_values(packed: &Packed) -> Result<usize, CodecError> {
 fn unpack_horizontal<const W: u32>(words: &[u64], base: u64, out: &mut [u64]) {
     let m = mask(W);
     let w = W as usize;
-    for (group, dst) in words.chunks_exact(w).zip(out.chunks_exact_mut(GROUP)) {
+    for (group, dst) in words.chunks_exact(w).zip(out.as_chunks_mut::<GROUP>().0.iter_mut()) {
         for (j, o) in (0u32..).zip(dst.iter_mut()) {
             let bit = j.wrapping_mul(W);
             let k = bit.wrapping_shr(6) as usize; // bit / 64
@@ -172,7 +170,7 @@ const ZERO_ROW: [u64; LANES] = [0; LANES];
 fn unpack_interleaved<const W: u32>(words: &[u64], base: u64, out: &mut [u64]) {
     let m = mask(W);
     let per_vector = (W as usize).wrapping_mul(LANES);
-    for (vector, dst) in words.chunks_exact(per_vector).zip(out.chunks_exact_mut(VECTOR)) {
+    for (vector, dst) in words.chunks_exact(per_vector).zip(out.as_chunks_mut::<VECTOR>().0.iter_mut()) {
         let (rows, _) = vector.as_chunks::<LANES>();
         let (dst_rows, _) = dst.as_chunks_mut::<LANES>();
         for (r, row) in (0u32..).zip(dst_rows.iter_mut()) {
