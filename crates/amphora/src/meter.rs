@@ -264,7 +264,7 @@ pub fn flush_bucket(d: Duration) -> usize {
 
 /// The replicated class's metrics, as their host exports them: name, type and help, in the
 /// order of [`ReplicaCounters`]' fields (docs/design/replication.md, "Metrics").
-pub const REPLICA_METRICS: [(&str, &str, &str); 15] = [
+pub const REPLICA_METRICS: [(&str, &str, &str); 16] = [
     (
         "amphora_replica_flush_backlog_entries",
         "gauge",
@@ -291,6 +291,13 @@ pub const REPLICA_METRICS: [(&str, &str, &str); 15] = [
         "amphora_replica_quorum_patience_refused_total",
         "counter",
         "Answer gaps a leading replica refused to learn for its quorum patience, because they passed its ceiling.",
+    ),
+    // As Kiln Metrics agreed it (amphora-constants/names/v1): the falsifier of the owner's own
+    // sessions' lease (replication.md, "The owner's own sessions last their role's raft timing").
+    (
+        "amphora_replica_own_sessions_expired_total",
+        "counter",
+        "The owner's own sessions (a floor session, the seed's attempt) that reached their lease at their barrier while this member led their term; many in one term are a sign the quorum patience is too short (one can wait behind a slow flush).",
     ),
     // Local reads (replication.md, "A local read on a replica"), as Kiln Metrics agreed them
     // (amphora-local-read/names/v1).
@@ -435,6 +442,7 @@ pub struct ReplicaMeter {
     slot_holds: [AtomicU64; 3],
     slot_held_us: AtomicU64,
     slot_us: AtomicU64,
+    own_expired: AtomicU64,
 }
 
 /// What a replica owner's counters say now ([`REPLICA_METRICS`]).
@@ -473,6 +481,8 @@ pub struct ReplicaCounters {
     pub write_slot_holds: [u64; 3],
     pub write_slot_held: Duration,
     pub write_slot_length: Duration,
+    /// The owner's own sessions that reached their lease at their barrier while it led their term.
+    pub own_sessions_expired: u64,
 }
 
 impl ReplicaCounters {
@@ -515,6 +525,11 @@ impl ReplicaMeter {
     /// An answer gap the owner refused to learn, past the patience's ceiling.
     pub fn refused(&self) {
         self.refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One of the owner's own sessions reached its lease at its barrier while it led its term.
+    pub fn own_session_expired(&self) {
+        self.own_expired.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A local read ran on one of this replica's readers.
@@ -608,6 +623,7 @@ impl ReplicaMeter {
             }),
             write_slot_held: Duration::from_micros(self.slot_held_us.load(Ordering::Relaxed)),
             write_slot_length: Duration::from_micros(self.slot_us.load(Ordering::Relaxed)),
+            own_sessions_expired: self.own_expired.load(Ordering::Relaxed),
         }
     }
 }
