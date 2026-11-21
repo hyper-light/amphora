@@ -15,6 +15,7 @@
 
 pub mod blink;
 pub mod columns;
+pub(crate) mod columns_path;
 #[cfg(test)]
 mod conformance;
 pub mod cursor;

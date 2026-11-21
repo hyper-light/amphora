@@ -834,6 +834,52 @@ impl<B: Block> Columns<B> {
             st.previous_behind = None;
         }
     }
+
+    /// What the planner costs the copy by at snapshot `s` (G11 step 5,
+    /// `translate::optimizer::column_path`): whether a generation answers `s` exactly, by the
+    /// same rules [`Columns::scan`] reads by (a generation made at or before `s`, no commit at or
+    /// before `s` dropped by a full queue); the rows that generation visits; the distinct keys
+    /// the queue holds at or before `s`, read from the rows; and the copy's measured nanoseconds
+    /// per scanned row at its current block size (None before a scan at that size).
+    pub fn plan_view(&self, s: Ts) -> PlanView {
+        let st = self.state.read();
+        let queue = self.feed.queue.lock();
+        let lost = queue.lost.is_some_and(|(first, _)| first <= s);
+        let (g, behind) = match usable(&st.current, s) {
+            Some(g) => (Some(g), st.behind),
+            None => (usable(&st.previous, s), st.previous_behind),
+        };
+        let behind = behind.is_some_and(|(first, _)| first <= s);
+        let g = g.filter(|_| !behind && !lost);
+        let mut queued = BTreeSet::new();
+        if g.is_some() && st.current.as_ref().is_some_and(|c| c.made <= s) {
+            for r in queue.records.iter().filter(|r| r.ts <= s) {
+                for c in &r.changes {
+                    queued.insert(c.key.as_slice());
+                }
+            }
+        }
+        let nanos_per_row = st
+            .sizer
+            .current
+            .and_then(|size| st.sizer.cost(size))
+            .map(|(nanos, rows)| nanos as f64 / rows as f64);
+        PlanView {
+            exact: g.is_some(),
+            rows: g.map_or(0, Generation::rows),
+            queued: queued.len(),
+            nanos_per_row,
+        }
+    }
+}
+
+/// The copy at one snapshot, as the planner costs it ([`Columns::plan_view`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlanView {
+    pub exact: bool,
+    pub rows: usize,
+    pub queued: usize,
+    pub nanos_per_row: Option<f64>,
 }
 
 /// Where prototype B keeps its file, outside the redo log.

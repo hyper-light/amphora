@@ -87,6 +87,7 @@ use std::{
 
 pub(crate) mod access_method;
 mod cardinality;
+pub(crate) mod column_path;
 pub(crate) mod constraints;
 pub(crate) mod cost;
 mod cost_params;
