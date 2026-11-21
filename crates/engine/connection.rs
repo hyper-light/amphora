@@ -1732,20 +1732,9 @@ impl Connection {
                     inner.phase = self.index_states_phase(&inner.fresh)?;
                 }
                 ReparsePhase::LoadIndexStates { stmt, states } => {
-                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                        let name = crate::util::normalize_ident(row.get::<&str>(0)?);
-                        let stored = row.get::<i64>(1)?;
-                        let state =
-                            crate::schema::IndexState::from_stored(stored).ok_or_else(|| {
-                                LimboError::Corrupt(format!(
-                                    "{}: index {name} has state {stored}, not 1 or 2",
-                                    crate::schema::INDEX_STATES_TABLE
-                                ))
-                            })?;
-                        states.try_reserve(1)?;
-                        states.insert(name, state);
-                        Ok(())
-                    }));
+                    crate::return_if_io!(
+                        stmt.run_with_row_callback_nonblock(|row| index_state_row(row, states))
+                    );
                     let states = std::mem::take(states);
                     inner.fresh.set_index_states(states)?;
                     inner.phase = ReparsePhase::RefreshStats {
@@ -1774,6 +1763,30 @@ impl Connection {
                 }
             }
         }
+    }
+
+    /// Amphora: the online schema change states [`crate::schema::INDEX_STATES_TABLE`] holds, for
+    /// the open path, whose schema `make_from_btree` builds without them (CP-T1.12): a database
+    /// reopened mid-change must see its index in the state the change left it, as a reparse does.
+    /// The connection's schema must already hold the table definitions. Empty without the table.
+    pub(crate) fn query_index_states(
+        self: &Arc<Connection>,
+    ) -> Result<crate::alloc::HashMap<String, crate::schema::IndexState>> {
+        let mut states = crate::alloc::HashMap::default();
+        if !self
+            .schema
+            .read()
+            .tables
+            .contains_key(crate::schema::INDEX_STATES_TABLE)
+        {
+            return Ok(states);
+        }
+        let mut stmt = self.prepare_internal(format!(
+            "SELECT name, state FROM {}",
+            crate::schema::INDEX_STATES_TABLE
+        ))?;
+        stmt.run_with_row_callback(|row| index_state_row(row, &mut states))?;
+        Ok(states)
     }
 
     /// Amphora: the phase after the schema's rows, sequences and types: read the online schema
@@ -5572,6 +5585,25 @@ impl Connection {
 }
 
 pub type Row = vdbe::Row;
+
+/// Amphora: one row of [`crate::schema::INDEX_STATES_TABLE`] (name, state) into `states`, as the
+/// open path and a reparse read it alike (CP-T1.12).
+fn index_state_row(
+    row: &Row,
+    states: &mut crate::alloc::HashMap<String, crate::schema::IndexState>,
+) -> Result<()> {
+    let name = crate::util::normalize_ident(row.get::<&str>(0)?);
+    let stored = row.get::<i64>(1)?;
+    let state = crate::schema::IndexState::from_stored(stored).ok_or_else(|| {
+        LimboError::Corrupt(format!(
+            "{}: index {name} has state {stored}, not 1 or 2",
+            crate::schema::INDEX_STATES_TABLE
+        ))
+    })?;
+    states.try_reserve(1)?;
+    states.insert(name, state);
+    Ok(())
+}
 
 pub type StepResult = vdbe::StepResult;
 

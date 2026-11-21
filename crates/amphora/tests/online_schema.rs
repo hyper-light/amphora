@@ -152,6 +152,9 @@ fn t_t1_12_1_writes_during_the_change_keep_the_index_and_reads_wait_for_public()
             !plan_text(&db, query).contains("ix"),
             "the writer read ix before public"
         );
+        // The reader reads first: a read prepares under the schema the writer published, where a
+        // cached EXPLAIN, which opens no transaction, keeps the plan of the schema it was made in.
+        assert!(count(&reader, "SELECT count(*) FROM t INDEXED BY ix", vec![]).is_err());
         assert!(
             !plan_text(&reader, query).contains("ix"),
             "a reader read ix before public"
@@ -169,6 +172,21 @@ fn t_t1_12_1_writes_during_the_change_keep_the_index_and_reads_wait_for_public()
     assert!(
         writer_plan.contains("ix"),
         "the writer's plan after public: {writer_plan}"
+    );
+    assert_eq!(
+        count(
+            &reader,
+            "SELECT count(*) FROM t INDEXED BY ix WHERE a = 5",
+            vec![]
+        )
+        .unwrap(),
+        count(
+            &reader,
+            "SELECT count(*) FROM t NOT INDEXED WHERE a = 5",
+            vec![]
+        )
+        .unwrap(),
+        "a reader's read through ix after public"
     );
     let reader_plan = plan_text(&reader, query);
     assert!(
