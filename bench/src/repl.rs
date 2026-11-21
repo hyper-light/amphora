@@ -29,7 +29,8 @@
 //!        commit:   --writers N --warmup-s N --seconds N
 //!        failover: --writers N --kills N --settle-s N
 //!        catchup:  --behind N --poll-us N
-//!        amphora:  --dir DIR --class persisted|replicated [--spanning N]
+//!        amphora:  --dir DIR --class persisted|replicated [--spanning N] --relay-records N (records the relay
+//!                  moves from a member at a time)
 //!        others:   [--scripts DIR (bench/servers/repl)] [--shell PROGRAM (bash)]
 
 use std::path::PathBuf;
@@ -127,6 +128,7 @@ struct Opts {
     dir: Option<PathBuf>,
     class: Option<String>,
     spanning: Option<u32>,
+    relay_records: Option<usize>,
     scripts: PathBuf,
     shell: String,
 }
@@ -155,6 +157,7 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
         dir: None,
         class: None,
         spanning: None,
+        relay_records: None,
         scripts: PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/servers/repl")),
         shell: "bash".into(),
     };
@@ -179,6 +182,7 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
             "--dir" => o.dir = Some(PathBuf::from(v()?)),
             "--class" => o.class = Some(v()?),
             "--spanning" => o.spanning = Some(v()?.parse()?),
+            "--relay-records" => o.relay_records = Some(v()?.parse()?),
             "--scripts" => o.scripts = PathBuf::from(v()?),
             "--shell" => o.shell = v()?,
             other => anyhow::bail!("unknown argument {other}"),
@@ -210,6 +214,7 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
     }
     if o.system == "amphora" {
         need(o.dir.as_ref(), "--dir", &m)?;
+        anyhow::ensure!(need(o.relay_records, "--relay-records", &m)? > 0, "--relay-records takes at least 1");
         match need(o.class.as_deref(), "--class", &m)? {
             "persisted" => {}
             "replicated" => anyhow::ensure!(need(o.spanning, "--spanning", &m)? >= 2, "--spanning takes at least 2"),
@@ -574,7 +579,8 @@ mod inproc {
             let cut: Arc<[AtomicBool; NODES]> = Arc::new(Default::default());
             let stop = Arc::new(AtomicBool::new(false));
             let (c, s, wait) = (cut.clone(), stop.clone(), o.deadline);
-            let relay = std::thread::spawn(move || relay(&handles, &c, &s, wait));
+            let records = need(o.relay_records, "--relay-records", &o.measure)?;
+            let relay = std::thread::spawn(move || relay(&handles, &c, &s, wait, records));
             Ok(Self { members, cut, stop, relay: Some(relay) })
         }
 
@@ -589,14 +595,14 @@ mod inproc {
     }
 
     /// Every member's outgoing records to the member they name, until `stop`; a cut member's
-    /// records, out or in, are lost as a dead node's are. Parks only when nothing moved, woken by
-    /// the next record's sender through the owner's ring.
-    fn relay(handles: &[amphora::replication::ReplicaHandle], cut: &[AtomicBool; NODES], stop: &AtomicBool, wait: Duration) {
+    /// records, out or in, are lost as a dead node's are. When nothing moved it yields its core and
+    /// looks again: no sleep of a picked length between a record and its delivery.
+    fn relay(handles: &[amphora::replication::ReplicaHandle], cut: &[AtomicBool; NODES], stop: &AtomicBool, wait: Duration, records: usize) {
         let is_cut = |i: usize| cut.get(i).is_some_and(|c| c.load(Ordering::Relaxed));
         while !stop.load(Ordering::Relaxed) {
             let mut moved = 0usize;
             for (from, handle) in handles.iter().enumerate() {
-                for record in handle.drain(4096).unwrap_or_default() {
+                for record in handle.drain(records).unwrap_or_default() {
                     let to = usize::try_from(record.to).unwrap_or(0).saturating_sub(1);
                     moved += 1;
                     if is_cut(from) || is_cut(to) {
@@ -887,9 +893,9 @@ mod tests {
         assert!(parse(&args(&format!("{base} --writers 2 --warmup-s 1 --seconds 3"))).is_ok());
         let e = parse(&args("--repl catchup --system rqlite --batch 1 --text-bytes 1 --deadline-s 5 --behind 10")).err().unwrap().to_string();
         assert!(e.contains("--poll-us"), "{e}");
-        let e = parse(&args("--repl failover --system amphora --batch 1 --text-bytes 1 --deadline-s 5 --writers 1 --kills 1 --settle-s 1 --dir d --class replicated")).err().unwrap().to_string();
+        let e = parse(&args("--repl failover --system amphora --batch 1 --text-bytes 1 --deadline-s 5 --writers 1 --kills 1 --settle-s 1 --dir d --relay-records 64 --class replicated")).err().unwrap().to_string();
         assert!(e.contains("--spanning"), "{e}");
-        assert!(parse(&args("--repl failover --system amphora --batch 1 --text-bytes 1 --deadline-s 5 --writers 1 --kills 1 --settle-s 1 --dir d --class persisted")).is_ok());
+        assert!(parse(&args("--repl failover --system amphora --batch 1 --text-bytes 1 --deadline-s 5 --writers 1 --kills 1 --settle-s 1 --dir d --relay-records 64 --class persisted")).is_ok());
     }
 
     // G12 step 1: the same write reaches rqlite and sqld as each one's dialect says.
