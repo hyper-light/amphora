@@ -42,6 +42,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 
 | Area | No. | Decision | Record |
 |---|---|---|---|
+| audit | – | Decision (lane audit-log): the audit log is RFC 6962's Merkle tree over Records, verified on every read | [audit.md](design/audit.md#decision-lane-audit-log-the-audit-log-is-rfc-6962s-merkle-tree-over-records-verified-on-every-read) |
 | client-protocol | 1 | Embedded first, one framed protocol between processes, no network listener yet (proposed 2026-11-21) | [client-protocol.md](design/client-protocol.md#1-embedded-first-one-framed-protocol-between-processes-no-network-listener-yet-proposed-2026-11-21) |
 | columnar | 1 | Columns as a copy derived from the rows, kept from the commit stream, exact at every snapshot, every size learned where it runs | [columnar.md](design/columnar.md#1-columns-as-a-copy-derived-from-the-rows-kept-from-the-commit-stream-exact-at-every-snapshot-every-size-learned-where-it-runs) |
 | engine | 1 | In-place versions in one shared buffer pool | [engine.md](design/engine.md#1-in-place-versions-in-one-shared-buffer-pool) |
