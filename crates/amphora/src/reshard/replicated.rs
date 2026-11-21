@@ -132,9 +132,9 @@ impl DirectoryMachine {
         }
         let k: Kept = postcard::from_bytes(&bytes)
             .map_err(|_| Fatal("a kept directory image that doesn't decode"))?;
-        k.directory
-            .check()
-            .map_err(|_| Fatal("a kept directory image whose spans don't cover every position once"))?;
+        k.directory.check().map_err(|_| {
+            Fatal("a kept directory image whose spans don't cover every position once")
+        })?;
         let at = Point {
             index: k.index,
             term: k.term,
@@ -540,7 +540,8 @@ mod tests {
         let mut image = Vec::new();
         let (at, conf) = log.members[0].image(&mut image).unwrap();
         let kept = log.dir.path().join("fresh");
-        let mut fresh = DirectoryMachine::open(NodeId(9), ConfState::default(), kept.clone()).unwrap();
+        let mut fresh =
+            DirectoryMachine::open(NodeId(9), ConfState::default(), kept.clone()).unwrap();
         fresh.install(&image, at, &conf).unwrap();
         assert_eq!(fresh.directory(), log.members[0].directory());
         assert_eq!(fresh.durable(), at);

@@ -104,7 +104,9 @@ pub trait Engine: Send + 'static {
     /// docs/design/reshard.md, "A group's holding"). By default an engine keeps no holding, and
     /// can't be a group's.
     fn holding(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
-        Err(anyhow::anyhow!("this engine keeps no holding, so it can't be a group's"))
+        Err(anyhow::anyhow!(
+            "this engine keeps no holding, so it can't be a group's"
+        ))
     }
 
     /// Keeps `holding` with its rows, in place of the one kept before, in a commit of its own
@@ -112,7 +114,9 @@ pub trait Engine: Send + 'static {
     /// a restart answers from it, never from a router's memory.
     fn keep_holding(&mut self, holding: &[u8]) -> anyhow::Result<()> {
         let _ = holding;
-        Err(anyhow::anyhow!("this engine keeps no holding, so it can't be a group's"))
+        Err(anyhow::anyhow!(
+            "this engine keeps no holding, so it can't be a group's"
+        ))
     }
 }
 
