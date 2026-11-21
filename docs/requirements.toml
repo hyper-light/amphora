@@ -937,3 +937,16 @@ tests = [
   { id = "T-G3.3.5", text = "crates/engine/tests/shared_pages.rs g3s3_plain_misses_read_into_the_pages_evictions_leave — passes when a table four times the cache reads today's rows on the plain path and its misses read into recycled pages" },
   { id = "T-G3.3.6", text = "crates/engine/tests/page_path_allocs.rs — passes when the plain path's point lookups that miss allocate less than today's and its hits no more (a counting allocator; --nocapture prints allocations per lookup, AC-G3.3.2's harness)" },
 ]
+# lane g6s3
+
+[[own]]
+id = "G6.3"
+title = "Learned plan hints against the cost model (G6 step 3; planner.md, decision of lane g6s3)"
+criteria = [
+  { id = "AC-G6.3.1", text = "hinted and unhinted plans' times on held-out JOB and corpus queries recorded (bench/plan_hints); no held-out query slower by more than 10% with hints on (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-G6.3.1", text = "crates/engine/tests/plan_hints.rs t_g6_3_1_* — passes when every hint set's answers equal the unhinted plan's and a computed nested loop's, and the planner obeys each mask; bench/plan_hints compares hinted answers with SQLite's" },
+  { id = "T-G6.3.2", text = "translate::optimizer::plan_hints::tests::t_g6_3_2_* — passes when the guard admits a faster hint, drops it once its held-out runs are slower, and never admits one no faster" },
+  { id = "T-G6.3.3", text = "translate::optimizer::plan_hints::tests::t_g6_3_3_memory_stays_bounded — passes when the model's size is constant over 10,000 runs and the guard holds no more classes than it was given" },
+]
