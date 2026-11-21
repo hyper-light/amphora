@@ -458,6 +458,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   Bounded (lane split-merge-8): every copy-path batch holds no more units than the process's memory
   budget (its pool of pages, decision 26) takes at the most bytes a unit has held, so a batch doubling on
   an idle node stops there (T-T1.9.R8).
+  A local database's Records move (lane split-merge-8): a row routes by its namespace, family and key
+  (`reshard::row_key`; needs Ada's word), and `database::Local` carries the copy path over its Records
+  rows, indexed by position from its first holding, with a log of its commits and a feed while held
+  (`database/group.rs`; T-T1.9.R9).
   Left: `database::Local` as a group (its holding and log through a replicated command), moves across
   nodes, load from the store's meter, and the full AC-T1.9.2 and AC-T1.9.3 runs.
 

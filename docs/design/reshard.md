@@ -208,11 +208,17 @@ deterministic simulator:
    wire, applied by the same `apply` a local writer and a replicated owner's log entry run
    (decision "A local database keeps its holding through its command", below; T-T1.9.R7).
 
-   Still left of this item: the rest of `database::Local` as a group's engine: its log of commits
-   and copy path (`head`, `export`, `changed`, `import`, `keep_log`, `sweep`), which needs its rows
-   indexed by position (today every command of a database is one key), and a `Database` over
-   `Groups<Local>`; moves to another node (the copy and catch-up over the network); a retired
-   group's files, which the shell's caller deletes.
+   Built (lane split-merge-8): every copy-path batch is bounded by the process's memory as well
+   as by time (decision "A batch bounded by the process's memory", T-T1.9.R8). `database::Local`
+   is a group's engine in full: a row routes by its namespace, family and key, and from its first
+   holding it keeps a log of its commits and its Records rows indexed by position, and carries the
+   copy path over them (decision "A row routes by its namespace, family and key", T-T1.9.R9).
+
+   Still left of this item: a `Database` over `Groups<Local>` (a command routed by its row's key,
+   which needs the store's routing key to be bytes, not a `&str`, and a Records transaction kept to
+   one group), with a split and merge of it under writes through `carry`; moves to another node
+   (the copy and catch-up over the network: a node-to-node protocol beside the owner transport,
+   which today speaks to one owner); a retired group's files, which the shell's caller deletes.
 2. **Load measured from the store's meter.** The writer's busy time per window, a bounded sample
    of written positions for the load cut, and the size cut from the B-tree's middle key. The
    window is the time between planner runs, and shares don't depend on its length.

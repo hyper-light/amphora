@@ -28,14 +28,17 @@ CREATE TABLE IF NOT EXISTS __amphora_group_feed (seq INTEGER NOT NULL, pos INTEG
 CREATE INDEX IF NOT EXISTS __amphora_group_feed_seq ON __amphora_group_feed (seq);
 CREATE TABLE IF NOT EXISTS __amphora_group_stamps (namespace TEXT NOT NULL, family TEXT NOT NULL, key BLOB NOT NULL, stamp INTEGER NOT NULL, PRIMARY KEY (namespace, family, key));";
 
+/// A u64's top bit: flipped, the u64's order is the order of the i64 of its bytes.
+const TOP: u64 = 0x8000_0000_0000_0000;
+
 /// A position as SQL orders it: the u64 with its top bit flipped, as an i64, so SQL's signed order
 /// is the positions' order.
 fn sql_pos(pos: Pos) -> amphora_engine::Value {
-    amphora_engine::Value::from_i64(i64::from_ne_bytes((pos ^ (1 << 63)).to_ne_bytes()))
+    amphora_engine::Value::from_i64(i64::from_ne_bytes((pos ^ TOP).to_ne_bytes()))
 }
 
 fn pos_of(v: i64) -> Pos {
-    u64::from_ne_bytes(v.to_ne_bytes()) ^ (1 << 63)
+    u64::from_ne_bytes(v.to_ne_bytes()) ^ TOP
 }
 
 fn pos_at(r: &amphora_engine::Row, n: usize) -> anyhow::Result<Pos> {
