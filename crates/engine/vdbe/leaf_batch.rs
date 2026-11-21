@@ -175,7 +175,10 @@ impl LeafBatch {
             && self.page_id == leaf.contents.id()
             && self.peers_epoch == leaf.peers_epoch
             && leaf.cell >= self.first
-            && leaf.cell.checked_sub(self.first).is_some_and(|row| row < self.rows)
+            && leaf
+                .cell
+                .checked_sub(self.first)
+                .is_some_and(|row| row < self.rows)
     }
 
     fn slot(&self, column_slot: usize, cell: usize) -> Option<&Slot> {
@@ -248,9 +251,7 @@ pub(crate) fn serve_column(
         let Ok(budget) = budget_bytes(cursor, plan.batched_cursors) else {
             return Ok(Served::RowAtATime);
         };
-        let backward = batch.live
-            && batch.page_id == leaf.contents.id()
-            && leaf.cell < batch.first;
+        let backward = batch.live && batch.page_id == leaf.contents.id() && leaf.cell < batch.first;
         let rows = decode_window(batch, &leaf, columns, budget, backward)?;
         #[cfg(test)]
         tests::note_decoded(rows);
@@ -377,7 +378,10 @@ fn alloc_error<E: std::fmt::Display>(error: E) -> LimboError {
 
 /// The bytes one cursor's batch may hold: the measured second-level cache, or the statement's
 /// memory budget shared among its batched cursors when that is smaller.
-fn budget_bytes(cursor: &BTreeCursor, batched_cursors: usize) -> std::result::Result<usize, BatchRefusal> {
+fn budget_bytes(
+    cursor: &BTreeCursor,
+    batched_cursors: usize,
+) -> std::result::Result<usize, BatchRefusal> {
     #[cfg(test)]
     if let Some(bytes) = tests::budget_override() {
         return Ok(bytes);

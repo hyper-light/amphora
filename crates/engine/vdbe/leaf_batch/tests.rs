@@ -51,13 +51,13 @@ fn open() -> Arc<Connection> {
     db.connect(crate::ConnectOpts::new()).unwrap()
 }
 
+/// A statement's rows, or the error it ended with (`sum` overflowing, say): both must match.
 fn rows(conn: &Arc<Connection>, sql: &str) -> Vec<String> {
     let mut stmt = conn.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
-    stmt.run_collect_rows()
-        .unwrap_or_else(|e| panic!("{sql}: {e}"))
-        .into_iter()
-        .map(|row| format!("{row:?}"))
-        .collect()
+    match stmt.run_collect_rows() {
+        Ok(rows) => rows.into_iter().map(|row| format!("{row:?}")).collect(),
+        Err(e) => vec![format!("error: {e}")],
+    }
 }
 
 /// A value of any storage class, in SQL.
@@ -67,7 +67,10 @@ fn literal(rng: &mut Rng) -> String {
         1 => format!("{}", rng.next() as i64),
         2 => format!("{}", rng.below(50) as i64 - 25),
         3 => format!("{:?}", (rng.below(20_000) as f64 - 10_000.0) / 7.0),
-        4 => format!("'{}'", ["a", "B", "ab", "Ab", "10", "2.5", "x y", ""][rng.below(8) as usize]),
+        4 => format!(
+            "'{}'",
+            ["a", "B", "ab", "Ab", "10", "2.5", "x y", ""][rng.below(8) as usize]
+        ),
         5 => format!("X'{:02x}{:02x}'", rng.below(256), rng.below(256)),
         // An overflow row: its record spills past the page.
         6 if rng.below(8) == 0 => format!("X'{}'", "ab".repeat(3_000 + rng.below(3_000) as usize)),
@@ -76,18 +79,26 @@ fn literal(rng: &mut Rng) -> String {
 }
 
 fn build(conn: &Arc<Connection>, rng: &mut Rng) {
-    conn.execute("CREATE TABLE t(a INTEGER, b REAL, c TEXT COLLATE NOCASE, d BLOB, e NUMERIC, f)").unwrap();
+    conn.execute("CREATE TABLE t(a INTEGER, b REAL, c TEXT COLLATE NOCASE, d BLOB, e NUMERIC, f)")
+        .unwrap();
     let n = 200 + rng.below(1_500);
     for _ in 0..n {
         let values: Vec<String> = (0..6).map(|_| literal(rng)).collect();
-        conn.execute(format!("INSERT INTO t VALUES ({})", values.join(","))).unwrap();
+        conn.execute(format!("INSERT INTO t VALUES ({})", values.join(",")))
+            .unwrap();
     }
-    conn.execute(format!("DELETE FROM t WHERE rowid % {} = 0", 3 + rng.below(5))).unwrap();
+    conn.execute(format!(
+        "DELETE FROM t WHERE rowid % {} = 0",
+        3 + rng.below(5)
+    ))
+    .unwrap();
     // Rows written before the column was added read its default.
-    conn.execute("ALTER TABLE t ADD COLUMN g TEXT DEFAULT 'dflt'").unwrap();
+    conn.execute("ALTER TABLE t ADD COLUMN g TEXT DEFAULT 'dflt'")
+        .unwrap();
     for _ in 0..rng.below(50) {
         let values: Vec<String> = (0..7).map(|_| literal(rng)).collect();
-        conn.execute(format!("INSERT INTO t VALUES ({})", values.join(","))).unwrap();
+        conn.execute(format!("INSERT INTO t VALUES ({})", values.join(",")))
+            .unwrap();
     }
 }
 
@@ -114,7 +125,9 @@ fn queries(rng: &mut Rng) -> Vec<String> {
     for _ in 0..12 {
         let p = predicate(rng);
         out.push(format!("SELECT * FROM t WHERE {p}"));
-        out.push(format!("SELECT count(*), sum(a), min(b), max(f), total(e) FROM t WHERE {p}"));
+        out.push(format!(
+            "SELECT count(*), sum(a), min(b), max(f), total(e) FROM t WHERE {p}"
+        ));
         out.push(format!("SELECT a, c FROM t WHERE {p} ORDER BY rowid DESC"));
     }
     out
@@ -132,7 +145,10 @@ fn differential(seed: u64, budget: Option<usize>) -> usize {
         let row_at_a_time = rows(&conn, &sql);
         conn.set_vectorized_scans(true);
         let batched = rows(&conn, &sql);
-        assert_eq!(batched, row_at_a_time, "seed {seed}, budget {budget:?}: {sql}");
+        assert_eq!(
+            batched, row_at_a_time,
+            "seed {seed}, budget {budget:?}: {sql}"
+        );
     }
     conn.set_vectorized_scans(false);
     BUDGET.with(|b| b.set(None));
@@ -174,13 +190,18 @@ fn qt7_writes_read_row_at_a_time_and_the_switch_reprepares() {
     let conn = open();
     conn.execute("CREATE TABLE t(a, b)").unwrap();
     for i in 0..500 {
-        conn.execute(format!("INSERT INTO t VALUES ({i}, 'v{i}')")).unwrap();
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+            .unwrap();
     }
     conn.set_vectorized_scans(true);
     DECODED.with(|d| d.set(0));
-    conn.execute("INSERT INTO t SELECT a + 1000, b FROM t").unwrap();
+    conn.execute("INSERT INTO t SELECT a + 1000, b FROM t")
+        .unwrap();
     assert_eq!(decoded(), 0, "a writing program read by batches");
-    assert_eq!(rows(&conn, "SELECT count(*), sum(a) FROM t"), rows(&conn, "SELECT count(a), sum(a) FROM t"));
+    assert_eq!(
+        rows(&conn, "SELECT count(*), sum(a) FROM t"),
+        rows(&conn, "SELECT count(a), sum(a) FROM t")
+    );
     assert!(decoded() > 0, "the read-only scan didn't use batches");
     BUDGET.with(|b| b.set(None));
 }

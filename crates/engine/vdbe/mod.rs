@@ -33,8 +33,8 @@ pub mod explain;
 pub mod group_table;
 #[allow(dead_code)]
 pub mod hash_table;
-pub mod leaf_batch;
 pub mod insn;
+pub mod leaf_batch;
 pub mod metrics;
 #[cfg(test)]
 mod native_extension_tests;
