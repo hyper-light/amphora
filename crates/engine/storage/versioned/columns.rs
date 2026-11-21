@@ -34,6 +34,8 @@ use crate::sync::{Arc, Mutex, RwLock};
 use crate::Result;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+pub mod scan;
+
 /// A row change the copy keeps: the key and the row after it (None: removed).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Change {
@@ -399,12 +401,21 @@ fn usable<B>(g: &Option<Generation<B>>, s: Ts) -> Option<&Generation<B>> {
 /// Immutable blocks as of commit `made`, and the positional deltas since: by block, place in the
 /// block's key column, and key.
 struct Generation<B> {
+    /// Unique in the process: what a cache of its decoded blocks is keyed by.
+    id: u64,
     made: Ts,
     blocks: Vec<B>,
     deltas: BTreeMap<(usize, usize, Vec<u8>), Versions>,
     delta_bytes: usize,
     /// The deltas' versions: what a rebuild folds.
     delta_versions: u64,
+}
+
+/// Generations made in this process so far: each one's id.
+static GENERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_generation() -> u64 {
+    GENERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl<B: Block> Generation<B> {
@@ -418,6 +429,7 @@ impl<B: Block> Generation<B> {
             blocks.push(B::make(&[])?);
         }
         Ok(Self {
+            id: next_generation(),
             made,
             blocks,
             deltas: BTreeMap::new(),
@@ -465,43 +477,66 @@ impl<B: Block> Generation<B> {
     /// order: how many delta versions the scan looked at.
     fn scan(&self, s: Ts, skip: &BTreeSet<Vec<u8>>, out: &mut Rowset) -> Result<u64> {
         let mut looked = 0u64;
+        for j in 0..self.blocks.len() {
+            looked = looked.saturating_add(self.scan_block(j, s, skip, out)?);
+        }
+        Ok(looked)
+    }
+
+    /// The deltas filed under block `j`.
+    fn block_deltas(
+        &self,
+        j: usize,
+    ) -> std::collections::btree_map::Range<'_, (usize, usize, Vec<u8>), Versions> {
+        self.deltas
+            .range((j, 0, Vec::new())..(j.saturating_add(1), 0, Vec::new()))
+    }
+
+    /// Block `j`'s rows at `s`, with its deltas, but for the keys in `skip`, into `out`, in key
+    /// order: how many delta versions it looked at.
+    fn scan_block(
+        &self,
+        j: usize,
+        s: Ts,
+        skip: &BTreeSet<Vec<u8>>,
+        out: &mut Rowset,
+    ) -> Result<u64> {
+        let Some(block) = self.blocks.get(j) else {
+            return Ok(0);
+        };
+        let mut looked = 0u64;
         let emit = |k: &[u8], v: &[u8], out: &mut Rowset| {
             if !skip.contains(k) {
                 out.push((k.to_vec(), v.to_vec()));
             }
         };
-        for (j, block) in self.blocks.iter().enumerate() {
-            let mut deltas = self
-                .deltas
-                .range((j, 0, Vec::new())..(j.saturating_add(1), 0, Vec::new()))
-                .peekable();
-            block.rows(&mut |i, k, v| {
-                // Inserted keys filed before this row's place, or at it with a smaller key.
-                let mut own: Option<&Versions> = None;
-                while let Some(((_, pos, dk), versions)) = deltas.peek() {
-                    if *pos > i || (*pos == i && dk.as_slice() > k) {
-                        break;
-                    }
-                    looked = looked.saturating_add(1);
-                    if *pos == i && dk.as_slice() == k {
-                        own = Some(*versions);
-                    } else if let Some(Some(row)) = at(versions, s) {
-                        emit(dk, row, out);
-                    }
-                    deltas.next();
+        let mut deltas = self.block_deltas(j).peekable();
+        block.rows(&mut |i, k, v| {
+            // Inserted keys filed before this row's place, or at it with a smaller key.
+            let mut own: Option<&Versions> = None;
+            while let Some(((_, pos, dk), versions)) = deltas.peek() {
+                if *pos > i || (*pos == i && dk.as_slice() > k) {
+                    break;
                 }
-                match own.and_then(|v| at(v, s)) {
-                    Some(Some(row)) => emit(k, row, out),
-                    Some(None) => {}
-                    None => emit(k, v, out),
-                }
-                Ok(true)
-            })?;
-            for ((_, _, dk), versions) in deltas {
                 looked = looked.saturating_add(1);
-                if let Some(Some(row)) = at(versions, s) {
+                if *pos == i && dk.as_slice() == k {
+                    own = Some(*versions);
+                } else if let Some(Some(row)) = at(versions, s) {
                     emit(dk, row, out);
                 }
+                deltas.next();
+            }
+            match own.and_then(|v| at(v, s)) {
+                Some(Some(row)) => emit(k, row, out),
+                Some(None) => {}
+                None => emit(k, v, out),
+            }
+            Ok(true)
+        })?;
+        for ((_, _, dk), versions) in deltas {
+            looked = looked.saturating_add(1);
+            if let Some(Some(row)) = at(versions, s) {
+                emit(dk, row, out);
             }
         }
         Ok(looked)
@@ -721,11 +756,9 @@ impl<B: Block> Columns<B> {
         self.state.write().rebuilds.last_cost = nanos;
     }
 
-    /// The rows at snapshot `s`, in key order; `rows` the row B-tree at `s`. Never waits for the
-    /// copy: what it hasn't applied yet is read from the rows.
-    pub fn scan(&self, s: Ts, rows: &dyn Rows) -> Result<(Rowset, ScanCounts)> {
-        let st = self.state.read();
-        let mut counts = ScanCounts::default();
+    /// The generation that answers snapshot `s` exactly, and the keys the queue holds at or
+    /// before `s` (read from the rows instead); None when none does, and the scan reads rows.
+    fn pick<'a>(&self, st: &'a State<B>, s: Ts) -> Option<(&'a Generation<B>, BTreeSet<Vec<u8>>)> {
         let queue = self.feed.queue.lock();
         let lost = queue.lost.is_some_and(|(first, _)| first <= s);
         // The current generation answers every snapshot from its making on; the previous one,
@@ -736,14 +769,7 @@ impl<B: Block> Columns<B> {
             None => (usable(&st.previous, s), st.previous_behind),
         };
         let behind = behind.is_some_and(|(first, _)| first <= s);
-        let g = match g {
-            Some(g) if !behind && !lost => g,
-            _ => {
-                drop(queue);
-                counts.fallbacks = 1;
-                return Ok((rows.all()?, counts));
-            }
-        };
+        let g = g.filter(|_| !behind && !lost)?;
         let mut skip = BTreeSet::new();
         if st.current.as_ref().is_some_and(|c| c.made <= s) {
             for r in queue.records.iter().filter(|r| r.ts <= s) {
@@ -752,7 +778,18 @@ impl<B: Block> Columns<B> {
                 }
             }
         }
-        drop(queue);
+        Some((g, skip))
+    }
+
+    /// The rows at snapshot `s`, in key order; `rows` the row B-tree at `s`. Never waits for the
+    /// copy: what it hasn't applied yet is read from the rows.
+    pub fn scan(&self, s: Ts, rows: &dyn Rows) -> Result<(Rowset, ScanCounts)> {
+        let st = self.state.read();
+        let mut counts = ScanCounts::default();
+        let Some((g, skip)) = self.pick(&st, s) else {
+            counts.fallbacks = 1;
+            return Ok((rows.all()?, counts));
+        };
         let mut out = Vec::new();
         counts.deltas = g.scan(s, &skip, &mut out)?;
         counts.copy = u64::try_from(out.len()).unwrap_or(u64::MAX);
@@ -803,6 +840,13 @@ impl<B: Block> Columns<B> {
         }
     }
 
+    /// A vectorized scan ([`scan::Plan`]) over a table of `rows` rows took `nanos`: charged to
+    /// the block size it was cut at, per row of the table, so the granules its summaries skipped
+    /// count for the size that let them be skipped (decision 1, part 6).
+    pub fn measured_scan(&self, nanos: u128, rows: usize) {
+        self.state.write().sizer.measure(nanos, rows);
+    }
+
     /// The copy's resident bytes: its generations' blocks and deltas, and the queue.
     pub fn resident(&self) -> usize {
         let st = self.state.read();
@@ -837,37 +881,22 @@ impl<B: Block> Columns<B> {
 
     /// What the planner costs the copy by at snapshot `s` (G11 step 5,
     /// `translate::optimizer::column_path`): whether a generation answers `s` exactly, by the
-    /// same rules [`Columns::scan`] reads by (a generation made at or before `s`, no commit at or
-    /// before `s` dropped by a full queue); the rows that generation visits; the distinct keys
-    /// the queue holds at or before `s`, read from the rows; and the copy's measured nanoseconds
-    /// per scanned row at its current block size (None before a scan at that size).
+    /// rule every scan of the copy reads by (`Columns::pick`); the rows that generation holds;
+    /// the distinct keys the queue holds at or before `s`, read from the rows; and the copy's
+    /// measured nanoseconds per row of the table at its current block size, as its scans charge
+    /// it ([`Columns::measured`], [`Columns::measured_scan`]; None before a scan at that size).
     pub fn plan_view(&self, s: Ts) -> PlanView {
         let st = self.state.read();
-        let queue = self.feed.queue.lock();
-        let lost = queue.lost.is_some_and(|(first, _)| first <= s);
-        let (g, behind) = match usable(&st.current, s) {
-            Some(g) => (Some(g), st.behind),
-            None => (usable(&st.previous, s), st.previous_behind),
-        };
-        let behind = behind.is_some_and(|(first, _)| first <= s);
-        let g = g.filter(|_| !behind && !lost);
-        let mut queued = BTreeSet::new();
-        if g.is_some() && st.current.as_ref().is_some_and(|c| c.made <= s) {
-            for r in queue.records.iter().filter(|r| r.ts <= s) {
-                for c in &r.changes {
-                    queued.insert(c.key.as_slice());
-                }
-            }
-        }
+        let picked = self.pick(&st, s);
         let nanos_per_row = st
             .sizer
             .current
             .and_then(|size| st.sizer.cost(size))
             .map(|(nanos, rows)| nanos as f64 / rows as f64);
         PlanView {
-            exact: g.is_some(),
-            rows: g.map_or(0, Generation::rows),
-            queued: queued.len(),
+            exact: picked.is_some(),
+            rows: picked.as_ref().map_or(0, |(g, _)| g.rows()),
+            queued: picked.as_ref().map_or(0, |(_, skip)| skip.len()),
             nanos_per_row,
         }
     }
@@ -1009,6 +1038,7 @@ impl Columns<Packed> {
             blocks.push(Packed::decode(&bytes, &mut at)?);
         }
         let mut g = Generation {
+            id: next_generation(),
             made,
             blocks,
             deltas: BTreeMap::new(),

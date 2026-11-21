@@ -1537,6 +1537,65 @@ are the coordinator's.
 - A statement planned again many times as its table grows slowly, each plan the same: the error
   too tight to say when a plan could change.
 
+## Decision (lane pl13): a nested loop that turns into a hash join at the learned costs' break-even, and a plan made again past its estimate's error
+
+**Decision.** PL.13 (docs/research/planner.md section 9, rank 13; `crates/engine/translate/optimizer/adaptive.rs`).
+Two run-time checks, each a pure core the executor drives, each with a fixed few counters:
+- **The join switch.** A nested-loop or index join counts its outer rows. It turns into a hash join
+  at the first outer row whose count reaches the switch point `B x (1 + hash_build) / (seek - hash_probe)`:
+  `B` the inner side's rows, the three weights the learned costs' (decision QT.5,
+  `learned_costs.rs`), in rows' visits. That is the row at which the seeks' extra cost over probes
+  so far equals the cost of reading and building the inner side. Where a probe costs no less than a
+  seek there is no point: the join never switches. A planner that chose the nested loop did so for
+  an estimate below the point, so the switch fires only when the rows outgrow the estimate.
+  Switching there is the ski-rental rule: whatever the outer side's true size, the join costs less
+  than twice the cheaper of the two methods chosen in hindsight. Rows already joined by seeks are
+  not joined again: the probes take the rows after them, so the answer is the same rows.
+- **Re-optimization at a materialization point.** Where a plan holds an intermediate result whole
+  (a hash join's build side, a sorter, a materialized subquery), its rows are counted against the
+  estimate. Outside `estimate / (1 + error)` to `estimate x (1 + error)`, `error` the relative
+  standard error of the statistics the estimate came from (`1 / sqrt(n)` for a sample of `n`, as
+  decision "lane pl9" uses it), the rest of the statement is due to be planned again on the counted
+  rows. Within it, the estimate could not be told apart from its own noise, and nothing changes.
+- **Memory.** The switch's hash table is held to the hash table's share of the statement's budget
+  (`vdbe::hash_table::table_share`), measured before the switch by an upper bound known without
+  reading it (the inner table's pages). A materialization point counts the bytes it holds against
+  its budget. Past either, a typed refusal (`AdaptiveError`): the join stays a nested loop, the
+  plan under way goes on, both always correct answers.
+- Nothing is picked: the point moves with the learned weights and the inner side's rows, the band
+  with the statistics' own sample size.
+
+**Built so far.** The two cores and their tests. The executor's shell is the next piece: a join
+emitted with both inner loops (the seek and the hash probe, `main_loop/hash.rs`'s build emitted
+behind the switch's jump) and an instruction that steps the switch; and a materialization point
+that hands its counted rows to a second prepare of the statement's rest. Until it lands no plan
+switches.
+
+**Why.** Audit row 13 (`bench/planner/audit/10-no-adaptive.sql`): a nested loop chosen for an
+estimate ran on however many rows came, and an estimate wrong by orders of magnitude was never
+corrected within the statement.
+
+**Sources.** SQL Server's batch-mode adaptive joins (Microsoft Learn, intelligent query processing
+details; f32, A): a hash or nested-loop join chosen at run time within one plan, against a threshold
+SQL Server picks, which the learned costs replace here. Perron et al., "How I Learned to Stop
+Worrying and Love Re-optimization", ICDE 2019 (f34, A): re-optimizing at materialization points on
+observed cardinalities cut JOB's 20 longest queries by 27%. Karlin, Manasse, Rudolph and Sleator,
+"Competitive snoopy caching", Algorithmica 3, 1988: the ski-rental rule's bound of 2.
+
+**Evidence.** `adaptive.rs`'s unit tests: answers identical with the switch on and off over 300
+random joins with NULL and repeated keys (T-PL.13.1, against the cores' model join; the engine's
+own differential waits on the shell); the switch fires once past the point and never at an
+estimate below it, its cost under twice the best, refused over budget (T-PL.13.2); a new plan asked
+only outside the band, the bytes held bounded (T-PL.13.3). JOB's 20 slowest queries against the
+parent (AC-PL.13.1) are the coordinator's, once the shell lands.
+
+**Falsified by.**
+- JOB's 20 slowest queries not faster than the parent with the shell in (AC-PL.13.1).
+- A join that switched and ran slower than the nested loop it left, on the same rows: the learned
+  weights wrong for the inner side's access (its pages not cached as the seek weight assumes).
+- A statement planned again whose new plan is the old one, many times over: the band too tight to
+  say when a plan could change.
+
 ## 22. Correlated subqueries unnested by dependent joins taken apart, from a worklist (PL.10)
 
 **Decision.** `optimizer/unnest.rs` keeps its fixed patterns and adds the general forms of Neumann

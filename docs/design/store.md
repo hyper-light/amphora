@@ -1881,7 +1881,7 @@ settle `point_pk`'s instructions per statement at one client fall by less than 1
 `table_count` at 32 clients rises less than 3x. The step's own bars: the log's and locks' share of
 point reads at 32 clients is at most 5%, and `point_pk` at 32 clients is at least 4x one client.
 
-## 41. Skipping the descent: an adaptive hash against a learned leaf locator (prototypes, not yet wired)
+## 41. Skipping the descent: an adaptive hash against a learned leaf locator (prototypes, behind a switch)
 
 G3 step 5 (G3.5, kiln plan 01a16b0f464172dc80c7a3b9a14acbce): the descent is within B-tree search's
 11.9-23.0% of a point read's user cycles (bench/records/2026-10-23-adacachy-read-path.md), so with it
@@ -1914,9 +1914,23 @@ gone a point read gains at most 1.14-1.30x (Amdahl's bound).
 - **Memory.** D holds at most its budget of entries (keys plus leaves tracked), evicting the least
   recently used leaves and refusing a leaf larger than the budget; E at most its budget of fences,
   refusing past it. The caller derives both from the memory it grants.
-- **Not yet.** The hook into `BTreeCursor`'s seek, behind a switch: a freed-page count every
-  connection sees, and a cursor that stands on a leaf it didn't descend to (SQLite's leaves have no
-  sibling links, so a step past the leaf must descend first). Until then the costs are the model's.
+- **The hook.** `AMPHORA_DESCENT_SKIP` = `off` | `hash` | `locator`, default `off`. Each
+  connection's pager holds the hook: hash and locators learned by its read cursors' descents, and
+  the stamp they are valid under: the connection's own count of pages that left their tree (every
+  free, every rollback to a savepoint or of a transaction) with its snapshot's identity (its WAL
+  position). A pager-wide count isn't sound: another connection's free happens at a snapshot this
+  one doesn't see, and a page learned under one snapshot proves nothing under another. When the
+  stamp moves, everything learned is dropped. Only a cursor opened to read consults it, and only
+  for a point seek; the named page is used only if it is loaded, clean and unlocked in the
+  connection's own cache (no I/O, nothing a write is changing), and only after `table_leaf_span`
+  proves the rowid in range; anything else descends. The cursor then stands on that leaf alone:
+  SQLite's leaves have no sibling links and the stack has no ancestors, so every other move (next,
+  prev, insert, delete, the current-leaf fast path) first descends again, to the row it stands on
+  or, with none, to the rowid its seek sought, which is where the plain descent would have put it;
+  a move to the root rebuilds the stack anyway. Bounds come from the connection's page cache, as
+  only cached pages are used: the locators together hold at most a fence a cached page, the hash
+  at most as many keys as the cached pages hold cells (SQLite's `MX_CELL`, btreeInt.h). Tested
+  through the real cursor by T-G3.5.4; AC-G3.5.2's measurement is `bench/descent_skip.sh`.
 - **Falsified if** point_pk at one client with the winner rises less than 20% against steps 2-4
   (AC-G3.5.2), or the winner's upkeep on the corpus's writes costs more than its lookups save.
 - **Tested.** T-G3.5.1: two tables sharing pages under random inserts, deletes, splits and merges,
