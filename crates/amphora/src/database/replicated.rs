@@ -2863,7 +2863,12 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.read_sets_moved += 1;
             return Ok(write.rebased(data, before));
         }
-        let marker = self.replica.machine().marker_page()?;
+        // A leader without the closed time's table holds no write that carries a read set
+        // (`Machine::prepare_db`): its refusal leaves the write to the exact base.
+        let Ok(applied) = self.replica.machine().applied_pages() else {
+            Self::read_set_event("unknown_base", write.base, before);
+            return Ok(None);
+        };
         let log = self.replica.core().raft.log();
         let held = log.first_index().map_err(unavailable)?.saturating_sub(1);
         if write.base.index < held
@@ -2886,7 +2891,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 } else {
                     readsets::Wrote::Opaque
                 };
-                if !write.untouched_by(&wrote, marker) {
+                if !write.untouched_by(&wrote, &applied) {
                     Self::read_set_event("conflict", write.base, before);
                     return Ok(None);
                 }

@@ -75,14 +75,17 @@ struct Head<'a> {
 /// The `Prepared` encoding in `data` (past the baseline's prefix and declaration), where it starts,
 /// and what follows it.
 fn head(data: &[u8]) -> Option<(Head<'_>, usize, &[u8])> {
-    let (start, body) = match data.strip_prefix(super::BASELINE_DELTA) {
+    // Inside its proposer's stamp (`closed`), which a moved base keeps as it was.
+    let (_, inner) = super::closed::open(data).ok()?;
+    let body = match inner.strip_prefix(super::BASELINE_DELTA) {
         Some(payload) => {
             let (_, rest) =
                 postcard::take_from_bytes::<api::replication::Bootstrap>(payload).ok()?;
-            (data.len().checked_sub(rest.len())?, rest)
+            rest
         }
-        None => (0, data),
+        None => inner,
     };
+    let start = data.len().checked_sub(body.len())?;
     let (head, rest) = postcard::take_from_bytes::<Head<'_>>(body).ok()?;
     Some((head, start, rest))
 }
@@ -128,16 +131,17 @@ impl Write {
         Some(bytes)
     }
 
-    /// Whether an entry that wrote `wrote` after this write's base, and the replica's marker table
-    /// page `marker` (which every apply writes), leaves what this write read and wrote as it was.
-    pub(crate) fn untouched_by(&self, wrote: &Wrote, marker: u32) -> bool {
+    /// Whether an entry that wrote `wrote` after this write's base, and the pages every apply
+    /// writes (`applied`: the replica's marker table's and the closed time's), leaves what this
+    /// write read and wrote as it was.
+    pub(crate) fn untouched_by(&self, wrote: &Wrote, applied: &[u32]) -> bool {
         let Wrote::Pages { pages, page1 } = wrote else {
             return false;
         };
         let touched = |page: &u32| {
             self.read.reads.binary_search(page).is_ok() || self.pages.binary_search(page).is_ok()
         };
-        if touched(&marker) || pages.iter().any(touched) {
+        if applied.iter().any(touched) || pages.iter().any(touched) {
             return false;
         }
         match page1 {
@@ -159,7 +163,16 @@ pub(crate) fn wrote(data: &[u8]) -> Wrote {
             page1: Page1::Unwritten,
         };
     }
-    if super::class::is_class(data) || super::bootstrap::is_seed(data) {
+    let Ok((_, inner)) = super::closed::open(data) else {
+        return Wrote::Opaque;
+    };
+    if inner.is_empty() {
+        return Wrote::Pages {
+            pages: Vec::new(),
+            page1: Page1::Unwritten,
+        };
+    }
+    if super::class::is_class(inner) || super::bootstrap::is_seed(inner) {
         return Wrote::Opaque;
     }
     let Some((head, _, rest)) = head(data) else {
@@ -221,19 +234,19 @@ mod tests {
     fn r1_a_write_is_untouched_only_by_entries_that_wrote_nothing_it_read_or_wrote() {
         let w = write(&[1, 3, 5], &[5, 9], Page1::Unwritten);
         let marker = 2;
-        assert!(w.untouched_by(&pages(&[7, 11], Page1::Unwritten), marker));
+        assert!(w.untouched_by(&pages(&[7, 11], Page1::Unwritten), &[marker]));
         assert!(
-            !w.untouched_by(&pages(&[3], Page1::Unwritten), marker),
+            !w.untouched_by(&pages(&[3], Page1::Unwritten), &[marker]),
             "a page read"
         );
         assert!(
-            !w.untouched_by(&pages(&[9], Page1::Unwritten), marker),
+            !w.untouched_by(&pages(&[9], Page1::Unwritten), &[marker]),
             "a page written, not read"
         );
-        assert!(!w.untouched_by(&Wrote::Opaque, marker));
+        assert!(!w.untouched_by(&Wrote::Opaque, &[marker]));
         let reads_marker = write(&[1, 2], &[2], Page1::Unwritten);
         assert!(
-            !reads_marker.untouched_by(&pages(&[], Page1::Unwritten), marker),
+            !reads_marker.untouched_by(&pages(&[], Page1::Unwritten), &[marker]),
             "every apply writes the marker"
         );
     }
@@ -245,17 +258,18 @@ mod tests {
     fn r2_page_ones_size_merges_with_readers_and_conflicts_with_another_allocation() {
         let marker = 2;
         let reader = write(&[1, 3], &[3], Page1::Unwritten);
-        assert!(reader.untouched_by(&pages(&[40], Page1::Size), marker));
-        assert!(!reader.untouched_by(&pages(&[], Page1::Other), marker));
+        assert!(reader.untouched_by(&pages(&[40], Page1::Size), &[marker]));
+        assert!(!reader.untouched_by(&pages(&[], Page1::Other), &[marker]));
         let allocates = write(&[1, 3], &[3, 41], Page1::Size);
-        assert!(!allocates.untouched_by(&pages(&[40], Page1::Size), marker));
-        assert!(!allocates.untouched_by(&pages(&[], Page1::Other), marker));
+        assert!(!allocates.untouched_by(&pages(&[40], Page1::Size), &[marker]));
+        assert!(!allocates.untouched_by(&pages(&[], Page1::Other), &[marker]));
     }
 
     /// AC-T1.8.R3 (the append-only wire change): do a `Prepared` with a read set encoded, then read
-    /// it as the leader does, rebase it, and decode it as a binary from before read sets does.
-    /// Expect: the leader reads its base, pages and read set; the rebased encoding carries the new
-    /// base, the same pages and the read set; the old decoding ignores the trailer.
+    /// it as the leader does, rebase it, and decode it as a binary from before read sets does; then
+    /// the same inside its proposer's closed-time stamp. Expect: the leader reads its base, pages
+    /// and read set; the rebased encoding carries the new base, the same pages and the read set;
+    /// the old decoding ignores the trailer; a stamped write moves its base and keeps its stamp.
     #[test]
     fn r3_a_read_set_rides_after_the_prepared_encoding_and_the_base_moves_alone() {
         let prepared = super::super::Prepared::for_test(
@@ -298,6 +312,17 @@ mod tests {
             pages(&[6], Page1::Size),
             "an entry's own read set says what it did to page 1"
         );
+        let stamped = super::super::closed::stamp(77, &data);
+        let w = Write::decode(&stamped).expect("a stamped write is read inside its stamp");
+        assert_eq!(w.base, Point { index: 4, term: 2 });
+        let moved = w.rebased(&stamped, Point { index: 9, term: 3 }).unwrap();
+        let (stamp, inner) = super::super::closed::open(&moved).unwrap();
+        assert_eq!(stamp, Some(77), "the proposer's stamp kept as it was");
+        assert_eq!(
+            Write::decode(inner).unwrap().base,
+            Point { index: 9, term: 3 }
+        );
+        assert_eq!(wrote(&moved), pages(&[6], Page1::Size));
         let bare = super::super::Prepared::for_test(
             Point { index: 4, term: 2 },
             vec![(1, vec![0; 8])],

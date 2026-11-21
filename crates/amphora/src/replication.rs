@@ -711,7 +711,13 @@ impl Machine {
                 base_term: self.point.term,
                 pages,
                 baseline: self.baseline.declaration().cloned(),
-                reads: traced.reads.map(|reads| readsets::ReadSet { reads, page1 }),
+                // Only on a base whose state has the closed time's table: an apply that makes it
+                // (the group's first stamped entry) changes the schema beyond any entry's pages,
+                // so a write prepared before it must not move past it (`readsets`).
+                reads: traced
+                    .reads
+                    .filter(|_| self.time.is_some())
+                    .map(|reads| readsets::ReadSet { reads, page1 }),
             },
             answer,
         ))
@@ -809,11 +815,15 @@ impl Machine {
         Ok(answer)
     }
 
-    /// The page of the replica's marker table, which every apply writes (`readsets`).
-    pub(crate) fn marker_page(&self) -> Result<u32, Refusal> {
-        self.db
-            .root_page("__amphora_replica")
-            .map_err(|e| crate::database::refused(&e))
+    /// The pages every apply writes (`readsets`): the replica's marker table's and the closed
+    /// time's (`closed::record`).
+    pub(crate) fn applied_pages(&self) -> Result<[u32; 2], Refusal> {
+        let root = |name: &str| {
+            self.db
+                .root_page(name)
+                .map_err(|e| crate::database::refused(&e))
+        };
+        Ok([root("__amphora_replica")?, root("__amphora_closed")?])
     }
 
     /// Applies `pages` at `at`, and flushes the log with them unless `flush` says the owner will.
