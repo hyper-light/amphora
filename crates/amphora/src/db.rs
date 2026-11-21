@@ -960,7 +960,9 @@ impl Db {
             };
             let visited = u64::try_from(row.get::<i64>(1).map_err(fail)?)?;
             answer = Some((last, visited));
-            Ok(false)
+            // Run on to its Halt: a write statement stopped at its row is abandoned unfinished,
+            // and the engine then refuses the transaction's commit.
+            Ok(true)
         })?;
         answer.ok_or_else(|| anyhow::anyhow!("the backfill of {index} answered nothing"))
     }
