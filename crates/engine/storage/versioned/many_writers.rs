@@ -182,7 +182,7 @@ fn draw(class: &str, s: &Sizes, w: u64, shared: bool, rng: &mut u64, next: &Atom
         let room = span.saturating_sub(len).max(1);
         i64::try_from(first + splitmix(rng) % room).unwrap()
     };
-    let mut fresh = || i64::try_from(next.fetch_add(1, Ordering::Relaxed)).unwrap();
+    let fresh = || i64::try_from(next.fetch_add(1, Ordering::Relaxed)).unwrap();
     match class {
         "insert_one" => Txn::Insert(vec![fresh()]),
         "insert_batch_100" => Txn::Insert((0..BATCH).map(|_| fresh()).collect()),
