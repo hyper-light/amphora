@@ -1201,9 +1201,16 @@ sketch keeps its column statistics' estimate (decision 20), which tells a common
 rare one; the sample would only count it. So does any other term: a parameter, a function, a
 subquery, another table's column, or a term that raises an error on a sample row.
 
-Each term is compiled once into a flat program of at most 64 operations (a loop over an explicit
-stack, CLAUDE.md §11). Each table's terms run within 1,048,576 steps, an operation on a row each
-(§2); a term the budget no longer covers is left to the other estimates.
+Each term is compiled once into a flat program, an operation for each node it holds (a loop over
+an explicit stack, CLAUDE.md §11). Each runs once on each sample row (§2), so a table's terms take
+their length times the sample's rows. The sample's rows are no more than the table's, so that is
+never more than a scan of the table takes to run the same terms. Until 2026-11-11 a term was held
+to 64 operations and a table's terms to 1,048,576 steps (64 × 1,024 × 16). Both counts were picked
+(Ada, 2026-11-11: "We don't tolerate arbitrary constants, learned and stat derived values only") and
+are gone; the parser's bound on a tree's height (`MAX_EXPR_DEPTH`) bounds the one walk down
+parentheses and COLLATEs. `a_long_term_is_estimated_on_the_sample`: an OR of 25 one-value BETWEENs,
+124 operations, was estimated at 20,000 rows against 10,000 counted (red at 490ea83, local-2); run on
+the sample it is within 1.25.
 
 Where at least ten sample rows pass the terms together, their share of the sample is the
 selectivity. Where fewer do, it is the share of the rows that pass, at least half a row's, but no
@@ -1270,9 +1277,121 @@ independent; an OR no constraint takes was not counted at all.
   count.
 - q06's lineitem off by more than 2.
 - JOB's first tables' q-error p95 not under 20.
-- JOB's median planning time over twice step 3's 1.9 ms (the sample's run, at most 1,048,576 steps
-  a table, is the cost to watch).
+- JOB's median planning time over twice step 3's 1.9 ms (the sample's run, a table's terms'
+  length times its sample's rows, is the cost to watch).
+- A statement whose terms' run on the sample takes longer than the statement's own execution
+  (the bound above assumes the scan runs the same operations the sample does; an IN list the
+  executor probes through an index and the sample walks value by value breaks it).
 - A CERT failure in the oracles.
+
+## Decision (lane pl6): No table read whole beneath loops that can give more than one row
+
+**Decision.** PL.6 (docs/research/planner.md section 9, rank 6). A read of a B-tree table by no
+key (a scan of the table, or of an index with no constraint seeking it) is planned beneath the
+loops before it only when they give at most one row: each reads its table by every column of a
+unique key with `=` (the rowid, a primary key or a unique index: `order.rs`'s one-row loop), or
+there are none. A hash join's build-only table runs no loop of its own and is left out. Otherwise
+the planner reads the table by a key at any cost: a seek of an index, an IN seek, a multi-index
+read or an automatic index (`access_method.rs`, `WholeReads::Refused`), or a hash join
+(`join.rs`, `join_lhs_and_rhs`), the cheaper of what exists. A seek taken only because the whole
+read was refused doesn't keep a seek's preference over a hash join, so a hash join of the same
+rows as the scan still wins where the seek reads more. The whole read stays only where none of
+these can read the table: no equality joins it to the loops before it (a cross join, a join by a
+range), or INDEXED BY and NOT INDEXED leave nothing else. A hash join's probe is a whole read
+too: where the loops before its build table can give more than one row, its build input is
+materialized from them (the existing key and payload materialization), so the probe is read
+once. The read that finds a RIGHT or FULL JOIN's unmatched rows runs once and keeps its choice.
+
+**Why.** An estimate of rows decides how often a whole read runs, and an estimate can be wrong
+by any factor: at step 3, 30 of JOB's 113 plans read a table whole beneath a first table
+estimated at 0.4 or 1.2 rows by a fixed selectivity (`bench/planner/loops.py` over
+`bench/records/2026-10-26-jupiter-planner-job-a.jsonl`). Each first table counted one row, so the
+whole read ran once; the audit's `10-no-adaptive`, statistics taken at 10 rows and the tables grown
+to 3,000, read q whole for each of p's 3,000 rows. Only a one-row loop bounds the reads by
+construction rather than by estimate. A hash join or an automatic index reads the table once
+whatever the loops before it give; a seek reads only the rows it finds.
+
+**Sources.**
+- Leis et al., "How Good Are Query Optimizers, Really?", PVLDB 9(3), 2015, section 4.1 (f32, A):
+  nested-loop joins without an index are "extremely risky" under misestimates, and with them
+  disabled "we observed no more timeouts" on JOB under PostgreSQL's estimates
+  (docs/research/planner.md section 5, lines 894 and 899 of the paper's text).
+- Leis et al. 2015 (f11, A): JOB's estimates are off by orders of magnitude at several joins,
+  the misestimate the rule is robust to.
+
+**Evidence.** `crates/engine/tests/nested_loops.rs`, red at c1ce17a (the batch's planner) and
+green with the change: `t_pl_6_1_ten_no_adaptive_reads_q_once` (T-PL.6.1), an outer join and the
+reverse order, JOB 1a's dimension and facts, a one-row loop that keeps its scan, a cross join and
+a range join that keep theirs (the counter finds it, so it is not vacuous), and a chain of hash
+joins whose third table is read once. Each test counts as `bench/planner/loops.py` does, whose
+own test holds step 3's counts: 30 of JOB's 113 plans, none of TPC-H's 22 at SF 1 or SF 10. A hash
+join's build table is listed in its block after the probe (`HASH JOIN q / SCAN p`) but read once,
+before the first probe (`Insn::Once`); the JSON plan's `hash_join` step names it (`build`), and the
+counter neither counts that read nor treats it as a loop. The JOB and TPC-H measurement against the
+parent is the batch's bench.
+
+**Falsified by.**
+- A JOB plan with such a read in the change's records (`loops.py` above 0), or a TPC-H plan.
+- A plan the rule changes that runs slower than its parent's on JOB, TPC-H or the bench suite
+  beyond the passes' spread (research rank 6's falsifier).
+- An answer that changes (`answers.py`), or an oracle finding where the forced materialization
+  of a hash join's build input is planned.
+## Decision (lane pl12): custom plans, then a generic one, for prepared statements
+
+**Decision.** PL.12 (docs/research/planner.md section 9, rank 12; `crates/engine/plan_cache.rs`).
+A prepared statement is planned at prepare without values, its generic plan, as before. While it
+is planned, every estimate that would take a parameter's value notes that it asked: an `=` or IN
+list on a column whose ANALYZE sample keeps common values (decision 20), and a term run over a
+table's sample (decision 21). A statement none asked of keeps its generic plan for good: a plan
+made with values would be the same plan, so it pays no planning (a key lookup, a table without
+statistics, a column whose values are about equally common). For the others, each run with a value
+bound chooses:
+- With no custom run measured, a custom plan: the statement parsed and planned again with the run's
+  values, which the estimates read as they read literals. The program still reads its parameters
+  from their registers, so a plan made for one value answers correctly for any.
+- After that, the generic plan once its estimated cost is not above the custom plans' average
+  raised by their planning: `generic x T <= average x (T + P)`, with `T` the custom runs' running
+  time and `P` their planning time (parse, plan and code), both measured by the statement on the
+  run itself (the connection's monotonic clock), summed over its custom runs. This is
+  PostgreSQL's `choose_custom_plan` comparison, with its planning cost measured where PostgreSQL
+  writes `1000 * cpu_operator_cost * (nrelations + 1) * nrelations`, and without its five runs:
+  the comparison is made from the first custom run on. Nothing in it is a constant: every input
+  is the statement's own estimate or its own measurement, on the host it runs on, as it runs.
+- A statement keeps two plans at most: the generic one, and the current run's custom one.
+- A schema change or ANALYZE plans the statement again (the existing reprepare, OP_Expire for
+  ANALYZE) and starts its choice again, its earlier measurements being of the old statistics.
+- `Connection::set_plan_cache_mode` (PostgreSQL's `plan_cache_mode`): `Auto` (the default),
+  `ForceGeneric`, `ForceCustom`, which the bench needs to time each plan. An EXPLAIN with values
+  bound shows the plan they give, as SQLite's re-prepare with bound values does.
+- Scope: SELECT statements (their plans carry an estimated cost); UPDATE and DELETE keep the
+  generic plan. A bound LIMIT keeps decision 17's q-middle: its value is not read here.
+
+**Why.** Audit row 8 (`bench/planner/audit/08-fixed-at-prepare.sql`): `WHERE k = ?` had one plan and
+one estimate, 1,000 rows, where k = 1 counts 1,000 and k = 9 none. kiln binds every value.
+
+**Sources.** PostgreSQL `src/backend/utils/cache/plancache.c`, `choose_custom_plan` ("Generate
+custom plans until we have done at least 5 (arbitrary)"; generic when its cost is below the custom
+plans' average plus planning) and `cached_plan_cost`; PostgreSQL docs, PREPARE and 19.7
+`plan_cache_mode`; CockroachDB, Query plan type (f35, A); SQLite `sqlite3_prepare_v2` item 3,
+recompiling on a bound value that could change the plan.
+
+**Evidence.** `crates/engine/tests/plan_cache.rs` (T-PL.12.3 to T-PL.12.6) and `plan_cache.rs`'s
+unit tests (T-PL.12.1, T-PL.12.2). The TPC-H prepared measurement (AC-PL.12.1) and the suite's
+(AC-PL.12.2) are the coordinator's.
+
+**Falsified by.**
+- A TPC-H query, prepared and run with qgen's parameters, slower under `Auto` than under
+  `ForceGeneric` (AC-PL.12.1).
+- The bench suite's prepared statements more than 2% slower than the parent (AC-PL.12.2): their
+  planning share kept them custom when it shouldn't.
+- A statement switched to generic on its first custom run whose later values would have gained
+  more than their planning (the comparison judged on one run): seen as runs under `Auto` slower
+  than under `ForceCustom` for a skewed parameter stream.
+
+**For PL.9** (statistics kept as rows change, statements re-planned): it should bump the
+connection's prepare generation where it re-plans, which resets each statement's choice
+(`Statement::reprepare`); a re-plan that keeps statistics close may want to keep the measurements
+instead, which is PL.9's call; `PlanValues` is how an estimate reads a bound value.
 
 ## 22. Correlated subqueries unnested by dependent joins taken apart, from a worklist (PL.10)
 

@@ -10,6 +10,7 @@ use std::{
 use amphora_engine_parser::ast::{fmt::ToTokens, Cmd};
 use tracing::{instrument, Level};
 
+use crate::plan_cache::{CustomRun, PlanCacheMode, PlanChoice, PlanKind, PlanValues};
 use crate::{alloc::TursoIteratorExt, connection::PrepareOptions};
 use crate::{
     busy::BusyHandlerState,
@@ -325,6 +326,22 @@ pub struct Statement {
     /// True if this statement called `Connection::start_nested()` during
     /// construction and therefore must call `end_nested()` on drop.
     nested_guard_active: bool,
+    /// Amphora (PL.12): the generic plan, kept here while a custom plan is `program`; `None` while
+    /// `program` is the generic plan. A statement keeps these two plans at most.
+    generic: Option<vdbe::Program>,
+    /// Amphora (PL.12): the custom runs' measurements, which choose each run's plan.
+    plan_choice: PlanChoice,
+    /// Amphora (PL.12): the custom run under way, measured until it ends.
+    custom_run: Option<OpenCustomRun>,
+}
+
+/// Amphora (PL.12): a custom run under way: its plan's estimated cost, the time its planning took,
+/// and when its planning ended, from which its running is timed.
+#[derive(Debug, Clone, Copy)]
+struct OpenCustomRun {
+    cost: f64,
+    planning: Duration,
+    planned_at: crate::io::clock::MonotonicInstant,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -406,6 +423,9 @@ impl Statement {
             is_blob_handle: false,
             nested_guard_active,
             analyze_refresh: None,
+            generic: None,
+            plan_choice: PlanChoice::default(),
+            custom_run: None,
         }
     }
 
@@ -579,6 +599,15 @@ impl Statement {
     /// gated behind cheap flag tests and kept out of line. A row in the middle
     /// of a scan runs only the interpreter call and the result-row bookkeeping.
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        let result = self.step_inner(waker);
+        // Amphora (PL.12): a custom run's running ends with its last step, or its error.
+        if self.custom_run.is_some() && matches!(result, Ok(StepResult::Done) | Err(_)) {
+            self.close_custom_run();
+        }
+        result
+    }
+
+    fn step_inner(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
         // ANALYZE already ran to Done; only its stats refresh is outstanding.
         // Checked first: the root-statement count was released at Done, so
         // `prepare_step` must not re-register this statement as a root.
@@ -677,6 +706,12 @@ impl Statement {
                 .matches_connection(&self.program.connection)
             {
                 if let Err(err) = self.reprepare() {
+                    self.release_active_root_if_counted();
+                    return Err(err);
+                }
+            }
+            if self.origin == StatementOrigin::Root {
+                if let Err(err) = self.choose_plan() {
                     self.release_active_root_if_counted();
                     return Err(err);
                 }
@@ -1051,34 +1086,54 @@ impl Statement {
         // publish new btree roots without bumping the schema cookie, so
         // same-version reprepare still refreshes it.
         conn.refresh_schema_from_shared_for_reprepare();
-        let new_program = {
-            let (cmd, _) = conn.parse_sql(&self.program.sql)?;
-            let cmd = cmd.expect("Same SQL string should be able to be parsed");
+        let new_program = self.plan_again(&PrepareOptions::default())?;
+        self.install_program(new_program)?;
+        self.state.metrics.reprepares = self.state.metrics.reprepares.saturating_add(1);
+        // Amphora (PL.12): the plan made now is the generic one, on the schema and statistics as
+        // they now are; the custom runs measured before are of the old ones, and start again.
+        self.generic = None;
+        self.plan_choice = PlanChoice::default();
+        self.custom_run = None;
+        Ok(())
+    }
 
-            let syms = conn.syms.read();
-            let mode = self.query_mode;
-            #[cfg(debug_assertions)]
-            crate::turso_assert_eq!(QueryMode::new(&cmd), mode);
-            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
-            let schema = conn.schema.read().clone();
-            let prepare_options = PrepareOptions::default();
-            translate::translate(
-                &schema,
-                stmt,
-                self.pager.clone(),
-                conn.clone(),
-                &syms,
-                mode,
-                &self.program.sql,
-                self.origin,
-                &prepare_options,
-            )?
+    /// The statement's SQL parsed and planned again with `prepare_options`: the generic plan
+    /// without values, a custom one with a run's (PL.12).
+    fn plan_again(&self, prepare_options: &PrepareOptions) -> Result<vdbe::Program> {
+        let conn = self.program.connection.clone();
+        let (cmd, _) = conn.parse_sql(&self.program.sql)?;
+        let Some(cmd) = cmd else {
+            return Err(LimboError::InternalError(
+                "a prepared statement's SQL no longer parses to a statement".to_string(),
+            ));
         };
+        let syms = conn.syms.read();
+        let mode = self.query_mode;
+        #[cfg(debug_assertions)]
+        crate::turso_assert_eq!(QueryMode::new(&cmd), mode);
+        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
+        let schema = conn.schema.read().clone();
+        translate::translate(
+            &schema,
+            stmt,
+            self.pager.clone(),
+            conn.clone(),
+            &syms,
+            mode,
+            &self.program.sql,
+            self.origin,
+            prepare_options,
+        )
+    }
 
+    /// Makes `program` the one the statement runs, its state sized for it, its bound parameters
+    /// and its per-run timeout kept.
+    fn install_program(&mut self, program: vdbe::Program) -> Result<()> {
         // Save parameters before they are reset
         let parameters = std::mem::take(&mut self.state.parameters);
+        let query_timeout_override = self.query_timeout_override;
         let (max_registers, cursor_count) = match self.query_mode {
-            QueryMode::Normal => (new_program.max_registers, new_program.cursor_ref.len()),
+            QueryMode::Normal => (program.max_registers, program.cursor_ref.len()),
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
             QueryMode::ExplainQueryPlan {
                 format: EqpFormat::Text,
@@ -1094,11 +1149,84 @@ impl Statement {
             Some(cursor_count),
             self.counted_as_active_root,
         )?;
-        self.state.metrics.reprepares = self.state.metrics.reprepares.saturating_add(1);
-        self.program = new_program;
+        self.program = program;
         // Load the parameters back into the state
         self.state.parameters = parameters;
+        self.query_timeout_override = query_timeout_override;
         Ok(())
+    }
+
+    /// Amphora (PL.12, `plan_cache.rs`): as a run starts, the plan it takes. A statement whose
+    /// generic plan no estimate read a parameter's value for keeps it: a plan made with values
+    /// would be the same plan. So does a run with no value bound. Otherwise the connection's
+    /// [crate::PlanCacheMode] decides, and under `Auto` the custom runs' measured costs
+    /// ([PlanChoice::next]); an EXPLAIN takes the plan its values give, as it runs nothing to
+    /// measure. A custom plan is made with the run's values and runs in place of the generic one,
+    /// which is kept beside it.
+    fn choose_plan(&mut self) -> Result<()> {
+        // A run re-entered before it left its start (a busy wait) keeps the plan it was given.
+        if self.custom_run.is_some() {
+            return Ok(());
+        }
+        let generic = self.generic.as_ref().unwrap_or(&self.program);
+        let generic_cost = match generic.plan_cost {
+            Some(cost) if generic.reads_parameter_values => cost,
+            _ => return Ok(()),
+        };
+        let bound = self
+            .state
+            .parameters
+            .iter()
+            .any(|value| !matches!(value, Value::Null));
+        let measured = self.query_mode == QueryMode::Normal;
+        let kind = match (bound, self.program.connection.plan_cache_mode()) {
+            (false, _) | (true, PlanCacheMode::ForceGeneric) => PlanKind::Generic,
+            (true, PlanCacheMode::ForceCustom) => PlanKind::Custom,
+            (true, PlanCacheMode::Auto) if measured => self.plan_choice.next(generic_cost),
+            (true, PlanCacheMode::Auto) => PlanKind::Custom,
+        };
+        if kind == PlanKind::Generic {
+            if let Some(generic) = self.generic.take() {
+                self.install_program(generic)?;
+            }
+            return Ok(());
+        }
+        let started = self.pager.io.current_time_monotonic();
+        let values = crate::sync::Arc::new(PlanValues::bound(self.state.parameters.clone()));
+        let custom = self.plan_again(&PrepareOptions {
+            plan_values: Some(values),
+            ..PrepareOptions::default()
+        })?;
+        let planned_at = self.pager.io.current_time_monotonic();
+        let cost = custom.plan_cost;
+        if self.generic.is_none() {
+            self.generic = Some(self.program.clone());
+        }
+        self.install_program(custom)?;
+        self.state.metrics.custom_plans = self.state.metrics.custom_plans.saturating_add(1);
+        self.custom_run = match cost {
+            Some(cost) if measured => Some(OpenCustomRun {
+                cost,
+                planning: planned_at.duration_since(started),
+                planned_at,
+            }),
+            _ => None,
+        };
+        Ok(())
+    }
+
+    /// Amphora (PL.12): the custom run under way has ended (its last row, an error, or a reset
+    /// part way): its running is measured to now and recorded.
+    fn close_custom_run(&mut self) {
+        let Some(run) = self.custom_run.take() else {
+            return;
+        };
+        let now = self.pager.io.current_time_monotonic();
+        self.plan_choice.record(CustomRun {
+            cost: run.cost,
+            planning: run.planning,
+            running: now.duration_since(run.planned_at),
+        });
     }
 
     pub fn num_columns(&self) -> usize {
@@ -1507,6 +1635,7 @@ impl Statement {
     }
 
     pub fn reset(&mut self) -> Result<()> {
+        self.close_custom_run();
         self.reset_internal(None, None, false)
     }
 
