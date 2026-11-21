@@ -762,7 +762,7 @@ impl Machine {
         // Each page number takes at least one byte of the entry, so a session that read more
         // pages than the entry has bytes could not carry its read set.
         let bound = u64::try_from(COMMAND_BYTES.saturating_add(ENVELOPE_BYTES)).unwrap_or(u64::MAX);
-        let (answer, pages, reads, page_one) = self
+        let (answer, pages, traced) = self
             .db
             .prepare_traced(COMMAND_BYTES, bound, |db| {
                 let mut connection = crate::sql::Connection::new(db);
@@ -773,7 +773,7 @@ impl Machine {
             .map_err(|e| crate::database::refused(&e))?;
         validate_pages(&pages, COMMAND_BYTES)?;
         let page1 = match pages.iter().find(|(page, _)| *page == 1) {
-            Some((_, image)) => readsets::page1_change(&page_one, image),
+            Some((_, image)) => readsets::page1_change(&traced.page_one, image),
             None => readsets::Page1::Unwritten,
         };
         Ok((
@@ -782,7 +782,7 @@ impl Machine {
                 base_term: self.point.term,
                 pages,
                 baseline: self.baseline.declaration().cloned(),
-                reads: reads.map(|reads| readsets::ReadSet { reads, page1 }),
+                reads: traced.reads.map(|reads| readsets::ReadSet { reads, page1 }),
             },
             answer,
         ))

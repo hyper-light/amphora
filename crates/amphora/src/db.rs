@@ -141,6 +141,13 @@ fn in_place(_path: &Path) {}
 /// A connection on a Turso database, with the statements it prepared kept.
 pub(crate) type Pages = Vec<(u32, Vec<u8>)>;
 
+/// What a traced preparation read (`Db::prepare_traced`): its read set, `None` past its bound,
+/// and page 1 as it stood at the session's base.
+pub(crate) struct Traced {
+    pub(crate) reads: Option<Vec<u32>>,
+    pub(crate) page_one: Vec<u8>,
+}
+
 pub struct Db {
     io: Arc<dyn IO>,
     db: Arc<Database>,
@@ -816,7 +823,7 @@ impl Db {
         max_bytes: usize,
         bound: u64,
         f: impl FnOnce(&mut Self) -> anyhow::Result<R>,
-    ) -> anyhow::Result<(R, Pages, Option<Vec<u32>>, Vec<u8>)> {
+    ) -> anyhow::Result<(R, Pages, Traced)> {
         self.exec("BEGIN IMMEDIATE")?;
         let pager = self.conn.get_pager();
         let result = self.page_one().and_then(|page_one| {
@@ -825,7 +832,7 @@ impl Db {
             let access = pager.take_access().map_err(fail)?;
             let pages = pager.transaction_image(max_bytes).map_err(fail)?;
             let reads = (!access.overflowed()).then(|| access.read().collect());
-            Ok((answer, pages, reads, page_one))
+            Ok((answer, pages, Traced { reads, page_one }))
         });
         pager.end_access();
         // A prepared transaction never leaves an engine commit marker, even when capture fails.
