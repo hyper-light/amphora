@@ -6,12 +6,16 @@
 //! the current engine stays the default until the comprehensive suite says otherwise. This stage:
 //! the page format ([`page`]), the buffer pool ([`pool`]), B-link trees on it ([`blink`]) and row
 //! versions on them ([`version`]: snapshots, first-writer-wins, rollback, collection); then their
-//! files ([`disk`]), the redo log ([`redo`]), and checkpoints and recovery ([`durable`]); and a table's column copy ([`columns`], G11).
+//! files ([`disk`]), the redo log ([`redo`]), and checkpoints and recovery ([`durable`]); the
+//! commit validations' Elle-style isolation checks (`elle`, G8 step 1); and a table's column copy
+//! ([`columns`], G11).
 
 pub mod blink;
 pub mod columns;
 pub mod disk;
 pub mod durable;
+#[cfg(test)]
+mod elle;
 pub mod page;
 pub mod pool;
 pub mod redo;

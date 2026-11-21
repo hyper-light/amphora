@@ -419,6 +419,12 @@ class Tagger:
         return f, shape
 
 
+def type_key(feats, shape):
+    """A query type: its shape and the entries it exercises, keywords aside (the syntax they make is
+    already there)."""
+    return json.dumps([list(shape), sorted(x for x in feats if not x.startswith("keyword:"))])
+
+
 def statement_count(sql):
     """Statements in the text, where SQLite's own parser says each ends (a trigger's body is one
     statement's), not counting what's only whitespace or comments."""

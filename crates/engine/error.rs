@@ -107,6 +107,10 @@ pub enum LimboError {
     TxTerminated,
     #[error("Write-write conflict")]
     WriteWriteConflict,
+    /// Amphora: a serializable transaction's commit refused by its validation (the versioned
+    /// storage, docs/design/engine.md decision 5): its caller rolls back and runs it again.
+    #[error("Serialization failure: run the transaction again")]
+    SerializationFailure,
     #[error("Commit dependency aborted")]
     CommitDependencyAborted,
     #[error("No such transaction ID: {0}")]
@@ -131,6 +135,19 @@ pub enum LimboError {
     UnsupportedEncoding(String),
     #[error("Out of memory")]
     OutOfMemory,
+    /// Amphora: the versioned storage's memory budget can't take `asked` more bytes for `what`
+    /// (docs/design/engine.md decision 10, G8 step 2): `held` of `limit` are taken. The change is
+    /// refused whole and nothing is kept; its caller rolls back, and may run it again once the
+    /// oldest snapshot closes and collection gives the memory back.
+    #[error(
+        "versioned storage memory budget full: {what} asked {asked} bytes, {held} of {limit} held"
+    )]
+    MemoryBudget {
+        what: &'static str,
+        asked: u64,
+        held: u64,
+        limit: u64,
+    },
 }
 
 /// `?` in functions returning boxed errors (see `InsnResult`) composes

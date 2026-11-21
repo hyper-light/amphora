@@ -1,0 +1,85 @@
+hash-threshold 8
+
+# written for keyword:FULL: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+query II nosort
+SELECT t1.a, t2.a FROM t1 FULL JOIN t2 ON t1.a = t2.a ORDER BY coalesce(t1.a, t2.a)
+----
+16 values hashing to b431b7b7ed8b68ad308d35da22624b91
+
+query I rowsort
+SELECT count(*) FROM t1 FULL OUTER JOIN t2 USING (a)
+----
+8
+
+query I rowsort
+SELECT count(*) FROM t1 FULL JOIN t2 ON 0
+----
+12
+
+query II nosort
+SELECT t1.a, t2.a FROM t1 FULL JOIN t2 ON t1.a = t2.a WHERE t1.a IS NULL OR t2.a IS NULL ORDER BY coalesce(t1.a, t2.a)
+----
+NULL
+NULL
+4
+NULL
+5
+NULL
+NULL
+7
+
+query I nosort
+SELECT a FROM t1 NATURAL FULL JOIN t2 ORDER BY 1
+----
+12 values hashing to f49bb8bdb3b28725062db9663585c48e
+
+query II rowsort
+SELECT count(t1.a), count(t2.a) FROM t1 FULL JOIN t2 ON t1.a = t2.a
+----
+6
+5
+
+query II nosort
+SELECT x.a, y.a FROM t2 AS x FULL JOIN t2 AS y ON y.a = x.a + 1 ORDER BY coalesce(x.a, y.a)
+----
+14 values hashing to 8ad2e874c847bb1a2b1b8901a3a1c491
+
+query II nosort
+SELECT t1.a, t2.a FROM t1 FULL JOIN t2 ON t1.a = t2.a AND t2.c > 15 ORDER BY coalesce(t1.a, t2.a)
+----
+20 values hashing to 7fac43e18cfacaee57a503d0a9ef0353
+
+query I rowsort
+SELECT sum(coalesce(t1.a, 0) + coalesce(t2.a, 0)) FROM t1 FULL JOIN t2 USING (a)
+----
+40
+
+query III nosort
+SELECT t1.a, t2.a, t3.a FROM t1 FULL JOIN t2 ON t1.a = t2.a FULL JOIN t2 AS t3 ON t3.a = t1.a ORDER BY 1, 2, 3
+----
+27 values hashing to 376ec0a232a00001570fa4fc4e9c52bf
+
+query I nosort
+SELECT a FROM t1 FULL JOIN t2 USING (a) ORDER BY 1
+----
+NULL
+1
+2
+3
+4
+5
+6
+7

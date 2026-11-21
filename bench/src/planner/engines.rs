@@ -247,6 +247,45 @@ impl Amphora {
         self.run_on(true, sql, deadline, |_| ())
     }
 
+    /// PL.12: `sql` prepared once on the timed connection, to run again and again with
+    /// [Amphora::run_prepared].
+    pub fn prepare(&mut self, sql: &str) -> anyhow::Result<amphora_engine::Statement> {
+        self.conn.prepare(sql).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// PL.12: one run of `stmt`, prepared once, with `values` bound and the connection's plan
+    /// cache mode `mode`, to its last row, then reset for its next run. `prepare_ms` is the
+    /// binding: a run's planning, where it makes a custom plan, is in its `exec_ms`.
+    pub fn run_prepared(&mut self, stmt: &mut amphora_engine::Statement, values: &[amphora_engine::Value], mode: amphora_engine::PlanCacheMode, deadline: Duration) -> Outcome {
+        let conn = self.conn.clone();
+        conn.set_plan_cache_mode(mode);
+        conn.set_query_timeout(deadline);
+        let began = Instant::now();
+        for (i, value) in values.iter().enumerate() {
+            let bound = NonZero::new(i + 1).ok_or_else(|| anyhow::anyhow!("parameter 0")).and_then(|n| stmt.bind_at(n, value.clone()).map_err(|e| anyhow::anyhow!("{e}")));
+            if let Err(e) = bound {
+                conn.set_query_timeout(Duration::ZERO);
+                return Outcome::Failed(e.to_string());
+            }
+        }
+        let bound = Instant::now();
+        let (mut rows, mut first) = (0u64, None);
+        let ended = self.drive(stmt, Some(began + deadline), |row| {
+            if rows == 0 {
+                first = Some(first_row(row.get_values().map(|v| v.to_string())));
+            }
+            rows += 1;
+        });
+        let done = Instant::now();
+        conn.set_query_timeout(Duration::ZERO);
+        let reset = stmt.reset().map_err(|e| anyhow::anyhow!("{e}"));
+        match (ended, reset) {
+            (Ok(true), Ok(())) => Outcome::Done(Run { rows, first, prepare_ms: ms(bound - began), exec_ms: ms(done - bound) }),
+            (Ok(false), _) => Outcome::TimedOut,
+            (Err(e), _) | (_, Err(e)) => Outcome::Failed(e.to_string()),
+        }
+    }
+
     /// EXPLAIN QUERY PLAN FORMAT=JSON's plan of `sql`.
     pub fn plan_json(&mut self, sql: &str) -> anyhow::Result<String> {
         let mut stmt = self.conn.prepare(format!("EXPLAIN QUERY PLAN FORMAT=JSON {sql}")).map_err(|e| anyhow::anyhow!("{e}"))?;

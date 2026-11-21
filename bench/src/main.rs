@@ -16,6 +16,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::disallowed_macros))]
 
 mod blink;
+mod cc;
 mod clickhouse;
 mod columns;
 mod eqp;
@@ -507,6 +508,10 @@ fn main() -> anyhow::Result<()> {
     // kiln's hot statements through Amphora's public SQL API, timed per execute (`sqlapi.rs`).
     if std::env::args().any(|a| a == "--sql-api") {
         return sqlapi::main();
+    }
+    // The versioned storage's commit validations against each other (`cc.rs`, G8 step 1).
+    if std::env::args().any(|a| a == "--cc") {
+        return cc::main();
     }
     // The versioned storage's B-link tree on its own (`blink.rs`).
     if std::env::args().any(|a| a == "--blink") {

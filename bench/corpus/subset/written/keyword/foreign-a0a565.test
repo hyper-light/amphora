@@ -1,0 +1,73 @@
+hash-threshold 8
+
+# written for keyword:FOREIGN: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+statement ok
+PRAGMA foreign_keys = ON
+
+statement ok
+CREATE TABLE po(a INTEGER, b TEXT, PRIMARY KEY (a, b))
+
+statement ok
+CREATE TABLE co1(x INTEGER, y TEXT, FOREIGN KEY (x, y) REFERENCES po(a, b))
+
+statement ok
+CREATE TABLE co2(x INTEGER, FOREIGN KEY (x) REFERENCES t2(a) ON DELETE SET NULL)
+
+statement ok
+CREATE TABLE co3(x, CONSTRAINT fk_x FOREIGN KEY (x) REFERENCES t2)
+
+statement ok
+INSERT INTO po VALUES (1, 'a')
+
+statement ok
+INSERT INTO co1 VALUES (1, 'a')
+
+statement error
+INSERT INTO co1 VALUES (1, 'b')
+
+statement ok
+INSERT INTO co2 VALUES (6)
+
+statement ok
+DELETE FROM t2 WHERE a = 6
+
+query T rowsort
+SELECT x FROM co2
+----
+NULL
+
+statement error
+INSERT INTO co3 VALUES (99)
+
+query TTT nosort
+SELECT "table", "from", "to" FROM pragma_foreign_key_list('co1') ORDER BY seq
+----
+po
+x
+a
+po
+y
+b
+
+query TTTT rowsort
+PRAGMA foreign_key_check
+----
+
+statement error
+CREATE TABLE co4(x, FOREIGN KEY (x, x) REFERENCES po(a))
+
+statement error
+CREATE TABLE co5(x, FOREIGN KEY REFERENCES po)
