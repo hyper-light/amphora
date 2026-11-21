@@ -793,7 +793,8 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   size the sizer learns, now charged per row of the table so skipped granules count. Each carries
   min/max and null counts per column and its key range and position; filters skip granules their
   summaries exclude and run on whole vectors, as do COUNT, SUM (exact for reals), MIN, MAX and
-  group-by. A key range (a wide-range statement) skips blocks outside it undecoded, by the blocks'
+  group-by (each row given its group's slot in one pass, each aggregate's vector folded by slot,
+  T-CS.4.5). A key range (a wide-range statement) skips blocks outside it undecoded, by the blocks'
   key bounds, and filters its boundary granules by their key column. Blocks no change touches are
   decoded once a generation. Every class equals the row store's answer, whole-table and over key
   ranges, with writes between scans, serially and on the morsel executor's workers (`Plan` is a
