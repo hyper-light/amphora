@@ -205,7 +205,7 @@ fn t_g5_4_1_cracking_writes_between_scans_match_a_plain_scan() {
                 assert_eq!(rowids, expected, "seed {seed}: entries for {lo}..={hi}");
             }
         }
-        let Skipping::Cracking(cracker) = &skipping else {
+        let Skipping::Cracking(cracker) = &mut skipping else {
             unreachable!()
         };
         // Every row the table holds is in the column once: integers as entries, others apart.
