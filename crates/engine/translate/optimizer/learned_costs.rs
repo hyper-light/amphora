@@ -207,7 +207,9 @@ impl Sampling {
 
     fn sampled(&self) -> bool {
         let every = self.every.load(Ordering::Relaxed).max(1);
-        self.runs.fetch_add(1, Ordering::Relaxed) % every == 0
+        self.runs
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(every)
     }
 
     /// Adds a timed run's `nanos`; once an epoch's `epoch` samples are in, sets `every` from their
@@ -232,7 +234,8 @@ fn sample_every(timing_nanos: f64, epoch: f64, sd: Option<f64>) -> Option<u64> {
         return None;
     }
     let k = (timing_nanos * epoch.sqrt() / sd).powf(2.0 / 3.0);
-    Some(k.clamp(1.0, epoch) as u64)
+    // The nearest whole number of runs.
+    Some(k.round().clamp(1.0, epoch) as u64)
 }
 
 impl LearnedCosts {
