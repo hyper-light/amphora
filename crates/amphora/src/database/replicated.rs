@@ -162,7 +162,7 @@ struct Control {
 }
 /// The readers of a replica's local reads (replication.md, "A local read on a replica"):
 /// connections of their own on the machine's database, each on what the machine committed when
-/// its read began. At most `CONNECTION_MAX` out at once, each charged to the process's page
+/// its read began. At most `readers` out at once, each charged to the process's page
 /// budget; one given back waits in the process's account for the next read (replication.md, "A
 /// replica's local readers bounded by derivation"). While the owner waits to start the database's
 /// log again, no read of this replica begins (replication.md, "A replica's database log").
@@ -176,11 +176,13 @@ struct Local {
     meter: Arc<ReplicaMeter>,
     /// The process's readers and the page budget they are charged to.
     account: Arc<Account>,
+    /// Readers out at once on this replica: the most clients that can be attached at once, each a
+    /// connection running one session at a time, so more readers than that can't be used by them;
+    /// a caller in the process past it waits. A connection holds a descriptor, so that is the
+    /// process's descriptor budget (`descriptors::process`, local-owner-transport.md, "One
+    /// descriptor budget"), read when the owner opens; the readers themselves hold none.
+    readers: usize,
 }
-/// Readers out at once on one replica: policy, the transport's bound on attached clients, each a
-/// connection running one session at a time (`transport::CONNECTION_MAX`), so more readers than
-/// that can't be used by them; a caller in the process past it waits.
-const READERS: usize = crate::transport::CONNECTION_MAX;
 /// Every replica's local readers in the process, and the page budget they are charged to
 /// (replication.md, "A replica's local readers bounded by derivation").
 struct Account {
@@ -288,12 +290,14 @@ impl Local {
         open: crate::store::Opener<Db>,
         meter: Arc<ReplicaMeter>,
         account: Arc<Account>,
+        readers: usize,
     ) -> Self {
         Self {
             open: Mutex::new(Some(open)),
             id: account.next.fetch_add(1, Ordering::Relaxed),
             meter,
             account,
+            readers,
         }
     }
     /// `f` on a reader: this replica's idle one, one opened now on a charge, one opened after
@@ -321,7 +325,7 @@ impl Local {
                 self.took(&mut ledger)?;
                 break (Some(idle.reader), idle.charge, open);
             }
-            if !held && ledger.out.get(&self.id).copied().unwrap_or(0) < READERS {
+            if !held && ledger.out.get(&self.id).copied().unwrap_or(0) < self.readers {
                 if let Some(charge) = self.account.pool.charge(pages) {
                     self.took(&mut ledger)?;
                     break (None, charge, open);
@@ -1346,7 +1350,8 @@ fn open_on<F: BlockFile + 'static>(
     let group = GroupStore::claim(&log, 1).map_err(unavailable)?;
     let replica =
         Replica::open(&settings, group, machine, Bytes::new(512 << 20)).map_err(unavailable)?;
-    let local = Local::new(reader, Arc::clone(&meter), account());
+    let readers = crate::descriptors::process()?.bound();
+    let local = Local::new(reader, Arc::clone(&meter), account(), readers);
     let control = Arc::new(Control {
         admitted: AtomicUsize::new(0),
         attesting: Mutex::new(None),
@@ -12288,21 +12293,23 @@ mod tests {
     }
 
     /// AC-T1.10.L2, T-T1.10.L8 (replication.md, "A replica's local readers bounded by
-    /// derivation"), on driven time: at most `CONNECTION_MAX` local readers at once, the most
-    /// attached clients that can read at once, and one more waits on its caller's thread up to its
-    /// own deadline. Do: one voter, 1 written; `CONNECTION_MAX` local reads held open on threads
+    /// derivation"), on driven time: at most as many local readers at once as the process's
+    /// descriptor budget lets clients attach, and one more waits on its caller's thread up to its
+    /// own deadline. Do: a descriptor budget of 6, one voter, 1 written; 6 local reads held open on threads
     /// of their own; one more asked on a thread of its own, its deadline FIFTH_WAIT away, while the
     /// owner answers a call; one of the held let go and a read asked; one held again and a read
     /// waiting with a long deadline; the owner dropped without its loop's end. Expect: every held
     /// read has its reader; the call answered while they are out; the one more refused Timeout no
     /// sooner than its deadline; the read after the let-go answers 1; the waiting read refused
-    /// Fenced once the owner is gone; the meter counting `CONNECTION_MAX` readers in use while
+    /// Fenced once the owner is gone; the meter counting 6 readers in use while
     /// they are held, every read that had a reader, one refused timeout and one fenced, and none
     /// in use at the end.
     #[test]
     fn local_readers_are_bounded_by_the_transport_not_four() {
         let dir = tempfile::tempdir().unwrap();
-        let most = crate::transport::CONNECTION_MAX;
+        // The bound moves with the budget: a budget of its own, small enough that the readers
+        // reach it, for the owner this thread opens.
+        let most = crate::descriptors::tests::budget(6).bound();
         // An account of the test's own, with room for one reader more than the bound, so the
         // count is what holds the one more back, never the budget (or another test's readers).
         let reader = usize::try_from(crate::db::READER_PAGES).unwrap();
@@ -12406,6 +12413,7 @@ mod tests {
                 db.opener(),
                 Arc::new(ReplicaMeter::default()),
                 Arc::clone(&account),
+                crate::descriptors::process().unwrap().bound(),
             ));
             (db, local)
         };

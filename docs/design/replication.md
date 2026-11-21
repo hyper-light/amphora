@@ -1631,6 +1631,14 @@ take no descriptor.
 pages above the pool's budget; a read refused while an idle reader of another replica held the charge it needed;
 a read answered past its deadline.
 
+**Amendment (lane constants, 2026-11-21): the count follows the descriptor budget.** `CONNECTION_MAX` is gone
+(local-owner-transport.md, "Decision (lane constants): one descriptor budget"). Connections are bounded by the
+process's descriptor budget, each holding its socket, so the most clients that can be attached at once is the
+budget's bound, and a replica's readers out at once are at most that, read when the owner opens. Nothing else in this
+decision changes: readers hold no descriptor and charge none, their pages are charged to the page budget, and a read
+past either waits to its deadline. Where `CONNECTION_MAX` is named above, read the budget's bound. AC-T1.10.L2 and
+T-T1.10.L8 say so; the test sets a budget of its own (6) and holds six readers out, the seventh waiting.
+
 ## A replica's database log: copied, bounded, and flushed off the owner (2026-11-09)
 
 Amphora goals 7582f00a and aa81fbbf, one design because both are the replica's database-log I/O. Requirements:

@@ -257,6 +257,16 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (`settle_s`; Amphora's loader had left the whole load, 7.5 GB, in its log). `--query` runs a
   statement on a database a run left behind.
 
+- **Picked constants replaced by derived ones** (lane constants, kiln goal dfabffcc; Ada, 2026-11-11: "learned and
+  stat derived values only"): a page's chain of deltas ends where its bytes reach a page (store.md decision 17); the
+  store's log is copied past its bound (decision 35); a term runs on the whole sample (planner.md decision 21); a
+  drained lease is probed from the probe's cost to the learned window (J1); a class entry's bound, the patience's
+  voters and a change's charge follow from what they bound; an owner's own session lasts its role's raft timing; and
+  an owner's connections are bounded by the process's descriptor budget, the system's limit less what is open
+  (local-owner-transport.md, "Decision (lane constants): one descriptor budget"; FD.1), with a replica's local
+  readers following it. Left: the owners' descriptors charged to the same budget (`OWNERS_MAX`), the replicated
+  owner's tick, poll and drive quantum, and the rest of the list (handoff/amphora-constants-list.md).
+
 ## Measured
 
 - **The oracles: wrong answers and slow plans** (G2 step 3; `amphora-bench --oracle`, `bench/src/oracle`,

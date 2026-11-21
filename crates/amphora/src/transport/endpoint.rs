@@ -3,7 +3,6 @@
 //! no filesystem permissions are widened or repaired when acquiring an existing endpoint.
 //! The safe exclusive socket option is upstream socket2 commit
 //! 8b8b96fdaa1301698fd2b6f4de188635df4a8bd1 (github.com/rust-lang/socket2/pull/678).
-use super::wire::CONNECTION_MAX;
 use amphora_api::{self as api, Refusal};
 use private_fs::{FileAccess, FileCreation, OpenOptions, PrivateDir, PrivateFile};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -200,9 +199,11 @@ pub(super) fn bind(path: &Path) -> Result<Bound, Refusal> {
     socket
         .bind(&SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
         .map_err(unavailable)?;
-    socket
-        .listen(i32::try_from(CONNECTION_MAX).map_err(unavailable)?)
-        .map_err(unavailable)?;
+    // The backlog is the system's own most: past it each system takes its limit (Linux's
+    // net.core.somaxconn, listen(2); XNU's kern.ipc.somaxconn, solisten), and Windows reads
+    // SOMAXCONN, 0x7fffffff, as "a maximum reasonable value" (Microsoft, listen function).
+    // Accepted connections are bounded by the process's descriptor budget, not here.
+    socket.listen(i32::MAX).map_err(unavailable)?;
     socket.set_nonblocking(true).map_err(unavailable)?;
     let listener = Listener::from(socket);
     let mut token = [0; 32];
