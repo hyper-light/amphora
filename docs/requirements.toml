@@ -342,6 +342,11 @@ criteria = [
 ]
 tests = [
   { id = "T-PL.7.1", text = "The audit's 09-cost-model — passes when its tables of 8 and 1,011 pages no longer both scan at one cost" },
+  # lane pl7
+  { id = "T-PL.7.2", text = "cost_fit::tests::t_pl_7_2_* — passes when the fit of synthetic samples from known weights with 5% noise lands within four standard errors and 5% of each, and a tenfold stall one sample in ten still leaves each within 5%" },
+  { id = "T-PL.7.3", text = "cost_fit::tests::t_pl_7_3_* — passes when terms never sampled have no fitted weight and the planner keeps their learned value, and the fit follows weights that move" },
+  { id = "T-PL.7.4", text = "cost_fit::tests::t_pl_7_4_* — passes when two hundred thousand samples leave the fit's size unchanged and its window longer than its least" },
+  { id = "T-PL.7.5", text = "cost_fit::tests::t_pl_7_5_* and tests/planner.rs, records_plans.rs, join_methods.rs with AMPHORA_FITTED_COSTS=1 — passes when the sample rate follows the timer's cost and the spread, a planner run with the switch on fits weights, and the planner suites pass with the switch on and off" },
 ]
 
 [[own]]

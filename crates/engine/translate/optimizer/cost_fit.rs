@@ -728,9 +728,9 @@ mod tests {
 
     /// Do: feed samples drawn from known weights with 5% multiplicative normal noise. Expect: each
     /// fitted weight within four of its standard errors of the truth, and within the noise's share
-    /// of it (T-PL.7.1's model: the fit recovers the weights within the samples' noise).
+    /// of it (T-PL.7.2).
     #[test]
-    fn t_pl_7_1_fit_recovers_known_weights_within_noise() {
+    fn t_pl_7_2_fit_recovers_known_weights_within_noise() {
         let truth = [3.0, 40.0, 25.0, 18.0, 6.0, 900.0];
         let noise = 0.05;
         let mut rng = Rng(7);
@@ -750,9 +750,9 @@ mod tests {
     }
 
     /// Do: feed exact samples where one in ten is ten times too slow (a stall). Expect: the fit
-    /// still lands within 5% of every weight (Huber's weights hold the outliers off).
+    /// still lands within 5% of every weight (T-PL.7.2: Huber's weights hold the outliers off).
     #[test]
-    fn t_pl_7_1_fit_holds_off_outliers() {
+    fn t_pl_7_2_fit_holds_off_outliers() {
         let truth = [2.0, 30.0, 20.0, 10.0, 5.0, 500.0];
         let mut rng = Rng(11);
         let mut fit = CostFit::new();
@@ -768,10 +768,10 @@ mod tests {
     }
 
     /// Do: feed samples that never count hash work. Expect: those terms have no fitted weight, so
-    /// the planner keeps their learned values; the others are fitted (PL.7: a weight with no
+    /// the planner keeps their learned values; the others are fitted (T-PL.7.3: a weight with no
     /// samples keeps the learned calibration value).
     #[test]
-    fn t_pl_7_1_unsampled_terms_keep_their_learned_weight() {
+    fn t_pl_7_3_unsampled_terms_keep_their_learned_weight() {
         let truth = [2.0, 30.0, 0.0, 0.0, 5.0, 500.0];
         let mut rng = Rng(3);
         let mut fit = CostFit::new();
@@ -792,9 +792,9 @@ mod tests {
 
     /// Do: two hundred thousand samples. Expect: the fit's size never changes and it holds no heap memory
     /// (its state is fixed-size arrays), and the epoch length grows past the minimum while the
-    /// weights hold still (memory is bounded; the window learns its length).
+    /// weights hold still (T-PL.7.4: memory is bounded; the window learns its length).
     #[test]
-    fn t_pl_7_1_memory_is_bounded() {
+    fn t_pl_7_4_memory_is_bounded() {
         let truth = [2.0, 30.0, 20.0, 10.0, 5.0, 500.0];
         let mut rng = Rng(5);
         let mut fit = CostFit::new();
@@ -808,9 +808,9 @@ mod tests {
     }
 
     /// Do: fit stationary samples, then move every weight to twice its value. Expect: the fit
-    /// follows to the new weights (the window drops the old epoch once the fits disagree).
+    /// follows to the new weights (T-PL.7.3: the window drops the old epoch once the fits disagree).
     #[test]
-    fn t_pl_7_1_fit_follows_moved_conditions() {
+    fn t_pl_7_3_fit_follows_moved_conditions() {
         let before = [2.0, 30.0, 20.0, 10.0, 5.0, 500.0];
         let after = before.map(|w| w * 2.0);
         let mut rng = Rng(9);
@@ -831,10 +831,10 @@ mod tests {
     }
 
     /// Do: ask the sampler with no spread yet, then with statements a hundred times the timing's
-    /// cost and a 1% spread, then with statements as cheap as their timing. (T-PL.7.1's sampling) Expect: every
-    /// statement, then all of them (1% of 100 is 1), then one in a hundred.
+    /// cost and a 1% spread, then with statements as cheap as their timing. Expect: every
+    /// statement, then all of them (1% of 100 is 1), then one in a hundred (T-PL.7.5).
     #[test]
-    fn t_pl_7_1_sample_rate_follows_overhead_and_spread() {
+    fn t_pl_7_5_sample_rate_follows_overhead_and_spread() {
         let mut s = Sampler::new(20.0);
         assert_eq!(s.rate(None), 1.0);
         s.timed(4000.0, 40.0);
@@ -846,9 +846,42 @@ mod tests {
         assert_eq!(taken, 10);
     }
 
-    /// Do: measure a clock read. Expect: a finite, non-negative time.
+    /// Do: open a database in memory, turn its switch on, and run scans, key lookups and sorts.
+    /// Expect: no weights before (switch off), then rows and seeks fitted from the statements' own
+    /// times, and no weight for the hash tables none of them built nor for page reads none of
+    /// them made, which keep their learned values (T-PL.7.5).
     #[test]
-    fn t_pl_7_1_clock_read_is_measured() {
+    fn t_pl_7_5_statements_run_with_the_switch_on_fit_weights() {
+        let io: crate::sync::Arc<dyn crate::io::IO> = crate::sync::Arc::new(crate::MemoryIO::new());
+        let db = crate::Database::open_file(io, ":memory:", crate::sync::Arc::new(crate::SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER)").unwrap();
+        let rows: Vec<String> = (1..=400).map(|i| format!("({i}, {})", i % 7)).collect();
+        conn.execute(format!("INSERT INTO t VALUES {}", rows.join(","))).unwrap();
+        conn.query("SELECT count(*) FROM t WHERE b = 3").unwrap().unwrap().run_collect_rows().unwrap();
+        assert_eq!(db.cost_fit.weights(), None);
+        conn.set_fitted_costs(true);
+        for i in 0..200 {
+            let sql = match i % 3 {
+                0 => format!("SELECT count(*) FROM t WHERE b = {}", i % 7),
+                1 => format!("SELECT b FROM t WHERE a = {}", 1 + i % 400),
+                _ => format!("SELECT a FROM t WHERE a > {} ORDER BY b", i % 400),
+            };
+            conn.query(sql).unwrap().unwrap().run_collect_rows().unwrap();
+        }
+        let w = db.cost_fit.weights().expect("fitted");
+        assert!(w.nanos(Term::Row).is_some(), "{w:?}");
+        assert!(w.nanos(Term::Seek).is_some(), "{w:?}");
+        assert_eq!(w.nanos(Term::HashBuild), None, "{w:?}");
+        assert_eq!(w.nanos(Term::HashProbe), None, "{w:?}");
+        assert_eq!(w.nanos(Term::PageRead), None, "{w:?}");
+        conn.set_fitted_costs(false);
+        assert_eq!(db.cost_fit.weights(), None);
+    }
+
+    /// Do: measure a clock read. Expect: a finite, non-negative time (T-PL.7.5).
+    #[test]
+    fn t_pl_7_5_clock_read_is_measured() {
         let c = clock_read_nanos();
         assert!(c.is_finite() && c >= 0.0, "{c}");
     }
