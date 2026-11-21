@@ -83,7 +83,8 @@ fn table(db: &Arc<Database>, rows: i64) {
 /// fixed stride over the table, on a connection on `path` caching `cache` pages.
 fn per_lookup(db: &Arc<Database>, path: PagePath, cache: i64, rows: i64, lookups: i64) -> f64 {
     let conn = connect(db);
-    conn.execute(format!("PRAGMA cache_size = {cache}")).unwrap();
+    conn.execute(format!("PRAGMA cache_size = {cache}"))
+        .unwrap();
     conn.get_pager().set_page_path(path);
     let mut stmt = conn.prepare("SELECT v FROM t WHERE id = ?").unwrap();
     let mut lookup = |id: i64| {
