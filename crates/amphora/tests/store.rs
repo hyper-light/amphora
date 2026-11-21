@@ -79,6 +79,11 @@ impl Engine for Events {
         reader.checkpoint()
     }
 
+    // As Amphora's own engine (`database::Local`): the store sees what its log holds uncopied.
+    fn uncopied(reader: &mut Db) -> anyhow::Result<Option<Checkpointed>> {
+        Ok(Some(reader.uncopied()))
+    }
+
     fn restart_log(&mut self) -> anyhow::Result<bool> {
         self.db.restart_log()
     }
@@ -583,6 +588,56 @@ fn the_log_stays_bounded_under_writes_and_reads_that_never_pause() {
     assert_eq!(count(&lab.store, "a"), 4000);
     // 256 frames of 4 KiB is 1 MiB; a log that never started again holds every commit's pages.
     assert!(most < 16 << 20, "the log grew to {most} bytes");
+}
+
+/// Do: write commits of 500 rows on a store whose log's bound is 12,288 frames until the log holds
+/// at least 10,240, past the 8,192 a pass once waited for. Expect: no checkpoint pass while the log is
+/// within its bound, since a recovery reads the whole log whatever was copied (docs/design/
+/// store.md, decision 35, 2026-11-11: the copy waits for the bound, not a picked count of frames);
+/// then, once the log has passed its bound, passes that copy it, and every row read back
+/// (AC-T1.4.4).
+#[test]
+fn a_log_within_its_bound_is_not_copied() {
+    let config = Config {
+        checkpoint_every: Duration::from_millis(1),
+        log_frames: 12_288,
+        ..Config::default()
+    };
+    let bound = config.log_frames;
+    let lab = lab(config, None);
+    let wal = {
+        let mut p = lab.path.clone().into_os_string();
+        p.push("-wal");
+        std::path::PathBuf::from(p)
+    };
+    // The log's header and its frames, each a 24-byte header and a 4 KiB page.
+    let frames = || std::fs::metadata(&wal).map_or(0, |m| m.len().saturating_sub(32) / (24 + 4096));
+    // A key of 1,000 bytes, in the table and its index: a commit of 500 rows writes hundreds of
+    // pages, so the log reaches its bound in a few dozen commits.
+    let key = "a".repeat(1_000);
+    let mut seq = 0;
+    let put = |seq: &mut i64| {
+        let rows = (0..500).map(|i| row(&key, *seq + i)).collect();
+        lab.store.put(rows).unwrap();
+        *seq += 500;
+    };
+    while frames() < 10_240 {
+        put(&mut seq);
+        lab.store.sync(soon()).unwrap();
+    }
+    assert!(frames() < bound, "{} frames", frames());
+    assert_eq!(
+        lab.store.counters().checkpoints,
+        0,
+        "passes with {} frames in a log of bound {bound}",
+        frames()
+    );
+    while lab.store.counters().checkpoints == 0 {
+        put(&mut seq);
+        lab.store.sync(soon()).unwrap();
+    }
+    assert!(frames() > bound, "a pass at {} frames", frames());
+    assert_eq!(count(&lab.store, &key), seq);
 }
 
 /// Do: let one flush go, then hold every flush until let go and write until the log is past its

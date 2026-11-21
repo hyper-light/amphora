@@ -300,8 +300,11 @@ fn marker(db: &mut Db, point: Point, configuration: &ConfState) -> anyhow::Resul
 
 impl Machine {
     pub fn open(path: &Path, initial: ConfState) -> Result<Self, Refusal> {
+        // The lease's descriptor is charged before the lease is opened.
+        let descriptor = crate::descriptors::process()?.take("open descriptors", 1)?;
         let owner = crate::database::Owned::new(
             std::sync::Arc::new(crate::database::exclusive_file(path)?),
+            descriptor,
             None,
         );
         Self::open_with_owner(path, initial, owner, 0, None, false)
