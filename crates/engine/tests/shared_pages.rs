@@ -622,3 +622,35 @@ fn g3s3_a_byte_flipped_on_disk_is_refused_on_each_page_path() {
         );
     }
 }
+
+/// G3 step 3 (decision 42): do read a table four times larger than a 200-page cache from the file,
+/// twice, on a connection on the plain path and one on today's, without shared pages. Expect: the
+/// same rows, and the plain path's misses read into the pages its evictions left (pcache1's
+/// recycled pages) rather than new ones.
+#[test]
+fn g3s3_plain_misses_read_into_the_pages_evictions_leave() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), false);
+    table(&connect(&db), 4000);
+    connect(&db)
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let on = |path: PagePath| {
+        let conn = connect(&db);
+        conn.execute("PRAGMA cache_size = 200").unwrap();
+        conn.get_pager().set_page_path(path);
+        conn
+    };
+    let (today, plain) = (on(PagePath::Today), on(PagePath::Plain));
+    for round in 0..2 {
+        let want = rows(&today, "SELECT id, v FROM t ORDER BY id");
+        assert_eq!(want.len(), 4000);
+        assert!(
+            rows(&plain, "SELECT id, v FROM t ORDER BY id") == want,
+            "round {round}: the plain path read other rows"
+        );
+    }
+    let recycled = plain.get_pager().recycled_pages();
+    assert!(recycled > 200, "misses past the cache recycled {recycled} pages");
+    assert_eq!(today.get_pager().recycled_pages(), 0);
+}

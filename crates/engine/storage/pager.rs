@@ -1138,6 +1138,22 @@ impl Page {
         }
     }
 
+    /// Amphora (decision 42): `page`, the spare its cache's last eviction left, made page `id`
+    /// as a new plain page is, with its buffer when no one else holds it: `pcache1`'s recycled
+    /// page. None when another holder remains.
+    pub fn recycle(mut page: PageRef, id: usize) -> Option<(PageRef, Option<Arc<Buffer>>)> {
+        let buffer = {
+            let inner = Arc::get_mut(&mut page)?.inner.get_mut();
+            let buffer = inner
+                .take_buffer()
+                .and_then(|mut buffer| Arc::get_mut(&mut buffer).is_some().then_some(buffer));
+            *inner = PageInner::unloaded(id);
+            inner.flags.store(PAGE_PLAIN, Ordering::Relaxed);
+            buffer
+        };
+        Some((page, buffer))
+    }
+
     /// Amphora: whether the page's pins are plain counts (decision 42).
     #[inline]
     pub fn is_plain(&self) -> bool {
@@ -3984,8 +4000,21 @@ impl Pager {
     /// its own), its checksum checked as it enters the process, then loaded and shared as a
     /// completed read is (`finish_read_page`): no completion, no callback. False, the page
     /// untouched, when the storage completes reads later.
-    fn read_disk_inline(&self, page_idx: usize, page: &PageRef, allow_empty: bool) -> Result<bool> {
-        let buffer = self.buffer_pool.get_page();
+    fn read_disk_inline(
+        &self,
+        page_idx: usize,
+        page: &PageRef,
+        allow_empty: bool,
+        spare: Option<Arc<Buffer>>,
+    ) -> Result<bool> {
+        let page_size = self
+            .get_page_size()
+            .and_then(|size| usize::try_from(size.get()).ok());
+        #[allow(clippy::arc_with_non_send_sync)]
+        let buffer = match spare.filter(|buffer| Some(buffer.len()) == page_size) {
+            Some(buffer) => buffer,
+            None => Arc::new(self.buffer_pool.get_page()),
+        };
         let read = {
             let io_ctx = self.io_ctx.read();
             self.db_file
@@ -4006,10 +4035,26 @@ impl Pager {
         let buffer = if read == 0 {
             Arc::new(Buffer::new_temporary(0))
         } else {
-            Arc::new(buffer)
+            buffer
         };
         sqlite3_ondisk::finish_read_page(page_idx, buffer, page.clone());
         Ok(true)
+    }
+
+    /// Amphora (decision 42): a plain page to read page `page_idx` into: the spare the cache's
+    /// last eviction left, with its buffer, or a new one.
+    fn plain_page(&self, page_idx: i64) -> Result<(PageRef, Option<Arc<Buffer>>)> {
+        let id = usize::try_from(page_idx).map_err(|_| LimboError::IntegerOverflow)?;
+        let spare = self.page_cache.write().take_spare();
+        if let Some(recycled) = spare.and_then(|page| Page::recycle(page, id)) {
+            return Ok(recycled);
+        }
+        Ok((Arc::new(Page::new_plain(id)), None))
+    }
+
+    /// Amphora (decision 42): spare pages this pager's misses have read into.
+    pub fn recycled_pages(&self) -> u64 {
+        self.page_cache.read().recycled()
     }
 
     /// Reads a page from disk (either WAL or DB file) bypassing page-cache
@@ -4184,7 +4229,7 @@ impl Pager {
             let (page, c) = self.read_page_no_cache(page_idx, None, false, group)?;
             return Ok((page, Some(c)));
         }
-        let page = self.new_read_page(page_idx)?;
+        let (page, spare) = self.plain_page(page_idx)?;
         // The log's frames are read as today (the log's read path is G3 step 2's).
         if let Some(wal) = self.wal.as_ref() {
             let page_no = u64::try_from(page_idx).map_err(|_| LimboError::IntegerOverflow)?;
@@ -4194,7 +4239,7 @@ impl Pager {
             }
         }
         let at = usize::try_from(page_idx).map_err(|_| LimboError::IntegerOverflow)?;
-        if self.read_disk_inline(at, &page, false)? {
+        if self.read_disk_inline(at, &page, false, spare)? {
             return Ok((page, None));
         }
         page.set_locked();
@@ -4633,7 +4678,10 @@ impl Pager {
             None => Version::File,
         };
         let key = shared.key(page_no, version);
-        let page = self.new_read_page(page_idx)?;
+        let (page, spare) = match self.page_path() {
+            PagePath::Plain => self.plain_page(page_idx)?,
+            PagePath::Today => (Arc::new(Page::new(page_idx)), None),
+        };
         // Amphora (decision 42): on the plain path the pool's own buffer, its count taken once as
         // the page enters this connection's cache; the pins after are this connection's
         // (PostgreSQL's private refcounts). The image was checked as it entered the process and is
@@ -4664,7 +4712,9 @@ impl Pager {
             Some(frame) => wal.read_frame(frame, page.clone(), self.buffer_pool.clone(), group)?,
             None => {
                 let at = usize::try_from(page_idx).map_err(|_| LimboError::IntegerOverflow)?;
-                if self.page_path() == PagePath::Plain && self.read_disk_inline(at, &page, false)? {
+                if self.page_path() == PagePath::Plain
+                    && self.read_disk_inline(at, &page, false, spare)?
+                {
                     return Ok(Some((page, None)));
                 }
                 page.set_locked();
