@@ -141,7 +141,9 @@ fn t_ns_2_6_ddl_and_indexes_answer_alike() {
         assert_eq!(rows(&versioned, q), want, "{q}");
     }
     for conn in [&pager, &versioned] {
-        assert!(conn.execute("INSERT INTO t VALUES (9, 'apple', 0)").is_err());
+        assert!(conn
+            .execute("INSERT INTO t VALUES (9, 'apple', 0)")
+            .is_err());
         run(conn, "DROP INDEX tc");
     }
     let q = "SELECT a, b, c FROM t ORDER BY c, a";
@@ -156,7 +158,10 @@ fn t_ns_2_6_analyze_answers_alike() {
     let (pdb, pager) = connect(false);
     let (vdb, versioned) = connect(true);
     for conn in [&pager, &versioned] {
-        run(conn, "CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER, c TEXT)");
+        run(
+            conn,
+            "CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER, c TEXT)",
+        );
         run(conn, "CREATE INDEX tb ON t (b)");
         run(conn, "CREATE INDEX tbc ON t (b, c)");
         for i in 0..200 {

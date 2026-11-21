@@ -18,9 +18,9 @@ use super::durable::Database as VDatabase;
 use crate::error::LimboError;
 use crate::storage::page_cache::DEFAULT_PAGE_CACHE_SIZE_IN_PAGES;
 use crate::sync::{Arc, Mutex, OnceLock};
-use std::collections::HashMap;
 use crate::types::IndexInfo;
 use crate::{Pager, Result};
+use std::collections::HashMap;
 
 /// The environment variable that turns the switch on for every connection: `versioned`.
 pub const ENV: &str = "AMPHORA_STORAGE";
@@ -55,10 +55,7 @@ pub fn open(path: &str) -> Result<Arc<Storage>> {
     } else {
         let dir = std::path::PathBuf::from(format!("{path}-versioned"));
         std::fs::create_dir_all(&dir).map_err(|e| {
-            LimboError::InternalError(format!(
-                "versioned storage: making {}: {e}",
-                dir.display()
-            ))
+            LimboError::InternalError(format!("versioned storage: making {}: {e}", dir.display()))
         })?;
         Arc::new(Files::open(&dir, lanes)?)
     };
@@ -205,7 +202,9 @@ impl Switch {
         if rollback {
             self.db.abort(txn, &mut d)
         } else {
-            self.db.commit(txn, &mut d, self.db.lane(), true).map(|_| ())
+            self.db
+                .commit(txn, &mut d, self.db.lane(), true)
+                .map(|_| ())
         }
     }
 }
