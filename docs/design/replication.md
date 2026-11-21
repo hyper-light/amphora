@@ -2415,7 +2415,7 @@ Falsified by: a non-serializable history with read sets on; a release A/B agains
 write gaps; a `conflict` share near one on workloads whose writes touch different pages (the read set too wide: the
 recorder catching reads the session didn't make).
 
-## The raft log as the WAL (built 2026-11-21, G12 step 2, lane g12s2)
+## Decision (lane g12s2): the raft log as the WAL (2026-11-21, G12 step 2)
 
 Requirements AC-T1.8.L1 and L2, tests T-T1.8.L1 and L2 (docs/requirements.toml); kiln plan "G12 Replication
 (CP-T1.8)", step 2.

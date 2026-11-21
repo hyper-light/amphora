@@ -121,6 +121,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | replication | – | Decision (lane constants): generations learned where they run (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-generations-learned-where-they-run-2026-11-21) |
 | replication | – | Decision (lane constants): a generation of restarts ends once it covers its spend (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-a-generation-of-restarts-ends-once-it-covers-its-spend-2026-11-21) |
 | replication | – | A follower's write that read nothing written since its base: read sets (built 2026-11-21, Amphora goal ceea4e0a) | [replication.md](design/replication.md#a-followers-write-that-read-nothing-written-since-its-base-read-sets-built-2026-11-21-amphora-goal-ceea4e0a) |
+| replication | – | Decision (lane g12s2): the raft log as the WAL (2026-11-21, G12 step 2) | [replication.md](design/replication.md#decision-lane-g12s2-the-raft-log-as-the-wal-2026-11-21-g12-step-2) |
 | reshard | – | Decision (lane split-merge): split, merge and move as one fenced hand-off, decided by measured share | [reshard.md](design/reshard.md#decision-lane-split-merge-split-merge-and-move-as-one-fenced-hand-off-decided-by-measured-share) |
 | semantics | 1 | TEXT is well-formed UTF-8 | [semantics.md](design/semantics.md#1-text-is-well-formed-utf-8) |
 | semantics | 2 | atanh's last digit is its platform's C library's | [semantics.md](design/semantics.md#2-atanhs-last-digit-is-its-platforms-c-librarys) |
