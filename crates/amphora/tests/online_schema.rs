@@ -810,7 +810,7 @@ fn t_t1_12_1_a_persons_alter_column_of_a_held_column_is_refused_and_the_changes_
     // CP-T1.12: while NOT NULL is validated on a, a person's ALTER COLUMN of a (the change's own
     // SQL, the old definition, or another) is refused and leaves the table as it was; the change's
     // own steps redefine it, and a breaking row's undo puts the old definition back.
-    let (_dir, db) = table(50);
+    let (_dir, mut db) = table(50);
     let nn = plan("ALTER TABLE t ALTER COLUMN a TO a INTEGER NOT NULL");
     assert_eq!(
         db.transaction(|db| online::step(db, &nn, 7)).unwrap(),
