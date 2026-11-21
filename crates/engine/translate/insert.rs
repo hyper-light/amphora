@@ -2240,7 +2240,12 @@ fn init_source_emission<'a>(
     database_id: usize,
 ) -> Result<()> {
     let required_column_count = if columns.is_empty() {
-        table.columns().iter().filter(|c| !c.is_generated()).count()
+        // Amphora: a column an online DROP COLUMN dropped takes no value (CP-T1.12).
+        table
+            .columns()
+            .iter()
+            .filter(|c| !c.is_generated() && !c.dropped())
+            .count()
     } else {
         columns.len()
     };

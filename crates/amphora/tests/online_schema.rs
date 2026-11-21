@@ -646,7 +646,10 @@ fn t_t1_12_1_a_dropped_column_is_hidden_while_its_values_are_cleared_then_record
         assert!(db.column_count("SELECT t.b FROM t").is_err());
         assert!(db.column_count("SELECT * FROM t WHERE b = 'r1'").is_err());
         assert_eq!(db.column_count("SELECT * FROM t").unwrap(), 2);
-        assert_eq!(count(db, "SELECT count(*) FROM pragma_table_info('t')", vec![]).unwrap(), 2);
+        assert_eq!(
+            count(db, "SELECT count(*) FROM pragma_table_info('t')", vec![]).unwrap(),
+            2
+        );
     };
     hidden(&db);
     hidden(&reader);
@@ -683,7 +686,12 @@ fn t_t1_12_1_a_dropped_column_is_hidden_while_its_values_are_cleared_then_record
     hidden(&db);
     hidden(&reader);
     assert_eq!(
-        count(&db, "SELECT count(*) FROM __amphora_migrations WHERE name = 'ix'", vec![]).unwrap(),
+        count(
+            &db,
+            "SELECT count(*) FROM __amphora_migrations WHERE name = 'ix'",
+            vec![]
+        )
+        .unwrap(),
         1
     );
     assert_eq!(integrity(&db), "ok");
@@ -701,7 +709,10 @@ fn t_t1_12_1_a_dropped_column_is_hidden_while_its_values_are_cleared_then_record
     drop(db);
     let db = Db::open(&dir.path().join("t.db")).unwrap();
     assert_eq!(db.column_count("SELECT * FROM t").unwrap(), 3);
-    assert_eq!(count(&db, "SELECT count(*) FROM t WHERE b IS NULL", vec![]).unwrap(), rows);
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM t WHERE b IS NULL", vec![]).unwrap(),
+        rows
+    );
     assert_eq!(integrity(&db), "ok");
 }
 
@@ -720,7 +731,7 @@ fn t_t1_12_1_a_drop_is_refused_where_the_engine_refuses_it_and_its_slot_keeps_th
         .migrate(
             Migration {
                 name: "t".into(),
-                sql: "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c INTEGER NOT NULL DEFAULT 7 CHECK (c > 0), d INTEGER CHECK (d <> a)); CREATE INDEX t_a ON t (b); CREATE VIEW v AS SELECT a FROM t; CREATE TABLE g (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER); CREATE TRIGGER gt AFTER INSERT ON g BEGIN SELECT 1; END; CREATE TABLE w (k INTEGER PRIMARY KEY, x INTEGER, y INTEGER) WITHOUT ROWID; CREATE TABLE o (id INTEGER PRIMARY KEY, x INTEGER); WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300) INSERT INTO t (a, b) SELECT i % 50, 'r' FROM n".into(),
+                sql: "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c INTEGER NOT NULL DEFAULT 7 CHECK (c > 0), d INTEGER CHECK (d <> a)); CREATE INDEX t_a ON t (b); CREATE VIEW v AS SELECT a FROM t; CREATE TABLE g (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER); CREATE TRIGGER gt AFTER INSERT ON g BEGIN SELECT 1; END; CREATE TABLE w (k INTEGER PRIMARY KEY, x INTEGER, y INTEGER) WITHOUT ROWID; CREATE TABLE o (id INTEGER PRIMARY KEY, x INTEGER); CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER CHECK (y <> x)); WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300) INSERT INTO t (a, b) SELECT i % 50, 'r' FROM n".into(),
             },
             until(),
         )
@@ -746,11 +757,23 @@ fn t_t1_12_1_a_drop_is_refused_where_the_engine_refuses_it_and_its_slot_keeps_th
             })
             .unwrap()
     };
+    let star = |database: &Database| {
+        database
+            .call(until(), |c| {
+                let n: i64 =
+                    c.query_row("SELECT count(*) FROM pragma_table_info('t')", [], |r| {
+                        r.get(0usize)
+                    })?;
+                Ok(n)
+            })
+            .unwrap()
+    };
     let before = schema();
     for (name, sql) in [
         ("pk", "ALTER TABLE t DROP COLUMN id"),
         ("ix", "ALTER TABLE t DROP COLUMN b"),
         ("vw", "ALTER TABLE t DROP COLUMN a"),
+        ("ck", "ALTER TABLE u DROP COLUMN x"),
         ("tg", "ALTER TABLE g DROP COLUMN x"),
         ("wr", "ALTER TABLE w DROP COLUMN x"),
         ("on", "ALTER TABLE o DROP COLUMN x"),
@@ -765,6 +788,7 @@ fn t_t1_12_1_a_drop_is_refused_where_the_engine_refuses_it_and_its_slot_keeps_th
             "{name}: {refusal:?}"
         );
         assert_eq!(schema(), before, "{name} changed the schema");
+        assert_eq!(star(&database), 5, "{name} left t's columns changed");
     }
     let dropped = change("c", "ALTER TABLE t DROP COLUMN c").unwrap();
     assert!(dropped.applied && dropped.rows >= 300, "{dropped:?}");
@@ -779,15 +803,6 @@ fn t_t1_12_1_a_drop_is_refused_where_the_engine_refuses_it_and_its_slot_keeps_th
         Ok(())
     });
     assert!(readd.is_err(), "the slot's name was taken");
-    let star = |database: &Database| {
-        database
-            .call(until(), |c| {
-                let n: i64 =
-                    c.query_row("SELECT count(*) FROM pragma_table_info('t')", [], |r| r.get(0usize))?;
-                Ok(n)
-            })
-            .unwrap()
-    };
     assert_eq!(star(&database), 4);
     drop(database);
     let database = Database::open(&path, until()).unwrap();

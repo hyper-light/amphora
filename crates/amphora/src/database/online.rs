@@ -983,6 +983,24 @@ fn begin_drop(db: &Db, plan: &Plan, column: &str) -> anyhow::Result<Stepped> {
         |_| Ok(true),
     )?;
     db.restage_schema()?;
+    // What the engine's DROP COLUMN doesn't check, prepared (never run) against the schema without
+    // the column, in this transaction: a view naming it, and a CHECK of another column naming it
+    // (an insert compiles every CHECK). A failure refuses the drop and its transaction is undone.
+    let mut views = Vec::new();
+    db.query(
+        "SELECT name FROM sqlite_schema WHERE type = 'view'",
+        [],
+        |row| {
+            views.push(row.get::<String>(0).map_err(unavailable)?);
+            Ok(true)
+        },
+    )?;
+    for view in views {
+        db.column_count(&format!("SELECT * FROM {}", quoted(&view)))
+            .map_err(|error| refuse(&format!("view {view} names the column: {error}")))?;
+    }
+    db.column_count(&format!("INSERT INTO {} DEFAULT VALUES", quoted(&plan.table)))
+        .map_err(|error| refuse(&format!("a constraint names the column: {error}")))?;
     Ok(Stepped::WriteOnly)
 }
 
@@ -1243,8 +1261,12 @@ mod tests {
         assert!(plan("ALTER TABLE t ADD COLUMN g AS (a + 1)").is_ok());
         assert!(plan("ALTER TABLE t ADD COLUMN g AS (a + 1) NOT NULL").is_err());
         assert!(plan("ALTER TABLE t ADD COLUMN g AS (a + 1) CHECK (g > 0)").is_err());
-        assert!(plan("ALTER TABLE t DROP COLUMN a").is_err());
+        assert_eq!(
+            plan("ALTER TABLE T DROP COLUMN A").unwrap().adds,
+            Adds::DropColumn("a".into())
+        );
         assert!(plan("ALTER TABLE t RENAME TO u").is_err());
+        assert!(plan("ALTER TABLE t RENAME COLUMN a TO b").is_err());
         assert!(plan("ALTER TABLE aux.t ADD COLUMN c").is_err());
     }
 
