@@ -55,7 +55,9 @@ impl std::fmt::Display for Unavailable {
                 program,
                 why,
             } => write!(f, "{engine}: its program {program} isn't here ({why})"),
-            Self::Unreachable { engine, why } => write!(f, "{engine}: its database didn't open: {why}"),
+            Self::Unreachable { engine, why } => {
+                write!(f, "{engine}: its database didn't open: {why}")
+            }
         }
     }
 }
@@ -91,10 +93,32 @@ pub fn open(name: &str) -> Result<Box<dyn Engine>, Unavailable> {
         "duckdb" => Shell::open(duckdb(bin("duckdb", "duckdb"))).map(boxed),
         "turso" => Shell::open(turso(bin("turso", "tursodb"))).map(boxed),
         // Run.sh's addresses for the bench's containers (bench/servers/<engine>.sh).
-        "postgres" => Shell::open(postgres("postgres", bin("postgres", "psql"), dsn("postgres", "postgres://postgres@127.0.0.1:55432/postgres"))).map(boxed),
-        "orioledb" => Shell::open(postgres("orioledb", bin("orioledb", "psql"), dsn("orioledb", "postgres://postgres@127.0.0.1:55433/postgres"))).map(boxed),
-        "cedardb" => Shell::open(postgres("cedardb", bin("cedardb", "psql"), dsn("cedardb", "postgres://postgres:amphorabenchlocalonly2026@127.0.0.1:55434/postgres"))).map(boxed),
-        "mysql" => Shell::open(mysql(bin("mysql", "mysql"), &dsn("mysql", "mysql://root@127.0.0.1:33306/convo"))?).map(boxed),
+        "postgres" => Shell::open(postgres(
+            "postgres",
+            bin("postgres", "psql"),
+            dsn("postgres", "postgres://postgres@127.0.0.1:55432/postgres"),
+        ))
+        .map(boxed),
+        "orioledb" => Shell::open(postgres(
+            "orioledb",
+            bin("orioledb", "psql"),
+            dsn("orioledb", "postgres://postgres@127.0.0.1:55433/postgres"),
+        ))
+        .map(boxed),
+        "cedardb" => Shell::open(postgres(
+            "cedardb",
+            bin("cedardb", "psql"),
+            dsn(
+                "cedardb",
+                "postgres://postgres:amphorabenchlocalonly2026@127.0.0.1:55434/postgres",
+            ),
+        ))
+        .map(boxed),
+        "mysql" => Shell::open(mysql(
+            bin("mysql", "mysql"),
+            &dsn("mysql", "mysql://root@127.0.0.1:33306/convo"),
+        )?)
+        .map(boxed),
         "clickhouse" => ClickHouse::open(&dsn("clickhouse", "http://127.0.0.1:58123")).map(boxed),
         other => Err(Unavailable::Unknown(other.to_owned())),
     }
@@ -155,17 +179,30 @@ pub fn sqlite_shell(engine: &'static str, program: String) -> ShellSpec {
         rows: Rows::Quote,
         error: |l| {
             !l.starts_with('\'')
-                && (l.starts_with("Parse error") || l.starts_with("Runtime error") || l.starts_with("Error"))
+                && (l.starts_with("Parse error")
+                    || l.starts_with("Runtime error")
+                    || l.starts_with("Error"))
         },
     }
 }
 
-/// DuckDB's shell (SQLite's shell's descendant: the same `.mode quote` and `.print`).
+/// DuckDB's shell (SQLite's shell's descendant: the same `.mode quote` and `.print`). Its quote mode
+/// writes a header line and puts its column separator (`|` by default) between values, so both are
+/// set as SQLite's shell has them (checked on DuckDB 2.0.1's release CLI).
 pub fn duckdb(program: String) -> ShellSpec {
     ShellSpec {
         engine: "duckdb",
         program,
-        args: ["-batch", "-quote", ":memory:"].map(String::from).to_vec(),
+        args: [
+            "-batch",
+            "-noheader",
+            "-quote",
+            "-separator",
+            ",",
+            ":memory:",
+        ]
+        .map(String::from)
+        .to_vec(),
         settle: Some("CHECKPOINT"),
         // Its errors are "<Kind> Error: ..." (Parser, Catalog, Binder, Conversion, ...).
         error: |l| !l.starts_with('\'') && (l.contains("Error: ") || l.starts_with("Error")),
@@ -173,23 +210,28 @@ pub fn duckdb(program: String) -> ShellSpec {
     }
 }
 
-/// Turso's shell (`tursodb`), its list mode with `|` between values and NULL as nothing.
+/// Turso's shell (`tursodb`), its list mode with `|` between values. Its NULL is nothing there, as
+/// empty text is, so `.nullvalue` makes it [`NULL_MARK`]. Its shell has no quote mode and no
+/// `.separator` (tursodb 0.8.4: list, pretty and line only), so a text value holding `|` or a line
+/// end reads as more values or rows than it is: such an answer disagrees.
 pub fn turso(program: String) -> ShellSpec {
     ShellSpec {
         engine: "turso",
         program,
-        args: ["--quiet", "--output-mode", "list", ":memory:"].map(String::from).to_vec(),
-        setup: Vec::new(),
+        args: ["--quiet", "--output-mode", "list", ":memory:"]
+            .map(String::from)
+            .to_vec(),
+        setup: vec![format!(".nullvalue {NULL_MARK}")],
         teardown: Vec::new(),
         echo: |m| format!("SELECT '{m}'"),
         terminator_line: true,
         settle: Some("PRAGMA wal_checkpoint(TRUNCATE)"),
         rows: Rows::Delimited {
             field: '|',
-            null: "",
+            null: NULL_MARK,
             escapes: false,
         },
-        // Its errors are miette reports: "× <kind> error: ...", or "Error: ...".
+        // Its errors are miette reports, "  × Parse error: no such table: nope", or "Error: ...".
         error: |l| {
             let t = l.trim_start();
             t.starts_with('×') || t.starts_with("Error") || t.starts_with("Parse error")
@@ -246,9 +288,13 @@ pub fn mysql(program: String, dsn: &str) -> Result<ShellSpec, Unavailable> {
         engine: "mysql",
         why: format!("{dsn}: {why}"),
     };
-    let rest = dsn.strip_prefix("mysql://").ok_or_else(|| bad("not mysql://user[:password]@host:port/db"))?;
+    let rest = dsn
+        .strip_prefix("mysql://")
+        .ok_or_else(|| bad("not mysql://user[:password]@host:port/db"))?;
     let (auth, addr) = rest.split_once('@').ok_or_else(|| bad("no user@"))?;
-    let (user, password) = auth.split_once(':').map_or((auth, None), |(u, p)| (u, Some(p)));
+    let (user, password) = auth
+        .split_once(':')
+        .map_or((auth, None), |(u, p)| (u, Some(p)));
     let addr = addr.split_once('/').map_or(addr, |(a, _)| a);
     let (host, port) = addr.split_once(':').unwrap_or((addr, "3306"));
     let db = fresh_name();
@@ -312,7 +358,10 @@ impl Shell {
         let mut child = cmd.spawn().map_err(|e| missing(e.to_string()))?;
         // The pipe's writing ends now live only in the child: its exit ends the reader.
         drop(cmd);
-        let input = child.stdin.take().ok_or_else(|| missing("no input pipe".into()))?;
+        let input = child
+            .stdin
+            .take()
+            .ok_or_else(|| missing("no input pipe".into()))?;
         let (tx, lines) = channel();
         std::thread::spawn(move || {
             let mut r = BufReader::new(reader);
@@ -342,10 +391,12 @@ impl Shell {
         };
         let setup = std::mem::take(&mut shell.spec.setup);
         for s in &setup {
-            shell.run(s, 0, None).map_err(|e| Unavailable::Unreachable {
-                engine: shell.spec.engine,
-                why: format!("{s}: {e:?}"),
-            })?;
+            shell
+                .run(s, 0, None)
+                .map_err(|e| Unavailable::Unreachable {
+                    engine: shell.spec.engine,
+                    why: format!("{s}: {e:?}"),
+                })?;
         }
         Ok(shell)
     }
@@ -363,9 +414,17 @@ impl Shell {
         }
         self.marks = self.marks.saturating_add(1);
         let mark = format!("kiln-corpus-mark-{}", self.marks);
-        let end = if self.spec.terminator_line { "\n;" } else { ";" };
+        let end = if self.spec.terminator_line {
+            "\n;"
+        } else {
+            ";"
+        };
         let text = format!("{sql}{end}\n{}\n", (self.spec.echo)(&mark));
-        if let Err(e) = self.input.write_all(text.as_bytes()).and_then(|()| self.input.flush()) {
+        if let Err(e) = self
+            .input
+            .write_all(text.as_bytes())
+            .and_then(|()| self.input.flush())
+        {
             let why = format!("its input closed: {e}");
             self.stop(why.clone());
             return Err(Stop::Refused(why));
@@ -373,8 +432,13 @@ impl Shell {
         let mut out = Vec::new();
         loop {
             let got = match until {
-                None => self.lines.recv().map_err(|_| RecvTimeoutError::Disconnected),
-                Some(u) => self.lines.recv_timeout(u.saturating_duration_since(Instant::now())),
+                None => self
+                    .lines
+                    .recv()
+                    .map_err(|_| RecvTimeoutError::Disconnected),
+                Some(u) => self
+                    .lines
+                    .recv_timeout(u.saturating_duration_since(Instant::now())),
             };
             match got {
                 Ok(line) if line == mark => return Ok(out),
@@ -396,14 +460,23 @@ impl Shell {
 }
 
 impl Engine for Shell {
-    fn run(&mut self, sql: &str, keep: usize, until: Option<Instant>) -> Result<Vec<Vec<Value>>, Stop> {
+    fn run(
+        &mut self,
+        sql: &str,
+        keep: usize,
+        until: Option<Instant>,
+    ) -> Result<Vec<Vec<Value>>, Stop> {
         let out = self.exchange(sql, until)?;
         if out.iter().any(|l| (self.spec.error)(l)) {
             return Err(Stop::Refused(out.join("\n")));
         }
         let mut rows = match self.spec.rows {
             Rows::Quote => quoted_rows(&out.join("\n")).map_err(Stop::Refused)?,
-            Rows::Delimited { field, null, escapes } => out
+            Rows::Delimited {
+                field,
+                null,
+                escapes,
+            } => out
                 .iter()
                 .map(|l| {
                     l.split(field)
@@ -422,7 +495,10 @@ impl Engine for Shell {
 
     fn settle(&mut self) -> Result<(), String> {
         match self.spec.settle {
-            Some(s) => self.run(s, 0, None).map(drop).map_err(|e| format!("{s}: {e:?}")),
+            Some(s) => self
+                .run(s, 0, None)
+                .map(drop)
+                .map_err(|e| format!("{s}: {e:?}")),
             None => Ok(()),
         }
     }
@@ -592,7 +668,10 @@ impl ClickHouse {
             if left.is_zero() {
                 return Err(Stop::PastBudget);
             }
-            path.push_str(&format!("&max_execution_time={}&timeout_overflow_mode=throw", left.as_secs_f64()));
+            path.push_str(&format!(
+                "&max_execution_time={}&timeout_overflow_mode=throw",
+                left.as_secs_f64()
+            ));
             stream.set_read_timeout(Some(left)).map_err(refused)?;
         }
         let head = format!(
@@ -607,7 +686,12 @@ impl ClickHouse {
         let mut body = Vec::new();
         match stream.read_to_end(&mut body) {
             Ok(_) => {}
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
                 return Err(Stop::PastBudget);
             }
             Err(e) => return Err(refused(e)),
@@ -627,14 +711,25 @@ impl ClickHouse {
 }
 
 impl Engine for ClickHouse {
-    fn run(&mut self, sql: &str, keep: usize, until: Option<Instant>) -> Result<Vec<Vec<Value>>, Stop> {
+    fn run(
+        &mut self,
+        sql: &str,
+        keep: usize,
+        until: Option<Instant>,
+    ) -> Result<Vec<Vec<Value>>, Stop> {
         let body = self.request(sql, until)?;
         Ok(body
             .lines()
             .take(keep)
             .map(|l| {
                 l.split('\t')
-                    .map(|v| if v == "\\N" { Value::Null } else { Value::Text(unescape(v)) })
+                    .map(|v| {
+                        if v == "\\N" {
+                            Value::Null
+                        } else {
+                            Value::Text(unescape(v))
+                        }
+                    })
                     .collect()
             })
             .collect())

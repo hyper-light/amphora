@@ -18,6 +18,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use amphora_corpus::amphora::AmphoraRender;
+use amphora_corpus::dialect::{Translated, Translation};
 use amphora_corpus::run::{Counts, Limits, Outcome, run_file};
 
 struct Args {
@@ -165,8 +166,32 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
             .unwrap_or(&file)
             .display()
             .to_string();
+        // The file's records in the engine's dialect, made when the corpus was built (G2 step 4).
+        let dialect = amphora_corpus::dialect::of(&a.engine);
+        let translation = match dialect {
+            Some(d) => Some(Translation::read(&amphora_corpus::dialect::path(
+                &a.pool,
+                d,
+                Path::new(&rel),
+            ))?),
+            None => None,
+        };
+        let fix_translation = match (dialect, fixture(&a.pool, &file)) {
+            (Some(d), Some(f)) => {
+                let frel = f.strip_prefix(&a.pool).unwrap_or(&f).to_path_buf();
+                Some(Translation::read(&amphora_corpus::dialect::path(
+                    &a.pool, d, &frel,
+                ))?)
+            }
+            _ => None,
+        };
+        let translated = translation.as_ref().map(|t| Translated {
+            file: t,
+            fixture: fix_translation.as_ref(),
+        });
         let file_began = Instant::now();
-        let mut engine = amphora_corpus::engines::open(&a.engine).map_err(|e| format!("{UNAVAILABLE}{e}"))?;
+        let mut engine =
+            amphora_corpus::engines::open(&a.engine).map_err(|e| format!("{UNAVAILABLE}{e}"))?;
         // Fill files stop at the deadline; every record, required ones too, is stopped once it has
         // run as long as the whole budget.
         let limits = Limits {
@@ -174,10 +199,11 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
             record: a.budget,
         };
         let name = a.engine.as_str();
-        let counts = run_file(engine.as_mut(), &mut render, &text, fix.as_deref(), limits, &mut |ran| {
+        let counts = run_file(engine.as_mut(), &mut render, &text, fix.as_deref(), translated, limits, &mut |ran| {
             let outcome = match &ran.outcome {
                 Outcome::Agree => "agree".to_owned(),
                 Outcome::Unreached => "unreached".to_owned(),
+                Outcome::Untranslatable(_) => "untranslatable".to_owned(),
                 other => {
                     let (shown, said) = match other {
                         Outcome::Answer { want, got } => (format!("SQLite answers {want}\n    {name} answers {got}"), "disagree"),
@@ -216,6 +242,7 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
             required_past = required_past.saturating_add(counts.past_budget);
         }
         total.unsettled = total.unsettled.saturating_add(counts.unsettled);
+        total.untranslatable = total.untranslatable.saturating_add(counts.untranslatable);
     }
     if let Some(mut t) = times {
         t.flush().map_err(|e| e.to_string())?;
@@ -225,11 +252,12 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
     }
     writeln!(
         out,
-        "{}: {files} files in {:.1} s: {} records agree, {} disagree, {} skipped (not SQLite's), {} not reached in the budget, {} stopped at the budget ({required_past} of them required), {} settles failed",
+        "{}: {files} files in {:.1} s: {} records agree, {} disagree, {} untranslatable into its dialect, {} skipped (not SQLite's), {} not reached in the budget, {} stopped at the budget ({required_past} of them required), {} settles failed",
         a.engine,
         began.elapsed().as_secs_f64(),
         total.agree,
         total.disagree,
+        total.untranslatable,
         total.skipped,
         total.unreached,
         total.past_budget,

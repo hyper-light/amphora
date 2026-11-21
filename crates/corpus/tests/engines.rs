@@ -56,7 +56,9 @@ fn t_g2_4_2_an_engine_whose_program_is_missing_is_refused() {
     }
     assert_eq!(
         refused,
-        ["sqlite", "duckdb", "turso", "postgres", "orioledb", "cedardb", "mysql"]
+        [
+            "sqlite", "duckdb", "turso", "postgres", "orioledb", "cedardb", "mysql"
+        ]
     );
 }
 
@@ -154,6 +156,7 @@ fn t_g2_4_2_a_file_runs_on_sqlites_shell_or_is_refused() {
         engine.as_mut(),
         &mut render,
         FILE,
+        None,
         None,
         Limits {
             deadline: None,
