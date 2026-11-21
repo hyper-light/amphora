@@ -913,6 +913,8 @@ mod tests {
             crate::Database::open_file(io, ":memory:", crate::sync::Arc::new(crate::SqliteDialect))
                 .unwrap();
         let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        // Off whatever `AMPHORA_FITTED_COSTS` says, so the suite runs either way.
+        conn.set_fitted_costs(false);
         conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER)")
             .unwrap();
         let rows: Vec<String> = (1..=400).map(|i| format!("({i}, {})", i % 7)).collect();
