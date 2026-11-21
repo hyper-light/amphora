@@ -314,7 +314,11 @@ mod tests {
         spacing.stepped(1, QUICK, 0).unwrap();
         assert!(spacing.due().unwrap(), "not due at 100,001 applied");
         spacing.restarted(0).unwrap();
-        assert_eq!(spacing.current, Window::default(), "the generation not forgotten");
+        assert_eq!(
+            spacing.current,
+            Window::default(),
+            "the generation not forgotten"
+        );
         spacing.stepped(1, QUICK, 1).unwrap();
         spacing.stepped(0, QUICK, 0).unwrap();
         spacing.stepped(50_999, QUICK, 0).unwrap();
@@ -330,7 +334,7 @@ mod tests {
     #[test]
     fn the_guess_is_the_worst_of_the_last_thousand_holds() {
         let mut spacing = Spacing::default();
-        let mut hold = |spacing: &mut Spacing, held| {
+        let hold = |spacing: &mut Spacing, held| {
             spacing.restarted(0).unwrap();
             spacing.stepped(held, QUICK, 1).unwrap();
             spacing.stepped(0, QUICK, 0).unwrap();
@@ -343,7 +347,10 @@ mod tests {
         hold(&mut spacing, 1);
         assert_eq!(spacing.worst.most(), 1);
         assert!(spacing.worst.holds.len() <= 1_000);
-        assert_eq!(spacing.current.held, 1_009, "a restart not due began a generation");
+        assert_eq!(
+            spacing.current.held, 1_009,
+            "a restart not due began a generation"
+        );
     }
 
     /// AC-T1.8.D1, T-T1.8.D3 (the share): do an owner applying entries in steps of 1 to 7, a step in

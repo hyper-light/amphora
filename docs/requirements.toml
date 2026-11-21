@@ -557,6 +557,16 @@ tests = [
   { id = "T-GN.1.2", text = "Slot: a gap of 40 ms after a member's first slot, then none — passes when it is believed at 40 and 79 ms and forgotten at 80 ms" },
 ]
 
+[[own]]
+id = "GN.2"
+title = "The log restarts' generation ends once it covers its own spend at the quantile: not a picked 3,000-tick window"
+criteria = [
+  { id = "AC-GN.2.1", text = "A generation runs from a restart to the restart made once it alone covers its held, its base tail and the next restart's guess strictly below 1 - q of what it applied; the one ended is forgotten; the guess is the worst of the last 1 / (1 - q) holds; no tick or time constant" },
+]
+tests = [
+  { id = "T-GN.2.1", text = "A restart holding 50, then 99,950 and 1 more applied; 1,000 holds of 1 after one of 9 — passes when due at 100,001 and not 100,000, the next at 51,001 and not 51,000, and the guess 9 through the 999th and 1 at the 1,000th" },
+]
+
 # lane cc-proto
 # Amphora's own IDs for G8 step 1 (kiln plan 01a16b0f4716761cb68dc0c96863b53b, step 1, under
 # CP-T1.3 and AC-T1.3.6): serializability by precision locking against SSI and OCC, measured.
