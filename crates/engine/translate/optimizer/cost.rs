@@ -136,7 +136,7 @@ pub(super) fn estimate_scan_cost(
     // CPU cost for processing all rows on each scan
     let cpu_cost = num_scans * base_row_count * params.cpu_cost_per_row;
 
-    Cost(file_reads(io_cost, params.cache_pages, params.page_miss) + cpu_cost)
+    Cost(file_reads(io_cost, table_pages, params.cache_pages, params.page_miss) + cpu_cost)
 }
 
 /// Estimate the work to add every row to a new in-memory index.
@@ -200,15 +200,23 @@ pub(super) fn table_pages_fetched(rows: f64, table_pages: f64, cache_pages: f64)
     }
 }
 
-/// Amphora (QT.5): the file reads of `cold_reads`, the pages a plan reads from a cold cache of
-/// `cache_pages`: the first `cache_pages` of them at most are pages it touches first, read from
-/// the file only if the cache doesn't already hold them, `page_miss` of the time as the
-/// connection's recent fetches show; the rest are pages the cache was too small to keep, read
-/// again whatever it held. A page the cache holds costs no read: its lookup is part of the seek or
-/// row visit that touches it.
-pub(super) fn file_reads(cold_reads: f64, cache_pages: f64, page_miss: f64) -> f64 {
-    let first = cold_reads.min(cache_pages.max(1.0)).max(0.0);
-    cold_reads - first + first * page_miss.clamp(0.0, 1.0)
+/// Amphora (QT.5): the file reads of `cold_reads`, the pages a plan reads of a tree of
+/// `tree_pages` from a cold cache of `cache_pages`. Of the tree's pages it touches first (at most
+/// all of them), the cache already holds a share: the share of the connection's recent fetches
+/// that found their page held, `1 - page_miss`, of the part of the tree the cache has room for,
+/// `cache_pages / tree_pages` at most 1. Those are no file read: a held page's lookup is part of
+/// the seek or row visit that touches it. The rest, and the pages the cache was too small to keep,
+/// are read.
+pub(super) fn file_reads(
+    cold_reads: f64,
+    tree_pages: f64,
+    cache_pages: f64,
+    page_miss: f64,
+) -> f64 {
+    let tree = tree_pages.max(1.0);
+    let first = cold_reads.min(tree).max(0.0);
+    let held = (1.0 - page_miss.clamp(0.0, 1.0)) * (cache_pages / tree).clamp(0.0, 1.0);
+    cold_reads - first * held
 }
 
 /// Estimate IO and CPU cost for index-based access.
@@ -287,6 +295,7 @@ pub fn estimate_index_cost(
         let looked_up = input_cardinality * rows_per_seek;
         file_reads(
             table_pages_fetched(looked_up, table_pages_count, params.cache_pages),
+            table_pages_count,
             params.cache_pages,
             params.page_miss,
         ) + looked_up * params.cpu_cost_per_seek
@@ -309,7 +318,8 @@ pub fn estimate_index_cost(
         seek_cost + leaf_scan_cost
     };
 
-    let io_cost = file_reads(index_io, params.cache_pages, params.page_miss) + table_lookup_cost;
+    let io_cost = file_reads(index_io, index_pages, params.cache_pages, params.page_miss)
+        + table_lookup_cost;
 
     // CPU cost: key comparisons during seeks + row processing
     let total_rows = input_cardinality * rows_per_seek;
@@ -857,16 +867,17 @@ mod tests {
         assert_eq!(table_pages_fetched(0.0, 4_000.0, 2_000.0), 0.0);
     }
 
-    /// Do: 300 cold reads with a cache of 100 pages, half the connection's fetches reading a
-    /// file, then none, then all. Expect: the 200 the cache couldn't keep read whatever, and of
-    /// the 100 first touched half, none and all (T-QT.5.5: a held page is no file read; a page
-    /// the cache is too small to keep is).
+    /// Do: 300 cold reads of a tree of 100 pages, the cache holding it, half the connection's
+    /// fetches reading a file, then none, then all; then a tree of 400 pages a cache of 100 holds
+    /// a quarter of. Expect: the 200 reads past the tree's pages read whatever, and of its 100
+    /// half, none and all; of the bigger tree's 300 first reads, a quarter held (T-QT.5.5: a held
+    /// page is no file read; a page the cache can't hold is).
     #[test]
     fn t_qt_5_5_held_pages_are_not_read_but_pages_the_cache_drops_are() {
-        assert_eq!(file_reads(300.0, 100.0, 0.5), 250.0);
-        assert_eq!(file_reads(300.0, 100.0, 0.0), 200.0);
-        assert_eq!(file_reads(300.0, 100.0, 1.0), 300.0);
-        assert_eq!(file_reads(40.0, 2_000.0, 0.0), 0.0);
+        assert_eq!(file_reads(300.0, 100.0, 2_000.0, 0.5), 250.0);
+        assert_eq!(file_reads(300.0, 100.0, 2_000.0, 0.0), 200.0);
+        assert_eq!(file_reads(300.0, 100.0, 2_000.0, 1.0), 300.0);
+        assert_eq!(file_reads(300.0, 400.0, 100.0, 0.0), 225.0);
     }
 
     /// Amphora: do: search an index of 1,000 leaf pages 200 times, with a cache that holds it and

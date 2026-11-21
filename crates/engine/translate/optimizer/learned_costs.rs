@@ -160,8 +160,9 @@ impl LearnedCosts {
         self.rates.lock().rate_mut(work).observe(units, nanos);
     }
 
-    /// The weights as they stand, every page priced as a file read; None only if the clock never
-    /// moved while calibrating.
+    /// The weights as they stand, no fetch's miss share given; None only if the clock never moved
+    /// while calibrating.
+    #[cfg(test)]
     pub(crate) fn weights(&self) -> Option<LearnedWeights> {
         self.rates.lock().weights(None)
     }
@@ -511,9 +512,9 @@ mod tests {
         let costs = LearnedCosts::from_rates(fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0));
         let params = super::super::cost_params::CostModelParams::new();
         assert_eq!(params.with_learned(costs.weights_at(None)).page_miss, 1.0);
-        assert_eq!(params.with_learned(costs.weights_at(Some(0.25))).page_miss, 0.25);
-        assert_eq!(params.with_learned(costs.weights_at(Some(3.0))).page_miss, 1.0);
-        assert_eq!(params.with_learned(costs.weights_at(Some(f64::NAN))).page_miss, 1.0);
+        for (miss, want) in [(Some(0.25), 0.25), (Some(3.0), 1.0), (Some(f64::NAN), 1.0)] {
+            assert_eq!(params.with_learned(costs.weights_at(miss)).page_miss, want);
+        }
     }
 
     /// Do: anchor the page read at 100 ns, as a database's open does, then read pages of its own
