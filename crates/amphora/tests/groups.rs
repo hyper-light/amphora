@@ -50,6 +50,9 @@ fn opt(v: Option<u64>) -> Value {
     v.map_or(Value::Null, |v| Value::from_i64(i64::try_from(v).unwrap()))
 }
 
+/// Keys with their positions, the last position taken, and whether none is past it.
+type KeysIn = (Vec<(String, Pos)>, Option<Pos>, bool);
+
 impl Events {
     fn open(db: Db) -> anyhow::Result<Self> {
         let mut meta = (0, None, 0);
@@ -102,7 +105,7 @@ impl Events {
         span: Span,
         positions: usize,
         keep: &dyn Fn(Pos) -> bool,
-    ) -> anyhow::Result<(Vec<(String, Pos)>, Option<Pos>, bool)> {
+    ) -> anyhow::Result<KeysIn> {
         let mut keys: Vec<(String, Pos)> = Vec::new();
         let (mut seen, mut last, mut done) = (0, None, true);
         self.db.query(
@@ -660,4 +663,262 @@ fn t_t1_9_r4_a_split_copies_the_moving_ranges_rows_and_a_merge_brings_them_back(
     assert!(groups.holding_of(GroupId(1)).is_none());
     assert_eq!(groups.holding_of(GroupId(0)).unwrap().owned(), Some(Span::ALL));
     every_key_in_its_group(&groups, &keys, &acked);
+}
+
+/// What a lab run saw: the operations that ended, flipped, and each cutover's pause (from the old
+/// group's fence carried out to the new group's taking the span up: the time the span took no
+/// writes), and the longest a client's write waited on a refusal before it was acknowledged.
+struct LabRun {
+    ended: u64,
+    flipped: u64,
+    pauses: Vec<Duration>,
+    longest_refused: Duration,
+    acked: u64,
+}
+
+fn env(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Groups on one node, split and merged by the planner from what is measured (each group's rows
+/// and the writes acknowledged in each window, and this machine's cores), carried out by the shell
+/// while `clients` threads write on, until `target` operations have ended. `preload` rows a key
+/// are written before the clients start (the partition's size). Every write acknowledged is
+/// checked at the end: read back from its key's group, and every key in exactly one group's file.
+fn lab_run(keys: usize, preload: usize, clients: usize, target: u64) -> LabRun {
+    use amphora::reshard::plan::{GroupLoad, NodeRoom, cut, plan};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let dir = tempfile::tempdir().unwrap();
+    let directory = Directory::new(NodeId(0));
+    let groups = Groups::on(&directory, Config::default(), |g| {
+        events(dir.path(), &g.0.to_string())
+    })
+    .unwrap();
+    let keys: Arc<Vec<String>> = Arc::new((0..keys).map(|i| format!("k{i}")).collect());
+    let acked = Arc::new(Mutex::new(vec![0i64; keys.len()]));
+    for chunk in keys.chunks(64) {
+        for _ in 0..preload {
+            let mut a = acked.lock().unwrap();
+            let rows = chunk
+                .iter()
+                .map(|k| {
+                    let i = k[1..].parse::<usize>().unwrap();
+                    a[i] += 1;
+                    row(k, a[i] - 1)
+                })
+                .collect::<Vec<_>>();
+            // A preload batch spans groups only once there are several: there is one here.
+            let t = groups.put_wait(rows, soon()).unwrap();
+            groups.durable(&t, soon()).unwrap();
+        }
+    }
+    let window: Arc<Mutex<std::collections::BTreeMap<Pos, u64>>> = Arc::default();
+    let stop = Arc::new(AtomicBool::new(false));
+    let hot = Arc::new(AtomicUsize::new(0));
+    let longest = Arc::new(Mutex::new(Duration::ZERO));
+    let total = Arc::new(AtomicUsize::new(0));
+    let threads: Vec<_> = (0..clients)
+        .map(|t| {
+            let (groups, keys, acked, window, stop, hot, longest, total) = (
+                groups.clone(),
+                Arc::clone(&keys),
+                Arc::clone(&acked),
+                Arc::clone(&window),
+                Arc::clone(&stop),
+                Arc::clone(&hot),
+                Arc::clone(&longest),
+                Arc::clone(&total),
+            );
+            std::thread::spawn(move || {
+                let mut x = 0x9e37_79b9_7f4a_7c15u64 ^ (t as u64 + 1);
+                let mine: Vec<usize> = (t..keys.len()).step_by(clients).collect();
+                while !stop.load(Ordering::Relaxed) {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    // Most writes hit a run of a sixteenth of the keys that moves now and then.
+                    let i = if x % 4 != 0 {
+                        let run = (mine.len() / 16).max(1);
+                        mine[(hot.load(Ordering::Relaxed) + (x >> 8) as usize % run) % mine.len()]
+                    } else {
+                        mine[(x >> 8) as usize % mine.len()]
+                    };
+                    let key = &keys[i];
+                    let seq = acked.lock().unwrap()[i];
+                    let asked = Instant::now();
+                    loop {
+                        match groups.put_wait(vec![row(key, seq)], soon()) {
+                            Ok(ticket) => {
+                                groups.durable(&ticket, soon()).unwrap();
+                                break;
+                            }
+                            Err(Refused::Away(_)) => std::thread::yield_now(),
+                            Err(e) => panic!("a write refused: {e:?}"),
+                        }
+                    }
+                    let waited = asked.elapsed();
+                    {
+                        let mut l = longest.lock().unwrap();
+                        *l = (*l).max(waited);
+                    }
+                    acked.lock().unwrap()[i] += 1;
+                    *window.lock().unwrap().entry(position(key)).or_default() += 1;
+                    total.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        })
+        .collect();
+
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get() as u64);
+    let (mut driver, _) = Driver::recover(directory, 1).unwrap();
+    let mut run = LabRun {
+        ended: 0,
+        flipped: 0,
+        pauses: Vec::new(),
+        longest_refused: Duration::ZERO,
+        acked: 0,
+    };
+    let mut fenced: std::collections::HashMap<OpId, Instant> = std::collections::HashMap::new();
+    let mut planned_at = 0;
+    while run.ended < target {
+        // A window: at least one write a key since the last plan (the test's parameter).
+        let seen = total.load(Ordering::Relaxed);
+        if seen < planned_at + keys.len() {
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        planned_at = seen;
+        let dirc = driver.directory().clone();
+        let w: Vec<(Pos, u64)> = std::mem::take(&mut *window.lock().unwrap())
+            .into_iter()
+            .collect();
+        let mut loads = Vec::new();
+        for (g, _) in dirc.groups() {
+            let Some(span) = groups.holding_of(g).and_then(|h| h.owned()) else {
+                continue;
+            };
+            let rows: Vec<(Pos, u64)> = keys
+                .iter()
+                .map(|k| position(k))
+                .filter(|p| span.contains(*p))
+                .map(|p| (p, 1))
+                .collect();
+            let load: Vec<(Pos, u64)> = w.iter().copied().filter(|(p, _)| span.contains(*p)).collect();
+            loads.push(GroupLoad {
+                group: g,
+                bytes: rows.len() as u64,
+                load: load.iter().map(|(_, c)| c).sum(),
+                by_size: cut(&rows),
+                by_load: cut(&load),
+            });
+        }
+        let proposals = plan(&dirc, &[NodeRoom { node: NodeId(0), cores }], &loads);
+        if proposals.is_empty() {
+            hot.fetch_add(keys.len() / 7 + 1, Ordering::Relaxed);
+        }
+        for p in proposals {
+            let Ok(out) = driver.begin(&p) else { continue };
+            let mut pending: std::collections::VecDeque<Out> = out.into();
+            while let Some(o) = pending.pop_front() {
+                match o {
+                    Out::Commit(_) => groups.route(driver.directory()).unwrap(),
+                    Out::Send(a) => {
+                        let reply = groups
+                            .carry(&a, soon(), |g| events(dir.path(), &g.0.to_string()))
+                            .unwrap();
+                        match (&a.what, &reply) {
+                            (amphora::reshard::driver::Do::Fence { .. }, _) => {
+                                fenced.entry(a.op).or_insert_with(Instant::now);
+                            }
+                            (_, amphora::reshard::driver::Reply::Activated) => {
+                                if let Some(at) = fenced.remove(&a.op) {
+                                    run.pauses.push(at.elapsed());
+                                }
+                            }
+                            _ => {}
+                        }
+                        pending.extend(
+                            driver
+                                .answer(Answer {
+                                    ask: a.ask,
+                                    op: a.op,
+                                    reply,
+                                })
+                                .unwrap(),
+                        );
+                    }
+                    Out::Ended(e) => {
+                        run.ended += 1;
+                        run.flipped += u64::from(e.done);
+                    }
+                }
+            }
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    for t in threads {
+        t.join().unwrap();
+    }
+    groups.sync(soon()).unwrap();
+    let acked = acked.lock().unwrap().clone();
+    every_key_in_its_group(&groups, &keys, &acked);
+    run.acked = acked.iter().map(|&n| u64::try_from(n).unwrap()).sum();
+    run.longest_refused = *longest.lock().unwrap();
+    run
+}
+
+fn p99(mut d: Vec<Duration>) -> Duration {
+    d.sort_unstable();
+    d.get(d.len().saturating_sub(1) * 99 / 100)
+        .copied()
+        .unwrap_or_default()
+}
+
+/// The cutover-pause harness (AC-T1.9.2): one group of `AMPHORA_RESHARD_PAUSE_ROWS` rows (a tiny
+/// partition by default; the coordinator's run sizes it to 10 GB) split by the planner while
+/// clients write on; prints each cutover's pause and the longest a write waited on a refusal.
+/// Expect every acknowledged write read back from exactly one group; the pause's bound is judged
+/// from the printed numbers, not asserted here (tests assert behaviour, not the clock).
+#[test]
+fn t_t1_9_p1_cutover_pause_harness() {
+    let keys = env("AMPHORA_RESHARD_PAUSE_KEYS", 256) as usize;
+    let rows = env("AMPHORA_RESHARD_PAUSE_ROWS", 1024) as usize;
+    let ops = env("AMPHORA_RESHARD_PAUSE_OPS", 1);
+    let clients = env("AMPHORA_RESHARD_CLIENTS", 4) as usize;
+    let run = lab_run(keys, rows.div_ceil(keys.max(1)), clients, ops);
+    assert!(run.flipped >= 1, "no cutover (non-vacuity)");
+    println!(
+        "cutover pause: {} operations, {} flipped, pause p99 {:?} max {:?}, longest write refused {:?}, {} writes acknowledged",
+        run.ended,
+        run.flipped,
+        p99(run.pauses.clone()),
+        run.pauses.iter().max().copied().unwrap_or_default(),
+        run.longest_refused,
+        run.acked,
+    );
+}
+
+/// The lab harness (AC-T1.9.3): `AMPHORA_RESHARD_OPS` automatic operations (a few by default;
+/// the coordinator's run takes 1,000), each chosen by the planner from what is measured and
+/// carried out while clients write on; expect writes lost exactly 0: every acknowledged write
+/// read back from its key's group, and every key in exactly one group's file.
+#[test]
+fn t_t1_9_l1_automatic_operations_lose_no_write() {
+    let keys = env("AMPHORA_RESHARD_KEYS", 256) as usize;
+    let ops = env("AMPHORA_RESHARD_OPS", 4);
+    let clients = env("AMPHORA_RESHARD_CLIENTS", 4) as usize;
+    let run = lab_run(keys, 1, clients, ops);
+    assert!(run.ended >= ops);
+    println!(
+        "lab: {} operations, {} flipped, {} writes acknowledged, 0 lost, pause p99 {:?}",
+        run.ended,
+        run.flipped,
+        run.acked,
+        p99(run.pauses.clone()),
+    );
 }
